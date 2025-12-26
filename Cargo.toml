@@ -2,5 +2,40 @@
 name = "succinctly"
 version = "0.1.0"
 edition = "2024"
+description = "High-performance succinct data structures for Rust"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-works/succinctly"
+keywords = ["succinct", "bitvector", "rank", "select", "data-structures"]
+categories = ["data-structures", "algorithms"]
+
+[features]
+default = []
+# Enable SIMD acceleration (auto-detected at compile time)
+simd = []
+# Enable runtime SIMD detection (slight overhead)
+runtime-dispatch = []
+# Include select0 support (increases index size)
+select0 = []
+
+# Test features (not for production)
+large-tests = []    # 1G bitvector tests (~125MB RAM)
+huge-tests = []     # 5G bitvector tests (~625MB RAM)
+mmap-tests = ["memmap2", "tempfile"]  # Memory-mapped tests
 
 [dependencies]
+memmap2 = { version = "0.9", optional = true }
+tempfile = { version = "3.10", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.0"
+rand = "0.8"
+rand_chacha = "0.3"
+
+[[bench]]
+name = "rank_select"
+harness = false
+
+[lib]
+name = "succinctly"
+path = "src/lib.rs"
