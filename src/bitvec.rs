@@ -263,7 +263,7 @@ impl RankSelect for BitVec {
             let inverted = !word;
 
             // Handle partial last word
-            let valid_bits = if word_idx == self.words.len() - 1 && self.len % 64 != 0 {
+            let valid_bits = if word_idx == self.words.len() - 1 && !self.len.is_multiple_of(64) {
                 self.len % 64
             } else {
                 64
