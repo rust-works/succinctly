@@ -6,9 +6,11 @@
 use crate::table::select_in_byte;
 
 /// Constant with 1 in each byte's LSB position.
+#[allow(dead_code)]
 pub const L8: u64 = 0x0101_0101_0101_0101;
 
 /// Constant with 1 in each byte's MSB position.
+#[allow(dead_code)]
 pub const H8: u64 = 0x8080_8080_8080_8080;
 
 /// Select the k-th set bit (0-indexed) in a 64-bit word.

@@ -8,7 +8,7 @@ use succinctly::{BitVec, RankSelect};
 /// Generate a bitvector with specified size and density.
 fn generate_bitvec(size: usize, density: f64, seed: u64) -> BitVec {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let word_count = (size + 63) / 64;
+    let word_count = size.div_ceil(64);
     let mut words = Vec::with_capacity(word_count);
 
     let threshold = (density * u64::MAX as f64) as u64;
@@ -98,8 +98,8 @@ fn bench_select(c: &mut Criterion) {
 fn bench_construction(c: &mut Criterion) {
     let mut group = c.benchmark_group("construction");
 
-    for size in [1_000_000, 10_000_000] {
-        let words: Vec<u64> = (0..(size + 63) / 64)
+    for size in [1_000_000usize, 10_000_000] {
+        let words: Vec<u64> = (0..size.div_ceil(64))
             .map(|i| i as u64 * 0x1234_5678_9ABC_DEF0)
             .collect();
 

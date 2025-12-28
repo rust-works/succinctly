@@ -185,7 +185,7 @@ mod tests {
         // samples[1] = word 10
         // etc.
 
-        let (word, rem) = idx.jump_to(25);
+        let (word, _rem) = idx.jump_to(25);
         // sample_idx = 2, use samples[1] = word 10
         // remaining = 25 - 10 = 15
         assert!(word <= 25);
@@ -198,7 +198,7 @@ mod tests {
         let idx = SelectIndex::build(&words, 640, 64);
 
         // Samples every 64 ones, which is every word
-        let (word, rem) = idx.jump_to(128);
+        let (word, _rem) = idx.jump_to(128);
         // sample_idx = 2, use samples[1] = word containing 64th bit = word 1
         assert!(word <= 2);
     }

@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 const WORDS_PER_BLOCK: usize = 8;
 
 /// Number of bits per basic block.
+#[allow(dead_code)]
 const BITS_PER_BLOCK: usize = WORDS_PER_BLOCK * 64;
 
 /// Number of blocks per superblock (for L0).
@@ -60,7 +61,7 @@ impl RankDirectory {
             return Self::empty();
         }
 
-        let num_blocks = (words.len() + WORDS_PER_BLOCK - 1) / WORDS_PER_BLOCK;
+        let num_blocks = words.len().div_ceil(WORDS_PER_BLOCK);
         let mut l0 = Vec::new();
         let mut l1_l2 = Vec::with_capacity(num_blocks);
 

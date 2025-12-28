@@ -6,31 +6,21 @@
 //! - Default: Uses Rust's `count_ones()` which auto-vectorizes
 //! - `simd`: Uses explicit SIMD intrinsics (NEON/POPCNT)
 //! - `portable-popcount`: Uses portable bitwise algorithm (no intrinsics)
+//!
+//! Feature priority (when multiple enabled): portable-popcount > simd > default
 
 /// Popcount a single u64 word.
 #[inline(always)]
 pub fn popcount_word(word: u64) -> u32 {
+    // Priority: portable-popcount > simd > default
     #[cfg(feature = "portable-popcount")]
     {
         popcount_word_portable(word)
     }
 
-    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    #[cfg(all(feature = "simd", not(feature = "portable-popcount")))]
     {
-        // Use POPCNT instruction directly
-        #[cfg(target_feature = "popcnt")]
-        {
-            word.count_ones()
-        }
-        #[cfg(not(target_feature = "popcnt"))]
-        {
-            word.count_ones()
-        }
-    }
-
-    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-    {
-        // On aarch64, count_ones compiles to CNT+ADDV
+        // On both x86_64 and aarch64, count_ones compiles to efficient instructions
         word.count_ones()
     }
 
@@ -44,19 +34,28 @@ pub fn popcount_word(word: u64) -> u32 {
 /// Popcount multiple words, returning total.
 #[inline]
 pub fn popcount_words(words: &[u64]) -> u32 {
-    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    // Priority: portable-popcount > simd > default
+    #[cfg(feature = "portable-popcount")]
+    {
+        popcount_words_portable(words)
+    }
+
+    #[cfg(all(
+        feature = "simd",
+        target_arch = "aarch64",
+        not(feature = "portable-popcount")
+    ))]
     {
         popcount_words_neon(words)
     }
 
-    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    #[cfg(all(
+        feature = "simd",
+        target_arch = "x86_64",
+        not(feature = "portable-popcount")
+    ))]
     {
         popcount_words_x86(words)
-    }
-
-    #[cfg(feature = "portable-popcount")]
-    {
-        popcount_words_portable(words)
     }
 
     #[cfg(not(any(feature = "simd", feature = "portable-popcount")))]
@@ -107,7 +106,11 @@ fn popcount_words_portable(words: &[u64]) -> u32 {
 }
 
 /// NEON-accelerated popcount for word slices.
-#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[cfg(all(
+    feature = "simd",
+    target_arch = "aarch64",
+    not(feature = "portable-popcount")
+))]
 #[inline]
 fn popcount_words_neon(words: &[u64]) -> u32 {
     use core::arch::aarch64::*;
@@ -139,7 +142,11 @@ fn popcount_words_neon(words: &[u64]) -> u32 {
 }
 
 /// Popcount 64 bytes using NEON.
-#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[cfg(all(
+    feature = "simd",
+    target_arch = "aarch64",
+    not(feature = "portable-popcount")
+))]
 #[inline]
 unsafe fn popcount_64bytes_neon(ptr: *const u8) -> u32 {
     use core::arch::aarch64::*;
@@ -168,7 +175,11 @@ unsafe fn popcount_64bytes_neon(ptr: *const u8) -> u32 {
 }
 
 /// x86_64 popcount using POPCNT instruction.
-#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "simd",
+    target_arch = "x86_64",
+    not(feature = "portable-popcount")
+))]
 #[inline]
 fn popcount_words_x86(words: &[u64]) -> u32 {
     use core::arch::x86_64::*;

@@ -13,6 +13,7 @@ pub mod x86;
 ///
 /// Uses the best available implementation for the current platform.
 #[inline]
+#[allow(dead_code)]
 pub fn popcount_512(data: &[u8; 64]) -> u32 {
     #[cfg(target_arch = "aarch64")]
     {
@@ -38,6 +39,7 @@ pub fn popcount_512(data: &[u8; 64]) -> u32 {
 
 /// Scalar fallback for 512-bit popcount.
 #[inline]
+#[allow(dead_code)]
 pub fn popcount_512_scalar(data: &[u8; 64]) -> u32 {
     // Process byte-by-byte to avoid alignment issues
     let mut total = 0u32;
@@ -67,9 +69,7 @@ mod tests {
     fn test_popcount_512_pattern() {
         let mut data = [0u8; 64];
         // Set alternating bits: 0b10101010 = 4 bits per byte
-        for byte in &mut data {
-            *byte = 0xAA;
-        }
+        data.fill(0xAA);
         assert_eq!(popcount_512(&data), 256);
     }
 
