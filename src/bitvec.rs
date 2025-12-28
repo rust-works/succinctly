@@ -7,6 +7,7 @@
 use alloc::vec::Vec;
 
 use crate::broadword::select_in_word;
+use crate::popcount::{popcount_word, popcount_words};
 use crate::rank::RankDirectory;
 use crate::select::SelectIndex;
 use crate::{Config, RankSelect};
@@ -81,8 +82,8 @@ impl BitVec {
             }
         }
 
-        // Count total ones
-        let ones_count: usize = words.iter().map(|w| w.count_ones() as usize).sum();
+        // Count total ones using the selected popcount implementation
+        let ones_count: usize = popcount_words(&words) as usize;
 
         // Build rank directory
         let rank_dir = RankDirectory::build(&words);
@@ -204,10 +205,10 @@ impl RankSelect for BitVec {
         // Get cumulative rank from directory
         let dir_rank = self.rank_dir.rank_at_word(word_idx);
 
-        // Add partial word count
+        // Add partial word count using the selected popcount implementation
         let word = self.words[word_idx];
         let mask = (1u64 << bit_idx) - 1;
-        let partial = (word & mask).count_ones() as usize;
+        let partial = popcount_word(word & mask) as usize;
 
         dir_rank + partial
     }
@@ -226,7 +227,7 @@ impl RankSelect for BitVec {
         // Scan words from the starting position
         for word_idx in start_word..self.words.len() {
             let word = self.words[word_idx];
-            let pop = word.count_ones() as usize;
+            let pop = popcount_word(word) as usize;
 
             if pop > remaining {
                 // Found the target word
@@ -269,10 +270,10 @@ impl RankSelect for BitVec {
             };
 
             let zeros_in_word = if valid_bits == 64 {
-                inverted.count_ones() as usize
+                popcount_word(inverted) as usize
             } else {
                 let mask = (1u64 << valid_bits) - 1;
-                (inverted & mask).count_ones() as usize
+                popcount_word(inverted & mask) as usize
             };
 
             if zeros_in_word > remaining {

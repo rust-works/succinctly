@@ -139,11 +139,56 @@ fn bench_select_in_word(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark popcount performance.
+///
+/// Run with different features to compare:
+/// - Default: `cargo bench --bench rank_select popcount`
+/// - SIMD:    `cargo bench --bench rank_select popcount --features simd`
+/// - Portable: `cargo bench --bench rank_select popcount --features portable-popcount`
+fn bench_popcount(c: &mut Criterion) {
+    let mut group = c.benchmark_group("popcount");
+
+    // Generate test data
+    let words_1m: Vec<u64> = (0u64..15625) // ~1M bits
+        .map(|i| i.wrapping_mul(0x1234_5678_9ABC_DEF0))
+        .collect();
+
+    let words_10m: Vec<u64> = (0u64..156250) // ~10M bits
+        .map(|i| i.wrapping_mul(0x1234_5678_9ABC_DEF0))
+        .collect();
+
+    // Benchmark popcount via BitVec construction (which calls popcount_words)
+    group.bench_function("1M_bits_construction", |b| {
+        b.iter(|| BitVec::from_words(black_box(words_1m.clone()), words_1m.len() * 64))
+    });
+
+    group.bench_function("10M_bits_construction", |b| {
+        b.iter(|| BitVec::from_words(black_box(words_10m.clone()), words_10m.len() * 64))
+    });
+
+    // Benchmark rank queries (which use popcount for partial words)
+    let bv_1m = BitVec::from_words(words_1m, 1_000_000);
+    let queries = generate_queries(10000, 1_000_000, 123);
+
+    group.bench_function("1M_rank_queries", |b| {
+        b.iter(|| {
+            let mut sum = 0usize;
+            for &q in queries.iter() {
+                sum += bv_1m.rank1(black_box(q));
+            }
+            sum
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_rank,
     bench_select,
     bench_construction,
-    bench_select_in_word
+    bench_select_in_word,
+    bench_popcount
 );
 criterion_main!(benches);

@@ -10,10 +10,16 @@ categories = ["data-structures", "algorithms"]
 
 [features]
 default = []
-# Enable SIMD acceleration (auto-detected at compile time)
+
+# Popcount implementation strategies (mutually exclusive for benchmarking)
+# If none specified, uses Rust's built-in count_ones() which auto-vectorizes
+
+# Use explicit SIMD intrinsics (NEON on ARM, POPCNT on x86)
 simd = []
-# Enable runtime SIMD detection (slight overhead)
-runtime-dispatch = []
+
+# Use portable bitwise popcount (no intrinsics, good for comparison)
+portable-popcount = []
+
 # Include select0 support (increases index size)
 select0 = []
 

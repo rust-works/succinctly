@@ -23,8 +23,12 @@
 //!
 //! ## Features
 //!
-//! - `simd` - Enable SIMD acceleration (compile-time detection)
-//! - `runtime-dispatch` - Enable runtime SIMD feature detection
+//! Popcount strategies (mutually exclusive, for benchmarking):
+//! - Default: Uses Rust's `count_ones()` which auto-vectorizes
+//! - `simd` - Use explicit SIMD intrinsics (NEON on ARM, POPCNT on x86)
+//! - `portable-popcount` - Use portable bitwise algorithm (no intrinsics)
+//!
+//! Other features:
 //! - `select0` - Include select0 index (increases memory usage)
 
 #![cfg_attr(not(test), no_std)]
@@ -34,10 +38,12 @@ extern crate alloc;
 
 mod bitvec;
 mod broadword;
+mod popcount;
 mod rank;
 mod select;
 mod table;
 
+// Keep simd module for its tests, but the main code uses popcount module
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod simd;
 
