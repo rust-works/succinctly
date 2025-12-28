@@ -113,8 +113,6 @@ fn popcount_words_portable(words: &[u64]) -> u32 {
 ))]
 #[inline]
 fn popcount_words_neon(words: &[u64]) -> u32 {
-    use core::arch::aarch64::*;
-
     if words.is_empty() {
         return 0;
     }

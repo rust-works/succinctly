@@ -49,6 +49,7 @@ mod simd;
 
 pub use bitvec::BitVec;
 pub use broadword::select_in_word;
+pub use popcount::{popcount_word, popcount_words};
 pub use rank::RankDirectory;
 pub use select::SelectIndex;
 

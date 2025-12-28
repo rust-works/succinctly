@@ -111,8 +111,20 @@ jobs:
         run: cargo test --verbose --features portable-popcount
 
   bench:
-    name: Benchmarks
-    runs-on: ubuntu-24.04-arm
+    name: Bench (${{ matrix.name }})
+    strategy:
+      matrix:
+        include:
+          - name: x86_64
+            runner: ubuntu-latest
+            arch: x86_64
+          - name: ARM64-Linux
+            runner: ubuntu-24.04-arm
+            arch: arm64
+          - name: ARM64-macOS
+            runner: macos-latest
+            arch: arm64-macos
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -128,7 +140,21 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-arm64-bench-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.arch }}-bench-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Print CPU info
+        run: |
+          echo "=== CPU Info ==="
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            lscpu | grep -E "Model name|Architecture|CPU\(s\)|Flags" || true
+            # Check for specific features
+            echo "=== Feature Detection ==="
+            if grep -q avx2 /proc/cpuinfo 2>/dev/null; then echo "AVX2: supported"; else echo "AVX2: not detected"; fi
+            if grep -q popcnt /proc/cpuinfo 2>/dev/null; then echo "POPCNT: supported"; else echo "POPCNT: not detected"; fi
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            sysctl -n machdep.cpu.brand_string || true
+            system_profiler SPHardwareDataType | grep -E "Chip|Cores" || true
+          fi
 
       - name: Run benchmarks (default)
         run: cargo bench --bench rank_select -- --noplot | tee bench-default.txt
@@ -142,7 +168,7 @@ jobs:
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results
+          name: benchmark-results-${{ matrix.arch }}
           path: bench-*.txt
 
   clippy:
