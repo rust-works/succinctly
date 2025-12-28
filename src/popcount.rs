@@ -219,7 +219,9 @@ mod tests {
     #[test]
     fn test_popcount_words_various_lengths() {
         for len in 0..20 {
-            let words: Vec<u64> = (0..len).map(|i| (i as u64) | 0x8000_0000_0000_0001).collect();
+            let words: Vec<u64> = (0..len)
+                .map(|i| (i as u64) | 0x8000_0000_0000_0001)
+                .collect();
             let expected: u32 = words.iter().map(|w| w.count_ones()).sum();
             assert_eq!(popcount_words(&words), expected, "len={}", len);
         }
