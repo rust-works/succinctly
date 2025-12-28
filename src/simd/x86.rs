@@ -62,7 +62,8 @@ mod tests {
             return;
         }
 
-        let data = [0xFFu64; 8];
+        // u64::MAX = 0xFFFF_FFFF_FFFF_FFFF has all 64 bits set
+        let data = [u64::MAX; 8];
         let result = unsafe { popcount_512_popcnt(data.as_ptr()) };
         assert_eq!(result, 512);
 
@@ -81,7 +82,8 @@ mod tests {
             return;
         }
 
-        let data = [0xFFu64; 16];
+        // u64::MAX = 0xFFFF_FFFF_FFFF_FFFF has all 64 bits set
+        let data = [u64::MAX; 16];
         unsafe {
             assert_eq!(popcount_words_popcnt(data.as_ptr(), 0), 0);
             assert_eq!(popcount_words_popcnt(data.as_ptr(), 1), 64);
