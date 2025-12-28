@@ -16,17 +16,18 @@ use core::arch::x86_64::*;
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "popcnt")]
 #[inline]
+#[allow(dead_code)]
 pub unsafe fn popcount_512_popcnt(ptr: *const u64) -> u32 {
     unsafe {
-        let mut sum = 0i64;
-        sum += _popcnt64(*ptr);
-        sum += _popcnt64(*ptr.add(1));
-        sum += _popcnt64(*ptr.add(2));
-        sum += _popcnt64(*ptr.add(3));
-        sum += _popcnt64(*ptr.add(4));
-        sum += _popcnt64(*ptr.add(5));
-        sum += _popcnt64(*ptr.add(6));
-        sum += _popcnt64(*ptr.add(7));
+        let mut sum = 0i32;
+        sum += _popcnt64(*ptr as i64);
+        sum += _popcnt64(*ptr.add(1) as i64);
+        sum += _popcnt64(*ptr.add(2) as i64);
+        sum += _popcnt64(*ptr.add(3) as i64);
+        sum += _popcnt64(*ptr.add(4) as i64);
+        sum += _popcnt64(*ptr.add(5) as i64);
+        sum += _popcnt64(*ptr.add(6) as i64);
+        sum += _popcnt64(*ptr.add(7) as i64);
         sum as u32
     }
 }
@@ -40,11 +41,12 @@ pub unsafe fn popcount_512_popcnt(ptr: *const u64) -> u32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "popcnt")]
 #[inline]
+#[allow(dead_code)]
 pub unsafe fn popcount_words_popcnt(ptr: *const u64, word_count: usize) -> u32 {
     unsafe {
-        let mut total = 0i64;
+        let mut total = 0i32;
         for i in 0..word_count {
-            total += _popcnt64(*ptr.add(i));
+            total += _popcnt64(*ptr.add(i) as i64);
         }
         total as u32
     }
