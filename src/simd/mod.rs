@@ -23,12 +23,9 @@ pub fn popcount_512(data: &[u8; 64]) -> u32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        // Use POPCNT instruction if available
-        if is_x86_feature_detected!("popcnt") {
-            unsafe { x86::popcount_512_popcnt(data.as_ptr() as *const u64) }
-        } else {
-            popcount_512_scalar(data)
-        }
+        // Use scalar implementation which LLVM optimizes to POPCNT when available.
+        // Runtime feature detection (is_x86_feature_detected!) requires std.
+        popcount_512_scalar(data)
     }
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
