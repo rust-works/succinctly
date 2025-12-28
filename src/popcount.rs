@@ -175,6 +175,9 @@ unsafe fn popcount_64bytes_neon(ptr: *const u8) -> u32 {
 }
 
 /// x86_64 popcount using POPCNT instruction.
+///
+/// Uses Rust's `count_ones()` which LLVM compiles to POPCNT when available.
+/// For benchmarking with explicit POPCNT, compile with `-C target-feature=+popcnt`.
 #[cfg(all(
     feature = "simd",
     target_arch = "x86_64",
@@ -182,24 +185,13 @@ unsafe fn popcount_64bytes_neon(ptr: *const u8) -> u32 {
 ))]
 #[inline]
 fn popcount_words_x86(words: &[u64]) -> u32 {
-    use core::arch::x86_64::*;
-
-    // Check for POPCNT support at runtime
-    if is_x86_feature_detected!("popcnt") {
-        let mut total = 0i64;
-        for &word in words {
-            // SAFETY: We checked for POPCNT support
-            total += unsafe { _popcnt64(word as i64) };
-        }
-        total as u32
-    } else {
-        // Fallback to Rust's count_ones
-        let mut total = 0u32;
-        for &word in words {
-            total += word.count_ones();
-        }
-        total
+    // count_ones() compiles to POPCNT on x86_64 with appropriate target features.
+    // This is the most portable approach for no_std environments.
+    let mut total = 0u32;
+    for &word in words {
+        total += word.count_ones();
     }
+    total
 }
 
 #[cfg(test)]
