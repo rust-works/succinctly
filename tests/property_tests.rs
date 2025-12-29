@@ -472,3 +472,374 @@ fn test_select0_comprehensive() {
         }
     }
 }
+
+// ============================================================================
+// Balanced Parentheses Property Tests
+// ============================================================================
+
+use succinctly::bp::{BalancedParens, enclose, find_close, find_open};
+
+/// Generate a valid balanced parentheses sequence.
+///
+/// This generator builds balanced sequences by randomly choosing to:
+/// - Add an open paren (if we haven't reached the target length)
+/// - Add a close paren (if there are unmatched opens)
+///
+/// Based on the Haskell hw-balancedparens generator.
+fn balanced_parens_strategy(max_pairs: usize) -> impl Strategy<Value = (Vec<u64>, usize)> {
+    (1..=max_pairs).prop_flat_map(|num_pairs| {
+        let len = num_pairs * 2;
+        // Generate a sequence of decisions: true = open, false = close
+        // We need exactly num_pairs opens and num_pairs closes
+        prop::collection::vec(any::<bool>(), len).prop_map(move |decisions| {
+            let mut bits = Vec::new();
+            let mut open_count = 0usize;
+            let mut close_count = 0usize;
+
+            for decision in decisions {
+                let need_opens = num_pairs - open_count;
+                let need_closes = num_pairs - close_count;
+                let unmatched_opens = open_count - close_count;
+
+                if need_opens == 0 {
+                    // Must close
+                    bits.push(false);
+                    close_count += 1;
+                } else if unmatched_opens == 0 {
+                    // Must open (can't close with no unmatched opens)
+                    bits.push(true);
+                    open_count += 1;
+                } else if need_closes == 0 {
+                    // Shouldn't happen, but just open
+                    bits.push(true);
+                    open_count += 1;
+                } else if decision {
+                    // Choose to open
+                    bits.push(true);
+                    open_count += 1;
+                } else {
+                    // Choose to close
+                    bits.push(false);
+                    close_count += 1;
+                }
+            }
+
+            // Convert bits to words
+            let len = bits.len();
+            let num_words = len.div_ceil(64);
+            let mut words = vec![0u64; num_words];
+
+            for (i, &bit) in bits.iter().enumerate() {
+                if bit {
+                    let word_idx = i / 64;
+                    let bit_idx = i % 64;
+                    words[word_idx] |= 1u64 << bit_idx;
+                }
+            }
+
+            (words, len)
+        })
+    })
+}
+
+/// Naive linear scan implementation of find_close for comparison
+fn naive_find_close(words: &[u64], len: usize, p: usize) -> Option<usize> {
+    if p >= len {
+        return None;
+    }
+
+    let word_idx = p / 64;
+    let bit_idx = p % 64;
+
+    // Check if position p is an open paren (bit = 1)
+    if (words[word_idx] >> bit_idx) & 1 == 0 {
+        return None; // Not an open paren
+    }
+
+    // Linear scan to find matching close
+    let mut excess = 1i32; // Start after the open at p
+    for pos in (p + 1)..len {
+        let w_idx = pos / 64;
+        let b_idx = pos % 64;
+        if (words[w_idx] >> b_idx) & 1 == 1 {
+            excess += 1;
+        } else {
+            excess -= 1;
+            if excess == 0 {
+                return Some(pos);
+            }
+        }
+    }
+    None
+}
+
+/// Naive linear scan implementation of find_open for comparison
+fn naive_find_open(words: &[u64], len: usize, p: usize) -> Option<usize> {
+    if p >= len || p == 0 {
+        return None;
+    }
+
+    let word_idx = p / 64;
+    let bit_idx = p % 64;
+
+    // Check if position p is a close paren (bit = 0)
+    if (words[word_idx] >> bit_idx) & 1 == 1 {
+        return None; // Not a close paren
+    }
+
+    // Linear scan backwards to find matching open
+    let mut excess = 1i32; // Start before the close at p
+    for pos in (0..p).rev() {
+        let w_idx = pos / 64;
+        let b_idx = pos % 64;
+        if (words[w_idx] >> b_idx) & 1 == 0 {
+            excess += 1;
+        } else {
+            excess -= 1;
+            if excess == 0 {
+                return Some(pos);
+            }
+        }
+    }
+    None
+}
+
+proptest! {
+    /// BalancedParens.find_close matches linear scan for all positions
+    #[test]
+    fn bp_find_close_matches_linear(
+        (words, len) in balanced_parens_strategy(64)
+    ) {
+        let bp = BalancedParens::new(words.clone(), len);
+
+        for p in 0..len {
+            let bp_result = bp.find_close(p);
+            let linear_result = find_close(&words, len, p);
+            let naive_result = naive_find_close(&words, len, p);
+
+            prop_assert_eq!(bp_result, linear_result,
+                "BalancedParens.find_close({}) != find_close() at len={}", p, len);
+            prop_assert_eq!(bp_result, naive_result,
+                "BalancedParens.find_close({}) != naive at len={}", p, len);
+        }
+    }
+
+    /// BalancedParens.find_open matches linear scan for all positions
+    #[test]
+    fn bp_find_open_matches_linear(
+        (words, len) in balanced_parens_strategy(64)
+    ) {
+        let bp = BalancedParens::new(words.clone(), len);
+
+        for p in 0..len {
+            let bp_result = bp.find_open(p);
+            let linear_result = find_open(&words, len, p);
+            let naive_result = naive_find_open(&words, len, p);
+
+            prop_assert_eq!(bp_result, linear_result,
+                "BalancedParens.find_open({}) != find_open() at len={}", p, len);
+            prop_assert_eq!(bp_result, naive_result,
+                "BalancedParens.find_open({}) != naive at len={}", p, len);
+        }
+    }
+
+    /// find_close and find_open are inverses
+    #[test]
+    fn bp_find_close_open_inverse(
+        (words, len) in balanced_parens_strategy(64)
+    ) {
+        let bp = BalancedParens::new(words, len);
+
+        for p in 0..len {
+            if bp.is_open(p) && let Some(close) = bp.find_close(p) {
+                let open = bp.find_open(close);
+                prop_assert_eq!(open, Some(p),
+                    "find_open(find_close({})) != {} at len={}", p, p, len);
+            }
+        }
+    }
+
+    /// next_sibling returns valid open positions
+    #[test]
+    fn bp_next_sibling_valid(
+        (words, len) in balanced_parens_strategy(64)
+    ) {
+        let bp = BalancedParens::new(words, len);
+
+        for p in 0..len {
+            if let Some(sibling) = bp.next_sibling(p) {
+                prop_assert!(bp.is_open(sibling),
+                    "next_sibling({}) = {} should be an open at len={}", p, sibling, len);
+                prop_assert!(sibling > p,
+                    "next_sibling({}) = {} should be > p at len={}", p, sibling, len);
+            }
+        }
+    }
+
+    /// first_child returns valid open positions
+    #[test]
+    fn bp_first_child_valid(
+        (words, len) in balanced_parens_strategy(64)
+    ) {
+        let bp = BalancedParens::new(words, len);
+
+        for p in 0..len {
+            if let Some(child) = bp.first_child(p) {
+                prop_assert!(bp.is_open(child),
+                    "first_child({}) = {} should be an open at len={}", p, child, len);
+                prop_assert_eq!(child, p + 1,
+                    "first_child({}) should be p+1 at len={}", p, len);
+            }
+        }
+    }
+
+    /// parent/enclose returns valid open positions
+    #[test]
+    fn bp_parent_valid(
+        (words, len) in balanced_parens_strategy(64)
+    ) {
+        let bp = BalancedParens::new(words.clone(), len);
+
+        for p in 0..len {
+            if bp.is_open(p) {
+                if let Some(parent) = bp.parent(p) {
+                    prop_assert!(bp.is_open(parent),
+                        "parent({}) = {} should be an open at len={}", p, parent, len);
+                    prop_assert!(parent < p,
+                        "parent({}) = {} should be < p at len={}", p, parent, len);
+
+                    // Verify parent encloses p
+                    let parent_close = bp.find_close(parent);
+                    let p_close = bp.find_close(p);
+                    prop_assert!(parent_close > p_close,
+                        "parent({}) should have close after p's close at len={}", p, len);
+                }
+
+                // Verify parent matches enclose
+                let enclose_result = enclose(&words, len, p);
+                prop_assert_eq!(bp.parent(p), enclose_result,
+                    "parent({}) != enclose() at len={}", p, len);
+            }
+        }
+    }
+
+    /// depth is always positive for valid positions
+    #[test]
+    fn bp_depth_positive(
+        (words, len) in balanced_parens_strategy(64)
+    ) {
+        let bp = BalancedParens::new(words, len);
+
+        for p in 0..len {
+            if let Some(d) = bp.depth(p) {
+                // Depth at open should be >= 1, at close can be 0
+                if bp.is_open(p) {
+                    prop_assert!(d >= 1, "depth({}) = {} should be >= 1 for open at len={}", p, d, len);
+                }
+            }
+        }
+    }
+
+    /// subtree_size is consistent with find_close
+    #[test]
+    fn bp_subtree_size_consistent(
+        (words, len) in balanced_parens_strategy(64)
+    ) {
+        let bp = BalancedParens::new(words, len);
+
+        for p in 0..len {
+            if bp.is_open(p) {
+                if let (Some(size), Some(close)) = (bp.subtree_size(p), bp.find_close(p)) {
+                    // subtree_size = (close - p) / 2
+                    let expected = (close - p) / 2;
+                    prop_assert_eq!(size, expected,
+                        "subtree_size({}) = {} != (close - p) / 2 = {} at len={}", p, size, expected, len);
+                }
+            } else {
+                prop_assert_eq!(bp.subtree_size(p), None,
+                    "subtree_size({}) should be None for close at len={}", p, len);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Larger scale balanced parentheses tests (matching Haskell's factor = 16384)
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+
+    /// Test with larger vectors (up to 1024 words = 65536 bits)
+    #[test]
+    fn bp_large_vectors(
+        (words, len) in balanced_parens_strategy(512)
+    ) {
+        let bp = BalancedParens::new(words.clone(), len);
+
+        // Test a sample of positions
+        let step = (len / 100).max(1);
+        for p in (0..len).step_by(step) {
+            if bp.is_open(p) {
+                let bp_result = bp.find_close(p);
+                let linear_result = find_close(&words, len, p);
+                prop_assert_eq!(bp_result, linear_result,
+                    "find_close mismatch at p={} len={}", p, len);
+            }
+        }
+    }
+
+    /// BalancedParens matches random word vectors (like Haskell RangeMinSpec)
+    #[test]
+    fn bp_random_words_find_close(
+        words in prop::collection::vec(any::<u64>(), 1..64),
+        p_frac in 0.0..1.0f64
+    ) {
+        let len = words.len() * 64;
+        let bp = BalancedParens::new(words.clone(), len);
+        let p = (p_frac * len as f64) as usize;
+
+        if p < len {
+            // Even for non-balanced sequences, the implementations should match
+            let bp_result = bp.find_close(p);
+            let linear_result = find_close(&words, len, p);
+            prop_assert_eq!(bp_result, linear_result,
+                "find_close({}) mismatch for random words at len={}", p, len);
+        }
+    }
+
+    /// next_sibling matches between BalancedParens and SimpleBalancedParens
+    #[test]
+    fn bp_next_sibling_matches(
+        words in prop::collection::vec(any::<u64>(), 1..64),
+        p_frac in 0.0..1.0f64
+    ) {
+        let len = words.len() * 64;
+        let bp = BalancedParens::new(words.clone(), len);
+        let p = (p_frac * len as f64) as usize;
+
+        if p < len {
+            // Compute next_sibling using linear scan
+            let naive_next_sibling = if bp.is_open(p) {
+                find_close(&words, len, p).and_then(|close| {
+                    if close + 1 < len {
+                        let w_idx = (close + 1) / 64;
+                        let b_idx = (close + 1) % 64;
+                        if (words[w_idx] >> b_idx) & 1 == 1 {
+                            Some(close + 1)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+
+            prop_assert_eq!(bp.next_sibling(p), naive_next_sibling,
+                "next_sibling({}) mismatch at len={}", p, len);
+        }
+    }
+}
