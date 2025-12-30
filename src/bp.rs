@@ -1465,4 +1465,366 @@ mod tests {
             p, bp_result, linear_result
         );
     }
+
+    // ========================================================================
+    // Edge case tests for block boundaries and special cases
+    // ========================================================================
+
+    #[test]
+    fn test_single_pair() {
+        // Simplest possible: "()" = 0b01
+        let bp = BalancedParens::new(vec![0b01], 2);
+        assert_eq!(bp.find_close(0), Some(1));
+        assert_eq!(bp.find_open(1), Some(0));
+        assert_eq!(bp.depth(0), Some(1));
+        assert_eq!(bp.depth(1), Some(0));
+        assert_eq!(bp.subtree_size(0), Some(0));
+    }
+
+    #[test]
+    fn test_find_close_at_word_boundary() {
+        // Create a sequence where open is at bit 63 (end of word 0)
+        // and close is at bit 64 (start of word 1)
+        // Pattern: 63 opens, then open at 63, close at 64, then 63 closes
+        // This tests the word boundary transition
+        let words = vec![u64::MAX, 0u64]; // 64 opens, 64 closes
+        let len = 128;
+        let bp = BalancedParens::new(words.clone(), len);
+
+        // Open at position 63 should match close at position 64
+        assert_eq!(bp.find_close(63), Some(64));
+        assert_eq!(find_close(&words, len, 63), Some(64));
+
+        // Open at position 0 should match close at position 127
+        assert_eq!(bp.find_close(0), Some(127));
+    }
+
+    #[test]
+    fn test_find_close_spanning_multiple_words() {
+        // 128 opens followed by 128 closes (4 words total)
+        let words = vec![u64::MAX, u64::MAX, 0u64, 0u64];
+        let len = 256;
+        let bp = BalancedParens::new(words.clone(), len);
+
+        // First open matches last close
+        assert_eq!(bp.find_close(0), Some(255));
+        assert_eq!(find_close(&words, len, 0), Some(255));
+
+        // Open at 127 matches close at 128
+        assert_eq!(bp.find_close(127), Some(128));
+        assert_eq!(find_close(&words, len, 127), Some(128));
+    }
+
+    #[test]
+    fn test_find_close_l1_boundary() {
+        // L1 boundary is at 32 words = 2048 bits
+        // Create: 2048 opens followed by 2048 closes
+        let num_opens = 32; // words
+        let mut words = Vec::with_capacity(64);
+        for _ in 0..num_opens {
+            words.push(u64::MAX); // 32 words of opens
+        }
+        for _ in 0..num_opens {
+            words.push(0u64); // 32 words of closes
+        }
+        let len = 64 * 64; // 4096 bits
+        let bp = BalancedParens::new(words.clone(), len);
+
+        // Open at position 0 should match close at position 4095
+        assert_eq!(bp.find_close(0), Some(4095));
+        assert_eq!(find_close(&words, len, 0), Some(4095));
+
+        // Open at position 2047 (last open) matches close at 2048 (first close)
+        assert_eq!(bp.find_close(2047), Some(2048));
+        assert_eq!(find_close(&words, len, 2047), Some(2048));
+
+        // Test some positions near L1 boundary (2048 bits)
+        for p in [2040, 2044, 2046, 2047] {
+            let bp_result = bp.find_close(p);
+            let linear_result = find_close(&words, len, p);
+            assert_eq!(
+                bp_result, linear_result,
+                "L1 boundary: find_close({}) mismatch",
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_close_across_l1_boundary() {
+        // Test where open is before L1 boundary and close is after
+        // Create pattern: many opens, then balanced pairs around boundary
+        // 31 words of opens (1984 bits), then "()" pairs, then closes
+
+        // Simple version: open at bit 2000, close somewhere after L1 boundary
+        let mut words = vec![u64::MAX; 64]; // Start with all opens
+        let len = 64 * 64;
+
+        // Turn some bits into closes to create a match across L1 boundary
+        // Position 2048 is the L1 boundary (word 32, bit 0)
+        // Put a close there to match an open before the boundary
+        words[32] = 0; // Word 32 = all closes
+
+        let bp = BalancedParens::new(words.clone(), len);
+
+        // Open at 2047 (word 31, bit 63) should match close at 2048 (word 32, bit 0)
+        assert_eq!(bp.find_close(2047), Some(2048));
+        assert_eq!(find_close(&words, len, 2047), Some(2048));
+    }
+
+    #[test]
+    fn test_partial_last_word() {
+        // Test with len not a multiple of 64
+        // "(())" but len = 4 (only 4 valid bits)
+        let bp = BalancedParens::new(vec![0b0011u64], 4);
+        assert_eq!(bp.find_close(0), Some(3));
+        assert_eq!(bp.find_close(1), Some(2));
+
+        // Larger partial word test: 100 bits (1 full word + 36 bits)
+        // Pattern: 50 opens followed by 50 closes
+        // For 50 opens then 50 closes:
+        // Word 0: bits 0-49 = opens (1), bits 50-63 = closes (0)
+        // Word 1: bits 0-35 = closes (0), bits 36-63 = invalid
+        let word0 = (1u64 << 50) - 1; // bits 0-49 are 1
+        let word1 = 0u64; // all closes
+        let words = vec![word0, word1];
+        let len = 100;
+        let bp = BalancedParens::new(words.clone(), len);
+
+        // Open at 0 matches close at 99
+        assert_eq!(bp.find_close(0), Some(99));
+        assert_eq!(find_close(&words, len, 0), Some(99));
+
+        // Open at 49 matches close at 50
+        assert_eq!(bp.find_close(49), Some(50));
+        assert_eq!(find_close(&words, len, 49), Some(50));
+    }
+
+    #[test]
+    fn test_deeply_nested() {
+        // Create very deep nesting: (((((...))))) with 32 levels
+        // 32 opens followed by 32 closes = 64 bits = 1 word
+        let word = (1u64 << 32) - 1; // bits 0-31 are opens
+        let bp = BalancedParens::new(vec![word], 64);
+
+        // Open at 0 matches close at 63
+        assert_eq!(bp.find_close(0), Some(63));
+
+        // Open at 31 (innermost) matches close at 32
+        assert_eq!(bp.find_close(31), Some(32));
+
+        // Test depths
+        assert_eq!(bp.depth(0), Some(1));
+        assert_eq!(bp.depth(31), Some(32));
+        assert_eq!(bp.depth(32), Some(31)); // After first close
+    }
+
+    #[test]
+    fn test_alternating_pairs() {
+        // ()()()()... - sequential pairs
+        // Pattern: 0b01 repeated = 0x5555555555555555
+        let word = 0x5555555555555555u64;
+        let bp = BalancedParens::new(vec![word], 64);
+
+        // Each open at even position matches close at odd position
+        for i in 0..32 {
+            let open = i * 2;
+            let close = i * 2 + 1;
+            assert_eq!(bp.find_close(open), Some(close));
+            assert_eq!(bp.find_open(close), Some(open));
+        }
+    }
+
+    #[test]
+    fn test_out_of_bounds() {
+        let bp = BalancedParens::new(vec![0b01u64], 2);
+
+        // Out of bounds positions should return None
+        assert_eq!(bp.find_close(2), None);
+        assert_eq!(bp.find_close(100), None);
+        assert_eq!(bp.find_open(2), None);
+        assert_eq!(bp.find_open(100), None);
+        assert_eq!(bp.depth(2), None);
+        assert_eq!(bp.depth(100), None);
+        assert_eq!(bp.subtree_size(2), None);
+    }
+
+    #[test]
+    fn test_empty() {
+        let bp = BalancedParens::new(vec![], 0);
+        assert!(bp.is_empty());
+        assert_eq!(bp.len(), 0);
+        assert_eq!(bp.find_close(0), None);
+        assert_eq!(bp.find_open(0), None);
+    }
+
+    #[test]
+    fn test_unbalanced_sequence() {
+        // "((" = 0b11 - two opens, no closes
+        // This is an invalid BP sequence, but the functions should handle it gracefully
+        let words = vec![0b11u64];
+        let bp = BalancedParens::new(words.clone(), 2);
+
+        // find_close should return None for unmatched opens
+        assert_eq!(bp.find_close(0), None);
+        assert_eq!(bp.find_close(1), None);
+        assert_eq!(find_close(&words, 2, 0), None);
+    }
+
+    #[test]
+    fn test_all_closes() {
+        // "))" = 0b00 - two closes, no opens
+        let words = vec![0u64];
+        let bp = BalancedParens::new(words.clone(), 2);
+
+        // find_close on close positions should return None
+        assert_eq!(bp.find_close(0), None);
+        assert_eq!(bp.find_close(1), None);
+    }
+
+    #[test]
+    fn test_find_close_near_end() {
+        // Test find_close where match is near the end of the bit vector
+        // "(())" but the close at position 3 is near len
+        let bp = BalancedParens::new(vec![0b0011u64], 4);
+        assert_eq!(bp.find_close(0), Some(3));
+
+        // Larger test: open near the beginning, close at the very end
+        let words = vec![u64::MAX, 0u64];
+        let len = 128;
+        let bp = BalancedParens::new(words.clone(), len);
+        assert_eq!(bp.find_close(0), Some(127));
+    }
+
+    #[test]
+    fn test_index_structure_correctness() {
+        // Verify the L0/L1/L2 indices are computed correctly
+        // for a specific known pattern
+        let words = vec![0b001011u64]; // "(()())" - balanced
+        let bp = BalancedParens::new(words, 6);
+
+        // L0 min_excess for this word should reflect the minimum reached
+        // Scanning: 1, 2, 1, 2, 1, 0 - min is 0
+        assert_eq!(bp.l0_min_excess[0], 0);
+
+        // L0 cum_excess should be 0 (balanced)
+        assert_eq!(bp.l0_cum_excess[0], 0);
+    }
+
+    #[test]
+    fn test_word_min_excess_full_word() {
+        // Test word_min_excess with full 64-bit patterns
+
+        // All opens: excess goes 1,2,3,...,64, min=0
+        let (min, total) = word_min_excess(u64::MAX, 64);
+        assert_eq!(min, 0);
+        assert_eq!(total, 64);
+
+        // All closes: excess goes -1,-2,...,-64, min=-64
+        let (min, total) = word_min_excess(0, 64);
+        assert_eq!(min, -64);
+        assert_eq!(total, -64);
+
+        // Alternating ()()()...: min=0, total=0
+        let (min, total) = word_min_excess(0x5555555555555555, 64);
+        assert_eq!(min, 0);
+        assert_eq!(total, 0);
+
+        // Alternating )()()(... (starting with close): min=-1, total=0
+        let (min, total) = word_min_excess(0xAAAAAAAAAAAAAAAAu64, 64);
+        assert_eq!(min, -1);
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_l1_index_construction() {
+        // Test that L1 indices are built correctly
+        // Create exactly 32 words to have one full L1 block
+        let mut words = Vec::with_capacity(32);
+        for _ in 0..32 {
+            words.push(0x5555555555555555u64); // ()()()... - balanced
+        }
+        let len = 32 * 64;
+        let bp = BalancedParens::new(words, len);
+
+        // Should have exactly 1 L1 block
+        assert_eq!(bp.l1_min_excess.len(), 1);
+        assert_eq!(bp.l1_cum_excess.len(), 1);
+
+        // L1 should also show balanced (cum_excess = 0)
+        assert_eq!(bp.l1_cum_excess[0], 0);
+    }
+
+    #[test]
+    fn test_multiple_l1_blocks() {
+        // Create 64 words = 2 L1 blocks
+        let mut words = Vec::with_capacity(64);
+        // First L1 block: 32 words of opens (positive excess)
+        for _ in 0..32 {
+            words.push(u64::MAX);
+        }
+        // Second L1 block: 32 words of closes (negative excess)
+        for _ in 0..32 {
+            words.push(0u64);
+        }
+        let len = 64 * 64;
+        let bp = BalancedParens::new(words.clone(), len);
+
+        // Should have 2 L1 blocks
+        assert_eq!(bp.l1_min_excess.len(), 2);
+
+        // First L1 block: all opens, min_excess = 0, cum_excess = 32*64 = 2048
+        assert_eq!(bp.l1_min_excess[0], 0);
+        assert_eq!(bp.l1_cum_excess[0], 2048);
+
+        // Second L1 block: all closes, min_excess = -2048, cum_excess = -2048
+        assert_eq!(bp.l1_min_excess[1], -2048);
+        assert_eq!(bp.l1_cum_excess[1], -2048);
+
+        // Test find_close across L1 boundary
+        assert_eq!(bp.find_close(2047), Some(2048));
+        assert_eq!(find_close(&words, len, 2047), Some(2048));
+    }
+
+    #[test]
+    fn test_find_close_immediate_match() {
+        // Test cases where match is immediately after the open
+        // "()" repeated
+        let word = 0x5555555555555555u64;
+        let bp = BalancedParens::new(vec![word], 64);
+
+        for i in 0..32 {
+            assert_eq!(bp.find_close(i * 2), Some(i * 2 + 1));
+        }
+    }
+
+    #[test]
+    fn test_sibling_chain() {
+        // "()()()..." - chain of siblings
+        let word = 0x5555555555555555u64;
+        let bp = BalancedParens::new(vec![word], 64);
+
+        // Each pair is a sibling of the next
+        for i in 0..31 {
+            let pos = i * 2;
+            assert_eq!(bp.next_sibling(pos), Some(pos + 2));
+        }
+        // Last sibling has no next
+        assert_eq!(bp.next_sibling(62), None);
+    }
+
+    #[test]
+    fn test_no_first_child_for_leaf() {
+        // "()" - leaf node has no first child
+        let bp = BalancedParens::new(vec![0b01u64], 2);
+        assert_eq!(bp.first_child(0), None);
+    }
+
+    #[test]
+    fn test_first_child_exists() {
+        // "(())" - root has first child
+        let bp = BalancedParens::new(vec![0b0011u64], 4);
+        assert_eq!(bp.first_child(0), Some(1));
+        assert_eq!(bp.first_child(1), None); // inner leaf
+    }
 }

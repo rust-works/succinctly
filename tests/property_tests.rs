@@ -843,3 +843,303 @@ proptest! {
         }
     }
 }
+
+// ============================================================================
+// Very large scale tests (matching Haskell's factor = 16384)
+// These test up to 16K words = 1M+ bits to match hw-balancedparens coverage
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(5))]
+
+    /// Test with very large random word vectors (16K words = 1M bits)
+    /// Matches Haskell RangeMinSpec's factor = 16384
+    #[test]
+    fn bp_very_large_random_words(
+        words in prop::collection::vec(any::<u64>(), 1..16384),
+        p_frac in 0.0..1.0f64
+    ) {
+        let len = words.len() * 64;
+        let bp = BalancedParens::new(words.clone(), len);
+        let p = (p_frac * len as f64) as usize;
+
+        if p < len {
+            let bp_result = bp.find_close(p);
+            let linear_result = find_close(&words, len, p);
+            prop_assert_eq!(bp_result, linear_result,
+                "find_close({}) mismatch for random words at len={}", p, len);
+        }
+    }
+
+    /// next_sibling at large scale
+    #[test]
+    fn bp_very_large_next_sibling(
+        words in prop::collection::vec(any::<u64>(), 1..16384),
+        p_frac in 0.0..1.0f64
+    ) {
+        let len = words.len() * 64;
+        let bp = BalancedParens::new(words.clone(), len);
+        let p = (p_frac * len as f64) as usize;
+
+        if p < len {
+            let naive_next_sibling = if bp.is_open(p) {
+                find_close(&words, len, p).and_then(|close| {
+                    if close + 1 < len {
+                        let w_idx = (close + 1) / 64;
+                        let b_idx = (close + 1) % 64;
+                        if (words[w_idx] >> b_idx) & 1 == 1 {
+                            Some(close + 1)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+
+            prop_assert_eq!(bp.next_sibling(p), naive_next_sibling,
+                "next_sibling({}) mismatch at len={}", p, len);
+        }
+    }
+}
+
+// ============================================================================
+// L1/L2 boundary crossing tests at scale
+// L1 blocks = 32 words = 2048 bits
+// L2 blocks = 1024 words = 65536 bits
+// ============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+
+    /// Test find_close that spans multiple L1 blocks (> 32 words)
+    #[test]
+    fn bp_spanning_l1_blocks(
+        words in prop::collection::vec(any::<u64>(), 64..256)
+    ) {
+        let len = words.len() * 64;
+        let bp = BalancedParens::new(words.clone(), len);
+
+        // Test positions near L1 boundaries (every 2048 bits)
+        for l1_block in 0..(len / 2048) {
+            let boundary = l1_block * 2048;
+            // Test positions around boundary
+            for offset in [0, 1, 31, 32, 33, 63, 64, 65].iter() {
+                let p = boundary.saturating_add(*offset);
+                if p < len && bp.is_open(p) {
+                    let bp_result = bp.find_close(p);
+                    let linear_result = find_close(&words, len, p);
+                    prop_assert_eq!(bp_result, linear_result,
+                        "find_close({}) mismatch near L1 boundary {} at len={}", p, boundary, len);
+                }
+            }
+        }
+    }
+
+    /// Test find_close that spans L2 blocks (> 1024 words)
+    #[test]
+    fn bp_spanning_l2_blocks(
+        words in prop::collection::vec(any::<u64>(), 1024..2048)
+    ) {
+        let len = words.len() * 64;
+        let bp = BalancedParens::new(words.clone(), len);
+
+        // Test positions near L2 boundaries (every 65536 bits)
+        for l2_block in 0..(len / 65536).max(1) {
+            let boundary = l2_block * 65536;
+            // Test positions around boundary
+            for offset in [0, 1, 63, 64, 65, 2047, 2048, 2049].iter() {
+                let p = boundary.saturating_add(*offset);
+                if p < len && bp.is_open(p) {
+                    let bp_result = bp.find_close(p);
+                    let linear_result = find_close(&words, len, p);
+                    prop_assert_eq!(bp_result, linear_result,
+                        "find_close({}) mismatch near L2 boundary {} at len={}", p, boundary, len);
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Specific pattern tests at large scale
+// ============================================================================
+
+#[test]
+fn test_large_deeply_nested() {
+    // Create deeply nested structure: ((((....))))
+    // 8K opens followed by 8K closes = 16K bits
+    let num_pairs: usize = 8192;
+    let len = num_pairs * 2;
+    let num_words = len.div_ceil(64);
+    let mut words = vec![0u64; num_words];
+
+    // Set first num_pairs bits to 1 (opens)
+    for i in 0..num_pairs {
+        let word_idx = i / 64;
+        let bit_idx = i % 64;
+        words[word_idx] |= 1u64 << bit_idx;
+    }
+
+    let bp = BalancedParens::new(words.clone(), len);
+
+    // First open should match last close
+    assert_eq!(bp.find_close(0), Some(len - 1));
+
+    // Each open at position i should match close at position (len - 1 - i)
+    for i in 0..100 {
+        let expected_close = len - 1 - i;
+        assert_eq!(
+            bp.find_close(i),
+            Some(expected_close),
+            "find_close({}) should be {}",
+            i,
+            expected_close
+        );
+    }
+
+    // Test from the middle
+    let mid = num_pairs - 1;
+    assert_eq!(bp.find_close(mid), Some(mid + 1));
+}
+
+#[test]
+fn test_large_flat_sequence() {
+    // Create flat sequence: ()()()()...
+    // Alternating 1,0,1,0,... = 0x5555...
+    let num_words = 1024; // 64K bits = 32K pairs
+    let len = num_words * 64;
+    let words: Vec<u64> = vec![0x5555_5555_5555_5555; num_words];
+
+    let bp = BalancedParens::new(words.clone(), len);
+
+    // Each open at even position should match the next odd position
+    for i in (0..1000).step_by(2) {
+        assert_eq!(
+            bp.find_close(i),
+            Some(i + 1),
+            "find_close({}) should be {}",
+            i,
+            i + 1
+        );
+    }
+
+    // Test at various block boundaries
+    for block in [0, 32, 64, 128, 512, 1023] {
+        let p = block * 64;
+        if p < len {
+            assert_eq!(
+                bp.find_close(p),
+                Some(p + 1),
+                "find_close({}) at block {} boundary",
+                p,
+                block
+            );
+        }
+    }
+}
+
+#[test]
+fn test_large_mixed_structure() {
+    // Create a sequence with varied depth
+    // Pattern: ()((()))(())((())) repeated
+    use rand::prelude::*;
+    use rand_chacha::ChaCha8Rng;
+
+    let mut rng = ChaCha8Rng::seed_from_u64(12345);
+
+    // Generate random balanced parens
+    let num_pairs = 16384;
+    let mut bits = Vec::with_capacity(num_pairs * 2);
+    let mut open_count = 0usize;
+    let mut close_count = 0usize;
+
+    while open_count < num_pairs || close_count < num_pairs {
+        let can_open = open_count < num_pairs;
+        let can_close = close_count < open_count;
+
+        if can_open && can_close {
+            if rng.r#gen::<bool>() {
+                bits.push(true);
+                open_count += 1;
+            } else {
+                bits.push(false);
+                close_count += 1;
+            }
+        } else if can_open {
+            bits.push(true);
+            open_count += 1;
+        } else {
+            bits.push(false);
+            close_count += 1;
+        }
+    }
+
+    // Convert to words
+    let len = bits.len();
+    let num_words = len.div_ceil(64);
+    let mut words = vec![0u64; num_words];
+    for (i, &bit) in bits.iter().enumerate() {
+        if bit {
+            words[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+
+    let bp = BalancedParens::new(words.clone(), len);
+
+    // Verify find_close matches linear scan at many positions
+    for p in (0..len).step_by(100) {
+        if bp.is_open(p) {
+            let bp_result = bp.find_close(p);
+            let linear_result = find_close(&words, len, p);
+            assert_eq!(
+                bp_result, linear_result,
+                "find_close({}) mismatch in mixed structure",
+                p
+            );
+        }
+    }
+
+    // Test all L1 boundaries
+    for l1_block in 0..(len / 2048) {
+        let boundary = l1_block * 2048;
+        if boundary < len && bp.is_open(boundary) {
+            let bp_result = bp.find_close(boundary);
+            let linear_result = find_close(&words, len, boundary);
+            assert_eq!(
+                bp_result, linear_result,
+                "find_close({}) mismatch at L1 boundary",
+                boundary
+            );
+        }
+    }
+}
+
+#[test]
+fn test_million_bit_random() {
+    // 1M bits = ~15625 words
+    use rand::prelude::*;
+    use rand_chacha::ChaCha8Rng;
+
+    let mut rng = ChaCha8Rng::seed_from_u64(99999);
+    let num_words = 15625;
+    let len = num_words * 64;
+    let words: Vec<u64> = (0..num_words).map(|_| rng.r#gen()).collect();
+
+    let bp = BalancedParens::new(words.clone(), len);
+
+    // Sample 1000 random positions
+    for _ in 0..1000 {
+        let p = rng.gen_range(0..len);
+        let bp_result = bp.find_close(p);
+        let linear_result = find_close(&words, len, p);
+        assert_eq!(
+            bp_result, linear_result,
+            "find_close({}) mismatch in 1M bit test",
+            p
+        );
+    }
+}
