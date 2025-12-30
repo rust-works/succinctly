@@ -39,6 +39,7 @@ extern crate alloc;
 mod bitvec;
 pub mod bp;
 mod broadword;
+pub mod json;
 mod popcount;
 mod rank;
 mod select;
