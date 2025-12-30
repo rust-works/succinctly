@@ -59,6 +59,33 @@ pub struct SemiIndex {
     pub bp: Vec<u64>,
 }
 
+impl SemiIndex {
+    /// Get the interest bits as raw bytes for binary serialization.
+    #[inline]
+    pub fn ib_as_bytes(&self) -> &[u8] {
+        crate::binary::words_to_bytes(&self.ib)
+    }
+
+    /// Get the balanced parentheses as raw bytes for binary serialization.
+    #[inline]
+    pub fn bp_as_bytes(&self) -> &[u8] {
+        crate::binary::words_to_bytes(&self.bp)
+    }
+
+    /// Create a SemiIndex from raw byte slices.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either byte slice length is not a multiple of 8.
+    pub fn from_bytes(ib_bytes: &[u8], bp_bytes: &[u8]) -> Self {
+        Self {
+            state: State::InJson, // Assume complete JSON
+            ib: crate::binary::bytes_to_words_vec(ib_bytes),
+            bp: crate::binary::bytes_to_words_vec(bp_bytes),
+        }
+    }
+}
+
 /// Check if byte is an opening bracket or brace.
 #[inline]
 fn is_open(c: u8) -> bool {
