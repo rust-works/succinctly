@@ -7,7 +7,10 @@
       "Bash(cargo test:*)",
       "Bash(cargo build:*)",
       "Bash(cargo clean:*)",
-      "Bash(cargo:*)"
+      "Bash(cargo:*)",
+      "Bash(xxd:*)",
+      "Bash(done)",
+      "Bash(git add:*)"
     ],
     "deny": [],
     "ask": []

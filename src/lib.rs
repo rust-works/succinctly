@@ -40,6 +40,7 @@ extern crate alloc;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+pub mod binary;
 mod bitvec;
 pub mod bp;
 mod broadword;
