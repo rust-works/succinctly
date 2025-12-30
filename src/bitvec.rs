@@ -662,10 +662,7 @@ mod tests {
     fn test_select_crossing_blocks() {
         // Pattern where select must cross block boundaries
         // 8 words per block, set one bit per word
-        let mut words = vec![0u64; 64]; // 8 blocks
-        for i in 0..64 {
-            words[i] = 1u64 << (i % 64);
-        }
+        let words: Vec<u64> = (0..64).map(|i| 1u64 << (i % 64)).collect();
         let bv = BitVec::from_words(words, 64 * 64);
 
         assert_eq!(bv.count_ones(), 64);
@@ -723,10 +720,7 @@ mod tests {
     #[test]
     fn test_select0_sparse_ones() {
         // Sparse ones: one bit set per word
-        let mut words = vec![0u64; 8];
-        for i in 0..8 {
-            words[i] = 1u64 << i;
-        }
+        let words: Vec<u64> = (0..8).map(|i| 1u64 << i).collect();
         let bv = BitVec::from_words(words, 512);
 
         assert_eq!(bv.count_ones(), 8);
