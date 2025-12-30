@@ -318,7 +318,7 @@ mod standard_cursor {
 // SIMD vs Scalar Comparison Tests
 // ============================================================================
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod simd_comparison {
     use super::*;
     use rand::prelude::*;
