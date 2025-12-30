@@ -5,7 +5,9 @@
       "Bash(cargo bench:*)",
       "Bash(rustc:*)",
       "Bash(cargo test:*)",
-      "Bash(cargo build:*)"
+      "Bash(cargo build:*)",
+      "Bash(cargo clean:*)",
+      "Bash(cargo:*)"
     ],
     "deny": [],
     "ask": []
