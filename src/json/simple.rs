@@ -20,6 +20,9 @@
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use super::BitWriter;
 
 /// ASCII byte constants
@@ -34,6 +37,7 @@ const COLON: u8 = b':';
 
 /// State machine states for Simple Cursor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum State {
     /// Normal JSON parsing mode
     InJson,
@@ -45,6 +49,7 @@ pub enum State {
 
 /// Result of simple cursor semi-indexing.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SemiIndex {
     /// Final state after processing
     pub state: State,

@@ -30,11 +30,15 @@
 //!
 //! Other features:
 //! - `select0` - Include select0 index (increases memory usage)
+//! - `serde` - Enable serialization/deserialization support
 
 #![cfg_attr(not(test), no_std)]
 
 #[cfg(not(test))]
 extern crate alloc;
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 mod bitvec;
 pub mod bp;
@@ -87,6 +91,7 @@ pub trait RankSelect {
 
 /// Configuration for building indices.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Config {
     /// Sample rate for select acceleration (default: 256)
     pub select_sample_rate: u32,

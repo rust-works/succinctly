@@ -23,6 +23,9 @@ portable-popcount = []
 # Include select0 support (increases index size)
 select0 = []
 
+# Enable serde serialization/deserialization
+serde = ["dep:serde"]
+
 # Test features (not for production)
 large-tests = []    # 1G bitvector tests (~125MB RAM)
 huge-tests = []     # 5G bitvector tests (~625MB RAM)
@@ -31,12 +34,14 @@ mmap-tests = ["memmap2", "tempfile"]  # Memory-mapped tests
 [dependencies]
 memmap2 = { version = "0.9", optional = true }
 tempfile = { version = "3.10", optional = true }
+serde = { version = "1.0", default-features = false, features = ["alloc", "derive"], optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
 proptest = "1.0"
 rand = "0.8"
 rand_chacha = "0.3"
+serde_json = "1.0"
 
 [[bench]]
 name = "rank_select"

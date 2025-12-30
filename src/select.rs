@@ -6,11 +6,15 @@
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Default sample rate for select index.
 pub const DEFAULT_SAMPLE_RATE: u32 = 256;
 
 /// Sample entry storing word index and cumulative count before that word.
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 struct SampleEntry {
     /// Word index containing the sample point.
     word_idx: u32,
@@ -31,6 +35,7 @@ struct SampleEntry {
 /// - Sample rate 256: ~3% overhead
 /// - Sample rate 512: ~1.5% overhead
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SelectIndex {
     /// Sample entries: samples[i] contains info for (i * sample_rate)-th 1-bit.
     samples: Vec<SampleEntry>,

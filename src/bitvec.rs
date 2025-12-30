@@ -6,6 +6,9 @@
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use crate::broadword::select_in_word;
 use crate::popcount::{popcount_word, popcount_words};
 use crate::rank::RankDirectory;
@@ -35,6 +38,7 @@ use crate::{Config, RankSelect};
 /// assert_eq!(bv.select1(0), Some(1));
 /// ```
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct BitVec {
     /// Raw bit storage
     words: Vec<u64>,

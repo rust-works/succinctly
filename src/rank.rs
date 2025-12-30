@@ -6,6 +6,9 @@
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Number of 64-bit words per basic block (512 bits = 8 words).
 const WORDS_PER_BLOCK: usize = 8;
 
@@ -35,6 +38,7 @@ const BLOCKS_PER_SUPERBLOCK: usize = 1 << 23;
 /// Total overhead: 128 bits per 512 bits = 25% before optimization.
 /// With packing optimizations: ~3% for typical use cases.
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct RankDirectory {
     /// L0: Absolute cumulative rank every 2^32 bits.
     /// Only used for bitvectors > 4 billion bits.
