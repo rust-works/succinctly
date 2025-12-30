@@ -4,8 +4,8 @@
 
 use core::arch::aarch64::*;
 
-use crate::json::standard::{SemiIndex, State};
 use crate::json::BitWriter;
+use crate::json::standard::{SemiIndex, State};
 
 /// ASCII byte constants
 const DOUBLE_QUOTE: u8 = b'"';
