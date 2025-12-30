@@ -30,6 +30,9 @@
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 // ============================================================================
 // Phase 1: Word-Level Operations
 // ============================================================================
@@ -433,6 +436,7 @@ pub fn enclose(words: &[u64], len: usize, p: usize) -> Option<usize> {
 /// assert_eq!(bp.find_close(3), Some(4)); // second inner pair
 /// ```
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct BalancedParens {
     /// The underlying bit vector (1=open, 0=close)
     words: Vec<u64>,
