@@ -206,17 +206,12 @@ pub fn find_close(words: &[u64], len: usize, p: usize) -> Option<usize> {
             word & ((1u64 << word_bits) - 1)
         };
 
-        let word_ones = masked_word.count_ones() as i32;
-        let word_excess = 2 * word_ones - word_bits as i32;
+        // Compute the minimum excess reached within this word
+        let (word_min, word_excess) = word_min_excess_i32(masked_word, word_bits);
 
-        // Check if excess might go to 0 in this word (meaning match found)
-        // Minimum possible excess in this word is excess + min_excess_in_word
-        // We need excess + some_prefix_excess = 0
-        // This happens if the cumulative excess drops to 0 at some point
-
-        // Simple check: if adding word_excess could bring us to 0 or below
-        // at some point, we need to scan this word bit by bit
-        if excess + word_excess <= 0 {
+        // Check if excess might drop to 0 within this word
+        // The minimum excess reached is: excess + word_min
+        if excess + word_min <= 0 {
             // The match might be in this word - do fine-grained search
             let mut bit_excess = excess;
             for bit in 0..word_bits {
@@ -239,6 +234,23 @@ pub fn find_close(words: &[u64], len: usize, p: usize) -> Option<usize> {
     }
 
     None
+}
+
+/// Helper function to compute min excess and total excess for a word (i32 version).
+fn word_min_excess_i32(word: u64, valid_bits: usize) -> (i32, i32) {
+    let mut excess: i32 = 0;
+    let mut min_excess: i32 = 0;
+
+    for i in 0..valid_bits {
+        if (word >> i) & 1 == 1 {
+            excess += 1; // open
+        } else {
+            excess -= 1; // close
+            min_excess = min_excess.min(excess);
+        }
+    }
+
+    (min_excess, excess)
 }
 
 /// Find matching open parenthesis (scanning backwards).
@@ -427,26 +439,19 @@ pub struct BalancedParens {
     /// Number of valid bits
     len: usize,
 
-    // Index structures for accelerated search (currently unused, reserved for future optimization)
-    // TODO: Fix find_close_from to use these indices correctly
     /// L0: Per-word min excess (signed, relative to start of word)
-    #[allow(dead_code)]
     l0_min_excess: Vec<i8>,
     /// L0: Per-word cumulative excess (total excess at end of word)
     l0_cum_excess: Vec<i16>,
 
     /// L1: Per-32-word block min excess
-    #[allow(dead_code)]
     l1_min_excess: Vec<i16>,
     /// L1: Per-32-word block cumulative excess
-    #[allow(dead_code)]
     l1_cum_excess: Vec<i16>,
 
     /// L2: Per-1024-word block min excess
-    #[allow(dead_code)]
     l2_min_excess: Vec<i16>,
     /// L2: Per-1024-word block cumulative excess
-    #[allow(dead_code)]
     l2_cum_excess: Vec<i16>,
 }
 
@@ -598,132 +603,205 @@ impl BalancedParens {
             return None;
         }
 
-        // If position p is a close, return None (or Some(p) depending on semantics)
+        // If position p is a close, return None
         if self.is_close(p) {
             return None;
         }
 
-        // Use linear scan for correctness (accelerated search has known issues)
-        // TODO: Fix and re-enable find_close_from for O(1) performance
-        find_close(&self.words, self.len, p)
+        // Use accelerated search with RangeMin indices
+        // Start after the open at position p with excess = 1
+        self.find_close_from(p + 1, 1)
     }
 
-    /// Internal: find position where excess drops to 0, starting from position p+1
-    /// with initial excess s.
+    /// Internal: find position where excess drops to 0, starting from given position
+    /// with given initial excess.
     ///
-    /// TODO: This accelerated search has bugs with multi-word sequences. Fix the index
-    /// usage to properly track cumulative excess across block boundaries.
-    #[allow(dead_code)]
-    fn find_close_from(&self, p: usize, initial_excess: i32) -> Option<usize> {
-        let start_pos = p + 1;
+    /// This implements the RangeMin algorithm from Sadakane & Navarro using a state machine
+    /// approach, matching the Haskell hw-balancedparens implementation (rm2FindClose).
+    ///
+    /// The key insight is that we can skip entire blocks (words, L1 blocks, L2 blocks)
+    /// if we know the minimum excess in that block won't bring us to 0.
+    ///
+    /// State machine:
+    /// - ScanBit: Process one bit at a time
+    /// - CheckL0/L1/L2: Check if match is in this block (using min_excess)
+    /// - FromL0/L1/L2: Decide next level based on position alignment
+    fn find_close_from(&self, start_pos: usize, initial_excess: i32) -> Option<usize> {
         if start_pos >= self.len {
             return None;
         }
 
+        // State machine states matching Haskell's FindState
+        #[derive(Clone, Copy, Debug)]
+        enum State {
+            ScanBit, // FindBP: Scan bit-by-bit
+            CheckL0, // FindL0: Check L0 (word) index
+            CheckL1, // FindL1: Check L1 (32-word block) index
+            CheckL2, // FindL2: Check L2 (1024-word block) index
+            FromL0,  // FindFromL0: Transition from L0 - decide next level
+            FromL1,  // FindFromL1: Transition from L1 - decide next level
+            FromL2,  // FindFromL2: Transition from L2 - decide next level
+        }
+
+        let mut state = State::FromL0;
         let mut excess = initial_excess;
         let mut pos = start_pos;
 
-        // Phase 1: Search within current word (up to word boundary)
-        let word_idx = pos / 64;
-        let bit_idx = pos % 64;
+        loop {
+            match state {
+                State::ScanBit => {
+                    // Haskell's FindBP: Scan single bit, then transition to FromL0
+                    if pos >= self.len {
+                        return None;
+                    }
 
-        if bit_idx > 0 {
-            let word = self.words[word_idx];
-            let valid_bits = if word_idx == self.words.len() - 1 && !self.len.is_multiple_of(64) {
-                self.len % 64
-            } else {
-                64
-            };
+                    let word_idx = pos / 64;
+                    let bit_idx = pos % 64;
+                    let bit = (self.words[word_idx] >> bit_idx) & 1;
 
-            for bit in bit_idx..valid_bits {
-                if (word >> bit) & 1 == 1 {
-                    excess += 1;
-                } else {
-                    excess -= 1;
-                    if excess == 0 {
-                        return Some(word_idx * 64 + bit);
+                    if bit == 0 {
+                        // Close paren
+                        excess -= 1;
+                        if excess == 0 {
+                            return Some(pos);
+                        }
+                    } else {
+                        // Open paren
+                        excess += 1;
+                    }
+                    pos += 1;
+                    state = State::FromL0;
+                }
+
+                State::CheckL0 => {
+                    // Haskell's FindL0: Check L0 (word) index
+                    // IMPORTANT: Only enter this state when pos is word-aligned!
+                    debug_assert!(
+                        pos.is_multiple_of(64),
+                        "CheckL0 requires word-aligned position"
+                    );
+
+                    let word_idx = pos / 64;
+                    if word_idx >= self.l0_min_excess.len() {
+                        return None;
+                    }
+
+                    let min_e = self.l0_min_excess[word_idx] as i32;
+                    if excess + min_e <= 0 {
+                        // Match might be in this word - scan bit by bit
+                        state = State::ScanBit;
+                    } else {
+                        // Match not in this word - skip entire word
+                        // Check for immediate match first (Haskell does this too)
+                        if pos < self.len && self.is_close(pos) && excess <= 1 {
+                            return Some(pos);
+                        }
+                        let word_excess = self.l0_cum_excess[word_idx] as i32;
+                        excess += word_excess;
+                        pos += 64;
+                        state = State::FromL0;
+                    }
+                }
+
+                State::CheckL1 => {
+                    // Haskell's FindL1: Check L1 (32-word block) index
+                    // IMPORTANT: Only enter this state when pos is word-aligned!
+                    debug_assert!(
+                        pos.is_multiple_of(64),
+                        "CheckL1 requires word-aligned position"
+                    );
+
+                    let l1_idx = pos / (64 * FACTOR_L1);
+                    if l1_idx >= self.l1_min_excess.len() {
+                        return None;
+                    }
+
+                    let min_e = self.l1_min_excess[l1_idx] as i32;
+                    if excess + min_e <= 0 {
+                        // Match might be in this L1 block - descend to L0
+                        state = State::CheckL0;
+                    } else if pos < self.len {
+                        // Match not in this L1 block - skip it
+                        if self.is_close(pos) && excess <= 1 {
+                            return Some(pos);
+                        }
+                        let l1_excess = self.l1_cum_excess[l1_idx] as i32;
+                        excess += l1_excess;
+                        pos += 64 * FACTOR_L1;
+                        state = State::FromL1;
+                    } else {
+                        return None;
+                    }
+                }
+
+                State::CheckL2 => {
+                    // Haskell's FindL2: Check L2 (1024-word block) index
+                    let l2_idx = pos / (64 * FACTOR_L1 * FACTOR_L2);
+                    if l2_idx >= self.l2_min_excess.len() {
+                        return None;
+                    }
+
+                    let min_e = self.l2_min_excess[l2_idx] as i32;
+                    if excess + min_e <= 0 {
+                        // Match might be in this L2 block - descend to L1
+                        state = State::CheckL1;
+                    } else if pos < self.len {
+                        // Match not in this L2 block - skip it
+                        if self.is_close(pos) && excess <= 1 {
+                            return Some(pos);
+                        }
+                        let l2_excess = self.l2_cum_excess[l2_idx] as i32;
+                        excess += l2_excess;
+                        pos += 64 * FACTOR_L1 * FACTOR_L2;
+                        state = State::FromL2;
+                    } else {
+                        return None;
+                    }
+                }
+
+                State::FromL0 => {
+                    // Haskell's FindFromL0: At word boundary? Try L1, else scan bits
+                    if pos.is_multiple_of(64) {
+                        state = State::FromL1;
+                    } else if pos < self.len {
+                        state = State::ScanBit;
+                    } else {
+                        return None;
+                    }
+                }
+
+                State::FromL1 => {
+                    // Haskell's FindFromL1: At L1 boundary? Try L2, else check L0
+                    if pos.is_multiple_of(64 * FACTOR_L1) {
+                        if pos < self.len {
+                            state = State::FromL2;
+                        } else {
+                            return None;
+                        }
+                    } else if pos < self.len {
+                        // Not at L1 boundary, but must be at word boundary (came from FromL0)
+                        state = State::CheckL0;
+                    } else {
+                        return None;
+                    }
+                }
+
+                State::FromL2 => {
+                    // Haskell's FindFromL2: At L2 boundary? Check L2, else check L1
+                    if pos.is_multiple_of(64 * FACTOR_L1 * FACTOR_L2) {
+                        if pos < self.len {
+                            state = State::CheckL2;
+                        } else {
+                            return None;
+                        }
+                    } else if pos < self.len {
+                        state = State::CheckL1;
+                    } else {
+                        return None;
                     }
                 }
             }
-            pos = (word_idx + 1) * 64;
         }
-
-        if pos >= self.len {
-            return None;
-        }
-
-        // Phase 2: Use L0/L1/L2 to find target word quickly
-        let mut current_word = pos / 64;
-
-        while current_word < self.words.len() {
-            // Check if we're at an L2 boundary and can skip L2 blocks
-            if current_word.is_multiple_of(FACTOR_L1 * FACTOR_L2) {
-                let l2_idx = current_word / (FACTOR_L1 * FACTOR_L2);
-                if l2_idx < self.l2_min_excess.len() {
-                    let l2_min = self.l2_min_excess[l2_idx] as i32;
-                    if excess + l2_min > 0 {
-                        // Match not in this L2 block, skip it
-                        excess += self.l2_cum_excess[l2_idx] as i32;
-                        current_word += FACTOR_L1 * FACTOR_L2;
-                        continue;
-                    }
-                }
-            }
-
-            // Check if we're at an L1 boundary and can skip L1 blocks
-            if current_word.is_multiple_of(FACTOR_L1) {
-                let l1_idx = current_word / FACTOR_L1;
-                if l1_idx < self.l1_min_excess.len() {
-                    let l1_min = self.l1_min_excess[l1_idx] as i32;
-                    if excess + l1_min > 0 {
-                        // Match not in this L1 block, skip it
-                        excess += self.l1_cum_excess[l1_idx] as i32;
-                        current_word += FACTOR_L1;
-                        continue;
-                    }
-                }
-            }
-
-            // Check L0 level - use index to skip word if match not here
-            if current_word < self.l0_min_excess.len() {
-                let l0_min = self.l0_min_excess[current_word] as i32;
-                if excess + l0_min > 0 {
-                    // Match not in this word, skip it using index
-                    excess += self.l0_cum_excess[current_word] as i32;
-                    current_word += 1;
-                    continue;
-                }
-            }
-
-            // Match should be in this word - scan bit by bit
-            let word = self.words[current_word];
-            let valid_bits = if current_word == self.words.len() - 1 && !self.len.is_multiple_of(64)
-            {
-                self.len % 64
-            } else {
-                64
-            };
-
-            for bit in 0..valid_bits {
-                if current_word * 64 + bit >= self.len {
-                    return None;
-                }
-                if (word >> bit) & 1 == 1 {
-                    excess += 1;
-                } else {
-                    excess -= 1;
-                    if excess == 0 {
-                        return Some(current_word * 64 + bit);
-                    }
-                }
-            }
-
-            // Word scanned but match not found (shouldn't happen if indices are correct,
-            // but handle gracefully). Update excess is already done, just move to next word.
-            current_word += 1;
-        }
-
-        None
     }
 
     /// Find matching open parenthesis.
@@ -1346,5 +1424,45 @@ mod tests {
         // Closes return None
         assert_eq!(bp.subtree_size(2), None);
         assert_eq!(bp.subtree_size(3), None);
+    }
+
+    #[test]
+    fn test_find_close_multi_word_regression() {
+        // Regression test from property test failure - tests that accelerated
+        // find_close matches linear scan for a multi-word bit vector
+        let words: Vec<u64> = vec![
+            6148914691236517205,
+            17768248446614328661,
+            7652237512791978695,
+            10679207262162398901,
+            11775793721244512726,
+            8946029940302164653,
+            4836752526886871298,
+            6851556326407803519,
+            4920914883505671372,
+            2108412058774050545,
+            11226564708885533661,
+            14782248937799897235,
+            3628355826111158270,
+            16652187963763892183,
+            15371706386568957536,
+            56015962,
+        ];
+        let len = 992;
+        let p = 153;
+
+        let bp = BalancedParens::new(words.clone(), len);
+        let linear_result = find_close(&words, len, p);
+        let bp_result = bp.find_close(p);
+
+        // First, make sure we're testing an open position
+        assert!(bp.is_open(p), "Position {} should be open", p);
+
+        // The results should match
+        assert_eq!(
+            bp_result, linear_result,
+            "find_close({}) mismatch: accelerated={:?}, linear={:?}",
+            p, bp_result, linear_result
+        );
     }
 }
