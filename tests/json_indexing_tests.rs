@@ -322,6 +322,7 @@ mod standard_cursor {
 mod simd_comparison {
     use super::*;
     use rand::prelude::*;
+    use succinctly::json::simd;
 
     fn compare_results(json: &[u8]) {
         let scalar = standard::build_semi_index(json);

@@ -127,13 +127,11 @@ unsafe fn classify_chars(chunk: __m128i) -> CharClass {
 #[target_feature(enable = "sse2")]
 #[cfg(target_arch = "x86_64")]
 unsafe fn unsigned_le(a: __m128i, b: __m128i) -> __m128i {
-    unsafe {
-        // For unsigned comparison a <= b:
-        // We use: min(a, b) == a
-        // SSE2 has _mm_min_epu8 for unsigned byte minimum
-        let min_ab = _mm_min_epu8(a, b);
-        _mm_cmpeq_epi8(min_ab, a)
-    }
+    // For unsigned comparison a <= b:
+    // We use: min(a, b) == a
+    // SSE2 has _mm_min_epu8 for unsigned byte minimum
+    let min_ab = _mm_min_epu8(a, b);
+    _mm_cmpeq_epi8(min_ab, a)
 }
 
 /// Process a 16-byte chunk and update IB/BP writers.
@@ -305,8 +303,8 @@ mod tests {
             let class = classify_chars(chunk);
 
             // Position 0 is '{', position 12 is '}'
-            assert_ne!(class.opens & (1 << 0), 0, "'{' at position 0");
-            assert_ne!(class.closes & (1 << 12), 0, "'}' at position 12");
+            assert_ne!(class.opens & (1 << 0), 0, "'{{' at position 0");
+            assert_ne!(class.closes & (1 << 12), 0, "'}}' at position 12");
 
             // Position 1 and 7 are '"'
             assert_ne!(class.quotes & (1 << 1), 0, "'\"' at position 1");
