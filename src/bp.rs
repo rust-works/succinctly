@@ -1520,13 +1520,8 @@ mod tests {
         // L1 boundary is at 32 words = 2048 bits
         // Create: 2048 opens followed by 2048 closes
         let num_opens = 32; // words
-        let mut words = Vec::with_capacity(64);
-        for _ in 0..num_opens {
-            words.push(u64::MAX); // 32 words of opens
-        }
-        for _ in 0..num_opens {
-            words.push(0u64); // 32 words of closes
-        }
+        let mut words = vec![u64::MAX; num_opens]; // 32 words of opens
+        words.extend(std::iter::repeat_n(0u64, num_opens)); // 32 words of closes
         let len = 64 * 64; // 4096 bits
         let bp = BalancedParens::new(words.clone(), len);
 
@@ -1740,10 +1735,7 @@ mod tests {
     fn test_l1_index_construction() {
         // Test that L1 indices are built correctly
         // Create exactly 32 words to have one full L1 block
-        let mut words = Vec::with_capacity(32);
-        for _ in 0..32 {
-            words.push(0x5555555555555555u64); // ()()()... - balanced
-        }
+        let words = vec![0x5555555555555555u64; 32]; // ()()()... - balanced
         let len = 32 * 64;
         let bp = BalancedParens::new(words, len);
 
@@ -1758,15 +1750,10 @@ mod tests {
     #[test]
     fn test_multiple_l1_blocks() {
         // Create 64 words = 2 L1 blocks
-        let mut words = Vec::with_capacity(64);
         // First L1 block: 32 words of opens (positive excess)
-        for _ in 0..32 {
-            words.push(u64::MAX);
-        }
+        let mut words = vec![u64::MAX; 32];
         // Second L1 block: 32 words of closes (negative excess)
-        for _ in 0..32 {
-            words.push(0u64);
-        }
+        words.extend(std::iter::repeat_n(0u64, 32));
         let len = 64 * 64;
         let bp = BalancedParens::new(words.clone(), len);
 
