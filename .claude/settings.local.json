@@ -10,7 +10,9 @@
       "Bash(cargo:*)",
       "Bash(xxd:*)",
       "Bash(done)",
-      "Bash(git add:*)"
+      "Bash(git rebase:*)",
+      "Bash(git stash:*)",
+      "Bash(git restore:*)"
     ],
     "deny": [],
     "ask": []
