@@ -39,7 +39,10 @@
 //! ```
 
 #[cfg(not(test))]
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, string::String, vec::Vec};
+
+#[cfg(test)]
+use std::borrow::Cow;
 
 use crate::bp::BalancedParens;
 use crate::broadword::select_in_word;
@@ -587,9 +590,12 @@ impl<'a> JsonString<'a> {
 
     /// Decode the string value.
     ///
+    /// Returns a `Cow::Borrowed` for strings without escapes (zero-copy),
+    /// or a `Cow::Owned` for strings that need escape decoding.
+    ///
     /// Returns an error if the string contains invalid escape sequences
     /// or invalid UTF-8.
-    pub fn as_str(&self) -> Result<&'a str, JsonError> {
+    pub fn as_str(&self) -> Result<Cow<'a, str>, JsonError> {
         // Skip opening quote
         let start = self.start + 1;
         let end = self.find_string_end();
@@ -598,12 +604,12 @@ impl<'a> JsonString<'a> {
 
         // Check if we need to decode escapes
         if !bytes.contains(&b'\\') {
-            // No escapes - can return directly
-            core::str::from_utf8(bytes).map_err(|_| JsonError::InvalidUtf8)
+            // No escapes - can return directly (zero-copy)
+            let s = core::str::from_utf8(bytes).map_err(|_| JsonError::InvalidUtf8)?;
+            Ok(Cow::Borrowed(s))
         } else {
             // Has escapes - need to decode
-            // For now, return error - full implementation would decode escapes
-            Err(JsonError::EscapeDecodeNotImplemented)
+            decode_escapes(bytes).map(Cow::Owned)
         }
     }
 
@@ -622,6 +628,109 @@ impl<'a> JsonString<'a> {
         }
         self.text.len()
     }
+}
+
+/// Decode JSON string escape sequences.
+///
+/// Handles: \\, \", \/, \b, \f, \n, \r, \t, and \uXXXX (including surrogate pairs)
+fn decode_escapes(bytes: &[u8]) -> Result<String, JsonError> {
+    let mut result = String::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            if i + 1 >= bytes.len() {
+                return Err(JsonError::InvalidEscape);
+            }
+            i += 1;
+            match bytes[i] {
+                b'"' => result.push('"'),
+                b'\\' => result.push('\\'),
+                b'/' => result.push('/'),
+                b'b' => result.push('\u{0008}'), // backspace
+                b'f' => result.push('\u{000C}'), // form feed
+                b'n' => result.push('\n'),
+                b'r' => result.push('\r'),
+                b't' => result.push('\t'),
+                b'u' => {
+                    // Unicode escape: \uXXXX
+                    if i + 4 >= bytes.len() {
+                        return Err(JsonError::InvalidUnicodeEscape);
+                    }
+                    let hex = &bytes[i + 1..i + 5];
+                    let codepoint = parse_hex4(hex)?;
+                    i += 4;
+
+                    // Check for surrogate pair
+                    if (0xD800..=0xDBFF).contains(&codepoint) {
+                        // High surrogate - must be followed by low surrogate
+                        if i + 6 < bytes.len() && bytes[i + 1] == b'\\' && bytes[i + 2] == b'u' {
+                            let low_hex = &bytes[i + 3..i + 7];
+                            let low = parse_hex4(low_hex)?;
+                            if (0xDC00..=0xDFFF).contains(&low) {
+                                // Valid surrogate pair
+                                let cp = 0x10000
+                                    + ((codepoint as u32 - 0xD800) << 10)
+                                    + (low as u32 - 0xDC00);
+                                if let Some(c) = char::from_u32(cp) {
+                                    result.push(c);
+                                    i += 6; // Skip \uXXXX for low surrogate
+                                } else {
+                                    return Err(JsonError::InvalidUnicodeEscape);
+                                }
+                            } else {
+                                return Err(JsonError::InvalidUnicodeEscape);
+                            }
+                        } else {
+                            return Err(JsonError::InvalidUnicodeEscape);
+                        }
+                    } else if (0xDC00..=0xDFFF).contains(&codepoint) {
+                        // Lone low surrogate
+                        return Err(JsonError::InvalidUnicodeEscape);
+                    } else {
+                        // Regular BMP character
+                        if let Some(c) = char::from_u32(codepoint as u32) {
+                            result.push(c);
+                        } else {
+                            return Err(JsonError::InvalidUnicodeEscape);
+                        }
+                    }
+                }
+                _ => return Err(JsonError::InvalidEscape),
+            }
+            i += 1;
+        } else {
+            // Regular UTF-8 byte - copy until next backslash or end
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'\\' {
+                i += 1;
+            }
+            let chunk =
+                core::str::from_utf8(&bytes[start..i]).map_err(|_| JsonError::InvalidUtf8)?;
+            result.push_str(chunk);
+        }
+    }
+
+    Ok(result)
+}
+
+/// Parse 4 hex digits into a u16.
+fn parse_hex4(hex: &[u8]) -> Result<u16, JsonError> {
+    if hex.len() != 4 {
+        return Err(JsonError::InvalidUnicodeEscape);
+    }
+
+    let mut value = 0u16;
+    for &b in hex {
+        let digit = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return Err(JsonError::InvalidUnicodeEscape),
+        };
+        value = value * 16 + digit as u16;
+    }
+    Ok(value)
 }
 
 // ============================================================================
@@ -681,8 +790,10 @@ pub enum JsonError {
     InvalidUtf8,
     /// Invalid number format
     InvalidNumber,
-    /// Escape sequence decoding not yet implemented
-    EscapeDecodeNotImplemented,
+    /// Invalid escape sequence in string
+    InvalidEscape,
+    /// Invalid unicode escape (not a valid hex digit or invalid codepoint)
+    InvalidUnicodeEscape,
 }
 
 // ============================================================================
@@ -1080,6 +1191,321 @@ mod tests {
             // Continue first iteration
             let (e2, _) = rest1.uncons().unwrap();
             assert!(matches!(e2, LightJson::Number(_)));
+        }
+    }
+
+    // ========================================================================
+    // Escape sequence tests
+    // ========================================================================
+
+    #[test]
+    fn test_string_no_escapes_is_borrowed() {
+        let json = br#""hello world""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                let result = s.as_str().unwrap();
+                // Should be Cow::Borrowed for strings without escapes
+                assert!(matches!(result, Cow::Borrowed(_)));
+                assert_eq!(&*result, "hello world");
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_escaped_quote() {
+        let json = br#""hello\"world""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                let result = s.as_str().unwrap();
+                assert_eq!(&*result, "hello\"world");
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_escaped_backslash() {
+        let json = br#""hello\\world""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                let result = s.as_str().unwrap();
+                assert_eq!(&*result, "hello\\world");
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_escaped_slash() {
+        let json = br#""hello\/world""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                let result = s.as_str().unwrap();
+                assert_eq!(&*result, "hello/world");
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_escaped_newline() {
+        let json = br#""hello\nworld""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                let result = s.as_str().unwrap();
+                assert_eq!(&*result, "hello\nworld");
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_escaped_tab() {
+        let json = br#""hello\tworld""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                let result = s.as_str().unwrap();
+                assert_eq!(&*result, "hello\tworld");
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_escaped_carriage_return() {
+        let json = br#""hello\rworld""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                let result = s.as_str().unwrap();
+                assert_eq!(&*result, "hello\rworld");
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_escaped_backspace() {
+        let json = br#""hello\bworld""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                let result = s.as_str().unwrap();
+                assert_eq!(&*result, "hello\u{0008}world");
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_escaped_formfeed() {
+        let json = br#""hello\fworld""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                let result = s.as_str().unwrap();
+                assert_eq!(&*result, "hello\u{000C}world");
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_unicode_escape_bmp() {
+        // \u0041 is 'A'
+        let json = br#""\u0041""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                let result = s.as_str().unwrap();
+                assert_eq!(&*result, "A");
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_unicode_escape_euro() {
+        // \u20AC is €
+        let json = br#""\u20AC""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                let result = s.as_str().unwrap();
+                assert_eq!(&*result, "€");
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_unicode_escape_lowercase() {
+        // \u00e9 is é (lowercase hex)
+        let json = br#""\u00e9""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                let result = s.as_str().unwrap();
+                assert_eq!(&*result, "é");
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_unicode_surrogate_pair() {
+        // \uD83D\uDE00 is 😀 (U+1F600)
+        let json = br#""\uD83D\uDE00""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                let result = s.as_str().unwrap();
+                assert_eq!(&*result, "😀");
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_multiple_escapes() {
+        let json = br#""line1\nline2\ttab\r\n""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                let result = s.as_str().unwrap();
+                assert_eq!(&*result, "line1\nline2\ttab\r\n");
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_mixed_escapes_and_unicode() {
+        let json = br#""Price: \u20AC100\nTax: \u00A310""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                let result = s.as_str().unwrap();
+                assert_eq!(&*result, "Price: €100\nTax: £10");
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_invalid_escape() {
+        let json = br#""\x""#; // \x is not valid JSON
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                assert_eq!(s.as_str(), Err(JsonError::InvalidEscape));
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_lone_high_surrogate() {
+        // Lone high surrogate without low surrogate
+        let json = br#""\uD83D""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                assert_eq!(s.as_str(), Err(JsonError::InvalidUnicodeEscape));
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_lone_low_surrogate() {
+        // Lone low surrogate
+        let json = br#""\uDE00""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                assert_eq!(s.as_str(), Err(JsonError::InvalidUnicodeEscape));
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_invalid_unicode_hex() {
+        // Invalid hex digit
+        let json = br#""\uXXXX""#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::String(s) => {
+                assert_eq!(s.as_str(), Err(JsonError::InvalidUnicodeEscape));
+            }
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_string_with_escaped_key_in_object() {
+        let json = br#"{"na\nme": "value"}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        match root.value() {
+            LightJson::Object(fields) => {
+                // find should handle escaped keys
+                let (field, _) = fields.uncons().unwrap();
+                match field.key() {
+                    LightJson::String(s) => {
+                        assert_eq!(&*s.as_str().unwrap(), "na\nme");
+                    }
+                    _ => panic!("expected string key"),
+                }
+            }
+            _ => panic!("expected object"),
         }
     }
 }
