@@ -1,4 +1,4 @@
-//! LightJson - Lazy JSON navigation without full parsing.
+//! StandardJson - Lazy JSON navigation using the standard cursor.
 //!
 //! This module provides a cursor-based API for navigating JSON structures
 //! without fully parsing the JSON text. Values are only decoded when explicitly
@@ -23,15 +23,15 @@
 //! # Example
 //!
 //! ```
-//! use succinctly::json::light::{JsonIndex, LightJson};
+//! use succinctly::json::light::{JsonIndex, StandardJson};
 //!
 //! let json = br#"{"name": "Alice", "age": 30}"#;
 //! let index = JsonIndex::build(json);
 //! let root = index.root(json);
 //!
-//! if let LightJson::Object(fields) = root.value() {
+//! if let StandardJson::Object(fields) = root.value() {
 //!     if let Some(name) = fields.find("name") {
-//!         if let LightJson::String(s) = name {
+//!         if let StandardJson::String(s) = name {
 //!             assert_eq!(&*s.as_str().unwrap(), "Alice");
 //!         }
 //!     }
@@ -308,50 +308,50 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     }
 
     /// Get the JSON value at this cursor position.
-    pub fn value(&self) -> LightJson<'a, W> {
+    pub fn value(&self) -> StandardJson<'a, W> {
         let Some(text_pos) = self.text_position() else {
-            return LightJson::Error("invalid cursor position");
+            return StandardJson::Error("invalid cursor position");
         };
 
         if text_pos >= self.text.len() {
-            return LightJson::Error("text position out of bounds");
+            return StandardJson::Error("text position out of bounds");
         }
 
         match self.text[text_pos] {
-            b'{' => LightJson::Object(JsonFields::from_object_cursor(*self)),
-            b'[' => LightJson::Array(JsonElements::from_array_cursor(*self)),
-            b'"' => LightJson::String(JsonString {
+            b'{' => StandardJson::Object(JsonFields::from_object_cursor(*self)),
+            b'[' => StandardJson::Array(JsonElements::from_array_cursor(*self)),
+            b'"' => StandardJson::String(JsonString {
                 text: self.text,
                 start: text_pos,
             }),
             b't' | b'f' => {
                 // true or false
                 if self.text[text_pos..].starts_with(b"true") {
-                    LightJson::Bool(true)
+                    StandardJson::Bool(true)
                 } else if self.text[text_pos..].starts_with(b"false") {
-                    LightJson::Bool(false)
+                    StandardJson::Bool(false)
                 } else {
-                    LightJson::Error("invalid boolean")
+                    StandardJson::Error("invalid boolean")
                 }
             }
             b'n' => {
                 if self.text[text_pos..].starts_with(b"null") {
-                    LightJson::Null
+                    StandardJson::Null
                 } else {
-                    LightJson::Error("invalid null")
+                    StandardJson::Error("invalid null")
                 }
             }
-            c if c == b'-' || c.is_ascii_digit() => LightJson::Number(JsonNumber {
+            c if c == b'-' || c.is_ascii_digit() => StandardJson::Number(JsonNumber {
                 text: self.text,
                 start: text_pos,
             }),
-            _ => LightJson::Error("unexpected character"),
+            _ => StandardJson::Error("unexpected character"),
         }
     }
 }
 
 // ============================================================================
-// LightJson: The value type
+// StandardJson: The value type
 // ============================================================================
 
 /// A JSON value with lazy decoding.
@@ -360,7 +360,7 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
 /// that yields children on demand. For strings and numbers, the raw bytes
 /// are stored and only parsed when you call `as_str()` or `as_i64()`.
 #[derive(Clone, Debug)]
-pub enum LightJson<'a, W = Vec<u64>> {
+pub enum StandardJson<'a, W = Vec<u64>> {
     /// A JSON string (quotes not yet stripped, escapes not yet decoded)
     String(JsonString<'a>),
     /// A JSON number (not yet parsed)
@@ -448,10 +448,10 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     ///
     /// Returns the value of the first field with the given name,
     /// or `None` if not found.
-    pub fn find(&self, name: &str) -> Option<LightJson<'a, W>> {
+    pub fn find(&self, name: &str) -> Option<StandardJson<'a, W>> {
         let mut fields = *self;
         while let Some((field, rest)) = fields.uncons() {
-            if let LightJson::String(key) = field.key() {
+            if let StandardJson::String(key) = field.key() {
                 if key.as_str().ok()? == name {
                     return Some(field.value());
                 }
@@ -495,13 +495,13 @@ impl<'a, W> Copy for JsonField<'a, W> {}
 impl<'a, W: AsRef<[u64]>> JsonField<'a, W> {
     /// Get the field key (always a string).
     #[inline]
-    pub fn key(&self) -> LightJson<'a, W> {
+    pub fn key(&self) -> StandardJson<'a, W> {
         self.key_cursor.value()
     }
 
     /// Get the field value.
     #[inline]
-    pub fn value(&self) -> LightJson<'a, W> {
+    pub fn value(&self) -> StandardJson<'a, W> {
         self.value_cursor.value()
     }
 }
@@ -554,7 +554,7 @@ impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
     /// Get the first element and the remaining elements.
     ///
     /// Returns `None` if there are no more elements.
-    pub fn uncons(&self) -> Option<(LightJson<'a, W>, JsonElements<'a, W>)> {
+    pub fn uncons(&self) -> Option<(StandardJson<'a, W>, JsonElements<'a, W>)> {
         let element_cursor = self.element_cursor?;
 
         let rest = JsonElements {
@@ -568,7 +568,7 @@ impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
     /// Get element by index.
     ///
     /// Note: This is O(n) as it iterates through elements.
-    pub fn get(&self, index: usize) -> Option<LightJson<'a, W>> {
+    pub fn get(&self, index: usize) -> Option<StandardJson<'a, W>> {
         let mut elements = *self;
         for _ in 0..index {
             let (_, rest) = elements.uncons()?;
@@ -579,7 +579,7 @@ impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
 }
 
 impl<'a, W: AsRef<[u64]>> Iterator for JsonElements<'a, W> {
-    type Item = LightJson<'a, W>;
+    type Item = StandardJson<'a, W>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let (elem, rest) = self.uncons()?;
@@ -869,7 +869,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::Object(fields) => {
+            StandardJson::Object(fields) => {
                 assert!(fields.is_empty());
             }
             _ => panic!("expected object"),
@@ -883,7 +883,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::Array(elements) => {
+            StandardJson::Array(elements) => {
                 assert!(elements.is_empty());
             }
             _ => panic!("expected array"),
@@ -896,19 +896,19 @@ mod tests {
         let json = b"true";
         let index = JsonIndex::build(json);
         let root = index.root(json);
-        assert!(matches!(root.value(), LightJson::Bool(true)));
+        assert!(matches!(root.value(), StandardJson::Bool(true)));
 
         // Test boolean false
         let json = b"false";
         let index = JsonIndex::build(json);
         let root = index.root(json);
-        assert!(matches!(root.value(), LightJson::Bool(false)));
+        assert!(matches!(root.value(), StandardJson::Bool(false)));
 
         // Test null
         let json = b"null";
         let index = JsonIndex::build(json);
         let root = index.root(json);
-        assert!(matches!(root.value(), LightJson::Null));
+        assert!(matches!(root.value(), StandardJson::Null));
     }
 
     #[test]
@@ -918,7 +918,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::Number(n) => {
+            StandardJson::Number(n) => {
                 assert_eq!(n.as_i64().unwrap(), 42);
             }
             _ => panic!("expected number"),
@@ -932,7 +932,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 assert_eq!(s.as_str().unwrap(), "hello");
             }
             _ => panic!("expected string"),
@@ -946,7 +946,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::Object(fields) => {
+            StandardJson::Object(fields) => {
                 assert!(!fields.is_empty());
 
                 // Uncons the first field
@@ -954,7 +954,7 @@ mod tests {
 
                 // Check key
                 match field.key() {
-                    LightJson::String(s) => {
+                    StandardJson::String(s) => {
                         assert_eq!(s.as_str().unwrap(), "name");
                     }
                     _ => panic!("expected string key"),
@@ -962,7 +962,7 @@ mod tests {
 
                 // Check value
                 match field.value() {
-                    LightJson::String(s) => {
+                    StandardJson::String(s) => {
                         assert_eq!(s.as_str().unwrap(), "Alice");
                     }
                     _ => panic!("expected string value"),
@@ -982,26 +982,26 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::Object(fields) => {
+            StandardJson::Object(fields) => {
                 // First field: name
                 let (field1, rest1) = fields.uncons().expect("should have first field");
                 match field1.key() {
-                    LightJson::String(s) => assert_eq!(s.as_str().unwrap(), "name"),
+                    StandardJson::String(s) => assert_eq!(s.as_str().unwrap(), "name"),
                     _ => panic!("expected string key"),
                 }
                 match field1.value() {
-                    LightJson::String(s) => assert_eq!(s.as_str().unwrap(), "Bob"),
+                    StandardJson::String(s) => assert_eq!(s.as_str().unwrap(), "Bob"),
                     _ => panic!("expected string value"),
                 }
 
                 // Second field: age
                 let (field2, rest2) = rest1.uncons().expect("should have second field");
                 match field2.key() {
-                    LightJson::String(s) => assert_eq!(s.as_str().unwrap(), "age"),
+                    StandardJson::String(s) => assert_eq!(s.as_str().unwrap(), "age"),
                     _ => panic!("expected string key"),
                 }
                 match field2.value() {
-                    LightJson::Number(n) => assert_eq!(n.as_i64().unwrap(), 30),
+                    StandardJson::Number(n) => assert_eq!(n.as_i64().unwrap(), 30),
                     _ => panic!("expected number value"),
                 }
 
@@ -1019,22 +1019,22 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::Object(fields) => {
+            StandardJson::Object(fields) => {
                 // Find existing field
                 match fields.find("age") {
-                    Some(LightJson::Number(n)) => assert_eq!(n.as_i64().unwrap(), 25),
+                    Some(StandardJson::Number(n)) => assert_eq!(n.as_i64().unwrap(), 25),
                     _ => panic!("expected number"),
                 }
 
                 // Find first field
                 match fields.find("name") {
-                    Some(LightJson::String(s)) => assert_eq!(s.as_str().unwrap(), "Charlie"),
+                    Some(StandardJson::String(s)) => assert_eq!(s.as_str().unwrap(), "Charlie"),
                     _ => panic!("expected string"),
                 }
 
                 // Find last field
                 match fields.find("city") {
-                    Some(LightJson::String(s)) => assert_eq!(s.as_str().unwrap(), "NYC"),
+                    Some(StandardJson::String(s)) => assert_eq!(s.as_str().unwrap(), "NYC"),
                     _ => panic!("expected string"),
                 }
 
@@ -1052,12 +1052,12 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::Array(elements) => {
+            StandardJson::Array(elements) => {
                 assert!(!elements.is_empty());
 
                 let (elem, rest) = elements.uncons().expect("should have one element");
                 match elem {
-                    LightJson::Number(n) => assert_eq!(n.as_i64().unwrap(), 42),
+                    StandardJson::Number(n) => assert_eq!(n.as_i64().unwrap(), 42),
                     _ => panic!("expected number"),
                 }
 
@@ -1074,21 +1074,21 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::Array(elements) => {
+            StandardJson::Array(elements) => {
                 let (e1, rest1) = elements.uncons().expect("first");
                 let (e2, rest2) = rest1.uncons().expect("second");
                 let (e3, rest3) = rest2.uncons().expect("third");
 
                 match e1 {
-                    LightJson::Number(n) => assert_eq!(n.as_i64().unwrap(), 1),
+                    StandardJson::Number(n) => assert_eq!(n.as_i64().unwrap(), 1),
                     _ => panic!("expected number"),
                 }
                 match e2 {
-                    LightJson::Number(n) => assert_eq!(n.as_i64().unwrap(), 2),
+                    StandardJson::Number(n) => assert_eq!(n.as_i64().unwrap(), 2),
                     _ => panic!("expected number"),
                 }
                 match e3 {
-                    LightJson::Number(n) => assert_eq!(n.as_i64().unwrap(), 3),
+                    StandardJson::Number(n) => assert_eq!(n.as_i64().unwrap(), 3),
                     _ => panic!("expected number"),
                 }
 
@@ -1105,17 +1105,17 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::Array(elements) => {
+            StandardJson::Array(elements) => {
                 match elements.get(0) {
-                    Some(LightJson::String(s)) => assert_eq!(s.as_str().unwrap(), "a"),
+                    Some(StandardJson::String(s)) => assert_eq!(s.as_str().unwrap(), "a"),
                     _ => panic!("expected string at index 0"),
                 }
                 match elements.get(1) {
-                    Some(LightJson::String(s)) => assert_eq!(s.as_str().unwrap(), "b"),
+                    Some(StandardJson::String(s)) => assert_eq!(s.as_str().unwrap(), "b"),
                     _ => panic!("expected string at index 1"),
                 }
                 match elements.get(2) {
-                    Some(LightJson::String(s)) => assert_eq!(s.as_str().unwrap(), "c"),
+                    Some(StandardJson::String(s)) => assert_eq!(s.as_str().unwrap(), "c"),
                     _ => panic!("expected string at index 2"),
                 }
                 assert!(elements.get(3).is_none());
@@ -1131,9 +1131,9 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::Object(fields) => match fields.find("person") {
-                Some(LightJson::Object(inner_fields)) => match inner_fields.find("name") {
-                    Some(LightJson::String(s)) => {
+            StandardJson::Object(fields) => match fields.find("person") {
+                Some(StandardJson::Object(inner_fields)) => match inner_fields.find("name") {
+                    Some(StandardJson::String(s)) => {
                         assert_eq!(s.as_str().unwrap(), "Dave");
                     }
                     _ => panic!("expected string"),
@@ -1151,11 +1151,11 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::Array(elements) => {
+            StandardJson::Array(elements) => {
                 // First object
                 match elements.get(0) {
-                    Some(LightJson::Object(fields)) => match fields.find("a") {
-                        Some(LightJson::Number(n)) => assert_eq!(n.as_i64().unwrap(), 1),
+                    Some(StandardJson::Object(fields)) => match fields.find("a") {
+                        Some(StandardJson::Number(n)) => assert_eq!(n.as_i64().unwrap(), 1),
                         _ => panic!("expected number"),
                     },
                     _ => panic!("expected object"),
@@ -1163,8 +1163,8 @@ mod tests {
 
                 // Second object
                 match elements.get(1) {
-                    Some(LightJson::Object(fields)) => match fields.find("b") {
-                        Some(LightJson::Number(n)) => assert_eq!(n.as_i64().unwrap(), 2),
+                    Some(StandardJson::Object(fields)) => match fields.find("b") {
+                        Some(StandardJson::Number(n)) => assert_eq!(n.as_i64().unwrap(), 2),
                         _ => panic!("expected number"),
                     },
                     _ => panic!("expected object"),
@@ -1181,7 +1181,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::Number(n) => {
+            StandardJson::Number(n) => {
                 assert_eq!(n.as_i64().unwrap(), -123);
             }
             _ => panic!("expected number"),
@@ -1195,7 +1195,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::Number(n) => {
+            StandardJson::Number(n) => {
                 let f = n.as_f64().unwrap();
                 assert!((f - 3.14159).abs() < 0.0001);
             }
@@ -1210,18 +1210,18 @@ mod tests {
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
-        if let LightJson::Array(elements) = root.value() {
+        if let StandardJson::Array(elements) = root.value() {
             // First iteration
             let (e1, rest1) = elements.uncons().unwrap();
-            assert!(matches!(e1, LightJson::Number(_)));
+            assert!(matches!(e1, StandardJson::Number(_)));
 
             // Start over - elements is still valid
             let (e1_again, _) = elements.uncons().unwrap();
-            assert!(matches!(e1_again, LightJson::Number(_)));
+            assert!(matches!(e1_again, StandardJson::Number(_)));
 
             // Continue first iteration
             let (e2, _) = rest1.uncons().unwrap();
-            assert!(matches!(e2, LightJson::Number(_)));
+            assert!(matches!(e2, StandardJson::Number(_)));
         }
     }
 
@@ -1236,7 +1236,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 let result = s.as_str().unwrap();
                 // Should be Cow::Borrowed for strings without escapes
                 assert!(matches!(result, Cow::Borrowed(_)));
@@ -1253,7 +1253,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 let result = s.as_str().unwrap();
                 assert_eq!(&*result, "hello\"world");
             }
@@ -1268,7 +1268,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 let result = s.as_str().unwrap();
                 assert_eq!(&*result, "hello\\world");
             }
@@ -1283,7 +1283,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 let result = s.as_str().unwrap();
                 assert_eq!(&*result, "hello/world");
             }
@@ -1298,7 +1298,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 let result = s.as_str().unwrap();
                 assert_eq!(&*result, "hello\nworld");
             }
@@ -1313,7 +1313,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 let result = s.as_str().unwrap();
                 assert_eq!(&*result, "hello\tworld");
             }
@@ -1328,7 +1328,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 let result = s.as_str().unwrap();
                 assert_eq!(&*result, "hello\rworld");
             }
@@ -1343,7 +1343,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 let result = s.as_str().unwrap();
                 assert_eq!(&*result, "hello\u{0008}world");
             }
@@ -1358,7 +1358,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 let result = s.as_str().unwrap();
                 assert_eq!(&*result, "hello\u{000C}world");
             }
@@ -1374,7 +1374,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 let result = s.as_str().unwrap();
                 assert_eq!(&*result, "A");
             }
@@ -1390,7 +1390,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 let result = s.as_str().unwrap();
                 assert_eq!(&*result, "€");
             }
@@ -1406,7 +1406,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 let result = s.as_str().unwrap();
                 assert_eq!(&*result, "é");
             }
@@ -1422,7 +1422,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 let result = s.as_str().unwrap();
                 assert_eq!(&*result, "😀");
             }
@@ -1437,7 +1437,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 let result = s.as_str().unwrap();
                 assert_eq!(&*result, "line1\nline2\ttab\r\n");
             }
@@ -1452,7 +1452,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 let result = s.as_str().unwrap();
                 assert_eq!(&*result, "Price: €100\nTax: £10");
             }
@@ -1467,7 +1467,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 assert_eq!(s.as_str(), Err(JsonError::InvalidEscape));
             }
             _ => panic!("expected string"),
@@ -1482,7 +1482,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 assert_eq!(s.as_str(), Err(JsonError::InvalidUnicodeEscape));
             }
             _ => panic!("expected string"),
@@ -1497,7 +1497,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 assert_eq!(s.as_str(), Err(JsonError::InvalidUnicodeEscape));
             }
             _ => panic!("expected string"),
@@ -1512,7 +1512,7 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::String(s) => {
+            StandardJson::String(s) => {
                 assert_eq!(s.as_str(), Err(JsonError::InvalidUnicodeEscape));
             }
             _ => panic!("expected string"),
@@ -1526,11 +1526,11 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            LightJson::Object(fields) => {
+            StandardJson::Object(fields) => {
                 // find should handle escaped keys
                 let (field, _) = fields.uncons().unwrap();
                 match field.key() {
-                    LightJson::String(s) => {
+                    StandardJson::String(s) => {
                         assert_eq!(&*s.as_str().unwrap(), "na\nme");
                     }
                     _ => panic!("expected string key"),
@@ -1550,10 +1550,10 @@ mod tests {
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
-        if let LightJson::Object(fields) = root.value() {
+        if let StandardJson::Object(fields) = root.value() {
             let keys: Vec<_> = fields
                 .map(|f| {
-                    if let LightJson::String(s) = f.key() {
+                    if let StandardJson::String(s) = f.key() {
                         s.as_str().unwrap().into_owned()
                     } else {
                         panic!("expected string key")
@@ -1572,10 +1572,10 @@ mod tests {
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
-        if let LightJson::Array(elements) = root.value() {
+        if let StandardJson::Array(elements) = root.value() {
             let nums: Vec<_> = elements
                 .filter_map(|e| {
-                    if let LightJson::Number(n) = e {
+                    if let StandardJson::Number(n) = e {
                         n.as_i64().ok()
                     } else {
                         None
@@ -1594,7 +1594,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
-        if let LightJson::Object(fields) = root.value() {
+        if let StandardJson::Object(fields) = root.value() {
             assert_eq!(fields.count(), 0);
         } else {
             panic!("expected object");
@@ -1607,7 +1607,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
-        if let LightJson::Array(elements) = root.value() {
+        if let StandardJson::Array(elements) = root.value() {
             assert_eq!(elements.count(), 0);
         } else {
             panic!("expected array");
