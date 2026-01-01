@@ -459,10 +459,10 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     pub fn find(&self, name: &str) -> Option<StandardJson<'a, W>> {
         let mut fields = *self;
         while let Some((field, rest)) = fields.uncons() {
-            if let StandardJson::String(key) = field.key() {
-                if key.as_str().ok()? == name {
-                    return Some(field.value());
-                }
+            if let StandardJson::String(key) = field.key()
+                && key.as_str().ok()? == name
+            {
+                return Some(field.value());
             }
             fields = rest;
         }
@@ -1198,14 +1198,14 @@ mod tests {
 
     #[test]
     fn test_float_number() {
-        let json = b"3.14159";
+        let json = b"1.23456";
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
         match root.value() {
             StandardJson::Number(n) => {
                 let f = n.as_f64().unwrap();
-                assert!((f - 3.14159).abs() < 0.0001);
+                assert!((f - 1.23456).abs() < 0.0001);
             }
             _ => panic!("expected number"),
         }
