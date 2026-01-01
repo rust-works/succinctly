@@ -16,6 +16,7 @@
 mod bit_writer;
 pub mod light;
 pub mod simple;
+pub mod simple_light;
 pub mod standard;
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -23,3 +24,4 @@ pub mod simd;
 
 pub use bit_writer::BitWriter;
 pub use light::{JsonIndex, StandardJson};
+pub use simple_light::SimpleJsonIndex;
