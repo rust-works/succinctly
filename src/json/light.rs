@@ -462,6 +462,16 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     }
 }
 
+impl<'a, W: AsRef<[u64]>> Iterator for JsonFields<'a, W> {
+    type Item = JsonField<'a, W>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (field, rest) = self.uncons()?;
+        *self = rest;
+        Some(field)
+    }
+}
+
 // ============================================================================
 // JsonField: A single key-value pair
 // ============================================================================
@@ -565,6 +575,16 @@ impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
             elements = rest;
         }
         elements.uncons().map(|(elem, _)| elem)
+    }
+}
+
+impl<'a, W: AsRef<[u64]>> Iterator for JsonElements<'a, W> {
+    type Item = LightJson<'a, W>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (elem, rest) = self.uncons()?;
+        *self = rest;
+        Some(elem)
     }
 }
 
@@ -1506,6 +1526,80 @@ mod tests {
                 }
             }
             _ => panic!("expected object"),
+        }
+    }
+
+    // ========================================================================
+    // Iterator tests
+    // ========================================================================
+
+    #[test]
+    fn test_json_fields_iterator() {
+        let json = br#"{"a": 1, "b": 2, "c": 3}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        if let LightJson::Object(fields) = root.value() {
+            let keys: Vec<_> = fields
+                .map(|f| {
+                    if let LightJson::String(s) = f.key() {
+                        s.as_str().unwrap().into_owned()
+                    } else {
+                        panic!("expected string key")
+                    }
+                })
+                .collect();
+            assert_eq!(keys, vec!["a", "b", "c"]);
+        } else {
+            panic!("expected object");
+        }
+    }
+
+    #[test]
+    fn test_json_elements_iterator() {
+        let json = br#"[1, 2, 3, 4, 5]"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        if let LightJson::Array(elements) = root.value() {
+            let nums: Vec<_> = elements
+                .filter_map(|e| {
+                    if let LightJson::Number(n) = e {
+                        n.as_i64().ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(nums, vec![1, 2, 3, 4, 5]);
+        } else {
+            panic!("expected array");
+        }
+    }
+
+    #[test]
+    fn test_iterator_empty_object() {
+        let json = br#"{}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        if let LightJson::Object(fields) = root.value() {
+            assert_eq!(fields.count(), 0);
+        } else {
+            panic!("expected object");
+        }
+    }
+
+    #[test]
+    fn test_iterator_empty_array() {
+        let json = br#"[]"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        if let LightJson::Array(elements) = root.value() {
+            assert_eq!(elements.count(), 0);
+        } else {
+            panic!("expected array");
         }
     }
 }
