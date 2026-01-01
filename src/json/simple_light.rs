@@ -67,8 +67,16 @@ impl SimpleJsonIndex<Vec<u64>> {
     ///
     /// This parses the JSON to build the interest bits (IB) and balanced
     /// parentheses (BP) index structures.
+    ///
+    /// On supported platforms (aarch64, x86_64), this automatically uses
+    /// SIMD-accelerated indexing for better performance.
     pub fn build(json: &[u8]) -> Self {
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        let semi = crate::json::simd::build_semi_index_simple(json);
+
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let semi = crate::json::simple::build_semi_index(json);
+
         let ib_len = json.len();
 
         // Count actual BP bits
