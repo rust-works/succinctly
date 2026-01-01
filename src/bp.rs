@@ -415,6 +415,10 @@ pub fn enclose(words: &[u64], len: usize, p: usize) -> Option<usize> {
 /// Stores auxiliary min-excess data at multiple levels for fast find_close/find_open.
 /// Based on the RangeMin data structure from haskell-works.
 ///
+/// The type parameter `W` controls how the underlying bit vector is stored:
+/// - `Vec<u64>` for owned data
+/// - `&[u64]` for borrowed data (e.g., from mmap)
+///
 /// # Space Overhead
 ///
 /// Approximately 6% overhead:
@@ -437,9 +441,9 @@ pub fn enclose(words: &[u64], len: usize, p: usize) -> Option<usize> {
 /// ```
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct BalancedParens {
+pub struct BalancedParens<W = Vec<u64>> {
     /// The underlying bit vector (1=open, 0=close)
-    words: Vec<u64>,
+    words: W,
     /// Number of valid bits
     len: usize,
 
@@ -464,92 +468,147 @@ const FACTOR_L1: usize = 32;
 /// L2 factor: L1 blocks per L2 block
 const FACTOR_L2: usize = 32;
 
-impl BalancedParens {
-    /// Build from a bitvector representing balanced parentheses.
+/// Helper function to build the L0/L1/L2 index structures from words.
+fn build_bp_index(
+    words: &[u64],
+    len: usize,
+) -> (Vec<i8>, Vec<i16>, Vec<i16>, Vec<i16>, Vec<i16>, Vec<i16>) {
+    if words.is_empty() || len == 0 {
+        return (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+
+    let num_words = words.len();
+    let num_l1 = num_words.div_ceil(FACTOR_L1);
+    let num_l2 = num_l1.div_ceil(FACTOR_L2);
+
+    // Build L0: per-word statistics
+    let mut l0_min_excess = Vec::with_capacity(num_words);
+    let mut l0_cum_excess = Vec::with_capacity(num_words);
+
+    for (i, &word) in words.iter().enumerate() {
+        let valid_bits = if i == num_words - 1 && !len.is_multiple_of(64) {
+            len % 64
+        } else {
+            64
+        };
+        let (min_e, total_e) = word_min_excess(word, valid_bits);
+        l0_min_excess.push(min_e);
+        l0_cum_excess.push(total_e);
+    }
+
+    // Build L1: per-32-word block statistics
+    let mut l1_min_excess = Vec::with_capacity(num_l1);
+    let mut l1_cum_excess = Vec::with_capacity(num_l1);
+
+    for block_idx in 0..num_l1 {
+        let start = block_idx * FACTOR_L1;
+        let end = (start + FACTOR_L1).min(num_words);
+
+        let mut block_min: i16 = 0;
+        let mut running_excess: i16 = 0;
+
+        for i in start..end {
+            let word_min = l0_min_excess[i] as i16;
+            let word_excess = l0_cum_excess[i];
+
+            // min_excess at word i = running_excess + word_min
+            block_min = block_min.min(running_excess + word_min);
+            running_excess += word_excess;
+        }
+
+        l1_min_excess.push(block_min);
+        l1_cum_excess.push(running_excess);
+    }
+
+    // Build L2: per-1024-word block statistics
+    let mut l2_min_excess = Vec::with_capacity(num_l2);
+    let mut l2_cum_excess = Vec::with_capacity(num_l2);
+
+    for block_idx in 0..num_l2 {
+        let start = block_idx * FACTOR_L2;
+        let end = (start + FACTOR_L2).min(num_l1);
+
+        let mut block_min: i16 = 0;
+        let mut running_excess: i16 = 0;
+
+        for i in start..end {
+            let l1_min = l1_min_excess[i];
+            let l1_excess = l1_cum_excess[i];
+
+            block_min = block_min.min(running_excess + l1_min);
+            running_excess += l1_excess;
+        }
+
+        l2_min_excess.push(block_min);
+        l2_cum_excess.push(running_excess);
+    }
+
+    (
+        l0_min_excess,
+        l0_cum_excess,
+        l1_min_excess,
+        l1_cum_excess,
+        l2_min_excess,
+        l2_cum_excess,
+    )
+}
+
+impl BalancedParens<Vec<u64>> {
+    /// Build from an owned bitvector representing balanced parentheses.
     ///
     /// # Arguments
     ///
     /// * `words` - Bit vector where 1=open, 0=close
     /// * `len` - Number of valid bits
     pub fn new(words: Vec<u64>, len: usize) -> Self {
-        if words.is_empty() || len == 0 {
-            return Self {
-                words: Vec::new(),
-                len: 0,
-                l0_min_excess: Vec::new(),
-                l0_cum_excess: Vec::new(),
-                l1_min_excess: Vec::new(),
-                l1_cum_excess: Vec::new(),
-                l2_min_excess: Vec::new(),
-                l2_cum_excess: Vec::new(),
-            };
+        let (
+            l0_min_excess,
+            l0_cum_excess,
+            l1_min_excess,
+            l1_cum_excess,
+            l2_min_excess,
+            l2_cum_excess,
+        ) = build_bp_index(&words, len);
+
+        Self {
+            words,
+            len,
+            l0_min_excess,
+            l0_cum_excess,
+            l1_min_excess,
+            l1_cum_excess,
+            l2_min_excess,
+            l2_cum_excess,
         }
+    }
+}
 
-        let num_words = words.len();
-        let num_l1 = num_words.div_ceil(FACTOR_L1);
-        let num_l2 = num_l1.div_ceil(FACTOR_L2);
-
-        // Build L0: per-word statistics
-        let mut l0_min_excess = Vec::with_capacity(num_words);
-        let mut l0_cum_excess = Vec::with_capacity(num_words);
-
-        for (i, &word) in words.iter().enumerate() {
-            let valid_bits = if i == num_words - 1 && !len.is_multiple_of(64) {
-                len % 64
-            } else {
-                64
-            };
-            let (min_e, total_e) = word_min_excess(word, valid_bits);
-            l0_min_excess.push(min_e);
-            l0_cum_excess.push(total_e);
-        }
-
-        // Build L1: per-32-word block statistics
-        let mut l1_min_excess = Vec::with_capacity(num_l1);
-        let mut l1_cum_excess = Vec::with_capacity(num_l1);
-
-        for block_idx in 0..num_l1 {
-            let start = block_idx * FACTOR_L1;
-            let end = (start + FACTOR_L1).min(num_words);
-
-            let mut block_min: i16 = 0;
-            let mut running_excess: i16 = 0;
-
-            for i in start..end {
-                let word_min = l0_min_excess[i] as i16;
-                let word_excess = l0_cum_excess[i];
-
-                // min_excess at word i = running_excess + word_min
-                block_min = block_min.min(running_excess + word_min);
-                running_excess += word_excess;
-            }
-
-            l1_min_excess.push(block_min);
-            l1_cum_excess.push(running_excess);
-        }
-
-        // Build L2: per-1024-word block statistics
-        let mut l2_min_excess = Vec::with_capacity(num_l2);
-        let mut l2_cum_excess = Vec::with_capacity(num_l2);
-
-        for block_idx in 0..num_l2 {
-            let start = block_idx * FACTOR_L2;
-            let end = (start + FACTOR_L2).min(num_l1);
-
-            let mut block_min: i16 = 0;
-            let mut running_excess: i16 = 0;
-
-            for i in start..end {
-                let l1_min = l1_min_excess[i];
-                let l1_excess = l1_cum_excess[i];
-
-                block_min = block_min.min(running_excess + l1_min);
-                running_excess += l1_excess;
-            }
-
-            l2_min_excess.push(block_min);
-            l2_cum_excess.push(running_excess);
-        }
+impl<W: AsRef<[u64]>> BalancedParens<W> {
+    /// Build from a bitvector representing balanced parentheses.
+    ///
+    /// This method works with any storage type that implements `AsRef<[u64]>`,
+    /// including `Vec<u64>`, `&[u64]`, `Box<[u64]>`, etc.
+    ///
+    /// # Arguments
+    ///
+    /// * `words` - Bit vector where 1=open, 0=close
+    /// * `len` - Number of valid bits
+    pub fn from_words(words: W, len: usize) -> Self {
+        let (
+            l0_min_excess,
+            l0_cum_excess,
+            l1_min_excess,
+            l1_cum_excess,
+            l2_min_excess,
+            l2_cum_excess,
+        ) = build_bp_index(words.as_ref(), len);
 
         Self {
             words,
@@ -575,13 +634,20 @@ impl BalancedParens {
         self.len == 0
     }
 
+    /// Get a reference to the underlying words.
+    #[inline]
+    pub fn words(&self) -> &[u64] {
+        self.words.as_ref()
+    }
+
     /// Check if position `p` is an open parenthesis.
     #[inline]
     pub fn is_open(&self, p: usize) -> bool {
         if p >= self.len {
             return false;
         }
-        (self.words[p / 64] >> (p % 64)) & 1 == 1
+        let words = self.words.as_ref();
+        (words[p / 64] >> (p % 64)) & 1 == 1
     }
 
     /// Check if position `p` is a close parenthesis.
@@ -590,7 +656,8 @@ impl BalancedParens {
         if p >= self.len {
             return false;
         }
-        (self.words[p / 64] >> (p % 64)) & 1 == 0
+        let words = self.words.as_ref();
+        (words[p / 64] >> (p % 64)) & 1 == 0
     }
 
     /// Find matching close parenthesis.
@@ -659,9 +726,10 @@ impl BalancedParens {
                         return None;
                     }
 
+                    let words = self.words.as_ref();
                     let word_idx = pos / 64;
                     let bit_idx = pos % 64;
-                    let bit = (self.words[word_idx] >> bit_idx) & 1;
+                    let bit = (words[word_idx] >> bit_idx) & 1;
 
                     if bit == 0 {
                         // Close paren
@@ -817,7 +885,7 @@ impl BalancedParens {
             return None;
         }
 
-        find_open(&self.words, self.len, p)
+        find_open(self.words.as_ref(), self.len, p)
     }
 
     /// Find enclosing open parenthesis (parent node).
@@ -829,7 +897,7 @@ impl BalancedParens {
             return None;
         }
 
-        enclose(&self.words, self.len, p)
+        enclose(self.words.as_ref(), self.len, p)
     }
 
     /// Navigate to first child in tree.
@@ -886,7 +954,8 @@ impl BalancedParens {
         }
 
         // Add partial word
-        let word = self.words[word_idx];
+        let words = self.words.as_ref();
+        let word = words[word_idx];
         for bit in 0..=bit_idx {
             if (word >> bit) & 1 == 1 {
                 total += 1;
