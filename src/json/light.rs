@@ -816,6 +816,17 @@ pub enum JsonError {
     InvalidUnicodeEscape,
 }
 
+impl core::fmt::Display for JsonError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            JsonError::InvalidUtf8 => write!(f, "invalid UTF-8 in string"),
+            JsonError::InvalidNumber => write!(f, "invalid number format"),
+            JsonError::InvalidEscape => write!(f, "invalid escape sequence in string"),
+            JsonError::InvalidUnicodeEscape => write!(f, "invalid unicode escape sequence"),
+        }
+    }
+}
+
 // ============================================================================
 // Type aliases for common configurations
 // ============================================================================
@@ -1601,5 +1612,30 @@ mod tests {
         } else {
             panic!("expected array");
         }
+    }
+
+    // ========================================================================
+    // Display tests
+    // ========================================================================
+
+    #[test]
+    fn test_json_error_display() {
+        use std::string::ToString;
+        assert_eq!(
+            JsonError::InvalidUtf8.to_string(),
+            "invalid UTF-8 in string"
+        );
+        assert_eq!(
+            JsonError::InvalidNumber.to_string(),
+            "invalid number format"
+        );
+        assert_eq!(
+            JsonError::InvalidEscape.to_string(),
+            "invalid escape sequence in string"
+        );
+        assert_eq!(
+            JsonError::InvalidUnicodeEscape.to_string(),
+            "invalid unicode escape sequence"
+        );
     }
 }
