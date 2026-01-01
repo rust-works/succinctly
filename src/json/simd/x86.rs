@@ -7,6 +7,7 @@
 use core::arch::x86_64::*;
 
 use crate::json::BitWriter;
+use crate::json::simple::{SemiIndex as SimpleSemiIndex, State as SimpleState};
 use crate::json::standard::{SemiIndex, State};
 
 /// ASCII byte constants
@@ -273,6 +274,130 @@ unsafe fn build_semi_index_standard_sse2(json: &[u8]) -> SemiIndex {
     }
 }
 
+// ============================================================================
+// Simple Cursor SIMD Implementation
+// ============================================================================
+
+/// Process a 16-byte chunk for simple cursor and update IB/BP writers.
+/// Returns the new state after processing all bytes.
+///
+/// Simple cursor differences from standard:
+/// - 3 states: InJson, InString, InEscape (no InValue)
+/// - IB marks all structural chars: { } [ ] : ,
+/// - BP encoding: { or [ → 11, } or ] → 00, : or , → 01
+#[inline]
+fn process_chunk_simple(
+    class: CharClass,
+    mut state: SimpleState,
+    ib: &mut BitWriter,
+    bp: &mut BitWriter,
+    bytes: &[u8],
+) -> SimpleState {
+    for i in 0..bytes.len().min(16) {
+        let bit = 1u16 << i;
+
+        let is_quote = (class.quotes & bit) != 0;
+        let is_backslash = (class.backslashes & bit) != 0;
+        let is_open = (class.opens & bit) != 0;
+        let is_close = (class.closes & bit) != 0;
+        let is_delim = (class.delims & bit) != 0;
+
+        match state {
+            SimpleState::InJson => {
+                if is_open {
+                    // { or [: write BP=11, IB=1
+                    bp.write_1();
+                    bp.write_1();
+                    ib.write_1();
+                } else if is_close {
+                    // } or ]: write BP=00, IB=1
+                    bp.write_0();
+                    bp.write_0();
+                    ib.write_1();
+                } else if is_delim {
+                    // , or :: write BP=01, IB=1
+                    bp.write_0();
+                    bp.write_1();
+                    ib.write_1();
+                } else if is_quote {
+                    // Start of string: IB=0, transition to InString
+                    ib.write_0();
+                    state = SimpleState::InString;
+                } else {
+                    // Whitespace or other: IB=0
+                    ib.write_0();
+                }
+            }
+            SimpleState::InString => {
+                // Always IB=0 inside strings
+                ib.write_0();
+                if is_quote {
+                    state = SimpleState::InJson;
+                } else if is_backslash {
+                    state = SimpleState::InEscape;
+                }
+            }
+            SimpleState::InEscape => {
+                // Escaped character: IB=0, return to InString
+                ib.write_0();
+                state = SimpleState::InString;
+            }
+        }
+    }
+
+    state
+}
+
+/// Build a semi-index from JSON bytes using SIMD-accelerated Simple Cursor algorithm.
+///
+/// Processes 16 bytes at a time using x86_64 SSE2 instructions for character
+/// classification, then processes the state machine transitions.
+#[cfg(target_arch = "x86_64")]
+pub fn build_semi_index_simple(json: &[u8]) -> SimpleSemiIndex {
+    // SAFETY: SSE2 is guaranteed to be available on all x86_64 processors
+    unsafe { build_semi_index_simple_sse2(json) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn build_semi_index_simple_sse2(json: &[u8]) -> SimpleSemiIndex {
+    unsafe {
+        let word_capacity = json.len().div_ceil(64);
+        let mut ib = BitWriter::with_capacity(word_capacity);
+        let mut bp = BitWriter::with_capacity(word_capacity * 2);
+        let mut state = SimpleState::InJson;
+
+        let mut offset = 0;
+
+        // Process 16-byte chunks
+        while offset + 16 <= json.len() {
+            let chunk = _mm_loadu_si128(json.as_ptr().add(offset) as *const __m128i);
+            let class = classify_chars(chunk);
+            state =
+                process_chunk_simple(class, state, &mut ib, &mut bp, &json[offset..offset + 16]);
+            offset += 16;
+        }
+
+        // Process remaining bytes (less than 16)
+        if offset < json.len() {
+            // Pad with zeros and process
+            let mut padded = [0u8; 16];
+            let remaining = json.len() - offset;
+            padded[..remaining].copy_from_slice(&json[offset..]);
+
+            let chunk = _mm_loadu_si128(padded.as_ptr() as *const __m128i);
+            let class = classify_chars(chunk);
+            state = process_chunk_simple(class, state, &mut ib, &mut bp, &json[offset..]);
+        }
+
+        SimpleSemiIndex {
+            state,
+            ib: ib.finish(),
+            bp: bp.finish(),
+        }
+    }
+}
+
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
@@ -515,5 +640,202 @@ mod tests {
             bits_to_string(&scalar_result.ib, json.len()),
             "IB mismatch for scientific notation"
         );
+    }
+
+    // ========================================================================
+    // Simple Cursor SIMD Tests
+    // ========================================================================
+
+    #[test]
+    fn test_simple_sse2_matches_scalar_empty_object() {
+        let json = b"{}";
+        let simd_result = build_semi_index_simple(json);
+        let scalar_result = crate::json::simple::build_semi_index(json);
+
+        assert_eq!(
+            bits_to_string(&simd_result.ib, json.len()),
+            bits_to_string(&scalar_result.ib, json.len()),
+            "IB mismatch"
+        );
+        assert_eq!(
+            bits_to_string(&simd_result.bp, 4),
+            bits_to_string(&scalar_result.bp, 4),
+            "BP mismatch"
+        );
+        assert_eq!(simd_result.state, scalar_result.state);
+    }
+
+    #[test]
+    fn test_simple_sse2_matches_scalar_empty_array() {
+        let json = b"[]";
+        let simd_result = build_semi_index_simple(json);
+        let scalar_result = crate::json::simple::build_semi_index(json);
+
+        assert_eq!(
+            bits_to_string(&simd_result.ib, json.len()),
+            bits_to_string(&scalar_result.ib, json.len()),
+            "IB mismatch"
+        );
+        assert_eq!(
+            bits_to_string(&simd_result.bp, 4),
+            bits_to_string(&scalar_result.bp, 4),
+            "BP mismatch"
+        );
+    }
+
+    #[test]
+    fn test_simple_sse2_matches_scalar_simple_object() {
+        let json = br#"{"a":"b"}"#;
+        let simd_result = build_semi_index_simple(json);
+        let scalar_result = crate::json::simple::build_semi_index(json);
+
+        assert_eq!(
+            bits_to_string(&simd_result.ib, json.len()),
+            bits_to_string(&scalar_result.ib, json.len()),
+            "IB mismatch"
+        );
+        // BP for simple: { → 11, : → 01, } → 00 = 110100
+        assert_eq!(
+            bits_to_string(&simd_result.bp, 6),
+            bits_to_string(&scalar_result.bp, 6),
+            "BP mismatch"
+        );
+    }
+
+    #[test]
+    fn test_simple_sse2_matches_scalar_array_with_values() {
+        let json = b"[1,2,3]";
+        let simd_result = build_semi_index_simple(json);
+        let scalar_result = crate::json::simple::build_semi_index(json);
+
+        assert_eq!(
+            bits_to_string(&simd_result.ib, json.len()),
+            bits_to_string(&scalar_result.ib, json.len()),
+            "IB mismatch"
+        );
+        // BP for simple: [ → 11, , → 01, , → 01, ] → 00 = 11010100
+        assert_eq!(
+            bits_to_string(&simd_result.bp, 8),
+            bits_to_string(&scalar_result.bp, 8),
+            "BP mismatch"
+        );
+    }
+
+    #[test]
+    fn test_simple_sse2_matches_scalar_nested() {
+        let json = br#"{"a":{"b":1}}"#;
+        let simd_result = build_semi_index_simple(json);
+        let scalar_result = crate::json::simple::build_semi_index(json);
+
+        assert_eq!(
+            bits_to_string(&simd_result.ib, json.len()),
+            bits_to_string(&scalar_result.ib, json.len()),
+            "IB mismatch"
+        );
+    }
+
+    #[test]
+    fn test_simple_sse2_matches_scalar_escaped() {
+        let json = br#"{"a":"b\"c"}"#;
+        let simd_result = build_semi_index_simple(json);
+        let scalar_result = crate::json::simple::build_semi_index(json);
+
+        assert_eq!(
+            bits_to_string(&simd_result.ib, json.len()),
+            bits_to_string(&scalar_result.ib, json.len()),
+            "IB mismatch"
+        );
+        assert_eq!(simd_result.state, scalar_result.state);
+    }
+
+    #[test]
+    fn test_simple_sse2_matches_scalar_escaped_backslash() {
+        let json = br#""a\\b""#;
+        let simd_result = build_semi_index_simple(json);
+        let scalar_result = crate::json::simple::build_semi_index(json);
+
+        assert_eq!(
+            bits_to_string(&simd_result.ib, json.len()),
+            bits_to_string(&scalar_result.ib, json.len()),
+            "IB mismatch"
+        );
+        assert_eq!(simd_result.state, scalar_result.state);
+    }
+
+    #[test]
+    fn test_simple_sse2_matches_scalar_long_input() {
+        // Test with input > 16 bytes to exercise chunk processing
+        let json = br#"{"name":"value","number":12345,"array":[1,2,3]}"#;
+        let simd_result = build_semi_index_simple(json);
+        let scalar_result = crate::json::simple::build_semi_index(json);
+
+        assert_eq!(
+            bits_to_string(&simd_result.ib, json.len()),
+            bits_to_string(&scalar_result.ib, json.len()),
+            "IB mismatch for long input"
+        );
+        assert_eq!(simd_result.state, scalar_result.state);
+    }
+
+    #[test]
+    fn test_simple_sse2_matches_scalar_whitespace() {
+        let json = b"{ \"a\" : 1 }";
+        let simd_result = build_semi_index_simple(json);
+        let scalar_result = crate::json::simple::build_semi_index(json);
+
+        assert_eq!(
+            bits_to_string(&simd_result.ib, json.len()),
+            bits_to_string(&scalar_result.ib, json.len()),
+            "IB mismatch for whitespace"
+        );
+    }
+
+    #[test]
+    fn test_simple_sse2_matches_scalar_exact_16_bytes() {
+        // Exactly 16 bytes - one full chunk
+        let json = br#"{"abc":"defghi"}"#; // 16 bytes
+        let simd_result = build_semi_index_simple(json);
+        let scalar_result = crate::json::simple::build_semi_index(json);
+
+        assert_eq!(
+            bits_to_string(&simd_result.ib, json.len()),
+            bits_to_string(&scalar_result.ib, json.len()),
+            "IB mismatch for 16-byte input"
+        );
+    }
+
+    #[test]
+    fn test_simple_sse2_matches_scalar_32_bytes() {
+        // 32 bytes - two full chunks
+        let json = br#"{"abcdefghij":"klmnopqrst"}"#;
+        let simd_result = build_semi_index_simple(json);
+        let scalar_result = crate::json::simple::build_semi_index(json);
+
+        assert_eq!(
+            bits_to_string(&simd_result.ib, json.len()),
+            bits_to_string(&scalar_result.ib, json.len()),
+            "IB mismatch for 32-byte input"
+        );
+    }
+
+    #[test]
+    fn test_simple_sse2_matches_scalar_unterminated_string() {
+        let json = br#"{"a"#;
+        let simd_result = build_semi_index_simple(json);
+        let scalar_result = crate::json::simple::build_semi_index(json);
+
+        assert_eq!(simd_result.state, scalar_result.state);
+        assert_eq!(simd_result.state, SimpleState::InString);
+    }
+
+    #[test]
+    fn test_simple_sse2_matches_scalar_unterminated_escape() {
+        // String ending with a single backslash: "\ (2 bytes: quote, backslash)
+        let json = br#""\"#;
+        let simd_result = build_semi_index_simple(json);
+        let scalar_result = crate::json::simple::build_semi_index(json);
+
+        assert_eq!(simd_result.state, scalar_result.state);
+        assert_eq!(simd_result.state, SimpleState::InEscape);
     }
 }

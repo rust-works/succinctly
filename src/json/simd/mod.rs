@@ -30,6 +30,9 @@ pub use super::standard::build_semi_index as build_semi_index_standard;
 #[cfg(target_arch = "aarch64")]
 pub use neon::build_semi_index_simple;
 
-// Fallback to scalar for simple cursor on non-NEON platforms
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
+pub use x86::build_semi_index_simple;
+
+// Fallback to scalar for simple cursor on other platforms
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub use super::simple::build_semi_index as build_semi_index_simple;
