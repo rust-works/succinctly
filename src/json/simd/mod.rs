@@ -6,6 +6,7 @@
 //! ## x86_64 Instruction Set Levels
 //!
 //! - **SSE2** (baseline): 16 bytes/iteration, universal availability
+//! - **SSE4.2** (enhanced): 16 bytes/iteration with PCMPISTRI, ~90% availability (2008+)
 //! - **AVX2** (optimal): 32 bytes/iteration, ~95% availability (2013+)
 //!
 //! The implementation uses runtime CPU detection to automatically select
@@ -28,6 +29,9 @@ pub mod neon;
 pub mod x86;
 
 #[cfg(target_arch = "x86_64")]
+pub mod sse42;
+
+#[cfg(target_arch = "x86_64")]
 pub mod avx2;
 
 // ============================================================================
@@ -45,10 +49,13 @@ pub use neon::build_semi_index_standard;
 // ============================================================================
 
 // In std mode (tests), use runtime dispatch to select best SIMD level
+// Priority: AVX2 > SSE4.2 > SSE2
 #[cfg(all(target_arch = "x86_64", test))]
 pub fn build_semi_index_standard(json: &[u8]) -> crate::json::standard::SemiIndex {
     if is_x86_feature_detected!("avx2") {
         avx2::build_semi_index_standard(json)
+    } else if is_x86_feature_detected!("sse4.2") {
+        sse42::build_semi_index_standard(json)
     } else {
         x86::build_semi_index_standard(json)
     }
@@ -58,6 +65,8 @@ pub fn build_semi_index_standard(json: &[u8]) -> crate::json::standard::SemiInde
 pub fn build_semi_index_simple(json: &[u8]) -> crate::json::simple::SemiIndex {
     if is_x86_feature_detected!("avx2") {
         avx2::build_semi_index_simple(json)
+    } else if is_x86_feature_detected!("sse4.2") {
+        sse42::build_semi_index_simple(json)
     } else {
         x86::build_semi_index_simple(json)
     }
