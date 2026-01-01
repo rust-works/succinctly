@@ -8,10 +8,13 @@
 //! - [`simple`]: 3-state machine, marks all structural characters
 //! - [`standard`]: 4-state machine, marks structural characters and value starts
 //!
+//! The [`light`] module provides a lazy JSON navigation API that avoids full parsing.
+//!
 //! SIMD-accelerated versions are available on supported platforms:
 //! - [`simd`]: ARM NEON acceleration (16 bytes at a time)
 
 mod bit_writer;
+pub mod light;
 pub mod simple;
 pub mod standard;
 
@@ -19,3 +22,4 @@ pub mod standard;
 pub mod simd;
 
 pub use bit_writer::BitWriter;
+pub use light::{JsonIndex, LightJson};
