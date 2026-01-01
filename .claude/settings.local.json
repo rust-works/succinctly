@@ -12,7 +12,8 @@
       "Bash(done)",
       "Bash(git rebase:*)",
       "Bash(git stash:*)",
-      "Bash(git restore:*)"
+      "Bash(git restore:*)",
+      "Bash(python3:*)"
     ],
     "deny": [],
     "ask": []
