@@ -22,7 +22,7 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
 //! use succinctly::json::light::{JsonIndex, LightJson};
 //!
 //! let json = br#"{"name": "Alice", "age": 30}"#;
@@ -32,7 +32,7 @@
 //! if let LightJson::Object(fields) = root.value() {
 //!     if let Some(name) = fields.find("name") {
 //!         if let LightJson::String(s) = name {
-//!             assert_eq!(s.as_str().unwrap(), "Alice");
+//!             assert_eq!(&*s.as_str().unwrap(), "Alice");
 //!         }
 //!     }
 //! }

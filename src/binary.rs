@@ -10,15 +10,16 @@
 //!
 //! ## Example
 //!
-//! ```ignore
+//! ```
 //! use succinctly::binary;
 //!
-//! // Write bit vector to file
-//! let words = vec![0b1010_1010u64; 100];
-//! binary::write_words(&words, "index.bin")?;
+//! // Convert words to bytes for storage
+//! let words = vec![0b1010_1010u64; 4];
+//! let bytes = binary::words_to_bytes(&words);
+//! assert_eq!(bytes.len(), 32); // 4 words * 8 bytes
 //!
-//! // Read back
-//! let loaded = binary::read_words("index.bin")?;
+//! // Convert bytes back to words
+//! let loaded = binary::bytes_to_words_vec(bytes);
 //! assert_eq!(words, loaded);
 //! ```
 
