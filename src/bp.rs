@@ -469,6 +469,7 @@ const FACTOR_L1: usize = 32;
 const FACTOR_L2: usize = 32;
 
 /// Helper function to build the L0/L1/L2 index structures from words.
+#[allow(clippy::type_complexity)]
 fn build_bp_index(
     words: &[u64],
     len: usize,
