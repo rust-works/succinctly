@@ -13,7 +13,12 @@
       "Bash(git rebase:*)",
       "Bash(git stash:*)",
       "Bash(git restore:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(nm:*)",
+      "Bash(objdump:*)",
+      "Bash(awk:*)",
+      "Bash(./test_simd_compile)",
+      "Bash(./test_crash)"
     ],
     "deny": [],
     "ask": []
