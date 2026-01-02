@@ -62,6 +62,9 @@ cargo test json
 # Test a single test function
 cargo test test_rank1_simple
 
+# Test all SIMD levels explicitly
+cargo test --test simd_level_tests
+
 # Run benchmarks for specific operation
 cargo bench rank_select
 ```
@@ -118,7 +121,17 @@ cargo bench rank_select
 - Two cursor implementations:
   - `simple`: 3-state machine, marks all structural characters
   - `standard`: 4-state machine, marks structural characters + value starts
-- SIMD acceleration available via `simd` submodule (NEON on ARM, SSE on x86)
+- SIMD acceleration with runtime dispatch to best available instruction set:
+  - x86_64: AVX2 (32 bytes) > SSE4.2 (16 bytes) > SSE2 (16 bytes)
+  - aarch64: NEON (16 bytes, mandatory)
+
+**SIMD Module Structure** ([src/json/simd/](src/json/simd/))
+- `x86.rs`: SSE2 baseline (16-byte chunks, universal on x86_64)
+- `sse42.rs`: SSE4.2 with PCMPISTRI string instructions (~90% availability)
+- `avx2.rs`: AVX2 256-bit processing (32-byte chunks, ~95% availability)
+- `bmi2.rs`: BMI2 PDEP/PEXT utilities (note: AMD Zen 1/2 have slow microcode)
+- `neon.rs`: ARM NEON (16-byte chunks, mandatory on aarch64)
+- `mod.rs`: Runtime CPU feature detection and dispatch
 
 ### Popcount Strategies
 
@@ -175,6 +188,7 @@ cargo bench rank_select
 - [tests/json_indexing_tests.rs](tests/json_indexing_tests.rs): JSON parsing
 - [tests/bp_coverage_tests.rs](tests/bp_coverage_tests.rs): BP edge cases
 - [tests/bitread_tests.rs](tests/bitread_tests.rs): Bit-level reading
+- [tests/simd_level_tests.rs](tests/simd_level_tests.rs): Cross-level SIMD validation
 
 ## `no_std` Support
 
@@ -188,4 +202,57 @@ The library is `no_std` compatible (except in tests):
 - Words are stored little-endian (bit 0 is LSB of first word)
 - Rank directory lookups are cache-friendly (sequential access)
 - Select uses exponential search + binary search for optimal cache behavior
-- SIMD implementations process 16 bytes at a time on supported platforms
+- SIMD implementations process 16-32 bytes per iteration with runtime dispatch
+
+## Key SIMD Implementation Learnings
+
+### Compilation Model
+- **`#[target_feature]` is a compiler directive**, not a runtime gate
+- All SIMD levels (SSE2, SSE4.2, AVX2) compile into single binary on any x86_64 host
+- Each function gets separate code generation with specific instructions
+- Running unsupported code without runtime guards causes SIGILL crash
+- Runtime dispatch via `is_x86_feature_detected!()` prevents crashes
+
+### Testing Strategy
+- **Problem**: Runtime dispatch only tests highest available SIMD level
+- **Solution**: [tests/simd_level_tests.rs](tests/simd_level_tests.rs) explicitly calls each implementation
+- Force-test SSE2, SSE4.2, AVX2 by calling module functions directly
+- Validate all produce identical results against scalar reference
+- Critical for catching bugs in lower SIMD levels on modern hardware
+
+### SIMD Instruction Set Hierarchy
+| Level   | Width  | Bytes/Iter | Availability | Notes                           |
+|---------|--------|------------|--------------|----------------------------------|
+| SSE2    | 128bit | 16         | 100%         | Universal baseline on x86_64     |
+| SSE4.2  | 128bit | 16         | ~90%         | PCMPISTRI string instructions    |
+| AVX2    | 256bit | 32         | ~95%         | 2x width, best price/performance |
+| BMI2    | N/A    | N/A        | ~95%         | PDEP/PEXT, but AMD Zen 1/2 slow  |
+
+### BMI2 Considerations
+- **Intel Haswell+**: 3-cycle PDEP/PEXT (fast)
+- **AMD Zen 1/2**: 18-cycle microcode (slower than scalar)
+- **AMD Zen 3+**: 3-cycle hardware (fast)
+- Provide utilities but don't force usage - let users opt-in
+
+### no_std Constraints
+- `is_x86_feature_detected!()` requires std (not available in no_std)
+- Test builds use std for runtime dispatch validation
+- Production no_std builds can call specific SIMD modules explicitly
+- Default to SSE2 in no_std or provide feature flags for manual selection
+
+### Character Classification Pattern
+```rust
+// SSE2/SSE4.2: 128-bit, 16-byte masks
+let quote_mask = _mm_movemask_epi8(eq_quote) as u16;
+
+// AVX2: 256-bit, 32-byte masks
+let quote_mask = _mm256_movemask_epi8(eq_quote) as u32;
+
+// SSE4.2 string search (finds multiple chars in one instruction)
+let structural_mask = _mm_cmpistrm(structural_chars, chunk, MODE);
+```
+
+### CI/CD Best Practices
+- Mirror CI checks locally: `cargo clippy --all-targets --all-features -- -D warnings`
+- `-D warnings` treats warnings as errors (enforced in GitHub Actions)
+- Test all feature combinations before pushing
