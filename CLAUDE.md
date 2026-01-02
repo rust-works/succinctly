@@ -256,3 +256,13 @@ let structural_mask = _mm_cmpistrm(structural_chars, chunk, MODE);
 - Mirror CI checks locally: `cargo clippy --all-targets --all-features -- -D warnings`
 - `-D warnings` treats warnings as errors (enforced in GitHub Actions)
 - Test all feature combinations before pushing
+- Periodically update Rust toolchain to catch new lints and idiomatic patterns
+
+### Rust Version Updates
+
+**Key toolchain considerations**:
+- New Clippy lints can break CI even when code is semantically unchanged
+- Rust 1.92.0 introduced `manual_is_multiple_of` lint suggesting `.is_multiple_of()` method
+- Example: `bytes.len() % 8 == 0` → `bytes.len().is_multiple_of(8)`
+- Regular toolchain updates help adopt new idiomatic patterns early
+- Consider `rust-toolchain.toml` for reproducible builds across environments
