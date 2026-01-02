@@ -8,6 +8,8 @@
 //! - **SSE2** (baseline): 16 bytes/iteration, universal availability
 //! - **SSE4.2** (enhanced): 16 bytes/iteration with PCMPISTRI, ~90% availability (2008+)
 //! - **AVX2** (optimal): 32 bytes/iteration, ~95% availability (2013+)
+//! - **BMI2** (bit manipulation): PDEP/PEXT for efficient mask operations, ~95% availability (2013+)
+//!   - **Note**: AMD Zen 1/2 have slow BMI2 (18 cycle latency), use with caution
 //!
 //! The implementation uses runtime CPU detection to automatically select
 //! the best available instruction set.
@@ -33,6 +35,9 @@ pub mod sse42;
 
 #[cfg(target_arch = "x86_64")]
 pub mod avx2;
+
+#[cfg(target_arch = "x86_64")]
+pub mod bmi2;
 
 // ============================================================================
 // ARM exports (NEON only)

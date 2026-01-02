@@ -47,9 +47,8 @@ unsafe fn classify_chars(chunk: __m128i) -> CharClass {
         // Use PCMPISTRI to find structural characters efficiently
         // Set up a string of structural characters: {}[]:,
         let structural = _mm_setr_epi8(
-            b'{' as i8, b'}' as i8, b'[' as i8, b']' as i8,
-            b':' as i8, b',' as i8, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0,
+            b'{' as i8, b'}' as i8, b'[' as i8, b']' as i8, b':' as i8, b',' as i8, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
         );
 
         // _SIDD_CMP_EQUAL_ANY: Find any bytes that match any byte in structural
