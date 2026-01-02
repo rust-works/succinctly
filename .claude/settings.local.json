@@ -18,7 +18,8 @@
       "Bash(objdump:*)",
       "Bash(awk:*)",
       "Bash(./test_simd_compile)",
-      "Bash(./test_crash)"
+      "Bash(./test_crash)",
+      "Bash(git checkout:*)"
     ],
     "deny": [],
     "ask": []
