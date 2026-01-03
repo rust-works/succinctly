@@ -1,6 +1,21 @@
 //! JSON generators for comprehensive benchmarking.
 
-use super::{ChaCha8Rng, Pattern, Rng, SeedableRng};
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    Comprehensive,
+    Users,
+    Nested,
+    Arrays,
+    Mixed,
+    Strings,
+    Numbers,
+    Literals,
+    Unicode,
+    Pathological,
+}
 
 /// Generate JSON of approximately target_size bytes
 pub fn generate_json(
@@ -39,7 +54,7 @@ pub fn generate_comprehensive_json(
     json.push_str(r#"{"metadata":{"version":"1.0","generated":true,"features":["strings","numbers","booleans","nulls","arrays","objects","nesting","escapes","unicode"]},"#);
 
     // Distribute target size across different features
-    let feature_size = (target_size - 200) / 10; // Reserve 200 for metadata/wrapper
+    let feature_size = target_size.saturating_sub(200) / 10; // Reserve 200 for metadata/wrapper
 
     // 1. Simple values (10%)
     json.push_str(r#""simple_values":{"#);
@@ -288,7 +303,7 @@ fn add_nested_objects(
     json.push_str(r#""tree":{"#);
     add_tree_structure(
         json,
-        (target_size - (json.len() - start_len)) / 2,
+        target_size.saturating_sub(json.len() - start_len) / 2,
         0,
         depth.min(10),
         rng,
@@ -450,7 +465,7 @@ pub fn generate_users_json(target_size: usize, seed: Option<u64>) -> String {
         ));
 
         // Stop if we've exceeded target size
-        if json.len() >= target_size - 10 {
+        if json.len() >= target_size.saturating_sub(10) {
             break;
         }
     }
@@ -467,16 +482,18 @@ pub fn generate_nested_json(target_size: usize, _seed: Option<u64>, depth: usize
     for i in 0..actual_depth {
         json.push_str(r#"{"level":"#);
         json.push_str(&i.to_string());
-        json.push_str(r#"","data":"#);
+        json.push_str(r#","data":"#);
     }
 
-    // Fill remaining space
-    while json.len() < target_size - 100 {
+    // Fill remaining space with a string value
+    json.push('"');
+    while json.len() < target_size.saturating_sub(100) {
         json.push_str("padding");
     }
+    json.push('"');
 
     for _ in 0..actual_depth {
-        json.push_str("\"}");
+        json.push('}');
     }
 
     json
@@ -504,7 +521,7 @@ pub fn generate_arrays_json(target_size: usize, seed: Option<u64>) -> String {
         }
         json.push(']');
 
-        if json.len() >= target_size - 10 {
+        if json.len() >= target_size.saturating_sub(10) {
             break;
         }
     }
@@ -542,7 +559,7 @@ pub fn generate_mixed_json(target_size: usize, seed: Option<u64>) -> String {
             _ => {}
         }
 
-        if json.len() >= target_size - 10 {
+        if json.len() >= target_size.saturating_sub(10) {
             break;
         }
     }
@@ -571,7 +588,7 @@ pub fn generate_strings_json(
         json.push_str(lorem);
         json.push('"');
 
-        if json.len() >= target_size - 10 {
+        if json.len() >= target_size.saturating_sub(10) {
             break;
         }
     }
@@ -600,7 +617,7 @@ pub fn generate_numbers_json(target_size: usize, seed: Option<u64>) -> String {
 
         json.push_str(&format!("{:.6}", num));
 
-        if json.len() >= target_size - 10 {
+        if json.len() >= target_size.saturating_sub(10) {
             break;
         }
     }
@@ -616,7 +633,7 @@ pub fn generate_literals_json(target_size: usize, seed: Option<u64>) -> String {
     json.push_str(r#"{"literals":["#);
 
     let mut count = 0;
-    while json.len() < target_size - 10 {
+    while json.len() < target_size.saturating_sub(10) {
         if count > 0 {
             json.push(',');
         }
@@ -663,7 +680,7 @@ pub fn generate_pathological_json(target_size: usize, _seed: Option<u64>) -> Str
         }
         json.push_str(pattern);
 
-        if json.len() >= target_size - 10 {
+        if json.len() >= target_size.saturating_sub(10) {
             break;
         }
     }

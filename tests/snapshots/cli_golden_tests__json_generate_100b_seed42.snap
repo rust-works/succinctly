@@ -1,0 +1,5 @@
+---
+source: tests/cli_golden_tests.rs
+expression: output
+---
+{"metadata":{"version":"1.0","generated":true,"features":["strings","numbers","booleans","nulls","arrays","objects","nesting","escapes","unicode"]},"simple_values":{},"strings":[],"numbers":[],"arrays":{"empty":[],"flat_numbers":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19],"flat_strings":["item_0","item_1","item_2","item_3","item_4","item_5","item_6","item_7","item_8","item_9","item_10","item_11","item_12","item_13","item_14"],"nested":[],"mixed":[1,"two",true,null,{"key":"value"},[1,2,3]]},"nested":{"shallow":{"a":1,"b":2,"c":3},"deep":{"level_0":{"level_1":{"level_2":{"level_3":{"level_4":"bottom"}}}}},"tree":{"leaf":true}},"data":[],"unicode":[],"edge_cases":{"empty_string":"","empty_object":{},"empty_array":[],"zero":0,"negative_zero":-0,"very_long_string":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","all_escapes":"\"\\\/\b\f\n\r\t","consecutive_commas":[1,2,3,4,5,6,7,8,9,10],"whitespace_heavy":"  lots   of   spaces  ","numbers":{"int":42,"neg":-42,"decimal":3.14,"exp":1e10,"neg_exp":1e-10}}}

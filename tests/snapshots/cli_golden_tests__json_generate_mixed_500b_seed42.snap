@@ -1,0 +1,5 @@
+---
+source: tests/cli_golden_tests.rs
+expression: output
+---
+{"data":[[0,1,2],{"key":"val_1"},true,3,[4,5,6]]}
