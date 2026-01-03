@@ -1,0 +1,5 @@
+---
+source: tests/cli_golden_tests.rs
+expression: output
+---
+{"users":[{"id":0,"name":"User0","email":"user0@example.com","age":31,"active":true,"score":146},{"id":1,"name":"User1","email":"user1@example.com","age":76,"active":true,"score":427},{"id":2,"name":"User2","email":"user2@example.com","age":39,"active":true,"score":737},{"id":3,"name":"User3","email":"user3@example.com","age":35,"active":true,"score":149},{"id":4,"name":"User4","email":"user4@example.com","age":37,"active":true,"score":164},{"id":5,"name":"User5","email":"user5@example.com","age":67,"active":true,"score":771}]}

@@ -1,0 +1,5 @@
+---
+source: tests/cli_golden_tests.rs
+expression: output
+---
+[{"a":{"b":{"c":[[[1]]],"d":true},"e":null},"f":""},{"a":{"b":{"c":[[[1]]],"d":true},"e":null},"f":""},{"a":{"b":{"c":[[[1]]],"d":true},"e":null},"f":""},{"a":{"b":{"c":[[[1]]],"d":true},"e":null},"f":""},{"a":{"b":{"c":[[[1]]],"d":true},"e":null},"f":""},{"a":{"b":{"c":[[[1]]],"d":true},"e":null},"f":""},{"a":{"b":{"c":[[[1]]],"d":true},"e":null},"f":""},{"a":{"b":{"c":[[[1]]],"d":true},"e":null},"f":""},{"a":{"b":{"c":[[[1]]],"d":true},"e":null},"f":""},{"a":{"b":{"c":[[[1]]],"d":true},"e":null},"f":""}]

@@ -2,8 +2,6 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -47,7 +45,7 @@ struct GenerateJson {
 
     /// JSON pattern to generate
     #[arg(short, long, default_value = "comprehensive")]
-    pattern: Pattern,
+    pattern: PatternArg,
 
     /// Random seed for reproducible generation
     #[arg(short, long)]
@@ -71,7 +69,7 @@ struct GenerateJson {
 }
 
 #[derive(Debug, Clone, ValueEnum)]
-enum Pattern {
+enum PatternArg {
     /// Comprehensive pattern testing all JSON features (default, best for benchmarking)
     Comprehensive,
     /// Array of user objects (realistic structure)
@@ -92,6 +90,23 @@ enum Pattern {
     Unicode,
     /// Worst-case for parsing (maximum structural density)
     Pathological,
+}
+
+impl From<PatternArg> for generators::Pattern {
+    fn from(arg: PatternArg) -> Self {
+        match arg {
+            PatternArg::Comprehensive => generators::Pattern::Comprehensive,
+            PatternArg::Users => generators::Pattern::Users,
+            PatternArg::Nested => generators::Pattern::Nested,
+            PatternArg::Arrays => generators::Pattern::Arrays,
+            PatternArg::Mixed => generators::Pattern::Mixed,
+            PatternArg::Strings => generators::Pattern::Strings,
+            PatternArg::Numbers => generators::Pattern::Numbers,
+            PatternArg::Literals => generators::Pattern::Literals,
+            PatternArg::Unicode => generators::Pattern::Unicode,
+            PatternArg::Pathological => generators::Pattern::Pathological,
+        }
+    }
 }
 
 /// Parse size string like "1mb", "512KB", "2GB", "1024" (case insensitive)
@@ -134,7 +149,7 @@ fn main() -> Result<()> {
             JsonSubcommand::Generate(args) => {
                 let json = generate_json(
                     args.size,
-                    args.pattern,
+                    args.pattern.into(),
                     args.seed,
                     args.depth,
                     args.escape_density,
@@ -170,7 +185,7 @@ fn main() -> Result<()> {
 }
 
 mod generators;
-use generators::*;
+use generators::generate_json;
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,54 @@
+---
+source: tests/cli_golden_tests.rs
+expression: output
+---
+Generate synthetic JSON files for benchmarking and testing
+
+Usage: succinctly json generate [OPTIONS] <SIZE>
+
+Arguments:
+  <SIZE>
+          Size of JSON to generate (supports b, kb, mb, gb - case insensitive) Examples: 1024, 1kb, 512MB, 2Gb
+
+Options:
+  -o, --output <OUTPUT>
+          Output file path (defaults to stdout)
+
+  -p, --pattern <PATTERN>
+          JSON pattern to generate
+
+          Possible values:
+          - comprehensive: Comprehensive pattern testing all JSON features (default, best for benchmarking)
+          - users:         Array of user objects (realistic structure)
+          - nested:        Deeply nested objects (tests nesting and BP operations)
+          - arrays:        Array of arrays (tests array handling)
+          - mixed:         Mix of all types (balanced distribution)
+          - strings:       String-heavy with escapes (tests string parsing and escape handling)
+          - numbers:       Number-heavy documents (tests number parsing)
+          - literals:      Boolean and null heavy (tests literal parsing)
+          - unicode:       Unicode-heavy strings (tests UTF-8 handling)
+          - pathological:  Worst-case for parsing (maximum structural density)
+          
+          [default: comprehensive]
+
+  -s, --seed <SEED>
+          Random seed for reproducible generation
+
+      --pretty
+          Pretty print JSON (slower, larger output)
+
+      --verify
+          Verify generated JSON is valid
+
+      --depth <DEPTH>
+          Nesting depth for nested structures (default: 5)
+          
+          [default: 5]
+
+      --escape-density <ESCAPE_DENSITY>
+          Escape sequence density (0.0-1.0, default: 0.1)
+          
+          [default: 0.1]
+
+  -h, --help
+          Print help (see a summary with '-h')
