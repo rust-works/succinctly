@@ -26,6 +26,9 @@ select0 = []
 # Enable serde serialization/deserialization
 serde = ["dep:serde"]
 
+# CLI tool features
+cli = ["clap", "rand", "rand_chacha", "anyhow", "serde_json"]
+
 # Test features (not for production)
 large-tests = []    # 1G bitvector tests (~125MB RAM)
 huge-tests = []     # 5G bitvector tests (~625MB RAM)
@@ -37,6 +40,13 @@ memmap2 = { version = "0.9", optional = true }
 tempfile = { version = "3.10", optional = true }
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"], optional = true }
 
+# CLI dependencies (optional, only for binary)
+clap = { version = "4.5", features = ["derive"], optional = true }
+rand = { version = "0.8", optional = true }
+rand_chacha = { version = "0.3", optional = true }
+anyhow = { version = "1.0", optional = true }
+serde_json = { version = "1.0", optional = true }
+
 [dev-dependencies]
 criterion = "0.5"
 proptest = "1.0"
@@ -47,6 +57,15 @@ serde_json = "1.0"
 [[bench]]
 name = "rank_select"
 harness = false
+
+[[bench]]
+name = "json_simd"
+harness = false
+
+[[bin]]
+name = "succinctly"
+path = "src/bin/main.rs"
+required-features = ["cli"]
 
 [lib]
 name = "succinctly"

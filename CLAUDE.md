@@ -67,6 +67,20 @@ cargo test --test simd_level_tests
 
 # Run benchmarks for specific operation
 cargo bench rank_select
+cargo bench json_simd
+```
+
+### CLI Tool
+
+```bash
+# Build CLI tool
+cargo build --release --features cli
+
+# Generate synthetic JSON for benchmarking
+./target/release/succinctly json generate 10mb -o benchmark.json
+./target/release/succinctly json generate 1mb --pattern pathological -o worst-case.json
+
+# See CLI.md for full documentation
 ```
 
 ## Code Architecture

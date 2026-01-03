@@ -53,7 +53,7 @@ pub use neon::build_semi_index_standard;
 // x86_64 exports with optional runtime dispatch (requires std)
 // ============================================================================
 
-// In std mode (tests), use runtime dispatch to select best SIMD level
+// Runtime dispatch (requires std, available in tests only)
 // Priority: AVX2 > SSE4.2 > SSE2
 #[cfg(all(target_arch = "x86_64", test))]
 pub fn build_semi_index_standard(json: &[u8]) -> crate::json::standard::SemiIndex {
@@ -77,8 +77,8 @@ pub fn build_semi_index_simple(json: &[u8]) -> crate::json::simple::SemiIndex {
     }
 }
 
-// In no_std mode, default to SSE2 (universally available)
-// Users can explicitly use avx2:: module if they know AVX2 is available
+// Outside of tests, default to SSE2 (universally available)
+// Users can explicitly use avx2:: or sse42:: modules if they know CPU capabilities
 #[cfg(all(target_arch = "x86_64", not(test)))]
 pub use x86::build_semi_index_simple;
 
