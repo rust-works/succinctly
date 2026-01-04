@@ -201,10 +201,8 @@ impl OwnedValue {
             OwnedValue::Bool(false) => "false".into(),
             OwnedValue::Int(n) => format!("{}", n),
             OwnedValue::Float(f) => {
-                if f.is_nan() {
-                    "null".into() // JSON doesn't support NaN
-                } else if f.is_infinite() {
-                    "null".into() // JSON doesn't support Infinity
+                if f.is_nan() || f.is_infinite() {
+                    "null".into() // JSON doesn't support NaN or Infinity
                 } else {
                     format!("{}", f)
                 }
@@ -301,7 +299,7 @@ mod tests {
         assert_eq!(OwnedValue::null(), OwnedValue::Null);
         assert_eq!(OwnedValue::bool(true), OwnedValue::Bool(true));
         assert_eq!(OwnedValue::int(42), OwnedValue::Int(42));
-        assert_eq!(OwnedValue::float(3.14), OwnedValue::Float(3.14));
+        assert_eq!(OwnedValue::float(2.5), OwnedValue::Float(2.5));
         assert_eq!(
             OwnedValue::string("hello"),
             OwnedValue::String("hello".into())
@@ -323,7 +321,7 @@ mod tests {
         assert_eq!(OwnedValue::Null.type_name(), "null");
         assert_eq!(OwnedValue::Bool(true).type_name(), "boolean");
         assert_eq!(OwnedValue::Int(42).type_name(), "number");
-        assert_eq!(OwnedValue::Float(3.14).type_name(), "number");
+        assert_eq!(OwnedValue::Float(2.5).type_name(), "number");
         assert_eq!(OwnedValue::String("".into()).type_name(), "string");
         assert_eq!(OwnedValue::Array(vec![]).type_name(), "array");
         assert_eq!(OwnedValue::Object(BTreeMap::new()).type_name(), "object");
@@ -348,7 +346,7 @@ mod tests {
         assert_eq!(OwnedValue::Bool(true).to_json(), "true");
         assert_eq!(OwnedValue::Bool(false).to_json(), "false");
         assert_eq!(OwnedValue::Int(42).to_json(), "42");
-        assert_eq!(OwnedValue::Float(3.14).to_json(), "3.14");
+        assert_eq!(OwnedValue::Float(2.5).to_json(), "2.5");
         assert_eq!(OwnedValue::String("hello".into()).to_json(), "\"hello\"");
         assert_eq!(
             OwnedValue::String("hello\nworld".into()).to_json(),
@@ -369,8 +367,8 @@ mod tests {
         );
         assert_eq!(OwnedValue::from(Literal::Int(42)), OwnedValue::Int(42));
         assert_eq!(
-            OwnedValue::from(Literal::Float(3.14)),
-            OwnedValue::Float(3.14)
+            OwnedValue::from(Literal::Float(2.5)),
+            OwnedValue::Float(2.5)
         );
         assert_eq!(
             OwnedValue::from(Literal::String("hello".into())),

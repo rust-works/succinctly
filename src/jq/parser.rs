@@ -654,7 +654,7 @@ impl<'a> Parser<'a> {
                 self.parse_postfix(expr)
             }
 
-            // Keywords: null, true, false, not
+            // Keywords: null, true, false, not, if, try, error
             Some(c) if c.is_alphabetic() => {
                 if self.matches_keyword("null") {
                     self.consume_keyword("null");
@@ -668,6 +668,12 @@ impl<'a> Parser<'a> {
                 } else if self.matches_keyword("not") {
                     self.consume_keyword("not");
                     Ok(Expr::Not)
+                } else if self.matches_keyword("if") {
+                    self.parse_if_expr()
+                } else if self.matches_keyword("try") {
+                    self.parse_try_expr()
+                } else if self.matches_keyword("error") {
+                    self.parse_error_expr()
                 } else {
                     Err(ParseError::new(
                         "unexpected identifier, expected expression",
@@ -682,6 +688,136 @@ impl<'a> Parser<'a> {
             )),
             None => Err(ParseError::new("unexpected end of input", self.pos)),
         }
+    }
+
+    /// Parse an if-then-else expression.
+    /// Syntax: if COND then THEN elif COND then THEN else ELSE end
+    fn parse_if_expr(&mut self) -> Result<Expr, ParseError> {
+        self.consume_keyword("if");
+        self.skip_ws();
+
+        // Parse condition
+        let cond = self.parse_pipe_expr()?;
+        self.skip_ws();
+
+        // Expect 'then'
+        if !self.matches_keyword("then") {
+            return Err(ParseError::new("expected 'then'", self.pos));
+        }
+        self.consume_keyword("then");
+        self.skip_ws();
+
+        // Parse then branch
+        let then_branch = self.parse_pipe_expr()?;
+        self.skip_ws();
+
+        // Parse elif/else/end
+        let else_branch = self.parse_else_branch()?;
+
+        Ok(Expr::If {
+            cond: Box::new(cond),
+            then_branch: Box::new(then_branch),
+            else_branch: Box::new(else_branch),
+        })
+    }
+
+    /// Parse the else branch of an if expression (handles elif chaining).
+    fn parse_else_branch(&mut self) -> Result<Expr, ParseError> {
+        if self.matches_keyword("elif") {
+            // elif is desugared to nested if
+            self.consume_keyword("elif");
+            self.skip_ws();
+
+            let cond = self.parse_pipe_expr()?;
+            self.skip_ws();
+
+            if !self.matches_keyword("then") {
+                return Err(ParseError::new("expected 'then'", self.pos));
+            }
+            self.consume_keyword("then");
+            self.skip_ws();
+
+            let then_branch = self.parse_pipe_expr()?;
+            self.skip_ws();
+
+            let else_branch = self.parse_else_branch()?;
+
+            Ok(Expr::If {
+                cond: Box::new(cond),
+                then_branch: Box::new(then_branch),
+                else_branch: Box::new(else_branch),
+            })
+        } else if self.matches_keyword("else") {
+            self.consume_keyword("else");
+            self.skip_ws();
+
+            let else_branch = self.parse_pipe_expr()?;
+            self.skip_ws();
+
+            if !self.matches_keyword("end") {
+                return Err(ParseError::new("expected 'end'", self.pos));
+            }
+            self.consume_keyword("end");
+
+            Ok(else_branch)
+        } else if self.matches_keyword("end") {
+            // No else branch - default to null
+            self.consume_keyword("end");
+            Ok(Expr::Literal(Literal::Null))
+        } else {
+            Err(ParseError::new(
+                "expected 'elif', 'else', or 'end'",
+                self.pos,
+            ))
+        }
+    }
+
+    /// Parse a try-catch expression.
+    /// Syntax: try EXPR catch HANDLER
+    ///         try EXPR                 (catch is implicit, suppresses errors)
+    fn parse_try_expr(&mut self) -> Result<Expr, ParseError> {
+        self.consume_keyword("try");
+        self.skip_ws();
+
+        // Parse the expression to try
+        let expr = self.parse_primary()?;
+        self.skip_ws();
+
+        // Check for optional catch
+        let catch = if self.matches_keyword("catch") {
+            self.consume_keyword("catch");
+            self.skip_ws();
+            Some(Box::new(self.parse_primary()?))
+        } else {
+            None
+        };
+
+        Ok(Expr::Try {
+            expr: Box::new(expr),
+            catch,
+        })
+    }
+
+    /// Parse an error expression.
+    /// Syntax: error
+    ///         error(MESSAGE)
+    fn parse_error_expr(&mut self) -> Result<Expr, ParseError> {
+        self.consume_keyword("error");
+        self.skip_ws();
+
+        // Check for optional message in parentheses
+        let msg = if self.peek() == Some('(') {
+            self.next();
+            self.skip_ws();
+            let msg_expr = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            Some(Box::new(msg_expr))
+        } else {
+            None
+        };
+
+        Ok(Expr::Error(msg))
     }
 
     /// Check if current character is an expression terminator (ends a primary expression).
@@ -699,6 +835,16 @@ impl<'a> Parser<'a> {
             // Keywords that follow expressions
             Some('a') if self.matches_keyword("and") => true,
             Some('o') if self.matches_keyword("or") => true,
+            // Conditional keywords
+            Some('t') if self.matches_keyword("then") => true,
+            Some('e')
+                if self.matches_keyword("elif")
+                    || self.matches_keyword("else")
+                    || self.matches_keyword("end") =>
+            {
+                true
+            }
+            Some('c') if self.matches_keyword("catch") => true,
             _ => false,
         }
     }
@@ -1179,7 +1325,7 @@ mod tests {
         assert_eq!(parse("false").unwrap(), Expr::Literal(Literal::Bool(false)));
         assert_eq!(parse("42").unwrap(), Expr::Literal(Literal::Int(42)));
         assert_eq!(parse("-123").unwrap(), Expr::Literal(Literal::Int(-123)));
-        assert_eq!(parse("3.14").unwrap(), Expr::Literal(Literal::Float(3.14)));
+        assert_eq!(parse("2.5").unwrap(), Expr::Literal(Literal::Float(2.5)));
         assert_eq!(
             parse("\"hello\"").unwrap(),
             Expr::Literal(Literal::String("hello".into()))
@@ -1434,5 +1580,145 @@ mod tests {
         // Boolean with comparison
         let expr = parse(".a > 0 and .b < 10").unwrap();
         assert!(matches!(expr, Expr::And(_, _)));
+    }
+
+    // Phase 3 tests: Conditionals and Control Flow
+
+    #[test]
+    fn test_if_then_else() {
+        // Basic if-then-else
+        let expr = parse("if .a then .b else .c end").unwrap();
+        assert!(matches!(expr, Expr::If { .. }));
+
+        // If with complex condition
+        let expr = parse("if .x > 0 then \"positive\" else \"non-positive\" end").unwrap();
+        match expr {
+            Expr::If { cond, .. } => {
+                assert!(matches!(
+                    *cond,
+                    Expr::Compare {
+                        op: CompareOp::Gt,
+                        ..
+                    }
+                ));
+            }
+            _ => panic!("expected If"),
+        }
+
+        // Nested if
+        let expr = parse("if .a then if .b then 1 else 2 end else 3 end").unwrap();
+        match expr {
+            Expr::If { then_branch, .. } => {
+                assert!(matches!(*then_branch, Expr::If { .. }));
+            }
+            _ => panic!("expected If"),
+        }
+    }
+
+    #[test]
+    fn test_if_elif() {
+        // if-elif-else
+        let expr = parse("if .a then 1 elif .b then 2 else 3 end").unwrap();
+        match expr {
+            Expr::If { else_branch, .. } => {
+                // elif is desugared to nested if
+                assert!(matches!(*else_branch, Expr::If { .. }));
+            }
+            _ => panic!("expected If"),
+        }
+
+        // Multiple elif
+        let expr = parse("if .a then 1 elif .b then 2 elif .c then 3 else 4 end").unwrap();
+        match expr {
+            Expr::If { else_branch, .. } => match *else_branch {
+                Expr::If { else_branch, .. } => {
+                    assert!(matches!(*else_branch, Expr::If { .. }));
+                }
+                _ => panic!("expected nested If"),
+            },
+            _ => panic!("expected If"),
+        }
+    }
+
+    #[test]
+    fn test_if_no_else() {
+        // if without else should default to null
+        let expr = parse("if .a then .b end").unwrap();
+        match expr {
+            Expr::If { else_branch, .. } => {
+                assert!(matches!(*else_branch, Expr::Literal(Literal::Null)));
+            }
+            _ => panic!("expected If"),
+        }
+    }
+
+    #[test]
+    fn test_try_catch() {
+        // try with catch
+        let expr = parse("try .foo catch \"default\"").unwrap();
+        match expr {
+            Expr::Try { catch, .. } => {
+                assert!(catch.is_some());
+            }
+            _ => panic!("expected Try"),
+        }
+
+        // try without catch
+        let expr = parse("try .foo").unwrap();
+        match expr {
+            Expr::Try { catch, .. } => {
+                assert!(catch.is_none());
+            }
+            _ => panic!("expected Try"),
+        }
+
+        // try with complex expression
+        let expr = parse("try .missing? catch null").unwrap();
+        assert!(matches!(expr, Expr::Try { .. }));
+    }
+
+    #[test]
+    fn test_error() {
+        // error without message
+        let expr = parse("error").unwrap();
+        match expr {
+            Expr::Error(msg) => {
+                assert!(msg.is_none());
+            }
+            _ => panic!("expected Error"),
+        }
+
+        // error with message
+        let expr = parse("error(\"something went wrong\")").unwrap();
+        match expr {
+            Expr::Error(msg) => {
+                assert!(msg.is_some());
+            }
+            _ => panic!("expected Error"),
+        }
+
+        // error with expression message
+        let expr = parse("error(.message)").unwrap();
+        match expr {
+            Expr::Error(msg) => {
+                assert!(msg.is_some());
+            }
+            _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn test_control_flow_in_expressions() {
+        // if in array construction
+        let expr = parse("[if .a then 1 else 2 end]").unwrap();
+        assert!(matches!(expr, Expr::Array(_)));
+
+        // try in pipe
+        let expr = parse(".foo | try . catch null").unwrap();
+        assert!(matches!(expr, Expr::Pipe(_)));
+
+        // if with arithmetic
+        let expr = parse("if .x > 0 then .x * 2 else .x end").unwrap();
+        assert!(matches!(expr, Expr::If { .. }));
     }
 }

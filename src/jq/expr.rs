@@ -83,6 +83,25 @@ pub enum Expr {
     /// Alternative operator: `.foo // "default"`
     /// Returns left if truthy, otherwise right.
     Alternative(Box<Expr>, Box<Expr>),
+
+    /// If-then-else conditional: `if .foo then .bar else .baz end`
+    /// elif is desugared to nested If during parsing.
+    If {
+        cond: Box<Expr>,
+        then_branch: Box<Expr>,
+        else_branch: Box<Expr>,
+    },
+
+    /// Try-catch error handling: `try .foo catch "default"`
+    /// If catch is None, errors are silently suppressed (outputs nothing).
+    Try {
+        expr: Box<Expr>,
+        catch: Option<Box<Expr>>,
+    },
+
+    /// Error raising: `error` or `error("message")`
+    /// Raises an error that can be caught by try-catch.
+    Error(Option<Box<Expr>>),
 }
 
 /// Arithmetic operators.
@@ -260,6 +279,28 @@ impl Expr {
     /// Create an alternative expression.
     pub fn alternative(left: Expr, right: Expr) -> Self {
         Expr::Alternative(Box::new(left), Box::new(right))
+    }
+
+    /// Create an if-then-else expression.
+    pub fn if_then_else(cond: Expr, then_branch: Expr, else_branch: Expr) -> Self {
+        Expr::If {
+            cond: Box::new(cond),
+            then_branch: Box::new(then_branch),
+            else_branch: Box::new(else_branch),
+        }
+    }
+
+    /// Create a try expression.
+    pub fn try_expr(expr: Expr, catch: Option<Expr>) -> Self {
+        Expr::Try {
+            expr: Box::new(expr),
+            catch: catch.map(Box::new),
+        }
+    }
+
+    /// Create an error expression.
+    pub fn error(msg: Option<Expr>) -> Self {
+        Expr::Error(msg.map(Box::new))
     }
 
     /// Returns true if this is the identity expression.
