@@ -27,7 +27,7 @@ select0 = []
 serde = ["dep:serde"]
 
 # CLI tool features
-cli = ["clap", "rand", "rand_chacha", "anyhow", "serde_json"]
+cli = ["clap", "rand", "rand_chacha", "anyhow", "serde_json", "memmap2"]
 
 # Test features (not for production)
 large-tests = []    # 1G bitvector tests (~125MB RAM)

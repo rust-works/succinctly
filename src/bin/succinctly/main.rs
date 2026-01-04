@@ -137,6 +137,10 @@ struct QueryJson {
     /// Show raw strings without quotes
     #[arg(short, long)]
     raw: bool,
+
+    /// Use memory-mapped I/O for reading files (more efficient for large files)
+    #[arg(long)]
+    mmap: bool,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -338,6 +342,21 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
+/// Wrapper enum to hold either owned bytes or memory-mapped file
+enum JsonInput {
+    Owned(Vec<u8>),
+    Mmap(memmap2::Mmap),
+}
+
+impl AsRef<[u8]> for JsonInput {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            JsonInput::Owned(v) => v,
+            JsonInput::Mmap(m) => m,
+        }
+    }
+}
+
 fn query_json(args: QueryJson) -> Result<()> {
     use std::io::Read;
     use succinctly::jq;
@@ -345,18 +364,35 @@ fn query_json(args: QueryJson) -> Result<()> {
     use succinctly::json::light::StandardJson;
 
     // Read input JSON
-    let json_bytes: Vec<u8> = match &args.input {
+    let json_input: JsonInput = match &args.input {
         Some(path) => {
-            std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?
+            if args.mmap {
+                let file = std::fs::File::open(path)
+                    .with_context(|| format!("Failed to open {}", path.display()))?;
+                // SAFETY: We assume the file won't be modified while we're reading it
+                let mmap = unsafe { memmap2::Mmap::map(&file) }
+                    .with_context(|| format!("Failed to memory-map {}", path.display()))?;
+                JsonInput::Mmap(mmap)
+            } else {
+                JsonInput::Owned(
+                    std::fs::read(path)
+                        .with_context(|| format!("Failed to read {}", path.display()))?,
+                )
+            }
         }
         None => {
+            if args.mmap {
+                anyhow::bail!("--mmap requires an input file (-i)");
+            }
             let mut buf = Vec::new();
             std::io::stdin()
                 .read_to_end(&mut buf)
                 .context("Failed to read from stdin")?;
-            buf
+            JsonInput::Owned(buf)
         }
     };
+
+    let json_bytes = json_input.as_ref();
 
     // Parse the jq expression
     let expr = jq::parse(&args.expression).map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
