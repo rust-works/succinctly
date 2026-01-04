@@ -111,17 +111,17 @@ fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue 
             }
         }
         StandardJson::Array(elements) => {
-            let items: Vec<OwnedValue> = elements.clone().map(|e| to_owned(&e)).collect();
+            let items: Vec<OwnedValue> = (*elements).map(|e| to_owned(&e)).collect();
             OwnedValue::Array(items)
         }
         StandardJson::Object(fields) => {
             let mut map = BTreeMap::new();
-            for field in fields.clone() {
+            for field in *fields {
                 // Get the key as a string
-                if let StandardJson::String(key_str_val) = field.key() {
-                    if let Ok(cow) = key_str_val.as_str() {
-                        map.insert(cow.into_owned(), to_owned(&field.value()));
-                    }
+                if let StandardJson::String(key_str_val) = field.key()
+                    && let Ok(cow) = key_str_val.as_str()
+                {
+                    map.insert(cow.into_owned(), to_owned(&field.value()));
                 }
             }
             OwnedValue::Object(map)
@@ -212,6 +212,16 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
         Expr::Not => eval_not(value),
 
         Expr::Alternative(left, right) => eval_alternative(left, right, value, optional),
+
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => eval_if(cond, then_branch, else_branch, value, optional),
+
+        Expr::Try { expr, catch } => eval_try(expr, catch.as_deref(), value, optional),
+
+        Expr::Error(msg) => eval_error(msg.as_deref(), value, optional),
     }
 }
 
@@ -373,12 +383,12 @@ fn collect_recursive<'a, W: Clone + AsRef<[u64]>>(
 
     match value {
         StandardJson::Array(elements) => {
-            for elem in elements.clone() {
+            for elem in *elements {
                 collect_recursive(&elem, results);
             }
         }
         StandardJson::Object(fields) => {
-            for field in fields.clone() {
+            for field in *fields {
                 collect_recursive(&field.value(), results);
             }
         }
@@ -773,6 +783,76 @@ fn eval_alternative<'a, W: Clone + AsRef<[u64]>>(
     } else {
         eval_single(right, value, optional)
     }
+}
+
+/// Evaluate if-then-else expression.
+fn eval_if<'a, W: Clone + AsRef<[u64]>>(
+    cond: &Expr,
+    then_branch: &Expr,
+    else_branch: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate condition
+    let cond_result = eval_single(cond, value.clone(), optional);
+
+    // Check if condition is truthy
+    let is_truthy = match &cond_result {
+        QueryResult::One(v) => to_owned(v).is_truthy(),
+        QueryResult::Owned(v) => v.is_truthy(),
+        QueryResult::Many(vs) => vs.first().map(|v| to_owned(v).is_truthy()).unwrap_or(false),
+        QueryResult::ManyOwned(vs) => vs.first().map(|v| v.is_truthy()).unwrap_or(false),
+        QueryResult::None => false,
+        QueryResult::Error(e) => return QueryResult::Error(e.clone()),
+    };
+
+    if is_truthy {
+        eval_single(then_branch, value, optional)
+    } else {
+        eval_single(else_branch, value, optional)
+    }
+}
+
+/// Evaluate try-catch expression.
+fn eval_try<'a, W: Clone + AsRef<[u64]>>(
+    expr: &Expr,
+    catch: Option<&Expr>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the expression
+    let result = eval_single(expr, value.clone(), optional);
+
+    match result {
+        // If error, use catch handler or return nothing
+        QueryResult::Error(_) => match catch {
+            Some(catch_expr) => eval_single(catch_expr, value, optional),
+            None => QueryResult::None,
+        },
+        // Non-error results pass through
+        other => other,
+    }
+}
+
+/// Evaluate error expression.
+fn eval_error<'a, W: Clone + AsRef<[u64]>>(
+    msg: Option<&Expr>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let message = match msg {
+        Some(msg_expr) => {
+            let msg_result = eval_single(msg_expr, value, optional);
+            match result_to_owned(msg_result) {
+                Ok(OwnedValue::String(s)) => s,
+                Ok(v) => v.to_json(),
+                Err(e) => return QueryResult::Error(e),
+            }
+        }
+        None => "null".into(),
+    };
+
+    QueryResult::Error(EvalError::new(message))
 }
 
 /// Evaluate a pipe (chain) of expressions.
@@ -1357,6 +1437,189 @@ mod tests {
         // Alternative with comparison
         query!(br#"{"val": 3}"#, ".val > 0 // false",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    // Phase 3 tests: Conditionals and Control Flow
+
+    #[test]
+    fn test_if_then_else() {
+        // Basic if-then-else: true condition
+        query!(br#"{"a": true}"#, "if .a then 1 else 2 end",
+            QueryResult::Owned(OwnedValue::Int(1)) => {}
+        );
+
+        // Basic if-then-else: false condition
+        query!(br#"{"a": false}"#, "if .a then 1 else 2 end",
+            QueryResult::Owned(OwnedValue::Int(2)) => {}
+        );
+
+        // If with comparison condition
+        query!(br#"{"x": 10}"#, "if .x > 5 then \"big\" else \"small\" end",
+            QueryResult::Owned(OwnedValue::String(s)) if s == "big" => {}
+        );
+
+        // If with null condition (falsy)
+        query!(br#"{"a": null}"#, "if .a then 1 else 2 end",
+            QueryResult::Owned(OwnedValue::Int(2)) => {}
+        );
+
+        // If with number condition (truthy, even 0)
+        query!(br#"{"a": 0}"#, "if .a then 1 else 2 end",
+            QueryResult::Owned(OwnedValue::Int(1)) => {}
+        );
+    }
+
+    #[test]
+    fn test_if_elif() {
+        // if-elif-else with first condition true
+        query!(br#"{"x": 1}"#, "if .x == 1 then \"one\" elif .x == 2 then \"two\" else \"other\" end",
+            QueryResult::Owned(OwnedValue::String(s)) if s == "one" => {}
+        );
+
+        // if-elif-else with second condition true
+        query!(br#"{"x": 2}"#, "if .x == 1 then \"one\" elif .x == 2 then \"two\" else \"other\" end",
+            QueryResult::Owned(OwnedValue::String(s)) if s == "two" => {}
+        );
+
+        // if-elif-else with else branch
+        query!(br#"{"x": 3}"#, "if .x == 1 then \"one\" elif .x == 2 then \"two\" else \"other\" end",
+            QueryResult::Owned(OwnedValue::String(s)) if s == "other" => {}
+        );
+    }
+
+    #[test]
+    fn test_if_no_else() {
+        // if without else (defaults to null)
+        query!(br#"{"a": false}"#, "if .a then 1 end",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+
+        query!(br#"{"a": true}"#, "if .a then 1 end",
+            QueryResult::Owned(OwnedValue::Int(1)) => {}
+        );
+    }
+
+    #[test]
+    fn test_if_with_expressions() {
+        // if with arithmetic in branches
+        query!(br#"{"x": 5}"#, "if .x > 0 then .x * 2 else .x end",
+            QueryResult::Owned(OwnedValue::Int(10)) => {}
+        );
+
+        // if with field access
+        query!(br#"{"type": "a", "a": 1, "b": 2}"#, "if .type == \"a\" then .a else .b end",
+            QueryResult::One(StandardJson::Number(n)) => {
+                assert_eq!(n.as_i64().unwrap(), 1);
+            }
+        );
+    }
+
+    #[test]
+    fn test_try_catch_success() {
+        // try with no error - returns result
+        query!(br#"{"a": 1}"#, "try .a catch 0",
+            QueryResult::One(StandardJson::Number(n)) => {
+                assert_eq!(n.as_i64().unwrap(), 1);
+            }
+        );
+
+        // try without catch, no error
+        query!(br#"{"a": 1}"#, "try .a",
+            QueryResult::One(StandardJson::Number(n)) => {
+                assert_eq!(n.as_i64().unwrap(), 1);
+            }
+        );
+    }
+
+    #[test]
+    fn test_try_catch_error() {
+        // try with catch - error is caught
+        query!(br#"{}"#, "try .missing catch \"default\"",
+            QueryResult::Owned(OwnedValue::String(s)) if s == "default" => {}
+        );
+
+        // try without catch - error is suppressed (returns None)
+        query!(br#"{}"#, "try .missing",
+            QueryResult::None => {}
+        );
+
+        // try with null catch
+        query!(br#"{}"#, "try .missing catch null",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    #[test]
+    fn test_try_catch_optional() {
+        // Optional inside try - optional suppresses the error first
+        query!(br#"{}"#, "try .missing? catch \"default\"",
+            QueryResult::None => {}
+        );
+    }
+
+    #[test]
+    fn test_error_basic() {
+        // error without message
+        query!(br#"{}"#, "error",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "null");
+            }
+        );
+
+        // error with string message
+        query!(br#"{}"#, "error(\"something went wrong\")",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "something went wrong");
+            }
+        );
+
+        // error with number message (gets serialized)
+        query!(br#"{}"#, "error(42)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "42");
+            }
+        );
+    }
+
+    #[test]
+    fn test_error_with_field() {
+        // error with field access for message
+        query!(br#"{"msg": "custom error"}"#, "error(.msg)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "custom error");
+            }
+        );
+    }
+
+    #[test]
+    fn test_try_catch_raised_error() {
+        // try-catch with error - error is caught
+        query!(br#"{}"#, "try error(\"oops\") catch \"caught\"",
+            QueryResult::Owned(OwnedValue::String(s)) if s == "caught" => {}
+        );
+
+        // try without catch - error is suppressed
+        query!(br#"{}"#, "try error(\"oops\")",
+            QueryResult::None => {}
+        );
+    }
+
+    #[test]
+    fn test_control_flow_combinations() {
+        // if inside try
+        query!(br#"{"a": true}"#, "try (if .a then .missing else .a end) catch \"error\"",
+            QueryResult::Owned(OwnedValue::String(s)) if s == "error" => {}
+        );
+
+        // try inside if
+        query!(br#"{"a": true}"#, "if .a then try .missing catch 0 else 1 end",
+            QueryResult::Owned(OwnedValue::Int(0)) => {}
+        );
+
+        // Nested if with arithmetic
+        query!(br#"{"x": 15}"#, "if .x < 10 then \"small\" elif .x < 20 then \"medium\" else \"large\" end",
+            QueryResult::Owned(OwnedValue::String(s)) if s == "medium" => {}
         );
     }
 }

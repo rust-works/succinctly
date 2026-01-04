@@ -24,6 +24,15 @@
 //! | `null`, `true`, `false` | Literal values |
 //! | `"string"` | String literal |
 //! | `123`, `3.14` | Number literal |
+//! | `.a + .b` | Arithmetic (+, -, *, /, %) |
+//! | `.a == .b` | Comparison (==, !=, <, <=, >, >=) |
+//! | `.a and .b` | Boolean AND |
+//! | `.a or .b` | Boolean OR |
+//! | `not` | Boolean NOT |
+//! | `.a // .b` | Alternative (default if falsy) |
+//! | `if .a then .b else .c end` | Conditional |
+//! | `try .a catch .b` | Error handling |
+//! | `error("msg")` | Raise error |
 //!
 //! # Example
 //!
