@@ -272,3 +272,129 @@ let structural_mask = _mm_cmpistrm(structural_chars, chunk, MODE);
 - Example: `bytes.len() % 8 == 0` → `bytes.len().is_multiple_of(8)`
 - Regular toolchain updates help adopt new idiomatic patterns early
 - Consider `rust-toolchain.toml` for reproducible builds across environments
+
+## jq Query Module
+
+### Current Implementation ([src/jq/](src/jq/))
+- `expr.rs`: AST for jq expressions
+- `parser.rs`: Recursive descent parser for jq syntax
+- `eval.rs`: Expression evaluator using cursor-based navigation
+- `mod.rs`: Public API exports
+
+**Supported jq syntax**:
+- `.` - Identity
+- `.foo` - Field access
+- `.[n]` - Array index (positive and negative)
+- `.[n:m]`, `.[n:]`, `.[:m]` - Array slicing
+- `.[]` - Iterate all elements
+- `.foo?` - Optional access (returns nothing instead of error)
+- `.foo.bar`, `.foo[0].bar` - Chained/piped expressions
+
+**CLI usage**:
+```bash
+# Query JSON files
+./target/release/succinctly json query '.users[].name' input.json
+./target/release/succinctly json query '.users[0]' input.json --raw  # Raw string output
+./target/release/succinctly json query '.items[]' input.json --mmap  # Memory-mapped input
+```
+
+### Future Implementation Plan
+See [docs/jq-implementation-plan.md](docs/jq-implementation-plan.md) for comprehensive roadmap including:
+- Comma operator, parentheses, recursive descent
+- Arithmetic/comparison operators
+- Conditionals (if-then-else, try-catch)
+- Builtin functions (type, length, keys, map, select, sort, etc.)
+- Variables and user-defined functions
+
+## Performance Optimization Learnings
+
+### O(1) vs O(n) Operations - Critical for Query Performance
+
+**Problem discovered**: Initial jq query implementation was 17x slower than jq (2.74s vs 0.16s for `.unicode[]` on 10MB file).
+
+**Root cause**: `text_position()` called `ib_select1()` which was O(n) linear scan per result.
+
+**Solution**: Add cumulative popcount index for O(log n) select via binary search.
+
+```rust
+// JsonIndex now includes:
+ib_rank: Vec<u32>,  // Cumulative popcount per word
+
+// Build cumulative index during construction:
+fn build_ib_rank(words: &[u64]) -> Vec<u32> {
+    let mut rank = Vec::with_capacity(words.len() + 1);
+    let mut cumulative: u32 = 0;
+    rank.push(0);
+    for &word in words {
+        cumulative += word.count_ones();
+        rank.push(cumulative);
+    }
+    rank
+}
+
+// Binary search for select:
+fn ib_select1(&self, k: usize) -> Option<usize> {
+    let k32 = k as u32;
+    let mut lo = 0usize;
+    let mut hi = words.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if self.ib_rank[mid + 1] <= k32 { lo = mid + 1; }
+        else { hi = mid; }
+    }
+    // Then scan within word for exact bit position
+}
+```
+
+**Result**: 627x speedup (2.76s → 4.4ms), now 5x faster than jq.
+
+### Key Insight: Hierarchical Indices
+When you have O(n) operations that get called O(n) times, total complexity becomes O(n²). Solutions:
+1. **Cumulative indices**: Store running totals for O(log n) binary search
+2. **Hierarchical structure**: L0/L1/L2 checkpoints (like Poppy rank directory)
+3. **Sampling**: Trade space for time with sampled indices
+
+### Zero-Copy Output Pattern
+For CLI output, use `raw_bytes()` to avoid string allocation:
+```rust
+// Zero-copy for strings and numbers:
+StandardJson::String(s) => out.write_all(s.raw_bytes())?,
+StandardJson::Number(n) => out.write_all(n.raw_bytes())?,
+
+// Use BufWriter for buffered I/O:
+let mut out = BufWriter::new(stdout.lock());
+```
+
+## Benchmark Infrastructure
+
+### JSON SIMD Benchmarks ([benches/json_simd.rs](benches/json_simd.rs))
+- Auto-discovers files from `data/bench/generated/`
+- Sorts by pattern name and file size
+- Limits to files ≤100MB for reasonable runtime
+- Compares SIMD implementations: AVX2, SSE4.2, SSE2, NEON, Scalar
+
+**Generating benchmark data**:
+```bash
+./target/release/succinctly json generate-suite
+./target/release/succinctly json generate-suite --max-size 10mb  # Smaller set
+```
+
+**Running benchmarks**:
+```bash
+cargo bench --bench json_simd
+cargo bench --bench json_simd -- pattern_comparison  # Compare patterns at 10MB
+```
+
+### Benchmark Patterns
+| Pattern | Description | Characteristics |
+|---------|-------------|-----------------|
+| comprehensive | Mixed content | Realistic workload |
+| users | User records | Nested objects |
+| nested | Deep nesting | Tests BP operations |
+| arrays | Large arrays | Tests iteration |
+| mixed | Varied structure | Edge cases |
+| strings | String-heavy | Tests escape handling |
+| numbers | Number-heavy | Tests number parsing |
+| literals | true/false/null | Tests literal detection |
+| unicode | Unicode strings | Tests UTF-8 handling |
+| pathological | Worst-case | Deep nesting, escapes |
