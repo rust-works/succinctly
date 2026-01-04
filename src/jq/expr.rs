@@ -105,6 +105,45 @@ pub enum Expr {
 
     /// Builtin function call: `type`, `length`, `keys`, etc.
     Builtin(Builtin),
+
+    /// String interpolation: `"Hello \(.name)"`
+    /// Contains a sequence of literal parts and expression parts.
+    StringInterpolation(Vec<StringPart>),
+
+    /// Format string: `@json`, `@text`, `@uri`, etc.
+    Format(FormatType),
+}
+
+/// A part of a string interpolation expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StringPart {
+    /// Literal string content
+    Literal(String),
+    /// Expression to be evaluated and converted to string
+    Expr(Box<Expr>),
+}
+
+/// Format string types for @format expressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatType {
+    /// @text - convert to string (same as tostring)
+    Text,
+    /// @json - format as JSON
+    Json,
+    /// @uri - URI encode
+    Uri,
+    /// @csv - CSV format (for arrays)
+    Csv,
+    /// @tsv - TSV format (for arrays)
+    Tsv,
+    /// @base64 - base64 encode
+    Base64,
+    /// @base64d - base64 decode
+    Base64d,
+    /// @html - HTML entity escape
+    Html,
+    /// @sh - shell quote
+    Sh,
 }
 
 /// Builtin functions supported by jq.
@@ -221,6 +260,32 @@ pub enum Builtin {
     FromEntries,
     /// `with_entries(f)` - to_entries | map(f) | from_entries
     WithEntries(Box<Expr>),
+
+    // Phase 6: Type Conversions
+    /// `tostring` - convert to string
+    ToString,
+    /// `tonumber` - convert to number
+    ToNumber,
+
+    // Phase 6: Additional String Functions
+    /// `explode` - string to array of codepoints
+    Explode,
+    /// `implode` - array of codepoints to string
+    Implode,
+    /// `test(re)` - test if regex matches (basic string contains for now)
+    Test(Box<Expr>),
+    /// `indices(s)` - array of indices where s occurs
+    Indices(Box<Expr>),
+    /// `index(s)` - first index of s, or null
+    Index(Box<Expr>),
+    /// `rindex(s)` - last index of s, or null
+    Rindex(Box<Expr>),
+    /// `tojsonstream` - convert to JSON stream format
+    ToJsonStream,
+    /// `fromjsonstream` - convert from JSON stream format
+    FromJsonStream,
+    /// `getpath(path)` - get value at path
+    GetPath(Box<Expr>),
 }
 
 /// Arithmetic operators.

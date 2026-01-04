@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
-use super::expr::{ArithOp, Builtin, CompareOp, Expr, Literal, ObjectKey};
+use super::expr::{ArithOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectKey, StringPart};
 use super::value::OwnedValue;
 
 /// Result of evaluating a jq expression.
@@ -224,6 +224,10 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
         Expr::Error(msg) => eval_error(msg.as_deref(), value, optional),
 
         Expr::Builtin(builtin) => eval_builtin(builtin, value, optional),
+
+        Expr::StringInterpolation(parts) => eval_string_interpolation(parts, value, optional),
+
+        Expr::Format(format_type) => eval_format(*format_type, value, optional),
     }
 }
 
@@ -950,6 +954,21 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         Builtin::ToEntries => builtin_to_entries(value, optional),
         Builtin::FromEntries => builtin_from_entries(value, optional),
         Builtin::WithEntries(f) => builtin_with_entries(f, value, optional),
+
+        // Phase 6: Type Conversions
+        Builtin::ToString => builtin_tostring(value, optional),
+        Builtin::ToNumber => builtin_tonumber(value, optional),
+
+        // Phase 6: Additional String Functions
+        Builtin::Explode => builtin_explode(value, optional),
+        Builtin::Implode => builtin_implode(value, optional),
+        Builtin::Test(re) => builtin_test(re, value, optional),
+        Builtin::Indices(s) => builtin_indices(s, value, optional),
+        Builtin::Index(s) => builtin_index(s, value, optional),
+        Builtin::Rindex(s) => builtin_rindex(s, value, optional),
+        Builtin::ToJsonStream => builtin_tojsonstream(value, optional),
+        Builtin::FromJsonStream => builtin_fromjsonstream(value, optional),
+        Builtin::GetPath(path) => builtin_getpath(path, value, optional),
     }
 }
 
@@ -2199,6 +2218,678 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>>(
 /// Convert an OwnedValue to JSON bytes for re-parsing
 fn owned_to_json_bytes(value: &OwnedValue) -> Vec<u8> {
     value.to_json().into_bytes()
+}
+
+// =============================================================================
+// Phase 6: String Interpolation & Format Strings
+// =============================================================================
+
+/// Evaluate string interpolation: `"Hello \(.name)"`
+fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>>(
+    parts: &[StringPart],
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let mut result = String::new();
+
+    for part in parts {
+        match part {
+            StringPart::Literal(s) => result.push_str(s),
+            StringPart::Expr(expr) => {
+                let val = eval_single(expr, value.clone(), optional);
+                let s = match val {
+                    QueryResult::One(v) => owned_to_string(&to_owned(&v)),
+                    QueryResult::Owned(v) => owned_to_string(&v),
+                    QueryResult::Many(vs) => {
+                        if let Some(v) = vs.first() {
+                            owned_to_string(&to_owned(v))
+                        } else {
+                            String::new()
+                        }
+                    }
+                    QueryResult::ManyOwned(vs) => {
+                        if let Some(v) = vs.first() {
+                            owned_to_string(v)
+                        } else {
+                            String::new()
+                        }
+                    }
+                    QueryResult::None => String::new(),
+                    QueryResult::Error(e) => return QueryResult::Error(e),
+                };
+                result.push_str(&s);
+            }
+        }
+    }
+
+    QueryResult::Owned(OwnedValue::String(result))
+}
+
+/// Convert an owned value to a string representation (for interpolation).
+fn owned_to_string(value: &OwnedValue) -> String {
+    match value {
+        OwnedValue::Null => "null".to_string(),
+        OwnedValue::Bool(true) => "true".to_string(),
+        OwnedValue::Bool(false) => "false".to_string(),
+        OwnedValue::Int(n) => format!("{}", n),
+        OwnedValue::Float(f) => format!("{}", f),
+        OwnedValue::String(s) => s.clone(), // Don't quote strings in interpolation
+        OwnedValue::Array(_) | OwnedValue::Object(_) => value.to_json(),
+    }
+}
+
+/// Evaluate a format string: `@json`, `@uri`, etc.
+fn eval_format<'a, W: Clone + AsRef<[u64]>>(
+    format_type: FormatType,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let owned = to_owned(&value);
+
+    let result = match format_type {
+        FormatType::Text => format_text(&owned),
+        FormatType::Json => format_json(&owned),
+        FormatType::Uri => format_uri(&owned, optional),
+        FormatType::Csv => format_csv(&owned, optional),
+        FormatType::Tsv => format_tsv(&owned, optional),
+        FormatType::Base64 => format_base64(&owned, optional),
+        FormatType::Base64d => format_base64d(&owned, optional),
+        FormatType::Html => format_html(&owned, optional),
+        FormatType::Sh => format_sh(&owned, optional),
+    };
+
+    match result {
+        Ok(s) => QueryResult::Owned(OwnedValue::String(s)),
+        Err(e) => QueryResult::Error(e),
+    }
+}
+
+/// @text - Convert to string (same as tostring)
+fn format_text(value: &OwnedValue) -> Result<String, EvalError> {
+    Ok(owned_to_string(value))
+}
+
+/// @json - Format as JSON
+fn format_json(value: &OwnedValue) -> Result<String, EvalError> {
+    Ok(value.to_json())
+}
+
+/// @uri - URI/percent encode
+fn format_uri(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+    match value {
+        OwnedValue::String(s) => {
+            let mut result = String::new();
+            for c in s.chars() {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+                    result.push(c);
+                } else {
+                    for b in c.to_string().as_bytes() {
+                        result.push_str(&format!("%{:02X}", b));
+                    }
+                }
+            }
+            Ok(result)
+        }
+        _ if optional => Ok(String::new()),
+        _ => Err(EvalError::type_error("string", value.type_name())),
+    }
+}
+
+/// @csv - CSV format (for arrays)
+fn format_csv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+    match value {
+        OwnedValue::Array(arr) => {
+            let parts: Vec<String> = arr
+                .iter()
+                .map(|v| match v {
+                    OwnedValue::String(s) => {
+                        if s.contains('"') || s.contains(',') || s.contains('\n') {
+                            format!("\"{}\"", s.replace('"', "\"\""))
+                        } else {
+                            s.clone()
+                        }
+                    }
+                    OwnedValue::Null => String::new(),
+                    other => owned_to_string(other),
+                })
+                .collect();
+            Ok(parts.join(","))
+        }
+        _ if optional => Ok(String::new()),
+        _ => Err(EvalError::type_error("array", value.type_name())),
+    }
+}
+
+/// @tsv - TSV format (for arrays)
+fn format_tsv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+    match value {
+        OwnedValue::Array(arr) => {
+            let parts: Vec<String> = arr
+                .iter()
+                .map(|v| match v {
+                    OwnedValue::String(s) => s
+                        .replace('\\', "\\\\")
+                        .replace('\t', "\\t")
+                        .replace('\n', "\\n")
+                        .replace('\r', "\\r"),
+                    OwnedValue::Null => String::new(),
+                    other => owned_to_string(other),
+                })
+                .collect();
+            Ok(parts.join("\t"))
+        }
+        _ if optional => Ok(String::new()),
+        _ => Err(EvalError::type_error("array", value.type_name())),
+    }
+}
+
+/// @base64 - Base64 encode (simple implementation without external crate)
+fn format_base64(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+    match value {
+        OwnedValue::String(s) => {
+            // Simple base64 encoding
+            const ALPHABET: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let bytes = s.as_bytes();
+            let mut result = String::new();
+
+            for chunk in bytes.chunks(3) {
+                let b0 = chunk[0] as u32;
+                let b1 = chunk.get(1).map(|&b| b as u32).unwrap_or(0);
+                let b2 = chunk.get(2).map(|&b| b as u32).unwrap_or(0);
+
+                let triple = (b0 << 16) | (b1 << 8) | b2;
+
+                result.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
+                result.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
+
+                if chunk.len() > 1 {
+                    result.push(ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
+                } else {
+                    result.push('=');
+                }
+
+                if chunk.len() > 2 {
+                    result.push(ALPHABET[(triple & 0x3F) as usize] as char);
+                } else {
+                    result.push('=');
+                }
+            }
+
+            Ok(result)
+        }
+        _ if optional => Ok(String::new()),
+        _ => Err(EvalError::type_error("string", value.type_name())),
+    }
+}
+
+/// @base64d - Base64 decode
+fn format_base64d(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+    match value {
+        OwnedValue::String(s) => {
+            // Simple base64 decoding
+            fn decode_char(c: u8) -> Option<u8> {
+                match c {
+                    b'A'..=b'Z' => Some(c - b'A'),
+                    b'a'..=b'z' => Some(c - b'a' + 26),
+                    b'0'..=b'9' => Some(c - b'0' + 52),
+                    b'+' => Some(62),
+                    b'/' => Some(63),
+                    b'=' => Some(0), // Padding
+                    _ => None,
+                }
+            }
+
+            let s = s.replace(|c: char| c.is_whitespace(), "");
+            let bytes: Vec<u8> = s.bytes().collect();
+            let mut result = Vec::new();
+
+            for chunk in bytes.chunks(4) {
+                if chunk.len() < 4 {
+                    break;
+                }
+
+                let a = decode_char(chunk[0]).ok_or_else(|| EvalError::new("invalid base64"))?;
+                let b = decode_char(chunk[1]).ok_or_else(|| EvalError::new("invalid base64"))?;
+                let c_val =
+                    decode_char(chunk[2]).ok_or_else(|| EvalError::new("invalid base64"))?;
+                let d = decode_char(chunk[3]).ok_or_else(|| EvalError::new("invalid base64"))?;
+
+                let triple =
+                    ((a as u32) << 18) | ((b as u32) << 12) | ((c_val as u32) << 6) | (d as u32);
+
+                result.push(((triple >> 16) & 0xFF) as u8);
+                if chunk[2] != b'=' {
+                    result.push(((triple >> 8) & 0xFF) as u8);
+                }
+                if chunk[3] != b'=' {
+                    result.push((triple & 0xFF) as u8);
+                }
+            }
+
+            String::from_utf8(result).map_err(|_| EvalError::new("invalid UTF-8 in decoded base64"))
+        }
+        _ if optional => Ok(String::new()),
+        _ => Err(EvalError::type_error("string", value.type_name())),
+    }
+}
+
+/// @html - HTML entity escape
+fn format_html(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+    match value {
+        OwnedValue::String(s) => {
+            let mut result = String::new();
+            for c in s.chars() {
+                match c {
+                    '<' => result.push_str("&lt;"),
+                    '>' => result.push_str("&gt;"),
+                    '&' => result.push_str("&amp;"),
+                    '"' => result.push_str("&quot;"),
+                    '\'' => result.push_str("&#39;"),
+                    _ => result.push(c),
+                }
+            }
+            Ok(result)
+        }
+        _ if optional => Ok(String::new()),
+        _ => Err(EvalError::type_error("string", value.type_name())),
+    }
+}
+
+/// @sh - Shell quote
+fn format_sh(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+    match value {
+        OwnedValue::String(s) => {
+            // Use single quotes and escape single quotes
+            if s.contains('\'') {
+                let escaped = s.replace('\'', "'\\''");
+                Ok(format!("'{}'", escaped))
+            } else {
+                Ok(format!("'{}'", s))
+            }
+        }
+        _ if optional => Ok(String::new()),
+        _ => Err(EvalError::type_error("string", value.type_name())),
+    }
+}
+
+// =============================================================================
+// Phase 6: Type Conversion Builtins
+// =============================================================================
+
+/// Builtin: tostring - convert any value to string
+fn builtin_tostring<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    _optional: bool,
+) -> QueryResult<'a, W> {
+    let owned = to_owned(&value);
+    let s = match owned {
+        OwnedValue::String(s) => s,
+        OwnedValue::Null => "null".to_string(),
+        OwnedValue::Bool(true) => "true".to_string(),
+        OwnedValue::Bool(false) => "false".to_string(),
+        OwnedValue::Int(n) => format!("{}", n),
+        OwnedValue::Float(f) => format!("{}", f),
+        OwnedValue::Array(_) | OwnedValue::Object(_) => owned.to_json(),
+    };
+    QueryResult::Owned(OwnedValue::String(s))
+}
+
+/// Builtin: tonumber - convert string to number
+fn builtin_tonumber<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match &value {
+        StandardJson::Number(n) => {
+            // Already a number, return as-is
+            if let Ok(i) = n.as_i64() {
+                QueryResult::Owned(OwnedValue::Int(i))
+            } else if let Ok(f) = n.as_f64() {
+                QueryResult::Owned(OwnedValue::Float(f))
+            } else {
+                QueryResult::Owned(OwnedValue::Int(0))
+            }
+        }
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                let s = cow.as_ref().trim();
+                if let Ok(i) = s.parse::<i64>() {
+                    QueryResult::Owned(OwnedValue::Int(i))
+                } else if let Ok(f) = s.parse::<f64>() {
+                    QueryResult::Owned(OwnedValue::Float(f))
+                } else if optional {
+                    QueryResult::None
+                } else {
+                    QueryResult::Error(EvalError::new(format!("cannot parse '{}' as number", s)))
+                }
+            } else if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(EvalError::new("invalid string"))
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("string or number", type_name(&value))),
+    }
+}
+
+// =============================================================================
+// Phase 6: Additional String Builtins
+// =============================================================================
+
+/// Builtin: explode - string to array of Unicode codepoints
+fn builtin_explode<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match &value {
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                let codepoints: Vec<OwnedValue> = cow
+                    .chars()
+                    .map(|c| OwnedValue::Int(c as u32 as i64))
+                    .collect();
+                QueryResult::Owned(OwnedValue::Array(codepoints))
+            } else if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(EvalError::new("invalid string"))
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    }
+}
+
+/// Builtin: implode - array of codepoints to string
+fn builtin_implode<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match &value {
+        StandardJson::Array(elements) => {
+            let mut result = String::new();
+            for elem in *elements {
+                if let StandardJson::Number(n) = elem
+                    && let Ok(codepoint) = n.as_i64()
+                {
+                    if let Some(c) = char::from_u32(codepoint as u32) {
+                        result.push(c);
+                    } else if optional {
+                        continue;
+                    } else {
+                        return QueryResult::Error(EvalError::new(format!(
+                            "invalid codepoint: {}",
+                            codepoint
+                        )));
+                    }
+                }
+            }
+            QueryResult::Owned(OwnedValue::String(result))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    }
+}
+
+/// Builtin: test(re) - test if string matches (basic substring matching)
+fn builtin_test<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the pattern
+    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Check if the input string contains the pattern (simple substring match)
+    match &value {
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                QueryResult::Owned(OwnedValue::Bool(cow.contains(&pattern)))
+            } else if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(EvalError::new("invalid string"))
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    }
+}
+
+/// Builtin: indices(s) - find all indices of substring s
+fn builtin_indices<'a, W: Clone + AsRef<[u64]>>(
+    s_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the pattern
+    let pattern = match result_to_owned(eval_single(s_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    match &value {
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                let mut indices = Vec::new();
+                let mut start = 0;
+                while let Some(pos) = cow[start..].find(&pattern) {
+                    indices.push(OwnedValue::Int((start + pos) as i64));
+                    start += pos + 1;
+                    if start >= cow.len() {
+                        break;
+                    }
+                }
+                QueryResult::Owned(OwnedValue::Array(indices))
+            } else if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(EvalError::new("invalid string"))
+            }
+        }
+        StandardJson::Array(elements) => {
+            // For arrays, find indices where element equals the pattern
+            let pattern_owned = OwnedValue::String(pattern);
+            let mut indices = Vec::new();
+            for (i, elem) in (*elements).enumerate() {
+                if to_owned(&elem) == pattern_owned {
+                    indices.push(OwnedValue::Int(i as i64));
+                }
+            }
+            QueryResult::Owned(OwnedValue::Array(indices))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("string or array", type_name(&value))),
+    }
+}
+
+/// Builtin: index(s) - first index of substring s, or null
+fn builtin_index<'a, W: Clone + AsRef<[u64]>>(
+    s_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the pattern
+    let pattern = match result_to_owned(eval_single(s_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    match &value {
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                if let Some(pos) = cow.find(&pattern) {
+                    QueryResult::Owned(OwnedValue::Int(pos as i64))
+                } else {
+                    QueryResult::Owned(OwnedValue::Null)
+                }
+            } else if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(EvalError::new("invalid string"))
+            }
+        }
+        StandardJson::Array(elements) => {
+            let pattern_owned = OwnedValue::String(pattern);
+            for (i, elem) in (*elements).enumerate() {
+                if to_owned(&elem) == pattern_owned {
+                    return QueryResult::Owned(OwnedValue::Int(i as i64));
+                }
+            }
+            QueryResult::Owned(OwnedValue::Null)
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("string or array", type_name(&value))),
+    }
+}
+
+/// Builtin: rindex(s) - last index of substring s, or null
+fn builtin_rindex<'a, W: Clone + AsRef<[u64]>>(
+    s_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the pattern
+    let pattern = match result_to_owned(eval_single(s_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    match &value {
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                if let Some(pos) = cow.rfind(&pattern) {
+                    QueryResult::Owned(OwnedValue::Int(pos as i64))
+                } else {
+                    QueryResult::Owned(OwnedValue::Null)
+                }
+            } else if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(EvalError::new("invalid string"))
+            }
+        }
+        StandardJson::Array(elements) => {
+            let pattern_owned = OwnedValue::String(pattern);
+            let items: Vec<_> = (*elements).collect();
+            for (i, elem) in items.iter().enumerate().rev() {
+                if to_owned(elem) == pattern_owned {
+                    return QueryResult::Owned(OwnedValue::Int(i as i64));
+                }
+            }
+            QueryResult::Owned(OwnedValue::Null)
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("string or array", type_name(&value))),
+    }
+}
+
+/// Builtin: tojsonstream - convert to JSON text stream format (simplified)
+fn builtin_tojsonstream<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    _optional: bool,
+) -> QueryResult<'a, W> {
+    // Simplified: just return the value as JSON lines format
+    let owned = to_owned(&value);
+    fn collect_stream(value: &OwnedValue, path: &[OwnedValue], results: &mut Vec<OwnedValue>) {
+        match value {
+            OwnedValue::Array(arr) => {
+                for (i, v) in arr.iter().enumerate() {
+                    let mut new_path = path.to_vec();
+                    new_path.push(OwnedValue::Int(i as i64));
+                    collect_stream(v, &new_path, results);
+                }
+            }
+            OwnedValue::Object(obj) => {
+                for (k, v) in obj.iter() {
+                    let mut new_path = path.to_vec();
+                    new_path.push(OwnedValue::String(k.clone()));
+                    collect_stream(v, &new_path, results);
+                }
+            }
+            _ => {
+                let entry =
+                    OwnedValue::Array(vec![OwnedValue::Array(path.to_vec()), value.clone()]);
+                results.push(entry);
+            }
+        }
+    }
+
+    let mut results = Vec::new();
+    collect_stream(&owned, &[], &mut results);
+    QueryResult::Owned(OwnedValue::Array(results))
+}
+
+/// Builtin: fromjsonstream - convert from JSON text stream format (simplified)
+fn builtin_fromjsonstream<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // This is a complex operation - provide a simplified version
+    match &value {
+        StandardJson::Array(_) => {
+            // For now, return the input - full implementation would reconstruct
+            QueryResult::Owned(to_owned(&value))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    }
+}
+
+/// Builtin: getpath(path) - get value at path
+fn builtin_getpath<'a, W: Clone + AsRef<[u64]>>(
+    path_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the path expression
+    let path = match result_to_owned(eval_single(path_expr, value.clone(), optional)) {
+        Ok(OwnedValue::Array(arr)) => arr,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("array", "path")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    let mut current = to_owned(&value);
+
+    for segment in path {
+        match (&current, &segment) {
+            (OwnedValue::Object(obj), OwnedValue::String(key)) => {
+                current = obj.get(key).cloned().unwrap_or(OwnedValue::Null);
+            }
+            (OwnedValue::Array(arr), OwnedValue::Int(idx)) => {
+                let index = if *idx < 0 {
+                    (arr.len() as i64 + *idx) as usize
+                } else {
+                    *idx as usize
+                };
+                current = arr.get(index).cloned().unwrap_or(OwnedValue::Null);
+            }
+            _ if optional => return QueryResult::None,
+            _ => {
+                return QueryResult::Error(EvalError::new(format!(
+                    "cannot index {} with {}",
+                    current.type_name(),
+                    segment.type_name()
+                )));
+            }
+        }
+    }
+
+    QueryResult::Owned(current)
 }
 
 /// Evaluate a pipe (chain) of expressions.
@@ -3661,6 +4352,270 @@ mod tests {
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.get("a"), Some(&OwnedValue::Int(1)));
                 assert_eq!(obj.get("b"), Some(&OwnedValue::Int(2)));
+            }
+        );
+    }
+
+    // =========================================================================
+    // Phase 6: String Interpolation & Format Strings
+    // =========================================================================
+
+    #[test]
+    fn test_string_interpolation() {
+        // Simple interpolation
+        query!(br#"{"name": "Alice"}"#, r#""Hello \(.name)""#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Hello Alice");
+            }
+        );
+
+        // Multiple interpolations
+        query!(br#"{"first": "John", "last": "Doe"}"#, r#""\(.first) \(.last)""#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "John Doe");
+            }
+        );
+
+        // Interpolation with number
+        query!(br#"{"count": 42}"#, r#""Count: \(.count)""#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Count: 42");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_json() {
+        query!(br#"{"a": 1}"#, "@json",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, r#"{"a":1}"#);
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_text() {
+        query!(br#""hello""#, "@text",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "hello");
+            }
+        );
+
+        query!(br#"42"#, "@text",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "42");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_uri() {
+        query!(br#""hello world""#, "@uri",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "hello%20world");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_csv() {
+        query!(br#"["a", "b", "c"]"#, "@csv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "a,b,c");
+            }
+        );
+
+        // CSV with quotes
+        query!(br#"["hello, world", "test"]"#, "@csv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "\"hello, world\",test");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_tsv() {
+        query!(br#"["a", "b", "c"]"#, "@tsv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "a\tb\tc");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_base64() {
+        query!(br#""hello""#, "@base64",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "aGVsbG8=");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_base64d() {
+        query!(br#""aGVsbG8=""#, "@base64d",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "hello");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_html() {
+        query!(br#""<script>alert('xss')</script>""#, "@html",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_sh() {
+        query!(br#""hello world""#, "@sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "'hello world'");
+            }
+        );
+
+        // Shell quoting with embedded single quote
+        query!(br#""it's a test""#, "@sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "'it'\\''s a test'");
+            }
+        );
+    }
+
+    // =========================================================================
+    // Phase 6: Type Conversion Builtins
+    // =========================================================================
+
+    #[test]
+    fn test_builtin_tostring() {
+        query!(br#"42"#, "tostring",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "42");
+            }
+        );
+
+        query!(br#"true"#, "tostring",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "true");
+            }
+        );
+
+        query!(br#"null"#, "tostring",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "null");
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_tonumber() {
+        query!(br#""42""#, "tonumber",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 42);
+            }
+        );
+
+        query!(br#""2.75""#, "tonumber",
+            QueryResult::Owned(OwnedValue::Float(f)) => {
+                assert!((f - 2.75).abs() < 0.001);
+            }
+        );
+
+        // Already a number
+        query!(br#"42"#, "tonumber",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 42);
+            }
+        );
+    }
+
+    // =========================================================================
+    // Phase 6: Additional String Builtins
+    // =========================================================================
+
+    #[test]
+    fn test_builtin_explode() {
+        query!(br#""abc""#, "explode",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0], OwnedValue::Int(97));  // 'a'
+                assert_eq!(arr[1], OwnedValue::Int(98));  // 'b'
+                assert_eq!(arr[2], OwnedValue::Int(99));  // 'c'
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_implode() {
+        query!(br#"[97, 98, 99]"#, "implode",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "abc");
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_test() {
+        query!(br#""hello world""#, r#"test("world")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        query!(br#""hello world""#, r#"test("xyz")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_indices() {
+        query!(br#""abcabc""#, r#"indices("bc")"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                assert_eq!(arr[0], OwnedValue::Int(1));
+                assert_eq!(arr[1], OwnedValue::Int(4));
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_index() {
+        query!(br#""hello world""#, r#"index("world")"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 6);
+            }
+        );
+
+        query!(br#""hello world""#, r#"index("xyz")"#,
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    #[test]
+    fn test_builtin_rindex() {
+        query!(br#""abcabc""#, r#"rindex("bc")"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 4);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_getpath() {
+        query!(br#"{"a": {"b": 42}}"#, r#"getpath(["a", "b"])"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 42);
+            }
+        );
+
+        query!(br#"[1, 2, 3]"#, r#"getpath([1])"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 2);
             }
         );
     }

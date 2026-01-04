@@ -28,7 +28,9 @@ use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
-use super::expr::{ArithOp, Builtin, CompareOp, Expr, Literal, ObjectEntry, ObjectKey};
+use super::expr::{
+    ArithOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey, StringPart,
+};
 
 /// Error that occurs during parsing.
 #[derive(Debug, Clone, PartialEq)]
@@ -288,7 +290,129 @@ impl<'a> Parser<'a> {
             .map_err(|_| ParseError::new("invalid number", start))
     }
 
-    /// Parse a string literal.
+    /// Parse a string literal or string interpolation.
+    /// Returns either a simple string literal or a StringInterpolation expression.
+    fn parse_string_or_interpolation(&mut self) -> Result<Expr, ParseError> {
+        self.expect('"')?;
+        let mut parts: Vec<StringPart> = Vec::new();
+        let mut current_literal = String::new();
+
+        loop {
+            match self.peek() {
+                None => {
+                    return Err(ParseError::new("unterminated string", self.pos));
+                }
+                Some('"') => {
+                    self.next();
+                    break;
+                }
+                Some('\\') => {
+                    self.next();
+                    match self.peek() {
+                        // String interpolation: \(expr)
+                        Some('(') => {
+                            self.next();
+                            // Save current literal if any
+                            if !current_literal.is_empty() {
+                                parts.push(StringPart::Literal(core::mem::take(
+                                    &mut current_literal,
+                                )));
+                            }
+                            // Parse the expression inside \(...)
+                            let expr = self.parse_pipe_expr()?;
+                            self.skip_ws();
+                            self.expect(')')?;
+                            parts.push(StringPart::Expr(Box::new(expr)));
+                        }
+                        Some('"') => {
+                            self.next();
+                            current_literal.push('"');
+                        }
+                        Some('\\') => {
+                            self.next();
+                            current_literal.push('\\');
+                        }
+                        Some('/') => {
+                            self.next();
+                            current_literal.push('/');
+                        }
+                        Some('n') => {
+                            self.next();
+                            current_literal.push('\n');
+                        }
+                        Some('r') => {
+                            self.next();
+                            current_literal.push('\r');
+                        }
+                        Some('t') => {
+                            self.next();
+                            current_literal.push('\t');
+                        }
+                        Some('b') => {
+                            self.next();
+                            current_literal.push('\x08');
+                        }
+                        Some('f') => {
+                            self.next();
+                            current_literal.push('\x0C');
+                        }
+                        Some('u') => {
+                            self.next();
+                            // Parse 4 hex digits
+                            let mut hex = String::new();
+                            for _ in 0..4 {
+                                match self.peek() {
+                                    Some(c) if c.is_ascii_hexdigit() => {
+                                        hex.push(c);
+                                        self.next();
+                                    }
+                                    _ => {
+                                        return Err(ParseError::new(
+                                            "invalid unicode escape",
+                                            self.pos,
+                                        ));
+                                    }
+                                }
+                            }
+                            let code = u32::from_str_radix(&hex, 16)
+                                .map_err(|_| ParseError::new("invalid unicode escape", self.pos))?;
+                            let c = char::from_u32(code).ok_or_else(|| {
+                                ParseError::new("invalid unicode code point", self.pos)
+                            })?;
+                            current_literal.push(c);
+                        }
+                        Some(c) => {
+                            return Err(ParseError::new(
+                                format!("invalid escape sequence '\\{}'", c),
+                                self.pos,
+                            ));
+                        }
+                        None => {
+                            return Err(ParseError::new("unterminated string", self.pos));
+                        }
+                    }
+                }
+                Some(c) => {
+                    self.next();
+                    current_literal.push(c);
+                }
+            }
+        }
+
+        // If no interpolations, return a simple string literal
+        if parts.is_empty() {
+            return Ok(Expr::Literal(Literal::String(current_literal)));
+        }
+
+        // Add final literal if any
+        if !current_literal.is_empty() {
+            parts.push(StringPart::Literal(current_literal));
+        }
+
+        Ok(Expr::StringInterpolation(parts))
+    }
+
+    /// Parse a simple string literal (for object keys, etc.)
     fn parse_string_literal(&mut self) -> Result<String, ParseError> {
         self.expect('"')?;
         let mut result = String::new();
@@ -596,11 +720,11 @@ impl<'a> Parser<'a> {
             // Object construction
             Some('{') => self.parse_object_construction(),
 
-            // String literal
-            Some('"') => {
-                let s = self.parse_string_literal()?;
-                Ok(Expr::Literal(Literal::String(s)))
-            }
+            // String literal or interpolation
+            Some('"') => self.parse_string_or_interpolation(),
+
+            // Format strings: @text, @json, @uri, etc.
+            Some('@') => self.parse_format_string(),
 
             // Number literal (starts with digit or negative sign followed by digit)
             Some(c) if c.is_ascii_digit() => {
@@ -820,6 +944,41 @@ impl<'a> Parser<'a> {
         };
 
         Ok(Expr::Error(msg))
+    }
+
+    /// Parse a format string: @text, @json, @uri, etc.
+    fn parse_format_string(&mut self) -> Result<Expr, ParseError> {
+        self.expect('@')?;
+
+        // Parse the format name
+        let format_start = self.pos;
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '6' || c == '4')
+        {
+            self.next();
+        }
+
+        let format_name = &self.input[format_start..self.pos];
+        let format_type = match format_name {
+            "text" => FormatType::Text,
+            "json" => FormatType::Json,
+            "uri" => FormatType::Uri,
+            "csv" => FormatType::Csv,
+            "tsv" => FormatType::Tsv,
+            "base64" => FormatType::Base64,
+            "base64d" => FormatType::Base64d,
+            "html" => FormatType::Html,
+            "sh" => FormatType::Sh,
+            _ => {
+                return Err(ParseError::new(
+                    format!("unknown format '@{}'", format_name),
+                    format_start,
+                ));
+            }
+        };
+
+        Ok(Expr::Format(format_type))
     }
 
     /// Try to parse a builtin function.
@@ -1168,6 +1327,85 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::WithEntries(Box::new(f))));
+        }
+
+        // Phase 6: Type Conversions
+        if self.matches_keyword("tostring") {
+            self.consume_keyword("tostring");
+            return Ok(Some(Builtin::ToString));
+        }
+        if self.matches_keyword("tonumber") {
+            self.consume_keyword("tonumber");
+            return Ok(Some(Builtin::ToNumber));
+        }
+
+        // Phase 6: Additional String Functions
+        if self.matches_keyword("explode") {
+            self.consume_keyword("explode");
+            return Ok(Some(Builtin::Explode));
+        }
+        if self.matches_keyword("implode") {
+            self.consume_keyword("implode");
+            return Ok(Some(Builtin::Implode));
+        }
+        if self.matches_keyword("test") {
+            self.consume_keyword("test");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let re = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Test(Box::new(re))));
+        }
+        if self.matches_keyword("indices") {
+            self.consume_keyword("indices");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let s = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Indices(Box::new(s))));
+        }
+        // Check index before rindex since rindex contains "index"
+        if self.matches_keyword("rindex") {
+            self.consume_keyword("rindex");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let s = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Rindex(Box::new(s))));
+        }
+        if self.matches_keyword("index") {
+            self.consume_keyword("index");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let s = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Index(Box::new(s))));
+        }
+        if self.matches_keyword("tojsonstream") {
+            self.consume_keyword("tojsonstream");
+            return Ok(Some(Builtin::ToJsonStream));
+        }
+        if self.matches_keyword("fromjsonstream") {
+            self.consume_keyword("fromjsonstream");
+            return Ok(Some(Builtin::FromJsonStream));
+        }
+        if self.matches_keyword("getpath") {
+            self.consume_keyword("getpath");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let path = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::GetPath(Box::new(path))));
         }
 
         Ok(None)
