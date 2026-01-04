@@ -29,6 +29,8 @@ struct JsonCommand {
 enum JsonSubcommand {
     /// Generate synthetic JSON files for benchmarking and testing
     Generate(GenerateJson),
+    /// Generate a suite of JSON files with various sizes and patterns
+    GenerateSuite(GenerateSuite),
 }
 
 /// Generate synthetic JSON files for benchmarking and testing
@@ -90,6 +92,26 @@ enum PatternArg {
     Unicode,
     /// Worst-case for parsing (maximum structural density)
     Pathological,
+}
+
+/// Generate a suite of JSON files with various sizes and patterns for benchmarking
+#[derive(Debug, Parser)]
+struct GenerateSuite {
+    /// Output directory (defaults to data/bench/generated)
+    #[arg(short, long, default_value = "data/bench/generated")]
+    output_dir: PathBuf,
+
+    /// Base seed for deterministic generation (each file uses seed + file_index)
+    #[arg(short, long, default_value = "42")]
+    seed: u64,
+
+    /// Clean output directory before generating
+    #[arg(long)]
+    clean: bool,
+
+    /// Verify all generated JSON files are valid
+    #[arg(long)]
+    verify: bool,
 }
 
 impl From<PatternArg> for generators::Pattern {
@@ -180,7 +202,105 @@ fn main() -> Result<()> {
 
                 Ok(())
             }
+            JsonSubcommand::GenerateSuite(args) => generate_suite(args),
         },
+    }
+}
+
+/// Suite configuration: patterns and sizes to generate
+const SUITE_PATTERNS: &[(&str, generators::Pattern)] = &[
+    ("comprehensive", generators::Pattern::Comprehensive),
+    ("users", generators::Pattern::Users),
+    ("nested", generators::Pattern::Nested),
+    ("arrays", generators::Pattern::Arrays),
+    ("mixed", generators::Pattern::Mixed),
+    ("strings", generators::Pattern::Strings),
+    ("numbers", generators::Pattern::Numbers),
+    ("literals", generators::Pattern::Literals),
+    ("unicode", generators::Pattern::Unicode),
+    ("pathological", generators::Pattern::Pathological),
+];
+
+/// Sizes to generate for each pattern (name, bytes)
+const SUITE_SIZES: &[(&str, usize)] = &[
+    ("1kb", 1024),
+    ("10kb", 10 * 1024),
+    ("100kb", 100 * 1024),
+    ("1mb", 1024 * 1024),
+    ("10mb", 10 * 1024 * 1024),
+];
+
+fn generate_suite(args: GenerateSuite) -> Result<()> {
+    let output_dir = &args.output_dir;
+
+    // Clean directory if requested
+    if args.clean && output_dir.exists() {
+        std::fs::remove_dir_all(output_dir)
+            .with_context(|| format!("Failed to clean directory: {}", output_dir.display()))?;
+        eprintln!("Cleaned {}", output_dir.display());
+    }
+
+    // Create output directory
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("Failed to create directory: {}", output_dir.display()))?;
+
+    let mut file_index: u64 = 0;
+    let mut total_bytes: usize = 0;
+    let mut file_count: usize = 0;
+
+    eprintln!("Generating JSON suite in {}...", output_dir.display());
+
+    for (pattern_name, pattern) in SUITE_PATTERNS {
+        // Create pattern subdirectory
+        let pattern_dir = output_dir.join(pattern_name);
+        std::fs::create_dir_all(&pattern_dir)?;
+
+        for (size_name, size) in SUITE_SIZES {
+            let filename = format!("{}.json", size_name);
+            let path = pattern_dir.join(&filename);
+
+            // Deterministic seed: base_seed + file_index
+            let seed = args.seed.wrapping_add(file_index);
+            file_index += 1;
+
+            let json = generate_json(*size, *pattern, Some(seed), 5, 0.1);
+
+            if args.verify {
+                serde_json::from_str::<serde_json::Value>(&json)
+                    .with_context(|| format!("Generated invalid JSON for {}", path.display()))?;
+            }
+
+            std::fs::write(&path, &json)?;
+            total_bytes += json.len();
+            file_count += 1;
+
+            eprintln!("  {} ({} bytes, seed={})", path.display(), json.len(), seed);
+        }
+    }
+
+    eprintln!();
+    eprintln!(
+        "Generated {} files ({} total)",
+        file_count,
+        format_bytes(total_bytes)
+    );
+
+    if args.verify {
+        eprintln!("All files validated successfully");
+    }
+
+    Ok(())
+}
+
+fn format_bytes(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.2} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} bytes", bytes)
     }
 }
 

@@ -3,7 +3,7 @@
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Pattern {
     Comprehensive,
     Users,
@@ -137,11 +137,11 @@ fn add_string_variations(
     let escape_patterns = [
         r#"Line with \"quoted\" text"#,
         r#"Path: C:\\Users\\test\\file.txt"#,
-        "Line with\nnewline",
-        "Tab\tseparated\tvalues",
+        r#"Line with\nnewline"#,
+        r#"Tab\tseparated\tvalues"#,
         r#"JSON: {\"key\":\"value\"}"#,
-        "Backspace:\x08 Formfeed:\x0C",
-        "Mixed: \"quotes\"\tand\nnewlines",
+        r#"Backspace:\b Formfeed:\f"#,
+        r#"Mixed: \"quotes\"\tand\nnewlines"#,
     ];
 
     let normal_strings = [
@@ -260,11 +260,17 @@ fn add_array_variations(
     json.push_str(r#"],"#);
 
     // Mixed type arrays
-    json.push_str(r#""mixed":[1,"two",true,null,{"key":"value"},[1,2,3]]"#);
+    json.push_str(r#""mixed":[1,"two",true,null,{"key":"value"},[1,2,3]],"#);
 
     // Fill remaining space with random arrays
+    json.push_str(r#""random":["#);
+    let mut first = true;
     while json.len() - start_len < target_size {
-        json.push_str(r#","random":["#);
+        if !first {
+            json.push(',');
+        }
+        first = false;
+        json.push('[');
         let array_len = rng.as_mut().map(|r| r.gen_range(3..10)).unwrap_or(5);
         for i in 0..array_len {
             if i > 0 {
@@ -277,6 +283,7 @@ fn add_array_variations(
         }
         json.push(']');
     }
+    json.push(']');
 }
 
 /// Add nested object structures

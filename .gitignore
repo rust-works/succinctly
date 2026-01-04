@@ -21,3 +21,6 @@ target
 #.idea/
 
 .claude/settings.local.json
+
+# Generated benchmark data
+data/bench/generated/
