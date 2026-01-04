@@ -9,6 +9,7 @@ Usage: succinctly json <COMMAND>
 Commands:
   generate        Generate synthetic JSON files for benchmarking and testing
   generate-suite  Generate a suite of JSON files with various sizes and patterns
+  query           Query JSON using jq-like expressions
   help            Print this message or the help of the given subcommand(s)
 
 Options:
