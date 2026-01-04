@@ -982,6 +982,194 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::In(Box::new(obj))));
         }
 
+        // Phase 5: String Functions
+        if self.matches_keyword("ascii_downcase") {
+            self.consume_keyword("ascii_downcase");
+            return Ok(Some(Builtin::AsciiDowncase));
+        }
+        if self.matches_keyword("ascii_upcase") {
+            self.consume_keyword("ascii_upcase");
+            return Ok(Some(Builtin::AsciiUpcase));
+        }
+        if self.matches_keyword("ltrimstr") {
+            self.consume_keyword("ltrimstr");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let s = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Ltrimstr(Box::new(s))));
+        }
+        if self.matches_keyword("rtrimstr") {
+            self.consume_keyword("rtrimstr");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let s = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Rtrimstr(Box::new(s))));
+        }
+        if self.matches_keyword("startswith") {
+            self.consume_keyword("startswith");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let s = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Startswith(Box::new(s))));
+        }
+        if self.matches_keyword("endswith") {
+            self.consume_keyword("endswith");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let s = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Endswith(Box::new(s))));
+        }
+        if self.matches_keyword("split") {
+            self.consume_keyword("split");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let s = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Split(Box::new(s))));
+        }
+        if self.matches_keyword("join") {
+            self.consume_keyword("join");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let s = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Join(Box::new(s))));
+        }
+        if self.matches_keyword("contains") {
+            self.consume_keyword("contains");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let b = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Contains(Box::new(b))));
+        }
+        if self.matches_keyword("inside") {
+            self.consume_keyword("inside");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let b = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Inside(Box::new(b))));
+        }
+
+        // Phase 5: Array Functions
+        if self.matches_keyword("first") {
+            self.consume_keyword("first");
+            return Ok(Some(Builtin::First));
+        }
+        if self.matches_keyword("last") {
+            self.consume_keyword("last");
+            return Ok(Some(Builtin::Last));
+        }
+        if self.matches_keyword("nth") {
+            self.consume_keyword("nth");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let n = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Nth(Box::new(n))));
+        }
+        if self.matches_keyword("reverse") {
+            self.consume_keyword("reverse");
+            return Ok(Some(Builtin::Reverse));
+        }
+        // Check flatten with depth before plain flatten
+        if self.matches_keyword("flatten") {
+            self.consume_keyword("flatten");
+            self.skip_ws();
+            if self.peek() == Some('(') {
+                self.next();
+                self.skip_ws();
+                let depth = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::FlattenDepth(Box::new(depth))));
+            }
+            return Ok(Some(Builtin::Flatten));
+        }
+        if self.matches_keyword("group_by") {
+            self.consume_keyword("group_by");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let f = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::GroupBy(Box::new(f))));
+        }
+        // Check unique_by before unique
+        if self.matches_keyword("unique_by") {
+            self.consume_keyword("unique_by");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let f = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::UniqueBy(Box::new(f))));
+        }
+        if self.matches_keyword("unique") {
+            self.consume_keyword("unique");
+            return Ok(Some(Builtin::Unique));
+        }
+        // Check sort_by before sort
+        if self.matches_keyword("sort_by") {
+            self.consume_keyword("sort_by");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let f = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::SortBy(Box::new(f))));
+        }
+        if self.matches_keyword("sort") {
+            self.consume_keyword("sort");
+            return Ok(Some(Builtin::Sort));
+        }
+
+        // Phase 5: Object Functions
+        if self.matches_keyword("to_entries") {
+            self.consume_keyword("to_entries");
+            return Ok(Some(Builtin::ToEntries));
+        }
+        if self.matches_keyword("from_entries") {
+            self.consume_keyword("from_entries");
+            return Ok(Some(Builtin::FromEntries));
+        }
+        if self.matches_keyword("with_entries") {
+            self.consume_keyword("with_entries");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let f = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::WithEntries(Box::new(f))));
+        }
+
         Ok(None)
     }
 

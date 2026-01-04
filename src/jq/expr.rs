@@ -167,6 +167,60 @@ pub enum Builtin {
     MinBy(Box<Expr>),
     /// `max_by(f)` - maximum element by key
     MaxBy(Box<Expr>),
+
+    // Phase 5: String Functions
+    /// `ascii_downcase` - lowercase ASCII characters
+    AsciiDowncase,
+    /// `ascii_upcase` - uppercase ASCII characters
+    AsciiUpcase,
+    /// `ltrimstr(s)` - remove prefix s
+    Ltrimstr(Box<Expr>),
+    /// `rtrimstr(s)` - remove suffix s
+    Rtrimstr(Box<Expr>),
+    /// `startswith(s)` - check if string starts with s
+    Startswith(Box<Expr>),
+    /// `endswith(s)` - check if string ends with s
+    Endswith(Box<Expr>),
+    /// `split(s)` - split string by separator
+    Split(Box<Expr>),
+    /// `join(s)` - join array elements with separator
+    Join(Box<Expr>),
+    /// `contains(b)` - check if input contains b
+    Contains(Box<Expr>),
+    /// `inside(b)` - check if input is inside b
+    Inside(Box<Expr>),
+
+    // Phase 5: Array Functions
+    /// `first` - first element (.[0])
+    First,
+    /// `last` - last element (.[-1])
+    Last,
+    /// `nth(n)` - nth element
+    Nth(Box<Expr>),
+    /// `reverse` - reverse array
+    Reverse,
+    /// `flatten` - flatten nested arrays (1 level)
+    Flatten,
+    /// `flatten(depth)` - flatten to specific depth
+    FlattenDepth(Box<Expr>),
+    /// `group_by(f)` - group by key function
+    GroupBy(Box<Expr>),
+    /// `unique` - remove duplicates
+    Unique,
+    /// `unique_by(f)` - remove duplicates by key
+    UniqueBy(Box<Expr>),
+    /// `sort` - sort array
+    Sort,
+    /// `sort_by(f)` - sort by key function
+    SortBy(Box<Expr>),
+
+    // Phase 5: Object Functions
+    /// `to_entries` - {k:v} → [{key:k, value:v}]
+    ToEntries,
+    /// `from_entries` - [{key:k, value:v}] → {k:v}
+    FromEntries,
+    /// `with_entries(f)` - to_entries | map(f) | from_entries
+    WithEntries(Box<Expr>),
 }
 
 /// Arithmetic operators.
