@@ -305,24 +305,17 @@ pub fn find_open(words: &[u64], len: usize, p: usize) -> Option<usize> {
     // Scan previous words
     for word_idx in (0..word_idx).rev() {
         let word = words[word_idx];
-        let word_ones = word.count_ones() as i32;
-        let word_excess = 2 * word_ones - 64;
 
-        // Check if the match might be in this word
-        if excess + word_excess >= 0 {
-            // Scan this word bit by bit (backwards)
-            for bit in (0..64).rev() {
-                if (word >> bit) & 1 == 1 {
-                    excess += 1;
-                    if excess == 0 {
-                        return Some(word_idx * 64 + bit);
-                    }
-                } else {
-                    excess -= 1;
+        // Scan this word bit by bit (backwards)
+        for bit in (0..64).rev() {
+            if (word >> bit) & 1 == 1 {
+                excess += 1;
+                if excess == 0 {
+                    return Some(word_idx * 64 + bit);
                 }
+            } else {
+                excess -= 1;
             }
-        } else {
-            excess += word_excess;
         }
     }
 
