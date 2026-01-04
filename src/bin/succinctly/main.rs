@@ -31,6 +31,8 @@ enum JsonSubcommand {
     Generate(GenerateJson),
     /// Generate a suite of JSON files with various sizes and patterns
     GenerateSuite(GenerateSuite),
+    /// Query JSON using jq-like expressions
+    Query(QueryJson),
 }
 
 /// Generate synthetic JSON files for benchmarking and testing
@@ -112,6 +114,37 @@ struct GenerateSuite {
     /// Verify all generated JSON files are valid
     #[arg(long)]
     verify: bool,
+}
+
+/// Query JSON using jq-like expressions
+#[derive(Debug, Parser)]
+struct QueryJson {
+    /// jq expression to evaluate (e.g., ".foo.bar[0]", ".users[].name")
+    expression: String,
+
+    /// Input JSON file (reads from stdin if not provided)
+    #[arg(short, long)]
+    input: Option<PathBuf>,
+
+    /// Output format
+    #[arg(short, long, default_value = "json")]
+    format: OutputFormat,
+
+    /// Compact output (no pretty printing)
+    #[arg(short, long)]
+    compact: bool,
+
+    /// Show raw strings without quotes
+    #[arg(short, long)]
+    raw: bool,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum OutputFormat {
+    /// Standard JSON output
+    Json,
+    /// One value per line (newline-delimited)
+    Lines,
 }
 
 impl From<PatternArg> for generators::Pattern {
@@ -203,6 +236,7 @@ fn main() -> Result<()> {
                 Ok(())
             }
             JsonSubcommand::GenerateSuite(args) => generate_suite(args),
+            JsonSubcommand::Query(args) => query_json(args),
         },
     }
 }
@@ -302,6 +336,202 @@ fn format_bytes(bytes: usize) -> String {
     } else {
         format!("{} bytes", bytes)
     }
+}
+
+fn query_json(args: QueryJson) -> Result<()> {
+    use std::io::Read;
+    use succinctly::jq;
+    use succinctly::json::JsonIndex;
+    use succinctly::json::light::StandardJson;
+
+    // Read input JSON
+    let json_bytes: Vec<u8> = match &args.input {
+        Some(path) => {
+            std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?
+        }
+        None => {
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .context("Failed to read from stdin")?;
+            buf
+        }
+    };
+
+    // Parse the jq expression
+    let expr = jq::parse(&args.expression).map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
+
+    // Build the index and run the query
+    let index = JsonIndex::build(&json_bytes);
+    let cursor = index.root(&json_bytes);
+    let result = jq::eval(&expr, cursor);
+
+    // Format a single value as string
+    let format_value = |value: &StandardJson<'_, Vec<u64>>| -> String {
+        match value {
+            StandardJson::String(s) => {
+                if args.raw {
+                    s.as_str().map(|s| s.to_string()).unwrap_or_default()
+                } else {
+                    format!("\"{}\"", s.as_str().unwrap_or_default())
+                }
+            }
+            StandardJson::Number(n) => {
+                if let Ok(i) = n.as_i64() {
+                    i.to_string()
+                } else if let Ok(f) = n.as_f64() {
+                    f.to_string()
+                } else {
+                    "null".to_string()
+                }
+            }
+            StandardJson::Bool(b) => b.to_string(),
+            StandardJson::Null => "null".to_string(),
+            StandardJson::Object(_) | StandardJson::Array(_) => {
+                // For complex types, we need to reconstruct JSON
+                reconstruct_json(value, !args.compact)
+            }
+            StandardJson::Error(e) => format!("<error: {}>", e),
+        }
+    };
+
+    // Output results
+    match result {
+        jq::QueryResult::One(value) => {
+            println!("{}", format_value(&value));
+        }
+        jq::QueryResult::Many(values) => match args.format {
+            OutputFormat::Json => {
+                if args.compact {
+                    print!("[");
+                    for (i, value) in values.iter().enumerate() {
+                        if i > 0 {
+                            print!(",");
+                        }
+                        print!("{}", format_value(value));
+                    }
+                    println!("]");
+                } else {
+                    println!("[");
+                    for (i, value) in values.iter().enumerate() {
+                        let comma = if i < values.len() - 1 { "," } else { "" };
+                        println!("  {}{}", format_value(value), comma);
+                    }
+                    println!("]");
+                }
+            }
+            OutputFormat::Lines => {
+                for value in values.iter() {
+                    println!("{}", format_value(value));
+                }
+            }
+        },
+        jq::QueryResult::None => {
+            // Print nothing for None (matches jq behavior for optional that didn't find anything)
+        }
+        jq::QueryResult::Error(e) => {
+            anyhow::bail!("Query error: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+/// Reconstruct JSON string from a StandardJson value
+fn reconstruct_json<W: Clone + AsRef<[u64]>>(
+    value: &succinctly::json::light::StandardJson<'_, W>,
+    pretty: bool,
+) -> String {
+    use succinctly::json::light::StandardJson;
+
+    fn inner<W: Clone + AsRef<[u64]>>(
+        value: &StandardJson<'_, W>,
+        pretty: bool,
+        indent: usize,
+    ) -> String {
+        let indent_str = if pretty {
+            "  ".repeat(indent)
+        } else {
+            String::new()
+        };
+        let newline = if pretty { "\n" } else { "" };
+
+        match value {
+            StandardJson::String(s) => {
+                format!("\"{}\"", s.as_str().unwrap_or_default())
+            }
+            StandardJson::Number(n) => {
+                if let Ok(i) = n.as_i64() {
+                    i.to_string()
+                } else if let Ok(f) = n.as_f64() {
+                    f.to_string()
+                } else {
+                    "null".to_string()
+                }
+            }
+            StandardJson::Bool(b) => b.to_string(),
+            StandardJson::Null => "null".to_string(),
+            StandardJson::Object(fields) => {
+                let items: Vec<_> = (*fields)
+                    .map(|f| {
+                        let key = match f.key() {
+                            StandardJson::String(s) => s.as_str().unwrap_or_default().to_string(),
+                            _ => String::new(),
+                        };
+                        let val = inner(&f.value(), pretty, indent + 1);
+                        if pretty {
+                            format!("{}  \"{}\": {}", indent_str, key, val)
+                        } else {
+                            format!("\"{}\":{}", key, val)
+                        }
+                    })
+                    .collect();
+
+                if items.is_empty() {
+                    "{}".to_string()
+                } else if pretty {
+                    format!(
+                        "{{{}{}{}{}}}",
+                        newline,
+                        items.join(&format!(",{}", newline)),
+                        newline,
+                        indent_str
+                    )
+                } else {
+                    format!("{{{}}}", items.join(","))
+                }
+            }
+            StandardJson::Array(elements) => {
+                let items: Vec<_> = (*elements)
+                    .map(|e| {
+                        let val = inner(&e, pretty, indent + 1);
+                        if pretty {
+                            format!("{}  {}", indent_str, val)
+                        } else {
+                            val
+                        }
+                    })
+                    .collect();
+
+                if items.is_empty() {
+                    "[]".to_string()
+                } else if pretty {
+                    format!(
+                        "[{}{}{}{}]",
+                        newline,
+                        items.join(&format!(",{}", newline)),
+                        newline,
+                        indent_str
+                    )
+                } else {
+                    format!("[{}]", items.join(","))
+                }
+            }
+            StandardJson::Error(e) => format!("<error: {}>", e),
+        }
+    }
+
+    inner(value, pretty, 0)
 }
 
 mod generators;

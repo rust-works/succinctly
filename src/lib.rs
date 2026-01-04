@@ -44,6 +44,7 @@ pub mod binary;
 mod bitvec;
 pub mod bp;
 mod broadword;
+pub mod jq;
 pub mod json;
 mod popcount;
 mod rank;
