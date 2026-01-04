@@ -9,9 +9,14 @@
 //! cargo bench --bench json_simd
 //! ```
 
+#[cfg(target_arch = "x86_64")]
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
+#[cfg(not(target_arch = "x86_64"))]
+use criterion::{Criterion, criterion_group, criterion_main};
+
 /// Generate a realistic JSON document with nested structures.
+#[cfg(target_arch = "x86_64")]
 fn generate_json(approx_size: usize) -> String {
     let mut json = String::with_capacity(approx_size);
     json.push_str("{\"users\":[");
@@ -260,6 +265,11 @@ criterion_group!(
 
 // Placeholder for non-x86_64 architectures
 #[cfg(not(target_arch = "x86_64"))]
-criterion_group!(benches,);
+fn bench_placeholder(_c: &mut Criterion) {
+    // No x86_64-specific SIMD benchmarks available on this platform
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+criterion_group!(benches, bench_placeholder);
 
 criterion_main!(benches);

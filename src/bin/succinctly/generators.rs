@@ -48,7 +48,7 @@ pub fn generate_comprehensive_json(
     depth: usize,
     escape_density: f64,
 ) -> String {
-    let mut rng = seed.map(|s| ChaCha8Rng::seed_from_u64(s));
+    let mut rng = seed.map(ChaCha8Rng::seed_from_u64);
     let mut json = String::with_capacity(target_size);
 
     json.push_str(r#"{"metadata":{"version":"1.0","generated":true,"features":["strings","numbers","booleans","nulls","arrays","objects","nesting","escapes","unicode"]},"#);
@@ -94,7 +94,7 @@ pub fn generate_comprehensive_json(
     // 8. Edge cases (5%)
     json.push_str(r#""edge_cases":{"#);
     add_edge_cases(&mut json, feature_size / 2);
-    json.push_str("}");
+    json.push('}');
 
     json.push('}');
     json
@@ -451,7 +451,7 @@ fn add_edge_cases(json: &mut String, _target_size: usize) {
 
 /// Generate user objects pattern
 pub fn generate_users_json(target_size: usize, seed: Option<u64>) -> String {
-    let mut rng = seed.map(|s| ChaCha8Rng::seed_from_u64(s));
+    let mut rng = seed.map(ChaCha8Rng::seed_from_u64);
     let mut json = String::with_capacity(target_size);
     json.push_str(r#"{"users":["#);
 
@@ -508,7 +508,7 @@ pub fn generate_nested_json(target_size: usize, _seed: Option<u64>, depth: usize
 
 /// Generate arrays of arrays
 pub fn generate_arrays_json(target_size: usize, seed: Option<u64>) -> String {
-    let mut rng = seed.map(|s| ChaCha8Rng::seed_from_u64(s));
+    let mut rng = seed.map(ChaCha8Rng::seed_from_u64);
     let mut json = String::with_capacity(target_size);
     json.push('[');
 
@@ -539,7 +539,7 @@ pub fn generate_arrays_json(target_size: usize, seed: Option<u64>) -> String {
 
 /// Generate mixed types
 pub fn generate_mixed_json(target_size: usize, seed: Option<u64>) -> String {
-    let mut rng = seed.map(|s| ChaCha8Rng::seed_from_u64(s));
+    let mut rng = seed.map(ChaCha8Rng::seed_from_u64);
     let mut json = String::with_capacity(target_size);
     json.push_str(r#"{"data":["#);
 
@@ -606,7 +606,7 @@ pub fn generate_strings_json(
 
 /// Generate number-heavy JSON
 pub fn generate_numbers_json(target_size: usize, seed: Option<u64>) -> String {
-    let mut rng = seed.map(|s| ChaCha8Rng::seed_from_u64(s));
+    let mut rng = seed.map(ChaCha8Rng::seed_from_u64);
     let mut json = String::with_capacity(target_size);
     json.push_str(r#"{"numbers":["#);
 
@@ -620,7 +620,7 @@ pub fn generate_numbers_json(target_size: usize, seed: Option<u64>) -> String {
         let num = rng
             .as_mut()
             .map(|r| r.r#gen::<f64>() * 1000000.0)
-            .unwrap_or(i as f64 * 3.14159);
+            .unwrap_or(i as f64 * std::f64::consts::PI);
 
         json.push_str(&format!("{:.6}", num));
 
@@ -635,7 +635,7 @@ pub fn generate_numbers_json(target_size: usize, seed: Option<u64>) -> String {
 
 /// Generate literal-heavy JSON (booleans and nulls)
 pub fn generate_literals_json(target_size: usize, seed: Option<u64>) -> String {
-    let mut rng = seed.map(|s| ChaCha8Rng::seed_from_u64(s));
+    let mut rng = seed.map(ChaCha8Rng::seed_from_u64);
     let mut json = String::with_capacity(target_size);
     json.push_str(r#"{"literals":["#);
 
@@ -665,7 +665,7 @@ pub fn generate_unicode_json(target_size: usize, seed: Option<u64>) -> String {
     add_unicode_strings(
         &mut json,
         target_size,
-        &mut seed.map(|s| ChaCha8Rng::seed_from_u64(s)),
+        &mut seed.map(ChaCha8Rng::seed_from_u64),
     );
     format!(r#"{{"unicode":[{}]}}"#, json)
 }

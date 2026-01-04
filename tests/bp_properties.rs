@@ -396,15 +396,15 @@ mod edge_cases {
 
         // Verify roundtrip for all positions
         for p in 0..len {
-            if bp.is_open(p) {
-                if let Some(close) = bp.find_close(p) {
-                    assert_eq!(
-                        bp.find_open(close),
-                        Some(p),
-                        "roundtrip failed at open position {}",
-                        p
-                    );
-                }
+            if bp.is_open(p)
+                && let Some(close) = bp.find_close(p)
+            {
+                assert_eq!(
+                    bp.find_open(close),
+                    Some(p),
+                    "roundtrip failed at open position {}",
+                    p
+                );
             }
         }
     }
