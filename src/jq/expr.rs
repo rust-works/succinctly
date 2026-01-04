@@ -56,6 +56,65 @@ pub enum Expr {
     /// Parenthesized expression (for grouping)
     /// This is mostly handled by the parser, but we keep it for clarity.
     Paren(Box<Expr>),
+
+    /// Arithmetic operation: `.a + .b`, `.a - .b`, `.a * .b`, `.a / .b`, `.a % .b`
+    Arithmetic {
+        op: ArithOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+
+    /// Comparison operation: `.a == .b`, `.a != .b`, `.a < .b`, etc.
+    Compare {
+        op: CompareOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+
+    /// Boolean AND: `.a and .b`
+    And(Box<Expr>, Box<Expr>),
+
+    /// Boolean OR: `.a or .b`
+    Or(Box<Expr>, Box<Expr>),
+
+    /// Boolean NOT: `not` (unary, applied via pipe)
+    Not,
+
+    /// Alternative operator: `.foo // "default"`
+    /// Returns left if truthy, otherwise right.
+    Alternative(Box<Expr>, Box<Expr>),
+}
+
+/// Arithmetic operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    /// Addition: `+`
+    Add,
+    /// Subtraction: `-`
+    Sub,
+    /// Multiplication: `*`
+    Mul,
+    /// Division: `/`
+    Div,
+    /// Modulo: `%`
+    Mod,
+}
+
+/// Comparison operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    /// Equal: `==`
+    Eq,
+    /// Not equal: `!=`
+    Ne,
+    /// Less than: `<`
+    Lt,
+    /// Less than or equal: `<=`
+    Le,
+    /// Greater than: `>`
+    Gt,
+    /// Greater than or equal: `>=`
+    Ge,
 }
 
 /// An entry in an object construction expression.
@@ -163,6 +222,44 @@ impl Expr {
     /// Create a parenthesized expression.
     pub fn paren(inner: Expr) -> Self {
         Expr::Paren(Box::new(inner))
+    }
+
+    /// Create an arithmetic expression.
+    pub fn arithmetic(op: ArithOp, left: Expr, right: Expr) -> Self {
+        Expr::Arithmetic {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        }
+    }
+
+    /// Create a comparison expression.
+    pub fn compare(op: CompareOp, left: Expr, right: Expr) -> Self {
+        Expr::Compare {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        }
+    }
+
+    /// Create an AND expression.
+    pub fn and(left: Expr, right: Expr) -> Self {
+        Expr::And(Box::new(left), Box::new(right))
+    }
+
+    /// Create an OR expression.
+    pub fn or(left: Expr, right: Expr) -> Self {
+        Expr::Or(Box::new(left), Box::new(right))
+    }
+
+    /// Create a NOT expression.
+    pub fn not() -> Self {
+        Expr::Not
+    }
+
+    /// Create an alternative expression.
+    pub fn alternative(left: Expr, right: Expr) -> Self {
+        Expr::Alternative(Box::new(left), Box::new(right))
     }
 
     /// Returns true if this is the identity expression.

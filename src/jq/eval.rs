@@ -7,7 +7,7 @@ use alloc::collections::BTreeMap;
 #[cfg(not(test))]
 use alloc::format;
 #[cfg(not(test))]
-use alloc::string::String;
+use alloc::string::{String, ToString};
 #[cfg(not(test))]
 use alloc::vec;
 #[cfg(not(test))]
@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
-use super::expr::{Expr, Literal, ObjectKey};
+use super::expr::{ArithOp, CompareOp, Expr, Literal, ObjectKey};
 use super::value::OwnedValue;
 
 /// Result of evaluating a jq expression.
@@ -200,6 +200,18 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
         Expr::RecursiveDescent => eval_recursive_descent(value),
 
         Expr::Paren(inner) => eval_single(inner, value, optional),
+
+        Expr::Arithmetic { op, left, right } => eval_arithmetic(*op, left, right, value, optional),
+
+        Expr::Compare { op, left, right } => eval_compare(*op, left, right, value, optional),
+
+        Expr::And(left, right) => eval_and(left, right, value, optional),
+
+        Expr::Or(left, right) => eval_or(left, right, value, optional),
+
+        Expr::Not => eval_not(value),
+
+        Expr::Alternative(left, right) => eval_alternative(left, right, value, optional),
     }
 }
 
@@ -371,6 +383,395 @@ fn collect_recursive<'a, W: Clone + AsRef<[u64]>>(
             }
         }
         _ => {}
+    }
+}
+
+/// Convert a QueryResult to an OwnedValue for use in computations.
+fn result_to_owned<W: Clone + AsRef<[u64]>>(
+    result: QueryResult<'_, W>,
+) -> Result<OwnedValue, EvalError> {
+    match result {
+        QueryResult::One(v) => Ok(to_owned(&v)),
+        QueryResult::Owned(v) => Ok(v),
+        QueryResult::Many(vs) => {
+            if let Some(v) = vs.first() {
+                Ok(to_owned(v))
+            } else {
+                Err(EvalError::new("empty result"))
+            }
+        }
+        QueryResult::ManyOwned(vs) => {
+            if let Some(v) = vs.into_iter().next() {
+                Ok(v)
+            } else {
+                Err(EvalError::new("empty result"))
+            }
+        }
+        QueryResult::None => Err(EvalError::new("no value")),
+        QueryResult::Error(e) => Err(e),
+    }
+}
+
+/// Evaluate arithmetic operations.
+fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>>(
+    op: ArithOp,
+    left: &Expr,
+    right: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let left_val = match result_to_owned(eval_single(left, value.clone(), optional)) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+    let right_val = match result_to_owned(eval_single(right, value, optional)) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    let result = match op {
+        ArithOp::Add => arith_add(left_val, right_val),
+        ArithOp::Sub => arith_sub(left_val, right_val),
+        ArithOp::Mul => arith_mul(left_val, right_val),
+        ArithOp::Div => arith_div(left_val, right_val),
+        ArithOp::Mod => arith_mod(left_val, right_val),
+    };
+
+    match result {
+        Ok(v) => QueryResult::Owned(v),
+        Err(e) => QueryResult::Error(e),
+    }
+}
+
+/// Add two values (numbers, strings, arrays, objects).
+fn arith_add(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalError> {
+    match (left, right) {
+        // Number addition
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => Ok(OwnedValue::Int(a.wrapping_add(b))),
+        (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 + b)),
+        (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a + b as f64)),
+        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a + b)),
+        // String concatenation
+        (OwnedValue::String(mut a), OwnedValue::String(b)) => {
+            a.push_str(&b);
+            Ok(OwnedValue::String(a))
+        }
+        // Array concatenation
+        (OwnedValue::Array(mut a), OwnedValue::Array(b)) => {
+            a.extend(b);
+            Ok(OwnedValue::Array(a))
+        }
+        // Object merge (right overwrites left)
+        (OwnedValue::Object(mut a), OwnedValue::Object(b)) => {
+            a.extend(b);
+            Ok(OwnedValue::Object(a))
+        }
+        // null + x = x, x + null = x
+        (OwnedValue::Null, other) | (other, OwnedValue::Null) => Ok(other),
+        (a, b) => Err(EvalError::new(format!(
+            "cannot add {} and {}",
+            a.type_name(),
+            b.type_name()
+        ))),
+    }
+}
+
+/// Subtract two values.
+fn arith_sub(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalError> {
+    match (left, right) {
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => Ok(OwnedValue::Int(a.wrapping_sub(b))),
+        (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 - b)),
+        (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a - b as f64)),
+        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a - b)),
+        // Array subtraction (remove elements)
+        (OwnedValue::Array(a), OwnedValue::Array(b)) => {
+            let result: Vec<_> = a.into_iter().filter(|x| !b.contains(x)).collect();
+            Ok(OwnedValue::Array(result))
+        }
+        (a, b) => Err(EvalError::new(format!(
+            "cannot subtract {} from {}",
+            b.type_name(),
+            a.type_name()
+        ))),
+    }
+}
+
+/// Multiply two values.
+fn arith_mul(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalError> {
+    match (left, right) {
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => Ok(OwnedValue::Int(a.wrapping_mul(b))),
+        (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 * b)),
+        (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a * b as f64)),
+        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a * b)),
+        // String repetition: "ab" * 3 = "ababab"
+        (OwnedValue::String(s), OwnedValue::Int(n))
+        | (OwnedValue::Int(n), OwnedValue::String(s)) => {
+            if n < 0 {
+                Ok(OwnedValue::Null)
+            } else {
+                Ok(OwnedValue::String(s.repeat(n as usize)))
+            }
+        }
+        // Object recursive merge
+        (OwnedValue::Object(a), OwnedValue::Object(b)) => {
+            Ok(OwnedValue::Object(merge_objects(a, b)))
+        }
+        // null * x = null
+        (OwnedValue::Null, _) | (_, OwnedValue::Null) => Ok(OwnedValue::Null),
+        (a, b) => Err(EvalError::new(format!(
+            "cannot multiply {} and {}",
+            a.type_name(),
+            b.type_name()
+        ))),
+    }
+}
+
+/// Recursively merge two objects.
+fn merge_objects(
+    mut left: BTreeMap<String, OwnedValue>,
+    right: BTreeMap<String, OwnedValue>,
+) -> BTreeMap<String, OwnedValue> {
+    for (k, v) in right {
+        match (left.get(&k).cloned(), v) {
+            (Some(OwnedValue::Object(a)), OwnedValue::Object(b)) => {
+                left.insert(k, OwnedValue::Object(merge_objects(a, b)));
+            }
+            (_, v) => {
+                left.insert(k, v);
+            }
+        }
+    }
+    left
+}
+
+/// Divide two values.
+fn arith_div(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalError> {
+    match (left, right) {
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => {
+            if b == 0 {
+                Err(EvalError::new("division by zero"))
+            } else {
+                Ok(OwnedValue::Float(a as f64 / b as f64))
+            }
+        }
+        (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 / b)),
+        (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a / b as f64)),
+        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a / b)),
+        // String split: "a,b,c" / "," = ["a", "b", "c"]
+        (OwnedValue::String(s), OwnedValue::String(sep)) => {
+            let parts: Vec<OwnedValue> = s
+                .split(&sep)
+                .map(|p| OwnedValue::String(p.to_string()))
+                .collect();
+            Ok(OwnedValue::Array(parts))
+        }
+        (a, b) => Err(EvalError::new(format!(
+            "cannot divide {} by {}",
+            a.type_name(),
+            b.type_name()
+        ))),
+    }
+}
+
+/// Modulo two values.
+fn arith_mod(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalError> {
+    match (left, right) {
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => {
+            if b == 0 {
+                Err(EvalError::new("modulo by zero"))
+            } else {
+                Ok(OwnedValue::Int(a % b))
+            }
+        }
+        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a % b)),
+        (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 % b)),
+        (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a % b as f64)),
+        (a, b) => Err(EvalError::new(format!(
+            "cannot compute modulo of {} and {}",
+            a.type_name(),
+            b.type_name()
+        ))),
+    }
+}
+
+/// Evaluate comparison operations.
+fn eval_compare<'a, W: Clone + AsRef<[u64]>>(
+    op: CompareOp,
+    left: &Expr,
+    right: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let left_val = match result_to_owned(eval_single(left, value.clone(), optional)) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+    let right_val = match result_to_owned(eval_single(right, value, optional)) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    let result = match op {
+        CompareOp::Eq => left_val == right_val,
+        CompareOp::Ne => left_val != right_val,
+        CompareOp::Lt => compare_values(&left_val, &right_val) == core::cmp::Ordering::Less,
+        CompareOp::Le => compare_values(&left_val, &right_val) != core::cmp::Ordering::Greater,
+        CompareOp::Gt => compare_values(&left_val, &right_val) == core::cmp::Ordering::Greater,
+        CompareOp::Ge => compare_values(&left_val, &right_val) != core::cmp::Ordering::Less,
+    };
+
+    QueryResult::Owned(OwnedValue::Bool(result))
+}
+
+/// Compare two values using jq ordering: null < bool < number < string < array < object.
+fn compare_values(left: &OwnedValue, right: &OwnedValue) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+
+    fn type_order(v: &OwnedValue) -> u8 {
+        match v {
+            OwnedValue::Null => 0,
+            OwnedValue::Bool(_) => 1,
+            OwnedValue::Int(_) | OwnedValue::Float(_) => 2,
+            OwnedValue::String(_) => 3,
+            OwnedValue::Array(_) => 4,
+            OwnedValue::Object(_) => 5,
+        }
+    }
+
+    let left_type = type_order(left);
+    let right_type = type_order(right);
+
+    if left_type != right_type {
+        return left_type.cmp(&right_type);
+    }
+
+    match (left, right) {
+        (OwnedValue::Null, OwnedValue::Null) => Ordering::Equal,
+        (OwnedValue::Bool(a), OwnedValue::Bool(b)) => a.cmp(b),
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => a.cmp(b),
+        (OwnedValue::Float(a), OwnedValue::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
+            (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)
+        }
+        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
+            a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
+        }
+        (OwnedValue::String(a), OwnedValue::String(b)) => a.cmp(b),
+        (OwnedValue::Array(a), OwnedValue::Array(b)) => {
+            for (av, bv) in a.iter().zip(b.iter()) {
+                match compare_values(av, bv) {
+                    Ordering::Equal => continue,
+                    other => return other,
+                }
+            }
+            a.len().cmp(&b.len())
+        }
+        (OwnedValue::Object(a), OwnedValue::Object(b)) => {
+            // Compare objects by sorted keys, then values
+            let mut a_keys: Vec<_> = a.keys().collect();
+            let mut b_keys: Vec<_> = b.keys().collect();
+            a_keys.sort();
+            b_keys.sort();
+
+            for (ak, bk) in a_keys.iter().zip(b_keys.iter()) {
+                match ak.cmp(bk) {
+                    Ordering::Equal => match compare_values(&a[*ak], &b[*bk]) {
+                        Ordering::Equal => continue,
+                        other => return other,
+                    },
+                    other => return other,
+                }
+            }
+            a.len().cmp(&b.len())
+        }
+        _ => Ordering::Equal,
+    }
+}
+
+/// Evaluate boolean AND (short-circuiting).
+fn eval_and<'a, W: Clone + AsRef<[u64]>>(
+    left: &Expr,
+    right: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate left first
+    let left_val = match result_to_owned(eval_single(left, value.clone(), optional)) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Short-circuit: if left is falsy, return false
+    if !left_val.is_truthy() {
+        return QueryResult::Owned(OwnedValue::Bool(false));
+    }
+
+    // Evaluate right
+    let right_val = match result_to_owned(eval_single(right, value, optional)) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    QueryResult::Owned(OwnedValue::Bool(right_val.is_truthy()))
+}
+
+/// Evaluate boolean OR (short-circuiting).
+fn eval_or<'a, W: Clone + AsRef<[u64]>>(
+    left: &Expr,
+    right: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate left first
+    let left_val = match result_to_owned(eval_single(left, value.clone(), optional)) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Short-circuit: if left is truthy, return true
+    if left_val.is_truthy() {
+        return QueryResult::Owned(OwnedValue::Bool(true));
+    }
+
+    // Evaluate right
+    let right_val = match result_to_owned(eval_single(right, value, optional)) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    QueryResult::Owned(OwnedValue::Bool(right_val.is_truthy()))
+}
+
+/// Evaluate boolean NOT.
+fn eval_not<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryResult<'a, W> {
+    let owned = to_owned(&value);
+    QueryResult::Owned(OwnedValue::Bool(!owned.is_truthy()))
+}
+
+/// Evaluate alternative operator (//): returns left if truthy, otherwise right.
+fn eval_alternative<'a, W: Clone + AsRef<[u64]>>(
+    left: &Expr,
+    right: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate left
+    let left_result = eval_single(left, value.clone(), optional);
+
+    // Check if left produced a truthy result
+    let is_truthy = match &left_result {
+        QueryResult::One(v) => to_owned(v).is_truthy(),
+        QueryResult::Owned(v) => v.is_truthy(),
+        QueryResult::Many(vs) => vs.first().map(|v| to_owned(v).is_truthy()).unwrap_or(false),
+        QueryResult::ManyOwned(vs) => vs.first().map(|v| v.is_truthy()).unwrap_or(false),
+        QueryResult::None => false,
+        QueryResult::Error(_) => false,
+    };
+
+    if is_truthy {
+        left_result
+    } else {
+        eval_single(right, value, optional)
     }
 }
 
@@ -732,6 +1133,230 @@ mod tests {
             QueryResult::One(StandardJson::Number(n)) => {
                 assert_eq!(n.as_i64().unwrap(), 1);
             }
+        );
+    }
+
+    // Phase 2 tests: Arithmetic, Comparison, Boolean operators
+
+    #[test]
+    fn test_arithmetic_add() {
+        // Number addition
+        query!(br#"{"a": 10, "b": 5}"#, ".a + .b",
+            QueryResult::Owned(OwnedValue::Int(15)) => {}
+        );
+
+        // Float addition
+        query!(br#"{"a": 1.5, "b": 2.5}"#, ".a + .b",
+            QueryResult::Owned(OwnedValue::Float(f)) if (f - 4.0).abs() < 0.001 => {}
+        );
+
+        // String concatenation
+        query!(br#"{"a": "hello", "b": " world"}"#, ".a + .b",
+            QueryResult::Owned(OwnedValue::String(s)) if s == "hello world" => {}
+        );
+
+        // Array concatenation
+        query!(br#"{"a": [1, 2], "b": [3, 4]}"#, ".a + .b",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 4);
+            }
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_sub() {
+        query!(br#"{"a": 10, "b": 3}"#, ".a - .b",
+            QueryResult::Owned(OwnedValue::Int(7)) => {}
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_mul() {
+        query!(br#"{"a": 6, "b": 7}"#, ".a * .b",
+            QueryResult::Owned(OwnedValue::Int(42)) => {}
+        );
+
+        // String repetition
+        query!(br#"{"s": "ab", "n": 3}"#, ".s * .n",
+            QueryResult::Owned(OwnedValue::String(s)) if s == "ababab" => {}
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_div() {
+        query!(br#"{"a": 10, "b": 4}"#, ".a / .b",
+            QueryResult::Owned(OwnedValue::Float(f)) if (f - 2.5).abs() < 0.001 => {}
+        );
+
+        // String split
+        query!(br#"{"s": "a,b,c", "sep": ","}"#, ".s / .sep",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+            }
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_mod() {
+        query!(br#"{"a": 10, "b": 3}"#, ".a % .b",
+            QueryResult::Owned(OwnedValue::Int(1)) => {}
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_precedence() {
+        // 2 + 3 * 4 = 2 + 12 = 14
+        query!(br#"{}"#, "2 + 3 * 4",
+            QueryResult::Owned(OwnedValue::Int(14)) => {}
+        );
+
+        // (2 + 3) * 4 = 5 * 4 = 20
+        query!(br#"{}"#, "(2 + 3) * 4",
+            QueryResult::Owned(OwnedValue::Int(20)) => {}
+        );
+    }
+
+    #[test]
+    fn test_comparison_eq() {
+        query!(br#"{"a": 1, "b": 1}"#, ".a == .b",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+
+        query!(br#"{"a": 1, "b": 2}"#, ".a == .b",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+
+        query!(br#"{"a": "foo", "b": "foo"}"#, ".a == .b",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    #[test]
+    fn test_comparison_ne() {
+        query!(br#"{"a": 1, "b": 2}"#, ".a != .b",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    #[test]
+    fn test_comparison_lt() {
+        query!(br#"{"a": 1, "b": 2}"#, ".a < .b",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+
+        query!(br#"{"a": 2, "b": 1}"#, ".a < .b",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+    }
+
+    #[test]
+    fn test_comparison_le() {
+        query!(br#"{"a": 1, "b": 1}"#, ".a <= .b",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    #[test]
+    fn test_comparison_gt() {
+        query!(br#"{"a": 2, "b": 1}"#, ".a > .b",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    #[test]
+    fn test_comparison_ge() {
+        query!(br#"{"a": 2, "b": 2}"#, ".a >= .b",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    #[test]
+    fn test_boolean_and() {
+        query!(br#"{"a": true, "b": true}"#, ".a and .b",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+
+        query!(br#"{"a": true, "b": false}"#, ".a and .b",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+
+        // Short-circuit: if first is falsy, second is not evaluated
+        query!(br#"{"a": false}"#, ".a and .nonexistent",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+    }
+
+    #[test]
+    fn test_boolean_or() {
+        query!(br#"{"a": false, "b": true}"#, ".a or .b",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+
+        query!(br#"{"a": false, "b": false}"#, ".a or .b",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+
+        // Short-circuit: if first is truthy, second is not evaluated
+        query!(br#"{"a": true}"#, ".a or .nonexistent",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    #[test]
+    fn test_boolean_not() {
+        query!(br#"true"#, ". | not",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+
+        query!(br#"false"#, ". | not",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+
+        query!(br#"null"#, ". | not",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+
+        // Numbers are truthy
+        query!(br#"0"#, ". | not",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+    }
+
+    #[test]
+    fn test_alternative() {
+        // Truthy value is returned
+        query!(br#"{"a": 1}"#, ".a // 0",
+            QueryResult::One(StandardJson::Number(n)) => {
+                assert_eq!(n.as_i64().unwrap(), 1);
+            }
+        );
+
+        // Falsy value (null) uses alternative
+        query!(br#"{"a": null}"#, ".a // 0",
+            QueryResult::Owned(OwnedValue::Int(0)) => {}
+        );
+
+        // Missing value uses alternative
+        query!(br#"{}"#, ".missing? // \"default\"",
+            QueryResult::Owned(OwnedValue::String(s)) if s == "default" => {}
+        );
+
+        // Chain alternatives
+        query!(br#"{"a": null, "b": null}"#, ".a // .b // 42",
+            QueryResult::Owned(OwnedValue::Int(42)) => {}
+        );
+    }
+
+    #[test]
+    fn test_complex_expressions() {
+        // Comparison with arithmetic
+        query!(br#"{"x": 10}"#, ".x > 5 and .x < 20",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+
+        // Alternative with comparison
+        query!(br#"{"val": 3}"#, ".val > 0 // false",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
     }
 }

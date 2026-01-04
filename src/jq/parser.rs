@@ -28,7 +28,7 @@ use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
-use super::expr::{Expr, Literal, ObjectEntry, ObjectKey};
+use super::expr::{ArithOp, CompareOp, Expr, Literal, ObjectEntry, ObjectKey};
 
 /// Error that occurs during parsing.
 #[derive(Debug, Clone, PartialEq)]
@@ -654,7 +654,7 @@ impl<'a> Parser<'a> {
                 self.parse_postfix(expr)
             }
 
-            // Keywords: null, true, false
+            // Keywords: null, true, false, not
             Some(c) if c.is_alphabetic() => {
                 if self.matches_keyword("null") {
                     self.consume_keyword("null");
@@ -665,9 +665,12 @@ impl<'a> Parser<'a> {
                 } else if self.matches_keyword("false") {
                     self.consume_keyword("false");
                     Ok(Expr::Literal(Literal::Bool(false)))
+                } else if self.matches_keyword("not") {
+                    self.consume_keyword("not");
+                    Ok(Expr::Not)
                 } else {
                     Err(ParseError::new(
-                        format!("unexpected identifier, expected expression"),
+                        "unexpected identifier, expected expression",
                         self.pos,
                     ))
                 }
@@ -681,12 +684,23 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Check if current character is an expression terminator.
+    /// Check if current character is an expression terminator (ends a primary expression).
+    /// This includes structural characters and infix operators.
     fn is_expr_terminator(&self) -> bool {
-        matches!(
-            self.peek(),
-            Some(',') | Some(')') | Some(']') | Some('}') | Some('|') | Some(':') | Some(';')
-        )
+        match self.peek() {
+            // Structural terminators
+            Some(',') | Some(')') | Some(']') | Some('}') | Some('|') | Some(':') | Some(';') => {
+                true
+            }
+            // Arithmetic operators
+            Some('+') | Some('-') | Some('*') | Some('/') | Some('%') => true,
+            // Comparison operators
+            Some('=') | Some('!') | Some('<') | Some('>') => true,
+            // Keywords that follow expressions
+            Some('a') if self.matches_keyword("and") => true,
+            Some('o') if self.matches_keyword("or") => true,
+            _ => false,
+        }
     }
 
     /// Parse postfix operations (field access, indexing) after a primary expression.
@@ -735,9 +749,158 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
+    /// Parse multiplicative expressions: `expr * expr`, `expr / expr`, `expr % expr`
+    fn parse_multiplicative(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_primary()?;
+
+        loop {
+            self.skip_ws();
+            let op = match self.peek() {
+                Some('*') => ArithOp::Mul,
+                Some('/') => {
+                    // Check it's not `//` (alternative operator)
+                    if self.peek_str(2) == "//" {
+                        break;
+                    }
+                    ArithOp::Div
+                }
+                Some('%') => ArithOp::Mod,
+                _ => break,
+            };
+            self.next();
+            self.skip_ws();
+            let right = self.parse_primary()?;
+            left = Expr::Arithmetic {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
+    }
+
+    /// Parse additive expressions: `expr + expr`, `expr - expr`
+    fn parse_additive(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_multiplicative()?;
+
+        loop {
+            self.skip_ws();
+            let op = match self.peek() {
+                Some('+') => ArithOp::Add,
+                Some('-') => {
+                    // Make sure it's not a negative number (handled in primary)
+                    ArithOp::Sub
+                }
+                _ => break,
+            };
+            self.next();
+            self.skip_ws();
+            let right = self.parse_multiplicative()?;
+            left = Expr::Arithmetic {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
+    }
+
+    /// Parse comparison expressions: `==`, `!=`, `<`, `<=`, `>`, `>=`
+    fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
+        let left = self.parse_additive()?;
+        self.skip_ws();
+
+        let op = match self.peek_str(2) {
+            "==" => CompareOp::Eq,
+            "!=" => CompareOp::Ne,
+            "<=" => CompareOp::Le,
+            ">=" => CompareOp::Ge,
+            s if s.starts_with('<') => CompareOp::Lt,
+            s if s.starts_with('>') => CompareOp::Gt,
+            _ => return Ok(left),
+        };
+
+        // Consume the operator
+        match op {
+            CompareOp::Eq | CompareOp::Ne | CompareOp::Le | CompareOp::Ge => {
+                self.next();
+                self.next();
+            }
+            CompareOp::Lt | CompareOp::Gt => {
+                self.next();
+            }
+        }
+
+        self.skip_ws();
+        let right = self.parse_additive()?;
+
+        Ok(Expr::Compare {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    }
+
+    /// Parse `and` expressions: `expr and expr`
+    fn parse_and(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_comparison()?;
+
+        loop {
+            self.skip_ws();
+            if !self.matches_keyword("and") {
+                break;
+            }
+            self.consume_keyword("and");
+            self.skip_ws();
+            let right = self.parse_comparison()?;
+            left = Expr::And(Box::new(left), Box::new(right));
+        }
+
+        Ok(left)
+    }
+
+    /// Parse `or` expressions: `expr or expr`
+    fn parse_or(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_and()?;
+
+        loop {
+            self.skip_ws();
+            if !self.matches_keyword("or") {
+                break;
+            }
+            self.consume_keyword("or");
+            self.skip_ws();
+            let right = self.parse_and()?;
+            left = Expr::Or(Box::new(left), Box::new(right));
+        }
+
+        Ok(left)
+    }
+
+    /// Parse alternative expressions: `expr // expr`
+    fn parse_alternative(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_or()?;
+
+        loop {
+            self.skip_ws();
+            if self.peek_str(2) != "//" {
+                break;
+            }
+            self.next();
+            self.next();
+            self.skip_ws();
+            let right = self.parse_or()?;
+            left = Expr::Alternative(Box::new(left), Box::new(right));
+        }
+
+        Ok(left)
+    }
+
     /// Parse a pipe expression: `expr | expr | ...`
     fn parse_pipe_expr(&mut self) -> Result<Expr, ParseError> {
-        let first = self.parse_primary()?;
+        let first = self.parse_alternative()?;
         self.skip_ws();
 
         if self.peek() != Some('|') {
@@ -749,7 +912,7 @@ impl<'a> Parser<'a> {
         while self.peek() == Some('|') {
             self.next();
             self.skip_ws();
-            exprs.push(self.parse_primary()?);
+            exprs.push(self.parse_alternative()?);
             self.skip_ws();
         }
 
@@ -1072,5 +1235,204 @@ mod tests {
         assert!(parse("{").is_err()); // unclosed brace
         assert!(parse("[").is_err()); // unclosed bracket
         assert!(parse("\"unterminated").is_err()); // unterminated string
+    }
+
+    #[test]
+    fn test_arithmetic() {
+        // Addition
+        let expr = parse(".a + .b").unwrap();
+        assert!(matches!(
+            expr,
+            Expr::Arithmetic {
+                op: ArithOp::Add,
+                ..
+            }
+        ));
+
+        // Subtraction
+        let expr = parse(".a - .b").unwrap();
+        assert!(matches!(
+            expr,
+            Expr::Arithmetic {
+                op: ArithOp::Sub,
+                ..
+            }
+        ));
+
+        // Multiplication
+        let expr = parse(".a * .b").unwrap();
+        assert!(matches!(
+            expr,
+            Expr::Arithmetic {
+                op: ArithOp::Mul,
+                ..
+            }
+        ));
+
+        // Division
+        let expr = parse(".a / .b").unwrap();
+        assert!(matches!(
+            expr,
+            Expr::Arithmetic {
+                op: ArithOp::Div,
+                ..
+            }
+        ));
+
+        // Modulo
+        let expr = parse(".a % .b").unwrap();
+        assert!(matches!(
+            expr,
+            Expr::Arithmetic {
+                op: ArithOp::Mod,
+                ..
+            }
+        ));
+
+        // Operator precedence: * before +
+        let expr = parse(".a + .b * .c").unwrap();
+        match expr {
+            Expr::Arithmetic {
+                op: ArithOp::Add,
+                right,
+                ..
+            } => {
+                assert!(matches!(
+                    *right,
+                    Expr::Arithmetic {
+                        op: ArithOp::Mul,
+                        ..
+                    }
+                ));
+            }
+            _ => panic!("expected Add with Mul on right"),
+        }
+
+        // Literals
+        let expr = parse("1 + 2").unwrap();
+        assert!(matches!(
+            expr,
+            Expr::Arithmetic {
+                op: ArithOp::Add,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_comparison() {
+        // Equality
+        let expr = parse(".a == .b").unwrap();
+        assert!(matches!(
+            expr,
+            Expr::Compare {
+                op: CompareOp::Eq,
+                ..
+            }
+        ));
+
+        // Inequality
+        let expr = parse(".a != .b").unwrap();
+        assert!(matches!(
+            expr,
+            Expr::Compare {
+                op: CompareOp::Ne,
+                ..
+            }
+        ));
+
+        // Less than
+        let expr = parse(".a < .b").unwrap();
+        assert!(matches!(
+            expr,
+            Expr::Compare {
+                op: CompareOp::Lt,
+                ..
+            }
+        ));
+
+        // Less than or equal
+        let expr = parse(".a <= .b").unwrap();
+        assert!(matches!(
+            expr,
+            Expr::Compare {
+                op: CompareOp::Le,
+                ..
+            }
+        ));
+
+        // Greater than
+        let expr = parse(".a > .b").unwrap();
+        assert!(matches!(
+            expr,
+            Expr::Compare {
+                op: CompareOp::Gt,
+                ..
+            }
+        ));
+
+        // Greater than or equal
+        let expr = parse(".a >= .b").unwrap();
+        assert!(matches!(
+            expr,
+            Expr::Compare {
+                op: CompareOp::Ge,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_boolean_operators() {
+        // AND
+        let expr = parse(".a and .b").unwrap();
+        assert!(matches!(expr, Expr::And(_, _)));
+
+        // OR
+        let expr = parse(".a or .b").unwrap();
+        assert!(matches!(expr, Expr::Or(_, _)));
+
+        // NOT
+        let expr = parse("not").unwrap();
+        assert!(matches!(expr, Expr::Not));
+
+        // Chained: and before or
+        let expr = parse(".a or .b and .c").unwrap();
+        match expr {
+            Expr::Or(_, right) => {
+                assert!(matches!(*right, Expr::And(_, _)));
+            }
+            _ => panic!("expected Or with And on right"),
+        }
+    }
+
+    #[test]
+    fn test_alternative() {
+        let expr = parse(".foo // \"default\"").unwrap();
+        assert!(matches!(expr, Expr::Alternative(_, _)));
+
+        // Chained alternatives
+        let expr = parse(".a // .b // .c").unwrap();
+        match expr {
+            Expr::Alternative(left, _) => {
+                assert!(matches!(*left, Expr::Alternative(_, _)));
+            }
+            _ => panic!("expected nested Alternative"),
+        }
+    }
+
+    #[test]
+    fn test_mixed_operators() {
+        // Complex expression: comparison in alternative
+        let expr = parse(".a > 0 // false").unwrap();
+        assert!(matches!(expr, Expr::Alternative(_, _)));
+
+        // Pipe with operators
+        let expr = parse(".a | . + 1").unwrap();
+        assert!(matches!(expr, Expr::Pipe(_)));
+
+        // Boolean with comparison
+        let expr = parse(".a > 0 and .b < 10").unwrap();
+        assert!(matches!(expr, Expr::And(_, _)));
     }
 }
