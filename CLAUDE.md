@@ -68,6 +68,7 @@ cargo test --test simd_level_tests
 # Run benchmarks for specific operation
 cargo bench rank_select
 cargo bench json_simd
+cargo bench balanced_parens
 ```
 
 ### CLI Tool
@@ -120,13 +121,22 @@ cargo build --release --features cli
   - L0: 2 bytes per word (min_excess + cum_excess)
   - L1: 4 bytes per 32 words
   - L2: 4 bytes per 1024 words
-- State machine-based find_close/find_open for O(1) amortized operations
-- Tree operations: `find_close`, `find_open`, `enclose`, `first_child`, `next_sibling`, `depth`, `subtree_size`
+- State machine-based `find_close` for O(1) operations via hierarchical search
+- Tree operations: `find_close`, `find_open`, `enclose`, `first_child`, `next_sibling`, `parent`, `excess`
 
 **BP Operations**
-- `find_close_in_word(word, p)`: Word-level matching using linear scan
-- `find_close(words, len, p)`: Vector-level linear scan (fallback/testing)
-- `BalancedParens::find_close(p)`: Accelerated using RangeMin state machine
+- `find_unmatched_close_in_word(x)`: Find first unmatched `)` in a word (linear scan)
+- `find_close_in_word(word, p)`: Word-level matching for `(` at position `p`
+- `find_close(words, len, p)`: Vector-level linear scan (O(n), used by `find_open`/`enclose`)
+- `find_open(words, len, p)`: Find matching `(` for `)` at position `p` (linear scan backwards)
+- `enclose(words, len, p)`: Find enclosing `(` (parent node)
+- `BalancedParens::find_close(p)`: Accelerated O(1) using RangeMin state machine
+- `BalancedParens::find_open(p)`: Currently uses linear scan (acceleration TODO)
+
+**BP Performance** (from benchmarks)
+- RangeMin `find_close` is ~40x faster than linear scan for 1M-node trees
+- Construction overhead: ~22µs for 10K nodes, ~220µs for 100K nodes
+- Deep nesting (worst case): RangeMin ~450ns vs linear ~17µs
 
 ### JSON Semi-Indexing
 
@@ -194,9 +204,10 @@ cargo build --release --features cli
 - Test edge cases: empty, single bit, partial words, word boundaries, block boundaries
 - Comprehensive coverage of all operations
 
-**Property tests**: [tests/property_tests.rs](tests/property_tests.rs), [tests/properties.rs](tests/properties.rs)
+**Property tests**: [tests/property_tests.rs](tests/property_tests.rs), [tests/properties.rs](tests/properties.rs), [tests/bp_properties.rs](tests/bp_properties.rs)
 - Uses `proptest` for randomized testing
 - Verifies rank/select consistency, BP operations correctness
+- BP tests verify: roundtrip invariants, RangeMin matches linear scan, tree navigation consistency
 
 **Integration tests**:
 - [tests/json_indexing_tests.rs](tests/json_indexing_tests.rs): JSON parsing
