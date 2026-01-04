@@ -65,8 +65,23 @@ pub struct JsonIndex<W = Vec<u64>> {
     ib: W,
     /// Number of valid bits in IB
     ib_len: usize,
+    /// Cumulative popcount per word (for fast rank/select on IB)
+    ib_rank: Vec<u32>,
     /// Balanced parentheses - encodes the JSON structure as a tree
     bp: BalancedParens<W>,
+}
+
+/// Build cumulative popcount index for IB.
+/// Returns a vector where entry i = total 1-bits in words [0, i).
+fn build_ib_rank(words: &[u64]) -> Vec<u32> {
+    let mut rank = Vec::with_capacity(words.len() + 1);
+    let mut cumulative: u32 = 0;
+    rank.push(0); // rank[0] = 0 (no words before word 0)
+    for &word in words {
+        cumulative += word.count_ones();
+        rank.push(cumulative);
+    }
+    rank
 }
 
 impl JsonIndex<Vec<u64>> {
@@ -89,9 +104,13 @@ impl JsonIndex<Vec<u64>> {
         // Count actual BP bits
         let bp_bit_count = count_bp_bits(&semi.bp);
 
+        // Build cumulative popcount index for IB
+        let ib_rank = build_ib_rank(&semi.ib);
+
         Self {
             ib: semi.ib,
             ib_len,
+            ib_rank,
             bp: BalancedParens::new(semi.bp, bp_bit_count),
         }
     }
@@ -109,9 +128,13 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     /// * `bp` - Balanced parentheses data
     /// * `bp_len` - Number of valid bits in BP
     pub fn from_parts(ib: W, ib_len: usize, bp: W, bp_len: usize) -> Self {
+        // Build cumulative popcount index for IB
+        let ib_rank = build_ib_rank(ib.as_ref());
+
         Self {
             ib,
             ib_len,
+            ib_rank,
             bp: BalancedParens::from_words(bp, bp_len),
         }
     }
@@ -149,29 +172,51 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     }
 
     /// Perform select1 on the IB (find position of k-th 1-bit).
+    ///
+    /// Uses binary search on the cumulative popcount index for O(log n) performance.
     fn ib_select1(&self, k: usize) -> Option<usize> {
         let words = self.ib.as_ref();
-        let mut remaining = k;
-
-        for (word_idx, &word) in words.iter().enumerate() {
-            let ones = word.count_ones() as usize;
-            if ones > remaining {
-                // Found the target word
-                let bit_pos = select_in_word(word, remaining as u32) as usize;
-                let result = word_idx * 64 + bit_pos;
-                return if result < self.ib_len {
-                    Some(result)
-                } else {
-                    None
-                };
-            }
-            remaining -= ones;
+        if words.is_empty() {
+            return None;
         }
 
-        None
+        // Binary search to find the word containing the k-th 1-bit
+        // ib_rank[i] = total 1-bits in words [0, i)
+        // We want the smallest i such that ib_rank[i+1] > k
+        let k32 = k as u32;
+
+        // Binary search: find first word where cumulative count exceeds k
+        let mut lo = 0usize;
+        let mut hi = words.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.ib_rank[mid + 1] <= k32 {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        if lo >= words.len() {
+            return None;
+        }
+
+        // Now lo is the word index, and ib_rank[lo] is count before this word
+        let remaining = k - self.ib_rank[lo] as usize;
+        let word = words[lo];
+        let bit_pos = select_in_word(word, remaining as u32) as usize;
+        let result = lo * 64 + bit_pos;
+
+        if result < self.ib_len {
+            Some(result)
+        } else {
+            None
+        }
     }
 
     /// Perform rank1 on the IB (count 1-bits in [0, pos)).
+    ///
+    /// Uses cumulative popcount index for O(1) performance.
     #[allow(dead_code)]
     fn ib_rank1(&self, pos: usize) -> usize {
         if pos == 0 {
@@ -182,11 +227,10 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
         let word_idx = pos / 64;
         let bit_idx = pos % 64;
 
-        let mut count = 0usize;
-        for &word in words.iter().take(word_idx) {
-            count += word.count_ones() as usize;
-        }
+        // Use cumulative index for full words
+        let mut count = self.ib_rank[word_idx.min(words.len())] as usize;
 
+        // Add partial word
         if word_idx < words.len() && bit_idx > 0 {
             let mask = (1u64 << bit_idx) - 1;
             count += (words[word_idx] & mask).count_ones() as usize;
@@ -254,23 +298,8 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
         // - IB has one bit set for each structural character/value start
         // - So BP position N corresponds to the N-th set bit in IB
         //
-        // We use rank1 on BP words to find how many opens (1-bits) are before this position
-        let bp = self.index.bp();
-
-        // Count 1-bits in BP up to (but not including) bp_pos
-        // This gives us the index of this node in IB
-        let bp_words = bp.words();
-        let word_idx = self.bp_pos / 64;
-        let bit_idx = self.bp_pos % 64;
-
-        let mut rank = 0usize;
-        for &word in bp_words.iter().take(word_idx) {
-            rank += word.count_ones() as usize;
-        }
-        if word_idx < bp_words.len() && bit_idx > 0 {
-            let mask = (1u64 << bit_idx) - 1;
-            rank += (bp_words[word_idx] & mask).count_ones() as usize;
-        }
+        // Use BP's O(1) rank1 function instead of linear scan
+        let rank = self.index.bp().rank1(self.bp_pos);
 
         // Now select1(rank) in IB gives us the text position
         self.index.ib_select1(rank)
