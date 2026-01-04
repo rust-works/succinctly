@@ -28,7 +28,7 @@ use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
-use super::expr::{ArithOp, CompareOp, Expr, Literal, ObjectEntry, ObjectKey};
+use super::expr::{ArithOp, Builtin, CompareOp, Expr, Literal, ObjectEntry, ObjectKey};
 
 /// Error that occurs during parsing.
 #[derive(Debug, Clone, PartialEq)]
@@ -654,7 +654,7 @@ impl<'a> Parser<'a> {
                 self.parse_postfix(expr)
             }
 
-            // Keywords: null, true, false, not, if, try, error
+            // Keywords: null, true, false, not, if, try, error, builtins
             Some(c) if c.is_alphabetic() => {
                 if self.matches_keyword("null") {
                     self.consume_keyword("null");
@@ -674,6 +674,8 @@ impl<'a> Parser<'a> {
                     self.parse_try_expr()
                 } else if self.matches_keyword("error") {
                     self.parse_error_expr()
+                } else if let Some(builtin) = self.try_parse_builtin()? {
+                    Ok(Expr::Builtin(builtin))
                 } else {
                     Err(ParseError::new(
                         "unexpected identifier, expected expression",
@@ -818,6 +820,169 @@ impl<'a> Parser<'a> {
         };
 
         Ok(Expr::Error(msg))
+    }
+
+    /// Try to parse a builtin function.
+    /// Returns Some(Builtin) if a builtin was parsed, None if not a builtin.
+    fn try_parse_builtin(&mut self) -> Result<Option<Builtin>, ParseError> {
+        // Type functions (no arguments)
+        if self.matches_keyword("type") {
+            self.consume_keyword("type");
+            return Ok(Some(Builtin::Type));
+        }
+        if self.matches_keyword("isnull") {
+            self.consume_keyword("isnull");
+            return Ok(Some(Builtin::IsNull));
+        }
+        if self.matches_keyword("isboolean") {
+            self.consume_keyword("isboolean");
+            return Ok(Some(Builtin::IsBoolean));
+        }
+        if self.matches_keyword("isnumber") {
+            self.consume_keyword("isnumber");
+            return Ok(Some(Builtin::IsNumber));
+        }
+        if self.matches_keyword("isstring") {
+            self.consume_keyword("isstring");
+            return Ok(Some(Builtin::IsString));
+        }
+        if self.matches_keyword("isarray") {
+            self.consume_keyword("isarray");
+            return Ok(Some(Builtin::IsArray));
+        }
+        if self.matches_keyword("isobject") {
+            self.consume_keyword("isobject");
+            return Ok(Some(Builtin::IsObject));
+        }
+
+        // Length & keys (no arguments)
+        if self.matches_keyword("length") {
+            self.consume_keyword("length");
+            return Ok(Some(Builtin::Length));
+        }
+        if self.matches_keyword("utf8bytelength") {
+            self.consume_keyword("utf8bytelength");
+            return Ok(Some(Builtin::Utf8ByteLength));
+        }
+        if self.matches_keyword("keys_unsorted") {
+            // Check keys_unsorted before keys
+            self.consume_keyword("keys_unsorted");
+            return Ok(Some(Builtin::KeysUnsorted));
+        }
+        if self.matches_keyword("keys") {
+            self.consume_keyword("keys");
+            return Ok(Some(Builtin::Keys));
+        }
+
+        // has(expr) - takes an argument
+        if self.matches_keyword("has") {
+            self.consume_keyword("has");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let arg = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Has(Box::new(arg))));
+        }
+
+        // Selection functions
+        if self.matches_keyword("select") {
+            self.consume_keyword("select");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let cond = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Select(Box::new(cond))));
+        }
+        if self.matches_keyword("empty") {
+            self.consume_keyword("empty");
+            return Ok(Some(Builtin::Empty));
+        }
+
+        // Map functions
+        if self.matches_keyword("map_values") {
+            // Check map_values before map
+            self.consume_keyword("map_values");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let f = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::MapValues(Box::new(f))));
+        }
+        if self.matches_keyword("map") {
+            self.consume_keyword("map");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let f = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Map(Box::new(f))));
+        }
+
+        // Reduction functions (no arguments)
+        if self.matches_keyword("add") {
+            self.consume_keyword("add");
+            return Ok(Some(Builtin::Add));
+        }
+        if self.matches_keyword("any") {
+            self.consume_keyword("any");
+            return Ok(Some(Builtin::Any));
+        }
+        if self.matches_keyword("all") {
+            self.consume_keyword("all");
+            return Ok(Some(Builtin::All));
+        }
+        if self.matches_keyword("min_by") {
+            // Check min_by before min
+            self.consume_keyword("min_by");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let f = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::MinBy(Box::new(f))));
+        }
+        if self.matches_keyword("min") {
+            self.consume_keyword("min");
+            return Ok(Some(Builtin::Min));
+        }
+        if self.matches_keyword("max_by") {
+            // Check max_by before max
+            self.consume_keyword("max_by");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let f = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::MaxBy(Box::new(f))));
+        }
+        if self.matches_keyword("max") {
+            self.consume_keyword("max");
+            return Ok(Some(Builtin::Max));
+        }
+
+        // in(obj) - takes an argument (note: "in" is also sometimes used differently in jq)
+        // We parse it with required parentheses
+        if self.matches_keyword("in") {
+            self.consume_keyword("in");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let obj = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::In(Box::new(obj))));
+        }
+
+        Ok(None)
     }
 
     /// Check if current character is an expression terminator (ends a primary expression).

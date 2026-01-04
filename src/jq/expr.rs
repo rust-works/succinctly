@@ -102,6 +102,71 @@ pub enum Expr {
     /// Error raising: `error` or `error("message")`
     /// Raises an error that can be caught by try-catch.
     Error(Option<Box<Expr>>),
+
+    /// Builtin function call: `type`, `length`, `keys`, etc.
+    Builtin(Builtin),
+}
+
+/// Builtin functions supported by jq.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Builtin {
+    // Type functions
+    /// `type` - returns the type name as a string
+    Type,
+    /// `isnull` - returns true if null
+    IsNull,
+    /// `isboolean` - returns true if boolean
+    IsBoolean,
+    /// `isnumber` - returns true if number
+    IsNumber,
+    /// `isstring` - returns true if string
+    IsString,
+    /// `isarray` - returns true if array
+    IsArray,
+    /// `isobject` - returns true if object
+    IsObject,
+
+    // Length & Keys functions
+    /// `length` - string/array/object length
+    Length,
+    /// `utf8bytelength` - byte length of string
+    Utf8ByteLength,
+    /// `keys` - sorted object keys or array indices
+    Keys,
+    /// `keys_unsorted` - object keys in original order
+    KeysUnsorted,
+    /// `has(key)` - check if object/array has key/index
+    Has(Box<Expr>),
+    /// `in(obj)` - check if key exists in object
+    In(Box<Expr>),
+
+    // Selection & Filtering
+    /// `select(condition)` - output input only if condition is truthy
+    Select(Box<Expr>),
+    /// `empty` - output nothing
+    Empty,
+
+    // Map & Iteration
+    /// `map(f)` - apply f to each element: [.[] | f]
+    Map(Box<Expr>),
+    /// `map_values(f)` - apply f to each object value
+    MapValues(Box<Expr>),
+
+    // Reduction
+    /// `add` - sum/concatenate array elements
+    Add,
+    /// `any` - true if any element is truthy
+    Any,
+    /// `all` - true if all elements are truthy
+    All,
+    /// `min` - minimum element
+    Min,
+    /// `max` - maximum element
+    Max,
+    /// `min_by(f)` - minimum element by key
+    MinBy(Box<Expr>),
+    /// `max_by(f)` - maximum element by key
+    MaxBy(Box<Expr>),
 }
 
 /// Arithmetic operators.
@@ -301,6 +366,11 @@ impl Expr {
     /// Create an error expression.
     pub fn error(msg: Option<Expr>) -> Self {
         Expr::Error(msg.map(Box::new))
+    }
+
+    /// Create a builtin function expression.
+    pub fn builtin(b: Builtin) -> Self {
+        Expr::Builtin(b)
     }
 
     /// Returns true if this is the identity expression.
