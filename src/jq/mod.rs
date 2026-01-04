@@ -16,6 +16,14 @@
 //! | `.foo.bar` | Chained field access |
 //! | `.foo[0].bar` | Mixed field and index access |
 //! | `.foo?` | Optional access (null if missing) |
+//! | `.foo, .bar` | Comma - output from both expressions |
+//! | `[.foo, .bar]` | Array construction |
+//! | `{foo: .bar}` | Object construction |
+//! | `(.foo)` | Parentheses for grouping |
+//! | `..` | Recursive descent |
+//! | `null`, `true`, `false` | Literal values |
+//! | `"string"` | String literal |
+//! | `123`, `3.14` | Number literal |
 //!
 //! # Example
 //!
@@ -49,7 +57,9 @@
 mod eval;
 mod expr;
 mod parser;
+mod value;
 
 pub use eval::{EvalError, QueryResult, eval, eval_lenient};
-pub use expr::Expr;
+pub use expr::{Expr, Literal, ObjectEntry, ObjectKey};
 pub use parser::{ParseError, parse};
+pub use value::OwnedValue;

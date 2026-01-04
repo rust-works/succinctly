@@ -517,6 +517,40 @@ fn query_json(args: QueryJson) -> Result<()> {
         jq::QueryResult::Error(e) => {
             anyhow::bail!("Query error: {}", e);
         }
+        jq::QueryResult::Owned(value) => {
+            writeln!(out, "{}", value.to_json())?;
+        }
+        jq::QueryResult::ManyOwned(values) => match args.format {
+            OutputFormat::Json => {
+                if args.compact {
+                    out.write_all(b"[")?;
+                    for (i, value) in values.iter().enumerate() {
+                        if i > 0 {
+                            out.write_all(b",")?;
+                        }
+                        out.write_all(value.to_json().as_bytes())?;
+                    }
+                    writeln!(out, "]")?;
+                } else {
+                    writeln!(out, "[")?;
+                    for (i, value) in values.iter().enumerate() {
+                        out.write_all(b"  ")?;
+                        out.write_all(value.to_json().as_bytes())?;
+                        if i < values.len() - 1 {
+                            writeln!(out, ",")?;
+                        } else {
+                            writeln!(out)?;
+                        }
+                    }
+                    writeln!(out, "]")?;
+                }
+            }
+            OutputFormat::Lines => {
+                for value in values.iter() {
+                    writeln!(out, "{}", value.to_json())?;
+                }
+            }
+        },
     }
 
     out.flush()?;

@@ -8,15 +8,27 @@
 //! - `.[2:5]` - slice
 //! - `.foo.bar` - chained access
 //! - `.foo?` - optional (returns null if missing)
+//! - `.foo, .bar` - comma (multiple outputs)
+//! - `[.foo, .bar]` - array construction
+//! - `{foo: .bar}` - object construction
+//! - `(.foo)` - parentheses for grouping
+//! - `..` - recursive descent
+//! - `null`, `true`, `false` - literals
+//! - `"string"` - string literals
+//! - `123`, `3.14` - number literals
 
+#[cfg(not(test))]
+use alloc::boxed::Box;
 #[cfg(not(test))]
 use alloc::format;
 #[cfg(not(test))]
 use alloc::string::{String, ToString};
 #[cfg(not(test))]
 use alloc::vec;
+#[cfg(not(test))]
+use alloc::vec::Vec;
 
-use super::expr::Expr;
+use super::expr::{Expr, Literal, ObjectEntry, ObjectKey};
 
 /// Error that occurs during parsing.
 #[derive(Debug, Clone, PartialEq)]
@@ -58,6 +70,12 @@ impl<'a> Parser<'a> {
     /// Peek at the current character without consuming it.
     fn peek(&self) -> Option<char> {
         self.input[self.pos..].chars().next()
+    }
+
+    /// Peek at the next n characters.
+    fn peek_str(&self, n: usize) -> &str {
+        let end = (self.pos + n).min(self.input.len());
+        &self.input[self.pos..end]
     }
 
     /// Consume and return the current character.
@@ -102,7 +120,26 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse an identifier (field name).
+    /// Check if current position matches a keyword (followed by non-ident char).
+    fn matches_keyword(&self, keyword: &str) -> bool {
+        if !self.input[self.pos..].starts_with(keyword) {
+            return false;
+        }
+        // Check that keyword is not followed by alphanumeric or underscore
+        let after = self.pos + keyword.len();
+        if after >= self.input.len() {
+            return true;
+        }
+        let next_char = self.input[after..].chars().next();
+        !matches!(next_char, Some(c) if c.is_alphanumeric() || c == '_')
+    }
+
+    /// Consume a keyword.
+    fn consume_keyword(&mut self, keyword: &str) {
+        self.pos += keyword.len();
+    }
+
+    /// Parse an identifier (field name or keyword).
     fn parse_ident(&mut self) -> Result<String, ParseError> {
         let start = self.pos;
 
@@ -137,8 +174,89 @@ impl<'a> Parser<'a> {
         Ok(self.input[start..self.pos].to_string())
     }
 
-    /// Parse a number (positive or negative integer).
-    fn parse_number(&mut self) -> Result<i64, ParseError> {
+    /// Parse a number literal (integer or float).
+    fn parse_number_literal(&mut self) -> Result<Literal, ParseError> {
+        let start = self.pos;
+
+        // Optional negative sign
+        if self.peek() == Some('-') {
+            self.next();
+        }
+
+        // Must have at least one digit
+        match self.peek() {
+            Some(c) if c.is_ascii_digit() => {
+                self.next();
+            }
+            _ => {
+                return Err(ParseError::new("expected digit", self.pos));
+            }
+        }
+
+        // Consume remaining digits
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() {
+                self.next();
+            } else {
+                break;
+            }
+        }
+
+        // Check for decimal point
+        let mut is_float = false;
+        if self.peek() == Some('.') {
+            // Look ahead to ensure it's not `..` (recursive descent)
+            if self.peek_str(2) != ".." {
+                self.next(); // consume the dot
+                is_float = true;
+
+                // Consume fractional digits
+                while let Some(c) = self.peek() {
+                    if c.is_ascii_digit() {
+                        self.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Check for exponent
+        if matches!(self.peek(), Some('e') | Some('E')) {
+            self.next();
+            is_float = true;
+
+            // Optional sign
+            if matches!(self.peek(), Some('+') | Some('-')) {
+                self.next();
+            }
+
+            // Exponent digits
+            while let Some(c) = self.peek() {
+                if c.is_ascii_digit() {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let num_str = &self.input[start..self.pos];
+        if is_float {
+            num_str
+                .parse::<f64>()
+                .map(Literal::Float)
+                .map_err(|_| ParseError::new("invalid number", start))
+        } else {
+            num_str
+                .parse::<i64>()
+                .map(Literal::Int)
+                .map_err(|_| ParseError::new("invalid number", start))
+        }
+    }
+
+    /// Parse an integer (for array indices).
+    fn parse_integer(&mut self) -> Result<i64, ParseError> {
         let start = self.pos;
 
         // Optional negative sign
@@ -170,8 +288,104 @@ impl<'a> Parser<'a> {
             .map_err(|_| ParseError::new("invalid number", start))
     }
 
+    /// Parse a string literal.
+    fn parse_string_literal(&mut self) -> Result<String, ParseError> {
+        self.expect('"')?;
+        let mut result = String::new();
+
+        loop {
+            match self.peek() {
+                None => {
+                    return Err(ParseError::new("unterminated string", self.pos));
+                }
+                Some('"') => {
+                    self.next();
+                    break;
+                }
+                Some('\\') => {
+                    self.next();
+                    match self.peek() {
+                        Some('"') => {
+                            self.next();
+                            result.push('"');
+                        }
+                        Some('\\') => {
+                            self.next();
+                            result.push('\\');
+                        }
+                        Some('/') => {
+                            self.next();
+                            result.push('/');
+                        }
+                        Some('n') => {
+                            self.next();
+                            result.push('\n');
+                        }
+                        Some('r') => {
+                            self.next();
+                            result.push('\r');
+                        }
+                        Some('t') => {
+                            self.next();
+                            result.push('\t');
+                        }
+                        Some('b') => {
+                            self.next();
+                            result.push('\x08');
+                        }
+                        Some('f') => {
+                            self.next();
+                            result.push('\x0C');
+                        }
+                        Some('u') => {
+                            self.next();
+                            // Parse 4 hex digits
+                            let mut hex = String::new();
+                            for _ in 0..4 {
+                                match self.peek() {
+                                    Some(c) if c.is_ascii_hexdigit() => {
+                                        hex.push(c);
+                                        self.next();
+                                    }
+                                    _ => {
+                                        return Err(ParseError::new(
+                                            "invalid unicode escape",
+                                            self.pos,
+                                        ));
+                                    }
+                                }
+                            }
+                            let code = u32::from_str_radix(&hex, 16)
+                                .map_err(|_| ParseError::new("invalid unicode escape", self.pos))?;
+                            let c = char::from_u32(code).ok_or_else(|| {
+                                ParseError::new("invalid unicode code point", self.pos)
+                            })?;
+                            result.push(c);
+                        }
+                        Some(c) => {
+                            return Err(ParseError::new(
+                                format!("invalid escape sequence '\\{}'", c),
+                                self.pos,
+                            ));
+                        }
+                        None => {
+                            return Err(ParseError::new("unterminated string", self.pos));
+                        }
+                    }
+                }
+                Some(c) => {
+                    self.next();
+                    result.push(c);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Parse a bracket expression: `[0]`, `[]`, `[1:3]`, etc.
-    fn parse_bracket(&mut self) -> Result<Expr, ParseError> {
+    /// This is for indexing, NOT array construction.
+    fn parse_index_bracket(&mut self) -> Result<Expr, ParseError> {
         self.expect('[')?;
         self.skip_ws();
 
@@ -193,7 +407,7 @@ impl<'a> Parser<'a> {
             }
 
             // `[:n]` - slice from start to n
-            let end = self.parse_number()?;
+            let end = self.parse_integer()?;
             self.skip_ws();
             self.expect(']')?;
             return Ok(Expr::Slice {
@@ -203,7 +417,7 @@ impl<'a> Parser<'a> {
         }
 
         // Parse first number
-        let first = self.parse_number()?;
+        let first = self.parse_integer()?;
         self.skip_ws();
 
         match self.peek() {
@@ -226,7 +440,7 @@ impl<'a> Parser<'a> {
                     })
                 } else {
                     // `[n:m]` - slice from n to m
-                    let second = self.parse_number()?;
+                    let second = self.parse_integer()?;
                     self.skip_ws();
                     self.expect(']')?;
                     Ok(Expr::Slice {
@@ -246,9 +460,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a bracket expression and check for optional marker.
-    fn parse_bracket_with_optional(&mut self) -> Result<Expr, ParseError> {
-        let expr = self.parse_bracket()?;
+    /// Parse an index bracket and check for optional marker.
+    fn parse_index_bracket_with_optional(&mut self) -> Result<Expr, ParseError> {
+        let expr = self.parse_index_bracket()?;
         self.skip_ws();
         if self.peek() == Some('?') {
             self.next();
@@ -258,64 +472,226 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a single term (field, bracket, or identity).
-    fn parse_term(&mut self) -> Result<Expr, ParseError> {
+    /// Parse array construction: `[expr]` or `[expr, expr, ...]`
+    fn parse_array_construction(&mut self) -> Result<Expr, ParseError> {
+        self.expect('[')?;
         self.skip_ws();
 
-        let expr = match self.peek() {
-            Some('[') => return self.parse_bracket_with_optional(),
-            Some(c) if c.is_alphabetic() || c == '_' => {
+        // Empty array
+        if self.peek() == Some(']') {
+            self.next();
+            // Empty array is constructed from identity with no iteration
+            return Ok(Expr::Array(Box::new(Expr::Comma(vec![]))));
+        }
+
+        // Parse the inner expression (which may be a comma expression)
+        let inner = self.parse_comma_expr()?;
+        self.skip_ws();
+        self.expect(']')?;
+
+        Ok(Expr::Array(Box::new(inner)))
+    }
+
+    /// Parse object construction: `{key: value, ...}`
+    fn parse_object_construction(&mut self) -> Result<Expr, ParseError> {
+        self.expect('{')?;
+        self.skip_ws();
+
+        let mut entries = Vec::new();
+
+        // Empty object
+        if self.peek() == Some('}') {
+            self.next();
+            return Ok(Expr::Object(entries));
+        }
+
+        loop {
+            self.skip_ws();
+
+            // Parse key
+            let key = if self.peek() == Some('(') {
+                // Dynamic key: (expr)
+                self.next();
+                let key_expr = self.parse_comma_expr()?;
+                self.expect(')')?;
+                ObjectKey::Expr(Box::new(key_expr))
+            } else if self.peek() == Some('"') {
+                // String key
+                let s = self.parse_string_literal()?;
+                ObjectKey::Literal(s)
+            } else {
+                // Identifier key
                 let name = self.parse_ident()?;
-                Expr::Field(name)
-            }
-            Some(c) => {
-                return Err(ParseError::new(
-                    format!("unexpected character '{}'", c),
-                    self.pos,
-                ));
-            }
-            None => {
-                return Err(ParseError::new("unexpected end of input", self.pos));
-            }
-        };
+                ObjectKey::Literal(name)
+            };
 
-        // Check for optional marker
+            self.skip_ws();
+
+            // Check for shorthand: `{foo}` means `{foo: .foo}`
+            let value = if self.peek() == Some(':') {
+                self.next();
+                self.skip_ws();
+                self.parse_pipe_expr()?
+            } else {
+                // Shorthand: key must be literal identifier
+                match &key {
+                    ObjectKey::Literal(name) => Expr::Field(name.clone()),
+                    ObjectKey::Expr(_) => {
+                        return Err(ParseError::new(
+                            "dynamic key requires explicit value",
+                            self.pos,
+                        ));
+                    }
+                }
+            };
+
+            entries.push(ObjectEntry { key, value });
+
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.next();
+                    continue;
+                }
+                Some('}') => {
+                    self.next();
+                    break;
+                }
+                Some(c) => {
+                    return Err(ParseError::new(
+                        format!("expected ',' or '}}', found '{}'", c),
+                        self.pos,
+                    ));
+                }
+                None => {
+                    return Err(ParseError::new(
+                        "expected ',' or '}', found end of input",
+                        self.pos,
+                    ));
+                }
+            }
+        }
+
+        Ok(Expr::Object(entries))
+    }
+
+    /// Parse a primary expression (atoms and parenthesized expressions).
+    fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         self.skip_ws();
-        if self.peek() == Some('?') {
-            self.next();
-            Ok(Expr::Optional(expr.into()))
-        } else {
-            Ok(expr)
+
+        match self.peek() {
+            // Parenthesized expression
+            Some('(') => {
+                self.next();
+                let expr = self.parse_comma_expr()?;
+                self.expect(')')?;
+                let paren = Expr::Paren(Box::new(expr));
+                // Check for postfix operations after parentheses
+                self.parse_postfix(paren)
+            }
+
+            // Array construction
+            Some('[') => self.parse_array_construction(),
+
+            // Object construction
+            Some('{') => self.parse_object_construction(),
+
+            // String literal
+            Some('"') => {
+                let s = self.parse_string_literal()?;
+                Ok(Expr::Literal(Literal::String(s)))
+            }
+
+            // Number literal (starts with digit or negative sign followed by digit)
+            Some(c) if c.is_ascii_digit() => {
+                let lit = self.parse_number_literal()?;
+                Ok(Expr::Literal(lit))
+            }
+            Some('-')
+                if self
+                    .peek_str(2)
+                    .chars()
+                    .nth(1)
+                    .is_some_and(|c| c.is_ascii_digit()) =>
+            {
+                let lit = self.parse_number_literal()?;
+                Ok(Expr::Literal(lit))
+            }
+
+            // Dot-based expressions
+            Some('.') => {
+                self.next();
+                self.skip_ws();
+
+                // Check for `..` (recursive descent)
+                if self.peek() == Some('.') {
+                    self.next();
+                    return Ok(Expr::RecursiveDescent);
+                }
+
+                // Check for `.[...]` (index/iterate)
+                if self.peek() == Some('[') {
+                    let first = self.parse_index_bracket_with_optional()?;
+                    return self.parse_postfix(first);
+                }
+
+                // Check for identity (just `.`)
+                if self.is_eof() || self.is_expr_terminator() {
+                    return Ok(Expr::Identity);
+                }
+
+                // Field access `.foo`
+                let name = self.parse_ident()?;
+                let mut expr = Expr::Field(name);
+
+                // Check for optional
+                self.skip_ws();
+                if self.peek() == Some('?') {
+                    self.next();
+                    expr = Expr::Optional(Box::new(expr));
+                }
+
+                self.parse_postfix(expr)
+            }
+
+            // Keywords: null, true, false
+            Some(c) if c.is_alphabetic() => {
+                if self.matches_keyword("null") {
+                    self.consume_keyword("null");
+                    Ok(Expr::Literal(Literal::Null))
+                } else if self.matches_keyword("true") {
+                    self.consume_keyword("true");
+                    Ok(Expr::Literal(Literal::Bool(true)))
+                } else if self.matches_keyword("false") {
+                    self.consume_keyword("false");
+                    Ok(Expr::Literal(Literal::Bool(false)))
+                } else {
+                    Err(ParseError::new(
+                        format!("unexpected identifier, expected expression"),
+                        self.pos,
+                    ))
+                }
+            }
+
+            Some(c) => Err(ParseError::new(
+                format!("unexpected character '{}', expected expression", c),
+                self.pos,
+            )),
+            None => Err(ParseError::new("unexpected end of input", self.pos)),
         }
     }
 
-    /// Parse a complete expression.
-    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        self.skip_ws();
-
-        // Must start with '.'
-        self.expect('.')?;
-        self.skip_ws();
-
-        // Check for just '.' (identity)
-        if self.is_eof() || self.peek() == Some('|') {
-            return Ok(Expr::Identity);
-        }
-
-        // Check for '[]' or '[n]' directly after '.'
-        if self.peek() == Some('[') {
-            let first = self.parse_bracket_with_optional()?;
-            return self.parse_chain(first);
-        }
-
-        // Parse first term (field name)
-        let first = self.parse_term()?;
-        self.parse_chain(first)
+    /// Check if current character is an expression terminator.
+    fn is_expr_terminator(&self) -> bool {
+        matches!(
+            self.peek(),
+            Some(',') | Some(')') | Some(']') | Some('}') | Some('|') | Some(':') | Some(';')
+        )
     }
 
-    /// Parse a chain of terms following the first one.
-    fn parse_chain(&mut self, first: Expr) -> Result<Expr, ParseError> {
-        let mut exprs = vec![first];
+    /// Parse postfix operations (field access, indexing) after a primary expression.
+    fn parse_postfix(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
+        let mut chain = vec![expr];
 
         loop {
             self.skip_ws();
@@ -327,19 +703,84 @@ impl<'a> Parser<'a> {
 
                     // Check for bracket after dot
                     if self.peek() == Some('[') {
-                        exprs.push(self.parse_bracket_with_optional()?);
+                        chain.push(self.parse_index_bracket_with_optional()?);
                     } else {
-                        exprs.push(self.parse_term()?);
+                        // Field access
+                        let name = self.parse_ident()?;
+                        let mut field_expr = Expr::Field(name);
+
+                        // Check for optional
+                        self.skip_ws();
+                        if self.peek() == Some('?') {
+                            self.next();
+                            field_expr = Expr::Optional(Box::new(field_expr));
+                        }
+
+                        chain.push(field_expr);
                     }
                 }
                 Some('[') => {
-                    exprs.push(self.parse_bracket_with_optional()?);
+                    chain.push(self.parse_index_bracket_with_optional()?);
                 }
                 _ => break,
             }
         }
 
+        if chain.len() == 1 {
+            expr = chain.pop().unwrap();
+        } else {
+            expr = Expr::Pipe(chain);
+        }
+
+        Ok(expr)
+    }
+
+    /// Parse a pipe expression: `expr | expr | ...`
+    fn parse_pipe_expr(&mut self) -> Result<Expr, ParseError> {
+        let first = self.parse_primary()?;
+        self.skip_ws();
+
+        if self.peek() != Some('|') {
+            return Ok(first);
+        }
+
+        let mut exprs = vec![first];
+
+        while self.peek() == Some('|') {
+            self.next();
+            self.skip_ws();
+            exprs.push(self.parse_primary()?);
+            self.skip_ws();
+        }
+
         Ok(Expr::pipe(exprs))
+    }
+
+    /// Parse a comma expression: `expr, expr, ...`
+    /// This is the lowest precedence operator.
+    fn parse_comma_expr(&mut self) -> Result<Expr, ParseError> {
+        let first = self.parse_pipe_expr()?;
+        self.skip_ws();
+
+        if self.peek() != Some(',') {
+            return Ok(first);
+        }
+
+        let mut exprs = vec![first];
+
+        while self.peek() == Some(',') {
+            self.next();
+            self.skip_ws();
+            exprs.push(self.parse_pipe_expr()?);
+            self.skip_ws();
+        }
+
+        Ok(Expr::comma(exprs))
+    }
+
+    /// Parse a complete expression (entry point).
+    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        self.parse_comma_expr()
     }
 }
 
@@ -361,6 +802,15 @@ impl<'a> Parser<'a> {
 ///
 /// // Iteration
 /// let expr = parse(".items[]").unwrap();
+///
+/// // Comma (multiple outputs)
+/// let expr = parse(".foo, .bar").unwrap();
+///
+/// // Array construction
+/// let expr = parse("[.foo, .bar]").unwrap();
+///
+/// // Object construction
+/// let expr = parse("{name: .name, age: .age}").unwrap();
 /// ```
 pub fn parse(input: &str) -> Result<Expr, ParseError> {
     let mut parser = Parser::new(input);
@@ -380,7 +830,7 @@ pub fn parse(input: &str) -> Result<Expr, ParseError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Expr, parse};
+    use super::*;
 
     #[test]
     fn test_identity() {
@@ -476,11 +926,151 @@ mod tests {
     }
 
     #[test]
+    fn test_comma() {
+        assert_eq!(
+            parse(".foo, .bar").unwrap(),
+            Expr::Comma(vec![Expr::Field("foo".into()), Expr::Field("bar".into()),])
+        );
+
+        assert_eq!(
+            parse(".a, .b, .c").unwrap(),
+            Expr::Comma(vec![
+                Expr::Field("a".into()),
+                Expr::Field("b".into()),
+                Expr::Field("c".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_pipe_operator() {
+        assert_eq!(
+            parse(". | .foo").unwrap(),
+            Expr::Pipe(vec![Expr::Identity, Expr::Field("foo".into()),])
+        );
+    }
+
+    #[test]
+    fn test_array_construction() {
+        // Empty array
+        let empty = parse("[]").unwrap();
+        assert!(matches!(empty, Expr::Array(_)));
+
+        // Array with elements
+        let arr = parse("[.foo, .bar]").unwrap();
+        match arr {
+            Expr::Array(inner) => {
+                assert!(matches!(*inner, Expr::Comma(_)));
+            }
+            _ => panic!("expected Array"),
+        }
+
+        // Array with iteration
+        let iter_arr = parse("[.items[]]").unwrap();
+        assert!(matches!(iter_arr, Expr::Array(_)));
+    }
+
+    #[test]
+    fn test_object_construction() {
+        // Empty object
+        let empty = parse("{}").unwrap();
+        assert_eq!(empty, Expr::Object(vec![]));
+
+        // Object with entries
+        let obj = parse("{name: .name, age: .age}").unwrap();
+        match obj {
+            Expr::Object(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].key, ObjectKey::Literal("name".into()));
+                assert_eq!(entries[1].key, ObjectKey::Literal("age".into()));
+            }
+            _ => panic!("expected Object"),
+        }
+
+        // Object shorthand
+        let shorthand = parse("{foo, bar}").unwrap();
+        match shorthand {
+            Expr::Object(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].key, ObjectKey::Literal("foo".into()));
+                assert_eq!(entries[0].value, Expr::Field("foo".into()));
+            }
+            _ => panic!("expected Object"),
+        }
+
+        // Dynamic key
+        let dynamic = parse("{(.key): .value}").unwrap();
+        match dynamic {
+            Expr::Object(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert!(matches!(entries[0].key, ObjectKey::Expr(_)));
+            }
+            _ => panic!("expected Object"),
+        }
+    }
+
+    #[test]
+    fn test_literals() {
+        assert_eq!(parse("null").unwrap(), Expr::Literal(Literal::Null));
+        assert_eq!(parse("true").unwrap(), Expr::Literal(Literal::Bool(true)));
+        assert_eq!(parse("false").unwrap(), Expr::Literal(Literal::Bool(false)));
+        assert_eq!(parse("42").unwrap(), Expr::Literal(Literal::Int(42)));
+        assert_eq!(parse("-123").unwrap(), Expr::Literal(Literal::Int(-123)));
+        assert_eq!(parse("3.14").unwrap(), Expr::Literal(Literal::Float(3.14)));
+        assert_eq!(
+            parse("\"hello\"").unwrap(),
+            Expr::Literal(Literal::String("hello".into()))
+        );
+        assert_eq!(
+            parse("\"hello\\nworld\"").unwrap(),
+            Expr::Literal(Literal::String("hello\nworld".into()))
+        );
+    }
+
+    #[test]
+    fn test_recursive_descent() {
+        assert_eq!(parse("..").unwrap(), Expr::RecursiveDescent);
+    }
+
+    #[test]
+    fn test_parentheses() {
+        let paren = parse("(.foo)").unwrap();
+        match paren {
+            Expr::Paren(inner) => {
+                assert_eq!(*inner, Expr::Field("foo".into()));
+            }
+            _ => panic!("expected Paren"),
+        }
+
+        // Nested parentheses
+        let nested = parse("((.foo))").unwrap();
+        assert!(matches!(nested, Expr::Paren(_)));
+    }
+
+    #[test]
+    fn test_complex_expressions() {
+        // Comma inside array
+        let expr = parse("[.a, .b, .c]").unwrap();
+        assert!(matches!(expr, Expr::Array(_)));
+
+        // Pipe inside parentheses
+        let expr = parse("(.foo | .bar)").unwrap();
+        assert!(matches!(expr, Expr::Paren(_)));
+
+        // Object with complex values
+        let expr = parse("{items: [.a, .b]}").unwrap();
+        assert!(matches!(expr, Expr::Object(_)));
+    }
+
+    #[test]
     fn test_errors() {
         assert!(parse("").is_err());
-        assert!(parse("foo").is_err()); // missing leading dot
+        assert!(parse("foo").is_err()); // missing leading dot for field access
         assert!(parse(".[").is_err()); // unclosed bracket
         assert!(parse(".[abc]").is_err()); // invalid index
         assert!(parse(".123").is_err()); // field starting with number
+        assert!(parse("{").is_err()); // unclosed brace
+        assert!(parse("[").is_err()); // unclosed bracket
+        assert!(parse("\"unterminated").is_err()); // unterminated string
     }
 }

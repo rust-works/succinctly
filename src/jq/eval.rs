@@ -3,6 +3,8 @@
 //! Evaluates expressions against JSON using the cursor-based navigation API.
 
 #[cfg(not(test))]
+use alloc::collections::BTreeMap;
+#[cfg(not(test))]
 use alloc::format;
 #[cfg(not(test))]
 use alloc::string::String;
@@ -11,14 +13,18 @@ use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
+#[cfg(test)]
+use std::collections::BTreeMap;
+
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
-use super::expr::Expr;
+use super::expr::{Expr, Literal, ObjectKey};
+use super::value::OwnedValue;
 
 /// Result of evaluating a jq expression.
 #[derive(Debug)]
 pub enum QueryResult<'a, W = Vec<u64>> {
-    /// Single value result.
+    /// Single value result (reference to original JSON).
     One(StandardJson<'a, W>),
 
     /// Multiple values (from iteration).
@@ -29,6 +35,12 @@ pub enum QueryResult<'a, W = Vec<u64>> {
 
     /// Error during evaluation.
     Error(EvalError),
+
+    /// Single owned value (from construction/computation).
+    Owned(OwnedValue),
+
+    /// Multiple owned values.
+    ManyOwned(Vec<OwnedValue>),
 }
 
 /// Error that occurs during evaluation.
@@ -76,6 +88,48 @@ fn type_name<W>(value: &StandardJson<'_, W>) -> &'static str {
     }
 }
 
+/// Convert a StandardJson value to an OwnedValue.
+fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue {
+    match value {
+        StandardJson::Null => OwnedValue::Null,
+        StandardJson::Bool(b) => OwnedValue::Bool(*b),
+        StandardJson::Number(n) => {
+            if let Ok(i) = n.as_i64() {
+                OwnedValue::Int(i)
+            } else if let Ok(f) = n.as_f64() {
+                OwnedValue::Float(f)
+            } else {
+                // Fallback - shouldn't happen for valid JSON
+                OwnedValue::Float(0.0)
+            }
+        }
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                OwnedValue::String(cow.into_owned())
+            } else {
+                OwnedValue::String(String::new())
+            }
+        }
+        StandardJson::Array(elements) => {
+            let items: Vec<OwnedValue> = elements.clone().map(|e| to_owned(&e)).collect();
+            OwnedValue::Array(items)
+        }
+        StandardJson::Object(fields) => {
+            let mut map = BTreeMap::new();
+            for field in fields.clone() {
+                // Get the key as a string
+                if let StandardJson::String(key_str_val) = field.key() {
+                    if let Ok(cow) = key_str_val.as_str() {
+                        map.insert(cow.into_owned(), to_owned(&field.value()));
+                    }
+                }
+            }
+            OwnedValue::Object(map)
+        }
+        StandardJson::Error(_) => OwnedValue::Null,
+    }
+}
+
 /// Evaluate a single expression against a JSON value.
 fn eval_single<'a, W: Clone + AsRef<[u64]>>(
     expr: &Expr,
@@ -96,17 +150,15 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
         },
 
         Expr::Index(idx) => match value {
-            StandardJson::Array(elements) => {
-                match get_element_at_index(elements, *idx) {
-                    Some(v) => QueryResult::One(v),
-                    None if optional => QueryResult::None,
-                    None => {
-                        // Count elements to give accurate error
-                        let len = count_elements(elements);
-                        QueryResult::Error(EvalError::index_out_of_bounds(*idx, len))
-                    }
+            StandardJson::Array(elements) => match get_element_at_index(elements, *idx) {
+                Some(v) => QueryResult::One(v),
+                None if optional => QueryResult::None,
+                None => {
+                    // Count elements to give accurate error
+                    let len = count_elements(elements);
+                    QueryResult::Error(EvalError::index_out_of_bounds(*idx, len))
                 }
-            }
+            },
             _ if optional => QueryResult::None,
             _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
         },
@@ -136,6 +188,189 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
         Expr::Optional(inner) => eval_single(inner, value, true),
 
         Expr::Pipe(exprs) => eval_pipe(exprs, value, optional),
+
+        Expr::Comma(exprs) => eval_comma(exprs, value, optional),
+
+        Expr::Array(inner) => eval_array_construction(inner, value, optional),
+
+        Expr::Object(entries) => eval_object_construction(entries, value, optional),
+
+        Expr::Literal(lit) => QueryResult::Owned(literal_to_owned(lit)),
+
+        Expr::RecursiveDescent => eval_recursive_descent(value),
+
+        Expr::Paren(inner) => eval_single(inner, value, optional),
+    }
+}
+
+/// Convert a literal to an owned value.
+fn literal_to_owned(lit: &Literal) -> OwnedValue {
+    match lit {
+        Literal::Null => OwnedValue::Null,
+        Literal::Bool(b) => OwnedValue::Bool(*b),
+        Literal::Int(n) => OwnedValue::Int(*n),
+        Literal::Float(f) => OwnedValue::Float(*f),
+        Literal::String(s) => OwnedValue::String(s.clone()),
+    }
+}
+
+/// Evaluate a comma expression (multiple outputs).
+fn eval_comma<'a, W: Clone + AsRef<[u64]>>(
+    exprs: &[Expr],
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    if exprs.is_empty() {
+        return QueryResult::None;
+    }
+
+    let mut all_results = Vec::new();
+    let mut all_owned = Vec::new();
+    let mut has_owned = false;
+
+    for expr in exprs {
+        match eval_single(expr, value.clone(), optional) {
+            QueryResult::One(v) => all_results.push(v),
+            QueryResult::Many(vs) => all_results.extend(vs),
+            QueryResult::Owned(v) => {
+                has_owned = true;
+                all_owned.push(v);
+            }
+            QueryResult::ManyOwned(vs) => {
+                has_owned = true;
+                all_owned.extend(vs);
+            }
+            QueryResult::None => {}
+            QueryResult::Error(e) => return QueryResult::Error(e),
+        }
+    }
+
+    // If we have any owned values, we need to convert all results to owned
+    if has_owned {
+        let mut converted: Vec<OwnedValue> = all_results.iter().map(to_owned).collect();
+        converted.extend(all_owned);
+        if converted.len() == 1 {
+            QueryResult::Owned(converted.pop().unwrap())
+        } else {
+            QueryResult::ManyOwned(converted)
+        }
+    } else if all_results.len() == 1 {
+        QueryResult::One(all_results.pop().unwrap())
+    } else {
+        QueryResult::Many(all_results)
+    }
+}
+
+/// Evaluate array construction.
+fn eval_array_construction<'a, W: Clone + AsRef<[u64]>>(
+    inner: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Collect all outputs from the inner expression into an array
+    let result = eval_single(inner, value, optional);
+
+    let items: Vec<OwnedValue> = match result {
+        QueryResult::One(v) => vec![to_owned(&v)],
+        QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
+        QueryResult::Owned(v) => vec![v],
+        QueryResult::ManyOwned(vs) => vs,
+        QueryResult::None => vec![],
+        QueryResult::Error(e) => return QueryResult::Error(e),
+    };
+
+    QueryResult::Owned(OwnedValue::Array(items))
+}
+
+/// Evaluate object construction.
+fn eval_object_construction<'a, W: Clone + AsRef<[u64]>>(
+    entries: &[super::expr::ObjectEntry],
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let mut map = BTreeMap::new();
+
+    for entry in entries {
+        // Evaluate the key
+        let key_str = match &entry.key {
+            ObjectKey::Literal(s) => s.clone(),
+            ObjectKey::Expr(key_expr) => {
+                let key_result = eval_single(key_expr, value.clone(), optional);
+                match key_result {
+                    QueryResult::One(StandardJson::String(s)) => {
+                        if let Ok(cow) = s.as_str() {
+                            cow.into_owned()
+                        } else {
+                            return QueryResult::Error(EvalError::new("key must be a string"));
+                        }
+                    }
+                    QueryResult::Owned(OwnedValue::String(s)) => s,
+                    QueryResult::Error(e) => return QueryResult::Error(e),
+                    _ => {
+                        return QueryResult::Error(EvalError::new("key must be a string"));
+                    }
+                }
+            }
+        };
+
+        // Evaluate the value
+        let val_result = eval_single(&entry.value, value.clone(), optional);
+        let owned_val = match val_result {
+            QueryResult::One(v) => to_owned(&v),
+            QueryResult::Owned(v) => v,
+            QueryResult::Many(vs) => {
+                // Multiple values - take the first one (jq behavior)
+                if let Some(v) = vs.first() {
+                    to_owned(v)
+                } else {
+                    OwnedValue::Null
+                }
+            }
+            QueryResult::ManyOwned(vs) => {
+                if let Some(v) = vs.into_iter().next() {
+                    v
+                } else {
+                    OwnedValue::Null
+                }
+            }
+            QueryResult::None => OwnedValue::Null,
+            QueryResult::Error(e) => return QueryResult::Error(e),
+        };
+
+        map.insert(key_str, owned_val);
+    }
+
+    QueryResult::Owned(OwnedValue::Object(map))
+}
+
+/// Evaluate recursive descent.
+fn eval_recursive_descent<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+) -> QueryResult<'a, W> {
+    let mut results = Vec::new();
+    collect_recursive(&value, &mut results);
+    QueryResult::Many(results)
+}
+
+/// Collect all values recursively.
+fn collect_recursive<'a, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'a, W>,
+    results: &mut Vec<StandardJson<'a, W>>,
+) {
+    results.push(value.clone());
+
+    match value {
+        StandardJson::Array(elements) => {
+            for elem in elements.clone() {
+                collect_recursive(&elem, results);
+            }
+        }
+        StandardJson::Object(fields) => {
+            for field in fields.clone() {
+                collect_recursive(&field.value(), results);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -169,12 +404,21 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>>(
                     QueryResult::Many(rs) => all_results.extend(rs),
                     QueryResult::None => {}
                     QueryResult::Error(e) => return QueryResult::Error(e),
+                    QueryResult::Owned(_) | QueryResult::ManyOwned(_) => {
+                        // TODO: Handle owned values in pipe properly
+                        // For now, skip (this would need refactoring)
+                    }
                 }
             }
             QueryResult::Many(all_results)
         }
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
+        QueryResult::Owned(_) | QueryResult::ManyOwned(_) => {
+            // Cannot continue piping with owned values without more complex handling
+            // For Phase 1, we return the owned value as-is
+            result
+        }
     }
 }
 
@@ -275,6 +519,8 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::Many(vs) => vs,
         QueryResult::None => Vec::new(),
         QueryResult::Error(_) => Vec::new(),
+        QueryResult::Owned(_) => Vec::new(), // Owned values not returned as StandardJson
+        QueryResult::ManyOwned(_) => Vec::new(),
     }
 }
 
@@ -402,6 +648,89 @@ mod tests {
         query!(br#"[0, 1, 2, 3, 4, 5]"#, ".[:2]",
             QueryResult::Many(values) => {
                 assert_eq!(values.len(), 2); // 0, 1
+            }
+        );
+    }
+
+    #[test]
+    fn test_comma() {
+        query!(br#"{"a": 1, "b": 2}"#, ".a, .b",
+            QueryResult::Many(values) => {
+                assert_eq!(values.len(), 2);
+            }
+        );
+    }
+
+    #[test]
+    fn test_literals() {
+        query!(br#"{}"#, "null",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+
+        query!(br#"{}"#, "true",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+
+        query!(br#"{}"#, "42",
+            QueryResult::Owned(OwnedValue::Int(42)) => {}
+        );
+
+        query!(br#"{}"#, "\"hello\"",
+            QueryResult::Owned(OwnedValue::String(s)) if s == "hello" => {}
+        );
+    }
+
+    #[test]
+    fn test_array_construction() {
+        query!(br#"{"a": 1, "b": 2}"#, "[.a, .b]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                assert_eq!(arr[0], OwnedValue::Int(1));
+                assert_eq!(arr[1], OwnedValue::Int(2));
+            }
+        );
+
+        // Empty array
+        query!(br#"{}"#, "[]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 0);
+            }
+        );
+    }
+
+    #[test]
+    fn test_object_construction() {
+        query!(br#"{"name": "Alice", "age": 30}"#, "{name: .name, years: .age}",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 2);
+                assert!(obj.contains_key("name"));
+                assert!(obj.contains_key("years"));
+            }
+        );
+
+        // Empty object
+        query!(br#"{}"#, "{}",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 0);
+            }
+        );
+    }
+
+    #[test]
+    fn test_recursive_descent() {
+        query!(br#"{"a": {"b": 1}}"#, "..",
+            QueryResult::Many(values) => {
+                // Should include: root object, "a" object, 1
+                assert_eq!(values.len(), 3);
+            }
+        );
+    }
+
+    #[test]
+    fn test_parentheses() {
+        query!(br#"{"foo": {"bar": 1}}"#, "(.foo).bar",
+            QueryResult::One(StandardJson::Number(n)) => {
+                assert_eq!(n.as_i64().unwrap(), 1);
             }
         );
     }
