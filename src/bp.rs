@@ -933,6 +933,8 @@ impl<W: AsRef<[u64]>> BalancedParens<W> {
     }
 
     /// Get excess at position p (number of opens minus closes in [0, p]).
+    ///
+    /// This is now O(1) using hierarchical cumulative excess indices.
     pub fn excess(&self, p: usize) -> i32 {
         if p >= self.len {
             return 0;
@@ -941,24 +943,107 @@ impl<W: AsRef<[u64]>> BalancedParens<W> {
         let word_idx = p / 64;
         let bit_idx = p % 64;
 
-        // Sum up cumulative excess from previous words
+        // Use hierarchical indices for O(1) prefix sum
+        // L2 covers 1024 words, L1 covers 32 words
+        let l2_idx = word_idx / (FACTOR_L1 * FACTOR_L2);
+        let l1_idx = word_idx / FACTOR_L1;
+        let l0_start = l1_idx * FACTOR_L1;
+
         let mut total: i32 = 0;
-        for i in 0..word_idx {
+
+        // Add L2 blocks before this one
+        for i in 0..l2_idx {
+            total += self.l2_cum_excess[i] as i32;
+        }
+
+        // Add L1 blocks within current L2 but before current L1
+        let l1_start_in_l2 = l2_idx * FACTOR_L2;
+        for i in l1_start_in_l2..l1_idx {
+            total += self.l1_cum_excess[i] as i32;
+        }
+
+        // Add L0 (word) entries within current L1 but before current word
+        for i in l0_start..word_idx {
             total += self.l0_cum_excess[i] as i32;
         }
 
-        // Add partial word
+        // Add partial word using popcount
         let words = self.words.as_ref();
         let word = words[word_idx];
-        for bit in 0..=bit_idx {
-            if (word >> bit) & 1 == 1 {
-                total += 1;
-            } else {
-                total -= 1;
-            }
-        }
+        // Mask off bits after bit_idx (we want bits 0..=bit_idx)
+        let mask = if bit_idx == 63 {
+            u64::MAX
+        } else {
+            (1u64 << (bit_idx + 1)) - 1
+        };
+        let masked = word & mask;
+        let ones = masked.count_ones() as i32;
+        let zeros = (bit_idx as i32 + 1) - ones;
+        total += ones - zeros;
 
         total
+    }
+
+    /// Count the number of 1-bits (opens) in [0, p).
+    ///
+    /// This is O(1) using the relationship: rank1(p) = (p + excess(p-1) + 1) / 2
+    /// But we compute it directly for better precision at boundaries.
+    #[inline]
+    pub fn rank1(&self, p: usize) -> usize {
+        if p == 0 {
+            return 0;
+        }
+        if p > self.len {
+            return self.rank1(self.len);
+        }
+
+        let word_idx = p / 64;
+        let bit_idx = p % 64;
+
+        // Use hierarchical indices for O(1) prefix sum of 1-bits
+        let l2_idx = word_idx / (FACTOR_L1 * FACTOR_L2);
+        let l1_idx = word_idx / FACTOR_L1;
+        let l0_start = l1_idx * FACTOR_L1;
+
+        let mut count: usize = 0;
+
+        // Count 1-bits in L2 blocks before this one
+        // Each L2 block covers FACTOR_L1 * FACTOR_L2 = 32 * 32 = 1024 words
+        for i in 0..l2_idx {
+            // For L2 block i: total bits = 64 * 1024 = 65536 bits per L2 block (or less for last)
+            // ones = (bits + excess) / 2
+            let block_start = i * FACTOR_L1 * FACTOR_L2;
+            let block_end = ((i + 1) * FACTOR_L1 * FACTOR_L2).min(self.words.as_ref().len());
+            let bits: usize = (block_end - block_start) * 64;
+            let excess = self.l2_cum_excess[i] as i64;
+            count += ((bits as i64 + excess) / 2) as usize;
+        }
+
+        // Count 1-bits in L1 blocks within current L2 but before current L1
+        let l1_start_in_l2 = l2_idx * FACTOR_L2;
+        for i in l1_start_in_l2..l1_idx {
+            let block_start = i * FACTOR_L1;
+            let block_end = ((i + 1) * FACTOR_L1).min(self.words.as_ref().len());
+            let bits: usize = (block_end - block_start) * 64;
+            let excess = self.l1_cum_excess[i] as i64;
+            count += ((bits as i64 + excess) / 2) as usize;
+        }
+
+        // Count 1-bits in words within current L1 but before current word
+        for i in l0_start..word_idx {
+            let excess = self.l0_cum_excess[i] as i64;
+            count += ((64i64 + excess) / 2) as usize;
+        }
+
+        // Count 1-bits in partial word [0, bit_idx)
+        if bit_idx > 0 {
+            let words = self.words.as_ref();
+            let word = words[word_idx];
+            let mask = (1u64 << bit_idx) - 1;
+            count += (word & mask).count_ones() as usize;
+        }
+
+        count
     }
 
     /// Get depth of node at position p.

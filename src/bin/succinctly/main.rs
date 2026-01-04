@@ -114,6 +114,11 @@ struct GenerateSuite {
     /// Verify all generated JSON files are valid
     #[arg(long)]
     verify: bool,
+
+    /// Maximum file size to generate (files larger than this are skipped)
+    /// Supports units: b, kb, mb, gb (e.g., "100mb", "1gb")
+    #[arg(short, long, value_parser = parse_size, default_value = "1gb")]
+    max_size: usize,
 }
 
 /// Query JSON using jq-like expressions
@@ -266,6 +271,8 @@ const SUITE_SIZES: &[(&str, usize)] = &[
     ("100kb", 100 * 1024),
     ("1mb", 1024 * 1024),
     ("10mb", 10 * 1024 * 1024),
+    ("100mb", 100 * 1024 * 1024),
+    ("1gb", 1024 * 1024 * 1024),
 ];
 
 fn generate_suite(args: GenerateSuite) -> Result<()> {
@@ -285,8 +292,13 @@ fn generate_suite(args: GenerateSuite) -> Result<()> {
     let mut file_index: u64 = 0;
     let mut total_bytes: usize = 0;
     let mut file_count: usize = 0;
+    let mut skipped_count: usize = 0;
 
-    eprintln!("Generating JSON suite in {}...", output_dir.display());
+    eprintln!(
+        "Generating JSON suite in {} (max size: {})...",
+        output_dir.display(),
+        format_bytes(args.max_size)
+    );
 
     for (pattern_name, pattern) in SUITE_PATTERNS {
         // Create pattern subdirectory
@@ -294,6 +306,12 @@ fn generate_suite(args: GenerateSuite) -> Result<()> {
         std::fs::create_dir_all(&pattern_dir)?;
 
         for (size_name, size) in SUITE_SIZES {
+            // Skip files that exceed max_size
+            if *size > args.max_size {
+                skipped_count += 1;
+                continue;
+            }
+
             let filename = format!("{}.json", size_name);
             let path = pattern_dir.join(&filename);
 
@@ -312,7 +330,12 @@ fn generate_suite(args: GenerateSuite) -> Result<()> {
             total_bytes += json.len();
             file_count += 1;
 
-            eprintln!("  {} ({} bytes, seed={})", path.display(), json.len(), seed);
+            eprintln!(
+                "  {} ({}, seed={})",
+                path.display(),
+                format_bytes(json.len()),
+                seed
+            );
         }
     }
 
@@ -322,6 +345,10 @@ fn generate_suite(args: GenerateSuite) -> Result<()> {
         file_count,
         format_bytes(total_bytes)
     );
+
+    if skipped_count > 0 {
+        eprintln!("Skipped {} files exceeding max size", skipped_count);
+    }
 
     if args.verify {
         eprintln!("All files validated successfully");
@@ -358,7 +385,7 @@ impl AsRef<[u8]> for JsonInput {
 }
 
 fn query_json(args: QueryJson) -> Result<()> {
-    use std::io::Read;
+    use std::io::{BufWriter, Read, Write};
     use succinctly::jq;
     use succinctly::json::JsonIndex;
     use succinctly::json::light::StandardJson;
@@ -398,67 +425,89 @@ fn query_json(args: QueryJson) -> Result<()> {
     let expr = jq::parse(&args.expression).map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
 
     // Build the index and run the query
-    let index = JsonIndex::build(&json_bytes);
-    let cursor = index.root(&json_bytes);
+    let index = JsonIndex::build(json_bytes);
+    let cursor = index.root(json_bytes);
     let result = jq::eval(&expr, cursor);
 
-    // Format a single value as string
-    let format_value = |value: &StandardJson<'_, Vec<u64>>| -> String {
+    // Use buffered output for better performance
+    let stdout = std::io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+
+    // Write a single value to output - use raw bytes when possible for performance
+    let write_value = |out: &mut BufWriter<_>,
+                       value: &StandardJson<'_, Vec<u64>>,
+                       raw: bool|
+     -> std::io::Result<()> {
         match value {
             StandardJson::String(s) => {
-                if args.raw {
-                    s.as_str().map(|s| s.to_string()).unwrap_or_default()
+                if raw {
+                    // Raw mode: output string content without quotes
+                    if let Ok(str_val) = s.as_str() {
+                        out.write_all(str_val.as_bytes())?;
+                    }
                 } else {
-                    format!("\"{}\"", s.as_str().unwrap_or_default())
+                    // Use raw_bytes() which includes quotes - zero-copy!
+                    out.write_all(s.raw_bytes())?;
                 }
             }
             StandardJson::Number(n) => {
-                if let Ok(i) = n.as_i64() {
-                    i.to_string()
-                } else if let Ok(f) = n.as_f64() {
-                    f.to_string()
-                } else {
-                    "null".to_string()
-                }
+                // Use raw_bytes() - zero-copy!
+                out.write_all(n.raw_bytes())?;
             }
-            StandardJson::Bool(b) => b.to_string(),
-            StandardJson::Null => "null".to_string(),
+            StandardJson::Bool(b) => {
+                out.write_all(if *b { b"true" } else { b"false" })?;
+            }
+            StandardJson::Null => {
+                out.write_all(b"null")?;
+            }
             StandardJson::Object(_) | StandardJson::Array(_) => {
-                // For complex types, we need to reconstruct JSON
-                reconstruct_json(value, !args.compact)
+                // For complex types, we still need to reconstruct JSON
+                // TODO: optimize by finding byte range via BP find_close
+                let json_str = reconstruct_json(value, false);
+                out.write_all(json_str.as_bytes())?;
             }
-            StandardJson::Error(e) => format!("<error: {}>", e),
+            StandardJson::Error(e) => {
+                write!(out, "<error: {}>", e)?;
+            }
         }
+        Ok(())
     };
 
-    // Output results
+    // Output results - default to jq-style one-value-per-line
     match result {
         jq::QueryResult::One(value) => {
-            println!("{}", format_value(&value));
+            write_value(&mut out, &value, args.raw)?;
+            writeln!(out)?;
         }
         jq::QueryResult::Many(values) => match args.format {
             OutputFormat::Json => {
                 if args.compact {
-                    print!("[");
+                    out.write_all(b"[")?;
                     for (i, value) in values.iter().enumerate() {
                         if i > 0 {
-                            print!(",");
+                            out.write_all(b",")?;
                         }
-                        print!("{}", format_value(value));
+                        write_value(&mut out, value, args.raw)?;
                     }
-                    println!("]");
+                    writeln!(out, "]")?;
                 } else {
-                    println!("[");
+                    writeln!(out, "[")?;
                     for (i, value) in values.iter().enumerate() {
-                        let comma = if i < values.len() - 1 { "," } else { "" };
-                        println!("  {}{}", format_value(value), comma);
+                        out.write_all(b"  ")?;
+                        write_value(&mut out, value, args.raw)?;
+                        if i < values.len() - 1 {
+                            writeln!(out, ",")?;
+                        } else {
+                            writeln!(out)?;
+                        }
                     }
-                    println!("]");
+                    writeln!(out, "]")?;
                 }
             }
             OutputFormat::Lines => {
                 for value in values.iter() {
-                    println!("{}", format_value(value));
+                    write_value(&mut out, value, args.raw)?;
+                    writeln!(out)?;
                 }
             }
         },
@@ -470,6 +519,7 @@ fn query_json(args: QueryJson) -> Result<()> {
         }
     }
 
+    out.flush()?;
     Ok(())
 }
 
