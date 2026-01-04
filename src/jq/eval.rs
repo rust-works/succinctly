@@ -920,6 +920,36 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         Builtin::Max => builtin_max(value, optional),
         Builtin::MinBy(f) => builtin_min_by(f, value, optional),
         Builtin::MaxBy(f) => builtin_max_by(f, value, optional),
+
+        // Phase 5: String Functions
+        Builtin::AsciiDowncase => builtin_ascii_downcase(value, optional),
+        Builtin::AsciiUpcase => builtin_ascii_upcase(value, optional),
+        Builtin::Ltrimstr(s) => builtin_ltrimstr(s, value, optional),
+        Builtin::Rtrimstr(s) => builtin_rtrimstr(s, value, optional),
+        Builtin::Startswith(s) => builtin_startswith(s, value, optional),
+        Builtin::Endswith(s) => builtin_endswith(s, value, optional),
+        Builtin::Split(sep) => builtin_split(sep, value, optional),
+        Builtin::Join(sep) => builtin_join(sep, value, optional),
+        Builtin::Contains(b) => builtin_contains(b, value, optional),
+        Builtin::Inside(b) => builtin_inside(b, value, optional),
+
+        // Phase 5: Array Functions
+        Builtin::First => builtin_first(value, optional),
+        Builtin::Last => builtin_last(value, optional),
+        Builtin::Nth(n) => builtin_nth(n, value, optional),
+        Builtin::Reverse => builtin_reverse(value, optional),
+        Builtin::Flatten => builtin_flatten(value, optional, 1),
+        Builtin::FlattenDepth(depth) => builtin_flatten_depth(depth, value, optional),
+        Builtin::GroupBy(f) => builtin_group_by(f, value, optional),
+        Builtin::Unique => builtin_unique(value, optional),
+        Builtin::UniqueBy(f) => builtin_unique_by(f, value, optional),
+        Builtin::Sort => builtin_sort(value, optional),
+        Builtin::SortBy(f) => builtin_sort_by(f, value, optional),
+
+        // Phase 5: Object Functions
+        Builtin::ToEntries => builtin_to_entries(value, optional),
+        Builtin::FromEntries => builtin_from_entries(value, optional),
+        Builtin::WithEntries(f) => builtin_with_entries(f, value, optional),
     }
 }
 
@@ -1418,6 +1448,757 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>>(
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
     }
+}
+
+// =============================================================================
+// Phase 5: String Functions
+// =============================================================================
+
+/// Builtin: ascii_downcase - lowercase ASCII characters
+fn builtin_ascii_downcase<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match &value {
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                let lowered: String = cow.chars().map(|c| c.to_ascii_lowercase()).collect();
+                QueryResult::Owned(OwnedValue::String(lowered))
+            } else {
+                QueryResult::Owned(OwnedValue::String(String::new()))
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    }
+}
+
+/// Builtin: ascii_upcase - uppercase ASCII characters
+fn builtin_ascii_upcase<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match &value {
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                let uppered: String = cow.chars().map(|c| c.to_ascii_uppercase()).collect();
+                QueryResult::Owned(OwnedValue::String(uppered))
+            } else {
+                QueryResult::Owned(OwnedValue::String(String::new()))
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    }
+}
+
+/// Builtin: ltrimstr(s) - remove prefix s
+fn builtin_ltrimstr<'a, W: Clone + AsRef<[u64]>>(
+    prefix_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the prefix string
+    let prefix_result = eval_single(prefix_expr, value.clone(), optional);
+    let prefix = match result_to_owned(prefix_result) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    match &value {
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                let result = if cow.starts_with(&prefix) {
+                    cow[prefix.len()..].to_string()
+                } else {
+                    cow.into_owned()
+                };
+                QueryResult::Owned(OwnedValue::String(result))
+            } else {
+                QueryResult::Owned(OwnedValue::String(String::new()))
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    }
+}
+
+/// Builtin: rtrimstr(s) - remove suffix s
+fn builtin_rtrimstr<'a, W: Clone + AsRef<[u64]>>(
+    suffix_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the suffix string
+    let suffix_result = eval_single(suffix_expr, value.clone(), optional);
+    let suffix = match result_to_owned(suffix_result) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    match &value {
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                let result = if cow.ends_with(&suffix) {
+                    cow[..cow.len() - suffix.len()].to_string()
+                } else {
+                    cow.into_owned()
+                };
+                QueryResult::Owned(OwnedValue::String(result))
+            } else {
+                QueryResult::Owned(OwnedValue::String(String::new()))
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    }
+}
+
+/// Builtin: startswith(s) - check if string starts with s
+fn builtin_startswith<'a, W: Clone + AsRef<[u64]>>(
+    prefix_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the prefix string
+    let prefix_result = eval_single(prefix_expr, value.clone(), optional);
+    let prefix = match result_to_owned(prefix_result) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    match &value {
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                QueryResult::Owned(OwnedValue::Bool(cow.starts_with(&prefix)))
+            } else {
+                QueryResult::Owned(OwnedValue::Bool(false))
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    }
+}
+
+/// Builtin: endswith(s) - check if string ends with s
+fn builtin_endswith<'a, W: Clone + AsRef<[u64]>>(
+    suffix_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the suffix string
+    let suffix_result = eval_single(suffix_expr, value.clone(), optional);
+    let suffix = match result_to_owned(suffix_result) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    match &value {
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                QueryResult::Owned(OwnedValue::Bool(cow.ends_with(&suffix)))
+            } else {
+                QueryResult::Owned(OwnedValue::Bool(false))
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    }
+}
+
+/// Builtin: split(s) - split string by separator
+fn builtin_split<'a, W: Clone + AsRef<[u64]>>(
+    sep_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the separator string
+    let sep_result = eval_single(sep_expr, value.clone(), optional);
+    let sep = match result_to_owned(sep_result) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    match &value {
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                let parts: Vec<OwnedValue> = cow
+                    .split(&sep)
+                    .map(|p| OwnedValue::String(p.to_string()))
+                    .collect();
+                QueryResult::Owned(OwnedValue::Array(parts))
+            } else {
+                QueryResult::Owned(OwnedValue::Array(vec![]))
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    }
+}
+
+/// Builtin: join(s) - join array elements with separator
+fn builtin_join<'a, W: Clone + AsRef<[u64]>>(
+    sep_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the separator string
+    let sep_result = eval_single(sep_expr, value.clone(), optional);
+    let sep = match result_to_owned(sep_result) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    match value {
+        StandardJson::Array(elements) => {
+            let mut parts: Vec<String> = Vec::new();
+            for elem in elements {
+                match &elem {
+                    StandardJson::String(s) => {
+                        if let Ok(cow) = s.as_str() {
+                            parts.push(cow.into_owned());
+                        }
+                    }
+                    StandardJson::Null => {
+                        // Skip nulls in join
+                    }
+                    _ => {
+                        // For non-strings, convert to string representation
+                        parts.push(to_owned(&elem).to_json());
+                    }
+                }
+            }
+            QueryResult::Owned(OwnedValue::String(parts.join(&sep)))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    }
+}
+
+/// Builtin: contains(b) - check if input contains b
+fn builtin_contains<'a, W: Clone + AsRef<[u64]>>(
+    b_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the value to check
+    let b_result = eval_single(b_expr, value.clone(), optional);
+    let b = match result_to_owned(b_result) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    let input = to_owned(&value);
+    QueryResult::Owned(OwnedValue::Bool(owned_contains(&input, &b)))
+}
+
+/// Check if `a` contains `b` (recursive containment check)
+fn owned_contains(a: &OwnedValue, b: &OwnedValue) -> bool {
+    match (a, b) {
+        // String contains string
+        (OwnedValue::String(a_str), OwnedValue::String(b_str)) => a_str.contains(b_str.as_str()),
+        // Array contains: all elements of b must be contained in a
+        (OwnedValue::Array(a_arr), OwnedValue::Array(b_arr)) => b_arr
+            .iter()
+            .all(|b_elem| a_arr.iter().any(|a_elem| owned_contains(a_elem, b_elem))),
+        // Object contains: all keys in b must exist in a with matching values
+        (OwnedValue::Object(a_obj), OwnedValue::Object(b_obj)) => b_obj.iter().all(|(k, b_val)| {
+            a_obj
+                .get(k)
+                .is_some_and(|a_val| owned_contains(a_val, b_val))
+        }),
+        // Scalars: equality
+        _ => a == b,
+    }
+}
+
+/// Builtin: inside(b) - check if input is inside b
+fn builtin_inside<'a, W: Clone + AsRef<[u64]>>(
+    b_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the container value
+    let b_result = eval_single(b_expr, value.clone(), optional);
+    let b = match result_to_owned(b_result) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    let input = to_owned(&value);
+    // inside is the inverse of contains: b contains input
+    QueryResult::Owned(OwnedValue::Bool(owned_contains(&b, &input)))
+}
+
+// =============================================================================
+// Phase 5: Array Functions
+// =============================================================================
+
+/// Builtin: first - first element (.[0])
+fn builtin_first<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
+        StandardJson::Array(elements) => match elements.get(0) {
+            Some(v) => QueryResult::One(v),
+            None if optional => QueryResult::None,
+            None => QueryResult::Error(EvalError::new("array is empty")),
+        },
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    }
+}
+
+/// Builtin: last - last element (.[-1])
+fn builtin_last<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
+        StandardJson::Array(elements) => {
+            let items: Vec<_> = elements.collect();
+            if items.is_empty() {
+                if optional {
+                    QueryResult::None
+                } else {
+                    QueryResult::Error(EvalError::new("array is empty"))
+                }
+            } else {
+                QueryResult::Owned(to_owned(&items[items.len() - 1]))
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    }
+}
+
+/// Builtin: nth(n) - nth element
+fn builtin_nth<'a, W: Clone + AsRef<[u64]>>(
+    n_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the index
+    let n_result = eval_single(n_expr, value.clone(), optional);
+    let n = match result_to_owned(n_result) {
+        Ok(OwnedValue::Int(i)) => i,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("number", "non-number")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    match value {
+        StandardJson::Array(elements) => match get_element_at_index(elements, n) {
+            Some(v) => QueryResult::One(v),
+            None if optional => QueryResult::None,
+            None => QueryResult::Error(EvalError::new(format!("index {} out of bounds", n))),
+        },
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    }
+}
+
+/// Builtin: reverse - reverse array
+fn builtin_reverse<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
+        StandardJson::Array(elements) => {
+            let mut items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
+            items.reverse();
+            QueryResult::Owned(OwnedValue::Array(items))
+        }
+        StandardJson::String(s) => {
+            // reverse also works on strings
+            if let Ok(cow) = s.as_str() {
+                let reversed: String = cow.chars().rev().collect();
+                QueryResult::Owned(OwnedValue::String(reversed))
+            } else {
+                QueryResult::Owned(OwnedValue::String(String::new()))
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array or string", type_name(&value))),
+    }
+}
+
+/// Builtin: flatten - flatten nested arrays (1 level)
+fn builtin_flatten<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+    depth: usize,
+) -> QueryResult<'a, W> {
+    match value {
+        StandardJson::Array(elements) => {
+            let items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
+            let flattened = flatten_owned(items, depth);
+            QueryResult::Owned(OwnedValue::Array(flattened))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    }
+}
+
+/// Flatten owned values to a specific depth
+fn flatten_owned(items: Vec<OwnedValue>, depth: usize) -> Vec<OwnedValue> {
+    if depth == 0 {
+        return items;
+    }
+
+    let mut result = Vec::new();
+    for item in items {
+        match item {
+            OwnedValue::Array(inner) => {
+                result.extend(flatten_owned(inner, depth - 1));
+            }
+            other => result.push(other),
+        }
+    }
+    result
+}
+
+/// Builtin: flatten(depth) - flatten to specific depth
+fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>>(
+    depth_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the depth
+    let depth_result = eval_single(depth_expr, value.clone(), optional);
+    let depth = match result_to_owned(depth_result) {
+        Ok(OwnedValue::Int(d)) if d >= 0 => d as usize,
+        Ok(OwnedValue::Int(_)) => {
+            return QueryResult::Error(EvalError::new("depth must be non-negative"));
+        }
+        Ok(_) => return QueryResult::Error(EvalError::type_error("number", "non-number")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    builtin_flatten(value, optional, depth)
+}
+
+/// Builtin: group_by(f) - group by key function
+fn builtin_group_by<'a, W: Clone + AsRef<[u64]>>(
+    f: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
+        StandardJson::Array(elements) => {
+            let items: Vec<StandardJson<'a, W>> = elements.collect();
+
+            // Compute keys for each item
+            let mut keyed: Vec<(OwnedValue, OwnedValue)> = Vec::new();
+            for item in items {
+                let key = match eval_single(f, item.clone(), optional) {
+                    QueryResult::One(v) => to_owned(&v),
+                    QueryResult::Owned(v) => v,
+                    QueryResult::Error(e) => return QueryResult::Error(e),
+                    _ => OwnedValue::Null,
+                };
+                keyed.push((key, to_owned(&item)));
+            }
+
+            // Sort by key
+            keyed.sort_by(|(a, _), (b, _)| compare_values(a, b));
+
+            // Group consecutive items with same key
+            let mut groups: Vec<OwnedValue> = Vec::new();
+            let mut current_group: Vec<OwnedValue> = Vec::new();
+            let mut current_key: Option<OwnedValue> = None;
+
+            for (key, item) in keyed {
+                match &current_key {
+                    Some(k) if compare_values(k, &key) == core::cmp::Ordering::Equal => {
+                        current_group.push(item);
+                    }
+                    _ => {
+                        if !current_group.is_empty() {
+                            groups.push(OwnedValue::Array(current_group));
+                        }
+                        current_group = vec![item];
+                        current_key = Some(key);
+                    }
+                }
+            }
+            if !current_group.is_empty() {
+                groups.push(OwnedValue::Array(current_group));
+            }
+
+            QueryResult::Owned(OwnedValue::Array(groups))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    }
+}
+
+/// Builtin: unique - remove duplicates
+fn builtin_unique<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
+        StandardJson::Array(elements) => {
+            let mut items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
+
+            // Sort first (jq's unique returns sorted unique values)
+            items.sort_by(compare_values);
+
+            // Remove consecutive duplicates
+            items.dedup_by(|a, b| compare_values(a, b) == core::cmp::Ordering::Equal);
+
+            QueryResult::Owned(OwnedValue::Array(items))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    }
+}
+
+/// Builtin: unique_by(f) - remove duplicates by key
+fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>>(
+    f: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
+        StandardJson::Array(elements) => {
+            let items: Vec<StandardJson<'a, W>> = elements.collect();
+
+            // Compute keys for each item
+            let mut keyed: Vec<(OwnedValue, OwnedValue)> = Vec::new();
+            for item in items {
+                let key = match eval_single(f, item.clone(), optional) {
+                    QueryResult::One(v) => to_owned(&v),
+                    QueryResult::Owned(v) => v,
+                    QueryResult::Error(e) => return QueryResult::Error(e),
+                    _ => OwnedValue::Null,
+                };
+                keyed.push((key, to_owned(&item)));
+            }
+
+            // Sort by key
+            keyed.sort_by(|(a, _), (b, _)| compare_values(a, b));
+
+            // Remove consecutive duplicates by key
+            keyed.dedup_by(|(a, _), (b, _)| compare_values(a, b) == core::cmp::Ordering::Equal);
+
+            let result: Vec<OwnedValue> = keyed.into_iter().map(|(_, v)| v).collect();
+            QueryResult::Owned(OwnedValue::Array(result))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    }
+}
+
+/// Builtin: sort - sort array
+fn builtin_sort<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
+        StandardJson::Array(elements) => {
+            let mut items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
+            items.sort_by(compare_values);
+            QueryResult::Owned(OwnedValue::Array(items))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    }
+}
+
+/// Builtin: sort_by(f) - sort by key function
+fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>>(
+    f: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
+        StandardJson::Array(elements) => {
+            let items: Vec<StandardJson<'a, W>> = elements.collect();
+
+            // Compute keys for each item
+            let mut keyed: Vec<(OwnedValue, OwnedValue)> = Vec::new();
+            for item in items {
+                let key = match eval_single(f, item.clone(), optional) {
+                    QueryResult::One(v) => to_owned(&v),
+                    QueryResult::Owned(v) => v,
+                    QueryResult::Error(e) => return QueryResult::Error(e),
+                    _ => OwnedValue::Null,
+                };
+                keyed.push((key, to_owned(&item)));
+            }
+
+            // Sort by key
+            keyed.sort_by(|(a, _), (b, _)| compare_values(a, b));
+
+            let result: Vec<OwnedValue> = keyed.into_iter().map(|(_, v)| v).collect();
+            QueryResult::Owned(OwnedValue::Array(result))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    }
+}
+
+// =============================================================================
+// Phase 5: Object Functions
+// =============================================================================
+
+/// Builtin: to_entries - {k:v} → [{key:k, value:v}]
+fn builtin_to_entries<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
+        StandardJson::Object(fields) => {
+            let mut entries: Vec<OwnedValue> = Vec::new();
+            for field in fields {
+                let key = if let StandardJson::String(k) = field.key()
+                    && let Ok(cow) = k.as_str()
+                {
+                    cow.into_owned()
+                } else {
+                    continue;
+                };
+                let val = to_owned(&field.value());
+
+                let mut entry = BTreeMap::new();
+                entry.insert("key".to_string(), OwnedValue::String(key));
+                entry.insert("value".to_string(), val);
+                entries.push(OwnedValue::Object(entry));
+            }
+            QueryResult::Owned(OwnedValue::Array(entries))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("object", type_name(&value))),
+    }
+}
+
+/// Builtin: from_entries - [{key:k, value:v}] → {k:v}
+fn builtin_from_entries<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
+        StandardJson::Array(elements) => {
+            let mut result = BTreeMap::new();
+
+            for elem in elements {
+                // Each element should be an object with "key"/"name" and "value" fields
+                if let StandardJson::Object(fields) = elem {
+                    let owned = to_owned(&StandardJson::Object(fields));
+                    if let OwnedValue::Object(obj) = owned {
+                        // Try "key" first, then "name", then "k"
+                        let key = obj
+                            .get("key")
+                            .or_else(|| obj.get("name"))
+                            .or_else(|| obj.get("k"));
+
+                        // Try "value" first, then "v"
+                        let val = obj
+                            .get("value")
+                            .or_else(|| obj.get("v"))
+                            .cloned()
+                            .unwrap_or(OwnedValue::Null);
+
+                        if let Some(OwnedValue::String(k)) = key {
+                            result.insert(k.clone(), val);
+                        }
+                    }
+                }
+            }
+
+            QueryResult::Owned(OwnedValue::Object(result))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    }
+}
+
+/// Builtin: with_entries(f) - to_entries | map(f) | from_entries
+fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>>(
+    f: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
+        StandardJson::Object(fields) => {
+            // Convert to entries
+            let mut entries: Vec<OwnedValue> = Vec::new();
+            for field in fields {
+                let key = if let StandardJson::String(k) = field.key()
+                    && let Ok(cow) = k.as_str()
+                {
+                    cow.into_owned()
+                } else {
+                    continue;
+                };
+                let val = to_owned(&field.value());
+
+                let mut entry = BTreeMap::new();
+                entry.insert("key".to_string(), OwnedValue::String(key));
+                entry.insert("value".to_string(), val);
+                entries.push(OwnedValue::Object(entry));
+            }
+
+            // Apply f to each entry
+            let mut transformed: Vec<OwnedValue> = Vec::new();
+            for entry in entries {
+                let entry_json = owned_to_json_bytes(&entry);
+                let index = crate::json::JsonIndex::build(&entry_json);
+                let cursor = index.root(&entry_json);
+
+                match eval_single(f, cursor.value(), optional) {
+                    QueryResult::One(v) => transformed.push(to_owned(&v)),
+                    QueryResult::Owned(v) => transformed.push(v),
+                    QueryResult::Many(vs) => {
+                        for v in vs {
+                            transformed.push(to_owned(&v));
+                        }
+                    }
+                    QueryResult::ManyOwned(vs) => transformed.extend(vs),
+                    QueryResult::None => {}
+                    QueryResult::Error(e) => return QueryResult::Error(e),
+                }
+            }
+
+            // Convert back from entries
+            let mut result = BTreeMap::new();
+            for entry in transformed {
+                if let OwnedValue::Object(obj) = entry {
+                    let key = obj
+                        .get("key")
+                        .or_else(|| obj.get("name"))
+                        .or_else(|| obj.get("k"));
+
+                    let val = obj
+                        .get("value")
+                        .or_else(|| obj.get("v"))
+                        .cloned()
+                        .unwrap_or(OwnedValue::Null);
+
+                    if let Some(OwnedValue::String(k)) = key {
+                        result.insert(k.clone(), val);
+                    }
+                }
+            }
+
+            QueryResult::Owned(OwnedValue::Object(result))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("object", type_name(&value))),
+    }
+}
+
+/// Convert an OwnedValue to JSON bytes for re-parsing
+fn owned_to_json_bytes(value: &OwnedValue) -> Vec<u8> {
+    value.to_json().into_bytes()
 }
 
 /// Evaluate a pipe (chain) of expressions.
@@ -2557,5 +3338,330 @@ mod tests {
 
         // Note: Piping owned values (e.g., "map(...) | add" or "keys | map(...)")
         // requires fixing eval_pipe to handle owned values, which is deferred.
+    }
+
+    // ==========================================================================
+    // Phase 5: String Functions Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_builtin_ascii_downcase() {
+        query!(br#""HELLO World""#, "ascii_downcase",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "hello world");
+            }
+        );
+
+        // Non-ASCII characters should be unchanged
+        query!(b"\"H\\u00e9LLO\"", "ascii_downcase",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "h\u{00e9}llo");
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_ascii_upcase() {
+        query!(br#""hello World""#, "ascii_upcase",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "HELLO WORLD");
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_ltrimstr() {
+        query!(br#""hello world""#, r#"ltrimstr("hello ")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "world");
+            }
+        );
+
+        // No match - returns original
+        query!(br#""hello world""#, r#"ltrimstr("goodbye")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "hello world");
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_rtrimstr() {
+        query!(br#""hello world""#, r#"rtrimstr(" world")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "hello");
+            }
+        );
+
+        // No match - returns original
+        query!(br#""hello world""#, r#"rtrimstr("goodbye")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "hello world");
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_startswith() {
+        query!(br#""hello world""#, r#"startswith("hello")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        query!(br#""hello world""#, r#"startswith("world")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_endswith() {
+        query!(br#""hello world""#, r#"endswith("world")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        query!(br#""hello world""#, r#"endswith("hello")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_split() {
+        query!(br#""a,b,c""#, r#"split(",")"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0], OwnedValue::String("a".into()));
+                assert_eq!(arr[1], OwnedValue::String("b".into()));
+                assert_eq!(arr[2], OwnedValue::String("c".into()));
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_join() {
+        query!(br#"["a", "b", "c"]"#, r#"join(",")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "a,b,c");
+            }
+        );
+
+        // Join with null values (should be skipped)
+        query!(br#"["a", null, "c"]"#, r#"join("-")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "a-c");
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_contains() {
+        // String contains
+        query!(br#""hello world""#, r#"contains("world")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        // Array contains
+        query!(br#"[1, 2, 3]"#, r#"contains([2])"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        // Object contains
+        query!(br#"{"a": 1, "b": 2}"#, r#"contains({"a": 1})"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_inside() {
+        // inside is the inverse of contains
+        query!(br#"[2]"#, r#"inside([1, 2, 3])"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        query!(br#"{"a": 1}"#, r#"inside({"a": 1, "b": 2})"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+    }
+
+    // ==========================================================================
+    // Phase 5: Array Functions Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_builtin_first() {
+        query!(br#"[1, 2, 3]"#, "first",
+            QueryResult::One(StandardJson::Number(n)) => {
+                assert_eq!(n.as_i64().unwrap(), 1);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_last() {
+        query!(br#"[1, 2, 3]"#, "last",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 3);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_nth() {
+        query!(br#"[10, 20, 30]"#, "nth(1)",
+            QueryResult::One(StandardJson::Number(n)) => {
+                assert_eq!(n.as_i64().unwrap(), 20);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_reverse() {
+        query!(br#"[1, 2, 3]"#, "reverse",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(3), OwnedValue::Int(2), OwnedValue::Int(1)]);
+            }
+        );
+
+        // Reverse also works on strings
+        query!(br#""hello""#, "reverse",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "olleh");
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_flatten() {
+        query!(br#"[[1, 2], [3, [4]]]"#, "flatten",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 4);
+                assert_eq!(arr[0], OwnedValue::Int(1));
+                assert_eq!(arr[3], OwnedValue::Array(vec![OwnedValue::Int(4)]));
+            }
+        );
+
+        // Flatten with depth
+        query!(br#"[[1], [[2]], [[[3]]]]"#, "flatten(2)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0], OwnedValue::Int(1));
+                assert_eq!(arr[1], OwnedValue::Int(2));
+                assert_eq!(arr[2], OwnedValue::Array(vec![OwnedValue::Int(3)]));
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_group_by() {
+        query!(br#"[{"a": 1}, {"a": 2}, {"a": 1}]"#, "group_by(.a)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                // Should group by .a value
+                assert_eq!(arr.len(), 2);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_unique() {
+        query!(br#"[1, 2, 1, 3, 2]"#, "unique",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_unique_by() {
+        query!(br#"[{"a": 1, "b": 1}, {"a": 1, "b": 2}, {"a": 2, "b": 3}]"#, "unique_by(.a)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_sort() {
+        query!(br#"[3, 1, 2]"#, "sort",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_sort_by() {
+        query!(br#"[{"a": 3}, {"a": 1}, {"a": 2}]"#, "sort_by(.a)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                // First element should have a=1
+                if let OwnedValue::Object(obj) = &arr[0] {
+                    assert_eq!(obj.get("a"), Some(&OwnedValue::Int(1)));
+                }
+            }
+        );
+    }
+
+    // ==========================================================================
+    // Phase 5: Object Functions Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_builtin_to_entries() {
+        query!(br#"{"a": 1, "b": 2}"#, "to_entries",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                // Each entry should have "key" and "value" fields
+                if let OwnedValue::Object(obj) = &arr[0] {
+                    assert!(obj.contains_key("key"));
+                    assert!(obj.contains_key("value"));
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_from_entries() {
+        query!(br#"[{"key": "a", "value": 1}, {"key": "b", "value": 2}]"#, "from_entries",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("a"), Some(&OwnedValue::Int(1)));
+                assert_eq!(obj.get("b"), Some(&OwnedValue::Int(2)));
+            }
+        );
+
+        // Also supports "name" instead of "key"
+        query!(br#"[{"name": "x", "value": 10}]"#, "from_entries",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("x"), Some(&OwnedValue::Int(10)));
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_with_entries() {
+        // Simple transformation - just pass through
+        // (Assignment syntax `.value = x` is not supported yet,
+        //  so we test a simple transformation using object construction)
+        query!(br#"{"a": 1, "b": 2}"#, "with_entries({key: .key, value: .value})",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("a"), Some(&OwnedValue::Int(1)));
+                assert_eq!(obj.get("b"), Some(&OwnedValue::Int(2)));
+            }
+        );
     }
 }
