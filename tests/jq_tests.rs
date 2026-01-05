@@ -448,8 +448,12 @@ fn test_parse_empty_error() {
 }
 
 #[test]
-fn test_parse_missing_dot_error() {
-    assert!(parse("foo").is_err());
+fn test_parse_func_call_syntax() {
+    // "foo" now parses as FuncCall{name:"foo", args:[]} for user-defined functions
+    // It will fail at evaluation time if the function doesn't exist
+    use succinctly::jq::Expr;
+    let expr = parse("foo").unwrap();
+    assert!(matches!(expr, Expr::FuncCall { name, args } if name == "foo" && args.is_empty()));
 }
 
 #[test]

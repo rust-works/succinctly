@@ -29,7 +29,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::expr::{
-    ArithOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey, StringPart,
+    ArithOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey, Pattern,
+    PatternEntry, StringPart,
 };
 
 /// Error that occurs during parsing.
@@ -823,13 +824,14 @@ impl<'a> Parser<'a> {
                     self.parse_first_expr()
                 } else if self.matches_keyword("last") {
                     self.parse_last_expr()
+                } else if self.matches_keyword("def") {
+                    // Phase 9: Function definition
+                    self.parse_def_expr()
                 } else if let Some(builtin) = self.try_parse_builtin()? {
                     Ok(Expr::Builtin(builtin))
                 } else {
-                    Err(ParseError::new(
-                        "unexpected identifier, expected expression",
-                        self.pos,
-                    ))
+                    // Phase 9: Try to parse as function call
+                    self.parse_func_call_or_error()
                 }
             }
 
@@ -1221,6 +1223,238 @@ impl<'a> Parser<'a> {
             to: Some(Box::new(second)),
             step: Some(Box::new(step)),
         })
+    }
+
+    // =========================================================================
+    // Phase 9: Variables & Definitions
+    // =========================================================================
+
+    /// Parse a pattern for destructuring.
+    /// Patterns can be:
+    /// - `$var` - simple variable binding
+    /// - `{key: $var, ...}` - object destructuring
+    /// - `[$first, $second, ...]` - array destructuring
+    fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
+        self.skip_ws();
+        match self.peek() {
+            Some('$') => {
+                // Simple variable: $var
+                self.next();
+                let name = self.parse_ident()?;
+                Ok(Pattern::Var(name))
+            }
+            Some('{') => {
+                // Object pattern: {key: $var, ...}
+                self.next();
+                self.skip_ws();
+
+                let mut entries = Vec::new();
+
+                // Empty object pattern
+                if self.peek() == Some('}') {
+                    self.next();
+                    return Ok(Pattern::Object(entries));
+                }
+
+                loop {
+                    self.skip_ws();
+                    // Parse key (must be identifier or string)
+                    let key = if self.peek() == Some('"') {
+                        self.parse_string_literal()?
+                    } else {
+                        self.parse_ident()?
+                    };
+
+                    self.skip_ws();
+                    self.expect(':')?;
+                    self.skip_ws();
+
+                    // Parse the pattern for this key
+                    let pattern = self.parse_pattern()?;
+                    entries.push(PatternEntry { key, pattern });
+
+                    self.skip_ws();
+                    match self.peek() {
+                        Some(',') => {
+                            self.next();
+                            continue;
+                        }
+                        Some('}') => {
+                            self.next();
+                            break;
+                        }
+                        _ => {
+                            return Err(ParseError::new("expected ',' or '}' in pattern", self.pos));
+                        }
+                    }
+                }
+
+                Ok(Pattern::Object(entries))
+            }
+            Some('[') => {
+                // Array pattern: [$first, $second, ...]
+                self.next();
+                self.skip_ws();
+
+                let mut patterns = Vec::new();
+
+                // Empty array pattern
+                if self.peek() == Some(']') {
+                    self.next();
+                    return Ok(Pattern::Array(patterns));
+                }
+
+                loop {
+                    self.skip_ws();
+                    let pattern = self.parse_pattern()?;
+                    patterns.push(pattern);
+
+                    self.skip_ws();
+                    match self.peek() {
+                        Some(',') => {
+                            self.next();
+                            continue;
+                        }
+                        Some(']') => {
+                            self.next();
+                            break;
+                        }
+                        _ => {
+                            return Err(ParseError::new("expected ',' or ']' in pattern", self.pos));
+                        }
+                    }
+                }
+
+                Ok(Pattern::Array(patterns))
+            }
+            _ => Err(ParseError::new(
+                "expected pattern ($var, {key: $var}, or [$var])",
+                self.pos,
+            )),
+        }
+    }
+
+    /// Parse a function definition.
+    /// Syntax: def NAME: BODY; or def NAME(PARAMS): BODY;
+    fn parse_def_expr(&mut self) -> Result<Expr, ParseError> {
+        self.consume_keyword("def");
+        self.skip_ws();
+
+        // Parse function name
+        let name = self.parse_ident()?;
+        self.skip_ws();
+
+        // Parse optional parameters
+        let params = if self.peek() == Some('(') {
+            self.next();
+            self.skip_ws();
+            let mut params = Vec::new();
+
+            if self.peek() != Some(')') {
+                loop {
+                    // Parameters can be $var or just var
+                    if self.peek() == Some('$') {
+                        self.next();
+                    }
+                    let param = self.parse_ident()?;
+                    params.push(param);
+                    self.skip_ws();
+
+                    match self.peek() {
+                        Some(';') | Some(',') => {
+                            self.next();
+                            self.skip_ws();
+                        }
+                        Some(')') => break,
+                        _ => {
+                            return Err(ParseError::new(
+                                "expected ';', ',', or ')' in parameter list",
+                                self.pos,
+                            ));
+                        }
+                    }
+                }
+            }
+            self.expect(')')?;
+            params
+        } else {
+            Vec::new()
+        };
+
+        self.skip_ws();
+        self.expect(':')?;
+        self.skip_ws();
+
+        // Parse function body
+        let body = self.parse_pipe_expr()?;
+        self.skip_ws();
+
+        // Expect semicolon
+        self.expect(';')?;
+        self.skip_ws();
+
+        // Parse the rest of the expression where this function is in scope
+        let then = self.parse_pipe_expr()?;
+
+        Ok(Expr::FuncDef {
+            name,
+            params,
+            body: Box::new(body),
+            then: Box::new(then),
+        })
+    }
+
+    /// Parse a function call or return an error for unknown identifier.
+    /// Function call syntax: NAME or NAME(args; args; ...)
+    fn parse_func_call_or_error(&mut self) -> Result<Expr, ParseError> {
+        let _start_pos = self.pos;
+        let name = self.parse_ident()?;
+        self.skip_ws();
+
+        // Check for function arguments
+        let args = if self.peek() == Some('(') {
+            self.next();
+            self.skip_ws();
+            let mut args = Vec::new();
+
+            if self.peek() != Some(')') {
+                loop {
+                    let arg = self.parse_pipe_expr()?;
+                    args.push(arg);
+                    self.skip_ws();
+
+                    match self.peek() {
+                        Some(';') => {
+                            self.next();
+                            self.skip_ws();
+                        }
+                        Some(')') => break,
+                        _ => {
+                            return Err(ParseError::new(
+                                "expected ';' or ')' in function arguments",
+                                self.pos,
+                            ));
+                        }
+                    }
+                }
+            }
+            self.expect(')')?;
+            args
+        } else {
+            Vec::new()
+        };
+
+        // Return as function call - the evaluator will check if it's defined
+        // Note: for known identifiers that aren't functions, we'd have returned earlier
+        // So if we reach here, it's either a user-defined function call or an error
+        if args.is_empty() {
+            // Zero-arg function call - but this might be an unknown identifier
+            // For now, treat it as a function call; the evaluator will handle errors
+            Ok(Expr::FuncCall { name, args })
+        } else {
+            // Has arguments, definitely a function call
+            Ok(Expr::FuncCall { name, args })
+        }
     }
 
     /// Parse a format string: @text, @json, @uri, etc.
@@ -2047,26 +2281,19 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a pipe expression: `expr | expr | ...`
-    /// Also handles `as` binding: `expr as $var | body`
+    /// Also handles `as` binding: `expr as $var | body` or `expr as {pattern} | body`
     fn parse_pipe_expr(&mut self) -> Result<Expr, ParseError> {
         let first = self.parse_alternative()?;
         self.skip_ws();
 
-        // Check for `as` binding
+        // Check for `as` binding (Phase 8: simple var, Phase 9: patterns)
         if self.matches_keyword("as") {
             self.consume_keyword("as");
             self.skip_ws();
-            self.expect('$')?;
-            let var = self.parse_ident()?;
-            self.skip_ws();
-            self.expect('|')?;
-            self.skip_ws();
-            let body = self.parse_pipe_expr()?;
-            return Ok(Expr::As {
-                expr: Box::new(first),
-                var,
-                body: Box::new(body),
-            });
+
+            // Check if it's a simple $var or a pattern
+            let as_expr = self.parse_as_pattern(first)?;
+            return Ok(as_expr);
         }
 
         if self.peek() != Some('|') {
@@ -2085,32 +2312,59 @@ impl<'a> Parser<'a> {
             if self.matches_keyword("as") {
                 self.consume_keyword("as");
                 self.skip_ws();
-                self.expect('$')?;
-                let var = self.parse_ident()?;
-                self.skip_ws();
-                self.expect('|')?;
-                self.skip_ws();
-                let body = self.parse_pipe_expr()?;
-                // Wrap what we have so far as the expression being bound
+
+                let as_expr = self.parse_as_pattern(next_expr)?;
+                // Wrap what we have so far
                 let so_far = if exprs.len() == 1 {
                     exprs.pop().unwrap()
                 } else {
                     Expr::Pipe(exprs)
                 };
-                return Ok(Expr::Pipe(vec![
-                    so_far,
-                    Expr::As {
-                        expr: Box::new(next_expr),
-                        var,
-                        body: Box::new(body),
-                    },
-                ]));
+                return Ok(Expr::Pipe(vec![so_far, as_expr]));
             }
 
             exprs.push(next_expr);
         }
 
         Ok(Expr::pipe(exprs))
+    }
+
+    /// Parse the pattern part of an `as` binding.
+    /// Called after "as" has been consumed.
+    fn parse_as_pattern(&mut self, expr: Expr) -> Result<Expr, ParseError> {
+        match self.peek() {
+            Some('$') => {
+                // Simple variable binding: `$var`
+                self.next();
+                let var = self.parse_ident()?;
+                self.skip_ws();
+                self.expect('|')?;
+                self.skip_ws();
+                let body = self.parse_pipe_expr()?;
+                Ok(Expr::As {
+                    expr: Box::new(expr),
+                    var,
+                    body: Box::new(body),
+                })
+            }
+            Some('{') | Some('[') => {
+                // Pattern destructuring: `{key: $var}` or `[$first, $second]`
+                let pattern = self.parse_pattern()?;
+                self.skip_ws();
+                self.expect('|')?;
+                self.skip_ws();
+                let body = self.parse_pipe_expr()?;
+                Ok(Expr::AsPattern {
+                    expr: Box::new(expr),
+                    pattern,
+                    body: Box::new(body),
+                })
+            }
+            _ => Err(ParseError::new(
+                "expected '$var' or pattern after 'as'",
+                self.pos,
+            )),
+        }
     }
 
     /// Parse a comma expression: `expr, expr, ...`
@@ -2422,7 +2676,7 @@ mod tests {
     #[test]
     fn test_errors() {
         assert!(parse("").is_err());
-        assert!(parse("foo").is_err()); // missing leading dot for field access
+        // Note: "foo" now parses as FuncCall{name:"foo", args:[]} - valid syntax for user functions
         assert!(parse(".[").is_err()); // unclosed bracket
         assert!(parse(".[abc]").is_err()); // invalid index
         assert!(parse(".123").is_err()); // field starting with number

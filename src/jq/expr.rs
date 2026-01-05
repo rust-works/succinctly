@@ -185,6 +185,59 @@ pub enum Expr {
         to: Option<Box<Expr>>,
         step: Option<Box<Expr>>,
     },
+
+    // Phase 9: Variables & Definitions
+    /// Destructuring variable binding: `. as {name: $n, age: $a} | ...`
+    /// or `. as [$first, $second] | ...`
+    AsPattern {
+        /// Expression to evaluate and destructure
+        expr: Box<Expr>,
+        /// Pattern to match against
+        pattern: Pattern,
+        /// Body expression where the variables are in scope
+        body: Box<Expr>,
+    },
+
+    /// Function definition: `def name: body;` or `def name(params): body;`
+    /// The function is in scope for the `then` expression.
+    FuncDef {
+        /// Function name
+        name: String,
+        /// Parameter names (empty for no-arg functions)
+        params: Vec<String>,
+        /// Function body
+        body: Box<Expr>,
+        /// Expression where this function is in scope
+        then: Box<Expr>,
+    },
+
+    /// Function call: `name` or `name(args)`
+    FuncCall {
+        /// Function name
+        name: String,
+        /// Arguments (empty for no-arg calls)
+        args: Vec<Expr>,
+    },
+}
+
+/// A pattern for destructuring variable binding.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    /// Simple variable: `$x`
+    Var(String),
+    /// Object pattern: `{name: $n, age: $a}`
+    Object(Vec<PatternEntry>),
+    /// Array pattern: `[$first, $second]`
+    Array(Vec<Pattern>),
+}
+
+/// An entry in an object destructuring pattern.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PatternEntry {
+    /// The key to match (always a string literal in patterns)
+    pub key: String,
+    /// The pattern to bind the value to
+    pub pattern: Pattern,
 }
 
 /// A part of a string interpolation expression.

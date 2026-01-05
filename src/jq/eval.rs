@@ -21,7 +21,8 @@ use std::collections::BTreeMap;
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
-    ArithOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey, StringPart,
+    ArithOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey, Pattern,
+    StringPart,
 };
 use super::value::OwnedValue;
 
@@ -271,6 +272,20 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
         Expr::Range { from, to, step } => {
             eval_range(from, to.as_deref(), step.as_deref(), value, optional)
         }
+
+        // Phase 9: Variables & Definitions
+        Expr::AsPattern {
+            expr,
+            pattern,
+            body,
+        } => eval_as_pattern(expr, pattern, body, value, optional),
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+        } => eval_func_def(name, params, body, then, value, optional),
+        Expr::FuncCall { name, args } => eval_func_call(name, args, value, optional),
     }
 }
 
@@ -3398,11 +3413,55 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>>(
         }
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
-        QueryResult::Owned(_) | QueryResult::ManyOwned(_) => {
-            // Cannot continue piping with owned values without more complex handling
-            // For Phase 1, we return the owned value as-is
-            result
+        QueryResult::Owned(v) => {
+            // Continue piping with owned value using eval_owned_pipe
+            eval_owned_pipe::<W>(rest, v, optional)
         }
+        QueryResult::ManyOwned(vs) => {
+            // Pipe each owned value through the rest
+            let mut all_results: Vec<OwnedValue> = Vec::new();
+            for v in vs {
+                match eval_owned_pipe::<W>(rest, v, optional) {
+                    QueryResult::Owned(r) => all_results.push(r),
+                    QueryResult::ManyOwned(rs) => all_results.extend(rs),
+                    QueryResult::One(r) => all_results.push(to_owned(&r)),
+                    QueryResult::Many(rs) => all_results.extend(rs.iter().map(to_owned)),
+                    QueryResult::None => {}
+                    QueryResult::Error(e) => return QueryResult::Error(e),
+                }
+            }
+            if all_results.is_empty() {
+                QueryResult::None
+            } else if all_results.len() == 1 {
+                QueryResult::Owned(all_results.pop().unwrap())
+            } else {
+                QueryResult::ManyOwned(all_results)
+            }
+        }
+    }
+}
+
+/// Evaluate a pipe with an OwnedValue as input.
+fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>>(
+    exprs: &[Expr],
+    value: OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    if exprs.is_empty() {
+        return QueryResult::Owned(value);
+    }
+
+    // For owned values, we need to serialize and re-evaluate
+    // This is less efficient but ensures correctness
+    let rest_expr = if exprs.len() == 1 {
+        exprs[0].clone()
+    } else {
+        Expr::Pipe(exprs.to_vec())
+    };
+
+    match eval_owned_expr(&rest_expr, &value, optional) {
+        Ok(v) => QueryResult::Owned(v),
+        Err(e) => QueryResult::Error(e),
     }
 }
 
@@ -3706,6 +3765,61 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
                 .as_ref()
                 .map(|e| Box::new(substitute_var(e, var_name, replacement))),
         },
+        // Phase 9: Variables & Definitions
+        Expr::AsPattern {
+            expr,
+            pattern,
+            body,
+        } => {
+            // Check if any pattern variable shadows the var_name
+            let shadowed = pattern_binds_var(pattern, var_name);
+            Expr::AsPattern {
+                expr: Box::new(substitute_var(expr, var_name, replacement)),
+                pattern: pattern.clone(),
+                body: if shadowed {
+                    body.clone()
+                } else {
+                    Box::new(substitute_var(body, var_name, replacement))
+                },
+            }
+        }
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+        } => {
+            // Check if any parameter shadows the var_name
+            let shadowed = params.contains(&var_name.to_string());
+            Expr::FuncDef {
+                name: name.clone(),
+                params: params.clone(),
+                body: if shadowed {
+                    body.clone()
+                } else {
+                    Box::new(substitute_var(body, var_name, replacement))
+                },
+                then: Box::new(substitute_var(then, var_name, replacement)),
+            }
+        }
+        Expr::FuncCall { name, args } => Expr::FuncCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| substitute_var(a, var_name, replacement))
+                .collect(),
+        },
+    }
+}
+
+/// Check if a pattern binds a given variable name.
+fn pattern_binds_var(pattern: &Pattern, var_name: &str) -> bool {
+    match pattern {
+        Pattern::Var(name) => name == var_name,
+        Pattern::Object(entries) => entries
+            .iter()
+            .any(|e| pattern_binds_var(&e.pattern, var_name)),
+        Pattern::Array(patterns) => patterns.iter().any(|p| pattern_binds_var(p, var_name)),
     }
 }
 
@@ -4578,6 +4692,877 @@ fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::None => QueryResult::Owned(OwnedValue::Bool(false)),
         _ => QueryResult::Owned(OwnedValue::Bool(true)),
     }
+}
+
+// ============================================================================
+// Phase 9: Variables & Definitions
+// ============================================================================
+
+/// Evaluate destructuring pattern binding: `expr as {key: $var, ...} | body`.
+fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>>(
+    expr: &Expr,
+    pattern: &Pattern,
+    body: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the expression to get the value to destructure
+    let bound_result = eval_single(expr, value.clone(), optional);
+
+    let bound_values: Vec<OwnedValue> = match bound_result {
+        QueryResult::One(v) => vec![to_owned(&v)],
+        QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
+        QueryResult::Owned(v) => vec![v],
+        QueryResult::ManyOwned(vs) => vs,
+        QueryResult::None => return QueryResult::None,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+    };
+
+    let mut all_results: Vec<OwnedValue> = Vec::new();
+
+    for bound_val in bound_values {
+        // Extract bindings from the pattern
+        let bindings = match extract_pattern_bindings(pattern, &bound_val) {
+            Ok(b) => b,
+            Err(e) => return QueryResult::Error(e),
+        };
+
+        // Substitute all bindings in the body
+        let mut substituted_body = body.clone();
+        for (var_name, var_value) in &bindings {
+            substituted_body = substitute_var(&substituted_body, var_name, var_value);
+        }
+
+        match eval_single(&substituted_body, value.clone(), optional) {
+            QueryResult::One(v) => all_results.push(to_owned(&v)),
+            QueryResult::Many(vs) => all_results.extend(vs.iter().map(to_owned)),
+            QueryResult::Owned(v) => all_results.push(v),
+            QueryResult::ManyOwned(vs) => all_results.extend(vs),
+            QueryResult::None => {}
+            QueryResult::Error(e) => return QueryResult::Error(e),
+        }
+    }
+
+    if all_results.is_empty() {
+        QueryResult::None
+    } else if all_results.len() == 1 {
+        QueryResult::Owned(all_results.pop().unwrap())
+    } else {
+        QueryResult::ManyOwned(all_results)
+    }
+}
+
+/// Extract variable bindings from a pattern matching an OwnedValue.
+fn extract_pattern_bindings(
+    pattern: &Pattern,
+    value: &OwnedValue,
+) -> Result<Vec<(String, OwnedValue)>, EvalError> {
+    match pattern {
+        Pattern::Var(name) => Ok(vec![(name.clone(), value.clone())]),
+        Pattern::Object(entries) => {
+            let obj = match value {
+                OwnedValue::Object(o) => o,
+                _ => return Err(EvalError::type_error("object", owned_type_name(value))),
+            };
+            let mut bindings = Vec::new();
+            for entry in entries {
+                let field_value = obj.get(&entry.key).cloned().unwrap_or(OwnedValue::Null);
+                let sub_bindings = extract_pattern_bindings(&entry.pattern, &field_value)?;
+                bindings.extend(sub_bindings);
+            }
+            Ok(bindings)
+        }
+        Pattern::Array(patterns) => {
+            let arr = match value {
+                OwnedValue::Array(a) => a,
+                _ => return Err(EvalError::type_error("array", owned_type_name(value))),
+            };
+            let mut bindings = Vec::new();
+            for (i, pat) in patterns.iter().enumerate() {
+                let elem_value = arr.get(i).cloned().unwrap_or(OwnedValue::Null);
+                let sub_bindings = extract_pattern_bindings(pat, &elem_value)?;
+                bindings.extend(sub_bindings);
+            }
+            Ok(bindings)
+        }
+    }
+}
+
+/// Get a type name for an OwnedValue.
+fn owned_type_name(value: &OwnedValue) -> &'static str {
+    match value {
+        OwnedValue::Null => "null",
+        OwnedValue::Bool(_) => "boolean",
+        OwnedValue::Int(_) | OwnedValue::Float(_) => "number",
+        OwnedValue::String(_) => "string",
+        OwnedValue::Array(_) => "array",
+        OwnedValue::Object(_) => "object",
+    }
+}
+
+/// Evaluate function definition: `def name(params): body; then`.
+///
+/// In jq, function definitions are scoped - the function is available in `then`.
+/// We implement this by substituting function calls with the body (with args substituted).
+fn eval_func_def<'a, W: Clone + AsRef<[u64]>>(
+    name: &str,
+    params: &[String],
+    body: &Expr,
+    then: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Substitute all calls to this function in `then` with the body
+    let expanded_then = expand_func_calls(then, name, params, body);
+    eval_single(&expanded_then, value, optional)
+}
+
+/// Expand function calls to a defined function by inlining the body.
+fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Expr) -> Expr {
+    match expr {
+        Expr::FuncCall { name, args } if name == func_name => {
+            // Check arity
+            if args.len() != params.len() {
+                // Return an error expression - wrong number of arguments
+                // Use a string literal as the error message
+                return Expr::Error(Some(Box::new(Expr::Literal(Literal::String(format!(
+                    "function {} takes {} arguments, got {}",
+                    func_name,
+                    params.len(),
+                    args.len()
+                ))))));
+            }
+            // Substitute parameters with arguments in the body
+            let mut result = body.clone();
+            // First, expand any nested function calls in the arguments
+            let expanded_args: Vec<Expr> = args
+                .iter()
+                .map(|a| expand_func_calls(a, func_name, params, body))
+                .collect();
+            // Then substitute each parameter
+            for (param, arg) in params.iter().zip(expanded_args.iter()) {
+                result = substitute_func_param(&result, param, arg);
+            }
+            // Also expand any recursive calls in the result
+            expand_func_calls(&result, func_name, params, body)
+        }
+        // Recursively expand in all subexpressions
+        Expr::Identity => Expr::Identity,
+        Expr::Field(s) => Expr::Field(s.clone()),
+        Expr::Index(i) => Expr::Index(*i),
+        Expr::Slice { start, end } => Expr::Slice {
+            start: *start,
+            end: *end,
+        },
+        Expr::Iterate => Expr::Iterate,
+        Expr::RecursiveDescent => Expr::RecursiveDescent,
+        Expr::Optional(e) => {
+            Expr::Optional(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Expr::Pipe(exprs) => Expr::Pipe(
+            exprs
+                .iter()
+                .map(|e| expand_func_calls(e, func_name, params, body))
+                .collect(),
+        ),
+        Expr::Comma(exprs) => Expr::Comma(
+            exprs
+                .iter()
+                .map(|e| expand_func_calls(e, func_name, params, body))
+                .collect(),
+        ),
+        Expr::Array(e) => Expr::Array(Box::new(expand_func_calls(e, func_name, params, body))),
+        Expr::Object(entries) => Expr::Object(
+            entries
+                .iter()
+                .map(|entry| {
+                    let new_key = match &entry.key {
+                        ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
+                        ObjectKey::Expr(e) => {
+                            ObjectKey::Expr(Box::new(expand_func_calls(e, func_name, params, body)))
+                        }
+                    };
+                    ObjectEntry {
+                        key: new_key,
+                        value: expand_func_calls(&entry.value, func_name, params, body),
+                    }
+                })
+                .collect(),
+        ),
+        Expr::Literal(lit) => Expr::Literal(lit.clone()),
+        Expr::Paren(e) => Expr::Paren(Box::new(expand_func_calls(e, func_name, params, body))),
+        Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
+            op: *op,
+            left: Box::new(expand_func_calls(left, func_name, params, body)),
+            right: Box::new(expand_func_calls(right, func_name, params, body)),
+        },
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op: *op,
+            left: Box::new(expand_func_calls(left, func_name, params, body)),
+            right: Box::new(expand_func_calls(right, func_name, params, body)),
+        },
+        Expr::And(l, r) => Expr::And(
+            Box::new(expand_func_calls(l, func_name, params, body)),
+            Box::new(expand_func_calls(r, func_name, params, body)),
+        ),
+        Expr::Or(l, r) => Expr::Or(
+            Box::new(expand_func_calls(l, func_name, params, body)),
+            Box::new(expand_func_calls(r, func_name, params, body)),
+        ),
+        Expr::Not => Expr::Not,
+        Expr::Alternative(l, r) => Expr::Alternative(
+            Box::new(expand_func_calls(l, func_name, params, body)),
+            Box::new(expand_func_calls(r, func_name, params, body)),
+        ),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => Expr::If {
+            cond: Box::new(expand_func_calls(cond, func_name, params, body)),
+            then_branch: Box::new(expand_func_calls(then_branch, func_name, params, body)),
+            else_branch: Box::new(expand_func_calls(else_branch, func_name, params, body)),
+        },
+        Expr::Try { expr, catch } => Expr::Try {
+            expr: Box::new(expand_func_calls(expr, func_name, params, body)),
+            catch: catch
+                .as_ref()
+                .map(|c| Box::new(expand_func_calls(c, func_name, params, body))),
+        },
+        Expr::Error(msg) => Expr::Error(msg.clone()),
+        Expr::Builtin(b) => Expr::Builtin(expand_func_calls_in_builtin(b, func_name, params, body)),
+        Expr::StringInterpolation(parts) => Expr::StringInterpolation(
+            parts
+                .iter()
+                .map(|p| match p {
+                    StringPart::Literal(s) => StringPart::Literal(s.clone()),
+                    StringPart::Expr(e) => {
+                        StringPart::Expr(Box::new(expand_func_calls(e, func_name, params, body)))
+                    }
+                })
+                .collect(),
+        ),
+        Expr::Format(f) => Expr::Format(*f),
+        Expr::Var(v) => Expr::Var(v.clone()),
+        Expr::As {
+            expr,
+            var,
+            body: as_body,
+        } => Expr::As {
+            expr: Box::new(expand_func_calls(expr, func_name, params, body)),
+            var: var.clone(),
+            body: Box::new(expand_func_calls(as_body, func_name, params, body)),
+        },
+        Expr::Reduce {
+            input,
+            var,
+            init,
+            update,
+        } => Expr::Reduce {
+            input: Box::new(expand_func_calls(input, func_name, params, body)),
+            var: var.clone(),
+            init: Box::new(expand_func_calls(init, func_name, params, body)),
+            update: Box::new(expand_func_calls(update, func_name, params, body)),
+        },
+        Expr::Foreach {
+            input,
+            var,
+            init,
+            update,
+            extract,
+        } => Expr::Foreach {
+            input: Box::new(expand_func_calls(input, func_name, params, body)),
+            var: var.clone(),
+            init: Box::new(expand_func_calls(init, func_name, params, body)),
+            update: Box::new(expand_func_calls(update, func_name, params, body)),
+            extract: extract
+                .as_ref()
+                .map(|e| Box::new(expand_func_calls(e, func_name, params, body))),
+        },
+        Expr::Limit { n, expr } => Expr::Limit {
+            n: Box::new(expand_func_calls(n, func_name, params, body)),
+            expr: Box::new(expand_func_calls(expr, func_name, params, body)),
+        },
+        Expr::FirstExpr(e) => {
+            Expr::FirstExpr(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Expr::LastExpr(e) => {
+            Expr::LastExpr(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Expr::NthExpr { n, expr } => Expr::NthExpr {
+            n: Box::new(expand_func_calls(n, func_name, params, body)),
+            expr: Box::new(expand_func_calls(expr, func_name, params, body)),
+        },
+        Expr::Until { cond, update } => Expr::Until {
+            cond: Box::new(expand_func_calls(cond, func_name, params, body)),
+            update: Box::new(expand_func_calls(update, func_name, params, body)),
+        },
+        Expr::While { cond, update } => Expr::While {
+            cond: Box::new(expand_func_calls(cond, func_name, params, body)),
+            update: Box::new(expand_func_calls(update, func_name, params, body)),
+        },
+        Expr::Repeat(e) => Expr::Repeat(Box::new(expand_func_calls(e, func_name, params, body))),
+        Expr::Range { from, to, step } => Expr::Range {
+            from: Box::new(expand_func_calls(from, func_name, params, body)),
+            to: to
+                .as_ref()
+                .map(|e| Box::new(expand_func_calls(e, func_name, params, body))),
+            step: step
+                .as_ref()
+                .map(|e| Box::new(expand_func_calls(e, func_name, params, body))),
+        },
+        Expr::AsPattern {
+            expr,
+            pattern,
+            body: pattern_body,
+        } => Expr::AsPattern {
+            expr: Box::new(expand_func_calls(expr, func_name, params, body)),
+            pattern: pattern.clone(),
+            body: Box::new(expand_func_calls(pattern_body, func_name, params, body)),
+        },
+        Expr::FuncDef {
+            name: inner_name,
+            params: inner_params,
+            body: inner_body,
+            then,
+        } => {
+            // If this defines the same function name, it shadows our function
+            if inner_name == func_name {
+                // Don't expand in the body or then - this is a new definition
+                expr.clone()
+            } else {
+                Expr::FuncDef {
+                    name: inner_name.clone(),
+                    params: inner_params.clone(),
+                    body: Box::new(expand_func_calls(inner_body, func_name, params, body)),
+                    then: Box::new(expand_func_calls(then, func_name, params, body)),
+                }
+            }
+        }
+        Expr::FuncCall { name, args } => {
+            // Different function name, just expand in arguments
+            Expr::FuncCall {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|a| expand_func_calls(a, func_name, params, body))
+                    .collect(),
+            }
+        }
+    }
+}
+
+/// Substitute a function parameter with an argument expression.
+fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
+    match expr {
+        // A variable reference to the parameter becomes the argument expression
+        Expr::Var(name) if name == param => arg.clone(),
+        Expr::Var(_) => expr.clone(),
+        Expr::Identity => Expr::Identity,
+        Expr::Field(name) => Expr::Field(name.clone()),
+        Expr::Index(i) => Expr::Index(*i),
+        Expr::Slice { start, end } => Expr::Slice {
+            start: *start,
+            end: *end,
+        },
+        Expr::Iterate => Expr::Iterate,
+        Expr::RecursiveDescent => Expr::RecursiveDescent,
+        Expr::Optional(e) => Expr::Optional(Box::new(substitute_func_param(e, param, arg))),
+        Expr::Pipe(exprs) => Expr::Pipe(
+            exprs
+                .iter()
+                .map(|e| substitute_func_param(e, param, arg))
+                .collect(),
+        ),
+        Expr::Comma(exprs) => Expr::Comma(
+            exprs
+                .iter()
+                .map(|e| substitute_func_param(e, param, arg))
+                .collect(),
+        ),
+        Expr::Array(e) => Expr::Array(Box::new(substitute_func_param(e, param, arg))),
+        Expr::Object(entries) => Expr::Object(
+            entries
+                .iter()
+                .map(|entry| {
+                    let new_key = match &entry.key {
+                        ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
+                        ObjectKey::Expr(e) => {
+                            ObjectKey::Expr(Box::new(substitute_func_param(e, param, arg)))
+                        }
+                    };
+                    ObjectEntry {
+                        key: new_key,
+                        value: substitute_func_param(&entry.value, param, arg),
+                    }
+                })
+                .collect(),
+        ),
+        Expr::Literal(lit) => Expr::Literal(lit.clone()),
+        Expr::Paren(e) => Expr::Paren(Box::new(substitute_func_param(e, param, arg))),
+        Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
+            op: *op,
+            left: Box::new(substitute_func_param(left, param, arg)),
+            right: Box::new(substitute_func_param(right, param, arg)),
+        },
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op: *op,
+            left: Box::new(substitute_func_param(left, param, arg)),
+            right: Box::new(substitute_func_param(right, param, arg)),
+        },
+        Expr::And(l, r) => Expr::And(
+            Box::new(substitute_func_param(l, param, arg)),
+            Box::new(substitute_func_param(r, param, arg)),
+        ),
+        Expr::Or(l, r) => Expr::Or(
+            Box::new(substitute_func_param(l, param, arg)),
+            Box::new(substitute_func_param(r, param, arg)),
+        ),
+        Expr::Not => Expr::Not,
+        Expr::Alternative(l, r) => Expr::Alternative(
+            Box::new(substitute_func_param(l, param, arg)),
+            Box::new(substitute_func_param(r, param, arg)),
+        ),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => Expr::If {
+            cond: Box::new(substitute_func_param(cond, param, arg)),
+            then_branch: Box::new(substitute_func_param(then_branch, param, arg)),
+            else_branch: Box::new(substitute_func_param(else_branch, param, arg)),
+        },
+        Expr::Try { expr, catch } => Expr::Try {
+            expr: Box::new(substitute_func_param(expr, param, arg)),
+            catch: catch
+                .as_ref()
+                .map(|c| Box::new(substitute_func_param(c, param, arg))),
+        },
+        Expr::Error(msg) => Expr::Error(msg.clone()),
+        Expr::Builtin(b) => Expr::Builtin(substitute_func_param_in_builtin(b, param, arg)),
+        Expr::StringInterpolation(parts) => Expr::StringInterpolation(
+            parts
+                .iter()
+                .map(|p| match p {
+                    StringPart::Literal(s) => StringPart::Literal(s.clone()),
+                    StringPart::Expr(e) => {
+                        StringPart::Expr(Box::new(substitute_func_param(e, param, arg)))
+                    }
+                })
+                .collect(),
+        ),
+        Expr::Format(f) => Expr::Format(*f),
+        Expr::As { expr, var, body } => {
+            // If var shadows param, don't substitute in body
+            if var == param {
+                Expr::As {
+                    expr: Box::new(substitute_func_param(expr, param, arg)),
+                    var: var.clone(),
+                    body: body.clone(),
+                }
+            } else {
+                Expr::As {
+                    expr: Box::new(substitute_func_param(expr, param, arg)),
+                    var: var.clone(),
+                    body: Box::new(substitute_func_param(body, param, arg)),
+                }
+            }
+        }
+        Expr::Reduce {
+            input,
+            var,
+            init,
+            update,
+        } => {
+            if var == param {
+                Expr::Reduce {
+                    input: Box::new(substitute_func_param(input, param, arg)),
+                    var: var.clone(),
+                    init: Box::new(substitute_func_param(init, param, arg)),
+                    update: update.clone(),
+                }
+            } else {
+                Expr::Reduce {
+                    input: Box::new(substitute_func_param(input, param, arg)),
+                    var: var.clone(),
+                    init: Box::new(substitute_func_param(init, param, arg)),
+                    update: Box::new(substitute_func_param(update, param, arg)),
+                }
+            }
+        }
+        Expr::Foreach {
+            input,
+            var,
+            init,
+            update,
+            extract,
+        } => {
+            if var == param {
+                Expr::Foreach {
+                    input: Box::new(substitute_func_param(input, param, arg)),
+                    var: var.clone(),
+                    init: Box::new(substitute_func_param(init, param, arg)),
+                    update: update.clone(),
+                    extract: extract.clone(),
+                }
+            } else {
+                Expr::Foreach {
+                    input: Box::new(substitute_func_param(input, param, arg)),
+                    var: var.clone(),
+                    init: Box::new(substitute_func_param(init, param, arg)),
+                    update: Box::new(substitute_func_param(update, param, arg)),
+                    extract: extract
+                        .as_ref()
+                        .map(|e| Box::new(substitute_func_param(e, param, arg))),
+                }
+            }
+        }
+        Expr::Limit { n, expr } => Expr::Limit {
+            n: Box::new(substitute_func_param(n, param, arg)),
+            expr: Box::new(substitute_func_param(expr, param, arg)),
+        },
+        Expr::FirstExpr(e) => Expr::FirstExpr(Box::new(substitute_func_param(e, param, arg))),
+        Expr::LastExpr(e) => Expr::LastExpr(Box::new(substitute_func_param(e, param, arg))),
+        Expr::NthExpr { n, expr } => Expr::NthExpr {
+            n: Box::new(substitute_func_param(n, param, arg)),
+            expr: Box::new(substitute_func_param(expr, param, arg)),
+        },
+        Expr::Until { cond, update } => Expr::Until {
+            cond: Box::new(substitute_func_param(cond, param, arg)),
+            update: Box::new(substitute_func_param(update, param, arg)),
+        },
+        Expr::While { cond, update } => Expr::While {
+            cond: Box::new(substitute_func_param(cond, param, arg)),
+            update: Box::new(substitute_func_param(update, param, arg)),
+        },
+        Expr::Repeat(e) => Expr::Repeat(Box::new(substitute_func_param(e, param, arg))),
+        Expr::Range { from, to, step } => Expr::Range {
+            from: Box::new(substitute_func_param(from, param, arg)),
+            to: to
+                .as_ref()
+                .map(|e| Box::new(substitute_func_param(e, param, arg))),
+            step: step
+                .as_ref()
+                .map(|e| Box::new(substitute_func_param(e, param, arg))),
+        },
+        Expr::AsPattern {
+            expr,
+            pattern,
+            body,
+        } => {
+            let shadowed = pattern_binds_var(pattern, param);
+            Expr::AsPattern {
+                expr: Box::new(substitute_func_param(expr, param, arg)),
+                pattern: pattern.clone(),
+                body: if shadowed {
+                    body.clone()
+                } else {
+                    Box::new(substitute_func_param(body, param, arg))
+                },
+            }
+        }
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+        } => {
+            let shadowed = params.contains(&param.to_string());
+            Expr::FuncDef {
+                name: name.clone(),
+                params: params.clone(),
+                body: if shadowed {
+                    body.clone()
+                } else {
+                    Box::new(substitute_func_param(body, param, arg))
+                },
+                then: Box::new(substitute_func_param(then, param, arg)),
+            }
+        }
+        Expr::FuncCall { name, args } => {
+            // In jq, function parameters are bare identifiers that parse as zero-arg FuncCalls
+            // Check if this is a reference to the parameter
+            if name == param && args.is_empty() {
+                arg.clone()
+            } else {
+                Expr::FuncCall {
+                    name: name.clone(),
+                    args: args
+                        .iter()
+                        .map(|a| substitute_func_param(a, param, arg))
+                        .collect(),
+                }
+            }
+        }
+    }
+}
+
+/// Expand function calls in a builtin expression.
+fn expand_func_calls_in_builtin(
+    builtin: &Builtin,
+    func_name: &str,
+    params: &[String],
+    body: &Expr,
+) -> Builtin {
+    match builtin {
+        Builtin::Type => Builtin::Type,
+        Builtin::IsNull => Builtin::IsNull,
+        Builtin::IsBoolean => Builtin::IsBoolean,
+        Builtin::IsNumber => Builtin::IsNumber,
+        Builtin::IsString => Builtin::IsString,
+        Builtin::IsArray => Builtin::IsArray,
+        Builtin::IsObject => Builtin::IsObject,
+        Builtin::Length => Builtin::Length,
+        Builtin::Utf8ByteLength => Builtin::Utf8ByteLength,
+        Builtin::Keys => Builtin::Keys,
+        Builtin::KeysUnsorted => Builtin::KeysUnsorted,
+        Builtin::Has(e) => Builtin::Has(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::In(e) => Builtin::In(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::Select(e) => {
+            Builtin::Select(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::Empty => Builtin::Empty,
+        Builtin::Map(e) => Builtin::Map(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::MapValues(e) => {
+            Builtin::MapValues(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::Add => Builtin::Add,
+        Builtin::Any => Builtin::Any,
+        Builtin::All => Builtin::All,
+        Builtin::Min => Builtin::Min,
+        Builtin::Max => Builtin::Max,
+        Builtin::MinBy(e) => {
+            Builtin::MinBy(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::MaxBy(e) => {
+            Builtin::MaxBy(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::AsciiDowncase => Builtin::AsciiDowncase,
+        Builtin::AsciiUpcase => Builtin::AsciiUpcase,
+        Builtin::Ltrimstr(e) => {
+            Builtin::Ltrimstr(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::Rtrimstr(e) => {
+            Builtin::Rtrimstr(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::Startswith(e) => {
+            Builtin::Startswith(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::Endswith(e) => {
+            Builtin::Endswith(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::Split(e) => {
+            Builtin::Split(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::Join(e) => Builtin::Join(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::Contains(e) => {
+            Builtin::Contains(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::Inside(e) => {
+            Builtin::Inside(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::First => Builtin::First,
+        Builtin::Last => Builtin::Last,
+        Builtin::Nth(e) => Builtin::Nth(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::Reverse => Builtin::Reverse,
+        Builtin::Flatten => Builtin::Flatten,
+        Builtin::FlattenDepth(e) => {
+            Builtin::FlattenDepth(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::GroupBy(e) => {
+            Builtin::GroupBy(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::Unique => Builtin::Unique,
+        Builtin::UniqueBy(e) => {
+            Builtin::UniqueBy(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::Sort => Builtin::Sort,
+        Builtin::SortBy(e) => {
+            Builtin::SortBy(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::ToEntries => Builtin::ToEntries,
+        Builtin::FromEntries => Builtin::FromEntries,
+        Builtin::WithEntries(e) => {
+            Builtin::WithEntries(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::ToString => Builtin::ToString,
+        Builtin::ToNumber => Builtin::ToNumber,
+        Builtin::Explode => Builtin::Explode,
+        Builtin::Implode => Builtin::Implode,
+        Builtin::Test(e) => Builtin::Test(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::Indices(e) => {
+            Builtin::Indices(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::Index(e) => {
+            Builtin::Index(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::Rindex(e) => {
+            Builtin::Rindex(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::ToJsonStream => Builtin::ToJsonStream,
+        Builtin::FromJsonStream => Builtin::FromJsonStream,
+        Builtin::GetPath(e) => {
+            Builtin::GetPath(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        #[cfg(feature = "regex")]
+        Builtin::Match(re, flags) => Builtin::Match(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            flags.clone(),
+        ),
+        #[cfg(feature = "regex")]
+        Builtin::Capture(e) => {
+            Builtin::Capture(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        #[cfg(feature = "regex")]
+        Builtin::Scan(e) => Builtin::Scan(Box::new(expand_func_calls(e, func_name, params, body))),
+        #[cfg(feature = "regex")]
+        Builtin::Splits(e) => {
+            Builtin::Splits(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        #[cfg(feature = "regex")]
+        Builtin::Sub(re, repl) => Builtin::Sub(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            Box::new(expand_func_calls(repl, func_name, params, body)),
+        ),
+        #[cfg(feature = "regex")]
+        Builtin::Gsub(re, repl) => Builtin::Gsub(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            Box::new(expand_func_calls(repl, func_name, params, body)),
+        ),
+        #[cfg(feature = "regex")]
+        Builtin::TestWithFlags(re, flags) => Builtin::TestWithFlags(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            flags.clone(),
+        ),
+        Builtin::Recurse => Builtin::Recurse,
+        Builtin::RecurseF(f) => {
+            Builtin::RecurseF(Box::new(expand_func_calls(f, func_name, params, body)))
+        }
+        Builtin::RecurseCond(f, c) => Builtin::RecurseCond(
+            Box::new(expand_func_calls(f, func_name, params, body)),
+            Box::new(expand_func_calls(c, func_name, params, body)),
+        ),
+        Builtin::Walk(f) => Builtin::Walk(Box::new(expand_func_calls(f, func_name, params, body))),
+        Builtin::IsValid(e) => {
+            Builtin::IsValid(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+    }
+}
+
+/// Substitute function parameter in a builtin expression.
+fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) -> Builtin {
+    match builtin {
+        Builtin::Type => Builtin::Type,
+        Builtin::IsNull => Builtin::IsNull,
+        Builtin::IsBoolean => Builtin::IsBoolean,
+        Builtin::IsNumber => Builtin::IsNumber,
+        Builtin::IsString => Builtin::IsString,
+        Builtin::IsArray => Builtin::IsArray,
+        Builtin::IsObject => Builtin::IsObject,
+        Builtin::Length => Builtin::Length,
+        Builtin::Utf8ByteLength => Builtin::Utf8ByteLength,
+        Builtin::Keys => Builtin::Keys,
+        Builtin::KeysUnsorted => Builtin::KeysUnsorted,
+        Builtin::Has(e) => Builtin::Has(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::In(e) => Builtin::In(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Select(e) => Builtin::Select(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Empty => Builtin::Empty,
+        Builtin::Map(e) => Builtin::Map(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::MapValues(e) => Builtin::MapValues(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Add => Builtin::Add,
+        Builtin::Any => Builtin::Any,
+        Builtin::All => Builtin::All,
+        Builtin::Min => Builtin::Min,
+        Builtin::Max => Builtin::Max,
+        Builtin::MinBy(e) => Builtin::MinBy(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::MaxBy(e) => Builtin::MaxBy(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::AsciiDowncase => Builtin::AsciiDowncase,
+        Builtin::AsciiUpcase => Builtin::AsciiUpcase,
+        Builtin::Ltrimstr(e) => Builtin::Ltrimstr(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Rtrimstr(e) => Builtin::Rtrimstr(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Startswith(e) => {
+            Builtin::Startswith(Box::new(substitute_func_param(e, param, arg)))
+        }
+        Builtin::Endswith(e) => Builtin::Endswith(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Split(e) => Builtin::Split(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Join(e) => Builtin::Join(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Contains(e) => Builtin::Contains(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Inside(e) => Builtin::Inside(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::First => Builtin::First,
+        Builtin::Last => Builtin::Last,
+        Builtin::Nth(e) => Builtin::Nth(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Reverse => Builtin::Reverse,
+        Builtin::Flatten => Builtin::Flatten,
+        Builtin::FlattenDepth(e) => {
+            Builtin::FlattenDepth(Box::new(substitute_func_param(e, param, arg)))
+        }
+        Builtin::GroupBy(e) => Builtin::GroupBy(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Unique => Builtin::Unique,
+        Builtin::UniqueBy(e) => Builtin::UniqueBy(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Sort => Builtin::Sort,
+        Builtin::SortBy(e) => Builtin::SortBy(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::ToEntries => Builtin::ToEntries,
+        Builtin::FromEntries => Builtin::FromEntries,
+        Builtin::WithEntries(e) => {
+            Builtin::WithEntries(Box::new(substitute_func_param(e, param, arg)))
+        }
+        Builtin::ToString => Builtin::ToString,
+        Builtin::ToNumber => Builtin::ToNumber,
+        Builtin::Explode => Builtin::Explode,
+        Builtin::Implode => Builtin::Implode,
+        Builtin::Test(e) => Builtin::Test(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Indices(e) => Builtin::Indices(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Index(e) => Builtin::Index(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Rindex(e) => Builtin::Rindex(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::ToJsonStream => Builtin::ToJsonStream,
+        Builtin::FromJsonStream => Builtin::FromJsonStream,
+        Builtin::GetPath(e) => Builtin::GetPath(Box::new(substitute_func_param(e, param, arg))),
+        #[cfg(feature = "regex")]
+        Builtin::Match(re, flags) => Builtin::Match(
+            Box::new(substitute_func_param(re, param, arg)),
+            flags.clone(),
+        ),
+        #[cfg(feature = "regex")]
+        Builtin::Capture(e) => Builtin::Capture(Box::new(substitute_func_param(e, param, arg))),
+        #[cfg(feature = "regex")]
+        Builtin::Scan(e) => Builtin::Scan(Box::new(substitute_func_param(e, param, arg))),
+        #[cfg(feature = "regex")]
+        Builtin::Splits(e) => Builtin::Splits(Box::new(substitute_func_param(e, param, arg))),
+        #[cfg(feature = "regex")]
+        Builtin::Sub(re, repl) => Builtin::Sub(
+            Box::new(substitute_func_param(re, param, arg)),
+            Box::new(substitute_func_param(repl, param, arg)),
+        ),
+        #[cfg(feature = "regex")]
+        Builtin::Gsub(re, repl) => Builtin::Gsub(
+            Box::new(substitute_func_param(re, param, arg)),
+            Box::new(substitute_func_param(repl, param, arg)),
+        ),
+        #[cfg(feature = "regex")]
+        Builtin::TestWithFlags(re, flags) => Builtin::TestWithFlags(
+            Box::new(substitute_func_param(re, param, arg)),
+            flags.clone(),
+        ),
+        Builtin::Recurse => Builtin::Recurse,
+        Builtin::RecurseF(f) => Builtin::RecurseF(Box::new(substitute_func_param(f, param, arg))),
+        Builtin::RecurseCond(f, c) => Builtin::RecurseCond(
+            Box::new(substitute_func_param(f, param, arg)),
+            Box::new(substitute_func_param(c, param, arg)),
+        ),
+        Builtin::Walk(f) => Builtin::Walk(Box::new(substitute_func_param(f, param, arg))),
+        Builtin::IsValid(e) => Builtin::IsValid(Box::new(substitute_func_param(e, param, arg))),
+    }
+}
+
+/// Evaluate a function call to an undefined function.
+/// This is an error case - the function was not defined.
+fn eval_func_call<'a, W: Clone + AsRef<[u64]>>(
+    name: &str,
+    _args: &[Expr],
+    _value: StandardJson<'a, W>,
+    _optional: bool,
+) -> QueryResult<'a, W> {
+    QueryResult::Error(EvalError::new(format!("undefined function: {}", name)))
 }
 
 #[cfg(test)]
@@ -6404,6 +7389,102 @@ mod tests {
         // isvalid returns false for error-producing expressions
         query!(br#"{"a": 1}"#, r#"isvalid(.b)"#,
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+    }
+
+    // =========================================================================
+    // Phase 9 Tests: Destructuring and Function Definitions
+    // =========================================================================
+
+    #[test]
+    fn test_destructuring_object_pattern() {
+        // Object destructuring: . as {name: $n, age: $a} | ...
+        query!(br#"{"name": "Alice", "age": 30}"#, r#". as {name: $n, age: $a} | "\($n) is \($a)""#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Alice is 30");
+            }
+        );
+    }
+
+    #[test]
+    fn test_destructuring_array_pattern() {
+        // Array destructuring: . as [$first, $second] | ...
+        query!(br#"[1, 2, 3]"#, r#". as [$a, $b] | $a + $b"#,
+            QueryResult::Owned(OwnedValue::Int(3)) => {}
+        );
+    }
+
+    #[test]
+    fn test_destructuring_nested_pattern() {
+        // Nested destructuring
+        query!(br#"{"user": {"name": "Bob", "id": 42}}"#, r#". as {user: {name: $n}} | $n"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Bob");
+            }
+        );
+    }
+
+    #[test]
+    fn test_function_def_simple() {
+        // Simple function definition without parameters
+        query!(br#"5"#, r#"def double: . * 2; double"#,
+            QueryResult::Owned(OwnedValue::Int(10)) => {}
+        );
+    }
+
+    #[test]
+    fn test_function_def_with_params() {
+        // Function with parameters (using 'addtwo' to avoid conflict with builtin 'add')
+        query!(br#"null"#, r#"def addtwo(a; b): a + b; addtwo(3; 4)"#,
+            QueryResult::Owned(OwnedValue::Int(7)) => {}
+        );
+    }
+
+    #[test]
+    fn test_function_def_chained() {
+        // Single def, then use in pipe
+        query!(br#"5"#, r#"def inc: . + 1; . | inc"#,
+            QueryResult::Owned(OwnedValue::Int(6)) => {}
+        );
+
+        // Two defs, use only second - this exercises nested func def
+        query!(br#"5"#, r#"def double: . * 2; def inc: . + 1; inc"#,
+            QueryResult::Owned(OwnedValue::Int(6)) => {}
+        );
+
+        // Two defs, use only first
+        query!(br#"5"#, r#"def double: . * 2; def inc: . + 1; double"#,
+            QueryResult::Owned(OwnedValue::Int(10)) => {}
+        );
+
+        // This should work: use both in a pipe, but inc is defined first
+        // (so inc isn't nested inside double's scope)
+        query!(br#"5"#, r#"def inc: . + 1; def double: . * 2; double | inc"#,
+            QueryResult::Owned(OwnedValue::Int(11)) => {}
+        );
+    }
+
+    #[test]
+    fn test_function_uses_input() {
+        // Function that uses the input value
+        query!(br#"{"x": 10}"#, r#"def getx: .x; getx"#,
+            QueryResult::One(StandardJson::Number(n)) => {
+                assert_eq!(n.as_i64().unwrap(), 10);
+            }
+        );
+    }
+
+    #[test]
+    fn test_function_with_filter_param() {
+        // Function with filter parameter (jq-style)
+        query!(br#"[1, 2, 3]"#, r#"def apply(f): map(f); apply(. * 2)"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![
+                    OwnedValue::Int(2),
+                    OwnedValue::Int(4),
+                    OwnedValue::Int(6),
+                ]);
+            }
         );
     }
 }
