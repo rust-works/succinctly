@@ -1118,6 +1118,586 @@ fn word_min_excess(word: u64, valid_bits: usize) -> (i8, i16) {
     (min_clamped, excess)
 }
 
+// ============================================================================
+// BalancedParensV2: O(1) rank using absolute cumulative prefix sums
+// ============================================================================
+
+/// Number of 64-bit words per basic block for V2 rank directory.
+const V2_WORDS_PER_BLOCK: usize = 8;
+
+/// Balanced parentheses with O(1) rank queries using absolute cumulative prefix sums.
+///
+/// This is an alternative implementation that stores absolute cumulative values
+/// instead of per-block relative values, enabling true O(1) rank1() queries.
+///
+/// The find_close/find_open operations use the same min-excess indices as
+/// the original BalancedParens, but rank1() is O(1) instead of O(n/block_size).
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct BalancedParensV2<W = Vec<u64>> {
+    /// The underlying bit vector (1=open, 0=close)
+    words: W,
+    /// Number of valid bits
+    len: usize,
+
+    // --- Min-excess indices for find_close (same as original) ---
+    /// L0: Per-word min excess (signed, relative to start of word)
+    l0_min_excess: Vec<i8>,
+    /// L0: Per-word excess (total excess within this word)
+    l0_word_excess: Vec<i16>,
+
+    /// L1: Per-32-word block min excess (relative to block start)
+    l1_min_excess: Vec<i16>,
+    /// L1: Per-32-word block excess (total excess within this block)
+    l1_block_excess: Vec<i16>,
+
+    /// L2: Per-1024-word block min excess (relative to block start)
+    l2_min_excess: Vec<i16>,
+    /// L2: Per-1024-word block excess (total excess within this block)
+    l2_block_excess: Vec<i16>,
+
+    // --- Cumulative rank directory for O(1) rank1() ---
+    /// Cumulative 1-bit count at the start of each 512-bit block (8 words)
+    /// This is an absolute value from position 0.
+    rank_l1: Vec<u32>,
+
+    /// Cumulative 1-bit count within each 512-bit block (7 x 9-bit offsets packed)
+    /// rank_l2[block] contains offsets for words 1-7 within the block.
+    rank_l2: Vec<u64>,
+}
+
+/// Build the V2 index structures with absolute cumulative rank.
+#[allow(clippy::type_complexity)]
+fn build_bp_index_v2(
+    words: &[u64],
+    len: usize,
+) -> (
+    Vec<i8>,
+    Vec<i16>,
+    Vec<i16>,
+    Vec<i16>,
+    Vec<i16>,
+    Vec<i16>,
+    Vec<u32>,
+    Vec<u64>,
+) {
+    if words.is_empty() || len == 0 {
+        return (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+
+    let num_words = words.len();
+    let num_l1 = num_words.div_ceil(FACTOR_L1);
+    let num_l2 = num_l1.div_ceil(FACTOR_L2);
+    let num_rank_blocks = num_words.div_ceil(V2_WORDS_PER_BLOCK);
+
+    // Build L0: per-word statistics (same as original)
+    let mut l0_min_excess = Vec::with_capacity(num_words);
+    let mut l0_word_excess = Vec::with_capacity(num_words);
+
+    for (i, &word) in words.iter().enumerate() {
+        let valid_bits = if i == num_words - 1 && !len.is_multiple_of(64) {
+            len % 64
+        } else {
+            64
+        };
+        let (min_e, total_e) = word_min_excess(word, valid_bits);
+        l0_min_excess.push(min_e);
+        l0_word_excess.push(total_e);
+    }
+
+    // Build L1: per-32-word block statistics (same as original)
+    let mut l1_min_excess = Vec::with_capacity(num_l1);
+    let mut l1_block_excess = Vec::with_capacity(num_l1);
+
+    for block_idx in 0..num_l1 {
+        let start = block_idx * FACTOR_L1;
+        let end = (start + FACTOR_L1).min(num_words);
+
+        let mut block_min: i16 = 0;
+        let mut running_excess: i16 = 0;
+
+        for i in start..end {
+            let word_min = l0_min_excess[i] as i16;
+            let word_excess = l0_word_excess[i];
+            block_min = block_min.min(running_excess + word_min);
+            running_excess += word_excess;
+        }
+
+        l1_min_excess.push(block_min);
+        l1_block_excess.push(running_excess);
+    }
+
+    // Build L2: per-1024-word block statistics (same as original)
+    let mut l2_min_excess = Vec::with_capacity(num_l2);
+    let mut l2_block_excess = Vec::with_capacity(num_l2);
+
+    for block_idx in 0..num_l2 {
+        let start = block_idx * FACTOR_L2;
+        let end = (start + FACTOR_L2).min(num_l1);
+
+        let mut block_min: i16 = 0;
+        let mut running_excess: i16 = 0;
+
+        for i in start..end {
+            let l1_min = l1_min_excess[i];
+            let l1_excess = l1_block_excess[i];
+            block_min = block_min.min(running_excess + l1_min);
+            running_excess += l1_excess;
+        }
+
+        l2_min_excess.push(block_min);
+        l2_block_excess.push(running_excess);
+    }
+
+    // Build rank directory with ABSOLUTE cumulative values
+    let mut rank_l1 = Vec::with_capacity(num_rank_blocks);
+    let mut rank_l2 = Vec::with_capacity(num_rank_blocks);
+
+    let mut cumulative_rank: u64 = 0;
+
+    for block_idx in 0..num_rank_blocks {
+        let block_start = block_idx * V2_WORDS_PER_BLOCK;
+        let block_end = (block_start + V2_WORDS_PER_BLOCK).min(num_words);
+
+        // Store absolute cumulative rank at block start
+        rank_l1.push(cumulative_rank as u32);
+
+        // Build L2 offsets within this block
+        let mut l2_packed: u64 = 0;
+        let mut block_cumulative: u16 = 0;
+
+        for (i, word_idx) in (block_start..block_end).enumerate() {
+            if i > 0 && i < 8 {
+                // Pack offset into 9 bits at position (i-1)*9
+                l2_packed |= (block_cumulative as u64) << ((i - 1) * 9);
+            }
+            block_cumulative += words[word_idx].count_ones() as u16;
+        }
+
+        rank_l2.push(l2_packed);
+        cumulative_rank += block_cumulative as u64;
+    }
+
+    (
+        l0_min_excess,
+        l0_word_excess,
+        l1_min_excess,
+        l1_block_excess,
+        l2_min_excess,
+        l2_block_excess,
+        rank_l1,
+        rank_l2,
+    )
+}
+
+impl BalancedParensV2<Vec<u64>> {
+    /// Build from an owned bitvector representing balanced parentheses.
+    pub fn new(words: Vec<u64>, len: usize) -> Self {
+        let (
+            l0_min_excess,
+            l0_word_excess,
+            l1_min_excess,
+            l1_block_excess,
+            l2_min_excess,
+            l2_block_excess,
+            rank_l1,
+            rank_l2,
+        ) = build_bp_index_v2(&words, len);
+
+        Self {
+            words,
+            len,
+            l0_min_excess,
+            l0_word_excess,
+            l1_min_excess,
+            l1_block_excess,
+            l2_min_excess,
+            l2_block_excess,
+            rank_l1,
+            rank_l2,
+        }
+    }
+}
+
+impl<W: AsRef<[u64]>> BalancedParensV2<W> {
+    /// Build from a generic storage type representing balanced parentheses.
+    ///
+    /// This is useful for borrowed data, e.g., from mmap.
+    pub fn from_words(words: W, len: usize) -> Self {
+        let (
+            l0_min_excess,
+            l0_word_excess,
+            l1_min_excess,
+            l1_block_excess,
+            l2_min_excess,
+            l2_block_excess,
+            rank_l1,
+            rank_l2,
+        ) = build_bp_index_v2(words.as_ref(), len);
+
+        Self {
+            words,
+            len,
+            l0_min_excess,
+            l0_word_excess,
+            l1_min_excess,
+            l1_block_excess,
+            l2_min_excess,
+            l2_block_excess,
+            rank_l1,
+            rank_l2,
+        }
+    }
+
+    /// Get the length in bits.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Check if the bit vector is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Get a reference to the underlying words.
+    #[inline]
+    pub fn words(&self) -> &[u64] {
+        self.words.as_ref()
+    }
+
+    /// Check if the bit at position p is a 1 (open parenthesis).
+    #[inline]
+    pub fn is_open(&self, p: usize) -> bool {
+        if p >= self.len {
+            return false;
+        }
+        let words = self.words.as_ref();
+        let word_idx = p / 64;
+        let bit_idx = p % 64;
+        (words[word_idx] >> bit_idx) & 1 == 1
+    }
+
+    /// Check if the bit at position p is a 0 (close parenthesis).
+    #[inline]
+    pub fn is_close(&self, p: usize) -> bool {
+        if p >= self.len {
+            return false;
+        }
+        !self.is_open(p)
+    }
+
+    /// O(1) rank1: Count 1-bits (opens) in positions [0, p).
+    ///
+    /// This is the key improvement over the original BalancedParens.
+    /// Uses absolute cumulative prefix sums for constant-time queries.
+    #[inline]
+    pub fn rank1(&self, p: usize) -> usize {
+        if p == 0 {
+            return 0;
+        }
+        let p = p.min(self.len);
+
+        let word_idx = p / 64;
+        let bit_idx = p % 64;
+
+        // Which 512-bit block (8 words)?
+        let block_idx = word_idx / V2_WORDS_PER_BLOCK;
+        let word_in_block = word_idx % V2_WORDS_PER_BLOCK;
+
+        // L1: absolute cumulative rank at block start
+        let l1_rank = if block_idx < self.rank_l1.len() {
+            self.rank_l1[block_idx] as usize
+        } else {
+            // Handle edge case: query beyond indexed range
+            return self.rank1_slow(p);
+        };
+
+        // L2: offset within block
+        let l2_rank = if word_in_block == 0 {
+            0
+        } else if block_idx < self.rank_l2.len() {
+            let l2_packed = self.rank_l2[block_idx];
+            let l2_idx = word_in_block - 1;
+            ((l2_packed >> (l2_idx * 9)) & 0x1FF) as usize
+        } else {
+            return self.rank1_slow(p);
+        };
+
+        // Count remaining bits in partial word
+        let partial = if bit_idx > 0 {
+            let words = self.words.as_ref();
+            let word = words[word_idx];
+            let mask = (1u64 << bit_idx) - 1;
+            (word & mask).count_ones() as usize
+        } else {
+            0
+        };
+
+        l1_rank + l2_rank + partial
+    }
+
+    /// Fallback slow rank1 for edge cases.
+    fn rank1_slow(&self, p: usize) -> usize {
+        let words = self.words.as_ref();
+        let word_idx = p / 64;
+        let bit_idx = p % 64;
+
+        let mut count = 0usize;
+        for i in 0..word_idx {
+            count += words[i].count_ones() as usize;
+        }
+        if bit_idx > 0 && word_idx < words.len() {
+            let mask = (1u64 << bit_idx) - 1;
+            count += (words[word_idx] & mask).count_ones() as usize;
+        }
+        count
+    }
+
+    /// Get excess at position p (number of opens minus closes in [0, p]).
+    #[inline]
+    pub fn excess(&self, p: usize) -> i32 {
+        if p >= self.len {
+            return 0;
+        }
+        // excess = 2 * rank1(p+1) - (p+1)
+        // Because: opens contribute +1, closes contribute -1
+        // rank1 counts opens, so closes = (p+1) - rank1
+        // excess = rank1 - ((p+1) - rank1) = 2*rank1 - (p+1)
+        let ones = self.rank1(p + 1) as i32;
+        let total = (p + 1) as i32;
+        2 * ones - total
+    }
+
+    /// Find matching close parenthesis.
+    pub fn find_close(&self, p: usize) -> Option<usize> {
+        if p >= self.len || self.is_close(p) {
+            return None;
+        }
+        self.find_close_from(p + 1, 1)
+    }
+
+    /// Internal: find position where excess drops to 0.
+    fn find_close_from(&self, start_pos: usize, initial_excess: i32) -> Option<usize> {
+        if start_pos >= self.len {
+            return None;
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum State {
+            ScanBit,
+            CheckL0,
+            CheckL1,
+            CheckL2,
+            FromL0,
+            FromL1,
+            FromL2,
+        }
+
+        let mut state = State::FromL0;
+        let mut excess = initial_excess;
+        let mut pos = start_pos;
+
+        loop {
+            match state {
+                State::ScanBit => {
+                    if pos >= self.len {
+                        return None;
+                    }
+
+                    let words = self.words.as_ref();
+                    let word_idx = pos / 64;
+                    let bit_idx = pos % 64;
+                    let bit = (words[word_idx] >> bit_idx) & 1;
+
+                    if bit == 0 {
+                        excess -= 1;
+                        if excess == 0 {
+                            return Some(pos);
+                        }
+                    } else {
+                        excess += 1;
+                    }
+                    pos += 1;
+                    state = State::FromL0;
+                }
+
+                State::CheckL0 => {
+                    debug_assert!(pos.is_multiple_of(64));
+
+                    let word_idx = pos / 64;
+                    if word_idx >= self.l0_min_excess.len() {
+                        return None;
+                    }
+
+                    let min_e = self.l0_min_excess[word_idx] as i32;
+                    if excess + min_e <= 0 {
+                        state = State::ScanBit;
+                    } else {
+                        if pos < self.len && self.is_close(pos) && excess <= 1 {
+                            return Some(pos);
+                        }
+                        let word_excess = self.l0_word_excess[word_idx] as i32;
+                        excess += word_excess;
+                        pos += 64;
+                        state = State::FromL0;
+                    }
+                }
+
+                State::CheckL1 => {
+                    debug_assert!(pos.is_multiple_of(64));
+
+                    let l1_idx = pos / (64 * FACTOR_L1);
+                    if l1_idx >= self.l1_min_excess.len() {
+                        return None;
+                    }
+
+                    let min_e = self.l1_min_excess[l1_idx] as i32;
+                    if excess + min_e <= 0 {
+                        state = State::CheckL0;
+                    } else if pos < self.len {
+                        if self.is_close(pos) && excess <= 1 {
+                            return Some(pos);
+                        }
+                        let l1_excess = self.l1_block_excess[l1_idx] as i32;
+                        excess += l1_excess;
+                        pos += 64 * FACTOR_L1;
+                        state = State::FromL1;
+                    } else {
+                        return None;
+                    }
+                }
+
+                State::CheckL2 => {
+                    let l2_idx = pos / (64 * FACTOR_L1 * FACTOR_L2);
+                    if l2_idx >= self.l2_min_excess.len() {
+                        return None;
+                    }
+
+                    let min_e = self.l2_min_excess[l2_idx] as i32;
+                    if excess + min_e <= 0 {
+                        state = State::CheckL1;
+                    } else if pos < self.len {
+                        if self.is_close(pos) && excess <= 1 {
+                            return Some(pos);
+                        }
+                        let l2_excess = self.l2_block_excess[l2_idx] as i32;
+                        excess += l2_excess;
+                        pos += 64 * FACTOR_L1 * FACTOR_L2;
+                        state = State::FromL2;
+                    } else {
+                        return None;
+                    }
+                }
+
+                State::FromL0 => {
+                    if pos.is_multiple_of(64) {
+                        state = State::FromL1;
+                    } else if pos < self.len {
+                        state = State::ScanBit;
+                    } else {
+                        return None;
+                    }
+                }
+
+                State::FromL1 => {
+                    if pos.is_multiple_of(64 * FACTOR_L1) {
+                        if pos < self.len {
+                            state = State::FromL2;
+                        } else {
+                            return None;
+                        }
+                    } else if pos < self.len {
+                        state = State::CheckL0;
+                    } else {
+                        return None;
+                    }
+                }
+
+                State::FromL2 => {
+                    if pos.is_multiple_of(64 * FACTOR_L1 * FACTOR_L2) {
+                        if pos < self.len {
+                            state = State::CheckL2;
+                        } else {
+                            return None;
+                        }
+                    } else if pos < self.len {
+                        state = State::CheckL1;
+                    } else {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Find matching open parenthesis.
+    ///
+    /// Given a close parenthesis at position `p`, returns the position
+    /// of its matching open.
+    pub fn find_open(&self, p: usize) -> Option<usize> {
+        if p >= self.len || self.is_open(p) {
+            return None;
+        }
+
+        find_open(self.words.as_ref(), self.len, p)
+    }
+
+    /// Find enclosing open parenthesis (parent node).
+    ///
+    /// Given an open parenthesis at position `p`, returns the position
+    /// of the open parenthesis that encloses it.
+    pub fn enclose(&self, p: usize) -> Option<usize> {
+        if p >= self.len || self.is_close(p) {
+            return None;
+        }
+
+        enclose(self.words.as_ref(), self.len, p)
+    }
+
+    /// Navigate to parent node.
+    ///
+    /// Alias for `enclose`.
+    pub fn parent(&self, p: usize) -> Option<usize> {
+        self.enclose(p)
+    }
+
+    /// Navigate to next sibling in tree.
+    pub fn next_sibling(&self, p: usize) -> Option<usize> {
+        if !self.is_open(p) {
+            return None;
+        }
+        let close = self.find_close(p)?;
+        if close + 1 < self.len && self.is_open(close + 1) {
+            Some(close + 1)
+        } else {
+            None
+        }
+    }
+
+    /// Navigate to first child.
+    pub fn first_child(&self, p: usize) -> Option<usize> {
+        if !self.is_open(p) || p + 1 >= self.len {
+            return None;
+        }
+        if self.is_open(p + 1) {
+            Some(p + 1)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1965,5 +2545,129 @@ mod tests {
         let bp = BalancedParens::new(vec![0b0011u64], 4);
         assert_eq!(bp.first_child(0), Some(1));
         assert_eq!(bp.first_child(1), None); // inner leaf
+    }
+
+    // ========================================================================
+    // BalancedParensV2 tests
+    // ========================================================================
+
+    #[test]
+    fn test_v2_rank1_simple() {
+        // "(()())" = 0b001011 - bits: 1 1 0 1 0 0
+        let bp = BalancedParensV2::new(vec![0b001011u64], 6);
+
+        // rank1(p) = count of 1s in [0, p)
+        assert_eq!(bp.rank1(0), 0); // no bits before 0
+        assert_eq!(bp.rank1(1), 1); // bit 0 is 1
+        assert_eq!(bp.rank1(2), 2); // bits 0,1 are 1
+        assert_eq!(bp.rank1(3), 2); // bit 2 is 0
+        assert_eq!(bp.rank1(4), 3); // bit 3 is 1
+        assert_eq!(bp.rank1(5), 3); // bit 4 is 0
+        assert_eq!(bp.rank1(6), 3); // bit 5 is 0
+    }
+
+    #[test]
+    fn test_v2_rank1_matches_v1() {
+        // Compare V1 and V2 rank1 on various patterns
+        // Note: V1 has an edge case bug at p==len when len is word-aligned,
+        // so we test up to len-1 for those cases
+        let patterns: &[(Vec<u64>, usize)] = &[
+            (vec![0b001011u64], 6),
+            (vec![0b0011u64], 4),
+            (vec![0x5555555555555555u64], 64), // alternating "()()()"
+            (vec![u64::MAX, 0], 128),          // all opens then all closes
+        ];
+
+        for (words, len) in patterns {
+            let v1 = BalancedParens::new(words.clone(), *len);
+            let v2 = BalancedParensV2::new(words.clone(), *len);
+
+            // Test positions 0 to len-1 (avoiding V1 edge case bug at p==len)
+            for p in 0..*len {
+                assert_eq!(
+                    v1.rank1(p),
+                    v2.rank1(p),
+                    "rank1({}) mismatch for pattern {:?}",
+                    p,
+                    words
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_v2_find_close_matches_v1() {
+        // Compare V1 and V2 find_close on various patterns
+        let patterns: &[(Vec<u64>, usize)] = &[
+            (vec![0b001011u64], 6),
+            (vec![0b0011u64], 4),
+            (vec![0x5555555555555555u64], 64),
+        ];
+
+        for (words, len) in patterns {
+            let v1 = BalancedParens::new(words.clone(), *len);
+            let v2 = BalancedParensV2::new(words.clone(), *len);
+
+            for p in 0..*len {
+                if v1.is_open(p) {
+                    assert_eq!(
+                        v1.find_close(p),
+                        v2.find_close(p),
+                        "find_close({}) mismatch for pattern {:?}",
+                        p,
+                        words
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_v2_excess() {
+        // "(()())" = 0b001011
+        let bp = BalancedParensV2::new(vec![0b001011u64], 6);
+
+        // excess(p) = opens - closes in [0, p]
+        assert_eq!(bp.excess(0), 1); // 1 open
+        assert_eq!(bp.excess(1), 2); // 2 opens
+        assert_eq!(bp.excess(2), 1); // 2 opens, 1 close
+        assert_eq!(bp.excess(3), 2); // 3 opens, 1 close
+        assert_eq!(bp.excess(4), 1); // 3 opens, 2 closes
+        assert_eq!(bp.excess(5), 0); // 3 opens, 3 closes
+    }
+
+    #[test]
+    fn test_v2_large_bitvector() {
+        // Test with multiple 512-bit blocks to verify the rank directory
+        // 64 words = 8 blocks of 8 words each
+        let mut words = Vec::with_capacity(64);
+
+        // First 32 words: all opens (1s)
+        for _ in 0..32 {
+            words.push(u64::MAX);
+        }
+        // Next 32 words: all closes (0s)
+        for _ in 0..32 {
+            words.push(0u64);
+        }
+
+        let len = 64 * 64; // 4096 bits
+        let v1 = BalancedParens::new(words.clone(), len);
+        let v2 = BalancedParensV2::new(words, len);
+
+        // Test rank1 at various positions
+        let test_positions = [0, 1, 63, 64, 512, 1024, 2048, 2049, 4095, 4096];
+        for &p in &test_positions {
+            assert_eq!(
+                v1.rank1(p),
+                v2.rank1(p),
+                "rank1({}) mismatch on large bitvector",
+                p
+            );
+        }
+
+        // Test find_close
+        assert_eq!(v1.find_close(0), v2.find_close(0));
+        assert_eq!(v1.find_close(2047), v2.find_close(2047));
     }
 }

@@ -77,6 +77,10 @@ harness = false
 name = "neon_movemask"
 harness = false
 
+[[bench]]
+name = "json_pipeline"
+harness = false
+
 [[bin]]
 name = "succinctly"
 path = "src/bin/succinctly/main.rs"
