@@ -73,6 +73,10 @@ harness = false
 name = "balanced_parens"
 harness = false
 
+[[bench]]
+name = "neon_movemask"
+harness = false
+
 [[bin]]
 name = "succinctly"
 path = "src/bin/succinctly/main.rs"
