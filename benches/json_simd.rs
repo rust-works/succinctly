@@ -137,7 +137,16 @@ fn bench_json_files(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes(*file_size));
 
-        // AVX2 (if available) - fastest on modern x86_64
+        // AVX-512 (if available) - fastest on Intel Ice Lake+ and AMD Zen 4+
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            group.bench_with_input(BenchmarkId::new("AVX512", name), &bytes, |b, bytes| {
+                b.iter(|| {
+                    succinctly::json::simd::avx512::build_semi_index_standard(black_box(bytes))
+                })
+            });
+        }
+
+        // AVX2 (if available) - fastest on older x86_64
         if is_x86_feature_detected!("avx2") {
             group.bench_with_input(BenchmarkId::new("AVX2", name), &bytes, |b, bytes| {
                 b.iter(|| succinctly::json::simd::avx2::build_semi_index_standard(black_box(bytes)))
@@ -189,6 +198,15 @@ fn bench_simple_cursor_files(c: &mut Criterion) {
         };
 
         group.throughput(Throughput::Bytes(*file_size));
+
+        // AVX-512 (if available)
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            group.bench_with_input(BenchmarkId::new("AVX512", name), &bytes, |b, bytes| {
+                b.iter(|| {
+                    succinctly::json::simd::avx512::build_semi_index_simple(black_box(bytes))
+                })
+            });
+        }
 
         // AVX2 (if available)
         if is_x86_feature_detected!("avx2") {
