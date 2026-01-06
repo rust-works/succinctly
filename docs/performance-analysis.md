@@ -169,38 +169,16 @@ while pos + step < words.len() && cumulative + word_popcount(pos + step) < k {
 
 ## Tier 3: Quick Wins (Low effort, measurable gain)
 
-### 7. Cache-Align RankDirectory
+### 7. Cache-Align RankDirectory ✓ IMPLEMENTED
 
-**Impact:** 1-3% cache hit improvement
-**Complexity:** Very Low
-**Estimated Lines:** ~30
+**Impact:** 3-4% rank query improvement (measured)
+**Status:** Completed
 
-**Implementation:**
-```rust
-#[repr(align(64))]
-struct CacheAlignedL1L2 {
-    data: Vec<u64>,
-}
-```
+The `RankDirectory` L1+L2 data is now allocated with 64-byte cache-line alignment using custom allocation via `alloc::alloc::alloc` with `Layout::from_size_align(size, 64)`.
 
 ---
 
-### 8. BP rank_l1 Memory Optimization
-
-**Impact:** 25% memory reduction for BP rank data
-**Complexity:** Very Low
-**Estimated Lines:** ~60
-
-**Current Issue:**
-- `rank_l1` uses `Vec<u32>` but typical JSON only needs ~16 bits
-
-**Implementation:**
-- Use `Vec<u16>` for rank_l1 (supports 65K structures)
-- Pack rank_l2 offsets more tightly
-
----
-
-### 9. BitWriter Batch Methods
+### 8. BitWriter Batch Methods
 
 **Impact:** 2-5% JSON parsing
 **Complexity:** Low
@@ -218,7 +196,7 @@ impl BitWriter {
 
 ---
 
-### 10. Broadword select_in_word Hybrid
+### 9. Broadword select_in_word Hybrid
 
 **Impact:** 2-4% select query latency
 **Complexity:** Low
@@ -258,11 +236,11 @@ pub fn select_in_word(word: u64, k: u32) -> u32 {
 
 **Opportunity:** Consolidate into single allocation with computed offsets
 
-### Issue 2: RankDirectory Cache Line Crossing
+### Issue 2: RankDirectory Cache Line Crossing ✓ RESOLVED
 
-**Current:** L1 and L2 in separate allocations, queries cross cache lines
+**Previous:** L1 and L2 in separate allocations, queries cross cache lines
 
-**Opportunity:** Interleave L1/L2 data or use `#[repr(align(64))]`
+**Solution:** L1+L2 data now uses 64-byte aligned allocation (see Item 7)
 
 ### Issue 3: BitWriter Flush Frequency
 
@@ -284,12 +262,11 @@ pub fn select_in_word(word: u64, k: u32) -> u32 {
 
 ## Implementation Roadmap
 
-### Phase 1: Quick Wins (~250 lines, 1-2 days)
+### Phase 1: Quick Wins (~150 lines remaining)
 
-1. Cache-align RankDirectory
-2. BP rank_l1 memory optimization (u32 → u16)
-3. BitWriter batch methods
-4. Broadword select hybrid
+1. ~~Cache-align RankDirectory~~ ✓ **DONE** (3-4% improvement measured)
+2. BitWriter batch methods
+3. Broadword select hybrid
 
 **Expected Impact:** 3-8% overall improvement
 
@@ -336,6 +313,7 @@ cd bench-compare && cargo bench
 | Multi-threading JSON | Very high complexity (2000+ lines), only helps files >10MB |
 | Select0 index | Low demand for 0-bit queries in JSON workloads |
 | Full BMI2 dependency | AMD Zen 1/2 have 18-cycle microcode PDEP/PEXT |
+| BP rank_l1 u32→u16 | Real JSON easily exceeds 65K structural elements (10MB file has ~1.5M); u16 would silently overflow |
 
 ---
 
