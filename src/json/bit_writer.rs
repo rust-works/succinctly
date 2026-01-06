@@ -78,7 +78,11 @@ impl BitWriter {
         if count <= space_in_word {
             // All bits fit in current word
             // Mask to only use the lowest `count` bits
-            let mask = if count == 64 { u64::MAX } else { (1u64 << count) - 1 };
+            let mask = if count == 64 {
+                u64::MAX
+            } else {
+                (1u64 << count) - 1
+            };
             self.current_word |= (bits & mask) << pos;
             self.bit_position += count as u32;
 
@@ -90,7 +94,11 @@ impl BitWriter {
         } else {
             // Bits span two words
             // First, fill the rest of current word
-            let mask = if count == 64 { u64::MAX } else { (1u64 << count) - 1 };
+            let mask = if count == 64 {
+                u64::MAX
+            } else {
+                (1u64 << count) - 1
+            };
             let masked_bits = bits & mask;
             self.current_word |= masked_bits << pos;
             self.words.push(self.current_word);

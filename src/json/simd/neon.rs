@@ -1,6 +1,9 @@
 //! NEON-accelerated JSON semi-indexing for ARM64.
 //!
 //! Processes 16 bytes at a time using ARM NEON SIMD instructions.
+//!
+//! Uses nibble-based lookup tables (simdjson technique) for efficient
+//! character classification with just 2 table lookups + 1 AND per chunk.
 
 use core::arch::aarch64::*;
 
@@ -8,15 +11,63 @@ use crate::json::BitWriter;
 use crate::json::simple::{SemiIndex as SimpleSemiIndex, State as SimpleState};
 use crate::json::standard::{SemiIndex, State};
 
-/// ASCII byte constants
-const DOUBLE_QUOTE: u8 = b'"';
-const BACKSLASH: u8 = b'\\';
-const OPEN_BRACE: u8 = b'{';
-const CLOSE_BRACE: u8 = b'}';
-const OPEN_BRACKET: u8 = b'[';
-const CLOSE_BRACKET: u8 = b']';
-const COMMA: u8 = b',';
-const COLON: u8 = b':';
+// Nibble lookup tables for character classification.
+// Each byte in the result has bit flags indicating character class:
+//   Bit 0: opens ({ [)
+//   Bit 1: closes (} ])
+//   Bit 2: delims (, :)
+//   Bit 3: quote (")
+//   Bit 4: backslash (\)
+//
+// The tables are designed so that lo_table[lo_nibble] & hi_table[hi_nibble]
+// produces the correct flags for each ASCII character.
+
+/// Low nibble lookup table (indexed by byte & 0x0F)
+const LO_NIBBLE_TABLE: [u8; 16] = [
+    0x00, // 0
+    0x00, // 1
+    0x08, // 2: quote (") has lo=2
+    0x00, // 3
+    0x00, // 4
+    0x00, // 5
+    0x00, // 6
+    0x00, // 7
+    0x00, // 8
+    0x00, // 9
+    0x04, // A: colon (:) has lo=A
+    0x01, // B: opens ({ [) have lo=B
+    0x14, // C: comma (,) has lo=C (bit 2), backslash (\) has lo=C (bit 4)
+    0x02, // D: closes (} ]) have lo=D
+    0x00, // E
+    0x00, // F
+];
+
+/// High nibble lookup table (indexed by byte >> 4)
+const HI_NIBBLE_TABLE: [u8; 16] = [
+    0x00, // 0
+    0x00, // 1
+    0x0C, // 2: comma (,) and quote (") have hi=2 (bits 2,3)
+    0x04, // 3: colon (:) has hi=3 (bit 2)
+    0x00, // 4
+    0x13, // 5: [ ] \ have hi=5 (bits 0,1,4)
+    0x00, // 6
+    0x03, // 7: { } have hi=7 (bits 0,1)
+    0x00, // 8
+    0x00, // 9
+    0x00, // A
+    0x00, // B
+    0x00, // C
+    0x00, // D
+    0x00, // E
+    0x00, // F
+];
+
+// Classification result bit flags
+const FLAG_OPEN: u8 = 0x01;
+const FLAG_CLOSE: u8 = 0x02;
+const FLAG_DELIM: u8 = 0x04;
+const FLAG_QUOTE: u8 = 0x08;
+const FLAG_BACKSLASH: u8 = 0x10;
 
 /// Extract a bitmask from the high bit of each byte in a NEON vector.
 /// Returns a u16 where bit i is set if byte i has its high bit set.
@@ -67,68 +118,66 @@ struct CharClass {
     string_special: u16,
 }
 
-/// Classify 16 bytes at once using NEON.
+/// Classify 16 bytes at once using NEON with nibble lookup tables.
+///
+/// Uses the simdjson technique: split each byte into high/low nibbles,
+/// lookup both in precomputed tables, AND the results to get classification.
+/// This replaces ~12 comparisons + ~8 ORs with just 2 lookups + 1 AND.
 #[inline]
 #[target_feature(enable = "neon")]
 unsafe fn classify_chars(chunk: uint8x16_t) -> CharClass {
     unsafe {
-        // Create comparison vectors for each character
-        let v_quote = vdupq_n_u8(DOUBLE_QUOTE);
-        let v_backslash = vdupq_n_u8(BACKSLASH);
-        let v_open_brace = vdupq_n_u8(OPEN_BRACE);
-        let v_close_brace = vdupq_n_u8(CLOSE_BRACE);
-        let v_open_bracket = vdupq_n_u8(OPEN_BRACKET);
-        let v_close_bracket = vdupq_n_u8(CLOSE_BRACKET);
-        let v_comma = vdupq_n_u8(COMMA);
-        let v_colon = vdupq_n_u8(COLON);
+        // Load nibble lookup tables into NEON registers
+        let lo_table = vld1q_u8(LO_NIBBLE_TABLE.as_ptr());
+        let hi_table = vld1q_u8(HI_NIBBLE_TABLE.as_ptr());
 
-        // Compare and get masks
-        let eq_quote = vceqq_u8(chunk, v_quote);
-        let eq_backslash = vceqq_u8(chunk, v_backslash);
-        let eq_open_brace = vceqq_u8(chunk, v_open_brace);
-        let eq_close_brace = vceqq_u8(chunk, v_close_brace);
-        let eq_open_bracket = vceqq_u8(chunk, v_open_bracket);
-        let eq_close_bracket = vceqq_u8(chunk, v_close_bracket);
-        let eq_comma = vceqq_u8(chunk, v_comma);
-        let eq_colon = vceqq_u8(chunk, v_colon);
+        // Split each byte into nibbles
+        let lo_nibble = vandq_u8(chunk, vdupq_n_u8(0x0F));
+        let hi_nibble = vshrq_n_u8::<4>(chunk);
 
-        // Combine opens and closes
-        let opens = vorrq_u8(eq_open_brace, eq_open_bracket);
-        let closes = vorrq_u8(eq_close_brace, eq_close_bracket);
-        let delims = vorrq_u8(eq_comma, eq_colon);
+        // Lookup both nibbles in their respective tables
+        let lo_result = vqtbl1q_u8(lo_table, lo_nibble);
+        let hi_result = vqtbl1q_u8(hi_table, hi_nibble);
 
-        // Value chars: alphanumeric, period, minus, plus
-        // a-z: 0x61-0x7a, A-Z: 0x41-0x5a, 0-9: 0x30-0x39
-        // period: 0x2e, minus: 0x2d, plus: 0x2b
+        // AND the results to get final classification
+        // Each byte now has bit flags for the character classes
+        let classified = vandq_u8(lo_result, hi_result);
+
+        // Extract individual class masks using vtstq_u8 (test bits)
+        // vtstq_u8 returns 0xFF if (a & b) != 0, else 0x00
+        let flag_open_vec = vdupq_n_u8(FLAG_OPEN);
+        let flag_close_vec = vdupq_n_u8(FLAG_CLOSE);
+        let flag_delim_vec = vdupq_n_u8(FLAG_DELIM);
+        let flag_quote_vec = vdupq_n_u8(FLAG_QUOTE);
+        let flag_backslash_vec = vdupq_n_u8(FLAG_BACKSLASH);
+
+        let opens_vec = vtstq_u8(classified, flag_open_vec);
+        let closes_vec = vtstq_u8(classified, flag_close_vec);
+        let delims_vec = vtstq_u8(classified, flag_delim_vec);
+        let quotes_vec = vtstq_u8(classified, flag_quote_vec);
+        let backslashes_vec = vtstq_u8(classified, flag_backslash_vec);
+
+        // Value chars still need range checks for alphanumeric
+        // (nibble lookup can't efficiently encode ranges)
+        // But we can simplify: period, minus, plus are in the nibble table too
 
         // Check for lowercase: c >= 'a' && c <= 'z'
-        let v_a_lower = vdupq_n_u8(b'a');
-        let v_z_lower = vdupq_n_u8(b'z');
-        let ge_a = vcgeq_u8(chunk, v_a_lower);
-        let le_z = vcleq_u8(chunk, v_z_lower);
-        let lowercase = vandq_u8(ge_a, le_z);
+        // Use unsigned subtraction trick: (c - 'a') <= ('z' - 'a')
+        let sub_a_lower = vsubq_u8(chunk, vdupq_n_u8(b'a'));
+        let lowercase = vcleq_u8(sub_a_lower, vdupq_n_u8(b'z' - b'a'));
 
-        // Check for uppercase: c >= 'A' && c <= 'Z'
-        let v_a_upper = vdupq_n_u8(b'A');
-        let v_z_upper = vdupq_n_u8(b'Z');
-        let ge_a_upper = vcgeq_u8(chunk, v_a_upper);
-        let le_z_upper = vcleq_u8(chunk, v_z_upper);
-        let uppercase = vandq_u8(ge_a_upper, le_z_upper);
+        // Check for uppercase: (c - 'A') <= ('Z' - 'A')
+        let sub_a_upper = vsubq_u8(chunk, vdupq_n_u8(b'A'));
+        let uppercase = vcleq_u8(sub_a_upper, vdupq_n_u8(b'Z' - b'A'));
 
-        // Check for digit: c >= '0' && c <= '9'
-        let v_0 = vdupq_n_u8(b'0');
-        let v_9 = vdupq_n_u8(b'9');
-        let ge_0 = vcgeq_u8(chunk, v_0);
-        let le_9 = vcleq_u8(chunk, v_9);
-        let digit = vandq_u8(ge_0, le_9);
+        // Check for digit: (c - '0') <= ('9' - '0')
+        let sub_0 = vsubq_u8(chunk, vdupq_n_u8(b'0'));
+        let digit = vcleq_u8(sub_0, vdupq_n_u8(b'9' - b'0'));
 
-        // Check for period, minus, plus
-        let v_period = vdupq_n_u8(b'.');
-        let v_minus = vdupq_n_u8(b'-');
-        let v_plus = vdupq_n_u8(b'+');
-        let eq_period = vceqq_u8(chunk, v_period);
-        let eq_minus = vceqq_u8(chunk, v_minus);
-        let eq_plus = vceqq_u8(chunk, v_plus);
+        // Check for period, minus, plus via direct comparison
+        let eq_period = vceqq_u8(chunk, vdupq_n_u8(b'.'));
+        let eq_minus = vceqq_u8(chunk, vdupq_n_u8(b'-'));
+        let eq_plus = vceqq_u8(chunk, vdupq_n_u8(b'+'));
 
         // Combine all value chars
         let alpha = vorrq_u8(lowercase, uppercase);
@@ -136,15 +185,16 @@ unsafe fn classify_chars(chunk: uint8x16_t) -> CharClass {
         let punct = vorrq_u8(vorrq_u8(eq_period, eq_minus), eq_plus);
         let value_chars = vorrq_u8(alnum, punct);
 
-        let quotes = neon_movemask(eq_quote);
-        let backslashes = neon_movemask(eq_backslash);
+        // Convert vector masks to u16 bitmasks
+        let quotes = neon_movemask(quotes_vec);
+        let backslashes = neon_movemask(backslashes_vec);
 
         CharClass {
             quotes,
             backslashes,
-            opens: neon_movemask(opens),
-            closes: neon_movemask(closes),
-            delims: neon_movemask(delims),
+            opens: neon_movemask(opens_vec),
+            closes: neon_movemask(closes_vec),
+            delims: neon_movemask(delims_vec),
             value_chars: neon_movemask(value_chars),
             string_special: quotes | backslashes,
         }
