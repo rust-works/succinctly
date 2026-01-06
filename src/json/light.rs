@@ -44,7 +44,7 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 #[cfg(test)]
 use std::borrow::Cow;
 
-use crate::bp::BalancedParensV2;
+use crate::bp::BalancedParens;
 use crate::broadword::select_in_word;
 
 // ============================================================================
@@ -68,7 +68,7 @@ pub struct JsonIndex<W = Vec<u64>> {
     /// Cumulative popcount per word (for fast rank/select on IB)
     ib_rank: Vec<u32>,
     /// Balanced parentheses - encodes the JSON structure as a tree
-    bp: BalancedParensV2<W>,
+    bp: BalancedParens<W>,
 }
 
 /// Build cumulative popcount index for IB.
@@ -111,7 +111,7 @@ impl JsonIndex<Vec<u64>> {
             ib: semi.ib,
             ib_len,
             ib_rank,
-            bp: BalancedParensV2::new(semi.bp, bp_bit_count),
+            bp: BalancedParens::new(semi.bp, bp_bit_count),
         }
     }
 }
@@ -135,7 +135,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
             ib,
             ib_len,
             ib_rank,
-            bp: BalancedParensV2::from_words(bp, bp_len),
+            bp: BalancedParens::from_words(bp, bp_len),
         }
     }
 
@@ -153,7 +153,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
 
     /// Get a reference to the balanced parentheses.
     #[inline]
-    pub fn bp(&self) -> &BalancedParensV2<W> {
+    pub fn bp(&self) -> &BalancedParens<W> {
         &self.bp
     }
 

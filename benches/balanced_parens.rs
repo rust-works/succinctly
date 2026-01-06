@@ -8,7 +8,7 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use succinctly::bp::{self, BalancedParens, BalancedParensV2};
+use succinctly::bp::{self, BalancedParens};
 
 /// Generate a balanced parentheses sequence with specified properties.
 ///
@@ -378,10 +378,9 @@ fn bench_navigation(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark V1 vs V2 rank1 performance.
-/// This is the key comparison - V1 has O(n/block_size) loops, V2 has O(1) lookups.
-fn bench_rank1_v1_vs_v2(c: &mut Criterion) {
-    let mut group = c.benchmark_group("bp/rank1_v1_vs_v2");
+/// Benchmark rank1 performance.
+fn bench_rank1(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bp/rank1");
 
     let configs = [
         ("10K_random", 10_000usize, 100usize),
@@ -391,31 +390,14 @@ fn bench_rank1_v1_vs_v2(c: &mut Criterion) {
 
     for (name, nodes, max_depth) in configs {
         let (words, len) = generate_balanced_parens(nodes, max_depth, 42);
-        let bp_v1 = BalancedParens::new(words.clone(), len);
-        let bp_v2 = BalancedParensV2::new(words, len);
+        let bp = BalancedParens::new(words, len);
 
         // Generate random query positions
-        let queries = generate_open_queries(&bp_v1, 1000, 123);
+        let queries = generate_open_queries(&bp, 1000, 123);
 
-        // Benchmark V1 rank1
         group.bench_with_input(
-            BenchmarkId::new("V1_rank1", name),
-            &(&bp_v1, &queries),
-            |b, (bp, queries)| {
-                b.iter(|| {
-                    let mut sum = 0usize;
-                    for &q in queries.iter() {
-                        sum += bp.rank1(black_box(q));
-                    }
-                    sum
-                })
-            },
-        );
-
-        // Benchmark V2 rank1
-        group.bench_with_input(
-            BenchmarkId::new("V2_rank1", name),
-            &(&bp_v2, &queries),
+            BenchmarkId::new("rank1", name),
+            &(&bp, &queries),
             |b, (bp, queries)| {
                 b.iter(|| {
                     let mut sum = 0usize;
@@ -431,59 +413,24 @@ fn bench_rank1_v1_vs_v2(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark V1 vs V2 excess performance.
-/// excess() depends on rank1(), so V2 should be faster.
-fn bench_excess_v1_vs_v2(c: &mut Criterion) {
-    let mut group = c.benchmark_group("bp/excess_v1_vs_v2");
+/// Benchmark excess performance.
+fn bench_excess(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bp/excess");
 
     let (words, len) = generate_balanced_parens(100_000, 200, 42);
-    let bp_v1 = BalancedParens::new(words.clone(), len);
-    let bp_v2 = BalancedParensV2::new(words, len);
+    let bp = BalancedParens::new(words, len);
 
-    let queries = generate_open_queries(&bp_v1, 1000, 789);
+    let queries = generate_open_queries(&bp, 1000, 789);
 
-    group.bench_function("V1_excess", |b| {
+    group.bench_function("excess_100K", |b| {
         b.iter(|| {
             let mut sum = 0i32;
             for &q in queries.iter() {
-                sum += bp_v1.excess(black_box(q));
+                sum += bp.excess(black_box(q));
             }
             sum
         })
     });
-
-    group.bench_function("V2_excess", |b| {
-        b.iter(|| {
-            let mut sum = 0i32;
-            for &q in queries.iter() {
-                sum += bp_v2.excess(black_box(q));
-            }
-            sum
-        })
-    });
-
-    group.finish();
-}
-
-/// Benchmark V2 construction overhead.
-fn bench_v2_construction(c: &mut Criterion) {
-    let mut group = c.benchmark_group("bp/v2_construction");
-
-    for nodes in [10_000usize, 100_000, 1_000_000] {
-        let (words, len) = generate_balanced_parens(nodes, 200, 42);
-
-        group.bench_with_input(
-            BenchmarkId::new("V1", format!("{}K", nodes / 1000)),
-            &(words.clone(), len),
-            |b, (words, len)| b.iter(|| BalancedParens::new(black_box(words.clone()), *len)),
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("V2", format!("{}K", nodes / 1000)),
-            &(words, len),
-            |b, (words, len)| b.iter(|| BalancedParensV2::new(black_box(words.clone()), *len)),
-        );
-    }
 
     group.finish();
 }
@@ -496,8 +443,7 @@ criterion_group!(
     bench_tree_structures,
     bench_construction,
     bench_navigation,
-    bench_rank1_v1_vs_v2,
-    bench_excess_v1_vs_v2,
-    bench_v2_construction,
+    bench_rank1,
+    bench_excess,
 );
 criterion_main!(benches);

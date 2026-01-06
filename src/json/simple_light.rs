@@ -37,7 +37,7 @@
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
-use crate::bp::BalancedParensV2;
+use crate::bp::BalancedParens;
 use crate::broadword::select_in_word;
 
 // ============================================================================
@@ -59,7 +59,7 @@ pub struct SimpleJsonIndex<W = Vec<u64>> {
     /// Number of valid bits in IB (== JSON text length)
     ib_len: usize,
     /// Balanced parentheses - encodes structure with 2-bit encoding
-    bp: BalancedParensV2<W>,
+    bp: BalancedParens<W>,
 }
 
 impl SimpleJsonIndex<Vec<u64>> {
@@ -86,7 +86,7 @@ impl SimpleJsonIndex<Vec<u64>> {
         Self {
             ib: semi.ib,
             ib_len,
-            bp: BalancedParensV2::new(semi.bp, bp_bit_count),
+            bp: BalancedParens::new(semi.bp, bp_bit_count),
         }
     }
 }
@@ -106,7 +106,7 @@ impl<W: AsRef<[u64]>> SimpleJsonIndex<W> {
         Self {
             ib,
             ib_len,
-            bp: BalancedParensV2::from_words(bp, bp_len),
+            bp: BalancedParens::from_words(bp, bp_len),
         }
     }
 
@@ -124,7 +124,7 @@ impl<W: AsRef<[u64]>> SimpleJsonIndex<W> {
 
     /// Get a reference to the balanced parentheses.
     #[inline]
-    pub fn bp(&self) -> &BalancedParensV2<W> {
+    pub fn bp(&self) -> &BalancedParens<W> {
         &self.bp
     }
 

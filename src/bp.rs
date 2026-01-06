@@ -523,24 +523,31 @@ pub fn enclose(words: &[u64], len: usize, p: usize) -> Option<usize> {
 }
 
 // ============================================================================
-// Phase 2: RangeMin Structure for O(1) Operations
+// RangeMin Structure for O(1) Operations
 // ============================================================================
 
-/// Balanced parentheses with O(1) navigation operations.
+/// Number of 64-bit words per basic block for rank directory.
+const WORDS_PER_RANK_BLOCK: usize = 8;
+
+/// L1 factor: words per L1 block
+const FACTOR_L1: usize = 32;
+/// L2 factor: L1 blocks per L2 block
+const FACTOR_L2: usize = 32;
+
+/// Balanced parentheses with O(1) navigation and rank operations.
 ///
-/// Stores auxiliary min-excess data at multiple levels for fast find_close/find_open.
+/// Stores auxiliary min-excess data at multiple levels for fast find_close/find_open,
+/// plus a rank directory for O(1) rank1() queries.
+///
 /// Based on the RangeMin data structure from haskell-works.
-///
-/// The type parameter `W` controls how the underlying bit vector is stored:
-/// - `Vec<u64>` for owned data
-/// - `&[u64]` for borrowed data (e.g., from mmap)
 ///
 /// # Space Overhead
 ///
-/// Approximately 6% overhead:
-/// - L0: 2 bytes per word (min excess + cumulative excess)
+/// Approximately 6-7% overhead:
+/// - L0: 2 bytes per word (min excess + word excess)
 /// - L1: 4 bytes per 32 words
 /// - L2: 4 bytes per 1024 words
+/// - Rank: ~1.5 bytes per 8 words
 ///
 /// # Example
 ///
@@ -558,682 +565,6 @@ pub fn enclose(words: &[u64], len: usize, p: usize) -> Option<usize> {
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct BalancedParens<W = Vec<u64>> {
-    /// The underlying bit vector (1=open, 0=close)
-    words: W,
-    /// Number of valid bits
-    len: usize,
-
-    /// L0: Per-word min excess (signed, relative to start of word)
-    l0_min_excess: Vec<i8>,
-    /// L0: Per-word cumulative excess (total excess at end of word)
-    l0_cum_excess: Vec<i16>,
-
-    /// L1: Per-32-word block min excess
-    l1_min_excess: Vec<i16>,
-    /// L1: Per-32-word block cumulative excess
-    l1_cum_excess: Vec<i16>,
-
-    /// L2: Per-1024-word block min excess
-    l2_min_excess: Vec<i16>,
-    /// L2: Per-1024-word block cumulative excess
-    l2_cum_excess: Vec<i16>,
-}
-
-/// L1 factor: words per L1 block
-const FACTOR_L1: usize = 32;
-/// L2 factor: L1 blocks per L2 block
-const FACTOR_L2: usize = 32;
-
-/// Helper function to build the L0/L1/L2 index structures from words.
-#[allow(clippy::type_complexity)]
-fn build_bp_index(
-    words: &[u64],
-    len: usize,
-) -> (Vec<i8>, Vec<i16>, Vec<i16>, Vec<i16>, Vec<i16>, Vec<i16>) {
-    if words.is_empty() || len == 0 {
-        return (
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        );
-    }
-
-    let num_words = words.len();
-    let num_l1 = num_words.div_ceil(FACTOR_L1);
-    let num_l2 = num_l1.div_ceil(FACTOR_L2);
-
-    // Build L0: per-word statistics
-    let mut l0_min_excess = Vec::with_capacity(num_words);
-    let mut l0_cum_excess = Vec::with_capacity(num_words);
-
-    for (i, &word) in words.iter().enumerate() {
-        let valid_bits = if i == num_words - 1 && !len.is_multiple_of(64) {
-            len % 64
-        } else {
-            64
-        };
-        let (min_e, total_e) = word_min_excess(word, valid_bits);
-        l0_min_excess.push(min_e);
-        l0_cum_excess.push(total_e);
-    }
-
-    // Build L1: per-32-word block statistics
-    let mut l1_min_excess = Vec::with_capacity(num_l1);
-    let mut l1_cum_excess = Vec::with_capacity(num_l1);
-
-    for block_idx in 0..num_l1 {
-        let start = block_idx * FACTOR_L1;
-        let end = (start + FACTOR_L1).min(num_words);
-
-        let mut block_min: i16 = 0;
-        let mut running_excess: i16 = 0;
-
-        for i in start..end {
-            let word_min = l0_min_excess[i] as i16;
-            let word_excess = l0_cum_excess[i];
-
-            // min_excess at word i = running_excess + word_min
-            block_min = block_min.min(running_excess + word_min);
-            running_excess += word_excess;
-        }
-
-        l1_min_excess.push(block_min);
-        l1_cum_excess.push(running_excess);
-    }
-
-    // Build L2: per-1024-word block statistics
-    let mut l2_min_excess = Vec::with_capacity(num_l2);
-    let mut l2_cum_excess = Vec::with_capacity(num_l2);
-
-    for block_idx in 0..num_l2 {
-        let start = block_idx * FACTOR_L2;
-        let end = (start + FACTOR_L2).min(num_l1);
-
-        let mut block_min: i16 = 0;
-        let mut running_excess: i16 = 0;
-
-        for i in start..end {
-            let l1_min = l1_min_excess[i];
-            let l1_excess = l1_cum_excess[i];
-
-            block_min = block_min.min(running_excess + l1_min);
-            running_excess += l1_excess;
-        }
-
-        l2_min_excess.push(block_min);
-        l2_cum_excess.push(running_excess);
-    }
-
-    (
-        l0_min_excess,
-        l0_cum_excess,
-        l1_min_excess,
-        l1_cum_excess,
-        l2_min_excess,
-        l2_cum_excess,
-    )
-}
-
-impl BalancedParens<Vec<u64>> {
-    /// Build from an owned bitvector representing balanced parentheses.
-    ///
-    /// # Arguments
-    ///
-    /// * `words` - Bit vector where 1=open, 0=close
-    /// * `len` - Number of valid bits
-    pub fn new(words: Vec<u64>, len: usize) -> Self {
-        let (
-            l0_min_excess,
-            l0_cum_excess,
-            l1_min_excess,
-            l1_cum_excess,
-            l2_min_excess,
-            l2_cum_excess,
-        ) = build_bp_index(&words, len);
-
-        Self {
-            words,
-            len,
-            l0_min_excess,
-            l0_cum_excess,
-            l1_min_excess,
-            l1_cum_excess,
-            l2_min_excess,
-            l2_cum_excess,
-        }
-    }
-}
-
-impl<W: AsRef<[u64]>> BalancedParens<W> {
-    /// Build from a bitvector representing balanced parentheses.
-    ///
-    /// This method works with any storage type that implements `AsRef<[u64]>`,
-    /// including `Vec<u64>`, `&[u64]`, `Box<[u64]>`, etc.
-    ///
-    /// # Arguments
-    ///
-    /// * `words` - Bit vector where 1=open, 0=close
-    /// * `len` - Number of valid bits
-    pub fn from_words(words: W, len: usize) -> Self {
-        let (
-            l0_min_excess,
-            l0_cum_excess,
-            l1_min_excess,
-            l1_cum_excess,
-            l2_min_excess,
-            l2_cum_excess,
-        ) = build_bp_index(words.as_ref(), len);
-
-        Self {
-            words,
-            len,
-            l0_min_excess,
-            l0_cum_excess,
-            l1_min_excess,
-            l1_cum_excess,
-            l2_min_excess,
-            l2_cum_excess,
-        }
-    }
-
-    /// Number of bits in the bitvector.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Returns true if the bitvector is empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Get a reference to the underlying words.
-    #[inline]
-    pub fn words(&self) -> &[u64] {
-        self.words.as_ref()
-    }
-
-    /// Check if position `p` is an open parenthesis.
-    #[inline]
-    pub fn is_open(&self, p: usize) -> bool {
-        if p >= self.len {
-            return false;
-        }
-        let words = self.words.as_ref();
-        (words[p / 64] >> (p % 64)) & 1 == 1
-    }
-
-    /// Check if position `p` is a close parenthesis.
-    #[inline]
-    pub fn is_close(&self, p: usize) -> bool {
-        if p >= self.len {
-            return false;
-        }
-        let words = self.words.as_ref();
-        (words[p / 64] >> (p % 64)) & 1 == 0
-    }
-
-    /// Find matching close parenthesis.
-    ///
-    /// Given an open parenthesis at position `p`, returns the position
-    /// of its matching close parenthesis.
-    ///
-    /// Returns `None` if:
-    /// - `p` is out of bounds
-    /// - Position `p` is a close parenthesis
-    /// - The sequence is unbalanced
-    pub fn find_close(&self, p: usize) -> Option<usize> {
-        if p >= self.len {
-            return None;
-        }
-
-        // If position p is a close, return None
-        if self.is_close(p) {
-            return None;
-        }
-
-        // Use accelerated search with RangeMin indices
-        // Start after the open at position p with excess = 1
-        self.find_close_from(p + 1, 1)
-    }
-
-    /// Internal: find position where excess drops to 0, starting from given position
-    /// with given initial excess.
-    ///
-    /// This implements the RangeMin algorithm from Sadakane & Navarro using a state machine
-    /// approach, matching the Haskell hw-balancedparens implementation (rm2FindClose).
-    ///
-    /// The key insight is that we can skip entire blocks (words, L1 blocks, L2 blocks)
-    /// if we know the minimum excess in that block won't bring us to 0.
-    ///
-    /// State machine:
-    /// - ScanBit: Process one bit at a time
-    /// - CheckL0/L1/L2: Check if match is in this block (using min_excess)
-    /// - FromL0/L1/L2: Decide next level based on position alignment
-    fn find_close_from(&self, start_pos: usize, initial_excess: i32) -> Option<usize> {
-        if start_pos >= self.len {
-            return None;
-        }
-
-        // State machine states matching Haskell's FindState
-        #[derive(Clone, Copy, Debug)]
-        enum State {
-            ScanBit, // FindBP: Scan bit-by-bit
-            CheckL0, // FindL0: Check L0 (word) index
-            CheckL1, // FindL1: Check L1 (32-word block) index
-            CheckL2, // FindL2: Check L2 (1024-word block) index
-            FromL0,  // FindFromL0: Transition from L0 - decide next level
-            FromL1,  // FindFromL1: Transition from L1 - decide next level
-            FromL2,  // FindFromL2: Transition from L2 - decide next level
-        }
-
-        let mut state = State::FromL0;
-        let mut excess = initial_excess;
-        let mut pos = start_pos;
-
-        loop {
-            match state {
-                State::ScanBit => {
-                    // Haskell's FindBP: Scan single bit, then transition to FromL0
-                    if pos >= self.len {
-                        return None;
-                    }
-
-                    let words = self.words.as_ref();
-                    let word_idx = pos / 64;
-                    let bit_idx = pos % 64;
-                    let bit = (words[word_idx] >> bit_idx) & 1;
-
-                    if bit == 0 {
-                        // Close paren
-                        excess -= 1;
-                        if excess == 0 {
-                            return Some(pos);
-                        }
-                    } else {
-                        // Open paren
-                        excess += 1;
-                    }
-                    pos += 1;
-                    state = State::FromL0;
-                }
-
-                State::CheckL0 => {
-                    // Haskell's FindL0: Check L0 (word) index
-                    // IMPORTANT: Only enter this state when pos is word-aligned!
-                    debug_assert!(
-                        pos.is_multiple_of(64),
-                        "CheckL0 requires word-aligned position"
-                    );
-
-                    let word_idx = pos / 64;
-                    if word_idx >= self.l0_min_excess.len() {
-                        return None;
-                    }
-
-                    let min_e = self.l0_min_excess[word_idx] as i32;
-                    if excess + min_e <= 0 {
-                        // Match might be in this word - scan bit by bit
-                        state = State::ScanBit;
-                    } else {
-                        // Match not in this word - skip entire word
-                        // Check for immediate match first (Haskell does this too)
-                        if pos < self.len && self.is_close(pos) && excess <= 1 {
-                            return Some(pos);
-                        }
-                        let word_excess = self.l0_cum_excess[word_idx] as i32;
-                        excess += word_excess;
-                        pos += 64;
-                        state = State::FromL0;
-                    }
-                }
-
-                State::CheckL1 => {
-                    // Haskell's FindL1: Check L1 (32-word block) index
-                    // IMPORTANT: Only enter this state when pos is word-aligned!
-                    debug_assert!(
-                        pos.is_multiple_of(64),
-                        "CheckL1 requires word-aligned position"
-                    );
-
-                    let l1_idx = pos / (64 * FACTOR_L1);
-                    if l1_idx >= self.l1_min_excess.len() {
-                        return None;
-                    }
-
-                    let min_e = self.l1_min_excess[l1_idx] as i32;
-                    if excess + min_e <= 0 {
-                        // Match might be in this L1 block - descend to L0
-                        state = State::CheckL0;
-                    } else if pos < self.len {
-                        // Match not in this L1 block - skip it
-                        if self.is_close(pos) && excess <= 1 {
-                            return Some(pos);
-                        }
-                        let l1_excess = self.l1_cum_excess[l1_idx] as i32;
-                        excess += l1_excess;
-                        pos += 64 * FACTOR_L1;
-                        state = State::FromL1;
-                    } else {
-                        return None;
-                    }
-                }
-
-                State::CheckL2 => {
-                    // Haskell's FindL2: Check L2 (1024-word block) index
-                    let l2_idx = pos / (64 * FACTOR_L1 * FACTOR_L2);
-                    if l2_idx >= self.l2_min_excess.len() {
-                        return None;
-                    }
-
-                    let min_e = self.l2_min_excess[l2_idx] as i32;
-                    if excess + min_e <= 0 {
-                        // Match might be in this L2 block - descend to L1
-                        state = State::CheckL1;
-                    } else if pos < self.len {
-                        // Match not in this L2 block - skip it
-                        if self.is_close(pos) && excess <= 1 {
-                            return Some(pos);
-                        }
-                        let l2_excess = self.l2_cum_excess[l2_idx] as i32;
-                        excess += l2_excess;
-                        pos += 64 * FACTOR_L1 * FACTOR_L2;
-                        state = State::FromL2;
-                    } else {
-                        return None;
-                    }
-                }
-
-                State::FromL0 => {
-                    // Haskell's FindFromL0: At word boundary? Try L1, else scan bits
-                    if pos.is_multiple_of(64) {
-                        state = State::FromL1;
-                    } else if pos < self.len {
-                        state = State::ScanBit;
-                    } else {
-                        return None;
-                    }
-                }
-
-                State::FromL1 => {
-                    // Haskell's FindFromL1: At L1 boundary? Try L2, else check L0
-                    if pos.is_multiple_of(64 * FACTOR_L1) {
-                        if pos < self.len {
-                            state = State::FromL2;
-                        } else {
-                            return None;
-                        }
-                    } else if pos < self.len {
-                        // Not at L1 boundary, but must be at word boundary (came from FromL0)
-                        state = State::CheckL0;
-                    } else {
-                        return None;
-                    }
-                }
-
-                State::FromL2 => {
-                    // Haskell's FindFromL2: At L2 boundary? Check L2, else check L1
-                    if pos.is_multiple_of(64 * FACTOR_L1 * FACTOR_L2) {
-                        if pos < self.len {
-                            state = State::CheckL2;
-                        } else {
-                            return None;
-                        }
-                    } else if pos < self.len {
-                        state = State::CheckL1;
-                    } else {
-                        return None;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Find matching open parenthesis.
-    ///
-    /// Given a close parenthesis at position `p`, returns the position
-    /// of its matching open parenthesis.
-    pub fn find_open(&self, p: usize) -> Option<usize> {
-        if p >= self.len || self.is_open(p) {
-            return None;
-        }
-
-        find_open(self.words.as_ref(), self.len, p)
-    }
-
-    /// Find enclosing open parenthesis (parent node).
-    ///
-    /// Given an open parenthesis at position `p`, returns the position
-    /// of the open parenthesis that encloses it.
-    pub fn enclose(&self, p: usize) -> Option<usize> {
-        if p >= self.len || self.is_close(p) {
-            return None;
-        }
-
-        enclose(self.words.as_ref(), self.len, p)
-    }
-
-    /// Navigate to first child in tree.
-    ///
-    /// If position `p` is an open parenthesis and is immediately followed
-    /// by another open, returns that position (the first child).
-    pub fn first_child(&self, p: usize) -> Option<usize> {
-        if p + 1 >= self.len {
-            return None;
-        }
-        if self.is_open(p) && self.is_open(p + 1) {
-            Some(p + 1)
-        } else {
-            None
-        }
-    }
-
-    /// Navigate to next sibling in tree.
-    ///
-    /// Returns the position of the next sibling's open parenthesis,
-    /// or `None` if this is the last sibling.
-    pub fn next_sibling(&self, p: usize) -> Option<usize> {
-        if !self.is_open(p) {
-            return None;
-        }
-        let close = self.find_close(p)?;
-        if close + 1 < self.len && self.is_open(close + 1) {
-            Some(close + 1)
-        } else {
-            None
-        }
-    }
-
-    /// Navigate to parent node.
-    ///
-    /// Alias for `enclose`.
-    pub fn parent(&self, p: usize) -> Option<usize> {
-        self.enclose(p)
-    }
-
-    /// Get excess at position p (number of opens minus closes in [0, p]).
-    ///
-    /// This is now O(1) using hierarchical cumulative excess indices.
-    pub fn excess(&self, p: usize) -> i32 {
-        if p >= self.len {
-            return 0;
-        }
-
-        let word_idx = p / 64;
-        let bit_idx = p % 64;
-
-        // Use hierarchical indices for O(1) prefix sum
-        // L2 covers 1024 words, L1 covers 32 words
-        let l2_idx = word_idx / (FACTOR_L1 * FACTOR_L2);
-        let l1_idx = word_idx / FACTOR_L1;
-        let l0_start = l1_idx * FACTOR_L1;
-
-        let mut total: i32 = 0;
-
-        // Add L2 blocks before this one
-        for i in 0..l2_idx {
-            total += self.l2_cum_excess[i] as i32;
-        }
-
-        // Add L1 blocks within current L2 but before current L1
-        let l1_start_in_l2 = l2_idx * FACTOR_L2;
-        for i in l1_start_in_l2..l1_idx {
-            total += self.l1_cum_excess[i] as i32;
-        }
-
-        // Add L0 (word) entries within current L1 but before current word
-        for i in l0_start..word_idx {
-            total += self.l0_cum_excess[i] as i32;
-        }
-
-        // Add partial word using popcount
-        let words = self.words.as_ref();
-        let word = words[word_idx];
-        // Mask off bits after bit_idx (we want bits 0..=bit_idx)
-        let mask = if bit_idx == 63 {
-            u64::MAX
-        } else {
-            (1u64 << (bit_idx + 1)) - 1
-        };
-        let masked = word & mask;
-        let ones = masked.count_ones() as i32;
-        let zeros = (bit_idx as i32 + 1) - ones;
-        total += ones - zeros;
-
-        total
-    }
-
-    /// Count the number of 1-bits (opens) in [0, p).
-    ///
-    /// This is O(1) using the relationship: rank1(p) = (p + excess(p-1) + 1) / 2
-    /// But we compute it directly for better precision at boundaries.
-    #[inline]
-    pub fn rank1(&self, p: usize) -> usize {
-        if p == 0 {
-            return 0;
-        }
-        if p > self.len {
-            return self.rank1(self.len);
-        }
-
-        let word_idx = p / 64;
-        let bit_idx = p % 64;
-
-        // Use hierarchical indices for O(1) prefix sum of 1-bits
-        let l2_idx = word_idx / (FACTOR_L1 * FACTOR_L2);
-        let l1_idx = word_idx / FACTOR_L1;
-        let l0_start = l1_idx * FACTOR_L1;
-
-        let mut count: usize = 0;
-
-        // Count 1-bits in L2 blocks before this one
-        // Each L2 block covers FACTOR_L1 * FACTOR_L2 = 32 * 32 = 1024 words
-        for i in 0..l2_idx {
-            // For L2 block i: total bits = 64 * 1024 = 65536 bits per L2 block (or less for last)
-            // ones = (bits + excess) / 2
-            let block_start = i * FACTOR_L1 * FACTOR_L2;
-            let block_end = ((i + 1) * FACTOR_L1 * FACTOR_L2).min(self.words.as_ref().len());
-            let bits: usize = (block_end - block_start) * 64;
-            let excess = self.l2_cum_excess[i] as i64;
-            count += ((bits as i64 + excess) / 2) as usize;
-        }
-
-        // Count 1-bits in L1 blocks within current L2 but before current L1
-        let l1_start_in_l2 = l2_idx * FACTOR_L2;
-        for i in l1_start_in_l2..l1_idx {
-            let block_start = i * FACTOR_L1;
-            let block_end = ((i + 1) * FACTOR_L1).min(self.words.as_ref().len());
-            let bits: usize = (block_end - block_start) * 64;
-            let excess = self.l1_cum_excess[i] as i64;
-            count += ((bits as i64 + excess) / 2) as usize;
-        }
-
-        // Count 1-bits in words within current L1 but before current word
-        for i in l0_start..word_idx {
-            let excess = self.l0_cum_excess[i] as i64;
-            count += ((64i64 + excess) / 2) as usize;
-        }
-
-        // Count 1-bits in partial word [0, bit_idx)
-        if bit_idx > 0 {
-            let words = self.words.as_ref();
-            let word = words[word_idx];
-            let mask = (1u64 << bit_idx) - 1;
-            count += (word & mask).count_ones() as usize;
-        }
-
-        count
-    }
-
-    /// Get depth of node at position p.
-    ///
-    /// The depth is the number of ancestors (including the node itself).
-    /// For a root node (position 0), depth is 1.
-    /// Returns `None` if position is out of bounds.
-    ///
-    /// # Example
-    ///
-    /// For the sequence "(()(()())) = 1101101000":
-    /// - depth(1) = 1 (root)
-    /// - depth(2) = 2 (first child)
-    /// - depth(5) = 3 (grandchild)
-    pub fn depth(&self, p: usize) -> Option<usize> {
-        if p >= self.len {
-            return None;
-        }
-
-        // Depth is the excess at position p (for an open) or excess at the matching open
-        // For 1-indexed positions in Haskell, depth = excess
-        // For 0-indexed, we compute excess up to and including position p
-        // The excess at an open parenthesis equals its depth
-        Some(self.excess(p) as usize)
-    }
-
-    /// Get the size of the subtree rooted at position p.
-    ///
-    /// The subtree size is the number of nodes (opens) in the subtree,
-    /// not including the node at p itself.
-    /// Returns `None` if position is out of bounds or not an open.
-    ///
-    /// # Example
-    ///
-    /// For the sequence "(()(()())) = 1101101000":
-    /// - subtree_size(1) = 5 (root has 5 descendants: 2 children + 2 grandchildren + their closes)
-    /// - subtree_size(2) = 1 (leaf node, subtree size = 1 for the () pair)
-    pub fn subtree_size(&self, p: usize) -> Option<usize> {
-        if p >= self.len || self.is_close(p) {
-            return None;
-        }
-
-        // Subtree size = (find_close(p) - p - 1) / 2
-        // The distance to matching close, minus 1 for the open itself,
-        // divided by 2 since each node has an open and close.
-        let close = self.find_close(p)?;
-        Some((close - p) / 2)
-    }
-}
-
-// ============================================================================
-// BalancedParensV2: O(1) rank using absolute cumulative prefix sums
-// ============================================================================
-
-/// Number of 64-bit words per basic block for V2 rank directory.
-const V2_WORDS_PER_BLOCK: usize = 8;
-
-/// Balanced parentheses with O(1) rank queries using absolute cumulative prefix sums.
-///
-/// This is an alternative implementation that stores absolute cumulative values
-/// instead of per-block relative values, enabling true O(1) rank1() queries.
-///
-/// The find_close/find_open operations use the same min-excess indices as
-/// the original BalancedParens, but rank1() is O(1) instead of O(n/block_size).
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct BalancedParensV2<W = Vec<u64>> {
     /// The underlying bit vector (1=open, 0=close)
     words: W,
     /// Number of valid bits
@@ -1267,7 +598,7 @@ pub struct BalancedParensV2<W = Vec<u64>> {
 
 /// Build the V2 index structures with absolute cumulative rank.
 #[allow(clippy::type_complexity)]
-fn build_bp_index_v2(
+fn build_bp_index(
     words: &[u64],
     len: usize,
 ) -> (
@@ -1296,7 +627,7 @@ fn build_bp_index_v2(
     let num_words = words.len();
     let num_l1 = num_words.div_ceil(FACTOR_L1);
     let num_l2 = num_l1.div_ceil(FACTOR_L2);
-    let num_rank_blocks = num_words.div_ceil(V2_WORDS_PER_BLOCK);
+    let num_rank_blocks = num_words.div_ceil(WORDS_PER_RANK_BLOCK);
 
     // Build L0: per-word statistics (same as original)
     let mut l0_min_excess = Vec::with_capacity(num_words);
@@ -1364,8 +695,8 @@ fn build_bp_index_v2(
     let mut cumulative_rank: u64 = 0;
 
     for block_idx in 0..num_rank_blocks {
-        let block_start = block_idx * V2_WORDS_PER_BLOCK;
-        let block_end = (block_start + V2_WORDS_PER_BLOCK).min(num_words);
+        let block_start = block_idx * WORDS_PER_RANK_BLOCK;
+        let block_end = (block_start + WORDS_PER_RANK_BLOCK).min(num_words);
 
         // Store absolute cumulative rank at block start
         rank_l1.push(cumulative_rank as u32);
@@ -1398,7 +729,7 @@ fn build_bp_index_v2(
     )
 }
 
-impl BalancedParensV2<Vec<u64>> {
+impl BalancedParens<Vec<u64>> {
     /// Build from an owned bitvector representing balanced parentheses.
     pub fn new(words: Vec<u64>, len: usize) -> Self {
         let (
@@ -1410,7 +741,7 @@ impl BalancedParensV2<Vec<u64>> {
             l2_block_excess,
             rank_l1,
             rank_l2,
-        ) = build_bp_index_v2(&words, len);
+        ) = build_bp_index(&words, len);
 
         Self {
             words,
@@ -1427,7 +758,7 @@ impl BalancedParensV2<Vec<u64>> {
     }
 }
 
-impl<W: AsRef<[u64]>> BalancedParensV2<W> {
+impl<W: AsRef<[u64]>> BalancedParens<W> {
     /// Build from a generic storage type representing balanced parentheses.
     ///
     /// This is useful for borrowed data, e.g., from mmap.
@@ -1441,7 +772,7 @@ impl<W: AsRef<[u64]>> BalancedParensV2<W> {
             l2_block_excess,
             rank_l1,
             rank_l2,
-        ) = build_bp_index_v2(words.as_ref(), len);
+        ) = build_bp_index(words.as_ref(), len);
 
         Self {
             words,
@@ -1507,12 +838,19 @@ impl<W: AsRef<[u64]>> BalancedParensV2<W> {
         }
         let p = p.min(self.len);
 
+        let words = self.words.as_ref();
         let word_idx = p / 64;
         let bit_idx = p % 64;
 
+        // Handle boundary case: word_idx beyond actual words
+        // This happens when p == len and len is a multiple of 64
+        if word_idx >= words.len() {
+            return self.rank1_slow(p);
+        }
+
         // Which 512-bit block (8 words)?
-        let block_idx = word_idx / V2_WORDS_PER_BLOCK;
-        let word_in_block = word_idx % V2_WORDS_PER_BLOCK;
+        let block_idx = word_idx / WORDS_PER_RANK_BLOCK;
+        let word_in_block = word_idx % WORDS_PER_RANK_BLOCK;
 
         // L1: absolute cumulative rank at block start
         let l1_rank = if block_idx < self.rank_l1.len() {
@@ -1535,7 +873,6 @@ impl<W: AsRef<[u64]>> BalancedParensV2<W> {
 
         // Count remaining bits in partial word
         let partial = if bit_idx > 0 {
-            let words = self.words.as_ref();
             let word = words[word_idx];
             let mask = (1u64 << bit_idx) - 1;
             (word & mask).count_ones() as usize
@@ -1794,6 +1131,53 @@ impl<W: AsRef<[u64]>> BalancedParensV2<W> {
         } else {
             None
         }
+    }
+
+    /// Get depth of node at position p.
+    ///
+    /// The depth is the number of ancestors (including the node itself).
+    /// For a root node (position 0), depth is 1.
+    /// Returns `None` if position is out of bounds.
+    ///
+    /// # Example
+    ///
+    /// For the sequence "(()(()())) = 1101101000":
+    /// - depth(1) = 1 (root)
+    /// - depth(2) = 2 (first child)
+    /// - depth(5) = 3 (grandchild)
+    pub fn depth(&self, p: usize) -> Option<usize> {
+        if p >= self.len {
+            return None;
+        }
+
+        // Depth is the excess at position p (for an open) or excess at the matching open
+        // For 1-indexed positions in Haskell, depth = excess
+        // For 0-indexed, we compute excess up to and including position p
+        // The excess at an open parenthesis equals its depth
+        Some(self.excess(p) as usize)
+    }
+
+    /// Get the size of the subtree rooted at position p.
+    ///
+    /// The subtree size is the number of nodes (opens) in the subtree,
+    /// not including the node at p itself.
+    /// Returns `None` if position is out of bounds or not an open.
+    ///
+    /// # Example
+    ///
+    /// For the sequence "(()(()())) = 1101101000":
+    /// - subtree_size(1) = 5 (root has 5 descendants: 2 children + 2 grandchildren + their closes)
+    /// - subtree_size(2) = 1 (leaf node, subtree size = 1 for the () pair)
+    pub fn subtree_size(&self, p: usize) -> Option<usize> {
+        if p >= self.len || self.is_close(p) {
+            return None;
+        }
+
+        // Subtree size = (find_close(p) - p - 1) / 2
+        // The distance to matching close, minus 1 for the open itself,
+        // divided by 2 since each node has an open and close.
+        let close = self.find_close(p)?;
+        Some((close - p) / 2)
     }
 }
 
@@ -2533,8 +1917,8 @@ mod tests {
         // Scanning: 1, 2, 1, 2, 1, 0 - min is 0
         assert_eq!(bp.l0_min_excess[0], 0);
 
-        // L0 cum_excess should be 0 (balanced)
-        assert_eq!(bp.l0_cum_excess[0], 0);
+        // L0 word_excess should be 0 (balanced)
+        assert_eq!(bp.l0_word_excess[0], 0);
     }
 
     #[test]
@@ -2572,10 +1956,10 @@ mod tests {
 
         // Should have exactly 1 L1 block
         assert_eq!(bp.l1_min_excess.len(), 1);
-        assert_eq!(bp.l1_cum_excess.len(), 1);
+        assert_eq!(bp.l1_block_excess.len(), 1);
 
-        // L1 should also show balanced (cum_excess = 0)
-        assert_eq!(bp.l1_cum_excess[0], 0);
+        // L1 should also show balanced (block_excess = 0)
+        assert_eq!(bp.l1_block_excess[0], 0);
     }
 
     #[test]
@@ -2591,13 +1975,13 @@ mod tests {
         // Should have 2 L1 blocks
         assert_eq!(bp.l1_min_excess.len(), 2);
 
-        // First L1 block: all opens, min_excess = 0, cum_excess = 32*64 = 2048
+        // First L1 block: all opens, min_excess = 0, block_excess = 32*64 = 2048
         assert_eq!(bp.l1_min_excess[0], 0);
-        assert_eq!(bp.l1_cum_excess[0], 2048);
+        assert_eq!(bp.l1_block_excess[0], 2048);
 
-        // Second L1 block: all closes, min_excess = -2048, cum_excess = -2048
+        // Second L1 block: all closes, min_excess = -2048, block_excess = -2048
         assert_eq!(bp.l1_min_excess[1], -2048);
-        assert_eq!(bp.l1_cum_excess[1], -2048);
+        assert_eq!(bp.l1_block_excess[1], -2048);
 
         // Test find_close across L1 boundary
         assert_eq!(bp.find_close(2047), Some(2048));
@@ -2647,13 +2031,13 @@ mod tests {
     }
 
     // ========================================================================
-    // BalancedParensV2 tests
+    // BalancedParens tests
     // ========================================================================
 
     #[test]
     fn test_v2_rank1_simple() {
         // "(()())" = 0b001011 - bits: 1 1 0 1 0 0
-        let bp = BalancedParensV2::new(vec![0b001011u64], 6);
+        let bp = BalancedParens::new(vec![0b001011u64], 6);
 
         // rank1(p) = count of 1s in [0, p)
         assert_eq!(bp.rank1(0), 0); // no bits before 0
@@ -2679,7 +2063,7 @@ mod tests {
 
         for (words, len) in patterns {
             let v1 = BalancedParens::new(words.clone(), *len);
-            let v2 = BalancedParensV2::new(words.clone(), *len);
+            let v2 = BalancedParens::new(words.clone(), *len);
 
             // Test positions 0 to len-1 (avoiding V1 edge case bug at p==len)
             for p in 0..*len {
@@ -2705,7 +2089,7 @@ mod tests {
 
         for (words, len) in patterns {
             let v1 = BalancedParens::new(words.clone(), *len);
-            let v2 = BalancedParensV2::new(words.clone(), *len);
+            let v2 = BalancedParens::new(words.clone(), *len);
 
             for p in 0..*len {
                 if v1.is_open(p) {
@@ -2724,7 +2108,7 @@ mod tests {
     #[test]
     fn test_v2_excess() {
         // "(()())" = 0b001011
-        let bp = BalancedParensV2::new(vec![0b001011u64], 6);
+        let bp = BalancedParens::new(vec![0b001011u64], 6);
 
         // excess(p) = opens - closes in [0, p]
         assert_eq!(bp.excess(0), 1); // 1 open
@@ -2748,7 +2132,7 @@ mod tests {
 
         let len = 64 * 64; // 4096 bits
         let v1 = BalancedParens::new(words.clone(), len);
-        let v2 = BalancedParensV2::new(words, len);
+        let v2 = BalancedParens::new(words, len);
 
         // Test rank1 at various positions
         let test_positions = [0, 1, 63, 64, 512, 1024, 2048, 2049, 4095, 4096];

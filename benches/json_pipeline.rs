@@ -12,12 +12,12 @@
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::io::Write;
-use succinctly::bp::BalancedParensV2;
+use succinctly::bp::BalancedParens;
 use succinctly::json::light::{JsonIndex, StandardJson};
 use succinctly::select_in_word;
 
 // ============================================================================
-// JsonIndexV2: Uses BalancedParensV2 for O(1) rank1
+// JsonIndexV2: Uses BalancedParens for O(1) rank1
 // ============================================================================
 
 /// V2 index with O(1) rank1 operations.
@@ -26,7 +26,7 @@ struct JsonIndexV2 {
     #[allow(dead_code)]
     ib_len: usize,
     ib_rank: Vec<u32>,
-    bp: BalancedParensV2<Vec<u64>>,
+    bp: BalancedParens<Vec<u64>>,
 }
 
 impl JsonIndexV2 {
@@ -45,7 +45,7 @@ impl JsonIndexV2 {
             ib: semi.ib,
             ib_len,
             ib_rank,
-            bp: BalancedParensV2::new(semi.bp, bp_bit_count),
+            bp: BalancedParens::new(semi.bp, bp_bit_count),
         }
     }
 
