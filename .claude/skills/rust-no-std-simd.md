@@ -49,3 +49,37 @@ NEON is always available on aarch64 - no runtime detection needed:
     unsafe { neon::popcount_512_neon(ptr) }
 }
 ```
+
+## Bit Position Conventions
+
+- Bit positions are 0-indexed from LSB in each u64 word
+- Words are stored little-endian (bit 0 is LSB of first word)
+- `word.to_le_bytes()` gives bytes in memory order for byte-level processing
+
+## Compile-Time Lookup Tables
+
+Use `const` blocks for zero-overhead lookup tables:
+```rust
+const BYTE_POPCOUNT: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut i: usize = 0;
+    while i < 256 {
+        table[i] = (i as u8).count_ones() as u8;
+        i += 1;
+    }
+    table
+};
+```
+
+Note: `for` loops aren't allowed in const contexts; use `while`.
+
+## Zero-Copy Output Patterns
+
+For CLI output, avoid allocation:
+```rust
+// Zero-copy for strings and numbers:
+out.write_all(value.raw_bytes())?;
+
+// Use BufWriter for buffered I/O:
+let mut out = BufWriter::new(stdout.lock());
+```

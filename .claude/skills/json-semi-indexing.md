@@ -166,3 +166,49 @@ fn naive_find_close(bp: &BalancedParens, p: usize) -> Option<usize> {
     None
 }
 ```
+
+## Performance Optimization
+
+### O(1) vs O(n) Operations
+
+**Problem**: `text_position()` calling `ib_select1()` was O(n) linear scan per result, causing O(n²) total complexity.
+
+**Solution**: Add cumulative popcount index for O(log n) select:
+
+```rust
+// Build cumulative index during construction
+fn build_ib_rank(words: &[u64]) -> Vec<u32> {
+    let mut rank = Vec::with_capacity(words.len() + 1);
+    let mut cumulative: u32 = 0;
+    rank.push(0);
+    for &word in words {
+        cumulative += word.count_ones();
+        rank.push(cumulative);
+    }
+    rank
+}
+
+// Binary search for select
+fn ib_select1(&self, k: usize) -> Option<usize> {
+    let k32 = k as u32;
+    let mut lo = 0;
+    let mut hi = self.words.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if self.ib_rank[mid + 1] <= k32 { lo = mid + 1; }
+        else { hi = mid; }
+    }
+    // Scan within word for exact bit position
+}
+```
+
+**Result**: 627x speedup (2.76s → 4.4ms), now faster than jq.
+
+### End-to-End Performance vs jq
+
+| Query | File | succinctly | jq | Speedup |
+|-------|------|------------|-----|---------|
+| `.unicode[]` | 10MB | 25ms | 179ms | 7.2x |
+| `.users[].name` | 10MB | 22ms | 160ms | 7.3x |
+| `.arrays[][]` | 10MB | 150ms | 297ms | 2.0x |
+| `.unicode[]` | 100MB | 221ms | 1.86s | 8.4x |

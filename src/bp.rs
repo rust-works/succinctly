@@ -153,7 +153,7 @@ fn find_close_in_word_fast(
     if bit_in_byte != 0 {
         // Scan remaining bits in first partial byte
         let byte_val = bytes[first_byte_idx];
-        let end_bit = (8.min(valid_bits - first_byte_idx * 8)) as usize;
+        let end_bit = 8.min(valid_bits - first_byte_idx * 8);
 
         for bit in bit_in_byte..end_bit {
             if (byte_val >> bit) & 1 == 1 {
