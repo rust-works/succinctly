@@ -53,6 +53,55 @@ impl BitWriter {
         self.write_bit(true);
     }
 
+    /// Write multiple bits from a u64 value efficiently.
+    ///
+    /// Writes the lowest `count` bits from `bits` to the output.
+    /// This is faster than calling `write_bit()` in a loop because it
+    /// handles word boundaries with a single check.
+    ///
+    /// # Arguments
+    /// * `bits` - The bits to write (only lowest `count` bits are used)
+    /// * `count` - Number of bits to write (must be <= 64)
+    ///
+    /// # Panics
+    /// Panics if `count > 64`.
+    #[inline]
+    pub fn write_bits(&mut self, bits: u64, count: usize) {
+        debug_assert!(count <= 64, "count must be <= 64");
+        if count == 0 {
+            return;
+        }
+
+        let pos = self.bit_position as usize;
+        let space_in_word = 64 - pos;
+
+        if count <= space_in_word {
+            // All bits fit in current word
+            // Mask to only use the lowest `count` bits
+            let mask = if count == 64 { u64::MAX } else { (1u64 << count) - 1 };
+            self.current_word |= (bits & mask) << pos;
+            self.bit_position += count as u32;
+
+            if self.bit_position == 64 {
+                self.words.push(self.current_word);
+                self.current_word = 0;
+                self.bit_position = 0;
+            }
+        } else {
+            // Bits span two words
+            // First, fill the rest of current word
+            let mask = if count == 64 { u64::MAX } else { (1u64 << count) - 1 };
+            let masked_bits = bits & mask;
+            self.current_word |= masked_bits << pos;
+            self.words.push(self.current_word);
+
+            // Then write remaining bits to new word
+            let remaining = count - space_in_word;
+            self.current_word = masked_bits >> space_in_word;
+            self.bit_position = remaining as u32;
+        }
+    }
+
     /// Write multiple zero bits efficiently.
     ///
     /// This is faster than calling `write_0()` in a loop because it can
@@ -244,5 +293,79 @@ mod tests {
         writer2.write_1();
 
         assert_eq!(writer1.finish(), writer2.finish());
+    }
+
+    #[test]
+    fn test_write_bits_small() {
+        let mut writer = BitWriter::new();
+        // Write 0b1101 (4 bits)
+        writer.write_bits(0b1101, 4);
+        let words = writer.finish();
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0], 0b1101);
+    }
+
+    #[test]
+    fn test_write_bits_with_offset() {
+        let mut writer = BitWriter::new();
+        writer.write_1(); // bit 0
+        writer.write_bits(0b110, 3); // bits 1-3: should be 0b1100 at positions 1,2,3
+        let words = writer.finish();
+        assert_eq!(words.len(), 1);
+        // Position 0: 1, positions 1-3: 110 (LSB first) = 0b1101
+        assert_eq!(words[0], 0b1101);
+    }
+
+    #[test]
+    fn test_write_bits_cross_word() {
+        let mut writer = BitWriter::new();
+        // Write 60 zeros to get near word boundary
+        writer.write_zeros(60);
+        // Now write 8 bits that span the boundary
+        writer.write_bits(0b11110000, 8);
+        let words = writer.finish();
+        assert_eq!(words.len(), 2);
+        // First word: bits 60-63 should be 0b0000 (low 4 bits of 0b11110000)
+        assert_eq!(words[0] >> 60, 0b0000);
+        // Second word: bits 0-3 should be 0b1111 (high 4 bits of 0b11110000)
+        assert_eq!(words[1] & 0xF, 0b1111);
+    }
+
+    #[test]
+    fn test_write_bits_full_word() {
+        let mut writer = BitWriter::new();
+        writer.write_bits(0xDEADBEEF_CAFEBABE, 64);
+        let words = writer.finish();
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0], 0xDEADBEEF_CAFEBABE);
+    }
+
+    #[test]
+    fn test_write_bits_matches_loop() {
+        // Verify write_bits produces same result as individual writes
+        let mut writer1 = BitWriter::new();
+        writer1.write_1();
+        writer1.write_0();
+        writer1.write_1();
+        writer1.write_1();
+        writer1.write_0();
+
+        let mut writer2 = BitWriter::new();
+        writer2.write_bits(0b01101, 5); // LSB first: 1,0,1,1,0
+
+        assert_eq!(writer1.finish(), writer2.finish());
+    }
+
+    #[test]
+    fn test_write_bits_exact_word_boundary() {
+        let mut writer = BitWriter::new();
+        // Write exactly 64 bits
+        writer.write_bits(u64::MAX, 64);
+        // Then write 4 more
+        writer.write_bits(0b1010, 4);
+        let words = writer.finish();
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0], u64::MAX);
+        assert_eq!(words[1], 0b1010);
     }
 }

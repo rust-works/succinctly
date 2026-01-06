@@ -249,6 +249,7 @@ fn process_chunk_standard_serial(
 /// Uses optimized scanning with fast-path for string content:
 /// - When inside a string with no quotes/backslashes, batch-write zeros
 /// - Uses trailing_zeros to skip to next interesting character
+/// - Uses write_bits for common multi-bit patterns (BP=10 for value start)
 #[inline]
 fn process_chunk_standard(
     class: CharClass,
@@ -278,11 +279,13 @@ fn process_chunk_standard(
                     bp.write_0();
                     ib.write_0();
                 } else if is_quote {
+                    // Value start: BP=10, IB=1
                     bp.write_1();
                     bp.write_0();
                     ib.write_1();
                     state = State::InString;
                 } else if is_value_char {
+                    // Value start: BP=10, IB=1
                     bp.write_1();
                     bp.write_0();
                     ib.write_1();
@@ -346,6 +349,7 @@ fn process_chunk_standard(
                     ib.write_0();
                     state = State::InJson;
                 } else if is_quote {
+                    // Value start: BP=10, IB=1
                     bp.write_1();
                     bp.write_0();
                     ib.write_1();
