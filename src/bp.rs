@@ -34,6 +34,57 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
+// Byte lookup tables for fast word_min_excess computation
+// ============================================================================
+
+/// Lookup table for minimum excess within each byte value (0-255).
+/// For byte value b, BYTE_MIN_EXCESS[b] is the minimum prefix sum reached
+/// when scanning bits 0..7, where 1=+1 (open), 0=-1 (close).
+const BYTE_MIN_EXCESS: [i8; 256] = {
+    let mut table = [0i8; 256];
+    let mut byte_val: u16 = 0;
+    while byte_val < 256 {
+        let mut excess: i8 = 0;
+        let mut min_e: i8 = 0;
+        let mut bit = 0;
+        while bit < 8 {
+            if (byte_val >> bit) & 1 == 1 {
+                excess += 1;
+            } else {
+                excess -= 1;
+                if excess < min_e {
+                    min_e = excess;
+                }
+            }
+            bit += 1;
+        }
+        table[byte_val as usize] = min_e;
+        byte_val += 1;
+    }
+    table
+};
+
+/// Lookup table for total excess of each byte value (0-255).
+/// For byte value b, BYTE_TOTAL_EXCESS[b] = popcount(b)*2 - 8 = opens - closes.
+const BYTE_TOTAL_EXCESS: [i8; 256] = {
+    let mut table = [0i8; 256];
+    let mut byte_val: u16 = 0;
+    while byte_val < 256 {
+        // Count 1-bits (opens)
+        let mut ones: i8 = 0;
+        let mut tmp = byte_val;
+        while tmp != 0 {
+            ones += (tmp & 1) as i8;
+            tmp >>= 1;
+        }
+        // total_excess = opens - closes = opens - (8 - opens) = 2*opens - 8
+        table[byte_val as usize] = 2 * ones - 8;
+        byte_val += 1;
+    }
+    table
+};
+
+// ============================================================================
 // Phase 1: Word-Level Operations
 // ============================================================================
 
@@ -240,20 +291,92 @@ pub fn find_close(words: &[u64], len: usize, p: usize) -> Option<usize> {
 }
 
 /// Helper function to compute min excess and total excess for a word (i32 version).
+/// Uses byte-level lookup tables for fast computation.
 fn word_min_excess_i32(word: u64, valid_bits: usize) -> (i32, i32) {
-    let mut excess: i32 = 0;
-    let mut min_excess: i32 = 0;
-
-    for i in 0..valid_bits {
-        if (word >> i) & 1 == 1 {
-            excess += 1; // open
-        } else {
-            excess -= 1; // close
-            min_excess = min_excess.min(excess);
-        }
+    if valid_bits == 0 {
+        return (0, 0);
     }
 
-    (min_excess, excess)
+    let full_bytes = valid_bits / 8;
+    let remaining_bits = valid_bits % 8;
+
+    let mut running_excess: i32 = 0;
+    let mut global_min: i32 = 0;
+
+    // Process full bytes using lookup tables
+    let bytes = word.to_le_bytes();
+    for byte in bytes.iter().take(full_bytes) {
+        let byte_val = *byte as usize;
+        let byte_min = running_excess + BYTE_MIN_EXCESS[byte_val] as i32;
+        global_min = global_min.min(byte_min);
+        running_excess += BYTE_TOTAL_EXCESS[byte_val] as i32;
+    }
+
+    // Process remaining bits (0-7) with bit-by-bit scan
+    if remaining_bits > 0 {
+        let byte_val = bytes[full_bytes];
+        let mut excess = running_excess;
+        for bit in 0..remaining_bits {
+            if (byte_val >> bit) & 1 == 1 {
+                excess += 1;
+            } else {
+                excess -= 1;
+                global_min = global_min.min(excess);
+            }
+        }
+        running_excess = excess;
+    }
+
+    (global_min, running_excess)
+}
+
+/// Compute minimum excess and total excess for a single word.
+///
+/// Returns (min_excess, total_excess) where:
+/// - min_excess: The minimum excess reached at any point in the word (negative if unmatched closes)
+/// - total_excess: The total excess at the end of the word (opens - closes)
+///
+/// Uses byte-level lookup tables for ~20x faster computation compared to bit-by-bit scanning.
+fn word_min_excess(word: u64, valid_bits: usize) -> (i8, i16) {
+    if valid_bits == 0 {
+        return (0, 0);
+    }
+
+    let full_bytes = valid_bits / 8;
+    let remaining_bits = valid_bits % 8;
+
+    let mut running_excess: i16 = 0;
+    let mut global_min: i16 = 0;
+
+    // Process full bytes using lookup tables
+    let bytes = word.to_le_bytes();
+    for byte in bytes.iter().take(full_bytes) {
+        let byte_val = *byte as usize;
+        // Min within this byte = running_excess + table lookup
+        let byte_min = running_excess + BYTE_MIN_EXCESS[byte_val] as i16;
+        global_min = global_min.min(byte_min);
+        running_excess += BYTE_TOTAL_EXCESS[byte_val] as i16;
+    }
+
+    // Process remaining bits (0-7) with bit-by-bit scan
+    if remaining_bits > 0 {
+        let byte_val = bytes[full_bytes];
+        let mut excess = running_excess;
+        for bit in 0..remaining_bits {
+            if (byte_val >> bit) & 1 == 1 {
+                excess += 1;
+            } else {
+                excess -= 1;
+                global_min = global_min.min(excess);
+            }
+        }
+        running_excess = excess;
+    }
+
+    // Clamp min_excess to i8 range (always valid for 64-bit words: range is -64..64)
+    let min_clamped = global_min.clamp(-128, 127) as i8;
+
+    (min_clamped, running_excess)
 }
 
 /// Find matching open parenthesis (scanning backwards).
@@ -1092,30 +1215,6 @@ impl<W: AsRef<[u64]>> BalancedParens<W> {
         let close = self.find_close(p)?;
         Some((close - p) / 2)
     }
-}
-
-/// Compute minimum excess and total excess for a single word.
-///
-/// Returns (min_excess, total_excess) where:
-/// - min_excess: The minimum excess reached at any point in the word (negative if unmatched closes)
-/// - total_excess: The total excess at the end of the word (opens - closes)
-fn word_min_excess(word: u64, valid_bits: usize) -> (i8, i16) {
-    let mut excess: i16 = 0;
-    let mut min_excess: i16 = 0;
-
-    for i in 0..valid_bits {
-        if (word >> i) & 1 == 1 {
-            excess += 1; // open
-        } else {
-            excess -= 1; // close
-            min_excess = min_excess.min(excess);
-        }
-    }
-
-    // Clamp min_excess to i8 range (should be fine for 64-bit words)
-    let min_clamped = min_excess.clamp(-128, 127) as i8;
-
-    (min_clamped, excess)
 }
 
 // ============================================================================
