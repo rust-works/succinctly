@@ -21,7 +21,7 @@ mod aarch64_benches {
         #[target_feature(enable = "neon")]
         pub unsafe fn serial(v: uint8x16_t) -> u16 {
             let mut mask: u16 = 0;
-            let arr: [u8; 16] = core::mem::transmute(v);
+            let arr: [u8; 16] = unsafe { core::mem::transmute(v) };
             for (i, &byte) in arr.iter().enumerate() {
                 if byte & 0x80 != 0 {
                     mask |= 1 << i;
@@ -34,76 +34,82 @@ mod aarch64_benches {
         #[inline]
         #[target_feature(enable = "neon")]
         pub unsafe fn parallel(v: uint8x16_t) -> u16 {
-            // Shift each byte right by 7 to get just the high bit (0 or 1)
-            let high_bits = vshrq_n_u8::<7>(v);
+            unsafe {
+                // Shift each byte right by 7 to get just the high bit (0 or 1)
+                let high_bits = vshrq_n_u8::<7>(v);
 
-            // Create shift amounts: [0,1,2,3,4,5,6,7, 0,1,2,3,4,5,6,7]
-            let shift_amounts: [i8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7];
-            let shifts = vld1q_s8(shift_amounts.as_ptr());
+                // Create shift amounts: [0,1,2,3,4,5,6,7, 0,1,2,3,4,5,6,7]
+                let shift_amounts: [i8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7];
+                let shifts = vld1q_s8(shift_amounts.as_ptr());
 
-            // Shift each byte left by its lane index (multiply by 2^i)
-            let shifted = vshlq_u8(high_bits, shifts);
+                // Shift each byte left by its lane index (multiply by 2^i)
+                let shifted = vshlq_u8(high_bits, shifts);
 
-            // Split into low and high halves
-            let low = vget_low_u8(shifted);
-            let high = vget_high_u8(shifted);
+                // Split into low and high halves
+                let low = vget_low_u8(shifted);
+                let high = vget_high_u8(shifted);
 
-            // Horizontal add within each half to get a single byte
-            let low_sum = vaddv_u8(low) as u16;
-            let high_sum = vaddv_u8(high) as u16;
+                // Horizontal add within each half to get a single byte
+                let low_sum = vaddv_u8(low) as u16;
+                let high_sum = vaddv_u8(high) as u16;
 
-            low_sum | (high_sum << 8)
+                low_sum | (high_sum << 8)
+            }
         }
 
         /// Alternative using multiplication instead of variable shifts
         #[inline]
         #[target_feature(enable = "neon")]
         pub unsafe fn parallel_mul(v: uint8x16_t) -> u16 {
-            // Shift each byte right by 7 to get just the high bit (0 or 1)
-            let high_bits = vshrq_n_u8::<7>(v);
+            unsafe {
+                // Shift each byte right by 7 to get just the high bit (0 or 1)
+                let high_bits = vshrq_n_u8::<7>(v);
 
-            // Split into halves
-            let lo = vget_low_u8(high_bits);
-            let hi = vget_high_u8(high_bits);
+                // Split into halves
+                let lo = vget_low_u8(high_bits);
+                let hi = vget_high_u8(high_bits);
 
-            // Weight by position using multiplication
-            let weights: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
-            let w = vld1_u8(weights.as_ptr());
+                // Weight by position using multiplication
+                let weights: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+                let w = vld1_u8(weights.as_ptr());
 
-            let weighted_lo = vmul_u8(lo, w);
-            let weighted_hi = vmul_u8(hi, w);
+                let weighted_lo = vmul_u8(lo, w);
+                let weighted_hi = vmul_u8(hi, w);
 
-            let sum_lo = vaddv_u8(weighted_lo) as u16;
-            let sum_hi = vaddv_u8(weighted_hi) as u16;
+                let sum_lo = vaddv_u8(weighted_lo) as u16;
+                let sum_hi = vaddv_u8(weighted_hi) as u16;
 
-            sum_lo | (sum_hi << 8)
+                sum_lo | (sum_hi << 8)
+            }
         }
 
         /// Using pairwise addition reduction
         #[inline]
         #[target_feature(enable = "neon")]
         pub unsafe fn parallel_padd(v: uint8x16_t) -> u16 {
-            // Shift each byte right by 7 to get just the high bit (0 or 1)
-            let high_bits = vshrq_n_u8::<7>(v);
+            unsafe {
+                // Shift each byte right by 7 to get just the high bit (0 or 1)
+                let high_bits = vshrq_n_u8::<7>(v);
 
-            // Create shift amounts
-            let shift_amounts: [i8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7];
-            let shifts = vld1q_s8(shift_amounts.as_ptr());
+                // Create shift amounts
+                let shift_amounts: [i8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7];
+                let shifts = vld1q_s8(shift_amounts.as_ptr());
 
-            // Shift each byte left by its lane index
-            let shifted = vshlq_u8(high_bits, shifts);
+                // Shift each byte left by its lane index
+                let shifted = vshlq_u8(high_bits, shifts);
 
-            // Use pairwise addition to reduce
-            // After first padd: 8 bytes, each is sum of 2 adjacent bytes
-            let p1 = vpaddq_u8(shifted, shifted);
-            // After second padd: 4 values of interest
-            let p2 = vpaddq_u8(p1, p1);
-            // After third padd: 2 values of interest
-            let p3 = vpaddq_u8(p2, p2);
+                // Use pairwise addition to reduce
+                // After first padd: 8 bytes, each is sum of 2 adjacent bytes
+                let p1 = vpaddq_u8(shifted, shifted);
+                // After second padd: 4 values of interest
+                let p2 = vpaddq_u8(p1, p1);
+                // After third padd: 2 values of interest
+                let p3 = vpaddq_u8(p2, p2);
 
-            // Extract the two bytes we need
-            let arr: [u8; 16] = core::mem::transmute(p3);
-            (arr[0] as u16) | ((arr[1] as u16) << 8)
+                // Extract the two bytes we need
+                let arr: [u8; 16] = core::mem::transmute(p3);
+                (arr[0] as u16) | ((arr[1] as u16) << 8)
+            }
         }
     }
 

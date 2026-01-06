@@ -1,0 +1,16 @@
+[package]
+name = "json-parser-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+criterion = "0.5"
+serde_json = "1.0"
+simd-json = "0.14"
+sonic-rs = "0.3"
+succinctly = { path = ".." }
+
+[[bench]]
+name = "json_parsers"
+harness = false

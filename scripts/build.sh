@@ -1,21 +1,48 @@
 #!/bin/bash
-
-# Build script that runs cargo build, fmt check, and clippy
-# Exits on first failure
+# Build, check, and lint both succinctly and bench-compare crates
 
 set -e
 
-echo "🔨 Building project..."
-cargo build
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
-echo "✅ Build successful!"
+echo "=== Checking succinctly ==="
+cd "$ROOT_DIR"
+cargo check --all-targets --all-features
 
-echo "🎨 Checking code formatting..."
-cargo fmt --check
-
-echo "✅ Code formatting check passed!"
-
-echo "🔍 Running clippy checks..."
+echo ""
+echo "=== Linting succinctly (clippy) ==="
 cargo clippy --all-targets --all-features -- -D warnings
 
-echo "✅ All checks passed! 🎉"
+echo ""
+echo "=== Building succinctly ==="
+cargo build --release
+
+echo ""
+echo "=== Building succinctly (with CLI) ==="
+cargo build --release --features cli
+
+echo ""
+echo "=== Checking bench-compare ==="
+cd "$ROOT_DIR/bench-compare"
+cargo check --all-targets
+
+echo ""
+echo "=== Linting bench-compare (clippy) ==="
+cargo clippy --all-targets -- -D warnings
+
+echo ""
+echo "=== Building bench-compare ==="
+cargo build --release
+
+echo ""
+echo "=== Build complete ==="
+echo "Binaries:"
+echo "  $ROOT_DIR/target/release/succinctly"
+echo ""
+echo "Run tests:"
+echo "  cd $ROOT_DIR && cargo test"
+echo ""
+echo "Run benchmarks:"
+echo "  cd $ROOT_DIR && cargo bench"
+echo "  cd $ROOT_DIR/bench-compare && cargo bench"

@@ -72,7 +72,7 @@ fn main() {
         );
 
         // Compare old vs new succinctly
-        let old_total = (succ_index + succ_traverse).as_secs_f64();
+        let _old_total = (succ_index + succ_traverse).as_secs_f64();
         let new_total = (succ_index + succ_fast_traverse).as_secs_f64();
         let traverse_speedup = succ_traverse.as_secs_f64() / succ_fast_traverse.as_secs_f64();
         println!(
@@ -108,16 +108,16 @@ fn count_serde(v: &serde_json::Value) -> usize {
 
 fn count_succinctly(v: StandardJson) -> usize {
     match v {
-        StandardJson::Array(mut elements) => {
+        StandardJson::Array(elements) => {
             let mut count = 1;
-            while let Some(elem) = elements.next() {
+            for elem in elements {
                 count += count_succinctly(elem);
             }
             count
         }
-        StandardJson::Object(mut entries) => {
+        StandardJson::Object(entries) => {
             let mut count = 1;
-            while let Some(entry) = entries.next() {
+            for entry in entries {
                 count += count_succinctly(entry.value());
             }
             count

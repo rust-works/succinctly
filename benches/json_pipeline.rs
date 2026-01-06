@@ -23,6 +23,7 @@ use succinctly::select_in_word;
 /// V2 index with O(1) rank1 operations.
 struct JsonIndexV2 {
     ib: Vec<u64>,
+    #[allow(dead_code)]
     ib_len: usize,
     ib_rank: Vec<u32>,
     bp: BalancedParensV2<Vec<u64>>,
@@ -234,10 +235,10 @@ fn extract_strings(value: &StandardJson) -> usize {
             let mut iter = *fields;
             while let Some((field, rest)) = iter.uncons() {
                 // Count key length
-                if let StandardJson::String(key) = field.key() {
-                    if let Ok(k) = key.as_str() {
-                        count += k.len();
-                    }
+                if let StandardJson::String(key) = field.key()
+                    && let Ok(k) = key.as_str()
+                {
+                    count += k.len();
                 }
                 count += extract_strings(&field.value());
                 iter = rest;
@@ -336,10 +337,10 @@ fn print_value<W: Write>(value: &StandardJson, out: &mut W) {
                 }
                 first = false;
                 let _ = out.write_all(b"\"");
-                if let StandardJson::String(key) = field.key() {
-                    if let Ok(k) = key.as_str() {
-                        let _ = out.write_all(k.as_bytes());
-                    }
+                if let StandardJson::String(key) = field.key()
+                    && let Ok(k) = key.as_str()
+                {
+                    let _ = out.write_all(k.as_bytes());
                 }
                 let _ = out.write_all(b"\":");
                 print_value(&field.value(), out);
@@ -367,11 +368,11 @@ fn print_strings<W: Write>(value: &StandardJson, out: &mut W) {
             let mut iter = *fields;
             while let Some((field, rest)) = iter.uncons() {
                 // Print key
-                if let StandardJson::String(key) = field.key() {
-                    if let Ok(k) = key.as_str() {
-                        let _ = out.write_all(k.as_bytes());
-                        let _ = out.write_all(b"\n");
-                    }
+                if let StandardJson::String(key) = field.key()
+                    && let Ok(k) = key.as_str()
+                {
+                    let _ = out.write_all(k.as_bytes());
+                    let _ = out.write_all(b"\n");
                 }
                 print_strings(&field.value(), out);
                 iter = rest;
@@ -447,7 +448,7 @@ fn bench_v1_vs_v2_text_position(c: &mut Criterion) {
     let Some(bytes) = load_test_file() else {
         return;
     };
-    let file_size = bytes.len() as u64;
+    let _file_size = bytes.len() as u64;
 
     // Build both indexes
     let index_v1 = JsonIndex::build(&bytes);
