@@ -480,13 +480,30 @@ The parser has three main components:
 
 ### Potential Optimization Opportunities
 
-#### A. Reduce `neon_movemask` calls
-Currently 6 calls in `classify_chars`. Could potentially:
-- Combine masks before extraction
-- Use alternative extraction strategies
+#### A. Reduce `neon_movemask` calls ❌ REJECTED
 
-**Estimated gain**: 5-10%
-**Effort**: 🔧🔧 Low-Medium (2-4 hours)
+**Status:** Investigated January 2026 - No improvement found
+
+**Approaches Tried:**
+1. **Batched extraction** (`neon_movemask_pair`, `neon_movemask_triple`): Group multiple vectors and extract together to improve ILP
+2. **Fully inlined extraction**: Inline all 12 lane extractions (6 vectors × 2 halves) in a single code block
+3. **Compute `string_special` in NEON domain**: OR the vectors before extraction instead of ORing u16 results
+
+**Benchmark Results:**
+- All approaches showed **no measurable improvement** (within noise)
+- Some showed slight **regressions** (1-2%) on string-heavy patterns
+
+**Analysis:**
+The M1/M2/M3 out-of-order execution engine already schedules independent `neon_movemask` calls efficiently. The lane extractions (`vgetq_lane_u64`) and multiplications are independent operations that the CPU can execute in parallel automatically. Manual batching adds code complexity without benefit.
+
+**Why It Failed:**
+1. Apple Silicon has excellent out-of-order execution
+2. The 6 movemask calls are already independent (no data dependencies)
+3. Function call overhead is negligible (inlined anyway)
+4. The multiplications (12 total) are fast on M1's multiply units
+
+**Estimated gain**: ~~5-10%~~ **0% (not effective)**
+**Effort**: 🔧🔧 Low-Medium (2-4 hours) ❌
 
 #### B. Optimize value character detection
 Current implementation uses 6 NEON comparisons for alphanumeric + punctuation:
@@ -556,16 +573,17 @@ Add software prefetch hints for upcoming chunks.
 ### Recommendation
 
 With Option C implemented, NEON is now **48% faster than scalar** (up from 30%). Further optimization has diminishing returns:
-- Option A (reduce movemask calls): May yield another 5-10%
+- Option A (reduce movemask calls): ❌ **Rejected** - no improvement found
 - Option B (value char detection): May yield 5-15%
 - Option D (prefetching): Likely minimal gain on M1/M2/M3
 
 The remaining options are **low priority** because:
 - Current 48% speedup is substantial
+- Option A was investigated and showed no benefit
 - Risk of regression on different Apple Silicon generations
 - x86 optimizations (AVX-512) have higher ROI
 
-If pursued, start with **Option A (reduce movemask calls)** as lowest risk.
+If pursued, try **Option B (value char detection)** next, though likelihood of success is low given Option A results.
 
 **Priority**: ⭐ LOW (already 48% faster than scalar after Option C)
 **Effort**: 🔧🔧 Low-Medium (4-8 hours for additional improvement)
