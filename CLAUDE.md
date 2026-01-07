@@ -273,11 +273,14 @@ Based on this work:
 
 ### Documentation
 
-Detailed analysis available in:
+**Quick Reference**: [docs/OPTIMIZATION-SUMMARY.md](docs/OPTIMIZATION-SUMMARY.md) - **Complete record of all optimizations** (what worked, what failed, exact performance numbers)
+
+Detailed analysis:
 - [docs/AVX512-VPOPCNTDQ-RESULTS.md](docs/AVX512-VPOPCNTDQ-RESULTS.md) - Popcount 5.2x speedup
-- [docs/AVX512-JSON-RESULTS.md](docs/AVX512-JSON-RESULTS.md) - Why AVX2 beats AVX-512 for JSON
-- [docs/optimization-opportunities.md](docs/optimization-opportunities.md) - CPU feature analysis
-- [docs/RECOMMENDED-OPTIMIZATIONS.md](docs/RECOMMENDED-OPTIMIZATIONS.md) - Prioritized optimization roadmap
+- [docs/AVX512-JSON-RESULTS.md](docs/AVX512-JSON-RESULTS.md) - Why AVX2 beats AVX-512 for JSON (historical)
+- [docs/FAILED-OPTIMIZATIONS.md](docs/FAILED-OPTIMIZATIONS.md) - Lessons from failed attempts
+- [docs/implemented-optimizations.md](docs/implemented-optimizations.md) - Catalog of successful optimizations
+- [docs/optimization-opportunities.md](docs/optimization-opportunities.md) - CPU feature analysis & remaining opportunities
 
 ### Production Recommendations
 
