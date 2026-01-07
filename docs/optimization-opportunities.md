@@ -445,6 +445,134 @@ SIMD multi-word prefix sum could batch excess computation across 4-8 words. Howe
 
 ---
 
+## 6.5. NEON JSON Parser Tuning (LOW PRIORITY)
+
+### Current State
+
+**File:** [src/json/simd/neon.rs](../src/json/simd/neon.rs)
+
+The NEON JSON parser is already implemented and working:
+
+| Benchmark (10MB comprehensive) | Throughput | Relative |
+|-------------------------------|------------|----------|
+| NEON (32-byte) | 560 MiB/s | 1.48x |
+| NEON (16-byte, old) | 505 MiB/s | 1.30x |
+| Scalar | 388 MiB/s | 1.00x |
+
+**Current speedup: 48% over scalar** - Improved from 30% after 32-byte optimization (Option C).
+
+### Implementation Details
+
+The parser has three main components:
+
+1. **`neon_movemask`** (lines 78-106): Converts NEON comparison results to u16 bitmask
+   - Uses multiplication trick: `(u64.wrapping_mul(0x0102040810204080) >> 56)`
+   - Requires 2 lane extractions (`vgetq_lane_u64`) per 16 bytes
+
+2. **`classify_chars`** (lines 132-207): Classifies 16 bytes using nibble lookup
+   - Uses `vqtbl1q_u8` for nibble-based character classification (simdjson technique)
+   - 6 `neon_movemask` calls to extract individual class masks
+   - Additional range checks for alphanumeric characters
+
+3. **`process_chunk_standard`** (lines 309-425): Serial state machine
+   - Processes classified bits one at a time
+   - Fast path for strings: batch-writes zeros when no quotes/backslashes
+
+### Potential Optimization Opportunities
+
+#### A. Reduce `neon_movemask` calls
+Currently 6 calls in `classify_chars`. Could potentially:
+- Combine masks before extraction
+- Use alternative extraction strategies
+
+**Estimated gain**: 5-10%
+**Effort**: 🔧🔧 Low-Medium (2-4 hours)
+
+#### B. Optimize value character detection
+Current implementation uses 6 NEON comparisons for alphanumeric + punctuation:
+```rust
+let lowercase = vcleq_u8(sub_a_lower, vdupq_n_u8(b'z' - b'a'));
+let uppercase = vcleq_u8(sub_a_upper, vdupq_n_u8(b'Z' - b'A'));
+let digit = vcleq_u8(sub_0, vdupq_n_u8(b'9' - b'0'));
+let eq_period = vceqq_u8(chunk, vdupq_n_u8(b'.'));
+let eq_minus = vceqq_u8(chunk, vdupq_n_u8(b'-'));
+let eq_plus = vceqq_u8(chunk, vdupq_n_u8(b'+'));
+```
+Could potentially use a lookup table approach similar to the structural character classification.
+
+**Estimated gain**: 5-15%
+**Effort**: 🔧🔧 Low-Medium (2-4 hours)
+
+#### C. Process 32 bytes at a time ✅ IMPLEMENTED
+
+**Status:** Completed January 2026
+
+**Implementation:**
+- Added `CharClass32` struct combining two 16-byte classifications into u32 masks
+- Added `process_chunk_standard_32()` for 32-byte state machine processing
+- Main loop now processes 32-byte chunks, with 16-byte remainder handling
+
+**Benchmark Results (10MB files):**
+
+| Pattern | Improvement | Throughput |
+|---------|-------------|------------|
+| nested | **-41.4%** time | 3.47 GiB/s |
+| strings | **-37.3%** time | 2.83 GiB/s |
+| unicode | **-14.5%** time | 1.70 GiB/s |
+| comprehensive | **-9.1%** time | 560 MiB/s |
+| mixed | **-7.5%** time | 389 MiB/s |
+| numbers | **-5.4%** time | 342 MiB/s |
+| users | **-5.0%** time | 681 MiB/s |
+| arrays | **-4.6%** time | 311 MiB/s |
+| literals | **-2.0%** time | 290 MiB/s |
+| pathological | no change | 412 MiB/s |
+
+**Analysis:**
+- String-heavy patterns benefit most (up to 41% improvement for nested, 37% for strings)
+- This is because the InString fast-path can now skip up to 32 consecutive string characters
+- Structural-heavy patterns (arrays, literals) see smaller but still positive gains (2-5%)
+- No regressions detected across any pattern
+
+**Overall NEON vs Scalar improvement (comprehensive 10MB):**
+- Before Option C: 505 MiB/s (1.30x over scalar)
+- After Option C: 560 MiB/s (1.48x over scalar)
+
+**Actual gain**: 10% overall, up to 41% on string-heavy workloads
+**Effort**: 🔧🔧🔧 Medium (4-6 hours) ✅
+
+#### D. Prefetching
+Add software prefetch hints for upcoming chunks.
+
+**Estimated gain**: 0-10% (M1 has good hardware prefetching)
+**Effort**: 🔧 Low (1-2 hours)
+
+### Why Limited Gains Expected
+
+1. **State machine is inherently serial**: The quote/escape tracking cannot be parallelized
+2. **Apple Silicon excels at scalar**: M1/M2/M3 have wide superscalar execution, reducing SIMD advantage
+3. **Memory bandwidth**: At 505 MiB/s, we're processing ~32 cycles per byte on a 3.2GHz M1 - not memory bound
+4. **Previous NEON investigation failed**: R1 showed 25% slowdown when trying to batch popcount operations
+
+### Recommendation
+
+With Option C implemented, NEON is now **48% faster than scalar** (up from 30%). Further optimization has diminishing returns:
+- Option A (reduce movemask calls): May yield another 5-10%
+- Option B (value char detection): May yield 5-15%
+- Option D (prefetching): Likely minimal gain on M1/M2/M3
+
+The remaining options are **low priority** because:
+- Current 48% speedup is substantial
+- Risk of regression on different Apple Silicon generations
+- x86 optimizations (AVX-512) have higher ROI
+
+If pursued, start with **Option A (reduce movemask calls)** as lowest risk.
+
+**Priority**: ⭐ LOW (already 48% faster than scalar after Option C)
+**Effort**: 🔧🔧 Low-Medium (4-8 hours for additional improvement)
+**Risk**: Medium (may regress, limited upside)
+
+---
+
 ## 7. No-std Runtime Dispatch (LOW PRIORITY)
 
 ### Current State

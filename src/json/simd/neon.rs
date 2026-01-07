@@ -124,6 +124,42 @@ struct CharClass {
     string_special: u16,
 }
 
+/// Character classification results for a 32-byte double chunk.
+/// Combines two 16-byte CharClass results into u32 masks.
+#[derive(Debug, Clone, Copy)]
+struct CharClass32 {
+    /// Mask of bytes that are '"'
+    quotes: u32,
+    /// Mask of bytes that are '\'
+    backslashes: u32,
+    /// Mask of bytes that are '{' or '['
+    opens: u32,
+    /// Mask of bytes that are '}' or ']'
+    closes: u32,
+    /// Mask of bytes that are ',' or ':'
+    delims: u32,
+    /// Mask of bytes that could start/continue a value (alphanumeric, ., -, +)
+    value_chars: u32,
+    /// Combined mask of quotes OR backslashes (for quick InString scanning)
+    string_special: u32,
+}
+
+impl CharClass32 {
+    /// Combine two 16-byte CharClass results into a 32-byte classification.
+    #[inline]
+    fn from_pair(lo: CharClass, hi: CharClass) -> Self {
+        Self {
+            quotes: (lo.quotes as u32) | ((hi.quotes as u32) << 16),
+            backslashes: (lo.backslashes as u32) | ((hi.backslashes as u32) << 16),
+            opens: (lo.opens as u32) | ((hi.opens as u32) << 16),
+            closes: (lo.closes as u32) | ((hi.closes as u32) << 16),
+            delims: (lo.delims as u32) | ((hi.delims as u32) << 16),
+            value_chars: (lo.value_chars as u32) | ((hi.value_chars as u32) << 16),
+            string_special: (lo.string_special as u32) | ((hi.string_special as u32) << 16),
+        }
+    }
+}
+
 /// Classify 16 bytes at once using NEON with nibble lookup tables.
 ///
 /// Uses the simdjson technique: split each byte into high/low nibbles,
@@ -424,9 +460,132 @@ fn process_chunk_standard(
     state
 }
 
+/// Process a 32-byte double chunk and update IB/BP writers.
+/// Returns the new state after processing all 32 bytes.
+///
+/// This processes two 16-byte chunks together, reducing loop overhead
+/// and potentially improving instruction-level parallelism.
+#[inline]
+fn process_chunk_standard_32(
+    class: CharClass32,
+    mut state: State,
+    ib: &mut BitWriter,
+    bp: &mut BitWriter,
+    len: usize,
+) -> State {
+    let len = len.min(32);
+    let mut i = 0;
+
+    while i < len {
+        let remaining_mask = !((1u32 << i) - 1); // Mask of positions >= i
+
+        match state {
+            State::InJson => {
+                let bit = 1u32 << i;
+                let is_open = (class.opens & bit) != 0;
+                let is_close = (class.closes & bit) != 0;
+                let is_quote = (class.quotes & bit) != 0;
+                let is_value_char = (class.value_chars & bit) != 0;
+
+                if is_open {
+                    bp.write_1();
+                    ib.write_1();
+                } else if is_close {
+                    bp.write_0();
+                    ib.write_0();
+                } else if is_quote {
+                    // Value start: BP=10, IB=1
+                    bp.write_1();
+                    bp.write_0();
+                    ib.write_1();
+                    state = State::InString;
+                } else if is_value_char {
+                    // Value start: BP=10, IB=1
+                    bp.write_1();
+                    bp.write_0();
+                    ib.write_1();
+                    state = State::InValue;
+                } else {
+                    ib.write_0();
+                }
+                i += 1;
+            }
+            State::InString => {
+                // Fast path: find the next quote or backslash
+                let special_remaining = class.string_special & remaining_mask;
+
+                if special_remaining == 0 {
+                    // No more quotes or backslashes in this chunk - write zeros for rest
+                    let zeros_to_write = len - i;
+                    ib.write_zeros(zeros_to_write);
+                    return State::InString;
+                }
+
+                // Find the next special character
+                let next_special = special_remaining.trailing_zeros() as usize;
+
+                // Write zeros up to (but not including) the special char
+                if next_special > i {
+                    let zeros = next_special - i;
+                    ib.write_zeros(zeros);
+                    i = next_special;
+                }
+
+                // Now process the special character at position i
+                let bit = 1u32 << i;
+                ib.write_0();
+
+                if (class.quotes & bit) != 0 {
+                    state = State::InJson;
+                } else {
+                    // It's a backslash
+                    state = State::InEscape;
+                }
+                i += 1;
+            }
+            State::InEscape => {
+                ib.write_0();
+                state = State::InString;
+                i += 1;
+            }
+            State::InValue => {
+                let bit = 1u32 << i;
+                let is_open = (class.opens & bit) != 0;
+                let is_close = (class.closes & bit) != 0;
+                let is_quote = (class.quotes & bit) != 0;
+                let is_value_char = (class.value_chars & bit) != 0;
+
+                if is_open {
+                    bp.write_1();
+                    ib.write_1();
+                    state = State::InJson;
+                } else if is_close {
+                    bp.write_0();
+                    ib.write_0();
+                    state = State::InJson;
+                } else if is_quote {
+                    // Value start: BP=10, IB=1
+                    bp.write_1();
+                    bp.write_0();
+                    ib.write_1();
+                    state = State::InString;
+                } else if is_value_char {
+                    ib.write_0();
+                } else {
+                    ib.write_0();
+                    state = State::InJson;
+                }
+                i += 1;
+            }
+        }
+    }
+
+    state
+}
+
 /// Build a semi-index from JSON bytes using SIMD-accelerated Standard Cursor algorithm.
 ///
-/// Processes 16 bytes at a time using ARM NEON instructions for character
+/// Processes 32 bytes at a time using ARM NEON instructions for character
 /// classification, then processes the state machine transitions.
 pub fn build_semi_index_standard(json: &[u8]) -> SemiIndex {
     // SAFETY: We check for NEON support at compile time via target_arch
@@ -443,8 +602,19 @@ unsafe fn build_semi_index_standard_neon(json: &[u8]) -> SemiIndex {
 
         let mut offset = 0;
 
-        // Process 16-byte chunks
-        while offset + 16 <= json.len() {
+        // Process 32-byte chunks (two 16-byte NEON loads)
+        while offset + 32 <= json.len() {
+            let chunk_lo = vld1q_u8(json.as_ptr().add(offset));
+            let chunk_hi = vld1q_u8(json.as_ptr().add(offset + 16));
+            let class_lo = classify_chars(chunk_lo);
+            let class_hi = classify_chars(chunk_hi);
+            let class32 = CharClass32::from_pair(class_lo, class_hi);
+            state = process_chunk_standard_32(class32, state, &mut ib, &mut bp, 32);
+            offset += 32;
+        }
+
+        // Process remaining 16-byte chunk if present
+        if offset + 16 <= json.len() {
             let chunk = vld1q_u8(json.as_ptr().add(offset));
             let class = classify_chars(chunk);
             state =
