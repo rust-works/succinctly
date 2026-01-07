@@ -588,11 +588,52 @@ let value_chars = vmvnq_u8(vceqq_u8(value_classified, zero));
 **Actual gain**: 10% overall, up to 41% on string-heavy workloads
 **Effort**: 🔧🔧🔧 Medium (4-6 hours) ✅
 
-#### D. Prefetching
-Add software prefetch hints for upcoming chunks.
+#### D. Prefetching ❌ REJECTED
 
-**Estimated gain**: 0-10% (M1 has good hardware prefetching)
-**Effort**: 🔧 Low (1-2 hours)
+**Status:** Investigated January 2026 - No improvement found
+
+**Approaches Tried:**
+1. **PLDL1KEEP** (L1 cache, temporal) at 256, 512, 1024 byte distances
+2. **PLDL1STRM** (L1 cache, streaming/non-temporal) at 1024 bytes
+3. **PLDL2KEEP** (L2 cache, temporal) at 2048 bytes
+
+**Implementation:**
+```rust
+#[inline(always)]
+unsafe fn prefetch_read(ptr: *const u8) {
+    unsafe {
+        asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+// In main loop:
+let prefetch_addr = offset + PREFETCH_DISTANCE;
+if prefetch_addr < json.len() {
+    prefetch_read(json.as_ptr().add(prefetch_addr));
+}
+```
+
+**Benchmark Results:**
+All approaches showed **no measurable improvement** (within noise, ±1-2%).
+
+**Analysis:**
+Apple M1/M2/M3 processors have highly effective hardware prefetchers that automatically detect sequential memory access patterns. The JSON parser's sequential read pattern is ideal for hardware prefetching:
+- Accesses are strictly sequential (32 bytes at a time)
+- Access pattern is perfectly predictable
+- Data is only used once (streaming)
+
+**Why It Failed:**
+1. Apple Silicon's hardware prefetcher is already optimized for sequential patterns
+2. Software prefetch hints add instruction overhead with no benefit
+3. At 571 MiB/s, we're not memory-bound (L1 cache hit rate is nearly 100%)
+4. The hardware prefetcher likely outperforms software hints for simple patterns
+
+**Estimated gain**: ~~0-10%~~ **0% (not effective)**
+**Effort**: 🔧 Low (1-2 hours) ❌
 
 ### Why Limited Gains Expected
 
@@ -603,22 +644,25 @@ Add software prefetch hints for upcoming chunks.
 
 ### Recommendation
 
-With Option C implemented, NEON is now **48% faster than scalar** (up from 30%). Further optimization has diminishing returns:
-- Option A (reduce movemask calls): ❌ **Rejected** - no improvement found
-- Option B (value char detection): May yield 5-15%
-- Option D (prefetching): Likely minimal gain on M1/M2/M3
+**All ARM optimization options have been exhausted.**
 
-The remaining options are **low priority** because:
-- Current 48% speedup is substantial
-- Option A was investigated and showed no benefit
-- Risk of regression on different Apple Silicon generations
-- x86 optimizations (AVX-512) have higher ROI
+With Options B and C implemented, NEON is now **52% faster than scalar** (571 MiB/s vs 376 MiB/s):
 
-If pursued, try **Option B (value char detection)** next, though likelihood of success is low given Option A results.
+| Option | Status | Result |
+|--------|--------|--------|
+| A (reduce movemask calls) | ❌ Rejected | No improvement - M1 OOO handles it |
+| B (value char detection) | ✅ Implemented | +2% overall, up to +6% on some patterns |
+| C (32-byte processing) | ✅ Implemented | +10% overall, up to +41% on strings |
+| D (prefetching) | ❌ Rejected | No improvement - HW prefetcher sufficient |
 
-**Priority**: ⭐ LOW (already 48% faster than scalar after Option C)
-**Effort**: 🔧🔧 Low-Medium (4-8 hours for additional improvement)
-**Risk**: Medium (may regress, limited upside)
+**Final NEON performance (comprehensive 10MB):**
+- NEON: 571 MiB/s (1.52x over scalar)
+- Scalar: 376 MiB/s (baseline)
+
+**No further ARM optimizations recommended.** The parser is now compute-bound on the serial state machine, not on SIMD classification or memory access. Any additional gains would require algorithmic changes (e.g., speculative parsing, branch prediction hints).
+
+**Priority**: ⭐⭐⭐ COMPLETE
+**Status**: All options investigated, diminishing returns reached
 
 ---
 
