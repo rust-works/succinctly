@@ -333,7 +333,7 @@ impl BitWriter {
 
 ---
 
-## 5. SIMD Prefix Sum for State Machine (HIGH COMPLEXITY)
+## 5. SIMD Prefix Sum for State Machine (HIGH COMPLEXITY, x86 ONLY)
 
 ### Current State
 [src/json/simd/avx2.rs:134-218](../src/json/simd/avx2.rs) processes classified bytes **serially**:
@@ -387,11 +387,25 @@ fn filter_structural_chars(chars: u32, quote_mask: u32) -> u32 {
 - **Escape handling**: Backslashes complicate quote detection
 - **Testing**: Requires extensive validation
 
+### Platform Considerations
+
+**x86 (AVX2/AVX-512)**: Recommended target
+- 256-bit vectors (4 x u64) or 512-bit (8 x u64)
+- Good amortization of setup overhead
+- `PCLMULQDQ` for carry-less multiply (useful for quote masking)
+
+**ARM (NEON)**: NOT RECOMMENDED
+- Only 128-bit vectors (2 x u64) - less amortization
+- No dedicated prefix sum instruction
+- Apple Silicon already excellent at scalar execution
+- Previous investigation (R1. NEON Batched Popcount) showed SIMD was **25% slower** than scalar due to extraction overhead and sequential dependencies
+- The bottleneck is the `cumulative += count` dependency chain, which is inherently serial regardless of architecture
+
 ### References
 - simdjson: https://github.com/simdjson/simdjson
 - "Parsing Gigabytes of JSON per Second" paper
 
-**Priority**: ⭐⭐⭐⭐ HIGH (but complex)
+**Priority**: ⭐⭐⭐⭐ HIGH (but complex, x86 only)
 **Effort**: 🔧🔧🔧🔧🔧 Very High (20-40 hours, research + implementation)
 **Risk**: High (complex algorithm, hard to debug)
 
@@ -550,7 +564,7 @@ See [implemented-optimizations.md](implemented-optimizations.md#52-exponential-s
 
 ### Phase 3: Advanced Optimizations (Week 3-4)
 1. BMI2 integration for bit packing (8 hours)
-2. SIMD prefix sum research + prototype (16 hours)
+2. SIMD prefix sum research + prototype (16 hours, x86 only - not recommended for ARM)
 3. ~~BP SIMD optimization~~ ✓ Already implemented (byte-level lookup tables)
 
 ### Phase 4: Polish (Week 5)
