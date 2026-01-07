@@ -397,67 +397,37 @@ fn filter_structural_chars(chars: u32, quote_mask: u32) -> u32 {
 
 ---
 
-## 6. Balanced Parentheses SIMD Optimization (MEDIUM IMPACT)
+## 6. Balanced Parentheses SIMD Optimization (LOW PRIORITY - MOSTLY IMPLEMENTED)
 
 ### Current State
-[src/bp.rs:62-78](../src/bp.rs) uses scalar loop for `find_unmatched_close_in_word`:
 
+**Already optimized:**
+- `BalancedParens::find_close` uses `find_close_in_word_fast` with byte-level lookup tables
+- Byte lookup tables (`BYTE_MIN_EXCESS`, `BYTE_TOTAL_EXCESS`, `BYTE_FIND_CLOSE`) enable O(1) matching within bytes
+- RangeMin hierarchical structure (L0/L1/L2) enables O(1) block skipping
+- **Result:** ~11x faster than linear scan (11.3 µs vs 130.9 µs for 1M elements)
+
+**Not optimized (low priority):**
+- Free function `find_unmatched_close_in_word` still uses bit-by-bit loop
+- `find_open` and `enclose` use bit-by-bit backward scanning
+- These are rarely used in JSON processing (JSON uses `BalancedParens` struct)
+
+### Remaining Opportunity
+
+SIMD multi-word prefix sum could batch excess computation across 4-8 words. However:
+- The hierarchical RangeMin structure already skips entire L0/L1/L2 blocks
+- Word-level scanning uses byte lookup tables (8x fewer iterations than bit-by-bit)
+- ROI is limited since the hot path is already well-optimized
+
+### Potential Improvement (if pursued)
 ```rust
-pub fn find_unmatched_close_in_word(x: u64) -> u32 {
-    let mut excess: i32 = 0;
-    for bit in 0..64 {  // ← Scalar loop
-        if (x >> bit) & 1 == 1 {
-            excess += 1;
-        } else {
-            excess -= 1;
-            if excess < 0 {
-                return bit;
-            }
-        }
-    }
-    64
-}
+// Batch process 4 words: compute which word contains the match
+// Then use existing byte-level scan within that word
 ```
 
-### Opportunity
-Use SIMD to compute excess in parallel for multiple words.
-
-### Approach
-```rust
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn find_close_simd(words: &[u64], start_word: usize) -> Option<usize> {
-    use core::arch::x86_64::*;
-
-    // Process 4 words (256 bits) at once
-    let v = _mm256_loadu_si256(words.as_ptr().add(start_word) as *const __m256i);
-
-    // Count 1s (opens) using POPCNT
-    let v_u64 = core::mem::transmute::<__m256i, [u64; 4]>(v);
-    let opens: [i32; 4] = [
-        v_u64[0].count_ones() as i32,
-        v_u64[1].count_ones() as i32,
-        v_u64[2].count_ones() as i32,
-        v_u64[3].count_ones() as i32,
-    ];
-
-    // Compute prefix sum of excess (2*opens - 64 per word)
-    // Find first word where cumulative excess < 0
-    // ...
-}
-```
-
-### Expected Improvement
-- **Throughput**: 2-3x for `find_close` across multiple words
-- **Use case**: Large tree structures with deep nesting
-
-### Considerations
-- **Complexity**: Prefix sum logic for signed values
-- **Early exit**: Need to handle when match found mid-chunk
-
-**Priority**: ⭐⭐ LOW-MEDIUM
+**Priority**: ⭐ LOW (main path already optimized)
 **Effort**: 🔧🔧🔧 Moderate-High (8-12 hours)
-**Risk**: Medium (complex bit arithmetic)
+**Risk**: Medium (diminishing returns)
 
 ---
 
@@ -588,7 +558,7 @@ The `ib_select1_binary` method already exists in the benchmark code. To producti
 ### Phase 3: Advanced Optimizations (Week 3-4)
 1. BMI2 integration for bit packing (8 hours)
 2. SIMD prefix sum research + prototype (16 hours)
-3. BP SIMD optimization (12 hours)
+3. ~~BP SIMD optimization~~ ✓ Already implemented (byte-level lookup tables)
 
 ### Phase 4: Polish (Week 5)
 1. Benchmarking and tuning (8 hours)

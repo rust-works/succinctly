@@ -375,10 +375,12 @@ fn test_sse2_matches_scalar() {
 | Rank directory | 3-level Poppy | O(1) | Enables fast navigation |
 | Cache alignment | 64-byte aligned alloc | - | 3-4% rank speedup |
 | Select index | Sampled positions | O(log n) | Enables fast select |
-| BP RangeMin | 3-level excess index | O(1) find_close | ~40x vs linear scan |
+| BP RangeMin | 3-level excess index | O(1) find_close | ~11x vs linear scan |
+| BP byte lookup | BYTE_FIND_CLOSE tables | O(1) per byte | ~4x vs bit-by-bit |
 | JSON SIMD | Multi-level dispatch | O(n) | 2-4x vs scalar |
 | String fast-path | Batch zero writing | O(n) | 2.5-8x on strings |
 | Cumulative index | Binary search select | O(log n) | 627x on queries |
+| Exponential search | Galloping from hint | O(log d) | 3.3x for sequential |
 
 ---
 
@@ -434,12 +436,52 @@ self.index.ib_select1_from(rank, hint)
 
 ---
 
+### 5.3 BP find_close Byte-Level Lookup Tables
+
+**File:** [src/bp.rs](../src/bp.rs)
+
+The `BalancedParens::find_close` operation uses byte-level lookup tables for fast excess tracking, achieving ~11x speedup over bit-by-bit scanning.
+
+**Lookup tables (compile-time generated):**
+
+```rust
+/// Minimum excess within each byte value (0-255)
+const BYTE_MIN_EXCESS: [i8; 256] = { /* precomputed */ };
+
+/// Total excess (opens - closes) for each byte value
+const BYTE_TOTAL_EXCESS: [i8; 256] = { /* precomputed */ };
+
+/// Find position where excess drops to 0 within a byte
+/// Index: [byte_value][initial_excess-1] → bit position (0-7) or 8 if not found
+const BYTE_FIND_CLOSE: [[u8; 16]; 256] = { /* precomputed */ };
+```
+
+**Algorithm (`find_close_in_word_fast`):**
+
+1. For each full byte in the word:
+   - Check if `excess + BYTE_MIN_EXCESS[byte]` can reach 0
+   - If yes, use `BYTE_FIND_CLOSE[byte][excess-1]` for O(1) match position
+   - If no, skip entire byte: `excess += BYTE_TOTAL_EXCESS[byte]`
+2. Handle partial bytes with bit-by-bit fallback
+
+**Benchmark Results:**
+
+| Implementation | 10K elements | 100K elements | 1M elements |
+|----------------|--------------|---------------|-------------|
+| RangeMin (byte-level) | 11.4 µs | 12.2 µs | 11.3 µs |
+| Linear (bit-by-bit) | 15.4 µs | 49.5 µs | 130.9 µs |
+
+**Speedup:** ~11.6x for 1M elements (130.9 µs → 11.3 µs)
+
+The RangeMin implementation combines the hierarchical skip structure (L0/L1/L2 blocks) with byte-level scanning for O(1) `find_close` operations.
+
+---
+
 ## Not Implemented (See optimization-opportunities.md)
 
 The following optimizations are documented but not yet implemented:
 
 - NEON nibble lookup tables (`vqtbl1q_u8`)
 - Optimized movemask for NEON
-- BP find_close state machine unrolling
 - AVX2 escape sequence preprocessing
 - Separate binary search select for random access patterns
