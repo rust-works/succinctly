@@ -6,9 +6,9 @@
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
-use crate::json::BitWriter;
 use crate::json::simple::{SemiIndex as SimpleSemiIndex, State as SimpleState};
 use crate::json::standard::{SemiIndex, State};
+use crate::json::BitWriter;
 
 /// ASCII byte constants
 const DOUBLE_QUOTE: i8 = b'"' as i8;

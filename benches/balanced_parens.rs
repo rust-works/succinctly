@@ -5,7 +5,7 @@
 //! - Various tree depths and sizes
 //! - find_close, find_open, enclose operations
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use succinctly::bp::{self, BalancedParens};

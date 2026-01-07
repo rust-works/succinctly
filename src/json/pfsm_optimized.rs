@@ -3,7 +3,7 @@
 //! This eliminates the intermediate phi_values vector and does everything in one pass.
 
 use crate::json::bit_writer::BitWriter;
-use crate::json::pfsm_tables::{PHI_TABLE, PfsmState, TRANSITION_TABLE};
+use crate::json::pfsm_tables::{PfsmState, PHI_TABLE, TRANSITION_TABLE};
 
 /// Single-pass PFSM: no intermediate vector allocation
 pub fn pfsm_process_chunk_optimized(

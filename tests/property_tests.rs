@@ -435,7 +435,7 @@ fn test_partial_last_word() {
 // Balanced Parentheses Property Tests
 // ============================================================================
 
-use succinctly::bp::{BalancedParens, enclose, find_close, find_open};
+use succinctly::bp::{enclose, find_close, find_open, BalancedParens};
 
 /// Generate a valid balanced parentheses sequence.
 ///

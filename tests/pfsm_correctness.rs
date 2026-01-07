@@ -1,6 +1,6 @@
 use std::fs;
 /// Correctness tests: Verify PFSM produces identical output to standard implementations
-use succinctly::json::{BitWriter, pfsm, pfsm_tables::PfsmState, standard};
+use succinctly::json::{pfsm, pfsm_tables::PfsmState, standard, BitWriter};
 
 #[test]
 fn test_pfsm_vs_standard_10kb() {

@@ -7,8 +7,8 @@
 //! - Implementation cross-verification (BalancedParens vs linear scan)
 
 use succinctly::bp::{
-    BalancedParens, enclose, find_close, find_close_in_word, find_open,
-    find_unmatched_close_in_word,
+    enclose, find_close, find_close_in_word, find_open, find_unmatched_close_in_word,
+    BalancedParens,
 };
 
 // ============================================================================

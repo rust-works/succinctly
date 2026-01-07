@@ -3581,7 +3581,11 @@ fn slice_elements<'a, W: Clone + AsRef<[u64]>>(
             (idx as usize).min(len)
         } else {
             let pos = len as i64 + idx;
-            if pos < 0 { 0 } else { pos as usize }
+            if pos < 0 {
+                0
+            } else {
+                pos as usize
+            }
         }
     };
 
@@ -5198,13 +5202,21 @@ fn get_float_value<'a, W: Clone + AsRef<[u64]>>(
 // no_std compatible floor: truncate towards negative infinity
 fn floor_f64(x: f64) -> f64 {
     let t = x as i64 as f64;
-    if x < t { t - 1.0 } else { t }
+    if x < t {
+        t - 1.0
+    } else {
+        t
+    }
 }
 
 // no_std compatible ceil: truncate towards positive infinity
 fn ceil_f64(x: f64) -> f64 {
     let t = x as i64 as f64;
-    if x > t { t + 1.0 } else { t }
+    if x > t {
+        t + 1.0
+    } else {
+        t
+    }
 }
 
 // no_std compatible round: round to nearest integer, half away from zero

@@ -8,7 +8,7 @@
 //! Run with:
 //! - `cargo bench --bench popcount_strategies --features simd`
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 #[cfg(feature = "simd")]
 use succinctly::popcount_words;

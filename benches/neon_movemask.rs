@@ -5,7 +5,7 @@
 //! - Parallel shift + horizontal add (optimized)
 //! - Alternative approaches (SHRN-based, etc.)
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64_benches {

@@ -10,7 +10,7 @@
 //! cargo bench --bench json_pipeline
 //! ```
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use std::io::Write;
 use succinctly::bp::BalancedParens;
 use succinctly::json::light::{JsonIndex, StandardJson};

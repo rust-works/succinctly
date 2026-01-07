@@ -1,8 +1,8 @@
 //! Integration tests for jq query functionality.
 
-use succinctly::jq::{QueryResult, eval, eval_lenient, parse};
-use succinctly::json::JsonIndex;
+use succinctly::jq::{eval, eval_lenient, parse, QueryResult};
 use succinctly::json::light::StandardJson;
+use succinctly::json::JsonIndex;
 
 /// Helper macro to run a query and match the result.
 /// Keeps the JsonIndex alive for the duration of the match.

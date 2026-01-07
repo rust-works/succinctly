@@ -7,9 +7,9 @@
 
 use core::arch::aarch64::*;
 
-use crate::json::BitWriter;
 use crate::json::simple::{SemiIndex as SimpleSemiIndex, State as SimpleState};
 use crate::json::standard::{SemiIndex, State};
+use crate::json::BitWriter;
 
 // Nibble lookup tables for character classification.
 // Each byte in the result has bit flags indicating character class:
@@ -185,14 +185,10 @@ struct CharClass {
 struct CharClass32 {
     /// Mask of bytes that are '"'
     quotes: u32,
-    /// Mask of bytes that are '\'
-    backslashes: u32,
     /// Mask of bytes that are '{' or '['
     opens: u32,
     /// Mask of bytes that are '}' or ']'
     closes: u32,
-    /// Mask of bytes that are ',' or ':'
-    delims: u32,
     /// Mask of bytes that could start/continue a value (alphanumeric, ., -, +)
     value_chars: u32,
     /// Combined mask of quotes OR backslashes (for quick InString scanning)
@@ -205,10 +201,8 @@ impl CharClass32 {
     fn from_pair(lo: CharClass, hi: CharClass) -> Self {
         Self {
             quotes: (lo.quotes as u32) | ((hi.quotes as u32) << 16),
-            backslashes: (lo.backslashes as u32) | ((hi.backslashes as u32) << 16),
             opens: (lo.opens as u32) | ((hi.opens as u32) << 16),
             closes: (lo.closes as u32) | ((hi.closes as u32) << 16),
-            delims: (lo.delims as u32) | ((hi.delims as u32) << 16),
             value_chars: (lo.value_chars as u32) | ((hi.value_chars as u32) << 16),
             string_special: (lo.string_special as u32) | ((hi.string_special as u32) << 16),
         }

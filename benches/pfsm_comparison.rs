@@ -1,6 +1,6 @@
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use std::fs;
-use succinctly::json::{BitWriter, pfsm, pfsm_optimized, pfsm_tables::PfsmState, standard};
+use succinctly::json::{pfsm, pfsm_optimized, pfsm_tables::PfsmState, standard, BitWriter};
 
 fn benchmark_pfsm_vs_standard(c: &mut Criterion) {
     // Test with real benchmark files

@@ -8,7 +8,7 @@
 //! 3. BP construction using PDEP to interleave OP/CL bits
 
 use crate::json::bit_writer::BitWriter;
-use crate::json::pfsm_tables::{PHI_TABLE, PfsmState, TRANSITION_TABLE};
+use crate::json::pfsm_tables::{PfsmState, PHI_TABLE, TRANSITION_TABLE};
 
 #[cfg(not(test))]
 use alloc::vec::Vec;

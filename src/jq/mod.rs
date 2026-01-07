@@ -68,10 +68,10 @@ mod expr;
 mod parser;
 mod value;
 
-pub use eval::{EvalError, QueryResult, eval, eval_lenient};
+pub use eval::{eval, eval_lenient, EvalError, QueryResult};
 pub use expr::{
     ArithOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey, Pattern,
     PatternEntry, StringPart,
 };
-pub use parser::{ParseError, parse};
+pub use parser::{parse, ParseError};
 pub use value::OwnedValue;

@@ -1,5 +1,5 @@
 /// Benchmark the default `build_semi_index` which now uses PFSM optimized.
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use std::fs;
 use succinctly::json::standard;
 

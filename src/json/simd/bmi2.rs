@@ -180,8 +180,8 @@ mod tests {
         // Example: deposit bits to positions marked by mask
         let src = 0b1011u64; // = 11, bits [3,2,1,0] = [1,0,1,1]
         let mask = 0b11001100u64; // positions [7,6,3,2]
-        // Deposit src[0]=1 -> pos 2, src[1]=1 -> pos 3, src[2]=0 -> pos 6, src[3]=1 -> pos 7
-        // Result: 10001100 = 140
+                                  // Deposit src[0]=1 -> pos 2, src[1]=1 -> pos 3, src[2]=0 -> pos 6, src[3]=1 -> pos 7
+                                  // Result: 10001100 = 140
         let expected = 140u64;
 
         assert_eq!(pdep_u64_fallback(src, mask), expected);

@@ -1,8 +1,8 @@
 ///! End-to-end benchmark: PFSM vs existing implementations across all JSON patterns
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::fs;
 use std::path::PathBuf;
-use succinctly::json::{BitWriter, pfsm, pfsm_tables::PfsmState};
+use succinctly::json::{pfsm, pfsm_tables::PfsmState, BitWriter};
 
 fn discover_json_files() -> Vec<(String, PathBuf, u64)> {
     let base_dir = PathBuf::from("data/bench/generated");

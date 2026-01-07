@@ -387,8 +387,8 @@ impl AsRef<[u8]> for JsonInput {
 fn query_json(args: QueryJson) -> Result<()> {
     use std::io::{BufWriter, Read, Write};
     use succinctly::jq;
-    use succinctly::json::JsonIndex;
     use succinctly::json::light::StandardJson;
+    use succinctly::json::JsonIndex;
 
     // Read input JSON
     let json_input: JsonInput = match &args.input {
