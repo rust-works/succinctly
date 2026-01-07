@@ -87,10 +87,6 @@ harness = false
 name = "popcount_strategies"
 harness = false
 
-[[bench]]
-name = "json_avx512_comparison"
-harness = false
-
 [[bin]]
 name = "succinctly"
 path = "src/bin/succinctly/main.rs"

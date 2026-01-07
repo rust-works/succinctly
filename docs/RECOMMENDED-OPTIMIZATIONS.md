@@ -1,10 +1,10 @@
 # Recommended Performance Optimizations
 
-**Date**: 2026-01-07 (Updated with AVX-512 results)
+**Date**: 2026-01-07 (Updated with AVX-512 results and removal)
 **CPU**: AMD Ryzen 9 7950X (Zen 4, znver4)
 **Architecture**: x86_64
 
-**Status**: AVX-512 optimizations completed - see results below
+**Status**: AVX-512 optimizations completed - VPOPCNTDQ kept, JSON parser removed
 
 ---
 
@@ -69,44 +69,35 @@ std = []      # ← Exists but must be explicitly enabled
 
 ## Priority Recommendations
 
-### 🔴 CRITICAL: Make `std` a Default Feature (2 minutes)
+### ✅ COMPLETED: Make `std` a Default Feature
 
-**Why**: Enable runtime dispatch by default for all users
-
-**Change**: `Cargo.toml` line 12
-```diff
-- default = []
-+ default = ["std"]
-```
+**Status**: Already completed (Cargo.toml line 12: `default = ["std"]`)
 
 **Impact**:
-- ✅ All library users get 1.5-1.8x speedup automatically
-- ✅ CLI already has it (no change)
-- ✅ `no_std` users can still opt-out: `default-features = false`
-- ⚠️ Breaks pure `no_std` by default (but they can disable)
-
-**Alternative** (if you want to preserve no_std by default):
-- Document prominently: "Use `--features std` for 1.8x performance"
-- Add to README/docs
-- Most users will miss this and get slow code
-
-**Recommendation**: ✅ **Add `std` to defaults** - It's 2026, most users have std
+- ✅ All library users get AVX2 runtime dispatch automatically
+- ✅ `no_std` users can opt-out: `default-features = false`
 
 ---
 
-### ✅ COMPLETED: AVX-512 Optimizations
+### ✅ COMPLETED: AVX-512 Optimizations and Cleanup
 
-**Status**: Implemented and benchmarked (2026-01-07)
+**Status**: Implemented, benchmarked, and cleaned up (2026-01-07)
 
 **Results**:
-- ✅ **AVX512-VPOPCNTDQ**: 5.2x speedup (96.8 GiB/s vs 18.5 GiB/s)
-- ❌ **AVX-512 JSON Parser**: 3% slower than AVX2 (590 MiB/s vs 608 MiB/s)
+- ✅ **AVX512-VPOPCNTDQ**: 5.2x speedup (104.4 GiB/s vs 20.3 GiB/s) - **KEPT**
+- ❌ **AVX-512 JSON Parser**: 7-17% slower than AVX2 (672 vs 732 MiB/s) - **REMOVED**
 
-**Key Learning**: Wider SIMD ≠ automatically faster. JSON parsing is memory-bound with sequential state machine dependencies.
+**Actions Taken**:
+- ✅ Removed `src/json/simd/avx512.rs` (627 lines of slower code)
+- ✅ Removed `benches/json_avx512_comparison.rs`
+- ✅ Updated runtime dispatch to prioritize AVX2 > SSE4.2 > SSE2
+- ✅ All 508 tests pass
+
+**Key Learning**: Wider SIMD ≠ automatically faster. JSON parsing is memory-bound with sequential state machine dependencies. Failed optimizations should be removed, not kept as technical debt.
 
 **Documentation**:
-- [AVX512-VPOPCNTDQ-RESULTS.md](AVX512-VPOPCNTDQ-RESULTS.md)
-- [AVX512-JSON-RESULTS.md](AVX512-JSON-RESULTS.md)
+- [AVX512-VPOPCNTDQ-RESULTS.md](AVX512-VPOPCNTDQ-RESULTS.md) - 5.2x speedup details
+- [AVX512-JSON-RESULTS.md](AVX512-JSON-RESULTS.md) - Why it was slower and removed
 - [PERFORMANCE-OUTCOMES-SUMMARY.md](PERFORMANCE-OUTCOMES-SUMMARY.md)
 
 ---

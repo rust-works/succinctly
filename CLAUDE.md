@@ -120,9 +120,8 @@ cargo build --release --features cli
 - `x86.rs`: SSE2 baseline (16 bytes/iteration, universal on x86_64)
 - `sse42.rs`: SSE4.2 with PCMPISTRI (16 bytes/iteration, ~90% availability)
 - `avx2.rs`: AVX2 256-bit processing (32 bytes/iteration, ~95% availability) **← Fastest**
-- `avx512.rs`: AVX-512 512-bit processing (64 bytes/iteration, 2019+/2022+) **← 3% slower than AVX2**
 - `neon.rs`: ARM NEON (16 bytes/iteration, mandatory on aarch64)
-- `mod.rs`: Runtime CPU feature detection and dispatch
+- `mod.rs`: Runtime CPU feature detection and dispatch (AVX2 > SSE4.2 > SSE2)
 
 ### jq Query Module
 
@@ -221,14 +220,14 @@ Two AVX-512 optimizations implemented with dramatically different results:
 
 **Real-world impact**: Minimal - popcount is only ~1.6% of BitVec construction time
 
-#### ❌ AVX-512 JSON Parser: 3% Slower than AVX2 (Memory-Bound)
+#### ❌ AVX-512 JSON Parser: 7-17% Slower than AVX2 (Memory-Bound) - REMOVED
 
-**Implementation**: [src/json/simd/avx512.rs](src/json/simd/avx512.rs)
-- Processes 64 bytes/iteration (vs 32 for AVX2)
-- Full character classification + state machine
-- **Result**: 590 MiB/s vs 608 MiB/s (AVX2) = **3% slower**
+**Previous Implementation**: ~~`src/json/simd/avx512.rs`~~ (removed 2026-01-07)
+- Processed 64 bytes/iteration (vs 32 for AVX2)
+- **Result**: 672 MiB/s vs 732 MiB/s (AVX2) = **8.9% slower**
+- **Action**: Implementation removed; runtime dispatch now prioritizes AVX2
 
-**Why AVX2 wins**:
+**Why AVX2 won**:
 1. **Memory-bound workload**: Waiting for data from memory, not compute
 2. **AMD Zen 4 architecture**: Splits AVX-512 into two 256-bit micro-ops (not native 512-bit)
 3. **State machine overhead**: Wider SIMD = more bytes to process sequentially afterward
@@ -237,12 +236,12 @@ Two AVX-512 optimizations implemented with dramatically different results:
 
 ### Performance Comparison Table
 
-| Workload | AVX-512 Result | Reason |
-|----------|---------------|---------|
-| Popcount | **5.2x faster** ✓ | Compute-bound, parallel, no dependencies |
-| JSON parsing | **3% slower** ✗ | Memory-bound, sequential state machine |
-| Rank queries | **Minimal impact** | Popcount only 1.6% of total time |
-| BitVec construction | **~1% faster** | Dominated by memory allocation + indexing |
+| Workload | AVX-512 Result | Status | Reason |
+|----------|---------------|--------|---------|
+| Popcount | **5.2x faster** ✓ | **KEPT** | Compute-bound, parallel, no dependencies |
+| JSON parsing | **7-17% slower** ✗ | **REMOVED** | Memory-bound, sequential state machine |
+| Rank queries | **Minimal impact** | N/A | Popcount only 1.6% of total time |
+| BitVec construction | **~1% faster** | N/A | Dominated by memory allocation + indexing |
 
 ### Architectural Insights
 
@@ -297,20 +296,16 @@ Detailed analysis available in:
 ### Command Reference
 
 ```bash
-# Test AVX-512 implementations
+# Test AVX-512 popcount implementation
 cargo test --lib --features simd popcount
-cargo test --lib json::simd::avx512
 
-# Benchmark popcount strategies
+# Benchmark popcount strategies (includes AVX-512 VPOPCNTDQ)
 cargo bench --bench popcount_strategies --features simd
-
-# Benchmark JSON SIMD levels
-cargo bench --bench json_avx512_comparison
 
 # Generate JSON benchmark suite
 cargo run --release --features cli -- json generate-suite
 
-# Run comprehensive JSON benchmarks
+# Run comprehensive JSON benchmarks (AVX2, SSE4.2, SSE2, Scalar)
 cargo bench --bench json_simd
 ```
 
@@ -321,4 +316,4 @@ cargo bench --bench json_simd
 3. **Measure end-to-end** - Micro-benchmarks can be misleading
 4. **Consider architecture** - Zen 4 splits AVX-512, future Zen 5 may not
 5. **Amdahl's Law always wins** - Optimize what matters (the slow 80%), not what's easy (the fast 20%)
-6. **Keep all implementations** - Useful for testing, reference, and future hardware
+6. **Remove failed optimizations** - Slower code creates technical debt (AVX-512 JSON removed after benchmarking)

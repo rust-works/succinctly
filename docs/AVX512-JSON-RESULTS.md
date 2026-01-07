@@ -1,14 +1,28 @@
 # AVX-512 JSON Parser Performance Results
 
-## Summary
+## ⚠️ IMPLEMENTATION REMOVED (2026-01-07)
 
-Successfully implemented AVX-512 JSON semi-indexing with runtime dispatch. **Unexpected result**: AVX2 outperforms AVX-512 by ~3% on AMD Zen 4 for JSON parsing workloads.
+**This document is retained for historical reference only.**
 
-## Implementation
+The AVX-512 JSON parser implementation has been **removed** from the codebase because it was consistently **7-17% slower** than AVX2 across all workloads. The implementation that was removed is documented below for educational purposes.
 
-- **Files**:
-  - [src/json/simd/avx512.rs](../src/json/simd/avx512.rs) - New AVX-512 implementation
-  - [src/json/simd/mod.rs](../src/json/simd/mod.rs) - Updated runtime dispatch
+**Files removed**:
+- `src/json/simd/avx512.rs` (627 lines)
+- `benches/json_avx512_comparison.rs`
+
+**Runtime dispatch updated**: Now prioritizes AVX2 > SSE4.2 > SSE2 (AVX-512 removed)
+
+---
+
+## Summary (Historical)
+
+Successfully implemented AVX-512 JSON semi-indexing with runtime dispatch. **Result**: AVX2 outperforms AVX-512 by 7-17% on AMD Zen 4 for JSON parsing workloads, leading to removal of the AVX-512 implementation.
+
+## Implementation (Historical)
+
+- **Files** (now removed):
+  - ~~`src/json/simd/avx512.rs`~~ - AVX-512 implementation (removed)
+  - `src/json/simd/mod.rs` - Runtime dispatch (updated to remove AVX-512)
 - **Chunk size**: 64 bytes per iteration (vs 32 for AVX2)
 - **Instructions**: AVX512F + AVX512BW (byte operations)
 - **Dispatch**: Automatic runtime CPU detection
@@ -254,42 +268,39 @@ Re-benchmark on Zen 5 when available.
 
 ## Conclusion
 
-AVX-512 JSON parser implementation is:
-- ✓ **Correct**: All tests pass, matches scalar behavior
+AVX-512 JSON parser implementation was:
+- ✓ **Correct**: All tests passed, matched scalar behavior
 - ✓ **Complete**: Full standard + simple cursor support
-- ✗ **Slower**: 3% slower than AVX2 on Zen 4
+- ✗ **Slower**: 7-17% slower than AVX2 on Zen 4
 - ✓ **Educational**: Demonstrates SIMD limitations for memory-bound workloads
+- ✅ **Removed**: Cleaned up after benchmarking proved it slower
 
 **Key Insight**: Wider SIMD isn't always better. Workload characteristics (memory-bound vs compute-bound) matter more than instruction set width.
 
-**Recommendation**: Keep AVX2 as default, use AVX-512 as learning reference and potential future optimization target.
+**Action Taken**: Implementation removed (2026-01-07). Failed optimizations create technical debt and should be removed rather than kept as "reference implementations".
 
-## Build Instructions
+## Build Instructions (Historical - No Longer Applicable)
 
+~~These instructions are no longer valid as the AVX-512 JSON implementation has been removed.~~
+
+Current build instructions for JSON benchmarks:
 ```bash
-# AVX-512 automatically used when available (currently slower than AVX2)
+# Build with AVX2 (automatically selected on supported CPUs)
 cargo build --release
 
-# Run all JSON SIMD tests
+# Run all JSON SIMD tests (AVX2, SSE4.2, SSE2, Scalar)
 cargo test --lib json::simd
-
-# Run AVX-512 specific tests
-cargo test --lib json::simd::avx512
-
-# Benchmark comparison
-cargo bench --bench json_avx512_comparison
 
 # Full JSON benchmark suite (requires generated data)
 cargo run --release --features cli -- json generate-suite
 cargo bench --bench json_simd
 ```
 
-## CPU Requirements
+## CPU Requirements (Current)
 
 - **Minimum**: x86_64 with SSE2 (universal)
-- **Recommended**: AVX2 (2013+) - fastest on current hardware
-- **AVX-512**: Requires AVX512F + AVX512BW (Ice Lake 2019+, Zen 4 2022+)
-- **Runtime**: Automatically selects best available (currently prioritizes AVX-512, should prioritize AVX2)
+- **Recommended**: AVX2 (2013+) - fastest implementation
+- **Runtime**: Automatically selects best available: AVX2 > SSE4.2 > SSE2
 
 ## References
 

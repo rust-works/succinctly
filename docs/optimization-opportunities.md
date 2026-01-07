@@ -1,143 +1,40 @@
 # Optimization Opportunities for Succinctly
 
 **System**: AMD Ryzen 9 7950X (Zen 4)
-**Date**: 2026-01-06
-**Current Status**: Production code uses SSE2 baseline, leaving ~50-80% performance on the table
+**Date**: 2026-01-07 (Updated after AVX-512 implementation and removal)
+**Current Status**: Production code uses AVX2 runtime dispatch (optimal)
 
 ---
 
 ## Executive Summary
 
-This document identifies optimization opportunities for the Succinctly library based on available CPU features and current implementation analysis. The Ryzen 9 7950X provides extensive SIMD capabilities (AVX-512, AVX2, BMI2) that are currently underutilized.
+This document identifies remaining optimization opportunities for the Succinctly library based on available CPU features and current implementation analysis. The Ryzen 9 7950X provides extensive SIMD capabilities (AVX2, BMI2) that can be further utilized.
 
-### Quick Wins (High ROI, Low Effort)
+### Completed Optimizations
 
-1. **Enable runtime dispatch in production** - 1.5-1.8x speedup, 5 lines of code
-2. **AVX-512 JSON parser** - 2x SIMD width, ~30% additional speedup over AVX2
-3. **AVX512-VPOPCNTDQ for rank** - 8x parallel popcount for rank operations
+1. ✅ **Runtime dispatch enabled** - AVX2 automatically selected (std feature default)
+2. ✅ **AVX512-VPOPCNTDQ** - 5.2x speedup for popcount operations
+3. ~~❌ **AVX-512 JSON parser**~~ - Implemented but 7-17% slower than AVX2, **removed**
 
----
+### Remaining Opportunities (High ROI)
 
-## 1. Enable Runtime CPU Feature Detection (CRITICAL)
-
-### Current State
-- **Production**: Hardcoded to SSE2 (2001 technology, 16 bytes/iteration)
-- **Tests only**: Runtime dispatch to AVX2/SSE4.2/SSE2
-- **Location**: [src/json/simd/mod.rs:80-86](../src/json/simd/mod.rs)
-
-### Problem
-```rust
-// Lines 80-86: Production code
-#[cfg(all(target_arch = "x86_64", not(test)))]
-pub use x86::build_semi_index_simple;  // ← Always SSE2!
-```
-
-### Impact
-- **Performance left on table**: 50-80% slower than possible
-- **Dispatch overhead**: 0.2 nanoseconds (negligible for any realistic workload)
-- **Benefit/Cost ratio**: 750:1 for 1KB JSON files
-
-### Solution
-Change conditional from `test` to `feature = "std"`:
-
-```rust
-// Enable runtime dispatch when std is available
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
-pub fn build_semi_index_standard(json: &[u8]) -> crate::json::standard::SemiIndex {
-    if is_x86_feature_detected!("avx2") {
-        avx2::build_semi_index_standard(json)
-    } else if is_x86_feature_detected!("sse4.2") {
-        sse42::build_semi_index_standard(json)
-    } else {
-        x86::build_semi_index_standard(json)
-    }
-}
-
-// Fallback for no_std: default to SSE2
-#[cfg(all(target_arch = "x86_64", not(feature = "std")))]
-pub use x86::build_semi_index_standard;
-```
-
-### Expected Improvement
-- **Throughput**: 1.5-1.8x for JSON parsing on systems with AVX2
-- **Compatibility**: Maintains no_std support
-- **Lines changed**: ~10
-
-**Priority**: ⭐⭐⭐⭐⭐ CRITICAL
-**Effort**: 🔧 Trivial (5 minutes)
-**Risk**: None (existing code, just changing `cfg` gates)
+1. **BMI1 JSON mask processing** - 5-10% speedup, targets actual bottleneck
+2. **BMI2 advanced optimizations** - 10-15% speedup on Zen 3+ (requires CPU detection)
 
 ---
 
-## 2. AVX-512 JSON Semi-Indexing (HIGH IMPACT)
+## 1. ✅ COMPLETED: Runtime CPU Feature Detection
 
-### Current State
-- Maximum SIMD width: 32 bytes (AVX2)
-- Available on CPU: 64 bytes (AVX-512F/BW/DQ)
+### Status
+**Completed** - Runtime dispatch is now enabled via `std` feature (default in Cargo.toml)
 
-### Opportunity
-Implement AVX-512 variant of JSON parser to process **64 bytes per iteration**.
-
-### CPU Feature Availability
-```
-✅ avx512f       - Foundation (512-bit registers)
-✅ avx512bw      - Byte/Word operations
-✅ avx512dq      - Doubleword/Quadword operations
-✅ avx512vl      - Vector length extensions
-✅ avx512vbmi    - Vector Byte Manipulation
-✅ avx512vbmi2   - Enhanced byte manipulation
-✅ avx512bitalg  - Bit algorithms
-```
-
-### Implementation Approach
-
-**New file**: `src/json/simd/avx512.rs`
-
+### Current Implementation
 ```rust
-#[cfg(target_arch = "x86_64")]
-use core::arch::x86_64::*;
-
-/// Classify 64 bytes at once using AVX-512
-#[inline]
-#[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn classify_chars_avx512(chunk: __m512i) -> CharClass512 {
-    // Create comparison vectors
-    let v_quote = _mm512_set1_epi8(b'"' as i8);
-    let v_backslash = _mm512_set1_epi8(b'\\' as i8);
-    // ... etc
-
-    // Compare and get mask (returns __mmask64, not movemask!)
-    let quotes = _mm512_cmpeq_epi8_mask(chunk, v_quote);
-    let backslashes = _mm512_cmpeq_epi8_mask(chunk, v_backslash);
-    // ...
-
-    CharClass512 { quotes, backslashes, opens, closes, delims, value_chars }
-}
-
-struct CharClass512 {
-    quotes: u64,      // Direct 64-bit mask
-    backslashes: u64,
-    opens: u64,
-    closes: u64,
-    delims: u64,
-    value_chars: u64,
-}
-```
-
-**Key differences from AVX2**:
-- `__m512i` instead of `__m256i`
-- `_mm512_cmpeq_epi8_mask` returns `u64` mask directly (no `movemask` needed!)
-- Process 64 bytes per loop iteration
-- Use `_mm512_loadu_si512` for unaligned loads
-
-### Runtime Dispatch Update
-```rust
-#[cfg(all(target_arch = "x86_64", feature = "std"))]
+// src/json/simd/mod.rs - Runtime dispatch enabled
+#[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
 pub fn build_semi_index_standard(json: &[u8]) -> SemiIndex {
-    if is_x86_feature_detected!("avx512bw") {
-        avx512::build_semi_index_standard(json)  // NEW!
-    } else if is_x86_feature_detected!("avx2") {
-        avx2::build_semi_index_standard(json)
+    if is_x86_feature_detected!("avx2") {
+        avx2::build_semi_index_standard(json)  // AVX2 selected first
     } else if is_x86_feature_detected!("sse4.2") {
         sse42::build_semi_index_standard(json)
     } else {
@@ -146,120 +43,70 @@ pub fn build_semi_index_standard(json: &[u8]) -> SemiIndex {
 }
 ```
 
-### Expected Improvement
-- **Throughput**: 1.3-1.5x over AVX2 (not 2x due to state machine bottleneck)
-- **Best case**: 2.5-2.7x over SSE2
-- **Memory bandwidth**: May become bottleneck at ~15+ GB/s
-
-### Considerations
-- **Frequency scaling**: AVX-512 may reduce CPU frequency on some chips
-  - Ryzen 7950X handles this well (good AVX-512 implementation)
-- **Code size**: Adds ~500 lines
-- **Testing**: Requires AVX-512 capable CPU
-
-**Priority**: ⭐⭐⭐⭐ HIGH
-**Effort**: 🔧🔧 Moderate (4-6 hours, copy/adapt from AVX2)
-**Risk**: Low (additive, doesn't break existing code)
+### Result
+- **Throughput**: AVX2 automatically selected on supported CPUs
+- **Compatibility**: Maintains no_std support via `default-features = false`
 
 ---
 
-## 3. AVX-512 VPOPCNTDQ for Rank Operations (HIGH IMPACT)
+## 2. ❌ REMOVED: AVX-512 JSON Semi-Indexing
 
-### Current State
-[src/popcount.rs](../src/popcount.rs) uses:
-- **Default**: `word.count_ones()` (auto-vectorized by LLVM)
-- **SIMD feature**: NEON on ARM, scalar on x86_64
-- **Portable**: Bitwise algorithm
+### Status
+**Implemented, benchmarked, and removed** (2026-01-07)
 
-### Opportunity
-Use `_mm512_popcnt_epi64` to count **8 u64 words in parallel**.
+### What Was Tried
+Implemented AVX-512 variant of JSON parser processing 64 bytes per iteration (vs 32 for AVX2).
+
+### Results
+- **Throughput**: 672 MiB/s (AVX-512) vs 732 MiB/s (AVX2)
+- **Conclusion**: AVX-512 was **7-17% slower** across all workloads
+
+### Why It Failed
+1. **Memory-bound workload** - JSON parsing waits for data, not compute
+2. **Zen 4 architecture** - Splits AVX-512 into 2×256-bit micro-ops (not native)
+3. **State machine overhead** - 64 bytes = more sequential processing
+4. **Amdahl's Law** - SIMD classification is only ~20% of work
+
+### Action Taken
+- Removed `src/json/simd/avx512.rs` (627 lines)
+- Removed benchmark `benches/json_avx512_comparison.rs`
+- Updated runtime dispatch to prioritize AVX2
+
+**Lesson**: Wider SIMD ≠ automatically faster. Remove failed optimizations.
+
+---
+
+## 3. ✅ COMPLETED: AVX-512 VPOPCNTDQ for Rank Operations
+
+### Status
+**Completed** - Implemented in [src/popcount.rs](../src/popcount.rs) with runtime dispatch
 
 ### Implementation
-
-**Update**: `src/popcount.rs`
+Uses `_mm512_popcnt_epi64` to count 8 u64 words in parallel with runtime CPU detection:
 
 ```rust
-/// AVX-512 VPOPCNTDQ implementation (Zen 4, Ice Lake+)
-#[cfg(all(
-    feature = "simd",
-    target_arch = "x86_64",
-    not(feature = "portable-popcount")
-))]
-#[inline]
-fn popcount_words_avx512vpopcntdq(words: &[u64]) -> u32 {
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::*;
-
-    if words.is_empty() {
-        return 0;
-    }
-
-    let mut total = 0u32;
-    let mut offset = 0;
-
-    // Process 8 words (512 bits) at a time
-    while offset + 8 <= words.len() {
-        unsafe {
-            let ptr = words.as_ptr().add(offset) as *const __m512i;
-            let v = _mm512_loadu_si512(ptr);
-            let counts = _mm512_popcnt_epi64(v);
-            // Sum the 8 popcounts
-            total += _mm512_reduce_add_epi64(counts) as u32;
-        }
-        offset += 8;
-    }
-
-    // Handle remaining words (< 8)
-    for &word in &words[offset..] {
-        total += word.count_ones();
-    }
-
-    total
-}
-
-/// Auto-detect and dispatch
-#[cfg(all(
-    feature = "simd",
-    target_arch = "x86_64",
-    not(feature = "portable-popcount")
-))]
-#[inline]
+// Lines 230-244 in src/popcount.rs
 fn popcount_words_x86(words: &[u64]) -> u32 {
     #[cfg(feature = "std")]
     {
         if is_x86_feature_detected!("avx512vpopcntdq") {
-            return popcount_words_avx512vpopcntdq(words);
+            return unsafe { popcount_words_avx512vpopcntdq(words) };
         }
     }
-
-    // Fallback: use count_ones() which compiles to POPCNT
-    let mut total = 0u32;
-    for &word in words {
-        total += word.count_ones();
-    }
-    total
+    // Fallback to scalar POPCNT
 }
 ```
 
-### Expected Improvement
-- **Throughput**: 2-4x for large word arrays (rank queries)
-- **Use cases**:
-  - Rank operations on large bitvectors
-  - Select index construction
-  - Balanced parentheses excess calculation
+### Results
+- **Throughput**: 104.4 GiB/s (AVX-512) vs 20.3 GiB/s (scalar) = **5.15x faster**
+- **Real-world impact**: Minimal - popcount is only ~1.6% of BitVec construction time
 
-### Considerations
-- **Feature detection**: Requires `avx512vpopcntdq` (available on Zen 4, Ice Lake+)
-- **Unaligned loads**: Use `_mm512_loadu_si512` (no alignment required)
-- **Short arrays**: Overhead matters for < 64 words, use scalar
-
-**Priority**: ⭐⭐⭐⭐ HIGH
-**Effort**: 🔧🔧 Moderate (2-3 hours)
-**Risk**: Low (additive optimization)
+### Documentation
+See [AVX512-VPOPCNTDQ-RESULTS.md](AVX512-VPOPCNTDQ-RESULTS.md) for full analysis
 
 ---
 
-## 4. BMI2 Integration for Efficient Bit Packing (MEDIUM IMPACT)
+## 4. BMI1/BMI2 Integration for Efficient Bit Operations (NEXT PRIORITY)
 
 ### Current State
 - [src/json/simd/bmi2.rs](../src/json/simd/bmi2.rs) provides utilities but not integrated

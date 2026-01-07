@@ -8,7 +8,6 @@
 //! - **SSE2** (baseline): 16 bytes/iteration, universal availability
 //! - **SSE4.2** (enhanced): 16 bytes/iteration with PCMPISTRI, ~90% availability (2008+)
 //! - **AVX2** (optimal): 32 bytes/iteration, ~95% availability (2013+)
-//! - **AVX-512** (maximum): 64 bytes/iteration, Intel Ice Lake (2019+), AMD Zen 4 (2022+)
 //! - **BMI2** (bit manipulation): PDEP/PEXT for efficient mask operations, ~95% availability (2013+)
 //!   - **Note**: AMD Zen 1/2 have slow BMI2 (18 cycle latency), use with caution
 //!
@@ -38,9 +37,6 @@ pub mod sse42;
 pub mod avx2;
 
 #[cfg(target_arch = "x86_64")]
-pub mod avx512;
-
-#[cfg(target_arch = "x86_64")]
 pub mod bmi2;
 
 // ============================================================================
@@ -58,12 +54,10 @@ pub use neon::build_semi_index_standard;
 // ============================================================================
 
 // Runtime dispatch when std is available (test mode or std feature)
-// Priority: AVX-512 > AVX2 > SSE4.2 > SSE2
+// Priority: AVX2 > SSE4.2 > SSE2
 #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
 pub fn build_semi_index_standard(json: &[u8]) -> crate::json::standard::SemiIndex {
-    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
-        avx512::build_semi_index_standard(json)
-    } else if is_x86_feature_detected!("avx2") {
+    if is_x86_feature_detected!("avx2") {
         avx2::build_semi_index_standard(json)
     } else if is_x86_feature_detected!("sse4.2") {
         sse42::build_semi_index_standard(json)
@@ -74,9 +68,7 @@ pub fn build_semi_index_standard(json: &[u8]) -> crate::json::standard::SemiInde
 
 #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
 pub fn build_semi_index_simple(json: &[u8]) -> crate::json::simple::SemiIndex {
-    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
-        avx512::build_semi_index_simple(json)
-    } else if is_x86_feature_detected!("avx2") {
+    if is_x86_feature_detected!("avx2") {
         avx2::build_semi_index_simple(json)
     } else if is_x86_feature_detected!("sse4.2") {
         sse42::build_semi_index_simple(json)
