@@ -89,16 +89,61 @@ while mask != 0 {
 
 ---
 
+## 3. BMI2 PDEP for BitWriter (2026-01-07) - ❌ REVERTED
+
+**Hypothesis**: Use BMI2 PDEP instruction to efficiently deposit bits into BitWriter without explicit shifting.
+
+**Implementation**: Replace `(bits & mask) << pos` with `_pdep_u64(bits, shifted_mask)` in `write_bits()`.
+
+```rust
+// Scalar (baseline):
+let mask = (1u64 << count) - 1;
+self.current_word |= (bits & mask) << pos;
+
+// BMI2 PDEP (attempted):
+let deposit_mask = (1u64 << count) - 1;
+let shifted_mask = deposit_mask << pos;
+self.current_word |= _pdep_u64(bits, shifted_mask);
+```
+
+**Results**: **3.4x SLOWER** than scalar
+
+| Implementation | Throughput | Result |
+|----------------|------------|--------|
+| Scalar | 1.27 GiB/s | baseline |
+| BMI2 PDEP | 381 MiB/s | **-71% slower (3.4x)** |
+
+**Why it failed**:
+
+1. **Wrong use case for PDEP**: PDEP is designed for **sparse** bit extraction/deposit (e.g., extracting bits at positions 0, 5, 12, 31). Our use case is **consecutive** bits (positions pos..pos+count), which simple shift handles optimally.
+
+2. **PDEP latency**: Even on Zen 4 with "fast" BMI2, PDEP has 3-cycle latency. Scalar shift + OR is 1 cycle each = 2 cycles total.
+
+3. **Extra work**: The BMI2 version still needs to compute the shifted mask (`deposit_mask << pos`), adding overhead without benefit.
+
+4. **Simple operations are already optimal**: `(bits & mask) << pos` compiles to 2-3 fast integer instructions. PDEP is overkill.
+
+**When PDEP would help**:
+- Extracting bits at non-consecutive positions (e.g., bit indices [0, 3, 7, 15, 31])
+- Packing/unpacking structured data with sparse fields
+- NOT for consecutive bit ranges like this use case
+
+**Action taken**: Reverted all changes (2026-01-07)
+
+**Lesson**: Fancy instructions aren't always better. PDEP/PEXT are specialized tools for sparse operations, not replacements for simple shift+mask.
+
+---
+
 ## Common Themes
 
 ### Pattern of Failure
 
-Both failed optimizations shared these characteristics:
+All three failed optimizations shared these characteristics:
 
-1. ❌ **Optimized the wrong thing**: Focused on micro-optimizations (SIMD width, iteration method) instead of actual bottlenecks
-2. ❌ **Theoretical vs empirical**: Assumed wider/smarter = faster without profiling
+1. ❌ **Optimized the wrong thing**: Focused on micro-optimizations (SIMD width, iteration method, fancy instructions) instead of actual bottlenecks
+2. ❌ **Theoretical vs empirical**: Assumed wider/smarter/fancier = faster without profiling
 3. ❌ **Ignored Amdahl's Law**: Optimized fast parts (10-20%) instead of slow parts (80%)
-4. ❌ **Misunderstood workload**: Didn't account for memory-bound nature and sequential dependencies
+4. ❌ **Misunderstood workload**: Didn't account for memory-bound nature, sequential dependencies, or instruction suitability
 
 ### What Works
 
@@ -167,11 +212,12 @@ If you can't answer these confidently, **don't optimize**.
 
 Based on these failures, **do NOT pursue**:
 
-1. ❌ AVX-512 JSON parsing (proven slower)
-2. ❌ BMI1 mask iteration (proven slower)
-3. ❌ BMI2 without understanding bottleneck first
+1. ❌ AVX-512 JSON parsing (proven 7-17% slower)
+2. ❌ BMI1 mask iteration (proven 25-31% slower)
+3. ❌ BMI2 PDEP for consecutive bits (proven 71% slower)
 4. ❌ Other "clever" iteration schemes
 5. ❌ Wider SIMD for memory-bound workloads
+6. ❌ Fancy instructions without understanding their actual use case
 
 ## What MIGHT Work (If You Must Optimize Further)
 

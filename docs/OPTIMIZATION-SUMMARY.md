@@ -402,7 +402,58 @@ while mask != 0 {
 
 ---
 
-### 3. NEON Batched Popcount for Cumulative Index (ARM)
+### 3. BMI2 PDEP for BitWriter (x86_64)
+
+**Status**: ❌ REVERTED
+**Date**: 2026-01-07
+
+**Technique**: Use BMI2 `_pdep_u64` instruction to deposit bits without explicit shifting in `BitWriter::write_bits()`.
+
+**Implementation**:
+```rust
+// Scalar (baseline):
+let mask = (1u64 << count) - 1;
+self.current_word |= (bits & mask) << pos;
+
+// BMI2 PDEP (attempted):
+let deposit_mask = (1u64 << count) - 1;
+let shifted_mask = deposit_mask << pos;
+self.current_word |= _pdep_u64(bits, shifted_mask);
+```
+
+**Performance Results**:
+
+| Implementation | Throughput (8-bit writes) | Result |
+|----------------|--------------------------|--------|
+| Scalar | 1.27 GiB/s | baseline |
+| BMI2 PDEP | 381 MiB/s | **-71% slower (3.4x)** |
+
+**Average Penalty**: **-71% (3.4x slower!)**
+
+**Why it failed**:
+
+1. **Wrong use case for PDEP**: PDEP is designed for **sparse** bit extraction/deposition (e.g., bits at positions [0, 5, 12, 31]). Our use case is **consecutive** bits (positions pos..pos+count), which simple shift handles optimally.
+
+2. **PDEP latency**: Even on Zen 4 with "fast" BMI2, PDEP has 3-cycle latency. Scalar shift + OR = 2 cycles total (1 cycle each).
+
+3. **Extra work**: The BMI2 version still needs to compute the shifted mask, adding overhead without benefit.
+
+4. **Simple operations are already optimal**: `(bits & mask) << pos` compiles to 2-3 fast integer ALU operations that modern CPUs can execute in parallel. PDEP is a complex instruction that ties up execution units.
+
+**When PDEP would actually help**:
+- Extracting bits at non-consecutive positions
+- Packing/unpacking structured data with sparse fields
+- **NOT** for consecutive bit ranges
+
+**Action taken**: Reverted all changes to `src/json/bit_writer.rs`, removed CPU detection code (~150 lines)
+
+**Lesson**: Fancy instructions aren't automatically better. PDEP/PEXT are specialized tools for sparse operations, not replacements for simple shift+mask. Always benchmark!
+
+**Documentation**: [docs/FAILED-OPTIMIZATIONS.md](FAILED-OPTIMIZATIONS.md)
+
+---
+
+### 4. NEON Batched Popcount for Cumulative Index (ARM)
 
 **Status**: ❌ REJECTED
 **Date**: January 2026
@@ -528,13 +579,15 @@ while mask != 0 {
 |--------------|---------|----------|--------|
 | AVX-512 JSON Parser | **-10%** (avg) | x86_64 | ❌ Removed |
 | BMI1 Mask Iteration | **-26%** (avg) | x86_64 | ❌ Reverted |
+| BMI2 PDEP BitWriter | **-71%** (3.4x slower!) | x86_64 | ❌ Reverted |
 | NEON Batched Popcount | **-25%** | ARM | ❌ Rejected |
 | NEON Movemask Batching | **0%** (no effect) | ARM | ❌ Rejected |
 | NEON Prefetching | **0%** (no effect) | ARM | ❌ Rejected |
 
-**Total Failed**: 5 attempts
-**Average Penalty**: -12% (for those with negative impact)
-**Lines Removed**: ~650 lines (AVX-512 JSON + BMI1)
+**Total Failed**: 6 attempts
+**Average Penalty**: -22% (for those with negative impact)
+**Worst Failure**: BMI2 PDEP (-71%, 3.4x slower)
+**Lines Removed**: ~800 lines (AVX-512 JSON + BMI1 + BMI2)
 
 ### Overall Impact
 
@@ -574,6 +627,7 @@ while mask != 0 {
 4. **✅ Simple code is often fastest**
    - `for i in 0..32` beats "clever" BMI1 iteration
    - Scalar `count_ones()` beats NEON batched popcount
+   - Simple shift+mask beats "fancy" BMI2 PDEP (by 3.4x!)
    - Compiler optimizations are excellent
 
 5. **✅ Cache-friendly data structures**
@@ -601,9 +655,14 @@ while mask != 0 {
 
 4. **❌ "Clever" code without profiling**
    - TZCNT/BLSR iteration: Intuitive but slower
+   - BMI2 PDEP: Fancy instruction, wrong use case
    - Must process ALL bytes for state machine, not just structural chars
 
-5. **❌ Keeping failed optimizations**
+5. **❌ Using specialized instructions incorrectly**
+   - PDEP is for sparse bits, not consecutive ranges
+   - Know when tools apply: PDEP for [0,5,12,31] ✓, not for [5,6,7,8] ✗
+
+6. **❌ Keeping failed optimizations**
    - Complexity is technical debt
    - Remove slower code, document the lesson
 
