@@ -505,20 +505,51 @@ The M1/M2/M3 out-of-order execution engine already schedules independent `neon_m
 **Estimated gain**: ~~5-10%~~ **0% (not effective)**
 **Effort**: 🔧🔧 Low-Medium (2-4 hours) ❌
 
-#### B. Optimize value character detection
-Current implementation uses 6 NEON comparisons for alphanumeric + punctuation:
-```rust
-let lowercase = vcleq_u8(sub_a_lower, vdupq_n_u8(b'z' - b'a'));
-let uppercase = vcleq_u8(sub_a_upper, vdupq_n_u8(b'Z' - b'A'));
-let digit = vcleq_u8(sub_0, vdupq_n_u8(b'9' - b'0'));
-let eq_period = vceqq_u8(chunk, vdupq_n_u8(b'.'));
-let eq_minus = vceqq_u8(chunk, vdupq_n_u8(b'-'));
-let eq_plus = vceqq_u8(chunk, vdupq_n_u8(b'+'));
-```
-Could potentially use a lookup table approach similar to the structural character classification.
+#### B. Optimize value character detection ✅ IMPLEMENTED
 
-**Estimated gain**: 5-15%
-**Effort**: 🔧🔧 Low-Medium (2-4 hours)
+**Status:** Completed January 2026 - Small but measurable improvement
+
+**Previous Implementation:**
+Used 13 NEON operations: 3 range checks (sub + compare each) + 3 equality checks + 4 ORs:
+```rust
+let lowercase = vcleq_u8(vsubq_u8(chunk, vdupq_n_u8(b'a')), vdupq_n_u8(25));
+let uppercase = vcleq_u8(vsubq_u8(chunk, vdupq_n_u8(b'A')), vdupq_n_u8(25));
+let digit = vcleq_u8(vsubq_u8(chunk, vdupq_n_u8(b'0')), vdupq_n_u8(9));
+// ... + 3 equality checks + 4 ORs
+```
+
+**New Implementation:**
+Uses nibble lookup tables (6 operations: 2 table loads + 2 lookups + AND + compare):
+```rust
+let value_lo_result = vqtbl1q_u8(value_lo_table, lo_nibble);
+let value_hi_result = vqtbl1q_u8(value_hi_table, hi_nibble);
+let value_classified = vandq_u8(value_lo_result, value_hi_result);
+let value_chars = vmvnq_u8(vceqq_u8(value_classified, zero));
+```
+
+**Benchmark Results:**
+
+| Pattern | Improvement | New Throughput |
+|---------|-------------|----------------|
+| comprehensive | +2% | 571 MiB/s |
+| nested | +6% | 3.70 GiB/s |
+| strings | +5% | 2.94 GiB/s |
+| literals | +3% | 305 MiB/s |
+| numbers | +2% | 351 MiB/s |
+| mixed | +1% | 394 MiB/s |
+| arrays | +1% | 316 MiB/s |
+
+**Analysis:**
+- Modest but consistent improvement (1-6%) across all patterns
+- No regressions detected
+- The lookup table reuses the already-computed `lo_nibble` and `hi_nibble` from structural classification
+
+**Overall NEON vs Scalar improvement (comprehensive 10MB):**
+- Before Option B: 560 MiB/s (1.48x over scalar)
+- After Option B: 571 MiB/s (1.52x over scalar)
+
+**Actual gain**: 2% overall, up to 6% on some patterns
+**Effort**: 🔧🔧 Low-Medium (2-4 hours) ✅
 
 #### C. Process 32 bytes at a time ✅ IMPLEMENTED
 

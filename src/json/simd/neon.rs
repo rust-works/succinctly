@@ -69,6 +69,61 @@ const FLAG_DELIM: u8 = 0x04;
 const FLAG_QUOTE: u8 = 0x08;
 const FLAG_BACKSLASH: u8 = 0x10;
 
+// Value character detection lookup tables.
+// These use a different encoding than structural chars because value chars
+// include ranges (0-9, A-Z, a-z) that don't map cleanly to nibble AND.
+//
+// Strategy: Use bit flags that indicate character classes, then AND the
+// lo and hi results. A character is a value char if the AND result has
+// any bit set in the VALUE_CHAR_MASK.
+//
+// Encoding:
+//   Bit 0: Could be digit (hi=3 with lo=0-9)
+//   Bit 1: Could be uppercase (hi=4 with lo=1-F, or hi=5 with lo=0-A)
+//   Bit 2: Could be lowercase (hi=6 with lo=1-F, or hi=7 with lo=0-A)
+//   Bit 3: Could be punct +/- (hi=2 with lo=B,D)
+//   Bit 4: Could be period (hi=2 with lo=E)
+
+/// Low nibble lookup for value chars
+const VALUE_LO_TABLE: [u8; 16] = [
+    0x07, // 0: digit, upper (0x50), lower (0x70)
+    0x07, // 1: digit, upper (0x41, 0x51), lower (0x61, 0x71)
+    0x07, // 2: digit, upper (0x42, 0x52), lower (0x62, 0x72)
+    0x07, // 3: digit, upper (0x43, 0x53), lower (0x63, 0x73)
+    0x07, // 4: digit, upper (0x44, 0x54), lower (0x64, 0x74)
+    0x07, // 5: digit, upper (0x45, 0x55), lower (0x65, 0x75)
+    0x07, // 6: digit, upper (0x46, 0x56), lower (0x66, 0x76)
+    0x07, // 7: digit, upper (0x47, 0x57), lower (0x67, 0x77)
+    0x07, // 8: digit, upper (0x48, 0x58), lower (0x68, 0x78)
+    0x07, // 9: digit, upper (0x49, 0x59), lower (0x69, 0x79)
+    0x06, // A: upper (0x4A, 0x5A), lower (0x6A, 0x7A) - NOT digit
+    0x0E, // B: upper (0x4B), lower (0x6B), punct '+' (0x2B)
+    0x06, // C: upper (0x4C), lower (0x6C)
+    0x0E, // D: upper (0x4D), lower (0x6D), punct '-' (0x2D)
+    0x16, // E: upper (0x4E), lower (0x6E), period '.' (0x2E)
+    0x06, // F: upper (0x4F), lower (0x6F)
+];
+
+/// High nibble lookup for value chars
+const VALUE_HI_TABLE: [u8; 16] = [
+    0x00, // 0: nothing
+    0x00, // 1: nothing
+    0x18, // 2: punct (+,-) and period (.)
+    0x01, // 3: digits
+    0x02, // 4: uppercase A-O (0x41-0x4F)
+    0x02, // 5: uppercase P-Z (0x50-0x5A)
+    0x04, // 6: lowercase a-o (0x61-0x6F)
+    0x04, // 7: lowercase p-z (0x70-0x7A)
+    0x00, // 8: nothing
+    0x00, // 9: nothing
+    0x00, // A: nothing
+    0x00, // B: nothing
+    0x00, // C: nothing
+    0x00, // D: nothing
+    0x00, // E: nothing
+    0x00, // F: nothing
+];
+
 /// Extract a bitmask from the high bit of each byte in a NEON vector.
 /// Returns a u16 where bit i is set if byte i has its high bit set.
 ///
@@ -199,33 +254,21 @@ unsafe fn classify_chars(chunk: uint8x16_t) -> CharClass {
         let quotes_vec = vtstq_u8(classified, flag_quote_vec);
         let backslashes_vec = vtstq_u8(classified, flag_backslash_vec);
 
-        // Value chars still need range checks for alphanumeric
-        // (nibble lookup can't efficiently encode ranges)
-        // But we can simplify: period, minus, plus are in the nibble table too
+        // Value chars detection using nibble lookup tables
+        // This replaces 13 NEON operations with 4 (2 lookups + 1 AND + 1 compare)
+        let value_lo_table = vld1q_u8(VALUE_LO_TABLE.as_ptr());
+        let value_hi_table = vld1q_u8(VALUE_HI_TABLE.as_ptr());
 
-        // Check for lowercase: c >= 'a' && c <= 'z'
-        // Use unsigned subtraction trick: (c - 'a') <= ('z' - 'a')
-        let sub_a_lower = vsubq_u8(chunk, vdupq_n_u8(b'a'));
-        let lowercase = vcleq_u8(sub_a_lower, vdupq_n_u8(b'z' - b'a'));
+        let value_lo_result = vqtbl1q_u8(value_lo_table, lo_nibble);
+        let value_hi_result = vqtbl1q_u8(value_hi_table, hi_nibble);
 
-        // Check for uppercase: (c - 'A') <= ('Z' - 'A')
-        let sub_a_upper = vsubq_u8(chunk, vdupq_n_u8(b'A'));
-        let uppercase = vcleq_u8(sub_a_upper, vdupq_n_u8(b'Z' - b'A'));
+        // AND the results - if any bit is set, the character is a value char
+        let value_classified = vandq_u8(value_lo_result, value_hi_result);
 
-        // Check for digit: (c - '0') <= ('9' - '0')
-        let sub_0 = vsubq_u8(chunk, vdupq_n_u8(b'0'));
-        let digit = vcleq_u8(sub_0, vdupq_n_u8(b'9' - b'0'));
-
-        // Check for period, minus, plus via direct comparison
-        let eq_period = vceqq_u8(chunk, vdupq_n_u8(b'.'));
-        let eq_minus = vceqq_u8(chunk, vdupq_n_u8(b'-'));
-        let eq_plus = vceqq_u8(chunk, vdupq_n_u8(b'+'));
-
-        // Combine all value chars
-        let alpha = vorrq_u8(lowercase, uppercase);
-        let alnum = vorrq_u8(alpha, digit);
-        let punct = vorrq_u8(vorrq_u8(eq_period, eq_minus), eq_plus);
-        let value_chars = vorrq_u8(alnum, punct);
+        // Check if any bit is set (non-zero means it's a value char)
+        // Compare with zero and invert: value_chars = (value_classified != 0)
+        let zero = vdupq_n_u8(0);
+        let value_chars = vmvnq_u8(vceqq_u8(value_classified, zero));
 
         // Convert vector masks to u16 bitmasks
         let quotes = neon_movemask(quotes_vec);
