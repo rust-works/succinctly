@@ -427,12 +427,32 @@ self.index.ib_select1_from(rank, hint)
 | count_all_leaves (8MB) | 106 ms | 92 ms | **13% faster** |
 | extract_all_strings (8MB) | 131 ms | 117 ms | **11% faster** |
 
-**Trade-off:** Random access is ~37% slower due to galloping overhead when hints are wrong. This is acceptable because:
-1. Real JSON queries (`.[]`) are sequential
-2. Random access patterns are rare in practice
-3. Overall query performance still exceeds jq by 2-8x
+**Dual Select Methods (January 2026):**
 
-**Future improvement:** For use cases requiring fast random access, add a separate `ib_select1_binary(k)` method that uses pure binary search. See [.claude/skills/bit-optimization.md](../.claude/skills/bit-optimization.md) for details.
+To address the 37% random access regression, both methods are now exposed:
+
+| Method | Use Case | Complexity | Best For |
+|--------|----------|------------|----------|
+| `ib_select1(k)` | Random access | O(log n) | `.[42]`, slicing, indexed lookups |
+| `ib_select1_from(k, hint)` | Sequential access | O(log d) | `.[]`, iteration, traversal |
+
+**Benchmark results (10K elements):**
+
+| Benchmark | Time | Throughput |
+|-----------|------|------------|
+| Sequential (exponential) | 108 µs | 92.2 Melem/s |
+| Sequential (binary) | 340 µs | 29.4 Melem/s |
+| Random (exponential) | 1080 µs | 9.3 Melem/s |
+| Random (binary) | 779 µs | 12.8 Melem/s |
+
+**Key findings:**
+- Sequential: Exponential search is **3.1x faster** (108 µs vs 340 µs)
+- Random: Binary search is **39% faster** (779 µs vs 1080 µs)
+- End-to-end JSON benchmarks show **no regression** from adding dual methods
+
+Callers should choose the appropriate method based on access pattern:
+- For iteration (`.[]`, tree traversal): use `ib_select1_from` with hint
+- For indexed access (`.[42]`, slicing): use `ib_select1`
 
 ---
 
