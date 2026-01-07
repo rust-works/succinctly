@@ -1,0 +1,49 @@
+scopes:
+  - name: "bitvec"
+    description: "Bitvector data structure and rank/select operations"
+    examples: ["bitvec: optimize rank1 query", "bitvec: fix select sampling"]
+    file_patterns: ["src/bitvec.rs", "src/rank.rs", "src/select.rs", "src/lib.rs"]
+  - name: "bp"
+    description: "Balanced parentheses tree navigation"
+    examples: ["bp: add subtree_size operation", "bp: fix find_close edge case"]
+    file_patterns: ["src/bp.rs"]
+  - name: "json"
+    description: "JSON semi-indexing and parsing"
+    examples: ["json: improve PFSM throughput", "json: fix unicode handling"]
+    file_patterns: ["src/json/**"]
+  - name: "jq"
+    description: "jq query language parser and evaluator"
+    examples: ["jq: add array slicing", "jq: fix negative index"]
+    file_patterns: ["src/jq/**"]
+  - name: "simd"
+    description: "SIMD optimizations (x86, AVX2, NEON)"
+    examples: ["simd: add AVX2 popcount", "simd: fix NEON alignment"]
+    file_patterns: ["src/simd/**", "src/json/simd/**", "src/popcount.rs"]
+  - name: "cli"
+    description: "Command-line interface tool"
+    examples: ["cli: add benchmark suite command", "cli: improve query output"]
+    file_patterns: ["src/bin/**", "src/main.rs"]
+  - name: "bench"
+    description: "Benchmarks and performance testing"
+    examples: ["bench: add PFSM comparison", "bench: fix json data generation"]
+    file_patterns: ["benches/**"]
+  - name: "test"
+    description: "Test suite and property tests"
+    examples: ["test: add bp edge case coverage", "test: fix flaky property test"]
+    file_patterns: ["tests/**"]
+  - name: "docs"
+    description: "Documentation and optimization notes"
+    examples: ["docs: update AVX-512 results", "docs: add PFSM integration guide"]
+    file_patterns: ["docs/**", "*.md", "CLAUDE.md", "CLI.md"]
+  - name: "ci"
+    description: "CI/CD pipelines and GitHub Actions"
+    examples: ["ci: add SIMD feature matrix", "ci: fix benchmark workflow"]
+    file_patterns: [".github/**"]
+  - name: "build"
+    description: "Build configuration and feature flags"
+    examples: ["build: add mmap-tests feature", "build: update dependencies"]
+    file_patterns: ["Cargo.toml", "Cargo.lock", "build.rs"]
+  - name: "core"
+    description: "Core utilities (broadword, tables, binary ops)"
+    examples: ["core: optimize broadword select", "core: add lookup table"]
+    file_patterns: ["src/broadword.rs", "src/table.rs", "src/binary.rs"]
