@@ -16,7 +16,12 @@ use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 use succinctly::json::light::{JsonCursor, JsonIndex, StandardJson};
 
 /// Test file paths (relative to workspace root)
+/// Note: 1GB excluded - too large for criterion's minimum sample requirements
 const TEST_FILES: &[(&str, &str)] = &[
+    ("1kb", "../data/bench/generated/comprehensive/1kb.json"),
+    ("10kb", "../data/bench/generated/comprehensive/10kb.json"),
+    ("100kb", "../data/bench/generated/comprehensive/100kb.json"),
+    ("1mb", "../data/bench/generated/comprehensive/1mb.json"),
     ("10mb", "../data/bench/generated/comprehensive/10mb.json"),
     ("100mb", "../data/bench/generated/comprehensive/100mb.json"),
 ];
@@ -116,7 +121,15 @@ fn bench_parse_only(c: &mut Criterion) {
 
         let mut group = c.benchmark_group(format!("parse_only/{}", name));
         group.throughput(Throughput::Bytes(file_size));
-        group.sample_size(if *name == "100mb" { 10 } else { 20 });
+        let sample_size = match *name {
+            "1kb" | "10kb" | "100kb" => 100,
+            "1mb" => 50,
+            "10mb" => 20,
+            "100mb" => 10,
+            "1gb" => 5,
+            _ => 20,
+        };
+        group.sample_size(sample_size);
 
         // serde_json
         group.bench_function("serde_json", |b| {
@@ -166,7 +179,15 @@ fn bench_parse_and_traverse(c: &mut Criterion) {
 
         let mut group = c.benchmark_group(format!("parse_traverse/{}", name));
         group.throughput(Throughput::Bytes(file_size));
-        group.sample_size(if *name == "100mb" { 10 } else { 20 });
+        let sample_size = match *name {
+            "1kb" | "10kb" | "100kb" => 100,
+            "1mb" => 50,
+            "10mb" => 20,
+            "100mb" => 10,
+            "1gb" => 5,
+            _ => 20,
+        };
+        group.sample_size(sample_size);
 
         // serde_json: parse + traverse
         group.bench_function("serde_json", |b| {
@@ -237,7 +258,15 @@ fn bench_traverse_only(c: &mut Criterion) {
 
         let mut group = c.benchmark_group(format!("traverse_only/{}", name));
         group.throughput(Throughput::Bytes(file_size));
-        group.sample_size(if *name == "100mb" { 10 } else { 20 });
+        let sample_size = match *name {
+            "1kb" | "10kb" | "100kb" => 100,
+            "1mb" => 50,
+            "10mb" => 20,
+            "100mb" => 10,
+            "1gb" => 5,
+            _ => 20,
+        };
+        group.sample_size(sample_size);
 
         // serde_json traverse
         group.bench_function("serde_json", |b| {
