@@ -35,9 +35,9 @@ Implemented and benchmarked AVX-512 optimizations on AMD Ryzen 9 7950X (Zen 4). 
 
 #### Microbenchmark (Raw Throughput)
 
-| Dataset | AVX-512 | Scalar | Speedup |
-|---------|---------|--------|---------|
-| 1M bits | 827 ns | ~50 µs | **~60x** |
+| Dataset  | AVX-512 | Scalar  | Speedup  |
+|----------|---------|---------|----------|
+| 1M bits  | 827 ns  | ~50 µs  | **~60x** |
 | 10M bits | 12.2 µs | ~500 µs | **~41x** |
 | 1MB data | 10.1 µs | 52.6 µs | **5.2x** |
 
@@ -45,21 +45,21 @@ Implemented and benchmarked AVX-512 optimizations on AMD Ryzen 9 7950X (Zen 4). 
 
 #### Alignment Analysis
 
-| Words | AVX-512 Loads | Time | ns/word |
-|-------|--------------|------|---------|
-| 8 (aligned) | 1 | 1.63 ns | 0.20 ns |
-| 64 (aligned) | 8 | 4.65 ns | 0.07 ns |
-| 512 (aligned) | 64 | 27.7 ns | **0.05 ns** |
-| 7 (unaligned) | 0 + scalar | 4.68 ns | 0.67 ns |
+| Words         | AVX-512 Loads | Time    | ns/word     |
+|---------------|---------------|---------|-------------|
+| 8 (aligned)   | 1             | 1.63 ns | 0.20 ns     |
+| 64 (aligned)  | 8             | 4.65 ns | 0.07 ns     |
+| 512 (aligned) | 64            | 27.7 ns | **0.05 ns** |
+| 7 (unaligned) | 0 + scalar    | 4.68 ns | 0.67 ns     |
 
 **Peak efficiency**: 0.05 nanoseconds per word for aligned 512-word blocks
 
 #### End-to-End Impact
 
-| Operation | Time | Popcount % |
-|-----------|------|-----------|
-| 1M bit construction | 50.1 µs | **1.6%** |
-| 10M bit construction | 660 µs | **1.8%** |
+| Operation             | Time    | Popcount % |
+|-----------------------|---------|------------|
+| 1M bit construction   | 50.1 µs | **1.6%**   |
+| 10M bit construction  | 660 µs  | **1.8%**   |
 | 1M rank queries (10k) | 30.8 µs | Negligible |
 
 **Real-world impact**: Minimal due to Amdahl's Law
@@ -94,12 +94,12 @@ Implemented and benchmarked AVX-512 optimizations on AMD Ryzen 9 7950X (Zen 4). 
 
 #### Throughput Comparison (Synthetic JSON)
 
-| Size | AVX-512 | AVX2 | SSE4.2 | SSE2 | Scalar |
-|------|---------|------|--------|------|--------|
-| **1KB** | 613 MiB/s | **664 MiB/s** ✓ | 638 MiB/s | 625 MiB/s | 493 MiB/s |
-| **10KB** | 589 MiB/s | **623 MiB/s** ✓ | 619 MiB/s | 618 MiB/s | 429 MiB/s |
+| Size      | AVX-512   | AVX2            | SSE4.2    | SSE2      | Scalar    |
+|-----------|-----------|-----------------|-----------|-----------|-----------|
+| **1KB**   | 613 MiB/s | **664 MiB/s** ✓ | 638 MiB/s | 625 MiB/s | 493 MiB/s |
+| **10KB**  | 589 MiB/s | **623 MiB/s** ✓ | 619 MiB/s | 618 MiB/s | 429 MiB/s |
 | **100KB** | 590 MiB/s | **625 MiB/s** ✓ | 606 MiB/s | 628 MiB/s | 434 MiB/s |
-| **1MB** | 592 MiB/s | **608 MiB/s** ✓ | 605 MiB/s | - | - |
+| **1MB**   | 592 MiB/s | **608 MiB/s** ✓ | 605 MiB/s | -         | -         |
 
 **Result**: AVX2 is consistently **3-6% faster** than AVX-512
 
@@ -113,11 +113,11 @@ SSE4.2:   1.68 ms  (605 MiB/s)
 
 #### SIMD vs Scalar Speedup
 
-| Size | AVX2 vs Scalar | AVX-512 vs Scalar |
-|------|----------------|-------------------|
-| 1KB | **1.35x** | 1.24x |
-| 10KB | **1.45x** | 1.37x |
-| 100KB | **1.44x** | 1.36x |
+| Size  | AVX2 vs Scalar | AVX-512 vs Scalar |
+|-------|----------------|-------------------|
+| 1KB   | **1.35x**      | 1.24x             |
+| 10KB  | **1.45x**      | 1.37x             |
+| 100KB | **1.44x**      | 1.36x             |
 
 AVX2 provides consistently better speedup than AVX-512
 
@@ -206,15 +206,15 @@ AVX-512 additional costs:
 
 ### Popcount vs JSON Parsing
 
-| Characteristic | Popcount | JSON Parsing |
-|----------------|----------|--------------|
-| **Bottleneck** | Compute | Memory + Sequential logic |
-| **Parallelism** | Embarrassingly parallel | Sequential dependencies |
-| **Memory access** | Sequential, predictable | Variable-length, unpredictable |
-| **Dependencies** | None (independent words) | State machine (each byte depends on previous) |
-| **SIMD benefit** | Perfect (5.2x) | Limited (0.97x) |
-| **Real-world impact** | Minimal (1-2% of time) | Significant (core operation) |
-| **Amdahl's Law** | Optimized 1.6% → 1% overall gain | Optimized 20% → 3% overall loss |
+| Characteristic        | Popcount                         | JSON Parsing                                  |
+|-----------------------|----------------------------------|-----------------------------------------------|
+| **Bottleneck**        | Compute                          | Memory + Sequential logic                     |
+| **Parallelism**       | Embarrassingly parallel          | Sequential dependencies                       |
+| **Memory access**     | Sequential, predictable          | Variable-length, unpredictable                |
+| **Dependencies**      | None (independent words)         | State machine (each byte depends on previous) |
+| **SIMD benefit**      | Perfect (5.2x)                   | Limited (0.97x)                               |
+| **Real-world impact** | Minimal (1-2% of time)           | Significant (core operation)                  |
+| **Amdahl's Law**      | Optimized 1.6% → 1% overall gain | Optimized 20% → 3% overall loss               |
 
 ### Key Insight
 

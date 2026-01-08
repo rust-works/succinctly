@@ -362,13 +362,13 @@ unsafe fn summarize(buffer: &[u8; 32]) -> (u32, u32, u32, u32, u32) {
 
 The [simd-json](https://github.com/simd-lite/simd-json) Rust crate takes a different approach:
 
-| Aspect | hw-json-simd | simd-json |
-|--------|--------------|-----------|
-| **Purpose** | Create navigable semi-index | Full JSON parsing |
-| **Output** | IB + BP bitvectors | Parsed DOM or tape |
+| Aspect        | hw-json-simd                   | simd-json                |
+|---------------|--------------------------------|--------------------------|
+| **Purpose**   | Create navigable semi-index    | Full JSON parsing        |
+| **Output**    | IB + BP bitvectors             | Parsed DOM or tape       |
 | **Algorithm** | Ottaviano-Grossi semi-indexing | Langdale-Lemire simdjson |
-| **Memory** | O(n/8) bytes additional | O(n) bytes for DOM |
-| **Use Case** | Query-time navigation | Complete deserialization |
+| **Memory**    | O(n/8) bytes additional        | O(n) bytes for DOM       |
+| **Use Case**  | Query-time navigation          | Complete deserialization |
 
 **Key Differences**:
 

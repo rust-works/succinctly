@@ -206,9 +206,9 @@ fn ib_select1(&self, k: usize) -> Option<usize> {
 
 ### End-to-End Performance vs jq
 
-| Query | File | succinctly | jq | Speedup |
-|-------|------|------------|-----|---------|
-| `.unicode[]` | 10MB | 25ms | 179ms | 7.2x |
-| `.users[].name` | 10MB | 22ms | 160ms | 7.3x |
-| `.arrays[][]` | 10MB | 150ms | 297ms | 2.0x |
-| `.unicode[]` | 100MB | 221ms | 1.86s | 8.4x |
+| Query           | File  | succinctly | jq    | Speedup |
+|-----------------|-------|------------|-------|---------|
+| `.unicode[]`    | 10MB  | 25ms       | 179ms | 7.2x    |
+| `.users[].name` | 10MB  | 22ms       | 160ms | 7.3x    |
+| `.arrays[][]`   | 10MB  | 150ms      | 297ms | 2.0x    |
+| `.unicode[]`    | 100MB | 221ms      | 1.86s | 8.4x    |

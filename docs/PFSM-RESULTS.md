@@ -7,28 +7,28 @@ The PFSM approach **is faster** when implemented correctly with single-pass proc
 ## Performance Results
 
 ### 1KB File
-| Implementation | Throughput | vs Standard Scalar | vs AVX2 |
-|----------------|------------|-------------------|---------|
-| **PFSM Optimized** | **951 MiB/s** | **+73% faster** ✓ | **+43% faster** ✓ |
-| Standard AVX2 | 666 MiB/s | +21% faster | - |
-| Standard Scalar | 551 MiB/s | - | -21% slower |
-| PFSM Two-Pass | 472 MiB/s | -14% slower | -29% slower |
+| Implementation     | Throughput    | vs Standard Scalar | vs AVX2           |
+|--------------------|---------------|--------------------|-------------------|
+| **PFSM Optimized** | **951 MiB/s** | **+73% faster** ✓  | **+43% faster** ✓ |
+| Standard AVX2      | 666 MiB/s     | +21% faster        | -                 |
+| Standard Scalar    | 551 MiB/s     | -                  | -21% slower       |
+| PFSM Two-Pass      | 472 MiB/s     | -14% slower        | -29% slower       |
 
 ### 10KB File
-| Implementation | Throughput | vs Standard Scalar | vs AVX2 |
-|----------------|------------|-------------------|---------|
-| **PFSM Optimized** | **949 MiB/s** | **+77% faster** ✓ | **+57% faster** ✓ |
-| Standard AVX2 | 603 MiB/s | +12% faster | - |
-| Standard Scalar | 537 MiB/s | - | -11% slower |
-| PFSM Two-Pass | 457 MiB/s | -15% slower | -24% slower |
+| Implementation     | Throughput    | vs Standard Scalar | vs AVX2           |
+|--------------------|---------------|--------------------|-------------------|
+| **PFSM Optimized** | **949 MiB/s** | **+77% faster** ✓  | **+57% faster** ✓ |
+| Standard AVX2      | 603 MiB/s     | +12% faster        | -                 |
+| Standard Scalar    | 537 MiB/s     | -                  | -11% slower       |
+| PFSM Two-Pass      | 457 MiB/s     | -15% slower        | -24% slower       |
 
 ### 100KB File
-| Implementation | Throughput | vs Standard Scalar | vs AVX2 |
-|----------------|------------|-------------------|---------|
-| **PFSM Optimized** | **817 MiB/s** | **+66% faster** ✓ | **+42% faster** ✓ |
-| Standard AVX2 | 577 MiB/s | +17% faster | - |
-| Standard Scalar | 491 MiB/s | - | -15% slower |
-| PFSM Two-Pass | 447 MiB/s | -9% slower | -23% slower |
+| Implementation     | Throughput    | vs Standard Scalar | vs AVX2           |
+|--------------------|---------------|--------------------|-------------------|
+| **PFSM Optimized** | **817 MiB/s** | **+66% faster** ✓  | **+42% faster** ✓ |
+| Standard AVX2      | 577 MiB/s     | +17% faster        | -                 |
+| Standard Scalar    | 491 MiB/s     | -                  | -15% slower       |
+| PFSM Two-Pass      | 447 MiB/s     | -9% slower         | -23% slower       |
 
 ## Key Findings
 

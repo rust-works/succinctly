@@ -17,11 +17,11 @@ hw-dsv is described as an "unbelievably fast streaming DSV file parser that read
 
 From the README benchmarks on a 7GB CSV file (2.9 GHz Intel Core i7):
 
-| Configuration | Throughput | Time |
-|---------------|------------|------|
+| Configuration             | Throughput | Time |
+|---------------------------|------------|------|
 | BMI2 disabled (broadword) | 16.3 MiB/s | 7:25 |
-| BMI2 only | 165 MiB/s | 0:43 |
-| BMI2 + AVX2 | 181 MiB/s | 0:39 |
+| BMI2 only                 | 165 MiB/s  | 0:43 |
+| BMI2 + AVX2               | 181 MiB/s  | 0:39 |
 
 This represents an **11x speedup** when using BMI2+AVX2 over the broadword fallback.
 

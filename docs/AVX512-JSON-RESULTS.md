@@ -52,12 +52,12 @@ pub fn build_semi_index_standard(json: &[u8]) -> SemiIndex {
 
 ### Throughput Comparison (Synthetic JSON)
 
-| Size | AVX-512 | AVX2 | SSE4.2 | SSE2 | Scalar |
-|------|---------|------|--------|------|--------|
-| 1KB | 613 MiB/s | **664 MiB/s** ✓ | 638 MiB/s | 625 MiB/s | 493 MiB/s |
-| 10KB | 589 MiB/s | **623 MiB/s** ✓ | 619 MiB/s | 618 MiB/s | 429 MiB/s |
+| Size  | AVX-512   | AVX2            | SSE4.2    | SSE2      | Scalar    |
+|-------|-----------|-----------------|-----------|-----------|-----------|
+| 1KB   | 613 MiB/s | **664 MiB/s** ✓ | 638 MiB/s | 625 MiB/s | 493 MiB/s |
+| 10KB  | 589 MiB/s | **623 MiB/s** ✓ | 619 MiB/s | 618 MiB/s | 429 MiB/s |
 | 100KB | 590 MiB/s | **625 MiB/s** ✓ | 606 MiB/s | 628 MiB/s | 434 MiB/s |
-| 1MB | 592 MiB/s | **608 MiB/s** ✓ | 605 MiB/s | - | - |
+| 1MB   | 592 MiB/s | **608 MiB/s** ✓ | 605 MiB/s | -         | -         |
 
 **AVX2 is ~3-6% faster than AVX-512** on this workload!
 
@@ -71,11 +71,11 @@ json_parse/1MB/SSE4.2   time:   [1.68 ms]  thrpt:  [605 MiB/s]
 
 ### SIMD vs Scalar Speedup
 
-| Size | AVX2 vs Scalar | AVX-512 vs Scalar |
-|------|----------------|-------------------|
-| 1KB | 1.35x | 1.24x |
-| 10KB | 1.45x | 1.37x |
-| 100KB | 1.44x | 1.36x |
+| Size  | AVX2 vs Scalar | AVX-512 vs Scalar |
+|-------|----------------|-------------------|
+| 1KB   | 1.35x          | 1.24x             |
+| 10KB  | 1.45x          | 1.37x             |
+| 100KB | 1.44x          | 1.36x             |
 
 AVX2 provides better speedup than AVX-512 on JSON workloads.
 

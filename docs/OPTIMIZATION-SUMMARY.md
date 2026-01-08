@@ -30,12 +30,12 @@ This document provides a comprehensive record of all optimizations attempted in 
 
 **Performance Results**:
 
-| Workload | SSE2 Baseline | AVX2 | Improvement |
-|----------|---------------|------|-------------|
-| 1KB JSON | 450 MiB/s | 806 MiB/s | **+79%** |
-| 10KB JSON | 420 MiB/s | 731 MiB/s | **+74%** |
-| 100KB JSON | 410 MiB/s | 725 MiB/s | **+77%** |
-| 1MB JSON | 400 MiB/s | 732 MiB/s | **+83%** |
+| Workload   | SSE2 Baseline | AVX2      | Improvement |
+|------------|---------------|-----------|-------------|
+| 1KB JSON   | 450 MiB/s     | 806 MiB/s | **+79%**    |
+| 10KB JSON  | 420 MiB/s     | 731 MiB/s | **+74%**    |
+| 100KB JSON | 410 MiB/s     | 725 MiB/s | **+77%**    |
+| 1MB JSON   | 400 MiB/s     | 732 MiB/s | **+83%**    |
 
 **Average Speedup**: **1.78x (78% faster)**
 
@@ -59,12 +59,12 @@ This document provides a comprehensive record of all optimizations attempted in 
 
 **Performance Results**:
 
-| Dataset Size | Scalar | AVX512-VPOPCNTDQ | Improvement |
-|--------------|--------|------------------|-------------|
-| 64B (8 words) | 4.68 ns | 1.63 ns | **+187%** |
-| 512B (64 words) | 42.8 ns | 4.65 ns | **+820%** |
-| 4KB (512 words) | 342 ns | 27.7 ns | **+1135%** |
-| 1MB (131K words) | 52.6 µs | 10.1 µs | **+421%** |
+| Dataset Size     | Scalar  | AVX512-VPOPCNTDQ | Improvement |
+|------------------|---------|------------------|-------------|
+| 64B (8 words)    | 4.68 ns | 1.63 ns          | **+187%**   |
+| 512B (64 words)  | 42.8 ns | 4.65 ns          | **+820%**   |
+| 4KB (512 words)  | 342 ns  | 27.7 ns          | **+1135%**  |
+| 1MB (131K words) | 52.6 µs | 10.1 µs          | **+421%**   |
 
 **Throughput**: 96.8 GiB/s (AVX-512) vs 18.5 GiB/s (scalar) = **5.2x faster**
 
@@ -93,9 +93,9 @@ This document provides a comprehensive record of all optimizations attempted in 
 
 **Performance Results**:
 
-| Workload | SSE2 | SSE4.2 | Improvement |
-|----------|------|--------|-------------|
-| 1MB JSON | 400 MiB/s | 550 MiB/s | **+38%** |
+| Workload | SSE2      | SSE4.2    | Improvement |
+|----------|-----------|-----------|-------------|
+| 1MB JSON | 400 MiB/s | 550 MiB/s | **+38%**    |
 
 **Average Speedup**: **1.38x (38% faster)**
 
@@ -118,14 +118,14 @@ This document provides a comprehensive record of all optimizations attempted in 
 
 **Performance Results**:
 
-| Pattern | 16-byte (old) | 32-byte (new) | Improvement |
-|---------|---------------|---------------|-------------|
-| nested (string-heavy) | 2.05 GiB/s | 3.47 GiB/s | **+69% (-41% time)** |
-| strings | 1.77 GiB/s | 2.83 GiB/s | **+60% (-37% time)** |
-| unicode | 1.45 GiB/s | 1.70 GiB/s | **+17% (-14% time)** |
-| comprehensive | 505 MiB/s | 560 MiB/s | **+11% (-9% time)** |
-| mixed | 360 MiB/s | 389 MiB/s | **+8% (-7% time)** |
-| arrays | 297 MiB/s | 311 MiB/s | **+5% (-4% time)** |
+| Pattern               | 16-byte (old) | 32-byte (new) | Improvement          |
+|-----------------------|---------------|---------------|----------------------|
+| nested (string-heavy) | 2.05 GiB/s    | 3.47 GiB/s    | **+69% (-41% time)** |
+| strings               | 1.77 GiB/s    | 2.83 GiB/s    | **+60% (-37% time)** |
+| unicode               | 1.45 GiB/s    | 1.70 GiB/s    | **+17% (-14% time)** |
+| comprehensive         | 505 MiB/s     | 560 MiB/s     | **+11% (-9% time)**  |
+| mixed                 | 360 MiB/s     | 389 MiB/s     | **+8% (-7% time)**   |
+| arrays                | 297 MiB/s     | 311 MiB/s     | **+5% (-4% time)**   |
 
 **Average Speedup**: **1.11x overall, up to 1.69x on string-heavy workloads**
 
@@ -148,12 +148,12 @@ This document provides a comprehensive record of all optimizations attempted in 
 
 **Performance Results**:
 
-| Pattern | Before | After | Improvement |
-|---------|--------|-------|-------------|
-| nested | 3.47 GiB/s | 3.70 GiB/s | **+6%** |
-| strings | 2.83 GiB/s | 2.94 GiB/s | **+4%** |
-| literals | 290 MiB/s | 305 MiB/s | **+5%** |
-| comprehensive | 560 MiB/s | 571 MiB/s | **+2%** |
+| Pattern       | Before     | After      | Improvement |
+|---------------|------------|------------|-------------|
+| nested        | 3.47 GiB/s | 3.70 GiB/s | **+6%**     |
+| strings       | 2.83 GiB/s | 2.94 GiB/s | **+4%**     |
+| literals      | 290 MiB/s  | 305 MiB/s  | **+5%**     |
+| comprehensive | 560 MiB/s  | 571 MiB/s  | **+2%**     |
 
 **Average Speedup**: **1.02-1.06x (2-6% faster)**
 
@@ -176,12 +176,12 @@ This document provides a comprehensive record of all optimizations attempted in 
 
 **Performance Results**:
 
-| CPU | Auto-Selected | Throughput | vs Baseline |
-|-----|---------------|------------|-------------|
-| Zen 4 (AVX2) | AVX2 | 732 MiB/s | **+83%** |
-| Skylake (AVX2) | AVX2 | 680 MiB/s | **+70%** |
-| Core 2 Duo (SSE2) | SSE2 | 400 MiB/s | baseline |
-| M1 (NEON) | NEON | 571 MiB/s | **+52%** |
+| CPU               | Auto-Selected | Throughput | vs Baseline |
+|-------------------|---------------|------------|-------------|
+| Zen 4 (AVX2)      | AVX2          | 732 MiB/s  | **+83%**    |
+| Skylake (AVX2)    | AVX2          | 680 MiB/s  | **+70%**    |
+| Core 2 Duo (SSE2) | SSE2          | 400 MiB/s  | baseline    |
+| M1 (NEON)         | NEON          | 571 MiB/s  | **+52%**    |
 
 **Dispatch Priority**:
 - x86_64: AVX2 > SSE4.2 > SSE2
@@ -207,10 +207,10 @@ This document provides a comprehensive record of all optimizations attempted in 
 
 **Performance Results**:
 
-| Operation | Bit-by-bit | Byte lookup | Improvement |
-|-----------|------------|-------------|-------------|
-| find_close (1M elements) | 130.9 µs | 11.3 µs | **+1058% (11x faster)** |
-| find_open | 125 µs | 15 µs | **+733% (8x faster)** |
+| Operation                | Bit-by-bit | Byte lookup | Improvement             |
+|--------------------------|------------|-------------|-------------------------|
+| find_close (1M elements) | 130.9 µs   | 11.3 µs     | **+1058% (11x faster)** |
+| find_open                | 125 µs     | 15 µs       | **+733% (8x faster)**   |
 
 **Average Speedup**: **~10x faster**
 
@@ -233,10 +233,10 @@ This document provides a comprehensive record of all optimizations attempted in 
 
 **Performance Results**:
 
-| Operation | Linear scan | Hierarchical | Improvement |
-|-----------|-------------|--------------|-------------|
-| enclose (1M tree) | ~1000 µs | 25 µs | **+3900% (40x faster)** |
-| find_close | 130 µs | 11 µs | **+1058% (11x faster)** |
+| Operation         | Linear scan | Hierarchical | Improvement             |
+|-------------------|-------------|--------------|-------------------------|
+| enclose (1M tree) | ~1000 µs    | 25 µs        | **+3900% (40x faster)** |
+| find_close        | 130 µs      | 11 µs        | **+1058% (11x faster)** |
 
 **Memory Overhead**: ~6% of BP bitvector size
 
@@ -261,12 +261,12 @@ This document provides a comprehensive record of all optimizations attempted in 
 
 **Performance Results**:
 
-| Access Pattern | Method | Time | Throughput |
-|----------------|--------|------|------------|
-| Sequential | Exponential | 108 µs | 92.2 Melem/s |
-| Sequential | Binary | 340 µs | 29.4 Melem/s |
-| Random | Binary | 779 µs | **12.8 Melem/s** |
-| Random | Exponential | 1080 µs | 9.3 Melem/s |
+| Access Pattern | Method      | Time    | Throughput       |
+|----------------|-------------|---------|------------------|
+| Sequential     | Exponential | 108 µs  | 92.2 Melem/s     |
+| Sequential     | Binary      | 340 µs  | 29.4 Melem/s     |
+| Random         | Binary      | 779 µs  | **12.8 Melem/s** |
+| Random         | Exponential | 1080 µs | 9.3 Melem/s      |
 
 **Speedup**:
 - Sequential: Exponential **3.1x faster**
@@ -291,10 +291,10 @@ This document provides a comprehensive record of all optimizations attempted in 
 
 **Performance Results**:
 
-| Method | Time | Speedup |
-|--------|------|---------|
-| Binary search select | 779 µs | baseline |
-| Cumulative index | 1.24 µs | **+62,700% (627x faster!)** |
+| Method               | Time    | Speedup                     |
+|----------------------|---------|-----------------------------|
+| Binary search select | 779 µs  | baseline                    |
+| Cumulative index     | 1.24 µs | **+62,700% (627x faster!)** |
 
 **Memory Overhead**: 4 bytes per u64 word (~50% of bitvector)
 
@@ -323,23 +323,23 @@ This document provides a comprehensive record of all optimizations attempted in 
 
 **Performance Results (Comprehensive Pattern)**:
 
-| Size | PFSM BMI2 | Standard Scalar | Standard AVX2 | vs Scalar | vs AVX2 |
-|------|-----------|-----------------|---------------|-----------|---------|
-| 1KB | 674 MiB/s | 551 MiB/s | 672 MiB/s | **+22%** | **+0.3%** |
-| 10KB | 701 MiB/s | 537 MiB/s | 599 MiB/s | **+30%** | **+17%** |
-| 100KB | 695 MiB/s | 485 MiB/s | 552 MiB/s | **+43%** | **+26%** |
-| 1MB | 679 MiB/s | 494 MiB/s | 546 MiB/s | **+37%** | **+24%** |
+| Size  | PFSM BMI2 | Standard Scalar | Standard AVX2 | vs Scalar | vs AVX2   |
+|-------|-----------|-----------------|---------------|-----------|-----------|
+| 1KB   | 674 MiB/s | 551 MiB/s       | 672 MiB/s     | **+22%**  | **+0.3%** |
+| 10KB  | 701 MiB/s | 537 MiB/s       | 599 MiB/s     | **+30%**  | **+17%**  |
+| 100KB | 695 MiB/s | 485 MiB/s       | 552 MiB/s     | **+43%**  | **+26%**  |
+| 1MB   | 679 MiB/s | 494 MiB/s       | 546 MiB/s     | **+37%**  | **+24%**  |
 
 **Average Speedup**: **1.33x vs scalar (33% faster), 1.17x vs AVX2 (17% faster)**
 
 **Cross-Pattern Results (10KB files)**:
 
-| Pattern | PFSM | Standard Scalar | Standard AVX2 | vs Scalar | vs AVX2 |
-|---------|------|-----------------|---------------|-----------|---------|
-| comprehensive | 696 MiB/s | 437 MiB/s | 666 MiB/s | **+59%** | **+5%** |
-| users | 681 MiB/s | 454 MiB/s | 704 MiB/s | **+50%** | -3% |
-| nested | 824 MiB/s | 573 MiB/s | 913 MiB/s | **+44%** | -10% |
-| arrays | 667 MiB/s | 458 MiB/s | 649 MiB/s | **+46%** | **+3%** |
+| Pattern       | PFSM      | Standard Scalar | Standard AVX2 | vs Scalar | vs AVX2 |
+|---------------|-----------|-----------------|---------------|-----------|---------|
+| comprehensive | 696 MiB/s | 437 MiB/s       | 666 MiB/s     | **+59%**  | **+5%** |
+| users         | 681 MiB/s | 454 MiB/s       | 704 MiB/s     | **+50%**  | -3%     |
+| nested        | 824 MiB/s | 573 MiB/s       | 913 MiB/s     | **+44%**  | -10%    |
+| arrays        | 667 MiB/s | 458 MiB/s       | 649 MiB/s     | **+46%**  | **+3%** |
 
 **Why it worked**:
 1. **Cache-friendly tables**: 256 entries = 1-2KB per table (fits in L1 cache)
@@ -368,12 +368,12 @@ This document provides a comprehensive record of all optimizations attempted in 
 
 **Performance Results**:
 
-| Size | AVX2 | AVX-512 | Result |
-|------|------|---------|--------|
-| 1KB | 806 MiB/s | 689 MiB/s | **-17% slower** |
-| 10KB | 731 MiB/s | 675 MiB/s | **-8% slower** |
-| 100KB | 725 MiB/s | 678 MiB/s | **-7% slower** |
-| 1MB | 732 MiB/s | 672 MiB/s | **-9% slower** |
+| Size  | AVX2      | AVX-512   | Result          |
+|-------|-----------|-----------|-----------------|
+| 1KB   | 806 MiB/s | 689 MiB/s | **-17% slower** |
+| 10KB  | 731 MiB/s | 675 MiB/s | **-8% slower**  |
+| 100KB | 725 MiB/s | 678 MiB/s | **-7% slower**  |
+| 1MB   | 732 MiB/s | 672 MiB/s | **-9% slower**  |
 
 **Average Penalty**: **-10% (7-17% slower across sizes)**
 
@@ -415,19 +415,19 @@ while mask != 0 {
 
 #### Dense JSON (many structural characters):
 
-| Size | AVX2 Baseline | AVX2+BMI1 | Result |
-|------|---------------|-----------|--------|
-| 1KB | 609 MiB/s | 457 MiB/s | **-25% slower** |
-| 10KB | 647 MiB/s | 450 MiB/s | **-30% slower** |
-| 100KB | 658 MiB/s | 458 MiB/s | **-30% slower** |
-| 1MB | 659 MiB/s | 454 MiB/s | **-31% slower** |
+| Size  | AVX2 Baseline | AVX2+BMI1 | Result          |
+|-------|---------------|-----------|-----------------|
+| 1KB   | 609 MiB/s     | 457 MiB/s | **-25% slower** |
+| 10KB  | 647 MiB/s     | 450 MiB/s | **-30% slower** |
+| 100KB | 658 MiB/s     | 458 MiB/s | **-30% slower** |
+| 1MB   | 659 MiB/s     | 454 MiB/s | **-31% slower** |
 
 #### Sparse JSON (few structural characters - "best case"):
 
-| Size | AVX2 Baseline | AVX2+BMI1 | Result |
-|------|---------------|-----------|--------|
-| 1KB | 796 MiB/s | 727 MiB/s | **-9% slower** |
-| 10KB | 790 MiB/s | 700 MiB/s | **-11% slower** |
+| Size | AVX2 Baseline | AVX2+BMI1 | Result          |
+|------|---------------|-----------|-----------------|
+| 1KB  | 796 MiB/s     | 727 MiB/s | **-9% slower**  |
+| 10KB | 790 MiB/s     | 700 MiB/s | **-11% slower** |
 
 **Average Penalty**: **-26% (9-31% slower)**
 
@@ -473,10 +473,10 @@ self.current_word |= _pdep_u64(bits, shifted_mask);
 
 **Performance Results**:
 
-| Implementation | Throughput (8-bit writes) | Result |
-|----------------|--------------------------|--------|
-| Scalar | 1.27 GiB/s | baseline |
-| BMI2 PDEP | 381 MiB/s | **-71% slower (3.4x)** |
+| Implementation | Throughput (8-bit writes) | Result                 |
+|----------------|---------------------------|------------------------|
+| Scalar         | 1.27 GiB/s                | baseline               |
+| BMI2 PDEP      | 381 MiB/s                 | **-71% slower (3.4x)** |
 
 **Average Penalty**: **-71% (3.4x slower!)**
 
@@ -513,11 +513,11 @@ self.current_word |= _pdep_u64(bits, shifted_mask);
 
 **Performance Results**:
 
-| Implementation | Throughput | vs Production |
-|----------------|------------|---------------|
-| `pfsm_optimized` (production) | 516-578 MiB/s | baseline |
-| `pfsm_simd` (batched) | 398-461 MiB/s | **-25% slower** |
-| `pfsm` (basic reference) | 282-344 MiB/s | -45% slower |
+| Implementation                | Throughput    | vs Production   |
+|-------------------------------|---------------|-----------------|
+| `pfsm_optimized` (production) | 516-578 MiB/s | baseline        |
+| `pfsm_simd` (batched)         | 398-461 MiB/s | **-25% slower** |
+| `pfsm` (basic reference)      | 282-344 MiB/s | -45% slower     |
 
 **The Misleading Result**:
 - Batched was 40% faster than basic `pfsm.rs` ✓
@@ -554,10 +554,10 @@ let t_vec = vld1q_u8([t0, t1, t2, t3].as_ptr() as *const u8);
 
 **Performance Results**:
 
-| Implementation | Throughput | Result |
-|----------------|------------|--------|
-| Scalar PFSM | 343 MiB/s | baseline |
-| NEON Shuffle | 182 MiB/s | **-47% slower** |
+| Implementation | Throughput | Result          |
+|----------------|------------|-----------------|
+| Scalar PFSM    | 343 MiB/s  | baseline        |
+| NEON Shuffle   | 182 MiB/s  | **-47% slower** |
 
 **Average Penalty**: **-47% (1.9x slower)**
 
@@ -595,10 +595,10 @@ let t_vec = vld1q_u8([t0, t1, t2, t3].as_ptr() as *const u8);
 
 **Performance Results**:
 
-| Implementation | Time (1M words = 8MB) | Result |
-|----------------|----------------------|--------|
-| Scalar `count_ones()` | 542 µs | baseline |
-| NEON batched | 722 µs | **-25% slower** |
+| Implementation        | Time (1M words = 8MB) | Result          |
+|-----------------------|-----------------------|-----------------|
+| Scalar `count_ones()` | 542 µs                | baseline        |
+| NEON batched          | 722 µs                | **-25% slower** |
 
 **Average Penalty**: **-25% (1.33x slower)**
 
@@ -630,11 +630,11 @@ let t_vec = vld1q_u8([t0, t1, t2, t3].as_ptr() as *const u8);
 
 **Performance Results**:
 
-| Approach | Result |
-|----------|--------|
+| Approach           | Result                                       |
+|--------------------|----------------------------------------------|
 | Batched extraction | **No measurable improvement** (within noise) |
-| Fully inlined | **No measurable improvement** |
-| NEON domain OR | **-1-2% slower** on string-heavy patterns |
+| Fully inlined      | **No measurable improvement**                |
+| NEON domain OR     | **-1-2% slower** on string-heavy patterns    |
 
 **Average Penalty**: **0% (no effect or slight regression)**
 
@@ -664,12 +664,12 @@ let t_vec = vld1q_u8([t0, t1, t2, t3].as_ptr() as *const u8);
 
 **Performance Results**:
 
-| Prefetch Distance | Result |
-|-------------------|--------|
-| 256 bytes (L1KEEP) | **No improvement** (within ±1-2% noise) |
-| 512 bytes (L1KEEP) | **No improvement** |
-| 1024 bytes (L1STRM) | **No improvement** |
-| 2048 bytes (L2KEEP) | **No improvement** |
+| Prefetch Distance   | Result                                  |
+|---------------------|-----------------------------------------|
+| 256 bytes (L1KEEP)  | **No improvement** (within ±1-2% noise) |
+| 512 bytes (L1KEEP)  | **No improvement**                      |
+| 1024 bytes (L1STRM) | **No improvement**                      |
+| 2048 bytes (L2KEEP) | **No improvement**                      |
 
 **Average Penalty**: **0% (no effect)**
 
@@ -689,18 +689,18 @@ let t_vec = vld1q_u8([t0, t1, t2, t3].as_ptr() as *const u8);
 
 ### Successful Optimizations
 
-| Optimization | Speedup | Platform | Status |
-|--------------|---------|----------|--------|
-| PFSM JSON Parser | **1.33x** (vs scalar), **1.17x** (vs AVX2) | x86_64 | ✅ Deployed |
-| AVX2 JSON Parser | **1.78x** | x86_64 | ✅ Deployed |
-| AVX512-VPOPCNTDQ | **5.2x** (micro), **1.01x** (e2e) | x86_64 | ✅ Deployed |
-| SSE4.2 PCMPISTRI | **1.38x** | x86_64 | ✅ Deployed |
-| NEON 32-byte Processing | **1.11x** (avg), **1.69x** (strings) | ARM | ✅ Deployed |
-| NEON Nibble Lookup | **1.02-1.06x** | ARM | ✅ Deployed |
-| BP Byte Lookup Tables | **11x** | All | ✅ Deployed |
-| Hierarchical RangeMin | **40x** | All | ✅ Deployed |
-| Cumulative Index | **627x** | All | ✅ Deployed |
-| Dual Select Methods | **3.1x** (seq), **1.39x** (rand) | All | ✅ Deployed |
+| Optimization            | Speedup                                    | Platform | Status     |
+|-------------------------|--------------------------------------------|----------|------------|
+| PFSM JSON Parser        | **1.33x** (vs scalar), **1.17x** (vs AVX2) | x86_64   | ✅ Deployed |
+| AVX2 JSON Parser        | **1.78x**                                  | x86_64   | ✅ Deployed |
+| AVX512-VPOPCNTDQ        | **5.2x** (micro), **1.01x** (e2e)          | x86_64   | ✅ Deployed |
+| SSE4.2 PCMPISTRI        | **1.38x**                                  | x86_64   | ✅ Deployed |
+| NEON 32-byte Processing | **1.11x** (avg), **1.69x** (strings)       | ARM      | ✅ Deployed |
+| NEON Nibble Lookup      | **1.02-1.06x**                             | ARM      | ✅ Deployed |
+| BP Byte Lookup Tables   | **11x**                                    | All      | ✅ Deployed |
+| Hierarchical RangeMin   | **40x**                                    | All      | ✅ Deployed |
+| Cumulative Index        | **627x**                                   | All      | ✅ Deployed |
+| Dual Select Methods     | **3.1x** (seq), **1.39x** (rand)           | All      | ✅ Deployed |
 
 **Total Successful**: 10 optimizations
 **Average Speedup**: 6.2x (geometric mean, excluding outliers)
@@ -709,16 +709,16 @@ let t_vec = vld1q_u8([t0, t1, t2, t3].as_ptr() as *const u8);
 
 ### Failed Optimizations
 
-| Optimization | Penalty | Platform | Action |
-|--------------|---------|----------|--------|
-| AVX-512 JSON Parser | **-10%** (avg) | x86_64 | ❌ Removed |
-| BMI1 Mask Iteration | **-26%** (avg) | x86_64 | ❌ Reverted |
-| BMI2 PDEP BitWriter | **-71%** (3.4x slower!) | x86_64 | ❌ Reverted |
-| PFSM Batched | **-25%** (vs production) | All | ❌ Not deployed |
-| NEON PFSM Shuffle | **-47%** | ARM | ❌ Reverted |
-| NEON Batched Popcount | **-25%** | ARM | ❌ Rejected |
-| NEON Movemask Batching | **0%** (no effect) | ARM | ❌ Rejected |
-| NEON Prefetching | **0%** (no effect) | ARM | ❌ Rejected |
+| Optimization           | Penalty                  | Platform | Action         |
+|------------------------|--------------------------|----------|----------------|
+| AVX-512 JSON Parser    | **-10%** (avg)           | x86_64   | ❌ Removed      |
+| BMI1 Mask Iteration    | **-26%** (avg)           | x86_64   | ❌ Reverted     |
+| BMI2 PDEP BitWriter    | **-71%** (3.4x slower!)  | x86_64   | ❌ Reverted     |
+| PFSM Batched           | **-25%** (vs production) | All      | ❌ Not deployed |
+| NEON PFSM Shuffle      | **-47%**                 | ARM      | ❌ Reverted     |
+| NEON Batched Popcount  | **-25%**                 | ARM      | ❌ Rejected     |
+| NEON Movemask Batching | **0%** (no effect)       | ARM      | ❌ Rejected     |
+| NEON Prefetching       | **0%** (no effect)       | ARM      | ❌ Rejected     |
 
 **Total Failed**: 8 attempts
 **Average Penalty**: -26% (for those with negative impact)

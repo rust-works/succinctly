@@ -253,11 +253,11 @@ PDEP and PEXT are fundamental operations for:
 
 From the README benchmarks on Intel Core i7:
 
-| Operation | Hardware (BMI2) | Software (Emulated) | Speedup |
-|-----------|-----------------|---------------------|---------|
-| pdep64    | 4.9 ns          | 10.5 ns             | ~2x     |
-| pext64    | 5.2 ns          | 73 ns               | ~14x    |
-| pext vector (1024 elements) | 1.6 us | 72 us       | ~45x    |
+| Operation                   | Hardware (BMI2) | Software (Emulated) | Speedup |
+|-----------------------------|-----------------|---------------------|---------|
+| pdep64                      | 4.9 ns          | 10.5 ns             | ~2x     |
+| pext64                      | 5.2 ns          | 73 ns               | ~14x    |
+| pext vector (1024 elements) | 1.6 us          | 72 us.              | ~45x    |
 
 PEXT shows dramatically better performance with hardware support due to its more complex software emulation.
 
@@ -398,13 +398,13 @@ impl Pext for u64 {
 
 ### Key Differences from Haskell
 
-| Aspect | Haskell | Rust |
-|--------|---------|------|
-| Polymorphism | Type classes | Traits |
-| Conditional compilation | CPP macros | `cfg` attributes |
-| Unsafe code | Hidden in GHC.Prim | Explicit `unsafe` blocks |
-| Feature detection | Compile-time flag | Runtime or compile-time |
-| Inlining | INLINE pragma | `#[inline]` attribute |
+| Aspect                  | Haskell            | Rust                     |
+|-------------------------|--------------------|--------------------------|
+| Polymorphism            | Type classes       | Traits                   |
+| Conditional compilation | CPP macros         | `cfg` attributes         |
+| Unsafe code             | Hidden in GHC.Prim | Explicit `unsafe` blocks |
+| Feature detection       | Compile-time flag  | Runtime or compile-time  |
+| Inlining                | INLINE pragma      | `#[inline]` attribute    |
 
 ### Crate Structure
 

@@ -268,16 +268,16 @@ The `KeyValue` typeclass allows functions to work polymorphically over both `Pai
 
 ## Dependencies
 
-| Package | Version Range | Purpose |
-|---------|---------------|---------|
-| base | >= 4.11, < 5 | Standard library |
-| aeson | >= 1.4, < 2.2 | JSON library |
-| bytestring | >= 0.10, < 0.12 | Binary data |
-| containers | >= 0.6, < 0.7 | Map data structure |
-| hashable | >= 1.3, < 1.5 | Hashing |
-| text | >= 1.2, < 3 | Text handling |
-| text-short | >= 0.1.3, < 0.2 | Short text optimization |
-| unordered-containers | >= 0.2, < 0.3 | HashMap |
+| Package              | Version Range   | Purpose                 |
+|----------------------|-----------------|-------------------------|
+| base                 | >= 4.11, < 5    | Standard library        |
+| aeson                | >= 1.4, < 2.2   | JSON library            |
+| bytestring           | >= 0.10, < 0.12 | Binary data             |
+| containers           | >= 0.6, < 0.7   | Map data structure      |
+| hashable             | >= 1.3, < 1.5   | Hashing                 |
+| text                 | >= 1.2, < 3     | Text handling           |
+| text-short           | >= 0.1.3, < 0.2 | Short text optimization |
+| unordered-containers | >= 0.2, < 0.3   | HashMap                 |
 
 ---
 
@@ -289,15 +289,15 @@ This library is well-suited for porting to Rust. The concepts translate naturall
 
 ### Feature Mapping
 
-| Haskell Feature | Rust Equivalent |
-|-----------------|-----------------|
-| `newtype JsonEndo a` | `struct JsonEndo<A>(Vec<A>)` or use `Vec::with_capacity` + `push` |
-| `DerivingVia` | Trait implementations or procedural macros |
-| Type classes (`ToJSON`, `KeyValue`) | Traits (`Serialize`, custom traits) |
-| CPP conditionals | Cargo features with `#[cfg(feature = "...")]` |
-| `Maybe v` | `Option<T>` |
-| `HashMap Text v` | `HashMap<String, V>` or `serde_json::Map` |
-| Higher-kinded types | Trait objects or GATs (limited) |
+| Haskell Feature                     | Rust Equivalent                                                   |
+|-------------------------------------|-------------------------------------------------------------------|
+| `newtype JsonEndo a`                | `struct JsonEndo<A>(Vec<A>)` or use `Vec::with_capacity` + `push` |
+| `DerivingVia`                       | Trait implementations or procedural macros                        |
+| Type classes (`ToJSON`, `KeyValue`) | Traits (`Serialize`, custom traits)                               |
+| CPP conditionals                    | Cargo features with `#[cfg(feature = "...")]`                     |
+| `Maybe v`                           | `Option<T>`                                                       |
+| `HashMap Text v`                    | `HashMap<String, V>` or `serde_json::Map`                         |
+| Higher-kinded types                 | Trait objects or GATs (limited)                                   |
 
 ### Rust Implementation Approach
 

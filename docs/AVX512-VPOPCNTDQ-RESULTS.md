@@ -56,32 +56,32 @@ throughput/scalar_1MB   time:   [52.631 µs]
 
 ### Raw Popcount Performance
 
-| Benchmark | Time | Improvement |
-|-----------|------|-------------|
-| 1M bits (125KB) | 827 ns | ~60x faster than scalar per-word loop |
-| 10M bits (1.25MB) | 12.2 µs | Sustained high throughput |
-| Single word (1000x) | 946 ns | Sub-nanosecond per word |
+| Benchmark           | Time    | Improvement                           |
+|---------------------|---------|---------------------------------------|
+| 1M bits (125KB)     | 827 ns  | ~60x faster than scalar per-word loop |
+| 10M bits (1.25MB)   | 12.2 µs | Sustained high throughput             |
+| Single word (1000x) | 946 ns  | Sub-nanosecond per word               |
 
 ### End-to-End Performance
 
-| Operation | Time | Impact |
-|-----------|------|--------|
-| 1M bit construction | 50.1 µs | Popcount is ~1.6% of time (most time in allocation/indexing) |
-| 10M bit construction | 660 µs | Popcount overhead minimal |
-| 1M rank queries (10k queries) | 30.8 µs | 3 ns per query - popcount fast enough to not bottleneck |
+| Operation                     | Time    | Impact                                                       |
+|-------------------------------|---------|--------------------------------------------------------------|
+| 1M bit construction           | 50.1 µs | Popcount is ~1.6% of time (most time in allocation/indexing) |
+| 10M bit construction          | 660 µs  | Popcount overhead minimal                                    |
+| 1M rank queries (10k queries) | 30.8 µs | 3 ns per query - popcount fast enough to not bottleneck      |
 
 ### Alignment Analysis
 
 AVX512 processes 8 u64 words per iteration. Performance scales linearly:
 
-| Words | AVX512 Loads | Time | ns/word |
-|-------|--------------|------|---------|
-| 8 (aligned) | 1 | 1.63 ns | 0.20 ns |
-| 16 (aligned) | 2 | 2.05 ns | 0.13 ns |
-| 64 (aligned) | 8 | 4.65 ns | 0.07 ns |
-| 512 (aligned) | 64 | 27.7 ns | 0.05 ns |
-| 7 (unaligned) | 0 + scalar | 4.68 ns | 0.67 ns |
-| 9 (unaligned) | 1 + scalar | 2.68 ns | 0.30 ns |
+| Words         | AVX512 Loads | Time    | ns/word |
+|---------------|--------------|---------|---------|
+| 8 (aligned)   | 1            | 1.63 ns | 0.20 ns |
+| 16 (aligned)  | 2            | 2.05 ns | 0.13 ns |
+| 64 (aligned)  | 8            | 4.65 ns | 0.07 ns |
+| 512 (aligned) | 64           | 27.7 ns | 0.05 ns |
+| 7 (unaligned) | 0 + scalar   | 4.68 ns | 0.67 ns |
+| 9 (unaligned) | 1 + scalar   | 2.68 ns | 0.30 ns |
 
 **Key insight**: AVX512 delivers **0.05-0.20 ns per word** for aligned data, vs **0.67 ns per word** for scalar fallback.
 

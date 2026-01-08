@@ -64,12 +64,12 @@ Your local `main` branch diverged from `origin/main`:
 
 **YES** - with cherry-picking strategy:
 
-| Item | Value | Conflict Risk | Strategy |
-|------|-------|---------------|----------|
-| Optimization docs | ⭐⭐⭐⭐⭐ Very High | ✅ None | Cherry-pick directly |
-| Runtime dispatch docs | ⭐⭐⭐⭐⭐ Very High | ✅ None | Cherry-pick directly |
-| generate-corpus | ⭐ Low | ⚠️ High | **Skip** - use origin's generate-suite |
-| bench_corpus | ⭐ Low | ⚠️ High | **Skip** - use origin's bench_json_files |
+| Item                  | Value              | Conflict Risk | Strategy                                 |
+|-----------------------|--------------------|---------------|------------------------------------------|
+| Optimization docs     | ⭐⭐⭐⭐⭐ Very High | ✅ None        | Cherry-pick directly                     |
+| Runtime dispatch docs | ⭐⭐⭐⭐⭐ Very High | ✅ None        | Cherry-pick directly                     |
+| generate-corpus       | ⭐ Low              | ⚠️ High       | **Skip** - use origin's generate-suite   |
+| bench_corpus          | ⭐ Low              | ⚠️ High       | **Skip** - use origin's bench_json_files |
 
 **Verdict**: ✅ **All high-value work can be preserved with zero conflicts**
 

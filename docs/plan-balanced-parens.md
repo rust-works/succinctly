@@ -17,11 +17,11 @@ In balanced parentheses encoding:
 
 ### Key Operations
 
-| Operation | Description |
-|-----------|-------------|
-| `find_close(i)` | Find position of `)` matching `(` at position `i` |
-| `find_open(i)` | Find position of `(` matching `)` at position `i` |
-| `enclose(i)` | Find position of `(` enclosing the `(` at position `i` (parent) |
+| Operation       | Description                                                     |
+|-----------------|-----------------------------------------------------------------|
+| `find_close(i)` | Find position of `)` matching `(` at position `i`               |
+| `find_open(i)`  | Find position of `(` matching `)` at position `i`               |
+| `enclose(i)`    | Find position of `(` enclosing the `(` at position `i` (parent) |
 
 ### Excess Function
 
@@ -416,11 +416,11 @@ src/
 
 ## Space/Time Complexity
 
-| Structure | Space Overhead | find_close | find_open | enclose |
-|-----------|---------------|------------|-----------|---------|
-| None (linear scan) | 0% | O(n) | O(n) | O(n) |
-| Phase 1 only | 0% | O(n) | O(n) | O(n) |
-| RangeMin | ~6% | O(1) | O(1) | O(1) |
+| Structure          | Space Overhead | find_close | find_open | enclose |
+|--------------------|----------------|------------|-----------|---------|
+| None (linear scan) | 0%             | O(n)       | O(n)      | O(n)    |
+| Phase 1 only       | 0%             | O(n)       | O(n)      | O(n)    |
+| RangeMin           | ~6%            | O(1)       | O(1)      | O(1)    |
 
 ---
 

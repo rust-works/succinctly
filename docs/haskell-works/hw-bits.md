@@ -396,16 +396,16 @@ The hw-bits library is well-suited for porting to Rust because:
 
 ### Rust Feature Mappings
 
-| Haskell Concept | Rust Equivalent |
-|----------------|-----------------|
-| Type classes (`BitWise`, `PopCount1`) | Traits |
-| Associated types (`type Elem v`) | Associated types in traits |
-| `Word8/16/32/64` | `u8/u16/u32/u64` |
-| `DVS.Vector Word64` | `Vec<u64>` or `Box<[u64]>` |
-| `DVU.Vector Bit.Bit` | `bitvec` crate or custom `BitVec` |
-| Newtype wrappers | `struct Broadword<T>(T)` |
-| INLINE pragmas | `#[inline]` attributes |
-| ST monad (Writer) | `&mut` references |
+| Haskell Concept                       | Rust Equivalent                   |
+|---------------------------------------|-----------------------------------|
+| Type classes (`BitWise`, `PopCount1`) | Traits                            |
+| Associated types (`type Elem v`)      | Associated types in traits        |
+| `Word8/16/32/64`                      | `u8/u16/u32/u64`                  |
+| `DVS.Vector Word64`                   | `Vec<u64>` or `Box<[u64]>`        |
+| `DVU.Vector Bit.Bit`                  | `bitvec` crate or custom `BitVec` |
+| Newtype wrappers                      | `struct Broadword<T>(T)`          |
+| INLINE pragmas                        | `#[inline]` attributes            |
+| ST monad (Writer)                     | `&mut` references                 |
 
 ### Suggested Rust Architecture
 

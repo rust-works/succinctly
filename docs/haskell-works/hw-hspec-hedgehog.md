@@ -47,7 +47,7 @@ hw-hspec-hedgehog/
 
 ### Dependencies
 
-| Dependency     | Version Range      | Purpose                                      |
+| Dependency     | Version Range     | Purpose                                      |
 |----------------|-------------------|----------------------------------------------|
 | base           | >= 4.11, < 5      | Haskell standard library                     |
 | hedgehog       | >= 0.5, < 1.3     | Property-based testing framework             |
@@ -102,10 +102,10 @@ Extracts the source location from the call stack for error reporting.
 ### 1. Language Extensions
 
 | Extension          | Purpose                                                                 |
-|-------------------|-------------------------------------------------------------------------|
+|--------------------|-------------------------------------------------------------------------|
 | `FlexibleContexts` | Allows more general type class constraints (used with `HasCallStack`)   |
-| `OverloadedStrings`| Enables string literals to be polymorphic (used for error messages)    |
-| `CPP`              | Preprocessor for conditional compilation (in DoctestDriver.hs)         |
+| `OverloadedStrings`| Enables string literals to be polymorphic (used for error messages)     |
+| `CPP`              | Preprocessor for conditional compilation (in DoctestDriver.hs)          |
 
 ### 2. Type Classes and Constraints
 
@@ -253,12 +253,12 @@ The library is small (approximately 30 lines of actual code) and conceptually si
 
 ### Rust Ecosystem Equivalents
 
-| Haskell Library | Rust Equivalent(s)                    | Notes                                      |
-|-----------------|--------------------------------------|--------------------------------------------|
-| Hspec           | Built-in `#[test]`, `test-case`      | Rust has native test support               |
-| Hedgehog        | `proptest`, `quickcheck`             | Property-based testing crates              |
-| HUnit           | Built-in `assert!` macros            | Native in Rust                             |
-| call-stack      | `std::backtrace::Backtrace`          | Available since Rust 1.65 (stable)         |
+| Haskell Library | Rust Equivalent(s)              | Notes                              |
+|-----------------|---------------------------------|------------------------------------|
+| Hspec           | Built-in `#[test]`, `test-case` | Rust has native test support       |
+| Hedgehog        | `proptest`, `quickcheck`        | Property-based testing crates      |
+| HUnit           | Built-in `assert!` macros       | Native in Rust                     |
+| call-stack      | `std::backtrace::Backtrace`     | Available since Rust 1.65 (stable) |
 
 ### Porting Strategy
 

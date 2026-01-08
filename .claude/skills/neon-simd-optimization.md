@@ -39,14 +39,14 @@ while offset + 32 <= data.len() {
 
 ### Benchmark Results (Apple M1)
 
-| Pattern | Improvement |
-|---------|-------------|
-| nested (deep nesting) | -41% time |
-| strings (string-heavy) | -37% time |
-| unicode | -15% time |
-| comprehensive (mixed) | -9% time |
-| numbers | -5% time |
-| arrays | -5% time |
+| Pattern                | Improvement |
+|------------------------|-------------|
+| nested (deep nesting)  | -41% time   |
+| strings (string-heavy) | -37% time   |
+| unicode                | -15% time   |
+| comprehensive (mixed)  | -9% time    |
+| numbers                | -5% time    |
+| arrays                 | -5% time    |
 
 String-heavy patterns benefit most because the `InString` fast-path can batch-write more zeros.
 

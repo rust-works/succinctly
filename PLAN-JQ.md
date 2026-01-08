@@ -10,37 +10,37 @@ Implement a subset of jq query expressions on top of the existing JSON semi-inde
 
 Support basic jq path syntax for navigating JSON:
 
-| Expression | Meaning | Implementation |
-|------------|---------|----------------|
-| `.` | Identity (root) | `index.root(text)` |
-| `.foo` | Object field access | `JsonFields::find("foo")` |
-| `.[0]` | Array index access | `JsonElements::get(0)` |
-| `.foo.bar` | Chained field access | Compose cursor navigation |
-| `.[]` | Iterate all elements | `JsonElements` / `JsonFields` iterators |
-| `.foo[]` | Field then iterate | Compose field access + iteration |
-| `.[2:5]` | Array slice | Iterate with skip/take |
+| Expression | Meaning              | Implementation                          |
+|------------|----------------------|-----------------------------------------|
+| `.`        | Identity (root)      | `index.root(text)`                      |
+| `.foo`     | Object field access  | `JsonFields::find("foo")`               |
+| `.[0]`     | Array index access   | `JsonElements::get(0)`                  |
+| `.foo.bar` | Chained field access | Compose cursor navigation               |
+| `.[]`      | Iterate all elements | `JsonElements` / `JsonFields` iterators |
+| `.foo[]`   | Field then iterate   | Compose field access + iteration        |
+| `.[2:5]`   | Array slice          | Iterate with skip/take                  |
 
 ### Phase 2: Filters and Conditionals
 
-| Expression | Meaning |
-|------------|---------|
-| `select(expr)` | Filter based on condition |
-| `.foo?` | Optional field (null if missing) |
-| `.foo // default` | Alternative operator |
-| `type` | Get value type as string |
-| `length` | Array/string/object length |
+| Expression        | Meaning                          |
+|-------------------|----------------------------------|
+| `select(expr)`    | Filter based on condition        |
+| `.foo?`           | Optional field (null if missing) |
+| `.foo // default` | Alternative operator             |
+| `type`            | Get value type as string         |
+| `length`          | Array/string/object length       |
 
 ### Phase 3: Operators and Functions
 
-| Expression | Meaning |
-|------------|---------|
-| `keys` | Object keys as array |
-| `values` | Object values as array |
-| `has("foo")` | Check if field exists |
-| `in(obj)` | Check if key in object |
-| `map(expr)` | Transform each element |
-| `first`, `last` | First/last element |
-| `nth(n)` | Nth element |
+| Expression      | Meaning                |
+|-----------------|------------------------|
+| `keys`          | Object keys as array   |
+| `values`        | Object values as array |
+| `has("foo")`    | Check if field exists  |
+| `in(obj)`       | Check if key in object |
+| `map(expr)`     | Transform each element |
+| `first`, `last` | First/last element     |
+| `nth(n)`        | Nth element            |
 
 ### Phase 4: Advanced (Future)
 
@@ -343,15 +343,15 @@ Add to `tests/cli_golden_tests.rs`:
 
 ## Estimated Effort
 
-| Component | Lines of Code | Complexity |
-|-----------|---------------|------------|
-| Expression AST | ~50 | Low |
-| Parser | ~200 | Medium |
-| Evaluator | ~300 | Medium |
-| Output formatting | ~100 | Low |
-| CLI integration | ~50 | Low |
-| Tests | ~300 | Low |
-| **Total** | **~1000** | Medium |
+| Component         | Lines of Code | Complexity |
+|-------------------|---------------|------------|
+| Expression AST    | ~50           | Low        |
+| Parser            | ~200          | Medium     |
+| Evaluator         | ~300          | Medium     |
+| Output formatting | ~100          | Low        |
+| CLI integration   | ~50           | Low        |
+| Tests             | ~300          | Low        |
+| **Total**         | **~1000**     | Medium     |
 
 ---
 

@@ -13,26 +13,26 @@ The `hw-rankselect` package in the haskell-works ecosystem relies on PDEP/PEXT (
 
 ## Target Platforms
 
-| Platform               | SIMD       | Notes                                    |
-|------------------------|------------|------------------------------------------|
-| aarch64-apple-darwin   | NEON       | Apple M1/M2/M3/M4                        |
-| aarch64-unknown-linux  | NEON, SVE  | AWS Graviton, Ampere Altra               |
-| x86_64 (baseline)      | SSE4.2+    | Reference for comparison                 |
+| Platform              | SIMD      | Notes                      |
+|-----------------------|-----------|----------------------------|
+| aarch64-apple-darwin  | NEON      | Apple M1/M2/M3/M4          |
+| aarch64-unknown-linux | NEON, SVE | AWS Graviton, Ampere Altra |
+| x86_64 (baseline)     | SSE4.2+   | Reference for comparison   |
 
 ## Hardware Options
 
-| Approach                | Availability              | Performance                | Notes                                    |
-|-------------------------|---------------------------|----------------------------|------------------------------------------|
-| ARM SVE2 BDEP/BEXT      | Optional in ARMv9         | Near-native PDEP/PEXT      | Not available on most current ARM chips  |
-| ARM NEON popcount       | All ARMv8 (aarch64)       | Fast (1.8 cycles/byte)     | Via `vcnt` instruction                   |
-| ARM SVE popcount        | Graviton3+, Apple M-series| 3x faster than NEON        | Limited availability                     |
+| Approach           | Availability               | Performance            | Notes                                   |
+|--------------------|----------------------------|------------------------|-----------------------------------------|
+| ARM SVE2 BDEP/BEXT | Optional in ARMv9          | Near-native PDEP/PEXT  | Not available on most current ARM chips |
+| ARM NEON popcount  | All ARMv8 (aarch64)        | Fast (1.8 cycles/byte) | Via `vcnt` instruction                  |
+| ARM SVE popcount   | Graviton3+, Apple M-series | 3x faster than NEON    | Limited availability                    |
 
 ### ARM SVE2 BDEP/BEXT
 
 SVE2 (Scalable Vector Extension 2) provides direct equivalents to x86 PDEP/PEXT:
 
 | SVE2 Instruction | x86 Equivalent | Operation                              |
-|------------------|----------------|----------------------------------------|
+|--------------------|------------------|------------------------------------------|
 | BDEP             | PDEP           | Scatter lower-bits into masked positions |
 | BEXT             | PEXT           | Gather bits from masked positions      |
 | BGRP             | (compound)     | `BEXT(a,b) | (BEXT(a,~b) << popcount(b))` |
@@ -103,11 +103,11 @@ unsafe fn popcount_512_neon(ptr: *const u8) -> u32 {
 
 ### Performance Characteristics
 
-| Approach                    | Throughput           | Notes                          |
-|-----------------------------|----------------------|--------------------------------|
-| Basic NEON (vcntq + vaddvq) | ~1.8 cycles/byte     | Single accumulator             |
-| Unrolled + multi-accumulator| ~1.5 cycles/byte     | Better ILP, reduces stalls     |
-| Scalar u64::count_ones()    | ~3-4 cycles/byte     | Baseline fallback              |
+| Approach                     | Throughput       | Notes                      |
+|------------------------------|------------------|----------------------------|
+| Basic NEON (vcntq + vaddvq)  | ~1.8 cycles/byte | Single accumulator         |
+| Unrolled + multi-accumulator | ~1.5 cycles/byte | Better ILP, reduces stalls |
+| Scalar u64::count_ones()     | ~3-4 cycles/byte | Baseline fallback          |
 
 **Key insight**: The basic NEON implementation gives 2x speedup over scalar. Using multiple accumulators with instruction-level parallelism can squeeze out another 20% on large blocks.
 
@@ -124,11 +124,11 @@ let wide = vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(acc)));
 
 When hardware support is unavailable, software emulation is required.
 
-| Polyfill                | Technique                      | Performance vs Native | ARM Support           |
-|-------------------------|--------------------------------|-----------------------|-----------------------|
-| ZP7                     | Parallel-prefix-popcount       | ~3-5x slower          | Portable C fallback   |
-| Multiplication tricks   | Bit concentration via multiply | Mask-dependent        | Pure arithmetic       |
-| Naive loop              | Bit-by-bit iteration           | ~10-20x slower        | Fully portable        |
+| Polyfill              | Technique                      | Performance vs Native | ARM Support         |
+|-----------------------|--------------------------------|-----------------------|---------------------|
+| ZP7                   | Parallel-prefix-popcount       | ~3-5x slower          | Portable C fallback |
+| Multiplication tricks | Bit concentration via multiply | Mask-dependent        | Pure arithmetic     |
+| Naive loop            | Bit-by-bit iteration           | ~10-20x slower        | Fully portable      |
 
 ### ZP7 (Zach's Peppy Parallel-Prefix-Popcountin' PEXT/PDEP Polyfill)
 
@@ -166,12 +166,12 @@ This technique:
 
 ### Performance Comparison
 
-| Implementation          | Latency (cycles) | Notes                          |
-|-------------------------|------------------|--------------------------------|
-| Intel PDEP/PEXT (native)| 3                | Haswell and later              |
-| AMD PDEP/PEXT (native)  | ~18              | Zen 1-2; improved in Zen 3     |
-| ZP7 (software)          | ~15-20           | Portable, branchless           |
-| Naive loop              | ~50-100          | Bit-by-bit, branch-heavy       |
+| Implementation           | Latency (cycles) | Notes                      |
+|--------------------------|------------------|----------------------------|
+| Intel PDEP/PEXT (native) | 3                | Haswell and later          |
+| AMD PDEP/PEXT (native)   | ~18              | Zen 1-2; improved in Zen 3 |
+| ZP7 (software)           | ~15-20           | Portable, branchless       |
+| Naive loop               | ~50-100          | Bit-by-bit, branch-heavy   |
 
 ## Rank/Select Data Structures (No PDEP/PEXT Required)
 
@@ -372,22 +372,22 @@ fn select1(&self, bitvec: &BitVec, k: usize) -> usize {
 
 ### Sample Rate Trade-offs
 
-| Sample Rate | Space Overhead | Select Speed | Notes                    |
-|-------------|----------------|--------------|--------------------------|
-| 64          | ~12.5%         | Very fast    | More memory, less scan   |
-| 256         | ~3%            | Fast         | Good balance             |
-| 512         | ~1.5%          | Moderate     | Space-efficient          |
-| 1024        | ~0.8%          | Slower       | Minimal overhead         |
+| Sample Rate | Space Overhead | Select Speed | Notes                  |
+|-------------|----------------|--------------|------------------------|
+| 64          | ~12.5%         | Very fast    | More memory, less scan |
+| 256         | ~3%            | Fast         | Good balance           |
+| 512         | ~1.5%          | Moderate     | Space-efficient        |
+| 1024        | ~0.8%          | Slower       | Minimal overhead       |
 
 ## Rust Libraries for ARM Rank/Select
 
 | Crate           | ARM Support | SIMD         | Notes                                      |
-|-----------------|-------------|--------------|-------------------------------------------|
-| vers-vecs       | Yes (pure)  | x86 optional | Fastest pure-Rust; no ARM-specific opts   |
-| indexed-bitvec  | Yes (pure)  | None         | Based on Zhou-Andersen-Kaminsky paper     |
-| succinct        | Yes (pure)  | None         | O(lg lg n) select via binary search       |
-| sdsl (bindings) | Partial     | Via C++      | Wraps C++ sdsl-lite; vgteam fork for ARM  |
-| rust-bio        | Yes (pure)  | None         | Bioinformatics focus; succinct rank/select|
+|-----------------|-------------|--------------|--------------------------------------------|
+| vers-vecs       | Yes (pure)  | x86 optional | Fastest pure-Rust; no ARM-specific opts    |
+| indexed-bitvec  | Yes (pure)  | None         | Based on Zhou-Andersen-Kaminsky paper      |
+| succinct        | Yes (pure)  | None         | O(lg lg n) select via binary search        |
+| sdsl (bindings) | Partial     | Via C++      | Wraps C++ sdsl-lite; vgteam fork for ARM   |
+| rust-bio        | Yes (pure)  | None         | Bioinformatics focus; succinct rank/select |
 
 ### vers-vecs (Recommended)
 
@@ -535,12 +535,12 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 ### Test Parameters
 
-| Parameter       | Values                           |
-|-----------------|----------------------------------|
-| Bitvector size  | 10^6, 10^7, 10^8 bits            |
-| Bit density     | 1%, 10%, 50%, 90%                |
-| Query pattern   | Random, sequential, adversarial  |
-| Platforms       | M1/M2, Graviton3, x86 baseline   |
+| Parameter      | Values                          |
+|----------------|---------------------------------|
+| Bitvector size | 10^6, 10^7, 10^8 bits           |
+| Bit density    | 1%, 10%, 50%, 90%               |
+| Query pattern  | Random, sequential, adversarial |
+| Platforms      | M1/M2, Graviton3, x86 baseline  |
 
 ### Metrics
 
@@ -604,11 +604,11 @@ fn bench_rank(c: &mut Criterion) {
 
 The [simdjson](https://simdjson.org/) library demonstrates that ARM NEON can achieve competitive performance for SIMD-intensive workloads:
 
-| Platform      | SIMD Width | Performance vs x86 AVX2 |
-|---------------|------------|-------------------------|
-| Apple A12     | 128-bit    | ~50-80% of Skylake      |
-| Apple M1      | 128-bit    | Competitive with AVX2   |
-| Graviton2/3   | 128-bit    | Near-parity with AVX2   |
+| Platform    | SIMD Width | Performance vs x86 AVX2 |
+|-------------|------------|-------------------------|
+| Apple A12   | 128-bit    | ~50-80% of Skylake      |
+| Apple M1    | 128-bit    | Competitive with AVX2   |
+| Graviton2/3 | 128-bit    | Near-parity with AVX2   |
 
 The 128-bit NEON vector width (vs 256-bit AVX2) is offset by:
 - ARM's efficient instruction dispatch

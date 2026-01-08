@@ -425,12 +425,12 @@ pub trait TreeCursor {
 
 ### Comparison to Existing Rust XML Libraries
 
-| Library | Approach | Memory | Random Access | Streaming |
-|---------|----------|--------|---------------|-----------|
-| quick-xml | SAX-style | Low | No | Yes |
-| roxmltree | DOM | High | Yes | No |
-| xmltree | DOM | High | Yes | No |
-| **hw-xml (ported)** | Succinct | Low | Yes | Yes |
+| Library             | Approach  | Memory | Random Access | Streaming |
+|---------------------|-----------|--------|---------------|-----------|
+| quick-xml           | SAX-style | Low    | No            | Yes       |
+| roxmltree           | DOM       | High   | Yes           | No        |
+| xmltree             | DOM       | High   | Yes           | No        |
+| **hw-xml (ported)** | Succinct  | Low    | Yes           | Yes       |
 
 ### Recommended Implementation Order
 

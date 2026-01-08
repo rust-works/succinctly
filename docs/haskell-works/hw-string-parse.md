@@ -66,16 +66,16 @@ This design follows the "list of successes" pattern, where:
 
 ### Core Functions
 
-| Function | Type | Purpose |
-|----------|------|---------|
-| `runParser` | `Parser a -> String -> a` | Execute a parser, expecting complete input consumption |
-| `item` | `Parser Char` | Consume and return a single character |
-| `unit` | `a -> Parser a` | Wrap a value in a parser (monadic return) |
-| `bind` | `Parser a -> (a -> Parser b) -> Parser b` | Sequential composition (monadic bind) |
-| `failure` | `Parser a` | A parser that always fails |
-| `combine` | `Parser a -> Parser a -> Parser a` | Combine results from two parsers |
-| `option` | `Parser a -> Parser a -> Parser a` | Try first parser, fallback to second |
-| `char` | `Char -> Parser Char` | Parse a specific character |
+| Function    | Type                                      | Purpose                                                |
+|-------------|-------------------------------------------|--------------------------------------------------------|
+| `runParser` | `Parser a -> String -> a`                 | Execute a parser, expecting complete input consumption |
+| `item`      | `Parser Char`                             | Consume and return a single character                  |
+| `unit`      | `a -> Parser a`                           | Wrap a value in a parser (monadic return)              |
+| `bind`      | `Parser a -> (a -> Parser b) -> Parser b` | Sequential composition (monadic bind)                  |
+| `failure`   | `Parser a`                                | A parser that always fails                             |
+| `combine`   | `Parser a -> Parser a -> Parser a`        | Combine results from two parsers                       |
+| `option`    | `Parser a -> Parser a -> Parser a`        | Try first parser, fallback to second                   |
+| `char`      | `Char -> Parser Char`                     | Parse a specific character                             |
 
 ### Type Class Instances
 
@@ -245,13 +245,13 @@ pub trait Parser {
 
 #### 2. Type Classes to Traits
 
-| Haskell | Rust | Notes |
-|---------|------|-------|
-| `Functor` | `map()` method or custom trait | Rust doesn't have HKTs, use method |
-| `Applicative` | Custom trait + methods | No direct equivalent |
-| `Monad` | `and_then()` / `flat_map()` | Similar to `Iterator::flat_map` |
-| `Alternative` | `or()` method or custom trait | Similar to `Option::or` |
-| `MonadPlus` | Combined trait | Manual implementation |
+| Haskell       | Rust                           | Notes                              |
+|---------------|--------------------------------|------------------------------------|
+| `Functor`     | `map()` method or custom trait | Rust doesn't have HKTs, use method |
+| `Applicative` | Custom trait + methods         | No direct equivalent               |
+| `Monad`       | `and_then()` / `flat_map()`    | Similar to `Iterator::flat_map`    |
+| `Alternative` | `or()` method or custom trait  | Similar to `Option::or`            |
+| `MonadPlus`   | Combined trait                 | Manual implementation              |
 
 #### 3. Key Function Translations
 
@@ -363,15 +363,15 @@ For reference, these libraries solve similar problems:
 
 ### Porting Effort Estimate
 
-| Component | Effort | Notes |
-|-----------|--------|-------|
-| Core Parser type | Low | Straightforward translation |
-| Functor (map) | Low | Simple method |
-| Applicative | Medium | Requires careful lifetime handling |
-| Monad (bind) | Medium | flat_map style |
-| Alternative (or) | Low | Simple fallback |
-| Type inference | Medium | May need more explicit types |
-| Tests | Low | Property-based testing with proptest |
+| Component        | Effort | Notes                                |
+|------------------|--------|--------------------------------------|
+| Core Parser type | Low    | Straightforward translation          |
+| Functor (map)    | Low    | Simple method                        |
+| Applicative      | Medium | Requires careful lifetime handling   |
+| Monad (bind)     | Medium | flat_map style                       |
+| Alternative (or) | Low    | Simple fallback                      |
+| Type inference   | Medium | May need more explicit types         |
+| Tests            | Low    | Property-based testing with proptest |
 
 **Total estimated effort:** 1-2 hours for a basic port, 4-8 hours for a polished, idiomatic Rust library with full documentation and tests.
 

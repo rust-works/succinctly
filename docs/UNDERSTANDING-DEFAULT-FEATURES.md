@@ -280,21 +280,21 @@ full = ["fs", "io-util", "io-std", ...]
 
 ### Before: `default = []`
 
-| User Type | What They Type | What They Get | Performance |
-|-----------|---------------|---------------|-------------|
-| Regular | `succinctly = "0.1"` | SSE2 only | 5 GB/s ❌ |
-| Embedded | `default-features = false` | SSE2 only | 5 GB/s ✅ |
-| Power User | `features = ["std"]` | AVX2 dispatch | 9 GB/s ✅ |
+| User Type  | What They Type             | What They Get | Performance |
+|------------|----------------------------|---------------|-------------|
+| Regular    | `succinctly = "0.1"`       | SSE2 only     | 5 GB/s ❌    |
+| Embedded   | `default-features = false` | SSE2 only     | 5 GB/s ✅    |
+| Power User | `features = ["std"]`       | AVX2 dispatch | 9 GB/s ✅    |
 
 **Problem**: 90% of users get slow code by default!
 
 ### After: `default = ["std"]`
 
-| User Type | What They Type | What They Get | Performance |
-|-----------|---------------|---------------|-------------|
-| Regular | `succinctly = "0.1"` | AVX2 dispatch | 9 GB/s ✅ |
-| Embedded | `default-features = false` | SSE2 only | 5 GB/s ✅ |
-| Power User | `succinctly = "0.1"` | AVX2 dispatch | 9 GB/s ✅ |
+| User Type  | What They Type             | What They Get | Performance |
+|------------|----------------------------|---------------|-------------|
+| Regular    | `succinctly = "0.1"`       | AVX2 dispatch | 9 GB/s ✅    |
+| Embedded   | `default-features = false` | SSE2 only     | 5 GB/s ✅    |
+| Power User | `succinctly = "0.1"`       | AVX2 dispatch | 9 GB/s ✅    |
 
 **Solution**: 90% of users get fast code, embedded still works!
 

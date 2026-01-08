@@ -4,20 +4,20 @@ This document provides an analysis of the `hw-*` (haskell-works) package ecosyst
 
 ## Overview
 
-| Package                                                                    | Version  | Description                          | License      | Analysis                                 |
-|----------------------------------------------------------------------------|----------|--------------------------------------|--------------|------------------------------------------|
-| [hw-aeson](https://github.com/haskell-works/hw-aeson)                      | 0.1.8.0  | Convenience functions for Aeson      | BSD-3-Clause | [Details](haskell-works/hw-aeson.md)     |
-| [hw-bits](https://github.com/haskell-works/hw-bits)                        | 0.7.2.2  | Bit manipulation                     | BSD-3-Clause | [Details](haskell-works/hw-bits.md)      |
-| [hw-dsv](https://github.com/haskell-works/hw-dsv)                          | 0.4.1.2  | Fast streaming DSV/CSV parser        | BSD-3-Clause | [Details](haskell-works/hw-dsv.md)       |
-| [hw-hspec-hedgehog](https://github.com/haskell-works/hw-hspec-hedgehog)    | 0.1.1.1  | Hspec-Hedgehog interoperability      | BSD-3-Clause | [Details](haskell-works/hw-hspec-hedgehog.md) |
-| [hw-json](https://github.com/haskell-works/hw-json)                        | 1.3.3.0  | Memory efficient JSON parser         | BSD-3-Clause | [Details](haskell-works/hw-json.md)      |
-| [hw-json-simd](https://github.com/haskell-works/hw-json-simd)              | 0.1.1.2  | SIMD-based JSON semi-indexer         | BSD-3-Clause | [Details](haskell-works/hw-json-simd.md) |
-| [hw-mquery](https://github.com/haskell-works/hw-mquery)                    | 0.2.1.1  | Monadic query DSL                    | BSD-3-Clause | [Details](haskell-works/hw-mquery.md)    |
-| [hw-prelude](https://github.com/haskell-works/hw-prelude)                  | 0.0.4.1  | Opinionated prelude library          | Apache-2.0   | [Details](haskell-works/hw-prelude.md)   |
-| [hw-prim](https://github.com/haskell-works/hw-prim)                        | 0.6.3.2  | Primitive functions and data types   | BSD-3-Clause | [Details](haskell-works/hw-prim.md)      |
-| [hw-simd](https://github.com/haskell-works/hw-simd)                        | 0.1.2.2  | SIMD library                         | BSD-3-Clause | [Details](haskell-works/hw-simd.md)      |
-| [hw-string-parse](https://github.com/haskell-works/hw-string-parse)        | 0.0.0.5  | String parser                        | BSD-3-Clause | [Details](haskell-works/hw-string-parse.md) |
-| [hw-xml](https://github.com/haskell-works/hw-xml)                          | 0.5.1.2  | XML parser (succinct data structures)| BSD-3-Clause | [Details](haskell-works/hw-xml.md)       |
+| Package                                                                 | Version | Description                           | License      | Analysis                                      |
+|-----------------------------------------------------------------------|-------|-------------------------------------|------------|---------------------------------------------|
+| [hw-aeson](https://github.com/haskell-works/hw-aeson)                   | 0.1.8.0 | Convenience functions for Aeson       | BSD-3-Clause | [Details](haskell-works/hw-aeson.md)          |
+| [hw-bits](https://github.com/haskell-works/hw-bits)                     | 0.7.2.2 | Bit manipulation                      | BSD-3-Clause | [Details](haskell-works/hw-bits.md)           |
+| [hw-dsv](https://github.com/haskell-works/hw-dsv)                       | 0.4.1.2 | Fast streaming DSV/CSV parser         | BSD-3-Clause | [Details](haskell-works/hw-dsv.md)            |
+| [hw-hspec-hedgehog](https://github.com/haskell-works/hw-hspec-hedgehog) | 0.1.1.1 | Hspec-Hedgehog interoperability       | BSD-3-Clause | [Details](haskell-works/hw-hspec-hedgehog.md) |
+| [hw-json](https://github.com/haskell-works/hw-json)                     | 1.3.3.0 | Memory efficient JSON parser          | BSD-3-Clause | [Details](haskell-works/hw-json.md)           |
+| [hw-json-simd](https://github.com/haskell-works/hw-json-simd)           | 0.1.1.2 | SIMD-based JSON semi-indexer          | BSD-3-Clause | [Details](haskell-works/hw-json-simd.md)      |
+| [hw-mquery](https://github.com/haskell-works/hw-mquery)                 | 0.2.1.1 | Monadic query DSL                     | BSD-3-Clause | [Details](haskell-works/hw-mquery.md)         |
+| [hw-prelude](https://github.com/haskell-works/hw-prelude)               | 0.0.4.1 | Opinionated prelude library           | Apache-2.0   | [Details](haskell-works/hw-prelude.md)        |
+| [hw-prim](https://github.com/haskell-works/hw-prim)                     | 0.6.3.2 | Primitive functions and data types    | BSD-3-Clause | [Details](haskell-works/hw-prim.md)           |
+| [hw-simd](https://github.com/haskell-works/hw-simd)                     | 0.1.2.2 | SIMD library                          | BSD-3-Clause | [Details](haskell-works/hw-simd.md)           |
+| [hw-string-parse](https://github.com/haskell-works/hw-string-parse)     | 0.0.0.5 | String parser                         | BSD-3-Clause | [Details](haskell-works/hw-string-parse.md)   |
+| [hw-xml](https://github.com/haskell-works/hw-xml)                       | 0.5.1.2 | XML parser (succinct data structures) | BSD-3-Clause | [Details](haskell-works/hw-xml.md)            |
 
 ## Dependency Graph
 
@@ -27,36 +27,36 @@ This document provides an analysis of the `hw-*` (haskell-works) package ecosyst
 
 ### Dependency Matrix
 
-| Package              | Depends On (hw-* only)                                                                                                                                                                                          |
-|----------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **hw-aeson**         | *(none)*                                                                                                                                                                                                        |
-| **hw-bits**          | hw-prim, hw-string-parse, hw-int, hw-hspec-hedgehog (test)                                                                                                                                                      |
-| **hw-dsv**           | hw-bits, hw-prim, hw-simd, hw-rankselect, hw-rankselect-base, hw-hspec-hedgehog (test)                                                                                                                          |
-| **hw-hspec-hedgehog**| *(none)*                                                                                                                                                                                                        |
-| **hw-json**          | hw-bits, hw-prim, hw-mquery, hw-balancedparens, hw-parser, hw-rankselect, hw-rankselect-base, hw-simd (x86_64), hw-json-simd (x86_64), hw-json-simple-cursor, hw-json-standard-cursor, hw-hspec-hedgehog (test) |
-| **hw-json-simd**     | hw-prim                                                                                                                                                                                                         |
-| **hw-mquery**        | hw-hspec-hedgehog (test)                                                                                                                                                                                        |
-| **hw-prelude**       | *(none)*                                                                                                                                                                                                        |
-| **hw-prim**          | hw-hspec-hedgehog (test)                                                                                                                                                                                        |
-| **hw-simd**          | hw-bits, hw-prim, hw-rankselect, hw-rankselect-base, hw-hedgehog (test), hw-hspec-hedgehog (test)                                                                                                               |
-| **hw-string-parse**  | *(none)*                                                                                                                                                                                                        |
-| **hw-xml**           | hw-bits, hw-prim, hw-balancedparens, hw-parser, hw-rankselect, hw-rankselect-base, hw-hspec-hedgehog (test)                                                                                                     |
+| Package               | Depends On (hw-* only)                                                                                                                                                                                          |
+|---------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **hw-aeson**          | *(none)*                                                                                                                                                                                                        |
+| **hw-bits**           | hw-prim, hw-string-parse, hw-int, hw-hspec-hedgehog (test)                                                                                                                                                      |
+| **hw-dsv**            | hw-bits, hw-prim, hw-simd, hw-rankselect, hw-rankselect-base, hw-hspec-hedgehog (test)                                                                                                                          |
+| **hw-hspec-hedgehog** | *(none)*                                                                                                                                                                                                        |
+| **hw-json**           | hw-bits, hw-prim, hw-mquery, hw-balancedparens, hw-parser, hw-rankselect, hw-rankselect-base, hw-simd (x86_64), hw-json-simd (x86_64), hw-json-simple-cursor, hw-json-standard-cursor, hw-hspec-hedgehog (test) |
+| **hw-json-simd**      | hw-prim                                                                                                                                                                                                         |
+| **hw-mquery**         | hw-hspec-hedgehog (test)                                                                                                                                                                                        |
+| **hw-prelude**        | *(none)*                                                                                                                                                                                                        |
+| **hw-prim**           | hw-hspec-hedgehog (test)                                                                                                                                                                                        |
+| **hw-simd**           | hw-bits, hw-prim, hw-rankselect, hw-rankselect-base, hw-hedgehog (test), hw-hspec-hedgehog (test)                                                                                                               |
+| **hw-string-parse**   | *(none)*                                                                                                                                                                                                        |
+| **hw-xml**            | hw-bits, hw-prim, hw-balancedparens, hw-parser, hw-rankselect, hw-rankselect-base, hw-hspec-hedgehog (test)                                                                                                     |
 
 ### External hw-* Dependencies
 
 These packages are referenced but are not part of this analysis:
 
-| External Package           | Used By                          |
-|----------------------------|----------------------------------|
-| **hw-rankselect**          | hw-dsv, hw-json, hw-simd, hw-xml |
-| **hw-rankselect-base**     | hw-dsv, hw-json, hw-simd, hw-xml |
-| **hw-balancedparens**      | hw-json, hw-xml                  |
-| **hw-parser**              | hw-json, hw-xml                  |
-| **hw-int**                 | hw-bits                          |
-| **hw-hedgehog**            | hw-simd (test)                   |
-| **hw-json-simple-cursor**  | hw-json                          |
-| **hw-json-standard-cursor**| hw-json                          |
-| **hw-ip**                  | hw-dsv (executable only)         |
+| External Package            | Used By                          |
+|---------------------------|--------------------------------|
+| **hw-rankselect**           | hw-dsv, hw-json, hw-simd, hw-xml |
+| **hw-rankselect-base**      | hw-dsv, hw-json, hw-simd, hw-xml |
+| **hw-balancedparens**       | hw-json, hw-xml                  |
+| **hw-parser**               | hw-json, hw-xml                  |
+| **hw-int**                  | hw-bits                          |
+| **hw-hedgehog**             | hw-simd (test)                   |
+| **hw-json-simple-cursor**   | hw-json                          |
+| **hw-json-standard-cursor** | hw-json                          |
+| **hw-ip**                   | hw-dsv (executable only)         |
 
 ## Dependency Layers
 
@@ -89,18 +89,18 @@ These packages are referenced but are not part of this analysis:
 
 ## GHC Compatibility
 
-| Package    | Tested GHC Versions                                                       |
-|------------|---------------------------------------------------------------------------|
-| hw-dsv     | 9.12.2, 9.10.2, 9.8.4, 9.6.7                                              |
-| hw-prim    | 9.12.1, 9.10.1, 9.8.4, 9.6.6, 9.4.8, 9.2.8, 9.0.2, 8.10.7, 8.8.4          |
-| hw-json    | 9.8.2, 9.6.6                                                              |
-| hw-prelude | *(not specified)*                                                         |
-| Others     | Typically 9.2.2, 9.0.2, 8.10.7, 8.8.4, 8.6.5                              |
+| Package    | Tested GHC Versions                                              |
+|----------|----------------------------------------------------------------|
+| hw-dsv     | 9.12.2, 9.10.2, 9.8.4, 9.6.7                                     |
+| hw-prim    | 9.12.1, 9.10.1, 9.8.4, 9.6.6, 9.4.8, 9.2.8, 9.0.2, 8.10.7, 8.8.4 |
+| hw-json    | 9.8.2, 9.6.6                                                     |
+| hw-prelude | *(not specified)*                                                |
+| Others     | Typically 9.2.2, 9.0.2, 8.10.7, 8.8.4, 8.6.5                     |
 
 ## SIMD/Performance Features
 
 | Package         | SSE4.2 | AVX2 | BMI2 | C Sources                      |
-|-----------------|--------|------|------|--------------------------------|
+|---------------|------|----|----|------------------------------|
 | hw-bits         | Yes    | -    | -    | -                              |
 | hw-dsv          | Yes    | Yes  | Yes  | -                              |
 | hw-json         | Yes    | -    | Yes  | -                              |
@@ -115,7 +115,7 @@ These packages are referenced but are not part of this analysis:
 ## ARM/aarch64 Portability
 
 | Package           | ARM Status   | Blocker                    | Rust ARM Strategy                      |
-|-------------------|--------------|----------------------------|----------------------------------------|
+|-----------------|------------|--------------------------|--------------------------------------|
 | bits-extra        | Fallback     | No BMI2 (PDEP/PEXT)        | Software emulation; no NEON equivalent |
 | hw-aeson          | Works        | None                       | N/A                                    |
 | hw-bits           | Works        | None                       | Pure algorithms portable               |
@@ -132,15 +132,15 @@ These packages are referenced but are not part of this analysis:
 
 ### x86_64 → ARM/NEON Instruction Mapping
 
-| x86_64 Intrinsic       | ARM/NEON Equivalent    | Notes                                          |
-|------------------------|------------------------|------------------------------------------------|
-| `_mm256_cmpeq_epi8`    | `vceqq_u8` (128-bit)   | Process 16 bytes vs 32                         |
-| `_mm256_movemask_epi8` | Manual extraction      | No direct equivalent; use `vshrn` + shifts     |
-| `_pdep_u64`            | Software emulation     | No ARM equivalent; ~10-20x slower              |
-| `_pext_u64`            | Software emulation     | No ARM equivalent; ~10-20x slower              |
-| `_mm256_and_si256`     | `vandq_u8`             | Direct equivalent                              |
-| `_mm256_or_si256`      | `vorrq_u8`             | Direct equivalent                              |
-| `_mm256_set1_epi8`     | `vdupq_n_u8`           | Direct equivalent                              |
+| x86_64 Intrinsic       | ARM/NEON Equivalent  | Notes                                      |
+|----------------------|--------------------|------------------------------------------|
+| `_mm256_cmpeq_epi8`    | `vceqq_u8` (128-bit) | Process 16 bytes vs 32                     |
+| `_mm256_movemask_epi8` | Manual extraction    | No direct equivalent; use `vshrn` + shifts |
+| `_pdep_u64`            | Software emulation   | No ARM equivalent; ~10-20x slower          |
+| `_pext_u64`            | Software emulation   | No ARM equivalent; ~10-20x slower          |
+| `_mm256_and_si256`     | `vandq_u8`           | Direct equivalent                          |
+| `_mm256_or_si256`      | `vorrq_u8`           | Direct equivalent                          |
+| `_mm256_set1_epi8`     | `vdupq_n_u8`         | Direct equivalent                          |
 
 ### ARM Porting Considerations
 
@@ -155,21 +155,21 @@ The `hw-rankselect` package is critical for succinct data structures but relies 
 
 ### Hardware Options
 
-| Approach                | Availability              | Performance                | Notes                                    |
-|-------------------------|---------------------------|----------------------------|------------------------------------------|
-| ARM SVE2 BDEP/BEXT      | Optional in ARMv9         | Near-native PDEP/PEXT      | Not available on most current ARM chips  |
-| ARM NEON popcount       | All ARMv8 (aarch64)       | Fast (1.8 cycles/byte)     | Via `vcnt` instruction                   |
-| ARM SVE popcount        | Graviton3+, Apple M-series| 3x faster than NEON        | Limited availability                     |
+| Approach           | Availability               | Performance            | Notes                                   |
+|------------------|--------------------------|----------------------|---------------------------------------|
+| ARM SVE2 BDEP/BEXT | Optional in ARMv9          | Near-native PDEP/PEXT  | Not available on most current ARM chips |
+| ARM NEON popcount  | All ARMv8 (aarch64)        | Fast (1.8 cycles/byte) | Via `vcnt` instruction                  |
+| ARM SVE popcount   | Graviton3+, Apple M-series | 3x faster than NEON    | Limited availability                    |
 
 **SVE2 Note**: SVE2 provides BDEP (bit deposit), BEXT (bit extract), and BGRP instructions—direct equivalents to x86 PDEP/PEXT. However, SVE2 is optional in ARMv9 and not yet widely available. All currently announced SVE2 cores only support 128-bit vectors (same as NEON).
 
 ### Software Polyfills for PDEP/PEXT
 
-| Polyfill                | Technique                      | Performance vs Native | ARM Support           |
-|-------------------------|--------------------------------|-----------------------|-----------------------|
-| ZP7 (zp7)               | Parallel-prefix-popcount       | ~3-5x slower          | Portable C fallback   |
-| Multiplication tricks   | Bit concentration via multiply | Mask-dependent        | Pure arithmetic       |
-| Naive loop              | Bit-by-bit iteration           | ~10-20x slower        | Fully portable        |
+| Polyfill              | Technique                      | Performance vs Native | ARM Support         |
+|---------------------|------------------------------|---------------------|-------------------|
+| ZP7 (zp7)             | Parallel-prefix-popcount       | ~3-5x slower          | Portable C fallback |
+| Multiplication tricks | Bit concentration via multiply | Mask-dependent        | Pure arithmetic     |
+| Naive loop            | Bit-by-bit iteration           | ~10-20x slower        | Fully portable      |
 
 **ZP7** ([github.com/zwegner/zp7](https://github.com/zwegner/zp7)) is a branchless PEXT/PDEP polyfill using parallel prefix algorithms. It's faster than naive loops on all architectures and can optionally use CLMUL (carryless multiply) for acceleration on x86.
 
@@ -182,7 +182,7 @@ pext(x, 0x8040201008040201) →
 ### Rank/Select Data Structures (No PDEP/PEXT Required)
 
 | Structure     | Space Overhead | Rank Time | Select Time | Key Technique                              |
-|---------------|----------------|-----------|-------------|--------------------------------------------|
+|-------------|--------------|---------|-----------|------------------------------------------|
 | Rank9         | 25%            | Very fast | Moderate    | 2-level interleaved index                  |
 | Rank9.v2      | 6.3%           | Fast      | Moderate    | Compressed 2-level                         |
 | Poppy         | 3%             | Fast      | Fast        | 3-level with interleaving                  |
@@ -200,12 +200,12 @@ pext(x, 0x8040201008040201) →
 ### Rust Libraries for ARM Rank/Select
 
 | Crate           | ARM Support | SIMD         | Notes                                      |
-|-----------------|-------------|--------------|-------------------------------------------|
-| vers-vecs       | Yes (pure)  | x86 optional | Fastest pure-Rust; no ARM-specific opts   |
-| indexed-bitvec  | Yes (pure)  | None         | Based on Zhou-Andersen-Kaminsky paper     |
-| succinct        | Yes (pure)  | None         | O(lg lg n) select via binary search       |
-| sdsl (bindings) | Partial     | Via C++      | Wraps C++ sdsl-lite; vgteam fork for ARM  |
-| rust-bio        | Yes (pure)  | None         | Bioinformatics focus; succinct rank/select|
+|---------------|-----------|------------|------------------------------------------|
+| vers-vecs       | Yes (pure)  | x86 optional | Fastest pure-Rust; no ARM-specific opts    |
+| indexed-bitvec  | Yes (pure)  | None         | Based on Zhou-Andersen-Kaminsky paper      |
+| succinct        | Yes (pure)  | None         | O(lg lg n) select via binary search        |
+| sdsl (bindings) | Partial     | Via C++      | Wraps C++ sdsl-lite; vgteam fork for ARM   |
+| rust-bio        | Yes (pure)  | None         | Bioinformatics focus; succinct rank/select |
 
 **Recommendation**: For Rust on ARM, use **vers-vecs** which achieves competitive performance without architecture-specific SIMD. The pure-Rust implementation uses broadword techniques that work well on ARM's 64-bit registers.
 
@@ -221,18 +221,18 @@ pext(x, 0x8040201008040201) →
 
 The [simdjson](https://simdjson.org/) library demonstrates ARM NEON can achieve competitive JSON parsing performance:
 
-| Platform      | SIMD Width | Performance vs x86 AVX2 |
-|---------------|------------|-------------------------|
-| Apple A12     | 128-bit    | ~50-80% of Skylake      |
-| Apple M1      | 128-bit    | Competitive with AVX2   |
-| Graviton2/3   | 128-bit    | Near-parity with AVX2   |
+| Platform    | SIMD Width | Performance vs x86 AVX2 |
+|-----------|----------|-----------------------|
+| Apple A12   | 128-bit    | ~50-80% of Skylake      |
+| Apple M1    | 128-bit    | Competitive with AVX2   |
+| Graviton2/3 | 128-bit    | Near-parity with AVX2   |
 
 The 128-bit NEON vector width (vs 256-bit AVX2) is offset by ARM's efficient instruction dispatch and lower memory latency on modern chips.
 
 ## Components Summary
 
 | Package           | Libraries          | Executables | Test Suites | Benchmarks |
-|-------------------|--------------------|-------------|-------------|------------|
+|-----------------|------------------|-----------|-----------|----------|
 | hw-aeson          | 1                  | -           | 2           | -          |
 | hw-bits           | 1                  | -           | 2           | 1          |
 | hw-dsv            | 1                  | 1           | 3           | 1          |
@@ -255,7 +255,7 @@ The 128-bit NEON vector width (vs 256-bit AVX2) is offset by ARM's efficient ins
 ## Rust Porting Assessment
 
 | Package           | Feasibility | Priority | Notes                                                                   |
-|-------------------|-------------|----------|-------------------------------------------------------------------------|
+|-----------------|-----------|--------|-----------------------------------------------------------------------|
 | bits-extra        | High        | High     | Direct `std::arch` equivalents for PDEP/PEXT; essential for succinct DS |
 | hw-prim           | High        | High     | Foundation library; traits map well from type classes                   |
 | hw-bits           | High        | High     | Pure bit manipulation; broadword/De Bruijn algorithms portable          |

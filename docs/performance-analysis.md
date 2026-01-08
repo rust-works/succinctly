@@ -252,11 +252,11 @@ pub fn select_in_word(word: u64, k: u32) -> u32 {
 
 ## SIMD Utilization Gaps
 
-| Gap | Current State | Opportunity |
-|-----|--------------|-------------|
-| AVX2 escape handling | Sequential after classification | Pre-compute escape masks in parallel |
-| NEON for BP operations | Not used | Port key BP operations to NEON |
-| BMI2 PDEP/PEXT | Disabled (AMD Zen 1/2 slow) | Enable with CPU detection |
+| Gap                    | Current State                   | Opportunity                          |
+|------------------------|---------------------------------|--------------------------------------|
+| AVX2 escape handling   | Sequential after classification | Pre-compute escape masks in parallel |
+| NEON for BP operations | Not used                        | Port key BP operations to NEON       |
+| BMI2 PDEP/PEXT         | Disabled (AMD Zen 1/2 slow)     | Enable with CPU detection            |
 
 ---
 
@@ -308,12 +308,12 @@ cd bench-compare && cargo bench
 
 ## Not Recommended
 
-| Optimization | Reason |
-|-------------|--------|
-| Multi-threading JSON | Very high complexity (2000+ lines), only helps files >10MB |
-| Select0 index | Low demand for 0-bit queries in JSON workloads |
-| Full BMI2 dependency | AMD Zen 1/2 have 18-cycle microcode PDEP/PEXT |
-| BP rank_l1 u32→u16 | Real JSON easily exceeds 65K structural elements (10MB file has ~1.5M); u16 would silently overflow |
+| Optimization         | Reason                                                                                              |
+|----------------------|-----------------------------------------------------------------------------------------------------|
+| Multi-threading JSON | Very high complexity (2000+ lines), only helps files >10MB                                          |
+| Select0 index        | Low demand for 0-bit queries in JSON workloads                                                      |
+| Full BMI2 dependency | AMD Zen 1/2 have 18-cycle microcode PDEP/PEXT                                                       |
+| BP rank_l1 u32→u16   | Real JSON easily exceeds 65K structural elements (10MB file has ~1.5M); u16 would silently overflow |
 
 ---
 
@@ -387,16 +387,16 @@ unsafe fn classify_structural_nibble(chunk: uint8x16_t) -> uint8x16_t {
 
 **Character classification with nibble lookup:**
 
-| Character | Hex  | Hi | Lo | lo_table[Lo] | hi_table[Hi] | AND result |
-|-----------|------|----|----|--------------|--------------|------------|
-| `{`       | 0x7B | 7  | B  | 4            | 4            | 4 (match)  |
-| `}`       | 0x7D | 7  | D  | 12           | 4            | 4 (match)  |
-| `[`       | 0x5B | 5  | B  | 4            | 4            | 4 (match)  |
-| `]`       | 0x5D | 5  | D  | 12           | 4            | 4 (match)  |
-| `:`       | 0x3A | 3  | A  | 10           | 2            | 2 (match)  |
-| `,`       | 0x2C | 2  | C  | 1            | 17           | 1 (match)  |
+| Character | Hex  | Hi | Lo | lo_table[Lo] | hi_table[Hi] | AND result                |
+|-----------|------|----|----|--------------|--------------|---------------------------|
+| `{`       | 0x7B | 7  | B  | 4            | 4            | 4 (match)                 |
+| `}`       | 0x7D | 7  | D  | 12           | 4            | 4 (match)                 |
+| `[`       | 0x5B | 5  | B  | 4            | 4            | 4 (match)                 |
+| `]`       | 0x5D | 5  | D  | 12           | 4            | 4 (match)                 |
+| `:`       | 0x3A | 3  | A  | 10           | 2            | 2 (match)                 |
+| `,`       | 0x2C | 2  | C  | 1            | 17           | 1 (match)                 |
 | `"`       | 0x22 | 2  | 2  | 0            | 17           | 0 (separate check needed) |
-| `a`       | 0x61 | 6  | 1  | 0            | 0            | 0 (no match) |
+| `a`       | 0x61 | 6  | 1  | 0            | 0            | 0 (no match)              |
 
 **Implementation notes:**
 - Quote (`"`) and backslash (`\`) still need separate checks (escape handling)
@@ -564,23 +564,23 @@ unsafe fn popcount_words_neon(words: &[u64]) -> u64 {
 
 #### What's Available (All M-series)
 
-| Instruction | Use Case | Notes |
-|-------------|----------|-------|
-| `vqtbl1q_u8` | Nibble lookup | Single 16-byte table |
-| `vqtbl2q_u8` | Extended lookup | Two 16-byte tables (32 entries) |
-| `vqtbl4q_u8` | Full byte map | Four tables (64 entries) |
-| `vcntq_u8` | Popcount | Per-byte population count |
-| `vaddvq_u8` | Horizontal add | Sum all bytes |
-| `vpaddq_u8` | Pairwise add | Adjacent byte pairs |
-| `vshrn_n_u16` | Narrow | 16-bit to 8-bit with shift |
+| Instruction   | Use Case        | Notes                           |
+|---------------|-----------------|---------------------------------|
+| `vqtbl1q_u8`  | Nibble lookup   | Single 16-byte table            |
+| `vqtbl2q_u8`  | Extended lookup | Two 16-byte tables (32 entries) |
+| `vqtbl4q_u8`  | Full byte map   | Four tables (64 entries)        |
+| `vcntq_u8`    | Popcount        | Per-byte population count       |
+| `vaddvq_u8`   | Horizontal add  | Sum all bytes                   |
+| `vpaddq_u8`   | Pairwise add    | Adjacent byte pairs             |
+| `vshrn_n_u16` | Narrow          | 16-bit to 8-bit with shift      |
 
 #### M4-Specific (Not Useful for JSON)
 
-| Feature | Status | Why Not Useful |
-|---------|--------|----------------|
+| Feature                | Status    | Why Not Useful                               |
+|------------------------|-----------|----------------------------------------------|
 | SME (Matrix Extension) | Available | Designed for ML matrix ops, not byte streams |
-| Streaming SVE | Available | Mode transitions zero registers; too costly |
-| SVE2 MATCH | Unknown | May not be in M4's streaming subset |
+| Streaming SVE          | Available | Mode transitions zero registers; too costly  |
+| SVE2 MATCH             | Unknown   | May not be in M4's streaming subset          |
 
 #### Performance Characteristics
 
@@ -594,13 +594,13 @@ From [simdjson M1 benchmarks](https://github.com/simdjson/simdjson/discussions/1
 
 ### Implementation Priority for ARM
 
-| Priority | Optimization | Expected Gain | Effort |
-|----------|-------------|---------------|--------|
-| 1 | Nibble lookup tables | 20-40% classify | Medium |
-| 2 | Batch movemask | 5-10% per chunk | Low |
-| 3 | Optimized movemask | 10-20% per chunk | Low |
-| 4 | SIMD popcount bulk | 5-10% rank ops | Low |
-| 5 | vtstq_u8 bit test | 2-5% | Very Low |
+| Priority | Optimization         | Expected Gain    | Effort   |
+|----------|----------------------|------------------|----------|
+| 1        | Nibble lookup tables | 20-40% classify  | Medium   |
+| 2        | Batch movemask       | 5-10% per chunk  | Low      |
+| 3        | Optimized movemask   | 10-20% per chunk | Low      |
+| 4        | SIMD popcount bulk   | 5-10% rank ops   | Low      |
+| 5        | vtstq_u8 bit test    | 2-5%             | Very Low |
 
 **Recommended order:** Start with nibble lookup (biggest win), then batch movemask (easy), then optimized movemask.
 

@@ -217,25 +217,25 @@ undefined :: HasCallStack => a
 
 ### GHC Extensions Used
 
-| Extension | Purpose |
-|-----------|---------|
-| `NoImplicitPrelude` | Prevents automatic Prelude import, enabling custom prelude |
-| `BlockArguments` | Allows blocks as function arguments without `$` |
-| `DataKinds` | Type-level programming with promoted data types |
-| `DeriveGeneric` | Automatic Generic instance derivation |
-| `DuplicateRecordFields` | Allow same field name in different records |
-| `FlexibleContexts` | More permissive type class constraints |
-| `FlexibleInstances` | More permissive instance declarations |
-| `LambdaCase` | `\case` syntax for pattern matching lambdas |
-| `MultiWayIf` | Guard-like syntax in if expressions |
-| `NoFieldSelectors` | Disable auto-generated field accessor functions |
-| `OverloadedRecordDot` | Use dot syntax for record field access |
-| `OverloadedStrings` | String literals can be any `IsString` type |
-| `RankNTypes` | Higher-rank polymorphism |
-| `ScopedTypeVariables` | Type variables scope across function body |
-| `TypeApplications` | Explicit type application with `@` |
-| `TypeOperators` | Allow operators in type signatures |
-| `TypeSynonymInstances` | Allow type synonyms in instance heads |
+| Extension               | Purpose                                                    |
+|-------------------------|------------------------------------------------------------|
+| `NoImplicitPrelude`     | Prevents automatic Prelude import, enabling custom prelude |
+| `BlockArguments`        | Allows blocks as function arguments without `$`            |
+| `DataKinds`             | Type-level programming with promoted data types            |
+| `DeriveGeneric`         | Automatic Generic instance derivation                      |
+| `DuplicateRecordFields` | Allow same field name in different records                 |
+| `FlexibleContexts`      | More permissive type class constraints                     |
+| `FlexibleInstances`     | More permissive instance declarations                      |
+| `LambdaCase`            | `\case` syntax for pattern matching lambdas                |
+| `MultiWayIf`            | Guard-like syntax in if expressions                        |
+| `NoFieldSelectors`      | Disable auto-generated field accessor functions            |
+| `OverloadedRecordDot`   | Use dot syntax for record field access                     |
+| `OverloadedStrings`     | String literals can be any `IsString` type                 |
+| `RankNTypes`            | Higher-rank polymorphism                                   |
+| `ScopedTypeVariables`   | Type variables scope across function body                  |
+| `TypeApplications`      | Explicit type application with `@`                         |
+| `TypeOperators`         | Allow operators in type signatures                         |
+| `TypeSynonymInstances`  | Allow type synonyms in instance heads                      |
 
 ### Key Type System Features
 

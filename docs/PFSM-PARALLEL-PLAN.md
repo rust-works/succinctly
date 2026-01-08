@@ -145,12 +145,12 @@ ib_writer.write_bits(ib_bits, 32);  // IB is always 1 bit per byte
 
 **Theoretical analysis** (32-byte chunk):
 
-| Operation | Scalar (current) | Parallel (proposed) |
-|-----------|------------------|---------------------|
-| Table lookups | 32 × 2 = 64 loads | 4 × 8 = 32 gathers |
-| State chain | 32 sequential deps | 5 shuffle levels |
-| BP writes | 32 conditional writes | 1 PEXT + 1 write |
-| Total | ~100 cycles? | ~40 cycles? |
+| Operation     | Scalar (current)      | Parallel (proposed) |
+|---------------|-----------------------|---------------------|
+| Table lookups | 32 × 2 = 64 loads     | 4 × 8 = 32 gathers  |
+| State chain   | 32 sequential deps    | 5 shuffle levels    |
+| BP writes     | 32 conditional writes | 1 PEXT + 1 write    |
+| Total         | ~100 cycles?          | ~40 cycles?         |
 
 **Potential speedup**: 2-3x over scalar (if memory-bound, less improvement)
 

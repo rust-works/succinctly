@@ -6,20 +6,20 @@ Your CPU has several important instruction sets between AVX2 (2013) and AVX-512 
 
 ### Available Instruction Sets
 
-| Instruction Set | Year | Your CPU | Availability | Potential Use |
-|-----------------|------|----------|--------------|---------------|
-| **BMI1** (Bit Manipulation 1) | 2013 | ✓ bmi1 | ~95% | TZCNT, BLSI, BLSMSK |
-| **BMI2** (Bit Manipulation 2) | 2013 | ✓ bmi2 | ~95% | PDEP, PEXT, BZHI |
-| **FMA** (Fused Multiply-Add) | 2013 | ✓ fma | ~95% | Math operations |
-| **F16C** (Half-precision float) | 2012 | ✓ f16c | ~95% | FP16 conversion |
-| **LZCNT** (Leading Zero Count) | 2013 | ✓ (via bmi1) | ~95% | Bit operations |
-| **POPCNT** (Population Count) | 2008 | ✓ popcnt | ~100% | Already using |
-| **AES-NI** (AES instructions) | 2010 | ✓ aes | ~98% | Encryption |
-| **PCLMULQDQ** | 2010 | ✓ pclmulqdq | ~98% | CRC, hashing |
-| **SHA** (SHA extensions) | 2017 | ✓ sha_ni | ~70% | SHA hashing |
-| **VAES** (Vector AES) | 2018 | ✓ vaes | ~20% | Wide AES |
-| **VPCLMULQDQ** (Vector PCLMUL) | 2018 | ✓ vpclmulqdq | ~20% | Wide CRC |
-| **GFNI** (Galois Field) | 2018 | ✓ gfni | ~20% | Crypto, encoding |
+| Instruction Set                 | Year | Your CPU     | Availability | Potential Use       |
+|---------------------------------|------|--------------|--------------|---------------------|
+| **BMI1** (Bit Manipulation 1)   | 2013 | ✓ bmi1       | ~95%         | TZCNT, BLSI, BLSMSK |
+| **BMI2** (Bit Manipulation 2)   | 2013 | ✓ bmi2       | ~95%         | PDEP, PEXT, BZHI    |
+| **FMA** (Fused Multiply-Add)    | 2013 | ✓ fma        | ~95%         | Math operations     |
+| **F16C** (Half-precision float) | 2012 | ✓ f16c       | ~95%         | FP16 conversion     |
+| **LZCNT** (Leading Zero Count)  | 2013 | ✓ (via bmi1) | ~95%         | Bit operations      |
+| **POPCNT** (Population Count)   | 2008 | ✓ popcnt     | ~100%        | Already using       |
+| **AES-NI** (AES instructions)   | 2010 | ✓ aes        | ~98%         | Encryption          |
+| **PCLMULQDQ**                   | 2010 | ✓ pclmulqdq  | ~98%         | CRC, hashing        |
+| **SHA** (SHA extensions)        | 2017 | ✓ sha_ni     | ~70%         | SHA hashing         |
+| **VAES** (Vector AES)           | 2018 | ✓ vaes       | ~20%         | Wide AES            |
+| **VPCLMULQDQ** (Vector PCLMUL)  | 2018 | ✓ vpclmulqdq | ~20%         | Wide CRC            |
+| **GFNI** (Galois Field)         | 2018 | ✓ gfni       | ~20%         | Crypto, encoding    |
 
 ## High-Value Opportunities for This Codebase
 

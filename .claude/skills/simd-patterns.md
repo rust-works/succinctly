@@ -29,12 +29,12 @@ fn process(data: &[u8]) {
 
 ## SIMD Instruction Set Hierarchy
 
-| Level   | Width  | Bytes/Iter | Availability | Notes                           |
-|---------|--------|------------|--------------|----------------------------------|
-| SSE2    | 128bit | 16         | 100%         | Universal baseline on x86_64     |
-| SSE4.2  | 128bit | 16         | ~90%         | PCMPISTRI string instructions    |
-| AVX2    | 256bit | 32         | ~95%         | 2x width, best price/performance |
-| BMI2    | N/A    | N/A        | ~95%         | PDEP/PEXT, but AMD Zen 1/2 slow  |
+| Level  | Width  | Bytes/Iter | Availability | Notes                            |
+|--------|--------|------------|--------------|----------------------------------|
+| SSE2   | 128bit | 16         | 100%         | Universal baseline on x86_64     |
+| SSE4.2 | 128bit | 16         | ~90%         | PCMPISTRI string instructions    |
+| AVX2   | 256bit | 32         | ~95%         | 2x width, best price/performance |
+| BMI2   | N/A    | N/A        | ~95%         | PDEP/PEXT, but AMD Zen 1/2 slow  |
 
 ### BMI2 Considerations
 

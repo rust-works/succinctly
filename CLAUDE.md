@@ -197,15 +197,15 @@ cargo bench --bench balanced_parens
 ```
 
 ### Benchmark Patterns
-| Pattern | Description |
-|---------|-------------|
-| comprehensive | Mixed content (realistic) |
-| users | User records (nested objects) |
-| nested | Deep nesting (tests BP) |
-| arrays | Large arrays (tests iteration) |
-| strings | String-heavy (tests escapes) |
-| unicode | Unicode strings |
-| pathological | Worst-case |
+| Pattern       | Description                    |
+|---------------|--------------------------------|
+| comprehensive | Mixed content (realistic)      |
+| users         | User records (nested objects)  |
+| nested        | Deep nesting (tests BP)        |
+| arrays        | Large arrays (tests iteration) |
+| strings       | String-heavy (tests escapes)   |
+| unicode       | Unicode strings                |
+| pathological  | Worst-case                     |
 
 ## CI/CD
 
@@ -249,12 +249,12 @@ Two AVX-512 optimizations implemented with dramatically different results:
 
 ### Performance Comparison Table
 
-| Workload | AVX-512 Result | Status | Reason |
-|----------|---------------|--------|---------|
-| Popcount | **5.2x faster** ✓ | **KEPT** | Compute-bound, parallel, no dependencies |
-| JSON parsing | **7-17% slower** ✗ | **REMOVED** | Memory-bound, sequential state machine |
-| Rank queries | **Minimal impact** | N/A | Popcount only 1.6% of total time |
-| BitVec construction | **~1% faster** | N/A | Dominated by memory allocation + indexing |
+| Workload            | AVX-512 Result     | Status      | Reason                                    |
+|---------------------|--------------------|-------------|-------------------------------------------|
+| Popcount            | **5.2x faster** ✓  | **KEPT**    | Compute-bound, parallel, no dependencies  |
+| JSON parsing        | **7-17% slower** ✗ | **REMOVED** | Memory-bound, sequential state machine    |
+| Rank queries        | **Minimal impact** | N/A         | Popcount only 1.6% of total time          |
+| BitVec construction | **~1% faster**     | N/A         | Dominated by memory allocation + indexing |
 
 ### Architectural Insights
 
@@ -353,20 +353,20 @@ Table-driven state machine approach ported from haskellworks hw-json-simd librar
 
 **Performance Results** (Comprehensive Pattern, 1MB):
 
-| Implementation | Throughput | vs PFSM |
-|----------------|------------|---------|
-| **PFSM BMI2+AVX2** | **679 MiB/s** | baseline |
-| Standard AVX2 | 546 MiB/s | -20% slower |
-| Standard Scalar | 494 MiB/s | -27% slower |
+| Implementation     | Throughput    | vs PFSM     |
+|--------------------|---------------|-------------|
+| **PFSM BMI2+AVX2** | **679 MiB/s** | baseline    |
+| Standard AVX2      | 546 MiB/s     | -20% slower |
+| Standard Scalar    | 494 MiB/s     | -27% slower |
 
 **Cross-Pattern Performance** (10KB files):
 
-| Pattern | PFSM | Standard Scalar | Standard AVX2 | Speedup vs Scalar | Speedup vs AVX2 |
-|---------|------|-----------------|---------------|-------------------|-----------------|
-| comprehensive | 696 MiB/s | 437 MiB/s | 666 MiB/s | **+59%** | **+5%** |
-| users | 681 MiB/s | 454 MiB/s | 704 MiB/s | **+50%** | -3% |
-| nested | 824 MiB/s | 573 MiB/s | 913 MiB/s | **+44%** | -10% |
-| arrays | 667 MiB/s | 458 MiB/s | 649 MiB/s | **+46%** | **+3%** |
+| Pattern       | PFSM      | Standard Scalar | Standard AVX2 | Speedup vs Scalar | Speedup vs AVX2 |
+|---------------|-----------|-----------------|---------------|-------------------|-----------------|
+| comprehensive | 696 MiB/s | 437 MiB/s       | 666 MiB/s     | **+59%**          | **+5%**         |
+| users         | 681 MiB/s | 454 MiB/s       | 704 MiB/s     | **+50%**          | -3%             |
+| nested        | 824 MiB/s | 573 MiB/s       | 913 MiB/s     | **+44%**          | -10%            |
+| arrays        | 667 MiB/s | 458 MiB/s       | 649 MiB/s     | **+46%**          | **+3%**         |
 
 **Why PFSM Wins**:
 - Table lookups are cache-friendly (256 entries = 1-2KB per table)

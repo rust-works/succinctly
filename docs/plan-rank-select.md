@@ -4,14 +4,14 @@
 
 Based on the research, **Poppy** (with CS-Poppy's sampled select) offers the best balance:
 
-| Criterion                | Poppy + Sampled Select | SPIDER          | Rank9           |
-|--------------------------|------------------------|-----------------|-----------------|
-| Space overhead           | ~3.5%                  | ~3.8%           | 25%             |
-| Rank performance         | Excellent              | Best for ≥8Gb   | Excellent       |
-| Select performance       | Very good              | Best            | Moderate        |
-| Implementation complexity| Medium                 | High            | Low             |
-| Cross-platform           | Yes                    | Yes             | Yes             |
-| No PDEP/PEXT required    | Yes                    | Yes             | Yes             |
+| Criterion                 | Poppy + Sampled Select | SPIDER        | Rank9     |
+|---------------------------|------------------------|---------------|-----------|
+| Space overhead            | ~3.5%                  | ~3.8%         | 25%       |
+| Rank performance          | Excellent              | Best for ≥8Gb | Excellent |
+| Select performance        | Very good              | Best          | Moderate  |
+| Implementation complexity | Medium                 | High          | Low       |
+| Cross-platform            | Yes                    | Yes           | Yes       |
+| No PDEP/PEXT required     | Yes                    | Yes           | Yes       |
 
 **Rationale**: Poppy is well-documented, proven in production (sdsl-lite), and provides excellent performance without PDEP/PEXT. SPIDER is newer and faster for very large datasets, but more complex. We can add SPIDER optimizations later.
 
@@ -1101,13 +1101,13 @@ jobs:
 
 ### Test Summary
 
-| Category           | Count | Purpose                                    |
-|--------------------|-------|-------------------------------------------|
-| Unit tests         | ~40   | Individual function correctness           |
-| Property tests     | ~10   | Invariants hold for random inputs         |
-| Reference tests    | ~5    | Match simple O(n) implementation          |
-| Edge case tests    | ~15   | Boundary conditions, extremes             |
-| Benchmark tests    | ~12   | Performance across sizes/densities        |
+| Category        | Count | Purpose                            |
+|-----------------|-------|------------------------------------|
+| Unit tests      | ~40   | Individual function correctness    |
+| Property tests  | ~10   | Invariants hold for random inputs  |
+| Reference tests | ~5    | Match simple O(n) implementation   |
+| Edge case tests | ~15   | Boundary conditions, extremes      |
+| Benchmark tests | ~12   | Performance across sizes/densities |
 
 **Total: ~80+ tests**
 
@@ -1117,12 +1117,12 @@ Testing with 1-billion-bit vectors requires special consideration for memory, ti
 
 #### Challenges
 
-| Challenge              | Impact                                      | Mitigation                              |
-|------------------------|---------------------------------------------|-----------------------------------------|
-| Memory (125MB+ data)   | CI runners may OOM; local dev machines vary | Feature-gate, separate test binary      |
-| Construction time      | Building index takes seconds                | Run as benchmark, not unit test         |
-| Reference comparison   | O(n) reference is too slow                  | Spot-check with sampling                |
-| CI timeout             | Full test suite too slow                    | Separate workflow, nightly runs         |
+| Challenge            | Impact                                      | Mitigation                         |
+|----------------------|---------------------------------------------|------------------------------------|
+| Memory (125MB+ data) | CI runners may OOM; local dev machines vary | Feature-gate, separate test binary |
+| Construction time    | Building index takes seconds                | Run as benchmark, not unit test    |
+| Reference comparison | O(n) reference is too slow                  | Spot-check with sampling           |
+| CI timeout           | Full test suite too slow                    | Separate workflow, nightly runs    |
 
 #### Test Categories for Large Vectors
 
@@ -1446,14 +1446,14 @@ fn test_1g_rank_latency() {
 
 #### Test Matrix Summary
 
-| Test Category      | Size     | RAM Required | Run Time | CI Frequency |
-|--------------------|----------|--------------|----------|--------------|
-| Unit tests         | < 1K     | < 1 MB       | < 1s     | Every PR     |
-| Property tests     | < 100K   | < 10 MB      | < 10s    | Every PR     |
-| Benchmark (smoke)  | < 100M   | < 50 MB      | < 30s    | Every PR     |
-| Large tests        | 1G       | ~200 MB      | ~2 min   | Nightly      |
-| Huge tests         | 5G       | ~700 MB      | ~5 min   | Nightly/main |
-| Mmap tests         | 10G+     | < 100 MB     | ~10 min  | Weekly       |
+| Test Category     | Size   | RAM Required | Run Time | CI Frequency |
+|-------------------|--------|--------------|----------|--------------|
+| Unit tests        | < 1K   | < 1 MB       | < 1s     | Every PR     |
+| Property tests    | < 100K | < 10 MB      | < 10s    | Every PR     |
+| Benchmark (smoke) | < 100M | < 50 MB      | < 30s    | Every PR     |
+| Large tests       | 1G     | ~200 MB      | ~2 min   | Nightly      |
+| Huge tests        | 5G     | ~700 MB      | ~5 min   | Nightly/main |
+| Mmap tests        | 10G+   | < 100 MB     | ~10 min  | Weekly       |
 
 ## File Structure
 
@@ -1507,12 +1507,12 @@ harness = false
 
 ## Performance Targets
 
-| Operation | Size    | Target Latency | Notes                        |
-|-----------|---------|----------------|------------------------------|
-| rank1     | 10^6    | < 20 ns        | Single cache line access     |
-| rank1     | 10^8    | < 30 ns        | L1+L2 lookup + partial word  |
-| select1   | 10^6    | < 50 ns        | Sample jump + short scan     |
-| select1   | 10^8    | < 100 ns       | Sample jump + block scan     |
+| Operation | Size | Target Latency | Notes                       |
+|-----------|------|----------------|-----------------------------|
+| rank1     | 10^6 | < 20 ns        | Single cache line access    |
+| rank1     | 10^8 | < 30 ns        | L1+L2 lookup + partial word |
+| select1   | 10^6 | < 50 ns        | Sample jump + short scan    |
+| select1   | 10^8 | < 100 ns       | Sample jump + block scan    |
 
 ## Testing Strategy
 

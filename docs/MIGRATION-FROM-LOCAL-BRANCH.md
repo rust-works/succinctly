@@ -95,15 +95,15 @@ The local `generate-corpus` feature conflicts with origin's `generate-suite`. Bo
 
 #### Comparison: `generate-corpus` vs `generate-suite`
 
-| Feature | Local `generate-corpus` | Origin `generate-suite` |
-|---------|------------------------|-------------------------|
-| Output dir | `corpus/` (flat) | `data/bench/generated/{pattern}/` (hierarchical) |
-| Sizes | 1KB, 16KB, 128KB, 1MB, 16MB | 1KB, 10KB, 100KB, 1MB, 10MB, 100MB, 1GB |
-| Structure | `{pattern}_{size}.json` | `{pattern}/{size}.json` |
-| Max size | No limit | Configurable (`--max-size`) |
-| Clean option | No | Yes (`--clean`) |
-| Patterns | 10 patterns | 10 patterns (same) |
-| Purpose | Benchmarking corpus | Comprehensive suite |
+| Feature      | Local `generate-corpus`     | Origin `generate-suite`                          |
+|--------------|-----------------------------|--------------------------------------------------|
+| Output dir   | `corpus/` (flat)            | `data/bench/generated/{pattern}/` (hierarchical) |
+| Sizes        | 1KB, 16KB, 128KB, 1MB, 16MB | 1KB, 10KB, 100KB, 1MB, 10MB, 100MB, 1GB          |
+| Structure    | `{pattern}_{size}.json`     | `{pattern}/{size}.json`                          |
+| Max size     | No limit                    | Configurable (`--max-size`)                      |
+| Clean option | No                          | Yes (`--clean`)                                  |
+| Patterns     | 10 patterns                 | 10 patterns (same)                               |
+| Purpose      | Benchmarking corpus         | Comprehensive suite                              |
 
 **Origin's `generate-suite` is more feature-complete**:
 - ✅ Hierarchical organization (better for large suites)
@@ -252,21 +252,21 @@ echo "Total size: $(du -sh "$CORPUS_DIR" | cut -f1)"
 
 ### Files to Restore
 
-| File | Status | Action | Priority |
-|------|--------|--------|----------|
-| `docs/optimization-opportunities.md` | ✅ New | Copy directly | HIGH |
-| `docs/runtime-dispatch-implications.md` | ✅ New | Copy directly | HIGH |
-| `.gitignore` (corpus/) | ⚠️ Modified | Merge changes | LOW |
-| `libtest_no_std.rlib` | ❌ Binary | Gitignore instead | N/A |
+| File                                    | Status      | Action            | Priority |
+|-----------------------------------------|-------------|-------------------|----------|
+| `docs/optimization-opportunities.md`    | ✅ New       | Copy directly     | HIGH     |
+| `docs/runtime-dispatch-implications.md` | ✅ New       | Copy directly     | HIGH     |
+| `.gitignore` (corpus/)                  | ⚠️ Modified | Merge changes     | LOW      |
+| `libtest_no_std.rlib`                   | ❌ Binary    | Gitignore instead | N/A      |
 
 ### Files to Adapt (Optional)
 
-| File | Local Change | Origin Equivalent | Recommendation |
-|------|--------------|-------------------|----------------|
-| `benches/json_simd.rs` | `bench_corpus()` | `bench_json_files()` | Use origin's version |
-| `src/bin/succinctly/main.rs` | `generate-corpus` | `generate-suite` | Use origin's version |
-| `src/bin/succinctly/generators.rs` | Minor tweaks | Enhanced version | Use origin's version |
-| `tests/cli_golden_tests.rs` | Corpus test | Suite tests | Use origin's version |
+| File                               | Local Change      | Origin Equivalent    | Recommendation       |
+|------------------------------------|-------------------|----------------------|----------------------|
+| `benches/json_simd.rs`             | `bench_corpus()`  | `bench_json_files()` | Use origin's version |
+| `src/bin/succinctly/main.rs`       | `generate-corpus` | `generate-suite`     | Use origin's version |
+| `src/bin/succinctly/generators.rs` | Minor tweaks      | Enhanced version     | Use origin's version |
+| `tests/cli_golden_tests.rs`        | Corpus test       | Suite tests          | Use origin's version |
 
 ### Files Not Needed
 

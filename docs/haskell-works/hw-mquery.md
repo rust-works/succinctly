@@ -77,22 +77,22 @@ newtype MQuery a = MQuery (DL.DList a)
 
 **Core Query Combinators:**
 
-| Function | Signature | Purpose |
-|----------|-----------|---------|
-| `satisfying` | `(a -> Bool) -> a -> MQuery a` | Filter by predicate |
-| `having` | `(a -> MQuery b) -> a -> MQuery a` | Filter by existence of sub-query results |
-| `select` | `a -> (a -> b) -> MQuery a` | Filter by ToBool result |
-| `valueOf` | `Eq a => a -> a -> MQuery a` | Exact value match |
-| `key` | `Entry k v -> MQuery k` | Extract entry key |
-| `value` | `Entry k v -> MQuery v` | Extract entry value |
-| `limit` | `Int -> MQuery a -> MQuery a` | Take first n results |
-| `skip` | `Int -> MQuery a -> MQuery a` | Drop first n results |
-| `page` | `Int -> Int -> MQuery a -> MQuery a` | Pagination (size, page number) |
-| `sorted` | `Ord a => MQuery a -> MQuery a` | Sort results |
-| `onList` | `([a] -> [a]) -> MQuery a -> MQuery a` | Apply list transformation |
-| `count` | `MQuery a -> MQuery Int` | Count results |
-| `aggregate` | `([a] -> b) -> MQuery a -> MQuery b` | Aggregate results |
-| `uniq` | `Eq a => [a] -> [a]` | Remove consecutive duplicates |
+| Function     | Signature                              | Purpose                                  |
+|--------------|----------------------------------------|------------------------------------------|
+| `satisfying` | `(a -> Bool) -> a -> MQuery a`         | Filter by predicate                      |
+| `having`     | `(a -> MQuery b) -> a -> MQuery a`     | Filter by existence of sub-query results |
+| `select`     | `a -> (a -> b) -> MQuery a`            | Filter by ToBool result                  |
+| `valueOf`    | `Eq a => a -> a -> MQuery a`           | Exact value match                        |
+| `key`        | `Entry k v -> MQuery k`                | Extract entry key                        |
+| `value`      | `Entry k v -> MQuery v`                | Extract entry value                      |
+| `limit`      | `Int -> MQuery a -> MQuery a`          | Take first n results                     |
+| `skip`       | `Int -> MQuery a -> MQuery a`          | Drop first n results                     |
+| `page`       | `Int -> Int -> MQuery a -> MQuery a`   | Pagination (size, page number)           |
+| `sorted`     | `Ord a => MQuery a -> MQuery a`        | Sort results                             |
+| `onList`     | `([a] -> [a]) -> MQuery a -> MQuery a` | Apply list transformation                |
+| `count`      | `MQuery a -> MQuery Int`               | Count results                            |
+| `aggregate`  | `([a] -> b) -> MQuery a -> MQuery b`   | Aggregate results                        |
+| `uniq`       | `Eq a => [a] -> [a]`                   | Remove consecutive duplicates            |
 
 **Lens Integration Operators:**
 
@@ -334,14 +334,14 @@ The core concepts translate well to Rust, though the implementation strategy dif
 
 ### Direct Translations
 
-| Haskell Concept | Rust Equivalent |
-|-----------------|-----------------|
+| Haskell Concept                          | Rust Equivalent                               |
+|------------------------------------------|-----------------------------------------------|
 | `newtype MQuery a = MQuery (DL.DList a)` | `struct MQuery<T>(Vec<T>)` or custom iterator |
-| `Functor` | `Iterator::map()` |
-| `Foldable` | `Iterator` trait |
-| `Monoid` | `Default + Extend` or custom trait |
-| `Pretty` | `Display` or `Debug` |
-| `ToBool` | Custom trait or `Into<bool>` |
+| `Functor`                                | `Iterator::map()`                             |
+| `Foldable`                               | `Iterator` trait                              |
+| `Monoid`                                 | `Default + Extend` or custom trait            |
+| `Pretty`                                 | `Display` or `Debug`                          |
+| `ToBool`                                 | Custom trait or `Into<bool>`                  |
 
 ### Rust Implementation Strategies
 
@@ -547,12 +547,12 @@ impl<T: Display> Display for MQuery<T> { ... }
 
 ### Dependencies for Rust Port
 
-| Purpose | Recommended Crate |
-|---------|-------------------|
-| Terminal colors | `colored`, `owo-colors`, or `termcolor` |
-| Pretty printing | `pretty` or custom |
-| JSON integration | `serde_json` |
-| Property testing | `proptest` or `quickcheck` |
+| Purpose          | Recommended Crate                       |
+|------------------|-----------------------------------------|
+| Terminal colors  | `colored`, `owo-colors`, or `termcolor` |
+| Pretty printing  | `pretty` or custom                      |
+| JSON integration | `serde_json`                            |
+| Property testing | `proptest` or `quickcheck`              |
 
 ---
 

@@ -12,12 +12,12 @@ This document records optimization attempts that failed, providing valuable less
 
 **Results**: **7-17% slower** than AVX2
 
-| Size | AVX-512 | AVX2 | Result |
-|------|---------|------|--------|
-| 1KB | 689 MiB/s | 806 MiB/s | **-17% slower** |
-| 10KB | 675 MiB/s | 731 MiB/s | **-8% slower** |
-| 100KB | 678 MiB/s | 725 MiB/s | **-7% slower** |
-| 1MB | 672 MiB/s | 732 MiB/s | **-9% slower** |
+| Size  | AVX-512   | AVX2      | Result          |
+|-------|-----------|-----------|-----------------|
+| 1KB   | 689 MiB/s | 806 MiB/s | **-17% slower** |
+| 10KB  | 675 MiB/s | 731 MiB/s | **-8% slower**  |
+| 100KB | 678 MiB/s | 725 MiB/s | **-7% slower**  |
+| 1MB   | 672 MiB/s | 732 MiB/s | **-9% slower**  |
 
 **Why it failed**:
 1. Memory-bound workload (waiting for data, not compute)
@@ -55,19 +55,19 @@ while mask != 0 {
 
 ### Dense JSON (many structural characters)
 
-| Size | AVX2 Baseline | AVX2+BMI1 | Result |
-|------|---------------|-----------|--------|
-| 1KB  | 609 MiB/s | 457 MiB/s | **-25% slower** |
-| 10KB | 647 MiB/s | 450 MiB/s | **-30% slower** |
-| 100KB | 658 MiB/s | 458 MiB/s | **-30% slower** |
-| 1MB  | 659 MiB/s | 454 MiB/s | **-31% slower** |
+| Size  | AVX2 Baseline | AVX2+BMI1 | Result          |
+|-------|---------------|-----------|-----------------|
+| 1KB   | 609 MiB/s     | 457 MiB/s | **-25% slower** |
+| 10KB  | 647 MiB/s     | 450 MiB/s | **-30% slower** |
+| 100KB | 658 MiB/s     | 458 MiB/s | **-30% slower** |
+| 1MB   | 659 MiB/s     | 454 MiB/s | **-31% slower** |
 
 ### Sparse JSON (few structural characters - "best case")
 
-| Size | AVX2 Baseline | AVX2+BMI1 | Result |
-|------|---------------|-----------|--------|
-| 1KB  | 796 MiB/s | 727 MiB/s | **-9% slower** |
-| 10KB | 790 MiB/s | 700 MiB/s | **-11% slower** |
+| Size | AVX2 Baseline | AVX2+BMI1 | Result          |
+|------|---------------|-----------|-----------------|
+| 1KB  | 796 MiB/s     | 727 MiB/s | **-9% slower**  |
+| 10KB | 790 MiB/s     | 700 MiB/s | **-11% slower** |
 
 **Why it failed**:
 
@@ -108,10 +108,10 @@ self.current_word |= _pdep_u64(bits, shifted_mask);
 
 **Results**: **3.4x SLOWER** than scalar
 
-| Implementation | Throughput | Result |
-|----------------|------------|--------|
-| Scalar | 1.27 GiB/s | baseline |
-| BMI2 PDEP | 381 MiB/s | **-71% slower (3.4x)** |
+| Implementation | Throughput | Result                 |
+|----------------|------------|------------------------|
+| Scalar         | 1.27 GiB/s | baseline               |
+| BMI2 PDEP      | 381 MiB/s  | **-71% slower (3.4x)** |
 
 **Why it failed**:
 
@@ -149,11 +149,11 @@ All three failed optimizations shared these characteristics:
 
 Successful optimizations that we DID keep:
 
-| Optimization | Result | Why It Worked |
-|--------------|--------|---------------|
-| **AVX2 SIMD** | 1.8x vs SSE2 | Targets actual bottleneck (classification) |
-| **AVX512-VPOPCNTDQ** | 5.2x vs scalar | Compute-bound, parallel, no dependencies |
-| **Runtime dispatch** | Auto-selects best | Transparent, no overhead |
+| Optimization         | Result            | Why It Worked                              |
+|----------------------|-------------------|--------------------------------------------|
+| **AVX2 SIMD**        | 1.8x vs SSE2      | Targets actual bottleneck (classification) |
+| **AVX512-VPOPCNTDQ** | 5.2x vs scalar    | Compute-bound, parallel, no dependencies   |
+| **Runtime dispatch** | Auto-selects best | Transparent, no overhead                   |
 
 ### Lessons Learned
 

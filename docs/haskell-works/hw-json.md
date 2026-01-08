@@ -13,11 +13,11 @@ hw-json is a memory-efficient JSON parsing library that uses **succinct data str
 
 The library demonstrates dramatic memory improvements over traditional parsers:
 
-| Parser | File Size | Memory Usage |
-|--------|-----------|--------------|
-| Scala/Argonaut | 78 MB JSON | ~2 GB |
-| Haskell/Aeson | 78 MB JSON | ~928 MB |
-| Haskell/hw-json | 78 MB JSON | ~495 MB |
+| Parser          | File Size  | Memory Usage |
+|-----------------|------------|--------------|
+| Scala/Argonaut  | 78 MB JSON | ~2 GB        |
+| Haskell/Aeson   | 78 MB JSON | ~928 MB      |
+| Haskell/hw-json | 78 MB JSON | ~495 MB      |
 
 The fundamental insight is that hw-json avoids building a traditional AST. Instead, it maintains:
 1. The original JSON bytes (memory-mapped)
@@ -285,18 +285,18 @@ Files are memory-mapped, avoiding copies:
 
 hw-json depends on several related libraries:
 
-| Library | Purpose |
-|---------|---------|
-| `hw-prim` | Primitive operations (Drop, Position, etc.) |
-| `hw-bits` | Bit manipulation utilities |
-| `hw-rankselect` | Rank/Select implementations (CsPoppy) |
-| `hw-rankselect-base` | Rank/Select type classes |
-| `hw-balancedparens` | Balanced parentheses data structures |
-| `hw-json-simple-cursor` | Simple backend cursor |
-| `hw-json-standard-cursor` | Standard backend cursor |
-| `hw-json-simd` | SIMD-accelerated operations (x86_64) |
-| `hw-mquery` | Query DSL |
-| `hw-parser` | Parser combinators |
+| Library                   | Purpose                                     |
+|---------------------------|---------------------------------------------|
+| `hw-prim`                 | Primitive operations (Drop, Position, etc.) |
+| `hw-bits`                 | Bit manipulation utilities                  |
+| `hw-rankselect`           | Rank/Select implementations (CsPoppy)       |
+| `hw-rankselect-base`      | Rank/Select type classes                    |
+| `hw-balancedparens`       | Balanced parentheses data structures        |
+| `hw-json-simple-cursor`   | Simple backend cursor                       |
+| `hw-json-standard-cursor` | Standard backend cursor                     |
+| `hw-json-simd`            | SIMD-accelerated operations (x86_64)        |
+| `hw-mquery`               | Query DSL                                   |
+| `hw-parser`               | Parser combinators                          |
 
 ---
 

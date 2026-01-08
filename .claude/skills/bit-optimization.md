@@ -136,10 +136,10 @@ fn select_with_hint(ib_rank: &[u32], k: usize, hint: usize) -> Option<usize> {
 
 ### Results
 
-| Access Pattern | Binary Search | Exponential Search | Speedup |
-|----------------|---------------|-------------------|---------|
-| Sequential | 335 µs | 102 µs | **3.3x** |
-| Random | 780 µs | 1.07 ms | **0.7x** (regression) |
+| Access Pattern | Binary Search | Exponential Search | Speedup               |
+|----------------|---------------|--------------------|-----------------------|
+| Sequential     | 335 µs        | 102 µs             | **3.3x**              |
+| Random         | 780 µs        | 1.07 ms            | **0.7x** (regression) |
 
 ### Trade-off: Random Access Regression
 
@@ -188,11 +188,11 @@ Each level has precomputed statistics enabling O(1) skip decision.
 
 ### What Happened
 
-| Implementation | Throughput | Role |
-|----------------|------------|------|
-| `pfsm_optimized.rs` | 516-578 MiB/s | **Production** (deployed) |
-| `pfsm_simd.rs` (batched) | 398-461 MiB/s | New attempt |
-| `pfsm.rs` (basic) | 282-344 MiB/s | Reference implementation |
+| Implementation           | Throughput    | Role                      |
+|--------------------------|---------------|---------------------------|
+| `pfsm_optimized.rs`      | 516-578 MiB/s | **Production** (deployed) |
+| `pfsm_simd.rs` (batched) | 398-461 MiB/s | New attempt               |
+| `pfsm.rs` (basic)        | 282-344 MiB/s | Reference implementation  |
 
 The batched approach was benchmarked against `pfsm.rs` (basic reference), showing a 40% improvement. But `pfsm_optimized.rs` was already deployed and was 25% faster than the "optimization".
 

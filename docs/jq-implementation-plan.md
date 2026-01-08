@@ -597,18 +597,18 @@ struct EvalContext<'a, W> {
 
 ## Estimated Scope
 
-| Phase | Features | Complexity | Lines of Code (est.) |
-|-------|----------|------------|---------------------|
-| 1 | Core operators | Medium | ~500 |
-| 2 | Arithmetic/Comparison | Medium | ~400 |
-| 3 | Control flow | Medium | ~300 |
-| 4 | Core builtins | High | ~800 |
-| 5 | Array/Object ops | High | ~600 |
-| 6 | Strings | Medium | ~400 |
-| 7 | Regex | Medium | ~200 + dependency |
-| 8 | Advanced control | High | ~500 |
-| 9 | Variables/Functions | High | ~600 |
-| 10 | I/O & Special | Low | ~300 |
+| Phase | Features              | Complexity | Lines of Code (est.) |
+|-------|-----------------------|------------|----------------------|
+| 1     | Core operators        | Medium     | ~500                 |
+| 2     | Arithmetic/Comparison | Medium     | ~400                 |
+| 3     | Control flow          | Medium     | ~300                 |
+| 4     | Core builtins         | High       | ~800                 |
+| 5     | Array/Object ops      | High       | ~600                 |
+| 6     | Strings               | Medium     | ~400                 |
+| 7     | Regex                 | Medium     | ~200 + dependency    |
+| 8     | Advanced control      | High       | ~500                 |
+| 9     | Variables/Functions   | High       | ~600                 |
+| 10    | I/O & Special         | Low        | ~300                 |
 
 **Total**: ~4,600 lines of Rust code for full implementation.
 

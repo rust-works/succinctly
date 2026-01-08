@@ -274,14 +274,14 @@ Porting hw-simd to Rust is **highly feasible** and would likely result in cleane
 
 Direct mappings for the C intrinsics used:
 
-| C/Haskell Function | Rust Equivalent |
-|-------------------|-----------------|
-| `_mm256_set1_epi8(b)` | `_mm256_set1_epi8(b)` |
+| C/Haskell Function        | Rust Equivalent           |
+|---------------------------|---------------------------|
+| `_mm256_set1_epi8(b)`     | `_mm256_set1_epi8(b)`     |
 | `_mm256_cmpeq_epi8(a, b)` | `_mm256_cmpeq_epi8(a, b)` |
 | `_mm256_movemask_epi8(a)` | `_mm256_movemask_epi8(a)` |
-| `_mm256_and_si256(a, b)` | `_mm256_and_si256(a, b)` |
-| `_mm256_or_si256(a, b)` | `_mm256_or_si256(a, b)` |
-| `_mm256_xor_si256(a, b)` | `_mm256_xor_si256(a, b)` |
+| `_mm256_and_si256(a, b)`  | `_mm256_and_si256(a, b)`  |
+| `_mm256_or_si256(a, b)`   | `_mm256_or_si256(a, b)`   |
+| `_mm256_xor_si256(a, b)`  | `_mm256_xor_si256(a, b)`  |
 
 ### Rust Implementation Strategy
 

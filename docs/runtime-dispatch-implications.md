@@ -261,12 +261,12 @@ if is_x86_feature_detected!("avx2") {  // ~0.2ns (load from static)
 
 | Input Size | Processing Time | Dispatch Overhead | % Impact |
 |------------|-----------------|-------------------|----------|
-| 16 bytes | 5 ns | 0.2 ns | 4% |
-| 64 bytes | 20 ns | 0.2 ns | 1% |
-| 256 bytes | 80 ns | 0.2 ns | 0.25% |
-| 1 KB | 300 ns | 0.2 ns | 0.07% |
-| 16 KB | 5 μs | 0.2 ns | 0.004% |
-| 1 MB | 300 μs | 0.2 ns | 0.00007% |
+| 16 bytes   | 5 ns            | 0.2 ns            | 4%       |
+| 64 bytes   | 20 ns           | 0.2 ns            | 1%       |
+| 256 bytes  | 80 ns           | 0.2 ns            | 0.25%    |
+| 1 KB       | 300 ns          | 0.2 ns            | 0.07%    |
+| 16 KB      | 5 μs            | 0.2 ns            | 0.004%   |
+| 1 MB       | 300 μs          | 0.2 ns            | 0.00007% |
 
 **Conclusion**: Overhead matters only for extremely small inputs (< 32 bytes).
 
@@ -539,12 +539,12 @@ fn test_all_simd_levels_produce_same_results() {
 
 **Runtime dispatch does NOT prevent embedded use** - it's an additive optimization:
 
-| Scenario | With `std` | Without `std` |
-|----------|------------|---------------|
-| **Desktop/Server** | ✅ Runtime dispatch (optimal) | ❌ (std usually available) |
-| **Embedded Linux** | ✅ Runtime dispatch OR compile-time | ✅ Static dispatch (SSE2) |
-| **Embedded + alloc** | N/A (no std) | ✅ Static dispatch (SSE2) |
-| **Bare-metal MCU** | ❌ No alloc | ❌ No alloc |
+| Scenario             | With `std`                         | Without `std`             |
+|----------------------|------------------------------------|---------------------------|
+| **Desktop/Server**   | ✅ Runtime dispatch (optimal)       | ❌ (std usually available) |
+| **Embedded Linux**   | ✅ Runtime dispatch OR compile-time | ✅ Static dispatch (SSE2)  |
+| **Embedded + alloc** | N/A (no std)                       | ✅ Static dispatch (SSE2)  |
+| **Bare-metal MCU**   | ❌ No alloc                         | ❌ No alloc                |
 
 ### Key Takeaways
 

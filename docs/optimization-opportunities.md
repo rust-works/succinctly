@@ -301,10 +301,10 @@ SIMD multi-word prefix sum could batch excess computation across 4-8 words. Howe
 The NEON JSON parser is already implemented and working:
 
 | Benchmark (10MB comprehensive) | Throughput | Relative |
-|-------------------------------|------------|----------|
-| NEON (32-byte) | 560 MiB/s | 1.48x |
-| NEON (16-byte, old) | 505 MiB/s | 1.30x |
-| Scalar | 388 MiB/s | 1.00x |
+|--------------------------------|------------|----------|
+| NEON (32-byte)                 | 560 MiB/s  | 1.48x    |
+| NEON (16-byte, old)            | 505 MiB/s  | 1.30x    |
+| Scalar                         | 388 MiB/s  | 1.00x    |
 
 **Current speedup: 48% over scalar** - Improved from 30% after 32-byte optimization (Option C).
 
@@ -376,15 +376,15 @@ let value_chars = vmvnq_u8(vceqq_u8(value_classified, zero));
 
 **Benchmark Results:**
 
-| Pattern | Improvement | New Throughput |
-|---------|-------------|----------------|
-| comprehensive | +2% | 571 MiB/s |
-| nested | +6% | 3.70 GiB/s |
-| strings | +5% | 2.94 GiB/s |
-| literals | +3% | 305 MiB/s |
-| numbers | +2% | 351 MiB/s |
-| mixed | +1% | 394 MiB/s |
-| arrays | +1% | 316 MiB/s |
+| Pattern       | Improvement | New Throughput |
+|---------------|-------------|----------------|
+| comprehensive | +2%         | 571 MiB/s      |
+| nested        | +6%         | 3.70 GiB/s     |
+| strings       | +5%         | 2.94 GiB/s     |
+| literals      | +3%         | 305 MiB/s      |
+| numbers       | +2%         | 351 MiB/s      |
+| mixed         | +1%         | 394 MiB/s      |
+| arrays        | +1%         | 316 MiB/s      |
 
 **Analysis:**
 - Modest but consistent improvement (1-6%) across all patterns
@@ -409,18 +409,18 @@ let value_chars = vmvnq_u8(vceqq_u8(value_classified, zero));
 
 **Benchmark Results (10MB files):**
 
-| Pattern | Improvement | Throughput |
-|---------|-------------|------------|
-| nested | **-41.4%** time | 3.47 GiB/s |
-| strings | **-37.3%** time | 2.83 GiB/s |
-| unicode | **-14.5%** time | 1.70 GiB/s |
-| comprehensive | **-9.1%** time | 560 MiB/s |
-| mixed | **-7.5%** time | 389 MiB/s |
-| numbers | **-5.4%** time | 342 MiB/s |
-| users | **-5.0%** time | 681 MiB/s |
-| arrays | **-4.6%** time | 311 MiB/s |
-| literals | **-2.0%** time | 290 MiB/s |
-| pathological | no change | 412 MiB/s |
+| Pattern       | Improvement     | Throughput |
+|---------------|-----------------|------------|
+| nested        | **-41.4%** time | 3.47 GiB/s |
+| strings       | **-37.3%** time | 2.83 GiB/s |
+| unicode       | **-14.5%** time | 1.70 GiB/s |
+| comprehensive | **-9.1%** time  | 560 MiB/s  |
+| mixed         | **-7.5%** time  | 389 MiB/s  |
+| numbers       | **-5.4%** time  | 342 MiB/s  |
+| users         | **-5.0%** time  | 681 MiB/s  |
+| arrays        | **-4.6%** time  | 311 MiB/s  |
+| literals      | **-2.0%** time  | 290 MiB/s  |
+| pathological  | no change       | 412 MiB/s  |
 
 **Analysis:**
 - String-heavy patterns benefit most (up to 41% improvement for nested, 37% for strings)
@@ -495,12 +495,12 @@ Apple M1/M2/M3 processors have highly effective hardware prefetchers that automa
 
 With Options B and C implemented, NEON is now **52% faster than scalar** (571 MiB/s vs 376 MiB/s):
 
-| Option | Status | Result |
-|--------|--------|--------|
-| A (reduce movemask calls) | ❌ Rejected | No improvement - M1 OOO handles it |
-| B (value char detection) | ✅ Implemented | +2% overall, up to +6% on some patterns |
-| C (32-byte processing) | ✅ Implemented | +10% overall, up to +41% on strings |
-| D (prefetching) | ❌ Rejected | No improvement - HW prefetcher sufficient |
+| Option                    | Status        | Result                                    |
+|---------------------------|---------------|-------------------------------------------|
+| A (reduce movemask calls) | ❌ Rejected    | No improvement - M1 OOO handles it        |
+| B (value char detection)  | ✅ Implemented | +2% overall, up to +6% on some patterns   |
+| C (32-byte processing)    | ✅ Implemented | +10% overall, up to +41% on strings       |
+| D (prefetching)           | ❌ Rejected    | No improvement - HW prefetcher sufficient |
 
 **Final NEON performance (comprehensive 10MB):**
 - NEON: 571 MiB/s (1.52x over scalar)
@@ -603,12 +603,12 @@ impl JsonIndex {
 
 ### Benchmark Results
 
-| Benchmark | Time | Throughput |
-|-----------|------|------------|
-| Sequential (exponential) | 108 µs | 92.2 Melem/s |
-| Sequential (binary) | 340 µs | 29.4 Melem/s |
-| Random (exponential) | 1080 µs | 9.3 Melem/s |
-| Random (binary) | 779 µs | **12.8 Melem/s** |
+| Benchmark                | Time    | Throughput       |
+|--------------------------|---------|------------------|
+| Sequential (exponential) | 108 µs  | 92.2 Melem/s     |
+| Sequential (binary)      | 340 µs  | 29.4 Melem/s     |
+| Random (exponential)     | 1080 µs | 9.3 Melem/s      |
+| Random (binary)          | 779 µs  | **12.8 Melem/s** |
 
 - Sequential: Exponential search **3.1x faster**
 - Random: Binary search **39% faster** (recovers the regression)
@@ -682,32 +682,32 @@ cargo rustc --release -- --emit asm
 
 ### AMD Ryzen 9 7950X (Zen 4) - Available Features
 
-| Feature | Available | Notes |
-|---------|-----------|-------|
-| SSE2 | ✅ | Universal baseline (2001) |
-| SSE4.2 | ✅ | PCMPISTRI string search (2008) |
-| AVX2 | ✅ | 32-byte SIMD (2013) |
-| BMI2 | ✅ | **Fast** on Zen 3+ (3-cycle PDEP/PEXT) |
-| AVX-512F | ✅ | Foundation, 64-byte SIMD |
-| AVX-512BW | ✅ | Byte/word operations |
-| AVX-512DQ | ✅ | Doubleword/quadword ops |
-| AVX-512VL | ✅ | Vector length extensions |
-| AVX-512VPOPCNTDQ | ✅ | **8x parallel popcount** |
-| AVX-512VBMI | ✅ | Vector byte manipulation |
-| AVX-512VBMI2 | ✅ | Enhanced byte manipulation |
-| AVX-512BITALG | ✅ | Bit algorithms |
-| LZCNT | ✅ | Leading zero count |
-| POPCNT | ✅ | Population count |
-| VAES | ✅ | Vector AES (not used here) |
+| Feature          | Available | Notes                                  |
+|------------------|-----------|----------------------------------------|
+| SSE2             | ✅         | Universal baseline (2001)              |
+| SSE4.2           | ✅         | PCMPISTRI string search (2008)         |
+| AVX2             | ✅         | 32-byte SIMD (2013)                    |
+| BMI2             | ✅         | **Fast** on Zen 3+ (3-cycle PDEP/PEXT) |
+| AVX-512F         | ✅         | Foundation, 64-byte SIMD               |
+| AVX-512BW        | ✅         | Byte/word operations                   |
+| AVX-512DQ        | ✅         | Doubleword/quadword ops                |
+| AVX-512VL        | ✅         | Vector length extensions               |
+| AVX-512VPOPCNTDQ | ✅         | **8x parallel popcount**               |
+| AVX-512VBMI      | ✅         | Vector byte manipulation               |
+| AVX-512VBMI2     | ✅         | Enhanced byte manipulation             |
+| AVX-512BITALG    | ✅         | Bit algorithms                         |
+| LZCNT            | ✅         | Leading zero count                     |
+| POPCNT           | ✅         | Population count                       |
+| VAES             | ✅         | Vector AES (not used here)             |
 
 ### Performance Expectations by Optimization Level
 
-| Level | SIMD Width | Est. Throughput | Relative | Status |
-|-------|------------|-----------------|----------|--------|
-| SSE2 | 16 bytes | 5 GB/s | 1.0x | Current (prod) |
-| AVX2 | 32 bytes | 9 GB/s | 1.8x | Available (tests) |
-| AVX-512 | 64 bytes | 12 GB/s | 2.4x | Proposed |
-| AVX-512 + prefix sum | 64 bytes | 18 GB/s | 3.6x | Future |
+| Level                | SIMD Width | Est. Throughput | Relative | Status            |
+|----------------------|------------|-----------------|----------|-------------------|
+| SSE2                 | 16 bytes   | 5 GB/s          | 1.0x     | Current (prod)    |
+| AVX2                 | 32 bytes   | 9 GB/s          | 1.8x     | Available (tests) |
+| AVX-512              | 64 bytes   | 12 GB/s         | 2.4x     | Proposed          |
+| AVX-512 + prefix sum | 64 bytes   | 18 GB/s         | 3.6x     | Future            |
 
 *Note: Throughput estimates for JSON semi-indexing on typical structured data*
 
@@ -811,10 +811,10 @@ fn build_ib_rank_neon(words: &[u64]) -> Vec<u32> {
 
 **Benchmark Results** (Apple M1, 1M words = 8MB):
 
-| Implementation | Time | Relative |
-|----------------|------|----------|
-| Scalar (`count_ones()`) | 542 µs | 1.00x |
-| NEON batched | 722 µs | **0.75x (25% slower!)** |
+| Implementation          | Time   | Relative                |
+|-------------------------|--------|-------------------------|
+| Scalar (`count_ones()`) | 542 µs | 1.00x                   |
+| NEON batched            | 722 µs | **0.75x (25% slower!)** |
 
 **Why It Failed**:
 1. **Extraction overhead**: 14 `vgetq_lane` calls per 8 words to extract individual counts

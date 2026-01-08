@@ -14,11 +14,11 @@ This document catalogs all optimization techniques currently implemented in the 
 
 The rank directory enables O(1) rank queries using a hierarchical structure:
 
-| Level | Granularity | Storage | Purpose |
-|-------|-------------|---------|---------|
-| L0 | 2^32 bits | u64 | Absolute rank (only for >4GB vectors) |
-| L1 | 512 bits (8 words) | u32 | Cumulative rank per block |
-| L2 | Within block | 7 x 9-bit | Offsets within each 512-bit block |
+| Level | Granularity        | Storage   | Purpose                               |
+|-------|--------------------|-----------|---------------------------------------|
+| L0    | 2^32 bits          | u64       | Absolute rank (only for >4GB vectors) |
+| L1    | 512 bits (8 words) | u32       | Cumulative rank per block             |
+| L2    | Within block       | 7 x 9-bit | Offsets within each 512-bit block     |
 
 **Memory overhead:** ~3% of bitvector size
 
@@ -58,11 +58,11 @@ let ptr = alloc::alloc::alloc(layout);
 
 Select queries use a sampled index for O(log n) acceleration:
 
-| Sample Rate | Memory Overhead | Speed |
-|-------------|-----------------|-------|
-| 64 | ~12.5% | Fastest |
-| 256 (default) | ~3% | Balanced |
-| 512 | ~1.5% | Most compact |
+| Sample Rate   | Memory Overhead | Speed        |
+|---------------|-----------------|--------------|
+| 64            | ~12.5%          | Fastest      |
+| 256 (default) | ~3%             | Balanced     |
+| 512           | ~1.5%           | Most compact |
 
 **Algorithm:**
 1. Binary search the sample index to find approximate word
@@ -74,11 +74,11 @@ Select queries use a sampled index for O(log n) acceleration:
 
 Three mutually exclusive implementations selected via feature flags:
 
-| Feature | Technique | Best For |
-|---------|-----------|----------|
-| (default) | Rust `count_ones()` | Auto-vectorizes on most platforms |
-| `simd` | Explicit NEON/POPCNT intrinsics | Maximum throughput |
-| `portable-popcount` | SWAR bitwise algorithm | Portability testing |
+| Feature             | Technique                       | Best For                          |
+|---------------------|---------------------------------|-----------------------------------|
+| (default)           | Rust `count_ones()`             | Auto-vectorizes on most platforms |
+| `simd`              | Explicit NEON/POPCNT intrinsics | Maximum throughput                |
+| `portable-popcount` | SWAR bitwise algorithm          | Portability testing               |
 
 **NEON bulk popcount (64 bytes at a time):**
 ```rust
@@ -133,11 +133,11 @@ const BYTE_TOTAL_EXCESS: [i8; 256] = [...];
 
 Enables O(1) `find_close` via 3-level excess tracking:
 
-| Level | Granularity | Storage | Purpose |
-|-------|-------------|---------|---------|
-| L0 | Per word | (i8 min, i16 total) | Word-level excess |
-| L1 | 32 words | (i16 min, i16 total) | Block aggregate |
-| L2 | 1024 words | (i16 min, i16 total) | Super-block aggregate |
+| Level | Granularity | Storage              | Purpose               |
+|-------|-------------|----------------------|-----------------------|
+| L0    | Per word    | (i8 min, i16 total)  | Word-level excess     |
+| L1    | 32 words    | (i16 min, i16 total) | Block aggregate       |
+| L2    | 1024 words  | (i16 min, i16 total) | Super-block aggregate |
 
 **Memory overhead:** ~6-7% of BP size
 
@@ -157,12 +157,12 @@ Reuses the same Poppy-style 3-level hierarchy as bitvector rank for O(1) rank qu
 
 Automatic selection of best available instruction set:
 
-| Level | Width | Bytes/Iter | Availability | File |
-|-------|-------|------------|--------------|------|
-| AVX2 | 256-bit | 32 | ~95% (2013+) | avx2.rs |
-| SSE4.2 | 128-bit | 16 | ~90% (2008+) | sse42.rs |
-| SSE2 | 128-bit | 16 | 100% | x86.rs |
-| NEON | 128-bit | 16 | 100% (ARM64) | neon.rs |
+| Level  | Width   | Bytes/Iter | Availability | File     |
+|--------|---------|------------|--------------|----------|
+| AVX2   | 256-bit | 32         | ~95% (2013+) | avx2.rs  |
+| SSE4.2 | 128-bit | 16         | ~90% (2008+) | sse42.rs |
+| SSE2   | 128-bit | 16         | 100%         | x86.rs   |
+| NEON   | 128-bit | 16         | 100% (ARM64) | neon.rs  |
 
 **Dispatch logic:**
 ```rust
@@ -221,11 +221,11 @@ let classified = vandq_u8(lo_result, hi_result);   // AND gives final flags
 
 **Benchmark Results (Apple M1):**
 
-| Pattern | Size | NEON (nibble) | Scalar | Speedup |
-|---------|------|---------------|--------|---------|
-| comprehensive | 1MB | 1.62 ms (500 MiB/s) | 2.04 ms (395 MiB/s) | **1.26x** |
+| Pattern       | Size | NEON (nibble)       | Scalar              | Speedup   |
+|---------------|------|---------------------|---------------------|-----------|
+| comprehensive | 1MB  | 1.62 ms (500 MiB/s) | 2.04 ms (395 MiB/s) | **1.26x** |
 | comprehensive | 10MB | 15.9 ms (503 MiB/s) | 20.1 ms (398 MiB/s) | **1.26x** |
-| strings | 1MB | 481 µs (1.78 GiB/s) | 1.46 ms (601 MiB/s) | **3.0x** |
+| strings       | 1MB  | 481 µs (1.78 GiB/s) | 1.46 ms (601 MiB/s) | **3.0x**  |
 
 The 3x speedup on string-heavy JSON comes from the combination of nibble lookup + fast-path string scanning.
 
@@ -410,13 +410,13 @@ pub fn get_fast(&self, index: usize) -> Option<StandardJson<'a, W>> {
 
 **Benchmark results (10MB JSON, 60K element array):**
 
-| Index | get() | get_fast() | Speedup |
-|-------|-------|------------|---------|
-| 10 | 535 ns | 115 ns | 4.7x |
-| 50 | 2.51 µs | 351 ns | 7.2x |
-| 100 | 5.04 µs | 637 ns | 7.9x |
-| 1000 | 48 µs | 5.7 µs | 8.4x |
-| 10000 | 506 µs | 58 µs | 8.7x |
+| Index | get()   | get_fast() | Speedup |
+|-------|---------|------------|---------|
+| 10    | 535 ns  | 115 ns     | 4.7x    |
+| 50    | 2.51 µs | 351 ns     | 7.2x    |
+| 100   | 5.04 µs | 637 ns     | 7.9x    |
+| 1000  | 48 µs   | 5.7 µs     | 8.4x    |
+| 10000 | 506 µs  | 58 µs      | 8.7x    |
 
 **Impact on jq evaluator:**
 - Updated `get_element_at_index()` to use `get_fast()` for all array index operations (`.[n]`, `.field[n]`)
@@ -463,20 +463,20 @@ fn test_sse2_matches_scalar() {
 
 ## Summary: Performance Impact
 
-| Optimization | Technique | Complexity | Impact |
-|--------------|-----------|------------|--------|
-| Rank directory | 3-level Poppy | O(1) | Enables fast navigation |
-| Cache alignment | 64-byte aligned alloc | - | 3-4% rank speedup |
-| Select index | Sampled positions | O(log n) | Enables fast select |
-| BP RangeMin | 3-level excess index | O(1) find_close | ~11x vs linear scan |
-| BP byte lookup | BYTE_FIND_CLOSE tables | O(1) per byte | ~4x vs bit-by-bit |
-| JSON SIMD | Multi-level dispatch | O(n) | 2-4x vs scalar |
-| NEON nibble lookup | vqtbl1q_u8 tables | O(n) | Replaces 12+ ops with 3 |
-| NEON movemask | Multiplication trick | O(1) | Avoids slow variable shifts |
-| String fast-path | Batch zero writing | O(n) | 2.5-8x on strings |
-| Cumulative index | Binary search select | O(log n) | 627x on queries |
-| Exponential search | Galloping from hint | O(log d) | 3.3x for sequential |
-| Dual select methods | Binary + exponential | O(log n) / O(log d) | 39% faster random access |
+| Optimization        | Technique              | Complexity          | Impact                      |
+|---------------------|------------------------|---------------------|-----------------------------|
+| Rank directory      | 3-level Poppy          | O(1)                | Enables fast navigation     |
+| Cache alignment     | 64-byte aligned alloc  | -                   | 3-4% rank speedup           |
+| Select index        | Sampled positions      | O(log n)            | Enables fast select         |
+| BP RangeMin         | 3-level excess index   | O(1) find_close     | ~11x vs linear scan         |
+| BP byte lookup      | BYTE_FIND_CLOSE tables | O(1) per byte       | ~4x vs bit-by-bit           |
+| JSON SIMD           | Multi-level dispatch   | O(n)                | 2-4x vs scalar              |
+| NEON nibble lookup  | vqtbl1q_u8 tables      | O(n)                | Replaces 12+ ops with 3     |
+| NEON movemask       | Multiplication trick   | O(1)                | Avoids slow variable shifts |
+| String fast-path    | Batch zero writing     | O(n)                | 2.5-8x on strings           |
+| Cumulative index    | Binary search select   | O(log n)            | 627x on queries             |
+| Exponential search  | Galloping from hint    | O(log d)            | 3.3x for sequential         |
+| Dual select methods | Binary + exponential   | O(log n) / O(log d) | 39% faster random access    |
 
 ---
 
@@ -517,29 +517,29 @@ self.index.ib_select1_from(rank, hint)
 
 **Results:**
 
-| Benchmark | Binary Search | Exponential Search | Improvement |
-|-----------|---------------|-------------------|-------------|
-| Sequential select (microbench) | 335 µs | 102 µs | **3.3x faster** |
-| count_all_leaves (8MB) | 106 ms | 92 ms | **13% faster** |
-| extract_all_strings (8MB) | 131 ms | 117 ms | **11% faster** |
+| Benchmark                      | Binary Search | Exponential Search | Improvement     |
+|--------------------------------|---------------|--------------------|-----------------|
+| Sequential select (microbench) | 335 µs        | 102 µs             | **3.3x faster** |
+| count_all_leaves (8MB)         | 106 ms        | 92 ms              | **13% faster**  |
+| extract_all_strings (8MB)      | 131 ms        | 117 ms             | **11% faster**  |
 
 **Dual Select Methods (January 2026):**
 
 To address the 37% random access regression, both methods are now exposed:
 
-| Method | Use Case | Complexity | Best For |
-|--------|----------|------------|----------|
-| `ib_select1(k)` | Random access | O(log n) | `.[42]`, slicing, indexed lookups |
-| `ib_select1_from(k, hint)` | Sequential access | O(log d) | `.[]`, iteration, traversal |
+| Method                     | Use Case          | Complexity | Best For                          |
+|----------------------------|-------------------|------------|-----------------------------------|
+| `ib_select1(k)`            | Random access     | O(log n)   | `.[42]`, slicing, indexed lookups |
+| `ib_select1_from(k, hint)` | Sequential access | O(log d)   | `.[]`, iteration, traversal       |
 
 **Benchmark results (10K elements):**
 
-| Benchmark | Time | Throughput |
-|-----------|------|------------|
-| Sequential (exponential) | 108 µs | 92.2 Melem/s |
-| Sequential (binary) | 340 µs | 29.4 Melem/s |
-| Random (exponential) | 1080 µs | 9.3 Melem/s |
-| Random (binary) | 779 µs | 12.8 Melem/s |
+| Benchmark                | Time    | Throughput   |
+|--------------------------|---------|--------------|
+| Sequential (exponential) | 108 µs  | 92.2 Melem/s |
+| Sequential (binary)      | 340 µs  | 29.4 Melem/s |
+| Random (exponential)     | 1080 µs | 9.3 Melem/s  |
+| Random (binary)          | 779 µs  | 12.8 Melem/s |
 
 **Key findings:**
 - Sequential: Exponential search is **3.1x faster** (108 µs vs 340 µs)
@@ -582,10 +582,10 @@ const BYTE_FIND_CLOSE: [[u8; 16]; 256] = { /* precomputed */ };
 
 **Benchmark Results:**
 
-| Implementation | 10K elements | 100K elements | 1M elements |
-|----------------|--------------|---------------|-------------|
-| RangeMin (byte-level) | 11.4 µs | 12.2 µs | 11.3 µs |
-| Linear (bit-by-bit) | 15.4 µs | 49.5 µs | 130.9 µs |
+| Implementation        | 10K elements | 100K elements | 1M elements |
+|-----------------------|--------------|---------------|-------------|
+| RangeMin (byte-level) | 11.4 µs      | 12.2 µs       | 11.3 µs     |
+| Linear (bit-by-bit)   | 15.4 µs      | 49.5 µs       | 130.9 µs    |
 
 **Speedup:** ~11.6x for 1M elements (130.9 µs → 11.3 µs)
 
