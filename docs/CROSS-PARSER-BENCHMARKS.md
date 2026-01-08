@@ -110,24 +110,24 @@ A realistic mix of objects, arrays, strings, numbers, and nested structures.
 
 | Size      | serde_json | simd-json | sonic-rs      | succinctly |
 |-----------|------------|-----------|---------------|------------|
-| **1KB**   | -          | -         | -             | -          |
-| **10KB**  | -          | -         | -             | -          |
-| **100KB** | -          | -         | -             | -          |
-| **1MB**   | -          | -         | -             | -          |
-| **10MB**  | 178 MiB/s  | 117 MiB/s | **723 MiB/s** | 539 MiB/s  |
-| **100MB** | 150 MiB/s  | 126 MiB/s | **710 MiB/s** | 550 MiB/s  |
+| **1KB**   | 217 MiB/s  | 274 MiB/s | **967 MiB/s** | 620 MiB/s  |
+| **10KB**  | 189 MiB/s  | 245 MiB/s | **890 MiB/s** | 579 MiB/s  |
+| **100KB** | 187 MiB/s  | 235 MiB/s | **844 MiB/s** | 514 MiB/s  |
+| **1MB**   | 178 MiB/s  | 159 MiB/s | **847 MiB/s** | 529 MiB/s  |
+| **10MB**  | 154 MiB/s  | 140 MiB/s | **729 MiB/s** | 546 MiB/s  |
+| **100MB** | 153 MiB/s  | 125 MiB/s | **726 MiB/s** | 553 MiB/s  |
 | **1GB**   | -          | -         | -             | -          |
 
 ##### Parse + Traverse
 
 | Size      | serde_json | simd-json | sonic-rs      | succinctly (fast) | succinctly (value) |
 |-----------|------------|-----------|---------------|-------------------|--------------------|
-| **1KB**   | -          | -         | -             | -                 | -                  |
-| **10KB**  | -          | -         | -             | -                 | -                  |
-| **100KB** | -          | -         | -             | -                 | -                  |
-| **1MB**   | -          | -         | -             | -                 | -                  |
-| **10MB**  | 157 MiB/s  | 242 MiB/s | **450 MiB/s** | 302 MiB/s         | 114 MiB/s          |
-| **100MB** | 138 MiB/s  | 124 MiB/s | -             | -                 | -                  |
+| **1KB**   | 226 MiB/s  | 375 MiB/s | **513 MiB/s** | 371 MiB/s         | 283 MiB/s          |
+| **10KB**  | 180 MiB/s  | 320 MiB/s | **463 MiB/s** | 326 MiB/s         | 206 MiB/s          |
+| **100KB** | 176 MiB/s  | 290 MiB/s | **442 MiB/s** | 289 MiB/s         | 120 MiB/s          |
+| **1MB**   | 186 MiB/s  | 294 MiB/s | **447 MiB/s** | 299 MiB/s         | 118 MiB/s          |
+| **10MB**  | 153 MiB/s  | 165 MiB/s | **430 MiB/s** | 307 MiB/s         | 114 MiB/s          |
+| **100MB** | 145 MiB/s  | 154 MiB/s | **435 MiB/s** | 315 MiB/s         | 101 MiB/s          |
 | **1GB**   | -          | -         | -             | -                 | -                  |
 
 #### Apple Silicon (M1/M2/M3)
@@ -172,14 +172,80 @@ JSON with many string values.
 
 ## Memory Overhead Comparison
 
-Memory usage for parsed/indexed representation (not including original JSON text):
+Memory usage for parsed/indexed representation (not including original JSON text).
 
-| Parser         | Overhead  | Description                                            |
-|----------------|-----------|--------------------------------------------------------|
-| **succinctly** | **~2-3%** | Two bitvectors: IB + BP with rank/select indices       |
-| serde_json     | ~100-200% | Full DOM with allocations per node                     |
-| simd-json      | ~100-200% | Similar to serde_json (DOM)                            |
-| sonic-rs       | ~50-150%  | Arena-based allocation, more compact than standard DOM |
+### Summary (x86_64 AMD Zen 4)
+
+| Parser         | Typical Overhead | Description                                            |
+|----------------|------------------|--------------------------------------------------------|
+| **succinctly** | **~24%**         | Two bitvectors: IB + BP with rank/select indices       |
+| serde_json     | ~600-670%        | Full DOM with allocations per node                     |
+| simd-json      | ~600-615%        | Similar to serde_json (DOM)                            |
+| sonic-rs       | ~255-380%        | Arena-based allocation, more compact than standard DOM |
+
+### Detailed Measurements by Size
+
+#### 1KB JSON (0.00 MB)
+
+| Parser     | Memory Size | Overhead | Ratio |
+|------------|-------------|----------|-------|
+| serde_json | 0.01 MB     | 440.1%   | 4.40x |
+| simd-json  | 0.01 MB     | 403.4%   | 4.03x |
+| sonic-rs   | 0.00 MB     | 254.9%   | 2.55x |
+| succinctly | 0.00 MB     | 23.6%    | 0.24x |
+
+#### 10KB JSON (0.01 MB)
+
+| Parser     | Memory Size | Overhead | Ratio |
+|------------|-------------|----------|-------|
+| serde_json | 0.06 MB     | 595.2%   | 5.95x |
+| simd-json  | 0.05 MB     | 543.9%   | 5.44x |
+| sonic-rs   | 0.03 MB     | 338.4%   | 3.38x |
+| succinctly | 0.00 MB     | 24.0%    | 0.24x |
+
+#### 100KB JSON (0.09 MB)
+
+| Parser     | Memory Size | Overhead | Ratio |
+|------------|-------------|----------|-------|
+| serde_json | 0.56 MB     | 657.6%   | 6.58x |
+| simd-json  | 0.51 MB     | 600.5%   | 6.01x |
+| sonic-rs   | 0.32 MB     | 372.3%   | 3.72x |
+| succinctly | 0.02 MB     | 24.2%    | 0.24x |
+
+#### 1MB JSON (0.81 MB)
+
+| Parser     | Memory Size | Overhead | Ratio |
+|------------|-------------|----------|-------|
+| serde_json | 5.44 MB     | 673.0%   | 6.73x |
+| simd-json  | 4.97 MB     | 614.5%   | 6.15x |
+| sonic-rs   | 3.08 MB     | 380.7%   | 3.81x |
+| succinctly | 0.19 MB     | 24.1%    | 0.24x |
+
+#### 10MB JSON (8.01 MB)
+
+| Parser     | Memory Size | Overhead | Ratio |
+|------------|-------------|----------|-------|
+| serde_json | 53.36 MB    | 666.5%   | 6.66x |
+| simd-json  | 48.72 MB    | 608.6%   | 6.09x |
+| sonic-rs   | 30.20 MB    | 377.2%   | 3.77x |
+| succinctly | 1.92 MB     | 24.0%    | 0.24x |
+
+#### 100MB JSON (80.01 MB)
+
+| Parser     | Memory Size | Overhead | Ratio |
+|------------|-------------|----------|-------|
+| serde_json | 526.73 MB   | 658.3%   | 6.58x |
+| simd-json  | 481.02 MB   | 601.2%   | 6.01x |
+| sonic-rs   | 298.22 MB   | 372.7%   | 3.73x |
+| succinctly | 19.14 MB    | 23.9%    | 0.24x |
+
+**Key Findings:**
+
+- **succinctly** maintains consistent ~24% overhead across all sizes
+- **serde_json** and **simd-json** use 6-7x more memory than the original JSON
+- **sonic-rs** uses 2.5-4x more memory (better than DOM but still significant)
+- succinctly uses **27x less memory** than serde_json on average
+- succinctly uses **15x less memory** than sonic-rs on average
 
 **Key Advantage**: Succinctly uses **30-50x less memory** than DOM parsers while maintaining competitive performance.
 
@@ -331,24 +397,30 @@ cargo bench --bench json_parsers -- "100mb"
 Across all tested workloads on x86_64 (AMD Zen 4):
 
 | Metric                    | Ranking | Throughput | Notes                                        |
-|---------------------------|---------|------------|----------------------------------------------|
+|-------------------------|-------|----------|--------------------------------------------|
 | **Parse-Only (10MB)**     | **2nd** | 539 MiB/s  | 74% of sonic-rs, 3x faster than serde_json   |
 | **Parse-Only (100MB)**    | **2nd** | 550 MiB/s  | 77% of sonic-rs, 3.7x faster than serde_json |
 | **Parse+Traverse (10MB)** | **2nd** | 302 MiB/s  | 67% of sonic-rs, 1.9x faster than serde_json |
 | **Memory Overhead**       | **1st** | 2-3%       | 30-50x less than DOM parsers                 |
 
-**Overall Position**: Succinctly is the **2nd fastest** JSON parser tested, while using **30-50x less memory** than competitors. It offers an excellent speed/memory tradeoff for applications where memory efficiency matters.
+**Overall Position**: Succinctly is the **2nd fastest** JSON parser tested, while using **~24% memory overhead** compared to **600-670%** for DOM parsers (27x more efficient). It offers an excellent speed/memory tradeoff for applications where memory efficiency matters.
 
 ## Changelog
 
-- **2026-01-08**: Initial x86_64 (AMD Zen 4) benchmarks
+- **2026-01-08 (Evening)**: Complete x86_64 (AMD Zen 4) benchmarks
+  - ✅ Added all file sizes: 1KB, 10KB, 100KB, 1MB, 10MB, 100MB
+  - ✅ Parse-only, parse+traverse, and traverse-only benchmarks
+  - ✅ **Memory overhead measurements** for all sizes
+  - ✅ All comprehensive pattern benchmarks complete
+  - Key findings: succinctly uses **~24% memory** vs **600-670%** for DOM parsers
+  - 1GB excluded (requires >10 samples, infeasible for criterion)
+  - TODO: Add pathological, numbers, strings patterns
+  - TODO: Add Apple Silicon benchmarks
+
+- **2026-01-08 (Initial)**: Initial x86_64 (AMD Zen 4) benchmarks
   - 10MB and 100MB comprehensive pattern
   - Parse-only and parse+traverse results
   - Incomplete: 100MB parse+traverse timed out
-  - Test files: Only 10MB and 100MB currently benchmarked
-  - TODO: Add 1KB, 10KB, 100KB, 1MB, 1GB benchmarks
-  - TODO: Add pathological, numbers, strings patterns
-  - TODO: Add Apple Silicon benchmarks
 
 ## References
 
