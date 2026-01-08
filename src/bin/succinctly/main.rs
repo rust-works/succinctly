@@ -17,6 +17,8 @@ struct Cli {
 enum Command {
     /// JSON operations (generate, parse, benchmark)
     Json(JsonCommand),
+    /// Command-line JSON processor (jq-compatible)
+    Jq(JqCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -156,6 +158,91 @@ enum OutputFormat {
     Lines,
 }
 
+/// Command-line JSON processor (jq-compatible CLI)
+#[derive(Debug, Parser)]
+#[command(name = "jq")]
+#[command(about = "Command-line JSON processor", long_about = None)]
+struct JqCommand {
+    /// jq filter expression (e.g., ".", ".foo", ".[]")
+    /// When using -f, this becomes the first input file instead.
+    /// If not provided, uses "." (identity)
+    #[arg(trailing_var_arg = true)]
+    positional_args: Vec<String>,
+
+    // === Input Options ===
+    /// Don't read any input; use null as the single input value
+    #[arg(short = 'n', long)]
+    null_input: bool,
+
+    /// Read each line as a string instead of JSON
+    #[arg(short = 'R', long)]
+    raw_input: bool,
+
+    /// Read all inputs into an array and use it as the single input value
+    #[arg(short = 's', long)]
+    slurp: bool,
+
+    // === Output Options ===
+    /// Compact output (no pretty printing)
+    #[arg(short = 'c', long)]
+    compact_output: bool,
+
+    /// Output raw strings without quotes
+    #[arg(short = 'r', long)]
+    raw_output: bool,
+
+    /// Like -r but don't print newline after each output
+    #[arg(short = 'j', long)]
+    join_output: bool,
+
+    /// Sort keys of each object on output
+    #[arg(short = 'S', long)]
+    sort_keys: bool,
+
+    /// Use tabs for indentation
+    #[arg(long)]
+    tab: bool,
+
+    /// Use n spaces for indentation (max 7)
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=7))]
+    indent: Option<u8>,
+
+    // === Program Input ===
+    /// Read filter from file instead of command line
+    #[arg(short = 'f', long, value_name = "FILE")]
+    from_file: Option<PathBuf>,
+
+    // === Variables ===
+    /// Set $name to the string value
+    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append)]
+    arg: Vec<String>,
+
+    /// Set $name to the JSON value
+    #[arg(long, value_names = ["NAME", "VALUE"], num_args = 2, action = clap::ArgAction::Append)]
+    argjson: Vec<String>,
+
+    /// Set $name to an array of JSON values read from file
+    #[arg(long, value_names = ["NAME", "FILE"], num_args = 2, action = clap::ArgAction::Append)]
+    slurpfile: Vec<String>,
+
+    /// Set $name to the string contents of file
+    #[arg(long, value_names = ["NAME", "FILE"], num_args = 2, action = clap::ArgAction::Append)]
+    rawfile: Vec<String>,
+
+    /// Consume remaining arguments as positional string values
+    #[arg(long)]
+    args: bool,
+
+    /// Consume remaining arguments as positional JSON values
+    #[arg(long)]
+    jsonargs: bool,
+
+    // === Exit Status ===
+    /// Set exit status based on output (0 if last output != false/null)
+    #[arg(short = 'e', long)]
+    exit_status: bool,
+}
+
 impl From<PatternArg> for generators::Pattern {
     fn from(arg: PatternArg) -> Self {
         match arg {
@@ -209,6 +296,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Jq(args) => {
+            let exit_code = jq_runner::run_jq(args)?;
+            std::process::exit(exit_code);
+        }
         Command::Json(json_cmd) => match json_cmd.command {
             JsonSubcommand::Generate(args) => {
                 let json = generate_json(
@@ -655,6 +746,7 @@ fn reconstruct_json<W: Clone + AsRef<[u64]>>(
 }
 
 mod generators;
+mod jq_runner;
 use generators::generate_json;
 
 #[cfg(test)]
