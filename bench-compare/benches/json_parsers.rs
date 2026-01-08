@@ -13,7 +13,94 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use succinctly::json::light::{JsonCursor, JsonIndex, StandardJson};
+
+// ============================================================================
+// Peak Memory Tracking Allocator
+// ============================================================================
+
+struct PeakAllocator {
+    current: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl PeakAllocator {
+    const fn new() -> Self {
+        Self {
+            current: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.current.store(0, Ordering::SeqCst);
+        self.peak.store(0, Ordering::SeqCst);
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+unsafe impl GlobalAlloc for PeakAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            let old = self.current.fetch_add(layout.size(), Ordering::SeqCst);
+            let new = old + layout.size();
+            // Update peak if this is a new high
+            let mut peak = self.peak.load(Ordering::SeqCst);
+            while new > peak {
+                match self
+                    .peak
+                    .compare_exchange_weak(peak, new, Ordering::SeqCst, Ordering::SeqCst)
+                {
+                    Ok(_) => break,
+                    Err(p) => peak = p,
+                }
+            }
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.current.fetch_sub(layout.size(), Ordering::SeqCst);
+        unsafe { System.dealloc(ptr, layout) };
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        if !new_ptr.is_null() {
+            let old_size = layout.size();
+            if new_size > old_size {
+                let diff = new_size - old_size;
+                let old = self.current.fetch_add(diff, Ordering::SeqCst);
+                let new = old + diff;
+                let mut peak = self.peak.load(Ordering::SeqCst);
+                while new > peak {
+                    match self.peak.compare_exchange_weak(
+                        peak,
+                        new,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        Err(p) => peak = p,
+                    }
+                }
+            } else {
+                self.current
+                    .fetch_sub(old_size - new_size, Ordering::SeqCst);
+            }
+        }
+        new_ptr
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: PeakAllocator = PeakAllocator::new();
 
 /// Test file paths (relative to workspace root)
 /// Note: 1GB excluded - too large for criterion's minimum sample requirements
@@ -107,6 +194,15 @@ fn count_succinctly_fast(cursor: JsonCursor) -> usize {
     count
 }
 
+/// Count nodes in simd-json OwnedValue
+fn count_simd_owned(v: &simd_json::OwnedValue) -> usize {
+    match v {
+        simd_json::OwnedValue::Array(arr) => 1 + arr.iter().map(count_simd_owned).sum::<usize>(),
+        simd_json::OwnedValue::Object(obj) => 1 + obj.values().map(count_simd_owned).sum::<usize>(),
+        _ => 1,
+    }
+}
+
 // ============================================================================
 // Benchmarks
 // ============================================================================
@@ -126,7 +222,6 @@ fn bench_parse_only(c: &mut Criterion) {
             "1mb" => 50,
             "10mb" => 20,
             "100mb" => 10,
-            "1gb" => 5,
             _ => 20,
         };
         group.sample_size(sample_size);
@@ -184,7 +279,6 @@ fn bench_parse_and_traverse(c: &mut Criterion) {
             "1mb" => 50,
             "10mb" => 20,
             "100mb" => 10,
-            "1gb" => 5,
             _ => 20,
         };
         group.sample_size(sample_size);
@@ -249,8 +343,7 @@ fn bench_traverse_only(c: &mut Criterion) {
         let serde_value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
         let mut simd_bytes = bytes.clone();
-        let simd_value: simd_json::OwnedValue =
-            simd_json::to_owned_value(&mut simd_bytes).unwrap();
+        let simd_value: simd_json::OwnedValue = simd_json::to_owned_value(&mut simd_bytes).unwrap();
 
         let sonic_value: sonic_rs::Value = sonic_rs::from_slice(&bytes).unwrap();
 
@@ -263,7 +356,6 @@ fn bench_traverse_only(c: &mut Criterion) {
             "1mb" => 50,
             "10mb" => 20,
             "100mb" => 10,
-            "1gb" => 5,
             _ => 20,
         };
         group.sample_size(sample_size);
@@ -275,20 +367,7 @@ fn bench_traverse_only(c: &mut Criterion) {
 
         // simd-json traverse (owned value)
         group.bench_function("simd_json", |b| {
-            b.iter(|| {
-                fn count_owned(v: &simd_json::OwnedValue) -> usize {
-                    match v {
-                        simd_json::OwnedValue::Array(arr) => {
-                            1 + arr.iter().map(count_owned).sum::<usize>()
-                        }
-                        simd_json::OwnedValue::Object(obj) => {
-                            1 + obj.values().map(count_owned).sum::<usize>()
-                        }
-                        _ => 1,
-                    }
-                }
-                count_owned(black_box(&simd_value))
-            })
+            b.iter(|| count_simd_owned(black_box(&simd_value)))
         });
 
         // sonic-rs traverse
@@ -316,10 +395,9 @@ fn bench_traverse_only(c: &mut Criterion) {
     }
 }
 
-/// Measure memory overhead for each parser (prints comparison table)
-fn measure_memory_overhead(c: &mut Criterion) {
-    // This benchmark prints memory statistics rather than measuring time
-    let mut group = c.benchmark_group("memory_overhead");
+/// Measure actual peak memory usage for each parser
+fn measure_peak_memory(c: &mut Criterion) {
+    let mut group = c.benchmark_group("peak_memory");
     group.sample_size(10);
 
     for (name, path) in TEST_FILES {
@@ -328,131 +406,113 @@ fn measure_memory_overhead(c: &mut Criterion) {
         };
 
         let json_size = bytes.len();
+        let json_kb = json_size as f64 / 1024.0;
         let json_mb = json_size as f64 / 1024.0 / 1024.0;
 
-        println!("\n{:=^60}", "");
-        println!(" Memory Overhead Analysis: {} ({:.2} MB) ", name, json_mb);
-        println!("{:=^60}", "");
+        println!("\n{:=^70}", "");
+        if json_mb >= 1.0 {
+            println!(" Peak Memory Usage: {} ({:.2} MB) ", name, json_mb);
+        } else {
+            println!(" Peak Memory Usage: {} ({:.2} KB) ", name, json_kb);
+        }
+        println!("{:=^70}", "");
 
-        // ===== serde_json =====
-        let serde_value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let serde_node_count = count_serde(&serde_value);
-        // serde_json::Value is 32 bytes per node on 64-bit (enum discriminant + 24 bytes data)
-        // Plus string data is owned (copied), plus hashmap overhead for objects
-        let serde_base = serde_node_count * 32;
-        // Estimate string storage: ~30% of JSON is typically string content
-        let serde_strings = (json_size as f64 * 0.3) as usize;
-        // HashMap overhead: ~48 bytes per entry for BTreeMap internals
-        let serde_map_overhead = serde_node_count / 4 * 48; // rough estimate
-        let serde_total = serde_base + serde_strings + serde_map_overhead;
+        // Measure serde_json
+        ALLOCATOR.reset();
+        let _serde_value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let serde_peak = ALLOCATOR.peak();
+        drop(_serde_value);
 
-        // ===== simd-json =====
+        // Measure simd-json
+        ALLOCATOR.reset();
         let mut simd_bytes = bytes.clone();
-        let simd_value: simd_json::OwnedValue = simd_json::to_owned_value(&mut simd_bytes).unwrap();
-        // simd-json OwnedValue uses halfbrown HashMap (more efficient)
-        // Node size similar to serde, but uses arena-like allocation
-        let simd_node_count = count_simd_owned(&simd_value);
-        let simd_base = simd_node_count * 32;
-        let simd_strings = (json_size as f64 * 0.3) as usize;
-        let simd_map_overhead = simd_node_count / 4 * 32; // halfbrown is more efficient
-        let simd_total = simd_base + simd_strings + simd_map_overhead;
+        let _simd_value: simd_json::OwnedValue =
+            simd_json::to_owned_value(&mut simd_bytes).unwrap();
+        let simd_peak = ALLOCATOR.peak();
+        drop(_simd_value);
+        drop(simd_bytes);
 
-        // ===== sonic-rs =====
-        let sonic_value: sonic_rs::Value = sonic_rs::from_slice(&bytes).unwrap();
-        let sonic_node_count = count_sonic(&sonic_value);
-        // sonic-rs uses arena allocation with 24-byte nodes + separate string storage
-        let sonic_base = sonic_node_count * 24;
-        let sonic_strings = (json_size as f64 * 0.3) as usize;
-        let sonic_total = sonic_base + sonic_strings;
+        // Measure sonic-rs
+        ALLOCATOR.reset();
+        let _sonic_value: sonic_rs::Value = sonic_rs::from_slice(&bytes).unwrap();
+        let sonic_peak = ALLOCATOR.peak();
+        drop(_sonic_value);
 
-        // ===== succinctly =====
-        let succ_index = JsonIndex::build(&bytes);
-        // IB: 1 bit per byte of input (rounded to u64 words)
-        let ib_bits = json_size;
-        let ib_bytes = ib_bits.div_ceil(64) * 8;
-
-        // BP: 2 bits per structural character (open + close parens)
-        // Plus RangeMin structure for navigation
-        let bp_len = succ_index.bp().len();
-        let bp_words = bp_len.div_ceil(64);
-        let bp_bytes = bp_words * 8;
-
-        // RangeMin L0: 2 bytes per word (min_excess + cum_excess as i8)
-        let rm_l0_bytes = bp_words * 2;
-        // RangeMin L1: 4 bytes per 32 words
-        let rm_l1_bytes = bp_words.div_ceil(32) * 4;
-        // RangeMin L2: 4 bytes per 1024 words
-        let rm_l2_bytes = bp_words.div_ceil(1024) * 4;
-        let rm_total = rm_l0_bytes + rm_l1_bytes + rm_l2_bytes;
-
-        // IB rank directory for select1 (cumulative popcount per word)
-        let ib_rank_bytes = ib_bits.div_ceil(64) * 4; // u32 per word
-
-        let succ_total = ib_bytes + ib_rank_bytes + bp_bytes + rm_total;
+        // Measure succinctly
+        ALLOCATOR.reset();
+        let _succ_index = JsonIndex::build(&bytes);
+        let succ_peak = ALLOCATOR.peak();
+        drop(_succ_index);
 
         // Print results
-        println!("\n{:<20} {:>12} {:>12} {:>10}", "Parser", "Est. Size", "Overhead", "Ratio");
-        println!("{:-<20} {:-<12} {:-<12} {:-<10}", "", "", "", "");
+        println!(
+            "\n{:<20} {:>15} {:>12} {:>12}",
+            "Parser", "Peak Memory", "Overhead", "vs JSON"
+        );
+        println!("{:-<20} {:-<15} {:-<12} {:-<12}", "", "", "", "");
 
-        let print_row = |name: &str, size: usize| {
-            let mb = size as f64 / 1024.0 / 1024.0;
-            let overhead = size as f64 / json_size as f64 * 100.0;
-            let ratio = size as f64 / json_size as f64;
-            println!("{:<20} {:>10.2} MB {:>10.1}% {:>10.2}x", name, mb, overhead, ratio);
+        let print_row = |parser: &str, peak: usize| {
+            let overhead_pct = peak as f64 / json_size as f64 * 100.0;
+            let ratio = peak as f64 / json_size as f64;
+            if peak >= 1024 * 1024 {
+                println!(
+                    "{:<20} {:>12.2} MB {:>10.1}% {:>11.2}x",
+                    parser,
+                    peak as f64 / 1024.0 / 1024.0,
+                    overhead_pct,
+                    ratio
+                );
+            } else {
+                println!(
+                    "{:<20} {:>12.2} KB {:>10.1}% {:>11.2}x",
+                    parser,
+                    peak as f64 / 1024.0,
+                    overhead_pct,
+                    ratio
+                );
+            }
         };
 
-        print_row("serde_json", serde_total);
-        print_row("simd-json", simd_total);
-        print_row("sonic-rs", sonic_total);
-        print_row("succinctly", succ_total);
-        println!("{:<20} {:>10.2} MB {:>10}  {:>10}", "(original JSON)", json_mb, "---", "1.00x");
-
-        // Detailed succinctly breakdown
-        println!("\nSuccinctly index breakdown:");
-        println!("  IB (interest bits):     {:>8.2} MB ({:.1}%)",
-            ib_bytes as f64 / 1024.0 / 1024.0,
-            ib_bytes as f64 / json_size as f64 * 100.0);
-        println!("  IB rank directory:      {:>8.2} MB ({:.1}%)",
-            ib_rank_bytes as f64 / 1024.0 / 1024.0,
-            ib_rank_bytes as f64 / json_size as f64 * 100.0);
-        println!("  BP (balanced parens):   {:>8.2} MB ({:.1}%)",
-            bp_bytes as f64 / 1024.0 / 1024.0,
-            bp_bytes as f64 / json_size as f64 * 100.0);
-        println!("  RangeMin structure:     {:>8.2} MB ({:.1}%)",
-            rm_total as f64 / 1024.0 / 1024.0,
-            rm_total as f64 / json_size as f64 * 100.0);
-        println!("  --------------------------------");
-        println!("  Total index overhead:   {:>8.2} MB ({:.1}%)",
-            succ_total as f64 / 1024.0 / 1024.0,
-            succ_total as f64 / json_size as f64 * 100.0);
+        print_row("serde_json", serde_peak);
+        print_row("simd-json", simd_peak);
+        print_row("sonic-rs", sonic_peak);
+        print_row("succinctly", succ_peak);
+        if json_mb >= 1.0 {
+            println!(
+                "{:<20} {:>12.2} MB {:>12} {:>12}",
+                "(original JSON)", json_mb, "---", "1.00x"
+            );
+        } else {
+            println!(
+                "{:<20} {:>12.2} KB {:>12} {:>12}",
+                "(original JSON)", json_kb, "---", "1.00x"
+            );
+        }
 
         // Memory efficiency comparison
         println!("\nMemory efficiency (smaller is better):");
-        println!("  succinctly uses {:.1}x LESS memory than serde_json",
-            serde_total as f64 / succ_total as f64);
-        println!("  succinctly uses {:.1}x LESS memory than simd-json",
-            simd_total as f64 / succ_total as f64);
-        println!("  succinctly uses {:.1}x LESS memory than sonic-rs",
-            sonic_total as f64 / succ_total as f64);
+        if succ_peak > 0 {
+            println!(
+                "  succinctly uses {:.1}x LESS memory than serde_json",
+                serde_peak as f64 / succ_peak as f64
+            );
+            println!(
+                "  succinctly uses {:.1}x LESS memory than simd-json",
+                simd_peak as f64 / succ_peak as f64
+            );
+            println!(
+                "  succinctly uses {:.1}x LESS memory than sonic-rs",
+                sonic_peak as f64 / succ_peak as f64
+            );
+        }
 
         // Dummy benchmark to satisfy criterion
         group.bench_function(format!("{}_measure", name), |b| {
-            b.iter(|| black_box(succ_total))
+            b.iter(|| black_box(succ_peak))
         });
     }
 
     group.finish();
-}
-
-/// Count nodes in simd-json OwnedValue
-fn count_simd_owned(v: &simd_json::OwnedValue) -> usize {
-    match v {
-        simd_json::OwnedValue::Array(arr) => 1 + arr.iter().map(count_simd_owned).sum::<usize>(),
-        simd_json::OwnedValue::Object(obj) => {
-            1 + obj.values().map(count_simd_owned).sum::<usize>()
-        }
-        _ => 1,
-    }
 }
 
 criterion_group!(
@@ -460,6 +520,6 @@ criterion_group!(
     bench_parse_only,
     bench_parse_and_traverse,
     bench_traverse_only,
-    measure_memory_overhead,
+    measure_peak_memory,
 );
 criterion_main!(benches);
