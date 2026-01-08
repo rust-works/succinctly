@@ -68,7 +68,7 @@ mod expr;
 mod parser;
 mod value;
 
-pub use eval::{eval, eval_lenient, EvalError, QueryResult};
+pub use eval::{eval, eval_lenient, substitute_vars, EvalError, QueryResult};
 pub use expr::{
     ArithOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey, Pattern,
     PatternEntry, StringPart,

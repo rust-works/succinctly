@@ -18,7 +18,9 @@ use super::JqCommand;
 pub mod exit_codes {
     pub const SUCCESS: i32 = 0;
     pub const FALSE_OR_NULL: i32 = 1; // With -e, last output was false or null
+    #[allow(dead_code)]
     pub const USAGE_ERROR: i32 = 2; // Usage problem or system error
+    #[allow(dead_code)]
     pub const COMPILE_ERROR: i32 = 3; // jq program compile error
     pub const NO_OUTPUT: i32 = 4; // With -e, no valid result produced
     #[allow(dead_code)]
@@ -30,7 +32,8 @@ pub mod exit_codes {
 pub struct EvalContext {
     /// Named arguments from --arg, --argjson, --slurpfile, --rawfile
     pub named: BTreeMap<String, OwnedValue>,
-    /// Positional arguments from --args or --jsonargs
+    /// Positional arguments from --args or --jsonargs (not yet implemented)
+    #[allow(dead_code)]
     pub positional: Vec<OwnedValue>,
 }
 
@@ -79,6 +82,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         eprintln!("jq: compile error: {}", e);
         anyhow::anyhow!("compile error")
     })?;
+
+    // Substitute variables from context into the expression
+    let expr = jq::substitute_vars(&expr, context.named.iter().map(|(k, v)| (k.as_str(), v)));
 
     // Get input values
     let inputs = get_inputs(&args)?;

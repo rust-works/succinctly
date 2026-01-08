@@ -3648,11 +3648,42 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>>(
 // Phase 8: Variables and Advanced Control Flow Implementation
 // =============================================================================
 
+/// Substitute multiple variables in an expression.
+///
+/// This is useful for CLI tools that pass variables via `--arg`, `--argjson`, etc.
+/// The function takes an iterator of (name, value) pairs and substitutes each
+/// variable reference `$name` with the corresponding value.
+///
+/// # Example
+///
+/// ```ignore
+/// use succinctly::jq::{parse, substitute_vars, eval, OwnedValue};
+/// use std::collections::BTreeMap;
+///
+/// let expr = parse("$name + $suffix").unwrap();
+/// let mut vars = BTreeMap::new();
+/// vars.insert("name".to_string(), OwnedValue::String("hello".to_string()));
+/// vars.insert("suffix".to_string(), OwnedValue::String("world".to_string()));
+///
+/// let substituted = substitute_vars(&expr, &vars);
+/// // Now evaluate substituted expression...
+/// ```
+pub fn substitute_vars<'a, I>(expr: &Expr, vars: I) -> Expr
+where
+    I: IntoIterator<Item = (&'a str, &'a OwnedValue)>,
+{
+    let mut result = expr.clone();
+    for (name, value) in vars {
+        result = substitute_var(&result, name, value);
+    }
+    result
+}
+
 /// Substitute a variable in an expression with a value.
 /// Returns a new expression with the variable replaced.
 fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr {
     match expr {
-        Expr::Var(name) if name == var_name => Expr::Literal(owned_to_literal(replacement)),
+        Expr::Var(name) if name == var_name => owned_to_expr(replacement),
         Expr::Var(_) => expr.clone(),
         Expr::Identity => Expr::Identity,
         Expr::Field(name) => Expr::Field(name.clone()),
@@ -4090,19 +4121,33 @@ fn substitute_var_in_builtin(
     }
 }
 
-/// Convert an OwnedValue to a Literal for substitution.
-fn owned_to_literal(value: &OwnedValue) -> Literal {
+/// Convert an OwnedValue to an Expr, preserving complex types.
+fn owned_to_expr(value: &OwnedValue) -> Expr {
     match value {
-        OwnedValue::Null => Literal::Null,
-        OwnedValue::Bool(b) => Literal::Bool(*b),
-        OwnedValue::Int(i) => Literal::Int(*i),
-        OwnedValue::Float(f) => Literal::Float(*f),
-        OwnedValue::String(s) => Literal::String(s.clone()),
-        OwnedValue::Array(_) | OwnedValue::Object(_) => {
-            // For complex values, we convert to JSON string
-            // This is a simplification - in a full implementation we'd need
-            // to handle these properly
-            Literal::String(format!("{:?}", value))
+        OwnedValue::Null => Expr::Literal(Literal::Null),
+        OwnedValue::Bool(b) => Expr::Literal(Literal::Bool(*b)),
+        OwnedValue::Int(i) => Expr::Literal(Literal::Int(*i)),
+        OwnedValue::Float(f) => Expr::Literal(Literal::Float(*f)),
+        OwnedValue::String(s) => Expr::Literal(Literal::String(s.clone())),
+        OwnedValue::Array(arr) => {
+            // Build array construction expression with all elements
+            if arr.is_empty() {
+                Expr::Array(Box::new(Expr::Builtin(Builtin::Empty)))
+            } else {
+                let elements: Vec<Expr> = arr.iter().map(owned_to_expr).collect();
+                Expr::Array(Box::new(Expr::Comma(elements)))
+            }
+        }
+        OwnedValue::Object(obj) => {
+            // Build object construction expression
+            let entries: Vec<ObjectEntry> = obj
+                .iter()
+                .map(|(k, v)| ObjectEntry {
+                    key: ObjectKey::Literal(k.clone()),
+                    value: owned_to_expr(v),
+                })
+                .collect();
+            Expr::Object(entries)
         }
     }
 }
