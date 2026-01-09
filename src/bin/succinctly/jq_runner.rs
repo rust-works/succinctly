@@ -458,6 +458,7 @@ struct OutputConfig {
     sort_keys: bool,
     indent_string: String,
     unbuffered: bool,
+    seq: bool,
 }
 
 impl OutputConfig {
@@ -503,6 +504,7 @@ impl OutputConfig {
             sort_keys: args.sort_keys,
             indent_string,
             unbuffered: args.unbuffered,
+            seq: args.seq,
         }
     }
 }
@@ -741,6 +743,10 @@ fn get_inputs(args: &JqCommand) -> Result<Vec<OwnedValue>> {
             for line in raw.lines() {
                 values.push(OwnedValue::String(line.to_string()));
             }
+        } else if args.seq {
+            // JSON sequence input (RFC 7464): split on RS, ignore parse failures
+            let parsed = parse_json_seq(&raw);
+            values.extend(parsed);
         } else {
             // JSON input: parse as JSON stream
             let parsed = parse_json_stream(&raw)?;
@@ -802,6 +808,29 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
     }
 
     Ok(values)
+}
+
+/// Parse JSON sequence format (RFC 7464).
+/// Input is split on RS (0x1E) characters, each segment parsed as JSON.
+/// Parse failures are silently ignored (per RFC 7464 recommendation).
+fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
+    let mut values = Vec::new();
+
+    // Split on RS character (0x1E)
+    for segment in s.split('\x1E') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+
+        // Try to parse as JSON, silently ignore failures
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(segment) {
+            values.push(serde_to_owned(&value));
+        }
+        // Parse failures are silently ignored per RFC 7464
+    }
+
+    values
 }
 
 /// Convert serde_json::Value to OwnedValue.
@@ -902,7 +931,15 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) 
 }
 
 /// Write a single output value.
+/// ASCII RS (Record Separator) character for JSON sequence format (RFC 7464)
+const ASCII_RS: u8 = 0x1E;
+
 fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig) -> Result<()> {
+    // In seq mode, prepend RS (Record Separator) before each value
+    if config.seq {
+        out.write_all(&[ASCII_RS])?;
+    }
+
     let output = if config.sort_keys {
         format_json_sorted(value, config)
     } else {

@@ -1280,3 +1280,144 @@ fn test_import_with_namespace() -> Result<()> {
     assert_eq!(stdout.trim(), "10", "mymath::double should multiply by 2");
     Ok(())
 }
+
+// =============================================================================
+// JSON Sequence Format (RFC 7464) Tests
+// =============================================================================
+
+/// Helper to run jq command with binary input (for testing --seq with RS characters)
+fn run_jq_binary_stdin(filter: &str, input: &[u8], extra_args: &[&str]) -> Result<(Vec<u8>, i32)> {
+    let mut cmd = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+        ])
+        .args(extra_args)
+        .arg(filter)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(input)?;
+    }
+
+    let output = cmd.wait_with_output()?;
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    Ok((output.stdout, exit_code))
+}
+
+#[test]
+fn test_seq_output_format() -> Result<()> {
+    // --seq should prepend RS (0x1E) before each output value
+    let (output, code) = run_jq_binary_stdin(".", br#"{"a":1}"#, &["--seq", "-c"])?;
+    assert_eq!(code, 0);
+
+    // Output should start with RS (0x1E)
+    assert!(
+        output.starts_with(&[0x1E]),
+        "Output should start with RS (0x1E), got: {:?}",
+        &output[..output.len().min(10)]
+    );
+
+    // Rest should be the JSON value
+    let rest = String::from_utf8(output[1..].to_vec())?;
+    assert_eq!(rest.trim(), r#"{"a":1}"#);
+    Ok(())
+}
+
+#[test]
+fn test_seq_input_parsing() -> Result<()> {
+    // --seq should parse RS-separated input values
+    let mut input = Vec::new();
+    input.push(0x1E); // RS
+    input.extend_from_slice(br#"{"x":1}"#);
+    input.push(b'\n');
+    input.push(0x1E); // RS
+    input.extend_from_slice(br#"{"x":2}"#);
+    input.push(b'\n');
+
+    let (output, code) = run_jq_binary_stdin(".x", &input, &["--seq"])?;
+    assert_eq!(code, 0);
+
+    // Should have two RS-prefixed outputs
+    let output_str = String::from_utf8(output)?;
+    let lines: Vec<_> = output_str.lines().collect();
+
+    // Each line should start with RS followed by the value
+    assert!(lines.len() >= 2, "Should have at least 2 output lines");
+    Ok(())
+}
+
+#[test]
+fn test_seq_ignores_parse_errors() -> Result<()> {
+    // RFC 7464 recommends silently ignoring parse errors
+    let mut input = Vec::new();
+    input.push(0x1E);
+    input.extend_from_slice(br#"{"valid":1}"#);
+    input.push(b'\n');
+    input.push(0x1E);
+    input.extend_from_slice(b"not valid json");
+    input.push(b'\n');
+    input.push(0x1E);
+    input.extend_from_slice(br#"{"valid":2}"#);
+    input.push(b'\n');
+
+    let (output, code) = run_jq_binary_stdin(".valid", &input, &["--seq"])?;
+    assert_eq!(code, 0);
+
+    // Should only see outputs from valid JSON (1 and 2), not the invalid segment
+    let output_str = String::from_utf8(output)?;
+    assert!(
+        output_str.contains("1"),
+        "Should have output from first valid value"
+    );
+    assert!(
+        output_str.contains("2"),
+        "Should have output from second valid value"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_seq_multiple_outputs() -> Result<()> {
+    // Each output from iterator should get RS prefix
+    let (output, code) = run_jq_binary_stdin(".[]", br#"[1,2,3]"#, &["--seq"])?;
+    assert_eq!(code, 0);
+
+    // Count RS characters - should be 3 (one per output)
+    let rs_count = output.iter().filter(|&&b| b == 0x1E).count();
+    assert_eq!(rs_count, 3, "Should have 3 RS characters for 3 outputs");
+    Ok(())
+}
+
+#[test]
+fn test_seq_with_slurp() -> Result<()> {
+    // --seq with -s should slurp all seq inputs into an array
+    let mut input = Vec::new();
+    input.push(0x1E);
+    input.extend_from_slice(b"1");
+    input.push(b'\n');
+    input.push(0x1E);
+    input.extend_from_slice(b"2");
+    input.push(b'\n');
+    input.push(0x1E);
+    input.extend_from_slice(b"3");
+    input.push(b'\n');
+
+    let (output, code) = run_jq_binary_stdin("add", &input, &["--seq", "-s"])?;
+    assert_eq!(code, 0);
+
+    // Output should be RS + "6" (1+2+3)
+    assert!(output.starts_with(&[0x1E]), "Output should start with RS");
+    let rest = String::from_utf8(output[1..].to_vec())?;
+    assert_eq!(rest.trim(), "6");
+    Ok(())
+}

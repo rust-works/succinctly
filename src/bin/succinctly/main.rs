@@ -261,6 +261,11 @@ struct JqCommand {
     #[arg(short = 'L', value_name = "DIR", action = clap::ArgAction::Append)]
     library_path: Vec<PathBuf>,
 
+    // === Formats ===
+    /// Parse input/output as application/json-seq (RFC 7464)
+    #[arg(long)]
+    seq: bool,
+
     // === Exit Status ===
     /// Set exit status based on output (0 if last output != false/null)
     #[arg(short = 'e', long)]
