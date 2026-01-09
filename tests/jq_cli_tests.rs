@@ -553,6 +553,48 @@ fn test_jq_help() -> Result<()> {
     assert!(stdout.contains("--argjson"));
     assert!(stdout.contains("--raw-output0"));
     assert!(stdout.contains("--unbuffered"));
+    assert!(stdout.contains("--ascii-output"));
+    assert!(stdout.contains("--color-output"));
+    assert!(stdout.contains("--monochrome-output"));
+    Ok(())
+}
+
+#[test]
+fn test_ascii_output() -> Result<()> {
+    // Test that --ascii-output escapes non-ASCII characters
+    let (output, _) = run_jq_stdin(".", r#"{"name":"世界"}"#, &["-c", "-a"])?;
+    // Chinese characters should be escaped as \uXXXX
+    assert!(output.contains(r#"\u4e16\u754c"#));
+    assert!(!output.contains("世界"));
+    Ok(())
+}
+
+#[test]
+fn test_ascii_output_emoji() -> Result<()> {
+    // Test that emoji (outside BMP) are escaped as surrogate pairs
+    let (output, _) = run_jq_stdin(".", r#"{"emoji":"🌍"}"#, &["-c", "-a"])?;
+    // Earth emoji U+1F30D should be encoded as surrogate pair
+    assert!(output.contains(r#"\ud83c\udf0d"#));
+    assert!(!output.contains("🌍"));
+    Ok(())
+}
+
+#[test]
+fn test_color_output() -> Result<()> {
+    // Test that -C adds ANSI color codes
+    let (output, _) = run_jq_stdin(".", r#"{"name":"test"}"#, &["-c", "-C"])?;
+    // Should contain ANSI escape sequences
+    assert!(output.contains("\x1b["));
+    Ok(())
+}
+
+#[test]
+fn test_monochrome_output() -> Result<()> {
+    // Test that -M disables color even when -C might be implied
+    let (output, _) = run_jq_stdin(".", r#"{"name":"test"}"#, &["-c", "-M"])?;
+    // Should NOT contain ANSI escape sequences
+    assert!(!output.contains("\x1b["));
+    assert_eq!(output.trim(), r#"{"name":"test"}"#);
     Ok(())
 }
 
