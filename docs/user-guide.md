@@ -335,18 +335,23 @@ succinctly json generate-suite --max-size 100mb
 
 ### Querying JSON
 
+The `jq` subcommand provides a jq-compatible interface:
+
 ```bash
 # Basic query
-succinctly json query '.users[0].name' -i data.json
+succinctly jq '.users[0].name' data.json
 
 # Multiple results
-succinctly json query '.users[].name' -i data.json
+succinctly jq '.users[].name' data.json
 
 # Raw output (no JSON formatting)
-succinctly json query '.users[0].name' -i data.json --raw
+succinctly jq -r '.users[0].name' data.json
 
-# Memory-mapped for large files
-succinctly json query '.data[]' -i huge.json --mmap
+# Compact output
+succinctly jq -c '.users[]' data.json
+
+# Read from stdin
+cat data.json | succinctly jq '.name'
 ```
 
 ## Feature Flags

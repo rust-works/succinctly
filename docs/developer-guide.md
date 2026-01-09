@@ -174,14 +174,14 @@ For CPU profiling on macOS:
 cargo build --release
 
 # Profile with Instruments
-xcrun xctrace record --template "Time Profiler" --launch -- ./target/release/succinctly json query '.users[]' -i large.json
+xcrun xctrace record --template "Time Profiler" --launch -- ./target/release/succinctly jq '.users[]' large.json
 ```
 
 For Linux with perf:
 
 ```bash
 cargo build --release
-perf record ./target/release/succinctly json query '.users[]' -i large.json
+perf record ./target/release/succinctly jq '.users[]' large.json
 perf report
 ```
 

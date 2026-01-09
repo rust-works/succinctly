@@ -52,7 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **CLI Tool**
   - `json generate` - Generate synthetic JSON for benchmarking
-  - `json query` - Query JSON files with jq syntax
+  - `jq` - jq-compatible command-line JSON processor
   - Multiple output formats and memory-mapping support
 
 - **Platform Support**
