@@ -547,7 +547,8 @@ fn test_object_construction() -> Result<()> {
         &["-c"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#"{"id":42,"name":"Alice"}"#);
+    // jq preserves expression order: name comes first, then id
+    assert_eq!(output.trim(), r#"{"name":"Alice","id":42}"#);
     Ok(())
 }
 
@@ -714,6 +715,44 @@ fn test_unbuffered_flag() -> Result<()> {
     let (output, code) = run_jq_stdin(".", r#"{"a":1}"#, &["-c", "--unbuffered"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"{"a":1}"#);
+    Ok(())
+}
+
+#[test]
+fn test_number_formatting_preserved() -> Result<()> {
+    // Test that exponential notation is preserved in compact output
+    // This is a key feature: succinctly preserves original number formatting
+    let (output, code) = run_jq_stdin(".", r#"{"val":4e4}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    // Should preserve "4e4" not convert to "40000"
+    assert_eq!(output.trim(), r#"{"val":4e4}"#);
+    Ok(())
+}
+
+#[test]
+fn test_number_formatting_various() -> Result<()> {
+    // Test various number formats are preserved
+    let (output, code) = run_jq_stdin(".", r#"{"a":1.0e10,"b":2e-5,"c":3.14159}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":1.0e10,"b":2e-5,"c":3.14159}"#);
+    Ok(())
+}
+
+#[test]
+fn test_number_formatting_field_access() -> Result<()> {
+    // Test number formatting preserved through field access
+    let (output, code) = run_jq_stdin(".val", r#"{"val":4e4}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "4e4");
+    Ok(())
+}
+
+#[test]
+fn test_number_formatting_array_iteration() -> Result<()> {
+    // Test number formatting preserved through array iteration
+    let (output, code) = run_jq_stdin(".[]", r#"[1e100, 2e-100]"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1e100\n2e-100");
     Ok(())
 }
 

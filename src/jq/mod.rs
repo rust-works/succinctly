@@ -65,6 +65,7 @@
 
 mod eval;
 mod expr;
+mod lazy;
 mod parser;
 mod value;
 
@@ -73,5 +74,6 @@ pub use expr::{
     ArithOp, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal, MetaValue, ModuleMeta,
     ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,
 };
+pub use lazy::JqValue;
 pub use parser::{parse, parse_program, ParseError};
 pub use value::OwnedValue;
