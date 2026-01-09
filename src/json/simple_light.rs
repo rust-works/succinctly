@@ -37,8 +37,8 @@
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
-use crate::bp::BalancedParens;
-use crate::broadword::select_in_word;
+use crate::trees::BalancedParens;
+use crate::util::broadword::select_in_word;
 
 // ============================================================================
 // SimpleJsonIndex: Holds the IB and BP index structures for simple cursor

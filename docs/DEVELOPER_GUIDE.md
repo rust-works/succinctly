@@ -4,21 +4,28 @@ This guide provides detailed information for developers working on succinctly.
 
 ## Architecture Overview
 
-Succinctly is organized into several core modules:
+Succinctly is organized into a modular hierarchy:
 
 ```
 src/
-├── lib.rs          # Public API, RankSelect trait, Config
-├── bitvec.rs       # BitVec implementation with rank/select
-├── rank.rs         # RankDirectory (Poppy 3-level)
-├── select.rs       # SelectIndex (sampled)
-├── bp.rs           # BalancedParens with RangeMin
-├── broadword.rs    # Bit manipulation primitives
-├── popcount.rs     # Population count implementations
-├── table.rs        # Precomputed lookup tables
-├── binary.rs       # Binary I/O utilities
-├── json/           # JSON semi-indexing
-│   ├── mod.rs      # Public API
+├── lib.rs              # Public API, RankSelect trait, Config
+├── bits/               # Bitvector implementations
+│   ├── mod.rs          # Re-exports
+│   ├── bitvec.rs       # BitVec with rank/select
+│   ├── rank.rs         # RankDirectory (Poppy 3-level)
+│   ├── select.rs       # SelectIndex (sampled)
+│   └── popcount.rs     # Population count strategies
+├── trees/              # Tree encodings
+│   ├── mod.rs          # Re-exports
+│   └── bp.rs           # BalancedParens with RangeMin
+├── util/               # Internal utilities (not public API)
+│   ├── mod.rs
+│   ├── broadword.rs    # Bit manipulation primitives
+│   ├── table.rs        # Precomputed lookup tables
+│   └── simd/           # SIMD utilities
+├── binary.rs           # Binary I/O utilities
+├── json/               # JSON semi-indexing
+│   ├── mod.rs          # Public API
 │   ├── pfsm_optimized.rs  # Table-driven parser (default)
 │   ├── pfsm_tables.rs     # State machine tables
 │   ├── standard.rs        # Standard cursor implementation
@@ -29,11 +36,32 @@ src/
 │       ├── sse42.rs       # SSE4.2 with PCMPISTRI
 │       ├── x86.rs         # SSE2 baseline
 │       └── neon.rs        # ARM NEON
-└── jq/             # jq query language
-    ├── mod.rs      # Public API
-    ├── expr.rs     # AST definitions
-    ├── parser.rs   # Recursive descent parser
-    └── eval.rs     # Expression evaluator
+├── jq/                 # jq query language
+│   ├── mod.rs          # Public API
+│   ├── expr.rs         # AST definitions
+│   ├── parser.rs       # Recursive descent parser
+│   └── eval.rs         # Expression evaluator
+└── bin/                # CLI tool
+    └── succinctly/
+        ├── main.rs
+        ├── generators.rs
+        └── jq_runner.rs
+```
+
+### Public API
+
+```rust
+// Recommended imports (explicit module paths)
+use succinctly::bits::BitVec;
+use succinctly::trees::BalancedParens;
+use succinctly::json::JsonIndex;
+use succinctly::jq::{parse, eval};
+
+// Convenience re-exports (also at crate root)
+use succinctly::{BitVec, BalancedParens, RankSelect};
+
+// Backward compatibility (deprecated)
+use succinctly::bp::BalancedParens;  // Use succinctly::trees instead
 ```
 
 ## Core Concepts
