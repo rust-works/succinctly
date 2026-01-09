@@ -469,8 +469,6 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     /// Get the JSON value at this cursor position.
     ///
     /// This calls `text_position()` to determine the value type.
-    /// For traversal where you only need to distinguish containers from
-    /// leaves, use [`value_lazy()`](Self::value_lazy) instead for better performance.
     pub fn value(&self) -> StandardJson<'a, W> {
         let Some(text_pos) = self.text_position() else {
             return StandardJson::Error("invalid cursor position");
@@ -780,7 +778,7 @@ impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
     /// Note: This is O(n) as it iterates through elements, calling `value()`
     /// for each intermediate element.
     ///
-    /// For better performance with random access, use [`get_fast`] which
+    /// For better performance with random access, use [`get_fast`](Self::get_fast) which
     /// only calls `value()` on the target element.
     pub fn get(&self, index: usize) -> Option<StandardJson<'a, W>> {
         let mut elements = *self;
