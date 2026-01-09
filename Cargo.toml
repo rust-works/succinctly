@@ -2,9 +2,14 @@
 name = "succinctly"
 version = "0.1.0"
 edition = "2021"
+authors = ["John Ky <newhoggy@gmail.com>"]
+rust-version = "1.70.0"
 description = "High-performance succinct data structures for Rust"
 license = "MIT"
 repository = "https://github.com/rust-works/succinctly"
+homepage = "https://github.com/rust-works/succinctly"
+documentation = "https://docs.rs/succinctly"
+readme = "README.md"
 keywords = ["succinct", "bitvector", "rank", "select", "data-structures"]
 categories = ["data-structures", "algorithms"]
 
