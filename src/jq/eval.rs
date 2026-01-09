@@ -286,6 +286,18 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
             then,
         } => eval_func_def(name, params, body, then, value, optional),
         Expr::FuncCall { name, args } => eval_func_call(name, args, value, optional),
+        Expr::NamespacedCall {
+            namespace,
+            name,
+            args: _,
+        } => {
+            // For now, namespaced calls return an error (modules not loaded)
+            // This will be properly handled once module loading is implemented
+            QueryResult::Error(EvalError::new(format!(
+                "module '{}' not loaded (namespaced call {}::{})",
+                namespace, namespace, name
+            )))
+        }
     }
 }
 
@@ -3917,6 +3929,18 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
                 .map(|a| substitute_var(a, var_name, replacement))
                 .collect(),
         },
+        Expr::NamespacedCall {
+            namespace,
+            name,
+            args,
+        } => Expr::NamespacedCall {
+            namespace: namespace.clone(),
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| substitute_var(a, var_name, replacement))
+                .collect(),
+        },
     }
 }
 
@@ -6273,6 +6297,18 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
                     .collect(),
             }
         }
+        Expr::NamespacedCall {
+            namespace,
+            name,
+            args,
+        } => Expr::NamespacedCall {
+            namespace: namespace.clone(),
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| expand_func_calls(a, func_name, params, body))
+                .collect(),
+        },
     }
 }
 
@@ -6518,6 +6554,18 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
                 }
             }
         }
+        Expr::NamespacedCall {
+            namespace,
+            name,
+            args,
+        } => Expr::NamespacedCall {
+            namespace: namespace.clone(),
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| substitute_func_param(a, param, arg))
+                .collect(),
+        },
     }
 }
 

@@ -256,6 +256,11 @@ struct JqCommand {
     #[arg(long, num_args = 0.., value_name = "JSON_VALUES")]
     jsonargs: Vec<String>,
 
+    // === Modules ===
+    /// Prepend directory to module search path
+    #[arg(short = 'L', value_name = "DIR", action = clap::ArgAction::Append)]
+    library_path: Vec<PathBuf>,
+
     // === Exit Status ===
     /// Set exit status based on output (0 if last output != false/null)
     #[arg(short = 'e', long)]

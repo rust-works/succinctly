@@ -6,9 +6,9 @@
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use succinctly::jq::{self, OwnedValue, QueryResult};
+use succinctly::jq::{self, Expr, OwnedValue, Program, QueryResult};
 use succinctly::json::light::StandardJson;
 use succinctly::json::JsonIndex;
 
@@ -82,6 +82,368 @@ pub struct EvalContext {
     pub named: BTreeMap<String, OwnedValue>,
     /// Positional arguments from --args or --jsonargs
     pub positional: Vec<OwnedValue>,
+}
+
+/// Module loader for resolving and loading jq modules.
+#[derive(Debug)]
+pub struct ModuleLoader {
+    /// Search path for modules (in order of priority)
+    search_path: Vec<PathBuf>,
+    /// Loaded modules (path -> function definitions)
+    loaded_modules: BTreeMap<String, Vec<(String, Expr)>>,
+    /// Auto-loaded ~/.jq file definitions (if file exists)
+    auto_loaded_defs: Vec<(String, Expr)>,
+}
+
+impl ModuleLoader {
+    /// Create a new module loader with the given search paths.
+    pub fn new(library_paths: &[PathBuf]) -> Self {
+        let mut search_path = Vec::new();
+        let mut auto_loaded_defs = Vec::new();
+
+        // Add command-line -L paths first (highest priority)
+        for path in library_paths {
+            if path.is_dir() {
+                search_path.push(path.clone());
+            }
+        }
+
+        // Add JQ_LIBRARY_PATH environment variable paths
+        if let Ok(jq_lib_path) = std::env::var("JQ_LIBRARY_PATH") {
+            for path_str in jq_lib_path.split(':') {
+                let path = PathBuf::from(path_str);
+                if path.is_dir() {
+                    search_path.push(path);
+                }
+            }
+        }
+
+        // Handle ~/.jq - can be either a file or directory
+        if let Some(home) = std::env::var_os("HOME") {
+            let jq_path = PathBuf::from(home).join(".jq");
+            if jq_path.is_file() {
+                // Auto-load ~/.jq file - functions defined here are always available
+                if let Ok(contents) = std::fs::read_to_string(&jq_path) {
+                    if let Ok(program) = jq::parse_program(&contents) {
+                        auto_loaded_defs = extract_func_defs(&program.expr);
+                    }
+                }
+            } else if jq_path.is_dir() {
+                // Add ~/.jq directory to search path
+                search_path.push(jq_path);
+            }
+        }
+
+        ModuleLoader {
+            search_path,
+            loaded_modules: BTreeMap::new(),
+            auto_loaded_defs,
+        }
+    }
+
+    /// Resolve a module path to a file path.
+    fn resolve_module(&self, module_path: &str) -> Option<PathBuf> {
+        // Add .jq extension if not present
+        let module_file = if module_path.ends_with(".jq") {
+            module_path.to_string()
+        } else {
+            format!("{}.jq", module_path)
+        };
+
+        // Search in each path
+        for base in &self.search_path {
+            let full_path = base.join(&module_file);
+            if full_path.is_file() {
+                return Some(full_path);
+            }
+        }
+
+        None
+    }
+
+    /// Load a module and return its function definitions.
+    pub fn load_module(&mut self, module_path: &str) -> Result<Vec<(String, Expr)>> {
+        // Check if already loaded
+        if let Some(defs) = self.loaded_modules.get(module_path) {
+            return Ok(defs.clone());
+        }
+
+        // Resolve the module path
+        let file_path = self
+            .resolve_module(module_path)
+            .ok_or_else(|| anyhow::anyhow!("module '{}' not found in search path", module_path))?;
+
+        // Read and parse the module
+        let contents = std::fs::read_to_string(&file_path)
+            .with_context(|| format!("failed to read module: {}", file_path.display()))?;
+
+        let program = jq::parse_program(&contents).map_err(|e| {
+            anyhow::anyhow!("parse error in module '{}': {}", file_path.display(), e)
+        })?;
+
+        // Extract function definitions from the expression
+        let defs = extract_func_defs(&program.expr);
+
+        // Cache the loaded module
+        self.loaded_modules
+            .insert(module_path.to_string(), defs.clone());
+
+        Ok(defs)
+    }
+
+    /// Process imports and includes, returning the modified expression with all functions defined.
+    pub fn process_program(&mut self, program: &Program) -> Result<Expr> {
+        let mut expr = program.expr.clone();
+
+        // First, prepend auto-loaded ~/.jq definitions (lowest priority, can be overridden)
+        for (name, body) in self.auto_loaded_defs.clone().into_iter().rev() {
+            expr = Expr::FuncDef {
+                name,
+                params: Vec::new(),
+                body: Box::new(body),
+                then: Box::new(expr),
+            };
+        }
+
+        // Process includes (definitions merged into current scope)
+        for include in &program.includes {
+            let defs = self.load_module(&include.path)?;
+            // Wrap expression with function definitions from the included module
+            for (name, body) in defs.into_iter().rev() {
+                expr = Expr::FuncDef {
+                    name,
+                    params: Vec::new(), // We'll need to extract params too
+                    body: Box::new(body),
+                    then: Box::new(expr),
+                };
+            }
+        }
+
+        // Process imports (definitions available under namespace::)
+        // Load modules and add their functions with namespace prefixes
+        for import in &program.imports {
+            let defs = self.load_module(&import.path)?;
+            let namespace = &import.alias;
+
+            // Add each function with a namespaced name (namespace::funcname)
+            for (name, body) in defs.into_iter().rev() {
+                let namespaced_name = format!("{}::{}", namespace, name);
+                expr = Expr::FuncDef {
+                    name: namespaced_name,
+                    params: Vec::new(),
+                    body: Box::new(body),
+                    then: Box::new(expr),
+                };
+            }
+        }
+
+        // Transform NamespacedCall expressions to regular FuncCall expressions
+        expr = rewrite_namespaced_calls(expr);
+
+        Ok(expr)
+    }
+}
+
+/// Recursively rewrite NamespacedCall expressions to regular FuncCall expressions
+/// by transforming `namespace::func(args)` to `namespace::func(args)` as a regular call
+fn rewrite_namespaced_calls(expr: Expr) -> Expr {
+    match expr {
+        Expr::NamespacedCall {
+            namespace,
+            name,
+            args,
+        } => {
+            // Convert to a regular function call with the namespaced name
+            let full_name = format!("{}::{}", namespace, name);
+            let rewritten_args: Vec<Expr> =
+                args.into_iter().map(rewrite_namespaced_calls).collect();
+            Expr::FuncCall {
+                name: full_name,
+                args: rewritten_args,
+            }
+        }
+        // Recursively process all other expression types
+        Expr::Pipe(exprs) => Expr::Pipe(exprs.into_iter().map(rewrite_namespaced_calls).collect()),
+        Expr::Comma(exprs) => {
+            Expr::Comma(exprs.into_iter().map(rewrite_namespaced_calls).collect())
+        }
+        Expr::Optional(inner) => Expr::Optional(Box::new(rewrite_namespaced_calls(*inner))),
+        Expr::Paren(inner) => Expr::Paren(Box::new(rewrite_namespaced_calls(*inner))),
+        Expr::Array(inner) => Expr::Array(Box::new(rewrite_namespaced_calls(*inner))),
+        Expr::Object(entries) => {
+            let new_entries = entries
+                .into_iter()
+                .map(|entry| jq::ObjectEntry {
+                    key: match entry.key {
+                        jq::ObjectKey::Expr(e) => {
+                            jq::ObjectKey::Expr(Box::new(rewrite_namespaced_calls(*e)))
+                        }
+                        other => other,
+                    },
+                    value: rewrite_namespaced_calls(entry.value),
+                })
+                .collect();
+            Expr::Object(new_entries)
+        }
+        Expr::FuncCall { name, args } => {
+            let new_args: Vec<Expr> = args.into_iter().map(rewrite_namespaced_calls).collect();
+            Expr::FuncCall {
+                name,
+                args: new_args,
+            }
+        }
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+        } => Expr::FuncDef {
+            name,
+            params,
+            body: Box::new(rewrite_namespaced_calls(*body)),
+            then: Box::new(rewrite_namespaced_calls(*then)),
+        },
+        Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
+            op,
+            left: Box::new(rewrite_namespaced_calls(*left)),
+            right: Box::new(rewrite_namespaced_calls(*right)),
+        },
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op,
+            left: Box::new(rewrite_namespaced_calls(*left)),
+            right: Box::new(rewrite_namespaced_calls(*right)),
+        },
+        Expr::And(left, right) => Expr::And(
+            Box::new(rewrite_namespaced_calls(*left)),
+            Box::new(rewrite_namespaced_calls(*right)),
+        ),
+        Expr::Or(left, right) => Expr::Or(
+            Box::new(rewrite_namespaced_calls(*left)),
+            Box::new(rewrite_namespaced_calls(*right)),
+        ),
+        Expr::Alternative(left, right) => Expr::Alternative(
+            Box::new(rewrite_namespaced_calls(*left)),
+            Box::new(rewrite_namespaced_calls(*right)),
+        ),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => Expr::If {
+            cond: Box::new(rewrite_namespaced_calls(*cond)),
+            then_branch: Box::new(rewrite_namespaced_calls(*then_branch)),
+            else_branch: Box::new(rewrite_namespaced_calls(*else_branch)),
+        },
+        Expr::Try { expr, catch } => Expr::Try {
+            expr: Box::new(rewrite_namespaced_calls(*expr)),
+            catch: catch.map(|e| Box::new(rewrite_namespaced_calls(*e))),
+        },
+        Expr::Error(inner) => Expr::Error(inner.map(|e| Box::new(rewrite_namespaced_calls(*e)))),
+        Expr::As { expr, var, body } => Expr::As {
+            expr: Box::new(rewrite_namespaced_calls(*expr)),
+            var,
+            body: Box::new(rewrite_namespaced_calls(*body)),
+        },
+        Expr::Reduce {
+            input,
+            var,
+            init,
+            update,
+        } => Expr::Reduce {
+            input: Box::new(rewrite_namespaced_calls(*input)),
+            var,
+            init: Box::new(rewrite_namespaced_calls(*init)),
+            update: Box::new(rewrite_namespaced_calls(*update)),
+        },
+        Expr::Foreach {
+            input,
+            var,
+            init,
+            update,
+            extract,
+        } => Expr::Foreach {
+            input: Box::new(rewrite_namespaced_calls(*input)),
+            var,
+            init: Box::new(rewrite_namespaced_calls(*init)),
+            update: Box::new(rewrite_namespaced_calls(*update)),
+            extract: extract.map(|e| Box::new(rewrite_namespaced_calls(*e))),
+        },
+        Expr::Limit { n, expr } => Expr::Limit {
+            n: Box::new(rewrite_namespaced_calls(*n)),
+            expr: Box::new(rewrite_namespaced_calls(*expr)),
+        },
+        Expr::FirstExpr(inner) => Expr::FirstExpr(Box::new(rewrite_namespaced_calls(*inner))),
+        Expr::LastExpr(inner) => Expr::LastExpr(Box::new(rewrite_namespaced_calls(*inner))),
+        Expr::NthExpr { n, expr } => Expr::NthExpr {
+            n: Box::new(rewrite_namespaced_calls(*n)),
+            expr: Box::new(rewrite_namespaced_calls(*expr)),
+        },
+        Expr::Until { cond, update } => Expr::Until {
+            cond: Box::new(rewrite_namespaced_calls(*cond)),
+            update: Box::new(rewrite_namespaced_calls(*update)),
+        },
+        Expr::While { cond, update } => Expr::While {
+            cond: Box::new(rewrite_namespaced_calls(*cond)),
+            update: Box::new(rewrite_namespaced_calls(*update)),
+        },
+        Expr::Repeat(inner) => Expr::Repeat(Box::new(rewrite_namespaced_calls(*inner))),
+        Expr::Range { from, to, step } => Expr::Range {
+            from: Box::new(rewrite_namespaced_calls(*from)),
+            to: to.map(|e| Box::new(rewrite_namespaced_calls(*e))),
+            step: step.map(|e| Box::new(rewrite_namespaced_calls(*e))),
+        },
+        Expr::AsPattern {
+            expr,
+            pattern,
+            body,
+        } => Expr::AsPattern {
+            expr: Box::new(rewrite_namespaced_calls(*expr)),
+            pattern,
+            body: Box::new(rewrite_namespaced_calls(*body)),
+        },
+        Expr::StringInterpolation(parts) => {
+            let new_parts = parts
+                .into_iter()
+                .map(|part| match part {
+                    jq::StringPart::Literal(s) => jq::StringPart::Literal(s),
+                    jq::StringPart::Expr(e) => {
+                        jq::StringPart::Expr(Box::new(rewrite_namespaced_calls(*e)))
+                    }
+                })
+                .collect();
+            Expr::StringInterpolation(new_parts)
+        }
+        // Expressions that don't contain sub-expressions - return as-is
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index(_)
+        | Expr::Slice { .. }
+        | Expr::Iterate
+        | Expr::RecursiveDescent
+        | Expr::Literal(_)
+        | Expr::Var(_)
+        | Expr::Not
+        | Expr::Format(_)
+        | Expr::Builtin(_) => expr,
+    }
+}
+
+/// Extract function definitions from an expression.
+fn extract_func_defs(expr: &Expr) -> Vec<(String, Expr)> {
+    let mut defs = Vec::new();
+
+    fn extract_inner(expr: &Expr, defs: &mut Vec<(String, Expr)>) {
+        if let Expr::FuncDef {
+            name, body, then, ..
+        } = expr
+        {
+            defs.push((name.clone(), (**body).clone()));
+            extract_inner(then, defs);
+        }
+    }
+
+    extract_inner(expr, &mut defs);
+    defs
 }
 
 /// Output formatting configuration
@@ -169,10 +531,17 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // Get the filter expression
     let filter_str = get_filter(&args)?;
 
-    // Parse the filter
-    let expr = jq::parse(&filter_str).map_err(|e| {
+    // Parse the filter as a full program (with module directives)
+    let program = jq::parse_program(&filter_str).map_err(|e| {
         eprintln!("jq: compile error: {}", e);
         anyhow::anyhow!("compile error")
+    })?;
+
+    // Create module loader and process imports/includes
+    let mut module_loader = ModuleLoader::new(&args.library_path);
+    let expr = module_loader.process_program(&program).map_err(|e| {
+        eprintln!("jq: module error: {}", e);
+        anyhow::anyhow!("module error")
     })?;
 
     // Build the $ARGS special variable

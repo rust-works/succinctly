@@ -3,9 +3,13 @@
 #[cfg(not(test))]
 use alloc::boxed::Box;
 #[cfg(not(test))]
+use alloc::collections::BTreeMap;
+#[cfg(not(test))]
 use alloc::string::String;
 #[cfg(not(test))]
 use alloc::vec::Vec;
+#[cfg(test)]
+use std::collections::BTreeMap;
 
 /// A jq expression representing a query path.
 #[derive(Debug, Clone, PartialEq)]
@@ -218,6 +222,94 @@ pub enum Expr {
         /// Arguments (empty for no-arg calls)
         args: Vec<Expr>,
     },
+
+    /// Namespaced function call: `module::func` or `module::func(args)`
+    NamespacedCall {
+        /// Module namespace
+        namespace: String,
+        /// Function name
+        name: String,
+        /// Arguments (empty for no-arg calls)
+        args: Vec<Expr>,
+    },
+}
+
+/// A complete jq program including module directives and the main expression.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Program {
+    /// Optional module metadata declaration
+    pub module: Option<ModuleMeta>,
+    /// Import directives
+    pub imports: Vec<Import>,
+    /// Include directives
+    pub includes: Vec<Include>,
+    /// The main expression (function definitions followed by the filter)
+    pub expr: Expr,
+}
+
+impl Default for Program {
+    fn default() -> Self {
+        Program {
+            module: None,
+            imports: Vec::new(),
+            includes: Vec::new(),
+            expr: Expr::Identity,
+        }
+    }
+}
+
+impl Program {
+    /// Create a program from just an expression (no module directives).
+    pub fn from_expr(expr: Expr) -> Self {
+        Program {
+            module: None,
+            imports: Vec::new(),
+            includes: Vec::new(),
+            expr,
+        }
+    }
+}
+
+/// Module metadata declaration: `module { ... };`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleMeta {
+    /// Metadata key-value pairs
+    pub metadata: BTreeMap<String, MetaValue>,
+}
+
+/// Values allowed in module metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetaValue {
+    /// String value
+    String(String),
+    /// Number value
+    Number(f64),
+    /// Boolean value
+    Bool(bool),
+    /// Array of values
+    Array(Vec<MetaValue>),
+    /// Nested object
+    Object(BTreeMap<String, MetaValue>),
+}
+
+/// Import directive: `import "path" as name;` or `import "path" as name { meta };`
+#[derive(Debug, Clone, PartialEq)]
+pub struct Import {
+    /// The module path (relative, without .jq extension)
+    pub path: String,
+    /// The namespace alias
+    pub alias: String,
+    /// Optional metadata overrides
+    pub metadata: Option<BTreeMap<String, MetaValue>>,
+}
+
+/// Include directive: `include "path";` or `include "path" { meta };`
+#[derive(Debug, Clone, PartialEq)]
+pub struct Include {
+    /// The module path (relative, without .jq extension)
+    pub path: String,
+    /// Optional metadata overrides
+    pub metadata: Option<BTreeMap<String, MetaValue>>,
 }
 
 /// A pattern for destructuring variable binding.

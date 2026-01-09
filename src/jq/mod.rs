@@ -70,8 +70,8 @@ mod value;
 
 pub use eval::{eval, eval_lenient, substitute_vars, EvalError, QueryResult};
 pub use expr::{
-    ArithOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey, Pattern,
-    PatternEntry, StringPart,
+    ArithOp, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal, MetaValue, ModuleMeta,
+    ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,
 };
-pub use parser::{parse, ParseError};
+pub use parser::{parse, parse_program, ParseError};
 pub use value::OwnedValue;

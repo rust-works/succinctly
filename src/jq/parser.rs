@@ -28,9 +28,14 @@ use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
+#[cfg(not(test))]
+use alloc::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeMap;
+
 use super::expr::{
-    ArithOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey, Pattern,
-    PatternEntry, StringPart,
+    ArithOp, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal, MetaValue, ModuleMeta,
+    ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,
 };
 
 /// Error that occurs during parsing.
@@ -1425,11 +1430,16 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a function call or return an error for unknown identifier.
-    /// Function call syntax: NAME or NAME(args; args; ...)
+    /// Function call syntax: NAME or NAME(args; args; ...) or NAMESPACE::NAME(args)
     fn parse_func_call_or_error(&mut self) -> Result<Expr, ParseError> {
         let _start_pos = self.pos;
         let name = self.parse_ident()?;
         self.skip_ws();
+
+        // Check for namespaced call (module::func)
+        if self.peek_str(2) == "::" {
+            return self.parse_namespaced_call(name);
+        }
 
         // Check for function arguments
         let args = if self.peek() == Some('(') {
@@ -2691,6 +2701,374 @@ impl<'a> Parser<'a> {
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         self.parse_comma_expr()
     }
+
+    // =========================================================================
+    // Module System Parsing
+    // =========================================================================
+
+    /// Parse a complete program including module directives.
+    fn parse_program(&mut self) -> Result<Program, ParseError> {
+        let mut program = Program::default();
+
+        self.skip_ws();
+
+        // Parse optional module declaration
+        if self.matches_keyword("module") {
+            program.module = Some(self.parse_module_declaration()?);
+        }
+
+        // Parse import and include directives
+        loop {
+            self.skip_ws();
+            if self.matches_keyword("import") {
+                program.imports.push(self.parse_import()?);
+            } else if self.matches_keyword("include") {
+                program.includes.push(self.parse_include()?);
+            } else {
+                break;
+            }
+        }
+
+        // Parse the main expression (which may include function definitions at module level)
+        self.skip_ws();
+        if !self.is_eof() {
+            program.expr = self.parse_module_body()?;
+        }
+
+        Ok(program)
+    }
+
+    /// Parse module body - handles standalone function definitions
+    /// In module files, `def foo: ...; def bar: ...;` doesn't need a trailing expression
+    fn parse_module_body(&mut self) -> Result<Expr, ParseError> {
+        self.skip_ws();
+
+        // Collect function definitions at module level
+        let mut defs: Vec<(String, Vec<String>, Expr)> = Vec::new();
+
+        // Parse function definitions until we hit something that isn't one
+        while self.matches_keyword("def") {
+            let (name, params, body) = self.parse_func_def_parts()?;
+            defs.push((name, params, body));
+            self.skip_ws();
+        }
+
+        // Parse the remaining expression (or use Identity if nothing left)
+        let tail_expr = if self.is_eof() {
+            Expr::Identity
+        } else {
+            self.parse_expr()?
+        };
+
+        // Wrap the tail expression with the function definitions in reverse order
+        let mut result = tail_expr;
+        for (name, params, body) in defs.into_iter().rev() {
+            result = Expr::FuncDef {
+                name,
+                params,
+                body: Box::new(body),
+                then: Box::new(result),
+            };
+        }
+
+        Ok(result)
+    }
+
+    /// Parse just the function definition parts (name, params, body) without the "then" clause
+    fn parse_func_def_parts(&mut self) -> Result<(String, Vec<String>, Expr), ParseError> {
+        self.consume_keyword("def");
+        self.skip_ws();
+
+        let name = self.parse_ident()?;
+        self.skip_ws();
+
+        // Parse optional parameters
+        let params = if self.peek() == Some('(') {
+            self.next();
+            self.skip_ws();
+            let mut params = Vec::new();
+            while self.peek() != Some(')') {
+                // Parameters can be $var or just var
+                if self.peek() == Some('$') {
+                    self.next();
+                }
+                let param = self.parse_ident()?;
+                params.push(param);
+                self.skip_ws();
+
+                match self.peek() {
+                    Some(';') | Some(',') => {
+                        self.next();
+                        self.skip_ws();
+                    }
+                    Some(')') => break,
+                    _ => {
+                        return Err(ParseError::new(
+                            "expected ';', ',', or ')' in parameter list",
+                            self.pos,
+                        ));
+                    }
+                }
+            }
+            self.expect(')')?;
+            params
+        } else {
+            Vec::new()
+        };
+
+        self.skip_ws();
+        self.expect(':')?;
+        self.skip_ws();
+
+        // Parse function body
+        let body = self.parse_pipe_expr()?;
+        self.skip_ws();
+
+        // Expect semicolon
+        self.expect(';')?;
+
+        Ok((name, params, body))
+    }
+
+    /// Parse module declaration: `module { ... };`
+    fn parse_module_declaration(&mut self) -> Result<ModuleMeta, ParseError> {
+        self.consume_keyword("module");
+        self.skip_ws();
+
+        let metadata = self.parse_metadata_object()?;
+
+        self.skip_ws();
+        if self.peek() != Some(';') {
+            return Err(ParseError::new(
+                "expected ';' after module declaration",
+                self.pos,
+            ));
+        }
+        self.next();
+
+        Ok(ModuleMeta { metadata })
+    }
+
+    /// Parse import directive: `import "path" as name;` or `import "path" as $name;`
+    fn parse_import(&mut self) -> Result<Import, ParseError> {
+        self.consume_keyword("import");
+        self.skip_ws();
+
+        // Parse the path string
+        let path = self.parse_string_literal()?;
+
+        self.skip_ws();
+
+        // Expect 'as'
+        if !self.matches_keyword("as") {
+            return Err(ParseError::new(
+                "expected 'as' in import directive",
+                self.pos,
+            ));
+        }
+        self.consume_keyword("as");
+        self.skip_ws();
+
+        // Parse the alias (optionally prefixed with $)
+        let alias = if self.peek() == Some('$') {
+            self.next();
+            self.parse_ident()?
+        } else {
+            self.parse_ident()?
+        };
+
+        self.skip_ws();
+
+        // Parse optional metadata
+        let metadata = if self.peek() == Some('{') {
+            Some(self.parse_metadata_object()?)
+        } else {
+            None
+        };
+
+        self.skip_ws();
+        if self.peek() != Some(';') {
+            return Err(ParseError::new(
+                "expected ';' after import directive",
+                self.pos,
+            ));
+        }
+        self.next();
+
+        Ok(Import {
+            path,
+            alias,
+            metadata,
+        })
+    }
+
+    /// Parse include directive: `include "path";`
+    fn parse_include(&mut self) -> Result<Include, ParseError> {
+        self.consume_keyword("include");
+        self.skip_ws();
+
+        // Parse the path string
+        let path = self.parse_string_literal()?;
+
+        self.skip_ws();
+
+        // Parse optional metadata
+        let metadata = if self.peek() == Some('{') {
+            Some(self.parse_metadata_object()?)
+        } else {
+            None
+        };
+
+        self.skip_ws();
+        if self.peek() != Some(';') {
+            return Err(ParseError::new(
+                "expected ';' after include directive",
+                self.pos,
+            ));
+        }
+        self.next();
+
+        Ok(Include { path, metadata })
+    }
+
+    /// Parse a metadata object: `{ key: value, ... }`
+    fn parse_metadata_object(&mut self) -> Result<BTreeMap<String, MetaValue>, ParseError> {
+        if self.peek() != Some('{') {
+            return Err(ParseError::new("expected '{' for metadata", self.pos));
+        }
+        self.next();
+        self.skip_ws();
+
+        let mut map = BTreeMap::new();
+
+        while self.peek() != Some('}') {
+            // Parse key
+            let key = self.parse_ident()?;
+            self.skip_ws();
+
+            // Expect ':'
+            if self.peek() != Some(':') {
+                return Err(ParseError::new("expected ':' in metadata object", self.pos));
+            }
+            self.next();
+            self.skip_ws();
+
+            // Parse value
+            let value = self.parse_meta_value()?;
+            map.insert(key, value);
+
+            self.skip_ws();
+
+            // Check for comma or end
+            if self.peek() == Some(',') {
+                self.next();
+                self.skip_ws();
+            } else if self.peek() != Some('}') {
+                return Err(ParseError::new(
+                    "expected ',' or '}' in metadata object",
+                    self.pos,
+                ));
+            }
+        }
+
+        self.next(); // consume '}'
+        Ok(map)
+    }
+
+    /// Parse a metadata value (string, number, bool, array, or object).
+    fn parse_meta_value(&mut self) -> Result<MetaValue, ParseError> {
+        self.skip_ws();
+
+        match self.peek() {
+            Some('"') => Ok(MetaValue::String(self.parse_string_literal()?)),
+            Some('{') => Ok(MetaValue::Object(self.parse_metadata_object()?)),
+            Some('[') => {
+                self.next();
+                self.skip_ws();
+                let mut arr = Vec::new();
+                while self.peek() != Some(']') {
+                    arr.push(self.parse_meta_value()?);
+                    self.skip_ws();
+                    if self.peek() == Some(',') {
+                        self.next();
+                        self.skip_ws();
+                    }
+                }
+                self.next(); // consume ']'
+                Ok(MetaValue::Array(arr))
+            }
+            Some('t') if self.matches_keyword("true") => {
+                self.consume_keyword("true");
+                Ok(MetaValue::Bool(true))
+            }
+            Some('f') if self.matches_keyword("false") => {
+                self.consume_keyword("false");
+                Ok(MetaValue::Bool(false))
+            }
+            Some(c) if c.is_ascii_digit() || c == '-' => {
+                let num_str = self.parse_number_str()?;
+                let num: f64 = num_str
+                    .parse()
+                    .map_err(|_| ParseError::new("invalid number in metadata", self.pos))?;
+                Ok(MetaValue::Number(num))
+            }
+            _ => Err(ParseError::new("invalid metadata value", self.pos)),
+        }
+    }
+
+    /// Parse a number as a string (for metadata).
+    fn parse_number_str(&mut self) -> Result<String, ParseError> {
+        let start = self.pos;
+        if self.peek() == Some('-') {
+            self.next();
+        }
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        Ok(self.input[start..self.pos].to_string())
+    }
+
+    /// Parse a namespaced call: `namespace::func` or `namespace::func(args)`.
+    /// Called when we've seen an identifier followed by `::`.
+    fn parse_namespaced_call(&mut self, namespace: String) -> Result<Expr, ParseError> {
+        // Consume '::'
+        self.next();
+        self.next();
+        self.skip_ws();
+
+        // Parse function name
+        let name = self.parse_ident()?;
+        self.skip_ws();
+
+        // Parse optional arguments
+        let args = if self.peek() == Some('(') {
+            self.next();
+            self.skip_ws();
+            let mut args = Vec::new();
+            while self.peek() != Some(')') {
+                args.push(self.parse_pipe_expr()?);
+                self.skip_ws();
+                if self.peek() == Some(';') {
+                    self.next();
+                    self.skip_ws();
+                }
+            }
+            self.next(); // consume ')'
+            args
+        } else {
+            Vec::new()
+        };
+
+        Ok(Expr::NamespacedCall {
+            namespace,
+            name,
+            args,
+        })
+    }
 }
 
 /// Parse a jq expression string into an AST.
@@ -2735,6 +3113,47 @@ pub fn parse(input: &str) -> Result<Expr, ParseError> {
     }
 
     Ok(expr)
+}
+
+/// Parse a complete jq program including module directives.
+///
+/// A jq program can optionally start with module directives:
+/// - `module { metadata };` - module metadata declaration
+/// - `import "path" as name;` - import a module with a namespace
+/// - `include "path";` - include a module's definitions directly
+///
+/// Followed by the main expression (with optional function definitions).
+///
+/// # Examples
+///
+/// ```
+/// use succinctly::jq::parse_program;
+///
+/// // Simple expression (no module directives)
+/// let prog = parse_program(".foo").unwrap();
+/// assert!(prog.module.is_none());
+/// assert!(prog.imports.is_empty());
+///
+/// // With import directive
+/// let prog = parse_program(r#"import "utils" as u; u::double"#).unwrap();
+/// assert_eq!(prog.imports.len(), 1);
+/// assert_eq!(prog.imports[0].path, "utils");
+/// assert_eq!(prog.imports[0].alias, "u");
+/// ```
+pub fn parse_program(input: &str) -> Result<Program, ParseError> {
+    let mut parser = Parser::new(input);
+    let program = parser.parse_program()?;
+
+    // Ensure we consumed all input
+    parser.skip_ws();
+    if !parser.is_eof() {
+        return Err(ParseError::new(
+            format!("unexpected character '{}'", parser.peek().unwrap()),
+            parser.pos,
+        ));
+    }
+
+    Ok(program)
 }
 
 #[cfg(test)]

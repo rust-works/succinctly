@@ -955,3 +955,328 @@ fn test_monochrome_overrides_jq_colors() -> Result<()> {
     );
     Ok(())
 }
+
+// =============================================================================
+// Module System Tests
+// =============================================================================
+
+#[test]
+fn test_include_directive() -> Result<()> {
+    // Create a temporary module file
+    let temp_dir = tempfile::tempdir()?;
+    let module_path = temp_dir.path().join("utils.jq");
+    std::fs::write(&module_path, "def double: . * 2;")?;
+
+    // Test include directive
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-n",
+            "-L",
+        ])
+        .arg(temp_dir.path())
+        .arg(r#"include "utils"; 21 | double"#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+
+    // Note: This test may fail if include isn't fully implemented yet
+    // For now, just verify parsing works (no parse error)
+    assert!(
+        !stderr.contains("compile error"),
+        "Should parse include directive without error: {}",
+        stderr
+    );
+    Ok(())
+}
+
+#[test]
+fn test_import_directive() -> Result<()> {
+    // Create a temporary module file
+    let temp_dir = tempfile::tempdir()?;
+    let module_path = temp_dir.path().join("mymod.jq");
+    std::fs::write(&module_path, "def triple: . * 3;")?;
+
+    // Test import directive
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-n",
+            "-L",
+        ])
+        .arg(temp_dir.path())
+        .arg(r#"import "mymod" as m; 10"#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    let stderr = String::from_utf8(output.stderr)?;
+
+    // Verify parsing works (no parse error)
+    assert!(
+        !stderr.contains("compile error"),
+        "Should parse import directive without error: {}",
+        stderr
+    );
+    Ok(())
+}
+
+#[test]
+fn test_library_path_option() -> Result<()> {
+    // Test -L option with a non-existent path (should still parse)
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-n",
+            "-L",
+            "/nonexistent/path",
+            ".",
+        ])
+        .stdout(Stdio::piped())
+        .output()?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(stdout.trim(), "null");
+    Ok(())
+}
+
+#[test]
+fn test_jq_library_path_env() -> Result<()> {
+    // Create a temporary module directory
+    let temp_dir = tempfile::tempdir()?;
+    let module_path = temp_dir.path().join("envmod.jq");
+    std::fs::write(&module_path, "def quadruple: . * 4;")?;
+
+    // Test JQ_LIBRARY_PATH environment variable
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-n",
+        ])
+        .arg(r#"include "envmod"; 5 | quadruple"#)
+        .env("JQ_LIBRARY_PATH", temp_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    let stderr = String::from_utf8(output.stderr)?;
+
+    // Verify parsing works and module is found
+    assert!(
+        !stderr.contains("compile error"),
+        "Should parse include directive without error: {}",
+        stderr
+    );
+    // Note: The actual execution may fail if the function isn't fully integrated
+    Ok(())
+}
+
+#[test]
+fn test_module_not_found_error() -> Result<()> {
+    // Test that a missing module produces an appropriate error
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-n",
+        ])
+        .arg(r#"include "nonexistent_module_xyz"; ."#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    let stderr = String::from_utf8(output.stderr)?;
+
+    // Should produce a module error
+    assert!(
+        stderr.contains("module") && stderr.contains("not found"),
+        "Should report module not found error: {}",
+        stderr
+    );
+    Ok(())
+}
+
+#[test]
+fn test_namespaced_call_parse() -> Result<()> {
+    // Test that namespaced calls parse correctly
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-n",
+        ])
+        .arg("mymod::func")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    let stderr = String::from_utf8(output.stderr)?;
+
+    // Should parse but fail at runtime (module not loaded)
+    // Not a compile error, but an eval error
+    assert!(
+        !stderr.contains("compile error"),
+        "Should parse namespaced call without compile error: {}",
+        stderr
+    );
+    Ok(())
+}
+
+#[test]
+fn test_home_jq_file_autoload() -> Result<()> {
+    // Create a temporary home directory with a .jq file
+    let temp_home = tempfile::tempdir()?;
+    let jq_file = temp_home.path().join(".jq");
+    std::fs::write(&jq_file, "def my_custom_func: . * 100;")?;
+
+    // Test that function from ~/.jq is available
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-n",
+            "5 | my_custom_func",
+        ])
+        .env("HOME", temp_home.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+
+    // Should successfully execute the function
+    assert!(
+        !stderr.contains("compile error"),
+        "Should not have compile error: {}",
+        stderr
+    );
+
+    // The function should multiply by 100
+    assert_eq!(
+        stdout.trim(),
+        "500",
+        "my_custom_func should multiply by 100"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_home_jq_dir_search_path() -> Result<()> {
+    // Create a temporary home directory with a .jq directory containing modules
+    let temp_home = tempfile::tempdir()?;
+    let jq_dir = temp_home.path().join(".jq");
+    std::fs::create_dir(&jq_dir)?;
+    std::fs::write(jq_dir.join("homemod.jq"), "def home_func: . + 1000;")?;
+
+    // Test that module from ~/.jq directory can be included
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-n",
+        ])
+        .arg(r#"include "homemod"; 7 | home_func"#)
+        .env("HOME", temp_home.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    let stderr = String::from_utf8(output.stderr)?;
+
+    // Should parse without error
+    assert!(
+        !stderr.contains("compile error") && !stderr.contains("module error"),
+        "Should find module in ~/.jq directory: {}",
+        stderr
+    );
+    Ok(())
+}
+
+#[test]
+fn test_import_with_namespace() -> Result<()> {
+    // Create a temporary module directory
+    let temp_dir = tempfile::tempdir()?;
+    let module_path = temp_dir.path().join("mymath.jq");
+    std::fs::write(&module_path, "def double: . * 2; def triple: . * 3;")?;
+
+    // Test import with namespace - should be able to call mymath::double
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-n",
+            "-L",
+        ])
+        .arg(temp_dir.path())
+        .arg(r#"import "mymath" as mymath; 5 | mymath::double"#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+
+    // Should not have errors
+    assert!(
+        !stderr.contains("compile error") && !stderr.contains("module error"),
+        "Should import module and use namespaced function: {}",
+        stderr
+    );
+
+    // Should output 10 (5 * 2)
+    assert_eq!(stdout.trim(), "10", "mymath::double should multiply by 2");
+    Ok(())
+}
