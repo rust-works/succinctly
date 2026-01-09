@@ -264,6 +264,11 @@ struct JqCommand {
     /// Flush output after each JSON value
     #[arg(long)]
     unbuffered: bool,
+
+    // === Info ===
+    /// Show version information
+    #[arg(short = 'V', long)]
+    version: bool,
 }
 
 impl From<PatternArg> for generators::Pattern {

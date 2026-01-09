@@ -88,6 +88,12 @@ impl OutputConfig {
 /// Run the jq command with the given arguments.
 /// Returns the exit code (0 for success, non-zero for various errors).
 pub fn run_jq(args: JqCommand) -> Result<i32> {
+    // Handle --version flag
+    if args.version {
+        println!("succinctly jq - JSON processor [version {}]", env!("CARGO_PKG_VERSION"));
+        return Ok(exit_codes::SUCCESS);
+    }
+
     // Build evaluation context from arguments
     let context = build_context(&args)?;
 
