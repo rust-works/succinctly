@@ -5,13 +5,13 @@
 //! navigation of JSON structure using rank/select operations.
 //!
 //! Two cursor types are provided:
-//! - `simple`: 3-state machine, marks all structural characters
-//! - `standard`: 4-state machine, marks structural characters and value starts
+//! - [`simple`](crate::json::simple): 3-state machine, marks all structural characters
+//! - [`standard`](crate::json::standard): 4-state machine, marks structural characters and value starts
 //!
-//! The `light` module provides a lazy JSON navigation API using the standard cursor.
+//! The [`light`](crate::json::light) module provides a lazy JSON navigation API using the standard cursor.
 //!
 //! SIMD-accelerated versions are available on supported platforms (x86_64, aarch64):
-//! - `simd`: Platform-specific SIMD acceleration (AVX2, NEON, etc.)
+//! - [`simd`](crate::json::simd): Platform-specific SIMD acceleration (AVX2, NEON, etc.)
 
 mod bit_writer;
 pub mod light;
