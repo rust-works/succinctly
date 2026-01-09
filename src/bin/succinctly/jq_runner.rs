@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use succinctly::jq::{self, Expr, OwnedValue, Program, QueryResult};
-use succinctly::json::light::StandardJson;
+use succinctly::jq::{self, Expr, JqValue, OwnedValue, Program, QueryResult};
+use succinctly::json::light::{JsonCursor, StandardJson};
 use succinctly::json::JsonIndex;
 
 use super::JqCommand;
@@ -558,9 +558,6 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 
     let expr = jq::substitute_vars(&expr, all_vars);
 
-    // Get input values
-    let inputs = get_inputs(&args)?;
-
     // Configure output
     let output_config = OutputConfig::from_args(&args);
 
@@ -572,14 +569,59 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     let mut last_output: Option<OwnedValue> = None;
     let mut had_output = false;
 
-    // Process each input
-    for input in inputs {
-        let results = evaluate_input(&input, &expr, &context)?;
+    // Check if we can use the lazy path (preserves number formatting)
+    // Conditions: not slurp, not raw_input, compact output without sort_keys/colors/ascii
+    let can_use_lazy_path = !args.slurp
+        && !args.raw_input
+        && !args.seq // seq input mode parses differently
+        && output_config.compact
+        && !output_config.sort_keys
+        && !output_config.color_output
+        && !output_config.ascii_output; // ASCII output requires escaping
 
-        for result in results {
-            had_output = true;
-            last_output = Some(result.clone());
-            write_output(&mut out, &result, &output_config)?;
+    if can_use_lazy_path && !args.null_input {
+        // Lazy path: read files as raw bytes and process directly
+        // This preserves original number formatting like "4e4"
+        let files = get_input_files(&args);
+        let raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
+            vec![read_stdin_bytes()?]
+        } else {
+            files
+                .iter()
+                .map(|path| read_file_bytes(path))
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        for raw in raw_inputs {
+            // Process as JSON stream (handle multiple JSON values in one input)
+            let values = find_json_values(&raw);
+            for (start, end) in values {
+                let json_bytes = &raw[start..end];
+                let index = JsonIndex::build(json_bytes);
+                let results = evaluate_bytes_lazy(json_bytes, &expr, &index);
+
+                for result in &results {
+                    had_output = true;
+                    // For exit_status tracking, we need to check the last value
+                    if args.exit_status {
+                        last_output = Some(result.materialize());
+                    }
+                    write_output_jq_value(&mut out, result, &output_config)?;
+                }
+            }
+        }
+    } else {
+        // Original path: parse through serde_json (loses number formatting)
+        let inputs = get_inputs(&args)?;
+
+        for input in inputs {
+            let results = evaluate_input(&input, &expr, &context)?;
+
+            for result in results {
+                had_output = true;
+                last_output = Some(result.clone());
+                write_output(&mut out, &result, &output_config)?;
+            }
         }
     }
 
@@ -778,6 +820,150 @@ fn read_file(path: &Path) -> Result<String> {
         .with_context(|| format!("Failed to read file: {}", path.display()))
 }
 
+/// Read stdin to bytes.
+fn read_stdin_bytes() -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut buf)
+        .context("Failed to read from stdin")?;
+    Ok(buf)
+}
+
+/// Read a file to bytes.
+fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))
+}
+
+/// Find the byte ranges of JSON values in a byte slice.
+///
+/// This is a simple heuristic that finds the boundaries of top-level JSON values
+/// by tracking brace/bracket nesting and handling strings.
+fn find_json_values(bytes: &[u8]) -> Vec<(usize, usize)> {
+    let mut values = Vec::new();
+    let mut pos = 0;
+
+    while pos < bytes.len() {
+        // Skip whitespace
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+
+        let start = pos;
+        let first_byte = bytes[pos];
+
+        // Determine end of this JSON value
+        let end = match first_byte {
+            b'{' | b'[' => {
+                // Object or array - find matching close
+                find_matching_close(bytes, pos)
+            }
+            b'"' => {
+                // String - find end quote
+                find_string_end(bytes, pos)
+            }
+            b't' | b'f' | b'n' => {
+                // true, false, null
+                find_literal_end(bytes, pos)
+            }
+            b'-' | b'0'..=b'9' => {
+                // Number
+                find_number_end(bytes, pos)
+            }
+            _ => None,
+        };
+
+        if let Some(end) = end {
+            values.push((start, end));
+            pos = end;
+        } else {
+            // Invalid JSON - skip to next whitespace
+            while pos < bytes.len() && !bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+        }
+    }
+
+    values
+}
+
+/// Find the end of an object or array starting at `pos`.
+fn find_matching_close(bytes: &[u8], pos: usize) -> Option<usize> {
+    let open = bytes[pos];
+    let close = if open == b'{' { b'}' } else { b']' };
+    let mut depth = 1;
+    let mut i = pos + 1;
+
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            b'"' => {
+                // Skip string
+                if let Some(end) = find_string_end(bytes, i) {
+                    i = end;
+                    continue;
+                } else {
+                    return None;
+                }
+            }
+            c if c == open => depth += 1,
+            c if c == close => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if depth == 0 {
+        Some(i)
+    } else {
+        None
+    }
+}
+
+/// Find the end of a string starting at `pos` (which points to opening quote).
+fn find_string_end(bytes: &[u8], pos: usize) -> Option<usize> {
+    let mut i = pos + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return Some(i + 1),
+            b'\\' => i += 2, // Skip escaped character
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Find the end of a literal (true, false, null) starting at `pos`.
+fn find_literal_end(bytes: &[u8], pos: usize) -> Option<usize> {
+    let mut i = pos;
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    Some(i)
+}
+
+/// Find the end of a number starting at `pos`.
+fn find_number_end(bytes: &[u8], pos: usize) -> Option<usize> {
+    let mut i = pos;
+    // Allow leading minus
+    if i < bytes.len() && bytes[i] == b'-' {
+        i += 1;
+    }
+    // Digits, dots, exponents
+    while i < bytes.len() {
+        match bytes[i] {
+            b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-' => i += 1,
+            _ => break,
+        }
+    }
+    if i > pos {
+        Some(i)
+    } else {
+        None
+    }
+}
+
 /// Parse a JSON value from a string.
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
     let s = s.trim();
@@ -892,6 +1078,20 @@ fn evaluate_input(
     }
 }
 
+/// Evaluate expression against raw JSON bytes, returning lazy JqValues.
+///
+/// This function preserves original number formatting by working directly
+/// with the source bytes instead of parsing through serde_json.
+fn evaluate_bytes_lazy<'a>(
+    json_bytes: &'a [u8],
+    expr: &jq::Expr,
+    index: &'a JsonIndex,
+) -> Vec<JqValue<'a, Vec<u64>>> {
+    let cursor = index.root(json_bytes);
+    let result = jq::eval(expr, cursor);
+    query_result_to_jq_values(result, cursor)
+}
+
 /// Convert StandardJson to OwnedValue.
 fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue {
     match value {
@@ -925,6 +1125,110 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) 
         ),
         StandardJson::Error(_) => OwnedValue::Null,
     }
+}
+
+/// Convert QueryResult to Vec<JqValue> for lazy output.
+///
+/// This preserves cursor references where possible, allowing lazy output
+/// that preserves original number formatting (e.g., `4e4` stays as `4e4`).
+fn query_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
+    result: QueryResult<'a, W>,
+    cursor: JsonCursor<'a, W>,
+) -> Vec<JqValue<'a, W>> {
+    match result {
+        QueryResult::One(v) => vec![standard_json_to_jq_value(v, &cursor)],
+        QueryResult::Many(vs) => vs
+            .into_iter()
+            .map(|v| standard_json_to_jq_value(v, &cursor))
+            .collect(),
+        QueryResult::None => vec![],
+        QueryResult::Error(e) => {
+            eprintln!("jq: error: {}", e);
+            vec![]
+        }
+        QueryResult::Owned(v) => vec![JqValue::from_owned(v)],
+        QueryResult::ManyOwned(vs) => vs.into_iter().map(JqValue::from_owned).collect(),
+    }
+}
+
+/// Convert StandardJson to JqValue, preserving raw number formatting.
+fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    _parent_cursor: &JsonCursor<'a, W>,
+) -> JqValue<'a, W> {
+    match value {
+        StandardJson::Null => JqValue::Null,
+        StandardJson::Bool(b) => JqValue::Bool(b),
+        StandardJson::Number(n) => {
+            // Use RawNumber to preserve original formatting like "4e4"
+            JqValue::RawNumber(n.raw_bytes())
+        }
+        StandardJson::String(s) => {
+            JqValue::String(s.as_str().map(|c| c.to_string()).unwrap_or_default())
+        }
+        StandardJson::Array(elements) => {
+            let items: Vec<JqValue<'a, W>> = elements
+                .map(|e| standard_json_to_jq_value(e, _parent_cursor))
+                .collect();
+            JqValue::Array(items)
+        }
+        StandardJson::Object(fields) => {
+            let map: IndexMap<String, JqValue<'a, W>> = fields
+                .map(|f| {
+                    let key = match f.key() {
+                        StandardJson::String(s) => s.as_str().unwrap_or_default().to_string(),
+                        _ => String::new(),
+                    };
+                    (key, standard_json_to_jq_value(f.value(), _parent_cursor))
+                })
+                .collect();
+            JqValue::Object(map)
+        }
+        StandardJson::Error(_) => JqValue::Null,
+    }
+}
+
+/// Write a single output JqValue (preserves number formatting when possible).
+fn write_output_jq_value<'a, Out: Write, Wrd: Clone + AsRef<[u64]>>(
+    out: &mut Out,
+    value: &JqValue<'a, Wrd>,
+    config: &OutputConfig,
+) -> Result<()> {
+    // In seq mode, prepend RS (Record Separator) before each value
+    if config.seq {
+        out.write_all(&[ASCII_RS])?;
+    }
+
+    // Handle raw output for strings
+    if config.raw_output {
+        if let Some(s) = value.as_str() {
+            out.write_all(s.as_bytes())?;
+            write_terminator(out, config)?;
+            return Ok(());
+        }
+    }
+
+    // For simple compact output without sort_keys or colors, use JqValue's direct output
+    // This preserves number formatting like "4e4"
+    if config.compact && !config.sort_keys && !config.color_output {
+        let mut output = String::new();
+        value
+            .write_json(&mut output)
+            .map_err(|_| anyhow::anyhow!("Failed to format JSON"))?;
+        out.write_all(output.as_bytes())?;
+    } else {
+        // For complex output (pretty-print, sort_keys, colors), materialize first
+        let owned = value.materialize();
+        let output = if config.sort_keys {
+            format_json_sorted(&owned, config)
+        } else {
+            format_json(&owned, config)
+        };
+        out.write_all(output.as_bytes())?;
+    }
+
+    write_terminator(out, config)?;
+    Ok(())
 }
 
 /// Write a single output value.
@@ -1468,7 +1772,7 @@ mod tests {
 
     #[test]
     fn test_sort_keys() {
-        let mut obj = BTreeMap::new();
+        let mut obj = IndexMap::new();
         obj.insert("z".to_string(), OwnedValue::Int(1));
         obj.insert("a".to_string(), OwnedValue::Int(2));
         let value = OwnedValue::Object(obj);

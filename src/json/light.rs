@@ -523,6 +523,95 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
             current: self.first_child(),
         }
     }
+
+    /// Get the byte range in the original text for this value.
+    ///
+    /// Returns `(start, end)` where `text[start..end]` is the raw JSON bytes
+    /// for this value, preserving original formatting.
+    ///
+    /// For containers (arrays/objects), uses BP structure to find the closing bracket.
+    /// For scalars (strings/numbers/bools/null), scans text to find value end.
+    pub fn text_range(&self) -> Option<(usize, usize)> {
+        let start = self.text_position()?;
+
+        if start >= self.text.len() {
+            return None;
+        }
+
+        let end = match self.text[start] {
+            // Containers: use BP to find closing bracket position
+            b'{' | b'[' => {
+                // Find the close paren in BP
+                let close_bp = self.index.bp().find_close(self.bp_pos)?;
+                // Map close BP position to text position
+                // The close bracket is at the BP close position's corresponding IB bit
+                let close_rank = self.index.bp().rank1(close_bp);
+                // For containers, there's a close bracket at this position
+                // We need to find the text position and then include the bracket
+                let close_text = self.index.ib_select1_from(close_rank, close_rank / 8)?;
+                close_text + 1 // Include the closing bracket
+            }
+            // String: scan for closing quote
+            b'"' => {
+                let mut i = start + 1;
+                while i < self.text.len() {
+                    match self.text[i] {
+                        b'"' => return Some((start, i + 1)),
+                        b'\\' => i += 2,
+                        _ => i += 1,
+                    }
+                }
+                self.text.len()
+            }
+            // Boolean true
+            b't' => {
+                if self.text[start..].starts_with(b"true") {
+                    start + 4
+                } else {
+                    return None;
+                }
+            }
+            // Boolean false
+            b'f' => {
+                if self.text[start..].starts_with(b"false") {
+                    start + 5
+                } else {
+                    return None;
+                }
+            }
+            // Null
+            b'n' => {
+                if self.text[start..].starts_with(b"null") {
+                    start + 4
+                } else {
+                    return None;
+                }
+            }
+            // Number: scan for end of number
+            c if c == b'-' || c.is_ascii_digit() => {
+                let mut i = start;
+                while i < self.text.len() {
+                    match self.text[i] {
+                        b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E' => i += 1,
+                        _ => break,
+                    }
+                }
+                i
+            }
+            _ => return None,
+        };
+
+        Some((start, end))
+    }
+
+    /// Get the raw bytes for this JSON value.
+    ///
+    /// Returns the original bytes from the JSON text, preserving formatting.
+    /// This is useful for zero-copy output of values.
+    pub fn raw_bytes(&self) -> Option<&'a [u8]> {
+        let (start, end) = self.text_range()?;
+        Some(&self.text[start..end])
+    }
 }
 
 // ============================================================================
@@ -711,6 +800,14 @@ impl<'a, W: AsRef<[u64]>> JsonField<'a, W> {
     #[inline]
     pub fn value(&self) -> StandardJson<'a, W> {
         self.value_cursor.value()
+    }
+
+    /// Get the value cursor directly.
+    ///
+    /// This allows access to the cursor for lazy value handling.
+    #[inline]
+    pub fn value_cursor(&self) -> JsonCursor<'a, W> {
+        self.value_cursor
     }
 }
 
