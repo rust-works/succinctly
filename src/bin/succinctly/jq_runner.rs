@@ -32,8 +32,7 @@ pub mod exit_codes {
 pub struct EvalContext {
     /// Named arguments from --arg, --argjson, --slurpfile, --rawfile
     pub named: BTreeMap<String, OwnedValue>,
-    /// Positional arguments from --args or --jsonargs (not yet implemented)
-    #[allow(dead_code)]
+    /// Positional arguments from --args or --jsonargs
     pub positional: Vec<OwnedValue>,
 }
 
@@ -42,8 +41,10 @@ struct OutputConfig {
     compact: bool,
     raw_output: bool,
     join_output: bool,
+    raw_output0: bool,
     sort_keys: bool,
     indent_string: String,
+    unbuffered: bool,
 }
 
 impl OutputConfig {
@@ -60,10 +61,12 @@ impl OutputConfig {
 
         OutputConfig {
             compact: args.compact_output,
-            raw_output: args.raw_output || args.join_output,
+            raw_output: args.raw_output || args.join_output || args.raw_output0,
             join_output: args.join_output,
+            raw_output0: args.raw_output0,
             sort_keys: args.sort_keys,
             indent_string,
+            unbuffered: args.unbuffered,
         }
     }
 }
@@ -83,8 +86,16 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         anyhow::anyhow!("compile error")
     })?;
 
+    // Build the $ARGS special variable
+    let args_value = build_args_var(&context);
+
     // Substitute variables from context into the expression
-    let expr = jq::substitute_vars(&expr, context.named.iter().map(|(k, v)| (k.as_str(), v)));
+    // First substitute regular named variables, then add $ARGS
+    let mut all_vars: Vec<(&str, &OwnedValue)> =
+        context.named.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    all_vars.push(("ARGS", &args_value));
+
+    let expr = jq::substitute_vars(&expr, all_vars);
 
     // Get input values
     let inputs = get_inputs(&args)?;
@@ -173,11 +184,36 @@ fn build_context(args: &JqCommand) -> Result<EvalContext> {
         }
     }
 
-    // Note: --args and --jsonargs handling would require modifying how we parse
-    // the command line to capture remaining arguments. For now, files are treated
-    // as input files, not positional arguments.
+    // Process --args: values become string positional args
+    for arg in &args.args {
+        context.positional.push(OwnedValue::String(arg.clone()));
+    }
+
+    // Process --jsonargs: values become JSON positional args
+    for arg in &args.jsonargs {
+        let json_value = parse_json_value(arg)
+            .with_context(|| format!("Invalid JSON for --jsonargs: {}", arg))?;
+        context.positional.push(json_value);
+    }
 
     Ok(context)
+}
+
+/// Build the $ARGS special variable containing named and positional args.
+fn build_args_var(context: &EvalContext) -> OwnedValue {
+    let mut args_obj = BTreeMap::new();
+
+    // Build named object from context.named
+    let named_obj: BTreeMap<String, OwnedValue> = context.named.clone();
+    args_obj.insert("named".to_string(), OwnedValue::Object(named_obj));
+
+    // Build positional array from context.positional
+    args_obj.insert(
+        "positional".to_string(),
+        OwnedValue::Array(context.positional.clone()),
+    );
+
+    OwnedValue::Object(args_obj)
 }
 
 /// Get the filter expression from arguments.
@@ -187,9 +223,8 @@ fn get_filter(args: &JqCommand) -> Result<String> {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read filter file: {}", path.display()))?;
         Ok(contents.trim().to_string())
-    } else if !args.positional_args.is_empty() {
-        // First positional arg is the filter
-        Ok(args.positional_args[0].clone())
+    } else if let Some(ref filter) = args.filter {
+        Ok(filter.clone())
     } else {
         Ok(".".to_string()) // Default: identity filter
     }
@@ -197,21 +232,26 @@ fn get_filter(args: &JqCommand) -> Result<String> {
 
 /// Get input files from arguments.
 fn get_input_files(args: &JqCommand) -> Vec<std::path::PathBuf> {
-    if args.from_file.is_some() {
-        // When -f is used, all positional args are input files
-        args.positional_args
-            .iter()
-            .map(std::path::PathBuf::from)
-            .collect()
-    } else if args.positional_args.len() > 1 {
-        // First arg is filter, rest are input files
-        args.positional_args[1..]
-            .iter()
-            .map(std::path::PathBuf::from)
-            .collect()
-    } else {
-        vec![]
+    // With --args or --jsonargs, files are not used (they would have been consumed)
+    if !args.args.is_empty() || !args.jsonargs.is_empty() {
+        return vec![];
     }
+
+    // When -f is used, the 'filter' field becomes the first input file
+    // because the filter comes from a file instead of command line
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+
+    if args.from_file.is_some() {
+        // When -f is used, the first positional arg (if any) is an input file
+        if let Some(ref first_file) = args.filter {
+            files.push(std::path::PathBuf::from(first_file));
+        }
+    }
+
+    // Add remaining files
+    files.extend(args.files.iter().map(std::path::PathBuf::from));
+
+    files
 }
 
 /// Get input values based on arguments.
@@ -415,18 +455,27 @@ fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig
     if config.raw_output {
         if let OwnedValue::String(s) = value {
             out.write_all(s.as_bytes())?;
-            if !config.join_output {
-                out.write_all(b"\n")?;
-            }
+            write_terminator(out, config)?;
             return Ok(());
         }
     }
 
     out.write_all(output.as_bytes())?;
-    if !config.join_output {
+    write_terminator(out, config)?;
+
+    Ok(())
+}
+
+/// Write the appropriate line terminator based on config.
+fn write_terminator<W: Write>(out: &mut W, config: &OutputConfig) -> Result<()> {
+    if config.raw_output0 {
+        out.write_all(&[0])?; // NUL byte
+    } else if !config.join_output {
         out.write_all(b"\n")?;
     }
-
+    if config.unbuffered {
+        out.flush()?;
+    }
     Ok(())
 }
 

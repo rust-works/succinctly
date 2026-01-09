@@ -551,5 +551,150 @@ fn test_jq_help() -> Result<()> {
     assert!(stdout.contains("--slurp"));
     assert!(stdout.contains("--arg"));
     assert!(stdout.contains("--argjson"));
+    assert!(stdout.contains("--raw-output0"));
+    assert!(stdout.contains("--unbuffered"));
+    Ok(())
+}
+
+// =============================================================================
+// New Compatibility Features Tests
+// =============================================================================
+
+#[test]
+fn test_raw_output0() -> Result<()> {
+    // Test that --raw-output0 outputs strings with NUL terminator
+    let (output, _) = run_jq_stdin(".name", r#"{"name":"Alice"}"#, &["--raw-output0"])?;
+    // Output should be "Alice\0" (NUL terminated)
+    assert_eq!(output.as_bytes(), b"Alice\0");
+    Ok(())
+}
+
+#[test]
+fn test_raw_output0_multiple() -> Result<()> {
+    // Test multiple outputs with NUL terminators
+    let (output, _) = run_jq_stdin(".[]", r#"["a","b","c"]"#, &["--raw-output0"])?;
+    // Each string should be NUL terminated
+    assert_eq!(output.as_bytes(), b"a\0b\0c\0");
+    Ok(())
+}
+
+#[test]
+fn test_unbuffered_flag() -> Result<()> {
+    // Test that --unbuffered flag works (just verify it parses correctly)
+    let (output, code) = run_jq_stdin(".", r#"{"a":1}"#, &["-c", "--unbuffered"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":1}"#);
+    Ok(())
+}
+
+#[test]
+fn test_args_positional() -> Result<()> {
+    // Test --args: positional args become $ARGS.positional
+    // Note: Use pipe syntax since parser doesn't support $VAR.field directly
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-n",
+            "-c",
+            "$ARGS | .positional",
+            "--args",
+            "hello",
+            "world",
+        ])
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(stdout.trim(), r#"["hello","world"]"#);
+    Ok(())
+}
+
+#[test]
+fn test_jsonargs_positional() -> Result<()> {
+    // Test --jsonargs: positional args are parsed as JSON
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-n",
+            "-c",
+            "$ARGS | .positional",
+            "--jsonargs",
+            "123",
+            "true",
+            r#"{"x":1}"#,
+        ])
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(stdout.trim(), r#"[123,true,{"x":1}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_args_named() -> Result<()> {
+    // Test $ARGS.named contains all named args
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-n",
+            "--arg",
+            "name",
+            "Alice",
+            "--arg",
+            "age",
+            "30",
+            "$ARGS | .named",
+        ])
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert_eq!(parsed["name"], "Alice");
+    assert_eq!(parsed["age"], "30");
+    Ok(())
+}
+
+#[test]
+fn test_args_combined() -> Result<()> {
+    // Test $ARGS with both named and positional args
+    // Named args first, then filter, then --args with values
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-n",
+            "--arg",
+            "x",
+            "1",
+            "$ARGS",
+            "--args",
+            "a",
+            "b",
+        ])
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert_eq!(parsed["named"]["x"], "1");
+    assert_eq!(parsed["positional"][0], "a");
+    assert_eq!(parsed["positional"][1], "b");
     Ok(())
 }

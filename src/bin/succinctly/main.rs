@@ -164,10 +164,13 @@ enum OutputFormat {
 #[command(about = "Command-line JSON processor", long_about = None)]
 struct JqCommand {
     /// jq filter expression (e.g., ".", ".foo", ".[]")
-    /// When using -f, this becomes the first input file instead.
     /// If not provided, uses "." (identity)
+    filter: Option<String>,
+
+    /// Input files (reads from stdin if none provided)
+    /// When using --args or --jsonargs, these become positional values instead.
     #[arg(trailing_var_arg = true)]
-    positional_args: Vec<String>,
+    files: Vec<String>,
 
     // === Input Options ===
     /// Don't read any input; use null as the single input value
@@ -194,6 +197,10 @@ struct JqCommand {
     /// Like -r but don't print newline after each output
     #[arg(short = 'j', long)]
     join_output: bool,
+
+    /// Like -r but print NUL instead of newline after each output
+    #[arg(long)]
+    raw_output0: bool,
 
     /// Sort keys of each object on output
     #[arg(short = 'S', long)]
@@ -230,17 +237,21 @@ struct JqCommand {
     rawfile: Vec<String>,
 
     /// Consume remaining arguments as positional string values
-    #[arg(long)]
-    args: bool,
+    #[arg(long, num_args = 0.., value_name = "STRINGS")]
+    args: Vec<String>,
 
     /// Consume remaining arguments as positional JSON values
-    #[arg(long)]
-    jsonargs: bool,
+    #[arg(long, num_args = 0.., value_name = "JSON_VALUES")]
+    jsonargs: Vec<String>,
 
     // === Exit Status ===
     /// Set exit status based on output (0 if last output != false/null)
     #[arg(short = 'e', long)]
     exit_status: bool,
+
+    /// Flush output after each JSON value
+    #[arg(long)]
+    unbuffered: bool,
 }
 
 impl From<PatternArg> for generators::Pattern {
