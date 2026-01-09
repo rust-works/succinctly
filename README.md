@@ -165,9 +165,9 @@ cargo build --release --features cli
 # Generate synthetic JSON for benchmarking
 ./target/release/succinctly json generate 10mb -o benchmark.json
 
-# Query JSON files
-./target/release/succinctly json query '.users[].name' -i input.json
-./target/release/succinctly json query '.users[0]' -i input.json --raw
+# Query JSON files (jq-compatible)
+./target/release/succinctly jq '.users[].name' input.json
+./target/release/succinctly jq -r '.users[0]' input.json
 ```
 
 ## Architecture

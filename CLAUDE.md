@@ -81,10 +81,10 @@ cargo build --release --features cli
 ./target/release/succinctly json generate 10mb -o benchmark.json
 ./target/release/succinctly json generate 1mb --pattern pathological -o worst-case.json
 
-# Query JSON files
-./target/release/succinctly json query '.users[].name' -i input.json
-./target/release/succinctly json query '.users[0]' -i input.json --raw
-./target/release/succinctly json query '.items[]' -i input.json --mmap
+# Query JSON files (jq-compatible interface)
+./target/release/succinctly jq '.users[].name' input.json
+./target/release/succinctly jq -r '.users[0]' input.json
+./target/release/succinctly jq '.items[]' input.json
 ```
 
 ## Code Architecture
