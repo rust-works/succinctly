@@ -237,12 +237,7 @@ cargo fmt
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE](LICENSE) or http://opensource.org/licenses/MIT)
-
-at your option.
+Licensed under the [MIT license](LICENSE).
 
 ## Acknowledgments
 
