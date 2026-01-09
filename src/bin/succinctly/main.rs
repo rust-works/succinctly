@@ -202,6 +202,18 @@ struct JqCommand {
     #[arg(long)]
     raw_output0: bool,
 
+    /// Output ASCII only, escaping non-ASCII as \uXXXX
+    #[arg(short = 'a', long)]
+    ascii_output: bool,
+
+    /// Colorize output (default if stdout is a terminal)
+    #[arg(short = 'C', long)]
+    color_output: bool,
+
+    /// Disable colorized output
+    #[arg(short = 'M', long)]
+    monochrome_output: bool,
+
     /// Sort keys of each object on output
     #[arg(short = 'S', long)]
     sort_keys: bool,

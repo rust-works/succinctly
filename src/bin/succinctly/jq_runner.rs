@@ -42,6 +42,8 @@ struct OutputConfig {
     raw_output: bool,
     join_output: bool,
     raw_output0: bool,
+    ascii_output: bool,
+    color_output: bool,
     sort_keys: bool,
     indent_string: String,
     unbuffered: bool,
@@ -59,11 +61,23 @@ impl OutputConfig {
             "  ".to_string() // Default: 2 spaces
         };
 
+        // Determine color output: -C forces on, -M forces off, default is auto (tty check)
+        let color_output = if args.monochrome_output {
+            false
+        } else if args.color_output {
+            true
+        } else {
+            // Default: color if stdout is a terminal
+            atty::is(atty::Stream::Stdout)
+        };
+
         OutputConfig {
             compact: args.compact_output,
             raw_output: args.raw_output || args.join_output || args.raw_output0,
             join_output: args.join_output,
             raw_output0: args.raw_output0,
+            ascii_output: args.ascii_output,
+            color_output,
             sort_keys: args.sort_keys,
             indent_string,
             unbuffered: args.unbuffered,
@@ -481,10 +495,16 @@ fn write_terminator<W: Write>(out: &mut W, config: &OutputConfig) -> Result<()> 
 
 /// Format a value as JSON.
 fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
-    if config.compact {
-        value.to_json()
+    let json = if config.compact {
+        format_json_impl(value, "", 0, config.ascii_output)
     } else {
-        format_json_pretty(value, &config.indent_string, 0)
+        format_json_impl(value, &config.indent_string, 0, config.ascii_output)
+    };
+
+    if config.color_output {
+        colorize_json(&json)
+    } else {
+        json
     }
 }
 
@@ -507,10 +527,21 @@ fn sort_keys(value: &OwnedValue) -> OwnedValue {
     }
 }
 
-/// Format JSON with pretty printing.
-fn format_json_pretty(value: &OwnedValue, indent: &str, level: usize) -> String {
-    let current_indent = indent.repeat(level);
-    let next_indent = indent.repeat(level + 1);
+/// Format JSON implementation with optional pretty printing and ASCII mode.
+fn format_json_impl(value: &OwnedValue, indent: &str, level: usize, ascii: bool) -> String {
+    let compact = indent.is_empty();
+    let current_indent = if compact {
+        String::new()
+    } else {
+        indent.repeat(level)
+    };
+    let next_indent = if compact {
+        String::new()
+    } else {
+        indent.repeat(level + 1)
+    };
+    let separator = if compact { "" } else { "\n" };
+    let space_after_colon = if compact { "" } else { " " };
 
     match value {
         OwnedValue::Null => "null".to_string(),
@@ -525,10 +556,22 @@ fn format_json_pretty(value: &OwnedValue, indent: &str, level: usize) -> String 
                 f.to_string()
             }
         }
-        OwnedValue::String(s) => format!("\"{}\"", escape_json_string(s)),
+        OwnedValue::String(s) => {
+            if ascii {
+                format!("\"{}\"", escape_json_string_ascii(s))
+            } else {
+                format!("\"{}\"", escape_json_string(s))
+            }
+        }
         OwnedValue::Array(arr) => {
             if arr.is_empty() {
                 "[]".to_string()
+            } else if compact {
+                let items: Vec<String> = arr
+                    .iter()
+                    .map(|v| format_json_impl(v, indent, level + 1, ascii))
+                    .collect();
+                format!("[{}]", items.join(","))
             } else {
                 let items: Vec<String> = arr
                     .iter()
@@ -536,29 +579,66 @@ fn format_json_pretty(value: &OwnedValue, indent: &str, level: usize) -> String 
                         format!(
                             "{}{}",
                             next_indent,
-                            format_json_pretty(v, indent, level + 1)
+                            format_json_impl(v, indent, level + 1, ascii)
                         )
                     })
                     .collect();
-                format!("[\n{}\n{}]", items.join(",\n"), current_indent)
+                format!(
+                    "[{}{}{separator}{}]",
+                    separator,
+                    items.join(&format!(",{}", separator)),
+                    current_indent
+                )
             }
         }
         OwnedValue::Object(obj) => {
             if obj.is_empty() {
                 "{}".to_string()
+            } else if compact {
+                let items: Vec<String> = obj
+                    .iter()
+                    .map(|(k, v)| {
+                        let key = if ascii {
+                            escape_json_string_ascii(k)
+                        } else {
+                            escape_json_string(k)
+                        };
+                        format!(
+                            "\"{}\":{}",
+                            key,
+                            format_json_impl(v, indent, level + 1, ascii)
+                        )
+                    })
+                    .collect();
+                format!("{{{}}}", items.join(","))
             } else {
                 let items: Vec<String> = obj
                     .iter()
                     .map(|(k, v)| {
+                        let key = if ascii {
+                            escape_json_string_ascii(k)
+                        } else {
+                            escape_json_string(k)
+                        };
                         format!(
-                            "{}\"{}\": {}",
-                            next_indent,
-                            escape_json_string(k),
-                            format_json_pretty(v, indent, level + 1)
+                            "\"{}\":{}{}",
+                            key,
+                            space_after_colon,
+                            format_json_impl(v, indent, level + 1, ascii)
                         )
                     })
                     .collect();
-                format!("{{\n{}\n{}}}", items.join(",\n"), current_indent)
+                // Add indent before each key
+                let indented_items: Vec<String> = items
+                    .iter()
+                    .map(|item| format!("{}{}", next_indent, item))
+                    .collect();
+                format!(
+                    "{{{}{}{separator}{}}}",
+                    separator,
+                    indented_items.join(&format!(",{}", separator)),
+                    current_indent
+                )
             }
         }
     }
@@ -580,6 +660,182 @@ fn escape_json_string(s: &str) -> String {
             c => result.push(c),
         }
     }
+    result
+}
+
+/// Escape special characters in a JSON string, also escaping non-ASCII as \uXXXX.
+fn escape_json_string_ascii(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            c if c.is_control() => {
+                result.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c if !c.is_ascii() => {
+                // Escape non-ASCII characters as \uXXXX
+                // For characters outside BMP, use surrogate pairs
+                let code = c as u32;
+                if code <= 0xFFFF {
+                    result.push_str(&format!("\\u{:04x}", code));
+                } else {
+                    // Surrogate pair for characters above U+FFFF
+                    let adjusted = code - 0x10000;
+                    let high = 0xD800 + (adjusted >> 10);
+                    let low = 0xDC00 + (adjusted & 0x3FF);
+                    result.push_str(&format!("\\u{:04x}\\u{:04x}", high, low));
+                }
+            }
+            c => result.push(c),
+        }
+    }
+    result
+}
+
+/// ANSI color codes for JSON syntax highlighting.
+mod colors {
+    pub const RESET: &str = "\x1b[0m";
+    pub const NULL: &str = "\x1b[1;30m"; // Bold black (gray)
+    pub const BOOL: &str = "\x1b[33m"; // Yellow
+    pub const NUMBER: &str = "\x1b[36m"; // Cyan
+    pub const STRING: &str = "\x1b[32m"; // Green
+    pub const KEY: &str = "\x1b[34m"; // Blue (for object keys)
+    pub const BRACKET: &str = "\x1b[1;37m"; // Bold white
+}
+
+/// Colorize a JSON string using ANSI escape codes.
+/// This is a simple parser that adds colors to JSON tokens.
+fn colorize_json(json: &str) -> String {
+    let mut result = String::with_capacity(json.len() * 2);
+    let mut chars = json.chars().peekable();
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut depth_stack: Vec<char> = Vec::new(); // Track context: '{' for object, '[' for array
+    let mut expecting_key = false; // True when next string in object is a key
+
+    while let Some(c) = chars.next() {
+        if escape_next {
+            result.push(c);
+            escape_next = false;
+            continue;
+        }
+
+        if in_string {
+            if c == '\\' {
+                result.push(c);
+                escape_next = true;
+            } else if c == '"' {
+                result.push(c);
+                result.push_str(colors::RESET);
+                in_string = false;
+            } else {
+                result.push(c);
+            }
+        } else {
+            match c {
+                '"' => {
+                    // Use expecting_key to determine if this is a key
+                    if expecting_key {
+                        result.push_str(colors::KEY);
+                        expecting_key = false; // After seeing key, next string is value
+                    } else {
+                        result.push_str(colors::STRING);
+                    }
+                    result.push(c);
+                    in_string = true;
+                }
+                '{' => {
+                    result.push_str(colors::BRACKET);
+                    result.push(c);
+                    result.push_str(colors::RESET);
+                    depth_stack.push('{');
+                    expecting_key = true; // First thing in object is a key
+                }
+                '[' => {
+                    result.push_str(colors::BRACKET);
+                    result.push(c);
+                    result.push_str(colors::RESET);
+                    depth_stack.push('[');
+                    // Arrays don't have keys
+                }
+                '}' | ']' => {
+                    result.push_str(colors::BRACKET);
+                    result.push(c);
+                    result.push_str(colors::RESET);
+                    depth_stack.pop();
+                    // Restore expecting_key state based on parent context
+                    expecting_key = false;
+                }
+                ':' => {
+                    result.push(c);
+                    // After colon, we're expecting a value, not a key
+                    expecting_key = false;
+                }
+                ',' => {
+                    result.push(c);
+                    // After comma in object context, next string is a key
+                    if depth_stack.last() == Some(&'{') {
+                        expecting_key = true;
+                    }
+                }
+                't' | 'f' => {
+                    // true or false
+                    result.push_str(colors::BOOL);
+                    result.push(c);
+                    // Consume rest of the keyword
+                    while let Some(&next) = chars.peek() {
+                        if next.is_alphabetic() {
+                            result.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                    result.push_str(colors::RESET);
+                }
+                'n' => {
+                    // null
+                    result.push_str(colors::NULL);
+                    result.push(c);
+                    while let Some(&next) = chars.peek() {
+                        if next.is_alphabetic() {
+                            result.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                    result.push_str(colors::RESET);
+                }
+                '0'..='9' | '-' | '.' | 'e' | 'E' | '+' => {
+                    result.push_str(colors::NUMBER);
+                    result.push(c);
+                    // Consume rest of number
+                    while let Some(&next) = chars.peek() {
+                        if next.is_ascii_digit()
+                            || next == '.'
+                            || next == 'e'
+                            || next == 'E'
+                            || next == '+'
+                            || next == '-'
+                        {
+                            result.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                    result.push_str(colors::RESET);
+                }
+                _ => {
+                    // Whitespace and other characters
+                    result.push(c);
+                }
+            }
+        }
+    }
+
     result
 }
 
