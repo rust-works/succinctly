@@ -4,10 +4,14 @@
 //! via feature flags for benchmarking:
 //!
 //! - Default: Uses Rust's `count_ones()` which auto-vectorizes
-//! - `simd`: Uses explicit SIMD intrinsics (NEON/POPCNT)
+//! - `simd`: Uses explicit SIMD intrinsics (NEON/POPCNT/AVX-512)
 //! - `portable-popcount`: Uses portable bitwise algorithm (no intrinsics)
 //!
 //! Feature priority (when multiple enabled): portable-popcount > simd > default
+//!
+//! ## References
+//!
+//! - Muła, Kurz, Lemire, ["Faster Population Counts Using AVX2 Instructions"](https://arxiv.org/abs/1611.07612) (2016)
 
 /// Popcount a single u64 word.
 #[inline(always)]
