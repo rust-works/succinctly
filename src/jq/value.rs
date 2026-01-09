@@ -5,16 +5,13 @@
 //! references into the original JSON bytes.
 
 #[cfg(not(test))]
-use alloc::collections::BTreeMap;
-#[cfg(not(test))]
 use alloc::format;
 #[cfg(not(test))]
 use alloc::string::{String, ToString};
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
-#[cfg(test)]
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 use super::expr::Literal;
 
@@ -37,8 +34,8 @@ pub enum OwnedValue {
     String(String),
     /// JSON array
     Array(Vec<OwnedValue>),
-    /// JSON object (BTreeMap for consistent ordering)
-    Object(BTreeMap<String, OwnedValue>),
+    /// JSON object (IndexMap preserves insertion order like jq)
+    Object(IndexMap<String, OwnedValue>),
 }
 
 impl OwnedValue {
@@ -79,7 +76,7 @@ impl OwnedValue {
 
     /// Create an empty object.
     pub fn object() -> Self {
-        OwnedValue::Object(BTreeMap::new())
+        OwnedValue::Object(IndexMap::new())
     }
 
     /// Create an object from key-value pairs.
@@ -162,7 +159,7 @@ impl OwnedValue {
     }
 
     /// Convert to an object reference, if possible.
-    pub fn as_object(&self) -> Option<&BTreeMap<String, OwnedValue>> {
+    pub fn as_object(&self) -> Option<&IndexMap<String, OwnedValue>> {
         match self {
             OwnedValue::Object(obj) => Some(obj),
             _ => None,
@@ -170,7 +167,7 @@ impl OwnedValue {
     }
 
     /// Convert to a mutable object reference, if possible.
-    pub fn as_object_mut(&mut self) -> Option<&mut BTreeMap<String, OwnedValue>> {
+    pub fn as_object_mut(&mut self) -> Option<&mut IndexMap<String, OwnedValue>> {
         match self {
             OwnedValue::Object(obj) => Some(obj),
             _ => None,
@@ -324,7 +321,7 @@ mod tests {
         assert_eq!(OwnedValue::Float(2.5).type_name(), "number");
         assert_eq!(OwnedValue::String("".into()).type_name(), "string");
         assert_eq!(OwnedValue::Array(vec![]).type_name(), "array");
-        assert_eq!(OwnedValue::Object(BTreeMap::new()).type_name(), "object");
+        assert_eq!(OwnedValue::Object(IndexMap::new()).type_name(), "object");
     }
 
     #[test]

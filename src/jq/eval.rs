@@ -5,8 +5,6 @@
 #[cfg(not(test))]
 use alloc::boxed::Box;
 #[cfg(not(test))]
-use alloc::collections::BTreeMap;
-#[cfg(not(test))]
 use alloc::format;
 #[cfg(not(test))]
 use alloc::string::{String, ToString};
@@ -15,8 +13,7 @@ use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
-#[cfg(test)]
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
@@ -120,7 +117,7 @@ fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue 
             OwnedValue::Array(items)
         }
         StandardJson::Object(fields) => {
-            let mut map = BTreeMap::new();
+            let mut map = IndexMap::new();
             for field in *fields {
                 // Get the key as a string
                 if let StandardJson::String(key_str_val) = field.key() {
@@ -386,7 +383,7 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let mut map = BTreeMap::new();
+    let mut map = IndexMap::new();
 
     for entry in entries {
         // Evaluate the key
@@ -614,9 +611,9 @@ fn arith_mul(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalErro
 
 /// Recursively merge two objects.
 fn merge_objects(
-    mut left: BTreeMap<String, OwnedValue>,
-    right: BTreeMap<String, OwnedValue>,
-) -> BTreeMap<String, OwnedValue> {
+    mut left: IndexMap<String, OwnedValue>,
+    right: IndexMap<String, OwnedValue>,
+) -> IndexMap<String, OwnedValue> {
     for (k, v) in right {
         match (left.get(&k).cloned(), v) {
             (Some(OwnedValue::Object(a)), OwnedValue::Object(b)) => {
@@ -1383,7 +1380,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'a, W> {
     match value {
         StandardJson::Object(fields) => {
-            let mut result_map = BTreeMap::new();
+            let mut result_map = IndexMap::new();
             for field in fields {
                 // Get the key
                 let key = if let StandardJson::String(k) = field.key() {
@@ -2248,7 +2245,7 @@ fn builtin_to_entries<'a, W: Clone + AsRef<[u64]>>(
                 };
                 let val = to_owned(&field.value());
 
-                let mut entry = BTreeMap::new();
+                let mut entry = IndexMap::new();
                 entry.insert("key".to_string(), OwnedValue::String(key));
                 entry.insert("value".to_string(), val);
                 entries.push(OwnedValue::Object(entry));
@@ -2267,7 +2264,7 @@ fn builtin_from_entries<'a, W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'a, W> {
     match value {
         StandardJson::Array(elements) => {
-            let mut result = BTreeMap::new();
+            let mut result = IndexMap::new();
 
             for elem in elements {
                 // Each element should be an object with "key"/"name" and "value" fields
@@ -2323,7 +2320,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>>(
                 };
                 let val = to_owned(&field.value());
 
-                let mut entry = BTreeMap::new();
+                let mut entry = IndexMap::new();
                 entry.insert("key".to_string(), OwnedValue::String(key));
                 entry.insert("value".to_string(), val);
                 entries.push(OwnedValue::Object(entry));
@@ -2351,7 +2348,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>>(
             }
 
             // Convert back from entries
-            let mut result = BTreeMap::new();
+            let mut result = IndexMap::new();
             for entry in transformed {
                 if let OwnedValue::Object(obj) = entry {
                     let key = obj
@@ -3143,7 +3140,7 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>>(
 /// Build a jq match object
 #[cfg(feature = "regex")]
 fn build_match_object(re: &regex::Regex, matched: &str, offset: usize, input: &str) -> OwnedValue {
-    let mut obj = BTreeMap::new();
+    let mut obj = IndexMap::new();
 
     obj.insert("offset".to_string(), OwnedValue::Int(offset as i64));
     obj.insert("length".to_string(), OwnedValue::Int(matched.len() as i64));
@@ -3160,7 +3157,7 @@ fn build_match_object(re: &regex::Regex, matched: &str, offset: usize, input: &s
                 continue; // Skip the full match
             }
             let cap = caps.get(i);
-            let mut cap_obj = BTreeMap::new();
+            let mut cap_obj = IndexMap::new();
             cap_obj.insert(
                 "offset".to_string(),
                 cap.map(|m| OwnedValue::Int(m.start() as i64))
@@ -3225,7 +3222,7 @@ fn builtin_capture<'a, W: Clone + AsRef<[u64]>>(
     // Extract named captures
     match re.captures(&input) {
         Some(caps) => {
-            let mut result = BTreeMap::new();
+            let mut result = IndexMap::new();
             for name in re.capture_names().flatten() {
                 if let Some(m) = caps.name(name) {
                     result.insert(name.to_string(), OwnedValue::String(m.as_str().to_string()));
@@ -3673,7 +3670,7 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>>(
 /// use std::collections::BTreeMap;
 ///
 /// let expr = parse("$name + $suffix").unwrap();
-/// let mut vars = BTreeMap::new();
+/// let mut vars = IndexMap::new();
 /// vars.insert("name".to_string(), OwnedValue::String("hello".to_string()));
 /// vars.insert("suffix".to_string(), OwnedValue::String("world".to_string()));
 ///
@@ -4880,7 +4877,7 @@ fn walk_impl(f: &Expr, value: OwnedValue, optional: bool) -> Result<OwnedValue, 
             OwnedValue::Array(new_arr?)
         }
         OwnedValue::Object(obj) => {
-            let new_obj: Result<BTreeMap<_, _>, _> = obj
+            let new_obj: Result<IndexMap<_, _>, _> = obj
                 .into_iter()
                 .map(|(k, v)| walk_impl(f, v, optional).map(|nv| (k, nv)))
                 .collect();
@@ -5060,11 +5057,6 @@ fn builtin_leaf_paths<'a, W: Clone + AsRef<[u64]>>(
 
 /// Helper to set a value at a path
 fn set_value_at_path(value: OwnedValue, path: &[OwnedValue], new_val: OwnedValue) -> OwnedValue {
-    #[cfg(not(test))]
-    use alloc::collections::BTreeMap;
-    #[cfg(test)]
-    use std::collections::BTreeMap;
-
     if path.is_empty() {
         return new_val;
     }
@@ -5072,7 +5064,7 @@ fn set_value_at_path(value: OwnedValue, path: &[OwnedValue], new_val: OwnedValue
         OwnedValue::String(key) => match value {
             OwnedValue::Object(mut entries) => {
                 if entries.contains_key(key) {
-                    let old = entries.remove(key).unwrap_or(OwnedValue::Null);
+                    let old = entries.shift_remove(key).unwrap_or(OwnedValue::Null);
                     let new = set_value_at_path(old, &path[1..], new_val);
                     entries.insert(key.clone(), new);
                 } else {
@@ -5084,7 +5076,7 @@ fn set_value_at_path(value: OwnedValue, path: &[OwnedValue], new_val: OwnedValue
             _ => {
                 // Create new object
                 let val = set_value_at_path(OwnedValue::Null, &path[1..], new_val);
-                let mut entries = BTreeMap::new();
+                let mut entries = IndexMap::new();
                 entries.insert(key.clone(), val);
                 OwnedValue::Object(entries)
             }
@@ -5159,7 +5151,7 @@ fn delete_path(value: OwnedValue, path: &[OwnedValue]) -> OwnedValue {
         match &path[0] {
             OwnedValue::String(key) => match value {
                 OwnedValue::Object(mut entries) => {
-                    entries.remove(key);
+                    entries.shift_remove(key);
                     return OwnedValue::Object(entries);
                 }
                 other => return other,
@@ -5184,7 +5176,7 @@ fn delete_path(value: OwnedValue, path: &[OwnedValue]) -> OwnedValue {
     match &path[0] {
         OwnedValue::String(key) => match value {
             OwnedValue::Object(mut entries) => {
-                if let Some(v) = entries.remove(key) {
+                if let Some(v) = entries.shift_remove(key) {
                     let updated = delete_path(v, &path[1..]);
                     entries.insert(key.clone(), updated);
                 }
@@ -5742,7 +5734,7 @@ fn builtin_env<'a, W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'a, W> {
     // Return empty object in no_std context
     // In std context, we could use std::env::vars()
-    QueryResult::Owned(OwnedValue::Object(BTreeMap::new()))
+    QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
 }
 
 /// Builtin: env.VAR or $ENV.VAR - get environment variable
@@ -5918,12 +5910,7 @@ fn builtin_bsearch<'a, W: Clone + AsRef<[u64]>>(
         Ok(idx) => QueryResult::Owned(OwnedValue::Int(idx as i64)),
         Err(idx) => {
             // jq returns an object with "index" field when not found
-            #[cfg(not(test))]
-            use alloc::collections::BTreeMap;
-            #[cfg(test)]
-            use std::collections::BTreeMap;
-
-            let mut obj = BTreeMap::new();
+            let mut obj = IndexMap::new();
             obj.insert("index".to_string(), OwnedValue::Int(idx as i64));
             QueryResult::Owned(OwnedValue::Object(obj))
         }

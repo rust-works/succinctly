@@ -4,6 +4,7 @@
 //! JSON semi-indexing and jq expression evaluator.
 
 use anyhow::{Context, Result};
+use indexmap::IndexMap;
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -79,7 +80,7 @@ fn print_build_configuration() {
 #[derive(Debug, Default)]
 pub struct EvalContext {
     /// Named arguments from --arg, --argjson, --slurpfile, --rawfile
-    pub named: BTreeMap<String, OwnedValue>,
+    pub named: IndexMap<String, OwnedValue>,
     /// Positional arguments from --args or --jsonargs
     pub positional: Vec<OwnedValue>,
 }
@@ -661,10 +662,10 @@ fn build_context(args: &JqCommand) -> Result<EvalContext> {
 
 /// Build the $ARGS special variable containing named and positional args.
 fn build_args_var(context: &EvalContext) -> OwnedValue {
-    let mut args_obj = BTreeMap::new();
+    let mut args_obj = IndexMap::new();
 
     // Build named object from context.named
-    let named_obj: BTreeMap<String, OwnedValue> = context.named.clone();
+    let named_obj: IndexMap<String, OwnedValue> = context.named.clone();
     args_obj.insert("named".to_string(), OwnedValue::Object(named_obj));
 
     // Build positional array from context.positional
@@ -995,8 +996,10 @@ fn format_json_sorted(value: &OwnedValue, config: &OutputConfig) -> String {
 fn sort_keys(value: &OwnedValue) -> OwnedValue {
     match value {
         OwnedValue::Object(obj) => {
-            let sorted: BTreeMap<String, OwnedValue> =
+            // Collect into BTreeMap to sort, then convert to IndexMap
+            let sorted_btree: BTreeMap<String, OwnedValue> =
                 obj.iter().map(|(k, v)| (k.clone(), sort_keys(v))).collect();
+            let sorted: IndexMap<String, OwnedValue> = sorted_btree.into_iter().collect();
             OwnedValue::Object(sorted)
         }
         OwnedValue::Array(arr) => OwnedValue::Array(arr.iter().map(sort_keys).collect()),

@@ -46,6 +46,7 @@ mmap-tests = ["memmap2", "tempfile"]  # Memory-mapped tests
 
 [dependencies]
 bytemuck = { version = "1.14", features = ["derive"] }
+indexmap = "2.2"
 libm = "0.2"
 memmap2 = { version = "0.9", optional = true }
 tempfile = { version = "3.10", optional = true }
