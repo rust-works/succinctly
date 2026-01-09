@@ -172,11 +172,21 @@ cargo build --release --features cli
 
 ## Architecture
 
+### Module Structure
+
+```
+succinctly
+├── bits         # Bitvector with rank/select
+├── trees        # Tree encodings (balanced parentheses)
+├── json         # JSON semi-indexing
+└── jq           # jq query language
+```
+
 ### Core Data Structures
 
-- **BitVec** - Bitvector with 3-level Poppy-style rank directory (~3% overhead) and sampled select index (~1-3% overhead)
-- **BalancedParens** - Hierarchical min-excess structure for O(1) tree navigation (~6% overhead)
-- **JsonIndex** - Semi-index combining Interest Bits (IB) and Balanced Parentheses (BP) for fast JSON navigation
+- **`bits::BitVec`** - Bitvector with 3-level Poppy-style rank directory (~3% overhead) and sampled select index (~1-3% overhead)
+- **`trees::BalancedParens`** - Hierarchical min-excess structure for O(1) tree navigation (~6% overhead)
+- **`json::JsonIndex`** - Semi-index combining Interest Bits (IB) and Balanced Parentheses (BP) for fast JSON navigation
 
 ### SIMD Support
 

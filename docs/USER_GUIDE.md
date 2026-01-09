@@ -106,18 +106,18 @@ Bits:     1 1 1 0 0 1 0 1 0 0
 ### Creating BalancedParens
 
 ```rust
-use succinctly::bp::BalancedParens;
+use succinctly::trees::BalancedParens;
 
 // From bits: ((()())())  ->  1110100100
-let bp = BalancedParens::new(&[0b0010010111], 10);
+let bp = BalancedParens::new(vec![0b0010010111], 10);
 ```
 
 ### Navigation Operations
 
 ```rust
-use succinctly::bp::BalancedParens;
+use succinctly::trees::BalancedParens;
 
-let bp = BalancedParens::new(&[0b0010010111], 10);
+let bp = BalancedParens::new(vec![0b0010010111], 10);
 
 // Find matching parenthesis
 assert_eq!(bp.find_close(0), Some(9));  // Match for outermost (

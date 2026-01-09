@@ -9,10 +9,10 @@ use alloc::vec::Vec;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::broadword::select_in_word;
-use crate::popcount::{popcount_word, popcount_words};
-use crate::rank::RankDirectory;
-use crate::select::SelectIndex;
+use crate::bits::popcount::{popcount_word, popcount_words};
+use crate::bits::rank::RankDirectory;
+use crate::bits::select::SelectIndex;
+use crate::util::broadword::select_in_word;
 use crate::{Config, RankSelect};
 
 /// A bitvector with rank/select support.

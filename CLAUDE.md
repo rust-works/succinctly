@@ -89,9 +89,50 @@ cargo build --release --features cli
 
 ## Code Architecture
 
+### Module Structure
+
+```
+src/
+├── lib.rs              # Public API, RankSelect trait, Config
+├── bits/               # Bitvector implementations
+│   ├── mod.rs          # Re-exports
+│   ├── bitvec.rs       # BitVec with rank/select
+│   ├── rank.rs         # 3-level Poppy rank directory
+│   ├── select.rs       # Sampled select index
+│   └── popcount.rs     # Population count strategies
+├── trees/              # Tree encodings
+│   ├── mod.rs          # Re-exports
+│   └── bp.rs           # Balanced parentheses with RangeMin
+├── util/               # Internal utilities
+│   ├── mod.rs
+│   ├── broadword.rs    # Bit manipulation primitives
+│   ├── table.rs        # Lookup tables
+│   └── simd/           # SIMD utilities
+├── json/               # JSON semi-indexing
+├── jq/                 # jq query language
+├── binary.rs           # Binary I/O
+└── bin/                # CLI tool
+```
+
+### Public API
+
+```rust
+// Recommended imports
+use succinctly::bits::BitVec;
+use succinctly::trees::BalancedParens;
+use succinctly::json::JsonIndex;
+use succinctly::jq::{parse, eval};
+
+// Convenience re-exports (also available at root)
+use succinctly::{BitVec, BalancedParens, RankSelect};
+
+// Backward compatibility (deprecated, use trees:: instead)
+use succinctly::bp::BalancedParens;
+```
+
 ### Core Data Structures
 
-**BitVec** ([src/bitvec.rs](src/bitvec.rs))
+**BitVec** ([src/bits/bitvec.rs](src/bits/bitvec.rs))
 - Main bitvector with rank/select support
 - Memory layout: raw words (`Vec<u64>`), rank directory (~3% overhead), select index (~1-3% overhead)
 - Uses 3-level Poppy-style rank directory (L0/L1/L2) for O(1) rank queries
@@ -104,7 +145,7 @@ cargo build --release --features cli
 
 ### Balanced Parentheses
 
-**BalancedParens** ([src/bp.rs](src/bp.rs))
+**BalancedParens** ([src/trees/bp.rs](src/trees/bp.rs))
 - Succinct tree navigation using balanced parentheses encoding (1=open, 0=close)
 - RangeMin structure with hierarchical min-excess indices (~6% overhead)
 - Tree operations: `find_close`, `find_open`, `enclose`, `first_child`, `next_sibling`, `parent`, `excess`
@@ -224,7 +265,7 @@ Two AVX-512 optimizations implemented with dramatically different results:
 
 #### ✅ AVX512-VPOPCNTDQ: 5.2x Speedup (Compute-Bound)
 
-**Implementation**: [src/popcount.rs](src/popcount.rs)
+**Implementation**: [src/bits/popcount.rs](src/bits/popcount.rs)
 - Processes 8 u64 words (512 bits) in parallel
 - Hardware `_mm512_popcnt_epi64` instruction
 - **Result**: 96.8 GiB/s vs 18.5 GiB/s (scalar) = **5.2x faster**

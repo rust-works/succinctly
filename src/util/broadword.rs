@@ -3,7 +3,7 @@
 //! These algorithms operate on 64-bit words using SIMD-within-a-register techniques,
 //! providing efficient bit operations without requiring hardware SIMD support.
 
-use crate::table::select_in_byte;
+use crate::util::table::select_in_byte;
 
 /// Constant with 1 in each byte's LSB position.
 #[allow(dead_code)]

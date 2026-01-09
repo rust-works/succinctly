@@ -44,8 +44,8 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 #[cfg(test)]
 use std::borrow::Cow;
 
-use crate::bp::BalancedParens;
-use crate::broadword::select_in_word;
+use crate::trees::BalancedParens;
+use crate::util::broadword::select_in_word;
 
 // ============================================================================
 // JsonIndex: Holds the IB and BP index structures

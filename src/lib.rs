@@ -5,6 +5,13 @@
 //! This crate provides space-efficient data structures with fast rank and select operations,
 //! optimized for both x86_64 and ARM (NEON) architectures.
 //!
+//! ## Module Organization
+//!
+//! - [`bits`] - Bitvector with O(1) rank and O(log n) select
+//! - [`trees`] - Succinct tree representations (balanced parentheses)
+//! - [`json`] - JSON semi-indexing with SIMD acceleration
+//! - [`jq`] - jq-style query language for JSON navigation
+//!
 //! ## Quick Start
 //!
 //! ```
@@ -45,26 +52,57 @@ extern crate std as alloc;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+// =============================================================================
+// Core modules (organized by category)
+// =============================================================================
+
+/// Bitvector implementations with rank and select support.
+pub mod bits;
+
+/// Succinct tree representations.
+pub mod trees;
+
+/// Internal utilities (not part of public API).
+pub(crate) mod util;
+
+/// Binary serialization utilities.
 pub mod binary;
-mod bitvec;
-pub mod bp;
-mod broadword;
-pub mod jq;
+
+// =============================================================================
+// Application modules
+// =============================================================================
+
+/// JSON semi-indexing with SIMD acceleration.
 pub mod json;
-mod popcount;
-mod rank;
-mod select;
-mod table;
 
-// Keep simd module for its tests, but the main code uses popcount module
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-mod simd;
+/// jq-style query language for JSON navigation.
+pub mod jq;
 
-pub use bitvec::BitVec;
-pub use broadword::select_in_word;
-pub use popcount::{popcount_word, popcount_words};
-pub use rank::RankDirectory;
-pub use select::SelectIndex;
+// =============================================================================
+// Public re-exports (convenience + backward compatibility)
+// =============================================================================
+
+// Core types
+pub use bits::BitVec;
+pub use bits::{popcount_word, popcount_words, RankDirectory, SelectIndex};
+pub use trees::BalancedParens;
+pub use util::select_in_word;
+
+// =============================================================================
+// Backward compatibility aliases
+// =============================================================================
+
+/// Backward compatibility alias for [`trees`] module.
+///
+/// Use `succinctly::trees` instead.
+#[doc(hidden)]
+pub mod bp {
+    pub use crate::trees::*;
+}
+
+// =============================================================================
+// Core traits
+// =============================================================================
 
 /// Trait for rank/select operations on bitvectors.
 ///
@@ -90,6 +128,10 @@ pub trait RankSelect {
     /// Returns `None` if fewer than `k+1` ones exist.
     fn select1(&self, k: usize) -> Option<usize>;
 }
+
+// =============================================================================
+// Configuration
+// =============================================================================
 
 /// Configuration for building indices.
 #[derive(Clone, Debug)]
