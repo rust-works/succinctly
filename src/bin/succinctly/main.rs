@@ -269,6 +269,10 @@ struct JqCommand {
     /// Show version information
     #[arg(short = 'V', long)]
     version: bool,
+
+    /// Show build configuration
+    #[arg(long)]
+    build_configuration: bool,
 }
 
 impl From<PatternArg> for generators::Pattern {

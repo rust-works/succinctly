@@ -27,6 +27,54 @@ pub mod exit_codes {
     pub const HALT_ERROR: i32 = 5; // halt_error without explicit code
 }
 
+/// Print build configuration information (similar to jq --build-configuration)
+fn print_build_configuration() {
+    println!("succinctly jq build configuration:");
+    println!();
+    println!("Version: {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "Target: {}-{}-{}",
+        std::env::consts::ARCH,
+        std::env::consts::FAMILY,
+        std::env::consts::OS
+    );
+    println!(
+        "Profile: {}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    println!();
+    println!("Features:");
+    println!("  std: {}", cfg!(feature = "std"));
+    println!("  simd: {}", cfg!(feature = "simd"));
+    println!("  regex: {}", cfg!(feature = "regex"));
+    println!();
+    println!("Platform:");
+    println!("  OS: {}", std::env::consts::OS);
+    println!("  Arch: {}", std::env::consts::ARCH);
+    println!("  Family: {}", std::env::consts::FAMILY);
+    #[cfg(target_arch = "x86_64")]
+    {
+        println!();
+        println!("x86_64 CPU features (runtime detected):");
+        println!("  SSE2: true (baseline)");
+        println!("  SSE4.2: {}", is_x86_feature_detected!("sse4.2"));
+        println!("  AVX2: {}", is_x86_feature_detected!("avx2"));
+        println!("  POPCNT: {}", is_x86_feature_detected!("popcnt"));
+        println!("  BMI1: {}", is_x86_feature_detected!("bmi1"));
+        println!("  BMI2: {}", is_x86_feature_detected!("bmi2"));
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        println!();
+        println!("aarch64 CPU features:");
+        println!("  NEON: true (mandatory on aarch64)");
+    }
+}
+
 /// Evaluation context for passing variables to the jq evaluator.
 #[derive(Debug, Default)]
 pub struct EvalContext {
@@ -94,6 +142,12 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             "succinctly jq - JSON processor [version {}]",
             env!("CARGO_PKG_VERSION")
         );
+        return Ok(exit_codes::SUCCESS);
+    }
+
+    // Handle --build-configuration flag
+    if args.build_configuration {
+        print_build_configuration();
         return Ok(exit_codes::SUCCESS);
     }
 
