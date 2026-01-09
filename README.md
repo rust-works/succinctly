@@ -243,9 +243,11 @@ Licensed under the [MIT license](LICENSE).
 
 This library implements algorithms from:
 
-- Vigna, "Broadword Implementation of Rank/Select Queries" (2008)
-- Zhou et al., "Space-Efficient, High-Performance Rank & Select" (Poppy, 2013)
+- Vigna, ["Broadword Implementation of Rank/Select Queries"](https://vigna.di.unimi.it/ftp/papers/Broadword.pdf) (WEA 2008)
+- Zhou, Andersen, Kaminsky, ["Space-Efficient, High-Performance Rank & Select"](https://www.cs.cmu.edu/~dga/papers/zhou-sea2013.pdf) (SEA 2013)
 - Sadakane & Navarro, "Fully-Functional Succinct Trees" (SODA 2010)
+- Langdale & Lemire, ["Parsing Gigabytes of JSON per Second"](https://arxiv.org/abs/1902.08318) (VLDB 2019)
+- Muła, Kurz, Lemire, ["Faster Population Counts Using AVX2 Instructions"](https://arxiv.org/abs/1611.07612) (2016)
 
 ## Related Work
 

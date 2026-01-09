@@ -3,6 +3,9 @@
 //! This module provides vectorized implementations of JSON semi-indexing
 //! that process multiple bytes at once using SIMD instructions.
 //!
+//! The vectorized character classification techniques are influenced by:
+//! - Langdale & Lemire, ["Parsing Gigabytes of JSON per Second"](https://arxiv.org/abs/1902.08318) (2019)
+//!
 //! ## x86_64 Instruction Set Levels
 //!
 //! - **SSE2** (baseline): 16 bytes/iteration, universal availability
