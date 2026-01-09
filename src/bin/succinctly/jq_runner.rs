@@ -800,9 +800,9 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
 
     // Try to parse as a stream of JSON values
     let mut values = Vec::new();
-    let mut deserializer = serde_json::Deserializer::from_str(s).into_iter::<serde_json::Value>();
+    let deserializer = serde_json::Deserializer::from_str(s).into_iter::<serde_json::Value>();
 
-    while let Some(result) = deserializer.next() {
+    for result in deserializer {
         let value = result.context("Invalid JSON in stream")?;
         values.push(serde_to_owned(&value));
     }
@@ -908,15 +908,11 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) 
         StandardJson::String(s) => {
             OwnedValue::String(s.as_str().map(|c| c.to_string()).unwrap_or_default())
         }
-        StandardJson::Array(elements) => OwnedValue::Array(
-            elements
-                .clone()
-                .map(|e| standard_json_to_owned(&e))
-                .collect(),
-        ),
+        StandardJson::Array(elements) => {
+            OwnedValue::Array((*elements).map(|e| standard_json_to_owned(&e)).collect())
+        }
         StandardJson::Object(fields) => OwnedValue::Object(
-            fields
-                .clone()
+            (*fields)
                 .map(|f| {
                     let key = match f.key() {
                         StandardJson::String(s) => s.as_str().unwrap_or_default().to_string(),
@@ -1029,10 +1025,8 @@ fn format_json_impl(value: &OwnedValue, indent: &str, level: usize, ascii: bool)
         OwnedValue::Bool(b) => b.to_string(),
         OwnedValue::Int(i) => i.to_string(),
         OwnedValue::Float(f) => {
-            if f.is_nan() {
-                "null".to_string() // JSON doesn't support NaN
-            } else if f.is_infinite() {
-                "null".to_string() // JSON doesn't support Infinity
+            if f.is_nan() || f.is_infinite() {
+                "null".to_string() // JSON doesn't support NaN or Infinity
             } else {
                 f.to_string()
             }

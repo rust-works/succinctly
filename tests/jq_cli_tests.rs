@@ -40,6 +40,7 @@ fn run_jq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(Strin
 }
 
 /// Helper to run jq command with file input
+#[allow(dead_code)]
 fn run_jq_file(filter: &str, file_path: &str, extra_args: &[&str]) -> Result<(String, i32)> {
     let output = Command::new("cargo")
         .args([
@@ -986,7 +987,7 @@ fn test_include_directive() -> Result<()> {
         .stderr(Stdio::piped())
         .output()?;
 
-    let stdout = String::from_utf8(output.stdout)?;
+    let _stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
 
     // Note: This test may fail if include isn't fully implemented yet
