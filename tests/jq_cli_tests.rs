@@ -137,6 +137,93 @@ fn test_arithmetic() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_unary_minus() -> Result<()> {
+    // Negate input value - use -- to prevent option parsing of -. filter
+    let mut cmd = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "--",
+            "-.",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(b"5")?;
+    }
+    let output = cmd.wait_with_output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout.trim(), "-5");
+    Ok(())
+}
+
+#[test]
+fn test_unary_minus_expression() -> Result<()> {
+    // Negate a complex expression
+    let mut cmd = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "--",
+            "-(.a + .b)",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(br#"{"a":3,"b":2}"#)?;
+    }
+    let output = cmd.wait_with_output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout.trim(), "-5");
+    Ok(())
+}
+
+#[test]
+fn test_double_negation() -> Result<()> {
+    // Double negation should return original value
+    let mut cmd = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "--",
+            "--.",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(b"5")?;
+    }
+    let output = cmd.wait_with_output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout.trim(), "5");
+    Ok(())
+}
+
 // =============================================================================
 // Input Options Tests
 // =============================================================================

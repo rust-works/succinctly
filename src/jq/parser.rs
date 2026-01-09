@@ -727,20 +727,34 @@ impl<'a> Parser<'a> {
             // Format strings: @text, @json, @uri, etc.
             Some('@') => self.parse_format_string(),
 
-            // Number literal (starts with digit or negative sign followed by digit)
+            // Number literal (starts with digit)
             Some(c) if c.is_ascii_digit() => {
                 let lit = self.parse_number_literal()?;
                 Ok(Expr::Literal(lit))
             }
-            Some('-')
+
+            // Unary minus: either a negative number literal or negation of an expression
+            Some('-') => {
+                // Check if this is a negative number literal (- followed by digit)
                 if self
                     .peek_str(2)
                     .chars()
                     .nth(1)
-                    .is_some_and(|c| c.is_ascii_digit()) =>
-            {
-                let lit = self.parse_number_literal()?;
-                Ok(Expr::Literal(lit))
+                    .is_some_and(|c| c.is_ascii_digit())
+                {
+                    let lit = self.parse_number_literal()?;
+                    Ok(Expr::Literal(lit))
+                } else {
+                    // Unary minus: negate the following expression
+                    // Implemented as (0 - expr)
+                    self.next(); // consume '-'
+                    let operand = self.parse_primary()?;
+                    Ok(Expr::Arithmetic {
+                        op: ArithOp::Sub,
+                        left: Box::new(Expr::Literal(Literal::Int(0))),
+                        right: Box::new(operand),
+                    })
+                }
             }
 
             // Dot-based expressions
