@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      release_version: ${{ env.RELEASE_VERSION }}
+    steps:
+    - name: Get the release version from the tag
+      shell: bash
+      if: env.RELEASE_VERSION == ''
+      run: |
+        echo "RELEASE_VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+        echo "version is: ${{ env.RELEASE_VERSION }}"
+    - name: Create GitHub release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ env.RELEASE_VERSION }}
+        release_name: ${{ env.RELEASE_VERSION }}
+        draft: false
+        prerelease: false
+
+  build-release:
+    name: Build Release
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [linux-x64, linux-arm64, macos-arm64, macos-x64, windows]
+        include:
+        - build: linux-x64
+          os: ubuntu-latest
+          rust: stable
+          target: x86_64-unknown-linux-gnu
+          archive-name: succinctly-linux-x64.tar.gz
+        - build: linux-arm64
+          os: ubuntu-24.04-arm
+          rust: stable
+          target: aarch64-unknown-linux-gnu
+          archive-name: succinctly-linux-arm64.tar.gz
+        - build: macos-arm64
+          os: macos-latest
+          rust: stable
+          target: aarch64-apple-darwin
+          archive-name: succinctly-macos-arm64.tar.gz
+        - build: macos-x64
+          os: macos-13
+          rust: stable
+          target: x86_64-apple-darwin
+          archive-name: succinctly-macos-x64.tar.gz
+        - build: windows
+          os: windows-latest
+          rust: stable
+          target: x86_64-pc-windows-msvc
+          archive-name: succinctly-windows-x64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.rust }}
+        target: ${{ matrix.target }}
+
+    - name: Build release binary
+      run: cargo build --verbose --release --features cli --target ${{ matrix.target }}
+
+    - name: Strip release binary (linux and macos)
+      if: matrix.build != 'windows'
+      run: strip "target/${{ matrix.target }}/release/succinctly"
+
+    - name: Build archive
+      shell: bash
+      run: |
+        mkdir archive
+        cp LICENSE README.md archive/
+        if [ "${{ matrix.build }}" = "windows" ]; then
+          cp "target/${{ matrix.target }}/release/succinctly.exe" archive/
+          cd archive
+          7z a "${{ matrix.archive-name }}" *
+        else
+          cp "target/${{ matrix.target }}/release/succinctly" archive/
+          cd archive
+          tar czf "${{ matrix.archive-name }}" *
+        fi
+
+    - name: Upload release archive
+      uses: actions/upload-release-asset@v1.0.1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create-release.outputs.upload_url }}
+        asset_path: archive/${{ matrix.archive-name }}
+        asset_name: ${{ matrix.archive-name }}
+        asset_content_type: application/octet-stream
+
+  publish-crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: [create-release, build-release]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Publish
+      run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
