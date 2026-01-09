@@ -827,3 +827,131 @@ fn test_args_combined() -> Result<()> {
     assert_eq!(parsed["positional"][1], "b");
     Ok(())
 }
+
+// =============================================================================
+// Environment Variable Tests
+// =============================================================================
+
+#[test]
+fn test_no_color_env_var() -> Result<()> {
+    // Test that NO_COLOR environment variable disables color output
+    // When NO_COLOR is set and no explicit -C/-M flag is given, colors should be disabled.
+    let mut child = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            ".", // No -C or -M flag
+        ])
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(b"{\"a\":1}")?;
+    }
+    let result = child.wait_with_output()?;
+    let stdout = String::from_utf8(result.stdout)?;
+
+    // Without -C flag and with NO_COLOR set, output should not contain ANSI codes
+    assert!(
+        !stdout.contains("\x1b["),
+        "Output should not contain ANSI escape codes when NO_COLOR is set"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_jq_colors_env_var() -> Result<()> {
+    // Test that JQ_COLORS environment variable customizes colors
+    // Format: "null:false:true:numbers:strings:arrays:objects:objectkeys"
+    // Use a distinctive color for null (red = 31) to verify it works
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-C", // Force color output
+            "-n",
+            "null",
+        ])
+        .env("JQ_COLORS", "0;31:::::::") // Red null, defaults for rest
+        .stdout(Stdio::piped())
+        .output()?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    // Check that the red color code (31) is present for null
+    assert!(
+        stdout.contains("\x1b[0;31m"),
+        "Output should contain custom red color for null"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_color_output_overrides_no_color() -> Result<()> {
+    // Test that -C flag overrides NO_COLOR env var
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-C", // Force color
+            "-n",
+            r#"{"a":1}"#,
+        ])
+        .env("NO_COLOR", "1") // This should be overridden by -C
+        .stdout(Stdio::piped())
+        .output()?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    // -C should force colors even with NO_COLOR set
+    assert!(
+        stdout.contains("\x1b["),
+        "Output should contain ANSI codes when -C is used"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_monochrome_overrides_jq_colors() -> Result<()> {
+    // Test that -M flag disables colors even if JQ_COLORS is set
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-M", // Monochrome output
+            "-n",
+            r#"{"a":1}"#,
+        ])
+        .env("JQ_COLORS", "0;31:0;32:0;33:0;34:0;35:0;36:0;37:0;38")
+        .stdout(Stdio::piped())
+        .output()?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    // -M should disable all colors
+    assert!(
+        !stdout.contains("\x1b["),
+        "Output should not contain ANSI codes when -M is used"
+    );
+    Ok(())
+}

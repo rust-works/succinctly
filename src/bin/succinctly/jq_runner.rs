@@ -92,6 +92,7 @@ struct OutputConfig {
     raw_output0: bool,
     ascii_output: bool,
     color_output: bool,
+    color_scheme: ColorScheme,
     sort_keys: bool,
     indent_string: String,
     unbuffered: bool,
@@ -109,15 +110,25 @@ impl OutputConfig {
             "  ".to_string() // Default: 2 spaces
         };
 
-        // Determine color output: -C forces on, -M forces off, default is auto (tty check)
+        // Determine color output with priority:
+        // 1. --monochrome-output (-M) forces off
+        // 2. --color-output (-C) forces on
+        // 3. NO_COLOR env var disables color (https://no-color.org/)
+        // 4. Default: color if stdout is a terminal
         let color_output = if args.monochrome_output {
             false
         } else if args.color_output {
             true
+        } else if std::env::var("NO_COLOR").is_ok() {
+            // NO_COLOR is set (any value means disable colors)
+            false
         } else {
             // Default: color if stdout is a terminal
             atty::is(atty::Stream::Stdout)
         };
+
+        // Get color scheme from JQ_COLORS env var (or defaults)
+        let color_scheme = ColorScheme::from_env();
 
         OutputConfig {
             compact: args.compact_output,
@@ -126,6 +137,7 @@ impl OutputConfig {
             raw_output0: args.raw_output0,
             ascii_output: args.ascii_output,
             color_output,
+            color_scheme,
             sort_keys: args.sort_keys,
             indent_string,
             unbuffered: args.unbuffered,
@@ -565,7 +577,7 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
     };
 
     if config.color_output {
-        colorize_json(&json)
+        colorize_json(&json, &config.color_scheme)
     } else {
         json
     }
@@ -759,20 +771,111 @@ fn escape_json_string_ascii(s: &str) -> String {
     result
 }
 
-/// ANSI color codes for JSON syntax highlighting.
-mod colors {
+/// Default ANSI color codes for JSON syntax highlighting.
+/// These match jq's default colors.
+mod default_colors {
     pub const RESET: &str = "\x1b[0m";
-    pub const NULL: &str = "\x1b[1;30m"; // Bold black (gray)
-    pub const BOOL: &str = "\x1b[33m"; // Yellow
-    pub const NUMBER: &str = "\x1b[36m"; // Cyan
-    pub const STRING: &str = "\x1b[32m"; // Green
-    pub const KEY: &str = "\x1b[34m"; // Blue (for object keys)
-    pub const BRACKET: &str = "\x1b[1;37m"; // Bold white
+    pub const NULL: &str = "\x1b[1;30m"; // Bold black (gray) - jq default
+    pub const FALSE: &str = "\x1b[0;39m"; // Default - jq default
+    pub const TRUE: &str = "\x1b[0;39m"; // Default - jq default
+    pub const NUMBER: &str = "\x1b[0;39m"; // Default - jq default
+    pub const STRING: &str = "\x1b[0;32m"; // Green - jq default
+    pub const ARRAY: &str = "\x1b[1;39m"; // Bold default - jq default
+    pub const OBJECT: &str = "\x1b[1;39m"; // Bold default - jq default
+    pub const KEY: &str = "\x1b[1;34m"; // Bold blue - jq default (or 1;39)
+}
+
+/// Color scheme for JSON syntax highlighting.
+/// Can be customized via JQ_COLORS environment variable.
+#[derive(Clone)]
+struct ColorScheme {
+    reset: String,
+    null: String,
+    false_: String,
+    true_: String,
+    number: String,
+    string: String,
+    array: String,
+    object: String,
+    key: String,
+}
+
+impl Default for ColorScheme {
+    fn default() -> Self {
+        ColorScheme {
+            reset: default_colors::RESET.to_string(),
+            null: default_colors::NULL.to_string(),
+            false_: default_colors::FALSE.to_string(),
+            true_: default_colors::TRUE.to_string(),
+            number: default_colors::NUMBER.to_string(),
+            string: default_colors::STRING.to_string(),
+            array: default_colors::ARRAY.to_string(),
+            object: default_colors::OBJECT.to_string(),
+            key: default_colors::KEY.to_string(),
+        }
+    }
+}
+
+impl ColorScheme {
+    /// Parse JQ_COLORS environment variable.
+    /// Format: "null:false:true:numbers:strings:arrays:objects:objectkeys"
+    /// Each value is an SGR parameter like "1;30" for bold black.
+    fn from_env() -> Self {
+        let mut scheme = ColorScheme::default();
+
+        if let Ok(colors) = std::env::var("JQ_COLORS") {
+            let parts: Vec<&str> = colors.split(':').collect();
+
+            // Parse each color in order
+            if let Some(sgr) = parts.first() {
+                if !sgr.is_empty() {
+                    scheme.null = format!("\x1b[{}m", sgr);
+                }
+            }
+            if let Some(sgr) = parts.get(1) {
+                if !sgr.is_empty() {
+                    scheme.false_ = format!("\x1b[{}m", sgr);
+                }
+            }
+            if let Some(sgr) = parts.get(2) {
+                if !sgr.is_empty() {
+                    scheme.true_ = format!("\x1b[{}m", sgr);
+                }
+            }
+            if let Some(sgr) = parts.get(3) {
+                if !sgr.is_empty() {
+                    scheme.number = format!("\x1b[{}m", sgr);
+                }
+            }
+            if let Some(sgr) = parts.get(4) {
+                if !sgr.is_empty() {
+                    scheme.string = format!("\x1b[{}m", sgr);
+                }
+            }
+            if let Some(sgr) = parts.get(5) {
+                if !sgr.is_empty() {
+                    scheme.array = format!("\x1b[{}m", sgr);
+                }
+            }
+            if let Some(sgr) = parts.get(6) {
+                if !sgr.is_empty() {
+                    scheme.object = format!("\x1b[{}m", sgr);
+                }
+            }
+            if let Some(sgr) = parts.get(7) {
+                if !sgr.is_empty() {
+                    scheme.key = format!("\x1b[{}m", sgr);
+                }
+            }
+        }
+
+        scheme
+    }
 }
 
 /// Colorize a JSON string using ANSI escape codes.
 /// This is a simple parser that adds colors to JSON tokens.
-fn colorize_json(json: &str) -> String {
+fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
     let mut result = String::with_capacity(json.len() * 2);
     let mut chars = json.chars().peekable();
     let mut in_string = false;
@@ -793,7 +896,7 @@ fn colorize_json(json: &str) -> String {
                 escape_next = true;
             } else if c == '"' {
                 result.push(c);
-                result.push_str(colors::RESET);
+                result.push_str(&scheme.reset);
                 in_string = false;
             } else {
                 result.push(c);
@@ -803,34 +906,40 @@ fn colorize_json(json: &str) -> String {
                 '"' => {
                     // Use expecting_key to determine if this is a key
                     if expecting_key {
-                        result.push_str(colors::KEY);
+                        result.push_str(&scheme.key);
                         expecting_key = false; // After seeing key, next string is value
                     } else {
-                        result.push_str(colors::STRING);
+                        result.push_str(&scheme.string);
                     }
                     result.push(c);
                     in_string = true;
                 }
                 '{' => {
-                    result.push_str(colors::BRACKET);
+                    result.push_str(&scheme.object);
                     result.push(c);
-                    result.push_str(colors::RESET);
+                    result.push_str(&scheme.reset);
                     depth_stack.push('{');
                     expecting_key = true; // First thing in object is a key
                 }
                 '[' => {
-                    result.push_str(colors::BRACKET);
+                    result.push_str(&scheme.array);
                     result.push(c);
-                    result.push_str(colors::RESET);
+                    result.push_str(&scheme.reset);
                     depth_stack.push('[');
                     // Arrays don't have keys
                 }
-                '}' | ']' => {
-                    result.push_str(colors::BRACKET);
+                '}' => {
+                    result.push_str(&scheme.object);
                     result.push(c);
-                    result.push_str(colors::RESET);
+                    result.push_str(&scheme.reset);
                     depth_stack.pop();
-                    // Restore expecting_key state based on parent context
+                    expecting_key = false;
+                }
+                ']' => {
+                    result.push_str(&scheme.array);
+                    result.push(c);
+                    result.push_str(&scheme.reset);
+                    depth_stack.pop();
                     expecting_key = false;
                 }
                 ':' => {
@@ -845,9 +954,9 @@ fn colorize_json(json: &str) -> String {
                         expecting_key = true;
                     }
                 }
-                't' | 'f' => {
-                    // true or false
-                    result.push_str(colors::BOOL);
+                't' => {
+                    // true
+                    result.push_str(&scheme.true_);
                     result.push(c);
                     // Consume rest of the keyword
                     while let Some(&next) = chars.peek() {
@@ -857,11 +966,25 @@ fn colorize_json(json: &str) -> String {
                             break;
                         }
                     }
-                    result.push_str(colors::RESET);
+                    result.push_str(&scheme.reset);
+                }
+                'f' => {
+                    // false
+                    result.push_str(&scheme.false_);
+                    result.push(c);
+                    // Consume rest of the keyword
+                    while let Some(&next) = chars.peek() {
+                        if next.is_alphabetic() {
+                            result.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                    result.push_str(&scheme.reset);
                 }
                 'n' => {
                     // null
-                    result.push_str(colors::NULL);
+                    result.push_str(&scheme.null);
                     result.push(c);
                     while let Some(&next) = chars.peek() {
                         if next.is_alphabetic() {
@@ -870,10 +993,10 @@ fn colorize_json(json: &str) -> String {
                             break;
                         }
                     }
-                    result.push_str(colors::RESET);
+                    result.push_str(&scheme.reset);
                 }
                 '0'..='9' | '-' | '.' | 'e' | 'E' | '+' => {
-                    result.push_str(colors::NUMBER);
+                    result.push_str(&scheme.number);
                     result.push(c);
                     // Consume rest of number
                     while let Some(&next) = chars.peek() {
@@ -889,7 +1012,7 @@ fn colorize_json(json: &str) -> String {
                             break;
                         }
                     }
-                    result.push_str(colors::RESET);
+                    result.push_str(&scheme.reset);
                 }
                 _ => {
                     // Whitespace and other characters
