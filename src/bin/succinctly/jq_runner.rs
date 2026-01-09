@@ -90,7 +90,10 @@ impl OutputConfig {
 pub fn run_jq(args: JqCommand) -> Result<i32> {
     // Handle --version flag
     if args.version {
-        println!("succinctly jq - JSON processor [version {}]", env!("CARGO_PKG_VERSION"));
+        println!(
+            "succinctly jq - JSON processor [version {}]",
+            env!("CARGO_PKG_VERSION")
+        );
         return Ok(exit_codes::SUCCESS);
     }
 
