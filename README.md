@@ -115,15 +115,30 @@ if let QueryResult::One(StandardJson::Number(age)) = eval(&expr, cursor) {
 
 ## Performance
 
-Benchmarked on AMD Ryzen 9 7950X (Zen 4) and Apple M-series processors:
+### JSON Semi-Indexing
 
-| Operation | Throughput | Notes |
-|-----------|------------|-------|
-| JSON semi-indexing (PFSM) | **950 MiB/s** | Table-driven parser, 40-77% faster than scalar |
-| JSON semi-indexing (AVX2) | 732 MiB/s | 32 bytes/iteration SIMD |
-| Rank query | ~3 ns | O(1) with Poppy directory |
-| Select query | ~50 ns | O(log n) with sampling |
-| Popcount (AVX-512) | 96.8 GiB/s | 5.2x faster than scalar |
+| Platform | Implementation | Throughput | Notes |
+|----------|----------------|------------|-------|
+| **x86_64** (AMD Ryzen 9 7950X) | PFSM (BMI2) | **679 MiB/s** | Table-driven, fastest on x86 |
+| | AVX2 | 732 MiB/s | 32 bytes/iteration |
+| | Scalar | 494 MiB/s | Baseline |
+| **ARM** (Apple M1 Max) | NEON | **574 MiB/s** | 32 bytes/iteration |
+| | Scalar (PFSM) | 557 MiB/s | Table-driven |
+| | Scalar | 405 MiB/s | Baseline |
+
+### Rank/Select Operations
+
+| Platform | Rank (O(1)) | Select (O(log n)) |
+|----------|-------------|-------------------|
+| **x86_64** (AMD Ryzen 9 7950X) | ~3 ns | ~50 ns |
+| **ARM** (Apple M1 Max) | ~21 ns | ~320 ns |
+
+### Platform-Specific Optimizations
+
+| Platform | Operation | Throughput | Speedup |
+|----------|-----------|------------|---------|
+| **x86_64** | Popcount (AVX-512 VPOPCNTDQ) | 96.8 GiB/s | 5.2x vs scalar |
+| **ARM** | NEON JSON (string-heavy) | 3.7 GiB/s | 1.69x vs scalar |
 
 See [docs/OPTIMIZATION-SUMMARY.md](docs/OPTIMIZATION-SUMMARY.md) for detailed benchmarks.
 
