@@ -327,14 +327,9 @@ Based on this work:
 
 ### Documentation
 
-**Quick Reference**: [docs/OPTIMIZATION-SUMMARY.md](docs/OPTIMIZATION-SUMMARY.md) - **Complete record of all optimizations** (what worked, what failed, exact performance numbers)
+**Quick Reference**: [docs/optimization-summary.md](docs/optimization-summary.md) - **Complete record of all optimizations** (what worked, what failed, exact performance numbers)
 
-Detailed analysis:
-- [docs/AVX512-VPOPCNTDQ-RESULTS.md](docs/AVX512-VPOPCNTDQ-RESULTS.md) - Popcount 5.2x speedup
-- [docs/AVX512-JSON-RESULTS.md](docs/AVX512-JSON-RESULTS.md) - Why AVX2 beats AVX-512 for JSON (historical)
-- [docs/FAILED-OPTIMIZATIONS.md](docs/FAILED-OPTIMIZATIONS.md) - Lessons from failed attempts
-- [docs/implemented-optimizations.md](docs/implemented-optimizations.md) - Catalog of successful optimizations
-- [docs/optimization-opportunities.md](docs/optimization-opportunities.md) - CPU feature analysis & remaining opportunities
+Historical analysis available in `docs/archive/`.
 
 ### Production Recommendations
 
@@ -431,7 +426,7 @@ cargo bench --bench pfsm_end_to_end
 
 ### Failed Optimizations
 
-See [docs/FAILED-OPTIMIZATIONS.md](docs/FAILED-OPTIMIZATIONS.md) for detailed analysis:
+See [docs/optimization-summary.md](docs/optimization-summary.md) for detailed analysis:
 - **AVX-512 JSON parser**: -7-17% slower (removed 2026-01-07)
 - **BMI1 mask iteration**: -25-31% slower (reverted 2026-01-07)
 - **BMI2 PDEP in BitWriter**: -71% slower (reverted 2026-01-07)
