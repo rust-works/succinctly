@@ -245,4 +245,8 @@ This library implements algorithms from:
 
 - Vigna, "Broadword Implementation of Rank/Select Queries" (2008)
 - Zhou et al., "Space-Efficient, High-Performance Rank & Select" (Poppy, 2013)
-- Sadakane & Navarro, "Fully-Functional Succinct Trees" (2010)
+- Sadakane & Navarro, "Fully-Functional Succinct Trees" (SODA 2010)
+
+## Related Work
+
+- [haskell-works](https://github.com/haskell-works) - Haskell implementations of the same techniques (`hw-json`, `hw-json-simd`, `hw-rankselect`, `hw-balancedparens`)
