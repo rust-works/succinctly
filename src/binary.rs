@@ -50,7 +50,7 @@ pub fn bytes_to_words(bytes: &[u8]) -> &[u64] {
         return &[];
     }
     assert!(
-        bytes.len().is_multiple_of(8),
+        bytes.len() % 8 == 0,
         "byte slice length must be a multiple of 8, got {}",
         bytes.len()
     );
@@ -76,7 +76,7 @@ pub fn try_bytes_to_words(bytes: &[u8]) -> Option<&[u64]> {
     if bytes.is_empty() {
         return Some(&[]);
     }
-    if bytes.len().is_multiple_of(8) {
+    if bytes.len() % 8 == 0 {
         Some(cast_slice(bytes))
     } else {
         None

@@ -775,7 +775,7 @@ fn build_bp_index(
     let mut l0_word_excess = Vec::with_capacity(num_words);
 
     for (i, &word) in words.iter().enumerate() {
-        let valid_bits = if i == num_words - 1 && !len.is_multiple_of(64) {
+        let valid_bits = if i == num_words - 1 && len % 64 != 0 {
             len % 64
         } else {
             64
@@ -1131,7 +1131,7 @@ impl<W: AsRef<[u64]>> BalancedParens<W> {
                 }
 
                 State::CheckL0 => {
-                    debug_assert!(pos.is_multiple_of(64));
+                    debug_assert!(pos % 64 == 0);
 
                     let word_idx = pos / 64;
                     if word_idx >= self.l0_min_excess.len() {
@@ -1152,7 +1152,7 @@ impl<W: AsRef<[u64]>> BalancedParens<W> {
                 }
 
                 State::CheckL1 => {
-                    debug_assert!(pos.is_multiple_of(64));
+                    debug_assert!(pos % 64 == 0);
 
                     let l1_idx = pos / (64 * FACTOR_L1);
                     if l1_idx >= self.l1_min_excess.len() {
@@ -1198,7 +1198,7 @@ impl<W: AsRef<[u64]>> BalancedParens<W> {
                 }
 
                 State::FromL0 => {
-                    if pos.is_multiple_of(64) {
+                    if pos % 64 == 0 {
                         state = State::FromL1;
                     } else if pos < self.len {
                         state = State::ScanWord;
@@ -1208,7 +1208,7 @@ impl<W: AsRef<[u64]>> BalancedParens<W> {
                 }
 
                 State::FromL1 => {
-                    if pos.is_multiple_of(64 * FACTOR_L1) {
+                    if pos % (64 * FACTOR_L1) == 0 {
                         if pos < self.len {
                             state = State::FromL2;
                         } else {
@@ -1222,7 +1222,7 @@ impl<W: AsRef<[u64]>> BalancedParens<W> {
                 }
 
                 State::FromL2 => {
-                    if pos.is_multiple_of(64 * FACTOR_L1 * FACTOR_L2) {
+                    if pos % (64 * FACTOR_L1 * FACTOR_L2) == 0 {
                         if pos < self.len {
                             state = State::CheckL2;
                         } else {
