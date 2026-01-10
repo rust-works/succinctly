@@ -124,6 +124,58 @@ cargo build --release --features cli
 SUCCINCTLY_PRESERVE_INPUT=1 ./target/release/succinctly jq . input.json
 ```
 
+### jq Benchmarking Command
+
+The `succinctly dev bench jq` command runs benchmarks comparing succinctly vs system jq.
+
+```bash
+# Run full benchmark suite (all patterns, all sizes)
+./target/release/succinctly dev bench jq
+
+# Run specific patterns and sizes
+./target/release/succinctly dev bench jq --patterns nested,strings --sizes 1kb,10kb,100kb,1mb
+
+# Custom output files
+./target/release/succinctly dev bench jq -o results.jsonl -m results.md
+
+# More runs for statistical significance
+./target/release/succinctly dev bench jq --runs 10
+```
+
+**Default output location**: `data/bench/results/` (git-ignored)
+- `data/bench/results/jq-bench.jsonl` - Raw benchmark data
+- `data/bench/results/jq-bench.md` - Formatted markdown tables
+
+**Features**:
+- Measures wall time with sub-millisecond precision
+- Measures peak memory using platform-specific methods
+- MD5 hash verification to ensure output correctness
+- Ctrl+C handling: writes partial results before exiting
+- CPU info automatically included in markdown output
+- Fixed-width columns with proper digit alignment (even with bold/non-bold mix)
+
+**Updating benchmark documentation**:
+
+1. Run benchmarks on your platform:
+   ```bash
+   ./target/release/succinctly dev bench jq
+   ```
+
+2. Review output in `data/bench/results/jq-bench.md`
+
+3. Update documentation in two places:
+   - **`docs/jq-comparison.md`** - Full benchmark results with all patterns and sizes
+   - **`README.md`** - Highlights only (e.g., summary table with key patterns/sizes)
+     - Link to `docs/jq-comparison.md` for detailed results
+
+4. Guidelines for curating results:
+   - Keep platform-specific sections (ARM vs x86_64)
+   - Don't replace one platform's data with another
+   - README should highlight best-case speedups and representative patterns
+   - `docs/jq-comparison.md` should have comprehensive results
+
+5. Note: `data/bench/results/` is git-ignored - raw results stay local
+
 ## Code Architecture
 
 ### Module Structure
@@ -284,11 +336,23 @@ Wait for CPU load to settle before running benchmarks. Ideally, load average sho
 ./target/release/succinctly json generate-suite
 ./target/release/succinctly json generate-suite --max-size 10mb
 
-# Run benchmarks
+# Run jq comparison benchmarks (recommended)
+./target/release/succinctly dev bench jq
+
+# Run criterion benchmarks
 cargo bench --bench json_simd
 cargo bench --bench balanced_parens
 cargo bench --bench jq_comparison
 ```
+
+### Benchmark Output Locations
+
+| Location                       | Purpose                        | Git Status   |
+|--------------------------------|--------------------------------|--------------|
+| `data/bench/generated/`        | Input JSON files               | git-ignored  |
+| `data/bench/results/`          | Benchmark output (JSONL, MD)   | git-ignored  |
+| `docs/jq-comparison.md`        | Curated benchmark documentation| tracked      |
+| `README.md`                    | Summary benchmarks             | tracked      |
 
 ### Benchmark Patterns
 | Pattern       | Description                    |
@@ -300,6 +364,9 @@ cargo bench --bench jq_comparison
 | strings       | String-heavy (tests escapes)   |
 | unicode       | Unicode strings                |
 | pathological  | Worst-case                     |
+| numbers       | Number-heavy documents         |
+| literals      | Mix of null, true, false       |
+| mixed         | Heterogeneous nested structures|
 
 ## CI/CD
 
@@ -489,6 +556,8 @@ End-to-end comparison of `succinctly jq -c . file.json` vs `jq -c . file.json`:
 | **10KB**  |  2.4 ms  (3.9 MiB/s)  |  4.3 ms  (2.2 MiB/s)  | **1.79x**  |
 | **100KB** |  4.6 ms (18.4 MiB/s)  |  8.2 ms (10.5 MiB/s)  | **1.76x**  |
 | **1MB**   | 24.7 ms (32.7 MiB/s)  | 43.9 ms (18.4 MiB/s)  | **1.78x**  |
+
+To regenerate these benchmarks: `./target/release/succinctly dev bench jq`
 
 ### Failed Optimizations
 
