@@ -133,9 +133,25 @@ if let QueryResult::One(StandardJson::Number(age)) = eval(&expr, cursor) {
 | **x86_64** (AMD Ryzen 9 7950X) | ~3 ns       | ~50 ns            |
 | **ARM** (Apple M1 Max)         | ~21 ns      | ~320 ns           |
 
-### jq Query Performance (Apple M1 Max)
+### jq Comparison: Identity Operation (`.`)
 
-End-to-end comparison of `succinctly jq -c . file.json` vs `jq -c . file.json`:
+Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
+
+#### x86_64 (AMD Ryzen 9 7950X, 100MB files)
+
+| Pattern        | jq Time | succinctly | Speedup       | Pattern Description          |
+|----------------|---------|------------|---------------|------------------------------|
+| **Nested**     | 1.38s   | **0.54s**  | **2.6x** ⚡   | Deep object nesting          |
+| **Numbers**    | 2.84s   | **1.52s**  | **1.9x** ⚡   | Number-heavy documents       |
+| **Strings**    | 1.29s   | **0.64s**  | **2.0x** ⚡   | String-heavy with escapes    |
+| **Unicode**    | 1.69s   | **1.43s**  | **1.2x** ⚡   | UTF-8 multibyte sequences    |
+| Comprehensive  | 3.28s   | 3.59s      | 0.9x          | All JSON features            |
+| Arrays         | 5.56s   | 6.40s      | 0.9x          | Arrays of arrays             |
+| Users          | 2.08s   | 2.02s      | 1.0x          | Realistic user objects       |
+
+**Trade-off**: succinctly uses 2-3x more memory to build succinct indexes, delivering 1.2-2.6x speedup on structured workloads. See [benchmarks/JQ-COMPARISON.md](benchmarks/JQ-COMPARISON.md) for full details.
+
+#### ARM (Apple M1 Max, smaller files)
 
 | Size      | succinctly           | jq                    | Speedup    |
 |-----------|----------------------|-----------------------|------------|
@@ -150,7 +166,7 @@ End-to-end comparison of `succinctly jq -c . file.json` vs `jq -c . file.json`:
 | **x86_64** | Popcount (AVX-512 VPOPCNTDQ) | 96.8 GiB/s |  5.2x vs scalar |
 | **ARM**    | NEON JSON (string-heavy)     |  3.7 GiB/s | 1.69x vs scalar |
 
-See [docs/OPTIMIZATION-SUMMARY.md](docs/OPTIMIZATION-SUMMARY.md) for detailed benchmarks.
+See [docs/OPTIMIZATION-SUMMARY.md](docs/OPTIMIZATION-SUMMARY.md) and [benchmarks/JQ-COMPARISON.md](benchmarks/JQ-COMPARISON.md) for detailed benchmarks.
 
 ## Feature Flags
 

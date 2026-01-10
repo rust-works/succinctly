@@ -842,6 +842,7 @@ Before implementing an optimization, ask:
 
 ### Performance Analysis Documents
 
+- [../benchmarks/JQ-COMPARISON.md](../benchmarks/JQ-COMPARISON.md) - jq vs succinctly comparison (x86_64)
 - [AVX512-VPOPCNTDQ-RESULTS.md](AVX512-VPOPCNTDQ-RESULTS.md) - Popcount 5.2x speedup
 - [AVX512-JSON-RESULTS.md](AVX512-JSON-RESULTS.md) - Why AVX2 beats AVX-512 (historical)
 - [FAILED-OPTIMIZATIONS.md](FAILED-OPTIMIZATIONS.md) - Detailed failure analysis
@@ -872,6 +873,6 @@ Before implementing an optimization, ask:
 
 ---
 
-**Last Updated**: 2026-01-08
+**Last Updated**: 2026-01-10
 **Maintained By**: Succinctly development team
 **Status**: All production optimizations deployed and tested
