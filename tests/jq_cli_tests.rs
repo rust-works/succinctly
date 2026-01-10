@@ -720,22 +720,22 @@ fn test_unbuffered_flag() -> Result<()> {
 
 #[test]
 fn test_number_formatting_preserved() -> Result<()> {
-    // Test that exponential notation is preserved with --no-jq-compat
+    // Test that exponential notation is preserved with --preserve-input
     // By default, jq-compat mode normalizes numbers like jq does
-    let (output, code) = run_jq_stdin(".", r#"{"val":4e4}"#, &["-c", "--no-jq-compat"])?;
+    let (output, code) = run_jq_stdin(".", r#"{"val":4e4}"#, &["-c", "--preserve-input"])?;
     assert_eq!(code, 0);
-    // With --no-jq-compat, should preserve "4e4" not convert to "40000"
+    // With --preserve-input, should preserve "4e4" not convert to "40000"
     assert_eq!(output.trim(), r#"{"val":4e4}"#);
     Ok(())
 }
 
 #[test]
 fn test_number_formatting_various() -> Result<()> {
-    // Test various number formats are preserved with --no-jq-compat
+    // Test various number formats are preserved with --preserve-input
     let (output, code) = run_jq_stdin(
         ".",
         r#"{"a":1.0e10,"b":2e-5,"c":3.14159}"#,
-        &["-c", "--no-jq-compat"],
+        &["-c", "--preserve-input"],
     )?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"{"a":1.0e10,"b":2e-5,"c":3.14159}"#);
@@ -744,8 +744,8 @@ fn test_number_formatting_various() -> Result<()> {
 
 #[test]
 fn test_number_formatting_field_access() -> Result<()> {
-    // Test number formatting preserved through field access with --no-jq-compat
-    let (output, code) = run_jq_stdin(".val", r#"{"val":4e4}"#, &["-c", "--no-jq-compat"])?;
+    // Test number formatting preserved through field access with --preserve-input
+    let (output, code) = run_jq_stdin(".val", r#"{"val":4e4}"#, &["-c", "--preserve-input"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "4e4");
     Ok(())
@@ -753,8 +753,8 @@ fn test_number_formatting_field_access() -> Result<()> {
 
 #[test]
 fn test_number_formatting_array_iteration() -> Result<()> {
-    // Test number formatting preserved through array iteration with --no-jq-compat
-    let (output, code) = run_jq_stdin(".[]", r#"[1e100, 2e-100]"#, &["-c", "--no-jq-compat"])?;
+    // Test number formatting preserved through array iteration with --preserve-input
+    let (output, code) = run_jq_stdin(".[]", r#"[1e100, 2e-100]"#, &["-c", "--preserve-input"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "1e100\n2e-100");
     Ok(())

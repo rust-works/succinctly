@@ -253,21 +253,21 @@ succinctly jq '.users[]' input.json
 - `--tab`: Use tabs for indentation
 - `--indent <N>`: Use N spaces for indentation (max 7)
 
-### Number Formatting
+### Output Formatting
 
-By default, succinctly formats numbers exactly like jq does:
+By default, succinctly formats output exactly like jq does:
 - **Scientific notation**: `4e4` → `4E+4`, `12e2` → `1.2E+3`, `1e-3` → `0.001`
 - **Trailing zeros**: preserved (`0.10` → `0.10`)
 - **Escape sequences**: `\b` and `\f` output as escape sequences (not `\u0008`)
 
-To preserve the original number formatting from the input (e.g., keep `4e4` as `4e4`):
+To preserve the original formatting from the input (e.g., keep `4e4` as `4e4`):
 
 ```bash
 # Using flag
-succinctly jq --no-jq-compat . input.json
+succinctly jq --preserve-input . input.json
 
 # Using environment variable
-SUCCINCTLY_JQ_COMPAT=0 succinctly jq . input.json
+SUCCINCTLY_PRESERVE_INPUT=1 succinctly jq . input.json
 ```
 
 ### Input Options
