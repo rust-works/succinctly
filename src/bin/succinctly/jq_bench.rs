@@ -178,6 +178,9 @@ pub fn run_benchmark(
         std::fs::write(md_path, markdown)?;
     }
 
+    // Check for hash mismatches
+    let mismatches: Vec<_> = results.iter().filter(|r| r.status != "match").collect();
+
     // Print summary
     if was_interrupted {
         eprintln!("\nBenchmark interrupted: {} files processed", results.len());
@@ -194,6 +197,21 @@ pub fn run_benchmark(
         if let Some(md_path) = output_md {
             eprintln!("  {}", md_path.display());
         }
+    }
+
+    // Report mismatches and fail if any found
+    if !mismatches.is_empty() {
+        eprintln!("\nHash mismatches detected ({}):", mismatches.len());
+        for m in &mismatches {
+            eprintln!(
+                "  {} {}: jq={} succinctly={}",
+                m.pattern, m.size, m.jq.hash, m.succinctly.hash
+            );
+        }
+        anyhow::bail!(
+            "{} hash mismatch(es) detected - jq and succinctly produced different output",
+            mismatches.len()
+        );
     }
 
     Ok(results)
