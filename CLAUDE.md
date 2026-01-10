@@ -2,6 +2,22 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Benchmark Documentation Rules
+
+**CRITICAL: Never replace platform-specific benchmarks with each other.**
+
+This project maintains benchmarks for multiple platforms (ARM/Apple Silicon and x86_64/Intel/AMD). When adding new benchmark data:
+
+1. **Keep both ARM and x86_64 benchmarks** - Never delete one platform's data when adding another
+2. **Add new platform data alongside existing data** - Create separate sections or files per platform
+3. **Name files with platform suffix** - e.g., `jq-comparison-m1.jsonl`, `jq-comparison-zen4.jsonl`
+4. **Update docs to show both** - README and docs should reference benchmarks from all platforms
+
+**Benchmark file locations**:
+- `docs/jq-comparison.md` - Main comparison document (include sections for each platform)
+- `docs/jq-comparison-m1.jsonl` - Apple M1 Max raw data
+- `docs/jq-comparison-zen4.jsonl` - AMD Zen 4 raw data (when available)
+
 ## Documentation Formatting Rules
 
 **Markdown tables MUST use fixed-width columns with space padding.** This is mandatory for readability in plain text editors and diffs.
