@@ -1126,6 +1126,7 @@ fn evaluate_input(
     // Convert result to Vec<OwnedValue>
     match result {
         QueryResult::One(v) => Ok(vec![standard_json_to_owned(&v)]),
+        QueryResult::OneCursor(c) => Ok(vec![standard_json_to_owned(&c.value())]),
         QueryResult::Many(vs) => Ok(vs.iter().map(standard_json_to_owned).collect()),
         QueryResult::None => Ok(vec![]),
         QueryResult::Error(e) => {
@@ -1196,6 +1197,8 @@ fn query_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
 ) -> Vec<JqValue<'a, W>> {
     match result {
         QueryResult::One(v) => vec![standard_json_to_jq_value(v, &cursor)],
+        // OneCursor: directly use the cursor - most memory efficient for unchanged values
+        QueryResult::OneCursor(c) => vec![JqValue::Cursor(c)],
         QueryResult::Many(vs) => vs
             .into_iter()
             .map(|v| standard_json_to_jq_value(v, &cursor))
@@ -1569,86 +1572,102 @@ fn write_jq_value_jq_compat<'a, Out: Write, Wrd: Clone + AsRef<[u64]>>(
                     }
                 }
                 StandardJson::Array(elements) => {
-                    // Convert to JqValue and recurse to handle nested numbers
-                    let arr_value: JqValue<'a, Wrd> =
-                        standard_json_to_jq_value(StandardJson::Array(elements), c);
-                    if let JqValue::Array(ref items) = arr_value {
-                        if items.is_empty() {
-                            out.write_all(b"[]")?;
-                        } else if compact {
-                            out.write_all(b"[")?;
-                            for (i, v) in items.iter().enumerate() {
-                                if i > 0 {
-                                    out.write_all(b",")?;
-                                }
-                                write_jq_value_jq_compat(out, v, config, level + 1)?;
+                    // Iterate directly over cursor children - no allocation
+                    if elements.is_empty() {
+                        out.write_all(b"[]")?;
+                    } else if compact {
+                        out.write_all(b"[")?;
+                        for (i, child_cursor) in elements.cursor_iter().enumerate() {
+                            if i > 0 {
+                                out.write_all(b",")?;
                             }
-                            out.write_all(b"]")?;
-                        } else {
-                            out.write_all(b"[")?;
-                            out.write_all(separator.as_bytes())?;
-                            for (i, v) in items.iter().enumerate() {
-                                if i > 0 {
-                                    out.write_all(b",")?;
-                                    out.write_all(separator.as_bytes())?;
-                                }
-                                out.write_all(next_indent.as_bytes())?;
-                                write_jq_value_jq_compat(out, v, config, level + 1)?;
-                            }
-                            out.write_all(separator.as_bytes())?;
-                            out.write_all(current_indent.as_bytes())?;
-                            out.write_all(b"]")?;
+                            let child_value = JqValue::Cursor(child_cursor);
+                            write_jq_value_jq_compat(out, &child_value, config, level + 1)?;
                         }
+                        out.write_all(b"]")?;
+                    } else {
+                        out.write_all(b"[")?;
+                        out.write_all(separator.as_bytes())?;
+                        for (i, child_cursor) in elements.cursor_iter().enumerate() {
+                            if i > 0 {
+                                out.write_all(b",")?;
+                                out.write_all(separator.as_bytes())?;
+                            }
+                            out.write_all(next_indent.as_bytes())?;
+                            let child_value = JqValue::Cursor(child_cursor);
+                            write_jq_value_jq_compat(out, &child_value, config, level + 1)?;
+                        }
+                        out.write_all(separator.as_bytes())?;
+                        out.write_all(current_indent.as_bytes())?;
+                        out.write_all(b"]")?;
                     }
                 }
                 StandardJson::Object(fields) => {
-                    // Convert to JqValue and recurse to handle nested numbers
-                    let obj_value: JqValue<'a, Wrd> =
-                        standard_json_to_jq_value(StandardJson::Object(fields), c);
-                    if let JqValue::Object(ref map) = obj_value {
-                        if map.is_empty() {
-                            out.write_all(b"{}")?;
-                        } else if compact {
-                            out.write_all(b"{")?;
-                            for (i, (k, v)) in map.iter().enumerate() {
-                                if i > 0 {
-                                    out.write_all(b",")?;
-                                }
-                                out.write_all(b"\"")?;
-                                let escaped = if config.ascii_output {
-                                    escape_json_string_ascii(k)
-                                } else {
-                                    escape_json_string(k)
-                                };
-                                out.write_all(escaped.as_bytes())?;
-                                out.write_all(b"\":")?;
-                                write_jq_value_jq_compat(out, v, config, level + 1)?;
+                    // Iterate directly over cursor fields - no allocation
+                    use succinctly::json::light::StandardJson as SJ;
+                    let mut is_first = true;
+                    let mut has_fields = false;
+                    // Check if empty first
+                    if fields.is_empty() {
+                        out.write_all(b"{}")?;
+                    } else if compact {
+                        out.write_all(b"{")?;
+                        for field in fields {
+                            has_fields = true;
+                            if !is_first {
+                                out.write_all(b",")?;
                             }
-                            out.write_all(b"}")?;
-                        } else {
-                            out.write_all(b"{")?;
-                            out.write_all(separator.as_bytes())?;
-                            for (i, (k, v)) in map.iter().enumerate() {
-                                if i > 0 {
-                                    out.write_all(b",")?;
-                                    out.write_all(separator.as_bytes())?;
-                                }
-                                out.write_all(next_indent.as_bytes())?;
+                            is_first = false;
+                            // Get key string
+                            if let SJ::String(k) = field.key() {
                                 out.write_all(b"\"")?;
-                                let escaped = if config.ascii_output {
-                                    escape_json_string_ascii(k)
-                                } else {
-                                    escape_json_string(k)
-                                };
-                                out.write_all(escaped.as_bytes())?;
+                                if let Ok(decoded) = k.as_str() {
+                                    let escaped = if config.ascii_output {
+                                        escape_json_string_ascii(&decoded)
+                                    } else {
+                                        escape_json_string(&decoded)
+                                    };
+                                    out.write_all(escaped.as_bytes())?;
+                                }
+                                out.write_all(b"\":")?;
+                            }
+                            let child_value = JqValue::Cursor(field.value_cursor());
+                            write_jq_value_jq_compat(out, &child_value, config, level + 1)?;
+                        }
+                        if !has_fields {
+                            // Shouldn't happen since we checked is_empty above
+                        }
+                        out.write_all(b"}")?;
+                    } else {
+                        out.write_all(b"{")?;
+                        out.write_all(separator.as_bytes())?;
+                        for field in fields {
+                            has_fields = true;
+                            if !is_first {
+                                out.write_all(b",")?;
+                                out.write_all(separator.as_bytes())?;
+                            }
+                            is_first = false;
+                            out.write_all(next_indent.as_bytes())?;
+                            if let SJ::String(k) = field.key() {
+                                out.write_all(b"\"")?;
+                                if let Ok(decoded) = k.as_str() {
+                                    let escaped = if config.ascii_output {
+                                        escape_json_string_ascii(&decoded)
+                                    } else {
+                                        escape_json_string(&decoded)
+                                    };
+                                    out.write_all(escaped.as_bytes())?;
+                                }
                                 out.write_all(b"\":")?;
                                 out.write_all(space_after_colon.as_bytes())?;
-                                write_jq_value_jq_compat(out, v, config, level + 1)?;
                             }
-                            out.write_all(separator.as_bytes())?;
-                            out.write_all(current_indent.as_bytes())?;
-                            out.write_all(b"}")?;
+                            let child_value = JqValue::Cursor(field.value_cursor());
+                            write_jq_value_jq_compat(out, &child_value, config, level + 1)?;
                         }
+                        out.write_all(separator.as_bytes())?;
+                        out.write_all(current_indent.as_bytes())?;
+                        out.write_all(b"}")?;
                     }
                 }
                 StandardJson::Error(_) => out.write_all(b"null")?,
