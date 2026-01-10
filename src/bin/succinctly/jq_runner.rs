@@ -1606,14 +1606,12 @@ fn write_jq_value_jq_compat<'a, Out: Write, Wrd: Clone + AsRef<[u64]>>(
                     // Iterate directly over cursor fields - no allocation
                     use succinctly::json::light::StandardJson as SJ;
                     let mut is_first = true;
-                    let mut has_fields = false;
                     // Check if empty first
                     if fields.is_empty() {
                         out.write_all(b"{}")?;
                     } else if compact {
                         out.write_all(b"{")?;
                         for field in fields {
-                            has_fields = true;
                             if !is_first {
                                 out.write_all(b",")?;
                             }
@@ -1634,15 +1632,11 @@ fn write_jq_value_jq_compat<'a, Out: Write, Wrd: Clone + AsRef<[u64]>>(
                             let child_value = JqValue::Cursor(field.value_cursor());
                             write_jq_value_jq_compat(out, &child_value, config, level + 1)?;
                         }
-                        if !has_fields {
-                            // Shouldn't happen since we checked is_empty above
-                        }
                         out.write_all(b"}")?;
                     } else {
                         out.write_all(b"{")?;
                         out.write_all(separator.as_bytes())?;
                         for field in fields {
-                            has_fields = true;
                             if !is_first {
                                 out.write_all(b",")?;
                                 out.write_all(separator.as_bytes())?;

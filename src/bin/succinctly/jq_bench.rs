@@ -391,7 +391,7 @@ fn parse_macos_times(stderr: &str) -> (f64, f64) {
 fn parse_linux_memory(stderr: &str) -> u64 {
     for line in stderr.lines() {
         if line.contains("Maximum resident set size") {
-            if let Some(num_str) = line.split(':').last() {
+            if let Some(num_str) = line.split(':').next_back() {
                 if let Ok(kb) = num_str.trim().parse::<u64>() {
                     return kb * 1024;
                 }
@@ -408,13 +408,13 @@ fn parse_linux_times(stderr: &str) -> (f64, f64) {
 
     for line in stderr.lines() {
         if line.contains("User time") {
-            if let Some(num_str) = line.split(':').last() {
+            if let Some(num_str) = line.split(':').next_back() {
                 if let Ok(t) = num_str.trim().parse::<f64>() {
                     user = t;
                 }
             }
         } else if line.contains("System time") {
-            if let Some(num_str) = line.split(':').last() {
+            if let Some(num_str) = line.split(':').next_back() {
                 if let Ok(t) = num_str.trim().parse::<f64>() {
                     sys = t;
                 }
