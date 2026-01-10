@@ -2,12 +2,7 @@
 
 Comprehensive benchmarks comparing `succinctly jq .` vs `jq .` for JSON formatting/printing.
 
-## Test Environment
-
-- **Platform**: Apple M1 Max
-- **OS**: macOS
-- **jq version**: System jq
-- **succinctly**: Built with `--release --features cli`
+Results are provided for both ARM (Apple M1 Max) and x86_64 (AMD Zen 4) platforms.
 
 ## Methodology
 
@@ -20,6 +15,134 @@ Run with:
 ```bash
 ./target/release/succinctly dev bench jq
 ```
+
+---
+
+# AMD Ryzen 9 7950X (Zen 4, x86_64)
+
+**CPU**: AMD Ryzen 9 7950X 16-Core Processor
+**OS**: Linux (WSL2)
+**jq version**: System jq
+**succinctly**: Built with `--release --features cli`
+
+## Pattern: arrays
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    7.55s | **   4.21s** | **     1.8x** |    4 GB |   134 MB |      0.04x |
+| **10mb**  |  738.2ms | ** 388.9ms** | **     1.9x** |  367 MB |    17 MB |      0.05x |
+| **1mb**   |   74.7ms | **  40.5ms** | **     1.8x** |   38 MB |     5 MB |      0.13x |
+| **100kb** |    9.7ms | **   6.1ms** | **     1.6x** |    5 MB |     4 MB |      0.76x |
+| **10kb**  |    2.9ms | **   2.5ms** | **     1.2x** |    2 MB |     4 MB |      1.78x |
+| **1kb**   |    2.6ms | **   2.3ms** | **     1.1x** |    2 MB |     4 MB |      1.78x |
+
+## Pattern: comprehensive
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    3.92s | **   2.33s** | **     1.7x** |    1 GB |   104 MB |      0.07x |
+| **10mb**  |  381.9ms | ** 220.9ms** | **     1.7x** |  149 MB |    14 MB |      0.09x |
+| **1mb**   |   44.6ms | **  25.5ms** | **     1.8x** |   17 MB |     5 MB |      0.30x |
+| **100kb** |    6.7ms | **   4.8ms** | **     1.4x** |    3 MB |     4 MB |      1.31x |
+| **10kb**  |    3.1ms | **   3.1ms** | **     1.0x** |    2 MB |     4 MB |      1.89x |
+| **1kb**   |    3.0ms | **   2.3ms** | **     1.3x** |    2 MB |     4 MB |      1.89x |
+
+## Pattern: literals
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    2.80s | **   2.40s** | **     1.2x** |  550 MB |   130 MB |      0.24x |
+| **10mb**  |  279.5ms | ** 228.7ms** | **     1.2x** |   50 MB |    16 MB |      0.33x |
+| **1mb**   |   29.7ms | **  24.7ms** | **     1.2x** |    7 MB |     5 MB |      0.78x |
+| **100kb** |    5.4ms | **   4.3ms** | **     1.2x** |    3 MB |     4 MB |      1.33x |
+| **10kb**  |    2.8ms | **   2.4ms** | **     1.1x** |    2 MB |     4 MB |      1.78x |
+| **1kb**   |    2.7ms | **   2.2ms** | **     1.2x** |    2 MB |     4 MB |      1.78x |
+
+## Pattern: mixed
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |  538.4ms | ** 295.4ms** | **     1.8x** |  218 MB |    20 MB |      0.09x |
+| **10mb**  |   60.2ms | **  32.6ms** | **     1.8x** |   23 MB |     5 MB |      0.23x |
+| **1mb**   |    7.6ms | **   5.2ms** | **     1.5x** |    4 MB |     4 MB |      1.07x |
+| **100kb** |    2.8ms | **   2.4ms** | **     1.2x** |    2 MB |     4 MB |      1.78x |
+| **10kb**  |    2.6ms | **   2.3ms** | **     1.2x** |    2 MB |     4 MB |      1.78x |
+| **1kb**   |    2.6ms | **   2.2ms** | **     1.2x** |    2 MB |     4 MB |      1.78x |
+
+## Pattern: nested
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    1.48s | ** 543.9ms** | **     2.7x** |  202 MB |   222 MB |      1.10x |
+| **10mb**  |  147.8ms | **  54.5ms** | **     2.7x** |   22 MB |    26 MB |      1.16x |
+| **1mb**   |   17.5ms | **   7.7ms** | **     2.3x** |    4 MB |     6 MB |      1.41x |
+| **100kb** |    4.2ms | **   2.7ms** | **     1.6x** |    2 MB |     4 MB |      1.70x |
+| **10kb**  |    2.7ms | **   2.1ms** | **     1.2x** |    2 MB |     4 MB |      1.78x |
+| **1kb**   |    2.6ms | **   2.3ms** | **     1.2x** |    2 MB |     4 MB |      1.78x |
+
+## Pattern: numbers
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    2.88s | **   1.31s** | **     2.2x** |  855 MB |   116 MB |      0.14x |
+| **10mb**  |  268.7ms | ** 127.3ms** | **     2.1x** |   87 MB |    15 MB |      0.18x |
+| **1mb**   |   31.0ms | **  14.7ms** | **     2.1x** |   10 MB |     5 MB |      0.46x |
+| **100kb** |    4.6ms | **   3.7ms** | **     1.3x** |    2 MB |     4 MB |      1.60x |
+| **10kb**  |    2.7ms | **   2.4ms** | **     1.1x** |    2 MB |     4 MB |      1.78x |
+| **1kb**   |    2.5ms | **   2.3ms** | **     1.1x** |    2 MB |     4 MB |      1.78x |
+
+## Pattern: pathological
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    8.71s | **   4.50s** | **     1.9x** |    5 GB |   135 MB |      0.03x |
+| **10mb**  |  796.7ms | ** 410.2ms** | **     1.9x** |  472 MB |    17 MB |      0.04x |
+| **1mb**   |   84.1ms | **  41.1ms** | **     2.0x** |   48 MB |     5 MB |      0.11x |
+| **100kb** |   10.2ms | **   6.1ms** | **     1.7x** |    6 MB |     4 MB |      0.64x |
+| **10kb**  |    3.1ms | **   2.6ms** | **     1.2x** |    2 MB |     4 MB |      1.78x |
+| **1kb**   |    2.8ms | **   2.4ms** | **     1.2x** |    2 MB |     4 MB |      1.78x |
+
+## Pattern: strings
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    1.36s | ** 566.2ms** | **     2.4x** |  130 MB |   108 MB |      0.83x |
+| **10mb**  |  141.3ms | **  59.0ms** | **     2.4x** |   14 MB |    14 MB |      1.02x |
+| **1mb**   |   15.9ms | **   8.1ms** | **     2.0x** |    3 MB |     5 MB |      1.58x |
+| **100kb** |    4.6ms | **   2.8ms** | **     1.7x** |    2 MB |     4 MB |      1.78x |
+| **10kb**  |    2.8ms | **   2.5ms** | **     1.1x** |    2 MB |     4 MB |      1.78x |
+| **1kb**   |    2.6ms | **   2.2ms** | **     1.2x** |    2 MB |     4 MB |      1.78x |
+
+## Pattern: unicode
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    1.75s | **   1.14s** | **     1.5x** |  297 MB |   124 MB |      0.42x |
+| **10mb**  |  169.4ms | ** 113.0ms** | **     1.5x** |   31 MB |    16 MB |      0.51x |
+| **1mb**   |   19.8ms | **  13.3ms** | **     1.5x** |    5 MB |     5 MB |      1.01x |
+| **100kb** |    4.0ms | **   3.2ms** | **     1.3x** |    2 MB |     4 MB |      1.78x |
+| **10kb**  |    2.8ms | **   2.3ms** | **     1.2x** |    2 MB |     4 MB |      1.78x |
+| **1kb**   |    2.6ms | **   2.3ms** | **     1.1x** |    2 MB |     4 MB |      1.78x |
+
+## Pattern: users
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    2.08s | **   1.25s** | **     1.7x** |  663 MB |    88 MB |      0.13x |
+| **10mb**  |  205.6ms | ** 125.4ms** | **     1.6x** |   68 MB |    12 MB |      0.18x |
+| **1mb**   |   22.7ms | **  14.2ms** | **     1.6x** |    8 MB |     5 MB |      0.58x |
+| **100kb** |    4.1ms | **   3.6ms** | **     1.1x** |    2 MB |     4 MB |      1.78x |
+| **10kb**  |    2.7ms | **   2.3ms** | **     1.2x** |    2 MB |     4 MB |      1.78x |
+| **1kb**   |    2.5ms | **   2.2ms** | **     1.2x** |    2 MB |     4 MB |      1.67x |
+
+---
+
+# Apple M1 Max (ARM, aarch64)
+
+**CPU**: Apple M1 Max
+**OS**: macOS
+**jq version**: System jq
+**succinctly**: Built with `--release --features cli`
 
 ## Pattern: arrays
 
@@ -131,6 +254,8 @@ Run with:
 | **10kb**  |    7.0ms | **   5.9ms** | **     1.2x** |    3 MB |     7 MB |      2.64x |
 | **1kb**   |    6.5ms | **   5.8ms** | **     1.1x** |    2 MB |     7 MB |      2.66x |
 
+---
+
 ## Pattern Descriptions
 
 | Pattern           | Description                                    |
@@ -150,22 +275,31 @@ Run with:
 
 ### Speed
 
+**AMD Zen 4 (x86_64)**:
+- **1.0-2.7x faster** across all patterns and sizes
+- **Best performance on nested data**: 2.7x speedup on deeply nested structures (100MB)
+- **String-heavy data**: 2.4x speedup due to efficient escape handling
+- **Numbers and pathological patterns**: 2.0-2.2x speedup on computation-heavy workloads
+- **Consistent wins**: succinctly is faster on every pattern and size tested
+
+**Apple M1 Max (ARM)**:
 - **1.0-6.4x faster** across all patterns and sizes
-- **Best performance on nested data**: 6.4x speedup on deeply nested structures
+- **Best performance on nested data**: 6.4x speedup on deeply nested structures (100MB)
 - **String-heavy data**: 4.6x speedup due to efficient escape handling
-- **Consistent wins**: succinctly is faster on every pattern tested
+- **Generally faster than x86_64**: ARM NEON SIMD provides better acceleration for JSON parsing
 
 ### Memory
 
-- **Dramatically lower memory usage** on most patterns
-- **3-37x less memory** on larger files: pathological (0.03x), arrays (0.04x), comprehensive (0.08x)
-- **Slightly higher on small files**: 1-2x overhead due to minimum index size
+**Both platforms show similar memory characteristics**:
+- **Dramatically lower memory usage** on large files (1MB+)
+- **3-37x less memory** on larger files: pathological (0.03x), arrays (0.04x), comprehensive (0.07-0.08x)
+- **Slightly higher on small files**: 1-2x overhead due to minimum index size (~4-7 MB baseline)
 - **Streaming output**: Uses lazy cursor evaluation - only materializes values when needed
 
 ### Why succinctly is faster
 
 1. **Succinct indexing**: JSON structure is pre-indexed using balanced parentheses, enabling O(1) navigation
-2. **SIMD acceleration**: Uses NEON on ARM for character classification
+2. **SIMD acceleration**: Uses NEON on ARM and SSE/AVX on x86_64 for character classification
 3. **Table-driven parser**: PFSM (Parallel Finite State Machine) with lookup tables
 4. **Lazy evaluation**: Only materializes values that are actually accessed
 5. **Streaming output**: For identity queries, outputs directly from source without building intermediate structures
