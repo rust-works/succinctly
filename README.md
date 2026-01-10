@@ -137,36 +137,24 @@ if let QueryResult::One(StandardJson::Number(age)) = eval(&expr, cursor) {
 
 Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
 
-#### ARM (Apple M1 Max, 100MB files)
+#### ARM (Apple M1 Max, 10MB files)
 
-| Pattern           | jq       | succinctly | Speedup      | jq Mem  | succ Mem | Mem Ratio |
-|-------------------|----------|------------|--------------|---------|----------|-----------|
-| **nested**        |  3.44s   |  **0.50s** | **6.9x**     |  205 MB |   321 MB | 1.57x     |
-| **strings**       |  3.30s   |  **0.82s** | **4.0x**     |  160 MB |   252 MB | 1.57x     |
-| **unicode**       |  3.40s   |  **1.84s** | **1.8x**     |  424 MB |   543 MB | 1.28x     |
-| **mixed**         |  0.92s   |  **0.54s** | **1.7x**     |  248 MB |   215 MB | 0.87x     |
-| **numbers**       |  3.70s   |  **2.26s** | **1.6x**     |  984 MB |   597 MB | 0.61x     |
-| **users**         |  4.09s   |  **2.53s** | **1.6x**     |  682 MB |   808 MB | 1.18x     |
-| **comprehensive** |  6.83s   |  **4.40s** | **1.6x**     | 1313 MB |  1463 MB | 1.11x     |
-| **pathological**  | 14.21s   | **10.15s** | **1.4x**     | 5256 MB |  4545 MB | 0.86x     |
-| **arrays**        | 10.84s   |  **8.75s** | **1.2x**     | 3612 MB |  3539 MB | 0.98x     |
-| **literals**      |  5.17s   |  **4.74s** | **1.1x**     | 1122 MB |  1480 MB | 1.32x     |
+| Pattern       | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|---------------|----------|--------------|---------------|---------|----------|------------|
+| **nested**    |  351.0ms | **  59.6ms** | **     5.9x** |   25 MB |    29 MB |      1.17x |
+| **strings**   |  317.8ms | **  71.5ms** | **     4.4x** |   18 MB |    17 MB |      0.98x |
+| **patholog.** |    1.42s | ** 646.2ms** | **     2.2x** |  526 MB |    20 MB |      0.04x |
+| **unicode**   |  317.4ms | ** 145.6ms** | **     2.2x** |   41 MB |    19 MB |      0.46x |
+| **users**     |  395.3ms | ** 181.7ms** | **     2.2x** |   70 MB |    15 MB |      0.21x |
+| **compreh.**  |  689.1ms | ** 361.6ms** | **     1.9x** |  135 MB |    17 MB |      0.13x |
+| **numbers**   |  379.0ms | ** 217.2ms** | **     1.7x** |   96 MB |    18 MB |      0.19x |
+| **arrays**    |    1.08s | ** 717.9ms** | **     1.5x** |  367 MB |    20 MB |      0.05x |
+| **literals**  |  511.1ms | ** 418.8ms** | **     1.2x** |  103 MB |    19 MB |      0.19x |
 
-**Key findings**: 1.1-6.9x faster across all patterns, best on nested/string-heavy data
-
-#### x86_64 (AMD Ryzen 9 7950X, 100MB files)
-
-| Pattern           | jq       | succinctly | Speedup      | Pattern Description       |
-|-------------------|----------|------------|--------------|---------------------------|
-| **nested**        | 1.38s    | **0.54s**  | **2.6x**     | Deep object nesting       |
-| **strings**       | 1.29s    | **0.64s**  | **2.0x**     | String-heavy with escapes |
-| **numbers**       | 2.84s    | **1.52s**  | **1.9x**     | Number-heavy documents    |
-| **unicode**       | 1.69s    | **1.43s**  | **1.2x**     | UTF-8 multibyte sequences |
-| **users**         | 2.08s    | 2.02s      | 1.0x         | Realistic user objects    |
-| **comprehensive** | 3.28s    | 3.59s      | 0.9x         | All JSON features         |
-| **arrays**        | 5.56s    | 6.40s      | 0.9x         | Arrays of arrays          |
-
-**Trade-off**: succinctly uses 2-3x more memory to build succinct indexes, delivering 1.2-2.6x speedup on structured workloads
+**Key findings**:
+- **1.2-5.9x faster** across all patterns
+- **5-25x less memory** on most patterns due to streaming lazy evaluation
+- Best speedup on nested/string-heavy data
 
 ### Platform-Specific Optimizations
 

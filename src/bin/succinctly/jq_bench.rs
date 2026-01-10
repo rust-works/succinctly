@@ -499,8 +499,16 @@ pub fn generate_markdown(results: &[BenchmarkResult]) -> String {
         }
 
         md.push_str(&format!("## Pattern: {}\n\n", pattern));
-        md.push_str("| Size              | jq       | succinctly | Speedup      | jq Mem  | succ Mem | Mem Ratio |\n");
-        md.push_str("|-------------------|----------|------------|--------------|---------|----------|-----------|\n");
+        // Column widths (content only, not including | separators):
+        // Size: 9 chars (e.g., "**10mb** ")
+        // jq: 8 chars (e.g., "  336.7ms")
+        // succinctly: 12 chars (e.g., "**  57.9ms**")
+        // Speedup: 13 chars (e.g., "**     5.8x**")
+        // jq Mem: 7 chars (e.g., "  25 MB")
+        // succ Mem: 8 chars (e.g., "   29 MB")
+        // Mem Ratio: 10 chars (e.g., "     1.16x")
+        md.push_str("| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |\n");
+        md.push_str("|-----------|----------|--------------|---------------|---------|----------|------------|\n");
 
         // Sort by size (largest first)
         let mut sorted = pattern_results.clone();
@@ -514,41 +522,39 @@ pub fn generate_markdown(results: &[BenchmarkResult]) -> String {
             let speedup = r.jq.wall_time_ms / r.succinctly.wall_time_ms;
             let mem_ratio = r.succinctly.peak_memory_bytes as f64 / r.jq.peak_memory_bytes as f64;
 
-            // Format values with fixed widths first
+            // Format values - format_time_fixed returns 8 chars, format_memory_fixed returns 7 chars
             let jq_time = format_time_fixed(r.jq.wall_time_ms);
             let succ_time = format_time_fixed(r.succinctly.wall_time_ms);
             let jq_mem = format_memory_fixed(r.jq.peak_memory_bytes);
             let succ_mem = format_memory_fixed(r.succinctly.peak_memory_bytes);
-            let speedup_str = format!("{:.1}x", speedup);
-            let mem_ratio_str = format!("{:.2}x", mem_ratio);
 
-            // Size column: **name** with trailing padding (17 chars total)
+            // Size column: **name** with trailing padding (9 chars total)
             let size_bold = format!("**{}**", r.size);
-            let size_col = format!("{:<17}", size_bold);
+            let size_col = format!("{:<9}", size_bold);
 
-            // jq time column: right-aligned in 8 chars
-            let jq_col = format!("{:>8}", jq_time);
+            // jq time column: already 8 chars from format_time_fixed
+            let jq_col = jq_time;
 
-            // Succinctly time column: bold if faster, pad then bold
-            let succ_padded = format!("{:>6}", succ_time);
+            // Succinctly time column: bold if faster (10 chars total: ** + 8 + **)
+            // succ_time is already 8 chars, need to pad non-bold case to same visual width
             let succ_col = if speedup >= 1.0 {
-                format!("**{}**", succ_padded)
+                format!("**{}**", succ_time) // 8 + 4 = 12 chars but renders as 8
             } else {
-                format!("  {}  ", succ_padded) // Same visual width: 2 + 6 + 2 = 10
+                format!("  {}  ", succ_time) // 8 + 4 = 12 chars, same visual width
             };
 
-            // Speedup column: bold if >= 1.0, pad then bold
-            let speedup_padded = format!("{:>8}", speedup_str);
+            // Speedup column: bold if >= 1.0 (12 chars visual width)
+            let speedup_str = format!("{:>8.1}x", speedup);
             let speedup_col = if speedup >= 1.0 {
-                format!("**{}**", speedup_padded)
+                format!("**{}**", speedup_str)
             } else {
-                format!("  {}  ", speedup_padded) // Same visual width: 2 + 8 + 2 = 12
+                format!("  {}  ", speedup_str) // Same visual width
             };
 
-            // Memory columns: right-aligned
-            let jq_mem_col = format!("{:>7}", jq_mem);
-            let succ_mem_col = format!("{:>8}", succ_mem);
-            let mem_ratio_col = format!("{:>9}", mem_ratio_str);
+            // Memory columns: right-aligned, format_memory_fixed returns 7 chars
+            let jq_mem_col = jq_mem;
+            let succ_mem_col = format!("{:>8}", succ_mem); // 8 chars for succ Mem column
+            let mem_ratio_col = format!("{:>9.2}x", mem_ratio);
 
             md.push_str(&format!(
                 "| {} | {} | {} | {} | {} | {} | {} |\n",
@@ -562,15 +568,16 @@ pub fn generate_markdown(results: &[BenchmarkResult]) -> String {
     md
 }
 
-/// Format time with fixed width (6 chars for value)
-/// Examples: " 1.23s", " 45.1ms", "123.4ms"
+/// Format time with fixed width (8 chars total)
+/// Examples: "   1.04s", " 765.6ms", "   6.1ms"
 fn format_time_fixed(ms: f64) -> String {
     if ms >= 1000.0 {
-        // Seconds: "X.XXs" or "XX.XXs"
-        format!("{:.2}s", ms / 1000.0)
+        // Seconds: "   1.04s" = 8 chars total
+        format!("{:>7.2}s", ms / 1000.0)
     } else {
-        // Milliseconds: "XX.Xms"
-        format!("{:.1}ms", ms)
+        // Milliseconds: " 765.6ms" = 8 chars total (padding on left)
+        let ms_str = format!("{:.1}ms", ms);
+        format!("{:>8}", ms_str)
     }
 }
 
@@ -607,9 +614,10 @@ mod tests {
 
     #[test]
     fn test_format_time_fixed() {
-        assert_eq!(format_time_fixed(1500.0), "1.50s");
-        assert_eq!(format_time_fixed(500.0), "500.0ms");
-        assert_eq!(format_time_fixed(0.5), "0.5ms");
+        // 8 chars total for each
+        assert_eq!(format_time_fixed(1500.0), "   1.50s");
+        assert_eq!(format_time_fixed(500.0), " 500.0ms");
+        assert_eq!(format_time_fixed(6.1), "   6.1ms");
     }
 
     #[test]

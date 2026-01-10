@@ -18,52 +18,53 @@ Benchmarks measure:
 
 Run with:
 ```bash
-./scripts/compare-hashes.sh
+./target/release/succinctly dev bench jq
 ```
 
 ## Results: 100MB Files
 
-| Pattern           | jq       | succinctly | Speedup      | jq Mem  | succ Mem | Mem Ratio |
-|-------------------|----------|------------|--------------|---------|----------|-----------|
-| **nested**        | 3.44s    |  **0.50s** | **6.9x**     |  205 MB |   321 MB | 1.57x     |
-| **strings**       | 3.30s    |  **0.82s** | **4.0x**     |  160 MB |   252 MB | 1.57x     |
-| **unicode**       | 3.40s    |  **1.84s** | **1.8x**     |  424 MB |   543 MB | 1.28x     |
-| **mixed**         | 0.92s    |  **0.54s** | **1.7x**     |  248 MB |   215 MB | 0.87x     |
-| **numbers**       | 3.70s    |  **2.26s** | **1.6x**     |  984 MB |   597 MB | 0.61x     |
-| **users**         | 4.09s    |  **2.53s** | **1.6x**     |  682 MB |   808 MB | 1.18x     |
-| **comprehensive** | 6.83s    |  **4.40s** | **1.6x**     | 1313 MB |  1463 MB | 1.11x     |
-| **pathological**  | 14.21s   | **10.15s** | **1.4x**     | 5256 MB |  4545 MB | 0.86x     |
-| **arrays**        | 10.84s   |  **8.75s** | **1.2x**     | 3612 MB |  3539 MB | 0.98x     |
-| **literals**      | 5.17s    |  **4.74s** | **1.1x**     | 1122 MB |  1480 MB | 1.32x     |
+| Pattern       | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|---------------|----------|--------------|---------------|---------|----------|------------|
+| **nested**    |    3.40s | ** 502.5ms** | **     6.8x** |  205 MB |   226 MB |      1.10x |
+| **strings**   |    3.21s | ** 735.0ms** | **     4.4x** |  159 MB |   111 MB |      0.70x |
+| **users**     |    4.14s | **   1.99s** | **     2.1x** |  681 MB |    91 MB |      0.13x |
+| **unicode**   |    3.33s | **   1.67s** | **     2.0x** |  422 MB |   127 MB |      0.30x |
+| **mixed**     |  920.7ms | ** 458.8ms** | **     2.0x** |  248 MB |    23 MB |      0.09x |
+| **patholog.** |   13.91s | **   7.84s** | **     1.8x** |    5 GB |   138 MB |      0.03x |
+| **compreh.**  |    6.75s | **   3.90s** | **     1.7x** |    1 GB |   107 MB |      0.08x |
+| **numbers**   |    3.72s | **   2.27s** | **     1.6x** |  984 MB |   119 MB |      0.12x |
+| **arrays**    |   10.68s | **   8.02s** | **     1.3x** |    4 GB |   137 MB |      0.04x |
+| **literals**  |    5.03s | **   4.73s** | **     1.1x** |    1 GB |   133 MB |      0.12x |
 
 ## Results: 10MB Files
 
-| Pattern           | jq       | succinctly | Speedup      | jq Mem  | succ Mem | Mem Ratio |
-|-------------------|----------|------------|--------------|---------|----------|-----------|
-| **nested**        | 0.33s    |  **0.05s** | **6.6x**     |   25 MB |    35 MB | 1.40x     |
-| **strings**       | 0.33s    |  **0.08s** | **4.1x**     |   16 MB |    29 MB | 1.81x     |
-| **comprehensive** | 0.84s    |  **0.40s** | **2.1x**     |  135 MB |   149 MB | 1.10x     |
-| **unicode**       | 0.35s    |  **0.17s** | **2.1x**     |   42 MB |    58 MB | 1.38x     |
-| **users**         | 0.43s    |  **0.22s** | **2.0x**     |   70 MB |    85 MB | 1.21x     |
-| **numbers**       | 0.38s    |  **0.21s** | **1.8x**     |   96 MB |    63 MB | 0.66x     |
-| **mixed**         | 0.09s    |  **0.05s** | **1.8x**     |   27 MB |    25 MB | 0.93x     |
-| **pathological**  | 1.40s    |  **0.92s** | **1.5x**     |  526 MB |   458 MB | 0.87x     |
-| **arrays**        | 1.07s    |  **0.80s** | **1.3x**     |  369 MB |   357 MB | 0.97x     |
-| **literals**      | 0.53s    |  **0.42s** | **1.3x**     |  105 MB |   151 MB | 1.44x     |
+| Pattern       | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|---------------|----------|--------------|---------------|---------|----------|------------|
+| **nested**    |  351.0ms | **  59.6ms** | **     5.9x** |   25 MB |    29 MB |      1.17x |
+| **strings**   |  317.8ms | **  71.5ms** | **     4.4x** |   18 MB |    17 MB |      0.98x |
+| **patholog.** |    1.42s | ** 646.2ms** | **     2.2x** |  526 MB |    20 MB |      0.04x |
+| **unicode**   |  317.4ms | ** 145.6ms** | **     2.2x** |   41 MB |    19 MB |      0.46x |
+| **users**     |  395.3ms | ** 181.7ms** | **     2.2x** |   70 MB |    15 MB |      0.21x |
+| **compreh.**  |  689.1ms | ** 361.6ms** | **     1.9x** |  135 MB |    17 MB |      0.13x |
+| **mixed**     |   92.7ms | **  51.6ms** | **     1.8x** |   27 MB |     8 MB |      0.31x |
+| **numbers**   |  379.0ms | ** 217.2ms** | **     1.7x** |   96 MB |    18 MB |      0.19x |
+| **arrays**    |    1.08s | ** 717.9ms** | **     1.5x** |  367 MB |    20 MB |      0.05x |
+| **literals**  |  511.1ms | ** 418.8ms** | **     1.2x** |  103 MB |    19 MB |      0.19x |
 
 ## Results: 1MB Files
 
-| Pattern           | jq       | succinctly | Speedup      | jq Mem  | succ Mem | Mem Ratio |
-|-------------------|----------|------------|--------------|---------|----------|-----------|
-| **nested**        | 0.03s    |  **0.00s** | **>6x**      |  4.6 MB |  5.8 MB  | 1.26x     |
-| **strings**       | 0.03s    |  **0.01s** | **3.0x**     |  3.6 MB |  5.1 MB  | 1.42x     |
-| **comprehensive** | 0.07s    |  **0.03s** | **2.3x**     |   17 MB |   18 MB  | 1.09x     |
-| **unicode**       | 0.04s    |  **0.01s** | **4.0x**     |  6.1 MB |  9.4 MB  | 1.54x     |
-| **users**         | 0.04s    |  **0.02s** | **2.0x**     |  9.4 MB |   11 MB  | 1.14x     |
-| **numbers**       | 0.04s    |  **0.02s** | **2.0x**     |   11 MB |  9.8 MB  | 0.85x     |
-| **pathological**  | 0.14s    |  **0.08s** | **1.8x**     |   55 MB |   49 MB  | 0.89x     |
-| **literals**      | 0.05s    |  **0.04s** | **1.3x**     |   10 MB |   19 MB  | 1.81x     |
-| **arrays**        | 0.11s    |  **0.10s** | **1.1x**     |   38 MB |   39 MB  | 1.04x     |
+| Pattern       | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|---------------|----------|--------------|---------------|---------|----------|------------|
+| **nested**    |   40.5ms | **  11.2ms** | **     3.6x** |    5 MB |     9 MB |      1.94x |
+| **strings**   |   39.3ms | **  12.5ms** | **     3.2x** |    4 MB |     8 MB |      2.16x |
+| **patholog.** |  146.5ms | **  64.8ms** | **     2.3x** |   55 MB |     8 MB |      0.15x |
+| **users**     |   46.4ms | **  23.7ms** | **     2.0x** |    9 MB |     8 MB |      0.80x |
+| **unicode**   |   40.3ms | **  20.7ms** | **     1.9x** |    7 MB |     8 MB |      1.17x |
+| **compreh.**  |   70.3ms | **  37.0ms** | **     1.9x** |   17 MB |     8 MB |      0.47x |
+| **numbers**   |   45.0ms | **  26.2ms** | **     1.7x** |   11 MB |     8 MB |      0.69x |
+| **arrays**    |  112.9ms | **  70.6ms** | **     1.6x** |   38 MB |     8 MB |      0.21x |
+| **mixed**     |   13.2ms | **   9.7ms** | **     1.4x** |    5 MB |     7 MB |      1.39x |
+| **literals**  |   57.2ms | **  44.1ms** | **     1.3x** |   10 MB |     8 MB |      0.78x |
 
 ## Pattern Descriptions
 
@@ -75,7 +76,7 @@ Run with:
 | **mixed**         | Heterogeneous nested structures                |
 | **nested**        | Deeply nested objects (tests tree navigation)  |
 | **numbers**       | Number-heavy documents with various formats    |
-| **pathological**  | Worst-case patterns (deep nesting, escapes).   |
+| **pathological**  | Worst-case patterns (deep nesting, escapes)    |
 | **strings**       | String-heavy with escape sequences             |
 | **unicode**       | UTF-8 multibyte sequences                      |
 | **users**         | Realistic user record objects                  |
@@ -84,17 +85,17 @@ Run with:
 
 ### Speed
 
-- **1.1-6.9x faster** across all patterns and sizes
-- **Best performance on nested data**: 6.9x speedup on deeply nested structures
-- **String-heavy data**: 4.0x speedup due to efficient escape handling
+- **1.1-6.8x faster** across all patterns and sizes
+- **Best performance on nested data**: 6.8x speedup on deeply nested structures
+- **String-heavy data**: 4.4x speedup due to efficient escape handling
 - **Consistent wins**: succinctly is faster on every pattern tested
 
 ### Memory
 
-- **Comparable memory usage** overall
-- **Lower memory on some patterns**: numbers (0.61x), pathological (0.86x), mixed (0.87x)
-- **Higher memory on others**: strings (1.57x), nested (1.57x)
-- **Trade-off**: succinctly builds succinct indexes which require additional memory, but this overhead is often offset by more efficient processing
+- **Dramatically lower memory usage** on most patterns
+- **3-37x less memory** on larger files: pathological (0.03x), arrays (0.04x), comprehensive (0.08x)
+- **Slightly higher on small files**: 1-2x overhead due to minimum index size
+- **Streaming output**: Uses lazy cursor evaluation - only materializes values when needed
 
 ### Why succinctly is faster
 
@@ -102,6 +103,7 @@ Run with:
 2. **SIMD acceleration**: Uses NEON on ARM for character classification
 3. **Table-driven parser**: PFSM (Parallel Finite State Machine) with lookup tables
 4. **Lazy evaluation**: Only materializes values that are actually accessed
+5. **Streaming output**: For identity queries, outputs directly from source without building intermediate structures
 
 ## Reproducing Benchmarks
 
@@ -113,5 +115,5 @@ cargo build --release --features cli
 ./target/release/succinctly json generate-suite
 
 # Run comparison
-./scripts/compare-hashes.sh > docs/jq-comparison-results.jsonl
+./target/release/succinctly dev bench jq
 ```
