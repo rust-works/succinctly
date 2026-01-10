@@ -2,6 +2,23 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Documentation Formatting Rules
+
+**Markdown tables MUST use fixed-width columns with space padding.** This is mandatory for readability in plain text editors and diffs.
+
+```markdown
+<!-- CORRECT: Fixed-width columns with padding -->
+| Size     | succinctly          | jq                  | Speedup    |
+|----------|---------------------|---------------------|------------|
+| **10KB** | 2.2 ms (4.3 MiB/s)  | 4.1 ms (2.3 MiB/s)  | **1.86x**  |
+| **1MB**  | 24.5 ms (33 MiB/s)  | 44 ms (18 MiB/s)    | **1.79x**  |
+
+<!-- WRONG: Unpadded columns -->
+| Size | succinctly | jq | Speedup |
+|------|------------|-----|---------|
+| **10KB** | 2.2 ms (4.3 MiB/s) | 4.1 ms (2.3 MiB/s) | **1.86x** |
+```
+
 ## AI Scratch Directory
 
 When working on this project, use `.ai/scratch/` for temporary files:
