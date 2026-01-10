@@ -28,6 +28,9 @@ target
 # Generated benchmark data
 data/bench/generated/
 
+# Generated benchmark results
+data/bench/results/
+
 # Build artifacts
 *.rlib
 libtest_no_std.rlib

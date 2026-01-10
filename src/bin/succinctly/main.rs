@@ -19,6 +19,8 @@ enum Command {
     Json(JsonCommand),
     /// Command-line JSON processor (jq-compatible)
     Jq(JqCommand),
+    /// Developer tools (benchmarking, profiling)
+    Dev(DevCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -33,6 +35,66 @@ enum JsonSubcommand {
     Generate(GenerateJson),
     /// Generate a suite of JSON files with various sizes and patterns
     GenerateSuite(GenerateSuite),
+}
+
+#[derive(Debug, Parser)]
+struct DevCommand {
+    #[command(subcommand)]
+    command: DevSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DevSubcommand {
+    /// Run benchmarks
+    Bench(BenchCommand),
+}
+
+#[derive(Debug, Parser)]
+struct BenchCommand {
+    #[command(subcommand)]
+    command: BenchSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum BenchSubcommand {
+    /// Benchmark succinctly jq vs system jq
+    Jq(BenchJqArgs),
+}
+
+/// Arguments for jq benchmark
+#[derive(Debug, Parser)]
+struct BenchJqArgs {
+    /// Directory containing generated JSON files
+    #[arg(short, long, default_value = "data/bench/generated")]
+    data_dir: PathBuf,
+
+    /// Output JSONL file for raw results
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Output markdown file for formatted tables
+    #[arg(short, long)]
+    markdown: Option<PathBuf>,
+
+    /// Patterns to benchmark (comma-separated, or "all")
+    #[arg(short, long, default_value = "all")]
+    patterns: String,
+
+    /// Sizes to benchmark (comma-separated, or "all")
+    #[arg(short, long, default_value = "all")]
+    sizes: String,
+
+    /// Number of warmup runs before benchmarking
+    #[arg(long, default_value = "1")]
+    warmup: usize,
+
+    /// Number of benchmark runs (median is taken)
+    #[arg(long, default_value = "3")]
+    runs: usize,
+
+    /// Path to succinctly binary
+    #[arg(long, default_value = "./target/release/succinctly")]
+    binary: PathBuf,
 }
 
 /// Generate synthetic JSON files for benchmarking and testing
@@ -347,7 +409,77 @@ fn main() -> Result<()> {
             }
             JsonSubcommand::GenerateSuite(args) => generate_suite(args),
         },
+        Command::Dev(dev_cmd) => match dev_cmd.command {
+            DevSubcommand::Bench(bench_cmd) => match bench_cmd.command {
+                BenchSubcommand::Jq(args) => run_jq_benchmark(args),
+            },
+        },
     }
+}
+
+/// Run jq benchmark
+fn run_jq_benchmark(args: BenchJqArgs) -> Result<()> {
+    let all_patterns = vec![
+        "arrays",
+        "comprehensive",
+        "literals",
+        "mixed",
+        "nested",
+        "numbers",
+        "pathological",
+        "strings",
+        "unicode",
+        "users",
+    ];
+    let all_sizes = vec!["1kb", "10kb", "100kb", "1mb", "10mb", "100mb"];
+
+    let patterns = if args.patterns == "all" {
+        all_patterns.into_iter().map(String::from).collect()
+    } else {
+        args.patterns
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    };
+
+    let sizes = if args.sizes == "all" {
+        all_sizes.into_iter().map(String::from).collect()
+    } else {
+        args.sizes
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    };
+
+    let config = jq_bench::BenchConfig {
+        data_dir: args.data_dir,
+        patterns,
+        sizes,
+        succinctly_binary: args.binary,
+        warmup_runs: args.warmup,
+        benchmark_runs: args.runs,
+    };
+
+    // Use default output paths if not specified
+    let results_dir = PathBuf::from("data/bench/results");
+    let default_jsonl = results_dir.join("jq-bench.jsonl");
+    let default_md = results_dir.join("jq-bench.md");
+
+    let output_jsonl = args.output.unwrap_or(default_jsonl);
+    let output_md = args.markdown.unwrap_or(default_md);
+
+    // Ensure results directory exists
+    if let Some(parent) = output_jsonl.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let _results = jq_bench::run_benchmark(
+        &config,
+        Some(output_jsonl.as_path()),
+        Some(output_md.as_path()),
+    )?;
+
+    Ok(())
 }
 
 /// Suite configuration: patterns and sizes to generate
@@ -470,6 +602,7 @@ fn format_bytes(bytes: usize) -> String {
 }
 
 mod generators;
+mod jq_bench;
 mod jq_runner;
 use generators::generate_json;
 
