@@ -137,27 +137,36 @@ if let QueryResult::One(StandardJson::Number(age)) = eval(&expr, cursor) {
 
 Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
 
+#### ARM (Apple M1 Max, 100MB files)
+
+| Pattern           | jq       | succinctly | Speedup      | jq Mem  | succ Mem | Mem Ratio |
+|-------------------|----------|------------|--------------|---------|----------|-----------|
+| **nested**        |  3.44s   |  **0.50s** | **6.9x**     |  205 MB |   321 MB | 1.57x     |
+| **strings**       |  3.30s   |  **0.82s** | **4.0x**     |  160 MB |   252 MB | 1.57x     |
+| **unicode**       |  3.40s   |  **1.84s** | **1.8x**     |  424 MB |   543 MB | 1.28x     |
+| **mixed**         |  0.92s   |  **0.54s** | **1.7x**     |  248 MB |   215 MB | 0.87x     |
+| **numbers**       |  3.70s   |  **2.26s** | **1.6x**     |  984 MB |   597 MB | 0.61x     |
+| **users**         |  4.09s   |  **2.53s** | **1.6x**     |  682 MB |   808 MB | 1.18x     |
+| **comprehensive** |  6.83s   |  **4.40s** | **1.6x**     | 1313 MB |  1463 MB | 1.11x     |
+| **pathological**  | 14.21s   | **10.15s** | **1.4x**     | 5256 MB |  4545 MB | 0.86x     |
+| **arrays**        | 10.84s   |  **8.75s** | **1.2x**     | 3612 MB |  3539 MB | 0.98x     |
+| **literals**      |  5.17s   |  **4.74s** | **1.1x**     | 1122 MB |  1480 MB | 1.32x     |
+
+**Key findings**: 1.1-6.9x faster across all patterns, best on nested/string-heavy data
+
 #### x86_64 (AMD Ryzen 9 7950X, 100MB files)
 
-| Pattern        | jq Time | succinctly | Speedup       | Pattern Description          |
-|----------------|---------|------------|---------------|------------------------------|
-| **Nested**     | 1.38s   | **0.54s**  | **2.6x** ⚡   | Deep object nesting          |
-| **Numbers**    | 2.84s   | **1.52s**  | **1.9x** ⚡   | Number-heavy documents       |
-| **Strings**    | 1.29s   | **0.64s**  | **2.0x** ⚡   | String-heavy with escapes    |
-| **Unicode**    | 1.69s   | **1.43s**  | **1.2x** ⚡   | UTF-8 multibyte sequences    |
-| Comprehensive  | 3.28s   | 3.59s      | 0.9x          | All JSON features            |
-| Arrays         | 5.56s   | 6.40s      | 0.9x          | Arrays of arrays             |
-| Users          | 2.08s   | 2.02s      | 1.0x          | Realistic user objects       |
+| Pattern           | jq       | succinctly | Speedup      | Pattern Description       |
+|-------------------|----------|------------|--------------|---------------------------|
+| **nested**        | 1.38s    | **0.54s**  | **2.6x**     | Deep object nesting       |
+| **strings**       | 1.29s    | **0.64s**  | **2.0x**     | String-heavy with escapes |
+| **numbers**       | 2.84s    | **1.52s**  | **1.9x**     | Number-heavy documents    |
+| **unicode**       | 1.69s    | **1.43s**  | **1.2x**     | UTF-8 multibyte sequences |
+| **users**         | 2.08s    | 2.02s      | 1.0x         | Realistic user objects    |
+| **comprehensive** | 3.28s    | 3.59s      | 0.9x         | All JSON features         |
+| **arrays**        | 5.56s    | 6.40s      | 0.9x         | Arrays of arrays          |
 
-**Trade-off**: succinctly uses 2-3x more memory to build succinct indexes, delivering 1.2-2.6x speedup on structured workloads. See [benchmarks/JQ-COMPARISON.md](benchmarks/JQ-COMPARISON.md) for full details.
-
-#### ARM (Apple M1 Max, smaller files)
-
-| Size      | succinctly           | jq                    | Speedup    |
-|-----------|----------------------|-----------------------|------------|
-| **10KB**  |  2.4 ms  (3.9 MiB/s) |  4.3 ms  (2.2 MiB/s)  | **1.79x**  |
-| **100KB** |  4.6 ms (18.4 MiB/s) |  8.2 ms (10.5 MiB/s)  | **1.76x**  |
-| **1MB**   | 24.7 ms (32.7 MiB/s) | 43.9 ms (18.4 MiB/s)  | **1.78x**  |
+**Trade-off**: succinctly uses 2-3x more memory to build succinct indexes, delivering 1.2-2.6x speedup on structured workloads
 
 ### Platform-Specific Optimizations
 
@@ -166,7 +175,7 @@ Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
 | **x86_64** | Popcount (AVX-512 VPOPCNTDQ) | 96.8 GiB/s |  5.2x vs scalar |
 | **ARM**    | NEON JSON (string-heavy)     |  3.7 GiB/s | 1.69x vs scalar |
 
-See [docs/OPTIMIZATION-SUMMARY.md](docs/OPTIMIZATION-SUMMARY.md) and [benchmarks/JQ-COMPARISON.md](benchmarks/JQ-COMPARISON.md) for detailed benchmarks.
+See [docs/OPTIMIZATION-SUMMARY.md](docs/OPTIMIZATION-SUMMARY.md) and [docs/jq-comparison.md](docs/jq-comparison.md) for detailed benchmarks.
 
 ## Feature Flags
 
@@ -206,12 +215,12 @@ cargo build --release --features cli
 # Generate synthetic JSON for benchmarking
 ./target/release/succinctly json generate 10mb -o benchmark.json
 
-# Query JSON files (jq-compatible)
+# Query JSON files (jq-compatible output by default)
 ./target/release/succinctly jq '.users[].name' input.json
 ./target/release/succinctly jq -r '.users[0]' input.json
 
-# Exact jq output compatibility (for diff/testing)
-./target/release/succinctly jq --jq-compat . input.json
+# Preserve original input formatting (numbers, escapes)
+./target/release/succinctly jq --preserve-input . input.json
 ```
 
 ## Architecture
