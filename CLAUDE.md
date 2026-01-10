@@ -98,14 +98,14 @@ cargo build --release --features cli
 ./target/release/succinctly json generate 10mb -o benchmark.json
 ./target/release/succinctly json generate 1mb --pattern pathological -o worst-case.json
 
-# Query JSON files (jq-compatible interface)
+# Query JSON files (jq-compatible interface, output matches jq by default)
 ./target/release/succinctly jq '.users[].name' input.json
 ./target/release/succinctly jq -r '.users[0]' input.json
 ./target/release/succinctly jq '.items[]' input.json
 
-# jq-compatible output (exact match with jq's number/string formatting)
-./target/release/succinctly jq --jq-compat . input.json
-SUCCINCTLY_JQ_COMPAT=1 ./target/release/succinctly jq . input.json
+# Preserve original number formatting (disable jq-compat)
+./target/release/succinctly jq --no-jq-compat . input.json
+SUCCINCTLY_JQ_COMPAT=0 ./target/release/succinctly jq . input.json
 ```
 
 ## Code Architecture
