@@ -117,28 +117,38 @@ if let QueryResult::One(StandardJson::Number(age)) = eval(&expr, cursor) {
 
 ### JSON Semi-Indexing
 
-| Platform | Implementation | Throughput | Notes |
-|----------|----------------|------------|-------|
-| **x86_64** (AMD Ryzen 9 7950X) | PFSM (BMI2) | **679 MiB/s** | Table-driven, fastest on x86 |
-| | AVX2 | 732 MiB/s | 32 bytes/iteration |
-| | Scalar | 494 MiB/s | Baseline |
-| **ARM** (Apple M1 Max) | NEON | **574 MiB/s** | 32 bytes/iteration |
-| | Scalar (PFSM) | 557 MiB/s | Table-driven |
-| | Scalar | 405 MiB/s | Baseline |
+| Platform                       | Implementation | Throughput    | Notes                        |
+|--------------------------------|----------------|---------------|------------------------------|
+| **x86_64** (AMD Ryzen 9 7950X) | PFSM (BMI2)    | **679 MiB/s** | Table-driven, fastest on x86 |
+|                                | AVX2           | 732 MiB/s     | 32 bytes/iteration           |
+|                                | Scalar         | 494 MiB/s     | Baseline                     |
+| **ARM** (Apple M1 Max)         | NEON           | **574 MiB/s** | 32 bytes/iteration           |
+|                                | Scalar (PFSM)  | 557 MiB/s     | Table-driven                 |
+|                                | Scalar         | 405 MiB/s     | Baseline                     |
 
 ### Rank/Select Operations
 
-| Platform | Rank (O(1)) | Select (O(log n)) |
-|----------|-------------|-------------------|
-| **x86_64** (AMD Ryzen 9 7950X) | ~3 ns | ~50 ns |
-| **ARM** (Apple M1 Max) | ~21 ns | ~320 ns |
+| Platform                       | Rank (O(1)) | Select (O(log n)) |
+|--------------------------------|-------------|-------------------|
+| **x86_64** (AMD Ryzen 9 7950X) | ~3 ns       | ~50 ns            |
+| **ARM** (Apple M1 Max)         | ~21 ns      | ~320 ns           |
+
+### jq Query Performance (Apple M1 Max)
+
+End-to-end comparison of `succinctly jq -c . file.json` vs `jq -c . file.json`:
+
+| Size      | succinctly           | jq                    | Speedup    |
+|-----------|----------------------|-----------------------|------------|
+| **10KB**  |  2.4 ms  (3.9 MiB/s) |  4.3 ms  (2.2 MiB/s)  | **1.79x**  |
+| **100KB** |  4.6 ms (18.4 MiB/s) |  8.2 ms (10.5 MiB/s)  | **1.76x**  |
+| **1MB**   | 24.7 ms (32.7 MiB/s) | 43.9 ms (18.4 MiB/s)  | **1.78x**  |
 
 ### Platform-Specific Optimizations
 
-| Platform | Operation | Throughput | Speedup |
-|----------|-----------|------------|---------|
-| **x86_64** | Popcount (AVX-512 VPOPCNTDQ) | 96.8 GiB/s | 5.2x vs scalar |
-| **ARM** | NEON JSON (string-heavy) | 3.7 GiB/s | 1.69x vs scalar |
+| Platform   | Operation                    | Throughput | Speedup         |
+|------------|------------------------------|------------|-----------------|
+| **x86_64** | Popcount (AVX-512 VPOPCNTDQ) | 96.8 GiB/s |  5.2x vs scalar |
+| **ARM**    | NEON JSON (string-heavy)     |  3.7 GiB/s | 1.69x vs scalar |
 
 See [docs/OPTIMIZATION-SUMMARY.md](docs/OPTIMIZATION-SUMMARY.md) for detailed benchmarks.
 
@@ -146,28 +156,28 @@ See [docs/OPTIMIZATION-SUMMARY.md](docs/OPTIMIZATION-SUMMARY.md) for detailed be
 
 ### Popcount Strategies (mutually exclusive)
 
-| Feature | Description |
-|---------|-------------|
-| *(default)* | Uses Rust's `count_ones()` which auto-vectorizes |
-| `simd` | Explicit SIMD intrinsics (NEON on ARM, POPCNT on x86) |
-| `portable-popcount` | Portable bitwise algorithm (no intrinsics) |
+| Feature             | Description                                           |
+|---------------------|-------------------------------------------------------|
+| *(default)*         | Uses Rust's `count_ones()` which auto-vectorizes      |
+| `simd`.             | Explicit SIMD intrinsics (NEON on ARM, POPCNT on x86) |
+| `portable-popcount` | Portable bitwise algorithm (no intrinsics)            |
 
 ### Other Features
 
-| Feature | Description |
-|---------|-------------|
-| `std` | Enable std library (default, required for runtime CPU detection) |
-| `serde` | Enable serialization/deserialization support |
-| `cli` | Build the CLI tool |
-| `regex` | Enable regex support in jq queries |
+| Feature | Description                                                      |
+|---------|------------------------------------------------------------------|
+| `std`   | Enable std library (default, required for runtime CPU detection) |
+| `serde` | Enable serialization/deserialization support                     |
+| `cli`   | Build the CLI tool                                               |
+| `regex` | Enable regex support in jq queries                               |
 
 ### Test Features
 
-| Feature | Description |
-|---------|-------------|
+| Feature       | Description                           |
+|---------------|---------------------------------------|
 | `large-tests` | Test with 1GB bitvectors (~125MB RAM) |
-| `huge-tests` | Test with 5GB bitvectors (~625MB RAM) |
-| `mmap-tests` | Memory-mapped file tests |
+| `huge-tests`  | Test with 5GB bitvectors (~625MB RAM) |
+| `mmap-tests`  | Memory-mapped file tests              |
 
 ## CLI Tool
 
@@ -210,10 +220,10 @@ succinctly
 
 The library uses runtime CPU feature detection to select the best implementation:
 
-| Platform | Features Used |
-|----------|---------------|
-| x86_64 | AVX2, AVX-512 VPOPCNTDQ, SSE4.2, SSE2 |
-| aarch64 | NEON (mandatory) |
+| Platform | Features Used                         |
+|----------|---------------------------------------|
+| x86_64   | AVX2, AVX-512 VPOPCNTDQ, SSE4.2, SSE2 |
+| aarch64  | NEON (mandatory)                      |
 
 ## Documentation
 

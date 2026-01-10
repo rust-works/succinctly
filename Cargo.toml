@@ -112,3 +112,6 @@ harness = false
 name = "json_standard"
 harness = false
 
+[[bench]]
+name = "jq_comparison"
+harness = false
