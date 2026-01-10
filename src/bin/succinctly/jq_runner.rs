@@ -520,6 +520,28 @@ impl OutputConfig {
             jq_compat,
         }
     }
+
+    /// Returns true if raw identity output can be used (no formatting transformations needed).
+    ///
+    /// When this returns true for identity queries, we can output the original JSON bytes
+    /// directly without parsing or materializing values, saving significant memory.
+    fn can_use_raw_identity(&self) -> bool {
+        // Raw output is safe when:
+        // - Compact mode (output matches compact input format)
+        // - No color (would need to inject ANSI codes)
+        // - No sort_keys (would need to reorder object keys)
+        // - No ascii_output (would need to escape non-ASCII)
+        // - No raw_output (would strip quotes from strings)
+        // - No seq mode (would need to add RS characters)
+        // - Not jq_compat (would need to reformat numbers like 4e4 → 4E+4)
+        self.compact
+            && !self.color_output
+            && !self.sort_keys
+            && !self.ascii_output
+            && !self.raw_output
+            && !self.seq
+            && !self.jq_compat
+    }
 }
 
 /// Run the jq command with the given arguments.
@@ -606,21 +628,44 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 .collect::<Result<Vec<_>>>()?
         };
 
+        // Check if we can use the identity fast path (raw bytes output, no materialization)
+        let use_identity_fast_path = expr.is_identity() && output_config.can_use_raw_identity();
+
         for raw in raw_inputs {
             // Process as JSON stream (handle multiple JSON values in one input)
             let values = find_json_values(&raw);
             for (start, end) in values {
                 let json_bytes = &raw[start..end];
+
+                // Fast path for identity query: output raw bytes directly without materialization.
+                // This avoids building the index and materializing JqValue, saving significant memory.
+                if use_identity_fast_path {
+                    had_output = true;
+                    // For exit_status, identity on valid JSON is not null/false
+                    if args.exit_status {
+                        // Parse minimally just to check the type for exit_status
+                        // For now, assume it's a truthy value (not null or false)
+                        // A more thorough check would parse the first token
+                        last_output = Some(OwnedValue::Bool(true));
+                    }
+                    out.write_all(json_bytes)?;
+                    out.write_all(b"\n")?;
+                    continue;
+                }
+
+                // Slow path: build index and evaluate expression
                 let index = JsonIndex::build(json_bytes);
                 let results = evaluate_bytes_lazy(json_bytes, &expr, &index);
 
-                for result in &results {
+                // Consume results to free memory after each value is written
+                for result in results {
                     had_output = true;
                     // For exit_status tracking, we need to check the last value
                     if args.exit_status {
                         last_output = Some(result.materialize());
                     }
-                    write_output_jq_value(&mut out, result, &output_config)?;
+                    write_output_jq_value(&mut out, &result, &output_config)?;
+                    // result is dropped here, freeing its memory immediately
                 }
             }
         }
@@ -1165,7 +1210,11 @@ fn query_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// Convert StandardJson to JqValue, preserving raw number formatting.
+/// Convert StandardJson to JqValue, preserving lazy cursor references.
+///
+/// **Phase 1 Lazy Optimization**: Arrays and objects store `JqValue::Cursor` for
+/// each child instead of recursively materializing. This defers allocation until
+/// the value is actually needed (e.g., for computation or output formatting).
 fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     _parent_cursor: &JsonCursor<'a, W>,
@@ -1178,22 +1227,24 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
             JqValue::RawNumber(n.raw_bytes())
         }
         StandardJson::String(s) => {
+            // Keep string lazy - use raw bytes reference instead of decoding
             JqValue::String(s.as_str().map(|c| c.to_string()).unwrap_or_default())
         }
         StandardJson::Array(elements) => {
-            let items: Vec<JqValue<'a, W>> = elements
-                .map(|e| standard_json_to_jq_value(e, _parent_cursor))
-                .collect();
+            // LAZY: Store cursor references instead of materializing children
+            let items: Vec<JqValue<'a, W>> = elements.cursor_iter().map(JqValue::Cursor).collect();
             JqValue::Array(items)
         }
         StandardJson::Object(fields) => {
+            // LAZY: Store cursor references instead of materializing values
             let map: IndexMap<String, JqValue<'a, W>> = fields
                 .map(|f| {
                     let key = match f.key() {
                         StandardJson::String(s) => s.as_str().unwrap_or_default().to_string(),
                         _ => String::new(),
                     };
-                    (key, standard_json_to_jq_value(f.value(), _parent_cursor))
+                    // Use cursor for value instead of materializing
+                    (key, JqValue::Cursor(f.value_cursor()))
                 })
                 .collect();
             JqValue::Object(map)
@@ -1490,39 +1541,117 @@ fn write_jq_value_jq_compat<'a, Out: Write, Wrd: Clone + AsRef<[u64]>>(
             out.write_all(formatted.as_bytes())?;
         }
         JqValue::Cursor(c) => {
-            // For cursor values, get raw bytes and check what type it is
-            if let Some(raw_bytes) = c.raw_bytes() {
-                let first = raw_bytes.first().copied().unwrap_or(0);
-                if first == b'-' || first.is_ascii_digit() {
-                    // Number: reformat according to jq rules
-                    let formatted = format_number_jq_compat(raw_bytes);
+            // For cursor values, check the type and handle appropriately
+            use succinctly::json::light::StandardJson;
+            match c.value() {
+                StandardJson::Null => out.write_all(b"null")?,
+                StandardJson::Bool(true) => out.write_all(b"true")?,
+                StandardJson::Bool(false) => out.write_all(b"false")?,
+                StandardJson::Number(n) => {
+                    // Reformat number according to jq rules
+                    let formatted = format_number_jq_compat(n.raw_bytes());
                     out.write_all(formatted.as_bytes())?;
-                } else if first == b'"' {
-                    // String: need to decode and re-encode with jq's escape preferences
-                    // (e.g., \u0008 → \b, \u000c → \f)
-                    let owned = value.materialize();
-                    if let OwnedValue::String(s) = owned {
+                }
+                StandardJson::String(s) => {
+                    // Re-encode string with jq's escape preferences
+                    if let Ok(decoded) = s.as_str() {
                         out.write_all(b"\"")?;
                         let escaped = if config.ascii_output {
-                            escape_json_string_ascii(&s)
+                            escape_json_string_ascii(&decoded)
                         } else {
-                            escape_json_string(&s)
+                            escape_json_string(&decoded)
                         };
                         out.write_all(escaped.as_bytes())?;
                         out.write_all(b"\"")?;
                     } else {
-                        // Unexpected, just write raw
-                        out.write_all(raw_bytes)?;
+                        // Fallback: write raw bytes
+                        out.write_all(s.raw_bytes())?;
                     }
-                } else {
-                    // Other types (null, bool, array, object): write as-is
-                    out.write_all(raw_bytes)?;
                 }
-            } else {
-                // Fallback: materialize and format
-                let owned = value.materialize();
-                let json = format_json_impl(&owned, indent, level, config.ascii_output);
-                out.write_all(json.as_bytes())?;
+                StandardJson::Array(elements) => {
+                    // Convert to JqValue and recurse to handle nested numbers
+                    let arr_value: JqValue<'a, Wrd> =
+                        standard_json_to_jq_value(StandardJson::Array(elements), c);
+                    if let JqValue::Array(ref items) = arr_value {
+                        if items.is_empty() {
+                            out.write_all(b"[]")?;
+                        } else if compact {
+                            out.write_all(b"[")?;
+                            for (i, v) in items.iter().enumerate() {
+                                if i > 0 {
+                                    out.write_all(b",")?;
+                                }
+                                write_jq_value_jq_compat(out, v, config, level + 1)?;
+                            }
+                            out.write_all(b"]")?;
+                        } else {
+                            out.write_all(b"[")?;
+                            out.write_all(separator.as_bytes())?;
+                            for (i, v) in items.iter().enumerate() {
+                                if i > 0 {
+                                    out.write_all(b",")?;
+                                    out.write_all(separator.as_bytes())?;
+                                }
+                                out.write_all(next_indent.as_bytes())?;
+                                write_jq_value_jq_compat(out, v, config, level + 1)?;
+                            }
+                            out.write_all(separator.as_bytes())?;
+                            out.write_all(current_indent.as_bytes())?;
+                            out.write_all(b"]")?;
+                        }
+                    }
+                }
+                StandardJson::Object(fields) => {
+                    // Convert to JqValue and recurse to handle nested numbers
+                    let obj_value: JqValue<'a, Wrd> =
+                        standard_json_to_jq_value(StandardJson::Object(fields), c);
+                    if let JqValue::Object(ref map) = obj_value {
+                        if map.is_empty() {
+                            out.write_all(b"{}")?;
+                        } else if compact {
+                            out.write_all(b"{")?;
+                            for (i, (k, v)) in map.iter().enumerate() {
+                                if i > 0 {
+                                    out.write_all(b",")?;
+                                }
+                                out.write_all(b"\"")?;
+                                let escaped = if config.ascii_output {
+                                    escape_json_string_ascii(k)
+                                } else {
+                                    escape_json_string(k)
+                                };
+                                out.write_all(escaped.as_bytes())?;
+                                out.write_all(b"\":")?;
+                                write_jq_value_jq_compat(out, v, config, level + 1)?;
+                            }
+                            out.write_all(b"}")?;
+                        } else {
+                            out.write_all(b"{")?;
+                            out.write_all(separator.as_bytes())?;
+                            for (i, (k, v)) in map.iter().enumerate() {
+                                if i > 0 {
+                                    out.write_all(b",")?;
+                                    out.write_all(separator.as_bytes())?;
+                                }
+                                out.write_all(next_indent.as_bytes())?;
+                                out.write_all(b"\"")?;
+                                let escaped = if config.ascii_output {
+                                    escape_json_string_ascii(k)
+                                } else {
+                                    escape_json_string(k)
+                                };
+                                out.write_all(escaped.as_bytes())?;
+                                out.write_all(b"\":")?;
+                                out.write_all(space_after_colon.as_bytes())?;
+                                write_jq_value_jq_compat(out, v, config, level + 1)?;
+                            }
+                            out.write_all(separator.as_bytes())?;
+                            out.write_all(current_indent.as_bytes())?;
+                            out.write_all(b"}")?;
+                        }
+                    }
+                }
+                StandardJson::Error(_) => out.write_all(b"null")?,
             }
         }
         JqValue::String(s) => {

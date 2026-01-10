@@ -870,6 +870,20 @@ impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
         Some((value, rest))
     }
 
+    /// Get the first element's cursor and the remaining elements.
+    ///
+    /// This is like `uncons` but returns the cursor instead of the value.
+    /// Useful for lazy evaluation where you want to defer calling `value()`.
+    pub fn uncons_cursor(&self) -> Option<(JsonCursor<'a, W>, JsonElements<'a, W>)> {
+        let element_cursor = self.element_cursor?;
+
+        let rest = JsonElements {
+            element_cursor: element_cursor.next_sibling(),
+        };
+
+        Some((element_cursor, rest))
+    }
+
     /// Get element by index (slow path).
     ///
     /// Note: This is O(n) as it iterates through elements, calling `value()`
@@ -915,6 +929,46 @@ impl<'a, W: AsRef<[u64]>> Iterator for JsonElements<'a, W> {
         let (elem, rest) = self.uncons()?;
         *self = rest;
         Some(elem)
+    }
+}
+
+// ============================================================================
+// ElementCursorIter: Iterator over element cursors
+// ============================================================================
+
+/// Iterator that yields cursors for each array element.
+///
+/// Unlike `JsonElements` which yields `StandardJson` values, this iterator
+/// yields `JsonCursor` values, allowing lazy evaluation of element values.
+#[derive(Clone, Copy, Debug)]
+pub struct ElementCursorIter<'a, W = Vec<u64>> {
+    elements: JsonElements<'a, W>,
+}
+
+impl<'a, W: AsRef<[u64]>> ElementCursorIter<'a, W> {
+    /// Create a new cursor iterator from JsonElements.
+    pub fn new(elements: JsonElements<'a, W>) -> Self {
+        Self { elements }
+    }
+}
+
+impl<'a, W: AsRef<[u64]>> Iterator for ElementCursorIter<'a, W> {
+    type Item = JsonCursor<'a, W>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (cursor, rest) = self.elements.uncons_cursor()?;
+        self.elements = rest;
+        Some(cursor)
+    }
+}
+
+impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
+    /// Get an iterator over element cursors.
+    ///
+    /// This allows iterating over array elements while keeping them as
+    /// lazy cursor references, deferring value evaluation until needed.
+    pub fn cursor_iter(self) -> ElementCursorIter<'a, W> {
+        ElementCursorIter::new(self)
     }
 }
 
