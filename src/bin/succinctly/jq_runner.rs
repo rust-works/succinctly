@@ -603,17 +603,18 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     let mut last_output: Option<OwnedValue> = None;
     let mut had_output = false;
 
-    // Check if we can use the lazy path (preserves/reformats number formatting)
-    // Conditions: not slurp, not raw_input, and either:
-    // - compact output without sort_keys/colors/ascii (preserves formatting), OR
-    // - jq_compat mode (needs raw bytes for proper number reformatting)
+    // The lazy path preserves number formatting and uses less memory.
+    // It's available when:
+    // - Not using features that require serde_json parsing (slurp, raw_input, seq input)
+    // - Not using output transformations that need full access to values (sort_keys, color, ascii)
+    // Both jq_compat (reformatting numbers) and preserve mode (keeping original formatting)
+    // use the lazy path for correctness.
     let can_use_lazy_path = !args.slurp
         && !args.raw_input
         && !args.seq // seq input mode parses differently
         && !output_config.sort_keys
         && !output_config.color_output
-        && !output_config.ascii_output // ASCII output requires escaping
-        && (output_config.compact || output_config.jq_compat);
+        && !output_config.ascii_output; // ASCII output requires escaping
 
     if can_use_lazy_path && !args.null_input {
         // Lazy path: read files as raw bytes and process directly
@@ -1277,16 +1278,13 @@ fn write_output_jq_value<'a, Out: Write, Wrd: Clone + AsRef<[u64]>>(
     }
 
     // For jq_compat mode, use the jq-compatible formatter (reformats numbers)
-    if config.jq_compat && !config.sort_keys && !config.color_output {
-        write_jq_value_jq_compat(out, value, config, 0)?;
-    } else if config.compact && !config.sort_keys && !config.color_output {
-        // For simple compact output, use JqValue's direct output
-        // This preserves number formatting like "4e4"
-        let mut output = String::new();
-        value
-            .write_json(&mut output)
-            .map_err(|_| anyhow::anyhow!("Failed to format JSON"))?;
-        out.write_all(output.as_bytes())?;
+    // For preserve mode (!jq_compat), use the preserve formatter (keeps original number format)
+    if !config.sort_keys && !config.color_output {
+        if config.jq_compat {
+            print_json(out, value, &JqCompatFormatter, config, 0)?;
+        } else {
+            print_json(out, value, &PreserveFormatter, config, 0)?;
+        }
     } else {
         // For complex output (pretty-print, sort_keys, colors), materialize first
         let owned = value.materialize();
@@ -1345,6 +1343,328 @@ fn write_terminator<W: Write>(out: &mut W, config: &OutputConfig) -> Result<()> 
     }
     Ok(())
 }
+
+// =============================================================================
+// LiteralFormatter trait and implementations
+// =============================================================================
+
+use std::borrow::Cow;
+
+/// Trait for formatting JSON literals (scalars).
+///
+/// This separates the concern of how to format individual values from the
+/// structural concerns of printing arrays, objects, and handling indentation.
+trait LiteralFormatter {
+    /// Format a raw number from source JSON bytes.
+    fn format_raw_number<'a>(&self, raw: &'a [u8]) -> Cow<'a, str>;
+
+    /// Format a computed floating-point number.
+    fn format_float(&self, f: f64) -> String;
+
+    /// Format a computed integer.
+    fn format_int(&self, i: i64) -> String;
+}
+
+/// jq-compatible formatter: reformats numbers according to jq's rules.
+///
+/// - Scientific notation normalized: `4e4` → `4E+4`
+/// - Small negative exponents expanded: `1e-3` → `0.001`
+/// - Uppercase E with explicit + sign
+struct JqCompatFormatter;
+
+impl LiteralFormatter for JqCompatFormatter {
+    fn format_raw_number<'a>(&self, raw: &'a [u8]) -> Cow<'a, str> {
+        Cow::Owned(format_number_jq_compat(raw))
+    }
+
+    fn format_float(&self, f: f64) -> String {
+        if f.is_nan() || f.is_infinite() {
+            "null".to_string()
+        } else {
+            format!("{}", f)
+        }
+    }
+
+    fn format_int(&self, i: i64) -> String {
+        format!("{}", i)
+    }
+}
+
+/// Preservation formatter: outputs raw bytes unchanged.
+///
+/// Useful for maintaining original number formatting from the source JSON.
+struct PreserveFormatter;
+
+impl LiteralFormatter for PreserveFormatter {
+    fn format_raw_number<'a>(&self, raw: &'a [u8]) -> Cow<'a, str> {
+        match core::str::from_utf8(raw) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(String::from_utf8_lossy(raw).into_owned()),
+        }
+    }
+
+    fn format_float(&self, f: f64) -> String {
+        if f.is_nan() || f.is_infinite() {
+            "null".to_string()
+        } else {
+            format!("{}", f)
+        }
+    }
+
+    fn format_int(&self, i: i64) -> String {
+        format!("{}", i)
+    }
+}
+
+// =============================================================================
+// Generic JSON Printer
+// =============================================================================
+
+/// Print a JqValue as JSON using the provided literal formatter.
+///
+/// This is the unified printer that handles JSON structure (arrays, objects,
+/// indentation) while delegating literal formatting to the formatter.
+fn print_json<'a, F, Out, Wrd>(
+    out: &mut Out,
+    value: &JqValue<'a, Wrd>,
+    formatter: &F,
+    config: &OutputConfig,
+    level: usize,
+) -> Result<()>
+where
+    F: LiteralFormatter,
+    Out: Write,
+    Wrd: Clone + AsRef<[u64]>,
+{
+    let compact = config.compact;
+    let indent = &config.indent_string;
+    let current_indent = if compact {
+        String::new()
+    } else {
+        indent.repeat(level)
+    };
+    let next_indent = if compact {
+        String::new()
+    } else {
+        indent.repeat(level + 1)
+    };
+    let separator = if compact { "" } else { "\n" };
+    let space_after_colon = if compact { "" } else { " " };
+
+    match value {
+        JqValue::Null => out.write_all(b"null")?,
+        JqValue::Bool(true) => out.write_all(b"true")?,
+        JqValue::Bool(false) => out.write_all(b"false")?,
+        JqValue::Int(n) => out.write_all(formatter.format_int(*n).as_bytes())?,
+        JqValue::Float(f) => out.write_all(formatter.format_float(*f).as_bytes())?,
+        JqValue::RawNumber(bytes) => {
+            out.write_all(formatter.format_raw_number(bytes).as_bytes())?;
+        }
+        JqValue::Cursor(c) => {
+            use succinctly::json::light::StandardJson;
+            match c.value() {
+                StandardJson::Null => out.write_all(b"null")?,
+                StandardJson::Bool(true) => out.write_all(b"true")?,
+                StandardJson::Bool(false) => out.write_all(b"false")?,
+                StandardJson::Number(n) => {
+                    out.write_all(formatter.format_raw_number(n.raw_bytes()).as_bytes())?;
+                }
+                StandardJson::String(s) => {
+                    if let Ok(decoded) = s.as_str() {
+                        out.write_all(b"\"")?;
+                        let escaped = if config.ascii_output {
+                            escape_json_string_ascii(&decoded)
+                        } else {
+                            escape_json_string(&decoded)
+                        };
+                        out.write_all(escaped.as_bytes())?;
+                        out.write_all(b"\"")?;
+                    } else {
+                        out.write_all(s.raw_bytes())?;
+                    }
+                }
+                StandardJson::Array(elements) => {
+                    if elements.is_empty() {
+                        out.write_all(b"[]")?;
+                    } else if compact {
+                        out.write_all(b"[")?;
+                        for (i, child_cursor) in elements.cursor_iter().enumerate() {
+                            if i > 0 {
+                                out.write_all(b",")?;
+                            }
+                            let child_value = JqValue::Cursor(child_cursor);
+                            print_json(out, &child_value, formatter, config, level + 1)?;
+                        }
+                        out.write_all(b"]")?;
+                    } else {
+                        out.write_all(b"[")?;
+                        out.write_all(separator.as_bytes())?;
+                        for (i, child_cursor) in elements.cursor_iter().enumerate() {
+                            if i > 0 {
+                                out.write_all(b",")?;
+                                out.write_all(separator.as_bytes())?;
+                            }
+                            out.write_all(next_indent.as_bytes())?;
+                            let child_value = JqValue::Cursor(child_cursor);
+                            print_json(out, &child_value, formatter, config, level + 1)?;
+                        }
+                        out.write_all(separator.as_bytes())?;
+                        out.write_all(current_indent.as_bytes())?;
+                        out.write_all(b"]")?;
+                    }
+                }
+                StandardJson::Object(fields) => {
+                    use succinctly::json::light::StandardJson as SJ;
+                    let mut is_first = true;
+                    if fields.is_empty() {
+                        out.write_all(b"{}")?;
+                    } else if compact {
+                        out.write_all(b"{")?;
+                        for field in fields {
+                            if !is_first {
+                                out.write_all(b",")?;
+                            }
+                            is_first = false;
+                            if let SJ::String(k) = field.key() {
+                                out.write_all(b"\"")?;
+                                if let Ok(decoded) = k.as_str() {
+                                    let escaped = if config.ascii_output {
+                                        escape_json_string_ascii(&decoded)
+                                    } else {
+                                        escape_json_string(&decoded)
+                                    };
+                                    out.write_all(escaped.as_bytes())?;
+                                }
+                                out.write_all(b"\":")?;
+                            }
+                            let child_value = JqValue::Cursor(field.value_cursor());
+                            print_json(out, &child_value, formatter, config, level + 1)?;
+                        }
+                        out.write_all(b"}")?;
+                    } else {
+                        out.write_all(b"{")?;
+                        out.write_all(separator.as_bytes())?;
+                        for field in fields {
+                            if !is_first {
+                                out.write_all(b",")?;
+                                out.write_all(separator.as_bytes())?;
+                            }
+                            is_first = false;
+                            out.write_all(next_indent.as_bytes())?;
+                            if let SJ::String(k) = field.key() {
+                                out.write_all(b"\"")?;
+                                if let Ok(decoded) = k.as_str() {
+                                    let escaped = if config.ascii_output {
+                                        escape_json_string_ascii(&decoded)
+                                    } else {
+                                        escape_json_string(&decoded)
+                                    };
+                                    out.write_all(escaped.as_bytes())?;
+                                }
+                                out.write_all(b"\":")?;
+                                out.write_all(space_after_colon.as_bytes())?;
+                            }
+                            let child_value = JqValue::Cursor(field.value_cursor());
+                            print_json(out, &child_value, formatter, config, level + 1)?;
+                        }
+                        out.write_all(separator.as_bytes())?;
+                        out.write_all(current_indent.as_bytes())?;
+                        out.write_all(b"}")?;
+                    }
+                }
+                StandardJson::Error(_) => out.write_all(b"null")?,
+            }
+        }
+        JqValue::String(s) => {
+            out.write_all(b"\"")?;
+            let escaped = if config.ascii_output {
+                escape_json_string_ascii(s)
+            } else {
+                escape_json_string(s)
+            };
+            out.write_all(escaped.as_bytes())?;
+            out.write_all(b"\"")?;
+        }
+        JqValue::Array(arr) => {
+            if arr.is_empty() {
+                out.write_all(b"[]")?;
+            } else if compact {
+                out.write_all(b"[")?;
+                for (i, v) in arr.iter().enumerate() {
+                    if i > 0 {
+                        out.write_all(b",")?;
+                    }
+                    print_json(out, v, formatter, config, level + 1)?;
+                }
+                out.write_all(b"]")?;
+            } else {
+                out.write_all(b"[")?;
+                out.write_all(separator.as_bytes())?;
+                for (i, v) in arr.iter().enumerate() {
+                    if i > 0 {
+                        out.write_all(b",")?;
+                        out.write_all(separator.as_bytes())?;
+                    }
+                    out.write_all(next_indent.as_bytes())?;
+                    print_json(out, v, formatter, config, level + 1)?;
+                }
+                out.write_all(separator.as_bytes())?;
+                out.write_all(current_indent.as_bytes())?;
+                out.write_all(b"]")?;
+            }
+        }
+        JqValue::Object(obj) => {
+            if obj.is_empty() {
+                out.write_all(b"{}")?;
+            } else if compact {
+                out.write_all(b"{")?;
+                for (i, (k, v)) in obj.iter().enumerate() {
+                    if i > 0 {
+                        out.write_all(b",")?;
+                    }
+                    out.write_all(b"\"")?;
+                    let escaped = if config.ascii_output {
+                        escape_json_string_ascii(k)
+                    } else {
+                        escape_json_string(k)
+                    };
+                    out.write_all(escaped.as_bytes())?;
+                    out.write_all(b"\":")?;
+                    print_json(out, v, formatter, config, level + 1)?;
+                }
+                out.write_all(b"}")?;
+            } else {
+                out.write_all(b"{")?;
+                out.write_all(separator.as_bytes())?;
+                for (i, (k, v)) in obj.iter().enumerate() {
+                    if i > 0 {
+                        out.write_all(b",")?;
+                        out.write_all(separator.as_bytes())?;
+                    }
+                    out.write_all(next_indent.as_bytes())?;
+                    out.write_all(b"\"")?;
+                    let escaped = if config.ascii_output {
+                        escape_json_string_ascii(k)
+                    } else {
+                        escape_json_string(k)
+                    };
+                    out.write_all(escaped.as_bytes())?;
+                    out.write_all(b"\":")?;
+                    out.write_all(space_after_colon.as_bytes())?;
+                    print_json(out, v, formatter, config, level + 1)?;
+                }
+                out.write_all(separator.as_bytes())?;
+                out.write_all(current_indent.as_bytes())?;
+                out.write_all(b"}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// =============================================================================
+// Number formatting helpers
+// =============================================================================
 
 /// Format a raw JSON number string according to jq's formatting rules.
 ///
@@ -1498,260 +1818,6 @@ fn format_decimal_jq(value: f64) -> String {
     } else {
         format!("{}{}", sign, trimmed)
     }
-}
-
-/// Write a JqValue as JSON with jq-compatible formatting.
-///
-/// This formats the value according to jq's output rules, including
-/// proper number formatting (uppercase E, explicit +, etc.).
-fn write_jq_value_jq_compat<'a, Out: Write, Wrd: Clone + AsRef<[u64]>>(
-    out: &mut Out,
-    value: &JqValue<'a, Wrd>,
-    config: &OutputConfig,
-    level: usize,
-) -> Result<()> {
-    let compact = config.compact;
-    let indent = &config.indent_string;
-    let current_indent = if compact {
-        String::new()
-    } else {
-        indent.repeat(level)
-    };
-    let next_indent = if compact {
-        String::new()
-    } else {
-        indent.repeat(level + 1)
-    };
-    let separator = if compact { "" } else { "\n" };
-    let space_after_colon = if compact { "" } else { " " };
-
-    match value {
-        JqValue::Null => out.write_all(b"null")?,
-        JqValue::Bool(true) => out.write_all(b"true")?,
-        JqValue::Bool(false) => out.write_all(b"false")?,
-        JqValue::Int(n) => write!(out, "{}", n)?,
-        JqValue::Float(f) => {
-            if f.is_nan() || f.is_infinite() {
-                out.write_all(b"null")?;
-            } else {
-                // For computed floats, use jq's formatting
-                write!(out, "{}", f)?;
-            }
-        }
-        JqValue::RawNumber(bytes) => {
-            // Reformat according to jq rules
-            let formatted = format_number_jq_compat(bytes);
-            out.write_all(formatted.as_bytes())?;
-        }
-        JqValue::Cursor(c) => {
-            // For cursor values, check the type and handle appropriately
-            use succinctly::json::light::StandardJson;
-            match c.value() {
-                StandardJson::Null => out.write_all(b"null")?,
-                StandardJson::Bool(true) => out.write_all(b"true")?,
-                StandardJson::Bool(false) => out.write_all(b"false")?,
-                StandardJson::Number(n) => {
-                    // Reformat number according to jq rules
-                    let formatted = format_number_jq_compat(n.raw_bytes());
-                    out.write_all(formatted.as_bytes())?;
-                }
-                StandardJson::String(s) => {
-                    // Re-encode string with jq's escape preferences
-                    if let Ok(decoded) = s.as_str() {
-                        out.write_all(b"\"")?;
-                        let escaped = if config.ascii_output {
-                            escape_json_string_ascii(&decoded)
-                        } else {
-                            escape_json_string(&decoded)
-                        };
-                        out.write_all(escaped.as_bytes())?;
-                        out.write_all(b"\"")?;
-                    } else {
-                        // Fallback: write raw bytes
-                        out.write_all(s.raw_bytes())?;
-                    }
-                }
-                StandardJson::Array(elements) => {
-                    // Iterate directly over cursor children - no allocation
-                    if elements.is_empty() {
-                        out.write_all(b"[]")?;
-                    } else if compact {
-                        out.write_all(b"[")?;
-                        for (i, child_cursor) in elements.cursor_iter().enumerate() {
-                            if i > 0 {
-                                out.write_all(b",")?;
-                            }
-                            let child_value = JqValue::Cursor(child_cursor);
-                            write_jq_value_jq_compat(out, &child_value, config, level + 1)?;
-                        }
-                        out.write_all(b"]")?;
-                    } else {
-                        out.write_all(b"[")?;
-                        out.write_all(separator.as_bytes())?;
-                        for (i, child_cursor) in elements.cursor_iter().enumerate() {
-                            if i > 0 {
-                                out.write_all(b",")?;
-                                out.write_all(separator.as_bytes())?;
-                            }
-                            out.write_all(next_indent.as_bytes())?;
-                            let child_value = JqValue::Cursor(child_cursor);
-                            write_jq_value_jq_compat(out, &child_value, config, level + 1)?;
-                        }
-                        out.write_all(separator.as_bytes())?;
-                        out.write_all(current_indent.as_bytes())?;
-                        out.write_all(b"]")?;
-                    }
-                }
-                StandardJson::Object(fields) => {
-                    // Iterate directly over cursor fields - no allocation
-                    use succinctly::json::light::StandardJson as SJ;
-                    let mut is_first = true;
-                    // Check if empty first
-                    if fields.is_empty() {
-                        out.write_all(b"{}")?;
-                    } else if compact {
-                        out.write_all(b"{")?;
-                        for field in fields {
-                            if !is_first {
-                                out.write_all(b",")?;
-                            }
-                            is_first = false;
-                            // Get key string
-                            if let SJ::String(k) = field.key() {
-                                out.write_all(b"\"")?;
-                                if let Ok(decoded) = k.as_str() {
-                                    let escaped = if config.ascii_output {
-                                        escape_json_string_ascii(&decoded)
-                                    } else {
-                                        escape_json_string(&decoded)
-                                    };
-                                    out.write_all(escaped.as_bytes())?;
-                                }
-                                out.write_all(b"\":")?;
-                            }
-                            let child_value = JqValue::Cursor(field.value_cursor());
-                            write_jq_value_jq_compat(out, &child_value, config, level + 1)?;
-                        }
-                        out.write_all(b"}")?;
-                    } else {
-                        out.write_all(b"{")?;
-                        out.write_all(separator.as_bytes())?;
-                        for field in fields {
-                            if !is_first {
-                                out.write_all(b",")?;
-                                out.write_all(separator.as_bytes())?;
-                            }
-                            is_first = false;
-                            out.write_all(next_indent.as_bytes())?;
-                            if let SJ::String(k) = field.key() {
-                                out.write_all(b"\"")?;
-                                if let Ok(decoded) = k.as_str() {
-                                    let escaped = if config.ascii_output {
-                                        escape_json_string_ascii(&decoded)
-                                    } else {
-                                        escape_json_string(&decoded)
-                                    };
-                                    out.write_all(escaped.as_bytes())?;
-                                }
-                                out.write_all(b"\":")?;
-                                out.write_all(space_after_colon.as_bytes())?;
-                            }
-                            let child_value = JqValue::Cursor(field.value_cursor());
-                            write_jq_value_jq_compat(out, &child_value, config, level + 1)?;
-                        }
-                        out.write_all(separator.as_bytes())?;
-                        out.write_all(current_indent.as_bytes())?;
-                        out.write_all(b"}")?;
-                    }
-                }
-                StandardJson::Error(_) => out.write_all(b"null")?,
-            }
-        }
-        JqValue::String(s) => {
-            out.write_all(b"\"")?;
-            let escaped = if config.ascii_output {
-                escape_json_string_ascii(s)
-            } else {
-                escape_json_string(s)
-            };
-            out.write_all(escaped.as_bytes())?;
-            out.write_all(b"\"")?;
-        }
-        JqValue::Array(arr) => {
-            if arr.is_empty() {
-                out.write_all(b"[]")?;
-            } else if compact {
-                out.write_all(b"[")?;
-                for (i, v) in arr.iter().enumerate() {
-                    if i > 0 {
-                        out.write_all(b",")?;
-                    }
-                    write_jq_value_jq_compat(out, v, config, level + 1)?;
-                }
-                out.write_all(b"]")?;
-            } else {
-                out.write_all(b"[")?;
-                out.write_all(separator.as_bytes())?;
-                for (i, v) in arr.iter().enumerate() {
-                    if i > 0 {
-                        out.write_all(b",")?;
-                        out.write_all(separator.as_bytes())?;
-                    }
-                    out.write_all(next_indent.as_bytes())?;
-                    write_jq_value_jq_compat(out, v, config, level + 1)?;
-                }
-                out.write_all(separator.as_bytes())?;
-                out.write_all(current_indent.as_bytes())?;
-                out.write_all(b"]")?;
-            }
-        }
-        JqValue::Object(obj) => {
-            if obj.is_empty() {
-                out.write_all(b"{}")?;
-            } else if compact {
-                out.write_all(b"{")?;
-                for (i, (k, v)) in obj.iter().enumerate() {
-                    if i > 0 {
-                        out.write_all(b",")?;
-                    }
-                    out.write_all(b"\"")?;
-                    let escaped = if config.ascii_output {
-                        escape_json_string_ascii(k)
-                    } else {
-                        escape_json_string(k)
-                    };
-                    out.write_all(escaped.as_bytes())?;
-                    out.write_all(b"\":")?;
-                    write_jq_value_jq_compat(out, v, config, level + 1)?;
-                }
-                out.write_all(b"}")?;
-            } else {
-                out.write_all(b"{")?;
-                out.write_all(separator.as_bytes())?;
-                for (i, (k, v)) in obj.iter().enumerate() {
-                    if i > 0 {
-                        out.write_all(b",")?;
-                        out.write_all(separator.as_bytes())?;
-                    }
-                    out.write_all(next_indent.as_bytes())?;
-                    out.write_all(b"\"")?;
-                    let escaped = if config.ascii_output {
-                        escape_json_string_ascii(k)
-                    } else {
-                        escape_json_string(k)
-                    };
-                    out.write_all(escaped.as_bytes())?;
-                    out.write_all(b"\":")?;
-                    out.write_all(space_after_colon.as_bytes())?;
-                    write_jq_value_jq_compat(out, v, config, level + 1)?;
-                }
-                out.write_all(separator.as_bytes())?;
-                out.write_all(current_indent.as_bytes())?;
-                out.write_all(b"}")?;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Format a value as JSON.
