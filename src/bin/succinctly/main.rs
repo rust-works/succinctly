@@ -181,6 +181,11 @@ struct JqCommand {
     #[arg(short = 'S', long)]
     sort_keys: bool,
 
+    /// Format numbers like jq (normalize 4e4 → 40000, 0.10 → 0.1)
+    /// Can also be enabled via SUCCINCTLY_JQ_COMPAT=1 environment variable
+    #[arg(long)]
+    jq_compat: bool,
+
     /// Use tabs for indentation
     #[arg(long)]
     tab: bool,
