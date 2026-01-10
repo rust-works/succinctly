@@ -7030,7 +7030,8 @@ mod tests {
 
     #[test]
     fn test_identity() {
-        query!(br#"{"foo": 1}"#, ".", QueryResult::One(StandardJson::Object(_)) => {});
+        // Identity returns OneCursor for efficient passthrough of unchanged containers
+        query!(br#"{"foo": 1}"#, ".", QueryResult::OneCursor(_) => {});
     }
 
     #[test]

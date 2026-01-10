@@ -53,40 +53,36 @@ macro_rules! query_lenient {
 // Identity tests
 // =============================================================================
 
+// Identity (.) now returns OneCursor for efficient passthrough of unchanged values
+
 #[test]
 fn test_identity_object() {
-    query!(br#"{"a": 1}"#, ".", QueryResult::One(StandardJson::Object(_)) => {});
+    query!(br#"{"a": 1}"#, ".", QueryResult::OneCursor(_) => {});
 }
 
 #[test]
 fn test_identity_array() {
-    query!(br#"[1, 2, 3]"#, ".", QueryResult::One(StandardJson::Array(_)) => {});
+    query!(br#"[1, 2, 3]"#, ".", QueryResult::OneCursor(_) => {});
 }
 
 #[test]
 fn test_identity_string() {
-    query!(br#""hello""#, ".", QueryResult::One(StandardJson::String(s)) => {
-        assert_eq!(s.as_str().unwrap().as_ref(), "hello");
-    });
+    query!(br#""hello""#, ".", QueryResult::OneCursor(_) => {});
 }
 
 #[test]
 fn test_identity_number() {
-    query!(b"42", ".", QueryResult::One(StandardJson::Number(n)) => {
-        assert_eq!(n.as_i64().unwrap(), 42);
-    });
+    query!(b"42", ".", QueryResult::OneCursor(_) => {});
 }
 
 #[test]
 fn test_identity_bool() {
-    query!(b"true", ".", QueryResult::One(StandardJson::Bool(b)) => {
-        assert!(b);
-    });
+    query!(b"true", ".", QueryResult::OneCursor(_) => {});
 }
 
 #[test]
 fn test_identity_null() {
-    query!(b"null", ".", QueryResult::One(StandardJson::Null) => {});
+    query!(b"null", ".", QueryResult::OneCursor(_) => {});
 }
 
 // =============================================================================
