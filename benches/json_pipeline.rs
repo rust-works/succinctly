@@ -718,9 +718,9 @@ fn bench_array_indexing(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark jq evaluation with array indexing.
+/// Benchmark jq evaluation with various query patterns.
 /// This tests the actual jq evaluator to measure end-to-end impact.
-fn bench_jq_array_index(c: &mut Criterion) {
+fn bench_jq_queries(c: &mut Criterion) {
     use succinctly::jq;
 
     let Some(bytes) = load_test_file() else {
@@ -730,14 +730,24 @@ fn bench_jq_array_index(c: &mut Criterion) {
     // Build index
     let index = JsonIndex::build(&bytes);
 
+    let mut group = c.benchmark_group("jq_queries");
+    group.sample_size(100);
+
+    // Identity filter - returns the entire document
+    let identity_expr = jq::parse(".").expect("Failed to parse identity expression");
+    group.bench_function("identity", |b| {
+        b.iter(|| {
+            let cursor = index.root(black_box(&bytes));
+            let result = jq::eval(&identity_expr, cursor);
+            black_box(result)
+        })
+    });
+
     // Parse a jq expression that accesses array elements by index
     // Typical pattern: .[50] or .items[50]
     let expr = jq::parse(".[50]").expect("Failed to parse jq expression");
 
-    let mut group = c.benchmark_group("jq_array_index");
-    group.sample_size(100);
-
-    group.bench_function("jq_root_array_index", |b| {
+    group.bench_function("root_array_index", |b| {
         b.iter(|| {
             let cursor = index.root(black_box(&bytes));
             let result = jq::eval(&expr, cursor);
@@ -747,7 +757,7 @@ fn bench_jq_array_index(c: &mut Criterion) {
 
     // Try field access + array index pattern
     if let Ok(field_expr) = jq::parse(".users[50]") {
-        group.bench_function("jq_field_array_index", |b| {
+        group.bench_function("field_array_index", |b| {
             b.iter(|| {
                 let cursor = index.root(black_box(&bytes));
                 let result = jq::eval(&field_expr, cursor);
@@ -759,7 +769,7 @@ fn bench_jq_array_index(c: &mut Criterion) {
     // Compare with iteration (should be slower due to multiple text_positions)
     let iter_expr = jq::parse(".[]").expect("Failed to parse iterate expression");
 
-    group.bench_function("jq_iterate_to_50", |b| {
+    group.bench_function("iterate_to_50", |b| {
         b.iter(|| {
             let cursor = index.root(black_box(&bytes));
             let result = jq::eval_lenient(&iter_expr, cursor);
@@ -782,6 +792,6 @@ criterion_group!(
     bench_v1_vs_v2_full_traverse,
     bench_select_patterns,
     bench_array_indexing,
-    bench_jq_array_index,
+    bench_jq_queries,
 );
 criterion_main!(benches);

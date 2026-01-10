@@ -248,6 +248,21 @@ The library is `no_std` compatible (except in tests):
 
 ## Benchmark Infrastructure
 
+**Before running benchmarks**, always check for heavy CPU activity that could skew results:
+
+```bash
+# Check CPU activity (macOS)
+top -l 1 -n 5 | head -20
+
+# Check CPU activity (Linux)
+top -bn1 | head -20
+
+# Alternative: check load average
+uptime
+```
+
+Wait for CPU load to settle before running benchmarks. Ideally, load average should be below 1.0 for reliable results.
+
 ```bash
 # Generate benchmark data
 ./target/release/succinctly json generate-suite
@@ -256,6 +271,7 @@ The library is `no_std` compatible (except in tests):
 # Run benchmarks
 cargo bench --bench json_simd
 cargo bench --bench balanced_parens
+cargo bench --bench jq_comparison
 ```
 
 ### Benchmark Patterns
@@ -443,7 +459,20 @@ cargo bench --bench pfsm_comparison
 
 # End-to-end benchmark across all JSON patterns
 cargo bench --bench pfsm_end_to_end
+
+# Compare succinctly jq vs system jq
+cargo bench --bench jq_comparison
 ```
+
+### jq Query Performance (Apple M1 Max)
+
+End-to-end comparison of `succinctly jq -c . file.json` vs `jq -c . file.json`:
+
+| Size      | succinctly            | jq                    | Speedup    |
+|-----------|-----------------------|-----------------------|------------|
+| **10KB**  |  2.4 ms  (3.9 MiB/s)  |  4.3 ms  (2.2 MiB/s)  | **1.79x**  |
+| **100KB** |  4.6 ms (18.4 MiB/s)  |  8.2 ms (10.5 MiB/s)  | **1.76x**  |
+| **1MB**   | 24.7 ms (32.7 MiB/s)  | 43.9 ms (18.4 MiB/s)  | **1.78x**  |
 
 ### Failed Optimizations
 
