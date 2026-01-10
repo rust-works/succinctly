@@ -497,12 +497,12 @@ impl OutputConfig {
         let color_scheme = ColorScheme::from_env();
 
         // Determine jq_compat mode with priority:
-        // 1. --jq-compat flag forces on
-        // 2. SUCCINCTLY_JQ_COMPAT=1 env var enables
-        // 3. Default: off (preserve original formatting)
-        let jq_compat = args.jq_compat
-            || std::env::var("SUCCINCTLY_JQ_COMPAT")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        // 1. --no-jq-compat flag forces off
+        // 2. SUCCINCTLY_JQ_COMPAT=0 env var disables
+        // 3. Default: on (jq-compatible formatting)
+        let jq_compat = !args.no_jq_compat
+            && !std::env::var("SUCCINCTLY_JQ_COMPAT")
+                .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
                 .unwrap_or(false);
 
         OutputConfig {

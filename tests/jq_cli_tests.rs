@@ -720,19 +720,23 @@ fn test_unbuffered_flag() -> Result<()> {
 
 #[test]
 fn test_number_formatting_preserved() -> Result<()> {
-    // Test that exponential notation is preserved in compact output
-    // This is a key feature: succinctly preserves original number formatting
-    let (output, code) = run_jq_stdin(".", r#"{"val":4e4}"#, &["-c"])?;
+    // Test that exponential notation is preserved with --no-jq-compat
+    // By default, jq-compat mode normalizes numbers like jq does
+    let (output, code) = run_jq_stdin(".", r#"{"val":4e4}"#, &["-c", "--no-jq-compat"])?;
     assert_eq!(code, 0);
-    // Should preserve "4e4" not convert to "40000"
+    // With --no-jq-compat, should preserve "4e4" not convert to "40000"
     assert_eq!(output.trim(), r#"{"val":4e4}"#);
     Ok(())
 }
 
 #[test]
 fn test_number_formatting_various() -> Result<()> {
-    // Test various number formats are preserved
-    let (output, code) = run_jq_stdin(".", r#"{"a":1.0e10,"b":2e-5,"c":3.14159}"#, &["-c"])?;
+    // Test various number formats are preserved with --no-jq-compat
+    let (output, code) = run_jq_stdin(
+        ".",
+        r#"{"a":1.0e10,"b":2e-5,"c":3.14159}"#,
+        &["-c", "--no-jq-compat"],
+    )?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"{"a":1.0e10,"b":2e-5,"c":3.14159}"#);
     Ok(())
@@ -740,8 +744,8 @@ fn test_number_formatting_various() -> Result<()> {
 
 #[test]
 fn test_number_formatting_field_access() -> Result<()> {
-    // Test number formatting preserved through field access
-    let (output, code) = run_jq_stdin(".val", r#"{"val":4e4}"#, &["-c"])?;
+    // Test number formatting preserved through field access with --no-jq-compat
+    let (output, code) = run_jq_stdin(".val", r#"{"val":4e4}"#, &["-c", "--no-jq-compat"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "4e4");
     Ok(())
@@ -749,10 +753,21 @@ fn test_number_formatting_field_access() -> Result<()> {
 
 #[test]
 fn test_number_formatting_array_iteration() -> Result<()> {
-    // Test number formatting preserved through array iteration
-    let (output, code) = run_jq_stdin(".[]", r#"[1e100, 2e-100]"#, &["-c"])?;
+    // Test number formatting preserved through array iteration with --no-jq-compat
+    let (output, code) = run_jq_stdin(".[]", r#"[1e100, 2e-100]"#, &["-c", "--no-jq-compat"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "1e100\n2e-100");
+    Ok(())
+}
+
+#[test]
+fn test_jq_compat_default() -> Result<()> {
+    // Test that jq-compat is now the default behavior
+    // Numbers should be formatted like jq does (normalized scientific notation)
+    let (output, code) = run_jq_stdin(".", r#"{"val":4e4}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    // Default jq-compat normalizes 4e4 to 4E+4 (like jq)
+    assert_eq!(output.trim(), r#"{"val":4E+4}"#);
     Ok(())
 }
 
