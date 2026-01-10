@@ -29,6 +29,13 @@ pub enum QueryResult<'a, W = Vec<u64>> {
     /// Single value result (reference to original JSON).
     One(StandardJson<'a, W>),
 
+    /// Single cursor result (for unchanged container values).
+    ///
+    /// This is more efficient than `One` for arrays/objects because
+    /// it preserves the cursor, allowing direct output of raw bytes
+    /// without decomposing into individual element cursors.
+    OneCursor(JsonCursor<'a, W>),
+
     /// Multiple values (from iteration).
     Many(Vec<StandardJson<'a, W>>),
 
@@ -43,6 +50,18 @@ pub enum QueryResult<'a, W = Vec<u64>> {
 
     /// Multiple owned values.
     ManyOwned(Vec<OwnedValue>),
+}
+
+impl<'a, W: Clone + AsRef<[u64]>> QueryResult<'a, W> {
+    /// Convert OneCursor to One by materializing the cursor value.
+    /// Used internally when we need StandardJson from a result.
+    #[inline]
+    fn materialize_cursor(self) -> Self {
+        match self {
+            QueryResult::OneCursor(c) => QueryResult::One(c.value()),
+            other => other,
+        }
+    }
 }
 
 /// Error that occurs during evaluation.
@@ -324,8 +343,11 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>>(
     let mut has_owned = false;
 
     for expr in exprs {
-        match eval_single(expr, value.clone(), optional) {
+        match eval_single(expr, value.clone(), optional).materialize_cursor() {
             QueryResult::One(v) => all_results.push(v),
+            QueryResult::OneCursor(_) => {
+                unreachable!("materialize_cursor should have converted this")
+            }
             QueryResult::Many(vs) => all_results.extend(vs),
             QueryResult::Owned(v) => {
                 has_owned = true;
@@ -365,8 +387,9 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>>(
     // Collect all outputs from the inner expression into an array
     let result = eval_single(inner, value, optional);
 
-    let items: Vec<OwnedValue> = match result {
+    let items: Vec<OwnedValue> = match result.materialize_cursor() {
         QueryResult::One(v) => vec![to_owned(&v)],
+        QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
         QueryResult::Owned(v) => vec![v],
         QueryResult::ManyOwned(vs) => vs,
@@ -410,8 +433,9 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>>(
 
         // Evaluate the value
         let val_result = eval_single(&entry.value, value.clone(), optional);
-        let owned_val = match val_result {
+        let owned_val = match val_result.materialize_cursor() {
             QueryResult::One(v) => to_owned(&v),
+            QueryResult::OneCursor(_) => unreachable!(),
             QueryResult::Owned(v) => v,
             QueryResult::Many(vs) => {
                 // Multiple values - take the first one (jq behavior)
@@ -473,8 +497,9 @@ fn collect_recursive<'a, W: Clone + AsRef<[u64]>>(
 fn result_to_owned<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
 ) -> Result<OwnedValue, EvalError> {
-    match result {
+    match result.materialize_cursor() {
         QueryResult::One(v) => Ok(to_owned(&v)),
+        QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Owned(v) => Ok(v),
         QueryResult::Many(vs) => {
             if let Some(v) = vs.first() {
@@ -844,6 +869,7 @@ fn eval_alternative<'a, W: Clone + AsRef<[u64]>>(
     // Check if left produced a truthy result
     let is_truthy = match &left_result {
         QueryResult::One(v) => to_owned(v).is_truthy(),
+        QueryResult::OneCursor(_) => unreachable!("eval_single never produces OneCursor"),
         QueryResult::Owned(v) => v.is_truthy(),
         QueryResult::Many(vs) => vs.first().map(|v| to_owned(v).is_truthy()).unwrap_or(false),
         QueryResult::ManyOwned(vs) => vs.first().map(|v| v.is_truthy()).unwrap_or(false),
@@ -872,6 +898,7 @@ fn eval_if<'a, W: Clone + AsRef<[u64]>>(
     // Check if condition is truthy
     let is_truthy = match &cond_result {
         QueryResult::One(v) => to_owned(v).is_truthy(),
+        QueryResult::OneCursor(_) => unreachable!("eval_single never produces OneCursor"),
         QueryResult::Owned(v) => v.is_truthy(),
         QueryResult::Many(vs) => vs.first().map(|v| to_owned(v).is_truthy()).unwrap_or(false),
         QueryResult::ManyOwned(vs) => vs.first().map(|v| v.is_truthy()).unwrap_or(false),
@@ -1331,6 +1358,7 @@ fn builtin_select<'a, W: Clone + AsRef<[u64]>>(
     // Check if condition is truthy
     let is_truthy = match &cond_result {
         QueryResult::One(v) => to_owned(v).is_truthy(),
+        QueryResult::OneCursor(_) => unreachable!("eval_single never produces OneCursor"),
         QueryResult::Owned(v) => v.is_truthy(),
         QueryResult::Many(vs) => vs.first().map(|v| to_owned(v).is_truthy()).unwrap_or(false),
         QueryResult::ManyOwned(vs) => vs.first().map(|v| v.is_truthy()).unwrap_or(false),
@@ -1356,8 +1384,9 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>>(
         StandardJson::Array(elements) => {
             let mut results = Vec::new();
             for elem in elements {
-                match eval_single(f, elem, optional) {
+                match eval_single(f, elem, optional).materialize_cursor() {
                     QueryResult::One(v) => results.push(to_owned(&v)),
+                    QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Owned(v) => results.push(v),
                     QueryResult::Many(vs) => results.extend(vs.iter().map(to_owned)),
                     QueryResult::ManyOwned(vs) => results.extend(vs),
@@ -1395,10 +1424,11 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>>(
 
                 // Apply f to the value
                 let field_val = field.value();
-                match eval_single(f, field_val, optional) {
+                match eval_single(f, field_val, optional).materialize_cursor() {
                     QueryResult::One(v) => {
                         result_map.insert(key, to_owned(&v));
                     }
+                    QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Owned(v) => {
                         result_map.insert(key, v);
                     }
@@ -1422,8 +1452,9 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>>(
             // map_values on array applies to each element
             let mut results = Vec::new();
             for elem in elements {
-                match eval_single(f, elem, optional) {
+                match eval_single(f, elem, optional).materialize_cursor() {
                     QueryResult::One(v) => results.push(to_owned(&v)),
+                    QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Owned(v) => results.push(v),
                     QueryResult::Many(vs) => {
                         if let Some(v) = vs.first() {
@@ -2333,8 +2364,9 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>>(
                 let index = crate::json::JsonIndex::build(&entry_json);
                 let cursor = index.root(&entry_json);
 
-                match eval_single(f, cursor.value(), optional) {
+                match eval_single(f, cursor.value(), optional).materialize_cursor() {
                     QueryResult::One(v) => transformed.push(to_owned(&v)),
+                    QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Owned(v) => transformed.push(v),
                     QueryResult::Many(vs) => {
                         for v in vs {
@@ -2396,9 +2428,10 @@ fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>>(
         match part {
             StringPart::Literal(s) => result.push_str(s),
             StringPart::Expr(expr) => {
-                let val = eval_single(expr, value.clone(), optional);
+                let val = eval_single(expr, value.clone(), optional).materialize_cursor();
                 let s = match val {
                     QueryResult::One(v) => owned_to_string(&to_owned(&v)),
+                    QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Owned(v) => owned_to_string(&v),
                     QueryResult::Many(vs) => {
                         if let Some(v) = vs.first() {
@@ -3472,13 +3505,15 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>>(
     }
 
     // Apply remaining expressions to the result
-    match result {
+    match result.materialize_cursor() {
         QueryResult::One(v) => eval_pipe(rest, v, optional),
+        QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(values) => {
             let mut all_results = Vec::new();
             for v in values {
-                match eval_pipe(rest, v, optional) {
+                match eval_pipe(rest, v, optional).materialize_cursor() {
                     QueryResult::One(r) => all_results.push(r),
+                    QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Many(rs) => all_results.extend(rs),
                     QueryResult::None => {}
                     QueryResult::Error(e) => return QueryResult::Error(e),
@@ -3500,8 +3535,9 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>>(
             // Pipe each owned value through the rest
             let mut all_results: Vec<OwnedValue> = Vec::new();
             for v in vs {
-                match eval_owned_pipe::<W>(rest, v, optional) {
+                match eval_owned_pipe::<W>(rest, v, optional).materialize_cursor() {
                     QueryResult::Owned(r) => all_results.push(r),
+                    QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::ManyOwned(rs) => all_results.extend(rs),
                     QueryResult::One(r) => all_results.push(to_owned(&r)),
                     QueryResult::Many(rs) => all_results.extend(rs.iter().map(to_owned)),
@@ -3634,6 +3670,11 @@ pub fn eval<'a, W: Clone + AsRef<[u64]>>(
     expr: &Expr,
     cursor: JsonCursor<'a, W>,
 ) -> QueryResult<'a, W> {
+    // Special case: Identity returns the cursor directly for efficient output
+    // This avoids decomposing arrays/objects into individual cursors
+    if matches!(expr, Expr::Identity) {
+        return QueryResult::OneCursor(cursor);
+    }
     eval_single(expr, cursor.value(), false)
 }
 
@@ -3645,6 +3686,7 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>>(
 ) -> Vec<StandardJson<'a, W>> {
     match eval(expr, cursor) {
         QueryResult::One(v) => vec![v],
+        QueryResult::OneCursor(c) => vec![c.value()],
         QueryResult::Many(vs) => vs,
         QueryResult::None => Vec::new(),
         QueryResult::Error(_) => Vec::new(),
@@ -4185,8 +4227,9 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>>(
     let bound_result = eval_single(expr, value.clone(), optional);
 
     // Get all values from the expression
-    let bound_values: Vec<OwnedValue> = match bound_result {
+    let bound_values: Vec<OwnedValue> = match bound_result.materialize_cursor() {
         QueryResult::One(v) => vec![to_owned(&v)],
+        QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
         QueryResult::Owned(v) => vec![v],
         QueryResult::ManyOwned(vs) => vs,
@@ -4199,8 +4242,9 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>>(
 
     for bound_val in bound_values {
         let substituted_body = substitute_var(body, var, &bound_val);
-        match eval_single(&substituted_body, value.clone(), optional) {
+        match eval_single(&substituted_body, value.clone(), optional).materialize_cursor() {
             QueryResult::One(v) => all_results.push(to_owned(&v)),
+            QueryResult::OneCursor(_) => unreachable!(),
             QueryResult::Many(vs) => all_results.extend(vs.iter().map(to_owned)),
             QueryResult::Owned(v) => all_results.push(v),
             QueryResult::ManyOwned(vs) => all_results.extend(vs),
@@ -4229,8 +4273,9 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'a, W> {
     // Evaluate input to get the stream of values
     let input_result = eval_single(input, value.clone(), optional);
-    let input_values: Vec<OwnedValue> = match input_result {
+    let input_values: Vec<OwnedValue> = match input_result.materialize_cursor() {
         QueryResult::One(v) => vec![to_owned(&v)],
+        QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
         QueryResult::Owned(v) => vec![v],
         QueryResult::ManyOwned(vs) => vs,
@@ -4277,8 +4322,9 @@ fn eval_owned_expr(
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
 
-    match eval_single(expr, cursor.value(), optional) {
+    match eval_single(expr, cursor.value(), optional).materialize_cursor() {
         QueryResult::One(v) => Ok(to_owned(&v)),
+        QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Owned(v) => Ok(v),
         QueryResult::Many(vs) => {
             if vs.len() == 1 {
@@ -4372,8 +4418,9 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'a, W> {
     // Evaluate input to get the stream
     let input_result = eval_single(input, value.clone(), optional);
-    let input_values: Vec<OwnedValue> = match input_result {
+    let input_values: Vec<OwnedValue> = match input_result.materialize_cursor() {
         QueryResult::One(v) => vec![to_owned(&v)],
+        QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
         QueryResult::Owned(v) => vec![v],
         QueryResult::ManyOwned(vs) => vs,
@@ -4480,8 +4527,9 @@ fn eval_first_expr<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     let result = eval_single(expr, value, optional);
-    match result {
+    match result.materialize_cursor() {
         QueryResult::One(v) => QueryResult::One(v),
+        QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(vs) => {
             if let Some(first) = vs.into_iter().next() {
                 QueryResult::One(first)
@@ -4509,8 +4557,9 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     let result = eval_single(expr, value, optional);
-    match result {
+    match result.materialize_cursor() {
         QueryResult::One(v) => QueryResult::One(v),
+        QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(vs) => {
             if let Some(last) = vs.into_iter().last() {
                 QueryResult::One(last)
@@ -4549,8 +4598,9 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>>(
     };
 
     let result = eval_single(expr, value, optional);
-    match result {
+    match result.materialize_cursor() {
         QueryResult::One(v) if n == 0 => QueryResult::One(v),
+        QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::One(_) => QueryResult::None,
         QueryResult::Many(vs) => {
             if let Some(item) = vs.into_iter().nth(n) {
@@ -5944,8 +5994,9 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>>(
     // Evaluate the expression to get the value to destructure
     let bound_result = eval_single(expr, value.clone(), optional);
 
-    let bound_values: Vec<OwnedValue> = match bound_result {
+    let bound_values: Vec<OwnedValue> = match bound_result.materialize_cursor() {
         QueryResult::One(v) => vec![to_owned(&v)],
+        QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
         QueryResult::Owned(v) => vec![v],
         QueryResult::ManyOwned(vs) => vs,
@@ -5968,8 +6019,9 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>>(
             substituted_body = substitute_var(&substituted_body, var_name, var_value);
         }
 
-        match eval_single(&substituted_body, value.clone(), optional) {
+        match eval_single(&substituted_body, value.clone(), optional).materialize_cursor() {
             QueryResult::One(v) => all_results.push(to_owned(&v)),
+            QueryResult::OneCursor(_) => unreachable!(),
             QueryResult::Many(vs) => all_results.extend(vs.iter().map(to_owned)),
             QueryResult::Owned(v) => all_results.push(v),
             QueryResult::ManyOwned(vs) => all_results.extend(vs),
