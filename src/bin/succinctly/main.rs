@@ -181,10 +181,10 @@ struct JqCommand {
     #[arg(short = 'S', long)]
     sort_keys: bool,
 
-    /// Disable jq-compatible number formatting (preserve original like 4e4, 0.10)
-    /// Can also be disabled via SUCCINCTLY_JQ_COMPAT=0 environment variable
+    /// Preserve original input formatting (numbers like 4e4, escape sequences)
+    /// Can also be enabled via SUCCINCTLY_PRESERVE_INPUT=1 environment variable
     #[arg(long)]
-    no_jq_compat: bool,
+    preserve_input: bool,
 
     /// Use tabs for indentation
     #[arg(long)]

@@ -103,9 +103,9 @@ cargo build --release --features cli
 ./target/release/succinctly jq -r '.users[0]' input.json
 ./target/release/succinctly jq '.items[]' input.json
 
-# Preserve original number formatting (disable jq-compat)
-./target/release/succinctly jq --no-jq-compat . input.json
-SUCCINCTLY_JQ_COMPAT=0 ./target/release/succinctly jq . input.json
+# Preserve original input formatting (numbers, escapes)
+./target/release/succinctly jq --preserve-input . input.json
+SUCCINCTLY_PRESERVE_INPUT=1 ./target/release/succinctly jq . input.json
 ```
 
 ## Code Architecture
