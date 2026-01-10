@@ -53,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CLI Tool**
   - `json generate` - Generate synthetic JSON for benchmarking
   - `jq` - jq-compatible command-line JSON processor
+  - `--jq-compat` flag and `SUCCINCTLY_JQ_COMPAT=1` env var for exact jq output compatibility
   - Multiple output formats and memory-mapping support
 
 - **Platform Support**

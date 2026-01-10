@@ -85,6 +85,10 @@ cargo build --release --features cli
 ./target/release/succinctly jq '.users[].name' input.json
 ./target/release/succinctly jq -r '.users[0]' input.json
 ./target/release/succinctly jq '.items[]' input.json
+
+# jq-compatible output (exact match with jq's number/string formatting)
+./target/release/succinctly jq --jq-compat . input.json
+SUCCINCTLY_JQ_COMPAT=1 ./target/release/succinctly jq . input.json
 ```
 
 ## Code Architecture

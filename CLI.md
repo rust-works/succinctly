@@ -216,6 +216,95 @@ Each section tests specific parsing features:
 - **Unicode**: UTF-8 multibyte sequences
 - **Nesting depth**: Balanced parentheses find_close operations
 
+## jq Command
+
+Query JSON files using a jq-compatible interface.
+
+```bash
+succinctly jq [OPTIONS] <FILTER> [FILES...]
+```
+
+### Basic Usage
+
+```bash
+# Identity filter (pretty-print)
+succinctly jq . input.json
+
+# Field access
+succinctly jq '.name' input.json
+
+# Array indexing
+succinctly jq '.[0]' input.json
+succinctly jq '.users[0].name' input.json
+
+# Iterate all elements
+succinctly jq '.[]' input.json
+succinctly jq '.users[]' input.json
+```
+
+### Output Options
+
+- `-c, --compact-output`: Compact output (no pretty printing)
+- `-r, --raw-output`: Output raw strings without quotes
+- `-j, --join-output`: Like -r but no newline after each output
+- `-S, --sort-keys`: Sort keys of each object on output
+- `-C, --color-output`: Colorize output
+- `-M, --monochrome-output`: Disable colorized output
+- `--tab`: Use tabs for indentation
+- `--indent <N>`: Use N spaces for indentation (max 7)
+
+### jq Compatibility Mode
+
+By default, succinctly preserves the original number formatting from the input (e.g., `4e4` stays as `4e4`). To get output that exactly matches jq's formatting:
+
+```bash
+# Using flag
+succinctly jq --jq-compat . input.json
+
+# Using environment variable
+SUCCINCTLY_JQ_COMPAT=1 succinctly jq . input.json
+```
+
+The `--jq-compat` flag normalizes:
+- **Numbers**: `4e4` → `4E+4`, `12e2` → `1.2E+3`, `1e-3` → `0.001`
+- **Trailing zeros**: preserved (`0.10` → `0.10`)
+- **Escape sequences**: `\u0008` → `\b`, `\u000c` → `\f`
+
+### Input Options
+
+- `-n, --null-input`: Don't read any input; use null as the single input value
+- `-R, --raw-input`: Read each line as a string instead of JSON
+- `-s, --slurp`: Read all inputs into an array
+
+### Variables
+
+- `--arg NAME VALUE`: Set $NAME to the string VALUE
+- `--argjson NAME VALUE`: Set $NAME to the JSON VALUE
+- `--slurpfile NAME FILE`: Set $NAME to an array of JSON values from FILE
+- `--rawfile NAME FILE`: Set $NAME to the string contents of FILE
+
+### Examples
+
+```bash
+# Compact output
+succinctly jq -c '.users[]' data.json
+
+# Raw string output
+succinctly jq -r '.name' user.json
+
+# Sort keys for diff-friendly output
+succinctly jq -S . config.json
+
+# Multiple files
+succinctly jq '.version' package1.json package2.json
+
+# Pipe from stdin
+cat data.json | succinctly jq '.items[]'
+
+# jq-compatible output for comparison
+succinctly jq --jq-compat . input.json | diff - <(jq . input.json)
+```
+
 ## Development
 
 Run tests for the CLI:

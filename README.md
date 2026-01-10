@@ -183,6 +183,9 @@ cargo build --release --features cli
 # Query JSON files (jq-compatible)
 ./target/release/succinctly jq '.users[].name' input.json
 ./target/release/succinctly jq -r '.users[0]' input.json
+
+# Exact jq output compatibility (for diff/testing)
+./target/release/succinctly jq --jq-compat . input.json
 ```
 
 ## Architecture
