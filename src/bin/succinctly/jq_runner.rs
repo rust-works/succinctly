@@ -460,6 +460,8 @@ struct OutputConfig {
     indent_string: String,
     unbuffered: bool,
     seq: bool,
+    /// Format numbers like jq (normalize 4e4 → 40000, 0.10 → 0.1)
+    jq_compat: bool,
 }
 
 impl OutputConfig {
@@ -494,6 +496,15 @@ impl OutputConfig {
         // Get color scheme from JQ_COLORS env var (or defaults)
         let color_scheme = ColorScheme::from_env();
 
+        // Determine jq_compat mode with priority:
+        // 1. --jq-compat flag forces on
+        // 2. SUCCINCTLY_JQ_COMPAT=1 env var enables
+        // 3. Default: off (preserve original formatting)
+        let jq_compat = args.jq_compat
+            || std::env::var("SUCCINCTLY_JQ_COMPAT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
         OutputConfig {
             compact: args.compact_output,
             raw_output: args.raw_output || args.join_output || args.raw_output0,
@@ -506,6 +517,7 @@ impl OutputConfig {
             indent_string,
             unbuffered: args.unbuffered,
             seq: args.seq,
+            jq_compat,
         }
     }
 }
@@ -569,15 +581,17 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     let mut last_output: Option<OwnedValue> = None;
     let mut had_output = false;
 
-    // Check if we can use the lazy path (preserves number formatting)
-    // Conditions: not slurp, not raw_input, compact output without sort_keys/colors/ascii
+    // Check if we can use the lazy path (preserves/reformats number formatting)
+    // Conditions: not slurp, not raw_input, and either:
+    // - compact output without sort_keys/colors/ascii (preserves formatting), OR
+    // - jq_compat mode (needs raw bytes for proper number reformatting)
     let can_use_lazy_path = !args.slurp
         && !args.raw_input
         && !args.seq // seq input mode parses differently
-        && output_config.compact
         && !output_config.sort_keys
         && !output_config.color_output
-        && !output_config.ascii_output; // ASCII output requires escaping
+        && !output_config.ascii_output // ASCII output requires escaping
+        && (output_config.compact || output_config.jq_compat);
 
     if can_use_lazy_path && !args.null_input {
         // Lazy path: read files as raw bytes and process directly
@@ -1208,9 +1222,12 @@ fn write_output_jq_value<'a, Out: Write, Wrd: Clone + AsRef<[u64]>>(
         }
     }
 
-    // For simple compact output without sort_keys or colors, use JqValue's direct output
-    // This preserves number formatting like "4e4"
-    if config.compact && !config.sort_keys && !config.color_output {
+    // For jq_compat mode, use the jq-compatible formatter (reformats numbers)
+    if config.jq_compat && !config.sort_keys && !config.color_output {
+        write_jq_value_jq_compat(out, value, config, 0)?;
+    } else if config.compact && !config.sort_keys && !config.color_output {
+        // For simple compact output, use JqValue's direct output
+        // This preserves number formatting like "4e4"
         let mut output = String::new();
         value
             .write_json(&mut output)
@@ -1271,6 +1288,326 @@ fn write_terminator<W: Write>(out: &mut W, config: &OutputConfig) -> Result<()> 
     }
     if config.unbuffered {
         out.flush()?;
+    }
+    Ok(())
+}
+
+/// Format a raw JSON number string according to jq's formatting rules.
+///
+/// jq's number formatting:
+/// - Integers: output as-is
+/// - Floats with trailing zeros: preserve them (0.10 → 0.10)
+/// - Scientific notation: normalize mantissa (12e2 → 1.2E+3), uppercase E, explicit +
+/// - e0 or e-0: eliminate exponent entirely (5.5e0 → 5.5)
+/// - Negative exponents >= -5: convert to decimal (1e-3 → 0.001)
+/// - Negative exponents < -5: keep scientific (1e-10 → 1E-10)
+/// - Negative zero: preserve as -0
+fn format_number_jq_compat(raw: &[u8]) -> String {
+    let s = match core::str::from_utf8(raw) {
+        Ok(s) => s,
+        Err(_) => return String::from_utf8_lossy(raw).into_owned(),
+    };
+
+    // Check if it contains exponent notation
+    let has_exp = s.contains('e') || s.contains('E');
+    let has_dot = s.contains('.');
+
+    if !has_exp && !has_dot {
+        // Plain integer - output as-is
+        return s.to_string();
+    }
+
+    if !has_exp {
+        // Plain decimal without exponent - preserve as-is (keeps trailing zeros)
+        return s.to_string();
+    }
+
+    // Has exponent - need to reformat according to jq rules
+    // Parse the full number to get the actual value
+    let value: f64 = match s.parse() {
+        Ok(v) => v,
+        Err(_) => return s.to_string(),
+    };
+
+    // Parse exponent to check for e0/e-0
+    let exp: i32 = if let Some(pos) = s.find(['e', 'E']) {
+        s[pos + 1..].parse().unwrap_or(0)
+    } else {
+        0
+    };
+
+    // For e0 or e-0, jq eliminates the exponent
+    if exp == 0 {
+        // Check if result is integer
+        if value.fract() == 0.0 && value.abs() < 1e15 {
+            return format!("{}", value as i64);
+        } else {
+            // Format as plain decimal
+            let formatted = format!("{}", value);
+            return formatted;
+        }
+    }
+
+    // For negative exponents >= -5, jq converts to decimal
+    if (-5..0).contains(&exp) {
+        // Convert to decimal: 1e-3 → 0.001
+        // Use smart rounding to avoid floating point noise
+        return format_decimal_jq(value);
+    }
+
+    // For other cases, use normalized scientific notation
+    // jq normalizes mantissa to have one digit before decimal point
+    if value == 0.0 {
+        return "0".to_string();
+    }
+
+    let abs_value = value.abs();
+    let log10 = abs_value.log10().floor() as i32;
+    let normalized_mantissa = abs_value / 10f64.powi(log10);
+    let new_exp = log10;
+
+    // Format mantissa with appropriate precision
+    // Round to avoid floating point noise (e.g., 9.199999999999999 → 9.2)
+    let mantissa_str = format_mantissa_jq(normalized_mantissa);
+
+    let sign = if value < 0.0 { "-" } else { "" };
+    let exp_sign = if new_exp >= 0 { "+" } else { "" };
+    format!("{}{}E{}{}", sign, mantissa_str, exp_sign, new_exp)
+}
+
+/// Format a mantissa value for jq-compatible output.
+/// Handles floating point precision issues by rounding appropriately.
+fn format_mantissa_jq(value: f64) -> String {
+    // Check if it's essentially an integer
+    if (value.round() - value).abs() < 1e-10 {
+        return format!("{}", value.round() as i64);
+    }
+
+    // Try different precisions and pick the shortest that rounds back correctly
+    for precision in 1..=15 {
+        let formatted = format!("{:.prec$}", value, prec = precision);
+        if let Ok(parsed) = formatted.parse::<f64>() {
+            if (parsed - value).abs() < 1e-14 {
+                // Trim trailing zeros
+                let trimmed = formatted.trim_end_matches('0');
+                if trimmed.ends_with('.') {
+                    return format!("{}0", trimmed);
+                } else {
+                    return trimmed.to_string();
+                }
+            }
+        }
+    }
+
+    // Fallback: full precision
+    let formatted = format!("{:.15}", value);
+    let trimmed = formatted.trim_end_matches('0');
+    if trimmed.ends_with('.') {
+        format!("{}0", trimmed)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Format a decimal value for jq-compatible output.
+/// Uses smart rounding to avoid floating point noise.
+fn format_decimal_jq(value: f64) -> String {
+    let sign = if value < 0.0 { "-" } else { "" };
+    let abs_value = value.abs();
+
+    // Check if it's essentially an integer
+    if (abs_value.round() - abs_value).abs() < 1e-10 {
+        return format!("{}", value.round() as i64);
+    }
+
+    // Try different precisions and pick the shortest that rounds back correctly
+    for precision in 1..=15 {
+        let formatted = format!("{:.prec$}", abs_value, prec = precision);
+        if let Ok(parsed) = formatted.parse::<f64>() {
+            if (parsed - abs_value).abs() < 1e-14 {
+                // Trim trailing zeros
+                let trimmed = formatted.trim_end_matches('0');
+                if trimmed.ends_with('.') {
+                    return format!("{}{}0", sign, trimmed);
+                } else {
+                    return format!("{}{}", sign, trimmed);
+                }
+            }
+        }
+    }
+
+    // Fallback: full precision
+    let formatted = format!("{:.15}", abs_value);
+    let trimmed = formatted.trim_end_matches('0');
+    if trimmed.ends_with('.') {
+        format!("{}{}0", sign, trimmed)
+    } else {
+        format!("{}{}", sign, trimmed)
+    }
+}
+
+/// Write a JqValue as JSON with jq-compatible formatting.
+///
+/// This formats the value according to jq's output rules, including
+/// proper number formatting (uppercase E, explicit +, etc.).
+fn write_jq_value_jq_compat<'a, Out: Write, Wrd: Clone + AsRef<[u64]>>(
+    out: &mut Out,
+    value: &JqValue<'a, Wrd>,
+    config: &OutputConfig,
+    level: usize,
+) -> Result<()> {
+    let compact = config.compact;
+    let indent = &config.indent_string;
+    let current_indent = if compact {
+        String::new()
+    } else {
+        indent.repeat(level)
+    };
+    let next_indent = if compact {
+        String::new()
+    } else {
+        indent.repeat(level + 1)
+    };
+    let separator = if compact { "" } else { "\n" };
+    let space_after_colon = if compact { "" } else { " " };
+
+    match value {
+        JqValue::Null => out.write_all(b"null")?,
+        JqValue::Bool(true) => out.write_all(b"true")?,
+        JqValue::Bool(false) => out.write_all(b"false")?,
+        JqValue::Int(n) => write!(out, "{}", n)?,
+        JqValue::Float(f) => {
+            if f.is_nan() || f.is_infinite() {
+                out.write_all(b"null")?;
+            } else {
+                // For computed floats, use jq's formatting
+                write!(out, "{}", f)?;
+            }
+        }
+        JqValue::RawNumber(bytes) => {
+            // Reformat according to jq rules
+            let formatted = format_number_jq_compat(bytes);
+            out.write_all(formatted.as_bytes())?;
+        }
+        JqValue::Cursor(c) => {
+            // For cursor values, get raw bytes and check what type it is
+            if let Some(raw_bytes) = c.raw_bytes() {
+                let first = raw_bytes.first().copied().unwrap_or(0);
+                if first == b'-' || first.is_ascii_digit() {
+                    // Number: reformat according to jq rules
+                    let formatted = format_number_jq_compat(raw_bytes);
+                    out.write_all(formatted.as_bytes())?;
+                } else if first == b'"' {
+                    // String: need to decode and re-encode with jq's escape preferences
+                    // (e.g., \u0008 → \b, \u000c → \f)
+                    let owned = value.materialize();
+                    if let OwnedValue::String(s) = owned {
+                        out.write_all(b"\"")?;
+                        let escaped = if config.ascii_output {
+                            escape_json_string_ascii(&s)
+                        } else {
+                            escape_json_string(&s)
+                        };
+                        out.write_all(escaped.as_bytes())?;
+                        out.write_all(b"\"")?;
+                    } else {
+                        // Unexpected, just write raw
+                        out.write_all(raw_bytes)?;
+                    }
+                } else {
+                    // Other types (null, bool, array, object): write as-is
+                    out.write_all(raw_bytes)?;
+                }
+            } else {
+                // Fallback: materialize and format
+                let owned = value.materialize();
+                let json = format_json_impl(&owned, indent, level, config.ascii_output);
+                out.write_all(json.as_bytes())?;
+            }
+        }
+        JqValue::String(s) => {
+            out.write_all(b"\"")?;
+            let escaped = if config.ascii_output {
+                escape_json_string_ascii(s)
+            } else {
+                escape_json_string(s)
+            };
+            out.write_all(escaped.as_bytes())?;
+            out.write_all(b"\"")?;
+        }
+        JqValue::Array(arr) => {
+            if arr.is_empty() {
+                out.write_all(b"[]")?;
+            } else if compact {
+                out.write_all(b"[")?;
+                for (i, v) in arr.iter().enumerate() {
+                    if i > 0 {
+                        out.write_all(b",")?;
+                    }
+                    write_jq_value_jq_compat(out, v, config, level + 1)?;
+                }
+                out.write_all(b"]")?;
+            } else {
+                out.write_all(b"[")?;
+                out.write_all(separator.as_bytes())?;
+                for (i, v) in arr.iter().enumerate() {
+                    if i > 0 {
+                        out.write_all(b",")?;
+                        out.write_all(separator.as_bytes())?;
+                    }
+                    out.write_all(next_indent.as_bytes())?;
+                    write_jq_value_jq_compat(out, v, config, level + 1)?;
+                }
+                out.write_all(separator.as_bytes())?;
+                out.write_all(current_indent.as_bytes())?;
+                out.write_all(b"]")?;
+            }
+        }
+        JqValue::Object(obj) => {
+            if obj.is_empty() {
+                out.write_all(b"{}")?;
+            } else if compact {
+                out.write_all(b"{")?;
+                for (i, (k, v)) in obj.iter().enumerate() {
+                    if i > 0 {
+                        out.write_all(b",")?;
+                    }
+                    out.write_all(b"\"")?;
+                    let escaped = if config.ascii_output {
+                        escape_json_string_ascii(k)
+                    } else {
+                        escape_json_string(k)
+                    };
+                    out.write_all(escaped.as_bytes())?;
+                    out.write_all(b"\":")?;
+                    write_jq_value_jq_compat(out, v, config, level + 1)?;
+                }
+                out.write_all(b"}")?;
+            } else {
+                out.write_all(b"{")?;
+                out.write_all(separator.as_bytes())?;
+                for (i, (k, v)) in obj.iter().enumerate() {
+                    if i > 0 {
+                        out.write_all(b",")?;
+                        out.write_all(separator.as_bytes())?;
+                    }
+                    out.write_all(next_indent.as_bytes())?;
+                    out.write_all(b"\"")?;
+                    let escaped = if config.ascii_output {
+                        escape_json_string_ascii(k)
+                    } else {
+                        escape_json_string(k)
+                    };
+                    out.write_all(escaped.as_bytes())?;
+                    out.write_all(b"\":")?;
+                    out.write_all(space_after_colon.as_bytes())?;
+                    write_jq_value_jq_compat(out, v, config, level + 1)?;
+                }
+                out.write_all(separator.as_bytes())?;
+                out.write_all(current_indent.as_bytes())?;
+                out.write_all(b"}")?;
+            }
+        }
     }
     Ok(())
 }
@@ -1433,6 +1770,8 @@ fn escape_json_string(s: &str) -> String {
         match c {
             '"' => result.push_str("\\\""),
             '\\' => result.push_str("\\\\"),
+            '\x08' => result.push_str("\\b"), // backspace
+            '\x0C' => result.push_str("\\f"), // form feed
             '\n' => result.push_str("\\n"),
             '\r' => result.push_str("\\r"),
             '\t' => result.push_str("\\t"),
@@ -1452,6 +1791,8 @@ fn escape_json_string_ascii(s: &str) -> String {
         match c {
             '"' => result.push_str("\\\""),
             '\\' => result.push_str("\\\\"),
+            '\x08' => result.push_str("\\b"), // backspace
+            '\x0C' => result.push_str("\\f"), // form feed
             '\n' => result.push_str("\\n"),
             '\r' => result.push_str("\\r"),
             '\t' => result.push_str("\\t"),
