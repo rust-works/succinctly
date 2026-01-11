@@ -553,20 +553,28 @@ pub fn generate_markdown(results: &[BenchmarkResult]) -> String {
             // jq time column: already 8 chars from format_time_fixed
             let jq_col = jq_time;
 
-            // Succinctly time column: bold if faster (10 chars total: ** + 8 + **)
-            // succ_time is already 8 chars, need to pad non-bold case to same visual width
+            // Succinctly time column: bold if faster (12 chars total)
+            // succ_time is 8 chars with leading spaces for alignment
+            // Move leading spaces outside ** so markdown renders correctly
             let succ_col = if speedup >= 1.0 {
-                format!("**{}**", succ_time) // 8 + 4 = 12 chars but renders as 8
+                let trimmed = succ_time.trim_start();
+                let padding = succ_time.len() - trimmed.len();
+                format!("{}**{}**", " ".repeat(padding), trimmed) // spaces before **, not after
             } else {
                 format!("  {}  ", succ_time) // 8 + 4 = 12 chars, same visual width
             };
 
-            // Speedup column: bold if >= 1.0 (12 chars visual width)
-            let speedup_str = format!("{:>8.1}x", speedup);
+            // Speedup column: bold if >= 1.0 (13 chars visual width)
+            // Move leading spaces outside ** so markdown renders correctly
+            let speedup_str = format!("{:.1}x", speedup);
             let speedup_col = if speedup >= 1.0 {
-                format!("**{}**", speedup_str)
+                // Right-align: total 9 chars visual, with ** markers = 13 chars
+                let padded = format!("{:>9}", speedup_str);
+                let trimmed = padded.trim_start();
+                let padding = padded.len() - trimmed.len();
+                format!("{}**{}**", " ".repeat(padding), trimmed)
             } else {
-                format!("  {}  ", speedup_str) // Same visual width
+                format!("{:>13}", speedup_str) // Same visual width without bold
             };
 
             // Memory columns: right-aligned, format_memory_fixed returns 7 chars
@@ -642,5 +650,50 @@ mod tests {
     fn test_format_memory_fixed() {
         assert_eq!(format_memory_fixed(1024 * 1024 * 100), " 100 MB");
         assert_eq!(format_memory_fixed(1024 * 500), " 500 KB");
+    }
+
+    #[test]
+    fn test_bold_formatting_spaces_outside() {
+        // Simulate what the code does for succ_col when speedup >= 1.0
+        let succ_time = format_time_fixed(59.6); // "  59.6ms" (8 chars)
+        let trimmed = succ_time.trim_start();
+        let padding = succ_time.len() - trimmed.len();
+        let succ_col = format!("{}**{}**", " ".repeat(padding), trimmed);
+
+        // Spaces should be BEFORE **, not after
+        assert!(
+            succ_col.starts_with("  **"),
+            "Expected spaces before **, got: {}",
+            succ_col
+        );
+        assert!(
+            !succ_col.contains("** "),
+            "Spaces should not be inside **: {}",
+            succ_col
+        );
+        assert_eq!(succ_col, "  **59.6ms**");
+    }
+
+    #[test]
+    fn test_speedup_bold_formatting() {
+        // Simulate speedup column formatting
+        let speedup = 5.8;
+        let speedup_str = format!("{:.1}x", speedup);
+        let padded = format!("{:>9}", speedup_str);
+        let trimmed = padded.trim_start();
+        let padding = padded.len() - trimmed.len();
+        let speedup_col = format!("{}**{}**", " ".repeat(padding), trimmed);
+
+        // Spaces should be BEFORE **, not after
+        assert!(
+            speedup_col.contains("**5.8x**"),
+            "Expected **5.8x**, got: {}",
+            speedup_col
+        );
+        assert!(
+            !speedup_col.contains("** "),
+            "Spaces should not be inside **: {}",
+            speedup_col
+        );
     }
 }
