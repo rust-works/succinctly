@@ -156,81 +156,81 @@ Memory-efficient: only one row materialized at a time.
 
 | Size      | Time     | Throughput   | Memory   |
 |-----------|----------|--------------|----------|
-| **100mb** |    4.50s |   22.2 MiB/s |  139 MB  |
-| **10mb**  |  481.8ms |   20.8 MiB/s |   19 MB  |
-| **1mb**   |   50.7ms |   19.7 MiB/s |    8 MB  |
+| **100mb** |    5.34s |   18.7 MiB/s |  139 MB  |
+| **10mb**  |  548.0ms |   18.2 MiB/s |   18 MB  |
+| **1mb**   |   61.6ms |   16.2 MiB/s |    5 MB  |
 
 ### Pattern: users
 
 | Size      | Time     | Throughput   | Memory   |
 |-----------|----------|--------------|----------|
-| **100mb** |    5.01s |   20.0 MiB/s |  139 MB  |
-| **10mb**  |  502.4ms |   19.9 MiB/s |   19 MB  |
-| **1mb**   |   55.0ms |   18.2 MiB/s |    8 MB  |
+| **100mb** |    5.65s |   17.7 MiB/s |  139 MB  |
+| **10mb**  |  586.5ms |   17.0 MiB/s |   18 MB  |
+| **1mb**   |   62.2ms |   16.1 MiB/s |    5 MB  |
 
 ### Pattern: numeric
 
 | Size      | Time     | Throughput   | Memory   |
 |-----------|----------|--------------|----------|
-| **100mb** |    4.68s |   21.4 MiB/s |  139 MB  |
-| **10mb**  |  489.7ms |   20.4 MiB/s |   19 MB  |
-| **1mb**   |   51.3ms |   19.5 MiB/s |    8 MB  |
+| **100mb** |    5.54s |   18.0 MiB/s |  139 MB  |
+| **10mb**  |  584.8ms |   17.1 MiB/s |   18 MB  |
+| **1mb**   |   61.7ms |   16.2 MiB/s |    5 MB  |
 
 ### Pattern: strings
 
 | Size      | Time     | Throughput   | Memory   |
 |-----------|----------|--------------|----------|
-| **100mb** |    2.15s |   46.4 MiB/s |  139 MB  |
-| **10mb**  |  217.5ms |   46.0 MiB/s |   19 MB  |
-| **1mb**   |   24.5ms |   40.8 MiB/s |    8 MB  |
+| **100mb** |    2.50s |   39.9 MiB/s |  138 MB  |
+| **10mb**  |  253.7ms |   39.4 MiB/s |   18 MB  |
+| **1mb**   |   29.4ms |   34.0 MiB/s |    5 MB  |
 
 ### Pattern: quoted
 
 | Size      | Time     | Throughput   | Memory   |
 |-----------|----------|--------------|----------|
-| **100mb** |    3.15s |   31.8 MiB/s |  139 MB  |
-| **10mb**  |  325.8ms |   30.7 MiB/s |   19 MB  |
-| **1mb**   |   35.3ms |   28.4 MiB/s |    8 MB  |
+| **100mb** |    3.58s |   27.9 MiB/s |  138 MB  |
+| **10mb**  |  369.2ms |   27.1 MiB/s |   18 MB  |
+| **1mb**   |   43.2ms |   23.1 MiB/s |    6 MB  |
 
 ### Pattern: multiline
 
 | Size      | Time     | Throughput   | Memory   |
 |-----------|----------|--------------|----------|
-| **100mb** |    2.83s |   35.4 MiB/s |  139 MB  |
-| **10mb**  |  305.9ms |   32.7 MiB/s |   19 MB  |
-| **1mb**   |   32.4ms |   30.8 MiB/s |    8 MB  |
+| **100mb** |    3.20s |   31.3 MiB/s |  138 MB  |
+| **10mb**  |  336.3ms |   29.7 MiB/s |   18 MB  |
+| **1mb**   |   39.6ms |   25.2 MiB/s |    5 MB  |
 
 ### Pattern: wide
 
 | Size      | Time     | Throughput   | Memory   |
 |-----------|----------|--------------|----------|
-| **100mb** |    9.24s |   10.8 MiB/s |  139 MB  |
-| **10mb**  |  899.2ms |   11.1 MiB/s |   19 MB  |
-| **1mb**   |   99.8ms |   10.0 MiB/s |    8 MB  |
+| **100mb** |   10.82s |    9.2 MiB/s |  139 MB  |
+| **10mb**  |    1.09s |    9.1 MiB/s |   17 MB  |
+| **1mb**   |  108.5ms |    9.2 MiB/s |    5 MB  |
 
 ### Pattern: long
 
 | Size      | Time     | Throughput   | Memory   |
 |-----------|----------|--------------|----------|
-| **100mb** |    7.83s |   12.8 MiB/s |  139 MB  |
-| **10mb**  |  754.3ms |   13.3 MiB/s |   19 MB  |
-| **1mb**   |   83.6ms |   12.0 MiB/s |    8 MB  |
+| **100mb** |    9.00s |   11.1 MiB/s |  139 MB  |
+| **10mb**  |  917.8ms |   10.9 MiB/s |   18 MB  |
+| **1mb**   |  100.6ms |    9.9 MiB/s |    5 MB  |
 
 ### Pattern: mixed
 
 | Size      | Time     | Throughput   | Memory   |
 |-----------|----------|--------------|----------|
-| **100mb** |    4.55s |   22.0 MiB/s |  139 MB  |
-| **10mb**  |  466.7ms |   21.4 MiB/s |   19 MB  |
-| **1mb**   |   50.1ms |   20.0 MiB/s |    8 MB  |
+| **100mb** |    5.56s |   18.0 MiB/s |  138 MB  |
+| **10mb**  |  548.7ms |   18.2 MiB/s |   18 MB  |
+| **1mb**   |   59.3ms |   16.9 MiB/s |    5 MB  |
 
 ### Pattern: pathological
 
 | Size      | Time     | Throughput   | Memory   |
 |-----------|----------|--------------|----------|
-| **100mb** |    3.51s |   28.5 MiB/s |  139 MB  |
-| **10mb**  |  360.2ms |   27.8 MiB/s |   19 MB  |
-| **1mb**   |   39.0ms |   25.7 MiB/s |    8 MB  |
+| **100mb** |    3.86s |   25.9 MiB/s |  138 MB  |
+| **10mb**  |  387.5ms |   25.8 MiB/s |   18 MB  |
+| **1mb**   |   43.0ms |   23.2 MiB/s |    6 MB  |
 
 ---
 
@@ -428,16 +428,16 @@ Worst-case CSV patterns (heavy quoting, escapes, edge cases).
 
 | Pattern          | Throughput   | Notes                                     |
 |------------------|--------------|-------------------------------------------|
-| **strings**      |   46.4 MiB/s | Fastest - few quotes, simple fields       |
-| **multiline**    |   35.4 MiB/s | Fast despite newlines in fields           |
-| **quoted**       |   31.8 MiB/s | Quote handling overhead                   |
-| **pathological** |   28.5 MiB/s | Complex edge cases                        |
-| **tabular**      |   22.2 MiB/s | Uniform column widths                     |
-| **mixed**        |   22.0 MiB/s | Varied content types                      |
-| **numeric**      |   21.4 MiB/s | Number-heavy content                      |
-| **users**        |   20.0 MiB/s | Realistic user records                    |
-| **long**         |   12.8 MiB/s | Many rows increases per-row overhead      |
-| **wide**         |   10.8 MiB/s | Many columns increases overhead           |
+| **strings**      |   39.9 MiB/s | Fastest - few quotes, simple fields       |
+| **multiline**    |   31.3 MiB/s | Fast despite newlines in fields           |
+| **quoted**       |   27.9 MiB/s | Quote handling overhead                   |
+| **pathological** |   25.9 MiB/s | Complex edge cases                        |
+| **tabular**      |   18.7 MiB/s | Uniform column widths                     |
+| **mixed**        |   18.0 MiB/s | Varied content types                      |
+| **numeric**      |   18.0 MiB/s | Number-heavy content                      |
+| **users**        |   17.7 MiB/s | Realistic user records                    |
+| **long**         |   11.1 MiB/s | Many rows increases per-row overhead      |
+| **wide**         |    9.2 MiB/s | Many columns increases overhead           |
 
 ## Pattern Descriptions
 
