@@ -17,6 +17,8 @@ struct Cli {
 enum Command {
     /// JSON operations (generate, parse, benchmark)
     Json(JsonCommand),
+    /// DSV (CSV/TSV) operations (generate, parse)
+    Dsv(DsvCommand),
     /// Command-line JSON processor (jq-compatible)
     Jq(JqCommand),
     /// Developer tools (benchmarking, profiling)
@@ -35,6 +37,20 @@ enum JsonSubcommand {
     Generate(GenerateJson),
     /// Generate a suite of JSON files with various sizes and patterns
     GenerateSuite(GenerateSuite),
+}
+
+#[derive(Debug, Parser)]
+struct DsvCommand {
+    #[command(subcommand)]
+    command: DsvSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DsvSubcommand {
+    /// Generate synthetic DSV (CSV/TSV) files for benchmarking and testing
+    Generate(GenerateDsv),
+    /// Generate a suite of DSV files with various sizes and patterns
+    GenerateSuite(GenerateDsvSuite),
 }
 
 #[derive(Debug, Parser)]
@@ -59,6 +75,8 @@ struct BenchCommand {
 enum BenchSubcommand {
     /// Benchmark succinctly jq vs system jq
     Jq(BenchJqArgs),
+    /// Benchmark succinctly jq with DSV input
+    Dsv(BenchDsvArgs),
 }
 
 /// Arguments for jq benchmark
@@ -95,6 +113,46 @@ struct BenchJqArgs {
     /// Path to succinctly binary
     #[arg(long, default_value = "./target/release/succinctly")]
     binary: PathBuf,
+}
+
+/// Arguments for DSV benchmark
+#[derive(Debug, Parser)]
+struct BenchDsvArgs {
+    /// Directory containing generated DSV files
+    #[arg(short, long, default_value = "data/bench/generated/dsv")]
+    data_dir: PathBuf,
+
+    /// Output JSONL file for raw results
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Output markdown file for formatted tables
+    #[arg(short, long)]
+    markdown: Option<PathBuf>,
+
+    /// Patterns to benchmark (comma-separated, or "all")
+    #[arg(short, long, default_value = "all")]
+    patterns: String,
+
+    /// Sizes to benchmark (comma-separated, or "all")
+    #[arg(short, long, default_value = "all")]
+    sizes: String,
+
+    /// Number of warmup runs before benchmarking
+    #[arg(long, default_value = "1")]
+    warmup: usize,
+
+    /// Number of benchmark runs (median is taken)
+    #[arg(long, default_value = "3")]
+    runs: usize,
+
+    /// Path to succinctly binary
+    #[arg(long, default_value = "./target/release/succinctly")]
+    binary: PathBuf,
+
+    /// Delimiter character for DSV files (default: comma)
+    #[arg(long, default_value = ",")]
+    delimiter: char,
 }
 
 /// Generate synthetic JSON files for benchmarking and testing
@@ -183,6 +241,109 @@ struct GenerateSuite {
     max_size: usize,
 }
 
+/// Generate synthetic DSV (CSV/TSV) files for benchmarking and testing
+#[derive(Debug, Parser)]
+struct GenerateDsv {
+    /// Size of DSV to generate (supports b, kb, mb, gb - case insensitive)
+    /// Examples: 1024, 1kb, 512MB, 2Gb
+    #[arg(value_parser = parse_size)]
+    size: usize,
+
+    /// Output file path (defaults to stdout)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// DSV pattern to generate
+    #[arg(short, long, default_value = "tabular")]
+    pattern: DsvPatternArg,
+
+    /// Random seed for reproducible generation
+    #[arg(short, long)]
+    seed: Option<u64>,
+
+    /// Field delimiter character
+    #[arg(short, long, default_value = ",")]
+    delimiter: char,
+
+    /// Include header row
+    #[arg(long, default_value = "true")]
+    header: bool,
+
+    /// Verify generated DSV can be parsed
+    #[arg(long)]
+    verify: bool,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum DsvPatternArg {
+    /// Standard tabular data with mixed types (default)
+    Tabular,
+    /// User/person records (realistic structure)
+    Users,
+    /// Numeric-heavy data (financial, scientific)
+    Numeric,
+    /// String-heavy data with various lengths
+    Strings,
+    /// Data with quoted fields containing delimiters
+    Quoted,
+    /// Data with quoted fields containing newlines
+    Multiline,
+    /// Wide tables (many columns)
+    Wide,
+    /// Narrow but long tables (few columns, many rows)
+    Long,
+    /// Mixed data types per row
+    Mixed,
+    /// Worst case: every field is quoted with embedded delimiters
+    Pathological,
+}
+
+impl From<DsvPatternArg> for dsv_generators::DsvPattern {
+    fn from(arg: DsvPatternArg) -> Self {
+        match arg {
+            DsvPatternArg::Tabular => dsv_generators::DsvPattern::Tabular,
+            DsvPatternArg::Users => dsv_generators::DsvPattern::Users,
+            DsvPatternArg::Numeric => dsv_generators::DsvPattern::Numeric,
+            DsvPatternArg::Strings => dsv_generators::DsvPattern::Strings,
+            DsvPatternArg::Quoted => dsv_generators::DsvPattern::Quoted,
+            DsvPatternArg::Multiline => dsv_generators::DsvPattern::Multiline,
+            DsvPatternArg::Wide => dsv_generators::DsvPattern::Wide,
+            DsvPatternArg::Long => dsv_generators::DsvPattern::Long,
+            DsvPatternArg::Mixed => dsv_generators::DsvPattern::Mixed,
+            DsvPatternArg::Pathological => dsv_generators::DsvPattern::Pathological,
+        }
+    }
+}
+
+/// Generate a suite of DSV files with various sizes and patterns for benchmarking
+#[derive(Debug, Parser)]
+struct GenerateDsvSuite {
+    /// Output directory (defaults to data/bench/generated/dsv)
+    #[arg(short, long, default_value = "data/bench/generated/dsv")]
+    output_dir: PathBuf,
+
+    /// Base seed for deterministic generation (each file uses seed + file_index)
+    #[arg(short, long, default_value = "42")]
+    seed: u64,
+
+    /// Field delimiter character
+    #[arg(short, long, default_value = ",")]
+    delimiter: char,
+
+    /// Clean output directory before generating
+    #[arg(long)]
+    clean: bool,
+
+    /// Verify all generated DSV files can be parsed
+    #[arg(long)]
+    verify: bool,
+
+    /// Maximum file size to generate (files larger than this are skipped)
+    /// Supports units: b, kb, mb, gb (e.g., "100mb", "1gb")
+    #[arg(short, long, value_parser = parse_size, default_value = "1gb")]
+    max_size: usize,
+}
+
 /// Command-line JSON processor (jq-compatible CLI)
 #[derive(Debug, Parser)]
 #[command(name = "jq")]
@@ -205,6 +366,14 @@ struct JqCommand {
     /// Read each line as a string instead of JSON
     #[arg(short = 'R', long)]
     raw_input: bool,
+
+    /// [Extension] Read input as DSV (delimiter-separated values).
+    /// Each row becomes a JSON array of strings.
+    /// Properly handles quoted fields with embedded delimiters and newlines.
+    /// Use comma for CSV, tab for TSV, or any single ASCII character.
+    /// Special CSV characters (quote " and newline) cannot be used as delimiters.
+    #[arg(long, value_name = "DELIMITER")]
+    input_dsv: Option<char>,
 
     /// Read all inputs into an array and use it as the single input value
     #[arg(short = 's', long)]
@@ -407,11 +576,43 @@ fn main() -> Result<()> {
 
                 Ok(())
             }
-            JsonSubcommand::GenerateSuite(args) => generate_suite(args),
+            JsonSubcommand::GenerateSuite(args) => generate_json_suite(args),
+        },
+        Command::Dsv(dsv_cmd) => match dsv_cmd.command {
+            DsvSubcommand::Generate(args) => {
+                let dsv = dsv_generators::generate_dsv(
+                    args.size,
+                    args.pattern.into(),
+                    args.seed,
+                    args.delimiter,
+                    args.header,
+                );
+
+                if args.verify {
+                    let config =
+                        succinctly::DsvConfig::default().with_delimiter(args.delimiter as u8);
+                    let parsed = succinctly::Dsv::parse_with_config(dsv.as_bytes(), &config);
+                    eprintln!("✓ DSV validated successfully ({} rows)", parsed.row_count());
+                }
+
+                match args.output {
+                    Some(path) => {
+                        std::fs::write(&path, &dsv)?;
+                        eprintln!("✓ Wrote {} bytes to {}", dsv.len(), path.display());
+                    }
+                    None => {
+                        print!("{}", dsv);
+                    }
+                }
+
+                Ok(())
+            }
+            DsvSubcommand::GenerateSuite(args) => generate_dsv_suite(args),
         },
         Command::Dev(dev_cmd) => match dev_cmd.command {
             DevSubcommand::Bench(bench_cmd) => match bench_cmd.command {
                 BenchSubcommand::Jq(args) => run_jq_benchmark(args),
+                BenchSubcommand::Dsv(args) => run_dsv_benchmark(args),
             },
         },
     }
@@ -482,6 +683,72 @@ fn run_jq_benchmark(args: BenchJqArgs) -> Result<()> {
     Ok(())
 }
 
+/// Run DSV benchmark
+fn run_dsv_benchmark(args: BenchDsvArgs) -> Result<()> {
+    let all_patterns = vec![
+        "tabular",
+        "users",
+        "numeric",
+        "strings",
+        "quoted",
+        "multiline",
+        "wide",
+        "long",
+        "mixed",
+        "pathological",
+    ];
+    let all_sizes = vec!["1kb", "10kb", "100kb", "1mb", "10mb", "100mb"];
+
+    let patterns = if args.patterns == "all" {
+        all_patterns.into_iter().map(String::from).collect()
+    } else {
+        args.patterns
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    };
+
+    let sizes = if args.sizes == "all" {
+        all_sizes.into_iter().map(String::from).collect()
+    } else {
+        args.sizes
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    };
+
+    let config = dsv_bench::BenchConfig {
+        data_dir: args.data_dir,
+        patterns,
+        sizes,
+        succinctly_binary: args.binary,
+        warmup_runs: args.warmup,
+        benchmark_runs: args.runs,
+        delimiter: args.delimiter,
+    };
+
+    // Use default output paths if not specified
+    let results_dir = PathBuf::from("data/bench/results");
+    let default_jsonl = results_dir.join("dsv-bench.jsonl");
+    let default_md = results_dir.join("dsv-bench.md");
+
+    let output_jsonl = args.output.unwrap_or(default_jsonl);
+    let output_md = args.markdown.unwrap_or(default_md);
+
+    // Ensure results directory exists
+    if let Some(parent) = output_jsonl.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let _results = dsv_bench::run_benchmark(
+        &config,
+        Some(output_jsonl.as_path()),
+        Some(output_md.as_path()),
+    )?;
+
+    Ok(())
+}
+
 /// Suite configuration: patterns and sizes to generate
 const SUITE_PATTERNS: &[(&str, generators::Pattern)] = &[
     ("comprehensive", generators::Pattern::Comprehensive),
@@ -507,7 +774,7 @@ const SUITE_SIZES: &[(&str, usize)] = &[
     ("1gb", 1024 * 1024 * 1024),
 ];
 
-fn generate_suite(args: GenerateSuite) -> Result<()> {
+fn generate_json_suite(args: GenerateSuite) -> Result<()> {
     let output_dir = &args.output_dir;
 
     // Clean directory if requested
@@ -589,6 +856,114 @@ fn generate_suite(args: GenerateSuite) -> Result<()> {
     Ok(())
 }
 
+/// DSV Suite configuration: patterns and sizes to generate
+const DSV_SUITE_PATTERNS: &[(&str, dsv_generators::DsvPattern)] = &[
+    ("tabular", dsv_generators::DsvPattern::Tabular),
+    ("users", dsv_generators::DsvPattern::Users),
+    ("numeric", dsv_generators::DsvPattern::Numeric),
+    ("strings", dsv_generators::DsvPattern::Strings),
+    ("quoted", dsv_generators::DsvPattern::Quoted),
+    ("multiline", dsv_generators::DsvPattern::Multiline),
+    ("wide", dsv_generators::DsvPattern::Wide),
+    ("long", dsv_generators::DsvPattern::Long),
+    ("mixed", dsv_generators::DsvPattern::Mixed),
+    ("pathological", dsv_generators::DsvPattern::Pathological),
+];
+
+fn generate_dsv_suite(args: GenerateDsvSuite) -> Result<()> {
+    let output_dir = &args.output_dir;
+
+    // Clean directory if requested
+    if args.clean && output_dir.exists() {
+        std::fs::remove_dir_all(output_dir)
+            .with_context(|| format!("Failed to clean directory: {}", output_dir.display()))?;
+        eprintln!("Cleaned {}", output_dir.display());
+    }
+
+    // Create output directory
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("Failed to create directory: {}", output_dir.display()))?;
+
+    let mut file_index: u64 = 0;
+    let mut total_bytes: usize = 0;
+    let mut file_count: usize = 0;
+    let mut skipped_count: usize = 0;
+
+    let extension = if args.delimiter == '\t' { "tsv" } else { "csv" };
+
+    eprintln!(
+        "Generating DSV suite in {} (max size: {}, delimiter: {:?})...",
+        output_dir.display(),
+        format_bytes(args.max_size),
+        args.delimiter
+    );
+
+    for (pattern_name, pattern) in DSV_SUITE_PATTERNS {
+        // Create pattern subdirectory
+        let pattern_dir = output_dir.join(pattern_name);
+        std::fs::create_dir_all(&pattern_dir)?;
+
+        for (size_name, size) in SUITE_SIZES {
+            // Skip files that exceed max_size
+            if *size > args.max_size {
+                skipped_count += 1;
+                continue;
+            }
+
+            let filename = format!("{}.{}", size_name, extension);
+            let path = pattern_dir.join(&filename);
+
+            // Deterministic seed: base_seed + file_index
+            let seed = args.seed.wrapping_add(file_index);
+            file_index += 1;
+
+            let dsv = dsv_generators::generate_dsv(
+                *size,
+                *pattern,
+                Some(seed),
+                args.delimiter,
+                true, // include_header
+            );
+
+            if args.verify {
+                let config = succinctly::DsvConfig::default().with_delimiter(args.delimiter as u8);
+                let parsed = succinctly::Dsv::parse_with_config(dsv.as_bytes(), &config);
+                if parsed.row_count() == 0 && !dsv.is_empty() {
+                    anyhow::bail!("Generated invalid DSV for {}", path.display());
+                }
+            }
+
+            std::fs::write(&path, &dsv)?;
+            total_bytes += dsv.len();
+            file_count += 1;
+
+            eprintln!(
+                "  {} ({}, seed={})",
+                path.display(),
+                format_bytes(dsv.len()),
+                seed
+            );
+        }
+    }
+
+    eprintln!();
+    eprintln!(
+        "Generated {} files ({} total)",
+        file_count,
+        format_bytes(total_bytes)
+    );
+
+    if skipped_count > 0 {
+        eprintln!("Skipped {} files exceeding max size", skipped_count);
+    }
+
+    if args.verify {
+        eprintln!("All files validated successfully");
+    }
+
+    Ok(())
+}
+
 fn format_bytes(bytes: usize) -> String {
     if bytes >= 1024 * 1024 * 1024 {
         format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
@@ -601,6 +976,8 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
+mod dsv_bench;
+mod dsv_generators;
 mod generators;
 mod jq_bench;
 mod jq_runner;

@@ -11,6 +11,7 @@
 //! - [`trees`] - Succinct tree representations (balanced parentheses)
 //! - [`json`] - JSON semi-indexing with SIMD acceleration
 //! - [`jq`] - jq-style query language for JSON navigation
+//! - [`dsv`] - High-performance CSV/TSV parsing with succinct indexing
 //!
 //! ## Quick Start
 //!
@@ -78,6 +79,9 @@ pub mod json;
 /// jq-style query language for JSON navigation.
 pub mod jq;
 
+/// High-performance DSV (CSV/TSV) parsing with succinct indexing.
+pub mod dsv;
+
 // =============================================================================
 // Public re-exports (convenience + backward compatibility)
 // =============================================================================
@@ -87,6 +91,9 @@ pub use bits::BitVec;
 pub use bits::{popcount_word, popcount_words, RankDirectory, SelectIndex};
 pub use trees::BalancedParens;
 pub use util::select_in_word;
+
+// DSV types
+pub use dsv::{Dsv, DsvConfig, DsvCursor, DsvIndex};
 
 // =============================================================================
 // Backward compatibility aliases
