@@ -830,11 +830,12 @@ These are critical for quote-aware parsing performance.
 
 | Optimization | hw-dsv | succinctly | Status |
 |--------------|--------|------------|--------|
-| `toggle64` with PDEP | Yes | No | **Not ported** |
-| `testWord8s` with PEXT | Yes | No | **Not ported** |
-| `prefix_xor` fallback | No | Yes | Implemented |
+| `toggle64` with PDEP | Yes | Yes | **Ported** |
+| `testWord8s` with PEXT | Yes | No | Not needed (AVX2 movemask suffices) |
+| `prefix_xor` fallback | No | Yes | Implemented (ARM fallback) |
 | AVX2 character matching | Yes | Yes | Ported |
 | NEON character matching | No | Yes | Added |
+| Runtime BMI2 detection | Yes | Yes | Ported |
 
 ### BMI2 Instructions Used by hw-dsv
 
@@ -982,19 +983,30 @@ pub fn build_index(text: &[u8], config: &DsvConfig) -> DsvIndex {
 |---------------------|---------------------------|--------------------------------|
 | Streaming           | Chunked lazy processing   | Full file in memory (simpler)  |
 | Index storage       | List of Vec<u64>          | Single BitVec with rank/select |
-| SIMD                | AVX2 + BMI2               | AVX2/SSE2/NEON + prefix_xor    |
-| BMI2 PDEP/PEXT      | Yes (critical)            | **Not yet implemented**        |
+| SIMD                | AVX2 + BMI2               | AVX2 + BMI2 (x86) / NEON (ARM) |
+| BMI2 PDEP           | Yes (toggle64)            | Yes (toggle64_bmi2)            |
 | Quote handling      | Same algorithm            | Same algorithm                 |
 | Memory model        | Haskell lazy              | Rust owned/borrowed            |
 
 ## Performance Expectations
 
 Based on hw-dsv benchmarks:
-- **With BMI2**: ~165 MiB/s expected (not yet achieved)
-- **Current (prefix_xor)**: ~10-28 MiB/s
+- **With BMI2** (x86_64): ~165 MiB/s expected
+- **With AVX2 only** (x86_64): ~20-46 MiB/s (prefix_xor fallback)
+- **With NEON** (ARM): ~10-28 MiB/s (prefix_xor, no BMI2 equivalent)
 - **Memory overhead**: ~3-4% of input size
 
 Succinctly's existing BitVec infrastructure should provide comparable performance to hw-dsv's rank/select operations.
+
+## Implementation Files
+
+| File | Purpose |
+|------|---------|
+| `src/dsv/simd/bmi2.rs` | BMI2 + AVX2 implementation with toggle64_bmi2 |
+| `src/dsv/simd/avx2.rs` | AVX2 implementation with prefix_xor fallback |
+| `src/dsv/simd/sse2.rs` | SSE2 implementation for older x86_64 |
+| `src/dsv/simd/neon.rs` | ARM NEON implementation with prefix_xor |
+| `src/dsv/simd/mod.rs` | Runtime dispatch (BMI2 > AVX2 > SSE2) |
 
 ## Open Questions
 
