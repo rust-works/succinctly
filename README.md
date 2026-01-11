@@ -226,7 +226,7 @@ See [docs/rust-json-comparison.md](docs/rust-json-comparison.md), [docs/jq-compa
 
 ## CLI Tool
 
-The library includes a CLI tool for JSON operations:
+The library includes a CLI tool for JSON and DSV operations:
 
 ```bash
 # Build the CLI
@@ -241,6 +241,10 @@ cargo build --release --features cli
 
 # Preserve original input formatting (numbers, escapes)
 ./target/release/succinctly jq --preserve-input . input.json
+
+# Query CSV/TSV files (converted to JSON on-the-fly)
+./target/release/succinctly jq --input-dsv ',' '.[] | .name' users.csv
+./target/release/succinctly jq --input-dsv '\t' '.[0]' data.tsv
 ```
 
 ## Architecture
@@ -276,6 +280,7 @@ The library uses runtime CPU feature detection to select the best implementation
 - [CLAUDE.md](CLAUDE.md) - Detailed architecture guide
 - [docs/rust-json-comparison.md](docs/rust-json-comparison.md) - Comparison with Rust JSON parsers
 - [docs/jq-comparison.md](docs/jq-comparison.md) - Comparison with system jq command
+- [docs/dsv-performance.md](docs/dsv-performance.md) - DSV (CSV/TSV) input performance benchmarks
 - [docs/optimization-summary.md](docs/optimization-summary.md) - Performance optimization history
 
 ## Contributing
