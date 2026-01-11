@@ -166,7 +166,7 @@ Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
 | **literals**      |  510.9ms | **397.1ms**   | **1.3x** |  103 MB |    19 MB |      0.19x |
 
 **Key findings**:
-- **1.2-5.9x faster** across all patterns
+- **1.2-6.3x faster** across all patterns
 - **5-25x less memory** on most patterns due to streaming lazy evaluation
 - Best speedup on nested/string-heavy data
 
