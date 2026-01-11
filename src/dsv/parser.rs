@@ -5,9 +5,8 @@
 
 use super::config::DsvConfig;
 use super::index::DsvIndex;
-use crate::bits::BitVec;
+use super::index_lightweight::DsvIndexLightweight;
 use crate::json::BitWriter;
-use crate::Config;
 
 /// Build a DsvIndex from input text.
 ///
@@ -19,7 +18,7 @@ use crate::Config;
 /// inside quotes are not treated as field/row boundaries.
 pub fn build_index(text: &[u8], config: &DsvConfig) -> DsvIndex {
     if text.is_empty() {
-        return DsvIndex::new(BitVec::new(), BitVec::new(), 0);
+        return DsvIndex::new_lightweight(DsvIndexLightweight::new(vec![], vec![], 0));
     }
 
     let num_words = text.len().div_ceil(64);
@@ -63,15 +62,8 @@ pub fn build_index(text: &[u8], config: &DsvConfig) -> DsvIndex {
     let markers_words = markers_writer.finish();
     let newlines_words = newlines_writer.finish();
 
-    let bit_config = Config {
-        select_sample_rate: config.select_sample_rate,
-    };
-
-    DsvIndex::new(
-        BitVec::with_config(markers_words, text.len(), bit_config.clone()),
-        BitVec::with_config(newlines_words, text.len(), bit_config),
-        text.len(),
-    )
+    let lightweight = DsvIndexLightweight::new(markers_words, newlines_words, text.len());
+    DsvIndex::new_lightweight(lightweight)
 }
 
 /// Build a DsvIndex using word-at-a-time processing (faster for large files).
@@ -81,7 +73,7 @@ pub fn build_index(text: &[u8], config: &DsvConfig) -> DsvIndex {
 #[allow(dead_code)]
 pub fn build_index_fast(text: &[u8], config: &DsvConfig) -> DsvIndex {
     if text.is_empty() {
-        return DsvIndex::new(BitVec::new(), BitVec::new(), 0);
+        return DsvIndex::new_lightweight(DsvIndexLightweight::new(vec![], vec![], 0));
     }
 
     let num_words = text.len().div_ceil(64);
@@ -123,15 +115,8 @@ pub fn build_index_fast(text: &[u8], config: &DsvConfig) -> DsvIndex {
     let markers_words = markers_writer.finish();
     let newlines_words = newlines_writer.finish();
 
-    let bit_config = Config {
-        select_sample_rate: config.select_sample_rate,
-    };
-
-    DsvIndex::new(
-        BitVec::with_config(markers_words, text.len(), bit_config.clone()),
-        BitVec::with_config(newlines_words, text.len(), bit_config),
-        text.len(),
-    )
+    let lightweight = DsvIndexLightweight::new(markers_words, newlines_words, text.len());
+    DsvIndex::new_lightweight(lightweight)
 }
 
 #[cfg(test)]

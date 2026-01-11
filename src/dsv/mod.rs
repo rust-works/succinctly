@@ -48,6 +48,7 @@
 mod config;
 mod cursor;
 mod index;
+mod index_lightweight;
 mod parser;
 pub mod simd;
 

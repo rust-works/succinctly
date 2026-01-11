@@ -1,7 +1,6 @@
 //! Cursor and navigation for DSV data.
 
 use super::index::DsvIndex;
-use crate::RankSelect;
 
 /// Lightweight cursor for navigating DSV data.
 ///
@@ -46,10 +45,10 @@ impl<'a> DsvCursor<'a> {
         }
 
         // Find rank of current position in markers
-        let current_rank = self.index.markers.rank1(self.position);
+        let current_rank = self.index.markers_rank1(self.position);
 
         // Find position of next marker
-        if let Some(next_pos) = self.index.markers.select1(current_rank) {
+        if let Some(next_pos) = self.index.markers_select1(current_rank) {
             if next_pos < self.text.len() {
                 self.position = next_pos + 1; // Move past the delimiter
                 return !self.at_end();
@@ -70,10 +69,10 @@ impl<'a> DsvCursor<'a> {
         }
 
         // Find rank of current position in newlines
-        let current_rank = self.index.newlines.rank1(self.position);
+        let current_rank = self.index.newlines_rank1(self.position);
 
         // Find position of next newline
-        if let Some(next_pos) = self.index.newlines.select1(current_rank) {
+        if let Some(next_pos) = self.index.newlines_select1(current_rank) {
             if next_pos < self.text.len() {
                 self.position = next_pos + 1; // Move past the newline
                 return !self.at_end();
@@ -95,7 +94,7 @@ impl<'a> DsvCursor<'a> {
         }
 
         // Row n starts after newline (n-1), which is the (n-1)th newline (0-indexed)
-        if let Some(newline_pos) = self.index.newlines.select1(n - 1) {
+        if let Some(newline_pos) = self.index.newlines_select1(n - 1) {
             let new_pos = newline_pos + 1;
             if new_pos <= self.text.len() {
                 self.position = new_pos;
@@ -115,11 +114,10 @@ impl<'a> DsvCursor<'a> {
         let start = self.position;
 
         // Find next marker (delimiter or newline)
-        let current_rank = self.index.markers.rank1(start);
+        let current_rank = self.index.markers_rank1(start);
         let end = self
             .index
-            .markers
-            .select1(current_rank)
+            .markers_select1(current_rank)
             .unwrap_or(self.text.len());
 
         &self.text[start..end]
@@ -138,8 +136,8 @@ impl<'a> DsvCursor<'a> {
         }
         // Check if the previous position was a newline
         let prev_pos = self.position - 1;
-        let rank_before = self.index.newlines.rank1(prev_pos);
-        let rank_at = self.index.newlines.rank1(self.position);
+        let rank_before = self.index.newlines_rank1(prev_pos);
+        let rank_at = self.index.newlines_rank1(self.position);
         rank_at > rank_before
     }
 }
@@ -269,8 +267,8 @@ impl<'a> Iterator for DsvFields<'a> {
                 self.finished = true;
             } else {
                 // Check if the next character is a newline
-                let next_rank = self.cursor.index.newlines.rank1(field_end + 1);
-                let curr_rank = self.cursor.index.newlines.rank1(field_end);
+                let next_rank = self.cursor.index.newlines_rank1(field_end + 1);
+                let curr_rank = self.cursor.index.newlines_rank1(field_end);
                 if next_rank > curr_rank {
                     self.finished = true;
                 }
@@ -299,8 +297,8 @@ impl<'a> Iterator for DsvFields<'a> {
             self.finished = true;
         } else {
             // Check if the next character is a newline
-            let next_rank = self.cursor.index.newlines.rank1(field_end + 1);
-            let curr_rank = self.cursor.index.newlines.rank1(field_end);
+            let next_rank = self.cursor.index.newlines_rank1(field_end + 1);
+            let curr_rank = self.cursor.index.newlines_rank1(field_end);
             if next_rank > curr_rank {
                 self.finished = true;
             }
