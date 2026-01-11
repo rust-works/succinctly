@@ -116,7 +116,8 @@ cargo test
 |---------------------------------------------------------------|--------------------------------------|
 | [RELEASE.md](RELEASE.md)                                      | Release process and checklist        |
 | [docs/optimization-summary.md](docs/optimization-summary.md)  | Complete optimization record         |
-| [docs/jq-comparison.md](docs/jq-comparison.md)                | Benchmark results                    |
+| [docs/jq-comparison.md](docs/jq-comparison.md)                | JSON jq benchmark results            |
+| [docs/dsv-performance.md](docs/dsv-performance.md)            | DSV input performance benchmarks     |
 
 ## Performance Summary
 
