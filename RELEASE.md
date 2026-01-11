@@ -7,7 +7,7 @@ This document describes the release process for succinctly.
 Releases are automated via GitHub Actions. When you push a tag matching `v*`, the release workflow:
 
 1. Creates a GitHub release
-2. Builds binaries for 5 platforms (linux-x64, linux-arm64, macos-arm64, macos-x64, windows)
+2. Builds binaries for 4 platforms (linux-x64, linux-arm64, macos-arm64, windows)
 3. Uploads archives to the GitHub release
 4. Publishes the crate to crates.io
 
@@ -119,13 +119,12 @@ git push origin vX.Y.Z
 
 The release workflow produces:
 
-| Platform | Archive | Contents |
-|----------|---------|----------|
-| Linux x64 | `succinctly-linux-x64.tar.gz` | `succinctly`, `LICENSE`, `README.md` |
-| Linux ARM64 | `succinctly-linux-arm64.tar.gz` | `succinctly`, `LICENSE`, `README.md` |
-| macOS ARM64 | `succinctly-macos-arm64.tar.gz` | `succinctly`, `LICENSE`, `README.md` |
-| macOS x64 | `succinctly-macos-x64.tar.gz` | `succinctly`, `LICENSE`, `README.md` |
-| Windows x64 | `succinctly-windows-x64.zip` | `succinctly.exe`, `LICENSE`, `README.md` |
+| Platform    | Archive                          | Contents                               |
+|-------------|----------------------------------|----------------------------------------|
+| Linux x64   | `succinctly-linux-x64.tar.gz`    | `succinctly`, `LICENSE`, `README.md`   |
+| Linux ARM64 | `succinctly-linux-arm64.tar.gz`  | `succinctly`, `LICENSE`, `README.md`   |
+| macOS ARM64 | `succinctly-macos-arm64.tar.gz`  | `succinctly`, `LICENSE`, `README.md`   |
+| Windows x64 | `succinctly-windows-x64.zip`     | `succinctly.exe`, `LICENSE`, `README.md` |
 
 All Unix binaries are stripped for smaller size.
 
