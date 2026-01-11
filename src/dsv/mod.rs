@@ -30,19 +30,41 @@
 //!
 //! # Performance
 //!
-//! - Index building: ~165 MiB/s with BMI2, ~16-30 MiB/s portable
+//! - Index building: ~100+ MiB/s with SIMD (AVX2/NEON), ~10 MiB/s scalar
 //! - Memory overhead: ~3-4% of input size
 //! - Field access: O(1) rank + O(log n) select
+//!
+//! ## SIMD Acceleration
+//!
+//! On x86_64 and ARM64 platforms, the parser uses SIMD instructions to process
+//! 64 bytes at a time:
+//! - **AVX2** (x86_64): 2x 32-byte loads with `_mm256_cmpeq_epi8`
+//! - **SSE2** (x86_64 fallback): 4x 16-byte loads
+//! - **NEON** (ARM64): 4x 16-byte loads with `vceqq_u8`
+//!
+//! The algorithm uses prefix XOR to compute quote state in parallel, avoiding
+//! the sequential dependency of byte-by-byte quote tracking.
 
 mod config;
 mod cursor;
 mod index;
 mod parser;
+pub mod simd;
 
 pub use config::DsvConfig;
 pub use cursor::{DsvCursor, DsvFields, DsvRow, DsvRows};
 pub use index::DsvIndex;
+
+// Use SIMD parser by default on supported platforms
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub use simd::build_index_simd as build_index;
+
+// Fallback to scalar parser on unsupported platforms
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub use parser::build_index;
+
+// Also export the scalar parser for testing/comparison
+pub use parser::build_index as build_index_scalar;
 
 #[cfg(not(test))]
 use alloc::vec::Vec;
