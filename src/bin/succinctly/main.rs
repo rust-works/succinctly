@@ -75,6 +75,8 @@ struct BenchCommand {
 enum BenchSubcommand {
     /// Benchmark succinctly jq vs system jq
     Jq(BenchJqArgs),
+    /// Benchmark succinctly jq with DSV input
+    Dsv(BenchDsvArgs),
 }
 
 /// Arguments for jq benchmark
@@ -111,6 +113,46 @@ struct BenchJqArgs {
     /// Path to succinctly binary
     #[arg(long, default_value = "./target/release/succinctly")]
     binary: PathBuf,
+}
+
+/// Arguments for DSV benchmark
+#[derive(Debug, Parser)]
+struct BenchDsvArgs {
+    /// Directory containing generated DSV files
+    #[arg(short, long, default_value = "data/bench/generated/dsv")]
+    data_dir: PathBuf,
+
+    /// Output JSONL file for raw results
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Output markdown file for formatted tables
+    #[arg(short, long)]
+    markdown: Option<PathBuf>,
+
+    /// Patterns to benchmark (comma-separated, or "all")
+    #[arg(short, long, default_value = "all")]
+    patterns: String,
+
+    /// Sizes to benchmark (comma-separated, or "all")
+    #[arg(short, long, default_value = "all")]
+    sizes: String,
+
+    /// Number of warmup runs before benchmarking
+    #[arg(long, default_value = "1")]
+    warmup: usize,
+
+    /// Number of benchmark runs (median is taken)
+    #[arg(long, default_value = "3")]
+    runs: usize,
+
+    /// Path to succinctly binary
+    #[arg(long, default_value = "./target/release/succinctly")]
+    binary: PathBuf,
+
+    /// Delimiter character for DSV files (default: comma)
+    #[arg(long, default_value = ",")]
+    delimiter: char,
 }
 
 /// Generate synthetic JSON files for benchmarking and testing
@@ -570,6 +612,7 @@ fn main() -> Result<()> {
         Command::Dev(dev_cmd) => match dev_cmd.command {
             DevSubcommand::Bench(bench_cmd) => match bench_cmd.command {
                 BenchSubcommand::Jq(args) => run_jq_benchmark(args),
+                BenchSubcommand::Dsv(args) => run_dsv_benchmark(args),
             },
         },
     }
@@ -632,6 +675,72 @@ fn run_jq_benchmark(args: BenchJqArgs) -> Result<()> {
     }
 
     let _results = jq_bench::run_benchmark(
+        &config,
+        Some(output_jsonl.as_path()),
+        Some(output_md.as_path()),
+    )?;
+
+    Ok(())
+}
+
+/// Run DSV benchmark
+fn run_dsv_benchmark(args: BenchDsvArgs) -> Result<()> {
+    let all_patterns = vec![
+        "tabular",
+        "users",
+        "numeric",
+        "strings",
+        "quoted",
+        "multiline",
+        "wide",
+        "long",
+        "mixed",
+        "pathological",
+    ];
+    let all_sizes = vec!["1kb", "10kb", "100kb", "1mb", "10mb", "100mb"];
+
+    let patterns = if args.patterns == "all" {
+        all_patterns.into_iter().map(String::from).collect()
+    } else {
+        args.patterns
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    };
+
+    let sizes = if args.sizes == "all" {
+        all_sizes.into_iter().map(String::from).collect()
+    } else {
+        args.sizes
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    };
+
+    let config = dsv_bench::BenchConfig {
+        data_dir: args.data_dir,
+        patterns,
+        sizes,
+        succinctly_binary: args.binary,
+        warmup_runs: args.warmup,
+        benchmark_runs: args.runs,
+        delimiter: args.delimiter,
+    };
+
+    // Use default output paths if not specified
+    let results_dir = PathBuf::from("data/bench/results");
+    let default_jsonl = results_dir.join("dsv-bench.jsonl");
+    let default_md = results_dir.join("dsv-bench.md");
+
+    let output_jsonl = args.output.unwrap_or(default_jsonl);
+    let output_md = args.markdown.unwrap_or(default_md);
+
+    // Ensure results directory exists
+    if let Some(parent) = output_jsonl.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let _results = dsv_bench::run_benchmark(
         &config,
         Some(output_jsonl.as_path()),
         Some(output_md.as_path()),
@@ -867,6 +976,7 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
+mod dsv_bench;
 mod dsv_generators;
 mod generators;
 mod jq_bench;
