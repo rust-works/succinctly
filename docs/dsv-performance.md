@@ -155,9 +155,33 @@ Worst-case CSV patterns (heavy quoting, escapes, edge cases).
 
 ---
 
+# AMD Ryzen 9 7950X (x86_64)
+
+**CPU**: AMD Ryzen 9 7950X 16-Core Processor
+**OS**: Linux (WSL2)
+**Delimiter**: `,` (comma-separated values)
+**succinctly**: Built with `--release --features cli`
+
+## Pattern: tabular
+
+Standard CSV with uniform column widths.
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    6.23s |   16.0 MiB/s |    1 GB  |
+| **10mb**  |  648.0ms |   15.4 MiB/s |  162 MB  |
+| **1mb**   |   66.3ms |   15.1 MiB/s |   20 MB  |
+| **100kb** |    8.9ms |   11.0 MiB/s |    6 MB  |
+| **10kb**  |    3.0ms |    3.3 MiB/s |    4 MB  |
+| **1kb**   |    2.2ms |    0.5 MiB/s |    4 MB  |
+
+---
+
 ## Summary
 
 ### Throughput by Pattern (100MB files)
+
+#### Apple M1 Max (ARM)
 
 | Pattern        | Throughput   | Notes                                     |
 |----------------|--------------|-------------------------------------------|
@@ -171,6 +195,12 @@ Worst-case CSV patterns (heavy quoting, escapes, edge cases).
 | **users**      |    9.7 MiB/s | Realistic user records                    |
 | **wide**       |    6.5 MiB/s | Many columns increases overhead           |
 | **long**       |    6.1 MiB/s | Many rows increases per-row overhead      |
+
+#### AMD Ryzen 9 7950X (x86_64)
+
+| Pattern        | Throughput   | Notes                                     |
+|----------------|--------------|-------------------------------------------|
+| **tabular**    |   16.0 MiB/s | Uniform column widths                     |
 
 ### Pattern Descriptions
 
@@ -189,12 +219,13 @@ Worst-case CSV patterns (heavy quoting, escapes, edge cases).
 
 ### Key Observations
 
-1. **String-heavy data is fastest** (25.4 MiB/s) - Simple fields without quoting have minimal parsing overhead
+1. **String-heavy data is fastest** (25.4 MiB/s on M1 Max) - Simple fields without quoting have minimal parsing overhead
 2. **Quote handling adds overhead** - Quoted patterns run at ~60% the speed of unquoted
 3. **Table shape matters**:
    - Wide tables (many columns): 6.5 MiB/s - More field boundaries to track
    - Long tables (many rows): 6.1 MiB/s - More row boundaries to process
-4. **Memory scales with file size** - Approximately 20x file size for large files (2GB for 100MB input)
+4. **Memory scales with file size** - Approximately 10-20x file size for large files (1-2GB for 100MB input)
+5. **x86_64 performance** - AMD Ryzen 9 7950X shows 57% faster throughput on tabular data (16.0 vs 10.2 MiB/s) with lower memory usage (1GB vs 2GB)
 
 ## Reproducing Benchmarks
 
