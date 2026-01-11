@@ -2,12 +2,23 @@
 
 Benchmarks for `succinctly jq --input-dsv` parsing DSV (CSV/TSV) files and converting them to JSON.
 
+**See also**: [DSV Profiling Analysis](dsv-profiling-analysis.md) - Detailed performance analysis and optimization opportunities.
+
 ## Methodology
 
 Benchmarks measure:
 - **Wall time**: Total elapsed time
 - **Peak memory**: Maximum resident set size (RSS)
 - **Throughput**: Input bytes processed per second
+
+**Note**: These benchmarks measure **end-to-end throughput** including:
+1. DSV parsing (SIMD-accelerated)
+2. Row/field iteration (rank/select operations)
+3. String conversion (UTF-8 validation)
+4. jq expression evaluation
+5. JSON output serialization
+
+For a breakdown of where time is spent, see [DSV Profiling Analysis](dsv-profiling-analysis.md).
 
 Run with:
 ```bash
