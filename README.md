@@ -3,7 +3,7 @@
 [![CI](https://github.com/rust-works/succinctly/actions/workflows/ci.yml/badge.svg)](https://github.com/rust-works/succinctly/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/succinctly.svg)](https://crates.io/crates/succinctly)
 [![docs.rs](https://docs.rs/succinctly/badge.svg)](https://docs.rs/succinctly)
-[![License](https://img.shields.io/crates/l/succinctly.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 High-performance succinct data structures for Rust.
 
