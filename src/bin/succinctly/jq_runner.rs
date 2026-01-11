@@ -603,14 +603,20 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     let mut last_output: Option<OwnedValue> = None;
     let mut had_output = false;
 
+    // Validate DSV delimiter if provided
+    if let Some(delim) = args.input_dsv {
+        validate_dsv_delimiter(delim)?;
+    }
+
     // The lazy path preserves number formatting and uses less memory.
     // It's available when:
-    // - Not using features that require serde_json parsing (slurp, raw_input, seq input)
+    // - Not using features that require serde_json parsing (slurp, raw_input, seq input, dsv)
     // - Not using output transformations that need full access to values (sort_keys, color, ascii)
     // Both jq_compat (reformatting numbers) and preserve mode (keeping original formatting)
     // use the lazy path for correctness.
     let can_use_lazy_path = !args.slurp
         && !args.raw_input
+        && args.input_dsv.is_none()
         && !args.seq // seq input mode parses differently
         && !output_config.sort_keys
         && !output_config.color_output
@@ -841,7 +847,11 @@ fn get_inputs(args: &JqCommand) -> Result<Vec<OwnedValue>> {
     let mut values = Vec::new();
 
     for raw in raw_inputs {
-        if args.raw_input {
+        if let Some(delimiter) = args.input_dsv {
+            // DSV input: each row becomes a JSON array of strings
+            let parsed = parse_dsv_input(&raw, delimiter);
+            values.extend(parsed);
+        } else if args.raw_input {
             // Raw input: each line becomes a string
             for line in raw.lines() {
                 values.push(OwnedValue::String(line.to_string()));
@@ -1078,6 +1088,65 @@ fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
     }
 
     values
+}
+
+/// Validate that the DSV delimiter is acceptable.
+/// Returns an error if the delimiter is a special CSV character.
+fn validate_dsv_delimiter(delimiter: char) -> Result<()> {
+    // Disallow characters with special meaning in CSV parsing
+    match delimiter {
+        '"' => Err(anyhow::anyhow!(
+            "Invalid delimiter '\"': quote character cannot be used as delimiter"
+        )),
+        '\n' | '\r' => Err(anyhow::anyhow!(
+            "Invalid delimiter: newline characters cannot be used as delimiter"
+        )),
+        c if !c.is_ascii() => Err(anyhow::anyhow!(
+            "Invalid delimiter '{}': only ASCII characters are supported",
+            c
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Parse DSV (delimiter-separated values) input into JSON arrays.
+/// Each row becomes a JSON array of strings.
+fn parse_dsv_input(s: &str, delimiter: char) -> Vec<OwnedValue> {
+    use succinctly::dsv::{Dsv, DsvConfig};
+
+    let config = DsvConfig::default().with_delimiter(delimiter as u8);
+
+    let dsv = Dsv::parse_with_config(s.as_bytes(), &config);
+    let mut values = Vec::with_capacity(dsv.row_count());
+
+    for row in dsv.rows() {
+        let fields: Vec<OwnedValue> = row
+            .fields()
+            .map(|field| {
+                // Strip quotes from quoted fields and decode the content
+                let field_str = strip_quotes_and_decode(field);
+                OwnedValue::String(field_str)
+            })
+            .collect();
+        values.push(OwnedValue::Array(fields));
+    }
+
+    values
+}
+
+/// Strip surrounding quotes from a field and handle escaped quotes.
+fn strip_quotes_and_decode(field: &[u8]) -> String {
+    let s = String::from_utf8_lossy(field);
+
+    // Check if field is quoted
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        // Remove surrounding quotes
+        let inner = &s[1..s.len() - 1];
+        // Unescape doubled quotes ("" -> ")
+        inner.replace("\"\"", "\"")
+    } else {
+        s.into_owned()
+    }
 }
 
 /// Convert serde_json::Value to OwnedValue.
