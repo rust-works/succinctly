@@ -204,6 +204,10 @@ Requires Intel Ice Lake+ or AMD Zen 4+.
 - Use `#[cfg(feature = "std")]` for std-only functionality
 - Test with `--no-default-features` to verify `no_std` works
 
+## Releases
+
+See [RELEASE.md](RELEASE.md) for the release process and checklist. Releases are handled by maintainers.
+
 ## Questions?
 
 - Open an issue for questions about contributing
