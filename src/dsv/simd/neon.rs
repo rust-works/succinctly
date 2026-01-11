@@ -67,15 +67,8 @@ unsafe fn build_index_neon(text: &[u8], config: &DsvConfig) -> DsvIndex {
         let mut padded = [0u8; 64];
         padded[..remaining].copy_from_slice(&text[offset..]);
 
-        let (mut markers_word, mut newlines_word, _) = unsafe {
-            process_chunk_64(
-                padded.as_ptr(),
-                delimiter,
-                quote_char,
-                newline,
-                in_quote,
-            )
-        };
+        let (mut markers_word, mut newlines_word, _) =
+            unsafe { process_chunk_64(padded.as_ptr(), delimiter, quote_char, newline, in_quote) };
 
         // Mask out the padding bits
         let mask = (1u64 << remaining) - 1;
