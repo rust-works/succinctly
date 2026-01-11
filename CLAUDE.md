@@ -74,11 +74,12 @@ use succinctly::jq::{parse, eval};
 
 ### Core Data Structures
 
-| Structure         | Description                            | Overhead |
-|-------------------|----------------------------------------|----------|
-| **BitVec**        | O(1) rank, O(log n) select             | ~3-4%    |
-| **BalancedParens**| Succinct tree navigation               | ~6%      |
-| **JsonIndex**     | JSON semi-indexing with PFSM parser    | ~950 MiB/s |
+| Structure         | Description                            | Overhead      |
+|-------------------|----------------------------------------|---------------|
+| **BitVec**        | O(1) rank, O(log n) select             | ~3-4%         |
+| **BalancedParens**| Succinct tree navigation               | ~6%           |
+| **JsonIndex**     | JSON semi-indexing with PFSM parser    | ~950 MiB/s    |
+| **DsvIndex**      | DSV semi-indexing with lightweight rank| 792-1331 MiB/s (iteration)|
 
 ## Feature Flags
 
@@ -137,12 +138,17 @@ To regenerate: `./target/release/succinctly dev bench jq`
 - PFSM table-driven JSON parser: 40-77% faster than scalar
 - AVX-512 VPOPCNTDQ: 5.2x faster (compute-bound)
 - Byte-level lookup tables: 50-90% speedup for BP operations
+- **DSV lightweight index: 5-9x faster iteration** (792-1331 MiB/s vs 145-150 MiB/s)
+  - Replaced full BitVec (3-level RankDirectory + SelectIndex) with simple cumulative rank arrays
+  - Better cache behavior, same memory overhead (~3-4%)
 
 **What failed:**
 - AVX-512 JSON parser: 7-17% slower (memory-bound) - removed
 - BMI2 PDEP in BitWriter: 71% slower - reverted
 - PFSM batched: 25% slower than production - not deployed
 
-**Key insight**: Wider SIMD != automatically faster. Profile on target hardware, benchmark against production code.
+**Key insights**:
+- Wider SIMD != automatically faster. Profile on target hardware, benchmark against production code.
+- Simpler data structures often outperform complex ones due to cache behavior.
 
 See `.claude/skills/simd-optimization/SKILL.md` and `.claude/skills/bit-optimization/SKILL.md` for details.

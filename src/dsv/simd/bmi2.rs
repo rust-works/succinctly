@@ -11,9 +11,9 @@ use core::arch::x86_64::*;
 
 use super::super::config::DsvConfig;
 use super::super::index::DsvIndex;
-use crate::bits::BitVec;
+use super::super::index_lightweight::DsvIndexLightweight;
+
 use crate::json::BitWriter;
-use crate::Config;
 
 /// Build a DsvIndex using AVX2 + BMI2 acceleration.
 ///
@@ -22,7 +22,7 @@ use crate::Config;
 #[cfg(target_arch = "x86_64")]
 pub fn build_index_simd(text: &[u8], config: &DsvConfig) -> DsvIndex {
     if text.is_empty() {
-        return DsvIndex::new(BitVec::new(), BitVec::new(), 0);
+        return DsvIndex::new_lightweight(DsvIndexLightweight::new(vec![], vec![], 0));
     }
 
     // SAFETY: Caller verified AVX2 and BMI2 are available via runtime detection
@@ -85,17 +85,9 @@ unsafe fn build_index_bmi2(text: &[u8], config: &DsvConfig) -> DsvIndex {
     let markers_words = markers_writer.finish();
     let newlines_words = newlines_writer.finish();
 
-    let bit_config = Config {
-        select_sample_rate: config.select_sample_rate,
-    };
-
-    DsvIndex::new(
-        BitVec::with_config(markers_words, text.len(), bit_config.clone()),
-        BitVec::with_config(newlines_words, text.len(), bit_config),
-        text.len(),
-    )
+    let lightweight = DsvIndexLightweight::new(markers_words, newlines_words, text.len());
+    DsvIndex::new_lightweight(lightweight)
 }
-
 /// Alternating bit pattern used by toggle64: 0101...
 const ODDS_MASK: u64 = 0x5555_5555_5555_5555;
 

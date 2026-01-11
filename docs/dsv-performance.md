@@ -4,6 +4,16 @@ Benchmarks for `succinctly jq --input-dsv` parsing DSV (CSV/TSV) files and conve
 
 **See also**: [DSV Profiling Analysis](dsv-profiling-analysis.md) - Detailed performance analysis and optimization opportunities.
 
+## Recent Optimizations (2026-01-12)
+
+**Lightweight Index**: DSV iteration now uses a lightweight index structure (simple cumulative rank arrays) instead of full BitVec with RankDirectory + SelectIndex. This provides:
+- **5-9x faster iteration** on field access (792-1331 MiB/s vs 145-150 MiB/s)
+- **Automatic optimization** - no CPU feature detection needed, fast on all platforms
+- **Same memory overhead** - ~3-4% of input size
+- **Better cache behavior** - smaller, simpler data structures
+
+The lightweight index replaces 3-level rank directory + select index with simple cumulative popcount arrays, dramatically reducing overhead for rank/select operations during field iteration.
+
 ## Methodology
 
 Benchmarks measure:
