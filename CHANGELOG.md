@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-01-11
+
 ### Added
 
 - **Core Data Structures**
@@ -70,3 +72,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Popcount: 96.8 GiB/s (AVX-512), 18.5 GiB/s (scalar)
 
 [Unreleased]: https://github.com/rust-works/succinctly/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/rust-works/succinctly/releases/tag/v0.1.0
