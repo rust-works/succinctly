@@ -63,6 +63,35 @@ Update in **two places**:
 - README should highlight best-case speedups and representative patterns
 - `docs/jq-comparison.md` should have comprehensive results
 
+## README Table Requirements
+
+### Platform Parity
+
+**Every benchmark table in README.md must have data for BOTH platforms:**
+- x86_64 (AMD Ryzen 9 7950X or equivalent)
+- ARM (Apple M1 Max or equivalent)
+
+If a table only shows one platform, add the missing platform's data from `docs/jq-comparison.md`.
+
+### Pattern Names
+
+**Never abbreviate pattern names in tables.** Use full names:
+- `pathological` not `patholog.`
+- `comprehensive` not `compreh.`
+
+### Bold Formatting in Tables
+
+When using bold for values in tables, ensure spaces are OUTSIDE the `**` markers:
+```markdown
+<!-- CORRECT -->
+|  **59.6ms** |
+
+<!-- WRONG (won't render as bold) -->
+| ** 59.6ms** |
+```
+
+See the markdown-tables skill for complete table formatting rules.
+
 ## Benchmark Patterns
 
 | Pattern       | Description                    |
