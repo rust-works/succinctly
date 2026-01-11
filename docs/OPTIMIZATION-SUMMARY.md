@@ -357,6 +357,60 @@ This document provides a comprehensive record of all optimizations attempted in 
 
 ---
 
+### 12. BMI2 PDEP for DSV Quote Masking (x86_64)
+
+**Status**: ✅ IMPLEMENTED
+**File**: [src/dsv/simd/bmi2.rs](../src/dsv/simd/bmi2.rs)
+**Date**: 2026-01-12
+
+**Technique**: Use BMI2 PDEP instruction for quote-aware CSV/DSV parsing, ported from hw-dsv's `indexCsvChunk` algorithm.
+
+**Algorithm** (from hw-dsv):
+```rust
+// PDEP scatters alternating pattern to quote positions
+let enters = _pdep_u64(ODDS_MASK << (pc & 0x1), qq);
+let leaves = _pdep_u64(ODDS_MASK << ((pc ^ 1) & 0x1), qq);
+
+// Carry-propagating addition creates quote mask
+let comp_leaves = !leaves;
+let pre_quote_mask = enters.wrapping_add(comp_leaves);
+let quote_mask = pre_quote_mask.wrapping_add(carry);
+```
+
+**Expected Performance Results** (based on hw-dsv benchmarks, 7GB CSV):
+
+| Configuration       | Throughput  | Speedup |
+|---------------------|-------------|---------|
+| Broadword (no BMI2) |  16.3 MiB/s | 1x      |
+| BMI2 enabled        | 165.0 MiB/s | **10.1x** |
+| BMI2 + AVX2         | 181.0 MiB/s | **11.1x** |
+
+**Expected Speedup**: **5-10x** on x86_64 with BMI2 support (awaiting benchmark validation)
+
+**Why it works**:
+1. **Single-cycle PDEP**: Replaces 6-operation `prefix_xor` loop with one instruction
+2. **Elegant enters/leaves tracking**: PDEP naturally separates quote entry and exit positions
+3. **Carry propagation**: Addition with complement efficiently toggles quote regions
+4. **No branching**: Pure bit manipulation, no conditional logic
+
+**Runtime Dispatch**:
+```rust
+// src/dsv/simd/mod.rs - BMI2 > AVX2 > SSE2 priority
+if is_x86_feature_detected!("bmi2") && is_x86_feature_detected!("avx2") {
+    return bmi2::build_index_simd(text, config);  // Fastest
+}
+```
+
+**Hardware Requirements**:
+- Intel Haswell+ (2013): Fast PDEP (3 cycles)
+- AMD Zen 3+ (2020): Fast PDEP (3 cycles)
+- AMD Zen 1/2: Slow PDEP (18 cycles) - will still use BMI2 but less benefit
+- ARM: No equivalent - uses `prefix_xor` fallback
+
+**Current Status**: Implemented with runtime dispatch, awaiting x86_64 benchmark validation
+
+---
+
 ## Failed Optimizations
 
 ### 1. AVX-512 JSON Parser (x86_64)
@@ -695,6 +749,7 @@ let t_vec = vld1q_u8([t0, t1, t2, t3].as_ptr() as *const u8);
 | AVX2 JSON Parser        | **1.78x**                                  | x86_64   | ✅ Deployed |
 | AVX512-VPOPCNTDQ        | **5.2x** (micro), **1.01x** (e2e)          | x86_64   | ✅ Deployed |
 | SSE4.2 PCMPISTRI        | **1.38x**                                  | x86_64   | ✅ Deployed |
+| BMI2 PDEP DSV Parsing   | **5-10x** (expected)                       | x86_64   | ✅ Implemented |
 | NEON 32-byte Processing | **1.11x** (avg), **1.69x** (strings)       | ARM      | ✅ Deployed |
 | NEON Nibble Lookup      | **1.02-1.06x**                             | ARM      | ✅ Deployed |
 | BP Byte Lookup Tables   | **11x**                                    | All      | ✅ Deployed |
@@ -702,7 +757,7 @@ let t_vec = vld1q_u8([t0, t1, t2, t3].as_ptr() as *const u8);
 | Cumulative Index        | **627x**                                   | All      | ✅ Deployed |
 | Dual Select Methods     | **3.1x** (seq), **1.39x** (rand)           | All      | ✅ Deployed |
 
-**Total Successful**: 10 optimizations
+**Total Successful**: 11 optimizations
 **Average Speedup**: 6.2x (geometric mean, excluding outliers)
 **Best Result**: Cumulative index (627x)
 **Most Impactful**: PFSM JSON parser (1.33x, supersedes AVX2 as fastest JSON parser)
@@ -732,6 +787,9 @@ let t_vec = vld1q_u8([t0, t1, t2, t3].as_ptr() as *const u8);
   - PFSM: 679 MiB/s
   - Standard AVX2: 546 MiB/s
   - Standard Scalar: ~280 MiB/s (baseline)
+- DSV parsing: **5-10x faster** (expected, BMI2 PDEP vs prefix_xor)
+  - With BMI2: ~100-180 MiB/s (expected)
+  - Current AVX2: ~18-40 MiB/s
 - Popcount: **5.2x faster** (AVX512-VPOPCNTDQ vs scalar)
 - End-to-end: **~2.4x faster** JSON indexing
 
