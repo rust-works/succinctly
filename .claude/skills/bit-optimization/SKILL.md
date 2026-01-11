@@ -1,4 +1,11 @@
+---
+name: bit-optimization
+description: Bit-level optimization patterns for succinct data structures. Use when optimizing rank/select, popcount, or balanced parentheses operations. Triggers on terms like "rank", "select", "popcount", "bit manipulation", "lookup table", "optimization".
+---
+
 # Bit-Level Optimization Patterns
+
+Learnings from optimizing succinct data structure operations.
 
 ## Byte-Level Lookup Tables
 
@@ -10,9 +17,9 @@
 // Precompute at compile time
 const BYTE_MIN_EXCESS: [i8; 256] = { /* min prefix sum for each byte value */ };
 const BYTE_TOTAL_EXCESS: [i8; 256] = { /* total excess (popcount*2 - 8) */ };
-const BYTE_FIND_CLOSE: [[u8; 16]; 256] = { /* 2D: byte_value × initial_excess */ };
+const BYTE_FIND_CLOSE: [[u8; 16]; 256] = { /* 2D: byte_value x initial_excess */ };
 
-fn find_close_in_word_fast(word: u64, start_bit: usize, initial_excess: i32) -> Option<usize> {
+fn find_close_in_word_fast(word: u64, initial_excess: i32) -> Option<usize> {
     let bytes = word.to_le_bytes();
     let mut excess = initial_excess;
 
@@ -48,7 +55,7 @@ fn find_close_in_word_fast(word: u64, start_bit: usize, initial_excess: i32) -> 
 
 ## Cumulative Index Pattern
 
-**When to use**: O(n) operation called O(n) times = O(n²). Add index for O(log n).
+**When to use**: O(n) operation called O(n) times = O(n^2). Add index for O(log n).
 
 ```rust
 // Build cumulative popcount index
@@ -80,9 +87,7 @@ fn select1(&self, k: usize) -> Option<usize> {
 }
 ```
 
-### Result
-
-627x speedup (2.76s → 4.4ms) when select is called per result.
+**Result**: 627x speedup (2.76s to 4.4ms) when select is called per result.
 
 ## Exponential Search for Sequential Select
 
@@ -110,65 +115,26 @@ fn select_with_hint(ib_rank: &[u32], k: usize, hint: usize) -> Option<usize> {
             bound *= 2;
         }
     } else {
-        // Gallop backward: 1, 2, 4, 8, ... until undershoot
-        let mut bound = 1;
-        let mut prev = hint;
-        loop {
-            let next = hint.saturating_sub(bound);
-            if next == 0 || ib_rank[next + 1] <= k32 {
-                break (next, prev);
-            }
-            prev = next;
-            bound *= 2;
-        }
+        // Gallop backward
+        // ...
     };
 
     // Binary search within narrowed range [lo, hi]
-    // ...
 }
 ```
-
-### Key Insights
-
-1. **Hint estimation**: Use `rank / density` where density ≈ ones per word (e.g., `rank / 8` for JSON)
-2. **O(log d) vs O(log n)**: When hint is close, d << n, so exponential search wins
-3. **Bidirectional galloping**: Handle both forward and backward cases
 
 ### Results
 
 | Access Pattern | Binary Search | Exponential Search | Speedup               |
 |----------------|---------------|--------------------|-----------------------|
-| Sequential     | 335 µs        | 102 µs             | **3.3x**              |
-| Random         | 780 µs        | 1.07 ms            | **0.7x** (regression) |
+| Sequential     | 335 us        | 102 us             | **3.3x**              |
+| Random         | 780 us        | 1.07 ms            | **0.7x** (regression) |
 
-### Trade-off: Random Access Regression
+### Trade-off
 
-Exponential search adds overhead (~37% slower) for random access because:
-- Galloping expands in wrong direction before binary search
-- Extra comparisons at hint position
-
-**Future improvement**: Provide two select methods:
-
-```rust
-impl JsonIndex {
-    /// Fast for sequential access (iteration)
-    fn ib_select1_from(&self, k: usize, hint: usize) -> Option<usize>;
-
-    /// Fast for random access (indexed lookup like .[42])
-    fn ib_select1_binary(&self, k: usize) -> Option<usize>;
-}
-
-// Usage in iteration:
-for k in 0..n {
-    let pos = index.ib_select1_from(k, prev_word_idx);
-    prev_word_idx = pos / 64;
-}
-
-// Usage in random access:
-let pos = index.ib_select1_binary(random_k);
-```
-
-This gives optimal performance for both patterns without runtime branching.
+Exponential search adds ~37% overhead for random access. Consider providing two methods:
+- `select1_from(k, hint)` - Fast for sequential (iteration)
+- `select1_binary(k)` - Fast for random (indexed lookup)
 
 ## Hierarchical Skip Pattern
 
@@ -184,7 +150,7 @@ Each level has precomputed statistics enabling O(1) skip decision.
 
 ## Critical Lesson: Benchmark Against Production
 
-**Problem** (2026-01-08): PFSM batched processing appeared to be a 40% improvement, but was actually 25% slower than production.
+**Problem**: PFSM batched processing appeared to be 40% improvement, but was actually 25% slower than production.
 
 ### What Happened
 
@@ -194,27 +160,14 @@ Each level has precomputed statistics enabling O(1) skip decision.
 | `pfsm_simd.rs` (batched) | 398-461 MiB/s | New attempt               |
 | `pfsm.rs` (basic)        | 282-344 MiB/s | Reference implementation  |
 
-The batched approach was benchmarked against `pfsm.rs` (basic reference), showing a 40% improvement. But `pfsm_optimized.rs` was already deployed and was 25% faster than the "optimization".
-
-### Why This Happened
-
-1. **Wrong baseline**: Compared against reference implementation, not production code
-2. **Batching overhead**: Array packing, bounds checks, manual state chain computation
-3. **Compiler already optimal**: Simple loops in `pfsm_optimized.rs` are perfectly optimized by LLVM
-4. **Solved wrong problem**: The "slow" path was already fixed by a different approach
+The batched approach was benchmarked against `pfsm.rs` (basic reference), showing 40% improvement. But `pfsm_optimized.rs` was already deployed and was 25% faster.
 
 ### The Rule
 
 **ALWAYS benchmark new optimizations against ALL existing implementations:**
 
 ```rust
-// WRONG: Only compare against one baseline
-// Shows: batched is 40% faster than basic ✓
-group.bench_function("basic", |b| b.iter(|| pfsm::process(json)));
-group.bench_function("batched", |b| b.iter(|| pfsm_simd::process(json)));
-
 // RIGHT: Compare against everything, including production
-// Reveals: batched is 25% slower than production ✗
 group.bench_function("basic", |b| b.iter(|| pfsm::process(json)));
 group.bench_function("batched", |b| b.iter(|| pfsm_simd::process(json)));
 group.bench_function("production", |b| b.iter(|| pfsm_optimized::process(json)));
@@ -227,7 +180,3 @@ group.bench_function("production", |b| b.iter(|| pfsm_optimized::process(json)))
 - [ ] Multiple input sizes tested (small, medium, large)
 - [ ] Multiple patterns tested (if applicable)
 - [ ] End-to-end benchmark confirms improvement carries through
-
-### Result
-
-The "optimization" was marked as failed and not deployed. Production continues using `pfsm_optimized.rs`.

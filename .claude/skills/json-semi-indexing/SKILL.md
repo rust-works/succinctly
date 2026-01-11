@@ -1,19 +1,17 @@
-# JSON Semi-Indexing and Succinct Data Structures
+---
+name: json-semi-indexing
+description: JSON semi-indexing implementation details and patterns. Use when working on JSON parsing, semi-index construction, or cursor navigation. Triggers on terms like "JSON index", "semi-index", "interest bits", "balanced parentheses", "JSON cursor".
+---
+
+# JSON Semi-Indexing Skill
+
+Implementation details for JSON semi-indexing using succinct data structures.
 
 ## JSON Semi-Index Structure
 
 The semi-index produces two bit vectors:
 - **Interest Bits (IB)**: Marks structurally interesting positions (opens, leaves)
 - **Balanced Parentheses (BP)**: Encodes the tree structure for navigation
-
-### Cursors
-
-**Simple Cursor**: 3 states (InJson, InString, InEscape)
-- Only tracks string boundaries for proper quote handling
-
-**Standard Cursor**: 4 states (InJson, InString, InEscape, InValue)
-- Treats primitive values (numbers, booleans, null) as leaves
-- Values emit BP=10 (open+close) making them leaf nodes
 
 ### State Machine Outputs (Phi)
 
@@ -24,9 +22,16 @@ Leaf (L):   IB=1, BP=10  - String/value start (treated as leaf node)
 None (-):   (nothing)    - Whitespace, delimiters, string content
 ```
 
-## SIMD JSON Semi-Indexing
+### Cursors
 
-### Architecture Pattern
+**Simple Cursor**: 3 states (InJson, InString, InEscape)
+- Only tracks string boundaries for proper quote handling
+
+**Standard Cursor**: 4 states (InJson, InString, InEscape, InValue)
+- Treats primitive values (numbers, booleans, null) as leaves
+- Values emit BP=10 (open+close) making them leaf nodes
+
+## SIMD Architecture Pattern
 
 Both NEON (ARM) and SSE2 (x86) use the same 16-byte chunk processing:
 
@@ -44,12 +49,6 @@ vandq_u8(a, b)              // Bitwise AND
 vorrq_u8(a, b)              // Bitwise OR
 ```
 
-Movemask emulation (NEON lacks native movemask):
-```rust
-vshrn_n_u16(vreinterpretq_u16_u8(mask), 4)  // Pack to 4-bit nibbles
-vget_lane_u64(vreinterpret_u64_u8(...), 0)  // Extract as u64
-```
-
 **x86 SSE2**:
 ```rust
 _mm_cmpeq_epi8(chunk, splat)  // Equality comparison
@@ -57,15 +56,7 @@ _mm_movemask_epi8(cmp)        // Extract MSBs as u16 bitmask
 _mm_min_epu8(a, b)            // For unsigned LE: min(a,b) == a
 ```
 
-Unsigned LE comparison (SSE2 lacks unsigned compare):
-```rust
-unsafe fn unsigned_le(a: __m128i, b: __m128i) -> __m128i {
-    let min_ab = _mm_min_epu8(a, b);
-    _mm_cmpeq_epi8(min_ab, a)  // a <= b iff min(a,b) == a
-}
-```
-
-### Multi-Architecture Support
+## Multi-Architecture Module Pattern
 
 ```rust
 // src/json/simd/mod.rs
@@ -86,6 +77,28 @@ pub use x86::build_semi_index_standard;
 pub use super::standard::build_semi_index as build_semi_index_standard;
 ```
 
+## PFSM (Table-Driven Parser)
+
+**Default implementation** achieving 950 MiB/s throughput.
+
+### Two-Stage Pipeline
+
+1. **Stage 1 - State Machine**: Sequential byte-by-byte with 256-entry lookup tables
+   - TRANSITION_TABLE: Maps (byte, state) -> next_state
+   - PHI_TABLE: Maps (byte, state) -> output bits (IB/OP/CL)
+
+2. **Stage 2 - Bit Extraction**: Parallel extraction of interest bits and BP
+   - BMI2+AVX2 path: Process 8 phi values at once using PEXT/PDEP
+   - Scalar fallback: Byte-by-byte extraction
+
+### Why PFSM Wins
+
+- Table lookups are cache-friendly (256 entries = 1-2KB per table)
+- State machine separates control flow from bit extraction
+- BMI2 PEXT/PDEP used correctly for sparse bit operations
+- Amortizes table lookup overhead across the entire input
+- Benefits from modern CPU branch prediction
+
 ## Balanced Parentheses Operations
 
 ### Core Operations
@@ -94,16 +107,7 @@ pub use super::standard::build_semi_index as build_semi_index_standard;
 - `find_open(p)`: Find matching open for close at position p
 - `excess(p)`: Count of opens minus closes up to position p
 - `enclose(p)`: Find the nearest enclosing open
-- `depth(p)`: Nesting depth at position p (same as excess)
-
-### Word-Level Operations
-
-`find_close_in_word(word, p)`: Find matching close within a single 64-bit word
-- Uses excess tracking with `count_ones` on masked portions
-- Returns `None` if match extends beyond word boundary
-
-`find_unmatched_close_in_word(word)`: Find first unmatched close
-- Important for multi-word find_close acceleration
+- `depth(p)`: Nesting depth at position p
 
 ### MinExcess for Acceleration
 
@@ -115,6 +119,7 @@ Pre-computed minimum excess within blocks enables skipping:
 ## BitWriter Pattern
 
 Efficient bit vector construction:
+
 ```rust
 pub struct BitWriter {
     words: Vec<u64>,
@@ -137,6 +142,7 @@ bp.write_bits(0b01, 2);  // Note: LSB first, so 0b01 = "10" in reading order
 ## Testing Patterns
 
 ### SIMD vs Scalar Comparison
+
 Always verify SIMD produces identical results to scalar:
 ```rust
 fn compare_results(json: &[u8]) {
@@ -149,66 +155,16 @@ fn compare_results(json: &[u8]) {
 ```
 
 ### Boundary Testing
+
 Test at SIMD chunk boundaries (multiples of 16):
 - Escapes spanning chunk boundaries
 - State transitions at position 15/16
 - Inputs of length 15, 16, 17, 31, 32, 33, etc.
 
-### Cross-Verification
-Verify accelerated operations match naive implementations:
-```rust
-fn naive_find_close(bp: &BalancedParens, p: usize) -> Option<usize> {
-    let mut excess = 1i64;
-    for i in (p + 1)..bp.len() {
-        excess += if bp.is_open(i) { 1 } else { -1 };
-        if excess == 0 { return Some(i); }
-    }
-    None
-}
-```
+## Performance Reference
 
-## Performance Optimization
-
-### O(1) vs O(n) Operations
-
-**Problem**: `text_position()` calling `ib_select1()` was O(n) linear scan per result, causing O(n²) total complexity.
-
-**Solution**: Add cumulative popcount index for O(log n) select:
-
-```rust
-// Build cumulative index during construction
-fn build_ib_rank(words: &[u64]) -> Vec<u32> {
-    let mut rank = Vec::with_capacity(words.len() + 1);
-    let mut cumulative: u32 = 0;
-    rank.push(0);
-    for &word in words {
-        cumulative += word.count_ones();
-        rank.push(cumulative);
-    }
-    rank
-}
-
-// Binary search for select
-fn ib_select1(&self, k: usize) -> Option<usize> {
-    let k32 = k as u32;
-    let mut lo = 0;
-    let mut hi = self.words.len();
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if self.ib_rank[mid + 1] <= k32 { lo = mid + 1; }
-        else { hi = mid; }
-    }
-    // Scan within word for exact bit position
-}
-```
-
-**Result**: 627x speedup (2.76s → 4.4ms), now faster than jq.
-
-### End-to-End Performance vs jq
-
-| Query           | File  | succinctly | jq    | Speedup |
-|-----------------|-------|------------|-------|---------|
-| `.unicode[]`    | 10MB  | 25ms       | 179ms | 7.2x    |
-| `.users[].name` | 10MB  | 22ms       | 160ms | 7.3x    |
-| `.arrays[][]`   | 10MB  | 150ms      | 297ms | 2.0x    |
-| `.unicode[]`    | 100MB | 221ms      | 1.86s | 8.4x    |
+| Size      | succinctly            | jq                    | Speedup    |
+|-----------|-----------------------|-----------------------|------------|
+| **10KB**  |  2.4 ms  (3.9 MiB/s)  |  4.3 ms  (2.2 MiB/s)  | **1.79x**  |
+| **100KB** |  4.6 ms (18.4 MiB/s)  |  8.2 ms (10.5 MiB/s)  | **1.76x**  |
+| **1MB**   | 24.7 ms (32.7 MiB/s)  | 43.9 ms (18.4 MiB/s)  | **1.78x**  |
