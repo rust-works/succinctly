@@ -137,19 +137,33 @@ if let QueryResult::One(StandardJson::Number(age)) = eval(&expr, cursor) {
 
 Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
 
+#### x86_64 (AMD Ryzen 9 7950X, 10MB files)
+
+| Pattern           | jq       | succinctly    | Speedup  | jq Mem  | succ Mem | Mem Ratio  |
+|-------------------|----------|---------------|----------|---------|----------|------------|
+| **nested**        |  147.8ms |  **54.5ms**   | **2.7x** |   22 MB |    26 MB |      1.16x |
+| **strings**       |  141.3ms |  **59.0ms**   | **2.4x** |   14 MB |    14 MB |      1.02x |
+| **numbers**       |  268.7ms | **127.3ms**   | **2.1x** |   87 MB |    15 MB |      0.18x |
+| **pathological**  |  796.7ms | **410.2ms**   | **1.9x** |  472 MB |    17 MB |      0.04x |
+| **comprehensive** |  381.9ms | **220.9ms**   | **1.7x** |  149 MB |    14 MB |      0.09x |
+| **users**         |  205.6ms | **125.4ms**   | **1.6x** |   68 MB |    12 MB |      0.18x |
+| **unicode**       |  169.4ms | **113.0ms**   | **1.5x** |   31 MB |    16 MB |      0.51x |
+| **arrays**        |  738.2ms | **388.9ms**   | **1.9x** |  367 MB |    17 MB |      0.05x |
+| **literals**      |  279.5ms | **228.7ms**   | **1.2x** |   50 MB |    16 MB |      0.33x |
+
 #### ARM (Apple M1 Max, 10MB files)
 
-| Pattern       | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
-|---------------|----------|--------------|---------------|---------|----------|------------|
-| **nested**    |  351.0ms | **  59.6ms** | **     5.9x** |   25 MB |    29 MB |      1.17x |
-| **strings**   |  317.8ms | **  71.5ms** | **     4.4x** |   18 MB |    17 MB |      0.98x |
-| **patholog.** |    1.42s | ** 646.2ms** | **     2.2x** |  526 MB |    20 MB |      0.04x |
-| **unicode**   |  317.4ms | ** 145.6ms** | **     2.2x** |   41 MB |    19 MB |      0.46x |
-| **users**     |  395.3ms | ** 181.7ms** | **     2.2x** |   70 MB |    15 MB |      0.21x |
-| **compreh.**  |  689.1ms | ** 361.6ms** | **     1.9x** |  135 MB |    17 MB |      0.13x |
-| **numbers**   |  379.0ms | ** 217.2ms** | **     1.7x** |   96 MB |    18 MB |      0.19x |
-| **arrays**    |    1.08s | ** 717.9ms** | **     1.5x** |  367 MB |    20 MB |      0.05x |
-| **literals**  |  511.1ms | ** 418.8ms** | **     1.2x** |  103 MB |    19 MB |      0.19x |
+| Pattern           | jq       | succinctly    | Speedup  | jq Mem  | succ Mem | Mem Ratio  |
+|-------------------|----------|---------------|----------|---------|----------|------------|
+| **nested**        |  347.2ms |  **54.8ms**   | **6.3x** |   25 MB |    29 MB |      1.17x |
+| **strings**       |  331.0ms |  **75.2ms**   | **4.4x** |   16 MB |    17 MB |      1.07x |
+| **pathological**  |    1.35s | **677.0ms**   | **2.0x** |  526 MB |    20 MB |      0.04x |
+| **unicode**       |  334.8ms | **157.1ms**   | **2.1x** |   41 MB |    19 MB |      0.46x |
+| **users**         |  413.7ms | **196.8ms**   | **2.1x** |   70 MB |    15 MB |      0.21x |
+| **comprehensive** |  692.4ms | **364.7ms**   | **1.9x** |  135 MB |    17 MB |      0.13x |
+| **numbers**       |  370.7ms | **213.8ms**   | **1.7x** |   97 MB |    18 MB |      0.19x |
+| **arrays**        |    1.07s | **700.8ms**   | **1.5x** |  368 MB |    20 MB |      0.05x |
+| **literals**      |  510.9ms | **397.1ms**   | **1.3x** |  103 MB |    19 MB |      0.19x |
 
 **Key findings**:
 - **1.2-5.9x faster** across all patterns
