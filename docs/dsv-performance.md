@@ -463,6 +463,115 @@ Worst-case CSV patterns (heavy quoting, escapes, edge cases).
 5. **Quote handling adds overhead** - Quoted patterns run at ~60% the speed of unquoted
 6. **Table shape matters less with streaming** - Wide/long tables no longer cause memory blowup
 
+---
+
+# Proposed Optimizations
+
+## BMI2 PDEP for Quote Masking (x86_64)
+
+**Status**: Implemented, awaiting x86_64 benchmark validation
+**File**: [src/dsv/simd/bmi2.rs](../src/dsv/simd/bmi2.rs)
+**Date**: 2026-01-12
+
+### Overview
+
+The BMI2 implementation uses the PDEP (Parallel Bit Deposit) instruction for quote-aware parsing, ported from the hw-dsv Haskell library's `indexCsvChunk` algorithm. This replaces the `prefix_xor` fallback with a more efficient approach on supported CPUs.
+
+### Algorithm
+
+The `index_chunk_bmi2` function implements the exact hw-dsv algorithm:
+
+```rust
+// From hw-dsv's indexCsvChunk:
+// let enters = pdep (oddsMask .<. (0x1 .&.      pc)) qq
+// let leaves = pdep (oddsMask .<. (0x1 .&. comp pc)) qq
+// let compLeaves    = comp leaves
+// let preQuoteMask  = enters + compLeaves
+// let quoteMask     = preQuoteMask + carry
+// let newCarry      = quoteMask `ltWord` (enters .|. compLeaves .|. carry)
+```
+
+Key components:
+- **PDEP instruction**: Scatters alternating bit pattern (`0x5555...`) to quote positions
+- **Quote parity (`pc`)**: Tracks odd/even quote count to determine inside/outside state
+- **Carry propagation**: Uses addition with complement for efficient toggle computation
+- **`ltWord` equivalent**: Unsigned comparison for carry detection
+
+### Expected Performance
+
+Based on hw-dsv benchmarks on 7GB CSV files:
+
+| Configuration       | Throughput | Speedup vs Baseline |
+|---------------------|------------|---------------------|
+| Broadword (no BMI2) |  16.3 MiB/s | 1x                 |
+| BMI2 enabled        | 165.0 MiB/s | **10.1x**          |
+| BMI2 + AVX2         | 181.0 MiB/s | **11.1x**          |
+
+**Expected improvement for succinctly (x86_64 with BMI2)**:
+- Current AVX2 + prefix_xor: ~18-40 MiB/s
+- With BMI2 PDEP: ~100-180 MiB/s (estimated 5-10x improvement)
+
+### Why PDEP Is Faster
+
+1. **Single-cycle operation**: PDEP executes in 1-3 cycles on Intel Haswell+ and AMD Zen 3+
+2. **Eliminates prefix XOR**: The 6-operation `prefix_xor` loop is replaced by one PDEP instruction
+3. **Reduces register pressure**: Fewer temporaries needed
+4. **Enables elegant quote tracking**: The enters/leaves approach cleanly handles quote state
+
+### Hardware Requirements
+
+| CPU                  | BMI2 Support | PDEP Performance |
+|----------------------|--------------|------------------|
+| Intel Haswell+ (2013)| Yes          | Fast (3 cycles)  |
+| AMD Zen 1/2 (2017-19)| Yes          | Slow (18 cycles) |
+| AMD Zen 3+ (2020+)   | Yes          | Fast (3 cycles)  |
+| Apple Silicon        | No           | N/A              |
+
+### Runtime Dispatch
+
+The implementation uses runtime CPU detection:
+
+```rust
+// src/dsv/simd/mod.rs
+pub fn build_index_simd(text: &[u8], config: &DsvConfig) -> DsvIndex {
+    if is_x86_feature_detected!("bmi2") && is_x86_feature_detected!("avx2") {
+        return bmi2::build_index_simd(text, config);  // Fastest path
+    }
+    if is_x86_feature_detected!("avx2") {
+        return avx2::build_index_simd(text, config);  // prefix_xor fallback
+    }
+    sse2::build_index_simd(text, config)              // SSE2 fallback
+}
+```
+
+### ARM Limitation
+
+ARM processors (including Apple Silicon M1-M4) have no equivalent to PDEP/PEXT:
+- SVE2 has BDEP/BEXT but operates on vectors only
+- Apple Silicon doesn't implement SVE/SVE2
+- Must continue using `prefix_xor` approach on ARM
+
+### Validation
+
+Tests verify BMI2 matches scalar and AVX2 results:
+- `test_bmi2_matches_scalar`: Compares against reference implementation
+- `test_bmi2_matches_avx2`: Ensures consistency with AVX2 path
+- `test_quoted_spanning_chunks`: Tests 64-byte boundary crossing
+
+### Next Steps
+
+1. **Benchmark on x86_64**: Run `./target/release/succinctly dev bench dsv` on AMD Zen 3+ or Intel Haswell+
+2. **Verify speedup**: Expect 5-10x improvement over current AVX2 results
+3. **Update documentation**: Add BMI2 results to this file after benchmarking
+
+### References
+
+- [hw-dsv source](https://github.com/haskell-works/hw-dsv) - Original Haskell implementation
+- [docs/dsv-port-plan.md](dsv-port-plan.md) - Full BMI2 optimization details
+- Intel PDEP/PEXT documentation
+
+---
+
 ## Reproducing Benchmarks
 
 ```bash
