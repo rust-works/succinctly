@@ -325,6 +325,14 @@ struct JqCommand {
     #[arg(short = 'R', long)]
     raw_input: bool,
 
+    /// [Extension] Read input as DSV (delimiter-separated values).
+    /// Each row becomes a JSON array of strings.
+    /// Properly handles quoted fields with embedded delimiters and newlines.
+    /// Use comma for CSV, tab for TSV, or any single ASCII character.
+    /// Special CSV characters (quote " and newline) cannot be used as delimiters.
+    #[arg(long, value_name = "DELIMITER")]
+    input_dsv: Option<char>,
+
     /// Read all inputs into an array and use it as the single input value
     #[arg(short = 's', long)]
     slurp: bool,
