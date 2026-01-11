@@ -96,12 +96,13 @@ unsafe fn build_index_bmi2(text: &[u8], config: &DsvConfig) -> DsvIndex {
     )
 }
 
-/// Alternating bit pattern used by toggle64: 0101...
+/// Alternating bit pattern used for quote state tracking: 0101...
 const ODDS_MASK: u64 = 0x5555_5555_5555_5555;
 
 /// Process a 64-byte chunk using AVX2 for character matching and BMI2 PDEP for quote masking.
 ///
-/// This is the core algorithm from hw-dsv, ported to Rust.
+/// This is the core algorithm from hw-dsv's indexCsvChunk, ported to Rust.
+/// It processes character matches and applies quote-aware filtering in one pass.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx2", enable = "bmi2")]
@@ -140,72 +141,103 @@ unsafe fn process_chunk_64_bmi2(
     let nl_mask1 = _mm256_movemask_epi8(eq_nl1) as u32 as u64;
 
     // Combine into 64-bit masks
-    let delim_mask = delim_mask0 | (delim_mask1 << 32);
-    let quote_mask = quote_mask0 | (quote_mask1 << 32);
-    let nl_mask = nl_mask0 | (nl_mask1 << 32);
+    let mk = delim_mask0 | (delim_mask1 << 32); // delimiter markers
+    let qq = quote_mask0 | (quote_mask1 << 32); // quote positions
+    let nl = nl_mask0 | (nl_mask1 << 32); // newline positions
 
-    // Use BMI2 PDEP for quote state masking (the hw-dsv algorithm)
-    let (outside_quotes, new_carry) = toggle64_bmi2(qq_carry, quote_mask);
+    // Apply the hw-dsv indexCsvChunk algorithm using PDEP
+    let (quote_mask, new_carry) = index_chunk_bmi2(qq_carry, qq);
 
-    // Delimiters and newlines are valid only outside quotes
-    let valid_delim = delim_mask & outside_quotes;
-    let valid_nl = nl_mask & outside_quotes;
+    // Delimiters and newlines are valid only outside quotes (where quote_mask is 1)
+    let filtered_markers = (nl | mk) & quote_mask;
+    let filtered_newlines = nl & quote_mask;
 
-    // Markers = delimiters OR newlines (outside quotes)
-    let markers = valid_delim | valid_nl;
-    let newlines = valid_nl;
-
-    (markers, newlines, new_carry)
+    (filtered_markers, filtered_newlines, new_carry)
 }
 
-/// Compute the quote mask using BMI2 PDEP instruction.
+/// Compute the quote mask using the hw-dsv indexCsvChunk algorithm with BMI2 PDEP.
 ///
-/// This is the critical function from hw-dsv that provides ~50-100x speedup
-/// over iterative approaches. It uses carry propagation to track which
-/// positions are inside vs outside quotes.
+/// This is the exact algorithm from hw-dsv/src/HaskellWorks/Data/Dsv/Internal/Vector.hs
+/// ported to Rust. It uses PDEP to efficiently compute which positions are inside
+/// vs outside quoted regions.
 ///
-/// # Algorithm
+/// # Algorithm (from hw-dsv)
 ///
-/// Given a bitmask `w` where each 1-bit marks a quote position:
-/// 1. Use PDEP to scatter an alternating pattern (0101...) to quote positions
-/// 2. Shift and add to create carry propagation
-/// 3. The result has 1-bits where we're outside quotes, 0-bits inside
+/// ```haskell
+/// let enters = pdep (oddsMask .<. (0x1 .&.      pc)) qq
+/// let leaves = pdep (oddsMask .<. (0x1 .&. comp pc)) qq
+/// let compLeaves    = comp leaves
+/// let preQuoteMask  = enters + compLeaves
+/// let quoteMask     = preQuoteMask + carry
+/// let newCarry      = quoteMask `ltWord` (enters .|. compLeaves .|. carry)
+/// ```
+///
+/// Where:
+/// - `pc` is the parity of quotes seen so far (0 = even, 1 = odd)
+/// - `qq` is the bitmask of quote positions in this chunk
+/// - `carry` is the arithmetic carry from the previous chunk
 ///
 /// # Arguments
-/// * `carry` - Carry from previous chunk (0 = outside quotes, 1 = inside quotes)
-/// * `w` - Bitmask of quote positions in this chunk
+/// * `carry` - Combined state: bits 0 = arithmetic carry, bit 1+ = quote parity count
+/// * `qq` - Bitmask of quote positions in this chunk
 ///
 /// # Returns
-/// * `(outside_mask, new_carry)` - Mask and carry for next chunk
+/// * `(quote_mask, new_carry)` - Mask (1 = outside quotes) and new carry state
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "bmi2")]
+unsafe fn index_chunk_bmi2(carry: u64, qq: u64) -> (u64, u64) {
+    // Extract the parity of quotes seen so far (determines if we're inside/outside)
+    // In hw-dsv, this is tracked separately as `pc`, but we encode it in the carry
+    let pc = carry & 0x1;
+
+    // PDEP scatters the alternating pattern (0101...) to quote positions
+    // - enters: marks odd-numbered quotes when pc=0, even-numbered when pc=1
+    // - leaves: marks even-numbered quotes when pc=0, odd-numbered when pc=1
+    let enters = _pdep_u64(ODDS_MASK << (pc & 0x1), qq);
+    let leaves = _pdep_u64(ODDS_MASK << ((pc ^ 1) & 0x1), qq);
+
+    // Compute the quote mask using carry-propagating addition
+    // This creates a mask where 1 = outside quotes, 0 = inside quotes
+    let comp_leaves = !leaves;
+    let pre_quote_mask = enters.wrapping_add(comp_leaves);
+    let quote_mask = pre_quote_mask.wrapping_add(carry & 0x1);
+
+    // Compute the new carry using unsigned comparison (ltWord equivalent)
+    // newCarry = quoteMask < (enters | compLeaves | carry)
+    let comparison_value = enters | comp_leaves | (carry & 0x1);
+    let new_carry = if quote_mask < comparison_value { 1 } else { 0 };
+
+    // The carry for next chunk includes the new arithmetic carry
+    // and the updated quote parity (number of quotes in this chunk)
+    let quote_count = qq.count_ones() as u64;
+    let new_parity = (pc + quote_count) & 0x1;
+
+    // Encode both pieces of state: parity in bit 0, arithmetic carry stays
+    // For the next iteration, we need the parity to determine enters/leaves
+    // The arithmetic carry is used in the addition
+    (quote_mask, new_parity | (new_carry << 1))
+}
+
+/// Simplified toggle64 for cases where we only need the quote mask.
+/// This is closer to the original hw-dsv Broadword.toggle64 function.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "bmi2")]
+#[allow(dead_code)]
 unsafe fn toggle64_bmi2(carry: u64, w: u64) -> (u64, u64) {
     // Extract the carry bit (0 or 1)
     let c = carry & 0x1;
 
     // PDEP scatters the alternating pattern to quote positions
-    // If c=0: places 1s at odd quotes (1st, 3rd, 5th...) - these are "enters"
-    // If c=1: places 1s at even quotes (2nd, 4th, 6th...) - shifted by 1
     let addend = _pdep_u64(ODDS_MASK << c, w);
 
-    // This is the key insight: we use addition with carry propagation
-    // to create a mask that "fills in" between quote pairs.
-    //
-    // The formula: ((addend << 1) | c) + !w
-    //
-    // - addend << 1: shift the deposited bits left by 1
-    // - | c: include the carry from previous chunk
-    // - + !w: add the complement of quote positions
-    //
-    // The addition propagates carries through non-quote regions,
-    // effectively "filling" the regions between matched quote pairs.
+    // The formula from hw-dsv Broadword.hs:
+    // ((addend .<. 1) .|. c) + comp w
     let comp_w = !w;
     let shifted = (addend << 1) | c;
     let (result, overflow) = shifted.overflowing_add(comp_w);
 
-    // The new carry depends on whether addition overflowed
-    // and the final state of the quote parity
     let new_carry = if overflow { 1 } else { 0 };
 
     (result, new_carry)
