@@ -23,7 +23,129 @@ Run with:
 **Delimiter**: `,` (comma-separated values)
 **succinctly**: Built with `--release --features cli`
 
-## Pattern: tabular
+## Optimized (SIMD + Streaming)
+
+Uses SIMD-accelerated DSV indexing (NEON on ARM) with streaming output.
+Memory-efficient: only one row materialized at a time.
+
+### Pattern: tabular
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    9.01s |   11.1 MiB/s |  142 MB  |
+| **10mb**  |  907.9ms |   11.0 MiB/s |   21 MB  |
+| **1mb**   |  104.7ms |    9.6 MiB/s |    9 MB  |
+| **100kb** |   16.2ms |    6.0 MiB/s |    7 MB  |
+| **10kb**  |    6.9ms |    1.4 MiB/s |    7 MB  |
+| **1kb**   |    6.1ms |    0.2 MiB/s |    7 MB  |
+
+### Pattern: users
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    9.29s |   10.8 MiB/s |  142 MB  |
+| **10mb**  |  953.7ms |   10.5 MiB/s |   21 MB  |
+| **1mb**   |   96.0ms |   10.4 MiB/s |    9 MB  |
+| **100kb** |   14.4ms |    6.8 MiB/s |    7 MB  |
+| **10kb**  |    6.2ms |    1.6 MiB/s |    7 MB  |
+| **1kb**   |    5.5ms |    0.2 MiB/s |    7 MB  |
+
+### Pattern: numeric
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    9.30s |   10.8 MiB/s |  142 MB  |
+| **10mb**  |  956.5ms |   10.5 MiB/s |   21 MB  |
+| **1mb**   |   96.5ms |   10.4 MiB/s |    9 MB  |
+| **100kb** |   16.3ms |    6.0 MiB/s |    7 MB  |
+| **10kb**  |    6.7ms |    1.5 MiB/s |    7 MB  |
+| **1kb**   |    5.6ms |    0.2 MiB/s |    7 MB  |
+
+### Pattern: strings
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    3.49s |   28.6 MiB/s |  142 MB  |
+| **10mb**  |  351.5ms |   28.4 MiB/s |   21 MB  |
+| **1mb**   |   41.3ms |   24.2 MiB/s |    9 MB  |
+| **100kb** |    9.2ms |   10.6 MiB/s |    7 MB  |
+| **10kb**  |    6.2ms |    1.6 MiB/s |    7 MB  |
+| **1kb**   |    5.7ms |    0.2 MiB/s |    7 MB  |
+
+### Pattern: quoted
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    6.06s |   16.5 MiB/s |  142 MB  |
+| **10mb**  |  626.8ms |   16.0 MiB/s |   21 MB  |
+| **1mb**   |   70.2ms |   14.3 MiB/s |    9 MB  |
+| **100kb** |   12.3ms |    7.9 MiB/s |    7 MB  |
+| **10kb**  |    6.1ms |    1.6 MiB/s |    7 MB  |
+| **1kb**   |    5.7ms |    0.2 MiB/s |    7 MB  |
+
+### Pattern: multiline
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    4.85s |   20.6 MiB/s |  142 MB  |
+| **10mb**  |  503.2ms |   19.9 MiB/s |   21 MB  |
+| **1mb**   |   59.7ms |   16.8 MiB/s |    9 MB  |
+| **100kb** |   11.6ms |    8.4 MiB/s |    7 MB  |
+| **10kb**  |    6.4ms |    1.5 MiB/s |    7 MB  |
+| **1kb**   |    5.7ms |    0.2 MiB/s |    7 MB  |
+
+### Pattern: wide
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |   13.88s |    7.2 MiB/s |  143 MB  |
+| **10mb**  |    1.40s |    7.2 MiB/s |   21 MB  |
+| **1mb**   |  147.8ms |    6.8 MiB/s |    9 MB  |
+| **100kb** |   20.1ms |    4.9 MiB/s |    7 MB  |
+| **10kb**  |    7.8ms |    1.3 MiB/s |    7 MB  |
+| **1kb**   |    5.7ms |    0.2 MiB/s |    7 MB  |
+
+### Pattern: long
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |   14.84s |    6.7 MiB/s |  142 MB  |
+| **10mb**  |    1.57s |    6.4 MiB/s |   21 MB  |
+| **1mb**   |  171.6ms |    5.8 MiB/s |    8 MB  |
+| **100kb** |   23.2ms |    4.2 MiB/s |    7 MB  |
+| **10kb**  |    7.1ms |    1.4 MiB/s |    7 MB  |
+| **1kb**   |    5.5ms |    0.2 MiB/s |    7 MB  |
+
+### Pattern: mixed
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    9.10s |   11.0 MiB/s |  142 MB  |
+| **10mb**  |  949.3ms |   10.5 MiB/s |   21 MB  |
+| **1mb**   |  103.3ms |    9.7 MiB/s |    9 MB  |
+| **100kb** |   14.8ms |    6.6 MiB/s |    7 MB  |
+| **10kb**  |    6.4ms |    1.5 MiB/s |    7 MB  |
+| **1kb**   |    6.1ms |    0.2 MiB/s |    7 MB  |
+
+### Pattern: pathological
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    6.93s |   14.4 MiB/s |  142 MB  |
+| **10mb**  |  715.7ms |   14.0 MiB/s |   21 MB  |
+| **1mb**   |   78.5ms |   12.7 MiB/s |    9 MB  |
+| **100kb** |   13.6ms |    7.2 MiB/s |    7 MB  |
+| **10kb**  |    6.8ms |    1.4 MiB/s |    7 MB  |
+| **1kb**   |    5.6ms |    0.2 MiB/s |    7 MB  |
+
+---
+
+## Baseline (Scalar, Materialized)
+
+Uses scalar DSV parsing with full JSON materialization.
+All rows converted to JSON arrays before output.
+
+### Pattern: tabular
 
 Standard CSV with uniform column widths.
 
@@ -36,7 +158,7 @@ Standard CSV with uniform column widths.
 | **10kb**  |    6.5ms |    1.5 MiB/s |    7 MB  |
 | **1kb**   |    5.7ms |    0.2 MiB/s |    7 MB  |
 
-## Pattern: users
+### Pattern: users
 
 Realistic user records with names, emails, addresses.
 
@@ -49,7 +171,7 @@ Realistic user records with names, emails, addresses.
 | **10kb**  |    6.9ms |    1.4 MiB/s |    7 MB  |
 | **1kb**   |    5.6ms |    0.2 MiB/s |    7 MB  |
 
-## Pattern: numeric
+### Pattern: numeric
 
 Numeric-heavy CSV (IDs, counts, measurements).
 
@@ -62,7 +184,7 @@ Numeric-heavy CSV (IDs, counts, measurements).
 | **10kb**  |    6.1ms |    1.6 MiB/s |    7 MB  |
 | **1kb**   |    5.7ms |    0.2 MiB/s |    7 MB  |
 
-## Pattern: strings
+### Pattern: strings
 
 String-heavy CSV with few quoted fields.
 
@@ -75,7 +197,7 @@ String-heavy CSV with few quoted fields.
 | **10kb**  |    6.0ms |    1.7 MiB/s |    7 MB  |
 | **1kb**   |    5.5ms |    0.2 MiB/s |    7 MB  |
 
-## Pattern: quoted
+### Pattern: quoted
 
 CSV with many quoted fields containing special characters.
 
@@ -88,7 +210,7 @@ CSV with many quoted fields containing special characters.
 | **10kb**  |    7.0ms |    1.4 MiB/s |    7 MB  |
 | **1kb**   |    6.1ms |    0.2 MiB/s |    7 MB  |
 
-## Pattern: multiline
+### Pattern: multiline
 
 CSV with multiline fields (newlines inside quotes).
 
@@ -101,7 +223,7 @@ CSV with multiline fields (newlines inside quotes).
 | **10kb**  |    7.0ms |    1.4 MiB/s |    7 MB  |
 | **1kb**   |    6.7ms |    0.2 MiB/s |    7 MB  |
 
-## Pattern: wide
+### Pattern: wide
 
 Wide tables (many columns per row).
 
@@ -114,7 +236,7 @@ Wide tables (many columns per row).
 | **10kb**  |    6.7ms |    1.5 MiB/s |    7 MB  |
 | **1kb**   |    6.0ms |    0.2 MiB/s |    7 MB  |
 
-## Pattern: long
+### Pattern: long
 
 Tall tables (many rows, few columns).
 
@@ -127,7 +249,7 @@ Tall tables (many rows, few columns).
 | **10kb**  |    8.1ms |    1.2 MiB/s |    8 MB  |
 | **1kb**   |    6.0ms |    0.2 MiB/s |    7 MB  |
 
-## Pattern: mixed
+### Pattern: mixed
 
 Mixed content with various field types and quoting.
 
@@ -140,7 +262,7 @@ Mixed content with various field types and quoting.
 | **10kb**  |    6.9ms |    1.4 MiB/s |    7 MB  |
 | **1kb**   |    5.8ms |    0.2 MiB/s |    7 MB  |
 
-## Pattern: pathological
+### Pattern: pathological
 
 Worst-case CSV patterns (heavy quoting, escapes, edge cases).
 
@@ -177,32 +299,66 @@ Standard CSV with uniform column widths.
 
 ---
 
-## Summary
+# Optimization Comparison
 
-### Throughput by Pattern (100MB files)
+## Memory Reduction (100MB files, Apple M1 Max)
 
-#### Apple M1 Max (ARM)
+| Pattern        | Baseline | Optimized | Reduction |
+|----------------|----------|-----------|-----------|
+| **long**       |    4 GB  |   142 MB  | **28x**   |
+| **wide**       |    3 GB  |   143 MB  | **21x**   |
+| **tabular**    |    2 GB  |   142 MB  | **14x**   |
+| **users**      |    2 GB  |   142 MB  | **14x**   |
+| **numeric**    |    2 GB  |   142 MB  | **14x**   |
+| **mixed**      |    2 GB  |   142 MB  | **14x**   |
+| **pathological**|  911 MB |   142 MB  | **6.4x**  |
+| **quoted**     |  861 MB  |   142 MB  | **6.1x**  |
+| **multiline**  |  743 MB  |   142 MB  | **5.2x**  |
+| **strings**    |  610 MB  |   142 MB  | **4.3x**  |
+
+## Throughput Improvement (100MB files, Apple M1 Max)
+
+| Pattern        | Baseline     | Optimized    | Speedup |
+|----------------|--------------|--------------|---------|
+| **strings**    |   25.4 MiB/s |   28.6 MiB/s | **+13%** |
+| **multiline**  |   18.5 MiB/s |   20.6 MiB/s | **+11%** |
+| **quoted**     |   14.9 MiB/s |   16.5 MiB/s | **+11%** |
+| **long**       |    6.1 MiB/s |    6.7 MiB/s | **+10%** |
+| **wide**       |    6.5 MiB/s |    7.2 MiB/s | **+11%** |
+| **tabular**    |   10.2 MiB/s |   11.1 MiB/s | **+9%**  |
+| **mixed**      |    9.9 MiB/s |   11.0 MiB/s | **+11%** |
+| **numeric**    |    9.8 MiB/s |   10.8 MiB/s | **+10%** |
+| **users**      |    9.7 MiB/s |   10.8 MiB/s | **+11%** |
+| **pathological**|  13.4 MiB/s |   14.4 MiB/s | **+7%**  |
+
+---
+
+# Summary
+
+## Throughput by Pattern (100MB files, Optimized)
+
+### Apple M1 Max (ARM)
 
 | Pattern        | Throughput   | Notes                                     |
 |----------------|--------------|-------------------------------------------|
-| **strings**    |   25.4 MiB/s | Fastest - few quotes, simple fields       |
-| **multiline**  |   18.5 MiB/s | Fast despite newlines in fields           |
-| **quoted**     |   14.9 MiB/s | Quote handling overhead                   |
-| **pathological**|  13.4 MiB/s | Complex edge cases                        |
-| **tabular**    |   10.2 MiB/s | Uniform column widths                     |
-| **mixed**      |    9.9 MiB/s | Varied content types                      |
-| **numeric**    |    9.8 MiB/s | Number-heavy content                      |
-| **users**      |    9.7 MiB/s | Realistic user records                    |
-| **wide**       |    6.5 MiB/s | Many columns increases overhead           |
-| **long**       |    6.1 MiB/s | Many rows increases per-row overhead      |
+| **strings**    |   28.6 MiB/s | Fastest - few quotes, simple fields       |
+| **multiline**  |   20.6 MiB/s | Fast despite newlines in fields           |
+| **quoted**     |   16.5 MiB/s | Quote handling overhead                   |
+| **pathological**|  14.4 MiB/s | Complex edge cases                        |
+| **tabular**    |   11.1 MiB/s | Uniform column widths                     |
+| **mixed**      |   11.0 MiB/s | Varied content types                      |
+| **numeric**    |   10.8 MiB/s | Number-heavy content                      |
+| **users**      |   10.8 MiB/s | Realistic user records                    |
+| **wide**       |    7.2 MiB/s | Many columns increases overhead           |
+| **long**       |    6.7 MiB/s | Many rows increases per-row overhead      |
 
-#### AMD Ryzen 9 7950X (x86_64)
+### AMD Ryzen 9 7950X (x86_64)
 
 | Pattern        | Throughput   | Notes                                     |
 |----------------|--------------|-------------------------------------------|
 | **tabular**    |   16.0 MiB/s | Uniform column widths                     |
 
-### Pattern Descriptions
+## Pattern Descriptions
 
 | Pattern         | Description                                           |
 |-----------------|-------------------------------------------------------|
@@ -217,15 +373,14 @@ Standard CSV with uniform column widths.
 | **mixed**       | Mixed content with various field types                |
 | **pathological**| Worst-case patterns (heavy escaping, edge cases)      |
 
-### Key Observations
+## Key Observations
 
-1. **String-heavy data is fastest** (25.4 MiB/s on M1 Max) - Simple fields without quoting have minimal parsing overhead
-2. **Quote handling adds overhead** - Quoted patterns run at ~60% the speed of unquoted
-3. **Table shape matters**:
-   - Wide tables (many columns): 6.5 MiB/s - More field boundaries to track
-   - Long tables (many rows): 6.1 MiB/s - More row boundaries to process
-4. **Memory scales with file size** - Approximately 10-20x file size for large files (1-2GB for 100MB input)
-5. **x86_64 performance** - AMD Ryzen 9 7950X shows 57% faster throughput on tabular data (16.0 vs 10.2 MiB/s) with lower memory usage (1GB vs 2GB)
+1. **Streaming reduces memory 5-28x** - Memory now ~1.4x file size instead of 6-40x
+2. **SIMD + streaming improves throughput 7-13%** - Faster parsing and reduced allocation overhead
+3. **Memory is now constant per-pattern** - ~142 MB for all 100MB files regardless of row/column count
+4. **String-heavy data is fastest** (28.6 MiB/s) - Simple fields without quoting have minimal overhead
+5. **Quote handling adds overhead** - Quoted patterns run at ~60% the speed of unquoted
+6. **Table shape matters less with streaming** - Wide/long tables no longer cause memory blowup
 
 ## Reproducing Benchmarks
 
