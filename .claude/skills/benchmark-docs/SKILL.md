@@ -138,4 +138,73 @@ Wait for CPU load to settle (ideally below 1.0) before running benchmarks.
 cargo bench --bench json_simd
 cargo bench --bench balanced_parens
 cargo bench --bench jq_comparison
+
+# JSON parser comparison (in bench-compare/)
+cd bench-compare && cargo bench --bench json_parsers
 ```
+
+## Running bench-compare Benchmarks
+
+The `bench-compare/` subproject requires test data to be generated first.
+
+### Step 1: Generate Test Data
+
+```bash
+# From project root, generate all sizes
+cargo run --release --features cli -- json generate 1kb -o data/bench/generated/comprehensive/1kb.json
+cargo run --release --features cli -- json generate 10kb -o data/bench/generated/comprehensive/10kb.json
+cargo run --release --features cli -- json generate 100kb -o data/bench/generated/comprehensive/100kb.json
+cargo run --release --features cli -- json generate 1mb -o data/bench/generated/comprehensive/1mb.json
+cargo run --release --features cli -- json generate 10mb -o data/bench/generated/comprehensive/10mb.json
+cargo run --release --features cli -- json generate 100mb -o data/bench/generated/comprehensive/100mb.json
+```
+
+### Step 2: Run Benchmarks
+
+```bash
+cd bench-compare
+cargo bench --bench json_parsers
+```
+
+### Step 3: Update Documentation
+
+After running, manually extract results from criterion output and update:
+- `bench-compare/README.md` - Full results with all sizes
+- `.claude/skills/benchmark-docs/SKILL.md` - Summary table
+
+### Key Points
+
+- Benchmarks compare: serde_json, simd-json, sonic-rs, succinctly
+- Test files must exist in `data/bench/generated/comprehensive/`
+- 1GB file is excluded (too large for criterion's sample requirements)
+- Memory measurements use a custom peak-tracking allocator
+
+## Rust JSON Parser Comparison
+
+The `bench-compare/` subproject benchmarks succinctly against other Rust JSON parsers.
+
+### When to Use Each Parser
+
+| Use Case                          | Best Choice      | Why                                      |
+|-----------------------------------|------------------|------------------------------------------|
+| Full document traversal           | **sonic-rs**     | Fastest parse + traverse (400+ MiB/s)    |
+| Selective field access (jq-style) | **succinctly**   | Lazy evaluation skips unused data        |
+| Memory-constrained environments   | **succinctly**   | 17-45x less memory than DOM parsers      |
+| Standard DOM parsing              | **serde_json**   | Best ecosystem compatibility             |
+| SIMD-accelerated DOM              | **simd-json**    | Fast parsing, moderate memory            |
+
+### Key Learnings
+
+1. **sonic-rs is fastest for full document access** - ~670 MiB/s parse, ~420 MiB/s parse+traverse on ARM
+2. **succinctly trades speed for memory** - 46% of input size vs 8-21x for DOM parsers
+3. **succinctly wins on selective queries** - jq-style queries are 1.2-6.3x faster than `jq` because unused data isn't parsed
+4. **simd-json has highest memory overhead** - 20x input size due to tape-based representation
+
+### Performance Characteristics (ARM, Apple M1 Max)
+
+| Parser      | Parse Only | Parse+Traverse | Memory (100MB) |
+|-------------|------------|----------------|----------------|
+| sonic-rs    | 687 MiB/s  | 425 MiB/s      | 955 MB (11.9x) |
+| succinctly  | 534 MiB/s  | 283 MiB/s      | 37 MB (0.46x)  |
+| simd-json   | 182 MiB/s  | 227 MiB/s      | 1654 MB (20.7x)|
+| serde_json  | 153 MiB/s  | 139 MiB/s      | 655 MB (8.2x)  |
