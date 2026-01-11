@@ -140,6 +140,100 @@ Memory-efficient: only one row materialized at a time.
 
 ---
 
+# AMD Ryzen 9 7950X (x86_64)
+
+**CPU**: AMD Ryzen 9 7950X 16-Core Processor
+**OS**: Linux (WSL2)
+**Delimiter**: `,` (comma-separated values)
+**succinctly**: Built with `RUSTFLAGS="-C target-cpu=native" cargo build --release --features cli`
+
+## Optimized (SIMD AVX2 + Streaming)
+
+Uses AVX2-accelerated DSV indexing with streaming output and native CPU optimizations.
+Memory-efficient: only one row materialized at a time.
+
+### Pattern: tabular
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    4.50s |   22.2 MiB/s |  139 MB  |
+| **10mb**  |  481.8ms |   20.8 MiB/s |   19 MB  |
+| **1mb**   |   50.7ms |   19.7 MiB/s |    8 MB  |
+
+### Pattern: users
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    5.01s |   20.0 MiB/s |  139 MB  |
+| **10mb**  |  502.4ms |   19.9 MiB/s |   19 MB  |
+| **1mb**   |   55.0ms |   18.2 MiB/s |    8 MB  |
+
+### Pattern: numeric
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    4.68s |   21.4 MiB/s |  139 MB  |
+| **10mb**  |  489.7ms |   20.4 MiB/s |   19 MB  |
+| **1mb**   |   51.3ms |   19.5 MiB/s |    8 MB  |
+
+### Pattern: strings
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    2.15s |   46.4 MiB/s |  139 MB  |
+| **10mb**  |  217.5ms |   46.0 MiB/s |   19 MB  |
+| **1mb**   |   24.5ms |   40.8 MiB/s |    8 MB  |
+
+### Pattern: quoted
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    3.15s |   31.8 MiB/s |  139 MB  |
+| **10mb**  |  325.8ms |   30.7 MiB/s |   19 MB  |
+| **1mb**   |   35.3ms |   28.4 MiB/s |    8 MB  |
+
+### Pattern: multiline
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    2.83s |   35.4 MiB/s |  139 MB  |
+| **10mb**  |  305.9ms |   32.7 MiB/s |   19 MB  |
+| **1mb**   |   32.4ms |   30.8 MiB/s |    8 MB  |
+
+### Pattern: wide
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    9.24s |   10.8 MiB/s |  139 MB  |
+| **10mb**  |  899.2ms |   11.1 MiB/s |   19 MB  |
+| **1mb**   |   99.8ms |   10.0 MiB/s |    8 MB  |
+
+### Pattern: long
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    7.83s |   12.8 MiB/s |  139 MB  |
+| **10mb**  |  754.3ms |   13.3 MiB/s |   19 MB  |
+| **1mb**   |   83.6ms |   12.0 MiB/s |    8 MB  |
+
+### Pattern: mixed
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    4.55s |   22.0 MiB/s |  139 MB  |
+| **10mb**  |  466.7ms |   21.4 MiB/s |   19 MB  |
+| **1mb**   |   50.1ms |   20.0 MiB/s |    8 MB  |
+
+### Pattern: pathological
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    3.51s |   28.5 MiB/s |  139 MB  |
+| **10mb**  |  360.2ms |   27.8 MiB/s |   19 MB  |
+| **1mb**   |   39.0ms |   25.7 MiB/s |    8 MB  |
+
+---
+
 ## Baseline (Scalar, Materialized)
 
 Uses scalar DSV parsing with full JSON materialization.
@@ -277,28 +371,6 @@ Worst-case CSV patterns (heavy quoting, escapes, edge cases).
 
 ---
 
-# AMD Ryzen 9 7950X (x86_64)
-
-**CPU**: AMD Ryzen 9 7950X 16-Core Processor
-**OS**: Linux (WSL2)
-**Delimiter**: `,` (comma-separated values)
-**succinctly**: Built with `--release --features cli`
-
-## Pattern: tabular
-
-Standard CSV with uniform column widths.
-
-| Size      | Time     | Throughput   | Memory   |
-|-----------|----------|--------------|----------|
-| **100mb** |    6.23s |   16.0 MiB/s |    1 GB  |
-| **10mb**  |  648.0ms |   15.4 MiB/s |  162 MB  |
-| **1mb**   |   66.3ms |   15.1 MiB/s |   20 MB  |
-| **100kb** |    8.9ms |   11.0 MiB/s |    6 MB  |
-| **10kb**  |    3.0ms |    3.3 MiB/s |    4 MB  |
-| **1kb**   |    2.2ms |    0.5 MiB/s |    4 MB  |
-
----
-
 # Optimization Comparison
 
 ## Memory Reduction (100MB files, Apple M1 Max)
@@ -354,9 +426,18 @@ Standard CSV with uniform column widths.
 
 ### AMD Ryzen 9 7950X (x86_64)
 
-| Pattern        | Throughput   | Notes                                     |
-|----------------|--------------|-------------------------------------------|
-| **tabular**    |   16.0 MiB/s | Uniform column widths                     |
+| Pattern          | Throughput   | Notes                                     |
+|------------------|--------------|-------------------------------------------|
+| **strings**      |   46.4 MiB/s | Fastest - few quotes, simple fields       |
+| **multiline**    |   35.4 MiB/s | Fast despite newlines in fields           |
+| **quoted**       |   31.8 MiB/s | Quote handling overhead                   |
+| **pathological** |   28.5 MiB/s | Complex edge cases                        |
+| **tabular**      |   22.2 MiB/s | Uniform column widths                     |
+| **mixed**        |   22.0 MiB/s | Varied content types                      |
+| **numeric**      |   21.4 MiB/s | Number-heavy content                      |
+| **users**        |   20.0 MiB/s | Realistic user records                    |
+| **long**         |   12.8 MiB/s | Many rows increases per-row overhead      |
+| **wide**         |   10.8 MiB/s | Many columns increases overhead           |
 
 ## Pattern Descriptions
 
