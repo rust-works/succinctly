@@ -821,21 +821,177 @@ fn bench_csv_parsing(c: &mut Criterion) {
    - [ ] Criterion benchmarks
    - [ ] Performance comparison with csv crate
 
+## BMI2 Optimization Details
+
+The hw-dsv library achieves ~10x speedup on x86_64 using two BMI2 instructions: **PDEP** and **PEXT**.
+These are critical for quote-aware parsing performance.
+
+### Current Implementation Status
+
+| Optimization | hw-dsv | succinctly | Status |
+|--------------|--------|------------|--------|
+| `toggle64` with PDEP | Yes | No | **Not ported** |
+| `testWord8s` with PEXT | Yes | No | **Not ported** |
+| `prefix_xor` fallback | No | Yes | Implemented |
+| AVX2 character matching | Yes | Yes | Ported |
+| NEON character matching | No | Yes | Added |
+
+### BMI2 Instructions Used by hw-dsv
+
+#### 1. PDEP (Parallel Bit Deposit) - Critical for Quote Masking
+
+**Function:** `toggle64` in `hw-dsv/src/HaskellWorks/Data/Dsv/Internal/Broadword.hs`
+
+```haskell
+toggle64 :: Word64 -> Word64 -> Word64
+toggle64 carry w =
+  let c = carry .&. 0x1
+      addend = pdep (0x5555555555555555 .<. c) w
+  in ((addend .<. 1) .|. c) + comp w
+```
+
+**Purpose:** Generate a mask that toggles between "inside quotes" and "outside quotes".
+
+**How it works:**
+1. Input `w` is a bitmask where `1` = quote position
+2. `0x5555555555555555` = alternating `01010101...` pattern
+3. PDEP places the alternating pattern at quote positions
+4. Addition creates carry propagation that toggles regions
+5. Result: `1` = outside quotes, `0` = inside quotes
+
+**Performance:**
+- With PDEP: ~3 cycles
+- Without PDEP: ~50-100 operations (must iterate through quote positions)
+
+**Rust implementation:**
+
+```rust
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn toggle64_bmi2(carry: u64, w: u64) -> u64 {
+    use std::arch::x86_64::_pdep_u64;
+    let c = carry & 0x1;
+    let addend = _pdep_u64(0x5555555555555555u64 << c, w);
+    ((addend << 1) | c).wrapping_add(!w)
+}
+```
+
+#### 2. PEXT (Parallel Bit Extract) - For Byte Compression
+
+**Function:** `testWord8s` in `hw-dsv/src/HaskellWorks/Data/Dsv/Internal/Bits.hs`
+
+```haskell
+testWord8s :: Word64 -> Word64
+testWord8s w = let w8s = w
+                   w4s = w8s .|. (w8s .>. 4)
+                   w2s = w4s .|. (w4s .>. 2)
+                   w1s = w2s .|. (w2s .>. 1)
+               in pext w1s 0x0101010101010101
+```
+
+**Purpose:** Compress 8 bytes of SIMD comparison results into 8 bits.
+
+**How it works:**
+1. Takes 8 bytes where each is 0x00 or 0xFF (from SIMD comparison)
+2. OR-reduces each byte to its LSB
+3. Uses PEXT to extract the 8 LSBs into positions 0-7
+
+**Performance:**
+- With PEXT: 1 cycle
+- Without PEXT: ~15-20 operations
+
+**Rust implementation:**
+
+```rust
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn test_word8s_bmi2(w: u64) -> u64 {
+    use std::arch::x86_64::_pext_u64;
+    let w4s = w | (w >> 4);
+    let w2s = w4s | (w4s >> 2);
+    let w1s = w2s | (w2s >> 1);
+    _pext_u64(w1s, 0x0101010101010101)
+}
+```
+
+#### 3. indexCsvChunk - Quote Entry/Exit Tracking
+
+**Location:** `hw-dsv/src/HaskellWorks/Data/Dsv/Internal/Vector.hs`
+
+```haskell
+let enters = pdep (oddsMask .<. (0x1 .&.      pc)) qq
+let leaves = pdep (oddsMask .<. (0x1 .&. comp pc)) qq
+```
+
+**Purpose:** Track where quotes are entered and exited for proper state management.
+
+### Performance Impact
+
+**Measured on 7GB CSV file (hw-dsv benchmarks):**
+
+| Configuration | Throughput | Speedup |
+|--------------|-----------|---------|
+| Broadword (no BMI2) | 16.3 MiB/s | 1x |
+| BMI2 enabled | 165 MiB/s | **10.1x** |
+| BMI2 + AVX2 | 181 MiB/s | **11.1x** |
+
+**Current succinctly performance:** 10-28 MiB/s (using `prefix_xor`)
+
+### Why BMI2 Matters
+
+1. **Single-cycle operations** - PDEP/PEXT execute in 1 cycle on Intel Haswell+ and AMD Zen+
+2. **Eliminates branches** - Bit manipulation replaces conditional logic
+3. **Reduces register pressure** - One instruction vs. many temporaries
+4. **Enables elegant algorithms** - `toggle64` would be very complex without PDEP
+
+### ARM/Apple Silicon Limitation
+
+ARM has **no equivalent** to PDEP/PEXT:
+- SVE2 has BDEP/BEXT but operates on vectors only
+- Apple Silicon (M1-M4) doesn't implement SVE/SVE2
+- Must use software emulation (`prefix_xor` approach)
+
+Expected ARM performance: 25-40 MiB/s (better than broadword due to NEON SIMD)
+
+### Implementation Plan for BMI2
+
+1. **Add runtime detection:**
+```rust
+pub fn build_index(text: &[u8], config: &DsvConfig) -> DsvIndex {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("bmi2") && is_x86_feature_detected!("avx2") {
+        return unsafe { build_index_bmi2_avx2(text, config) };
+    }
+    // Fall back to current implementation
+    build_index_simd(text, config)
+}
+```
+
+2. **Implement BMI2 path:**
+   - Replace `prefix_xor` with `toggle64_bmi2`
+   - Use PEXT for byte mask compression where applicable
+   - Keep existing SIMD character matching
+
+3. **Benchmark both paths:**
+   - Verify 5-10x improvement on x86_64 with BMI2
+   - Ensure no regression on ARM
+
 ## Key Differences from hw-dsv
 
 | Aspect              | hw-dsv                    | This Port                      |
 |---------------------|---------------------------|--------------------------------|
 | Streaming           | Chunked lazy processing   | Full file in memory (simpler)  |
 | Index storage       | List of Vec<u64>          | Single BitVec with rank/select |
-| SIMD                | AVX2 + BMI2               | BMI2 PDEP + portable fallback  |
+| SIMD                | AVX2 + BMI2               | AVX2/SSE2/NEON + prefix_xor    |
+| BMI2 PDEP/PEXT      | Yes (critical)            | **Not yet implemented**        |
 | Quote handling      | Same algorithm            | Same algorithm                 |
 | Memory model        | Haskell lazy              | Rust owned/borrowed            |
 
 ## Performance Expectations
 
 Based on hw-dsv benchmarks:
-- **With BMI2**: ~165 MiB/s expected
-- **Portable**: ~16-30 MiB/s expected
+- **With BMI2**: ~165 MiB/s expected (not yet achieved)
+- **Current (prefix_xor)**: ~10-28 MiB/s
 - **Memory overhead**: ~3-4% of input size
 
 Succinctly's existing BitVec infrastructure should provide comparable performance to hw-dsv's rank/select operations.
