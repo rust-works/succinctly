@@ -307,7 +307,40 @@ This document provides a comprehensive record of all optimizations attempted in 
 
 ---
 
-### 11. PFSM (Parallel Finite State Machine) JSON Parser (x86_64)
+### 11. DSV Lightweight Index for NEON (ARM)
+
+**Status**: ✅ IMPLEMENTED & DEPLOYED
+**File**: [src/dsv/simd/neon.rs](../src/dsv/simd/neon.rs)
+**Date**: 2026-01-12
+
+**Technique**: Use lightweight cumulative rank index instead of full BitVec with 3-level rank directory for DSV parsing on ARM.
+
+**Background**: The x86 implementations (AVX2, BMI2) were using `DsvIndexLightweight` which provides O(1) rank via simple cumulative popcount arrays. The NEON implementation was still using the older `BitVec` structure with full `RankDirectory` and `SelectIndex` (~6% memory overhead vs ~0.8% for lightweight).
+
+**Performance Results** (Apple M1 Max, 10MB files):
+
+| Pattern      | Before (BitVec) | After (Lightweight) | Improvement      |
+|--------------|-----------------|---------------------|------------------|
+| **strings**  | 29.0 MiB/s      | 75.1 MiB/s          | **+159% (2.6x)** |
+| **wide**     | 7.1 MiB/s       | 30.6 MiB/s          | **+331% (4.3x)** |
+| **multiline**| 20.3 MiB/s      | 26.8 MiB/s          | **+32%**         |
+| **quoted**   | 16.6 MiB/s      | 18.1 MiB/s          | **+9%**          |
+| **users**    | 10.5 MiB/s      | 12.3 MiB/s          | **+17%**         |
+| **tabular**  | 10.6 MiB/s      | 10.5 MiB/s          | ~same            |
+
+**Average Speedup**: **1.8x (80% faster)**, up to **4.3x on wide patterns**
+
+**Why it worked**:
+- Eliminated 3-level rank directory lookups
+- Simpler array structure fits better in cache
+- Reduces memory overhead from ~6% to ~0.8%
+- Patterns with more fields per row (strings, wide) benefit most
+
+**Current Status**: Default NEON DSV implementation
+
+---
+
+### 12. PFSM (Parallel Finite State Machine) JSON Parser (x86_64)
 
 **Status**: ✅ IMPLEMENTED & DEPLOYED
 **Files**: [src/json/pfsm.rs](../src/json/pfsm.rs), [src/json/pfsm_tables.rs](../src/json/pfsm_tables.rs)
@@ -689,20 +722,21 @@ let t_vec = vld1q_u8([t0, t1, t2, t3].as_ptr() as *const u8);
 
 ### Successful Optimizations
 
-| Optimization            | Speedup                                    | Platform | Status     |
-|-------------------------|--------------------------------------------|----------|------------|
-| PFSM JSON Parser        | **1.33x** (vs scalar), **1.17x** (vs AVX2) | x86_64   | ✅ Deployed |
-| AVX2 JSON Parser        | **1.78x**                                  | x86_64   | ✅ Deployed |
-| AVX512-VPOPCNTDQ        | **5.2x** (micro), **1.01x** (e2e)          | x86_64   | ✅ Deployed |
-| SSE4.2 PCMPISTRI        | **1.38x**                                  | x86_64   | ✅ Deployed |
-| NEON 32-byte Processing | **1.11x** (avg), **1.69x** (strings)       | ARM      | ✅ Deployed |
-| NEON Nibble Lookup      | **1.02-1.06x**                             | ARM      | ✅ Deployed |
-| BP Byte Lookup Tables   | **11x**                                    | All      | ✅ Deployed |
-| Hierarchical RangeMin   | **40x**                                    | All      | ✅ Deployed |
-| Cumulative Index        | **627x**                                   | All      | ✅ Deployed |
-| Dual Select Methods     | **3.1x** (seq), **1.39x** (rand)           | All      | ✅ Deployed |
+| Optimization              | Speedup                                    | Platform | Status     |
+|---------------------------|--------------------------------------------|----------|------------|
+| PFSM JSON Parser          | **1.33x** (vs scalar), **1.17x** (vs AVX2) | x86_64   | ✅ Deployed |
+| AVX2 JSON Parser          | **1.78x**                                  | x86_64   | ✅ Deployed |
+| AVX512-VPOPCNTDQ          | **5.2x** (micro), **1.01x** (e2e)          | x86_64   | ✅ Deployed |
+| SSE4.2 PCMPISTRI          | **1.38x**                                  | x86_64   | ✅ Deployed |
+| NEON 32-byte Processing   | **1.11x** (avg), **1.69x** (strings)       | ARM      | ✅ Deployed |
+| NEON Nibble Lookup        | **1.02-1.06x**                             | ARM      | ✅ Deployed |
+| DSV Lightweight Index ARM | **1.8x** (avg), **4.3x** (wide)            | ARM      | ✅ Deployed |
+| BP Byte Lookup Tables     | **11x**                                    | All      | ✅ Deployed |
+| Hierarchical RangeMin     | **40x**                                    | All      | ✅ Deployed |
+| Cumulative Index          | **627x**                                   | All      | ✅ Deployed |
+| Dual Select Methods       | **3.1x** (seq), **1.39x** (rand)           | All      | ✅ Deployed |
 
-**Total Successful**: 10 optimizations
+**Total Successful**: 11 optimizations
 **Average Speedup**: 6.2x (geometric mean, excluding outliers)
 **Best Result**: Cumulative index (627x)
 **Most Impactful**: PFSM JSON parser (1.33x, supersedes AVX2 as fastest JSON parser)
@@ -738,6 +772,7 @@ let t_vec = vld1q_u8([t0, t1, t2, t3].as_ptr() as *const u8);
 **ARM (Apple Silicon)**:
 - JSON parsing: **1.52x faster** (NEON vs scalar)
 - String-heavy workloads: **Up to 1.69x faster**
+- DSV parsing: **1.8x faster** (avg), **4.3x faster** (wide patterns)
 - End-to-end: **~1.5x faster** JSON indexing
 - Note: PFSM not yet ported to ARM (x86_64 only)
 
@@ -860,7 +895,7 @@ Before implementing an optimization, ask:
 
 ## Conclusion
 
-**Success Rate**: 10/18 attempted optimizations (56%)
+**Success Rate**: 11/19 attempted optimizations (58%)
 
 **Key Insight**: The most successful optimizations were algorithmic (cumulative index: 627x, RangeMin: 40x) rather than micro-optimizations. SIMD acceleration works best when:
 1. Targeting actual bottlenecks (AVX2 JSON: 78%)
@@ -873,6 +908,6 @@ Before implementing an optimization, ask:
 
 ---
 
-**Last Updated**: 2026-01-10
+**Last Updated**: 2026-01-12
 **Maintained By**: Succinctly development team
 **Status**: All production optimizations deployed and tested
