@@ -109,12 +109,12 @@ Space overhead: ~6% of bitvector size.
 
 ### JSON Semi-Indexing
 
-JSON documents are converted to two bitvectors:
+JSON documents are converted to two bitvectors for efficient navigation without full parsing. See [parsing/json.md](parsing/json.md) for detailed implementation documentation covering:
 
-1. **Interest Bits (IB)**: Marks structural characters (`, : [ ] { }`)
-2. **Balanced Parentheses (BP)**: Encodes document structure
-
-This enables navigation without parsing string contents.
+- Semi-index structure (Interest Bits + Balanced Parentheses)
+- PFSM table-driven parser (~950 MiB/s)
+- SIMD character classification
+- Navigation cursor API
 
 ## Development Workflow
 

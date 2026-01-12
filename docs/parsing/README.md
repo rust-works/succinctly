@@ -1,0 +1,99 @@
+# Parsing Documentation
+
+This directory documents how the succinctly library parses structured data formats using semi-indexing techniques.
+
+## Overview
+
+Traditional parsers materialize data into memory structures (DOM trees, row arrays). Succinctly instead creates **semi-indices**: compact bit vectors that mark structural boundaries, enabling O(1) navigation without full materialization.
+
+| Format | Document | Key Technique |
+|--------|----------|---------------|
+| JSON | [json.md](json.md) | Interest bits + balanced parentheses |
+| CSV/TSV | [dsv.md](dsv.md) | Marker bits + quote state tracking |
+
+---
+
+## Semi-Indexing Approach
+
+### Traditional Parsing
+
+```
+Input → Full Parse → DOM/Rows → Query
+         ↓
+   10-50x memory overhead
+```
+
+### Semi-Indexing
+
+```
+Input → Bit Index → Lazy Navigation → Query
+           ↓
+      ~3-4% memory overhead
+```
+
+**Benefits**:
+- Memory efficient: 3-4% overhead vs 10-50x
+- Fast construction: SIMD-accelerated
+- Lazy evaluation: Decode values only when accessed
+- Random access: O(1) rank, O(log n) select
+
+---
+
+## Common Techniques
+
+Both parsers share optimisation techniques:
+
+| Technique | JSON | DSV | Document |
+|-----------|------|-----|----------|
+| SIMD character detection | AVX2, NEON | AVX2, NEON | [simd.md](../optimisations/simd.md) |
+| Lookup tables | PFSM tables | - | [lookup-tables.md](../optimisations/lookup-tables.md) |
+| State machine | 4-state FSM | Quote toggle | [state-machines.md](../optimisations/state-machines.md) |
+| Rank/select indices | BP navigation | Field lookup | [hierarchical-structures.md](../optimisations/hierarchical-structures.md) |
+| Parallel prefix | - | Quote masking | [parallel-prefix.md](../optimisations/parallel-prefix.md) |
+| PDEP/PEXT | - | toggle64_bmi2 | [bit-manipulation.md](../optimisations/bit-manipulation.md) |
+
+---
+
+## Performance Summary
+
+### Parsing Throughput
+
+| Format | Platform | Throughput |
+|--------|----------|------------|
+| JSON | x86_64 PFSM | ~950 MiB/s |
+| JSON | ARM NEON | ~570 MiB/s |
+| DSV | x86_64 BMI2 | 1.3-3.7 GB/s |
+| DSV | ARM NEON | ~800 MiB/s |
+
+### Memory Overhead
+
+| Approach | Overhead |
+|----------|----------|
+| Semi-index | ~3-4% of input |
+| DOM parser (JSON) | 10-50x input |
+| Materialized (CSV) | 6-40x input |
+
+---
+
+## Quick Links
+
+- [JSON Parsing](json.md) - Semi-index structure, PFSM, SIMD classification
+- [DSV Parsing](dsv.md) - Quote handling, PDEP carry propagation, lightweight index
+
+### Optimisation Techniques
+
+- [simd.md](../optimisations/simd.md) - AVX2, NEON character detection
+- [lookup-tables.md](../optimisations/lookup-tables.md) - PFSM state tables
+- [state-machines.md](../optimisations/state-machines.md) - Parser state machines
+- [parallel-prefix.md](../optimisations/parallel-prefix.md) - Quote state with prefix XOR
+- [bit-manipulation.md](../optimisations/bit-manipulation.md) - PDEP for 10x faster quotes
+- [hierarchical-structures.md](../optimisations/hierarchical-structures.md) - Rank/select indices
+- [cache-memory.md](../optimisations/cache-memory.md) - Why lightweight index wins
+
+---
+
+## References
+
+- Langdale, G. & Lemire, D. "Parsing Gigabytes of JSON per Second" (2019)
+- simdjson: https://github.com/simdjson/simdjson
+- hw-json/hw-dsv (Haskell): https://github.com/haskell-works
