@@ -64,11 +64,27 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release --examples
 - **Random access**: 5.8-10.7M ops/sec (93-173ns per field)
 - **Parse speed**: 1.3-3.7 GB/s (SIMD with BMI2+AVX2)
 
-**CLI benchmark: Query comparison** (strings 10MB):
-- **Full output** (`--query '.'`): 80.2ms (124.7 MiB/s)
-- **Single column** (`--query '.[0]'`): 62.4ms (160.3 MiB/s) - **1.29x faster**
+**CLI benchmark: Query comparison** (10MB files, AMD Ryzen 9 7950X):
 
-Single column selection is faster due to reduced JSON serialization overhead, while still including full DSV parsing and iteration.
+Single column selection (`.[0]`) vs full output (`.`) - **Average 1.67x faster**:
+
+| Pattern       | Full Output      | Single Column    | Speedup |
+|---------------|------------------|------------------|---------|
+| wide          | 44.7 MiB/s       | 83.8 MiB/s       | **1.88x** |
+| users         | 22.1 MiB/s       | 41.0 MiB/s       | **1.85x** |
+| tabular       | 19.5 MiB/s       | 34.9 MiB/s       | **1.79x** |
+| mixed         | 19.7 MiB/s       | 35.1 MiB/s       | **1.78x** |
+| numeric       | 20.6 MiB/s       | 36.5 MiB/s       | **1.77x** |
+| pathological  | 52.5 MiB/s       | 88.7 MiB/s       | **1.69x** |
+| quoted        | 63.5 MiB/s       | 103.4 MiB/s      | **1.63x** |
+| long          | 11.4 MiB/s       | 17.6 MiB/s       | **1.54x** |
+| multiline     | 39.1 MiB/s       | 54.0 MiB/s       | **1.38x** |
+| strings       | 126.4 MiB/s      | 169.0 MiB/s      | **1.34x** |
+
+**Key insights:**
+- Wide tables benefit most (1.88x) - more columns to skip
+- Average speedup: 1.67x (40% time reduction)
+- Speedup from reduced JSON serialization (DSV parsing unchanged)
 
 ---
 
