@@ -3,6 +3,8 @@
 //! This module implements the core algorithm from hw-dsv that creates bit vectors
 //! marking field delimiters and newlines, with proper handling of quoted fields.
 
+use alloc::vec;
+
 use super::config::DsvConfig;
 use super::index::DsvIndex;
 use super::index_lightweight::DsvIndexLightweight;

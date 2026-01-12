@@ -9,6 +9,8 @@
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+use alloc::vec;
+
 use super::super::config::DsvConfig;
 use super::super::index::DsvIndex;
 use super::super::index_lightweight::DsvIndexLightweight;
