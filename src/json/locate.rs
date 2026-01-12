@@ -4,7 +4,12 @@
 //! to a specific byte offset or line/column position in a JSON document.
 
 #[cfg(not(test))]
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
 #[cfg(test)]
 use std::vec;

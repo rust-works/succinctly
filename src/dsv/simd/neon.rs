@@ -3,6 +3,9 @@
 //! Processes 64 bytes at a time using ARM NEON SIMD instructions to find
 //! delimiters, newlines, and quotes in parallel.
 
+#[cfg(not(test))]
+use alloc::vec;
+
 use core::arch::aarch64::*;
 
 use super::super::config::DsvConfig;
@@ -362,9 +365,7 @@ mod tests {
         let mut csv = Vec::new();
         csv.push(b'"');
         // Add content to push past 64 bytes before closing quote
-        for _ in 0..70 {
-            csv.push(b'x');
-        }
+        csv.resize(71, b'x');
         csv.push(b'"');
         csv.push(b',');
         csv.push(b'b');
