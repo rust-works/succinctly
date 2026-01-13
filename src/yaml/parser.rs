@@ -443,15 +443,8 @@ impl<'a> Parser<'a> {
                 b'&' | b'*' => {
                     // Allowed - will be parsed by parse_anchor() or parse_alias()
                 }
-                b'?' => {
-                    // Check if it's explicit key (? at start of content + whitespace)
-                    if self.peek_at(1) == Some(b' ')
-                        || self.peek_at(1) == Some(b'\t')
-                        || self.peek_at(1) == Some(b'\n')
-                    {
-                        return Err(YamlError::ExplicitKeyNotSupported { offset: self.pos });
-                    }
-                }
+                // Explicit keys (`?`) are now supported
+                b'?' => {}
                 b'!' => {
                     return Err(YamlError::TagNotSupported { offset: self.pos });
                 }
@@ -1019,6 +1012,204 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Parse an explicit key (`? key`).
+    /// The key can be any value: scalar, sequence, or mapping.
+    fn parse_explicit_key(&mut self, indent: usize) -> Result<(), YamlError> {
+        // Close any deeper containers
+        self.close_deeper_indents(indent);
+
+        // Check if we need to open a new mapping
+        let need_new_mapping = self.type_stack.last() != Some(&NodeType::Mapping)
+            || self.indent_stack.last().copied() != Some(indent);
+
+        if need_new_mapping {
+            // Open new mapping
+            self.write_bp_open();
+            self.write_ty(false); // 0 = mapping
+            self.indent_stack.push(indent);
+            self.type_stack.push(NodeType::Mapping);
+        }
+
+        // Skip `?`
+        self.advance();
+
+        // Skip whitespace/comments after `?`
+        self.skip_inline_whitespace();
+
+        // Check for anchor before key
+        if self.peek() == Some(b'&') {
+            let _ = self.parse_anchor()?;
+            self.skip_inline_whitespace();
+        }
+
+        // Check what the key is
+        if self.at_line_end() {
+            // Key is on next line(s) - it could be a complex structure
+            // For now, the next line will parse as the key content
+            // and the `:` line will provide the value
+            self.skip_to_eol();
+            return Ok(());
+        }
+
+        // Mark key position
+        self.set_ib();
+
+        // Parse the key value inline
+        match self.peek() {
+            Some(b'-')
+                if matches!(
+                    self.peek_at(1),
+                    Some(b' ') | Some(b'\n') | Some(b'\r') | None
+                ) =>
+            {
+                // Sequence as key - open key node and let sequence parsing continue
+                // The key will be a sequence
+                self.write_bp_open();
+                self.write_ty(true); // sequence
+                self.indent_stack.push(indent + 2); // Indent for sequence content
+                self.type_stack.push(NodeType::Sequence);
+
+                // Parse first sequence item inline
+                self.write_bp_open(); // item node
+                self.advance(); // skip `-`
+                self.skip_inline_whitespace();
+
+                if !self.at_line_end() {
+                    // Parse item value
+                    if self.looks_like_mapping_entry() {
+                        self.parse_compact_mapping_entry(indent + 3)?;
+                    } else {
+                        self.parse_value(indent + 2)?;
+                    }
+                }
+                self.write_bp_close(); // close item
+            }
+            Some(b'[') => {
+                // Flow sequence as key
+                self.write_bp_open();
+                self.parse_flow_sequence()?;
+                self.write_bp_close();
+            }
+            Some(b'{') => {
+                // Flow mapping as key
+                self.write_bp_open();
+                self.parse_flow_mapping()?;
+                self.write_bp_close();
+            }
+            Some(b'|') | Some(b'>') => {
+                // Block scalar as key
+                self.parse_block_scalar(indent)?;
+            }
+            Some(b'"') => {
+                // Double-quoted key
+                self.write_bp_open();
+                self.parse_double_quoted()?;
+                self.write_bp_close();
+            }
+            Some(b'\'') => {
+                // Single-quoted key
+                self.write_bp_open();
+                self.parse_single_quoted()?;
+                self.write_bp_close();
+            }
+            _ => {
+                // Unquoted scalar key
+                self.write_bp_open();
+                self.parse_unquoted_value_with_indent(indent);
+                self.write_bp_close();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parse an explicit value (`: value` after explicit key).
+    fn parse_explicit_value(&mut self, indent: usize) -> Result<(), YamlError> {
+        // Close deeper structures, but keep the mapping at this indent open
+        self.close_deeper_indents(indent + 1);
+
+        // Skip `:`
+        self.advance();
+
+        // Skip whitespace after `:`
+        self.skip_inline_whitespace();
+
+        // Check for anchor
+        if self.peek() == Some(b'&') {
+            let _ = self.parse_anchor()?;
+            self.skip_inline_whitespace();
+        }
+
+        // Check if value is on this line or next
+        if self.at_line_end() {
+            // Value is on next line(s) or null
+            self.skip_to_eol();
+            return Ok(());
+        }
+
+        // Parse the value
+        self.set_ib();
+
+        match self.peek() {
+            Some(b'-')
+                if matches!(
+                    self.peek_at(1),
+                    Some(b' ') | Some(b'\n') | Some(b'\r') | None
+                ) =>
+            {
+                // Sequence as value
+                self.write_bp_open();
+                self.write_ty(true); // sequence
+                self.indent_stack.push(indent + 2);
+                self.type_stack.push(NodeType::Sequence);
+
+                // Parse first sequence item
+                self.write_bp_open(); // item node
+                self.advance(); // skip `-`
+                self.skip_inline_whitespace();
+
+                if !self.at_line_end() {
+                    if self.looks_like_mapping_entry() {
+                        self.parse_compact_mapping_entry(indent + 3)?;
+                    } else {
+                        self.parse_value(indent + 2)?;
+                    }
+                }
+                self.write_bp_close(); // close item
+            }
+            Some(b'[') => {
+                self.parse_flow_sequence()?;
+            }
+            Some(b'{') => {
+                self.parse_flow_mapping()?;
+            }
+            Some(b'|') | Some(b'>') => {
+                self.parse_block_scalar(indent)?;
+            }
+            Some(b'"') => {
+                self.write_bp_open();
+                self.parse_double_quoted()?;
+                self.write_bp_close();
+            }
+            Some(b'\'') => {
+                self.write_bp_open();
+                self.parse_single_quoted()?;
+                self.write_bp_close();
+            }
+            Some(b'*') => {
+                // Alias as value
+                self.parse_alias()?;
+            }
+            _ => {
+                self.write_bp_open();
+                self.parse_unquoted_value_with_indent(indent);
+                self.write_bp_close();
+            }
+        }
+
+        Ok(())
+    }
+
     /// Parse an inline scalar value (on the same line as the key).
     fn parse_inline_value(&mut self, min_indent: usize) -> Result<(), YamlError> {
         match self.peek() {
@@ -1477,14 +1668,33 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// Parse a key in flow context (scalar only, no containers).
+    /// Parse a key in flow context.
+    /// Keys can be scalars, flow sequences, or flow mappings (complex keys).
     fn parse_flow_key(&mut self) -> Result<(), YamlError> {
+        // Check for anchor on key
+        if self.peek() == Some(b'&') {
+            let _ = self.parse_anchor()?;
+            self.skip_flow_whitespace();
+        }
+
         match self.peek() {
             Some(b'"') => {
                 self.parse_double_quoted()?;
             }
             Some(b'\'') => {
                 self.parse_single_quoted()?;
+            }
+            Some(b'[') => {
+                // Flow sequence as key (complex key)
+                self.parse_flow_sequence()?;
+            }
+            Some(b'{') => {
+                // Flow mapping as key (complex key)
+                self.parse_flow_mapping()?;
+            }
+            Some(b'*') => {
+                // Alias as key
+                self.parse_alias()?;
             }
             _ => {
                 self.parse_flow_unquoted_key()?;
@@ -2171,6 +2381,24 @@ impl<'a> Parser<'a> {
                 ) =>
             {
                 self.parse_sequence_item(indent)?;
+            }
+            Some(b'?')
+                if matches!(
+                    self.peek_at(1),
+                    Some(b' ') | Some(b'\n') | Some(b'\r') | None
+                ) =>
+            {
+                // Explicit key indicator
+                self.parse_explicit_key(indent)?;
+            }
+            Some(b':')
+                if matches!(
+                    self.peek_at(1),
+                    Some(b' ') | Some(b'\n') | Some(b'\r') | None
+                ) =>
+            {
+                // Explicit value indicator (value for previous explicit key)
+                self.parse_explicit_value(indent)?;
             }
             Some(b'#') => {
                 // Comment line - skip

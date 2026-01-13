@@ -240,7 +240,6 @@ fn test_4CQQ_spec_example_218_multiline_flow_scalars() {
 /// Nested implicit complex keys
 /// Tags: complex-key flow mapping sequence
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_4FJ6_nested_implicit_complex_keys() {
     let yaml = b"---\n[\n  [ a, [ [[b,c]]: d, e]]: 23\n]";
 
@@ -440,7 +439,6 @@ fn test_5T43_colon_at_the_beginning_of_adjacent_flow_scalar() {
 /// Spec Example 8.17. Explicit Block Mapping Entries
 /// Tags: explicit-key spec mapping comment literal sequence
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_5WE3_spec_example_817_explicit_block_mapping_entries() {
     let yaml = b"? explicit key # Empty value\n? |\n  block key\n: - one # Explicit compact\n  - two # block value";
 
@@ -485,7 +483,6 @@ fn test_6BCT_spec_example_63_separation_spaces() {
 /// Mapping, key and flow sequence item anchors
 /// Tags: anchor complex-key flow mapping sequence
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_6BFJ_mapping_key_and_flow_sequence_item_anchors() {
     let yaml = b"---\n&mapping\n&key [ &item a, b, c ]: value";
 
@@ -571,7 +568,6 @@ fn test_6KGN_anchor_for_empty_node() {
 /// Aliases in Explicit Block Mapping
 /// Tags: alias explicit-key empty-key
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_6M2F_aliases_in_explicit_block_mapping() {
     let yaml = b"? &a a\n: &b b\n: *a";
 
@@ -583,7 +579,6 @@ fn test_6M2F_aliases_in_explicit_block_mapping() {
 /// Zero-indented sequences in explicit mapping keys
 /// Tags: explicit-key mapping sequence
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_6PBE_zeroindented_sequences_in_explicit_mapping_keys() {
     let yaml = b"---\n?\n- a\n- b\n:\n- c\n- d";
 
@@ -672,7 +667,6 @@ fn test_7TMG_comment_in_flow_sequence_before_comma() {
 /// Block Mapping with Missing Values
 /// Tags: explicit-key mapping
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_7W2P_block_mapping_with_missing_values() {
     let yaml = b"? a\n? b\nc:";
 
@@ -926,7 +920,6 @@ fn test_9U5K_spec_example_212_compact_nested_mapping() {
 /// Spec Example 6.2. Indentation Indicators
 /// Tags: explicit-key spec libyaml-err indent whitespace sequence upto-1.2
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_A2M4_spec_example_62_indentation_indicators() {
     let yaml = b"? a\n: -\tb\n  -  -\t\tc\n     - d";
 
@@ -1048,7 +1041,6 @@ fn test_CPZ3_doublequoted_scalar_starting_with_a_tab() {
 /// Spec Example 7.20. Single Pair Explicit Entry
 /// Tags: explicit-key spec flow mapping
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_CT4Q_spec_example_720_single_pair_explicit_entry() {
     let yaml = b"[\n? foo\n bar : baz\n]";
 
@@ -1126,7 +1118,6 @@ fn test_DE56_trailing_tabs_in_double_quoted() {
 /// Spec Example 7.16. Flow Mapping Entries
 /// Tags: explicit-key spec flow mapping
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_DFF7_spec_example_716_flow_mapping_entries() {
     let yaml = b"{\n? explicit: entry,\nimplicit: entry,\n?\n}";
 
@@ -1270,7 +1261,6 @@ fn test_FQ7F_spec_example_21_sequence_of_scalars() {
 /// Spec Example 7.3. Completely Empty Flow Nodes
 /// Tags: empty-key explicit-key spec flow mapping
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_FRK4_spec_example_73_completely_empty_flow_nodes() {
     let yaml = b"{\n  ? foo :,\n  : bar,\n}";
 
@@ -1304,7 +1294,6 @@ fn test_G4RS_spec_example_217_quoted_scalars() {
 /// Mixed Block Mapping (explicit to implicit)
 /// Tags: explicit-key mapping
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_GH63_mixed_block_mapping_explicit_to_implicit() {
     let yaml = b"? a\n: 1.3\nfifteen: d";
 
@@ -1437,7 +1426,6 @@ fn test_JQ4R_spec_example_814_block_sequence() {
 /// Question marks in scalars
 /// Tags: flow scalar
 #[test]
-#[ignore = "explicit keys not supported"]
 fn test_JR7V_question_marks_in_scalars() {
     let yaml = b"- a?string\n- another ? string\n- key: value?\n- [a?string]\n- [another ? string]\n- {key: value? }\n- {key: value?}\n- {key?: value }";
 
@@ -1460,7 +1448,6 @@ fn test_JS2J_spec_example_629_node_anchors() {
 /// Block Mapping with Multiline Scalars
 /// Tags: explicit-key mapping scalar
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_JTV5_block_mapping_with_multiline_scalars() {
     let yaml = b"? a\n  true\n: null\n  d\n? e\n  42";
 
@@ -1516,7 +1503,6 @@ fn test_KH5V_inline_tabs_in_double_quoted() {
 /// Various combinations of explicit block mappings
 /// Tags: explicit-key mapping sequence
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_KK5P_various_combinations_of_explicit_block_mappings() {
     let yaml = b"complex1:\n  ? - a\ncomplex2:\n  ? - a\n  : b\ncomplex3:\n  ? - a\n  : >\n    b\ncomplex4:\n  ? >\n    a\n  :\ncomplex5:\n  ? - a\n  : - b";
 
@@ -1605,7 +1591,6 @@ fn test_M29M_literal_block_scalar() {
 /// Question mark edge cases
 /// Tags: edge empty-key
 #[test]
-#[ignore = "explicit keys not supported"]
 fn test_M2N8_question_mark_edge_cases() {
     let yaml = b"- ? : x";
 
@@ -1617,7 +1602,6 @@ fn test_M2N8_question_mark_edge_cases() {
 /// Spec Example 2.11. Mapping between Sequences
 /// Tags: complex-key explicit-key spec mapping sequence
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_M5DY_spec_example_211_mapping_between_sequences() {
     let yaml = b"? - Detroit Tigers\n  - Chicago cubs\n:\n  - 2001-07-23\n? [ New York Yankees,\n    Atlanta Braves ]\n: [ 2001-07-02, 2001-08-12,\n    2001-08-14 ]";
 
@@ -1783,7 +1767,6 @@ fn test_PRH3_spec_example_79_single_quoted_lines() {
 /// Anchors on Empty Scalars
 /// Tags: anchor explicit-key
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_PW8X_anchors_on_empty_scalars() {
     let yaml = b"- &a\n- a\n-\n  &a : a\n  b: &b\n-\n  &c : &a\n-\n  ? &d\n-\n  ? &e\n  : &a";
 
@@ -1881,7 +1864,6 @@ fn test_RLU9_sequence_indent() {
 /// Mixed Block Mapping (implicit to explicit)
 /// Tags: explicit-key mapping
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_RR7F_mixed_block_mapping_implicit_to_explicit() {
     let yaml = b"a: 4.2\n? d\n: 23";
 
@@ -1893,7 +1875,6 @@ fn test_RR7F_mixed_block_mapping_implicit_to_explicit() {
 /// Various Trailing Comments [1.3]
 /// Tags: anchor comment folded mapping 1.3-mod
 #[test]
-#[ignore = "explicit keys not supported"]
 fn test_RZP5_various_trailing_comments_13() {
     let yaml = b"a: \"double\n  quotes\" # lala\nb: plain\n value  # lala\nc  : #lala\n  d\n? # lala\n - seq1\n: # lala\n - #lala\n  seq2\ne: &node # lala\n - x: y\nblock: > # lala\n  abcde";
 
@@ -1927,7 +1908,6 @@ fn test_S7BG_colon_followed_by_comma() {
 /// Spec Example 5.3. Block Structure Indicators
 /// Tags: explicit-key spec mapping sequence
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_S9E8_spec_example_53_block_structure_indicators() {
     let yaml = b"sequence:\n- one\n- two\nmapping:\n  ? sky\n  : blue\n  sea : green";
 
@@ -1939,7 +1919,6 @@ fn test_S9E8_spec_example_53_block_structure_indicators() {
 /// Flow Sequence in Flow Mapping
 /// Tags: complex-key sequence mapping flow
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_SBG9_flow_sequence_in_flow_mapping() {
     let yaml = b"{a: [b, c], [d, e]: f}";
 
@@ -2105,7 +2084,6 @@ fn test_V55R_aliases_in_block_sequence() {
 /// Spec Example 8.19. Compact Block Mappings
 /// Tags: complex-key explicit-key spec mapping
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_V9D5_spec_example_819_compact_block_mappings() {
     let yaml = b"- sun: yellow\n- ? earth: blue\n  : moon: white";
 
@@ -2128,7 +2106,6 @@ fn test_W42U_spec_example_815_block_sequence_entry_types() {
 /// Aliases in Flow Objects
 /// Tags: alias complex-key flow
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_X38W_aliases_in_flow_objects() {
     let yaml = b"{ &a [a, &b b]: *b, *a : [c, *b, d]}";
 
@@ -2140,7 +2117,6 @@ fn test_X38W_aliases_in_flow_objects() {
 /// Explicit key and value seperated by comment
 /// Tags: comment explicit-key mapping
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_X8DW_explicit_key_and_value_seperated_by_comment() {
     let yaml = b"---\n? key\n# comment\n: value";
 
@@ -2221,7 +2197,6 @@ fn test_ZK9H_nested_top_level_flow_mapping() {
 /// Key with anchor after missing explicit mapping value
 /// Tags: anchor explicit-key mapping
 #[test]
-#[ignore = "complex/explicit keys not supported"]
 fn test_ZWK4_key_with_anchor_after_missing_explicit_mapping_value() {
     let yaml = b"---\na: 1\n? b\n&anchor c: 3";
 
