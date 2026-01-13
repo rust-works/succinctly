@@ -12,6 +12,14 @@ documentation = "https://docs.rs/succinctly"
 readme = "README.md"
 keywords = ["succinct", "bitvector", "rank", "select", "data-structures"]
 categories = ["data-structures", "algorithms"]
+include = [
+    "src/**/*",
+    "benches/**/*",
+    "tests/**/*",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+]
 
 [features]
 default = ["std"]

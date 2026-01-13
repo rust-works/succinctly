@@ -702,4 +702,131 @@ mod tests {
         // At innermost value
         assert_eq!(locate_offset(&index, json, 18), Some(".a.b.c".to_string()));
     }
+
+    #[test]
+    fn test_locate_large_array_deep_in_tree() {
+        // Regression test for a bug where enclose() would skip words when the
+        // word_excess was 0 (equal opens and closes) even though the enclosing
+        // parent was within that word. The fix uses word_max_excess_rev() to
+        // correctly identify words that might contain the enclosing parent.
+        //
+        // This test creates a structure where:
+        // - There's a deeply nested array with many elements
+        // - The array's opening bracket is in word N
+        // - Some elements are at positions where parent() must scan back through
+        //   a word with equal opens/closes to find the array
+        let json = br#"{"outer":{"inner":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49]}}"#;
+        let index = JsonIndex::build(json);
+
+        // Test locating elements at various positions in the array
+        // Element 0 is at the start
+        let elem0_pos = json.windows(1).position(|w| w == b"0").unwrap();
+        assert_eq!(
+            locate_offset(&index, json, elem0_pos),
+            Some(".outer.inner[0]".to_string())
+        );
+
+        // Element 49 is near the end - this is the one most likely to trigger
+        // the bug as it's furthest from the array's opening bracket
+        let elem49_start = json
+            .windows(4)
+            .position(|w| w == b",49]")
+            .map(|p| p + 1)
+            .unwrap();
+        assert_eq!(
+            locate_offset(&index, json, elem49_start),
+            Some(".outer.inner[49]".to_string())
+        );
+    }
+
+    #[test]
+    fn test_locate_offset_at_word_boundary() {
+        // Test with a JSON structure that causes positions to cross 64-bit word boundaries
+        // Word 0: bits 0-63, Word 1: bits 64-127, Word 2: bits 128-191, etc.
+        //
+        // Create a structure with many elements so that elements span multiple words
+        // in the BP (balanced parentheses) index
+        let mut json = String::from(r#"{"data":["#);
+        for i in 0..100 {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!("\"item{}\"", i));
+        }
+        json.push_str("]}");
+
+        let json_bytes = json.as_bytes();
+        let index = JsonIndex::build(json_bytes);
+
+        // Test that we can locate elements throughout the array
+        // Earlier elements
+        let item5_pos = json.find("\"item5\"").unwrap();
+        assert_eq!(
+            locate_offset(&index, json_bytes, item5_pos),
+            Some(".data[5]".to_string())
+        );
+
+        // Middle elements
+        let item50_pos = json.find("\"item50\"").unwrap();
+        assert_eq!(
+            locate_offset(&index, json_bytes, item50_pos),
+            Some(".data[50]".to_string())
+        );
+
+        // Late elements
+        let item99_pos = json.find("\"item99\"").unwrap();
+        assert_eq!(
+            locate_offset(&index, json_bytes, item99_pos),
+            Some(".data[99]".to_string())
+        );
+    }
+
+    #[test]
+    fn test_locate_enclose_word_boundary_regression() {
+        // Regression test for a bug in bp.rs enclose() where words with word_excess=0
+        // (equal opens and closes) were incorrectly skipped even when they contained
+        // the enclosing parent.
+        //
+        // The bug was originally found at byte offset 956 in a JSON file with specific
+        // structure. This test uses a JSON structure that creates enough BP positions
+        // to span multiple 64-bit words with the problematic pattern.
+        //
+        // The fix is in enclose() in bp.rs - this test ensures locate_offset() works
+        // correctly with structures that exercise that code path.
+
+        // This JSON is based on a minimal reproduction of the original bug.
+        // It has:
+        // - A complex nested structure creating many BP positions
+        // - Multiple arrays and objects to fill BP words
+        // - Elements at positions that span word boundaries
+        let json = include_str!("../../tests/testdata/locate_regression.json");
+
+        let json_bytes = json.as_bytes();
+        let index = JsonIndex::build(json_bytes);
+
+        // Test offset 956 which failed in the original bug
+        let result = locate_offset(&index, json_bytes, 956);
+        assert!(
+            result.is_some(),
+            "Failed to locate offset 956 - this indicates the enclose() word boundary bug"
+        );
+
+        // The path should be in the strings array (element 10 in original file)
+        let path = result.unwrap();
+        assert!(
+            path.starts_with(".strings["),
+            "Expected path starting with '.strings[', got: {path}"
+        );
+
+        // Test more offsets that were affected by the bug
+        for offset in [1000, 1500, 2000, 2500] {
+            if offset < json.len() {
+                let result = locate_offset(&index, json_bytes, offset);
+                assert!(
+                    result.is_some(),
+                    "Failed to locate offset {offset} - may indicate enclose() word boundary bug"
+                );
+            }
+        }
+    }
 }

@@ -64,6 +64,34 @@ const BYTE_MIN_EXCESS: [i8; 256] = {
     table
 };
 
+/// Lookup table for maximum prefix excess when scanning a byte backwards (bits 7..0).
+/// For byte value b, BYTE_MAX_EXCESS_REV[b] is the maximum running excess reached
+/// when scanning bits 7 down to 0, where 1=+1 (open), 0=-1 (close).
+/// This is used by `enclose()` to determine if a word might contain the enclosing parent.
+const BYTE_MAX_EXCESS_REV: [i8; 256] = {
+    let mut table = [0i8; 256];
+    let mut byte_val: u16 = 0;
+    while byte_val < 256 {
+        let mut excess: i8 = 0;
+        let mut max_e: i8 = 0;
+        let mut bit: i8 = 7;
+        while bit >= 0 {
+            if (byte_val >> bit) & 1 == 1 {
+                excess += 1;
+                if excess > max_e {
+                    max_e = excess;
+                }
+            } else {
+                excess -= 1;
+            }
+            bit -= 1;
+        }
+        table[byte_val as usize] = max_e;
+        byte_val += 1;
+    }
+    table
+};
+
 /// Lookup table for total excess of each byte value (0-255).
 /// For byte value b, BYTE_TOTAL_EXCESS[b] = popcount(b)*2 - 8 = opens - closes.
 const BYTE_TOTAL_EXCESS: [i8; 256] = {
@@ -520,6 +548,31 @@ fn word_min_excess(word: u64, valid_bits: usize) -> (i8, i16) {
     (min_clamped, running_excess)
 }
 
+/// Compute the maximum prefix excess when scanning a word backwards (from bit 63 to 0).
+///
+/// Returns `(max_excess, total_excess)` where:
+/// - `max_excess`: maximum running excess reached during the backward scan
+/// - `total_excess`: total change in excess after processing all 64 bits (= 2*popcount - 64)
+///
+/// This is used by `enclose()` to quickly determine if a word might contain
+/// the enclosing parent without doing a bit-by-bit scan.
+fn word_max_excess_rev(word: u64) -> (i32, i32) {
+    let bytes = word.to_le_bytes();
+    let mut running_excess: i32 = 0;
+    let mut global_max: i32 = 0;
+
+    // Process bytes from high to low (reverse order for backward scan)
+    for byte in bytes.iter().rev() {
+        let byte_val = *byte as usize;
+        // Max within this byte when scanning backwards = running_excess + table lookup
+        let byte_max = running_excess + BYTE_MAX_EXCESS_REV[byte_val] as i32;
+        global_max = global_max.max(byte_max);
+        running_excess += BYTE_TOTAL_EXCESS[byte_val] as i32;
+    }
+
+    (global_max, running_excess)
+}
+
 /// Find matching open parenthesis (scanning backwards).
 ///
 /// Given a close parenthesis at position `p`, find the matching open.
@@ -640,11 +693,16 @@ pub fn enclose(words: &[u64], len: usize, p: usize) -> Option<usize> {
     // Scan previous words
     for word_idx in (0..start_word).rev() {
         let word = words[word_idx];
-        let word_ones = word.count_ones() as i32;
-        let word_excess = 2 * word_ones - 64;
+        let (max_excess_in_word, word_excess) = word_max_excess_rev(word);
 
-        // Check if the match might be in this word
-        if excess + word_excess >= 1 {
+        // Check if the match might be in this word.
+        // When scanning backwards, the running excess could reach 1 if:
+        //   excess + max_excess_in_word >= 1
+        //
+        // This is different from checking word_excess (total change).
+        // Example: word ")(" = 0xAA...AA has word_excess=0 (32 opens, 32 closes)
+        // but max_excess_in_word=1 (hits 1 at the first '(' when scanning back).
+        if excess + max_excess_in_word >= 1 {
             for bit in (0..64).rev() {
                 if (word >> bit) & 1 == 1 {
                     excess += 1;
@@ -2309,5 +2367,70 @@ mod tests {
         // Test find_close
         assert_eq!(v1.find_close(0), v2.find_close(0));
         assert_eq!(v1.find_close(2047), v2.find_close(2047));
+    }
+
+    #[test]
+    fn test_enclose_word_boundary_with_zero_excess() {
+        // Regression test for a bug where enclose() would skip words when the
+        // word's total excess was 0 (equal opens and closes), even though the
+        // enclosing parent was within that word.
+        //
+        // The bug was in the condition:
+        //   if excess + word_excess >= 1  // WRONG: checks final excess
+        // Fixed to:
+        //   if excess + max_excess_in_word >= 1  // CORRECT: checks max during scan
+        //
+        // To trigger the bug, we need:
+        // 1. Position p in word N where we call enclose(p)
+        // 2. When scanning backwards from p, the partial scan of word N gives excess = 0
+        // 3. Word N-1 has word_excess = 0 but contains the enclosing parent
+        //
+        // This means the buggy code checks: 0 + 0 >= 1 = false, and SKIPS word N-1
+
+        let mut words = vec![0u64; 4];
+
+        // Word 0: Root structure
+        words[0] = 0x0000_0000_0000_0001; // Just bit 0 is open (root)
+
+        // Word 1: Use ")(" pattern = 0xAAAA... (close at even bits, open at odd bits)
+        // This has word_excess = 0 but when scanning backwards from bit 63:
+        //   bit 63: 1 (open) -> excess = +1 -> FOUND!
+        // So max_excess_backward = 1
+        words[1] = 0xAAAA_AAAA_AAAA_AAAA;
+
+        // Word 2: ALSO use ")(" pattern
+        // When scanning this word in the FULL word loop, max_excess = 1 but word_excess = 0
+        words[2] = 0xAAAA_AAAA_AAAA_AAAA;
+
+        // Word 3: Open at bit 2 with balanced prefix (bits 0,1 = open,close = "()")
+        // Pattern: bit 0 = 1 (open), bit 1 = 0 (close), bit 2 = 1 (open) = 0b101 = 0x5
+        // When we call enclose(194) (word 3 bit 2):
+        // - Partial word 3 scan: bits 1, 0 = close, open -> excess = -1 + 1 = 0
+        // - Now we check word 2 (the FULL word loop)
+        // - Word 2 has word_excess = 0
+        // - Buggy code: 0 + 0 >= 1 is FALSE -> SKIP word 2 (BUG!)
+        // - Fixed code: 0 + 1 >= 1 is TRUE -> scan word 2, find parent at bit 63
+        words[3] = 0x0000_0000_0000_0005; // Open at bit 0, close at bit 1, open at bit 2
+
+        let len = 256; // 4 words
+        let parent = enclose(&words, len, 194);
+
+        assert_eq!(
+            parent,
+            Some(191), // Word 2 bit 63
+            "enclose(194) should find parent at position 191 (word 2 bit 63). \
+             With the buggy code that checked word_excess instead of max_excess, \
+             word 2 would be skipped because word_excess=0, returning wrong parent."
+        );
+
+        // Verify the conditions for the bug:
+        let word2_popcount = words[2].count_ones();
+        assert_eq!(word2_popcount, 32, "Word 2 should have exactly 32 ones");
+
+        let word2_excess = 2 * word2_popcount as i32 - 64;
+        assert_eq!(
+            word2_excess, 0,
+            "Word 2 excess should be 0 (this is what triggered the bug)"
+        );
     }
 }

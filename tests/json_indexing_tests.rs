@@ -1,6 +1,6 @@
 //! Tests for JSON semi-indexing (both scalar and SIMD versions).
 
-use succinctly::json::{simple, standard};
+use succinctly::json::{locate::locate_offset, simple, standard, JsonIndex};
 
 // ============================================================================
 // Helper functions
@@ -773,5 +773,156 @@ mod edge_cases {
                 String::from_utf8_lossy(json)
             );
         }
+    }
+}
+
+// ============================================================================
+// Locate Offset Exhaustive Tests
+// ============================================================================
+
+mod locate_exhaustive {
+    use super::*;
+
+    /// Test locate_offset at every byte position in a JSON structure.
+    /// This catches BP word boundary bugs that only manifest at specific alignments.
+    fn test_all_offsets(json: &[u8], description: &str) {
+        let index = JsonIndex::build(json);
+        let mut failures = Vec::new();
+
+        for offset in 0..json.len() {
+            let result = locate_offset(&index, json, offset);
+            let ch = json[offset];
+
+            // Structural characters and whitespace legitimately return None
+            let is_structural =
+                ch == b'{' || ch == b'}' || ch == b'[' || ch == b']' || ch == b':' || ch == b',';
+            let is_whitespace = ch == b' ' || ch == b'\n' || ch == b'\t' || ch == b'\r';
+
+            if result.is_none() && !is_structural && !is_whitespace {
+                failures.push((offset, ch));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "{}: Failed to locate {} offsets: {:?}",
+            description,
+            failures.len(),
+            failures
+                .iter()
+                .take(10)
+                .map(|(o, c)| format!("{}:'{}' ", o, *c as char))
+                .collect::<String>()
+        );
+    }
+
+    #[test]
+    fn test_locate_wide_array_100() {
+        let mut json = br#"{"data":["#.to_vec();
+        for i in 0..100 {
+            if i > 0 {
+                json.push(b',');
+            }
+            json.extend(i.to_string().as_bytes());
+        }
+        json.extend(b"]}");
+        test_all_offsets(&json, "Wide array (100 elements)");
+    }
+
+    #[test]
+    fn test_locate_wide_array_500() {
+        let mut json = br#"{"data":["#.to_vec();
+        for i in 0..500 {
+            if i > 0 {
+                json.push(b',');
+            }
+            json.extend(i.to_string().as_bytes());
+        }
+        json.extend(b"]}");
+        test_all_offsets(&json, "Wide array (500 elements)");
+    }
+
+    #[test]
+    fn test_locate_deep_nesting_20() {
+        let mut json = Vec::new();
+        for i in 0..20 {
+            json.extend(format!(r#"{{"level{}":"v{}","n":"#, i, i).as_bytes());
+        }
+        json.extend(br#""bottom""#);
+        for _ in 0..20 {
+            json.push(b'}');
+        }
+        test_all_offsets(&json, "Deep nesting (20 levels)");
+    }
+
+    #[test]
+    fn test_locate_mixed_structure_100_users() {
+        let mut json = br#"{"users":["#.to_vec();
+        for i in 0..100 {
+            if i > 0 {
+                json.push(b',');
+            }
+            json.extend(
+                format!(
+                    r#"{{"id":{},"name":"user{}","tags":["a","b"],"meta":{{"x":{}}}}}"#,
+                    i, i, i
+                )
+                .as_bytes(),
+            );
+        }
+        json.extend(b"]}");
+        test_all_offsets(&json, "Mixed structure (100 users)");
+    }
+
+    #[test]
+    fn test_locate_string_heavy() {
+        // JSON with many strings of varying lengths to test different byte alignments
+        let mut json = br#"{"strings":["#.to_vec();
+        for i in 0..200 {
+            if i > 0 {
+                json.push(b',');
+            }
+            // Varying length strings
+            let s = "x".repeat(i % 50 + 1);
+            json.extend(format!(r#""{}""#, s).as_bytes());
+        }
+        json.extend(b"]}");
+        test_all_offsets(&json, "String-heavy (200 strings)");
+    }
+
+    #[test]
+    fn test_locate_original_regression_file() {
+        // Use the actual regression test file
+        let json = include_str!("testdata/locate_regression.json");
+        test_all_offsets(json.as_bytes(), "Original regression file (5KB)");
+    }
+
+    #[test]
+    fn test_locate_generated_10kb() {
+        // Generate a ~10KB JSON with mixed structure
+        let mut json = br#"{"data":{"records":["#.to_vec();
+        for i in 0..150 {
+            if i > 0 {
+                json.push(b',');
+            }
+            json.extend(
+                format!(
+                    r#"{{"id":{},"value":"item_{}","nested":{{"a":{},"b":{},"c":[1,2,3]}}}}"#,
+                    i,
+                    i,
+                    i * 10,
+                    i * 20
+                )
+                .as_bytes(),
+            );
+        }
+        json.extend(b"]}}");
+
+        assert!(
+            json.len() > 10000,
+            "Generated JSON should be >10KB, got {}",
+            json.len()
+        );
+        test_all_offsets(&json, "Generated 10KB+ JSON");
     }
 }
