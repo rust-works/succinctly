@@ -1,14 +1,16 @@
-//! YAML semi-indexing for succinct YAML parsing (Phase 2: YAML with flow style).
+//! YAML semi-indexing for succinct YAML parsing (Phase 3: YAML with block scalars).
 //!
 //! This module provides semi-indexing for YAML 1.2 documents, enabling efficient
 //! navigation using rank/select operations on the balanced parentheses (BP) tree.
 //!
-//! # Phase 2 Scope
+//! # Phase 3 Scope
 //!
 //! - Block mappings and sequences
-//! - **Flow mappings `{key: value}` and sequences `[a, b, c]`**
+//! - Flow mappings `{key: value}` and sequences `[a, b, c]`
 //! - Nested flow containers (e.g., `{users: [{name: Alice}]}`)
 //! - Simple scalars (unquoted, double-quoted, single-quoted)
+//! - **Block scalars: literal (`|`) and folded (`>`)**
+//! - **Chomping modifiers: strip (`-`), keep (`+`), clip (default)**
 //! - Comments (ignored in block context)
 //! - Single document only
 //!
@@ -22,9 +24,13 @@
 //! let index = YamlIndex::build(yaml)?;
 //! let root = index.root(yaml);
 //!
-//! // Flow style also works
+//! // Flow style
 //! let yaml_flow = b"person: {name: Alice, age: 30}";
 //! let index_flow = YamlIndex::build(yaml_flow)?;
+//!
+//! // Block scalar (literal)
+//! let yaml_block = b"description: |\n  Line 1\n  Line 2";
+//! let index_block = YamlIndex::build(yaml_block)?;
 //! ```
 //!
 //! # Architecture
@@ -37,8 +43,8 @@
 //! 2. **Semi-Index** (O(1) queries): Once built, navigation uses only the
 //!    BP tree structure without re-parsing.
 //!
-//! The oracle handles both block style (indentation-based) and flow style
-//! (bracket-based like JSON) constructs uniformly.
+//! The oracle handles block style (indentation-based), flow style
+//! (bracket-based like JSON), and block scalars uniformly.
 
 mod error;
 mod index;
@@ -49,6 +55,7 @@ mod parser;
 pub use error::YamlError;
 pub use index::YamlIndex;
 pub use light::{
-    YamlCursor, YamlElements, YamlField, YamlFields, YamlNumber, YamlString, YamlValue,
+    ChompingIndicator, YamlCursor, YamlElements, YamlField, YamlFields, YamlNumber, YamlString,
+    YamlValue,
 };
 pub use locate::locate_offset;

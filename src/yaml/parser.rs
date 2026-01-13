@@ -1,13 +1,15 @@
-//! YAML parser (oracle) for Phase 2: YAML with flow style.
+//! YAML parser (oracle) for Phase 3: YAML with block scalars.
 //!
 //! This module implements the sequential oracle that resolves YAML's
 //! context-sensitive grammar and emits IB/BP/TY bits for index construction.
 //!
-//! # Phase 2 Scope
+//! # Phase 3 Scope
 //!
 //! - Block mappings and sequences
-//! - **Flow mappings `{key: value}` and sequences `[a, b, c]`**
+//! - Flow mappings `{key: value}` and sequences `[a, b, c]`
 //! - Simple scalars (unquoted, double-quoted, single-quoted)
+//! - **Block scalars: literal (`|`) and folded (`>`)**
+//! - **Chomping modifiers: strip (`-`), keep (`+`), clip (default)**
 //! - Comments (ignored in block context, not allowed in flow)
 //! - Single document only
 
@@ -26,6 +28,38 @@ pub enum NodeType {
     /// Scalar value (string, number, etc.)
     #[allow(dead_code)]
     Scalar,
+}
+
+/// Block scalar style (literal or folded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockStyle {
+    /// Literal (`|`): preserves newlines exactly
+    Literal,
+    /// Folded (`>`): folds newlines to spaces
+    Folded,
+}
+
+/// Chomping indicator for block scalars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChompingIndicator {
+    /// Clip (default): single trailing newline
+    Clip,
+    /// Strip (`-`): no trailing newlines
+    Strip,
+    /// Keep (`+`): preserve all trailing newlines
+    Keep,
+}
+
+/// Block scalar header information.
+#[derive(Debug)]
+struct BlockScalarHeader {
+    /// Literal or folded style (used for debugging/future extensions)
+    #[allow(dead_code)]
+    style: BlockStyle,
+    /// Chomping behavior
+    chomping: ChompingIndicator,
+    /// Explicit indentation indicator (1-9), or 0 for auto-detect
+    explicit_indent: u8,
 }
 
 /// Output from parsing: the semi-index structures.
@@ -276,12 +310,13 @@ impl<'a> Parser<'a> {
     fn check_unsupported(&self) -> Result<(), YamlError> {
         if let Some(b) = self.peek() {
             match b {
-                // Flow style is now supported in Phase 2
+                // Flow style is supported in Phase 2+
                 b'{' | b'[' => {
                     // Allowed - will be parsed by parse_flow_*
                 }
+                // Block scalars are supported in Phase 3+
                 b'|' | b'>' => {
-                    return Err(YamlError::BlockScalarNotSupported { offset: self.pos });
+                    // Allowed - will be parsed by parse_block_scalar()
                 }
                 b'&' | b'*' => {
                     return Err(YamlError::AnchorAliasNotSupported { offset: self.pos });
@@ -509,7 +544,8 @@ impl<'a> Parser<'a> {
         }
 
         // Parse the item value
-        self.parse_value(indent + 2)?;
+        // Pass structure indent for block scalars (content must be > this)
+        self.parse_value(indent)?;
 
         // Close the sequence item
         self.write_bp_close();
@@ -575,13 +611,17 @@ impl<'a> Parser<'a> {
             self.write_bp_close();
         } else {
             self.check_unsupported()?;
-            // Check for flow style - these handle their own BP
+            // Check for flow style or block scalar - these handle their own BP
             match self.peek() {
                 Some(b'[') => {
                     self.parse_flow_sequence()?;
                 }
                 Some(b'{') => {
                     self.parse_flow_mapping()?;
+                }
+                Some(b'|') | Some(b'>') => {
+                    // Block scalar - handles its own BP
+                    self.parse_block_scalar(indent)?;
                 }
                 _ => {
                     // Scalar value - wrap in BP
@@ -613,7 +653,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a value (could be scalar or nested structure).
-    fn parse_value(&mut self, _min_indent: usize) -> Result<(), YamlError> {
+    fn parse_value(&mut self, min_indent: usize) -> Result<(), YamlError> {
         self.check_unsupported()?;
 
         match self.peek() {
@@ -640,6 +680,10 @@ impl<'a> Parser<'a> {
             Some(b'{') => {
                 // Flow mapping
                 self.parse_flow_mapping()?;
+            }
+            Some(b'|') | Some(b'>') => {
+                // Block scalar - handles its own BP
+                self.parse_block_scalar(min_indent)?;
             }
             _ => {
                 self.set_ib();
@@ -936,6 +980,257 @@ impl<'a> Parser<'a> {
         end - start
     }
 
+    // =========================================================================
+    // Block scalar parsing (Phase 3)
+    // =========================================================================
+
+    /// Parse the header of a block scalar (indicator + modifiers).
+    /// Returns the header info and advances past the header.
+    fn parse_block_scalar_header(&mut self) -> Result<BlockScalarHeader, YamlError> {
+        let style = match self.peek() {
+            Some(b'|') => BlockStyle::Literal,
+            Some(b'>') => BlockStyle::Folded,
+            _ => {
+                return Err(YamlError::UnexpectedCharacter {
+                    offset: self.pos,
+                    char: self.peek().map(|b| b as char).unwrap_or('\0'),
+                    context: "expected block scalar indicator (| or >)",
+                });
+            }
+        };
+        self.advance(); // consume indicator
+
+        let mut chomping = ChompingIndicator::Clip;
+        let mut explicit_indent: u8 = 0;
+
+        // Parse optional modifiers (order can vary: |2- or |-2)
+        for _ in 0..2 {
+            match self.peek() {
+                Some(b'-') => {
+                    chomping = ChompingIndicator::Strip;
+                    self.advance();
+                }
+                Some(b'+') => {
+                    chomping = ChompingIndicator::Keep;
+                    self.advance();
+                }
+                Some(c) if c.is_ascii_digit() && c != b'0' => {
+                    explicit_indent = c - b'0';
+                    self.advance();
+                }
+                _ => break,
+            }
+        }
+
+        Ok(BlockScalarHeader {
+            style,
+            chomping,
+            explicit_indent,
+        })
+    }
+
+    /// Detect content indentation from the first non-empty line.
+    /// Returns the indentation level, or None if block is empty.
+    fn detect_block_content_indent(&mut self, base_indent: usize) -> Option<usize> {
+        let saved_pos = self.pos;
+        let saved_line = self.line;
+
+        // Scan ahead to find first non-empty line
+        loop {
+            if self.peek().is_none() {
+                // EOF - empty block scalar
+                self.pos = saved_pos;
+                self.line = saved_line;
+                return None;
+            }
+
+            // Count spaces at start of line
+            let mut indent = 0;
+            while self.peek() == Some(b' ') {
+                indent += 1;
+                self.advance();
+            }
+
+            // Check what's on this line
+            match self.peek() {
+                Some(b'\n') => {
+                    // Empty line - skip and continue
+                    self.advance();
+                    self.line += 1;
+                }
+                Some(b'#') => {
+                    // Comment line - skip to end
+                    self.skip_to_eol();
+                    if self.peek() == Some(b'\n') {
+                        self.advance();
+                        self.line += 1;
+                    }
+                }
+                Some(b'\r') => {
+                    // Handle \r\n
+                    self.advance();
+                    if self.peek() == Some(b'\n') {
+                        self.advance();
+                    }
+                    self.line += 1;
+                }
+                None => {
+                    // EOF
+                    self.pos = saved_pos;
+                    self.line = saved_line;
+                    return None;
+                }
+                _ => {
+                    // Found content - restore position and return indent
+                    self.pos = saved_pos;
+                    self.line = saved_line;
+
+                    if indent <= base_indent {
+                        // Content must be more indented than indicator
+                        return None;
+                    }
+                    return Some(indent);
+                }
+            }
+        }
+    }
+
+    /// Consume block scalar content lines until indentation drops.
+    /// Returns the end position of the content (before trailing newlines based on chomping).
+    fn consume_block_scalar_content(
+        &mut self,
+        content_indent: usize,
+        chomping: ChompingIndicator,
+    ) -> usize {
+        let mut last_content_end = self.pos;
+        let mut trailing_newline_start = self.pos;
+
+        loop {
+            if self.peek().is_none() {
+                break; // EOF ends block scalar
+            }
+
+            let line_start = self.pos;
+
+            // Count spaces at start of line
+            let mut line_indent = 0;
+            while self.peek() == Some(b' ') {
+                line_indent += 1;
+                self.advance();
+            }
+
+            // Check what's on this line
+            match self.peek() {
+                Some(b'\n') => {
+                    // Empty line - include in content (counts as trailing newline area)
+                    trailing_newline_start = line_start;
+                    self.advance();
+                    self.line += 1;
+                }
+                Some(b'\r') => {
+                    // Handle \r\n
+                    trailing_newline_start = line_start;
+                    self.advance();
+                    if self.peek() == Some(b'\n') {
+                        self.advance();
+                    }
+                    self.line += 1;
+                }
+                Some(b'#') if line_indent < content_indent => {
+                    // Comment at lower indent - end of block
+                    self.pos = line_start;
+                    break;
+                }
+                None => {
+                    break; // EOF
+                }
+                _ => {
+                    if line_indent < content_indent {
+                        // Real content at lower indent - end of block scalar
+                        self.pos = line_start;
+                        break;
+                    }
+
+                    // This is a content line - skip to end
+                    self.skip_to_eol();
+                    last_content_end = self.pos;
+                    trailing_newline_start = self.pos;
+
+                    if self.peek() == Some(b'\n') {
+                        self.advance();
+                        self.line += 1;
+                    } else if self.peek() == Some(b'\r') {
+                        self.advance();
+                        if self.peek() == Some(b'\n') {
+                            self.advance();
+                        }
+                        self.line += 1;
+                    }
+                }
+            }
+        }
+
+        // Return position based on chomping
+        match chomping {
+            ChompingIndicator::Strip => last_content_end,
+            ChompingIndicator::Clip => {
+                // Include one trailing newline if there was content
+                if last_content_end > 0 && trailing_newline_start > last_content_end {
+                    last_content_end + 1 // Include one newline
+                } else {
+                    last_content_end
+                }
+            }
+            ChompingIndicator::Keep => self.pos, // Include all trailing newlines
+        }
+    }
+
+    /// Parse a block scalar (| or >) including all content lines.
+    fn parse_block_scalar(&mut self, base_indent: usize) -> Result<(), YamlError> {
+        // Mark the indicator position
+        self.set_ib();
+        self.write_bp_open();
+
+        // Parse the header
+        let header = self.parse_block_scalar_header()?;
+
+        // Skip to end of indicator line (may have trailing comment)
+        self.skip_to_eol();
+        if self.peek() == Some(b'\n') {
+            self.advance();
+            self.line += 1;
+        } else if self.peek() == Some(b'\r') {
+            self.advance();
+            if self.peek() == Some(b'\n') {
+                self.advance();
+            }
+            self.line += 1;
+        }
+
+        // Determine content indentation
+        let content_indent = if header.explicit_indent > 0 {
+            base_indent + header.explicit_indent as usize
+        } else {
+            // Auto-detect from first content line
+            match self.detect_block_content_indent(base_indent) {
+                Some(indent) => indent,
+                None => {
+                    // Empty block scalar
+                    self.write_bp_close();
+                    return Ok(());
+                }
+            }
+        };
+
+        // Consume content lines
+        let _content_end = self.consume_block_scalar_content(content_indent, header.chomping);
+
+        // Close the block scalar node
+        self.write_bp_close();
+
+        Ok(())
+    }
+
     /// Main parsing loop.
     fn parse(&mut self) -> Result<SemiIndex, YamlError> {
         if self.input.is_empty() {
@@ -1173,5 +1468,144 @@ mod tests {
         let yaml = b"   \n\n  ";
         let result = build_semi_index(yaml);
         assert!(matches!(result, Err(YamlError::EmptyInput)));
+    }
+
+    // =========================================================================
+    // Block scalar tests (Phase 3)
+    // =========================================================================
+
+    #[test]
+    fn test_block_literal_basic() {
+        let yaml = b"text: |\n  line1\n  line2\n";
+        let result = build_semi_index(yaml);
+        assert!(result.is_ok(), "Block literal should parse: {:?}", result);
+    }
+
+    #[test]
+    fn test_block_folded_basic() {
+        let yaml = b"text: >\n  line1\n  line2\n";
+        let result = build_semi_index(yaml);
+        assert!(result.is_ok(), "Block folded should parse: {:?}", result);
+    }
+
+    #[test]
+    fn test_block_literal_strip() {
+        let yaml = b"text: |-\n  content\n";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "Block literal strip should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_block_literal_keep() {
+        let yaml = b"text: |+\n  content\n\n\n";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "Block literal keep should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_block_folded_strip() {
+        let yaml = b"text: >-\n  content\n";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "Block folded strip should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_block_folded_keep() {
+        let yaml = b"text: >+\n  content\n\n";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "Block folded keep should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_block_explicit_indent() {
+        let yaml = b"text: |2\n  content\n";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "Block with explicit indent should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_block_explicit_indent_with_chomping() {
+        let yaml = b"text: |2-\n  content\n";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "Block with explicit indent and chomping should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_block_empty() {
+        let yaml = b"text: |\nnext: value\n";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "Empty block scalar should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_block_in_sequence() {
+        let yaml = b"- |\n  item\n- value\n";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "Block scalar in sequence should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_block_with_nested_indent() {
+        let yaml = b"code: |\n  def foo():\n    return 42\n";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "Block with nested indent should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_block_multiple() {
+        let yaml = b"one: |\n  first\ntwo: |\n  second\n";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "Multiple block scalars should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_block_with_comment() {
+        let yaml = b"text: | # this is a comment\n  content\n";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "Block scalar with comment should parse: {:?}",
+            result
+        );
     }
 }

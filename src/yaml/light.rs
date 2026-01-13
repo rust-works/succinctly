@@ -148,6 +148,24 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 text: self.text,
                 start: text_pos,
             }),
+            b'|' => {
+                // Block literal scalar
+                let chomping = self.parse_chomping_indicator(text_pos);
+                YamlValue::String(YamlString::BlockLiteral {
+                    text: self.text,
+                    indicator_pos: text_pos,
+                    chomping,
+                })
+            }
+            b'>' => {
+                // Block folded scalar
+                let chomping = self.parse_chomping_indicator(text_pos);
+                YamlValue::String(YamlString::BlockFolded {
+                    text: self.text,
+                    indicator_pos: text_pos,
+                    chomping,
+                })
+            }
             _ => {
                 // Unquoted scalar
                 let end = self.find_scalar_end(text_pos);
@@ -158,6 +176,24 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 })
             }
         }
+    }
+
+    /// Parse chomping indicator from block scalar header.
+    fn parse_chomping_indicator(&self, indicator_pos: usize) -> ChompingIndicator {
+        let mut pos = indicator_pos + 1;
+        // Check next 2 characters for chomping indicator
+        for _ in 0..2 {
+            if pos >= self.text.len() {
+                break;
+            }
+            match self.text[pos] {
+                b'-' => return ChompingIndicator::Strip,
+                b'+' => return ChompingIndicator::Keep,
+                b'0'..=b'9' => pos += 1, // Skip explicit indent
+                _ => break,
+            }
+        }
+        ChompingIndicator::Clip
     }
 
     /// Find the end of an unquoted scalar.
@@ -445,7 +481,12 @@ impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
             element_cursor: element_cursor.next_sibling(),
         };
 
-        let value = element_cursor.value();
+        // For block sequences, element_cursor points to the item wrapper node (at `-`).
+        // We need to navigate to the item's first child to get the actual value.
+        // If the item wrapper has a child, use that; otherwise use the wrapper itself
+        // (for empty items or items where the value is implicitly null).
+        let value_cursor = element_cursor.first_child().unwrap_or(element_cursor);
+        let value = value_cursor.value();
         Some((value, rest))
     }
 
@@ -455,7 +496,9 @@ impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
         for _ in 0..index {
             cursor = cursor.next_sibling()?;
         }
-        Some(cursor.value())
+        // Navigate to item's child to get actual value
+        let value_cursor = cursor.first_child().unwrap_or(cursor);
+        Some(value_cursor.value())
     }
 }
 
@@ -473,8 +516,19 @@ impl<'a, W: AsRef<[u64]>> Iterator for YamlElements<'a, W> {
 // YamlString: Lazy string decoding
 // ============================================================================
 
-/// A YAML string that hasn't been decoded yet.
-#[derive(Clone, Copy, Debug)]
+/// Chomping indicator for block scalars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChompingIndicator {
+    /// Clip (default): single trailing newline
+    Clip,
+    /// Strip (`-`): no trailing newlines
+    Strip,
+    /// Keep (`+`): preserve all trailing newlines
+    Keep,
+}
+
+/// A YAML string value with different encoding styles.
+#[derive(Clone, Debug)]
 pub enum YamlString<'a> {
     /// Double-quoted string (escapes need decoding)
     DoubleQuoted { text: &'a [u8], start: usize },
@@ -485,6 +539,18 @@ pub enum YamlString<'a> {
         text: &'a [u8],
         start: usize,
         end: usize,
+    },
+    /// Block literal scalar (`|`): preserves newlines
+    BlockLiteral {
+        text: &'a [u8],
+        indicator_pos: usize,
+        chomping: ChompingIndicator,
+    },
+    /// Block folded scalar (`>`): folds newlines to spaces
+    BlockFolded {
+        text: &'a [u8],
+        indicator_pos: usize,
+        chomping: ChompingIndicator,
     },
 }
 
@@ -501,6 +567,20 @@ impl<'a> YamlString<'a> {
                 &text[*start..end]
             }
             YamlString::Unquoted { text, start, end } => &text[*start..*end],
+            YamlString::BlockLiteral {
+                text,
+                indicator_pos,
+                chomping,
+            }
+            | YamlString::BlockFolded {
+                text,
+                indicator_pos,
+                chomping,
+            } => {
+                let (_, content_end) =
+                    Self::find_block_content_range(text, *indicator_pos, *chomping);
+                &text[*indicator_pos..content_end]
+            }
         }
     }
 
@@ -537,6 +617,16 @@ impl<'a> YamlString<'a> {
                 let s = core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
                 Ok(Cow::Borrowed(s))
             }
+            YamlString::BlockLiteral {
+                text,
+                indicator_pos,
+                chomping,
+            } => decode_block_literal(text, *indicator_pos, *chomping),
+            YamlString::BlockFolded {
+                text,
+                indicator_pos,
+                chomping,
+            } => decode_block_folded(text, *indicator_pos, *chomping),
         }
     }
 
@@ -566,6 +656,166 @@ impl<'a> YamlString<'a> {
             }
         }
         text.len()
+    }
+
+    /// Find content range for a block scalar.
+    /// Returns (content_start, content_end).
+    fn find_block_content_range(
+        text: &[u8],
+        indicator_pos: usize,
+        chomping: ChompingIndicator,
+    ) -> (usize, usize) {
+        // Skip indicator and modifiers to find newline
+        let mut pos = indicator_pos + 1;
+        while pos < text.len() && text[pos] != b'\n' {
+            pos += 1;
+        }
+        if pos >= text.len() {
+            return (pos, pos); // Empty block scalar
+        }
+        pos += 1; // Skip newline
+
+        let content_start = pos;
+
+        // Determine content indentation from first non-empty line
+        let content_indent = Self::detect_block_indent(text, pos);
+        if content_indent == 0 {
+            return (content_start, content_start); // Empty block scalar
+        }
+
+        // Find end of block scalar content
+        let mut last_content_end = pos;
+        let mut trailing_newline_start = pos;
+
+        while pos < text.len() {
+            let line_start = pos;
+
+            // Count spaces at start of line
+            let mut line_indent = 0;
+            while pos < text.len() && text[pos] == b' ' {
+                line_indent += 1;
+                pos += 1;
+            }
+
+            // Check what's on this line
+            if pos >= text.len() {
+                break;
+            }
+
+            match text[pos] {
+                b'\n' => {
+                    // Empty line
+                    trailing_newline_start = line_start;
+                    pos += 1;
+                }
+                b'\r' => {
+                    trailing_newline_start = line_start;
+                    pos += 1;
+                    if pos < text.len() && text[pos] == b'\n' {
+                        pos += 1;
+                    }
+                }
+                _ => {
+                    if line_indent < content_indent {
+                        // Dedent - end of block
+                        pos = line_start;
+                        break;
+                    }
+
+                    // Content line - skip to end
+                    while pos < text.len() && text[pos] != b'\n' && text[pos] != b'\r' {
+                        pos += 1;
+                    }
+                    last_content_end = pos;
+                    trailing_newline_start = pos;
+
+                    if pos < text.len() {
+                        if text[pos] == b'\r' {
+                            pos += 1;
+                            if pos < text.len() && text[pos] == b'\n' {
+                                pos += 1;
+                            }
+                        } else if text[pos] == b'\n' {
+                            pos += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply chomping
+        let content_end = match chomping {
+            ChompingIndicator::Strip => last_content_end,
+            ChompingIndicator::Clip => {
+                if last_content_end < text.len()
+                    && trailing_newline_start >= last_content_end
+                    && trailing_newline_start < text.len()
+                {
+                    // Include one newline
+                    let mut end = last_content_end;
+                    if end < text.len() && text[end] == b'\n' {
+                        end += 1;
+                    } else if end < text.len() && text[end] == b'\r' {
+                        end += 1;
+                        if end < text.len() && text[end] == b'\n' {
+                            end += 1;
+                        }
+                    }
+                    end
+                } else {
+                    last_content_end
+                }
+            }
+            ChompingIndicator::Keep => pos,
+        };
+
+        (content_start, content_end)
+    }
+
+    /// Detect content indentation from first non-empty line.
+    fn detect_block_indent(text: &[u8], start: usize) -> usize {
+        let mut pos = start;
+
+        loop {
+            if pos >= text.len() {
+                return 0;
+            }
+
+            // Count spaces
+            let mut indent = 0;
+            while pos < text.len() && text[pos] == b' ' {
+                indent += 1;
+                pos += 1;
+            }
+
+            if pos >= text.len() {
+                return 0;
+            }
+
+            match text[pos] {
+                b'\n' => {
+                    pos += 1;
+                }
+                b'\r' => {
+                    pos += 1;
+                    if pos < text.len() && text[pos] == b'\n' {
+                        pos += 1;
+                    }
+                }
+                b'#' => {
+                    // Comment line - skip
+                    while pos < text.len() && text[pos] != b'\n' {
+                        pos += 1;
+                    }
+                    if pos < text.len() {
+                        pos += 1;
+                    }
+                }
+                _ => {
+                    return indent;
+                }
+            }
+        }
     }
 }
 
@@ -709,6 +959,200 @@ fn parse_hex(hex: &[u8]) -> Result<u32, YamlStringError> {
         value = value * 16 + digit as u32;
     }
     Ok(value)
+}
+
+/// Decode a literal block scalar (preserves newlines).
+fn decode_block_literal<'a>(
+    text: &'a [u8],
+    indicator_pos: usize,
+    chomping: ChompingIndicator,
+) -> Result<Cow<'a, str>, YamlStringError> {
+    let (content_start, content_end) =
+        YamlString::find_block_content_range(text, indicator_pos, chomping);
+
+    if content_start >= content_end {
+        return Ok(Cow::Borrowed(""));
+    }
+
+    let content = &text[content_start..content_end];
+
+    // Detect the common indentation to strip
+    let indent = YamlString::detect_block_indent(text, content_start);
+    if indent == 0 {
+        // No indentation to strip - just convert to string
+        let s = core::str::from_utf8(content).map_err(|_| YamlStringError::InvalidUtf8)?;
+        return Ok(Cow::Borrowed(s));
+    }
+
+    // Build result by stripping indent from each line
+    let mut result = String::with_capacity(content.len());
+    let mut pos = 0;
+
+    while pos < content.len() {
+        // Count and skip indentation
+        let mut line_indent = 0;
+        while pos + line_indent < content.len() && content[pos + line_indent] == b' ' {
+            line_indent += 1;
+        }
+
+        // Strip the common indent (up to `indent` spaces)
+        let skip = line_indent.min(indent);
+        pos += skip;
+
+        // Find end of line
+        let line_start = pos;
+        while pos < content.len() && content[pos] != b'\n' && content[pos] != b'\r' {
+            pos += 1;
+        }
+
+        // Append line content
+        let line = core::str::from_utf8(&content[line_start..pos])
+            .map_err(|_| YamlStringError::InvalidUtf8)?;
+        result.push_str(line);
+
+        // Handle line ending
+        if pos < content.len() {
+            if content[pos] == b'\r' {
+                pos += 1;
+                result.push('\n');
+                if pos < content.len() && content[pos] == b'\n' {
+                    pos += 1;
+                }
+            } else if content[pos] == b'\n' {
+                pos += 1;
+                result.push('\n');
+            }
+        }
+    }
+
+    Ok(Cow::Owned(result))
+}
+
+/// Decode a folded block scalar (folds newlines to spaces).
+fn decode_block_folded<'a>(
+    text: &'a [u8],
+    indicator_pos: usize,
+    chomping: ChompingIndicator,
+) -> Result<Cow<'a, str>, YamlStringError> {
+    let (content_start, content_end) =
+        YamlString::find_block_content_range(text, indicator_pos, chomping);
+
+    if content_start >= content_end {
+        return Ok(Cow::Borrowed(""));
+    }
+
+    let content = &text[content_start..content_end];
+
+    // Detect the common indentation to strip
+    let indent = YamlString::detect_block_indent(text, content_start);
+
+    // Build result by folding newlines
+    let mut result = String::with_capacity(content.len());
+    let mut pos = 0;
+    let mut prev_was_blank = false;
+    let mut prev_was_more_indented = false;
+    let mut first_line = true;
+
+    while pos < content.len() {
+        // Count indentation
+        let mut line_indent = 0;
+        while pos + line_indent < content.len() && content[pos + line_indent] == b' ' {
+            line_indent += 1;
+        }
+
+        // Check if this is a blank line
+        let is_blank = pos + line_indent >= content.len()
+            || content[pos + line_indent] == b'\n'
+            || content[pos + line_indent] == b'\r';
+
+        if is_blank {
+            // Blank line = paragraph break
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push('\n');
+            prev_was_blank = true;
+            prev_was_more_indented = false;
+
+            // Skip to next line
+            pos += line_indent;
+            if pos < content.len() {
+                if content[pos] == b'\r' {
+                    pos += 1;
+                    if pos < content.len() && content[pos] == b'\n' {
+                        pos += 1;
+                    }
+                } else if content[pos] == b'\n' {
+                    pos += 1;
+                }
+            }
+        } else {
+            // Strip the common indent
+            let skip = line_indent.min(indent);
+            pos += skip;
+
+            // Check if more indented (relative to content indent)
+            let is_more_indented = line_indent > indent;
+
+            // Find end of line
+            let line_start = pos;
+            while pos < content.len() && content[pos] != b'\n' && content[pos] != b'\r' {
+                pos += 1;
+            }
+
+            // Add joining character
+            if !first_line && !result.is_empty() && !result.ends_with('\n') {
+                if is_more_indented || prev_was_more_indented || prev_was_blank {
+                    result.push('\n');
+                } else {
+                    result.push(' ');
+                }
+            }
+
+            // Append line content
+            let line = core::str::from_utf8(&content[line_start..pos])
+                .map_err(|_| YamlStringError::InvalidUtf8)?;
+            result.push_str(line);
+
+            prev_was_blank = false;
+            prev_was_more_indented = is_more_indented;
+            first_line = false;
+
+            // Skip line ending
+            if pos < content.len() {
+                if content[pos] == b'\r' {
+                    pos += 1;
+                    if pos < content.len() && content[pos] == b'\n' {
+                        pos += 1;
+                    }
+                } else if content[pos] == b'\n' {
+                    pos += 1;
+                }
+            }
+        }
+    }
+
+    // Apply chomping at the end
+    match chomping {
+        ChompingIndicator::Strip => {
+            while result.ends_with('\n') {
+                result.pop();
+            }
+        }
+        ChompingIndicator::Clip => {
+            while result.ends_with("\n\n") {
+                result.pop();
+            }
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+        }
+        ChompingIndicator::Keep => {
+            // Keep all trailing newlines as-is
+        }
+    }
+
+    Ok(Cow::Owned(result))
 }
 
 // ============================================================================
@@ -990,6 +1434,108 @@ mod tests {
             }
         } else {
             panic!("expected mapping");
+        }
+    }
+
+    // =========================================================================
+    // Block scalar navigation tests (Phase 3)
+    // =========================================================================
+
+    #[test]
+    fn test_block_literal_navigation() {
+        let yaml = b"text: |\n  Line 1\n  Line 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = root.value() {
+            if let Some(YamlValue::String(s)) = fields.find("text") {
+                // Block literal should preserve newlines
+                let decoded = s.as_str().unwrap();
+                assert!(
+                    decoded.contains("Line 1") && decoded.contains("Line 2"),
+                    "block literal should contain both lines, got: {:?}",
+                    decoded
+                );
+            } else {
+                panic!("expected string for text");
+            }
+        } else {
+            panic!("expected mapping");
+        }
+    }
+
+    #[test]
+    fn test_block_folded_navigation() {
+        let yaml = b"text: >\n  First part\n  second part\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = root.value() {
+            if let Some(YamlValue::String(s)) = fields.find("text") {
+                // Block folded should fold newlines to spaces
+                let decoded = s.as_str().unwrap();
+                assert!(
+                    decoded.contains("First part") && decoded.contains("second part"),
+                    "block folded should contain both parts, got: {:?}",
+                    decoded
+                );
+            } else {
+                panic!("expected string for text");
+            }
+        } else {
+            panic!("expected mapping");
+        }
+    }
+
+    #[test]
+    fn test_block_scalar_in_sequence() {
+        // First test a simple sequence without block scalars to establish baseline
+        let yaml_simple = b"- item1\n- item2\n";
+        let index_simple = YamlIndex::build(yaml_simple).unwrap();
+        let root_simple = index_simple.root(yaml_simple);
+
+        if let YamlValue::Sequence(elements) = root_simple.value() {
+            let items: Vec<_> = elements.collect();
+            assert_eq!(items.len(), 2, "simple: expected 2 items");
+            // Check these work
+            if let YamlValue::String(s) = &items[0] {
+                assert_eq!(&*s.as_str().unwrap(), "item1");
+            } else {
+                panic!("simple: expected string for item1, got: {:?}", items[0]);
+            }
+        } else {
+            panic!("simple: expected sequence");
+        }
+
+        // Now test with block scalar
+        let yaml = b"- |\n  item\n- value\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Sequence(elements) = root.value() {
+            let items: Vec<_> = elements.collect();
+            assert_eq!(items.len(), 2, "expected 2 items, got items: {:?}", items);
+
+            // First item is block literal
+            if let YamlValue::String(s) = &items[0] {
+                let decoded = s.as_str().unwrap();
+                assert!(
+                    decoded.contains("item"),
+                    "first item should contain 'item', got: {:?}",
+                    decoded
+                );
+            } else {
+                panic!("expected string for first item, got: {:?}", items[0]);
+            }
+
+            // Second item is regular value
+            if let YamlValue::String(s) = &items[1] {
+                assert_eq!(&*s.as_str().unwrap(), "value");
+            } else {
+                panic!("expected string for second item");
+            }
+        } else {
+            panic!("expected sequence, got: {:?}", root.value());
         }
     }
 }

@@ -61,13 +61,14 @@ pub enum YamlError {
         offset: usize,
     },
 
-    /// Document marker found but multi-document not supported in Phase 1.
+    /// Document marker found but multi-document not supported.
     MultiDocumentNotSupported {
         /// Byte offset of the `---` marker
         offset: usize,
     },
 
-    /// Flow style (`{` or `[`) not supported in Phase 1.
+    /// Flow style (`{` or `[`) - kept for backwards compatibility but no longer used.
+    #[deprecated(note = "Flow style is now supported in Phase 2+")]
     FlowStyleNotSupported {
         /// Byte offset of the flow character
         offset: usize,
@@ -75,25 +76,19 @@ pub enum YamlError {
         char: char,
     },
 
-    /// Block scalar (`|` or `>`) not supported in Phase 1.
-    BlockScalarNotSupported {
-        /// Byte offset of the block scalar indicator
-        offset: usize,
-    },
-
-    /// Anchor or alias not supported in Phase 1.
+    /// Anchor or alias not supported.
     AnchorAliasNotSupported {
         /// Byte offset of the `&` or `*`
         offset: usize,
     },
 
-    /// Explicit key (`?`) not supported in Phase 1.
+    /// Explicit key (`?`) not supported.
     ExplicitKeyNotSupported {
         /// Byte offset of the `?`
         offset: usize,
     },
 
-    /// Tag not supported in Phase 1.
+    /// Tag not supported.
     TagNotSupported {
         /// Byte offset of the `!`
         offset: usize,
@@ -187,18 +182,12 @@ impl fmt::Display for YamlError {
                     offset
                 )
             }
+            #[allow(deprecated)]
             YamlError::FlowStyleNotSupported { offset, char } => {
                 write!(
                     f,
                     "flow style '{}' not supported at offset {}",
                     char, offset
-                )
-            }
-            YamlError::BlockScalarNotSupported { offset } => {
-                write!(
-                    f,
-                    "block scalars (| or >) not supported at offset {}",
-                    offset
                 )
             }
             YamlError::AnchorAliasNotSupported { offset } => {
