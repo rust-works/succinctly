@@ -356,8 +356,11 @@ impl<'a> Parser<'a> {
                     // Allowed - will be parsed by parse_anchor() or parse_alias()
                 }
                 b'?' => {
-                    // Check if it's explicit key (? at start of content + space)
-                    if self.peek_at(1) == Some(b' ') || self.peek_at(1) == Some(b'\n') {
+                    // Check if it's explicit key (? at start of content + whitespace)
+                    if self.peek_at(1) == Some(b' ')
+                        || self.peek_at(1) == Some(b'\t')
+                        || self.peek_at(1) == Some(b'\n')
+                    {
                         return Err(YamlError::ExplicitKeyNotSupported { offset: self.pos });
                     }
                 }
@@ -503,10 +506,13 @@ impl<'a> Parser<'a> {
             match b {
                 b'\n' | b'#' => break,
                 b':' => {
-                    // Colon followed by space ends the value (could be a key)
+                    // Colon followed by whitespace ends the value (could be a key)
                     // But in value context, colons in URLs etc. are allowed
-                    // For Phase 1, we stop at colon + space
-                    if self.peek_at(1) == Some(b' ') || self.peek_at(1) == Some(b'\n') {
+                    // For Phase 1, we stop at colon + whitespace
+                    if self.peek_at(1) == Some(b' ')
+                        || self.peek_at(1) == Some(b'\t')
+                        || self.peek_at(1) == Some(b'\n')
+                    {
                         break;
                     }
                     self.advance();
@@ -531,23 +537,35 @@ impl<'a> Parser<'a> {
         while let Some(b) = self.peek() {
             match b {
                 b':' => {
-                    // Check for colon + space or colon + newline
+                    // Check for colon + whitespace or colon + newline
                     if self.peek_at(1) == Some(b' ')
+                        || self.peek_at(1) == Some(b'\t')
                         || self.peek_at(1) == Some(b'\n')
                         || self.peek_at(1).is_none()
                     {
                         break;
                     }
-                    // Colon without space might be part of the key (e.g., URL-like)
-                    // In strict mode, we could error here
-                    return Err(YamlError::ColonWithoutSpace { offset: self.pos });
+                    // Colon not followed by whitespace is part of the key
+                    // (e.g., "key::" or URLs like "http://example.com")
+                    self.advance();
                 }
-                b'\n' | b'#' => {
+                b'\n' => {
                     // Key without colon
                     return Err(YamlError::KeyWithoutValue {
                         offset: start,
                         line: self.line,
                     });
+                }
+                b'#' => {
+                    // # is only a comment if preceded by whitespace
+                    // Otherwise it's part of the key (e.g., "a#b: value")
+                    if self.pos > start && self.input[self.pos - 1] == b' ' {
+                        return Err(YamlError::KeyWithoutValue {
+                            offset: start,
+                            line: self.line,
+                        });
+                    }
+                    self.advance();
                 }
                 _ => self.advance(),
             }
@@ -820,12 +838,17 @@ impl<'a> Parser<'a> {
     // Flow style parsing (Phase 2)
     // =========================================================================
 
-    /// Skip whitespace in flow context (spaces, tabs, newlines).
+    /// Skip whitespace in flow context (spaces, tabs, newlines, and comments).
     /// Unlike block context, newlines are allowed within flow constructs.
+    /// Comments (`# ...`) are also skipped in flow context.
     fn skip_flow_whitespace(&mut self) {
         while let Some(b) = self.peek() {
             match b {
                 b' ' | b'\t' | b'\n' | b'\r' => self.advance(),
+                b'#' => {
+                    // Skip comment to end of line
+                    self.skip_to_eol();
+                }
                 _ => break,
             }
         }
@@ -1478,10 +1501,6 @@ impl<'a> Parser<'a> {
         // Skip initial whitespace and comments
         self.skip_newlines();
 
-        if self.peek().is_none() {
-            return Err(YamlError::EmptyInput);
-        }
-
         // Open virtual root sequence (wraps all documents)
         // Position 0 with text position 0
         self.write_bp_open_at(0);
@@ -1491,8 +1510,10 @@ impl<'a> Parser<'a> {
         // This ensures document content at indent 0 creates its own container
         self.indent_stack[0] = usize::MAX;
 
-        // Parse all documents
-        self.parse_documents()?;
+        // Parse all documents (may be empty for comment-only files)
+        if self.peek().is_some() {
+            self.parse_documents()?;
+        }
 
         // Close any remaining open document
         self.end_document();
@@ -1587,8 +1608,37 @@ impl<'a> Parser<'a> {
     fn parse_document_line(&mut self) -> Result<(), YamlError> {
         self.check_unsupported()?;
 
-        // Count indentation
-        let indent = self.count_indent()?;
+        // Count indentation - but handle tabs specially for flow structures
+        let indent = match self.count_indent() {
+            Ok(n) => n,
+            Err(YamlError::TabIndentation { .. }) => {
+                // Tabs found - check if this leads to a flow structure
+                // Skip all leading whitespace (tabs and spaces)
+                while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+                    self.advance();
+                }
+                // If it's a flow structure, that's allowed
+                match self.peek() {
+                    Some(b'{') | Some(b'[') => {
+                        self.close_deeper_indents(0);
+                        self.parse_value(0)?;
+                        // Move to next line if we haven't already
+                        if self.peek() == Some(b'\n') {
+                            self.advance();
+                        }
+                        return Ok(());
+                    }
+                    _ => {
+                        // Not a flow structure - re-report the tab error
+                        return Err(YamlError::TabIndentation {
+                            line: self.line,
+                            offset: self.pos,
+                        });
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
 
         // Skip to content
         for _ in 0..indent {
@@ -1607,6 +1657,11 @@ impl<'a> Parser<'a> {
             Some(b'\n') => {
                 // Empty line
                 self.advance();
+            }
+            Some(b'{') | Some(b'[') => {
+                // Flow mapping or sequence at document root
+                self.close_deeper_indents(indent);
+                self.parse_value(indent)?;
             }
             Some(_) => {
                 self.parse_mapping_entry(indent)?;
@@ -1765,9 +1820,13 @@ mod tests {
 
     #[test]
     fn test_whitespace_only() {
+        // Whitespace-only is valid YAML (empty stream)
         let yaml = b"   \n\n  ";
         let result = build_semi_index(yaml);
-        assert!(matches!(result, Err(YamlError::EmptyInput)));
+        assert!(
+            result.is_ok(),
+            "Whitespace-only should parse as empty stream"
+        );
     }
 
     // =========================================================================
