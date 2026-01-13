@@ -275,10 +275,17 @@ impl<'a> Parser<'a> {
                     i += 1;
                 }
                 b'\t' => {
-                    return Err(YamlError::TabIndentation {
-                        line: self.line,
-                        offset: i,
-                    });
+                    // Tab after spaces - check context
+                    // If we haven't seen any spaces and hit a tab at start of line,
+                    // that's tab indentation (error). But tab after spaces is content.
+                    if count == 0 {
+                        return Err(YamlError::TabIndentation {
+                            line: self.line,
+                            offset: i,
+                        });
+                    }
+                    // Tab after spaces is start of content, stop counting indent
+                    break;
                 }
                 _ => break,
             }
@@ -298,6 +305,87 @@ impl<'a> Parser<'a> {
             }
         }
         true // EOF counts as line end
+    }
+
+    /// Check if current position starts a key-value pair (compact mapping).
+    /// Returns true if there's a `:` followed by space/tab/newline/EOF on this line.
+    /// Also returns true for empty key case (`:` at start).
+    fn looks_like_mapping_entry(&self) -> bool {
+        // If we're at a flow structure, it's not a compact mapping
+        match self.peek() {
+            Some(b'{') | Some(b'[') => return false,
+            // Empty key: `:` at start followed by whitespace/newline/EOF
+            Some(b':') => {
+                let next = self.peek_at(1);
+                if matches!(next, Some(b' ') | Some(b'\t') | Some(b'\n') | None) {
+                    return true;
+                }
+                // Colon not followed by whitespace - continue checking
+            }
+            _ => {}
+        }
+
+        let mut i = self.pos;
+
+        // If starting with a quote, skip the quoted string first
+        if i < self.input.len() && (self.input[i] == b'"' || self.input[i] == b'\'') {
+            let quote = self.input[i];
+            i += 1;
+            while i < self.input.len() {
+                if self.input[i] == quote {
+                    // Check for escaped quote in single-quoted strings
+                    if quote == b'\'' && i + 1 < self.input.len() && self.input[i + 1] == b'\'' {
+                        i += 2; // Skip ''
+                        continue;
+                    }
+                    i += 1; // Skip closing quote
+                    break;
+                } else if self.input[i] == b'\\' && quote == b'"' {
+                    i += 2; // Skip escape sequence in double-quoted
+                } else if self.input[i] == b'\n' {
+                    return false; // Unclosed quote
+                } else {
+                    i += 1;
+                }
+            }
+            // After quoted key, check for `: `
+            // Skip optional whitespace
+            while i < self.input.len() && self.input[i] == b' ' {
+                i += 1;
+            }
+            if i < self.input.len() && self.input[i] == b':' {
+                let next = if i + 1 < self.input.len() {
+                    Some(self.input[i + 1])
+                } else {
+                    None
+                };
+                return matches!(next, Some(b' ') | Some(b'\t') | Some(b'\n') | None);
+            }
+            return false;
+        }
+
+        // Scan for `: ` pattern in unquoted key
+        while i < self.input.len() {
+            match self.input[i] {
+                b'\n' => return false, // Line ended without finding `: `
+                b':' => {
+                    // Check what follows the colon
+                    let next = if i + 1 < self.input.len() {
+                        Some(self.input[i + 1])
+                    } else {
+                        None
+                    };
+                    match next {
+                        Some(b' ') | Some(b'\t') | Some(b'\n') | None => return true,
+                        _ => i += 1, // Colon not followed by whitespace, continue
+                    }
+                }
+                // Note: " and ' in the middle of a key are allowed (e.g., bla"keks: foo)
+                // Continue scanning past them.
+                _ => i += 1,
+            }
+        }
+        false
     }
 
     /// Skip to end of line (handles comments).
@@ -640,12 +728,90 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
 
-        // Parse the item value
-        // Pass structure indent for block scalars (content must be > this)
-        self.parse_value(indent)?;
+        // Check for compact mapping: `- key: value`
+        // This is a mapping entry directly as the sequence item value
+        if self.looks_like_mapping_entry() {
+            // The sequence item contains a mapping
+            // Use a virtual indent for this inline mapping (item_indent + 1)
+            let compact_indent = indent + 1;
+            self.parse_compact_mapping_entry(compact_indent)?;
+        } else {
+            // Parse the item value normally
+            // Pass structure indent for block scalars (content must be > this)
+            self.parse_value(indent)?;
+        }
 
         // Close the sequence item
         self.write_bp_close();
+
+        Ok(())
+    }
+
+    /// Parse a compact mapping entry within a sequence item.
+    /// This handles `- key: value` where the mapping is inline with the sequence item.
+    fn parse_compact_mapping_entry(&mut self, indent: usize) -> Result<(), YamlError> {
+        // Open a mapping for this compact entry
+        self.write_bp_open();
+        self.write_ty(false); // 0 = mapping
+        self.indent_stack.push(indent);
+        self.type_stack.push(NodeType::Mapping);
+
+        // Mark key position
+        self.set_ib();
+
+        // Open key node
+        self.write_bp_open();
+
+        // Parse the key
+        match self.peek() {
+            Some(b'"') => {
+                self.parse_double_quoted()?;
+            }
+            Some(b'\'') => {
+                self.parse_single_quoted()?;
+            }
+            _ => {
+                self.parse_unquoted_key()?;
+            }
+        }
+
+        // Close key node
+        self.write_bp_close();
+
+        // Expect colon
+        if self.peek() != Some(b':') {
+            return Err(YamlError::UnexpectedCharacter {
+                offset: self.pos,
+                char: self.peek().map(|b| b as char).unwrap_or('\0'),
+                context: "expected ':' after key in compact mapping",
+            });
+        }
+        self.advance(); // Skip ':'
+
+        // Skip space after colon
+        self.skip_inline_whitespace();
+
+        // Parse value
+        if self.at_line_end() {
+            // Value is on next line or implicit null
+            self.skip_to_eol();
+        } else {
+            // Inline value
+            self.check_unsupported()?;
+
+            // Open value node
+            self.set_ib();
+            self.write_bp_open();
+            self.parse_inline_value()?;
+            self.write_bp_close();
+        }
+
+        // Close mapping
+        self.write_bp_close();
+
+        // Pop the mapping from stacks
+        self.indent_stack.pop();
+        self.type_stack.pop();
 
         Ok(())
     }
@@ -677,15 +843,36 @@ impl<'a> Parser<'a> {
         // Open key node
         self.write_bp_open();
 
-        // Parse the key
-        let _key_len = match self.peek() {
-            Some(b'"') => self.parse_double_quoted()?,
-            Some(b'\'') => self.parse_single_quoted()?,
-            _ => self.parse_unquoted_key()?,
-        };
+        // Parse the key - check for empty key first (colon at start)
+        if self.peek() == Some(b':') {
+            // Empty key - check that it's followed by proper terminator
+            let next = self.peek_at(1);
+            if matches!(next, Some(b' ') | Some(b'\t') | Some(b'\n') | None) {
+                // Empty key case - key length is 0, don't advance yet
+            } else {
+                // Colon followed by something else - not an empty key
+                self.parse_unquoted_key()?;
+            }
+        } else {
+            // Parse the key
+            match self.peek() {
+                Some(b'"') => {
+                    self.parse_double_quoted()?;
+                }
+                Some(b'\'') => {
+                    self.parse_single_quoted()?;
+                }
+                _ => {
+                    self.parse_unquoted_key()?;
+                }
+            }
+        }
 
         // Close key node
         self.write_bp_close();
+
+        // Skip optional whitespace between key and colon (e.g., 'key' : value)
+        self.skip_inline_whitespace();
 
         // Expect colon
         if self.peek() != Some(b':') {
@@ -702,6 +889,14 @@ impl<'a> Parser<'a> {
 
         // Parse value
         if self.at_line_end() {
+            // Check if at EOF - if so, we need an explicit empty value node
+            if self.peek().is_none() {
+                // EOF after colon - emit empty value
+                self.set_ib();
+                self.write_bp_open();
+                self.write_bp_close();
+                return Ok(());
+            }
             // Value is on next line (nested structure or explicit null)
             // Don't create a placeholder - the nested structure that follows
             // will become the value directly. If no nested structure follows
@@ -1664,7 +1859,28 @@ impl<'a> Parser<'a> {
                 self.parse_value(indent)?;
             }
             Some(_) => {
-                self.parse_mapping_entry(indent)?;
+                // Check if this looks like a mapping entry (has `: ` on this line)
+                // This handles both quoted keys ("foo": bar) and unquoted keys (foo: bar)
+                if self.looks_like_mapping_entry() {
+                    self.parse_mapping_entry(indent)?;
+                } else {
+                    // Bare scalar document (e.g., `---\nplain value` or `---\n"quoted"`)
+                    self.close_deeper_indents(indent);
+                    self.set_ib();
+                    self.write_bp_open();
+                    match self.peek() {
+                        Some(b'"') => {
+                            self.parse_double_quoted()?;
+                        }
+                        Some(b'\'') => {
+                            self.parse_single_quoted()?;
+                        }
+                        _ => {
+                            self.parse_unquoted_value();
+                        }
+                    }
+                    self.write_bp_close();
+                }
             }
             None => {}
         }
@@ -2064,5 +2280,113 @@ mod tests {
         let yaml = b"---\na: 1\n---\nb: 2\n---\nc: 3";
         let result = build_semi_index(yaml);
         assert!(result.is_ok(), "three documents should parse: {:?}", result);
+    }
+
+    #[test]
+    fn test_question_mark_in_value() {
+        // Question mark should be allowed in plain scalar values
+        let yaml = b"- a?string";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "question mark in value should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_question_mark_in_key() {
+        // Question mark should be allowed in plain scalar keys
+        let yaml = b"key?: value";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "question mark in key should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_question_mark_in_flow_key() {
+        // Question mark in flow mapping key
+        let yaml = b"{key?: value}";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "question mark in flow key should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_question_mark_in_flow_value() {
+        // Question mark in flow mapping value
+        let yaml = b"{key: value?}";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "question mark in flow value should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_question_marks_full() {
+        // Full JR7V test case - question marks in various contexts
+        let yaml = b"- a?string\n- another ? string\n- key: value?\n- [a?string]\n- [another ? string]\n- {key: value? }\n- {key: value?}\n- {key?: value }";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "question marks test should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_compact_mapping_in_sequence() {
+        // This is `- key: value` - a compact mapping within a sequence item
+        let yaml = b"- key: value";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "compact mapping in sequence should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_flow_mapping_in_sequence() {
+        // Flow mapping inside sequence item with various spacing patterns
+        let yaml = b"- { one : two , three: four , }\n- {five: six,seven : eight}";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "flow mapping in sequence should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_double_colon_plain_scalar() {
+        // ::vector is a plain scalar, not a mapping entry
+        let yaml = b"- ::vector";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "double colon plain scalar should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_quoted_key_mapping() {
+        // Quoted keys with special characters
+        let yaml = b"\"foo\": bar\n'single': value";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "quoted key mapping should parse: {:?}",
+            result
+        );
     }
 }

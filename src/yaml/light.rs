@@ -59,6 +59,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     ///
     /// Containers are nodes that have children AND have a valid TY bit.
     /// This distinguishes real containers from item wrappers and other BP nodes.
+    /// Note: for empty containers (like `[]` or `{}`), the text-based check in
+    /// `value()` handles them before calling `is_container()`.
     #[inline]
     pub fn is_container(&self) -> bool {
         if self.index.bp().first_child(self.bp_pos).is_none() {
@@ -162,7 +164,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // Check if this is a container with a TY bit (structural container)
         // This must come BEFORE the heuristic checks to ensure we use the authoritative
         // TY bits for containers that have them (like document sequences).
-        if self.is_container() {
+        //
+        // Special case: the root (bp_pos=0) is always the virtual document sequence,
+        // even if it's empty (no documents). Check it explicitly.
+        if self.bp_pos == 0 || self.is_container() {
             // Determine if mapping or sequence using the TY bits
             // (This handles virtual containers like the document root wrapper)
             if self.index.is_sequence_at_bp(self.bp_pos) {
@@ -289,10 +294,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // Flow context delimiters
                 b',' | b']' | b'}' => break,
                 b':' => {
-                    // Colon followed by space ends the scalar
-                    if end + 1 < self.text.len()
-                        && (self.text[end + 1] == b' ' || self.text[end + 1] == b'\n')
-                    {
+                    // Colon followed by space, newline, or EOF ends the scalar
+                    if end + 1 >= self.text.len() {
+                        // Colon at EOF - this is a key separator
+                        break;
+                    }
+                    if self.text[end + 1] == b' ' || self.text[end + 1] == b'\n' {
                         break;
                     }
                     end += 1;
