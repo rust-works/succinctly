@@ -111,15 +111,30 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             return YamlValue::Error("text position out of bounds");
         }
 
+        // Check for flow containers by looking at the text
+        // (empty flow containers may not have children, so check text first)
+        let byte = self.text[text_pos];
+        if byte == b'[' {
+            // Flow sequence
+            return YamlValue::Sequence(YamlElements::from_sequence_cursor(*self));
+        }
+        if byte == b'{' {
+            // Flow mapping
+            return YamlValue::Mapping(YamlFields::from_mapping_cursor(*self));
+        }
+
         // Check if this is a container by looking at the BP structure
         if self.is_container() {
-            // Check TY bits to determine if mapping or sequence
-            // For now, use a simple heuristic based on the text
-            let byte = self.text[text_pos];
-            if byte == b'-' {
-                return YamlValue::Sequence(YamlElements::from_sequence_cursor(*self));
-            } else {
-                return YamlValue::Mapping(YamlFields::from_mapping_cursor(*self));
+            // Determine if mapping or sequence based on the text
+            match byte {
+                b'-' => {
+                    // Block sequence starts with `-`
+                    return YamlValue::Sequence(YamlElements::from_sequence_cursor(*self));
+                }
+                _ => {
+                    // Block mapping (key: value)
+                    return YamlValue::Mapping(YamlFields::from_mapping_cursor(*self));
+                }
             }
         }
 
@@ -150,7 +165,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         let mut end = start;
         while end < self.text.len() {
             match self.text[end] {
+                // Block context delimiters
                 b'\n' | b'#' => break,
+                // Flow context delimiters
+                b',' | b']' | b'}' => break,
                 b':' => {
                     // Colon followed by space ends the scalar
                     if end + 1 < self.text.len()
@@ -842,5 +860,136 @@ mod tests {
             start: 0,
         };
         assert_eq!(&*s.as_str().unwrap(), "it's");
+    }
+
+    // =========================================================================
+    // Flow style navigation tests (Phase 2)
+    // =========================================================================
+
+    #[test]
+    fn test_flow_sequence_navigation() {
+        let yaml = b"items: [1, 2, 3]";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        // Root should be a mapping with "items" key
+        if let YamlValue::Mapping(fields) = root.value() {
+            if let Some(YamlValue::Sequence(elements)) = fields.find("items") {
+                let items: Vec<_> = elements.collect();
+                assert_eq!(items.len(), 3);
+
+                // Check first element
+                if let YamlValue::String(s) = &items[0] {
+                    assert_eq!(&*s.as_str().unwrap(), "1");
+                } else {
+                    panic!("expected string value for item");
+                }
+            } else {
+                panic!("expected sequence for items");
+            }
+        } else {
+            panic!("expected mapping");
+        }
+    }
+
+    #[test]
+    fn test_flow_mapping_navigation() {
+        let yaml = b"person: {name: Alice, age: 30}";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        // Root should be a mapping with "person" key
+        if let YamlValue::Mapping(fields) = root.value() {
+            if let Some(YamlValue::Mapping(person_fields)) = fields.find("person") {
+                // Check name
+                if let Some(YamlValue::String(s)) = person_fields.find("name") {
+                    assert_eq!(&*s.as_str().unwrap(), "Alice");
+                } else {
+                    panic!("expected name field");
+                }
+
+                // Check age
+                if let Some(YamlValue::String(s)) = person_fields.find("age") {
+                    assert_eq!(&*s.as_str().unwrap(), "30");
+                } else {
+                    panic!("expected age field");
+                }
+            } else {
+                panic!("expected mapping for person");
+            }
+        } else {
+            panic!("expected mapping");
+        }
+    }
+
+    #[test]
+    fn test_flow_nested_navigation() {
+        let yaml = b"data: {users: [{name: Alice}, {name: Bob}]}";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = root.value() {
+            if let Some(YamlValue::Mapping(data_fields)) = fields.find("data") {
+                if let Some(YamlValue::Sequence(users)) = data_fields.find("users") {
+                    let items: Vec<_> = users.collect();
+                    assert_eq!(items.len(), 2, "expected 2 users");
+
+                    // Check first user
+                    if let YamlValue::Mapping(user_fields) = &items[0] {
+                        if let Some(YamlValue::String(s)) = user_fields.find("name") {
+                            assert_eq!(&*s.as_str().unwrap(), "Alice");
+                        }
+                    }
+
+                    // Check second user
+                    if let YamlValue::Mapping(user_fields) = &items[1] {
+                        if let Some(YamlValue::String(s)) = user_fields.find("name") {
+                            assert_eq!(&*s.as_str().unwrap(), "Bob");
+                        }
+                    }
+                } else {
+                    panic!("expected users sequence");
+                }
+            } else {
+                panic!("expected data mapping");
+            }
+        } else {
+            panic!("expected mapping");
+        }
+    }
+
+    #[test]
+    fn test_flow_empty_sequence_navigation() {
+        let yaml = b"items: []";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = root.value() {
+            if let Some(YamlValue::Sequence(elements)) = fields.find("items") {
+                let items: Vec<_> = elements.collect();
+                assert_eq!(items.len(), 0, "expected empty sequence");
+            } else {
+                panic!("expected sequence for items");
+            }
+        } else {
+            panic!("expected mapping");
+        }
+    }
+
+    #[test]
+    fn test_flow_empty_mapping_navigation() {
+        let yaml = b"data: {}";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = root.value() {
+            if let Some(YamlValue::Mapping(data_fields)) = fields.find("data") {
+                assert!(data_fields.is_empty(), "expected empty mapping");
+            } else {
+                panic!("expected mapping for data");
+            }
+        } else {
+            panic!("expected mapping");
+        }
     }
 }

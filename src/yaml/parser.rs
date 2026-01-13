@@ -1,13 +1,14 @@
-//! YAML parser (oracle) for Phase 1: YAML-lite.
+//! YAML parser (oracle) for Phase 2: YAML with flow style.
 //!
 //! This module implements the sequential oracle that resolves YAML's
 //! context-sensitive grammar and emits IB/BP/TY bits for index construction.
 //!
-//! # Phase 1 Scope
+//! # Phase 2 Scope
 //!
-//! - Block mappings and sequences only
+//! - Block mappings and sequences
+//! - **Flow mappings `{key: value}` and sequences `[a, b, c]`**
 //! - Simple scalars (unquoted, double-quoted, single-quoted)
-//! - Comments (ignored)
+//! - Comments (ignored in block context, not allowed in flow)
 //! - Single document only
 
 #[cfg(not(test))]
@@ -271,15 +272,13 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Check for unsupported YAML features.
+    /// Check for unsupported YAML features (Phase 2: flow style is now supported).
     fn check_unsupported(&self) -> Result<(), YamlError> {
         if let Some(b) = self.peek() {
             match b {
+                // Flow style is now supported in Phase 2
                 b'{' | b'[' => {
-                    return Err(YamlError::FlowStyleNotSupported {
-                        offset: self.pos,
-                        char: b as char,
-                    });
+                    // Allowed - will be parsed by parse_flow_*
                 }
                 b'|' | b'>' => {
                     return Err(YamlError::BlockScalarNotSupported { offset: self.pos });
@@ -566,26 +565,38 @@ impl<'a> Parser<'a> {
         // Skip space after colon
         self.skip_inline_whitespace();
 
-        // Open value node
-        self.set_ib();
-        self.write_bp_open();
-
         // Parse value
         if self.at_line_end() {
             // Value is on next line (nested structure or explicit null)
+            // Open a placeholder value node
+            self.set_ib();
+            self.write_bp_open();
             self.skip_to_eol();
+            self.write_bp_close();
         } else {
             self.check_unsupported()?;
-            self.parse_inline_value()?;
+            // Check for flow style - these handle their own BP
+            match self.peek() {
+                Some(b'[') => {
+                    self.parse_flow_sequence()?;
+                }
+                Some(b'{') => {
+                    self.parse_flow_mapping()?;
+                }
+                _ => {
+                    // Scalar value - wrap in BP
+                    self.set_ib();
+                    self.write_bp_open();
+                    self.parse_inline_value()?;
+                    self.write_bp_close();
+                }
+            }
         }
-
-        // Close value node
-        self.write_bp_close();
 
         Ok(())
     }
 
-    /// Parse an inline value (on the same line as the key).
+    /// Parse an inline scalar value (on the same line as the key).
     fn parse_inline_value(&mut self) -> Result<(), YamlError> {
         match self.peek() {
             Some(b'"') => {
@@ -620,8 +631,15 @@ impl<'a> Parser<'a> {
             }
             Some(b'-') if self.peek_at(1) == Some(b' ') => {
                 // Inline sequence item - this creates a nested sequence
-                // For simplicity in Phase 1, we treat this as the value starting a sequence
                 // The caller already opened a BP node for us
+            }
+            Some(b'[') => {
+                // Flow sequence
+                self.parse_flow_sequence()?;
+            }
+            Some(b'{') => {
+                // Flow mapping
+                self.parse_flow_mapping()?;
             }
             _ => {
                 self.set_ib();
@@ -631,6 +649,291 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(())
+    }
+
+    // =========================================================================
+    // Flow style parsing (Phase 2)
+    // =========================================================================
+
+    /// Skip whitespace in flow context (spaces, tabs, newlines).
+    /// Unlike block context, newlines are allowed within flow constructs.
+    fn skip_flow_whitespace(&mut self) {
+        while let Some(b) = self.peek() {
+            match b {
+                b' ' | b'\t' | b'\n' | b'\r' => self.advance(),
+                _ => break,
+            }
+        }
+    }
+
+    /// Parse a flow sequence: `[item1, item2, ...]`
+    fn parse_flow_sequence(&mut self) -> Result<(), YamlError> {
+        // Mark the `[` position
+        self.set_ib();
+
+        // Open sequence container
+        self.write_bp_open();
+        self.write_ty(true); // 1 = sequence
+
+        // Skip `[`
+        self.advance();
+        self.skip_flow_whitespace();
+
+        // Parse items
+        let mut first = true;
+        while self.peek() != Some(b']') {
+            if self.peek().is_none() {
+                return Err(YamlError::UnexpectedEof {
+                    context: "flow sequence",
+                });
+            }
+
+            if !first {
+                // Expect comma
+                if self.peek() != Some(b',') {
+                    return Err(YamlError::UnexpectedCharacter {
+                        offset: self.pos,
+                        char: self.peek().map(|b| b as char).unwrap_or('\0'),
+                        context: "expected ',' or ']' in flow sequence",
+                    });
+                }
+                self.advance(); // Skip `,`
+                self.skip_flow_whitespace();
+
+                // Allow trailing comma
+                if self.peek() == Some(b']') {
+                    break;
+                }
+            }
+            first = false;
+
+            // Parse flow value (item) - containers handle their own BP
+            match self.peek() {
+                Some(b'[') => {
+                    self.parse_flow_sequence()?;
+                }
+                Some(b'{') => {
+                    self.parse_flow_mapping()?;
+                }
+                _ => {
+                    // Scalar value - wrap in BP
+                    self.set_ib();
+                    self.write_bp_open();
+                    self.parse_flow_scalar()?;
+                    self.write_bp_close();
+                }
+            }
+            self.skip_flow_whitespace();
+        }
+
+        // Skip `]`
+        if self.peek() == Some(b']') {
+            self.set_ib();
+            self.advance();
+        }
+
+        // Close sequence
+        self.write_bp_close();
+
+        Ok(())
+    }
+
+    /// Parse a flow mapping: `{key: value, ...}`
+    fn parse_flow_mapping(&mut self) -> Result<(), YamlError> {
+        // Mark the `{` position
+        self.set_ib();
+
+        // Open mapping container
+        self.write_bp_open();
+        self.write_ty(false); // 0 = mapping
+
+        // Skip `{`
+        self.advance();
+        self.skip_flow_whitespace();
+
+        // Parse key-value pairs
+        let mut first = true;
+        while self.peek() != Some(b'}') {
+            if self.peek().is_none() {
+                return Err(YamlError::UnexpectedEof {
+                    context: "flow mapping",
+                });
+            }
+
+            if !first {
+                // Expect comma
+                if self.peek() != Some(b',') {
+                    return Err(YamlError::UnexpectedCharacter {
+                        offset: self.pos,
+                        char: self.peek().map(|b| b as char).unwrap_or('\0'),
+                        context: "expected ',' or '}' in flow mapping",
+                    });
+                }
+                self.advance(); // Skip `,`
+                self.skip_flow_whitespace();
+
+                // Allow trailing comma
+                if self.peek() == Some(b'}') {
+                    break;
+                }
+            }
+            first = false;
+
+            // Parse key
+            self.set_ib();
+            self.write_bp_open();
+            self.parse_flow_key()?;
+            self.write_bp_close();
+
+            self.skip_flow_whitespace();
+
+            // Expect colon
+            if self.peek() != Some(b':') {
+                return Err(YamlError::UnexpectedCharacter {
+                    offset: self.pos,
+                    char: self.peek().map(|b| b as char).unwrap_or('\0'),
+                    context: "expected ':' after key in flow mapping",
+                });
+            }
+            self.advance(); // Skip `:`
+            self.skip_flow_whitespace();
+
+            // Parse value - for nested containers, they handle their own BP
+            match self.peek() {
+                Some(b'[') => {
+                    self.parse_flow_sequence()?;
+                }
+                Some(b'{') => {
+                    self.parse_flow_mapping()?;
+                }
+                _ => {
+                    // Scalar value - wrap in BP
+                    self.set_ib();
+                    self.write_bp_open();
+                    self.parse_flow_scalar()?;
+                    self.write_bp_close();
+                }
+            }
+
+            self.skip_flow_whitespace();
+        }
+
+        // Skip `}`
+        if self.peek() == Some(b'}') {
+            self.set_ib();
+            self.advance();
+        }
+
+        // Close mapping
+        self.write_bp_close();
+
+        Ok(())
+    }
+
+    /// Parse a key in flow context (scalar only, no containers).
+    fn parse_flow_key(&mut self) -> Result<(), YamlError> {
+        match self.peek() {
+            Some(b'"') => {
+                self.parse_double_quoted()?;
+            }
+            Some(b'\'') => {
+                self.parse_single_quoted()?;
+            }
+            _ => {
+                self.parse_flow_unquoted_key()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse an unquoted key in flow context.
+    /// Stops at `:`, `,`, `}`, `]`, or whitespace before those.
+    fn parse_flow_unquoted_key(&mut self) -> Result<usize, YamlError> {
+        let start = self.pos;
+
+        while let Some(b) = self.peek() {
+            match b {
+                b':' | b',' | b'}' | b']' | b'\n' | b'\r' => break,
+                b' ' | b'\t' => {
+                    // Check if whitespace is followed by a delimiter
+                    let mut lookahead = self.pos + 1;
+                    while lookahead < self.input.len() {
+                        match self.input[lookahead] {
+                            b' ' | b'\t' => lookahead += 1,
+                            b':' | b',' | b'}' | b']' => {
+                                // Whitespace before delimiter - stop here
+                                break;
+                            }
+                            _ => {
+                                // Continue with the key
+                                self.advance();
+                                break;
+                            }
+                        }
+                    }
+                    if lookahead == self.input.len()
+                        || matches!(
+                            self.input[lookahead],
+                            b':' | b',' | b'}' | b']' | b'\n' | b'\r'
+                        )
+                    {
+                        break;
+                    }
+                }
+                _ => self.advance(),
+            }
+        }
+
+        // Trim trailing whitespace
+        let mut end = self.pos;
+        while end > start && matches!(self.input[end - 1], b' ' | b'\t') {
+            end -= 1;
+        }
+
+        if end == start {
+            return Err(YamlError::UnexpectedEof {
+                context: "flow key",
+            });
+        }
+
+        Ok(end - start)
+    }
+
+    /// Parse a scalar value in flow context (string or unquoted).
+    fn parse_flow_scalar(&mut self) -> Result<(), YamlError> {
+        match self.peek() {
+            Some(b'"') => {
+                self.parse_double_quoted()?;
+            }
+            Some(b'\'') => {
+                self.parse_single_quoted()?;
+            }
+            _ => {
+                self.parse_flow_unquoted_value();
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse an unquoted value in flow context.
+    /// Stops at `,`, `}`, `]`, or newline.
+    fn parse_flow_unquoted_value(&mut self) -> usize {
+        let start = self.pos;
+
+        while let Some(b) = self.peek() {
+            match b {
+                b',' | b'}' | b']' | b'\n' | b'\r' => break,
+                _ => self.advance(),
+            }
+        }
+
+        // Trim trailing whitespace
+        let mut end = self.pos;
+        while end > start && matches!(self.input[end - 1], b' ' | b'\t') {
+            end -= 1;
+        }
+
+        end - start
     }
 
     /// Main parsing loop.
@@ -794,13 +1097,68 @@ mod tests {
     }
 
     #[test]
-    fn test_flow_style_not_supported() {
+    fn test_flow_sequence() {
         let yaml = b"items: [1, 2, 3]";
         let result = build_semi_index(yaml);
-        assert!(matches!(
-            result,
-            Err(YamlError::FlowStyleNotSupported { .. })
-        ));
+        assert!(result.is_ok(), "Flow sequence should parse: {:?}", result);
+    }
+
+    #[test]
+    fn test_flow_mapping() {
+        let yaml = b"person: {name: Alice, age: 30}";
+        let result = build_semi_index(yaml);
+        assert!(result.is_ok(), "Flow mapping should parse: {:?}", result);
+    }
+
+    #[test]
+    fn test_flow_nested() {
+        let yaml = b"data: {users: [{name: Alice}, {name: Bob}]}";
+        let result = build_semi_index(yaml);
+        assert!(result.is_ok(), "Nested flow should parse: {:?}", result);
+    }
+
+    #[test]
+    fn test_flow_with_strings() {
+        let yaml = b"items: [\"hello\", 'world', plain]";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "Flow with strings should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_flow_trailing_comma() {
+        let yaml = b"items: [1, 2, 3,]";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "Flow with trailing comma should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_flow_empty_sequence() {
+        let yaml = b"items: []";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "Empty flow sequence should parse: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_flow_empty_mapping() {
+        let yaml = b"data: {}";
+        let result = build_semi_index(yaml);
+        assert!(
+            result.is_ok(),
+            "Empty flow mapping should parse: {:?}",
+            result
+        );
     }
 
     #[test]
