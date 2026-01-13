@@ -19,6 +19,8 @@ enum Command {
     Json(JsonCommand),
     /// DSV (CSV/TSV) operations (generate, parse)
     Dsv(DsvCommand),
+    /// YAML operations (generate, parse)
+    Yaml(YamlCommand),
     /// Command-line JSON processor (jq-compatible)
     Jq(JqCommand),
     /// Find jq expression for a position in a JSON file
@@ -53,6 +55,20 @@ enum DsvSubcommand {
     Generate(GenerateDsv),
     /// Generate a suite of DSV files with various sizes and patterns
     GenerateSuite(GenerateDsvSuite),
+}
+
+#[derive(Debug, Parser)]
+struct YamlCommand {
+    #[command(subcommand)]
+    command: YamlSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum YamlSubcommand {
+    /// Generate synthetic YAML files for benchmarking and testing
+    Generate(GenerateYaml),
+    /// Generate a suite of YAML files with various sizes and patterns
+    GenerateSuite(GenerateYamlSuite),
 }
 
 #[derive(Debug, Parser)]
@@ -350,6 +366,97 @@ struct GenerateDsvSuite {
     max_size: usize,
 }
 
+/// Generate synthetic YAML files for benchmarking and testing
+#[derive(Debug, Parser)]
+struct GenerateYaml {
+    /// Size of YAML to generate (supports b, kb, mb, gb - case insensitive)
+    /// Examples: 1024, 1kb, 512MB, 2Gb
+    #[arg(value_parser = parse_size)]
+    size: usize,
+
+    /// Output file path (defaults to stdout)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// YAML pattern to generate
+    #[arg(short, long, default_value = "comprehensive")]
+    pattern: YamlPatternArg,
+
+    /// Random seed for reproducible generation
+    #[arg(short, long)]
+    seed: Option<u64>,
+
+    /// Verify generated YAML can be parsed
+    #[arg(long)]
+    verify: bool,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum YamlPatternArg {
+    /// Comprehensive pattern testing various YAML features (default)
+    Comprehensive,
+    /// Array of user/person records (realistic structure)
+    Users,
+    /// Deeply nested mappings and sequences
+    Nested,
+    /// Sequences at various levels
+    Sequences,
+    /// Mixed mappings and sequences
+    Mixed,
+    /// String-heavy with quoted strings
+    Strings,
+    /// Numeric values (integers and floats)
+    Numbers,
+    /// Configuration file style (realistic config)
+    Config,
+    /// Unicode strings in various scripts
+    Unicode,
+    /// Worst case for parsing (maximum depth and density)
+    Pathological,
+}
+
+impl From<YamlPatternArg> for yaml_generators::YamlPattern {
+    fn from(arg: YamlPatternArg) -> Self {
+        match arg {
+            YamlPatternArg::Comprehensive => yaml_generators::YamlPattern::Comprehensive,
+            YamlPatternArg::Users => yaml_generators::YamlPattern::Users,
+            YamlPatternArg::Nested => yaml_generators::YamlPattern::Nested,
+            YamlPatternArg::Sequences => yaml_generators::YamlPattern::Sequences,
+            YamlPatternArg::Mixed => yaml_generators::YamlPattern::Mixed,
+            YamlPatternArg::Strings => yaml_generators::YamlPattern::Strings,
+            YamlPatternArg::Numbers => yaml_generators::YamlPattern::Numbers,
+            YamlPatternArg::Config => yaml_generators::YamlPattern::Config,
+            YamlPatternArg::Unicode => yaml_generators::YamlPattern::Unicode,
+            YamlPatternArg::Pathological => yaml_generators::YamlPattern::Pathological,
+        }
+    }
+}
+
+/// Generate a suite of YAML files with various sizes and patterns for benchmarking
+#[derive(Debug, Parser)]
+struct GenerateYamlSuite {
+    /// Output directory (defaults to data/bench/generated/yaml)
+    #[arg(short, long, default_value = "data/bench/generated/yaml")]
+    output_dir: PathBuf,
+
+    /// Base seed for deterministic generation (each file uses seed + file_index)
+    #[arg(short, long, default_value = "42")]
+    seed: u64,
+
+    /// Clean output directory before generating
+    #[arg(long)]
+    clean: bool,
+
+    /// Verify all generated YAML files can be parsed
+    #[arg(long)]
+    verify: bool,
+
+    /// Maximum file size to generate (files larger than this are skipped)
+    /// Supports units: b, kb, mb, gb (e.g., "100mb", "1gb")
+    #[arg(short, long, value_parser = parse_size, default_value = "1gb")]
+    max_size: usize,
+}
+
 /// Command-line JSON processor (jq-compatible CLI)
 #[derive(Debug, Parser)]
 #[command(name = "jq")]
@@ -618,6 +725,31 @@ fn main() -> Result<()> {
                 Ok(())
             }
             DsvSubcommand::GenerateSuite(args) => generate_dsv_suite(args),
+        },
+        Command::Yaml(yaml_cmd) => match yaml_cmd.command {
+            YamlSubcommand::Generate(args) => {
+                let yaml =
+                    yaml_generators::generate_yaml(args.size, args.pattern.into(), args.seed);
+
+                if args.verify {
+                    succinctly::yaml::YamlIndex::build(yaml.as_bytes())
+                        .map_err(|e| anyhow::anyhow!("Generated invalid YAML: {}", e))?;
+                    eprintln!("✓ YAML validated successfully");
+                }
+
+                match args.output {
+                    Some(path) => {
+                        std::fs::write(&path, &yaml)?;
+                        eprintln!("✓ Wrote {} bytes to {}", yaml.len(), path.display());
+                    }
+                    None => {
+                        print!("{}", yaml);
+                    }
+                }
+
+                Ok(())
+            }
+            YamlSubcommand::GenerateSuite(args) => generate_yaml_suite(args),
         },
         Command::Dev(dev_cmd) => match dev_cmd.command {
             DevSubcommand::Bench(bench_cmd) => match bench_cmd.command {
@@ -975,6 +1107,103 @@ fn generate_dsv_suite(args: GenerateDsvSuite) -> Result<()> {
     Ok(())
 }
 
+/// YAML Suite configuration: patterns and sizes to generate
+const YAML_SUITE_PATTERNS: &[(&str, yaml_generators::YamlPattern)] = &[
+    ("comprehensive", yaml_generators::YamlPattern::Comprehensive),
+    ("users", yaml_generators::YamlPattern::Users),
+    ("nested", yaml_generators::YamlPattern::Nested),
+    ("sequences", yaml_generators::YamlPattern::Sequences),
+    ("mixed", yaml_generators::YamlPattern::Mixed),
+    ("strings", yaml_generators::YamlPattern::Strings),
+    ("numbers", yaml_generators::YamlPattern::Numbers),
+    ("config", yaml_generators::YamlPattern::Config),
+    ("unicode", yaml_generators::YamlPattern::Unicode),
+    ("pathological", yaml_generators::YamlPattern::Pathological),
+];
+
+fn generate_yaml_suite(args: GenerateYamlSuite) -> Result<()> {
+    let output_dir = &args.output_dir;
+
+    // Clean directory if requested
+    if args.clean && output_dir.exists() {
+        std::fs::remove_dir_all(output_dir)
+            .with_context(|| format!("Failed to clean directory: {}", output_dir.display()))?;
+        eprintln!("Cleaned {}", output_dir.display());
+    }
+
+    // Create output directory
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("Failed to create directory: {}", output_dir.display()))?;
+
+    let mut file_index: u64 = 0;
+    let mut total_bytes: usize = 0;
+    let mut file_count: usize = 0;
+    let mut skipped_count: usize = 0;
+
+    eprintln!(
+        "Generating YAML suite in {} (max size: {})...",
+        output_dir.display(),
+        format_bytes(args.max_size)
+    );
+
+    for (pattern_name, pattern) in YAML_SUITE_PATTERNS {
+        // Create pattern subdirectory
+        let pattern_dir = output_dir.join(pattern_name);
+        std::fs::create_dir_all(&pattern_dir)?;
+
+        for (size_name, size) in SUITE_SIZES {
+            // Skip files that exceed max_size
+            if *size > args.max_size {
+                skipped_count += 1;
+                continue;
+            }
+
+            let filename = format!("{}.yaml", size_name);
+            let path = pattern_dir.join(&filename);
+
+            // Deterministic seed: base_seed + file_index
+            let seed = args.seed.wrapping_add(file_index);
+            file_index += 1;
+
+            let yaml = yaml_generators::generate_yaml(*size, *pattern, Some(seed));
+
+            if args.verify {
+                if let Err(e) = succinctly::yaml::YamlIndex::build(yaml.as_bytes()) {
+                    anyhow::bail!("Generated invalid YAML for {}: {}", path.display(), e);
+                }
+            }
+
+            std::fs::write(&path, &yaml)?;
+            total_bytes += yaml.len();
+            file_count += 1;
+
+            eprintln!(
+                "  {} ({}, seed={})",
+                path.display(),
+                format_bytes(yaml.len()),
+                seed
+            );
+        }
+    }
+
+    eprintln!();
+    eprintln!(
+        "Generated {} files ({} total)",
+        file_count,
+        format_bytes(total_bytes)
+    );
+
+    if skipped_count > 0 {
+        eprintln!("Skipped {} files exceeding max size", skipped_count);
+    }
+
+    if args.verify {
+        eprintln!("All files validated successfully");
+    }
+
+    Ok(())
+}
+
 fn format_bytes(bytes: usize) -> String {
     if bytes >= 1024 * 1024 * 1024 {
         format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
@@ -993,6 +1222,7 @@ mod generators;
 mod jq_bench;
 mod jq_locate;
 mod jq_runner;
+mod yaml_generators;
 use generators::generate_json;
 
 #[cfg(test)]
