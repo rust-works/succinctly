@@ -64,6 +64,8 @@ fn value_to_json<W: AsRef<[u64]>>(value: &YamlValue<'_, W>) -> String {
                     .replace('\n', "\\n")
                     .replace('\r', "\\r")
                     .replace('\t', "\\t")
+                    .replace('\x08', "\\b")
+                    .replace('\x0c', "\\f")
             )
         }
         YamlValue::Mapping(fields) => {
@@ -97,7 +99,14 @@ fn value_to_json<W: AsRef<[u64]>>(value: &YamlValue<'_, W>) -> String {
                     other => value_to_json(&other),
                 };
                 let val = value_to_json(&field.value());
-                entries.push(format!("\"{}\": {}", key, val));
+                // Escape the key for JSON
+                let escaped_key = key
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+                    .replace('\t', "\\t");
+                entries.push(format!("\"{}\": {}", escaped_key, val));
             }
             format!("{{{}}}", entries.join(", "))
         }
@@ -119,20 +128,28 @@ fn value_to_json<W: AsRef<[u64]>>(value: &YamlValue<'_, W>) -> String {
 /// Normalize JSON for comparison (remove whitespace).
 fn normalize_json(json: &str) -> String {
     // Only normalize whitespace OUTSIDE of strings, not inside them
-    // This simple approach handles basic cases but not nested quotes
     let mut result = String::new();
     let mut in_string = false;
-    let mut prev_char = '\0';
+    let mut escape_count = 0;
 
     for c in json.chars() {
-        if c == '"' && prev_char != '\\' {
-            in_string = !in_string;
-        }
-
-        if in_string || !c.is_whitespace() {
+        if in_string {
+            if c == '\\' {
+                escape_count += 1;
+            } else {
+                // A quote ends the string only if preceded by even number of backslashes
+                if c == '"' && escape_count % 2 == 0 {
+                    in_string = false;
+                }
+                escape_count = 0;
+            }
+            result.push(c);
+        } else if c == '"' {
+            in_string = true;
+            result.push(c);
+        } else if !c.is_whitespace() {
             result.push(c);
         }
-        prev_char = c;
     }
     result
 }
@@ -1128,7 +1145,7 @@ fn test_753E_block_scalar_strip_13() {
 /// Tags: spec scalar upto-1.2 whitespace
 #[test]
 fn test_7A4E_spec_example_76_double_quoted_lines() {
-    let yaml = b"\" 1st non-empty\n 2nd non-empty \n\t\t\t\t3rd non-empty \"";
+    let yaml = b"\" 1st non-empty\n\n 2nd non-empty \n\t\t\t\t3rd non-empty \"";
 
     // Should parse without error
     let result = YamlIndex::build(yaml);
@@ -1703,7 +1720,7 @@ fn test_9SHH_spec_example_58_quoted_scalar_indicators() {
 /// Tags: double spec scalar whitespace 1.3-mod
 #[test]
 fn test_9TFX_spec_example_76_double_quoted_lines_13() {
-    let yaml = b"---\n\" 1st non-empty\n 2nd non-empty \n 3rd non-empty \"";
+    let yaml = b"---\n\" 1st non-empty\n\n 2nd non-empty \n 3rd non-empty \"";
 
     // Should parse without error
     let result = YamlIndex::build(yaml);
@@ -2356,7 +2373,7 @@ fn test_F6MC_more_indented_lines_at_the_beginning_of_folded_block_scalars() {
 /// Tags: spec literal scalar comment
 #[test]
 fn test_F8F9_spec_example_85_chomping_trailing_lines() {
-    let yaml = b" # Strip\n  # Comments:\nstrip: |-\n  # text\n  \n # Clip\n  # comments:\nclip: |\n  # text\n \n # Keep\n  # comments:\nkeep: |+\n  # text\n # Trail\n  # comments.";
+    let yaml = b" # Strip\n  # Comments:\nstrip: |-\n  # text\n  \n # Clip\n  # comments:\nclip: |\n  # text\n \n # Keep\n  # comments:\nkeep: |+\n  # text\n\n # Trail\n  # comments.";
 
     // Should parse without error
     let result = YamlIndex::build(yaml);
@@ -2529,7 +2546,7 @@ fn test_GH63_mixed_block_mapping_explicit_to_implicit() {
 /// Tags: comment literal scalar whitespace
 #[test]
 fn test_H2RW_blank_lines() {
-    let yaml = b"foo: 1\nbar: 2\n    \ntext: |\n  a\n    \n  b\n  c\n \n  d";
+    let yaml = b"foo: 1\n\nbar: 2\n    \ntext: |\n  a\n    \n  b\n\n  c\n \n  d";
 
     // Should parse without error
     let result = YamlIndex::build(yaml);
@@ -3254,7 +3271,7 @@ fn test_MZX3_nonspecific_tags_on_scalars() {
 /// Tags: double scalar single whitespace
 #[test]
 fn test_NAT4_various_empty_or_newline_only_quoted_strings() {
-    let yaml = b"---\na: '\n  '\nb: '  \n  '\nc: \"\n  \"\nd: \"  \n  \"\ne: '\n  '\nf: \"\n  \"\ng: '\n  '\nh: \"\n  \"";
+    let yaml = b"---\na: '\n  '\nb: '  \n  '\nc: \"\n  \"\nd: \"  \n  \"\ne: '\n\n  '\nf: \"\n\n  \"\ng: '\n\n\n  '\nh: \"\n\n\n  \"";
 
     // Should parse without error
     let result = YamlIndex::build(yaml);
@@ -3445,7 +3462,7 @@ fn test_PBJ2_spec_example_23_mapping_scalars_to_sequences() {
 /// Tags: single spec scalar whitespace upto-1.2
 #[test]
 fn test_PRH3_spec_example_79_single_quoted_lines() {
-    let yaml = b"' 1st non-empty\n 2nd non-empty \n\t\t\t\t3rd non-empty '";
+    let yaml = b"' 1st non-empty\n\n 2nd non-empty \n\t\t\t\t3rd non-empty '";
 
     // Should parse without error
     let result = YamlIndex::build(yaml);
@@ -3844,7 +3861,7 @@ fn test_T26H_spec_example_88_literal_content_13() {
 /// Tags: single spec scalar whitespace 1.3-mod
 #[test]
 fn test_T4YY_spec_example_79_single_quoted_lines_13() {
-    let yaml = b"---\n' 1st non-empty\n 2nd non-empty \n 3rd non-empty '";
+    let yaml = b"---\n' 1st non-empty\n\n 2nd non-empty \n 3rd non-empty '";
 
     // Should parse without error
     let result = YamlIndex::build(yaml);
@@ -4107,7 +4124,7 @@ fn test_X8DW_explicit_key_and_value_seperated_by_comment() {
 #[test]
 fn test_XV9V_spec_example_65_empty_lines_13() {
     let yaml =
-        b"Folding:\n  \"Empty line\n  as a line feed\"\nChomping: |\n  Clipped empty lines\n ";
+        b"Folding:\n  \"Empty line\n\n  as a line feed\"\nChomping: |\n  Clipped empty lines\n ";
 
     // Should parse without error
     let result = YamlIndex::build(yaml);

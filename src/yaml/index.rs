@@ -43,6 +43,8 @@ pub struct YamlIndex<W = Vec<u64>> {
     bp_to_text: Vec<u32>,
     /// Sequence item markers - 1 if BP position is a sequence item wrapper
     seq_items: W,
+    /// Container markers - 1 if BP position has a TY entry (is a mapping or sequence)
+    containers: W,
     /// Anchor definitions: anchor name → BP position of the anchored value
     anchors: BTreeMap<String, usize>,
     /// Alias references: BP position of alias → target BP position (resolved at parse time)
@@ -82,6 +84,7 @@ impl YamlIndex<Vec<u64>> {
             ty_len: semi.ty_len,
             bp_to_text: semi.bp_to_text,
             seq_items: semi.seq_items,
+            containers: semi.containers,
             anchors: semi.anchors,
             aliases: semi.aliases,
         })
@@ -102,6 +105,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         ty_len: usize,
         bp_to_text: Vec<u32>,
         seq_items: W,
+        containers: W,
         anchors: BTreeMap<String, usize>,
         aliases: BTreeMap<usize, usize>,
     ) -> Self {
@@ -116,6 +120,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             ty_len,
             bp_to_text,
             seq_items,
+            containers,
             anchors,
             aliases,
         }
@@ -199,12 +204,52 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     #[inline]
     pub fn is_sequence_at_bp(&self, bp_pos: usize) -> bool {
         // The TY index equals the number of container opens before this position.
-        // Since sequence items have BP opens but no TY entries, we need to
-        // subtract the count of sequence items from the BP rank.
-        let bp_opens_before = self.bp.rank1(bp_pos);
-        let seq_items_before = self.count_seq_items_before(bp_pos);
-        let ty_idx = bp_opens_before.saturating_sub(seq_items_before);
+        // Use the containers bitvector to count how many BP opens before bp_pos
+        // actually have TY entries (are mappings or sequences).
+        let ty_idx = self.count_containers_before(bp_pos);
         self.is_sequence_at(ty_idx)
+    }
+
+    /// Check if a BP position is a container (has a TY entry).
+    ///
+    /// Containers are mappings and sequences. Other BP nodes (scalars, sequence items)
+    /// don't have TY entries.
+    #[inline]
+    pub fn is_container(&self, bp_pos: usize) -> bool {
+        let word_idx = bp_pos / 64;
+        let bit_idx = bp_pos % 64;
+        let container_words = self.containers.as_ref();
+        if word_idx < container_words.len() {
+            (container_words[word_idx] >> bit_idx) & 1 == 1
+        } else {
+            false
+        }
+    }
+
+    /// Count containers at BP positions 0..bp_pos.
+    ///
+    /// This gives the TY index for a BP position that is a container.
+    #[inline]
+    pub fn count_containers_before(&self, bp_pos: usize) -> usize {
+        let container_words = self.containers.as_ref();
+        if container_words.is_empty() {
+            return 0;
+        }
+
+        let word_idx = bp_pos / 64;
+        let bit_idx = bp_pos % 64;
+
+        let mut count = 0usize;
+        for word in container_words.iter().take(word_idx) {
+            count += word.count_ones() as usize;
+        }
+
+        if word_idx < container_words.len() && bit_idx > 0 {
+            let mask = (1u64 << bit_idx) - 1;
+            count += (container_words[word_idx] & mask).count_ones() as usize;
+        }
+
+        count
     }
 
     /// Check if a BP position corresponds to an alias.

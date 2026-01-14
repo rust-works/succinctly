@@ -63,24 +63,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// `value()` handles them before calling `is_container()`.
     #[inline]
     pub fn is_container(&self) -> bool {
-        // Sequence item wrappers are NOT containers - they have BP open/close
-        // but no TY entry. They exist to wrap the item's content.
-        if self.index.is_seq_item(self.bp_pos) {
-            return false;
-        }
-
-        if self.index.bp().first_child(self.bp_pos).is_none() {
-            return false;
-        }
-
-        // Check if this position has a valid TY entry.
-        // We need to account for sequence items when computing the TY index:
-        // TY index = count of BP opens before this position - count of seq item opens before
-        let bp_opens_before = self.index.bp().rank1(self.bp_pos);
-        let seq_items_before = self.index.count_seq_items_before(self.bp_pos);
-        let ty_idx = bp_opens_before.saturating_sub(seq_items_before);
-
-        ty_idx < self.index.ty_len()
+        // Use the containers bitvector to check if this BP position has a TY entry.
+        // Containers are mappings and sequences; sequence items and scalars are not.
+        self.index.is_container(self.bp_pos)
     }
 
     /// Get the byte position in the YAML text.
@@ -132,6 +117,18 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         if self.bp_pos == 0 {
             // Root is always a sequence (of documents)
             return YamlValue::Sequence(YamlElements::from_sequence_cursor(*self));
+        }
+
+        // Special case: sequence item wrappers delegate to their first child's value.
+        // A sequence item is a thin wrapper around the actual content:
+        //   - [item1, item2]  <- sequence item wrappers contain the actual values
+        // The item wrapper's first_child IS the value (could be scalar, mapping, etc.)
+        if self.index.is_seq_item(self.bp_pos) {
+            if let Some(child) = self.first_child() {
+                return child.value();
+            }
+            // Empty sequence item (null)
+            return YamlValue::Null;
         }
 
         let Some(text_pos) = self.text_position() else {
@@ -390,6 +387,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
 
         // Check if there's a colon before us on this line (meaning key: value on same line)
         let mut has_colon_before = false;
+        let mut colon_pos = 0;
         let mut scan = line_start;
         while scan < value_pos {
             if self.text[scan] == b':' {
@@ -398,6 +396,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     let next = self.text[scan + 1];
                     if next == b' ' || next == b'\t' || next == b'\n' {
                         has_colon_before = true;
+                        colon_pos = scan;
                     }
                 }
             }
@@ -405,8 +404,29 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         }
 
         if has_colon_before {
-            // Value is on same line as key, use this line's indent
-            Self::compute_line_indent_static(self.text, value_pos)
+            // Value is on same line as key.
+            // Find the effective content indent, which is the column of the key.
+            // For compact mappings in sequences like "- key: value", we need to
+            // find where the actual content starts (after any "- " indicators).
+
+            // Scan backwards from the colon to find the key start
+            let mut key_start = colon_pos;
+            while key_start > line_start {
+                let prev = self.text[key_start - 1];
+                if prev == b' ' || prev == b'\t' {
+                    break;
+                }
+                // Skip over quoted key content
+                if prev == b'"' || prev == b'\'' {
+                    // This is end of a quoted key - harder to handle, just use line indent
+                    return Self::compute_line_indent_static(self.text, value_pos);
+                }
+                key_start -= 1;
+            }
+
+            // key_start is now at the start of the key
+            // The base indent is the column position of the key
+            key_start - line_start
         } else {
             // Value is on its own line (after key:)
             // Find the key by looking at the previous line with a colon
@@ -1957,6 +1977,27 @@ fn decode_block_literal<'a>(
                 pos += 1;
                 result.push('\n');
             }
+        }
+    }
+
+    // Apply chomping at the end
+    match chomping {
+        ChompingIndicator::Strip => {
+            while result.ends_with('\n') {
+                result.pop();
+            }
+        }
+        ChompingIndicator::Clip => {
+            // Clip: Ensure exactly one trailing newline
+            while result.ends_with("\n\n") {
+                result.pop();
+            }
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+        }
+        ChompingIndicator::Keep => {
+            // Keep all trailing newlines as-is
         }
     }
 

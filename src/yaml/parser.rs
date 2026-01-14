@@ -96,6 +96,9 @@ pub struct SemiIndex {
     /// Sequence item marker bits: 1 if this BP position is a sequence item wrapper.
     /// Sequence items have BP open/close but no TY entry.
     pub seq_items: Vec<u64>,
+    /// Container marker bits: 1 if this BP position has a TY entry (is a mapping or sequence).
+    /// Used to compute correct TY index from BP position.
+    pub containers: Vec<u64>,
     /// Number of valid bits in IB (= input length)
     #[allow(dead_code)]
     pub ib_len: usize,
@@ -121,6 +124,8 @@ struct Parser<'a> {
     bp_words: Vec<u64>,
     ty_words: Vec<u64>,
     seq_item_words: Vec<u64>,
+    /// Container marker bits - marks BP positions that have TY entries (mappings/sequences)
+    container_words: Vec<u64>,
     bp_pos: usize,
     ty_pos: usize,
 
@@ -150,6 +155,7 @@ impl<'a> Parser<'a> {
         let bp_words = vec![0u64; input.len().div_ceil(32).max(1)]; // ~2x IB for BP
         let ty_words = vec![0u64; input.len().div_ceil(64).max(1)];
         let seq_item_words = vec![0u64; input.len().div_ceil(32).max(1)]; // Same size as BP
+        let container_words = vec![0u64; input.len().div_ceil(32).max(1)]; // Same size as BP
 
         Self {
             input,
@@ -159,6 +165,7 @@ impl<'a> Parser<'a> {
             bp_words,
             ty_words,
             seq_item_words,
+            container_words,
             bp_pos: 0,
             ty_pos: 0,
             bp_to_text: Vec::new(),
@@ -237,16 +244,41 @@ impl<'a> Parser<'a> {
         self.seq_item_words[word_idx] |= 1u64 << bit_idx;
     }
 
+    /// Mark current BP position as a container (has TY entry).
+    /// Call this BEFORE write_bp_open for containers.
+    #[inline]
+    #[allow(dead_code)]
+    fn mark_container(&mut self) {
+        let bp_pos = self.bp_pos;
+        let word_idx = bp_pos / 64;
+        let bit_idx = bp_pos % 64;
+        while word_idx >= self.container_words.len() {
+            self.container_words.push(0);
+        }
+        self.container_words[word_idx] |= 1u64 << bit_idx;
+    }
+
     /// Write a type bit: 0 = mapping, 1 = sequence.
+    /// Also marks the current BP position as a container.
     #[inline]
     fn write_ty(&mut self, is_sequence: bool) {
-        let word_idx = self.ty_pos / 64;
-        let bit_idx = self.ty_pos % 64;
-        while word_idx >= self.ty_words.len() {
+        // Mark this BP position as a container (bp_pos - 1 because write_bp_open already incremented)
+        let container_bp_pos = self.bp_pos - 1;
+        let word_idx = container_bp_pos / 64;
+        let bit_idx = container_bp_pos % 64;
+        while word_idx >= self.container_words.len() {
+            self.container_words.push(0);
+        }
+        self.container_words[word_idx] |= 1u64 << bit_idx;
+
+        // Write the TY bit
+        let ty_word_idx = self.ty_pos / 64;
+        let ty_bit_idx = self.ty_pos % 64;
+        while ty_word_idx >= self.ty_words.len() {
             self.ty_words.push(0);
         }
         if is_sequence {
-            self.ty_words[word_idx] |= 1u64 << bit_idx;
+            self.ty_words[ty_word_idx] |= 1u64 << ty_bit_idx;
         }
         self.ty_pos += 1;
     }
@@ -843,6 +875,41 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Close a sequence that was the value of a previous mapping entry.
+    ///
+    /// When we're about to add a new entry to a mapping at indent N, and the top
+    /// of the stack is a Sequence at indent N with a Mapping below it also at
+    /// indent N, the Sequence was the value of a previous entry and must be closed.
+    ///
+    /// YAML allows sequences-as-values to start at the same indent as the key:
+    /// ```yaml
+    /// foo:      # key at indent 0
+    /// - item    # sequence value at indent 0  <- allowed
+    /// bar:      # new key at indent 0 - closes the sequence
+    /// ```
+    fn close_same_indent_sequence_before_mapping_entry(&mut self, indent: usize) {
+        // Check if we have a Sequence at same indent as a Mapping below it
+        if self.indent_stack.len() >= 2 && self.type_stack.len() >= 2 {
+            let top_idx = self.indent_stack.len() - 1;
+            let top_indent = self.indent_stack[top_idx];
+            let top_type = self.type_stack[top_idx];
+            let below_indent = self.indent_stack[top_idx - 1];
+            let below_type = self.type_stack[top_idx - 1];
+
+            // If Sequence at indent N is on top of Mapping at indent N,
+            // and we're adding a mapping entry at indent N, close the Sequence
+            if top_type == NodeType::Sequence
+                && below_type == NodeType::Mapping
+                && top_indent == indent
+                && below_indent == indent
+            {
+                self.indent_stack.pop();
+                self.type_stack.pop();
+                self.write_bp_close();
+            }
+        }
+    }
+
     /// Parse a sequence item (starts with `- `).
     fn parse_sequence_item(&mut self, indent: usize) -> Result<(), YamlError> {
         let _item_start = self.pos;
@@ -1003,6 +1070,13 @@ impl<'a> Parser<'a> {
         // This ensures we return to the appropriate context before deciding
         // whether to open a new mapping or add to an existing one.
         self.close_deeper_indents(indent);
+
+        // Close any sequence that was the value of a previous mapping entry.
+        // This handles:
+        //   foo:
+        //   - item  <- sequence at same indent as mapping
+        //   bar:    <- new entry closes the sequence
+        self.close_same_indent_sequence_before_mapping_entry(indent);
 
         // Now check if we need to open a new mapping
         let need_new_mapping = self.type_stack.last() != Some(&NodeType::Mapping)
@@ -2506,6 +2580,7 @@ impl<'a> Parser<'a> {
             ty: self.ty_words.clone(),
             bp_to_text: self.bp_to_text.clone(),
             seq_items: self.seq_item_words.clone(),
+            containers: self.container_words.clone(),
             ib_len: self.input.len(),
             bp_len: self.bp_pos,
             ty_len: self.ty_pos,
