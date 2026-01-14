@@ -224,7 +224,7 @@ fn test_2JQS_block_mapping_with_missing_keys() {
 /// Tags: mapping scalar
 #[test]
 fn test_36F6_multiline_plain_scalar_with_empty_line() {
-    let yaml = b"---\nplain: a\n b\n c";
+    let yaml = b"---\nplain: a\n b\n\n c";
 
     // Should parse without error
     let result = YamlIndex::build(yaml);
@@ -1066,7 +1066,8 @@ fn test_6SLA_allowed_characters_in_quoted_mapping_key() {
 /// Tags: double spec whitespace scalar 1.3-mod
 #[test]
 fn test_6WPF_spec_example_68_flow_folding_13() {
-    let yaml = b"---\n\"\n  foo \n \n    bar\n  baz\n\"";
+    // Note: there's an empty line between "bar" and "baz"
+    let yaml = b"---\n\"\n  foo \n \n    bar\n\n  baz\n\"";
 
     // Should parse without error
     let result = YamlIndex::build(yaml);
@@ -2242,7 +2243,7 @@ fn test_E76Z_aliases_in_implicit_block_mapping() {
 /// Tags: scalar whitespace 1.3-mod
 #[test]
 fn test_EX5H_multiline_scalar_at_top_level_13() {
-    let yaml = b"---\na\nb  \n  c\nd\ne";
+    let yaml = b"---\na\nb  \n  c\nd\n\ne";
 
     // Should parse without error
     let result = YamlIndex::build(yaml);
@@ -2556,7 +2557,7 @@ fn test_HM87_scalars_in_flow_start_with_syntax_char() {
     assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
 
     let expected_json = "[
-  \"?x\"
+  \":x\"
 ]";
     let actual_json = yaml_to_json(yaml).unwrap();
     assert_eq!(
@@ -2593,7 +2594,7 @@ fn test_HMK4_spec_example_216_indentation_determines_scope() {
 /// Tags: spec scalar whitespace upto-1.2
 #[test]
 fn test_HS5T_spec_example_712_plain_lines() {
-    let yaml = b"1st non-empty\n 2nd non-empty \n\t\t\t\t3rd non-empty";
+    let yaml = b"1st non-empty\n\n 2nd non-empty \n\t\t\t\t3rd non-empty";
 
     // Should parse without error
     let result = YamlIndex::build(yaml);
@@ -3881,7 +3882,8 @@ fn test_TE2A_spec_example_816_block_mappings() {
 /// Tags: double spec whitespace scalar upto-1.2
 #[test]
 fn test_TL85_spec_example_68_flow_folding() {
-    let yaml = b"\"\n  foo \n \n  \t\t bar\n  baz\n\"";
+    // Note: there's an empty line between "bar" and "baz"
+    let yaml = b"\"\n  foo \n \n  \t bar\n\n  baz\n\"";
 
     // Should parse without error
     let result = YamlIndex::build(yaml);

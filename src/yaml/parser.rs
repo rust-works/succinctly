@@ -704,15 +704,10 @@ impl<'a> Parser<'a> {
             let mut lookahead = self.pos + 1; // Skip \n
             let mut next_indent = 0;
 
-            // Count indentation on next line (spaces and tabs both count)
-            while lookahead < self.input.len() {
-                match self.input[lookahead] {
-                    b' ' | b'\t' => {
-                        next_indent += 1;
-                        lookahead += 1;
-                    }
-                    _ => break,
-                }
+            // Count indentation on next line (only spaces count as indent in YAML)
+            while lookahead < self.input.len() && self.input[lookahead] == b' ' {
+                next_indent += 1;
+                lookahead += 1;
             }
 
             // Check what comes after the indent
@@ -724,13 +719,28 @@ impl<'a> Parser<'a> {
             let next_char = self.input[lookahead];
 
             // If empty line (just whitespace then newline), skip it and continue
-            if next_char == b'\n' {
-                self.advance(); // Skip current \n
-                                // Skip the empty line's whitespace
-                while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
-                    self.advance();
+            // This includes lines with only spaces, tabs, or a mix
+            if next_char == b'\n' || next_char == b'\t' {
+                // Check if rest of line is whitespace
+                let mut check_pos = lookahead;
+                while check_pos < self.input.len() && matches!(self.input[check_pos], b' ' | b'\t')
+                {
+                    check_pos += 1;
                 }
-                continue;
+                if check_pos >= self.input.len()
+                    || self.input[check_pos] == b'\n'
+                    || self.input[check_pos] == b'\r'
+                {
+                    // Empty line - skip it and continue
+                    self.advance(); // Skip current \n
+                                    // Skip to end of empty line
+                    while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+                        self.advance();
+                    }
+                    continue;
+                }
+                // Tab followed by content at top level - this is a continuation
+                // (handled below)
             }
 
             // Continuation requires more indent than where scalar started
@@ -1066,13 +1076,66 @@ impl<'a> Parser<'a> {
                 self.write_bp_close();
                 return Ok(());
             }
-            // Value is on next line (nested structure or explicit null)
-            // Don't create a placeholder - the nested structure that follows
-            // will become the value directly. If no nested structure follows
-            // at a deeper indent, the value is implicitly null (handled by
-            // the BP structure where key has no sibling value).
+            // Value is on next line - check what kind of value
             self.skip_to_eol();
-            return Ok(());
+
+            // Look ahead to see what the next content line looks like
+            self.skip_newlines();
+            if self.peek().is_none() {
+                // EOF - null value
+                return Ok(());
+            }
+
+            // Count indentation of next line
+            let next_indent = self.count_indent().unwrap_or(0);
+            if next_indent <= indent {
+                // Next line is at same or lower indent - null value
+                return Ok(());
+            }
+
+            // Skip to the content position
+            let saved_pos = self.pos;
+            for _ in 0..next_indent {
+                self.advance();
+            }
+
+            // Check if this is a nested structure or a plain scalar value
+            match self.peek() {
+                Some(b'-') if matches!(self.peek_at(1), Some(b' ') | Some(b'\n') | None) => {
+                    // Sequence - will be handled by main loop
+                    self.pos = saved_pos;
+                    return Ok(());
+                }
+                Some(b'?') if matches!(self.peek_at(1), Some(b' ') | Some(b'\n') | None) => {
+                    // Explicit key - will be handled by main loop
+                    self.pos = saved_pos;
+                    return Ok(());
+                }
+                Some(b'{') | Some(b'[') | Some(b'|') | Some(b'>') => {
+                    // Flow/block structure - will be handled by main loop
+                    self.pos = saved_pos;
+                    return Ok(());
+                }
+                Some(b'#') => {
+                    // Comment - will be handled by main loop
+                    self.pos = saved_pos;
+                    return Ok(());
+                }
+                _ => {
+                    // Check if this looks like a mapping entry
+                    if self.looks_like_mapping_entry() {
+                        // Nested mapping - will be handled by main loop
+                        self.pos = saved_pos;
+                        return Ok(());
+                    }
+                    // Plain scalar value - parse it here with key's indent as base
+                    self.set_ib();
+                    self.write_bp_open();
+                    self.parse_unquoted_value_with_indent(indent);
+                    self.write_bp_close();
+                    return Ok(());
+                }
+            }
         }
 
         {

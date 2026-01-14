@@ -125,6 +125,15 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
 
     /// Get the YAML value at this cursor position.
     pub fn value(&self) -> YamlValue<'a, W> {
+        // Special case: the root (bp_pos=0) is always the virtual document sequence,
+        // even if it's empty (no documents). Check it explicitly FIRST before
+        // looking at text bytes, since the root's text_position may point to the
+        // first document's content (like a flow mapping starting with '{').
+        if self.bp_pos == 0 {
+            // Root is always a sequence (of documents)
+            return YamlValue::Sequence(YamlElements::from_sequence_cursor(*self));
+        }
+
         let Some(text_pos) = self.text_position() else {
             return YamlValue::Error("invalid cursor position");
         };
@@ -174,14 +183,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         }
 
         // Check if this is a container with a TY bit (structural container)
-        // This must come BEFORE the heuristic checks to ensure we use the authoritative
-        // TY bits for containers that have them (like document sequences).
-        //
-        // Special case: the root (bp_pos=0) is always the virtual document sequence,
-        // even if it's empty (no documents). Check it explicitly.
-        if self.bp_pos == 0 || self.is_container() {
+        // This uses the authoritative TY bits for containers that have them.
+        if self.is_container() {
             // Determine if mapping or sequence using the TY bits
-            // (This handles virtual containers like the document root wrapper)
             if self.index.is_sequence_at_bp(self.bp_pos) {
                 return YamlValue::Sequence(YamlElements::from_sequence_cursor(*self));
             } else {
@@ -243,12 +247,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 })
             }
             _ => {
-                // Unquoted scalar
-                let end = self.find_scalar_end(text_pos);
+                // Unquoted (plain) scalar - may span multiple lines
+                let base_indent = self.compute_base_indent_for_plain(text_pos);
+                let end = self.find_plain_scalar_end(text_pos, base_indent);
                 YamlValue::String(YamlString::Unquoted {
                     text: self.text,
                     start: text_pos,
                     end,
+                    base_indent,
                 })
             }
         }
@@ -311,7 +317,114 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         (chomping, explicit_indent)
     }
 
-    /// Find the end of an unquoted scalar.
+    fn compute_line_indent_static(text: &[u8], pos: usize) -> usize {
+        // Find start of line
+        let mut line_start = pos;
+        while line_start > 0 && text[line_start - 1] != b'\n' {
+            line_start -= 1;
+        }
+
+        // Count spaces at start of line (tabs don't count as indentation in YAML)
+        let mut indent = 0;
+        while line_start + indent < text.len() && text[line_start + indent] == b' ' {
+            indent += 1;
+        }
+        indent
+    }
+
+    /// Compute the base indent for plain scalar continuation.
+    /// For values on their own line (after key:), this returns the key's indent.
+    /// For values on the same line as the key, this returns that line's indent.
+    fn compute_base_indent_for_plain(&self, value_pos: usize) -> usize {
+        // Find start of current line
+        let mut line_start = value_pos;
+        while line_start > 0 && self.text[line_start - 1] != b'\n' {
+            line_start -= 1;
+        }
+
+        // Check if there's a colon before us on this line (meaning key: value on same line)
+        let mut has_colon_before = false;
+        let mut scan = line_start;
+        while scan < value_pos {
+            if self.text[scan] == b':' {
+                // Check if this colon is a key separator (followed by space/tab/newline)
+                if scan + 1 < self.text.len() {
+                    let next = self.text[scan + 1];
+                    if next == b' ' || next == b'\t' || next == b'\n' {
+                        has_colon_before = true;
+                    }
+                }
+            }
+            scan += 1;
+        }
+
+        if has_colon_before {
+            // Value is on same line as key, use this line's indent
+            Self::compute_line_indent_static(self.text, value_pos)
+        } else {
+            // Value is on its own line (after key:)
+            // Find the key by looking at the previous line with a colon
+            if line_start == 0 {
+                // No previous line, return 0
+                return 0;
+            }
+
+            // Go to previous line
+            // Find start of previous line
+            let mut prev_line_start = line_start - 1;
+            while prev_line_start > 0 && self.text[prev_line_start - 1] != b'\n' {
+                prev_line_start -= 1;
+            }
+
+            // The key should be on this previous line - return its indent
+            Self::compute_line_indent_static(self.text, prev_line_start)
+        }
+    }
+
+    /// Check if a position is inside a flow context (inside `[]` or `{}`).
+    /// Returns true if there's an unmatched `[` or `{` before the position.
+    fn is_in_flow_context(&self, pos: usize) -> bool {
+        let mut depth = 0i32;
+        let mut in_double_quote = false;
+        let mut in_single_quote = false;
+        let mut i = 0;
+
+        while i < pos {
+            let byte = self.text[i];
+
+            if in_double_quote {
+                if byte == b'\\' && i + 1 < pos {
+                    i += 2; // Skip escaped character
+                    continue;
+                }
+                if byte == b'"' {
+                    in_double_quote = false;
+                }
+            } else if in_single_quote {
+                if byte == b'\'' {
+                    // Check for escaped single quote ''
+                    if i + 1 < pos && self.text[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+            } else {
+                match byte {
+                    b'"' => in_double_quote = true,
+                    b'\'' => in_single_quote = true,
+                    b'[' | b'{' => depth += 1,
+                    b']' | b'}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+
+        depth > 0
+    }
+
+    /// Find the end of a single-line unquoted scalar (stops at newline).
     fn find_scalar_end(&self, start: usize) -> usize {
         let mut end = start;
         while end < self.text.len() {
@@ -339,6 +452,175 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             end -= 1;
         }
         end
+    }
+
+    /// Find the end of a plain (unquoted) scalar, including continuation lines.
+    /// A continuation line is more indented than base_indent (in block context),
+    /// or any line that doesn't start with a flow delimiter (in flow context).
+    fn find_plain_scalar_end(&self, start: usize, base_indent: usize) -> usize {
+        let in_flow = self.is_in_flow_context(start);
+        let mut end = start;
+
+        loop {
+            // Find end of current line content
+            while end < self.text.len() {
+                match self.text[end] {
+                    b'\n' => break,
+                    b'#' => {
+                        // # preceded by space is a comment
+                        if end > start && self.text[end - 1] == b' ' {
+                            break;
+                        }
+                        end += 1;
+                    }
+                    // Flow context delimiters
+                    b',' | b']' | b'}' => break,
+                    b':' => {
+                        // Colon followed by space, newline, or EOF ends the scalar
+                        if end + 1 >= self.text.len() {
+                            break;
+                        }
+                        if self.text[end + 1] == b' '
+                            || self.text[end + 1] == b'\n'
+                            || self.text[end + 1] == b'\t'
+                        {
+                            break;
+                        }
+                        end += 1;
+                    }
+                    _ => end += 1,
+                }
+            }
+
+            // Trim trailing whitespace from current line
+            let mut line_end = end;
+            while line_end > start && self.text[line_end - 1] == b' ' {
+                line_end -= 1;
+            }
+
+            // Check if there's a continuation line
+            if end >= self.text.len() || self.text[end] != b'\n' {
+                // No newline, end of text or hit delimiter
+                return line_end;
+            }
+
+            // Look ahead to see if next line is a continuation
+            let newline_pos = end;
+            end += 1; // Skip newline
+
+            // Skip empty lines (they can be part of multiline scalar)
+            let mut empty_lines_end = end;
+            while empty_lines_end < self.text.len() {
+                // Count indentation of this line
+                let mut line_indent = 0;
+                while empty_lines_end + line_indent < self.text.len()
+                    && self.text[empty_lines_end + line_indent] == b' '
+                {
+                    line_indent += 1;
+                }
+
+                // Check what's after the indentation
+                let after_indent = empty_lines_end + line_indent;
+                if after_indent >= self.text.len() {
+                    // EOF after spaces
+                    return line_end;
+                }
+
+                match self.text[after_indent] {
+                    b'\n' => {
+                        // Empty line - continue looking
+                        empty_lines_end = after_indent + 1;
+                    }
+                    b'\r' => {
+                        // Handle CRLF
+                        empty_lines_end = after_indent + 1;
+                        if empty_lines_end < self.text.len() && self.text[empty_lines_end] == b'\n'
+                        {
+                            empty_lines_end += 1;
+                        }
+                    }
+                    b'\t' => {
+                        // Tabs after spaces - check if rest of line is whitespace only
+                        // If so, this is an empty line for folding purposes
+                        let mut check_pos = after_indent;
+                        while check_pos < self.text.len()
+                            && matches!(self.text[check_pos], b'\t' | b' ')
+                        {
+                            check_pos += 1;
+                        }
+                        if check_pos >= self.text.len()
+                            || matches!(self.text[check_pos], b'\n' | b'\r')
+                        {
+                            // Line has only whitespace - treat as empty line, continue looking
+                            empty_lines_end = check_pos;
+                            if check_pos < self.text.len() && self.text[check_pos] == b'\r' {
+                                empty_lines_end += 1;
+                                if empty_lines_end < self.text.len()
+                                    && self.text[empty_lines_end] == b'\n'
+                                {
+                                    empty_lines_end += 1;
+                                }
+                            } else if check_pos < self.text.len() && self.text[check_pos] == b'\n' {
+                                empty_lines_end += 1;
+                            }
+                            // Continue the loop to check the next line
+                        } else if line_indent == 0 && base_indent == 0 {
+                            // Tab at start of line at top level - this is content (continuation)
+                            end = empty_lines_end;
+                            break;
+                        } else {
+                            // Tab after indent, followed by content - not a continuation
+                            return line_end;
+                        }
+                    }
+                    b'#' => {
+                        // Comment line - not a continuation
+                        return line_end;
+                    }
+                    b'-' => {
+                        // Possible sequence indicator
+                        if after_indent + 1 < self.text.len()
+                            && (self.text[after_indent + 1] == b' '
+                                || self.text[after_indent + 1] == b'\n')
+                        {
+                            // This is a sequence item - not a continuation
+                            return line_end;
+                        }
+                        // Not a sequence indicator (dash not followed by space/newline)
+                        // Check if it's a continuation based on indentation or flow context
+                        if in_flow || line_indent > base_indent {
+                            end = empty_lines_end;
+                            break;
+                        }
+                        return line_end;
+                    }
+                    // Flow delimiters terminate the scalar regardless of indentation
+                    b']' | b'}' | b',' => {
+                        return line_end;
+                    }
+                    _ => {
+                        // Non-empty line - check indentation or flow context
+                        if in_flow || line_indent > base_indent {
+                            // Continuation line (in flow context, any non-delimiter continues)
+                            end = empty_lines_end;
+                            break;
+                        } else {
+                            // Not indented enough - scalar ends before this
+                            return line_end;
+                        }
+                    }
+                }
+            }
+
+            // If we fell through the empty lines loop without finding continuation
+            if empty_lines_end >= self.text.len() {
+                return line_end;
+            }
+
+            // Continue to include this continuation line
+            // The newline and any empty lines become part of the scalar
+            let _ = newline_pos; // newline_pos marks where content ended
+        }
     }
 
     /// Get children of this cursor for traversal.
@@ -703,11 +985,13 @@ pub enum YamlString<'a> {
     DoubleQuoted { text: &'a [u8], start: usize },
     /// Single-quoted string (' needs unescaping)
     SingleQuoted { text: &'a [u8], start: usize },
-    /// Unquoted string (raw bytes)
+    /// Unquoted (plain) string - may span multiple lines
     Unquoted {
         text: &'a [u8],
         start: usize,
         end: usize,
+        /// Base indentation level for detecting continuation lines
+        base_indent: usize,
     },
     /// Block literal scalar (`|`): preserves newlines
     BlockLiteral {
@@ -746,7 +1030,9 @@ impl<'a> YamlString<'a> {
                 let end = Self::find_single_quote_end(text, *start);
                 &text[*start..end]
             }
-            YamlString::Unquoted { text, start, end } => &text[*start..*end],
+            YamlString::Unquoted {
+                text, start, end, ..
+            } => &text[*start..*end],
             YamlString::BlockLiteral {
                 text,
                 indicator_pos,
@@ -800,10 +1086,21 @@ impl<'a> YamlString<'a> {
                     decode_single_quoted(bytes).map(Cow::Owned)
                 }
             }
-            YamlString::Unquoted { text, start, end } => {
+            YamlString::Unquoted {
+                text,
+                start,
+                end,
+                base_indent,
+            } => {
                 let bytes = &text[*start..*end];
-                let s = core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
-                Ok(Cow::Borrowed(s))
+                // Need folding if contains newlines (multiline plain scalar)
+                if !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+                    let s =
+                        core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
+                    Ok(Cow::Borrowed(s))
+                } else {
+                    decode_plain_scalar(bytes, *base_indent).map(Cow::Owned)
+                }
             }
             YamlString::BlockLiteral {
                 text,
@@ -1029,24 +1326,6 @@ impl<'a> YamlString<'a> {
         };
 
         (content_start, content_end)
-    }
-
-    /// Compute the indentation of the line containing a given position.
-    /// Scans backwards to find line start, then counts spaces.
-    #[allow(dead_code)]
-    fn compute_line_indent(text: &[u8], pos: usize) -> usize {
-        // Find start of line
-        let mut line_start = pos;
-        while line_start > 0 && text[line_start - 1] != b'\n' {
-            line_start -= 1;
-        }
-
-        // Count spaces at start of line
-        let mut indent = 0;
-        while line_start + indent < text.len() && text[line_start + indent] == b' ' {
-            indent += 1;
-        }
-        indent
     }
 
     /// Compute the indentation of the mapping key associated with a block scalar.
@@ -1393,6 +1672,153 @@ fn fold_quoted_line_break(bytes: &[u8], mut i: usize, result: &mut String) -> us
     } else {
         // Empty lines -> newlines (first line break becomes space, rest become \n)
         // Actually per YAML spec: empty lines preserve as \n each
+        for _ in 0..empty_lines {
+            result.push('\n');
+        }
+    }
+
+    i
+}
+
+/// Decode a plain (unquoted) scalar with line folding.
+///
+/// Rules for plain scalars:
+/// - Continuation lines must be more indented than base_indent
+/// - Single line breaks between non-empty lines become spaces (folding)
+/// - Empty lines (only whitespace) become literal newlines
+/// - Leading whitespace on continuation lines is stripped (up to a reasonable amount)
+/// - Trailing whitespace on each line is stripped
+fn decode_plain_scalar(bytes: &[u8], base_indent: usize) -> Result<String, YamlStringError> {
+    let mut result = String::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' | b'\n' => {
+                // Line folding
+                i = fold_plain_line_break(bytes, i, base_indent, &mut result);
+            }
+            _ => {
+                // Regular content - read until end of line
+                let start = i;
+                while i < bytes.len() && !matches!(bytes[i], b'\n' | b'\r') {
+                    i += 1;
+                }
+                // Trim trailing whitespace
+                let mut end = i;
+                while end > start && matches!(bytes[end - 1], b' ' | b'\t') {
+                    end -= 1;
+                }
+                let chunk = core::str::from_utf8(&bytes[start..end])
+                    .map_err(|_| YamlStringError::InvalidUtf8)?;
+                result.push_str(chunk);
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Handle line folding for plain scalars.
+/// Returns the new position after processing the line break(s).
+///
+/// Rules:
+/// - Skip the line break
+/// - Count consecutive empty lines (they become \n)
+/// - Skip leading whitespace on the continuation line (indentation)
+/// - Add a space for the line break (or \n for each empty line)
+fn fold_plain_line_break(
+    bytes: &[u8],
+    mut i: usize,
+    base_indent: usize,
+    result: &mut String,
+) -> usize {
+    // Skip the first line break
+    if bytes[i] == b'\r' {
+        i += 1;
+        if i < bytes.len() && bytes[i] == b'\n' {
+            i += 1;
+        }
+    } else if bytes[i] == b'\n' {
+        i += 1;
+    }
+
+    // Count empty lines (lines with only whitespace)
+    let mut empty_lines = 0;
+    loop {
+        // Skip leading whitespace (spaces for indentation)
+        let line_start = i;
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        let line_indent = i - line_start;
+
+        // Check if this is an empty line
+        if i < bytes.len() && (bytes[i] == b'\n' || bytes[i] == b'\r') {
+            empty_lines += 1;
+            // Skip the line break
+            if bytes[i] == b'\r' {
+                i += 1;
+                if i < bytes.len() && bytes[i] == b'\n' {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        } else if i >= bytes.len() {
+            // End of content
+            break;
+        } else if bytes[i] == b'\t' {
+            // Tab after spaces - check if the rest of line is whitespace
+            // If so, this is an empty line for folding purposes
+            let mut check = i;
+            while check < bytes.len() && matches!(bytes[check], b'\t' | b' ') {
+                check += 1;
+            }
+            if check >= bytes.len() || matches!(bytes[check], b'\n' | b'\r') {
+                // Line is all whitespace - treat as empty line
+                empty_lines += 1;
+                i = check;
+                if i < bytes.len() && bytes[i] == b'\r' {
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == b'\n' {
+                        i += 1;
+                    }
+                } else if i < bytes.len() && bytes[i] == b'\n' {
+                    i += 1;
+                }
+                // Continue looking for more empty lines
+            } else {
+                // Tab followed by content - skip the tabs as indentation
+                while i < bytes.len() && bytes[i] == b'\t' {
+                    i += 1;
+                }
+                break;
+            }
+        } else {
+            // Non-empty line with content
+            // For plain scalars, we've already included all continuation lines
+            // in the bytes range, so we just need to strip the indentation
+            // The content indent must be > base_indent for this to be a continuation
+            if line_indent > base_indent {
+                // Valid continuation - position is after the indentation
+                break;
+            } else {
+                // This shouldn't happen if find_plain_scalar_end worked correctly
+                // but handle it gracefully
+                break;
+            }
+        }
+    }
+
+    // Output the folded content
+    if empty_lines == 0 {
+        // Single line break -> space
+        if !result.is_empty() {
+            result.push(' ');
+        }
+    } else {
+        // Empty lines -> newlines
         for _ in 0..empty_lines {
             result.push('\n');
         }
