@@ -1,3 +1,4 @@
+#![allow(clippy::items_after_test_module)]
 //! YamlCursor - Lazy YAML navigation using the semi-index.
 //!
 //! This module provides a cursor-based API for navigating YAML structures
@@ -5,7 +6,7 @@
 //! requested.
 
 #[cfg(not(test))]
-use alloc::{borrow::Cow, format, string::String, string::ToString, vec::Vec};
+use alloc::{borrow::Cow, string::String, string::ToString, vec::Vec};
 
 #[cfg(test)]
 use std::borrow::Cow;
@@ -1047,47 +1048,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             YamlValue::Null => output.push_str("null"),
             YamlValue::String(s) => {
                 if let Ok(str_val) = s.as_str() {
-                    // Check for YAML special values that map to JSON types
-                    match str_val.as_ref() {
-                        "null" | "~" | "" => {
-                            output.push_str("null");
-                            return;
-                        }
-                        "true" | "True" | "TRUE" => {
-                            output.push_str("true");
-                            return;
-                        }
-                        "false" | "False" | "FALSE" => {
-                            output.push_str("false");
-                            return;
-                        }
-                        _ => {}
-                    }
-
-                    // Try to parse as number
-                    if let Ok(n) = str_val.parse::<i64>() {
-                        output.push_str(&n.to_string());
-                        return;
-                    }
-                    if let Ok(f) = str_val.parse::<f64>() {
-                        if !f.is_nan() && !f.is_infinite() {
-                            output.push_str(&f.to_string());
-                            return;
-                        }
-                    }
-
-                    // Check for special float literals
-                    match str_val.as_ref() {
-                        ".inf" | ".Inf" | ".INF" | "-.inf" | "-.Inf" | "-.INF" | ".nan"
-                        | ".NaN" | ".NAN" => {
-                            output.push_str("null"); // JSON doesn't support these
-                            return;
-                        }
-                        _ => {}
-                    }
-
-                    // It's a string - write with JSON escaping
-                    write_json_string(output, &str_val);
+                    write_yaml_scalar_as_json(output, &str_val);
                 } else {
                     output.push_str("null");
                 }
@@ -1151,46 +1112,7 @@ fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlVal
         YamlValue::Null => output.push_str("null"),
         YamlValue::String(s) => {
             if let Ok(str_val) = s.as_str() {
-                // Check for YAML special values
-                match str_val.as_ref() {
-                    "null" | "~" | "" => {
-                        output.push_str("null");
-                        return;
-                    }
-                    "true" | "True" | "TRUE" => {
-                        output.push_str("true");
-                        return;
-                    }
-                    "false" | "False" | "FALSE" => {
-                        output.push_str("false");
-                        return;
-                    }
-                    _ => {}
-                }
-
-                // Try to parse as number
-                if let Ok(n) = str_val.parse::<i64>() {
-                    output.push_str(&n.to_string());
-                    return;
-                }
-                if let Ok(f) = str_val.parse::<f64>() {
-                    if !f.is_nan() && !f.is_infinite() {
-                        output.push_str(&f.to_string());
-                        return;
-                    }
-                }
-
-                // Check for special float literals
-                match str_val.as_ref() {
-                    ".inf" | ".Inf" | ".INF" | "-.inf" | "-.Inf" | "-.INF" | ".nan" | ".NaN"
-                    | ".NAN" => {
-                        output.push_str("null");
-                        return;
-                    }
-                    _ => {}
-                }
-
-                write_json_string(output, &str_val);
+                write_yaml_scalar_as_json(output, &str_val);
             } else {
                 output.push_str("null");
             }
@@ -1243,22 +1165,232 @@ fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlVal
 }
 
 /// Write a string with JSON escaping.
+///
+/// Uses a fast path for ASCII-only strings without special characters,
+/// which is the common case for YAML data.
 fn write_json_string(output: &mut String, s: &str) {
     output.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            c if c.is_control() => {
-                output.push_str(&format!("\\u{:04x}", c as u32));
+
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Find the next byte that needs escaping
+        let start = i;
+        while i < bytes.len() {
+            let b = bytes[i];
+            // Check for bytes that need escaping: ", \, control chars (0x00-0x1F)
+            if b == b'"' || b == b'\\' || b < 0x20 {
+                break;
             }
-            _ => output.push(c),
+            i += 1;
+        }
+
+        // Copy the safe span directly
+        if start < i {
+            // SAFETY: We're copying valid UTF-8 bytes that don't contain
+            // any multi-byte sequence starters that would be split
+            output.push_str(&s[start..i]);
+        }
+
+        // Handle the escape character if any
+        if i < bytes.len() {
+            let b = bytes[i];
+            match b {
+                b'"' => output.push_str("\\\""),
+                b'\\' => output.push_str("\\\\"),
+                b'\n' => output.push_str("\\n"),
+                b'\r' => output.push_str("\\r"),
+                b'\t' => output.push_str("\\t"),
+                b if b < 0x20 => {
+                    // Control character - use \uXXXX
+                    output.push_str("\\u00");
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    output.push(HEX[(b >> 4) as usize] as char);
+                    output.push(HEX[(b & 0xf) as usize] as char);
+                }
+                _ => unreachable!(),
+            }
+            i += 1;
         }
     }
+
     output.push('"');
+}
+
+/// Fast integer to string formatting without allocation.
+/// Writes the integer directly to the output string.
+#[inline]
+fn write_i64(output: &mut String, mut n: i64) {
+    if n == 0 {
+        output.push('0');
+        return;
+    }
+
+    if n < 0 {
+        output.push('-');
+        // Handle MIN value specially to avoid overflow
+        if n == i64::MIN {
+            output.push_str("9223372036854775808");
+            return;
+        }
+        n = -n;
+    }
+
+    // Buffer for digits (max 19 digits for i64)
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+
+    // SAFETY: buf contains only ASCII digits
+    output.push_str(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
+}
+
+/// Fast f64 to string formatting.
+/// For simple cases, writes directly; falls back to to_string() for edge cases.
+#[inline]
+fn write_f64(output: &mut String, f: f64) {
+    // Check for integer-like floats (no fractional part)
+    if f.fract() == 0.0 && f.abs() < 9007199254740992.0 {
+        // Can represent exactly as i64
+        write_i64(output, f as i64);
+    } else {
+        // Fall back to standard formatting for non-integer floats
+        output.push_str(&f.to_string());
+    }
+}
+
+/// Fast YAML scalar to JSON conversion.
+///
+/// This function is optimized to quickly identify the type of a YAML scalar
+/// by checking the first byte before doing more expensive parsing.
+#[inline]
+fn write_yaml_scalar_as_json(output: &mut String, str_val: &str) {
+    let bytes = str_val.as_bytes();
+
+    // Empty string -> null
+    if bytes.is_empty() {
+        output.push_str("null");
+        return;
+    }
+
+    let first = bytes[0];
+
+    // Fast path: check first byte to determine possible types
+    match first {
+        // Could be null or number
+        b'n' => {
+            if str_val == "null" {
+                output.push_str("null");
+                return;
+            }
+        }
+        // Could be "~" (null)
+        b'~' => {
+            if bytes.len() == 1 {
+                output.push_str("null");
+                return;
+            }
+        }
+        // Could be true/True/TRUE
+        b't' => {
+            if str_val == "true" {
+                output.push_str("true");
+                return;
+            }
+        }
+        b'T' => {
+            if str_val == "True" || str_val == "TRUE" {
+                output.push_str("true");
+                return;
+            }
+        }
+        // Could be false/False/FALSE
+        b'f' => {
+            if str_val == "false" {
+                output.push_str("false");
+                return;
+            }
+        }
+        b'F' => {
+            if str_val == "False" || str_val == "FALSE" {
+                output.push_str("false");
+                return;
+            }
+        }
+        // Could be .inf, .nan, etc.
+        b'.' => match str_val {
+            ".inf" | ".Inf" | ".INF" | ".nan" | ".NaN" | ".NAN" => {
+                output.push_str("null");
+                return;
+            }
+            _ => {}
+        },
+        // Could be negative number or -.inf
+        b'-' => {
+            if bytes.len() > 1 {
+                match bytes[1] {
+                    b'.' => {
+                        if str_val == "-.inf" || str_val == "-.Inf" || str_val == "-.INF" {
+                            output.push_str("null");
+                            return;
+                        }
+                    }
+                    b'0'..=b'9' => {
+                        // Likely a negative number - try parsing
+                        if let Ok(n) = str_val.parse::<i64>() {
+                            write_i64(output, n);
+                            return;
+                        }
+                        if let Ok(f) = str_val.parse::<f64>() {
+                            if !f.is_nan() && !f.is_infinite() {
+                                write_f64(output, f);
+                                return;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Digits - likely a number
+        b'0'..=b'9' => {
+            if let Ok(n) = str_val.parse::<i64>() {
+                write_i64(output, n);
+                return;
+            }
+            if let Ok(f) = str_val.parse::<f64>() {
+                if !f.is_nan() && !f.is_infinite() {
+                    write_f64(output, f);
+                    return;
+                }
+            }
+        }
+        // Could be +number or +.inf
+        b'+' => {
+            if bytes.len() > 1 && bytes[1].is_ascii_digit() {
+                if let Ok(n) = str_val.parse::<i64>() {
+                    write_i64(output, n);
+                    return;
+                }
+                if let Ok(f) = str_val.parse::<f64>() {
+                    if !f.is_nan() && !f.is_infinite() {
+                        write_f64(output, f);
+                        return;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // It's a string - write with JSON escaping
+    write_json_string(output, str_val);
 }
 
 // ============================================================================
@@ -3669,5 +3801,239 @@ mod tests {
         let yaml = b"-\n - inner1\n - inner2";
         let result = YamlIndex::build(yaml);
         assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
+    }
+}
+
+// ============================================================================
+// Document trait implementations
+// ============================================================================
+
+use crate::jq::document::{
+    DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue,
+};
+
+impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
+    type Value = YamlValue<'a, W>;
+
+    #[inline]
+    fn value(&self) -> Self::Value {
+        YamlCursor::value(self)
+    }
+
+    #[inline]
+    fn first_child(&self) -> Option<Self> {
+        YamlCursor::first_child(self)
+    }
+
+    #[inline]
+    fn next_sibling(&self) -> Option<Self> {
+        YamlCursor::next_sibling(self)
+    }
+
+    #[inline]
+    fn parent(&self) -> Option<Self> {
+        YamlCursor::parent(self)
+    }
+
+    #[inline]
+    fn is_container(&self) -> bool {
+        YamlCursor::is_container(self)
+    }
+
+    #[inline]
+    fn text_position(&self) -> Option<usize> {
+        YamlCursor::text_position(self)
+    }
+}
+
+impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
+    type Cursor = YamlCursor<'a, W>;
+    type Fields = YamlFields<'a, W>;
+    type Elements = YamlElements<'a, W>;
+
+    fn is_null(&self) -> bool {
+        match self {
+            YamlValue::Null => true,
+            YamlValue::String(s) if s.is_unquoted() => {
+                // YAML null values: null, ~, empty string
+                if let Ok(str_val) = s.as_str() {
+                    matches!(str_val.as_ref(), "null" | "~" | "")
+                } else {
+                    false
+                }
+            }
+            YamlValue::Alias { target, .. } => {
+                // Resolve alias and check target
+                target.map(|t| t.value().is_null()).unwrap_or(true) // Unresolved alias treated as null
+            }
+            _ => false,
+        }
+    }
+
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            YamlValue::String(s) if s.is_unquoted() => {
+                let str_val = s.as_str().ok()?;
+                match str_val.as_ref() {
+                    "true" | "True" | "TRUE" => Some(true),
+                    "false" | "False" | "FALSE" => Some(false),
+                    _ => None,
+                }
+            }
+            YamlValue::Alias { target, .. } => target.and_then(|t| t.value().as_bool()),
+            _ => None,
+        }
+    }
+
+    fn as_i64(&self) -> Option<i64> {
+        match self {
+            YamlValue::String(s) if s.is_unquoted() => {
+                let str_val = s.as_str().ok()?;
+                str_val.parse().ok()
+            }
+            YamlValue::Alias { target, .. } => target.and_then(|t| t.value().as_i64()),
+            _ => None,
+        }
+    }
+
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            YamlValue::String(s) if s.is_unquoted() => {
+                let str_val = s.as_str().ok()?;
+                // Handle special YAML float values
+                match str_val.as_ref() {
+                    ".inf" | ".Inf" | ".INF" => Some(f64::INFINITY),
+                    "-.inf" | "-.Inf" | "-.INF" => Some(f64::NEG_INFINITY),
+                    ".nan" | ".NaN" | ".NAN" => Some(f64::NAN),
+                    _ => str_val.parse().ok(),
+                }
+            }
+            YamlValue::Alias { target, .. } => target.and_then(|t| t.value().as_f64()),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<Cow<'_, str>> {
+        match self {
+            YamlValue::String(s) => s.as_str().ok(),
+            YamlValue::Alias { target, .. } => {
+                // For aliases, we need to return an owned string since the
+                // target value is created temporarily
+                target.and_then(|t| {
+                    if let YamlValue::String(s) = t.value() {
+                        s.as_str().ok().map(|cow| Cow::Owned(cow.into_owned()))
+                    } else {
+                        None
+                    }
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn as_object(&self) -> Option<Self::Fields> {
+        match self {
+            YamlValue::Mapping(fields) => Some(*fields),
+            YamlValue::Alias { target, .. } => target.and_then(|t| t.value().as_object()),
+            _ => None,
+        }
+    }
+
+    fn as_array(&self) -> Option<Self::Elements> {
+        match self {
+            YamlValue::Sequence(elements) => Some(*elements),
+            YamlValue::Alias { target, .. } => target.and_then(|t| t.value().as_array()),
+            _ => None,
+        }
+    }
+
+    fn type_name(&self) -> &'static str {
+        match self {
+            YamlValue::Null => "null",
+            YamlValue::String(s) => {
+                // Determine effective type based on content
+                if s.is_unquoted() {
+                    if let Ok(str_val) = s.as_str() {
+                        match str_val.as_ref() {
+                            "null" | "~" | "" => return "null",
+                            "true" | "True" | "TRUE" | "false" | "False" | "FALSE" => {
+                                return "boolean"
+                            }
+                            _ => {
+                                // Check if it's a number
+                                if str_val.parse::<i64>().is_ok() || str_val.parse::<f64>().is_ok()
+                                {
+                                    return "number";
+                                }
+                            }
+                        }
+                    }
+                }
+                "string"
+            }
+            YamlValue::Mapping(_) => "object",
+            YamlValue::Sequence(_) => "array",
+            YamlValue::Alias { target, .. } => {
+                target.map(|t| t.value().type_name()).unwrap_or("null")
+            }
+            YamlValue::Error(_) => "error",
+        }
+    }
+
+    fn is_error(&self) -> bool {
+        matches!(self, YamlValue::Error(_))
+    }
+
+    fn error_message(&self) -> Option<&'static str> {
+        match self {
+            YamlValue::Error(msg) => Some(msg),
+            _ => None,
+        }
+    }
+}
+
+impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for YamlFields<'a, W> {
+    type Value = YamlValue<'a, W>;
+    type Cursor = YamlCursor<'a, W>;
+
+    fn uncons(&self) -> Option<(DocumentField<Self::Value, Self::Cursor>, Self)> {
+        let (field, rest) = YamlFields::uncons(self)?;
+        Some((
+            DocumentField {
+                key: field.key(),
+                value: field.value(),
+                value_cursor: field.value_cursor(),
+            },
+            rest,
+        ))
+    }
+
+    fn find(&self, name: &str) -> Option<Self::Value> {
+        YamlFields::find(self, name)
+    }
+
+    fn is_empty(&self) -> bool {
+        YamlFields::is_empty(self)
+    }
+}
+
+impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for YamlElements<'a, W> {
+    type Value = YamlValue<'a, W>;
+    type Cursor = YamlCursor<'a, W>;
+
+    fn uncons(&self) -> Option<(Self::Value, Self)> {
+        YamlElements::uncons(self)
+    }
+
+    fn uncons_cursor(&self) -> Option<(Self::Cursor, Self)> {
+        YamlElements::uncons_cursor(self)
+    }
+
+    fn get(&self, index: usize) -> Option<Self::Value> {
+        YamlElements::get(self, index)
+    }
+
+    fn is_empty(&self) -> bool {
+        YamlElements::is_empty(self)
     }
 }
