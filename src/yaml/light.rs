@@ -5,10 +5,12 @@
 //! requested.
 
 #[cfg(not(test))]
-use alloc::{borrow::Cow, string::String, vec::Vec};
+use alloc::{borrow::Cow, format, string::String, string::ToString, vec::Vec};
 
 #[cfg(test)]
 use std::borrow::Cow;
+#[cfg(test)]
+use std::string::ToString;
 
 use super::index::YamlIndex;
 
@@ -582,41 +584,19 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
 
         // If no flow markers on this line, check if we need to look back.
         // A multiline flow context would have a flow marker on a previous line.
-        // We only need to scan back if this line starts with whitespace (could be
-        // continuation of flow content) or if there's a ] or } that might close
-        // an outer flow context.
         if !has_flow_marker_on_line {
-            // Check if line starts with whitespace (potential flow continuation)
-            if line_start < self.text.len() && !matches!(self.text[line_start], b' ' | b'\t') {
-                // Line doesn't start with whitespace and has no flow markers = not in flow
-                return false;
-            }
-
-            // Check if there's any ] or } on this line that might indicate we're closing flow
-            let mut has_closer = false;
-            for i in line_start..pos {
-                if matches!(self.text[i], b']' | b'}') {
-                    has_closer = true;
+            // Quick check: scan back at most 256 bytes for any [ or {
+            // If there are no flow openers in the recent context, we're not in flow.
+            let quick_start = line_start.saturating_sub(256);
+            let mut found_opener = false;
+            for i in quick_start..line_start {
+                if matches!(self.text[i], b'[' | b'{') {
+                    found_opener = true;
                     break;
                 }
             }
-
-            // If no openers or closers on this line, and line starts with whitespace,
-            // we might be in a flow context from a previous line. We need to scan back.
-            // But for typical block YAML, this is rare, so check a small window first.
-            if !has_closer {
-                // Quick check: scan back at most 256 bytes for any [ or {
-                let quick_start = line_start.saturating_sub(256);
-                let mut found_opener = false;
-                for i in quick_start..line_start {
-                    if matches!(self.text[i], b'[' | b'{') {
-                        found_opener = true;
-                        break;
-                    }
-                }
-                if !found_opener {
-                    return false;
-                }
+            if !found_opener {
+                return false;
             }
         }
 
@@ -1019,6 +999,266 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         }
         self.text.len()
     }
+
+    /// Convert this YAML value directly to a JSON string.
+    ///
+    /// This streams directly from the YAML cursor to JSON output without
+    /// building an intermediate DOM. Much more efficient than converting
+    /// to OwnedValue first.
+    ///
+    /// Note: This outputs the raw structure including the document wrapper array.
+    /// For yq-style output (unwrapping single documents), use `to_json_document()`.
+    pub fn to_json(&self) -> String {
+        let mut output = String::new();
+        self.write_json_to(&mut output);
+        output
+    }
+
+    /// Convert YAML to JSON, unwrapping single documents.
+    ///
+    /// If the root is a single-document array `[doc]`, returns just `doc` as JSON.
+    /// If there are multiple documents, returns the array `[doc1, doc2, ...]`.
+    /// This matches yq's behavior.
+    pub fn to_json_document(&self) -> String {
+        let mut output = String::new();
+
+        // Check if this is the root document array with a single document
+        if self.bp_pos == 0 {
+            if let YamlValue::Sequence(elements) = self.value() {
+                let mut iter = elements.into_iter();
+                if let Some(first) = iter.next() {
+                    if iter.next().is_none() {
+                        // Single document - output it directly without array wrapper
+                        write_yaml_value_as_json(&mut output, first);
+                        return output;
+                    }
+                }
+            }
+        }
+
+        // Multiple documents or not at root - output as-is
+        self.write_json_to(&mut output);
+        output
+    }
+
+    /// Write this YAML value as JSON to a string buffer.
+    fn write_json_to(&self, output: &mut String) {
+        match self.value() {
+            YamlValue::Null => output.push_str("null"),
+            YamlValue::String(s) => {
+                if let Ok(str_val) = s.as_str() {
+                    // Check for YAML special values that map to JSON types
+                    match str_val.as_ref() {
+                        "null" | "~" | "" => {
+                            output.push_str("null");
+                            return;
+                        }
+                        "true" | "True" | "TRUE" => {
+                            output.push_str("true");
+                            return;
+                        }
+                        "false" | "False" | "FALSE" => {
+                            output.push_str("false");
+                            return;
+                        }
+                        _ => {}
+                    }
+
+                    // Try to parse as number
+                    if let Ok(n) = str_val.parse::<i64>() {
+                        output.push_str(&n.to_string());
+                        return;
+                    }
+                    if let Ok(f) = str_val.parse::<f64>() {
+                        if !f.is_nan() && !f.is_infinite() {
+                            output.push_str(&f.to_string());
+                            return;
+                        }
+                    }
+
+                    // Check for special float literals
+                    match str_val.as_ref() {
+                        ".inf" | ".Inf" | ".INF" | "-.inf" | "-.Inf" | "-.INF" | ".nan"
+                        | ".NaN" | ".NAN" => {
+                            output.push_str("null"); // JSON doesn't support these
+                            return;
+                        }
+                        _ => {}
+                    }
+
+                    // It's a string - write with JSON escaping
+                    write_json_string(output, &str_val);
+                } else {
+                    output.push_str("null");
+                }
+            }
+            YamlValue::Mapping(fields) => {
+                output.push('{');
+                let mut first = true;
+                for field in fields {
+                    if !first {
+                        output.push(',');
+                    }
+                    first = false;
+
+                    // Write key
+                    if let YamlValue::String(s) = field.key() {
+                        if let Ok(key_str) = s.as_str() {
+                            write_json_string(output, &key_str);
+                        } else {
+                            output.push_str("\"\"");
+                        }
+                    } else {
+                        output.push_str("\"\"");
+                    }
+
+                    output.push(':');
+
+                    // Write value by recursing on the cursor
+                    field.value_cursor().write_json_to(output);
+                }
+                output.push('}');
+            }
+            YamlValue::Sequence(elements) => {
+                output.push('[');
+                let mut first = true;
+                for elem in elements {
+                    if !first {
+                        output.push(',');
+                    }
+                    first = false;
+
+                    // For sequences, we get YamlValue not cursor, so need to handle inline
+                    write_yaml_value_as_json(output, elem);
+                }
+                output.push(']');
+            }
+            YamlValue::Alias { target, .. } => {
+                if let Some(target_cursor) = target {
+                    target_cursor.write_json_to(output);
+                } else {
+                    output.push_str("null");
+                }
+            }
+            YamlValue::Error(_) => output.push_str("null"),
+        }
+    }
+}
+
+/// Write a YAML value as JSON (for sequence elements where we don't have a cursor).
+fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlValue<'_, W>) {
+    match value {
+        YamlValue::Null => output.push_str("null"),
+        YamlValue::String(s) => {
+            if let Ok(str_val) = s.as_str() {
+                // Check for YAML special values
+                match str_val.as_ref() {
+                    "null" | "~" | "" => {
+                        output.push_str("null");
+                        return;
+                    }
+                    "true" | "True" | "TRUE" => {
+                        output.push_str("true");
+                        return;
+                    }
+                    "false" | "False" | "FALSE" => {
+                        output.push_str("false");
+                        return;
+                    }
+                    _ => {}
+                }
+
+                // Try to parse as number
+                if let Ok(n) = str_val.parse::<i64>() {
+                    output.push_str(&n.to_string());
+                    return;
+                }
+                if let Ok(f) = str_val.parse::<f64>() {
+                    if !f.is_nan() && !f.is_infinite() {
+                        output.push_str(&f.to_string());
+                        return;
+                    }
+                }
+
+                // Check for special float literals
+                match str_val.as_ref() {
+                    ".inf" | ".Inf" | ".INF" | "-.inf" | "-.Inf" | "-.INF" | ".nan" | ".NaN"
+                    | ".NAN" => {
+                        output.push_str("null");
+                        return;
+                    }
+                    _ => {}
+                }
+
+                write_json_string(output, &str_val);
+            } else {
+                output.push_str("null");
+            }
+        }
+        YamlValue::Mapping(fields) => {
+            output.push('{');
+            let mut first = true;
+            for field in fields {
+                if !first {
+                    output.push(',');
+                }
+                first = false;
+
+                if let YamlValue::String(s) = field.key() {
+                    if let Ok(key_str) = s.as_str() {
+                        write_json_string(output, &key_str);
+                    } else {
+                        output.push_str("\"\"");
+                    }
+                } else {
+                    output.push_str("\"\"");
+                }
+
+                output.push(':');
+                field.value_cursor().write_json_to(output);
+            }
+            output.push('}');
+        }
+        YamlValue::Sequence(elements) => {
+            output.push('[');
+            let mut first = true;
+            for elem in elements {
+                if !first {
+                    output.push(',');
+                }
+                first = false;
+                write_yaml_value_as_json(output, elem);
+            }
+            output.push(']');
+        }
+        YamlValue::Alias { target, .. } => {
+            if let Some(target_cursor) = target {
+                target_cursor.write_json_to(output);
+            } else {
+                output.push_str("null");
+            }
+        }
+        YamlValue::Error(_) => output.push_str("null"),
+    }
+}
+
+/// Write a string with JSON escaping.
+fn write_json_string(output: &mut String, s: &str) {
+    output.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            c if c.is_control() => {
+                output.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            _ => output.push(c),
+        }
+    }
+    output.push('"');
 }
 
 // ============================================================================
@@ -1221,6 +1461,42 @@ impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.element_cursor.is_none()
+    }
+
+    /// Get the cursor for the first element and the remaining elements.
+    ///
+    /// This returns the cursor directly, which is useful when you need to
+    /// call cursor methods like `to_json()` without going through YamlValue.
+    pub fn uncons_cursor(&self) -> Option<(YamlCursor<'a, W>, YamlElements<'a, W>)> {
+        let element_cursor = self.element_cursor?;
+
+        let rest = YamlElements {
+            element_cursor: element_cursor.next_sibling(),
+        };
+
+        // For block sequences, navigate to the actual value cursor
+        if element_cursor.is_container() {
+            Some((element_cursor, rest))
+        } else if let Some(text_pos) = element_cursor.text_position() {
+            if text_pos < element_cursor.text.len()
+                && element_cursor.text[text_pos] == b'-'
+                && text_pos + 1 < element_cursor.text.len()
+                && (element_cursor.text[text_pos + 1] == b' '
+                    || element_cursor.text[text_pos + 1] == b'\t')
+            {
+                // Block sequence item - return child cursor if exists
+                if let Some(child) = element_cursor.first_child() {
+                    Some((child, rest))
+                } else {
+                    // Empty item - return element cursor (will produce null)
+                    Some((element_cursor, rest))
+                }
+            } else {
+                Some((element_cursor, rest))
+            }
+        } else {
+            Some((element_cursor, rest))
+        }
     }
 
     /// Get the first element and the remaining elements.

@@ -1,4 +1,4 @@
-//! Profile the YAML processing pipeline to identify bottlenecks.
+//! Profile the YAML processing pipeline to compare old vs new approach.
 //!
 //! Run with:
 //! ```bash
@@ -9,24 +9,19 @@ use indexmap::IndexMap;
 use std::borrow::Cow;
 use std::time::Instant;
 use succinctly::jq::OwnedValue;
-use succinctly::json::JsonIndex;
 use succinctly::yaml::{YamlIndex, YamlValue};
 
-/// Convert a YAML value to an OwnedValue (mirrors yq_runner.rs logic)
+/// OLD approach: Convert a YAML value to an OwnedValue
 fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> OwnedValue {
     match value {
         YamlValue::String(s) => {
             let str_value: Cow<str> = s.as_str().unwrap_or(Cow::Borrowed(""));
-
-            // Try to parse as special YAML values
             match str_value.as_ref() {
                 "null" | "~" | "" => return OwnedValue::Null,
                 "true" | "True" | "TRUE" => return OwnedValue::Bool(true),
                 "false" | "False" | "FALSE" => return OwnedValue::Bool(false),
                 _ => {}
             }
-
-            // Try to parse as number
             if let Ok(n) = str_value.parse::<i64>() {
                 return OwnedValue::Int(n);
             }
@@ -35,15 +30,12 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> OwnedValue {
                     return OwnedValue::Float(f);
                 }
             }
-
-            // Check for special float literals
             match str_value.as_ref() {
                 ".inf" | ".Inf" | ".INF" => return OwnedValue::Float(f64::INFINITY),
                 "-.inf" | "-.Inf" | "-.INF" => return OwnedValue::Float(f64::NEG_INFINITY),
                 ".nan" | ".NaN" | ".NAN" => return OwnedValue::Float(f64::NAN),
                 _ => {}
             }
-
             OwnedValue::String(str_value.into_owned())
         }
         YamlValue::Mapping(fields) => {
@@ -51,10 +43,7 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> OwnedValue {
             for field in fields {
                 let key = match field.key() {
                     YamlValue::String(s) => s.as_str().unwrap_or(Cow::Borrowed("")).into_owned(),
-                    other => {
-                        let value = yaml_to_owned_value(other);
-                        value.to_json()
-                    }
+                    other => yaml_to_owned_value(other).to_json(),
                 };
                 let value = yaml_to_owned_value(field.value());
                 map.insert(key, value);
@@ -92,12 +81,11 @@ fn main() {
     // Warm up
     let _ = YamlIndex::build(&data);
 
-    // Step 1: Time parsing (build YAML index)
+    // ========== OLD APPROACH ==========
     let start = Instant::now();
     let index = YamlIndex::build(&data).unwrap();
-    let yaml_parse_time = start.elapsed();
+    let old_parse_time = start.elapsed();
 
-    // Step 2: Time YAML to OwnedValue conversion
     let start = Instant::now();
     let root = index.root(&data);
     let owned = match root.value() {
@@ -114,77 +102,85 @@ fn main() {
         }
         other => yaml_to_owned_value(other),
     };
-    let yaml_to_owned_time = start.elapsed();
+    let old_convert_time = start.elapsed();
 
-    // Step 3: Time OwnedValue to JSON string conversion
     let start = Instant::now();
-    let json_str = owned.to_json();
-    let to_json_time = start.elapsed();
+    let old_json = owned.to_json();
+    let old_serialize_time = start.elapsed();
 
-    // Step 4: Time JSON parsing (build JSON index)
+    let old_total = old_parse_time + old_convert_time + old_serialize_time;
+
+    // ========== NEW APPROACH ==========
     let start = Instant::now();
-    let json_index = JsonIndex::build(json_str.as_bytes());
-    let json_parse_time = start.elapsed();
+    let index = YamlIndex::build(&data).unwrap();
+    let new_parse_time = start.elapsed();
 
-    // Step 5: Time jq evaluation (identity filter)
     let start = Instant::now();
-    let _cursor = json_index.root(json_str.as_bytes());
-    // For identity filter, we just access the root - no real work
-    let jq_eval_time = start.elapsed();
+    let root = index.root(&data);
+    let new_json = root.to_json_document();
+    let new_convert_time = start.elapsed();
 
-    // Step 6: Time final JSON output
-    let start = Instant::now();
-    let _output = owned.to_json(); // This is what gets printed
-    let output_time = start.elapsed();
+    let new_total = new_parse_time + new_convert_time;
 
-    let total =
-        yaml_parse_time + yaml_to_owned_time + to_json_time + json_parse_time + jq_eval_time;
-    let total_with_output = total + output_time;
-
+    // ========== RESULTS ==========
     eprintln!();
-    eprintln!("=== Timing breakdown for {:.1} KiB ===", size_kb);
-    eprintln!(
-        "1. YAML parse (index):   {:>8.2?} ({:>5.1}%)",
-        yaml_parse_time,
-        100.0 * yaml_parse_time.as_secs_f64() / total.as_secs_f64()
-    );
-    eprintln!(
-        "2. YAML -> OwnedValue:   {:>8.2?} ({:>5.1}%)",
-        yaml_to_owned_time,
-        100.0 * yaml_to_owned_time.as_secs_f64() / total.as_secs_f64()
-    );
-    eprintln!(
-        "3. OwnedValue -> JSON:   {:>8.2?} ({:>5.1}%)",
-        to_json_time,
-        100.0 * to_json_time.as_secs_f64() / total.as_secs_f64()
-    );
-    eprintln!(
-        "4. JSON parse (index):   {:>8.2?} ({:>5.1}%)",
-        json_parse_time,
-        100.0 * json_parse_time.as_secs_f64() / total.as_secs_f64()
-    );
-    eprintln!(
-        "5. jq eval (identity):   {:>8.2?} ({:>5.1}%)",
-        jq_eval_time,
-        100.0 * jq_eval_time.as_secs_f64() / total.as_secs_f64()
-    );
-    eprintln!("─────────────────────────────────────");
-    eprintln!("Processing total:        {:>8.2?}", total);
-    eprintln!("6. Final JSON output:    {:>8.2?}", output_time);
-    eprintln!("─────────────────────────────────────");
-    eprintln!("Grand total:             {:>8.2?}", total_with_output);
-    eprintln!(
-        "Throughput:              {:.1} MiB/s",
-        (size_kb / 1024.0) / total_with_output.as_secs_f64()
-    );
-
+    eprintln!("=== Comparison for {:.1} KiB ===", size_kb);
     eprintln!();
-    eprintln!("=== Bottleneck Analysis ===");
-    let json_roundtrip = to_json_time + json_parse_time;
+    eprintln!("OLD (via OwnedValue):");
+    eprintln!("  Parse:     {:>8.2?}", old_parse_time);
+    eprintln!("  Convert:   {:>8.2?}", old_convert_time);
+    eprintln!("  Serialize: {:>8.2?}", old_serialize_time);
     eprintln!(
-        "JSON round-trip (3+4):   {:>8.2?} ({:.1}% of processing)",
-        json_roundtrip,
-        100.0 * json_roundtrip.as_secs_f64() / total.as_secs_f64()
+        "  Total:     {:>8.2?}  ({:.1} MiB/s)",
+        old_total,
+        (size_kb / 1024.0) / old_total.as_secs_f64()
     );
-    eprintln!("Could save by direct eval: ~{:.2?}", json_roundtrip);
+    eprintln!();
+    eprintln!("NEW (direct cursor → JSON):");
+    eprintln!("  Parse:     {:>8.2?}", new_parse_time);
+    eprintln!("  Convert:   {:>8.2?}", new_convert_time);
+    eprintln!(
+        "  Total:     {:>8.2?}  ({:.1} MiB/s)",
+        new_total,
+        (size_kb / 1024.0) / new_total.as_secs_f64()
+    );
+    eprintln!();
+    eprintln!(
+        "Speedup: {:.2}x",
+        old_total.as_secs_f64() / new_total.as_secs_f64()
+    );
+    eprintln!();
+
+    // Verify outputs match
+    if old_json == new_json {
+        eprintln!("✓ Output matches ({} bytes)", old_json.len());
+    } else {
+        eprintln!("✗ Output MISMATCH!");
+        eprintln!("  Old: {} bytes", old_json.len());
+        eprintln!("  New: {} bytes", new_json.len());
+
+        // Find first difference
+        let old_bytes = old_json.as_bytes();
+        let new_bytes = new_json.as_bytes();
+        for i in 0..old_bytes.len().min(new_bytes.len()) {
+            if old_bytes[i] != new_bytes[i] {
+                let start = i.saturating_sub(20);
+                let end = (i + 40).min(old_bytes.len()).min(new_bytes.len());
+                eprintln!("  First diff at byte {}", i);
+                eprintln!(
+                    "  Old[{}..{}]: {:?}",
+                    start,
+                    end,
+                    &old_json[start..end.min(old_json.len())]
+                );
+                eprintln!(
+                    "  New[{}..{}]: {:?}",
+                    start,
+                    end,
+                    &new_json[start..end.min(new_json.len())]
+                );
+                break;
+            }
+        }
+    }
 }

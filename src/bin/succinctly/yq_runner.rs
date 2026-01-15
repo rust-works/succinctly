@@ -8,7 +8,7 @@ use indexmap::IndexMap;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
-use succinctly::jq::{self, OwnedValue, QueryResult};
+use succinctly::jq::{self, Expr, OwnedValue, QueryResult};
 use succinctly::json::light::StandardJson;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{YamlIndex, YamlValue};
@@ -592,8 +592,65 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     let mut last_output: Option<OwnedValue> = None;
     let mut had_output = false;
 
-    // Handle --null-input
-    if args.null_input {
+    // Fast path: identity filter with compact output - stream directly from YAML cursor
+    // This avoids building OwnedValue DOM and JSON round-trip
+    let is_identity = matches!(program.expr, Expr::Identity);
+    let can_fast_path = is_identity
+        && output_config.compact
+        && !args.null_input
+        && !args.slurp
+        && context.named.is_empty();
+
+    if can_fast_path {
+        // Direct YAML → JSON streaming
+        if args.files.is_empty() {
+            let yaml_bytes = read_stdin()?;
+            let index = YamlIndex::build(&yaml_bytes)
+                .map_err(|e| anyhow::anyhow!("YAML parse error: {}", e))?;
+            let root = index.root(&yaml_bytes);
+
+            // Output each document directly using cursor iteration
+            match root.value() {
+                YamlValue::Sequence(mut docs) => {
+                    while let Some((cursor, rest)) = docs.uncons_cursor() {
+                        had_output = true;
+                        let json = cursor.to_json();
+                        writeln!(writer, "{}", json)?;
+                        docs = rest;
+                    }
+                }
+                _ => {
+                    had_output = true;
+                    let json = root.to_json_document();
+                    writeln!(writer, "{}", json)?;
+                }
+            }
+        } else {
+            for file_path in &args.files {
+                let yaml_bytes = read_file(Path::new(file_path))?;
+                let index = YamlIndex::build(&yaml_bytes)
+                    .map_err(|e| anyhow::anyhow!("YAML parse error in {}: {}", file_path, e))?;
+                let root = index.root(&yaml_bytes);
+
+                match root.value() {
+                    YamlValue::Sequence(mut docs) => {
+                        while let Some((cursor, rest)) = docs.uncons_cursor() {
+                            had_output = true;
+                            let json = cursor.to_json();
+                            writeln!(writer, "{}", json)?;
+                            docs = rest;
+                        }
+                    }
+                    _ => {
+                        had_output = true;
+                        let json = root.to_json_document();
+                        writeln!(writer, "{}", json)?;
+                    }
+                }
+            }
+        }
+    } else if args.null_input {
+        // Handle --null-input
         let results = evaluate_input(&OwnedValue::Null, &program.expr, &context)?;
         for result in results {
             last_output = Some(result.clone());
@@ -601,7 +658,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             output_value(&mut writer, &result, &output_config)?;
         }
     } else {
-        // Collect inputs
+        // Standard path: collect inputs via OwnedValue
         let inputs: Vec<OwnedValue> = if args.files.is_empty() {
             // Read from stdin
             let yaml_bytes = read_stdin()?;
