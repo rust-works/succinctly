@@ -264,7 +264,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             _ => {
                 // Unquoted (plain) scalar - may span multiple lines
                 let base_indent = self.compute_base_indent_for_plain(effective_text_pos);
-                let end = self.find_plain_scalar_end(effective_text_pos, base_indent);
+                let is_doc_root = self.is_document_root_scalar(effective_text_pos);
+                let end = self.find_plain_scalar_end(effective_text_pos, base_indent, is_doc_root);
                 YamlValue::String(YamlString::Unquoted {
                     text: self.text,
                     start: effective_text_pos,
@@ -378,7 +379,21 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// Compute the base indent for plain scalar continuation.
     /// For values on their own line (after key:), this returns the key's indent.
     /// For values on the same line as the key, this returns that line's indent.
+    /// Compute base indent for plain scalar continuation checking.
+    /// Returns (base_indent, is_document_root) where is_document_root is true
+    /// if this scalar is the document root content (right after --- or at start).
     fn compute_base_indent_for_plain(&self, value_pos: usize) -> usize {
+        let (indent, _is_root) = self.compute_base_indent_and_root_flag(value_pos);
+        indent
+    }
+
+    /// Check if value is at document root level (right after --- or at document start).
+    fn is_document_root_scalar(&self, value_pos: usize) -> bool {
+        let (_indent, is_root) = self.compute_base_indent_and_root_flag(value_pos);
+        is_root
+    }
+
+    fn compute_base_indent_and_root_flag(&self, value_pos: usize) -> (usize, bool) {
         // Find start of current line
         let mut line_start = value_pos;
         while line_start > 0 && self.text[line_start - 1] != b'\n' {
@@ -404,7 +419,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         }
 
         if has_colon_before {
-            // Value is on same line as key.
+            // Value is on same line as key - not a document root
             // Find the effective content indent, which is the column of the key.
             // For compact mappings in sequences like "- key: value", we need to
             // find where the actual content starts (after any "- " indicators).
@@ -419,31 +434,52 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // Skip over quoted key content
                 if prev == b'"' || prev == b'\'' {
                     // This is end of a quoted key - harder to handle, just use line indent
-                    return Self::compute_line_indent_static(self.text, value_pos);
+                    return (
+                        Self::compute_line_indent_static(self.text, value_pos),
+                        false,
+                    );
                 }
                 key_start -= 1;
             }
 
             // key_start is now at the start of the key
             // The base indent is the column position of the key
-            key_start - line_start
+            (key_start - line_start, false)
         } else {
-            // Value is on its own line (after key:)
-            // Find the key by looking at the previous line with a colon
+            // Value is on its own line
+            // Check if previous line is a document marker (---) or if we're at start
             if line_start == 0 {
-                // No previous line, return 0
-                return 0;
+                // No previous line, this is document root
+                return (0, true);
             }
 
             // Go to previous line
-            // Find start of previous line
             let mut prev_line_start = line_start - 1;
             while prev_line_start > 0 && self.text[prev_line_start - 1] != b'\n' {
                 prev_line_start -= 1;
             }
 
-            // The key should be on this previous line - return its indent
-            Self::compute_line_indent_static(self.text, prev_line_start)
+            // Check if previous line is "---" (document start marker)
+            let prev_line = &self.text[prev_line_start..line_start.saturating_sub(1)];
+            let trimmed = prev_line
+                .iter()
+                .copied()
+                .skip_while(|&b| b == b' ')
+                .collect::<alloc::vec::Vec<u8>>();
+
+            if trimmed.starts_with(b"---") {
+                let rest = &trimmed[3..];
+                if rest.is_empty() || rest.iter().all(|&b| b == b' ' || b == b'\t') {
+                    // Previous line is just "---" (possibly with trailing whitespace)
+                    return (0, true);
+                }
+            }
+
+            // Not at document root - return previous line's indent
+            (
+                Self::compute_line_indent_static(self.text, prev_line_start),
+                false,
+            )
         }
     }
 
@@ -523,7 +559,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// Find the end of a plain (unquoted) scalar, including continuation lines.
     /// A continuation line is more indented than base_indent (in block context),
     /// or any line that doesn't start with a flow delimiter (in flow context).
-    fn find_plain_scalar_end(&self, start: usize, base_indent: usize) -> usize {
+    /// For document root scalars (is_doc_root=true), continuation at indent 0 is allowed.
+    fn find_plain_scalar_end(&self, start: usize, base_indent: usize, is_doc_root: bool) -> usize {
         let in_flow = self.is_in_flow_context(start);
         let mut end = start;
 
@@ -533,14 +570,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 match self.text[end] {
                     b'\n' => break,
                     b'#' => {
-                        // # preceded by space is a comment
-                        if end > start && self.text[end - 1] == b' ' {
+                        // # preceded by whitespace (space or tab) is a comment
+                        if end > start && matches!(self.text[end - 1], b' ' | b'\t') {
                             break;
                         }
                         end += 1;
                     }
-                    // Flow context delimiters
-                    b',' | b']' | b'}' => break,
+                    // Flow context delimiters - only terminate in flow context
+                    b',' | b']' | b'}' if in_flow => break,
                     b':' => {
                         // Colon followed by space, newline, or EOF ends the scalar
                         if end + 1 >= self.text.len() {
@@ -558,9 +595,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 }
             }
 
-            // Trim trailing whitespace from current line
+            // Trim trailing whitespace (spaces and tabs) from current line
             let mut line_end = end;
-            while line_end > start && self.text[line_end - 1] == b' ' {
+            while line_end > start && matches!(self.text[line_end - 1], b' ' | b'\t') {
                 line_end -= 1;
             }
 
@@ -630,12 +667,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 empty_lines_end += 1;
                             }
                             // Continue the loop to check the next line
-                        } else if line_indent == 0 && base_indent == 0 {
-                            // Tab at start of line at top level - this is content (continuation)
+                        } else if in_flow || line_indent > base_indent {
+                            // Tab followed by content, with sufficient indent - this is a continuation
                             end = empty_lines_end;
                             break;
                         } else {
-                            // Tab after indent, followed by content - not a continuation
+                            // Tab after indent, followed by content, not enough indent - not a continuation
                             return line_end;
                         }
                     }
@@ -644,6 +681,23 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         return line_end;
                     }
                     b'-' => {
+                        // Check for document start marker "---" at column 0
+                        if line_indent == 0
+                            && after_indent + 2 < self.text.len()
+                            && self.text[after_indent + 1] == b'-'
+                            && self.text[after_indent + 2] == b'-'
+                        {
+                            // Check what follows the "---"
+                            let after_marker = after_indent + 3;
+                            if after_marker >= self.text.len()
+                                || matches!(self.text[after_marker], b' ' | b'\t' | b'\n' | b'\r')
+                            {
+                                // This is a document start marker - not a continuation
+                                return line_end;
+                            }
+                            // "---" followed by content is a plain scalar continuation
+                            // (like "---word1")
+                        }
                         // Possible sequence indicator
                         if after_indent + 1 < self.text.len()
                             && (self.text[after_indent + 1] == b' '
@@ -654,7 +708,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         }
                         // Not a sequence indicator (dash not followed by space/newline)
                         // Check if it's a continuation based on indentation or flow context
-                        if in_flow || line_indent > base_indent {
+                        // For document root scalars, allow same-level continuation at indent 0
+                        if in_flow || line_indent > base_indent || (is_doc_root && line_indent == 0)
+                        {
                             end = empty_lines_end;
                             break;
                         }
@@ -664,9 +720,35 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     b']' | b'}' | b',' => {
                         return line_end;
                     }
+                    b'.' => {
+                        // Check for document end marker "..." at column 0
+                        if line_indent == 0
+                            && after_indent + 2 < self.text.len()
+                            && self.text[after_indent + 1] == b'.'
+                            && self.text[after_indent + 2] == b'.'
+                        {
+                            // Check what follows the "..."
+                            let after_marker = after_indent + 3;
+                            if after_marker >= self.text.len()
+                                || matches!(self.text[after_marker], b' ' | b'\t' | b'\n' | b'\r')
+                            {
+                                // This is a document end marker - not a continuation
+                                return line_end;
+                            }
+                        }
+                        // Not a document marker, check if it's a continuation
+                        if in_flow || line_indent > base_indent || (is_doc_root && line_indent == 0)
+                        {
+                            end = empty_lines_end;
+                            break;
+                        }
+                        return line_end;
+                    }
                     _ => {
                         // Non-empty line - check indentation or flow context
-                        if in_flow || line_indent > base_indent {
+                        // For document root scalars, allow same-level continuation at indent 0
+                        if in_flow || line_indent > base_indent || (is_doc_root && line_indent == 0)
+                        {
                             // Continuation line (in flow context, any non-delimiter continues)
                             end = empty_lines_end;
                             break;

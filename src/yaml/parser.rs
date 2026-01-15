@@ -306,10 +306,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Skip whitespace on the current line (spaces only, not newlines).
+    /// Skip whitespace on the current line (spaces and tabs, not newlines).
     fn skip_inline_whitespace(&mut self) {
         while let Some(b) = self.peek() {
-            if b == b' ' {
+            if b == b' ' || b == b'\t' {
                 self.advance();
             } else {
                 break;
@@ -711,7 +711,14 @@ impl<'a> Parser<'a> {
             // Parse content on current line
             while let Some(b) = self.peek() {
                 match b {
-                    b'\n' | b'#' => break,
+                    b'\n' => break,
+                    b'#' => {
+                        // # is only a comment if preceded by whitespace
+                        if self.pos > start && self.input[self.pos - 1] == b' ' {
+                            break;
+                        }
+                        self.advance();
+                    }
                     b':' => {
                         // Colon followed by whitespace ends the value (could be a key)
                         // But in value context, colons in URLs etc. are allowed
