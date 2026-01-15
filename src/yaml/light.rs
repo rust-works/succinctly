@@ -135,11 +135,25 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             return YamlValue::Error("invalid cursor position");
         };
 
+        // text_pos == self.text.len() is used as a sentinel for null values
+        // (e.g., explicit keys without values: `? key` with no `: value`)
         if text_pos >= self.text.len() {
-            return YamlValue::Error("text position out of bounds");
+            return YamlValue::Null;
         }
 
-        // Check for alias first (before containers)
+        // Check if this is a container FIRST - this takes priority over text-based detection.
+        // This is important for mappings where the key is an alias (e.g., `*alias : value`),
+        // which would otherwise be detected as an alias by looking at the leading `*`.
+        if self.is_container() {
+            // Determine if mapping or sequence using the TY bits
+            if self.index.is_sequence_at_bp(self.bp_pos) {
+                return YamlValue::Sequence(YamlElements::from_sequence_cursor(*self));
+            } else {
+                return YamlValue::Mapping(YamlFields::from_mapping_cursor(*self));
+            }
+        }
+
+        // Check for alias (only for non-container nodes)
         let byte = self.text[text_pos];
         if byte == b'*' {
             return self.parse_alias_value(text_pos);
@@ -194,17 +208,6 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         return YamlValue::Sequence(YamlElements::from_sequence_cursor(*self));
                     }
                 }
-            }
-        }
-
-        // Check if this is a container with a TY bit (structural container)
-        // This uses the authoritative TY bits for containers that have them.
-        if self.is_container() {
-            // Determine if mapping or sequence using the TY bits
-            if self.index.is_sequence_at_bp(self.bp_pos) {
-                return YamlValue::Sequence(YamlElements::from_sequence_cursor(*self));
-            } else {
-                return YamlValue::Mapping(YamlFields::from_mapping_cursor(*self));
             }
         }
 
@@ -400,10 +403,77 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             line_start -= 1;
         }
 
+        // Compute line indent (spaces at start of line)
+        let line_indent = Self::compute_line_indent_static(self.text, line_start);
+
+        // Check for explicit key indicator `? `, explicit value indicator `: `,
+        // and sequence indicator `- ` before the value on this line.
+        // Also check for key separators (`:` followed by space/tab/newline).
+        let mut last_seq_col = None;
+        let mut explicit_indicator_col = None;
+        let mut last_key_separator_pos = None;
+        let mut scan = line_start + line_indent; // Skip leading whitespace
+        while scan < value_pos {
+            if self.text[scan] == b'?' {
+                // Check if this is an explicit key indicator (followed by space/tab/newline)
+                if scan + 1 < self.text.len()
+                    && matches!(self.text[scan + 1], b' ' | b'\t' | b'\n' | b'\r')
+                {
+                    explicit_indicator_col = Some(scan - line_start);
+                }
+            }
+            if self.text[scan] == b':' {
+                // Check if this colon is a key separator (followed by space/tab/newline)
+                if scan + 1 < self.text.len() && matches!(self.text[scan + 1], b' ' | b'\t' | b'\n')
+                {
+                    // Check if this is an explicit value indicator at start of content
+                    if scan == line_start + line_indent {
+                        explicit_indicator_col = Some(scan - line_start);
+                    } else {
+                        // This is a key separator for `key: value`
+                        last_key_separator_pos = Some(scan);
+                    }
+                }
+            }
+            if self.text[scan] == b'-' {
+                // Check if this is a sequence indicator (followed by space/tab)
+                if scan + 1 < self.text.len() && matches!(self.text[scan + 1], b' ' | b'\t') {
+                    // This is a sequence indicator at column (scan - line_start)
+                    last_seq_col = Some(scan - line_start);
+                }
+            }
+            scan += 1;
+        }
+
+        // If there's a key separator after the sequence indicator, use the key:value logic
+        // (handled below in has_colon_before). This handles `- key: value` patterns.
+        // Only use sequence indicator if there's no key separator between it and the value.
+        let seq_col_before_key = match (last_seq_col, last_key_separator_pos) {
+            (Some(seq_col), Some(key_sep_pos)) => {
+                // Check if sequence indicator is before the key separator
+                let seq_pos = line_start + seq_col;
+                if seq_pos < key_sep_pos {
+                    // Key separator is after sequence indicator - don't use seq_col
+                    None
+                } else {
+                    Some(seq_col)
+                }
+            }
+            (Some(seq_col), None) => Some(seq_col),
+            _ => None,
+        };
+
+        if let Some(seq_col) = seq_col_before_key {
+            return (seq_col, false);
+        }
+        if let Some(exp_col) = explicit_indicator_col {
+            return (exp_col, false);
+        }
+
         // Check if there's a colon before us on this line (meaning key: value on same line)
         let mut has_colon_before = false;
         let mut colon_pos = 0;
-        let mut scan = line_start;
+        scan = line_start;
         while scan < value_pos {
             if self.text[scan] == b':' {
                 // Check if this colon is a key separator (followed by space/tab/newline)
@@ -447,6 +517,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             (key_start - line_start, false)
         } else {
             // Value is on its own line
+            // (Sequence indicators were already handled above)
+
             // Check if previous line is a document marker (---) or if we're at start
             if line_start == 0 {
                 // No previous line, this is document root
@@ -667,8 +739,13 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 empty_lines_end += 1;
                             }
                             // Continue the loop to check the next line
-                        } else if in_flow || line_indent > base_indent {
-                            // Tab followed by content, with sufficient indent - this is a continuation
+                        } else if in_flow
+                            || line_indent > base_indent
+                            || (is_doc_root && line_indent == 0)
+                        {
+                            // Tab followed by content, with sufficient indent - this is a continuation.
+                            // For document root scalars (base_indent=0), tabs at start of line
+                            // are valid continuation per YAML spec example 7.12 "Plain Lines".
                             end = empty_lines_end;
                             break;
                         } else {
@@ -701,10 +778,18 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         // Possible sequence indicator
                         if after_indent + 1 < self.text.len()
                             && (self.text[after_indent + 1] == b' '
+                                || self.text[after_indent + 1] == b'\t'
                                 || self.text[after_indent + 1] == b'\n')
                         {
-                            // This is a sequence item - not a continuation
-                            return line_end;
+                            // This looks like a sequence indicator `- `.
+                            // It's only a real sequence indicator if the indent matches
+                            // the base indent. If the `- ` is more indented, it's part
+                            // of the scalar content (like AB8U test case).
+                            if line_indent == base_indent || (is_doc_root && line_indent == 0) {
+                                // This is a sequence item at correct indent - not a continuation
+                                return line_end;
+                            }
+                            // `- ` at greater indent is scalar content - continue below
                         }
                         // Not a sequence indicator (dash not followed by space/newline)
                         // Check if it's a continuation based on indentation or flow context
@@ -718,6 +803,42 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     }
                     // Flow delimiters terminate the scalar regardless of indentation
                     b']' | b'}' | b',' => {
+                        return line_end;
+                    }
+                    b'?' => {
+                        // Check for explicit key indicator "?" at start of line
+                        // `? ` or `?\n` or `?` at EOF is an explicit key indicator
+                        if after_indent + 1 >= self.text.len()
+                            || matches!(self.text[after_indent + 1], b' ' | b'\t' | b'\n' | b'\r')
+                        {
+                            // This is an explicit key indicator - not a continuation
+                            return line_end;
+                        }
+                        // `?` followed by content is a plain scalar continuation
+                        // Check if it's a continuation based on indentation or flow context
+                        if in_flow || line_indent > base_indent || (is_doc_root && line_indent == 0)
+                        {
+                            end = empty_lines_end;
+                            break;
+                        }
+                        return line_end;
+                    }
+                    b':' => {
+                        // Check for explicit value indicator ":" at start of line
+                        // `: ` or `:\n` or `:` at EOF is an explicit value indicator
+                        if after_indent + 1 >= self.text.len()
+                            || matches!(self.text[after_indent + 1], b' ' | b'\t' | b'\n' | b'\r')
+                        {
+                            // This is an explicit value indicator - not a continuation
+                            return line_end;
+                        }
+                        // `:` followed by content is a plain scalar continuation
+                        // Check if it's a continuation based on indentation or flow context
+                        if in_flow || line_indent > base_indent || (is_doc_root && line_indent == 0)
+                        {
+                            end = empty_lines_end;
+                            break;
+                        }
                         return line_end;
                     }
                     b'.' => {
@@ -1055,7 +1176,8 @@ impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
             if text_pos < element_cursor.text.len()
                 && element_cursor.text[text_pos] == b'-'
                 && text_pos + 1 < element_cursor.text.len()
-                && element_cursor.text[text_pos + 1] == b' '
+                && (element_cursor.text[text_pos + 1] == b' '
+                    || element_cursor.text[text_pos + 1] == b'\t')
             {
                 // This is a block sequence item marker `- `
                 if let Some(child) = element_cursor.first_child() {
@@ -1407,6 +1529,14 @@ impl<'a> YamlString<'a> {
 
             // Check what's on this line
             if pos >= text.len() {
+                // EOF after spaces - if indent >= content_indent, these spaces are content
+                // (a line with only spaces that ends at EOF)
+                if line_indent >= content_indent {
+                    // The spaces themselves are content (after stripping indent)
+                    // pos is at EOF, last_content_end should be set to include this line
+                    last_content_end = pos;
+                    has_content = true;
+                }
                 break;
             }
 
@@ -1498,8 +1628,10 @@ impl<'a> YamlString<'a> {
 
         // Check if we start with `-` (sequence item indicator)
         if pos < text.len() && text[pos] == b'-' {
-            // Check if followed by space (block sequence indicator)
-            if pos + 1 < text.len() && (text[pos + 1] == b' ' || text[pos + 1] == b'\n') {
+            // Check if followed by space or tab (block sequence indicator)
+            if pos + 1 < text.len()
+                && (text[pos + 1] == b' ' || text[pos + 1] == b'\t' || text[pos + 1] == b'\n')
+            {
                 // Check if there's a `:` between `-` and the indicator
                 // If so, it's `- key: |` and we should return line_indent + 2
                 // If not, it's `- |` and we should return line_indent
@@ -2001,6 +2133,13 @@ fn decode_block_literal<'a>(
         YamlString::find_block_content_range(text, indicator_pos, chomping, explicit_indent);
 
     if content_start >= content_end {
+        // Empty block scalar - but with keep chomping, we should preserve
+        // the implicit final line break (YAML spec section 8.1.1.2).
+        // Even when the block has no content, there's an implicit line break
+        // at the end of the indicator line that keep chomping preserves.
+        if chomping == ChompingIndicator::Keep {
+            return Ok(Cow::Borrowed("\n"));
+        }
         return Ok(Cow::Borrowed(""));
     }
 
@@ -2097,6 +2236,11 @@ fn decode_block_folded<'a>(
         YamlString::find_block_content_range(text, indicator_pos, chomping, explicit_indent);
 
     if content_start >= content_end {
+        // Empty block scalar - but with keep chomping, we should preserve
+        // the implicit final line break (YAML spec section 8.1.1.2).
+        if chomping == ChompingIndicator::Keep {
+            return Ok(Cow::Borrowed("\n"));
+        }
         return Ok(Cow::Borrowed(""));
     }
 

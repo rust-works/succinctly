@@ -147,6 +147,10 @@ struct Parser<'a> {
     // Document tracking
     /// Whether we're currently inside a document
     in_document: bool,
+
+    // Explicit key tracking
+    /// Whether we have a pending explicit key that needs a value (null if not followed by `:`)
+    pending_explicit_key: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -174,6 +178,7 @@ impl<'a> Parser<'a> {
             anchors: BTreeMap::new(),
             aliases: BTreeMap::new(),
             in_document: false,
+            pending_explicit_key: false,
         }
     }
 
@@ -256,6 +261,18 @@ impl<'a> Parser<'a> {
             self.container_words.push(0);
         }
         self.container_words[word_idx] |= 1u64 << bit_idx;
+    }
+
+    /// Close a pending explicit key by adding a null value node.
+    /// Call this when a new key or end of mapping is encountered without an explicit value.
+    fn close_pending_explicit_key(&mut self) {
+        if self.pending_explicit_key {
+            // Add a null value node (empty open/close pair)
+            // Use input.len() as the text position to indicate "no text" / null value
+            self.write_bp_open_at(self.input.len());
+            self.write_bp_close();
+            self.pending_explicit_key = false;
+        }
     }
 
     /// Write a type bit: 0 = mapping, 1 = sequence.
@@ -344,6 +361,17 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(count)
+    }
+
+    /// Get the current column position (0-based).
+    /// This counts characters from the start of the current line.
+    fn current_column(&self) -> usize {
+        // Find the start of the current line
+        let mut line_start = self.pos;
+        while line_start > 0 && self.input[line_start - 1] != b'\n' {
+            line_start -= 1;
+        }
+        self.pos - line_start
     }
 
     /// Check if at end of meaningful content on this line.
@@ -590,6 +618,7 @@ impl<'a> Parser<'a> {
             }
             Some(b'-')
                 if self.peek_at(1) == Some(b' ')
+                    || self.peek_at(1) == Some(b'\t')
                     || self.peek_at(1) == Some(b'\n')
                     || self.peek_at(1).is_none() =>
             {
@@ -628,6 +657,10 @@ impl<'a> Parser<'a> {
         // Close any remaining open containers within the document
         // The virtual root is at indent_stack[0], so close everything above it
         while self.indent_stack.len() > 1 {
+            // If we're closing a mapping that has a pending explicit key, close it first
+            if self.type_stack.last() == Some(&NodeType::Mapping) {
+                self.close_pending_explicit_key();
+            }
             self.indent_stack.pop();
             self.type_stack.pop();
             self.write_bp_close();
@@ -778,17 +811,36 @@ impl<'a> Parser<'a> {
                     }
                     continue;
                 }
-                // Tab followed by content at top level - this is a continuation
-                // (handled below)
+                // Tab followed by content - for document root scalars (start_indent == 0),
+                // this is a continuation per YAML spec example 7.12 "Plain Lines".
+                // The tabs become part of the folded content (converted to space).
+                if start_indent == 0 && next_char == b'\t' {
+                    // Continue to next line - this is a valid continuation
+                    self.advance(); // Skip \n
+                                    // Skip leading whitespace (tabs are content, but we're at the scalar's level)
+                    while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+                        self.advance();
+                    }
+                    continue;
+                }
             }
 
             // Continuation requires more indent than where scalar started
-            // and next line shouldn't start block structure or be a comment
+            // and next line shouldn't start block structure or be a comment.
+            //
+            // For sequence indicators `- `, they're only block structure if at a
+            // "proper" indent level. A `- ` at indent just 1 greater than start_indent
+            // (like ` - ` when start_indent is 0) is scalar content, not a sequence.
+            // This handles cases like AB8U where the `- ` is at an invalid indent.
+            let is_sequence_indicator = next_char == b'-'
+                && lookahead + 1 < self.input.len()
+                && matches!(self.input[lookahead + 1], b' ' | b'\t');
+            let sequence_indicator_is_block_structure = is_sequence_indicator
+                && (next_indent <= start_indent || next_indent >= start_indent + 2);
+
             if next_indent > start_indent
                 && next_char != b'#'
-                && !(next_char == b'-'
-                    && lookahead + 1 < self.input.len()
-                    && self.input[lookahead + 1] == b' ')
+                && !sequence_indicator_is_block_structure
                 && !(next_char == b':'
                     && lookahead + 1 < self.input.len()
                     && matches!(self.input[lookahead + 1], b' ' | b'\n'))
@@ -873,6 +925,10 @@ impl<'a> Parser<'a> {
             // Containers at the same level should stay open so new entries
             // can be added to them.
             if current_indent > new_indent {
+                // If we're closing a mapping that has a pending explicit key, close it first
+                if self.type_stack.last() == Some(&NodeType::Mapping) {
+                    self.close_pending_explicit_key();
+                }
                 self.indent_stack.pop();
                 self.type_stack.pop();
                 self.write_bp_close();
@@ -929,6 +985,13 @@ impl<'a> Parser<'a> {
         self.close_deeper_indents(indent);
 
         // Now check if we need to open a new sequence (check AFTER closing)
+        // Normally, sequence items must be at the exact same indent as the sequence.
+        // However, for nested sequences created by `- - item` pattern, items can be
+        // at greater indent because the nested sequence's indent is virtual.
+        //
+        // We need a new sequence if:
+        // 1. There's no sequence on the stack, OR
+        // 2. The item indent doesn't match the sequence indent
         let need_new_sequence = self.type_stack.last() != Some(&NodeType::Sequence)
             || self.indent_stack.last().copied() != Some(indent);
 
@@ -972,12 +1035,15 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(b'-')
             && matches!(
                 self.peek_at(1),
-                Some(b' ') | Some(b'\n') | Some(b'\r') | None
+                Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | None
             )
         {
             // Nested sequence - the item value is another sequence.
-            // Use indent + 2 as the virtual indent for the nested sequence.
-            self.parse_sequence_item(indent + 2)?;
+            // Use the actual column position of the nested `-` as the indent.
+            // This ensures that subsequent items at the same column (like `- d` after `- c`)
+            // will be correctly recognized as siblings in the same sequence.
+            let nested_indent = self.current_column();
+            self.parse_sequence_item(nested_indent)?;
             // Don't close the outer item - it will be closed when we return
             // to a lower indent level.
         } else if self.looks_like_mapping_entry() {
@@ -1078,6 +1144,9 @@ impl<'a> Parser<'a> {
         // whether to open a new mapping or add to an existing one.
         self.close_deeper_indents(indent);
 
+        // If there's a pending explicit key without value, close it with null
+        self.close_pending_explicit_key();
+
         // Close any sequence that was the value of a previous mapping entry.
         // This handles:
         //   foo:
@@ -1134,6 +1203,18 @@ impl<'a> Parser<'a> {
                 }
                 Some(b'\'') => {
                     self.parse_single_quoted()?;
+                }
+                Some(b'*') => {
+                    // Alias as key - parse alias name
+                    // Skip `*`
+                    self.advance();
+                    // Parse alias name (same rules as anchor names)
+                    let alias_name = self.parse_anchor_name()?;
+                    // Record the alias reference
+                    // Look up the anchor's BP position
+                    if let Some(&target_bp_pos) = self.anchors.get(&alias_name) {
+                        self.aliases.insert(self.bp_pos - 1, target_bp_pos);
+                    }
                 }
                 _ => {
                     self.parse_unquoted_key()?;
@@ -1195,7 +1276,12 @@ impl<'a> Parser<'a> {
 
             // Check if this is a nested structure or a plain scalar value
             match self.peek() {
-                Some(b'-') if matches!(self.peek_at(1), Some(b' ') | Some(b'\n') | None) => {
+                Some(b'-')
+                    if matches!(
+                        self.peek_at(1),
+                        Some(b' ') | Some(b'\t') | Some(b'\n') | None
+                    ) =>
+                {
                     // Sequence - will be handled by main loop
                     self.pos = saved_pos;
                     return Ok(());
@@ -1341,6 +1427,9 @@ impl<'a> Parser<'a> {
         // Close any deeper containers
         self.close_deeper_indents(indent);
 
+        // If there's a pending explicit key without value, close it with null
+        self.close_pending_explicit_key();
+
         // Check if we need to open a new mapping
         let need_new_mapping = self.type_stack.last() != Some(&NodeType::Mapping)
             || self.indent_stack.last().copied() != Some(indent);
@@ -1443,6 +1532,9 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // Mark that we have an explicit key waiting for a value
+        self.pending_explicit_key = true;
+
         Ok(())
     }
 
@@ -1450,6 +1542,9 @@ impl<'a> Parser<'a> {
     fn parse_explicit_value(&mut self, indent: usize) -> Result<(), YamlError> {
         // Close deeper structures, but keep the mapping at this indent open
         self.close_deeper_indents(indent + 1);
+
+        // This value is for the pending explicit key
+        self.pending_explicit_key = false;
 
         // Skip `:`
         self.advance();
@@ -1471,13 +1566,11 @@ impl<'a> Parser<'a> {
         }
 
         // Parse the value
-        self.set_ib();
-
         match self.peek() {
             Some(b'-')
                 if matches!(
                     self.peek_at(1),
-                    Some(b' ') | Some(b'\n') | Some(b'\r') | None
+                    Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | None
                 ) =>
             {
                 // Sequence as value
@@ -1510,11 +1603,13 @@ impl<'a> Parser<'a> {
                 self.parse_block_scalar(indent)?;
             }
             Some(b'"') => {
+                self.set_ib();
                 self.write_bp_open();
                 self.parse_double_quoted()?;
                 self.write_bp_close();
             }
             Some(b'\'') => {
+                self.set_ib();
                 self.write_bp_open();
                 self.parse_single_quoted()?;
                 self.write_bp_close();
@@ -1524,6 +1619,7 @@ impl<'a> Parser<'a> {
                 self.parse_alias()?;
             }
             _ => {
+                self.set_ib();
                 self.write_bp_open();
                 self.parse_unquoted_value_with_indent(indent);
                 self.write_bp_close();
@@ -1577,7 +1673,7 @@ impl<'a> Parser<'a> {
                 self.parse_single_quoted()?;
                 self.write_bp_close();
             }
-            Some(b'-') if self.peek_at(1) == Some(b' ') => {
+            Some(b'-') if self.peek_at(1) == Some(b' ') || self.peek_at(1) == Some(b'\t') => {
                 // Inline sequence item - this creates a nested sequence
                 // The caller already opened a BP node for us
             }
@@ -1729,6 +1825,86 @@ impl<'a> Parser<'a> {
         false
     }
 
+    /// Check if we're looking at an explicit key indicator `?` in flow context
+    fn looks_like_explicit_flow_key(&self) -> bool {
+        self.peek() == Some(b'?')
+            && matches!(
+                self.peek_at(1),
+                Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | None
+            )
+    }
+
+    /// Parse an explicit mapping entry in flow context: `? key : value`
+    /// Creates a single-pair mapping as the sequence element.
+    fn parse_explicit_flow_mapping_entry(&mut self) -> Result<(), YamlError> {
+        // Open implicit mapping
+        self.set_ib();
+        self.write_bp_open();
+        self.write_ty(false); // 0 = mapping
+
+        // Skip `?`
+        self.advance();
+        self.skip_flow_whitespace();
+
+        // Parse key - can be scalar, quoted, flow mapping, or flow sequence
+        self.set_ib();
+        self.write_bp_open();
+        match self.peek() {
+            Some(b'{') => self.parse_flow_mapping()?,
+            Some(b'[') => self.parse_flow_sequence()?,
+            Some(b':') => {
+                // Empty key (null) - ?: means null key
+                // Don't consume anything, write empty node
+            }
+            Some(b',') | Some(b']') | Some(b'}') => {
+                // Empty key (null) - ? followed by terminator
+            }
+            _ => self.parse_explicit_flow_key_scalar()?,
+        }
+        self.write_bp_close();
+
+        // Skip whitespace before possible colon
+        self.skip_flow_whitespace();
+
+        // Check for colon (explicit value indicator)
+        if self.peek() == Some(b':') {
+            self.advance();
+            self.skip_flow_whitespace();
+
+            // Parse value (if present before , or ])
+            if !matches!(self.peek(), Some(b',') | Some(b']') | Some(b'}') | None) {
+                self.set_ib();
+                self.write_bp_open();
+                match self.peek() {
+                    Some(b'[') => {
+                        self.parse_flow_sequence()?;
+                    }
+                    Some(b'{') => {
+                        self.parse_flow_mapping()?;
+                    }
+                    _ => {
+                        self.parse_flow_scalar()?;
+                    }
+                }
+                self.write_bp_close();
+            } else {
+                // Empty value (null)
+                self.set_ib();
+                self.write_bp_open();
+                self.write_bp_close();
+            }
+        } else {
+            // No colon - value is null
+            self.write_bp_open_at(self.input.len());
+            self.write_bp_close();
+        }
+
+        // Close implicit mapping
+        self.write_bp_close();
+
+        Ok(())
+    }
+
     /// Parse an implicit mapping entry in flow context: `key : value`
     /// Creates a single-pair mapping as the sequence element.
     fn parse_implicit_flow_mapping_entry(&mut self) -> Result<(), YamlError> {
@@ -1843,8 +2019,11 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            // Check for implicit mapping entry FIRST (handles all key types including { and [)
-            if self.looks_like_flow_mapping_entry() {
+            // Check for explicit key `? key : value` in flow context
+            if self.looks_like_explicit_flow_key() {
+                self.parse_explicit_flow_mapping_entry()?;
+            } else if self.looks_like_flow_mapping_entry() {
+                // Check for implicit mapping entry (handles all key types including { and [)
                 // This is an implicit single-pair mapping: [ key : value ]
                 self.parse_implicit_flow_mapping_entry()?;
             } else {
@@ -1998,6 +2177,35 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(b'&') {
             let _ = self.parse_anchor()?;
             self.skip_flow_whitespace();
+        }
+
+        // Check for explicit key indicator
+        if self.looks_like_explicit_flow_key() {
+            // Skip `?`
+            self.advance();
+            self.skip_flow_whitespace();
+            // Parse the actual key
+            match self.peek() {
+                Some(b'"') => {
+                    self.parse_double_quoted()?;
+                }
+                Some(b'\'') => {
+                    self.parse_single_quoted()?;
+                }
+                Some(b'[') => {
+                    self.parse_flow_sequence()?;
+                }
+                Some(b'{') => {
+                    self.parse_flow_mapping()?;
+                }
+                Some(b':') | Some(b',') | Some(b'}') => {
+                    // Empty key (null) - don't consume anything
+                }
+                _ => {
+                    self.parse_explicit_flow_unquoted_key()?;
+                }
+            }
+            return Ok(());
         }
 
         match self.peek() {
@@ -2198,6 +2406,164 @@ impl<'a> Parser<'a> {
         }
 
         end - start
+    }
+
+    /// Parse an explicit flow key scalar.
+    /// Unlike implicit flow keys which stop at `:`, explicit keys stop at `: ` (colon+space)
+    /// because the colon is part of the explicit value syntax.
+    fn parse_explicit_flow_key_scalar(&mut self) -> Result<(), YamlError> {
+        match self.peek() {
+            Some(b'"') => {
+                self.parse_double_quoted()?;
+            }
+            Some(b'\'') => {
+                self.parse_single_quoted()?;
+            }
+            _ => {
+                self.parse_explicit_flow_unquoted_key()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse an explicit unquoted key in flow context.
+    /// Stops at `: ` (colon followed by whitespace) or flow delimiters, but NOT at bare `:`.
+    fn parse_explicit_flow_unquoted_key(&mut self) -> Result<usize, YamlError> {
+        let start = self.pos;
+
+        while let Some(b) = self.peek() {
+            match b {
+                b',' | b'}' | b']' => break,
+                b':' => {
+                    // Only stop at `: ` or `:\n` or `:` at end
+                    let next = self.peek_at(1);
+                    if matches!(
+                        next,
+                        Some(b' ')
+                            | Some(b'\t')
+                            | Some(b'\n')
+                            | Some(b'\r')
+                            | Some(b',')
+                            | Some(b'}')
+                            | Some(b']')
+                            | None
+                    ) {
+                        break;
+                    }
+                    // Colon not followed by space - include it in the key
+                    self.advance();
+                }
+                b'\n' | b'\r' => {
+                    // Multiline key - check if next line continues the key
+                    let mut lookahead = self.pos;
+                    // Skip newline
+                    if lookahead < self.input.len() && self.input[lookahead] == b'\r' {
+                        lookahead += 1;
+                    }
+                    if lookahead < self.input.len() && self.input[lookahead] == b'\n' {
+                        lookahead += 1;
+                    }
+                    // Skip leading whitespace on next line
+                    while lookahead < self.input.len()
+                        && matches!(self.input[lookahead], b' ' | b'\t')
+                    {
+                        lookahead += 1;
+                    }
+                    // Check what follows
+                    if lookahead >= self.input.len()
+                        || matches!(self.input[lookahead], b',' | b'}' | b']')
+                    {
+                        // Delimiter or EOF - stop key here
+                        break;
+                    }
+                    // Check for `: ` on next line (explicit value indicator)
+                    if lookahead + 1 < self.input.len()
+                        && self.input[lookahead] == b':'
+                        && matches!(self.input[lookahead + 1], b' ' | b'\t' | b'\n' | b'\r')
+                    {
+                        // Explicit value indicator - stop key here
+                        break;
+                    }
+                    // Check for single `:` followed by flow delimiter
+                    if lookahead < self.input.len()
+                        && self.input[lookahead] == b':'
+                        && (lookahead + 1 >= self.input.len()
+                            || matches!(self.input[lookahead + 1], b',' | b'}' | b']'))
+                    {
+                        break;
+                    }
+                    // Continue parsing on next line
+                    self.advance(); // Skip newline char(s)
+                    if self.peek() == Some(b'\n') {
+                        self.advance();
+                    }
+                    // Skip leading whitespace
+                    while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+                        self.advance();
+                    }
+                }
+                b' ' | b'\t' => {
+                    // Check if whitespace is followed by `: ` or a delimiter
+                    let mut lookahead = self.pos + 1;
+                    while lookahead < self.input.len()
+                        && matches!(self.input[lookahead], b' ' | b'\t')
+                    {
+                        lookahead += 1;
+                    }
+                    if lookahead < self.input.len() {
+                        match self.input[lookahead] {
+                            b':' => {
+                                // Check if colon is followed by space/end
+                                let after_colon = if lookahead + 1 < self.input.len() {
+                                    Some(self.input[lookahead + 1])
+                                } else {
+                                    None
+                                };
+                                if matches!(
+                                    after_colon,
+                                    Some(b' ')
+                                        | Some(b'\t')
+                                        | Some(b'\n')
+                                        | Some(b'\r')
+                                        | Some(b',')
+                                        | Some(b'}')
+                                        | Some(b']')
+                                        | None
+                                ) {
+                                    // Whitespace before `: ` - stop here
+                                    break;
+                                }
+                                // Colon not followed by space - continue with the key
+                                self.advance();
+                            }
+                            b',' | b'}' | b']' => {
+                                // Whitespace before delimiter - stop here
+                                break;
+                            }
+                            b'\n' | b'\r' => {
+                                // Newline - check next line
+                                break;
+                            }
+                            _ => {
+                                // Continue with the key
+                                self.advance();
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                _ => self.advance(),
+            }
+        }
+
+        // Trim trailing whitespace
+        let mut end = self.pos;
+        while end > start && matches!(self.input[end - 1], b' ' | b'\t') {
+            end -= 1;
+        }
+
+        Ok(end - start)
     }
 
     // =========================================================================
@@ -2739,7 +3105,7 @@ impl<'a> Parser<'a> {
             Some(b'-')
                 if matches!(
                     self.peek_at(1),
-                    Some(b' ') | Some(b'\n') | Some(b'\r') | None
+                    Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | None
                 ) =>
             {
                 self.parse_sequence_item(indent)?;
@@ -2831,7 +3197,10 @@ impl<'a> Parser<'a> {
                             // Anchor with value on next line - will be parsed in next iteration
                         }
                         Some(b'-')
-                            if matches!(self.peek_at(1), Some(b' ') | Some(b'\n') | None) =>
+                            if matches!(
+                                self.peek_at(1),
+                                Some(b' ') | Some(b'\t') | Some(b'\n') | None
+                            ) =>
                         {
                             // Anchor before block sequence on same line
                             self.parse_sequence_item(indent)?;
@@ -2861,9 +3230,16 @@ impl<'a> Parser<'a> {
                 }
             }
             Some(b'*') => {
-                // Alias - this IS the value
-                self.close_deeper_indents(indent);
-                self.parse_alias()?;
+                // Alias - could be a standalone value or a key in a mapping
+                // Check if this is `*alias : value` pattern (alias as mapping key)
+                if self.looks_like_mapping_entry() {
+                    // Alias is a key - let parse_mapping_entry handle it
+                    self.parse_mapping_entry(indent)?;
+                } else {
+                    // Standalone alias value
+                    self.close_deeper_indents(indent);
+                    self.parse_alias()?;
+                }
             }
             Some(_) => {
                 // Check if this looks like a mapping entry (has `: ` on this line)

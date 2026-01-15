@@ -3697,8 +3697,8 @@ fn test_RR7F_mixed_block_mapping_implicit_to_explicit() {
     assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
 
     let expected_json = "{
-  \"d\": 23,
-  \"a\": 4.2
+  \"a\": 4.2,
+  \"d\": 23
 }";
     let actual_json = yaml_to_json(yaml).unwrap();
     assert_eq!(
