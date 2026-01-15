@@ -266,8 +266,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             }
             _ => {
                 // Unquoted (plain) scalar - may span multiple lines
-                let base_indent = self.compute_base_indent_for_plain(effective_text_pos);
-                let is_doc_root = self.is_document_root_scalar(effective_text_pos);
+                let (base_indent, is_doc_root) =
+                    self.compute_base_indent_and_root_flag(effective_text_pos);
                 let end = self.find_plain_scalar_end(effective_text_pos, base_indent, is_doc_root);
                 YamlValue::String(YamlString::Unquoted {
                     text: self.text,
@@ -385,12 +385,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// Compute base indent for plain scalar continuation checking.
     /// Returns (base_indent, is_document_root) where is_document_root is true
     /// if this scalar is the document root content (right after --- or at start).
+    #[allow(dead_code)]
     fn compute_base_indent_for_plain(&self, value_pos: usize) -> usize {
         let (indent, _is_root) = self.compute_base_indent_and_root_flag(value_pos);
         indent
     }
 
     /// Check if value is at document root level (right after --- or at document start).
+    #[allow(dead_code)]
     fn is_document_root_scalar(&self, value_pos: usize) -> bool {
         let (_indent, is_root) = self.compute_base_indent_and_root_flag(value_pos);
         is_root
@@ -558,17 +560,89 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// Check if a position is inside a flow context (inside `[]` or `{}`).
     /// Returns true if there's an unmatched `[` or `{` before the position.
     fn is_in_flow_context(&self, pos: usize) -> bool {
+        // Find start of line containing pos
+        let mut line_start = pos;
+        while line_start > 0 && self.text[line_start - 1] != b'\n' {
+            line_start -= 1;
+        }
+
+        // Fast path: check if current line has any flow markers at all.
+        // If no [ or { on this line, and we're not continuing from a previous line's
+        // flow context, we can skip the expensive scan.
+        let mut has_flow_marker_on_line = false;
+        for i in line_start..pos {
+            match self.text[i] {
+                b'[' | b'{' => {
+                    has_flow_marker_on_line = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // If no flow markers on this line, check if we need to look back.
+        // A multiline flow context would have a flow marker on a previous line.
+        // We only need to scan back if this line starts with whitespace (could be
+        // continuation of flow content) or if there's a ] or } that might close
+        // an outer flow context.
+        if !has_flow_marker_on_line {
+            // Check if line starts with whitespace (potential flow continuation)
+            if line_start < self.text.len() && !matches!(self.text[line_start], b' ' | b'\t') {
+                // Line doesn't start with whitespace and has no flow markers = not in flow
+                return false;
+            }
+
+            // Check if there's any ] or } on this line that might indicate we're closing flow
+            let mut has_closer = false;
+            for i in line_start..pos {
+                if matches!(self.text[i], b']' | b'}') {
+                    has_closer = true;
+                    break;
+                }
+            }
+
+            // If no openers or closers on this line, and line starts with whitespace,
+            // we might be in a flow context from a previous line. We need to scan back.
+            // But for typical block YAML, this is rare, so check a small window first.
+            if !has_closer {
+                // Quick check: scan back at most 256 bytes for any [ or {
+                let quick_start = line_start.saturating_sub(256);
+                let mut found_opener = false;
+                for i in quick_start..line_start {
+                    if matches!(self.text[i], b'[' | b'{') {
+                        found_opener = true;
+                        break;
+                    }
+                }
+                if !found_opener {
+                    return false;
+                }
+            }
+        }
+
+        // Full scan needed - there might be flow context
+        // Scan back up to 4KB or start of text
+        let scan_start = if line_start > 4096 {
+            let mut start = line_start.saturating_sub(4096);
+            while start > 0 && self.text[start - 1] != b'\n' {
+                start -= 1;
+            }
+            start
+        } else {
+            0
+        };
+
         let mut depth = 0i32;
         let mut in_double_quote = false;
         let mut in_single_quote = false;
-        let mut i = 0;
+        let mut i = scan_start;
 
         while i < pos {
             let byte = self.text[i];
 
             if in_double_quote {
                 if byte == b'\\' && i + 1 < pos {
-                    i += 2; // Skip escaped character
+                    i += 2;
                     continue;
                 }
                 if byte == b'"' {
@@ -576,7 +650,6 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 }
             } else if in_single_quote {
                 if byte == b'\'' {
-                    // Check for escaped single quote ''
                     if i + 1 < pos && self.text[i + 1] == b'\'' {
                         i += 2;
                         continue;
