@@ -35,6 +35,7 @@ This directory documents optimisation techniques used in the succinctly library,
 | AVX2 JSON Parser | **1.78x** | SIMD | [simd.md](simd.md) |
 | PFSM Tables | **1.77x** | State machines | [state-machines.md](state-machines.md) |
 | NEON DSV Index | **1.8x** | SIMD | [simd.md](simd.md) |
+| Lazy line + direct indexing | **2-6%** | State machines | [state-machines.md](state-machines.md) |
 
 ### Notable Failures (Instructive)
 

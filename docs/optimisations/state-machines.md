@@ -294,6 +294,66 @@ Then chain results: select appropriate outcome based on previous state.
 | Batch zero writing   | `json/bit_writer.rs`   | Bulk bit operations   | Reduces ops   |
 | 3-state FSM          | `json/pfsm_*.rs`       | Minimal state count   | Cache-friendly|
 
+### Successful Optimizations
+
+| Technique                    | Result     | Reason                                    |
+|------------------------------|------------|-------------------------------------------|
+| Lazy line number computation | **+2-6%**  | Avoid per-byte work only needed on errors |
+| Direct indexing in hot loops | **+2-5%**  | Eliminate Option overhead in tight loops  |
+
+#### Lazy Line Number Computation (YAML)
+
+Line numbers are only needed for error reporting, but were tracked on every byte:
+
+```rust
+// Before: track line on every byte (slow)
+fn advance(&mut self) {
+    if self.pos < self.input.len() {
+        if self.input[self.pos] == b'\n' {
+            self.line += 1;  // Paid on EVERY byte
+        }
+        self.pos += 1;
+    }
+}
+
+// After: compute on-demand only for errors (fast)
+fn advance(&mut self) {
+    if self.pos < self.input.len() {
+        self.pos += 1;
+    }
+}
+
+fn current_line(&self) -> usize {
+    // Only called on error paths
+    self.input[..self.pos].iter().filter(|&&b| b == b'\n').count() + 1
+}
+```
+
+**Result**: 2-6% faster across YAML workloads.
+
+#### Direct Indexing vs Option Pattern
+
+The peek/advance pattern has hidden overhead:
+
+```rust
+// Before: Option wrapping overhead
+fn skip_to_eol(&mut self) {
+    while let Some(b) = self.peek() {  // Option created each iteration
+        if b == b'\n' { break; }
+        self.advance();  // Function call + bounds check
+    }
+}
+
+// After: direct indexing
+fn skip_to_eol(&mut self) {
+    while self.pos < self.input.len() && self.input[self.pos] != b'\n' {
+        self.pos += 1;
+    }
+}
+```
+
+**Result**: Sequences improved 4.7-5.4%, strings improved 2.5-6.2%.
+
 ### Failed Optimizations
 
 | Technique              | Result  | Reason                            |
@@ -346,6 +406,8 @@ fn process_byte(byte: u8, state: u8) -> (u8, u8) {
 3. **Fast-path common cases**: Most JSON bytes are string content
 4. **SIMD for classification, not FSM**: Use SIMD to find interesting bytes
 5. **State dependency is fundamental**: Can't fully parallelize FSM
+6. **Defer error-only work**: Track line numbers on-demand, not per-byte
+7. **Direct indexing beats Option**: `while pos < len { arr[pos] }` beats `while let Some(b) = peek()`
 
 ---
 

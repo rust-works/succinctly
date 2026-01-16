@@ -118,7 +118,6 @@ pub struct SemiIndex {
 struct Parser<'a> {
     input: &'a [u8],
     pos: usize,
-    line: usize,
 
     // Index builders
     ib_words: Vec<u64>,
@@ -165,7 +164,6 @@ impl<'a> Parser<'a> {
         Self {
             input,
             pos: 0,
-            line: 1,
             ib_words,
             bp_words,
             ty_words,
@@ -303,33 +301,35 @@ impl<'a> Parser<'a> {
     #[inline]
     fn advance(&mut self) {
         if self.pos < self.input.len() {
-            if self.input[self.pos] == b'\n' {
-                self.line += 1;
-            }
             self.pos += 1;
         }
     }
 
-    /// Advance position by multiple bytes, tracking newlines.
+    /// Advance position by multiple bytes.
     #[inline]
     fn advance_by(&mut self, count: usize) {
-        let end = (self.pos + count).min(self.input.len());
-        // Count newlines in the range we're skipping
-        for &b in &self.input[self.pos..end] {
-            if b == b'\n' {
-                self.line += 1;
-            }
-        }
-        self.pos = end;
+        self.pos = (self.pos + count).min(self.input.len());
+    }
+
+    /// Compute line number at current position (1-indexed).
+    /// Only called on error paths, so we pay the cost only when needed.
+    #[inline]
+    fn current_line(&self) -> usize {
+        // Count newlines from start to current position
+        self.input[..self.pos]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count()
+            + 1
     }
 
     /// Skip whitespace on the current line (spaces and tabs, not newlines).
+    #[inline]
     fn skip_inline_whitespace(&mut self) {
-        while let Some(b) = self.peek() {
-            if b == b' ' || b == b'\t' {
-                self.advance();
-            } else {
-                break;
+        while self.pos < self.input.len() {
+            match self.input[self.pos] {
+                b' ' | b'\t' => self.pos += 1,
+                _ => break,
             }
         }
     }
@@ -347,7 +347,7 @@ impl<'a> Parser<'a> {
             // that's tab indentation (error). But tab after spaces is content.
             if count == 0 {
                 return Err(YamlError::TabIndentation {
-                    line: self.line,
+                    line: self.current_line(),
                     offset: next_pos,
                 });
             }
@@ -463,12 +463,10 @@ impl<'a> Parser<'a> {
     }
 
     /// Skip to end of line (handles comments).
+    #[inline]
     fn skip_to_eol(&mut self) {
-        while let Some(b) = self.peek() {
-            if b == b'\n' {
-                break;
-            }
-            self.advance();
+        while self.pos < self.input.len() && self.input[self.pos] != b'\n' {
+            self.pos += 1;
         }
     }
 
@@ -892,7 +890,7 @@ impl<'a> Parser<'a> {
                     // Key without colon
                     return Err(YamlError::KeyWithoutValue {
                         offset: start,
-                        line: self.line,
+                        line: self.current_line(),
                     });
                 }
                 b'#' => {
@@ -901,7 +899,7 @@ impl<'a> Parser<'a> {
                     if self.pos > start && self.input[self.pos - 1] == b' ' {
                         return Err(YamlError::KeyWithoutValue {
                             offset: start,
-                            line: self.line,
+                            line: self.current_line(),
                         });
                     }
                     self.advance();
@@ -1344,14 +1342,12 @@ impl<'a> Parser<'a> {
 
                 // Save position to look ahead
                 let saved_pos = self.pos;
-                let saved_line = self.line;
 
                 // Look at next content line
                 self.skip_newlines();
                 if self.peek().is_none() {
                     // EOF - value is null, create explicit null node for anchor
                     self.pos = saved_pos;
-                    self.line = saved_line;
                     self.set_ib();
                     self.write_bp_open();
                     self.write_bp_close();
@@ -1378,7 +1374,6 @@ impl<'a> Parser<'a> {
                     // Next line is at same or lower indent and not a sequence - value is null
                     // Create explicit null node for anchor to point to
                     self.pos = saved_pos;
-                    self.line = saved_line;
                     self.set_ib();
                     self.write_bp_open();
                     self.write_bp_close();
@@ -2622,14 +2617,12 @@ impl<'a> Parser<'a> {
     /// Returns the indentation level, or None if block is empty.
     fn detect_block_content_indent(&mut self, base_indent: usize) -> Option<usize> {
         let saved_pos = self.pos;
-        let saved_line = self.line;
 
         // Scan ahead to find first non-empty line
         loop {
             if self.peek().is_none() {
                 // EOF - empty block scalar
                 self.pos = saved_pos;
-                self.line = saved_line;
                 return None;
             }
 
@@ -2645,14 +2638,12 @@ impl<'a> Parser<'a> {
                 Some(b'\n') => {
                     // Empty line - skip and continue
                     self.advance();
-                    self.line += 1;
                 }
                 Some(b'#') => {
                     // Comment line - skip to end
                     self.skip_to_eol();
                     if self.peek() == Some(b'\n') {
                         self.advance();
-                        self.line += 1;
                     }
                 }
                 Some(b'\r') => {
@@ -2661,18 +2652,15 @@ impl<'a> Parser<'a> {
                     if self.peek() == Some(b'\n') {
                         self.advance();
                     }
-                    self.line += 1;
                 }
                 None => {
                     // EOF
                     self.pos = saved_pos;
-                    self.line = saved_line;
                     return None;
                 }
                 _ => {
                     // Found content - restore position and return indent
                     self.pos = saved_pos;
-                    self.line = saved_line;
 
                     if indent <= base_indent {
                         // Content must be more indented than indicator
@@ -2714,7 +2702,6 @@ impl<'a> Parser<'a> {
                     // Empty line - include in content (counts as trailing newline area)
                     trailing_newline_start = line_start;
                     self.advance();
-                    self.line += 1;
                 }
                 Some(b'\r') => {
                     // Handle \r\n
@@ -2723,7 +2710,6 @@ impl<'a> Parser<'a> {
                     if self.peek() == Some(b'\n') {
                         self.advance();
                     }
-                    self.line += 1;
                 }
                 Some(b'#') if line_indent < content_indent => {
                     // Comment at lower indent - end of block
@@ -2747,13 +2733,11 @@ impl<'a> Parser<'a> {
 
                     if self.peek() == Some(b'\n') {
                         self.advance();
-                        self.line += 1;
                     } else if self.peek() == Some(b'\r') {
                         self.advance();
                         if self.peek() == Some(b'\n') {
                             self.advance();
                         }
-                        self.line += 1;
                     }
                 }
             }
@@ -2787,13 +2771,11 @@ impl<'a> Parser<'a> {
         self.skip_to_eol();
         if self.peek() == Some(b'\n') {
             self.advance();
-            self.line += 1;
         } else if self.peek() == Some(b'\r') {
             self.advance();
             if self.peek() == Some(b'\n') {
                 self.advance();
             }
-            self.line += 1;
         }
 
         // Determine content indentation
@@ -3086,7 +3068,7 @@ impl<'a> Parser<'a> {
                     _ => {
                         // Not a flow structure - re-report the tab error
                         return Err(YamlError::TabIndentation {
-                            line: self.line,
+                            line: self.current_line(),
                             offset: self.pos,
                         });
                     }
