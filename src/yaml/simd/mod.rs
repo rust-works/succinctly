@@ -82,6 +82,34 @@ pub fn find_single_quote(input: &[u8], start: usize, end: usize) -> Option<usize
     }
 }
 
+/// Count leading spaces (indentation) from the given position.
+///
+/// Returns the number of consecutive space characters starting at `start`.
+/// Stops at the first non-space character or end of input.
+///
+/// This is used for fast indentation counting in YAML block-style parsing.
+#[inline]
+pub fn count_leading_spaces(input: &[u8], start: usize) -> usize {
+    if start >= input.len() {
+        return 0;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon::count_leading_spaces_neon(input, start)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86::count_leading_spaces_x86(input, start)
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        count_leading_spaces_scalar(input, start)
+    }
+}
+
 // ============================================================================
 // Scalar fallbacks (for non-SIMD platforms or testing)
 // ============================================================================
@@ -106,6 +134,12 @@ fn find_single_quote_scalar(input: &[u8], start: usize, end: usize) -> Option<us
         }
     }
     None
+}
+
+/// Scalar implementation of count_leading_spaces.
+#[allow(dead_code)]
+fn count_leading_spaces_scalar(input: &[u8], start: usize) -> usize {
+    input[start..].iter().take_while(|&&b| b == b' ').count()
 }
 
 #[cfg(test)]
@@ -212,6 +246,77 @@ mod tests {
                 scalar_sq,
                 simd_sq,
                 "single-quote mismatch for {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    #[test]
+    fn test_count_leading_spaces_basic() {
+        assert_eq!(count_leading_spaces(b"  hello", 0), 2);
+        assert_eq!(count_leading_spaces(b"    world", 0), 4);
+        assert_eq!(count_leading_spaces(b"no spaces", 0), 0);
+        assert_eq!(count_leading_spaces(b"", 0), 0);
+    }
+
+    #[test]
+    fn test_count_leading_spaces_offset() {
+        assert_eq!(count_leading_spaces(b"xx  hello", 2), 2);
+        assert_eq!(count_leading_spaces(b"key:   value", 4), 3);
+    }
+
+    #[test]
+    fn test_count_leading_spaces_all_spaces() {
+        let spaces = vec![b' '; 100];
+        assert_eq!(count_leading_spaces(&spaces, 0), 100);
+    }
+
+    #[test]
+    fn test_count_leading_spaces_long() {
+        // Test with > 16 bytes to exercise SIMD path
+        let mut input = vec![b' '; 50];
+        input.extend_from_slice(b"content");
+        assert_eq!(count_leading_spaces(&input, 0), 50);
+    }
+
+    #[test]
+    fn test_count_leading_spaces_at_boundary() {
+        // Spaces ending exactly at 16-byte boundary
+        let mut input = vec![b' '; 16];
+        input.push(b'x');
+        assert_eq!(count_leading_spaces(&input, 0), 16);
+
+        // Spaces ending at 32-byte boundary
+        let mut input32 = vec![b' '; 32];
+        input32.push(b'x');
+        assert_eq!(count_leading_spaces(&input32, 0), 32);
+    }
+
+    #[test]
+    fn test_count_leading_spaces_simd_matches_scalar() {
+        let test_cases: &[&[u8]] = &[
+            b"",
+            b" ",
+            b"  ",
+            b"   ",
+            b"    ",
+            b"        ",                         // 8 spaces
+            b"                ",                 // 16 spaces
+            b"                                ", // 32 spaces
+            b"no spaces",
+            b" one",
+            b"  two",
+            b"                x",  // 16 spaces + char
+            b"                 x", // 17 spaces + char
+        ];
+
+        for &input in test_cases {
+            let scalar = count_leading_spaces_scalar(input, 0);
+            let simd = count_leading_spaces(input, 0);
+            assert_eq!(
+                scalar,
+                simd,
+                "leading spaces mismatch for {:?}",
                 String::from_utf8_lossy(input)
             );
         }

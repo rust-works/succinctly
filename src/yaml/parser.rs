@@ -336,29 +336,22 @@ impl<'a> Parser<'a> {
 
     /// Count leading spaces (indentation) at start of a line.
     fn count_indent(&self) -> Result<usize, YamlError> {
-        let mut count = 0;
-        let mut i = self.pos;
-        while i < self.input.len() {
-            match self.input[i] {
-                b' ' => {
-                    count += 1;
-                    i += 1;
-                }
-                b'\t' => {
-                    // Tab after spaces - check context
-                    // If we haven't seen any spaces and hit a tab at start of line,
-                    // that's tab indentation (error). But tab after spaces is content.
-                    if count == 0 {
-                        return Err(YamlError::TabIndentation {
-                            line: self.line,
-                            offset: i,
-                        });
-                    }
-                    // Tab after spaces is start of content, stop counting indent
-                    break;
-                }
-                _ => break,
+        // Use SIMD-accelerated space counting
+        let count = super::simd::count_leading_spaces(self.input, self.pos);
+
+        // Check for tab at the position after spaces
+        let next_pos = self.pos + count;
+        if next_pos < self.input.len() && self.input[next_pos] == b'\t' {
+            // Tab after spaces - check context
+            // If we haven't seen any spaces and hit a tab at start of line,
+            // that's tab indentation (error). But tab after spaces is content.
+            if count == 0 {
+                return Err(YamlError::TabIndentation {
+                    line: self.line,
+                    offset: next_pos,
+                });
             }
+            // Tab after spaces is start of content, indent count is correct
         }
         Ok(count)
     }

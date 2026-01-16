@@ -737,9 +737,9 @@ Each phase is independently useful and can be released separately.
 
 ---
 
-## Implemented: SIMD String Fast-Path (Phase 1.5)
+## Implemented: SIMD Optimizations (Phase 1.5)
 
-The YAML parser includes SIMD-accelerated string scanning for quoted strings.
+The YAML parser includes SIMD-accelerated operations for hot paths in parsing.
 
 ### Implementation
 
@@ -756,6 +756,9 @@ pub fn find_quote_or_escape(input: &[u8], start: usize, end: usize) -> Option<us
 
 /// Find next `'` in single-quoted strings
 pub fn find_single_quote(input: &[u8], start: usize, end: usize) -> Option<usize>;
+
+/// Count leading spaces (indentation) from position
+pub fn count_leading_spaces(input: &[u8], start: usize) -> usize;
 ```
 
 ### Platform-Specific Details
@@ -779,13 +782,29 @@ let high_packed = (high_u64.wrapping_mul(MAGIC) >> 56) as u8;
 
 ### Benchmark Results (Apple M1 Max)
 
+#### String Scanning
+
 | Benchmark              | Scalar         | SIMD           | Improvement    |
 |------------------------|----------------|----------------|----------------|
 | yaml/quoted/double/10  | 1.57µs         | 1.44µs         | **8-9% faster**|
 | yaml/quoted/double/100 | 7.57µs         | 6.97µs         | **8-9% faster**|
 | yaml/quoted/double/1000| 67.1µs (688 MiB/s) | 63.0µs (738 MiB/s) | **7.3% throughput** |
 
+#### Indentation Scanning
+
+End-to-end yq identity filter benchmarks after adding SIMD indentation:
+
+| Pattern       | Size  | Before       | After        | Improvement     |
+|---------------|-------|--------------|--------------|-----------------|
+| comprehensive | 1KB   | 4.15 ms      | 3.58 ms      | **+14-24% faster** |
+| comprehensive | 10KB  | 4.91 ms      | 4.23 ms      | **+14-18% faster** |
+| comprehensive | 100KB | 11.40 ms     | 10.73 ms     | **+5-8% faster**   |
+| users         | 1KB   | 3.91 ms      | 3.43 ms      | **+12-16% faster** |
+| users         | 10KB  | 4.76 ms      | 4.26 ms      | **+10-14% faster** |
+
 ### Integration with Parser
+
+#### String Scanning
 
 The `parse_double_quoted()` and `parse_single_quoted()` functions use SIMD to skip to the next interesting character:
 
@@ -805,6 +824,26 @@ fn parse_double_quoted(&mut self) -> Result<usize, YamlError> {
             return Err(YamlError::UnclosedQuote { ... });
         }
     }
+}
+```
+
+#### Indentation Counting
+
+The `count_indent()` function uses SIMD to count leading spaces at line starts:
+
+```rust
+fn count_indent(&self) -> Result<usize, YamlError> {
+    // SIMD-accelerated space counting (16 bytes/iteration on ARM, 32 on AVX2)
+    let count = simd::count_leading_spaces(self.input, self.pos);
+
+    // Check for tab at the position after spaces (YAML error handling)
+    let next_pos = self.pos + count;
+    if next_pos < self.input.len() && self.input[next_pos] == b'\t' {
+        if count == 0 {
+            return Err(YamlError::TabIndentation { ... });
+        }
+    }
+    Ok(count)
 }
 ```
 

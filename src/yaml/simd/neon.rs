@@ -115,6 +115,46 @@ unsafe fn find_single_quote_neon_impl(input: &[u8], start: usize, end: usize) ->
         .map(|pos| offset + pos)
 }
 
+/// Count leading spaces (indentation) using NEON.
+///
+/// Returns the number of consecutive space characters starting at `start`.
+#[inline]
+pub fn count_leading_spaces_neon(input: &[u8], start: usize) -> usize {
+    // SAFETY: target_arch = aarch64 guarantees NEON
+    unsafe { count_leading_spaces_neon_impl(input, start) }
+}
+
+#[target_feature(enable = "neon")]
+unsafe fn count_leading_spaces_neon_impl(input: &[u8], start: usize) -> usize {
+    let data = &input[start..];
+    let len = data.len();
+    let mut offset = 0;
+
+    let space_vec = vdupq_n_u8(b' ');
+
+    // Process 16-byte chunks
+    while offset + 16 <= len {
+        let chunk = vld1q_u8(data.as_ptr().add(offset));
+
+        // Compare against space
+        let matches = vceqq_u8(chunk, space_vec);
+
+        // Extract bitmask (1 bit per byte where match occurred)
+        let mask = neon_movemask(matches);
+
+        if mask != 0xFFFF {
+            // Found a non-space - count trailing ones (consecutive spaces from start)
+            // Invert mask: 1s become 0s where spaces were, then count trailing zeros
+            return offset + (!mask).trailing_zeros() as usize;
+        }
+
+        offset += 16;
+    }
+
+    // Handle remaining bytes
+    offset + data[offset..].iter().take_while(|&&b| b == b' ').count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +199,41 @@ mod tests {
         let mut input = vec![b'a'; 20];
         input[18] = b'"';
         assert_eq!(find_quote_or_escape_neon(&input, 0, input.len()), Some(18));
+    }
+
+    #[test]
+    fn test_neon_count_leading_spaces_basic() {
+        assert_eq!(count_leading_spaces_neon(b"  hello", 0), 2);
+        assert_eq!(count_leading_spaces_neon(b"    world", 0), 4);
+        assert_eq!(count_leading_spaces_neon(b"no spaces", 0), 0);
+    }
+
+    #[test]
+    fn test_neon_count_leading_spaces_long() {
+        // Test with > 16 bytes to exercise SIMD path
+        let mut input = vec![b' '; 50];
+        input.extend_from_slice(b"content");
+        assert_eq!(count_leading_spaces_neon(&input, 0), 50);
+    }
+
+    #[test]
+    fn test_neon_count_leading_spaces_at_boundary() {
+        // Spaces ending exactly at 16-byte boundary
+        let mut input = vec![b' '; 16];
+        input.push(b'x');
+        assert_eq!(count_leading_spaces_neon(&input, 0), 16);
+
+        // Spaces ending at 32-byte boundary
+        let mut input32 = vec![b' '; 32];
+        input32.push(b'x');
+        assert_eq!(count_leading_spaces_neon(&input32, 0), 32);
+    }
+
+    #[test]
+    fn test_neon_count_leading_spaces_in_remainder() {
+        // Non-space in remainder bytes (< 16)
+        let mut input = vec![b' '; 20];
+        input.push(b'x');
+        assert_eq!(count_leading_spaces_neon(&input, 0), 20);
     }
 }

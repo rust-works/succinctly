@@ -125,21 +125,27 @@ String-heavy YAML with quoted variants.
 
 1. **Semi-index architecture**: YAML structure is pre-indexed using balanced parentheses, enabling O(1) navigation
 2. **SIMD string scanning**: ARM NEON accelerates quoted string parsing (6-9% faster than scalar)
-3. **Streaming output**: For identity queries, outputs directly from source without building intermediate structures
-4. **Lazy evaluation**: Only materializes values that are actually accessed
+3. **SIMD indentation counting**: Vectorized space counting for block-style parsing (10-24% faster on small files)
+4. **Streaming output**: For identity queries, outputs directly from source without building intermediate structures
+5. **Lazy evaluation**: Only materializes values that are actually accessed
 
 ### SIMD Optimizations
 
-The YAML parser uses platform-specific SIMD for string scanning:
+The YAML parser uses platform-specific SIMD for two hot paths:
 
-| Platform | Instruction Set | Width           | String Scanning Speedup |
-|----------|-----------------|-----------------|-------------------------|
-| ARM64    | NEON            | 16 bytes/iter   | 6-9% faster             |
-| x86_64   | SSE2/AVX2       | 16-32 bytes/iter| 6-9% faster             |
+| Platform | Instruction Set | Width            | Operations                          |
+|----------|-----------------|------------------|-------------------------------------|
+| ARM64    | NEON            | 16 bytes/iter    | String scanning, indentation count  |
+| x86_64   | SSE2/AVX2       | 16-32 bytes/iter | String scanning, indentation count  |
 
-String scanning benchmarks (double-quoted strings, 1000 entries):
+**String scanning** (double-quoted strings, 1000 entries):
 - **Scalar**: 67.1µs @ 688 MiB/s
 - **SIMD**:   63.0µs @ 738 MiB/s (+7.3% throughput)
+
+**Indentation scanning** (end-to-end improvement on yq identity):
+- **1KB files**: 14-24% faster
+- **10KB files**: 10-18% faster
+- **100KB+ files**: 5-8% faster (other costs dominate)
 
 ### Trade-offs
 
