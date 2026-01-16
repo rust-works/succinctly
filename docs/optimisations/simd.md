@@ -358,6 +358,55 @@ It's effective for JSON (used in `json/simd/neon.rs`) where you classify 6+ char
 types simultaneously: `{`, `}`, `[`, `]`, `:`, `,`, `"`, `\`, plus value chars.
 The single classification pass replaces ~13 comparisons with 6 operations.
 
+### NEON/SSE2 Colon-Space Detection for YAML (-15-20% end-to-end penalty)
+
+**Attempted**: Use SIMD to find the `: ` pattern for YAML key-value detection.
+
+```rust
+// NEON approach - find colons, then check if next byte is space
+let colon_vec = vdupq_n_u8(b':');
+let chunk = vld1q_u8(data.as_ptr().add(offset));
+let colons = vceqq_u8(chunk, colon_vec);
+let colon_mask = neon_movemask(colons);
+
+if colon_mask != 0 {
+    let bit_pos = colon_mask.trailing_zeros() as usize;
+    if data[offset + bit_pos + 1] == b' ' {
+        return Some(offset + bit_pos);
+    }
+}
+```
+
+**Isolation benchmark** (Apple M1 Max) - looked promising:
+
+| Scenario             | SIMD    | Scalar   | Speedup           |
+|----------------------|---------|----------|-------------------|
+| Short key (11 bytes) | 4.13 ns | 2.31 ns  | **-44% (slower)** |
+| Medium key (46 bytes)| 3.35 ns | 10.67 ns | **3.2x**          |
+| Long key (92 bytes)  | 4.97 ns | 27.79 ns | **5.6x**          |
+
+**End-to-end result**: 15-20% slower when integrated into parser.
+
+| YAML benchmark   | With SIMD | Without SIMD | Change             |
+|------------------|-----------|--------------|-------------------|
+| simple_kv/10     | 1.38 µs   | 1.33 µs      | **-4% (slower)**  |
+| simple_kv/100    | 6.05 µs   | 5.26 µs      | **-15% (slower)** |
+| simple_kv/1000   | 53.7 µs   | 44.7 µs      | **-20% (slower)** |
+
+**Why it failed end-to-end**:
+
+| Factor             | Isolation Benchmark | Real YAML Parsing          |
+|--------------------|---------------------|----------------------------|
+| Search distance    | 46-92+ bytes        | 5-15 bytes (typical keys)  |
+| Breakeven point    | ~16 bytes           | Keys shorter than breakeven|
+| Additional overhead| None                | Finding line_end, extra call|
+
+**Key insight**: SIMD setup cost (~4 ns) is only amortized when scanning 40+ bytes.
+Typical YAML keys like `name:`, `host:`, `timeout:` are 5-15 chars, where scalar wins.
+
+**Lesson learned**: Isolation benchmarks can mislead - a function can be 5x faster in
+isolation but cause regression when integrated due to real-world data characteristics.
+
 ---
 
 ## Usage in Succinctly
@@ -380,6 +429,9 @@ The single classification pass replaces ~13 comparisons with 6 operations.
 3. **Memory bandwidth limits**: 32 bytes/cycle is often the ceiling
 4. **Runtime dispatch is cheap**: One branch vs. many iterations
 5. **ARM NEON is different**: No movemask; use multiplication trick
+6. **SIMD setup cost matters**: For short operations (<16 bytes), scalar wins
+7. **Isolation benchmarks can mislead**: A function can be 5x faster in isolation but cause regression when integrated (colon-space detection won for 46+ byte scans, but real YAML keys are 5-15 bytes)
+8. **Know your data characteristics**: Benchmark with realistic data sizes, not arbitrary test cases
 
 ---
 
