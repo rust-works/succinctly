@@ -11,6 +11,10 @@ scopes:
     description: "JSON semi-indexing and parsing"
     examples: ["json: improve PFSM throughput", "json: fix unicode handling"]
     file_patterns: ["src/json/**"]
+  - name: "yaml"
+    description: "YAML semi-indexing and parsing"
+    examples: ["yaml: add block scalar support", "yaml: fix anchor resolution"]
+    file_patterns: ["src/yaml/**"]
   - name: "jq"
     description: "jq query language parser and evaluator"
     examples: ["jq: add array slicing", "jq: fix negative index"]
