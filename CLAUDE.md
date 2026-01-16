@@ -65,6 +65,7 @@ src/
 ├── bits/               # BitVec, rank/select, popcount
 ├── trees/              # Balanced parentheses
 ├── json/               # JSON semi-indexing (PFSM default)
+├── yaml/               # YAML semi-indexing (oracle parser)
 ├── jq/                 # jq query language
 └── bin/                # CLI tool
 ```
@@ -75,6 +76,7 @@ src/
 use succinctly::bits::BitVec;
 use succinctly::trees::BalancedParens;
 use succinctly::json::JsonIndex;
+use succinctly::yaml::YamlIndex;
 use succinctly::jq::{parse, eval};
 ```
 
@@ -85,6 +87,7 @@ use succinctly::jq::{parse, eval};
 | **BitVec**        | O(1) rank, O(log n) select             | ~3-4% overhead|
 | **BalancedParens**| Succinct tree navigation               | ~6% overhead  |
 | **JsonIndex**     | JSON semi-indexing with PFSM parser    | ~950 MiB/s    |
+| **YamlIndex**     | YAML semi-indexing with oracle parser  | ~250-400 MiB/s|
 | **DsvIndex**      | DSV semi-indexing with lightweight rank| 11-169 MiB/s (CLI), 85-1676 MiB/s (API)|
 
 ### jq Format Functions
@@ -154,6 +157,7 @@ cargo test
 | [RELEASE.md](RELEASE.md)                                          | Release process and checklist        |
 | [docs/optimisations/](docs/optimisations/)                        | Optimisation techniques reference    |
 | [docs/jq-comparison.md](docs/jq-comparison.md)                    | JSON jq benchmark results            |
+| [docs/yq-comparison.md](docs/yq-comparison.md)                    | YAML yq benchmark results            |
 | [docs/dsv-performance.md](docs/dsv-performance.md)                | DSV input performance benchmarks     |
 
 ## Performance Summary
@@ -162,11 +166,21 @@ cargo test
 
 | Size      | succinctly            | jq                    | Speedup    |
 |-----------|-----------------------|-----------------------|------------|
-| **10KB**  |  2.4 ms  (3.9 MiB/s)  |  4.3 ms  (2.2 MiB/s)  | **1.79x**  |
-| **100KB** |  4.6 ms (18.4 MiB/s)  |  8.2 ms (10.5 MiB/s)  | **1.76x**  |
-| **1MB**   | 24.7 ms (32.7 MiB/s)  | 43.9 ms (18.4 MiB/s)  | **1.78x**  |
+| **10KB**  |  4.1 ms  (2.3 MiB/s)  |  4.1 ms  (2.3 MiB/s)  | **1.0x**   |
+| **100KB** |  6.6 ms (13.0 MiB/s)  |  8.4 ms (10.2 MiB/s)  | **1.3x**   |
+| **1MB**   | 28.3 ms (28.5 MiB/s)  | 45.8 ms (17.6 MiB/s)  | **1.6x**   |
 
-To regenerate: `./target/release/succinctly dev bench jq`
+To regenerate: `cargo bench --bench jq_comparison`
+
+### yq Query Performance (Apple M1 Max)
+
+| Size      | succinctly            | yq                    | Speedup    |
+|-----------|-----------------------|-----------------------|------------|
+| **10KB**  |  4.0 ms  (2.5 MiB/s)  |  8.1 ms  (1.2 MiB/s)  | **2.0x**   |
+| **100KB** |  6.7 ms (13.7 MiB/s)  | 19.7 ms  (4.7 MiB/s)  | **2.9x**   |
+| **1MB**   | 32.0 ms (28.8 MiB/s)  |118.9 ms  (7.8 MiB/s)  | **3.7x**   |
+
+To regenerate: `cargo bench --bench yq_comparison`
 
 ### Optimisation Techniques
 

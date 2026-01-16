@@ -9,9 +9,14 @@ criterion = "0.5"
 serde_json = "1.0"
 simd-json = "0.14"
 sonic-rs = "0.3"
+serde_yaml = "0.9"
 succinctly = { path = ".." }
 tracking-allocator = "0.4"
 
 [[bench]]
 name = "json_parsers"
+harness = false
+
+[[bench]]
+name = "yaml_parsers"
 harness = false

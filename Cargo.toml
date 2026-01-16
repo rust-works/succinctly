@@ -129,3 +129,11 @@ harness = false
 [[bench]]
 name = "dsv_profile"
 harness = false
+
+[[bench]]
+name = "yaml_bench"
+harness = false
+
+[[bench]]
+name = "yq_comparison"
+harness = false

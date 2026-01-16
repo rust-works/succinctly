@@ -63,6 +63,7 @@
 //! }
 //! ```
 
+pub mod document;
 mod eval;
 mod expr;
 mod lazy;

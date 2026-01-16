@@ -1,0 +1,8 @@
+---
+name: John
+age: 30
+items:
+  - apple
+  - banana
+nested:
+  key: value

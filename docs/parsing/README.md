@@ -10,6 +10,7 @@ Traditional parsers materialize data into memory structures (DOM trees, row arra
 |--------|----------|---------------|
 | JSON | [json.md](json.md) | Interest bits + balanced parentheses |
 | CSV/TSV | [dsv.md](dsv.md) | Marker bits + quote state tracking |
+| YAML | [yaml.md](yaml.md) | Feasibility analysis (not implemented) |
 
 ---
 
@@ -79,6 +80,7 @@ Both parsers share optimisation techniques:
 
 - [JSON Parsing](json.md) - Semi-index structure, PFSM, SIMD classification
 - [DSV Parsing](dsv.md) - Quote handling, PDEP carry propagation, lightweight index
+- [YAML Analysis](yaml.md) - Feasibility study, ambiguity analysis, oracle model
 
 ### Optimisation Techniques
 

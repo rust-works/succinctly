@@ -12,6 +12,7 @@
 //! - [`json`] - JSON semi-indexing with SIMD acceleration
 //! - [`jq`] - jq-style query language for JSON navigation
 //! - [`dsv`] - High-performance CSV/TSV parsing with succinct indexing
+//! - [`yaml`] - YAML semi-indexing (Phase 1: block style)
 //!
 //! ## Quick Start
 //!
@@ -81,6 +82,9 @@ pub mod jq;
 
 /// High-performance DSV (CSV/TSV) parsing with succinct indexing.
 pub mod dsv;
+
+/// YAML semi-indexing (Phase 1: YAML-lite).
+pub mod yaml;
 
 // =============================================================================
 // Public re-exports (convenience + backward compatibility)

@@ -9,7 +9,9 @@ Usage: succinctly <COMMAND>
 Commands:
   json       JSON operations (generate, parse, benchmark)
   dsv        DSV (CSV/TSV) operations (generate, parse)
+  yaml       YAML operations (generate, parse)
   jq         Command-line JSON processor (jq-compatible)
+  yq         Command-line YAML processor (jq-compatible syntax)
   jq-locate  Find jq expression for a position in a JSON file
   dev        Developer tools (benchmarking, profiling)
   help       Print this message or the help of the given subcommand(s)

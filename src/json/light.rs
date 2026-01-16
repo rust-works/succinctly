@@ -1,3 +1,4 @@
+#![allow(clippy::items_after_test_module)]
 //! StandardJson - Lazy JSON navigation using the standard cursor.
 //!
 //! This module provides a cursor-based API for navigating JSON structures
@@ -1238,6 +1239,170 @@ pub type OwnedJsonCursor<'a> = JsonCursor<'a, Vec<u64>>;
 
 /// JSON cursor with borrowed index.
 pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
+
+// ============================================================================
+// Document trait implementations
+// ============================================================================
+
+use crate::jq::document::{
+    DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue,
+};
+
+impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
+    type Value = StandardJson<'a, W>;
+
+    #[inline]
+    fn value(&self) -> Self::Value {
+        JsonCursor::value(self)
+    }
+
+    #[inline]
+    fn first_child(&self) -> Option<Self> {
+        JsonCursor::first_child(self)
+    }
+
+    #[inline]
+    fn next_sibling(&self) -> Option<Self> {
+        JsonCursor::next_sibling(self)
+    }
+
+    #[inline]
+    fn parent(&self) -> Option<Self> {
+        JsonCursor::parent(self)
+    }
+
+    #[inline]
+    fn is_container(&self) -> bool {
+        JsonCursor::is_container(self)
+    }
+
+    #[inline]
+    fn text_position(&self) -> Option<usize> {
+        JsonCursor::text_position(self)
+    }
+}
+
+impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
+    type Cursor = JsonCursor<'a, W>;
+    type Fields = JsonFields<'a, W>;
+    type Elements = JsonElements<'a, W>;
+
+    #[inline]
+    fn is_null(&self) -> bool {
+        matches!(self, StandardJson::Null)
+    }
+
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            StandardJson::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    fn as_i64(&self) -> Option<i64> {
+        match self {
+            StandardJson::Number(n) => n.as_i64().ok(),
+            _ => None,
+        }
+    }
+
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            StandardJson::Number(n) => n.as_f64().ok(),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<Cow<'_, str>> {
+        match self {
+            StandardJson::String(s) => s.as_str().ok(),
+            _ => None,
+        }
+    }
+
+    fn as_object(&self) -> Option<Self::Fields> {
+        match self {
+            StandardJson::Object(fields) => Some(*fields),
+            _ => None,
+        }
+    }
+
+    fn as_array(&self) -> Option<Self::Elements> {
+        match self {
+            StandardJson::Array(elements) => Some(*elements),
+            _ => None,
+        }
+    }
+
+    fn type_name(&self) -> &'static str {
+        match self {
+            StandardJson::Null => "null",
+            StandardJson::Bool(_) => "boolean",
+            StandardJson::Number(_) => "number",
+            StandardJson::String(_) => "string",
+            StandardJson::Array(_) => "array",
+            StandardJson::Object(_) => "object",
+            StandardJson::Error(_) => "error",
+        }
+    }
+
+    fn is_error(&self) -> bool {
+        matches!(self, StandardJson::Error(_))
+    }
+
+    fn error_message(&self) -> Option<&'static str> {
+        match self {
+            StandardJson::Error(msg) => Some(msg),
+            _ => None,
+        }
+    }
+}
+
+impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for JsonFields<'a, W> {
+    type Value = StandardJson<'a, W>;
+    type Cursor = JsonCursor<'a, W>;
+
+    fn uncons(&self) -> Option<(DocumentField<Self::Value, Self::Cursor>, Self)> {
+        let (field, rest) = JsonFields::uncons(self)?;
+        Some((
+            DocumentField {
+                key: field.key(),
+                value: field.value(),
+                value_cursor: field.value_cursor(),
+            },
+            rest,
+        ))
+    }
+
+    fn find(&self, name: &str) -> Option<Self::Value> {
+        JsonFields::find(self, name)
+    }
+
+    fn is_empty(&self) -> bool {
+        JsonFields::is_empty(self)
+    }
+}
+
+impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for JsonElements<'a, W> {
+    type Value = StandardJson<'a, W>;
+    type Cursor = JsonCursor<'a, W>;
+
+    fn uncons(&self) -> Option<(Self::Value, Self)> {
+        JsonElements::uncons(self)
+    }
+
+    fn uncons_cursor(&self) -> Option<(Self::Cursor, Self)> {
+        JsonElements::uncons_cursor(self)
+    }
+
+    fn get(&self, index: usize) -> Option<Self::Value> {
+        JsonElements::get_fast(self, index)
+    }
+
+    fn is_empty(&self) -> bool {
+        JsonElements::is_empty(self)
+    }
+}
 
 #[cfg(test)]
 mod tests {
