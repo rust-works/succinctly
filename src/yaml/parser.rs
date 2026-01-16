@@ -1300,9 +1300,7 @@ impl<'a> Parser<'a> {
 
             // Skip to the content position
             let saved_pos = self.pos;
-            for _ in 0..next_indent {
-                self.advance();
-            }
+            self.advance_by(next_indent);
 
             // Check if this is a nested structure or a plain scalar value
             match self.peek() {
@@ -3097,9 +3095,7 @@ impl<'a> Parser<'a> {
         };
 
         // Skip to content
-        for _ in 0..indent {
-            self.advance();
-        }
+        self.advance_by(indent);
 
         // close_deeper_indents will handle closing any SequenceItem entries
         // when we return to a lower indent level
