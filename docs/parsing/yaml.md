@@ -780,9 +780,11 @@ let high_packed = (high_u64.wrapping_mul(MAGIC) >> 56) as u8;
 - SSE2 baseline (16 bytes/iteration)
 - AVX2 fast path (32 bytes/iteration) when available
 
-### Benchmark Results (Apple M1 Max)
+### Benchmark Results
 
-#### String Scanning
+#### Apple M1 Max (ARM64 NEON)
+
+##### String Scanning
 
 | Benchmark              | Scalar         | SIMD           | Improvement    |
 |------------------------|----------------|----------------|----------------|
@@ -790,7 +792,7 @@ let high_packed = (high_u64.wrapping_mul(MAGIC) >> 56) as u8;
 | yaml/quoted/double/100 | 7.57µs         | 6.97µs         | **8-9% faster**|
 | yaml/quoted/double/1000| 67.1µs (688 MiB/s) | 63.0µs (738 MiB/s) | **7.3% throughput** |
 
-#### Indentation Scanning
+##### Indentation Scanning
 
 End-to-end yq identity filter benchmarks after adding SIMD indentation:
 
@@ -801,6 +803,67 @@ End-to-end yq identity filter benchmarks after adding SIMD indentation:
 | comprehensive | 100KB | 11.40 ms     | 10.73 ms     | **+5-8% faster**   |
 | users         | 1KB   | 3.91 ms      | 3.43 ms      | **+12-16% faster** |
 | users         | 10KB  | 4.76 ms      | 4.26 ms      | **+10-14% faster** |
+
+#### AMD Ryzen 9 7950X (x86_64 AVX2/AVX-512) - Baseline (2026-01-17)
+
+**Platform:** AMD Ryzen 9 7950X 16-Core (AVX-512, BMI2, POPCNT)
+**OS:** Linux 6.6.87 WSL2
+**Compiler:** rustc with `-C target-cpu=native`
+
+##### Simple Key-Value Pairs
+| Count  | Time      | Throughput   |
+|--------|-----------|--------------|
+| 10     | 702 ns    | 176 MiB/s    |
+| 100    | 3.72 µs   | 379 MiB/s    |
+| 1,000  | 34.98 µs  | 457 MiB/s    |
+| 10,000 | 364 µs    | 491 MiB/s    |
+
+##### Nested Structures
+| Depth | Width | Time      | Throughput   |
+|-------|-------|-----------|--------------|
+| 3     | 3     | 3.31 µs   | 300 MiB/s    |
+| 5     | 2     | 4.98 µs   | 340 MiB/s    |
+| 10    | 2     | 196.6 µs  | 427 MiB/s    |
+| 3     | 5     | 12.54 µs  | 342 MiB/s    |
+
+##### Sequences
+| Items  | Time     | Throughput   |
+|--------|----------|--------------|
+| 10     | 678 ns   | 112 MiB/s    |
+| 100    | 3.28 µs  | 258 MiB/s    |
+| 1,000  | 31.51 µs | 284 MiB/s    |
+| 10,000 | 309 µs   | 290 MiB/s    |
+
+##### Quoted Strings (Regular)
+| Count | Type   | Time     | Throughput   |
+|-------|--------|----------|--------------|
+| 10    | Double | 712 ns   | 163 MiB/s    |
+| 10    | Single | 698 ns   | 166 MiB/s    |
+| 100   | Double | 4.56 µs  | 331 MiB/s    |
+| 100   | Single | 4.41 µs  | 343 MiB/s    |
+| 1,000 | Double | 42.1 µs  | 361 MiB/s    |
+| 1,000 | Single | 41.3 µs  | 368 MiB/s    |
+
+##### Long Quoted Strings (100 strings each)
+| String Length | Type   | Time      | Throughput   |
+|---------------|--------|-----------|--------------|
+| 64 bytes      | Double | 5.39 µs   | 1.27 GiB/s   |
+| 64 bytes      | Single | 5.41 µs   | 1.27 GiB/s   |
+| 256 bytes     | Double | 11.56 µs  | 2.14 GiB/s   |
+| 256 bytes     | Single | 11.32 µs  | 2.19 GiB/s   |
+| 1024 bytes    | Double | 34.24 µs  | 2.81 GiB/s   |
+| 1024 bytes    | Single | 34.27 µs  | 2.81 GiB/s   |
+| 4096 bytes    | Double | 128.8 µs  | 2.97 GiB/s   |
+| 4096 bytes    | Single | 128.5 µs  | 2.98 GiB/s   |
+
+##### Large Files
+| Size   | Time      | Throughput   |
+|--------|-----------|--------------|
+| 1 KB   | 2.79 µs   | 342 MiB/s    |
+| 10 KB  | 21.3 µs   | 448 MiB/s    |
+| 100 KB | 194.3 µs  | 491 MiB/s    |
+
+**Summary:** Baseline throughput ranges from 176-491 MiB/s for structured data, with string scanning achieving 2.8-3.0 GiB/s. This establishes a performance baseline before AVX2/AVX-512 optimizations.
 
 ### Integration with Parser
 
