@@ -46,6 +46,7 @@ This directory documents optimisation techniques used in the succinctly library,
 | BMI1 Mask Iteration | **-26%** | Optimised <1% of runtime | [simd.md](simd.md) |
 | NEON Batched Popcount | **-25%** | Prefix sum inherently sequential | [parallel-prefix.md](parallel-prefix.md) |
 | AVX-512 JSON Parser | **-10%** | Memory-bound, not compute-bound | [simd.md](simd.md) |
+| SIMD Lookahead Quote Skip | **-2 to -6%** | Short strings, SIMD overhead dominates | [state-machines.md](state-machines.md) |
 
 ---
 

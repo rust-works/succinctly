@@ -361,6 +361,60 @@ fn skip_to_eol(&mut self) {
 | NEON PFSM shuffle      | -47%    | Shuffle overhead exceeds benefit  |
 | AVX-512 FSM            | -10%    | Memory-bound, not compute-bound   |
 | BMI1 mask iteration    | -26%    | FSM needs all bytes, not just structural |
+| SIMD lookahead quote skip | -2 to -6% | Short strings, SIMD overhead dominates |
+
+#### SIMD Quote Scanning in Lookahead (YAML) - Failed
+
+Attempted to use existing SIMD `find_quote_or_escape()` in lookahead functions to skip quoted keys faster:
+
+```rust
+// Before: byte-by-byte scanning
+while i < self.input.len() {
+    if self.input[i] == quote {
+        if quote == b'\'' && i + 1 < self.input.len() && self.input[i + 1] == b'\'' {
+            i += 2;
+            continue;
+        }
+        i += 1;
+        break;
+    } else if self.input[i] == b'\\' && quote == b'"' {
+        i += 2;
+    } else if self.input[i] == b'\n' {
+        return false;
+    } else {
+        i += 1;
+    }
+}
+
+// After (slower!): SIMD scanning
+loop {
+    let line_end = self.input[i..].iter()
+        .position(|&b| b == b'\n')  // Extra linear scan!
+        .map(|p| i + p)
+        .unwrap_or(self.input.len());
+
+    match simd::find_quote_or_escape(self.input, i, line_end) {
+        Some(offset) => {
+            let pos = i + offset;
+            if self.input[pos] == b'"' {
+                i = pos + 1;
+                break;
+            } else {
+                i = pos + 2;  // Skip escape
+            }
+        }
+        None => return false,
+    }
+}
+```
+
+**Why it failed** (2-6% regression):
+1. **YAML keys are short**: Typical keys are <50 bytes; SIMD setup cost dominates
+2. **Extra linear scan**: Finding `line_end` is another O(n) scan not needed by scalar version
+3. **Function call overhead**: SIMD dispatch adds cost for short strings
+4. **Match statement overhead**: Option matching in loop adds branches
+
+**Lesson**: SIMD only pays off for long strings (>100 bytes). Lookahead functions typically process short keys where byte-by-byte is faster.
 
 ---
 
