@@ -33,6 +33,7 @@ use alloc::{
 use std::collections::BTreeMap;
 
 use super::error::YamlError;
+use super::simd;
 
 /// Node type in the YAML structure tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +308,19 @@ impl<'a> Parser<'a> {
             }
             self.pos += 1;
         }
+    }
+
+    /// Advance position by multiple bytes, tracking newlines.
+    #[inline]
+    fn advance_by(&mut self, count: usize) {
+        let end = (self.pos + count).min(self.input.len());
+        // Count newlines in the range we're skipping
+        for &b in &self.input[self.pos..end] {
+            if b == b'\n' {
+                self.line += 1;
+            }
+        }
+        self.pos = end;
     }
 
     /// Skip whitespace on the current line (spaces and tabs, not newlines).
@@ -656,69 +670,79 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a double-quoted string.
+    ///
+    /// Uses SIMD fast-path to skip to the next quote or backslash.
     fn parse_double_quoted(&mut self) -> Result<usize, YamlError> {
         let start = self.pos;
         self.advance(); // Skip opening quote
 
-        while let Some(b) = self.peek() {
-            match b {
-                b'"' => {
-                    self.advance();
-                    return Ok(self.pos - start);
-                }
-                b'\\' => {
-                    self.advance(); // Skip backslash
-                    if self.peek().is_some() {
-                        self.advance(); // Skip escaped char
-                    } else {
-                        return Err(YamlError::UnexpectedEof {
-                            context: "escape sequence in string",
-                        });
+        loop {
+            // SIMD fast-path: find next quote or backslash
+            if let Some(offset) = simd::find_quote_or_escape(self.input, self.pos, self.input.len())
+            {
+                // Skip to the found character
+                self.advance_by(offset);
+
+                // Now process the found character
+                match self.peek() {
+                    Some(b'"') => {
+                        self.advance();
+                        return Ok(self.pos - start);
+                    }
+                    Some(b'\\') => {
+                        self.advance(); // Skip backslash
+                        if self.peek().is_some() {
+                            self.advance(); // Skip escaped char
+                        } else {
+                            return Err(YamlError::UnexpectedEof {
+                                context: "escape sequence in string",
+                            });
+                        }
+                    }
+                    _ => {
+                        // Should not happen since we found quote or backslash
+                        self.advance();
                     }
                 }
-                b'\n' => {
-                    // Multi-line string - continue
-                    self.advance();
-                }
-                _ => self.advance(),
+            } else {
+                // No quote or backslash found - string is unclosed
+                return Err(YamlError::UnclosedQuote {
+                    start_offset: start,
+                    quote_type: '"',
+                });
             }
         }
-
-        Err(YamlError::UnclosedQuote {
-            start_offset: start,
-            quote_type: '"',
-        })
     }
 
     /// Parse a single-quoted string.
+    ///
+    /// Uses SIMD fast-path to skip to the next single quote.
     fn parse_single_quoted(&mut self) -> Result<usize, YamlError> {
         let start = self.pos;
         self.advance(); // Skip opening quote
 
-        while let Some(b) = self.peek() {
-            match b {
-                b'\'' => {
-                    // Check for escaped quote ('')
-                    if self.peek_at(1) == Some(b'\'') {
-                        self.advance();
-                        self.advance();
-                    } else {
-                        self.advance();
-                        return Ok(self.pos - start);
-                    }
-                }
-                b'\n' => {
-                    // Multi-line string - continue
+        loop {
+            // SIMD fast-path: find next single quote
+            if let Some(offset) = simd::find_single_quote(self.input, self.pos, self.input.len()) {
+                // Skip to the found quote
+                self.advance_by(offset);
+
+                // Check for escaped quote ('')
+                if self.peek_at(1) == Some(b'\'') {
                     self.advance();
+                    self.advance();
+                } else {
+                    self.advance();
+                    return Ok(self.pos - start);
                 }
-                _ => self.advance(),
+            } else {
+                // No quote found - string is unclosed
+                return Err(YamlError::UnclosedQuote {
+                    start_offset: start,
+                    quote_type: '\'',
+                });
             }
         }
-
-        Err(YamlError::UnclosedQuote {
-            start_offset: start,
-            quote_type: '\'',
-        })
     }
 
     /// Parse an unquoted scalar value with a minimum indentation requirement.

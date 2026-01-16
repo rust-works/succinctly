@@ -77,6 +77,26 @@ fn generate_single_quoted_strings(count: usize) -> Vec<u8> {
     yaml
 }
 
+/// Generate long double-quoted strings (stress test for SIMD string scanning).
+fn generate_long_quoted_strings(count: usize, string_len: usize) -> Vec<u8> {
+    let mut yaml = Vec::with_capacity(count * (string_len + 20));
+    let long_string: String = "x".repeat(string_len);
+    for i in 0..count {
+        yaml.extend_from_slice(format!("key{}: \"{}\"\n", i, long_string).as_bytes());
+    }
+    yaml
+}
+
+/// Generate long single-quoted strings (stress test for SIMD string scanning).
+fn generate_long_single_quoted_strings(count: usize, string_len: usize) -> Vec<u8> {
+    let mut yaml = Vec::with_capacity(count * (string_len + 20));
+    let long_string: String = "y".repeat(string_len);
+    for i in 0..count {
+        yaml.extend_from_slice(format!("key{}: '{}'\n", i, long_string).as_bytes());
+    }
+    yaml
+}
+
 /// Generate a mixed YAML structure approximating target size.
 /// Uses simple key-value pairs to ensure valid YAML.
 fn generate_mixed_yaml(target_size: usize) -> Vec<u8> {
@@ -206,12 +226,53 @@ fn bench_large_files(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark long strings to stress SIMD string scanning.
+fn bench_long_strings(c: &mut Criterion) {
+    let mut group = c.benchmark_group("yaml/long_strings");
+
+    // Test with various string lengths: 64, 256, 1024, 4096 bytes
+    for &string_len in &[64, 256, 1024, 4096] {
+        let count = 100; // 100 entries each
+
+        // Double-quoted long strings
+        let double_yaml = generate_long_quoted_strings(count, string_len);
+        group.throughput(Throughput::Bytes(double_yaml.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::new("double", format!("{}b", string_len)),
+            &double_yaml,
+            |b, yaml| {
+                b.iter(|| {
+                    let index = YamlIndex::build(black_box(yaml)).unwrap();
+                    black_box(index)
+                })
+            },
+        );
+
+        // Single-quoted long strings
+        let single_yaml = generate_long_single_quoted_strings(count, string_len);
+        group.throughput(Throughput::Bytes(single_yaml.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::new("single", format!("{}b", string_len)),
+            &single_yaml,
+            |b, yaml| {
+                b.iter(|| {
+                    let index = YamlIndex::build(black_box(yaml)).unwrap();
+                    black_box(index)
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_simple_kv,
     bench_nested,
     bench_sequences,
     bench_quoted_strings,
+    bench_long_strings,
     bench_large_files,
 );
 criterion_main!(benches);

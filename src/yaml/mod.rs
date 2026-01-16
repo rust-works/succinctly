@@ -52,6 +52,7 @@ mod index;
 mod light;
 mod locate;
 mod parser;
+mod simd;
 
 pub use error::YamlError;
 pub use index::YamlIndex;

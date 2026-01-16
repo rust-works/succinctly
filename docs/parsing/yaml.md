@@ -737,6 +737,79 @@ Each phase is independently useful and can be released separately.
 
 ---
 
+## Implemented: SIMD String Fast-Path (Phase 1.5)
+
+The YAML parser includes SIMD-accelerated string scanning for quoted strings.
+
+### Implementation
+
+Located in `src/yaml/simd/`:
+- `mod.rs` - Platform dispatch and scalar fallbacks
+- `neon.rs` - ARM NEON implementation (16 bytes/iteration)
+- `x86.rs` - SSE2/AVX2 implementation (16-32 bytes/iteration)
+
+### Functions
+
+```rust
+/// Find next `"` or `\` in double-quoted strings
+pub fn find_quote_or_escape(input: &[u8], start: usize, end: usize) -> Option<usize>;
+
+/// Find next `'` in single-quoted strings
+pub fn find_single_quote(input: &[u8], start: usize, end: usize) -> Option<usize>;
+```
+
+### Platform-Specific Details
+
+#### ARM64 (NEON)
+
+Uses the multiplication trick for movemask (no native `movemask` on ARM):
+
+```rust
+const MAGIC: u64 = 0x0102040810204080;
+let low_packed = (low_u64.wrapping_mul(MAGIC) >> 56) as u8;
+let high_packed = (high_u64.wrapping_mul(MAGIC) >> 56) as u8;
+(low_packed as u16) | ((high_packed as u16) << 8)
+```
+
+#### x86_64 (SSE2/AVX2)
+
+- Runtime feature detection for AVX2
+- SSE2 baseline (16 bytes/iteration)
+- AVX2 fast path (32 bytes/iteration) when available
+
+### Benchmark Results (Apple M1 Max)
+
+| Benchmark              | Scalar         | SIMD           | Improvement    |
+|------------------------|----------------|----------------|----------------|
+| yaml/quoted/double/10  | 1.57µs         | 1.44µs         | **8-9% faster**|
+| yaml/quoted/double/100 | 7.57µs         | 6.97µs         | **8-9% faster**|
+| yaml/quoted/double/1000| 67.1µs (688 MiB/s) | 63.0µs (738 MiB/s) | **7.3% throughput** |
+
+### Integration with Parser
+
+The `parse_double_quoted()` and `parse_single_quoted()` functions use SIMD to skip to the next interesting character:
+
+```rust
+fn parse_double_quoted(&mut self) -> Result<usize, YamlError> {
+    self.advance(); // Skip opening quote
+    loop {
+        // SIMD fast-path: find next quote or backslash
+        if let Some(offset) = simd::find_quote_or_escape(self.input, self.pos, self.input.len()) {
+            self.advance_by(offset);
+            match self.peek() {
+                Some(b'"') => { self.advance(); return Ok(self.pos - start); }
+                Some(b'\\') => { /* handle escape */ }
+                _ => { self.advance(); }
+            }
+        } else {
+            return Err(YamlError::UnclosedQuote { ... });
+        }
+    }
+}
+```
+
+---
+
 ## High-Performance Pure Rust Oracle
 
 This section details how to achieve rapidyaml-level performance (~150 MB/s) in pure Rust by combining rapidyaml's architectural insights with succinctly's proven optimization techniques.
