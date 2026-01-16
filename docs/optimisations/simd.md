@@ -309,6 +309,55 @@ unsafe fn process_64_avx2(data: &[u8; 64]) -> u64 {
 **Result**: 1.33x slower.
 **Reason**: Prefix sum is inherently sequential; extraction overhead dominates.
 
+### NEON Nibble Lookup for YAML (-12-15% penalty)
+
+**Attempted**: Use nibble-based lookup tables for YAML string scanning.
+
+The simdjson technique splits each byte into high/low nibbles (4 bits each), looks up both
+in precomputed 16-entry tables, and ANDs the results to classify characters:
+
+```rust
+unsafe fn classify_yaml_chars(chunk: uint8x16_t) -> uint8x16_t {
+    let lo_table = vld1q_u8(YAML_LO_NIBBLE.as_ptr());
+    let hi_table = vld1q_u8(YAML_HI_NIBBLE.as_ptr());
+
+    let lo_nibble = vandq_u8(chunk, vdupq_n_u8(0x0F));
+    let hi_nibble = vshrq_n_u8::<4>(chunk);
+
+    let lo_result = vqtbl1q_u8(lo_table, lo_nibble);
+    let hi_result = vqtbl1q_u8(hi_table, hi_nibble);
+
+    vandq_u8(lo_result, hi_result)  // Each byte has classification flags
+}
+```
+
+**Result**: 12-15% slower than direct comparison for YAML.
+
+**Benchmark data** (Apple M1, finding quote at end of string):
+
+| Size | Nibble Lookup | Direct Comparison | Delta |
+|------|---------------|-------------------|-------|
+| 16B  | 2.77 ns       | 2.43 ns           | -12%  |
+| 64B  | 5.58 ns       | 4.75 ns           | -15%  |
+| 256B | 16.83 ns      | 14.88 ns          | -12%  |
+
+**Why it failed for YAML**:
+
+YAML string scanning only needs to find 2-3 specific characters (`"`, `\`, `'`).
+
+| Approach | Operations per 16-byte chunk |
+|----------|------------------------------|
+| Direct comparison | 2 comparisons + 1 OR |
+| Nibble lookup | 2 table loads + 2 lookups + 1 AND + 1 test |
+
+The table lookup overhead doesn't amortize when searching for few characters.
+
+**When nibble lookup DOES work**:
+
+It's effective for JSON (used in `json/simd/neon.rs`) where you classify 6+ character
+types simultaneously: `{`, `}`, `[`, `]`, `:`, `,`, `"`, `\`, plus value chars.
+The single classification pass replaces ~13 comparisons with 6 operations.
+
 ---
 
 ## Usage in Succinctly
