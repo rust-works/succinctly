@@ -266,3 +266,18 @@ For detailed documentation on optimisation techniques used in this project, see 
   - **Key insight**: BMI2 quote indexing only works when escaping is context-free (CSV's `""`, not YAML's `\"`)
   - **Additional context-sensitivity**: YAML has two quote types (`"` vs `'`), block scalars (`|` `>`), and context-dependent quote meaning
   - See [docs/parsing/yaml.md#p6-bmi2-operations-pdeppext---rejected-](docs/parsing/yaml.md#p6-bmi2-operations-pdeppext---rejected-) for full analysis
+- ❌ P7 (Newline Index): **REJECTED** - use case mismatch (CLI feature, not parsing optimization)
+  - **Discovery**: JSON's `NewlineIndex` is NOT built during parsing
+    - Only used in `jq-locate` CLI tool for `--line X --column Y` → byte offset conversion
+    - Never built during JSON parsing, jq queries, or benchmarks
+    - Zero performance impact on actual JSON processing
+  - **YAML's current approach**: Lazy O(n) `current_line()` only on error paths
+    - 4 call sites, all in error reporting (TabIndentation, UnexpectedToken, etc.)
+    - Comment: "Only called on error paths, so we pay the cost only when needed"
+    - Benchmarks use valid YAML (no errors, so `current_line()` never called)
+  - **Two possible interpretations**:
+    - Option A (CLI feature): Add `yq-locate` tool with on-demand NewlineIndex (no benchmark impact)
+    - Option B (misguided): Build index during parsing (O(n) overhead with zero benefit for valid YAML)
+  - **Why Option B would fail**: Adds build cost to hot path (parsing) to optimize cold path (errors/CLI)
+  - **Pattern recognition**: Not all JSON features are optimizations - NewlineIndex is CLI UX, not performance
+  - See [docs/parsing/yaml.md#p7-newline-index---rejected-](docs/parsing/yaml.md#p7-newline-index---rejected-) for full analysis

@@ -1832,6 +1832,112 @@ YAML cannot use BMI2 like DSV does because:
 
 ---
 
+### P7: Newline Index - REJECTED ❌
+
+**Status:** Analyzed and rejected 2026-01-17 (not implemented)
+
+**Goal:** Build a newline index (bitvector + rank structure) for fast line number lookups, similar to JSON's `NewlineIndex`.
+
+**Analysis Findings:**
+
+**JSON's `NewlineIndex` usage:**
+- **NOT built during parsing** - only in `jq-locate` CLI tool
+- **Purpose:** Convert `--line X --column Y` to byte offset for user convenience
+- **Never used in:** JSON parsing, jq queries, or benchmarks
+- **Zero performance impact** on actual JSON processing
+
+**From `jq_locate.rs`:**
+```rust
+let offset = match (args.offset, args.line, args.column) {
+    (Some(off), None, None) => off,  // Direct offset - no index needed
+    (None, Some(line), Some(column)) => {
+        // Only build index if user provides line/column
+        let newline_index = NewlineIndex::build(&text);
+        newline_index.to_offset(line, column)?
+    }
+};
+```
+
+**YAML's current approach:**
+```rust
+fn current_line(&self) -> usize {
+    // Count newlines from start to current position
+    self.input[..self.pos].iter().filter(|&&b| b == b'\n').count() + 1
+}
+```
+- **Cost:** O(n) linear scan
+- **Comment:** "Only called on error paths, so we pay the cost only when needed."
+- **Call sites:** 4 total, all in error reporting (TabIndentation, UnexpectedToken, etc.)
+
+**Two possible interpretations of P7:**
+
+**Option A: CLI Tool Feature (like JSON)**
+- Add `yq-locate` tool for YAML
+- Build NewlineIndex only in CLI tool, on-demand
+- **No impact on parsing or benchmarks**
+- **Not a performance optimization** - just a UX feature
+
+**Option B: Build Index During Parsing (misguided)**
+- Build NewlineIndex during every YAML parse
+- Use for O(1) error reporting
+- **Impact on benchmarks:**
+  - Build cost: O(n) scan + storage (1 bit per byte + rank index)
+  - Benefit: Zero (benchmarks use valid YAML, never call `current_line()`)
+  - **Result: Pure overhead, regression**
+
+**Critical differences from JSON:**
+
+| Aspect | JSON | YAML |
+|--------|------|------|
+| **Builds NewlineIndex during parse?** | ❌ No | ❌ No (would be mistake) |
+| **Uses in benchmarks?** | ❌ No | ❌ No |
+| **Uses in CLI tools?** | ✅ Yes (`jq-locate`) | ❓ No `yq-locate` yet |
+| **Line number for errors** | Lazy O(n) scan | Lazy O(n) scan |
+
+**Why Option B would fail:**
+
+**Benchmark workloads:**
+- All valid YAML (no parse errors)
+- `current_line()` never called
+- Build index: O(n) cost
+- Use index: 0 times
+- **Net: Pure overhead** ❌
+
+**Error reporting:**
+- Build index: O(n) cost
+- Use index: 1-2 times per error
+- Save: O(n) → O(1) per lookup
+- **But:** Error reporting is not a hot path!
+
+**Why this differs from P5/P6:**
+
+| Optimization | Issue |
+|--------------|-------|
+| P5 (Flow SIMD) | Size mismatch (SIMD sweet spot vs real data) |
+| P6 (BMI2) | Grammar mismatch (can't apply DSV techniques) |
+| **P7 (Newline Index)** | **Use case mismatch** (CLI feature, not parsing optimization) |
+
+**Decision: REJECT P7 as a performance optimization**
+
+Reasons:
+1. ❌ **Not a performance feature** - JSON doesn't build it during parsing
+2. ❌ **No benchmark impact** - Only useful for CLI tools (not implemented)
+3. ❌ **Would cause regression** - O(n) build cost with zero benefit for valid YAML
+4. ❌ **Misunderstood precedent** - NewlineIndex is CLI UX, not optimization
+
+**Alternative (not a performance optimization):**
+- Could add `yq-locate` CLI tool with on-demand NewlineIndex
+- Would match JSON's approach (build only when needed)
+- **Not relevant to parsing performance benchmarks**
+
+**Key Lesson:**
+
+Not all features in JSON are performance optimizations. NewlineIndex is a CLI convenience feature built on-demand, not during normal parsing. Applying it to YAML parsing would be adding overhead to the hot path (parsing) to optimize the cold path (CLI tool that doesn't exist yet).
+
+**No implementation or micro-benchmarks performed.** Optimization rejected at analysis stage after discovering JSON's NewlineIndex is not built during parsing.
+
+---
+
 ### P4: NEON `classify_yaml_chars` Port - REJECTED ❌
 
 **Status:** Tested and rejected 2026-01-17
@@ -2499,8 +2605,8 @@ unsafe fn is_simple_kv_line(line: &[u8]) -> Option<(usize, usize)> {
 | ~~**P3**~~ | ~~Branchless Character Classification~~ | ~~2-4%~~ | Low | ❌ **REJECTED** (+25-44% regression!) |
 | ~~**P4**~~ | ~~Anchor/Alias SIMD~~ | ~~5-15%~~ | Medium | ✅ **DONE** (+6-17%) |
 | ~~**P5**~~ | ~~Flow Collection Fast Path~~ | ~~10-20%~~ | Medium | ❌ **REJECTED** (size mismatch - aborted at analysis) |
-| ~~**P6**~~ | ~~BMI2 operations (PDEP/PEXT)~~ | ~~3-8%~~ | Medium | ❌ **REJECTED** (size mismatch + bugs - aborted at analysis) |
-| **P7** | Newline Index | 2-5% | Medium | Pending |
+| ~~**P6**~~ | ~~BMI2 operations (PDEP/PEXT)~~ | ~~3-8%~~ | Medium | ❌ **REJECTED** (grammar mismatch - aborted at analysis) |
+| ~~**P7**~~ | ~~Newline Index~~ | ~~2-5%~~ | Medium | ❌ **REJECTED** (use case mismatch - CLI feature, not optimization) |
 | **P8** | AVX-512 variants | 0-10% (uncertain) | Medium | Low priority |
 
 **Achieved So Far:** P0 + P0+ + P2 + P2.5 + P2.7 + P4 = **+34-59% overall** improvement, **largest single gain: Block Scalar SIMD (+19-25%)**
