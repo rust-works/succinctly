@@ -206,3 +206,9 @@ For detailed documentation on optimisation techniques used in this project, see 
 - Wider SIMD != automatically faster (AVX-512 JSON was 10% slower than AVX2)
 - Algorithmic improvements beat micro-optimisations (cumulative index: 627x speedup)
 - Simpler data structures often outperform complex ones due to cache behaviour
+- Caching hot values eliminates repeated lookups (type checking: 1-17% improvement)
+
+**Recent YAML optimizations:**
+- P2.5 (Cached Type Checking): 1-17% improvement depending on nesting depth
+  - See [docs/parsing/yaml.md#p25-cached-type-checking](docs/parsing/yaml.md#p25-cached-type-checking) for details
+  - Best for deeply nested YAML (Kubernetes configs, CI/CD files)

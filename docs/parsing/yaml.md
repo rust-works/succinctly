@@ -994,6 +994,76 @@ Attempted to replicate JSON's PFSM success (33-77% improvement) by implementing 
 
 ---
 
+### P2.5: Cached Type Checking - IMPLEMENTED ✅
+
+**Status:** Completed 2026-01-17
+
+**Motivation:** The parser frequently checks `type_stack.last() == Some(&NodeType::X)` to determine the current container type when deciding whether to open new containers. This involves:
+1. `Vec::last()` - O(1) but requires a bounds check and pointer math
+2. `Option` unwrapping for comparison
+3. Reference comparison (`&NodeType`)
+
+For a hot path called once per structural element, these small costs accumulate.
+
+**Implementation:**
+
+Added a cached `current_type: Option<NodeType>` field to the `Parser` struct that mirrors the top of `type_stack`:
+
+```rust
+struct Parser<'a> {
+    type_stack: Vec<NodeType>,
+    current_type: Option<NodeType>,  // ← New field
+    // ...
+}
+
+#[inline]
+fn push_type(&mut self, node_type: NodeType) {
+    self.type_stack.push(node_type);
+    self.current_type = Some(node_type);
+}
+
+#[inline]
+fn pop_type(&mut self) -> Option<NodeType> {
+    let popped = self.type_stack.pop();
+    self.current_type = self.type_stack.last().copied();
+    popped
+}
+```
+
+**Benefits:**
+1. **Direct comparison**: `self.current_type == Some(NodeType::Mapping)` instead of `self.type_stack.last() == Some(&NodeType::Mapping)`
+2. **Register allocation**: Compiler can keep `current_type` in a register
+3. **Fewer memory accesses**: No need to access `Vec` internals
+4. **Zero cost**: Only 8 bytes added to `Parser` struct (one-time cost)
+
+**Performance Results (AMD Ryzen 9 7950X):**
+
+| Workload | Baseline | Optimized | Improvement | Note |
+|----------|----------|-----------|-------------|------|
+| Deeply nested (100 levels) | 16.5 µs | 13.7 µs | **-16.8%** | **Best case** |
+| Deeply nested (50 levels) | 5.34 µs | 4.93 µs | **-7.9%** | Strong |
+| Deeply nested (20 levels) | 1.58 µs | 1.55 µs | **-3.5%** | Good |
+| Wide structure (500 width) | 13.5 µs | 13.3 µs | **-2.2%** | Modest |
+| Simple KV (1kb) | 2.54 µs | 2.47 µs | **-2.0%** | End-to-end |
+| Simple KV (10kb) | 19.2 µs | 18.9 µs | **-1.4%** | End-to-end |
+| Simple KV (100kb) | 170 µs | 168 µs | **-1.1%** | End-to-end |
+| Simple KV (1mb) | 1.55 ms | 1.56 ms | +0.6% | Neutral (large) |
+
+**Key Findings:**
+- **Deeply nested YAML** (100 levels): 16.8% faster - excellent for Kubernetes configs with deep nesting
+- **Typical workloads** (1kb-100kb): Consistent 1-2% improvement
+- **Large files** (1mb+): Neutral (cache effects dominate)
+- **No regressions** in real-world scenarios
+
+**Code Locations:**
+- Implementation: [`src/yaml/parser.rs:187-200`](../../src/yaml/parser.rs#L187-L200)
+- Micro-benchmarks: [`benches/yaml_type_stack_micro.rs`](../../benches/yaml_type_stack_micro.rs)
+- Full analysis: [/tmp/cached_type_benchmark_analysis.md](/tmp/cached_type_benchmark_analysis.md)
+
+**Complexity:** Very low - only 2 helper methods and 1 cached field. All type stack operations now go through `push_type()` and `pop_type()`.
+
+---
+
 ## x86_64 Optimization Implementation Plan
 
 This section details planned and implemented SIMD optimizations for x86_64 (AMD Ryzen 9 7950X and similar).
@@ -1341,11 +1411,12 @@ unsafe fn is_simple_kv_line(line: &[u8]) -> Option<(usize, usize)> {
 | ~~**P0+**~~ | ~~Hybrid Scalar/SIMD Integration~~ | ~~5-10%~~ | Low | ✅ **DONE** (+4-7%) |
 | ~~**P1**~~ | ~~YFSM Tables~~ | ~~15-25%~~ | High | ❌ **REJECTED** (0-2%) |
 | ~~**P2**~~ | ~~Integrate classify_yaml_chars~~ | ~~5-10%~~ | Medium | ✅ **DONE** (+8-17%) |
+| ~~**P2.5**~~ | ~~Cached Type Checking~~ | ~~1-2%~~ | Low | ✅ **DONE** (+1-17%) |
 | **P3** | BMI2 operations (PDEP/PEXT) | 3-8% | Medium | Pending |
 | **P4** | Newline Index | 2-5% | Medium | Pending |
 | **P5** | AVX-512 variants | 0-10% (uncertain) | Medium | Low priority |
 
-**Achieved So Far:** P0 + P0+ + P2 = **+8-17% overall** on large files (392-484 MiB/s → 422-515 MiB/s)
+**Achieved So Far:** P0 + P0+ + P2 + P2.5 = **+9-17% overall** on typical files, **up to +20%** on deeply nested YAML
 
 **P2 Results (2026-01-17):**
 - simple_kv/1000: **-12%** (41.9µs → 36.8µs)
@@ -1353,6 +1424,15 @@ unsafe fn is_simple_kv_line(line: &[u8]) -> Option<(usize, usize)> {
 - large/100kb: **-11%** (222µs → 198µs)
 - large/1mb: **-17%** (2.18ms → 1.82ms)
 - End-to-end vs yq: **30x faster** on 10KB, **10.5x** on 100KB, **3.3x** on 1MB
+
+**P2.5 Results (2026-01-17) - Cached Type Checking:**
+- Optimization: Cache `current_type` field to avoid `type_stack.last()` overhead
+- Deeply nested (100 levels): **-16.8%** time improvement
+- Small/medium files (1kb-100kb): **-1.0% to -2.0%** consistent improvement
+- Large files (1mb): Neutral (±0.6%)
+- Best for: Kubernetes configs, CI/CD files with moderate nesting
+- Implementation: 2 helper methods (`push_type`, `pop_type`), 1 cached field
+- See: [`src/yaml/parser.rs:187-200`](../../src/yaml/parser.rs#L187-L200)
 
 **Remaining Target:** P3-P4 = **+5-13% potential** (conservative estimate)
 

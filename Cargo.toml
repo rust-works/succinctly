@@ -137,3 +137,7 @@ harness = false
 [[bench]]
 name = "yq_comparison"
 harness = false
+
+[[bench]]
+name = "yaml_type_stack_micro"
+harness = false
