@@ -176,9 +176,9 @@ To regenerate: `cargo bench --bench jq_comparison`
 
 | Size      | succinctly            | yq                    | Speedup    |
 |-----------|-----------------------|-----------------------|------------|
-| **10KB**  |  4.0 ms  (2.5 MiB/s)  |  8.1 ms  (1.2 MiB/s)  | **2.0x**   |
-| **100KB** |  6.7 ms (13.7 MiB/s)  | 19.7 ms  (4.7 MiB/s)  | **2.9x**   |
-| **1MB**   | 32.0 ms (28.8 MiB/s)  |118.9 ms  (7.8 MiB/s)  | **3.7x**   |
+| **10KB**  |  4.5 ms  (2.2 MiB/s)  |  7.5 ms  (1.3 MiB/s)  | **1.7x**   |
+| **100KB** | 10.6 ms  (8.6 MiB/s)  | 19.8 ms  (4.6 MiB/s)  | **1.9x**   |
+| **1MB**   | 72.9 ms (12.7 MiB/s)  |118.6 ms  (7.8 MiB/s)  | **1.6x**   |
 
 To regenerate: `cargo bench --bench yq_comparison`
 

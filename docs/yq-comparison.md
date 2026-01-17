@@ -33,21 +33,21 @@ cargo bench --bench yq_comparison
 
 ## Summary Results
 
-### ARM (Apple M1 Max) - yq Identity Comparison (comprehensive pattern)
+### ARM (Apple M1 Max) - yq Identity Comparison (users pattern)
 
 | Size      | succinctly   | yq           | Speedup       |
 |-----------|--------------|--------------|---------------|
-| **10KB**  |   4.9 ms     |   8.1 ms     | **1.7x**      |
-| **100KB** |  11.4 ms     |  20.0 ms     | **1.8x**      |
-| **1MB**   |  72.7 ms     | 119.4 ms     | **1.6x**      |
+| **10KB**  |   4.5 ms     |   7.5 ms     | **1.7x**      |
+| **100KB** |  10.6 ms     |  19.8 ms     | **1.9x**      |
+| **1MB**   |  72.9 ms     | 118.6 ms     | **1.6x**      |
 
 #### Throughput Comparison (ARM)
 
 | Size      | succinctly      | yq             | Ratio         |
 |-----------|-----------------|----------------|---------------|
-| **10KB**  |   2.0 MiB/s     |   1.2 MiB/s    | **1.7x**      |
-| **100KB** |   8.1 MiB/s     |   4.6 MiB/s    | **1.8x**      |
-| **1MB**   |  12.7 MiB/s     |   7.7 MiB/s    | **1.6x**      |
+| **10KB**  |   2.2 MiB/s     |   1.3 MiB/s    | **1.7x**      |
+| **100KB** |   8.6 MiB/s     |   4.6 MiB/s    | **1.9x**      |
+| **1MB**   |  12.7 MiB/s     |   7.8 MiB/s    | **1.6x**      |
 
 ### x86_64 (AMD Ryzen 9 7950X) - Internal Micro-Benchmarks (P0+ Optimized)
 
