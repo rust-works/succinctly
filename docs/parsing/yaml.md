@@ -865,6 +865,412 @@ End-to-end yq identity filter benchmarks after adding SIMD indentation:
 
 **Summary:** Baseline throughput ranges from 176-491 MiB/s for structured data, with string scanning achieving 2.8-3.0 GiB/s. This establishes a performance baseline before AVX2/AVX-512 optimizations.
 
+---
+
+## x86_64 Optimization Implementation Plan
+
+This section details planned SIMD and other optimizations for x86_64 (AMD Ryzen 9 7950X and similar), based on proven techniques from the JSON parser.
+
+### Current SIMD Implementation (Baseline)
+
+The YAML parser currently uses basic SIMD operations in [`src/yaml/simd/x86.rs`](../../src/yaml/simd/x86.rs:1):
+
+| Function | SSE2 | AVX2 | Usage | Speedup |
+|----------|------|------|-------|---------|
+| `find_quote_or_escape` | ✓ | ✓ | Double-quoted string scanning | ~8-9% |
+| `find_single_quote` | ✓ | ✓ | Single-quoted string scanning | ~8-9% |
+| `count_leading_spaces` | ✓ | ✓ | Indentation counting | ~14-24% |
+
+**Throughput:** 16 bytes/iteration (SSE2), 32 bytes/iteration (AVX2)
+
+### JSON Parser Techniques (Proven on x86_64)
+
+Analysis of [`src/json/simd/`](../../src/json/simd/) reveals these techniques:
+
+#### 1. **Multi-Character Classification** ([x86.rs](../../src/json/simd/x86.rs:44-123), [avx2.rs](../../src/json/simd/avx2.rs:44-129))
+
+JSON classifies 6 character classes in parallel per 16/32-byte chunk:
+- Quotes (`"`)
+- Backslashes (`\`)
+- Opens (`{`, `[`)
+- Closes (`}`, `]`)
+- Delimiters (`,`, `:`)
+- Value characters (alphanumeric, `.`, `-`, `+`)
+
+**Technique:** Single SIMD load + multiple comparisons + movemask → 6 bitmasks
+
+```rust
+unsafe fn classify_chars(chunk: __m256i) -> CharClass {
+    let eq_quote = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'"' as i8));
+    let eq_backslash = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'\\' as i8));
+    // ... more comparisons
+    CharClass {
+        quotes: _mm256_movemask_epi8(eq_quote) as u32,
+        backslashes: _mm256_movemask_epi8(eq_backslash) as u32,
+        // ... 4 more masks
+    }
+}
+```
+
+**Benefit:** 1 load + 6-8 vector ops = bulk classification
+
+#### 2. **PFSM Tables** ([pfsm_tables.rs](../../src/json/pfsm_tables.rs:1-150))
+
+Pre-computed state transition tables eliminate branching:
+
+```rust
+pub const TRANSITION_TABLE: [u32; 256];  // (byte, state) → next_state
+pub const PHI_TABLE: [u32; 256];         // (byte, state) → output_bits (IB/BP)
+```
+
+**Access pattern:**
+```rust
+let trans = TRANSITION_TABLE[byte as usize];
+let next_state = (trans >> (state * 8)) & 0xFF;
+let phi = PHI_TABLE[byte as usize];
+let output_bits = (phi >> (state * 8)) & 0x07;
+```
+
+**Benefit:** Branch-free state machine, predictable memory access
+
+#### 3. **BMI2 Bit Manipulation** ([bmi2.rs](../../src/json/simd/bmi2.rs:1-200))
+
+PDEP/PEXT for efficient bitmask manipulation:
+- **PEXT:** Extract bits matching mask positions
+- **PDEP:** Deposit bits to mask positions
+
+**Warning:** AMD Zen 1/2 have 18-cycle PDEP/PEXT (microcode). Only use on:
+- Intel Haswell+ (3 cycles)
+- AMD Zen 3+ (3 cycles)
+
+Current system (Ryzen 9 7950X = Zen 4) is **fast path eligible**.
+
+#### 4. **Range-Based Character Detection**
+
+Efficient alphanumeric detection using unsigned comparison trick:
+
+```rust
+// Check if c >= 'a' && c <= 'z'
+let v_a = _mm256_set1_epi8(b'a' as i8);
+let range = _mm256_set1_epi8((b'z' - b'a') as i8);
+let sub_a = _mm256_sub_epi8(chunk, v_a);
+let lowercase = _mm256_cmpeq_epi8(_mm256_min_epu8(sub_a, range), sub_a);
+```
+
+**Benefit:** Single comparison for range instead of 2 comparisons
+
+---
+
+### Proposed Optimizations for YAML (x86_64)
+
+Based on baseline benchmarks and JSON techniques, here are high-value optimizations:
+
+#### **Optimization 1: Multi-Character Classification**
+
+**Target:** Core parsing loop in [`src/yaml/parser.rs`](../../src/yaml/parser.rs:666-1647)
+
+**Approach:** Classify YAML structural characters in bulk, similar to JSON.
+
+**YAML Structural Characters:**
+| Character(s) | Meaning | Detection |
+|-------------|---------|-----------|
+| `:` + space | Mapping separator | Compare + AND with shifted space mask |
+| `-` + space | Sequence item | Compare + AND with shifted space mask |
+| `#` | Comment start | Compare |
+| `"`, `'` | Quote delimiters | Compare (already done) |
+| `\n` | Line boundary | Compare |
+| ` ` (space) | Indentation/whitespace | Compare (already done) |
+| `{`, `}`, `[`, `]` | Flow style | Compare |
+| `\|`, `>` | Block scalars | Compare |
+| `&`, `*` | Anchors/aliases | Compare |
+
+**Implementation:**
+
+```rust
+#[derive(Debug, Clone, Copy)]
+struct YamlCharClass {
+    newlines: u32,       // \n
+    colons: u32,         // :
+    hyphens: u32,        // -
+    spaces: u32,         // space (for indentation + context detection)
+    quotes_double: u32,  // "
+    quotes_single: u32,  // '
+    backslashes: u32,    // \
+    flow_open: u32,      // { or [
+    flow_close: u32,     // } or ]
+    block_scalar: u32,   // | or >
+    anchors: u32,        // & or *
+    hash: u32,           // # (comments)
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn classify_yaml_chars_avx2(chunk: __m256i) -> YamlCharClass {
+    // Similar to JSON classify_chars, but for YAML characters
+    // ~12 comparisons, 1 load = still faster than byte-by-byte
+}
+```
+
+**Context-Sensitive Detection:**
+- `: ` pattern: `colon_mask & (space_mask << 1)` = positions where `:` followed by space
+- `- ` pattern: `hyphen_mask & (space_mask << 1)` = sequence items
+
+**Expected Improvement:** 10-20% faster parsing (reduces branches in hot loops)
+
+**Files to Modify:**
+- `src/yaml/simd/x86.rs` - Add `classify_yaml_chars_*` functions
+- `src/yaml/parser.rs` - Use classification in parsing loops (lines 666-1647)
+
+---
+
+#### **Optimization 2: Newline Index with SIMD**
+
+**Target:** Indentation tracking (currently line-by-line)
+
+**Approach:** Pre-scan entire document for newlines using SIMD, build rank/select index.
+
+**Algorithm:**
+
+1. **SIMD Newline Detection** (32 bytes/iter with AVX2):
+```rust
+#[target_feature(enable = "avx2")]
+unsafe fn find_newlines_avx2(input: &[u8]) -> Vec<u64> {
+    let newline_vec = _mm256_set1_epi8(b'\n' as i8);
+    let mut newline_bits = vec![0u64; input.len().div_ceil(64)];
+
+    for (chunk_idx, chunk) in input.chunks(32).enumerate() {
+        let data = _mm256_loadu_si256(chunk.as_ptr() as *const __m256i);
+        let matches = _mm256_cmpeq_epi8(data, newline_vec);
+        let mask = _mm256_movemask_epi8(matches) as u32;
+
+        // Deposit mask into newline_bits at appropriate word/bit position
+        // (details omitted for brevity)
+    }
+    newline_bits
+}
+```
+
+2. **Build Lightweight Rank Index:**
+```rust
+pub struct NewlineIndex {
+    newlines: Vec<u64>,         // Bit vector of newline positions
+    cumulative_rank: Vec<u32>,  // Rank every 512 bits (8 words)
+}
+```
+
+3. **O(1) Line Number Lookup:**
+```rust
+fn line_at_offset(&self, offset: usize) -> usize {
+    // rank1(offset) = line number
+    let word_idx = offset / 64;
+    let base_rank = self.cumulative_rank[word_idx / 8];
+    let residual = ...; // popcount within word
+    base_rank + residual
+}
+```
+
+**Expected Improvement:**
+- Newline pre-scan: ~3-5% overhead
+- Line lookups: O(n) → O(1) (useful for `locate_offset()`)
+- Net: ~2-5% faster overall (amortized over large files)
+
+**Files to Modify:**
+- New file: `src/yaml/newline_index.rs`
+- `src/yaml/parser.rs` - Use newline index for line tracking
+- `src/yaml/locate.rs` - Use for O(1) line lookups
+
+---
+
+#### **Optimization 3: YFSM Tables (YAML Finite State Machine)**
+
+**Target:** Replace branchy state machine with table lookups (like JSON PFSM)
+
+**Challenge:** YAML has more states than JSON due to context sensitivity.
+
+**JSON States (4):**
+- InJson, InString, InEscape, InValue
+
+**YAML States (8-10 needed):**
+- Block, InKey, InValue, InString, InEscape, InSingle, FlowMap, FlowSeq, InBlockScalar, InComment
+
+**Table Size:**
+- Transition: `256 * 10 bytes = 2.5 KB` (fits in L1 cache)
+- Phi output: `256 * 10 bytes = 2.5 KB`
+
+**Challenge:** YAML's indentation sensitivity requires external stack state (indent levels).
+
+**Hybrid Approach:**
+1. **YFSM handles string/escape states** (table-driven, branch-free)
+2. **Indentation stack remains** (inherently sequential, can't be table-ized)
+3. **Structural characters use YFSM** for IB/BP emission
+
+**Implementation:**
+
+```rust
+pub const YAML_TRANSITION_TABLE: [u64; 256];  // 8 states packed in u64
+pub const YAML_PHI_TABLE: [u64; 256];         // Output bits per state
+
+#[inline]
+fn yfsm_step(byte: u8, state: YfsmState) -> (YfsmState, u8) {
+    let trans = YAML_TRANSITION_TABLE[byte as usize];
+    let next_state = ((trans >> (state as u32 * 8)) & 0xFF) as u8;
+
+    let phi = YAML_PHI_TABLE[byte as usize];
+    let output = ((phi >> (state as u32 * 8)) & 0xFF) as u8;
+
+    (next_state.into(), output)
+}
+```
+
+**Expected Improvement:** 15-25% faster (proven from JSON: PFSM gave 33-77% speedup)
+
+**Files to Create/Modify:**
+- New: `src/yaml/yfsm_tables.rs` - Pre-computed tables
+- New: `src/bin/generate_yfsm_tables.rs` - Table generator
+- `src/yaml/parser.rs` - Use YFSM in place of manual state transitions
+
+---
+
+#### **Optimization 4: Speculative Inline Parsing**
+
+**Target:** Common YAML patterns (e.g., `key: value`)
+
+**Approach:** Fast-path for simple key-value pairs without full state machine.
+
+**Pattern Detection (SIMD-assisted):**
+
+```rust
+#[target_feature(enable = "avx2")]
+unsafe fn is_simple_kv_line(line: &[u8]) -> Option<(usize, usize)> {
+    // Find colon position using SIMD
+    let colon_vec = _mm256_set1_epi8(b':' as i8);
+    // ... (similar to find_quote_or_escape)
+
+    // Verify: colon followed by space, no quotes before colon
+    if colon_found && line[colon_pos + 1] == b' ' {
+        return Some((indent, colon_pos));
+    }
+    None
+}
+```
+
+**Fast Path:**
+- Detect `  key: value` pattern
+- Skip full parser, directly emit IB/BP bits
+- Fall back to full parser for complex cases
+
+**Expected Improvement:** 10-15% on config files (many simple KV pairs)
+
+**Files to Modify:**
+- `src/yaml/parser.rs` - Add speculative parse path before full parse
+
+---
+
+#### **Optimization 5: AVX-512 Exploration (Optional)**
+
+**Platform:** AMD Ryzen 9 7950X has AVX-512 support (F, DQ, BW, VL, VBMI, VBMI2, VNNI).
+
+**Approach:** Process 64 bytes/iteration instead of 32.
+
+**Functions to AVX-512-ize:**
+- `classify_yaml_chars_avx512` - 64-byte classification
+- `find_newlines_avx512` - 64-byte newline scan
+- `count_leading_spaces_avx512` - 64-byte space counting
+
+**Warning from JSON experience:**
+> "Wider SIMD != automatically faster (AVX-512 JSON was 10% slower than AVX2)"
+> — [docs/optimisations/README.md](../optimisations/README.md)
+
+**Reasons AVX-512 can be slower:**
+- Frequency throttling (CPU reduces clock speed with AVX-512)
+- Cache alignment issues
+- Overhead of extracting 64-bit masks
+
+**Recommendation:**
+- Implement AVX-512 variants
+- Benchmark against AVX2
+- Only use if >5% faster
+- Provide runtime dispatch
+
+**Files to Create:**
+- `src/yaml/simd/avx512.rs` - AVX-512 implementations (if beneficial)
+
+---
+
+### Implementation Priority
+
+| Priority | Optimization | Expected Gain | Complexity | Dependencies |
+|----------|--------------|---------------|------------|--------------|
+| **P0** | Multi-Character Classification | 10-20% | Medium | None |
+| **P0** | Enhance existing SIMD (quote/space) | 5-10% | Low | None |
+| **P1** | YFSM Tables | 15-25% | High | P0 (classification) |
+| **P2** | Newline Index | 2-5% | Medium | None |
+| **P2** | Speculative Inline Parsing | 10-15% | Medium | P0 (classification) |
+| **P3** | AVX-512 variants | 0-10% (uncertain) | Medium | P0, P1 |
+
+**Total Expected Improvement:** 40-60% faster parsing (conservative estimate)
+
+**Target:** 300-700 MiB/s (from current 176-491 MiB/s baseline)
+
+---
+
+### Benchmarking Strategy
+
+After each optimization:
+
+1. **Run micro-benchmarks:**
+```bash
+cargo bench --bench yaml_bench
+```
+
+2. **Compare against baseline:**
+```bash
+# Save results to dated file
+cargo bench --bench yaml_bench > .ai/scratch/yaml_bench_after_P0_opt.txt
+```
+
+3. **Update docs with results** in this section
+
+4. **Profile hot paths:**
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --release --example yaml_profile
+./target/release/examples/yaml_profile data/bench/yaml/100kb.yaml
+```
+
+---
+
+### Hardware-Specific Notes
+
+**AMD Ryzen 9 7950X (Zen 4):**
+- ✓ AVX2: 32 bytes/cycle (use this as primary path)
+- ✓ AVX-512: 64 bytes/cycle (benchmark carefully)
+- ✓ BMI2: 3-cycle PDEP/PEXT (Zen 3+, usable)
+- ✓ POPCNT: 1-cycle (use liberally)
+- L1 cache: 512 KB (16×32 KB) - tables fit easily
+- L2 cache: 16 MB (16×1 MB) - excellent for working set
+- L3 cache: 32 MB - shared, use for large buffers
+
+**Optimization Guideline:**
+- Favor AVX2 over AVX-512 unless proven faster
+- Use BMI2 where appropriate (fast on Zen 4)
+- Keep hot tables <32 KB for L1 residency
+- Align buffers to 32-byte boundaries for AVX2
+
+---
+
+### References
+
+**Implemented JSON Optimizations:**
+- [SIMD x86 module](../../src/json/simd/x86.rs)
+- [AVX2 module](../../src/json/simd/avx2.rs)
+- [PFSM tables](../../src/json/pfsm_tables.rs)
+- [BMI2 utilities](../../src/json/simd/bmi2.rs)
+
+**Optimization Documentation:**
+- [SIMD techniques](../optimisations/simd.md)
+- [Bit manipulation](../optimisations/bit-manipulation.md)
+- [State machines](../optimisations/state-machines.md)
+- [Optimization overview](../optimisations/README.md)
+
 ### Integration with Parser
 
 #### String Scanning
