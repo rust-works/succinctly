@@ -2023,23 +2023,16 @@ Profiling the end-to-end pipeline on 1MB YAML files reveals:
 | **BP** (Balanced Parens) | Tree structure | ✓ RangeMin for O(1) `find_close` |
 | **TY** (Type Bits) | 0=mapping, 1=sequence | ✗ Linear scan |
 | **seq_items** | Sequence item markers | ✗ Linear scan |
-| **containers** | Container markers | ✗ Linear scan |
+| **containers** | Container markers | ✓ `containers_rank` cumulative |
 | **bp_to_text** | BP position → text offset | ✓ Dense array O(1) |
 
-### Opportunity 1: Cumulative Index for `containers`
+### Opportunity 1: Cumulative Index for `containers` ✓ IMPLEMENTED
 
-**Current**: `count_containers_before(bp_pos)` iterates word-by-word:
-```rust
-for word in container_words.iter().take(word_idx) {
-    count += word.count_ones() as usize;
-}
-```
+**Status**: Implemented. `containers_rank: Vec<u32>` added to `YamlIndex`.
 
-**Proposed**: Add `containers_rank: Vec<u32>` cumulative popcount index (like `ib_rank`).
+**Result**: `count_containers_before()` now uses O(1) cumulative lookup instead of O(n) iteration.
 
-**Impact**: `is_sequence_at_bp()` called for every container during traversal becomes O(1).
-
-**Cost**: ~16KB overhead per 1MB file (one u32 per 64 BP positions).
+**Measured Impact**: ~7% improvement in To JSON phase (30ms → 28ms for 1MB).
 
 ### Opportunity 2: Cumulative Index for `seq_items`
 
@@ -2125,14 +2118,34 @@ for (start, end) in structural_segments {
 
 ### Priority Ranking
 
-| Opportunity | Effort | Impact | Priority |
-|-------------|--------|--------|----------|
-| 1. `containers_rank` | Low | Medium | **P1** |
-| 4. String boundaries | Medium | High | **P1** |
-| 3. Pack flag in bp_to_text | Low | Low | **P2** |
-| 5. SIMD JSON escaping | Medium | Medium | **P2** |
-| 2. `seq_items_rank` | Low | Low | **P3** |
-| 6. Streaming identity | High | High | **P3** |
+| Opportunity | Effort | Impact | Priority | Status |
+|-------------|--------|--------|----------|--------|
+| 1. `containers_rank` | Low | Medium | **P1** | ✓ Done |
+| 4. String boundaries | Medium | High | **P1** | Pending |
+| 3. Pack flag in bp_to_text | Low | Low | **P2** | Pending |
+| 5. SIMD JSON escaping | Medium | Medium | **P2** | Pending |
+| 2. `seq_items_rank` | Low | Low | **P3** | Pending |
+| 6. Streaming identity | High | High | **P3** | Pending |
+
+### Detailed Bottleneck Analysis
+
+Profiling 1MB YAML (111,529 nodes, 93% strings) reveals:
+
+| Component | Time | % of Total | Notes |
+|-----------|------|------------|-------|
+| Tree traversal (`value()` calls) | ~25 ms | 90% | The dominant cost |
+| String formatting overhead | ~2.7 ms | 10% | Much smaller than expected |
+
+**Per-node breakdown** (104,091 string nodes):
+- Time per node: ~225 ns
+- Time per string: ~241 ns
+
+**Key functions called per scalar**:
+1. `compute_base_indent_and_root_flag()` - scans backward to line start, forward to find `:`, `-`, `?`
+2. `find_plain_scalar_end()` - scans forward to find scalar boundary
+3. `is_in_flow_context()` - quick path if no `[` or `{` in recent text
+
+**Implication**: String boundary pre-computation (Opportunity 4) would have the highest impact by eliminating `find_plain_scalar_end()` during traversal. Estimated reduction from 241 ns to ~50 ns per string could save ~20ms.
 
 ---
 
