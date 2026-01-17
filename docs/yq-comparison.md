@@ -215,6 +215,9 @@ The YAML parser uses platform-specific SIMD for hot paths:
 - Context-sensitive pattern detection capabilities (e.g., `: ` and `- `)
 - Newline detection infrastructure (ready for future use)
 
+**Rejected Optimizations:**
+- **P1 (YFSM)**: Table-driven state machine for string parsing tested but showed only 0-2% improvement vs expected 15-25%. YAML strings are too simple compared to JSON (where PFSM succeeded with 33-77% gains). P0+ SIMD already optimal. See [docs/parsing/yaml.md](parsing/yaml.md#p1-yfsm-yaml-finite-state-machine---rejected-) for full analysis.
+
 ### Trade-offs
 
 - **Small files (<1KB)**: Process startup dominates; speedup is modest (~1.7x)

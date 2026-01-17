@@ -953,6 +953,47 @@ See [Tuning Opportunities](#unquoted-structural-scanning-tuning) below for propo
 
 ---
 
+### P1: YFSM (YAML Finite State Machine) - REJECTED ❌
+
+**Status:** Tested and rejected 2026-01-17
+
+Attempted to replicate JSON's PFSM success (33-77% improvement) by implementing table-driven state machine for YAML string parsing.
+
+**Implementation Details:**
+- 5-state machine: Block, InDoubleQuote, InSingleQuote, InEscape, InComment
+- Pre-computed tables: `TRANSITION_TABLE[256]`, `PHI_TABLE[256]` (4KB total)
+- Branch-free state transitions via table lookups
+- All 719 tests passed ✅
+
+**Performance Results (AMD Ryzen 9 7950X):**
+
+| Benchmark | P0+ Baseline | YFSM | Change |
+|-----------|-------------|------|--------|
+| quoted/double/1000 | 46.898 µs @ 990.95 MiB/s | 47.073 µs @ 987.64 MiB/s | **-0.3%** |
+| quoted/single/1000 | 50.073 µs @ 851.24 MiB/s | 50.250 µs @ 849.27 MiB/s | **-0.4%** |
+| long_strings/double/64b | 7.6155 µs @ 923.71 MiB/s | 7.4822 µs @ 939.83 MiB/s | **+1.7%** |
+| long_strings/double/256b | 19.577 µs @ 1.2548 GiB/s | 19.384 µs @ 1.2770 GiB/s | **+1.0%** |
+
+**Conclusion:** YFSM provides **0-2% improvement** vs expected **15-25%**. Rejected because:
+
+1. ❌ **No significant performance gain** - YAML strings are too simple compared to JSON
+2. ❌ **P0+ SIMD already optimal** - Table lookups (2 per byte) slower than SIMD (32 bytes at once)
+3. ❌ **Wrong optimization target** - YAML bottlenecks are indentation/context, not strings
+4. ❌ **Added complexity** - 4KB tables + generator + state machine for minimal benefit
+
+**Why YFSM Failed:**
+
+| Factor | JSON (PFSM Success) | YAML (YFSM Failure) |
+|--------|---------------------|---------------------|
+| String complexity | High (nested, escapes, surrogates) | Low (flat, simple escapes) |
+| Baseline performance | ~600 MiB/s | ~990 MiB/s (P0+ SIMD) |
+| SIMD applicability | Moderate (complex patterns) | High (simple quote/escape) |
+| Table lookup cost | Worth it (complex logic) | Not worth it (simple SIMD wins) |
+
+**Full analysis:** [.ai/scratch/yfsm_experiment_results.md](../../.ai/scratch/yfsm_experiment_results.md)
+
+---
+
 ## x86_64 Optimization Implementation Plan
 
 This section details planned and implemented SIMD optimizations for x86_64 (AMD Ryzen 9 7950X and similar).
@@ -1294,18 +1335,19 @@ unsafe fn is_simple_kv_line(line: &[u8]) -> Option<(usize, usize)> {
 
 ### Implementation Priority
 
-| Priority | Optimization | Expected Gain | Complexity | Dependencies |
-|----------|--------------|---------------|------------|--------------|
-| **P0** | Multi-Character Classification | 10-20% | Medium | None |
-| **P0** | Enhance existing SIMD (quote/space) | 5-10% | Low | None |
-| **P1** | YFSM Tables | 15-25% | High | P0 (classification) |
-| **P2** | Newline Index | 2-5% | Medium | None |
-| **P2** | Speculative Inline Parsing | 10-15% | Medium | P0 (classification) |
-| **P3** | AVX-512 variants | 0-10% (uncertain) | Medium | P0, P1 |
+| Priority | Optimization | Expected Gain | Complexity | Status |
+|----------|--------------|---------------|------------|--------|
+| ~~**P0**~~ | ~~Multi-Character Classification~~ | ~~10-20%~~ | Medium | ✅ **DONE** (+4-10%) |
+| ~~**P0+**~~ | ~~Hybrid Scalar/SIMD Integration~~ | ~~5-10%~~ | Low | ✅ **DONE** (+4-7%) |
+| ~~**P1**~~ | ~~YFSM Tables~~ | ~~15-25%~~ | High | ❌ **REJECTED** (0-2%) |
+| **P2** | Integrate classify_yaml_chars | 5-10% | Medium | 🔜 **NEXT** |
+| **P3** | BMI2 operations (PDEP/PEXT) | 3-8% | Medium | Pending |
+| **P4** | Newline Index | 2-5% | Medium | Pending |
+| **P5** | AVX-512 variants | 0-10% (uncertain) | Medium | Low priority |
 
-**Total Expected Improvement:** 40-60% faster parsing (conservative estimate)
+**Achieved So Far:** P0 + P0+ = **+4-10% overall** (176-491 MiB/s → 187-550 MiB/s)
 
-**Target:** 300-700 MiB/s (from current 176-491 MiB/s baseline)
+**Remaining Target:** P2-P4 = **+10-23% potential** (conservative estimate)
 
 ---
 
