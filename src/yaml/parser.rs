@@ -364,6 +364,42 @@ impl<'a> Parser<'a> {
         super::simd::find_newline(self.input, self.pos)
     }
 
+    /// SIMD fast-path for skipping regular characters in unquoted values.
+    /// Returns the number of bytes that can be safely skipped, or None if
+    /// a potential terminator was found immediately.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn skip_unquoted_simd(&self, _value_start: usize) -> Option<usize> {
+        // Use classify_yaml_chars to scan 32 bytes at once
+        if let Some(class) = super::simd::classify_yaml_chars(self.input, self.pos) {
+            // Check for any potential terminators: newline, colon, or hash
+            let terminators = class.newlines | class.colons | class.hash;
+
+            if terminators == 0 {
+                // No structural characters in this 32-byte chunk - safe to skip all
+                let chunk_size = if self.pos + 32 <= self.input.len() {
+                    32
+                } else {
+                    16
+                };
+                return Some(chunk_size);
+            }
+
+            // Found a potential terminator - find its position
+            let first_pos = terminators.trailing_zeros() as usize;
+
+            // If it's at position 0, we can't skip anything
+            if first_pos == 0 {
+                return None;
+            }
+
+            // We can safely skip up to the terminator position
+            Some(first_pos)
+        } else {
+            None
+        }
+    }
+
     /// Count leading spaces (indentation) at start of a line.
     fn count_indent(&self) -> Result<usize, YamlError> {
         // Use SIMD-accelerated space counting
@@ -773,6 +809,7 @@ impl<'a> Parser<'a> {
 
         loop {
             // Parse content on current line
+            // Use inline scalar loop for common case, SIMD for long runs
             while let Some(b) = self.peek() {
                 match b {
                     b'\n' => break,
@@ -794,7 +831,18 @@ impl<'a> Parser<'a> {
                         }
                         self.advance();
                     }
-                    _ => self.advance(),
+                    _ => {
+                        // SIMD fast-path: skip long runs of regular characters
+                        // Only use SIMD if we have enough remaining bytes to justify overhead
+                        #[cfg(target_arch = "x86_64")]
+                        if self.input.len() - self.pos >= 32 {
+                            if let Some(skip) = self.skip_unquoted_simd(start) {
+                                self.advance_by(skip);
+                                continue;
+                            }
+                        }
+                        self.advance();
+                    }
                 }
             }
 
@@ -934,7 +982,17 @@ impl<'a> Parser<'a> {
                     }
                     self.advance();
                 }
-                _ => self.advance(),
+                _ => {
+                    // SIMD fast-path: skip long runs of regular characters
+                    #[cfg(target_arch = "x86_64")]
+                    if self.input.len() - self.pos >= 32 {
+                        if let Some(skip) = self.skip_unquoted_simd(start) {
+                            self.advance_by(skip);
+                            continue;
+                        }
+                    }
+                    self.advance();
+                }
             }
         }
 

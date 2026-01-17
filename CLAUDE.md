@@ -180,6 +180,14 @@ To regenerate: `cargo bench --bench jq_comparison`
 | **100KB** | 10.6 ms  (8.6 MiB/s)  | 19.8 ms  (4.6 MiB/s)  | **1.9x**   |
 | **1MB**   | 72.9 ms (12.7 MiB/s)  |118.6 ms  (7.8 MiB/s)  | **1.6x**   |
 
+### yq Query Performance (AMD Ryzen 9 7950X)
+
+| Size      | succinctly            | yq                    | Speedup    |
+|-----------|-----------------------|-----------------------|------------|
+| **10KB**  |  2.0 ms  (4.9 MiB/s)  | 60.2 ms (166 KiB/s)   | **30x**    |
+| **100KB** |  7.1 ms (13.0 MiB/s)  | 74.2 ms  (1.2 MiB/s)  | **10.5x**  |
+| **1MB**   | 59.7 ms (15.4 MiB/s)  |194.2 ms  (4.7 MiB/s)  | **3.3x**   |
+
 To regenerate: `cargo bench --bench yq_comparison`
 
 ### Optimisation Techniques

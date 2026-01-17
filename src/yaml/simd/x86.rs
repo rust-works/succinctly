@@ -10,7 +10,9 @@ use core::arch::x86_64::*;
 // ============================================================================
 
 /// Character classification results for a 32-byte chunk (AVX2).
+/// Some fields are not currently used but are part of the classification infrastructure.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct YamlCharClass {
     /// Mask of bytes that are '\n'
     pub newlines: u32,

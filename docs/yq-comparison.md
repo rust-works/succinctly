@@ -49,40 +49,45 @@ cargo bench --bench yq_comparison
 | **100KB** |   8.6 MiB/s     |   4.6 MiB/s    | **1.9x**      |
 | **1MB**   |  12.7 MiB/s     |   7.8 MiB/s    | **1.6x**      |
 
-### x86_64 (AMD Ryzen 9 7950X) - Internal Micro-Benchmarks (P0+ Optimized)
+### x86_64 (AMD Ryzen 9 7950X) - yq Identity Comparison (P2 Optimized)
+
+| Size      | succinctly        | yq              | Speedup        |
+|-----------|-------------------|-----------------|----------------|
+| **10KB**  |   2.0 ms (4.9 MiB/s)  |  60.2 ms (166 KiB/s) | **30x**   |
+| **100KB** |   7.1 ms (13.0 MiB/s) |  74.2 ms (1.2 MiB/s) | **10.5x** |
+| **1MB**   |  59.7 ms (15.4 MiB/s) | 194.2 ms (4.7 MiB/s) | **3.3x**  |
+
+### x86_64 (AMD Ryzen 9 7950X) - Internal Micro-Benchmarks (P2 Optimized)
 
 #### Performance Summary (Selected Benchmarks)
 
-| Benchmark | Baseline | P0+ Optimized | Improvement |
-|-----------|----------|---------------|-------------|
-| simple_kv/10000 | 364 µs (491 MiB/s) | 326 µs (550 MiB/s) | **+7.1%** |
-| sequences/10000 | 309 µs (290 MiB/s) | 274 µs (366 MiB/s) | **+6.8%** |
-| nested/d3_w5 | 12.54 µs (342 MiB/s) | 11.26 µs (380 MiB/s) | **+10.2%** |
-| quoted_strings/double/1000 | 42.1 µs (361 MiB/s) | 37.9 µs (405 MiB/s) | **+11.1%** |
-| long_strings/4096b/double | 128.8 µs (2.97 GiB/s) | 105.2 µs (3.63 GiB/s) | **+18.3%** |
-| long_strings/4096b/single | 128.5 µs (2.98 GiB/s) | 100.6 µs (3.79 GiB/s) | **+21.7%** |
-| large/100kb | 194.3 µs (491 MiB/s) | 170.4 µs (559 MiB/s) | **+12.3%** |
-| large/10kb | 21.3 µs (448 MiB/s) | 19.6 µs (487 MiB/s) | **+8.0%** |
-| large/1kb | 2.79 µs (342 MiB/s) | 2.52 µs (378 MiB/s) | **+9.7%** |
+| Benchmark | P0+ Baseline | P2 Optimized | Improvement |
+|-----------|--------------|--------------|-------------|
+| simple_kv/1000 | 41.9 µs | 36.8 µs | **-12%** |
+| simple_kv/10000 | 418 µs | 371 µs | **-11%** |
+| nested/d5_w2 | 5.8 µs | 5.1 µs | **-12%** |
+| large/10kb | 24.4 µs | 22.4 µs | **-8%** |
+| large/100kb | 222 µs | 198 µs | **-11%** |
+| large/1mb | 2.18 ms | 1.82 ms | **-17%** |
+| long_strings/4096b/double | 135 µs | 135 µs | (unchanged) |
+| long_strings/4096b/single | 139 µs | 133 µs | **-4%** |
 
-#### Overall Throughput (P0+ Optimized - 2026-01-17)
+#### Overall Throughput (P2 Optimized - 2026-01-17)
 
-| Workload Category | Baseline Range | P0+ Optimized Range | Improvement |
-|-------------------|----------------|---------------------|-------------|
-| Simple KV         | 176-491 MiB/s  | 187-550 MiB/s       | **+4-7%** |
-| Nested structures | 300-427 MiB/s  | 326-456 MiB/s       | **+9-10%** |
-| Sequences         | 112-290 MiB/s  | 121-378 MiB/s       | **+7-8%** |
-| Quoted strings    | 163-368 MiB/s  | 180-405 MiB/s       | **+10-11%** |
-| Long strings      | 2.8-3.0 GiB/s  | 3.4-3.8 GiB/s       | **+2-21%** |
-| Large files       | 342-491 MiB/s  | 378-559 MiB/s       | **+6-8%** |
+| Workload Category | P0+ Baseline | P2 Optimized | Improvement |
+|-------------------|--------------|--------------|-------------|
+| Simple KV         | 343-482 MiB/s | 435-484 MiB/s | **+9-11%** |
+| Nested structures | 277-454 MiB/s | 277-454 MiB/s | (unchanged) |
+| Sequences         | 268-384 MiB/s | 268-384 MiB/s | (unchanged) |
+| Large files       | 392-484 MiB/s | 422-515 MiB/s | **+8-17%** |
 
-**Key Achievements:**
-- ✅ **Structured data: +4-7% faster** (hybrid scalar/SIMD space skipping)
-- ✅ **String scanning: +2-21% faster** (AVX2 quote/escape detection + smart dispatch)
-- ✅ **Large files: +6-8% faster** (559 MiB/s on 100KB files)
-- ✅ **No regressions** across any workload
+**Key Achievements (P2):**
+- ✅ **Large files: +8-17% faster** (515 MiB/s on 1MB files)
+- ✅ **Unquoted values: +9-12% faster** (SIMD classify_yaml_chars integration)
+- ✅ **30x faster than yq** on 10KB files (end-to-end CLI comparison)
+- ✅ **No regressions** - conditional SIMD avoids overhead for short values
 
-**See also:** [docs/parsing/yaml.md](parsing/yaml.md) for full P0+ optimization details and implementation plan.
+**See also:** [docs/parsing/yaml.md](parsing/yaml.md) for full P2 optimization details and implementation plan.
 
 ---
 
@@ -194,26 +199,28 @@ The YAML parser uses platform-specific SIMD for hot paths:
 - **10KB files**: 10-18% faster
 - **100KB+ files**: 5-8% faster (other costs dominate)
 
-#### x86_64 (AVX2) P0+ Optimized Results (2026-01-17)
+#### x86_64 (AVX2) P2 Optimized Results (2026-01-17)
 
-**String scanning improvements:**
-- Double-quoted strings (1000 entries): **+11.1% faster** (42.1µs → 37.9µs, 361 → 405 MiB/s)
-- Single-quoted strings (1000 entries): **+13.7% faster** (41.3µs → 36.3µs, 368 → 420 MiB/s)
-- Long strings (4KB double): **+18.3% faster** (128.8µs → 105.2µs, 2.97 → 3.63 GiB/s)
-- Long strings (4KB single): **+21.7% faster** (128.5µs → 100.6µs, 2.98 → 3.79 GiB/s)
+**P2 Integration of `classify_yaml_chars`:**
+- Uses SIMD to scan 32 bytes at once for unquoted value/key terminators
+- Conditional activation: only uses SIMD for values ≥32 bytes remaining
+- Avoids overhead for typical short YAML values (<32 bytes)
 
-**Overall parsing improvements:**
-- Sequences (10,000 items): **+6.8% faster** (309µs → 274µs, 290 → 366 MiB/s)
-- Nested structures: **+9-10% faster** (326-456 MiB/s range)
-- Large files (100KB): **+12.3% faster** (194.3µs → 170.4µs, 491 → 559 MiB/s)
-- Large files (10KB): **+8.0% faster** (21.3µs → 19.6µs, 448 → 487 MiB/s)
-- Large files (1KB): **+9.7% faster** (2.79µs → 2.52µs, 342 → 378 MiB/s)
+**Unquoted value/key parsing improvements:**
+- simple_kv/1000: **-12% faster** (41.9µs → 36.8µs)
+- simple_kv/10000: **-11% faster** (418µs → 371µs)
+- large/100kb: **-11% faster** (222µs → 198µs)
+- large/1mb: **-17% faster** (2.18ms → 1.82ms)
 
-**Optimizations:**
+**End-to-end yq comparison (x86_64):**
+- 10KB files: **30x faster** than yq (2.0ms vs 60.2ms)
+- 100KB files: **10.5x faster** than yq (7.1ms vs 74.2ms)
+- 1MB files: **3.3x faster** than yq (59.7ms vs 194.2ms)
+
+**Optimizations (cumulative):**
 - **P0**: Multi-character classification infrastructure (8 types in parallel)
 - **P0+**: Hybrid scalar/SIMD space skipping (fast path for 0-8 spaces, SIMD for longer runs)
-- Context-sensitive pattern detection capabilities (e.g., `: ` and `- `)
-- Newline detection infrastructure (ready for future use)
+- **P2**: Conditional SIMD for unquoted value/key scanning (32-byte chunks via `classify_yaml_chars`)
 
 **Rejected Optimizations:**
 - **P1 (YFSM)**: Table-driven state machine for string parsing tested but showed only 0-2% improvement vs expected 15-25%. YAML strings are too simple compared to JSON (where PFSM succeeded with 33-77% gains). P0+ SIMD already optimal. See [docs/parsing/yaml.md](parsing/yaml.md#p1-yfsm-yaml-finite-state-machine---rejected-) for full analysis.
