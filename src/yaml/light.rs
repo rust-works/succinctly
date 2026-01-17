@@ -1071,10 +1071,18 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         match self.value() {
             YamlValue::Null => output.push_str("null"),
             YamlValue::String(s) => {
-                if let Ok(str_val) = s.as_str() {
-                    write_yaml_scalar_as_json(output, &str_val);
-                } else {
-                    output.push_str("null");
+                // Direct transcoding optimization (avoids intermediate allocation for quoted strings)
+                match write_yaml_string_to_json(output, &s) {
+                    Ok(true) => {} // Written directly as JSON string
+                    Ok(false) => {
+                        // Unquoted/block scalar - need type detection, fall back to original path
+                        if let Ok(str_val) = s.as_str() {
+                            write_yaml_scalar_as_json(output, &str_val);
+                        } else {
+                            output.push_str("null");
+                        }
+                    }
+                    Err(_) => output.push_str("null"),
                 }
             }
             YamlValue::Mapping(fields) => {
@@ -1086,12 +1094,18 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     }
                     first = false;
 
-                    // Write key
+                    // Write key - try direct transcoding first
                     if let YamlValue::String(s) = field.key() {
-                        if let Ok(key_str) = s.as_str() {
-                            write_json_string(output, &key_str);
-                        } else {
-                            output.push_str("\"\"");
+                        match write_yaml_string_to_json(output, &s) {
+                            Ok(true) => {} // Written directly
+                            Ok(false) | Err(_) => {
+                                // Fall back to original path
+                                if let Ok(key_str) = s.as_str() {
+                                    write_json_string(output, &key_str);
+                                } else {
+                                    output.push_str("\"\"");
+                                }
+                            }
                         }
                     } else {
                         output.push_str("\"\"");
@@ -1135,10 +1149,18 @@ fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlVal
     match value {
         YamlValue::Null => output.push_str("null"),
         YamlValue::String(s) => {
-            if let Ok(str_val) = s.as_str() {
-                write_yaml_scalar_as_json(output, &str_val);
-            } else {
-                output.push_str("null");
+            // Direct transcoding optimization (avoids intermediate allocation for quoted strings)
+            match write_yaml_string_to_json(output, &s) {
+                Ok(true) => {} // Written directly as JSON string
+                Ok(false) => {
+                    // Unquoted/block scalar - need type detection, fall back to original path
+                    if let Ok(str_val) = s.as_str() {
+                        write_yaml_scalar_as_json(output, &str_val);
+                    } else {
+                        output.push_str("null");
+                    }
+                }
+                Err(_) => output.push_str("null"),
             }
         }
         YamlValue::Mapping(fields) => {
@@ -1150,11 +1172,18 @@ fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlVal
                 }
                 first = false;
 
+                // Write key - try direct transcoding first
                 if let YamlValue::String(s) = field.key() {
-                    if let Ok(key_str) = s.as_str() {
-                        write_json_string(output, &key_str);
-                    } else {
-                        output.push_str("\"\"");
+                    match write_yaml_string_to_json(output, &s) {
+                        Ok(true) => {} // Written directly
+                        Ok(false) | Err(_) => {
+                            // Fall back to original path
+                            if let Ok(key_str) = s.as_str() {
+                                write_json_string(output, &key_str);
+                            } else {
+                                output.push_str("\"\"");
+                            }
+                        }
                     }
                 } else {
                     output.push_str("\"\"");
@@ -1240,6 +1269,374 @@ fn write_json_string(output: &mut String, s: &str) {
     }
 
     output.push('"');
+}
+
+// ============================================================================
+// Direct YAML→JSON Transcoding (Zero-Copy for Escaped Strings)
+// ============================================================================
+
+/// Write a JSON character escape sequence to output.
+/// Helper for direct transcoding functions.
+#[inline]
+fn write_json_escape(output: &mut String, ch: char) {
+    match ch {
+        '"' => output.push_str("\\\""),
+        '\\' => output.push_str("\\\\"),
+        '\n' => output.push_str("\\n"),
+        '\r' => output.push_str("\\r"),
+        '\t' => output.push_str("\\t"),
+        c if (c as u32) < 0x20 => {
+            // Control character - use \uXXXX
+            output.push_str("\\u00");
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let b = c as u8;
+            output.push(HEX[(b >> 4) as usize] as char);
+            output.push(HEX[(b & 0xf) as usize] as char);
+        }
+        c if (c as u32) >= 0x80 && (c as u32) < 0x100 => {
+            // Extended ASCII (0x80-0xFF) - write as \u00XX
+            output.push_str("\\u00");
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let b = c as u8;
+            output.push(HEX[(b >> 4) as usize] as char);
+            output.push(HEX[(b & 0xf) as usize] as char);
+        }
+        c if (c as u32) >= 0x100 => {
+            // Unicode - write as \uXXXX or surrogate pair
+            let cp = c as u32;
+            if cp <= 0xFFFF {
+                output.push_str("\\u");
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                output.push(HEX[((cp >> 12) & 0xF) as usize] as char);
+                output.push(HEX[((cp >> 8) & 0xF) as usize] as char);
+                output.push(HEX[((cp >> 4) & 0xF) as usize] as char);
+                output.push(HEX[(cp & 0xF) as usize] as char);
+            } else {
+                // Surrogate pair for characters > 0xFFFF
+                let adjusted = cp - 0x10000;
+                let high = 0xD800 + (adjusted >> 10);
+                let low = 0xDC00 + (adjusted & 0x3FF);
+                output.push_str("\\u");
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                output.push(HEX[((high >> 12) & 0xF) as usize] as char);
+                output.push(HEX[((high >> 8) & 0xF) as usize] as char);
+                output.push(HEX[((high >> 4) & 0xF) as usize] as char);
+                output.push(HEX[(high & 0xF) as usize] as char);
+                output.push_str("\\u");
+                output.push(HEX[((low >> 12) & 0xF) as usize] as char);
+                output.push(HEX[((low >> 8) & 0xF) as usize] as char);
+                output.push(HEX[((low >> 4) & 0xF) as usize] as char);
+                output.push(HEX[(low & 0xF) as usize] as char);
+            }
+        }
+        c => output.push(c),
+    }
+}
+
+/// Transcode a double-quoted YAML string directly to JSON output.
+/// Avoids intermediate String allocation by decoding YAML escapes and
+/// re-encoding as JSON escapes in a single pass.
+fn transcode_double_quoted_to_json(
+    output: &mut String,
+    bytes: &[u8],
+) -> Result<(), YamlStringError> {
+    output.push('"');
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if i + 1 >= bytes.len() {
+                    return Err(YamlStringError::InvalidEscape);
+                }
+                i += 1;
+                match bytes[i] {
+                    // YAML escapes that map directly to JSON escapes
+                    b'n' => output.push_str("\\n"),
+                    b'r' => output.push_str("\\r"),
+                    b't' | b'\t' => output.push_str("\\t"),
+                    b'"' => output.push_str("\\\""),
+                    b'\\' => output.push_str("\\\\"),
+                    b'/' => output.push('/'),
+                    b' ' => output.push(' '),
+                    // YAML escapes that need JSON \uXXXX encoding
+                    b'0' => output.push_str("\\u0000"),
+                    b'a' => output.push_str("\\u0007"), // bell
+                    b'b' => output.push_str("\\u0008"), // backspace
+                    b'v' => output.push_str("\\u000b"), // vertical tab
+                    b'f' => output.push_str("\\u000c"), // form feed
+                    b'e' => output.push_str("\\u001b"), // escape
+                    b'N' => output.push_str("\\u0085"), // next line
+                    b'_' => output.push_str("\\u00a0"), // non-breaking space
+                    b'L' => output.push_str("\\u2028"), // line separator
+                    b'P' => output.push_str("\\u2029"), // paragraph separator
+                    b'\n' => {
+                        // Escaped line break - skip entirely
+                        i += 1;
+                        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    b'\r' => {
+                        // Escaped CRLF
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'\n' {
+                            i += 1;
+                        }
+                        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    b'x' => {
+                        // \xNN - 2 hex digits
+                        if i + 2 >= bytes.len() {
+                            return Err(YamlStringError::InvalidEscape);
+                        }
+                        let hex = &bytes[i + 1..i + 3];
+                        let val = parse_hex(hex)?;
+                        if val < 0x20 || val == 0x22 || val == 0x5C {
+                            // Control char, quote, or backslash - escape it
+                            write_json_escape(
+                                output,
+                                char::from_u32(val as u32).unwrap_or('\u{FFFD}'),
+                            );
+                        } else if val <= 0x7F {
+                            output.push(val as u8 as char);
+                        } else {
+                            write_json_escape(
+                                output,
+                                char::from_u32(val as u32).unwrap_or('\u{FFFD}'),
+                            );
+                        }
+                        i += 2;
+                    }
+                    b'u' => {
+                        // \uNNNN - 4 hex digits
+                        if i + 4 >= bytes.len() {
+                            return Err(YamlStringError::InvalidEscape);
+                        }
+                        let hex = &bytes[i + 1..i + 5];
+                        let codepoint = parse_hex(hex)? as u32;
+                        let ch = char::from_u32(codepoint).ok_or(YamlStringError::InvalidEscape)?;
+                        write_json_escape(output, ch);
+                        i += 4;
+                    }
+                    b'U' => {
+                        // \UNNNNNNNN - 8 hex digits
+                        if i + 8 >= bytes.len() {
+                            return Err(YamlStringError::InvalidEscape);
+                        }
+                        let hex = &bytes[i + 1..i + 9];
+                        let codepoint = parse_hex(hex)?;
+                        let ch = char::from_u32(codepoint).ok_or(YamlStringError::InvalidEscape)?;
+                        write_json_escape(output, ch);
+                        i += 8;
+                    }
+                    _ => return Err(YamlStringError::InvalidEscape),
+                }
+                i += 1;
+            }
+            b'\r' | b'\n' => {
+                // Line folding: handle newlines - fold to space or preserve empty lines
+                i = transcode_fold_line_break_to_json(bytes, i, output);
+            }
+            b'"' => {
+                // Quote inside string needs escaping
+                output.push_str("\\\"");
+                i += 1;
+            }
+            b if b < 0x20 => {
+                // Control character needs escaping
+                write_json_escape(output, b as char);
+                i += 1;
+            }
+            _ => {
+                // Regular content - copy until we hit special char
+                let start = i;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    if matches!(b, b'\\' | b'\n' | b'\r' | b'"') || b < 0x20 {
+                        break;
+                    }
+                    i += 1;
+                }
+                // Copy the safe span
+                let chunk = core::str::from_utf8(&bytes[start..i])
+                    .map_err(|_| YamlStringError::InvalidUtf8)?;
+                output.push_str(chunk);
+            }
+        }
+    }
+
+    output.push('"');
+    Ok(())
+}
+
+/// Transcode a single-quoted YAML string directly to JSON output.
+fn transcode_single_quoted_to_json(
+    output: &mut String,
+    bytes: &[u8],
+) -> Result<(), YamlStringError> {
+    output.push('"');
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if i + 1 < bytes.len() && bytes[i + 1] == b'\'' => {
+                // '' -> ' (no JSON escaping needed for single quote)
+                output.push('\'');
+                i += 2;
+            }
+            b'\r' | b'\n' => {
+                // Line folding
+                i = transcode_fold_line_break_to_json(bytes, i, output);
+            }
+            b'"' => {
+                // Quote needs escaping in JSON
+                output.push_str("\\\"");
+                i += 1;
+            }
+            b'\\' => {
+                // Backslash needs escaping in JSON
+                output.push_str("\\\\");
+                i += 1;
+            }
+            b if b < 0x20 => {
+                // Control character needs escaping
+                write_json_escape(output, b as char);
+                i += 1;
+            }
+            _ => {
+                // Regular content - copy until we hit special char
+                let start = i;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    if matches!(b, b'\n' | b'\r' | b'"' | b'\\') || b < 0x20 {
+                        break;
+                    }
+                    // Check for '' escape
+                    if b == b'\'' && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        break;
+                    }
+                    i += 1;
+                }
+                let chunk = core::str::from_utf8(&bytes[start..i])
+                    .map_err(|_| YamlStringError::InvalidUtf8)?;
+                output.push_str(chunk);
+            }
+        }
+    }
+
+    output.push('"');
+    Ok(())
+}
+
+/// Handle line folding during direct transcoding.
+/// Returns the new position after processing the line break(s).
+fn transcode_fold_line_break_to_json(bytes: &[u8], mut i: usize, output: &mut String) -> usize {
+    // Trim trailing whitespace from output
+    while output.ends_with(' ') || output.ends_with('\t') {
+        output.pop();
+    }
+
+    // Skip the first line break
+    if bytes[i] == b'\r' {
+        i += 1;
+        if i < bytes.len() && bytes[i] == b'\n' {
+            i += 1;
+        }
+    } else if bytes[i] == b'\n' {
+        i += 1;
+    }
+
+    // Count empty lines
+    let mut empty_lines = 0;
+    loop {
+        // Skip whitespace at start of line
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+            i += 1;
+        }
+
+        // Check if this is an empty line
+        if i < bytes.len() && (bytes[i] == b'\n' || bytes[i] == b'\r') {
+            empty_lines += 1;
+            if bytes[i] == b'\r' {
+                i += 1;
+                if i < bytes.len() && bytes[i] == b'\n' {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Output the folded result
+    if empty_lines == 0 {
+        // Single line break -> space
+        output.push(' ');
+    } else {
+        // Empty lines -> newlines (per YAML spec, no leading space)
+        for _ in 0..empty_lines {
+            output.push_str("\\n");
+        }
+    }
+
+    i
+}
+
+/// Write a YamlString directly to JSON output, avoiding intermediate allocation
+/// for strings that need escape decoding.
+///
+/// Returns true if the string was written as a JSON string (quoted),
+/// false if it should be treated as a scalar for type detection.
+fn write_yaml_string_to_json(
+    output: &mut String,
+    s: &YamlString<'_>,
+) -> Result<bool, YamlStringError> {
+    match s {
+        YamlString::DoubleQuoted { text, start } => {
+            let end = YamlString::find_double_quote_end(text, *start);
+            let bytes = &text[*start + 1..end - 1]; // Strip quotes
+
+            // Check if we need decoding (has escapes or newlines)
+            if !bytes.contains(&b'\\') && !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+                // Fast path: no decoding needed, just JSON-escape
+                let s = core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
+                write_json_string(output, s);
+            } else {
+                // Transcode directly: YAML escapes → JSON escapes
+                transcode_double_quoted_to_json(output, bytes)?;
+            }
+            Ok(true) // Always a string, no type detection
+        }
+        YamlString::SingleQuoted { text, start } => {
+            let end = YamlString::find_single_quote_end(text, *start);
+            let bytes = &text[*start + 1..end - 1]; // Strip quotes
+
+            // Check if we need decoding (has '' or newlines)
+            if !bytes.contains(&b'\'') && !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+                // Fast path: no decoding needed, just JSON-escape
+                let s = core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
+                write_json_string(output, s);
+            } else {
+                // Transcode directly
+                transcode_single_quoted_to_json(output, bytes)?;
+            }
+            Ok(true) // Always a string, no type detection
+        }
+        YamlString::Unquoted { .. }
+        | YamlString::BlockLiteral { .. }
+        | YamlString::BlockFolded { .. } => {
+            // For unquoted and block scalars, we need type detection
+            // Return false to signal caller should use the original path
+            Ok(false)
+        }
+    }
 }
 
 /// Fast integer to string formatting without allocation.
@@ -3278,6 +3675,240 @@ mod tests {
     }
 
     // =========================================================================
+    // Comprehensive as_str() escape tests (old decode path)
+    // =========================================================================
+    // These tests verify the decode_double_quoted and decode_single_quoted
+    // functions handle all YAML escape sequences correctly.
+
+    #[test]
+    fn test_decode_double_quoted_tab_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"hello\\tworld\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "hello\tworld");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_carriage_return_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"line\\rbreak\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "line\rbreak");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_backslash_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"path\\\\to\\\\file\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "path\\to\\file");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_quote_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"say \\\"hello\\\"\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "say \"hello\"");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_null_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"null\\0char\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "null\0char");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_bell_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"bell\\achar\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "bell\x07char");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_backspace_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"back\\bspace\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "back\x08space");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_formfeed_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"form\\ffeed\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "form\x0Cfeed");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_vertical_tab_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"vert\\vtab\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "vert\x0Btab");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_escape_char_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"esc\\echar\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "esc\x1Bchar");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_space_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"spaced\\ word\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "spaced word");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_slash_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"path\\/to\\/file\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "path/to/file");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_next_line_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"next\\Nline\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "next\u{0085}line");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_nbsp_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"non\\_break\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "non\u{00A0}break");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_line_separator_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"line\\Lsep\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "line\u{2028}sep");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_paragraph_separator_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"para\\Psep\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "para\u{2029}sep");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_hex_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"hex\\x41char\"", // \x41 = 'A'
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "hexAchar");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_hex_control_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"ctrl\\x07char\"", // \x07 = bell
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "ctrl\x07char");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_unicode_4digit_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"euro\\u20ACsign\"", // € = U+20AC
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "euro€sign");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_unicode_8digit_escape() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"emoji\\U0001F600face\"", // 😀 = U+1F600
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "emoji😀face");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_multiple_escapes() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"line1\\nline2\\ttabbed\\\\slash\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "line1\nline2\ttabbed\\slash");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_escaped_newline_continuation() {
+        // Backslash followed by actual newline = line continuation (no space)
+        let s = YamlString::DoubleQuoted {
+            text: b"\"line one\\\n  line two\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "line oneline two");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_escaped_crlf_continuation() {
+        let s = YamlString::DoubleQuoted {
+            text: b"\"line one\\\r\n  line two\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "line oneline two");
+    }
+
+    #[test]
+    fn test_decode_single_quoted_double_quote() {
+        // " in single-quoted is literal (no escaping needed in YAML)
+        let s = YamlString::SingleQuoted {
+            text: b"'say \"hello\"'",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "say \"hello\"");
+    }
+
+    #[test]
+    fn test_decode_single_quoted_backslash() {
+        // \ in single-quoted is literal (not an escape char)
+        let s = YamlString::SingleQuoted {
+            text: b"'path\\to\\file'",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "path\\to\\file");
+    }
+
+    // =========================================================================
     // Flow style navigation tests (Phase 2)
     // =========================================================================
 
@@ -4061,5 +4692,519 @@ mod tests {
         let yaml = b"-\n - inner1\n - inner2";
         let result = YamlIndex::build(yaml);
         assert!(result.is_ok(), "Failed to parse: {:?}", result.err());
+    }
+
+    // =========================================================================
+    // Direct transcoding tests (to_json_document path)
+    // =========================================================================
+    // These tests verify that the direct YAML→JSON transcoding produces
+    // semantically identical output to the old as_str() + JSON encoding path.
+    //
+    // Both paths should produce valid JSON that decodes to the same string value,
+    // though they may use different escape formats (e.g., \u0085 vs raw character).
+
+    /// Helper: Get JSON output via to_json_document (uses new transcoding path)
+    fn get_json_via_transcode(yaml: &[u8]) -> String {
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        root.to_json_document()
+    }
+
+    /// Helper: Get JSON output via as_str() + manual encoding (old decode path)
+    fn get_json_via_decode(yaml: &[u8]) -> String {
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        // Extract first document's value
+        match first_doc(root) {
+            YamlValue::String(s) => {
+                let decoded = s.as_str().unwrap();
+                // Manually JSON-encode like the old path did
+                let mut out = String::from("\"");
+                for ch in decoded.chars() {
+                    match ch {
+                        '"' => out.push_str("\\\""),
+                        '\\' => out.push_str("\\\\"),
+                        '\n' => out.push_str("\\n"),
+                        '\r' => out.push_str("\\r"),
+                        '\t' => out.push_str("\\t"),
+                        '\x08' => out.push_str("\\b"),
+                        '\x0c' => out.push_str("\\f"),
+                        c if (c as u32) < 0x20 => {
+                            out.push_str(&format!("\\u{:04x}", c as u32));
+                        }
+                        c => out.push(c),
+                    }
+                }
+                out.push('"');
+                out
+            }
+            YamlValue::Mapping(fields) => {
+                // For mappings, extract all string values and compare
+                let mut pairs = Vec::new();
+                for field in fields.into_iter() {
+                    if let YamlValue::String(k) = field.key() {
+                        if let YamlValue::String(v) = field.value() {
+                            let key_str = k.as_str().unwrap();
+                            let val_str = v.as_str().unwrap();
+                            pairs.push(format!("\"{}\":\"{}\"", key_str, val_str));
+                        }
+                    }
+                }
+                format!("{{{}}}", pairs.join(","))
+            }
+            _ => panic!("expected string or mapping"),
+        }
+    }
+
+    /// Parse a JSON string and return the decoded content (strips quotes, unescapes).
+    /// Used to compare semantic equivalence of different JSON escape formats.
+    fn json_string_to_rust_string(json: &str) -> String {
+        assert!(
+            json.starts_with('"') && json.ends_with('"'),
+            "not a JSON string: {}",
+            json
+        );
+        let inner = &json[1..json.len() - 1];
+        let mut result = String::new();
+        let mut chars = inner.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('n') => result.push('\n'),
+                    Some('r') => result.push('\r'),
+                    Some('t') => result.push('\t'),
+                    Some('b') => result.push('\x08'),
+                    Some('f') => result.push('\x0c'),
+                    Some('"') => result.push('"'),
+                    Some('\\') => result.push('\\'),
+                    Some('/') => result.push('/'),
+                    Some('u') => {
+                        let hex: String = chars.by_ref().take(4).collect();
+                        let codepoint = u32::from_str_radix(&hex, 16).unwrap();
+                        // Handle surrogate pairs
+                        if (0xD800..=0xDBFF).contains(&codepoint) {
+                            if chars.next() == Some('\\') && chars.next() == Some('u') {
+                                let low_hex: String = chars.by_ref().take(4).collect();
+                                let low = u32::from_str_radix(&low_hex, 16).unwrap();
+                                let full = 0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00);
+                                result.push(char::from_u32(full).unwrap());
+                            }
+                        } else {
+                            result.push(char::from_u32(codepoint).unwrap());
+                        }
+                    }
+                    Some(c) => panic!("unknown escape: \\{}", c),
+                    None => panic!("trailing backslash"),
+                }
+            } else {
+                result.push(c);
+            }
+        }
+        result
+    }
+
+    /// Assert that two JSON strings decode to the same Rust string value.
+    /// This allows for different escape formats (e.g., \u0085 vs raw char).
+    fn assert_json_semantically_equal(transcoded: &str, decoded: &str, context: &str) {
+        let transcoded_value = json_string_to_rust_string(transcoded);
+        let decoded_value = json_string_to_rust_string(decoded);
+        assert_eq!(
+            transcoded_value, decoded_value,
+            "{}: JSON strings decode to different values.\n  transcoded JSON: {}\n  decoded JSON: {}\n  transcoded value: {:?}\n  decoded value: {:?}",
+            context, transcoded, decoded, transcoded_value, decoded_value
+        );
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_simple() {
+        let yaml = b"\"hello world\"";
+        let json = get_json_via_transcode(yaml);
+        assert_eq!(json, "\"hello world\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_newline_escape() {
+        let yaml = b"\"hello\\nworld\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded, "transcoded vs decoded mismatch");
+        assert_eq!(transcoded, "\"hello\\nworld\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_tab_escape() {
+        let yaml = b"\"hello\\tworld\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"hello\\tworld\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_backslash_escape() {
+        let yaml = b"\"path\\\\to\\\\file\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"path\\\\to\\\\file\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_quote_escape() {
+        let yaml = b"\"say \\\"hello\\\"\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"say \\\"hello\\\"\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_null_escape() {
+        let yaml = b"\"null\\0char\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"null\\u0000char\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_bell_escape() {
+        let yaml = b"\"bell\\achar\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"bell\\u0007char\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_backspace_escape() {
+        let yaml = b"\"back\\bspace\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        // Both \b and \u0008 are valid JSON for backspace - verify semantic equivalence
+        assert_json_semantically_equal(&transcoded, &decoded, "backspace escape");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_formfeed_escape() {
+        let yaml = b"\"form\\ffeed\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        // Both \f and \u000c are valid JSON for form feed - verify semantic equivalence
+        assert_json_semantically_equal(&transcoded, &decoded, "formfeed escape");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_vertical_tab_escape() {
+        let yaml = b"\"vert\\vtab\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"vert\\u000btab\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_escape_escape() {
+        let yaml = b"\"esc\\echar\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"esc\\u001bchar\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_next_line_escape() {
+        let yaml = b"\"next\\Nline\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        // Transcoding uses \u0085, old path uses raw char - verify semantic equivalence
+        assert_json_semantically_equal(&transcoded, &decoded, "next line escape");
+        assert_eq!(transcoded, "\"next\\u0085line\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_nbsp_escape() {
+        let yaml = b"\"non\\_break\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        // Transcoding uses \u00a0, old path uses raw NBSP - verify semantic equivalence
+        assert_json_semantically_equal(&transcoded, &decoded, "nbsp escape");
+        assert_eq!(transcoded, "\"non\\u00a0break\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_line_separator_escape() {
+        let yaml = b"\"line\\Lsep\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        // Transcoding uses \u2028, old path uses raw char - verify semantic equivalence
+        assert_json_semantically_equal(&transcoded, &decoded, "line separator escape");
+        assert_eq!(transcoded, "\"line\\u2028sep\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_paragraph_separator_escape() {
+        let yaml = b"\"para\\Psep\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        // Transcoding uses \u2029, old path uses raw char - verify semantic equivalence
+        assert_json_semantically_equal(&transcoded, &decoded, "paragraph separator escape");
+        assert_eq!(transcoded, "\"para\\u2029sep\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_hex_escape() {
+        let yaml = b"\"hex\\x41char\""; // \x41 = 'A'
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"hexAchar\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_hex_control_escape() {
+        let yaml = b"\"ctrl\\x07char\""; // \x07 = bell
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"ctrl\\u0007char\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_unicode_4digit_escape() {
+        let yaml = b"\"euro\\u20ACsign\""; // € = U+20AC
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        // Transcoding uses \u20ac, old path uses raw € - verify semantic equivalence
+        assert_json_semantically_equal(&transcoded, &decoded, "unicode 4-digit escape");
+        assert_eq!(transcoded, "\"euro\\u20acsign\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_unicode_8digit_escape() {
+        let yaml = b"\"emoji\\U0001F600face\""; // 😀 = U+1F600
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        // Transcoding uses surrogate pair \ud83d\ude00, old path uses raw 😀
+        // Verify semantic equivalence
+        assert_json_semantically_equal(&transcoded, &decoded, "unicode 8-digit escape");
+        assert_eq!(transcoded, "\"emoji\\ud83d\\ude00face\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_multiple_escapes() {
+        let yaml = b"\"line1\\nline2\\ttabbed\\\\slash\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"line1\\nline2\\ttabbed\\\\slash\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_multiline_folding() {
+        // Line break in double-quoted string folds to space
+        let yaml = b"\"hello\nworld\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"hello world\"");
+    }
+
+    #[test]
+    fn test_transcode_double_quoted_multiline_empty_lines() {
+        // Empty lines become literal newlines (per YAML spec, no leading space)
+        let yaml = b"\"hello\n\nworld\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"hello\\nworld\"");
+    }
+
+    #[test]
+    fn test_transcode_single_quoted_simple() {
+        let yaml = b"'hello world'";
+        let json = get_json_via_transcode(yaml);
+        assert_eq!(json, "\"hello world\"");
+    }
+
+    #[test]
+    fn test_transcode_single_quoted_escape() {
+        // '' in single-quoted = literal '
+        let yaml = b"'it''s working'";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"it's working\"");
+    }
+
+    #[test]
+    fn test_transcode_single_quoted_double_quote() {
+        // " in single-quoted needs JSON escaping
+        let yaml = b"'say \"hello\"'";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"say \\\"hello\\\"\"");
+    }
+
+    #[test]
+    fn test_transcode_single_quoted_backslash() {
+        // \ in single-quoted needs JSON escaping (not a YAML escape!)
+        let yaml = b"'path\\to\\file'";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"path\\\\to\\\\file\"");
+    }
+
+    #[test]
+    fn test_transcode_single_quoted_multiline_folding() {
+        // Line break in single-quoted string folds to space
+        let yaml = b"'hello\nworld'";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"hello world\"");
+    }
+
+    #[test]
+    fn test_transcode_single_quoted_multiline_empty_lines() {
+        // Empty lines become literal newlines (per YAML spec, no leading space)
+        let yaml = b"'hello\n\nworld'";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"hello\\nworld\"");
+    }
+
+    #[test]
+    fn test_transcode_in_mapping_context() {
+        // Test transcoding works correctly in mapping values
+        let yaml = b"key: \"value\\nwith\\nnewlines\"";
+        let transcoded = get_json_via_transcode(yaml);
+        assert!(transcoded.contains("value\\nwith\\nnewlines"));
+    }
+
+    #[test]
+    fn test_transcode_slash_escape() {
+        // \/ is valid YAML escape for /
+        let yaml = b"\"path\\/to\\/file\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"path/to/file\"");
+    }
+
+    #[test]
+    fn test_transcode_space_escape() {
+        // \  (backslash space) is valid YAML escape for space
+        let yaml = b"\"spaced\\ word\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"spaced word\"");
+    }
+
+    #[test]
+    fn test_transcode_carriage_return_escape() {
+        let yaml = b"\"line\\rbreak\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"line\\rbreak\"");
+    }
+
+    #[test]
+    fn test_transcode_crlf_multiline() {
+        // CRLF line endings should fold to space
+        let yaml = b"\"hello\r\nworld\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"hello world\"");
+    }
+
+    #[test]
+    fn test_transcode_escaped_newline_continuation() {
+        // Backslash-newline is a line continuation (no space added)
+        // This is the escaped literal newline, not \n escape sequence
+        let yaml = b"\"line one\\\n  line two\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"line oneline two\"");
+    }
+
+    #[test]
+    fn test_transcode_escaped_crlf_continuation() {
+        // Backslash-CRLF is also a line continuation
+        let yaml = b"\"line one\\\r\n  line two\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"line oneline two\"");
+    }
+
+    #[test]
+    fn test_transcode_tab_escape_literal() {
+        // \<tab> is valid YAML escape (same as \t)
+        let yaml = b"\"tab\\\there\"";
+        let transcoded = get_json_via_transcode(yaml);
+        let decoded = get_json_via_decode(yaml);
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"tab\\there\"");
+    }
+
+    // =========================================================================
+    // Additional coverage tests: ensure old as_str tests have transcode equivalents
+    // =========================================================================
+
+    #[test]
+    fn test_transcode_matches_old_multiline_double_quoted_simple() {
+        // Equivalent to test_multiline_double_quoted_simple but via transcode
+        let yaml = b"key: \"line one\n  line two\"";
+        let transcoded = get_json_via_transcode(yaml);
+        // Should contain "line one line two" (folded)
+        assert!(
+            transcoded.contains("line one line two"),
+            "got: {}",
+            transcoded
+        );
+    }
+
+    #[test]
+    fn test_transcode_matches_old_multiline_double_quoted_empty_line() {
+        // Equivalent to test_multiline_double_quoted_empty_line but via transcode
+        let yaml = b"key: \"line one\n\n  line two\"";
+        let transcoded = get_json_via_transcode(yaml);
+        // Should contain "line one\nline two" (empty line becomes newline)
+        assert!(
+            transcoded.contains("line one\\nline two"),
+            "got: {}",
+            transcoded
+        );
+    }
+
+    #[test]
+    fn test_transcode_matches_old_multiline_single_quoted_simple() {
+        // Equivalent to test_multiline_single_quoted_simple but via transcode
+        let yaml = b"key: 'line one\n  line two'";
+        let transcoded = get_json_via_transcode(yaml);
+        // Should contain "line one line two" (folded)
+        assert!(
+            transcoded.contains("line one line two"),
+            "got: {}",
+            transcoded
+        );
+    }
+
+    #[test]
+    fn test_transcode_matches_old_multiline_single_quoted_with_escaped_quote() {
+        // Equivalent to test_multiline_single_quoted_with_escaped_quote but via transcode
+        let yaml = b"key: 'it''s\n  working'";
+        let transcoded = get_json_via_transcode(yaml);
+        // Should contain "it's working"
+        assert!(transcoded.contains("it's working"), "got: {}", transcoded);
     }
 }

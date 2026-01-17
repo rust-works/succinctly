@@ -153,3 +153,7 @@ harness = false
 [[bench]]
 name = "yaml_anchor_micro"
 harness = false
+
+[[bench]]
+name = "yaml_transcode_micro"
+harness = false
