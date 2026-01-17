@@ -38,18 +38,41 @@ mod neon;
 #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
 mod x86;
 
-// Portable broadword module - always compiled for testing, used as fallback
-#[cfg(not(feature = "scalar-yaml"))]
+// Portable broadword module - compiled when:
+// 1. broadword-yaml feature is enabled on ARM64 (explicit opt-in), OR
+// 2. On non-SIMD platforms (automatic fallback)
+// NOT compiled on x86_64 (uses native SIMD) or ARM64 without broadword-yaml (uses NEON)
+#[cfg(all(
+    not(feature = "scalar-yaml"),
+    any(
+        all(target_arch = "aarch64", feature = "broadword-yaml"),
+        not(any(target_arch = "aarch64", target_arch = "x86_64"))
+    )
+))]
 mod broadword;
 
 // Re-export platform-specific types for P0 optimizations
 #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
 pub use x86::YamlCharClass;
 
-// Re-export broadword types - always use from the portable broadword module
-// (even on ARM64 with NEON, since the types are identical)
-#[cfg(not(feature = "scalar-yaml"))]
+// Re-export broadword types when broadword module is compiled
+#[cfg(all(
+    not(feature = "scalar-yaml"),
+    any(
+        all(target_arch = "aarch64", feature = "broadword-yaml"),
+        not(any(target_arch = "aarch64", target_arch = "x86_64"))
+    )
+))]
 pub use broadword::{YamlCharClass16, YamlCharClassBroadword};
+
+// Re-export NEON types on ARM64 when using NEON (not broadword)
+// Only YamlCharClass16 is used; YamlCharClassBroadword is broadword-specific
+#[cfg(all(
+    target_arch = "aarch64",
+    not(feature = "broadword-yaml"),
+    not(feature = "scalar-yaml")
+))]
+pub use neon::YamlCharClass16;
 
 // ============================================================================
 // Public API - platform-dispatched functions
@@ -214,12 +237,13 @@ pub fn classify_yaml_chars(input: &[u8], offset: usize) -> Option<YamlCharClass>
     x86::classify_yaml_chars(input, offset)
 }
 
-/// Classify 16 bytes of YAML structural characters using broadword operations.
+/// Classify 16 bytes of YAML structural characters.
 ///
-/// Uses pure u64 arithmetic instead of SIMD intrinsics.
+/// On ARM64: Uses NEON or broadword depending on feature flags.
+/// On other platforms: Uses broadword (SWAR).
 /// Returns classification bitmasks for 8 character types at once.
 ///
-/// Available on ARM64 (with or without broadword-yaml feature) and non-SIMD platforms.
+/// Available on ARM64 and non-SIMD platforms.
 #[inline]
 #[cfg(all(
     not(feature = "scalar-yaml"),
@@ -227,18 +251,34 @@ pub fn classify_yaml_chars(input: &[u8], offset: usize) -> Option<YamlCharClass>
 ))]
 #[allow(dead_code)]
 pub fn classify_yaml_chars_16(input: &[u8], offset: usize) -> Option<YamlCharClass16> {
-    broadword::classify_yaml_chars_16(input, offset)
+    // ARM64 with NEON (default)
+    #[cfg(all(target_arch = "aarch64", not(feature = "broadword-yaml")))]
+    {
+        neon::classify_yaml_chars_16(input, offset)
+    }
+
+    // Broadword: when feature enabled on ARM64, or on non-SIMD platforms
+    #[cfg(any(
+        all(target_arch = "aarch64", feature = "broadword-yaml"),
+        not(any(target_arch = "aarch64", target_arch = "x86_64"))
+    ))]
+    {
+        broadword::classify_yaml_chars_16(input, offset)
+    }
 }
 
 /// Classify 8 bytes of YAML structural characters using broadword operations.
 ///
 /// Uses pure u64 arithmetic instead of SIMD intrinsics.
 ///
-/// Available on ARM64 (with or without broadword-yaml feature) and non-SIMD platforms.
+/// Available on ARM64 (with broadword-yaml feature) and non-SIMD platforms.
 #[inline]
 #[cfg(all(
     not(feature = "scalar-yaml"),
-    any(target_arch = "aarch64", not(target_arch = "x86_64"))
+    any(
+        all(target_arch = "aarch64", feature = "broadword-yaml"),
+        not(any(target_arch = "aarch64", target_arch = "x86_64"))
+    )
 ))]
 #[allow(dead_code)]
 pub fn classify_yaml_chars_8(input: &[u8], offset: usize) -> Option<YamlCharClassBroadword> {
@@ -268,8 +308,24 @@ pub fn find_newline(input: &[u8], start: usize) -> Option<usize> {
         x86::find_newline_x86(input, start)
     }
 
-    // ARM64 and other platforms use broadword (when not scalar)
-    #[cfg(all(not(target_arch = "x86_64"), not(feature = "scalar-yaml")))]
+    // ARM64 with NEON (default, when not scalar or broadword)
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(feature = "broadword-yaml"),
+        not(feature = "scalar-yaml")
+    ))]
+    {
+        neon::find_newline_broadword(input, start)
+    }
+
+    // Broadword: when feature enabled on ARM64, or on non-SIMD platforms (when not scalar)
+    #[cfg(all(
+        not(feature = "scalar-yaml"),
+        any(
+            all(target_arch = "aarch64", feature = "broadword-yaml"),
+            not(any(target_arch = "aarch64", target_arch = "x86_64"))
+        )
+    ))]
     {
         broadword::find_newline_broadword(input, start)
     }
