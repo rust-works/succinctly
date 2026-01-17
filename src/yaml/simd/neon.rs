@@ -161,6 +161,21 @@ unsafe fn count_leading_spaces_neon_impl(input: &[u8], start: usize) -> usize {
 /// This is used for fast-path scanning in unquoted value parsing.
 #[inline]
 pub fn find_unquoted_structural_neon(input: &[u8], start: usize, end: usize) -> Option<usize> {
+    let len = end - start;
+
+    // Fast path: for short inputs, scalar is faster than SIMD setup overhead
+    // (NEON movemask uses expensive multiplication trick)
+    if len < 32 {
+        let data = &input[start..end];
+        for (i, &b) in data.iter().enumerate() {
+            match b {
+                b'\n' | b'#' | b':' => return Some(i),
+                _ => {}
+            }
+        }
+        return None;
+    }
+
     // SAFETY: target_arch = aarch64 guarantees NEON
     unsafe { find_unquoted_structural_neon_impl(input, start, end) }
 }
