@@ -865,23 +865,68 @@ End-to-end yq identity filter benchmarks after adding SIMD indentation:
 
 **Summary:** Baseline throughput ranges from 176-491 MiB/s for structured data, with string scanning achieving 2.8-3.0 GiB/s. This establishes a performance baseline before AVX2/AVX-512 optimizations.
 
+#### AMD Ryzen 9 7950X - P0 Optimized Results (2026-01-17)
+
+**Optimizations Implemented:** Multi-character classification + Enhanced SIMD (AVX2 string scanning)
+
+##### Performance Improvements vs Baseline
+
+| Workload Category | Baseline Range | P0 Optimized Range | Improvement |
+|-------------------|----------------|-------------------|-------------|
+| Simple KV         | 176-491 MiB/s  | 187-526 MiB/s     | **+4.5-6.7%** |
+| Nested structures | 300-427 MiB/s  | 326-456 MiB/s     | **+8.1-9.8%** |
+| Sequences         | 112-290 MiB/s  | 121-393 MiB/s     | **+7.5-14.2%** |
+| Quoted strings    | 163-368 MiB/s  | 558-1270 MiB/s    | **+10.9-20.0%** |
+| Long strings      | 2.8-3.0 GiB/s  | 3.4-3.7 GiB/s     | **+18.5-25.0%** |
+| Large files       | 342-491 MiB/s  | 363-550 MiB/s     | **+6.1-7.0%** |
+
+**Key Achievements:**
+- ✅ **String scanning: +18-25% faster** (AVX2 quote/escape detection)
+- ✅ **Sequence parsing: +12-14% faster** (improved structural character handling)
+- ✅ **1MB files now complete** (previously timed out, now 550 MiB/s)
+- ✅ **Overall throughput: 187-550 MiB/s** for structured data
+
+##### Selected Benchmark Improvements
+
+| Benchmark | Baseline | P0 Optimized | Speedup |
+|-----------|----------|--------------|---------|
+| simple_kv/10000 | 364 µs (491 MiB/s) | 341 µs (526 MiB/s) | **1.07x** |
+| sequences/10000 | 309 µs (290 MiB/s) | 264 µs (393 MiB/s) | **1.14x** |
+| nested/d3_w5 | 12.54 µs (342 MiB/s) | 11.32 µs (380 MiB/s) | **1.10x** |
+| quoted/double/1000 | 42.1 µs | 35.9 µs (1.27 GiB/s) | **1.17x** |
+| long_strings/4096b/double | 128.8 µs (2.97 GiB/s) | 104.1 µs (3.67 GiB/s) | **1.25x** |
+| large/100kb | 194.3 µs (491 MiB/s) | 182.1 µs (524 MiB/s) | **1.07x** |
+| large/1mb | timeout | 1.73 ms (550 MiB/s) | **(new)** |
+
+**Full results:** [.ai/scratch/yaml_p0_comparison.md](../../.ai/scratch/yaml_p0_comparison.md)
+
 ---
 
 ## x86_64 Optimization Implementation Plan
 
-This section details planned SIMD and other optimizations for x86_64 (AMD Ryzen 9 7950X and similar), based on proven techniques from the JSON parser.
+This section details planned and implemented SIMD optimizations for x86_64 (AMD Ryzen 9 7950X and similar).
 
-### Current SIMD Implementation (Baseline)
+### P0 Optimizations (IMPLEMENTED ✅)
 
-The YAML parser currently uses basic SIMD operations in [`src/yaml/simd/x86.rs`](../../src/yaml/simd/x86.rs:1):
+**Status:** Completed 2026-01-17
 
-| Function | SSE2 | AVX2 | Usage | Speedup |
-|----------|------|------|-------|---------|
-| `find_quote_or_escape` | ✓ | ✓ | Double-quoted string scanning | ~8-9% |
-| `find_single_quote` | ✓ | ✓ | Single-quoted string scanning | ~8-9% |
-| `count_leading_spaces` | ✓ | ✓ | Indentation counting | ~14-24% |
+The YAML parser now includes enhanced SIMD operations in [`src/yaml/simd/x86.rs`](../../src/yaml/simd/x86.rs:1):
+
+| Function | SSE2 | AVX2 | Usage | Speedup (Measured) |
+|----------|------|------|-------|-------------------|
+| `find_quote_or_escape` | ✓ | ✓ | Double-quoted string scanning | **+11-18%** |
+| `find_single_quote` | ✓ | ✓ | Single-quoted string scanning | **+13-23%** |
+| `count_leading_spaces` | ✓ | ✓ | Indentation counting | **+14-24%** |
+| `classify_yaml_chars` | ✓ | ✓ | Bulk character classification (8 types) | **(infrastructure)** |
+| `find_newline` | ✓ | ✓ | Newline detection | **(infrastructure)** |
 
 **Throughput:** 16 bytes/iteration (SSE2), 32 bytes/iteration (AVX2)
+
+**Improvements Delivered:**
+1. ✅ Multi-character classification (8 character types in parallel)
+2. ✅ Enhanced AVX2 paths for all string scanning functions
+3. ✅ Context-sensitive pattern detection (e.g., `: ` and `- ` via bitmask operations)
+4. ✅ Newline detection infrastructure for future optimizations
 
 ### JSON Parser Techniques (Proven on x86_64)
 

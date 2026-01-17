@@ -20,6 +20,10 @@ mod neon;
 #[cfg(target_arch = "x86_64")]
 mod x86;
 
+// Re-export platform-specific types for P0 optimizations
+#[cfg(target_arch = "x86_64")]
+pub use x86::YamlCharClass;
+
 // ============================================================================
 // Public API - platform-dispatched functions
 // ============================================================================
@@ -108,6 +112,54 @@ pub fn count_leading_spaces(input: &[u8], start: usize) -> usize {
     {
         count_leading_spaces_scalar(input, start)
     }
+}
+
+// ============================================================================
+// P0 Optimizations - Multi-Character Classification
+// ============================================================================
+
+/// Classify YAML structural characters in a chunk (32 bytes on AVX2, 16 on SSE2).
+///
+/// Returns classification bitmasks for multiple character types at once.
+/// This is the main P0 optimization for bulk character detection.
+///
+/// Currently only available on x86_64. Returns None on other platforms.
+#[inline]
+#[cfg(target_arch = "x86_64")]
+pub fn classify_yaml_chars(input: &[u8], offset: usize) -> Option<YamlCharClass> {
+    x86::classify_yaml_chars(input, offset)
+}
+
+/// Find the next newline (`\n`) from the given position.
+///
+/// Returns offset from `start` to the newline, or `None` if not found.
+/// Uses SIMD for fast scanning on supported platforms.
+#[inline]
+pub fn find_newline(input: &[u8], start: usize) -> Option<usize> {
+    if start >= input.len() {
+        return None;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86::find_newline_x86(input, start)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        find_newline_scalar(input, start)
+    }
+}
+
+/// Scalar implementation of find_newline.
+#[allow(dead_code)]
+fn find_newline_scalar(input: &[u8], start: usize) -> Option<usize> {
+    for (i, &b) in input[start..].iter().enumerate() {
+        if b == b'\n' {
+            return Some(i);
+        }
+    }
+    None
 }
 
 // ============================================================================
