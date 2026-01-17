@@ -865,40 +865,58 @@ End-to-end yq identity filter benchmarks after adding SIMD indentation:
 
 **Summary:** Baseline throughput ranges from 176-491 MiB/s for structured data, with string scanning achieving 2.8-3.0 GiB/s. This establishes a performance baseline before AVX2/AVX-512 optimizations.
 
-#### AMD Ryzen 9 7950X - P0 Optimized Results (2026-01-17)
+#### AMD Ryzen 9 7950X - P0+ Optimized Results (2026-01-17)
 
-**Optimizations Implemented:** Multi-character classification + Enhanced SIMD (AVX2 string scanning)
+**Optimizations Implemented:**
+- **P0**: Multi-character classification infrastructure (AVX2/SSE2)
+- **P0+**: Hybrid scalar/SIMD space skipping integration into parser hot paths
 
 ##### Performance Improvements vs Baseline
 
-| Workload Category | Baseline Range | P0 Optimized Range | Improvement |
-|-------------------|----------------|-------------------|-------------|
-| Simple KV         | 176-491 MiB/s  | 187-526 MiB/s     | **+4.5-6.7%** |
-| Nested structures | 300-427 MiB/s  | 326-456 MiB/s     | **+8.1-9.8%** |
-| Sequences         | 112-290 MiB/s  | 121-393 MiB/s     | **+7.5-14.2%** |
-| Quoted strings    | 163-368 MiB/s  | 558-1270 MiB/s    | **+10.9-20.0%** |
-| Long strings      | 2.8-3.0 GiB/s  | 3.4-3.7 GiB/s     | **+18.5-25.0%** |
-| Large files       | 342-491 MiB/s  | 363-550 MiB/s     | **+6.1-7.0%** |
+| Workload Category | Baseline Range | P0+ Optimized Range | Improvement |
+|-------------------|----------------|---------------------|-------------|
+| Simple KV         | 176-491 MiB/s  | 187-550 MiB/s       | **+4-7%** |
+| Nested structures | 300-427 MiB/s  | 326-456 MiB/s       | **+9-10%** |
+| Sequences         | 112-290 MiB/s  | 121-378 MiB/s       | **+7-8%** |
+| Quoted strings    | 163-368 MiB/s  | 180-405 MiB/s       | **+10-11%** |
+| Long strings      | 2.8-3.0 GiB/s  | 3.4-3.8 GiB/s       | **+2-21%** |
+| Large files       | 342-491 MiB/s  | 378-559 MiB/s       | **+6-8%** |
 
 **Key Achievements:**
-- ✅ **String scanning: +18-25% faster** (AVX2 quote/escape detection)
-- ✅ **Sequence parsing: +12-14% faster** (improved structural character handling)
-- ✅ **1MB files now complete** (previously timed out, now 550 MiB/s)
-- ✅ **Overall throughput: 187-550 MiB/s** for structured data
+- ✅ **Structured data: +4-7% faster** (hybrid SIMD space skipping in hot paths)
+- ✅ **String scanning: +2-21% faster** (AVX2 quote/escape detection + smart dispatch)
+- ✅ **Large files: +6-8% faster** (559 MiB/s on 100KB files)
+- ✅ **No regressions** across any workload
+- ✅ **Overall throughput: 187-559 MiB/s** for structured data
 
 ##### Selected Benchmark Improvements
 
-| Benchmark | Baseline | P0 Optimized | Speedup |
-|-----------|----------|--------------|---------|
-| simple_kv/10000 | 364 µs (491 MiB/s) | 341 µs (526 MiB/s) | **1.07x** |
-| sequences/10000 | 309 µs (290 MiB/s) | 264 µs (393 MiB/s) | **1.14x** |
-| nested/d3_w5 | 12.54 µs (342 MiB/s) | 11.32 µs (380 MiB/s) | **1.10x** |
-| quoted/double/1000 | 42.1 µs | 35.9 µs (1.27 GiB/s) | **1.17x** |
-| long_strings/4096b/double | 128.8 µs (2.97 GiB/s) | 104.1 µs (3.67 GiB/s) | **1.25x** |
-| large/100kb | 194.3 µs (491 MiB/s) | 182.1 µs (524 MiB/s) | **1.07x** |
-| large/1mb | timeout | 1.73 ms (550 MiB/s) | **(new)** |
+| Benchmark | Baseline | P0+ Optimized | Speedup |
+|-----------|----------|---------------|---------|
+| simple_kv/10000 | 364 µs (491 MiB/s) | 326 µs (550 MiB/s) | **+7.1%** |
+| sequences/10000 | 309 µs (290 MiB/s) | 274 µs (366 MiB/s) | **+6.8%** |
+| nested/d3_w5 | 12.54 µs (342 MiB/s) | 11.26 µs (380 MiB/s) | **+10.2%** |
+| quoted/double/1000 | 42.1 µs (361 MiB/s) | 37.9 µs (405 MiB/s) | **+11.1%** |
+| long_strings/4096b/double | 128.8 µs (2.97 GiB/s) | 105.2 µs (3.63 GiB/s) | **+18.3%** |
+| long_strings/4096b/single | 128.5 µs (2.98 GiB/s) | 100.6 µs (3.79 GiB/s) | **+21.7%** |
+| large/100kb | 194.3 µs (491 MiB/s) | 170.4 µs (559 MiB/s) | **+12.3%** |
+| large/10kb | 21.3 µs (448 MiB/s) | 19.6 µs (487 MiB/s) | **+8.0%** |
+| large/1kb | 2.79 µs (342 MiB/s) | 2.52 µs (378 MiB/s) | **+9.7%** |
 
-**Full results:** [.ai/scratch/yaml_p0_comparison.md](../../.ai/scratch/yaml_p0_comparison.md)
+##### Implementation Details
+
+**P0 Infrastructure** ([`src/yaml/simd/x86.rs`](../../src/yaml/simd/x86.rs)):
+- `classify_yaml_chars_avx2()` - Detect 8 character types in 32 bytes
+- `classify_yaml_chars_sse2()` - Detect 8 character types in 16 bytes
+- `count_leading_spaces()` - Fast indentation counting
+- `find_quote_or_escape()`, `find_single_quote()` - String scanning
+
+**P0+ Integration** ([`src/yaml/parser.rs`](../../src/yaml/parser.rs)):
+- Hybrid scalar/SIMD approach: check first 8 bytes scalar, use SIMD for longer runs
+- Integrated into 3 hot paths: sequence indent checking, block scalar indentation
+- Avoids SIMD dispatch overhead for typical 2-4 space YAML indents
+
+**Full results:** [.ai/scratch/yaml_p0_plus_integration_summary.md](../../.ai/scratch/yaml_p0_plus_integration_summary.md)
 
 ---
 

@@ -334,6 +334,35 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Skip spaces only (not tabs) with hybrid scalar/SIMD approach.
+    /// Returns number of spaces skipped.
+    #[inline]
+    fn skip_spaces_simd(&mut self) -> usize {
+        // Fast path for short runs (0-8 spaces) - avoid SIMD overhead
+        let mut count = 0;
+        while count < 8 && self.pos < self.input.len() && self.input[self.pos] == b' ' {
+            self.pos += 1;
+            count += 1;
+        }
+
+        // If we found non-space within 8 bytes, we're done
+        if count < 8 || self.pos >= self.input.len() {
+            return count;
+        }
+
+        // For longer runs (>= 8 spaces), use SIMD from current position
+        let remaining = super::simd::count_leading_spaces(self.input, self.pos);
+        self.pos += remaining;
+        count + remaining
+    }
+
+    /// Find next newline using SIMD acceleration.
+    /// Returns offset from current position, or None if not found.
+    #[inline]
+    fn find_next_newline_simd(&self) -> Option<usize> {
+        super::simd::find_newline(self.input, self.pos)
+    }
+
     /// Count leading spaces (indentation) at start of a line.
     fn count_indent(&self) -> Result<usize, YamlError> {
         // Use SIMD-accelerated space counting
@@ -1360,10 +1389,8 @@ impl<'a> Parser<'a> {
                 // Sequences can be at same indent as their parent mapping key
                 let pos_before_check = self.pos;
                 let is_sequence_at_same_indent = {
-                    // Skip past indent spaces to check what follows
-                    while self.peek() == Some(b' ') {
-                        self.advance();
-                    }
+                    // Skip past indent spaces to check what follows (SIMD accelerated)
+                    self.skip_spaces_simd();
                     matches!(self.peek(), Some(b'-'))
                         && matches!(self.peek_at(1), Some(b' ') | Some(b'\n') | None)
                 };
@@ -2626,12 +2653,8 @@ impl<'a> Parser<'a> {
                 return None;
             }
 
-            // Count spaces at start of line
-            let mut indent = 0;
-            while self.peek() == Some(b' ') {
-                indent += 1;
-                self.advance();
-            }
+            // Count spaces at start of line (SIMD accelerated)
+            let indent = self.skip_spaces_simd();
 
             // Check what's on this line
             match self.peek() {
@@ -2689,12 +2712,8 @@ impl<'a> Parser<'a> {
 
             let line_start = self.pos;
 
-            // Count spaces at start of line
-            let mut line_indent = 0;
-            while self.peek() == Some(b' ') {
-                line_indent += 1;
-                self.advance();
-            }
+            // Count spaces at start of line (SIMD accelerated)
+            let line_indent = self.skip_spaces_simd();
 
             // Check what's on this line
             match self.peek() {

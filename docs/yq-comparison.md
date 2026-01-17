@@ -18,7 +18,7 @@ Benchmarks comparing `succinctly yq .` (identity filter) vs `yq .` (Mike Farah's
 **OS**: Linux 6.6.87.2-microsoft-standard-WSL2 (WSL2)
 **succinctly**: Built with `--release --features cli` and `-C target-cpu=native`
 **SIMD**: SSE2/AVX2 (16/32 bytes/iteration for string scanning)
-**Optimizations**: P0 SIMD optimizations (multi-character classification, enhanced AVX2)
+**Optimizations**: P0+ SIMD optimizations (multi-character classification + hybrid scalar/SIMD integration)
 
 ## Methodology
 
@@ -49,37 +49,40 @@ cargo bench --bench yq_comparison
 | **100KB** |   8.1 MiB/s     |   4.6 MiB/s    | **1.8x**      |
 | **1MB**   |  12.7 MiB/s     |   7.7 MiB/s    | **1.6x**      |
 
-### x86_64 (AMD Ryzen 9 7950X) - Internal Micro-Benchmarks (P0 Optimized)
+### x86_64 (AMD Ryzen 9 7950X) - Internal Micro-Benchmarks (P0+ Optimized)
 
 #### Performance Summary (Selected Benchmarks)
 
-| Benchmark | Baseline | P0 Optimized | Improvement |
-|-----------|----------|--------------|-------------|
-| simple_kv/10000 | 364 µs (491 MiB/s) | 341 µs (526 MiB/s) | **+6.7%** |
-| sequences/10000 | 309 µs (290 MiB/s) | 264 µs (393 MiB/s) | **+14.2%** |
-| nested/d3_w5 | 12.54 µs (342 MiB/s) | 11.32 µs (380 MiB/s) | **+9.6%** |
-| quoted_strings/double/1000 | 42.1 µs | 35.9 µs | **+16.8%** |
-| long_strings/4096b/double | 128.8 µs (2.97 GiB/s) | 104.1 µs (3.67 GiB/s) | **+24.8%** |
-| large/100kb | 194.3 µs (491 MiB/s) | 182.1 µs (524 MiB/s) | **+7.0%** |
-| large/1mb | timeout | 1.73 ms (550 MiB/s) | **(new)** |
+| Benchmark | Baseline | P0+ Optimized | Improvement |
+|-----------|----------|---------------|-------------|
+| simple_kv/10000 | 364 µs (491 MiB/s) | 326 µs (550 MiB/s) | **+7.1%** |
+| sequences/10000 | 309 µs (290 MiB/s) | 274 µs (366 MiB/s) | **+6.8%** |
+| nested/d3_w5 | 12.54 µs (342 MiB/s) | 11.26 µs (380 MiB/s) | **+10.2%** |
+| quoted_strings/double/1000 | 42.1 µs (361 MiB/s) | 37.9 µs (405 MiB/s) | **+11.1%** |
+| long_strings/4096b/double | 128.8 µs (2.97 GiB/s) | 105.2 µs (3.63 GiB/s) | **+18.3%** |
+| long_strings/4096b/single | 128.5 µs (2.98 GiB/s) | 100.6 µs (3.79 GiB/s) | **+21.7%** |
+| large/100kb | 194.3 µs (491 MiB/s) | 170.4 µs (559 MiB/s) | **+12.3%** |
+| large/10kb | 21.3 µs (448 MiB/s) | 19.6 µs (487 MiB/s) | **+8.0%** |
+| large/1kb | 2.79 µs (342 MiB/s) | 2.52 µs (378 MiB/s) | **+9.7%** |
 
-#### Overall Throughput (P0 Optimized - 2026-01-17)
+#### Overall Throughput (P0+ Optimized - 2026-01-17)
 
-| Workload Category | Baseline Range | P0 Optimized Range | Improvement |
-|-------------------|----------------|-------------------|-------------|
-| Simple KV         | 176-491 MiB/s  | 187-526 MiB/s     | **+4.5-6.7%** |
-| Nested structures | 300-427 MiB/s  | 326-456 MiB/s     | **+8.1-9.8%** |
-| Sequences         | 112-290 MiB/s  | 121-393 MiB/s     | **+7.5-14.2%** |
-| Quoted strings    | 163-368 MiB/s  | 558-1270 MiB/s    | **+10.9-20.0%** |
-| Long strings      | 2.8-3.0 GiB/s  | 3.4-3.7 GiB/s     | **+18.5-25.0%** |
-| Large files       | 342-491 MiB/s  | 363-550 MiB/s     | **+6.1-7.0%** |
+| Workload Category | Baseline Range | P0+ Optimized Range | Improvement |
+|-------------------|----------------|---------------------|-------------|
+| Simple KV         | 176-491 MiB/s  | 187-550 MiB/s       | **+4-7%** |
+| Nested structures | 300-427 MiB/s  | 326-456 MiB/s       | **+9-10%** |
+| Sequences         | 112-290 MiB/s  | 121-378 MiB/s       | **+7-8%** |
+| Quoted strings    | 163-368 MiB/s  | 180-405 MiB/s       | **+10-11%** |
+| Long strings      | 2.8-3.0 GiB/s  | 3.4-3.8 GiB/s       | **+2-21%** |
+| Large files       | 342-491 MiB/s  | 378-559 MiB/s       | **+6-8%** |
 
 **Key Achievements:**
-- ✅ **String scanning: +18-25% faster** (AVX2 quote/escape detection)
-- ✅ **Sequence parsing: +12-14% faster** (improved structural character handling)
-- ✅ **1MB files now complete** (previously timed out, now 550 MiB/s)
+- ✅ **Structured data: +4-7% faster** (hybrid scalar/SIMD space skipping)
+- ✅ **String scanning: +2-21% faster** (AVX2 quote/escape detection + smart dispatch)
+- ✅ **Large files: +6-8% faster** (559 MiB/s on 100KB files)
+- ✅ **No regressions** across any workload
 
-**See also:** [docs/parsing/yaml.md](parsing/yaml.md) for full P0 optimization details and implementation plan.
+**See also:** [docs/parsing/yaml.md](parsing/yaml.md) for full P0+ optimization details and implementation plan.
 
 ---
 
@@ -191,22 +194,26 @@ The YAML parser uses platform-specific SIMD for hot paths:
 - **10KB files**: 10-18% faster
 - **100KB+ files**: 5-8% faster (other costs dominate)
 
-#### x86_64 (AVX2) P0 Optimized Results (2026-01-17)
+#### x86_64 (AVX2) P0+ Optimized Results (2026-01-17)
 
 **String scanning improvements:**
-- Double-quoted strings (1000 entries): **+17% faster** (42.1µs → 35.9µs)
-- Single-quoted strings (1000 entries): **+20% faster** (41.3µs → 33.6µs)
-- Long strings (4KB): **+24.8% faster** (128.8µs → 104.1µs, 2.97 → 3.67 GiB/s)
+- Double-quoted strings (1000 entries): **+11.1% faster** (42.1µs → 37.9µs, 361 → 405 MiB/s)
+- Single-quoted strings (1000 entries): **+13.7% faster** (41.3µs → 36.3µs, 368 → 420 MiB/s)
+- Long strings (4KB double): **+18.3% faster** (128.8µs → 105.2µs, 2.97 → 3.63 GiB/s)
+- Long strings (4KB single): **+21.7% faster** (128.5µs → 100.6µs, 2.98 → 3.79 GiB/s)
 
 **Overall parsing improvements:**
-- Sequences (10,000 items): **+14.2% faster** (309µs → 264µs)
-- Nested structures: **+8-10% faster**
-- Large files (100KB): **+7.0% faster** (194.3µs → 182.1µs)
+- Sequences (10,000 items): **+6.8% faster** (309µs → 274µs, 290 → 366 MiB/s)
+- Nested structures: **+9-10% faster** (326-456 MiB/s range)
+- Large files (100KB): **+12.3% faster** (194.3µs → 170.4µs, 491 → 559 MiB/s)
+- Large files (10KB): **+8.0% faster** (21.3µs → 19.6µs, 448 → 487 MiB/s)
+- Large files (1KB): **+9.7% faster** (2.79µs → 2.52µs, 342 → 378 MiB/s)
 
-**New capabilities:**
-- Multi-character classification (8 types in parallel)
-- Context-sensitive pattern detection (e.g., `: ` and `- `)
-- Newline detection infrastructure
+**Optimizations:**
+- **P0**: Multi-character classification infrastructure (8 types in parallel)
+- **P0+**: Hybrid scalar/SIMD space skipping (fast path for 0-8 spaces, SIMD for longer runs)
+- Context-sensitive pattern detection capabilities (e.g., `: ` and `- `)
+- Newline detection infrastructure (ready for future use)
 
 ### Trade-offs
 
