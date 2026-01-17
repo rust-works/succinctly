@@ -3061,33 +3061,9 @@ impl<'a> Parser<'a> {
     fn parse_anchor_name(&mut self) -> Result<String, YamlError> {
         let start = self.pos;
 
-        // YAML anchor names can contain any character except flow indicators,
-        // whitespace, and certain special chars.
-        // Colons are allowed if not followed by whitespace (which would make it a key separator).
-        while let Some(b) = self.peek() {
-            match b {
-                // Stop at flow indicators, whitespace, and newlines
-                b' ' | b'\t' | b'\n' | b'\r' | b'[' | b']' | b'{' | b'}' | b',' => break,
-                // Colon is allowed in anchor names if not followed by whitespace
-                b':' => {
-                    if let Some(next) = self.peek_at(1) {
-                        if next == b' ' || next == b'\t' || next == b'\n' || next == b'\r' {
-                            break;
-                        }
-                    }
-                    // Colon followed by non-whitespace - part of anchor name
-                    self.advance();
-                }
-                // High byte indicates start of multi-byte UTF-8 - consume all bytes
-                0x80..=0xFF => {
-                    // Multi-byte UTF-8 character - consume continuation bytes
-                    self.advance();
-                }
-                _ => {
-                    self.advance();
-                }
-            }
-        }
+        // Use SIMD to find the end of the anchor name (P4 optimization)
+        let end = simd::parse_anchor_name(self.input, start);
+        self.pos = end;
 
         if self.pos == start {
             return Err(YamlError::InvalidAnchorName {

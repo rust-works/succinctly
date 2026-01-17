@@ -739,6 +739,132 @@ fn find_block_scalar_end_scalar(input: &[u8], start: usize, min_indent: usize) -
     input.len()
 }
 
+// ============================================================================
+// Anchor/Alias Name Parsing (P4 Optimization)
+// ============================================================================
+
+/// Parse anchor/alias name using AVX2 SIMD to find terminator characters.
+///
+/// Searches for YAML anchor name terminators:
+/// - Whitespace: space, tab, newline, CR
+/// - Flow indicators: [ ] { } ,
+/// - Colons followed by whitespace
+///
+/// Returns the position of the first terminator, or end of input.
+#[target_feature(enable = "avx2")]
+unsafe fn parse_anchor_name_avx2(input: &[u8], start: usize) -> usize {
+    let len = input.len();
+    if start >= len {
+        return start;
+    }
+
+    let mut pos = start;
+    let end = len;
+
+    // Prepare comparison vectors for all terminator characters
+    let space = _mm256_set1_epi8(b' ' as i8);
+    let tab = _mm256_set1_epi8(b'\t' as i8);
+    let newline = _mm256_set1_epi8(b'\n' as i8);
+    let cr = _mm256_set1_epi8(b'\r' as i8);
+    let lbracket = _mm256_set1_epi8(b'[' as i8);
+    let rbracket = _mm256_set1_epi8(b']' as i8);
+    let lbrace = _mm256_set1_epi8(b'{' as i8);
+    let rbrace = _mm256_set1_epi8(b'}' as i8);
+    let comma = _mm256_set1_epi8(b',' as i8);
+    let colon = _mm256_set1_epi8(b':' as i8);
+
+    // Process 32 bytes at a time with AVX2
+    while pos + 32 <= end {
+        let chunk = _mm256_loadu_si256(input.as_ptr().add(pos) as *const __m256i);
+
+        // Check for all terminator types
+        let is_space = _mm256_cmpeq_epi8(chunk, space);
+        let is_tab = _mm256_cmpeq_epi8(chunk, tab);
+        let is_newline = _mm256_cmpeq_epi8(chunk, newline);
+        let is_cr = _mm256_cmpeq_epi8(chunk, cr);
+        let is_lbracket = _mm256_cmpeq_epi8(chunk, lbracket);
+        let is_rbracket = _mm256_cmpeq_epi8(chunk, rbracket);
+        let is_lbrace = _mm256_cmpeq_epi8(chunk, lbrace);
+        let is_rbrace = _mm256_cmpeq_epi8(chunk, rbrace);
+        let is_comma = _mm256_cmpeq_epi8(chunk, comma);
+        let is_colon = _mm256_cmpeq_epi8(chunk, colon);
+
+        // Combine all terminator checks
+        let ws = _mm256_or_si256(is_space, is_tab);
+        let ws = _mm256_or_si256(ws, is_newline);
+        let ws = _mm256_or_si256(ws, is_cr);
+
+        let flow = _mm256_or_si256(is_lbracket, is_rbracket);
+        let flow = _mm256_or_si256(flow, is_lbrace);
+        let flow = _mm256_or_si256(flow, is_rbrace);
+        let flow = _mm256_or_si256(flow, is_comma);
+
+        let terminators = _mm256_or_si256(ws, flow);
+        let terminators = _mm256_or_si256(terminators, is_colon);
+
+        let mask = _mm256_movemask_epi8(terminators);
+
+        if mask != 0 {
+            // Found terminator - find first position
+            let offset = mask.trailing_zeros() as usize;
+            return pos + offset;
+        }
+
+        pos += 32;
+    }
+
+    // Handle remaining bytes with scalar fallback
+    parse_anchor_name_scalar(input, pos)
+}
+
+/// Scalar fallback for parsing anchor names.
+fn parse_anchor_name_scalar(input: &[u8], start: usize) -> usize {
+    let mut pos = start;
+    while pos < input.len() {
+        let b = input[pos];
+        match b {
+            // Stop at flow indicators, whitespace, and newlines
+            b' ' | b'\t' | b'\n' | b'\r' | b'[' | b']' | b'{' | b'}' | b',' => break,
+            // Colon is allowed in anchor names if not followed by whitespace
+            b':' => {
+                if pos + 1 < input.len() {
+                    let next = input[pos + 1];
+                    if next == b' ' || next == b'\t' || next == b'\n' || next == b'\r' {
+                        break;
+                    }
+                }
+                pos += 1;
+            }
+            _ => pos += 1,
+        }
+    }
+    pos
+}
+
+/// Public API: Parse anchor/alias name with runtime SIMD dispatch.
+///
+/// Returns the position of the first terminator character.
+#[inline]
+pub fn parse_anchor_name(input: &[u8], start: usize) -> usize {
+    // Use SIMD for longer names (16+ bytes expected)
+    if start + 16 <= input.len() {
+        #[cfg(any(test, feature = "std"))]
+        {
+            if is_x86_feature_detected!("avx2") {
+                return unsafe { parse_anchor_name_avx2(input, start) };
+            }
+        }
+
+        #[cfg(not(any(test, feature = "std")))]
+        {
+            return unsafe { parse_anchor_name_avx2(input, start) };
+        }
+    }
+
+    // Fallback to scalar for short names or no SIMD
+    parse_anchor_name_scalar(input, start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

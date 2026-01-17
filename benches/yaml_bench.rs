@@ -139,6 +139,69 @@ fn generate_long_block_scalars(count: usize, lines_per_block: usize) -> Vec<u8> 
     yaml
 }
 
+/// Generate anchor-heavy YAML (for P4 SIMD anchor name parsing optimization).
+/// Simulates Kubernetes manifests with many anchors and aliases.
+fn generate_anchor_heavy(pairs: usize) -> Vec<u8> {
+    let mut yaml = Vec::with_capacity(pairs * 100);
+
+    // Define anchors with increasingly long names (simulating real K8s patterns)
+    for i in 0..pairs {
+        if i % 3 == 0 {
+            // Long anchor names (32+ chars) - where SIMD wins big
+            yaml.extend_from_slice(
+                format!(
+                    "common_configuration_setting_{}: &config_anchor_very_long_name_{} value{}\n",
+                    i, i, i
+                )
+                .as_bytes(),
+            );
+        } else if i % 3 == 1 {
+            // Medium anchor names (16-24 chars)
+            yaml.extend_from_slice(
+                format!("setting_{}: &anchor_medium_{} val{}\n", i, i, i).as_bytes(),
+            );
+        } else {
+            // Reference previous anchors with aliases
+            let ref_idx = i.saturating_sub(3);
+            if ref_idx % 3 == 0 {
+                yaml.extend_from_slice(
+                    format!("ref_{}: *config_anchor_very_long_name_{}\n", i, ref_idx).as_bytes(),
+                );
+            } else {
+                yaml.extend_from_slice(
+                    format!("ref_{}: *anchor_medium_{}\n", i, ref_idx).as_bytes(),
+                );
+            }
+        }
+    }
+    yaml
+}
+
+/// Generate Kubernetes-like YAML with realistic anchor patterns.
+fn generate_k8s_like(resources: usize) -> Vec<u8> {
+    let mut yaml = Vec::with_capacity(resources * 500);
+
+    // Common configuration anchors
+    yaml.extend_from_slice(b"common: &default_resource_limits\n");
+    yaml.extend_from_slice(b"  cpu: \"1000m\"\n");
+    yaml.extend_from_slice(b"  memory: \"512Mi\"\n");
+    yaml.extend_from_slice(b"labels: &common_labels_for_deployment\n");
+    yaml.extend_from_slice(b"  app: myapp\n");
+    yaml.extend_from_slice(b"  environment: production\n");
+    yaml.extend_from_slice(b"---\n");
+
+    // Generate resources referencing anchors
+    for i in 0..resources {
+        yaml.extend_from_slice(format!("resource_{}:\n", i).as_bytes());
+        yaml.extend_from_slice(b"  metadata:\n");
+        yaml.extend_from_slice(b"    labels: *common_labels_for_deployment\n");
+        yaml.extend_from_slice(b"  spec:\n");
+        yaml.extend_from_slice(b"    resources:\n");
+        yaml.extend_from_slice(b"      limits: *default_resource_limits\n");
+    }
+    yaml
+}
+
 // ============================================================================
 // Benchmark Groups
 // ============================================================================
@@ -326,6 +389,37 @@ fn bench_block_scalars(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_anchors(c: &mut Criterion) {
+    let mut group = c.benchmark_group("yaml/anchors");
+
+    // Test anchor-heavy YAML with various counts
+    for &count in &[10, 100, 1000, 5000] {
+        let yaml = generate_anchor_heavy(count);
+        group.throughput(Throughput::Bytes(yaml.len() as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(count), &yaml, |b, yaml| {
+            b.iter(|| {
+                let index = YamlIndex::build(black_box(yaml)).unwrap();
+                black_box(index)
+            })
+        });
+    }
+
+    // Test Kubernetes-like patterns
+    for &resources in &[10, 50, 100] {
+        let label = format!("k8s_{}", resources);
+        let yaml = generate_k8s_like(resources);
+        group.throughput(Throughput::Bytes(yaml.len() as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(&label), &yaml, |b, yaml| {
+            b.iter(|| {
+                let index = YamlIndex::build(black_box(yaml)).unwrap();
+                black_box(index)
+            })
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_simple_kv,
@@ -335,5 +429,6 @@ criterion_group!(
     bench_long_strings,
     bench_large_files,
     bench_block_scalars,
+    bench_anchors,
 );
 criterion_main!(benches);

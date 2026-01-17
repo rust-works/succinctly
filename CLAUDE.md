@@ -237,3 +237,12 @@ For detailed documentation on optimisation techniques used in this project, see 
   - `.map_or()` overhead and cache pollution from 256-byte tables dominated any benefit
   - Third consecutive optimization where micro-benchmarks mislead (P2.6, P2.8, P3 all failed)
   - See [docs/parsing/yaml.md#p3-branchless-character-classification---rejected-](docs/parsing/yaml.md#p3-branchless-character-classification---rejected-) for full analysis
+- ✅ P4 (Anchor/Alias SIMD): **6-17% improvement** on anchor-heavy workloads
+  - AVX2 SIMD scans for anchor name terminators in 32-byte chunks
+  - anchors/100: 13.60µs → 11.65µs (-14.6%, 1.17x faster)
+  - anchors/1000: 155.5µs → 139.2µs (-10.1%, 1.11x faster)
+  - k8s_100: 33.92µs → 31.40µs (-7.4%, 1.08x faster)
+  - Micro-benchmarks confirmed: 9-12x faster for 32-64 byte anchor names
+  - **First successful optimization since P2.7** - proves SIMD string searching wins when targeting real bottlenecks
+  - Best for: Kubernetes manifests, CI/CD configs with many anchors/aliases
+  - See [docs/parsing/yaml.md#p4-anchoralias-simd---accepted-](docs/parsing/yaml.md#p4-anchoralias-simd---accepted-) for full analysis

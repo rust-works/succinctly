@@ -351,6 +351,58 @@ pub fn find_block_scalar_end(input: &[u8], start: usize, min_indent: usize) -> O
     }
 }
 
+// ============================================================================
+// P4 Optimizations - Anchor/Alias Name Parsing
+// ============================================================================
+
+/// Parse anchor/alias name using SIMD to find terminator characters.
+///
+/// Searches for YAML anchor name terminators:
+/// - Whitespace: space, tab, newline, CR
+/// - Flow indicators: [ ] { } ,
+/// - Colons followed by whitespace
+///
+/// Returns the position of the first terminator, or end of input.
+///
+/// This is the main P4 optimization for fast anchor/alias name scanning.
+#[inline]
+pub fn parse_anchor_name(input: &[u8], start: usize) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86::parse_anchor_name(input, start)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        parse_anchor_name_scalar(input, start)
+    }
+}
+
+/// Scalar fallback for parse_anchor_name
+#[allow(dead_code)]
+fn parse_anchor_name_scalar(input: &[u8], start: usize) -> usize {
+    let mut pos = start;
+    while pos < input.len() {
+        let b = input[pos];
+        match b {
+            // Stop at flow indicators, whitespace, and newlines
+            b' ' | b'\t' | b'\n' | b'\r' | b'[' | b']' | b'{' | b'}' | b',' => break,
+            // Colon is allowed in anchor names if not followed by whitespace
+            b':' => {
+                if pos + 1 < input.len() {
+                    let next = input[pos + 1];
+                    if next == b' ' || next == b'\t' || next == b'\n' || next == b'\r' {
+                        break;
+                    }
+                }
+                pos += 1;
+            }
+            _ => pos += 1,
+        }
+    }
+    pos
+}
+
 /// Scalar fallback for find_block_scalar_end
 #[allow(dead_code)]
 fn find_block_scalar_end_scalar(input: &[u8], start: usize, min_indent: usize) -> Option<usize> {
