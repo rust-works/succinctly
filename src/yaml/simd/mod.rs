@@ -13,22 +13,43 @@
 //!
 //! Uses SIMD comparisons to check 16/32 bytes at a time, then
 //! extracts a bitmask and uses `trailing_zeros()` to find the position.
+//!
+//! ## Broadword Fallback
+//!
+//! The `broadword` module provides a portable implementation using pure u64
+//! arithmetic (SWAR = SIMD Within A Register). This works on any platform
+//! without CPU-specific intrinsics and can be enabled with `--features broadword-yaml`
+//! to use instead of NEON on ARM64 for comparison testing.
+//!
+//! ## Scalar Fallback
+//!
+//! Use `--features scalar-yaml` to force pure scalar (byte-by-byte) implementations.
+//! This is useful for benchmarking baseline performance without any SIMD or broadword.
 
-#[cfg(target_arch = "aarch64")]
+// NEON module only when not using broadword or scalar fallback
+#[cfg(all(
+    target_arch = "aarch64",
+    not(feature = "broadword-yaml"),
+    not(feature = "scalar-yaml")
+))]
 mod neon;
 
-#[cfg(target_arch = "x86_64")]
+// x86 module only when not using scalar fallback
+#[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
 mod x86;
 
+// Portable broadword module - always compiled for testing, used as fallback
+#[cfg(not(feature = "scalar-yaml"))]
+mod broadword;
+
 // Re-export platform-specific types for P0 optimizations
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
 pub use x86::YamlCharClass;
 
-// Re-export ARM64 broadword types for P0 optimizations
-// NOTE: Currently unused - broadword integration is disabled. See P4 analysis.
-#[cfg(target_arch = "aarch64")]
-#[allow(unused_imports)]
-pub use neon::{YamlCharClass16, YamlCharClassBroadword};
+// Re-export broadword types - always use from the portable broadword module
+// (even on ARM64 with NEON, since the types are identical)
+#[cfg(not(feature = "scalar-yaml"))]
+pub use broadword::{YamlCharClass16, YamlCharClassBroadword};
 
 // ============================================================================
 // Public API - platform-dispatched functions
@@ -47,19 +68,38 @@ pub fn find_quote_or_escape(input: &[u8], start: usize, end: usize) -> Option<us
     }
     let end = end.min(input.len());
 
-    #[cfg(target_arch = "aarch64")]
+    // Scalar fallback: when scalar-yaml feature is enabled
+    #[cfg(feature = "scalar-yaml")]
+    {
+        find_quote_or_escape_scalar(input, start, end)
+    }
+
+    // ARM64 with NEON (default, when not scalar or broadword)
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(feature = "broadword-yaml"),
+        not(feature = "scalar-yaml")
+    ))]
     {
         neon::find_quote_or_escape_neon(input, start, end)
     }
 
-    #[cfg(target_arch = "x86_64")]
+    // x86_64 uses native SIMD (when not scalar)
+    #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
     {
         x86::find_quote_or_escape_x86(input, start, end)
     }
 
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    // Broadword fallback: when feature enabled on ARM64, or on non-SIMD platforms (when not scalar)
+    #[cfg(all(
+        not(feature = "scalar-yaml"),
+        any(
+            all(target_arch = "aarch64", feature = "broadword-yaml"),
+            not(any(target_arch = "aarch64", target_arch = "x86_64"))
+        )
+    ))]
     {
-        find_quote_or_escape_scalar(input, start, end)
+        broadword::find_quote_or_escape_broadword(input, start, end)
     }
 }
 
@@ -76,19 +116,38 @@ pub fn find_single_quote(input: &[u8], start: usize, end: usize) -> Option<usize
     }
     let end = end.min(input.len());
 
-    #[cfg(target_arch = "aarch64")]
+    // Scalar fallback: when scalar-yaml feature is enabled
+    #[cfg(feature = "scalar-yaml")]
+    {
+        find_single_quote_scalar(input, start, end)
+    }
+
+    // ARM64 with NEON (default, when not scalar or broadword)
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(feature = "broadword-yaml"),
+        not(feature = "scalar-yaml")
+    ))]
     {
         neon::find_single_quote_neon(input, start, end)
     }
 
-    #[cfg(target_arch = "x86_64")]
+    // x86_64 uses native SIMD (when not scalar)
+    #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
     {
         x86::find_single_quote_x86(input, start, end)
     }
 
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    // Broadword fallback: when feature enabled on ARM64, or on non-SIMD platforms (when not scalar)
+    #[cfg(all(
+        not(feature = "scalar-yaml"),
+        any(
+            all(target_arch = "aarch64", feature = "broadword-yaml"),
+            not(any(target_arch = "aarch64", target_arch = "x86_64"))
+        )
+    ))]
     {
-        find_single_quote_scalar(input, start, end)
+        broadword::find_single_quote_broadword(input, start, end)
     }
 }
 
@@ -104,19 +163,38 @@ pub fn count_leading_spaces(input: &[u8], start: usize) -> usize {
         return 0;
     }
 
-    #[cfg(target_arch = "aarch64")]
+    // Scalar fallback: when scalar-yaml feature is enabled
+    #[cfg(feature = "scalar-yaml")]
+    {
+        count_leading_spaces_scalar(input, start)
+    }
+
+    // ARM64 with NEON (default, when not scalar or broadword)
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(feature = "broadword-yaml"),
+        not(feature = "scalar-yaml")
+    ))]
     {
         neon::count_leading_spaces_neon(input, start)
     }
 
-    #[cfg(target_arch = "x86_64")]
+    // x86_64 uses native SIMD (when not scalar)
+    #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
     {
         x86::count_leading_spaces_x86(input, start)
     }
 
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    // Broadword fallback: when feature enabled on ARM64, or on non-SIMD platforms (when not scalar)
+    #[cfg(all(
+        not(feature = "scalar-yaml"),
+        any(
+            all(target_arch = "aarch64", feature = "broadword-yaml"),
+            not(any(target_arch = "aarch64", target_arch = "x86_64"))
+        )
+    ))]
     {
-        count_leading_spaces_scalar(input, start)
+        broadword::count_leading_spaces_broadword(input, start)
     }
 }
 
@@ -131,34 +209,40 @@ pub fn count_leading_spaces(input: &[u8], start: usize) -> usize {
 ///
 /// Currently only available on x86_64. Returns None on other platforms.
 #[inline]
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
 pub fn classify_yaml_chars(input: &[u8], offset: usize) -> Option<YamlCharClass> {
     x86::classify_yaml_chars(input, offset)
 }
 
 /// Classify 16 bytes of YAML structural characters using broadword operations.
 ///
-/// ARM64 version using pure u64 arithmetic instead of NEON movemask emulation.
+/// Uses pure u64 arithmetic instead of SIMD intrinsics.
 /// Returns classification bitmasks for 8 character types at once.
 ///
-/// NOTE: Currently unused - broadword integration is disabled. See P4 analysis.
+/// Available on ARM64 (with or without broadword-yaml feature) and non-SIMD platforms.
 #[inline]
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(
+    not(feature = "scalar-yaml"),
+    any(target_arch = "aarch64", not(target_arch = "x86_64"))
+))]
 #[allow(dead_code)]
 pub fn classify_yaml_chars_16(input: &[u8], offset: usize) -> Option<YamlCharClass16> {
-    neon::classify_yaml_chars_16(input, offset)
+    broadword::classify_yaml_chars_16(input, offset)
 }
 
 /// Classify 8 bytes of YAML structural characters using broadword operations.
 ///
-/// ARM64 version for smaller chunks.
+/// Uses pure u64 arithmetic instead of SIMD intrinsics.
 ///
-/// NOTE: Currently unused - broadword integration is disabled. See P4 analysis.
+/// Available on ARM64 (with or without broadword-yaml feature) and non-SIMD platforms.
 #[inline]
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(
+    not(feature = "scalar-yaml"),
+    any(target_arch = "aarch64", not(target_arch = "x86_64"))
+))]
 #[allow(dead_code)]
 pub fn classify_yaml_chars_8(input: &[u8], offset: usize) -> Option<YamlCharClassBroadword> {
-    neon::classify_yaml_chars_broadword(input, offset)
+    broadword::classify_yaml_chars_broadword(input, offset)
 }
 
 /// Find the next newline (`\n`) from the given position.
@@ -172,19 +256,22 @@ pub fn find_newline(input: &[u8], start: usize) -> Option<usize> {
         return None;
     }
 
-    #[cfg(target_arch = "x86_64")]
+    // Scalar fallback: when scalar-yaml feature is enabled
+    #[cfg(feature = "scalar-yaml")]
+    {
+        find_newline_scalar(input, start)
+    }
+
+    // x86_64 uses native SIMD (when not scalar)
+    #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
     {
         x86::find_newline_x86(input, start)
     }
 
-    #[cfg(target_arch = "aarch64")]
+    // ARM64 and other platforms use broadword (when not scalar)
+    #[cfg(all(not(target_arch = "x86_64"), not(feature = "scalar-yaml")))]
     {
-        neon::find_newline_broadword(input, start)
-    }
-
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        find_newline_scalar(input, start)
+        broadword::find_newline_broadword(input, start)
     }
 }
 

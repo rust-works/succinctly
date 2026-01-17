@@ -442,7 +442,7 @@ impl<'a> Parser<'a> {
     ///
     /// NOTE: Currently disabled - benchmarks showed neutral to slight regression.
     /// Kept for future investigation. See P4 analysis in docs/parsing/yaml.md.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(feature = "scalar-yaml")))]
     #[inline]
     #[allow(dead_code)]
     fn skip_unquoted_simd(&self, _value_start: usize) -> Option<usize> {

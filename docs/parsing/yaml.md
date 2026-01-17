@@ -1607,6 +1607,160 @@ Following the P3 NEON rejection, we implemented a pure broadword (SWAR) approach
 
 ---
 
+### Portable Broadword Module (IMPLEMENTED ✅)
+
+**Status:** Added 2026-01-17 for non-SIMD platform support.
+
+The broadword implementation has been refactored into a portable module at [`src/yaml/simd/broadword.rs`](../../src/yaml/simd/broadword.rs) that works on any platform without CPU-specific intrinsics.
+
+**Use Cases:**
+1. **Non-x86/non-ARM platforms** - WebAssembly, RISC-V, MIPS, etc.
+2. **Testing/comparison** - Use `--features broadword-yaml` to compare broadword vs NEON on ARM64
+3. **Fallback** - Automatic fallback for platforms without SIMD
+
+**Feature Flag:**
+```toml
+[features]
+broadword-yaml = []  # Use broadword instead of NEON on ARM64
+```
+
+**ARM64 Benchmark Results (Broadword vs NEON):**
+
+| Benchmark | NEON | Broadword | Change |
+|-----------|------|-----------|--------|
+| simple_kv/10 | 1.57 µs | 1.53 µs | **-2.9%** ✅ |
+| simple_kv/100 | 6.0 µs | 5.79 µs | **-3.8%** ✅ |
+| simple_kv/1000 | 47.9 µs | 47.1 µs | **-1.8%** ✅ |
+| simple_kv/10000 | 503 µs | 491 µs | **-2.4%** ✅ |
+| nested/d5_w2 | 6.5 µs | 6.7 µs | **+3.0%** ❌ |
+| sequences/10000 | 397 µs | 381 µs | **-3.9%** ✅ |
+| quoted/double/100 | 6.7 µs | 6.6 µs | **-2.4%** ✅ |
+| long_strings/double/1024b | 41.3 µs | 44.7 µs | **+7.8%** ❌ |
+| long_strings/double/4096b | 146.5 µs | 162.4 µs | **+11%** ❌ |
+| large/1kb | 4.4 µs | 4.4 µs | **-1.2%** ✅ |
+| large/10kb | 29.6 µs | 28.8 µs | **-2.5%** ✅ |
+| large/100kb | 266 µs | 263 µs | **-1.0%** ⚖️ |
+| large/1mb | 2.46 ms | 2.45 ms | **-0.1%** ⚖️ |
+
+**End-to-End Benchmarks (yq_comparison):**
+
+| Benchmark | NEON | Broadword | Change |
+|-----------|------|-----------|--------|
+| succinctly/10kb | 4.17 ms | 4.24 ms | **+1.6%** ⚖️ |
+| succinctly/100kb | 9.0 ms | 9.3 ms | **+3.4%** ❌ |
+| succinctly/1mb | 53.1 ms | 54.3 ms | **+2.3%** ❌ |
+
+**Analysis:**
+
+The portable broadword module shows **mixed results compared to NEON**:
+
+1. **Simple KV workloads: Slightly faster** (-2 to -4%) - Broadword's lower overhead benefits short operations.
+
+2. **Long strings: Slower** (+8 to +11%) - NEON's 16-byte processing is more efficient for long strings, as expected from the earlier P4 analysis.
+
+3. **Large files: Neutral** (±1%) - The difference is within noise for bulk parsing.
+
+4. **Overall: Comparable** - For general YAML workloads, broadword is competitive with NEON. The main regressions are in long quoted strings.
+
+**Conclusion:**
+
+The portable broadword module is a viable fallback for platforms without SIMD:
+- ✅ **No significant regression** for typical YAML workloads
+- ✅ **Simpler code** without NEON intrinsics
+- ✅ **Works everywhere** - any platform with u64 arithmetic
+- ❌ **Long strings are slower** - but this is a rare case in typical YAML
+
+**Code Location:**
+- Portable module: [`src/yaml/simd/broadword.rs`](../../src/yaml/simd/broadword.rs)
+- Feature flag dispatch: [`src/yaml/simd/mod.rs:65-283`](../../src/yaml/simd/mod.rs#L65-L283)
+
+---
+
+### Broadword vs Scalar Performance (MEASURED ✅)
+
+**Status:** Measured 2026-01-17
+
+To quantify the benefit of broadword over pure byte-by-byte processing, we added a `scalar-yaml` feature flag that disables all SIMD and broadword optimizations.
+
+**Feature Flags:**
+```toml
+[features]
+broadword-yaml = []  # Use broadword instead of NEON on ARM64
+scalar-yaml = []     # Use pure scalar (byte-by-byte) - baseline
+```
+
+**ARM64 Micro-Benchmark Results (Broadword vs Scalar):**
+
+| Benchmark | Broadword | Scalar | Broadword Speedup |
+|-----------|-----------|--------|-------------------|
+| simple_kv/10 | 1.63 µs | 1.54 µs | -5% ❌ |
+| simple_kv/100 | 5.89 µs | 5.64 µs | -4% ❌ |
+| simple_kv/1000 | 49.2 µs | 46.8 µs | -5% ❌ |
+| simple_kv/10000 | 501 µs | 497 µs | -1% ⚖️ |
+| nested/d10_w2 | 220 µs | 237 µs | **+7%** ✅ |
+| sequences/100 | 5.12 µs | 4.84 µs | -5% ❌ |
+| sequences/1000 | 38.6 µs | 41.7 µs | **+7%** ✅ |
+| sequences/10000 | 388 µs | 379 µs | -2% ⚖️ |
+| **quoted/double/100** | 6.51 µs | 7.60 µs | **+15%** ✅ |
+| **quoted/single/100** | 6.63 µs | 6.85 µs | **+3%** ✅ |
+| **quoted/double/1000** | 56.0 µs | 66.1 µs | **+15%** ✅ |
+| **quoted/single/1000** | 54.5 µs | 57.1 µs | **+5%** ✅ |
+| **long_strings/double/64b** | 7.70 µs | 9.61 µs | **+20%** ✅ |
+| **long_strings/single/64b** | 7.52 µs | 8.74 µs | **+14%** ✅ |
+| **long_strings/double/256b** | 14.7 µs | 25.2 µs | **+42%** ✅ |
+| **long_strings/single/256b** | 13.96 µs | 22.0 µs | **+37%** ✅ |
+| **long_strings/double/1024b** | 45.0 µs | 85.1 µs | **+47%** ✅ |
+| **long_strings/single/1024b** | 42.1 µs | 68.3 µs | **+38%** ✅ |
+| **long_strings/double/4096b** | 164 µs | 332 µs | **+51%** ✅ |
+| **long_strings/single/4096b** | 154 µs | 271 µs | **+43%** ✅ |
+| large/1kb | 4.46 µs | 4.37 µs | -2% ⚖️ |
+| large/10kb | 29.4 µs | 28.1 µs | -4% ❌ |
+| large/100kb | 269 µs | 267 µs | -1% ⚖️ |
+| large/1mb | 2.51 ms | 2.60 ms | **+4%** ✅ |
+
+**End-to-End Benchmarks (yq_comparison):**
+
+| Benchmark | Broadword | Scalar | Broadword Speedup |
+|-----------|-----------|--------|-------------------|
+| succinctly/10kb | 4.25 ms | 4.24 ms | 0% ⚖️ |
+| succinctly/100kb | 8.96 ms | 9.77 ms | **+8%** ✅ |
+| succinctly/1mb | 54.8 ms | 55.4 ms | **+1%** ⚖️ |
+| nested/1kb (broadword) | 3.55 ms | 3.75 ms | **+5%** ✅ |
+| nested/10kb (broadword) | 3.88 ms | 4.09 ms | **+5%** ✅ |
+
+**Analysis:**
+
+The broadword optimization shows **strong benefits where it matters most**:
+
+1. **Quoted strings: +15-20% faster** - The broadword find_quote/find_single_quote functions process 8 bytes per iteration vs 1 byte for scalar, showing clear wins in quoted content.
+
+2. **Long strings: +40-50% faster** - This is where broadword shines. Scanning 4KB strings is 2x faster with broadword because it can skip 8 bytes at a time.
+
+3. **Simple KV workloads: ~5% slower** - Surprising regression, likely due to:
+   - Short strings where setup overhead > vectorization benefit
+   - Unquoted values don't use find_quote/find_single_quote
+   - Indentation counting dominates (broadword helps less here)
+
+4. **Large files: Neutral to slight improvement** - End-to-end performance is similar because:
+   - Most time is spent in parser logic, not scanning
+   - Benefits in quoted strings balance out overhead in unquoted content
+
+**Conclusion:**
+
+Broadword provides **significant speedup (40-50%)** for the operations it optimizes:
+- ✅ **Quoted string scanning** - Strong improvement with quoted content
+- ✅ **Long string scanning** - 2x faster for multi-KB strings
+- ⚖️ **Short strings/simple KV** - Minimal or slightly negative impact
+- ⚖️ **End-to-end** - Modest overall improvement (+1-8%)
+
+For platforms without SIMD (WebAssembly, RISC-V), broadword is **essential** for acceptable performance with quoted strings. On ARM64 with NEON, broadword is **competitive** and can be used as a simpler alternative.
+
+**Code Location:**
+- Scalar implementations: [`src/yaml/simd/mod.rs:348-372`](../../src/yaml/simd/mod.rs#L348-L372)
+- Feature dispatch: [`src/yaml/simd/mod.rs:65-283`](../../src/yaml/simd/mod.rs#L65-L283)
+
+---
+
 ## x86_64 Optimization Implementation Plan
 
 This section details planned and implemented SIMD optimizations for x86_64 (AMD Ryzen 9 7950X and similar).

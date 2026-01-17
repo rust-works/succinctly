@@ -52,6 +52,14 @@ large-tests = []    # 1G bitvector tests (~125MB RAM)
 huge-tests = []     # 5G bitvector tests (~625MB RAM)
 mmap-tests = ["memmap2", "tempfile"]  # Memory-mapped tests
 
+# Use portable broadword (SWAR) instead of NEON for YAML parsing on ARM64.
+# Useful for testing broadword performance vs NEON intrinsics.
+broadword-yaml = []
+
+# Use pure scalar (byte-by-byte) for YAML parsing. Disables all SIMD/broadword.
+# Useful for benchmarking baseline scalar performance.
+scalar-yaml = []
+
 [dependencies]
 bytemuck = { version = "1.14", features = ["derive"] }
 indexmap = "2.2"
