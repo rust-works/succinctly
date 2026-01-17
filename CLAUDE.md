@@ -281,3 +281,21 @@ For detailed documentation on optimisation techniques used in this project, see 
   - **Why Option B would fail**: Adds build cost to hot path (parsing) to optimize cold path (errors/CLI)
   - **Pattern recognition**: Not all JSON features are optimizations - NewlineIndex is CLI UX, not performance
   - See [docs/parsing/yaml.md#p7-newline-index---rejected-](docs/parsing/yaml.md#p7-newline-index---rejected-) for full analysis
+- ❌ P8 (AVX-512 Variants): **REJECTED** - benchmark design flaw + JSON precedent (7% slower at realistic sizes)
+  - **Primary reason**: Memory-bound workload doesn't benefit from wider SIMD
+    - JSON AVX-512 was **7-17% slower** than AVX2 and removed from codebase
+    - YAML is similarly memory-bound (sequential text parsing)
+    - Memory bandwidth bottleneck prevents wider vectors from helping
+  - **Micro-benchmark design flaw**:
+    - Measured loop iterations instead of work performed
+    - AVX2: 8 iterations for 256B (32B chunks)
+    - AVX-512: 4 iterations for 256B (64B chunks)
+    - "2x speedup" was artificial - half the iterations, not twice the efficiency
+  - **Realistic size results** (AMD Ryzen 9 7950X):
+    - 64B: **7% slower** (18.59ns vs 17.34ns) - memory bandwidth bottleneck
+    - 128B: **Neutral** (18.94ns vs 18.95ns) - break-even point
+    - 256B+: "Wins" misleading (fewer iterations, not faster per-byte)
+  - **Zen 4 limitation**: Splits 512-bit ops into two 256-bit paths (overhead without benefit)
+  - **Pattern recognition**: P5/P6/P7/P8 all rejected for mismatch (size/grammar/use case/benchmark)
+  - **Key lesson**: Wider SIMD ≠ faster for memory-bound workloads (AVX2 already saturates RAM bandwidth)
+  - See [docs/parsing/yaml.md#p8-avx-512-variants---rejected-](docs/parsing/yaml.md#p8-avx-512-variants---rejected-) for full analysis

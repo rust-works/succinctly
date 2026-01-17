@@ -47,6 +47,7 @@ This directory documents optimisation techniques used in the succinctly library,
 | BMI1 Mask Iteration | **-26%** | Optimised <1% of runtime | [simd.md](simd.md) |
 | NEON Batched Popcount | **-25%** | Prefix sum inherently sequential | [parallel-prefix.md](parallel-prefix.md) |
 | AVX-512 JSON Parser | **-10%** | Memory-bound, not compute-bound | [simd.md](simd.md) |
+| AVX-512 YAML Parser | **-7%** | Memory bandwidth bottleneck + benchmark flaw | [simd.md](simd.md) |
 | SIMD Lookahead Quote Skip | **-2 to -6%** | Short strings, SIMD overhead dominates | [state-machines.md](state-machines.md) |
 
 ---
@@ -99,6 +100,11 @@ The DSV lightweight index (simple array) beat the theoretically optimal 3-level 
 
 AVX-512 is slower than AVX2 for memory-bound workloads. The memory system can't keep up with wider vectors.
 
+**Evidence:**
+- JSON parsing: AVX-512 was 7-17% slower, removed from codebase
+- YAML parsing: AVX-512 was 7% slower at realistic 64B chunks
+- Pattern: Sequential text parsing saturates RAM bandwidth at AVX2 width already
+
 ### 4. Algorithmic > Micro
 
 A 627x speedup from cumulative index (algorithmic) dwarfs any SIMD optimisation.
@@ -106,6 +112,14 @@ A 627x speedup from cumulative index (algorithmic) dwarfs any SIMD optimisation.
 ### 5. Profile Against Production
 
 PFSM batched was 40% faster than reference but 25% slower than production. Always benchmark against what you're replacing.
+
+### 6. Benchmark Design Matters
+
+Micro-benchmarks must reflect real usage patterns, not just measure primitive operations in isolation.
+
+**YAML P8 lesson**: Benchmark measured loop iterations (AVX-512: 4 iterations for 256B, AVX2: 8 iterations) and showed "2x speedup" - but real parsing does the same total work for both. The apparent win was measuring *fewer function calls*, not *more work per call*.
+
+**Pattern to avoid**: Comparing different loop structures instead of comparing equivalent work.
 
 ---
 

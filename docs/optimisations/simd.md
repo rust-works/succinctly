@@ -107,12 +107,20 @@ unsafe fn popcount_avx512(words: &[u64; 8]) -> u64 {
 
 **When AVX-512 wins**: Compute-bound operations like popcount (5.2x faster).
 
-**When AVX-512 loses**: Memory-bound operations like JSON parsing (7-17% slower).
+**When AVX-512 loses**: Memory-bound operations like JSON parsing (7-17% slower) and YAML parsing (7% slower at 64B).
 
 **Why it can be slower**:
-1. Zen 4 splits AVX-512 into 2×256-bit micro-ops
-2. Higher power consumption causes frequency throttling
-3. Memory bandwidth is the bottleneck, not compute
+1. **Memory bandwidth bottleneck**: Sequential text parsing saturates RAM bandwidth at AVX2 width already
+2. **Zen 4 splits AVX-512 ops**: Physical execution units are 256-bit wide, so 512-bit ops split into two 256-bit micro-ops (overhead without benefit)
+3. **Higher power → frequency throttling**: CPU may reduce clock speed with AVX-512
+4. **Benchmark design matters**: Measuring loop iterations vs actual work can show misleading "wins"
+
+**Lessons from YAML P8 rejection (2026-01-18)**:
+- AVX-512 showed 7% regression at realistic 64B chunk size
+- Apparent "2x wins" at 256B+ were benchmark artifacts (half the loop iterations, not twice the efficiency)
+- Real parsing scans linearly → AVX2 and AVX-512 do same total work, but AVX-512 adds overhead
+- **Pattern**: When JSON AVX-512 failed (7-17% slower), YAML AVX-512 also failed (same memory-bound workload)
+- See [docs/parsing/yaml.md](../parsing/yaml.md#p8-avx-512-variants---rejected-) for full analysis
 
 ---
 

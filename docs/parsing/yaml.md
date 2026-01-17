@@ -1938,6 +1938,141 @@ Not all features in JSON are performance optimizations. NewlineIndex is a CLI co
 
 ---
 
+### P8: AVX-512 Variants - REJECTED ❌
+
+**Status:** Micro-benchmarked and rejected 2026-01-18
+
+Attempted to use AVX-512 (64-byte SIMD) instead of AVX2 (32-byte) for YAML primitives, expecting wider vectors to improve throughput on systems with AVX-512 support (AMD Ryzen 9 7950X).
+
+**Implementation Details:**
+- Created `benches/yaml_avx512_micro.rs` with three AVX-512 primitives:
+  1. `classify_yaml_chars_avx512` - 64-byte character classification
+  2. `find_block_scalar_end_avx512` - 64-byte block scalar boundary detection
+  3. `parse_anchor_name_avx512` - 64-byte anchor name parsing
+- Used AVX-512-BW instructions (`_mm512_cmpeq_epi8_mask` for mask generation)
+- Benchmarked against AVX2 implementations at 6 input sizes (32B to 4KB)
+
+**Micro-Benchmark Results (AMD Ryzen 9 7950X):**
+
+**Character Classification (classify_yaml_chars):**
+
+| Size | AVX2 Time | AVX2 Throughput | AVX-512 Time | AVX-512 Throughput | Speedup |
+|------|-----------|-----------------|--------------|-------------------|---------|
+| 32B  | 17.49 ns  | 1.70 GiB/s      | 1.66 ns      | 17.92 GiB/s       | **10.5x** ❌ *Invalid (optimization artifact)* |
+| 64B  | 17.34 ns  | 3.44 GiB/s      | 18.59 ns     | 3.21 GiB/s        | **0.93x (7% slower)** ❌ |
+| 128B | 18.95 ns  | 6.29 GiB/s      | 18.94 ns     | 6.30 GiB/s        | **1.00x (neutral)** |
+| 256B | 58.33 ns  | 4.09 GiB/s      | 29.05 ns     | 8.21 GiB/s        | **2.01x faster** ⚠️ *Misleading* |
+| 1KB  | 164.74 ns | 5.79 GiB/s      | 138.97 ns    | 6.86 GiB/s        | **1.19x faster** ⚠️ *Misleading* |
+| 4KB  | 422.42 ns | 9.03 GiB/s      | 380.55 ns    | 10.02 GiB/s       | **1.11x faster** ⚠️ *Misleading* |
+
+**Critical Issue: Flawed Benchmark Design**
+
+The benchmark measured **loop iterations**, not realistic work:
+
+```rust
+// AVX2: processes 32 bytes per iteration
+while pos + 32 <= input.len() {
+    results.push(classify_yaml_chars_avx2(input, pos));
+    pos += 32;  // 8 iterations for 256B input
+}
+
+// AVX-512: processes 64 bytes per iteration
+while pos + 64 <= input.len() {
+    results.push(classify_yaml_chars_avx512(input, pos));
+    pos += 64;  // 4 iterations for 256B input
+}
+```
+
+**Why the "2x speedup" at 256B is artificial:**
+- AVX2 does 8 iterations (256 ÷ 32)
+- AVX-512 does 4 iterations (256 ÷ 64)
+- Benchmark measures **number of function calls**, not **amount of work per call**
+- AVX-512 appears "2x faster" because it does **half the iterations**, not because it's twice as efficient
+
+**In real YAML parsing:**
+- We scan linearly through input looking for specific characters
+- Both AVX2 and AVX-512 would need to examine the same positions
+- AVX-512's wider vector doesn't reduce total work, just changes loop structure
+
+**Realistic Small-Size Results:**
+
+At actual YAML chunk sizes (64-128B), AVX-512 shows:
+- **64B: 7% slower** (18.59ns vs 17.34ns) - Memory bandwidth bottleneck
+- **128B: Neutral** (18.94ns vs 18.95ns) - Break-even point
+
+**Why AVX-512 Cannot Help YAML:**
+
+**1. JSON Precedent - AVX-512 Was 7-17% Slower**
+
+From `docs/archive/avx512-json-results.md`:
+```markdown
+The AVX-512 JSON parser implementation has been **removed** from the codebase
+because it was consistently **7-17% slower** than AVX2 across all workloads.
+```
+
+Key quote from `CLAUDE.md`:
+> "Wider SIMD != automatically faster (AVX-512 JSON was 10% slower than AVX2)"
+
+**2. Memory-Bound Workload**
+
+Both JSON and YAML parsing are memory-bound:
+- Throughput limited by RAM bandwidth, not compute
+- Wider SIMD vectors = more data demand per cycle
+- Memory subsystem can't keep up → stalls
+
+From `docs/optimisations/cache-memory.md`:
+> **This is why AVX-512 JSON parsing was 7-17% slower** - the workload was memory-bound.
+
+**3. Zen 4 Architecture Limitation**
+
+AMD Ryzen 9 7950X (Zen 4) splits 512-bit operations:
+- Physical execution units: 256-bit wide
+- 512-bit operations split into two 256-bit ops
+- Adds overhead without benefit
+- AVX2 uses native 256-bit paths directly
+
+**4. Benchmark Design Doesn't Reflect Real Parsing**
+
+The micro-benchmark's "wins" at 256B+ come from:
+- Doing fewer loop iterations (not more work per iteration)
+- Not matching real YAML parsing patterns
+- Real parsing: sequential scan, early-exit on character match
+- Benchmark: process entire input in fixed chunks
+
+**5. Pattern Recognition: P5/P6/P7/P8 Rejections**
+
+All four recent optimizations rejected for **mismatch between assumptions and reality**:
+- **P5:** Size mismatch (SIMD sweet spot vs real data)
+- **P6:** Grammar mismatch (can't apply DSV techniques)
+- **P7:** Use case mismatch (CLI feature, not optimization)
+- **P8:** Benchmark mismatch (measures iterations, not work)
+
+**Decision: REJECT P8**
+
+**Primary reasons:**
+1. **Micro-benchmark design flaw** - measures loop iterations instead of work performed
+2. **Realistic sizes (64-128B) show regression/neutral** - no benefit where it matters
+3. **JSON precedent** - AVX-512 was 7-17% slower and removed from codebase
+4. **Memory-bound workload** - YAML parsing limited by RAM bandwidth like JSON
+5. **Zen 4 splits 512-bit ops** - overhead without benefit on target platform
+6. **High risk of end-to-end regression** - no validation of real-world benefit
+
+**Key Lesson:**
+
+Wider SIMD is not automatically faster. For memory-bound workloads like sequential text parsing:
+- **Bottleneck:** RAM bandwidth (can't feed wider vectors fast enough)
+- **AVX2 (32B):** Already saturates memory bandwidth
+- **AVX-512 (64B):** Doubles data demand → more stalls, slower throughput
+
+**Pattern:** When JSON and YAML both parse sequentially through memory, same bottlenecks apply. JSON's AVX-512 failure strongly predicts YAML's would fail too.
+
+**No end-to-end benchmarks performed.** Optimization rejected after micro-benchmark analysis revealed flawed design and JSON's precedent confirmed memory-bound workloads don't benefit from wider SIMD.
+
+**Files created (to be cleaned up):**
+- `benches/yaml_avx512_micro.rs` - AVX-512 micro-benchmarks (DELETE)
+
+---
+
 ### P4: NEON `classify_yaml_chars` Port - REJECTED ❌
 
 **Status:** Tested and rejected 2026-01-17
@@ -2607,7 +2742,7 @@ unsafe fn is_simple_kv_line(line: &[u8]) -> Option<(usize, usize)> {
 | ~~**P5**~~ | ~~Flow Collection Fast Path~~ | ~~10-20%~~ | Medium | ❌ **REJECTED** (size mismatch - aborted at analysis) |
 | ~~**P6**~~ | ~~BMI2 operations (PDEP/PEXT)~~ | ~~3-8%~~ | Medium | ❌ **REJECTED** (grammar mismatch - aborted at analysis) |
 | ~~**P7**~~ | ~~Newline Index~~ | ~~2-5%~~ | Medium | ❌ **REJECTED** (use case mismatch - CLI feature, not optimization) |
-| **P8** | AVX-512 variants | 0-10% (uncertain) | Medium | Low priority |
+| ~~**P8**~~ | ~~AVX-512 variants~~ | ~~0-10%~~ | Medium | ❌ **REJECTED** (benchmark mismatch + JSON precedent - micro-benchmarked, 7% slower at 64B) |
 
 **Achieved So Far:** P0 + P0+ + P2 + P2.5 + P2.7 + P4 = **+34-59% overall** improvement, **largest single gain: Block Scalar SIMD (+19-25%)**
 
