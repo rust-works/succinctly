@@ -826,6 +826,17 @@ SIMD search for `\n`, `#`, `:` in unquoted values (`find_unquoted_structural`):
 
 The optimization scales with file size - larger files benefit more because SIMD setup cost is amortized over more data and unquoted values tend to be longer.
 
+**⚠️ Post-Implementation Analysis (2026-01-17):**
+
+End-to-end benchmarks on ARM (M1 Max) showed **no measurable improvement** and small regressions at 10KB:
+- `yq_identity_comparison/succinctly/10kb`: **+6% regression**
+- `yq_identity_comparison/succinctly/100kb`: no change
+- `yq_identity_comparison/succinctly/1mb`: no change
+
+**Root Cause Analysis:** SIMD overhead dominates for typical YAML values (10-40 bytes).
+
+See [Tuning Opportunities](#unquoted-structural-scanning-tuning) below for proposed fixes.
+
 #### AMD Ryzen 9 7950X (x86_64 AVX2/AVX-512) - Baseline (2026-01-17)
 
 **Platform:** AMD Ryzen 9 7950X 16-Core (AVX-512, BMI2, POPCNT)
@@ -1355,6 +1366,203 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release --example yaml_profile
 - [Bit manipulation](../optimisations/bit-manipulation.md)
 - [State machines](../optimisations/state-machines.md)
 - [Optimization overview](../optimisations/README.md)
+
+---
+
+### Unquoted Structural Scanning Tuning
+
+The `find_unquoted_structural` SIMD optimization ([`src/yaml/parser.rs:774-810`](../../src/yaml/parser.rs#L774-L810)) showed regressions on typical YAML workloads. This section analyzes the issues and proposes fixes.
+
+#### Problem Analysis
+
+**Typical YAML value lengths** (from benchmark data):
+- `simple string without special chars` = 32 bytes
+- `Lorem ipsum dolor sit amet` = 26 bytes
+- `email@example.com` = 17 bytes
+- `User Name` = 9 bytes
+
+**Issue 1: SIMD overhead dominates for short values**
+
+Most YAML values are 10-40 bytes. SIMD processes 16-32 bytes/chunk but has setup cost:
+- Bounds checking
+- Slice creation
+- Runtime feature detection (AVX2)
+- Vector register setup
+
+For a 20-byte value ending at newline, scalar loop (~20 iterations) may be faster than SIMD setup + 1 chunk.
+
+**Issue 2: Repeated SIMD calls on non-terminating characters**
+
+Current code pattern:
+```rust
+loop {
+    if let Some(offset) = simd::find_unquoted_structural(...) {
+        self.pos = found_pos;
+        match self.input[found_pos] {
+            b':' => {
+                // Check if followed by whitespace
+                if !is_terminator { self.advance(); }  // Advance by 1, then SIMD again
+            }
+        }
+    }
+}
+```
+
+For `http://example.com:8080/path`, this finds `:` at position 4, checks context, advances 1, then SIMDs again to find `:` at position 21. Each SIMD call scans 16-32 bytes to find a character 5-10 bytes away.
+
+**Issue 3: Searching entire input unnecessarily**
+
+```rust
+simd::find_unquoted_structural(self.input, self.pos, self.input.len())
+```
+
+Passes `input.len()` as end bound, but newline typically terminates within 50-100 bytes.
+
+#### Proposed Tuning Opportunities
+
+**Opportunity 1: Minimum Length Threshold**
+
+Only use SIMD when remaining data is long enough to benefit:
+
+```rust
+const SIMD_THRESHOLD: usize = 32;
+
+let remaining = self.input.len() - self.pos;
+if remaining >= SIMD_THRESHOLD {
+    // Use SIMD
+} else {
+    // Use scalar - faster for short values
+}
+```
+
+**Expected impact:** Avoids SIMD overhead for 80%+ of values.
+
+**Opportunity 2: Scalar Fast-Path for First N Bytes**
+
+Check first 16-32 bytes scalar before invoking SIMD:
+
+```rust
+// Fast scalar check for first 32 bytes
+let check_len = remaining.min(32);
+for i in 0..check_len {
+    match self.input[self.pos + i] {
+        b'\n' => { self.pos += i; break; }
+        b'#' if preceded_by_space => { self.pos += i; break; }
+        b':' if followed_by_whitespace => { self.pos += i; break; }
+        _ => {}
+    }
+}
+// Only use SIMD if not found in first 32 bytes
+```
+
+**Expected impact:** Most values terminate within 32 bytes, avoiding SIMD entirely.
+
+**Opportunity 3: Continue from Found Position + 1**
+
+When `#` or `:` doesn't terminate, skip to position+1 before next search:
+
+```rust
+// Instead of: self.advance() then SIMD from self.pos
+// Do: remember last position, SIMD from last_pos + 1
+let search_start = found_pos + 1;
+```
+
+**Expected impact:** Reduces redundant scanning of already-checked bytes.
+
+**Opportunity 4: Newline-Only Fast Path**
+
+For most values, `\n` is found first. A simpler single-character search is faster:
+
+```rust
+// Try newline-only search first
+if let Some(nl_offset) = memchr(b'\n', &input[start..]) {
+    // Check if there's a # or : before newline (less common)
+    let segment = &input[start..start + nl_offset];
+    if !segment.iter().any(|&b| b == b'#' || b == b':') {
+        return Some(nl_offset);  // Fast path
+    }
+}
+// Fall back to 3-character SIMD search
+```
+
+**Expected impact:** 5-10% faster on typical config files.
+
+**Opportunity 5: Bounded Search Range**
+
+Limit search to reasonable line length instead of entire input:
+
+```rust
+const MAX_LINE_SCAN: usize = 256;
+let end = (self.pos + MAX_LINE_SCAN).min(self.input.len());
+simd::find_unquoted_structural(self.input, self.pos, end)
+```
+
+**Expected impact:** Reduces cache pressure on large files.
+
+#### Recommended Fix
+
+Combine **Opportunity 1 + 2**: Add minimum threshold with scalar fast-path.
+
+```rust
+fn parse_unquoted_value_with_indent(&mut self, start_indent: usize) -> usize {
+    let start = self.pos;
+
+    loop {
+        let remaining = self.input.len() - self.pos;
+
+        // Fast scalar path for typical short values (< 32 bytes to newline)
+        let check_len = remaining.min(32);
+        let mut found_terminator = false;
+
+        for i in 0..check_len {
+            let b = self.input[self.pos + i];
+            match b {
+                b'\n' => {
+                    self.pos += i;
+                    found_terminator = true;
+                    break;
+                }
+                b'#' if self.pos + i > start
+                    && self.input[self.pos + i - 1] == b' ' => {
+                    self.pos += i;
+                    found_terminator = true;
+                    break;
+                }
+                b':' if self.pos + i + 1 < self.input.len()
+                    && matches!(self.input[self.pos + i + 1], b' ' | b'\t' | b'\n') => {
+                    self.pos += i;
+                    found_terminator = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if found_terminator {
+            break;
+        }
+
+        // Only use SIMD if scalar didn't find terminator in first 32 bytes
+        if remaining > 32 {
+            // ... existing SIMD code for long values ...
+        }
+    }
+}
+```
+
+**Expected improvement:** Eliminate 6% regression at 10KB, potential 3-5% improvement at all sizes.
+
+#### Implementation Status
+
+| Opportunity | Status | Expected Impact |
+|-------------|--------|-----------------|
+| 1. Minimum threshold | Proposed | High |
+| 2. Scalar fast-path | Proposed | High |
+| 3. Continue from position+1 | Proposed | Medium |
+| 4. Newline-only fast path | Proposed | Medium |
+| 5. Bounded search range | Proposed | Low |
+
+---
 
 ### Integration with Parser
 
