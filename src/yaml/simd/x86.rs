@@ -541,6 +541,131 @@ unsafe fn count_leading_spaces_avx2(input: &[u8], start: usize) -> usize {
     offset + data[offset..].iter().take_while(|&&b| b == b' ').count()
 }
 
+/// Find the next structural character for unquoted values: `\n`, `#`, or `:`.
+///
+/// Returns offset from `start` to the found character, or `None` if not found before `end`.
+/// This is used for fast-path scanning in unquoted value parsing.
+#[inline]
+pub fn find_unquoted_structural_x86(input: &[u8], start: usize, end: usize) -> Option<usize> {
+    // Runtime dispatch to best available implementation
+    #[cfg(any(test, feature = "std"))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: We just checked for AVX2 support
+            return unsafe { find_unquoted_structural_avx2(input, start, end) };
+        }
+    }
+
+    // SAFETY: SSE2 is guaranteed on x86_64
+    unsafe { find_unquoted_structural_sse2(input, start, end) }
+}
+
+#[target_feature(enable = "sse2")]
+unsafe fn find_unquoted_structural_sse2(input: &[u8], start: usize, end: usize) -> Option<usize> {
+    let len = end - start;
+    let data = &input[start..end];
+    let mut offset = 0;
+
+    // Vectors for the three structural characters
+    let newline_vec = _mm_set1_epi8(b'\n' as i8);
+    let hash_vec = _mm_set1_epi8(b'#' as i8);
+    let colon_vec = _mm_set1_epi8(b':' as i8);
+
+    while offset + 16 <= len {
+        let chunk = _mm_loadu_si128(data.as_ptr().add(offset) as *const __m128i);
+
+        // Compare against all three targets
+        let newlines = _mm_cmpeq_epi8(chunk, newline_vec);
+        let hashes = _mm_cmpeq_epi8(chunk, hash_vec);
+        let colons = _mm_cmpeq_epi8(chunk, colon_vec);
+
+        // OR all results together
+        let matches = _mm_or_si128(_mm_or_si128(newlines, hashes), colons);
+
+        // Extract bitmask (one bit per byte)
+        let mask = _mm_movemask_epi8(matches) as u32;
+
+        if mask != 0 {
+            return Some(offset + mask.trailing_zeros() as usize);
+        }
+
+        offset += 16;
+    }
+
+    // Handle remaining bytes with scalar loop
+    for i in offset..len {
+        match data[i] {
+            b'\n' | b'#' | b':' => return Some(i),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+#[cfg(any(test, feature = "std"))]
+#[target_feature(enable = "avx2")]
+unsafe fn find_unquoted_structural_avx2(input: &[u8], start: usize, end: usize) -> Option<usize> {
+    let len = end - start;
+    let data = &input[start..end];
+    let mut offset = 0;
+
+    // Vectors for the three structural characters
+    let newline_vec = _mm256_set1_epi8(b'\n' as i8);
+    let hash_vec = _mm256_set1_epi8(b'#' as i8);
+    let colon_vec = _mm256_set1_epi8(b':' as i8);
+
+    while offset + 32 <= len {
+        let chunk = _mm256_loadu_si256(data.as_ptr().add(offset) as *const __m256i);
+
+        // Compare against all three targets
+        let newlines = _mm256_cmpeq_epi8(chunk, newline_vec);
+        let hashes = _mm256_cmpeq_epi8(chunk, hash_vec);
+        let colons = _mm256_cmpeq_epi8(chunk, colon_vec);
+
+        // OR all results together
+        let matches = _mm256_or_si256(_mm256_or_si256(newlines, hashes), colons);
+
+        // Extract bitmask (one bit per byte)
+        let mask = _mm256_movemask_epi8(matches) as u32;
+
+        if mask != 0 {
+            return Some(offset + mask.trailing_zeros() as usize);
+        }
+
+        offset += 32;
+    }
+
+    // Handle remaining bytes (16-31 bytes) with SSE2
+    if offset + 16 <= len {
+        let newline_vec_sse = _mm_set1_epi8(b'\n' as i8);
+        let hash_vec_sse = _mm_set1_epi8(b'#' as i8);
+        let colon_vec_sse = _mm_set1_epi8(b':' as i8);
+
+        let chunk = _mm_loadu_si128(data.as_ptr().add(offset) as *const __m128i);
+        let newlines = _mm_cmpeq_epi8(chunk, newline_vec_sse);
+        let hashes = _mm_cmpeq_epi8(chunk, hash_vec_sse);
+        let colons = _mm_cmpeq_epi8(chunk, colon_vec_sse);
+        let matches = _mm_or_si128(_mm_or_si128(newlines, hashes), colons);
+        let mask = _mm_movemask_epi8(matches) as u32;
+
+        if mask != 0 {
+            return Some(offset + mask.trailing_zeros() as usize);
+        }
+        offset += 16;
+    }
+
+    // Handle remaining bytes (< 16)
+    for i in offset..len {
+        match data[i] {
+            b'\n' | b'#' | b':' => return Some(i),
+            _ => {}
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -776,6 +901,69 @@ mod tests {
             hyphen_space_pattern & (1 << 11),
             0,
             "False positive: hyphen-space at position 11"
+        );
+    }
+
+    // ========================================================================
+    // Tests for find_unquoted_structural
+    // ========================================================================
+
+    #[test]
+    fn test_sse2_find_unquoted_structural_basic() {
+        unsafe {
+            // Newline
+            assert_eq!(
+                find_unquoted_structural_sse2(b"hello\nworld", 0, 11),
+                Some(5)
+            );
+            // Hash
+            assert_eq!(
+                find_unquoted_structural_sse2(b"value # comment", 0, 15),
+                Some(6)
+            );
+            // Colon
+            assert_eq!(find_unquoted_structural_sse2(b"key: value", 0, 10), Some(3));
+            // None
+            assert_eq!(find_unquoted_structural_sse2(b"no special", 0, 10), None);
+        }
+    }
+
+    #[test]
+    fn test_sse2_find_unquoted_structural_long() {
+        // Test with > 16 bytes to exercise SIMD path
+        let mut input = vec![b'a'; 50];
+        input[30] = b'\n';
+        unsafe {
+            assert_eq!(
+                find_unquoted_structural_sse2(&input, 0, input.len()),
+                Some(30)
+            );
+        }
+    }
+
+    #[test]
+    fn test_dispatched_find_unquoted_structural() {
+        // Newline
+        assert_eq!(
+            find_unquoted_structural_x86(b"hello\nworld", 0, 11),
+            Some(5)
+        );
+        // Hash
+        assert_eq!(
+            find_unquoted_structural_x86(b"value # comment", 0, 15),
+            Some(6)
+        );
+        // Colon
+        assert_eq!(find_unquoted_structural_x86(b"key: value", 0, 10), Some(3));
+        // None
+        assert_eq!(find_unquoted_structural_x86(b"no special", 0, 10), None);
+
+        // Test long string
+        let mut input = vec![b'a'; 50];
+        input[30] = b':';
+        assert_eq!(
+            find_unquoted_structural_x86(&input, 0, input.len()),
+            Some(30)
         );
     }
 }

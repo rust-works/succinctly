@@ -114,6 +114,38 @@ pub fn count_leading_spaces(input: &[u8], start: usize) -> usize {
     }
 }
 
+/// Find the next structural character for unquoted values: `\n`, `#`, or `:`.
+///
+/// Returns the offset from `start` to the found character, or `None` if
+/// not found before `end`.
+///
+/// This is used for fast-path scanning in unquoted value parsing - the SIMD
+/// search finds the next potentially interesting character, then the parser
+/// handles context-aware validation (e.g., `#` must be preceded by whitespace
+/// to be a comment, `:` must be followed by whitespace to be a key-value separator).
+#[inline]
+pub fn find_unquoted_structural(input: &[u8], start: usize, end: usize) -> Option<usize> {
+    if start >= end || start >= input.len() {
+        return None;
+    }
+    let end = end.min(input.len());
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon::find_unquoted_structural_neon(input, start, end)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86::find_unquoted_structural_x86(input, start, end)
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        find_unquoted_structural_scalar(input, start, end)
+    }
+}
+
 // ============================================================================
 // P0 Optimizations - Multi-Character Classification
 // ============================================================================
@@ -193,6 +225,17 @@ fn find_single_quote_scalar(input: &[u8], start: usize, end: usize) -> Option<us
 #[allow(dead_code)]
 fn count_leading_spaces_scalar(input: &[u8], start: usize) -> usize {
     input[start..].iter().take_while(|&&b| b == b' ').count()
+}
+
+/// Scalar implementation of find_unquoted_structural.
+#[allow(dead_code)]
+fn find_unquoted_structural_scalar(input: &[u8], start: usize, end: usize) -> Option<usize> {
+    for (i, &b) in input[start..end].iter().enumerate() {
+        if b == b'\n' || b == b'#' || b == b':' {
+            return Some(i);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -370,6 +413,81 @@ mod tests {
                 scalar,
                 simd,
                 "leading spaces mismatch for {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_unquoted_structural_basic() {
+        // Newline
+        assert_eq!(find_unquoted_structural(b"hello\nworld", 0, 11), Some(5));
+        // Hash
+        assert_eq!(find_unquoted_structural(b"value # comment", 0, 15), Some(6));
+        // Colon
+        assert_eq!(find_unquoted_structural(b"key: value", 0, 10), Some(3));
+        // None
+        assert_eq!(find_unquoted_structural(b"no special", 0, 10), None);
+    }
+
+    #[test]
+    fn test_find_unquoted_structural_priority() {
+        // First match wins
+        assert_eq!(find_unquoted_structural(b"a:b\nc#d", 0, 7), Some(1)); // : at 1
+        assert_eq!(find_unquoted_structural(b"a\nb:c#d", 0, 7), Some(1)); // \n at 1
+        assert_eq!(find_unquoted_structural(b"a#b:c\nd", 0, 7), Some(1)); // # at 1
+    }
+
+    #[test]
+    fn test_find_unquoted_structural_long() {
+        // Test with > 16 bytes to exercise SIMD path
+        let mut input = vec![b'a'; 50];
+        input[30] = b'\n';
+        assert_eq!(find_unquoted_structural(&input, 0, input.len()), Some(30));
+
+        // Test with > 32 bytes
+        let mut input = vec![b'a'; 100];
+        input[75] = b':';
+        assert_eq!(find_unquoted_structural(&input, 0, input.len()), Some(75));
+    }
+
+    #[test]
+    fn test_find_unquoted_structural_offset() {
+        let input = b"key: value # comment\n";
+        // Start after the first colon
+        assert_eq!(find_unquoted_structural(input, 4, input.len()), Some(7)); // # at 11 -> offset 7
+    }
+
+    #[test]
+    fn test_find_unquoted_structural_empty_range() {
+        assert_eq!(find_unquoted_structural(b"hello", 5, 5), None);
+        assert_eq!(find_unquoted_structural(b"hello", 10, 5), None);
+    }
+
+    #[test]
+    fn test_find_unquoted_structural_simd_matches_scalar() {
+        let test_cases: &[&[u8]] = &[
+            b"",
+            b":",
+            b"\n",
+            b"#",
+            b"no special chars",
+            b"colon at end:",
+            b":colon at start",
+            b"has newline\n",
+            b"has # hash",
+            b"has : and \n and #",
+            // Long strings
+            &[b'x'; 100],
+        ];
+
+        for &input in test_cases {
+            let scalar = find_unquoted_structural_scalar(input, 0, input.len());
+            let simd = find_unquoted_structural(input, 0, input.len());
+            assert_eq!(
+                scalar,
+                simd,
+                "structural mismatch for {:?}",
                 String::from_utf8_lossy(input)
             );
         }

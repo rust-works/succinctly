@@ -772,29 +772,41 @@ impl<'a> Parser<'a> {
         let start = self.pos;
 
         loop {
-            // Parse content on current line
-            while let Some(b) = self.peek() {
-                match b {
-                    b'\n' => break,
-                    b'#' => {
-                        // # is only a comment if preceded by whitespace
-                        if self.pos > start && self.input[self.pos - 1] == b' ' {
-                            break;
+            // Parse content on current line - use SIMD to find next structural char (\n, #, :)
+            loop {
+                if let Some(offset) =
+                    simd::find_unquoted_structural(self.input, self.pos, self.input.len())
+                {
+                    // Jump to the found position
+                    let found_pos = self.pos + offset;
+                    self.pos = found_pos;
+
+                    match self.input[found_pos] {
+                        b'\n' => break, // End of line
+                        b'#' => {
+                            // # is only a comment if preceded by whitespace
+                            if self.pos > start && self.input[self.pos - 1] == b' ' {
+                                break;
+                            }
+                            self.advance();
                         }
-                        self.advance();
-                    }
-                    b':' => {
-                        // Colon followed by whitespace ends the value (could be a key)
-                        // But in value context, colons in URLs etc. are allowed
-                        if self.peek_at(1) == Some(b' ')
-                            || self.peek_at(1) == Some(b'\t')
-                            || self.peek_at(1) == Some(b'\n')
-                        {
-                            break;
+                        b':' => {
+                            // Colon followed by whitespace ends the value (could be a key)
+                            // But in value context, colons in URLs etc. are allowed
+                            if self.peek_at(1) == Some(b' ')
+                                || self.peek_at(1) == Some(b'\t')
+                                || self.peek_at(1) == Some(b'\n')
+                            {
+                                break;
+                            }
+                            self.advance();
                         }
-                        self.advance();
+                        _ => unreachable!(), // SIMD only finds \n, #, or :
                     }
-                    _ => self.advance(),
+                } else {
+                    // No structural character found - consume rest of input
+                    self.pos = self.input.len();
+                    break;
                 }
             }
 

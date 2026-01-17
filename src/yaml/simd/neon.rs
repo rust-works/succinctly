@@ -155,6 +155,65 @@ unsafe fn count_leading_spaces_neon_impl(input: &[u8], start: usize) -> usize {
     offset + data[offset..].iter().take_while(|&&b| b == b' ').count()
 }
 
+/// Find the next structural character for unquoted values: `\n`, `#`, or `:`.
+///
+/// Returns offset from `start` to the found character, or `None` if not found before `end`.
+/// This is used for fast-path scanning in unquoted value parsing.
+#[inline]
+pub fn find_unquoted_structural_neon(input: &[u8], start: usize, end: usize) -> Option<usize> {
+    // SAFETY: target_arch = aarch64 guarantees NEON
+    unsafe { find_unquoted_structural_neon_impl(input, start, end) }
+}
+
+#[target_feature(enable = "neon")]
+unsafe fn find_unquoted_structural_neon_impl(
+    input: &[u8],
+    start: usize,
+    end: usize,
+) -> Option<usize> {
+    let len = end - start;
+    let data = &input[start..end];
+    let mut offset = 0;
+
+    // Vectors for the three structural characters
+    let newline_vec = vdupq_n_u8(b'\n');
+    let hash_vec = vdupq_n_u8(b'#');
+    let colon_vec = vdupq_n_u8(b':');
+
+    // Process 16-byte chunks
+    while offset + 16 <= len {
+        let chunk = vld1q_u8(data.as_ptr().add(offset));
+
+        // Compare against all three targets
+        let newlines = vceqq_u8(chunk, newline_vec);
+        let hashes = vceqq_u8(chunk, hash_vec);
+        let colons = vceqq_u8(chunk, colon_vec);
+
+        // OR all results together
+        let matches = vorrq_u8(vorrq_u8(newlines, hashes), colons);
+
+        // Extract bitmask
+        let mask = neon_movemask(matches);
+
+        if mask != 0 {
+            // Found a match - return position of first match
+            return Some(offset + mask.trailing_zeros() as usize);
+        }
+
+        offset += 16;
+    }
+
+    // Handle remaining bytes with scalar loop
+    for (i, &b) in data[offset..len].iter().enumerate() {
+        match b {
+            b'\n' | b'#' | b':' => return Some(offset + i),
+            _ => {}
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
