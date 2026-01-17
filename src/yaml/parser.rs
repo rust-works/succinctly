@@ -771,41 +771,97 @@ impl<'a> Parser<'a> {
         let start = self.pos;
 
         loop {
-            // Parse content on current line - use SIMD to find next structural char (\n, #, :)
-            loop {
-                if let Some(offset) =
-                    simd::find_unquoted_structural(self.input, self.pos, self.input.len())
-                {
-                    // Jump to the found position
-                    let found_pos = self.pos + offset;
-                    self.pos = found_pos;
+            // Parse content on current line
+            // Hybrid approach: check first 8 bytes with scalar loop, use SIMD for longer values
+            const SIMD_THRESHOLD: usize = 8;
 
-                    match self.input[found_pos] {
-                        b'\n' => break, // End of line
-                        b'#' => {
-                            // # is only a comment if preceded by whitespace
-                            if self.pos > start && self.input[self.pos - 1] == b' ' {
-                                break;
-                            }
-                            self.advance();
-                        }
-                        b':' => {
-                            // Colon followed by whitespace ends the value (could be a key)
-                            // But in value context, colons in URLs etc. are allowed
-                            if self.peek_at(1) == Some(b' ')
-                                || self.peek_at(1) == Some(b'\t')
-                                || self.peek_at(1) == Some(b'\n')
-                            {
-                                break;
-                            }
-                            self.advance();
-                        }
-                        _ => unreachable!(), // SIMD only finds \n, #, or :
+            // Fast path: scalar check for short values (< 8 bytes)
+            let line_start = self.pos;
+            let mut found_structural = false;
+
+            while self.pos - line_start < SIMD_THRESHOLD && self.pos < self.input.len() {
+                match self.input[self.pos] {
+                    b'\n' => {
+                        found_structural = true;
+                        break;
                     }
-                } else {
-                    // No structural character found - consume rest of input
-                    self.pos = self.input.len();
-                    break;
+                    b'#' => {
+                        // # is only a comment if preceded by whitespace
+                        if self.pos > start && self.input[self.pos - 1] == b' ' {
+                            found_structural = true;
+                            break;
+                        }
+                        self.advance();
+                    }
+                    b':' => {
+                        // Colon followed by whitespace ends the value
+                        if self.peek_at(1) == Some(b' ')
+                            || self.peek_at(1) == Some(b'\t')
+                            || self.peek_at(1) == Some(b'\n')
+                        {
+                            found_structural = true;
+                            break;
+                        }
+                        self.advance();
+                    }
+                    _ => self.advance(),
+                }
+            }
+
+            // If we found a structural char in the first 8 bytes, handle it
+            if found_structural {
+                // Already positioned at the structural character
+                match self.peek() {
+                    Some(b'\n') => {
+                        // Will be handled below
+                    }
+                    Some(b'#') | Some(b':') => {
+                        // Already at the right position
+                    }
+                    _ => {}
+                }
+                // Break to check continuation
+                // (The \n check happens below)
+            } else if self.pos >= self.input.len() {
+                // Reached EOF in scalar check
+                break;
+            } else {
+                // Value is longer than 8 bytes - use SIMD for the rest
+                loop {
+                    if let Some(offset) =
+                        simd::find_unquoted_structural(self.input, self.pos, self.input.len())
+                    {
+                        // Jump to the found position
+                        let found_pos = self.pos + offset;
+                        self.pos = found_pos;
+
+                        match self.input[found_pos] {
+                            b'\n' => break, // End of line
+                            b'#' => {
+                                // # is only a comment if preceded by whitespace
+                                if self.pos > start && self.input[self.pos - 1] == b' ' {
+                                    break;
+                                }
+                                self.advance();
+                            }
+                            b':' => {
+                                // Colon followed by whitespace ends the value (could be a key)
+                                // But in value context, colons in URLs etc. are allowed
+                                if self.peek_at(1) == Some(b' ')
+                                    || self.peek_at(1) == Some(b'\t')
+                                    || self.peek_at(1) == Some(b'\n')
+                                {
+                                    break;
+                                }
+                                self.advance();
+                            }
+                            _ => unreachable!(), // SIMD only finds \n, #, or :
+                        }
+                    } else {
+                        // No structural character found - consume rest of input
+                        self.pos = self.input.len();
+                        break;
+                    }
                 }
             }
 
