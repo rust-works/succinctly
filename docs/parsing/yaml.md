@@ -804,6 +804,28 @@ End-to-end yq identity filter benchmarks after adding SIMD indentation:
 | users         | 1KB   | 3.91 ms      | 3.43 ms      | **+12-16% faster** |
 | users         | 10KB  | 4.76 ms      | 4.26 ms      | **+10-14% faster** |
 
+##### Unquoted Structural Scanning (Chunked Skip)
+
+SIMD search for `\n`, `#`, `:` in unquoted values (`find_unquoted_structural`):
+
+**Parser-level benchmarks (yaml/large):**
+
+| Size   | Before       | After        | Improvement     |
+|--------|--------------|--------------|-----------------|
+| 1 KB   | 4.09 µs      | 3.99 µs      | ~1.5% (noise)   |
+| 10 KB  | 28.9 µs      | 28.3 µs      | **+3.8%**       |
+| 100 KB | 264 µs       | 257 µs       | **+5.2%**       |
+| 1 MB   | 2.51 ms      | 2.33 ms      | **+8.3%**       |
+
+**End-to-end yq identity benchmarks:**
+
+| Size   | Before       | After        | Improvement     |
+|--------|--------------|--------------|-----------------|
+| 100 KB | 11.8 ms      | 10.8 ms      | **+7.8%**       |
+| 1 MB   | 73.7 ms      | 71.4 ms      | **+2.7%**       |
+
+The optimization scales with file size - larger files benefit more because SIMD setup cost is amortized over more data and unquoted values tend to be longer.
+
 #### AMD Ryzen 9 7950X (x86_64 AVX2/AVX-512) - Baseline (2026-01-17)
 
 **Platform:** AMD Ryzen 9 7950X 16-Core (AVX-512, BMI2, POPCNT)
