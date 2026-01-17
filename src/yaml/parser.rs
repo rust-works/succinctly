@@ -142,6 +142,8 @@ struct Parser<'a> {
 
     // Node type stack (to track if we're in mapping or sequence)
     type_stack: Vec<NodeType>,
+    /// Cached current type for branchless access (avoids Option unwrapping in hot paths)
+    current_type: Option<NodeType>,
 
     // Anchor and alias tracking
     /// Anchors collected during parsing: name → bp_pos of anchored value
@@ -180,11 +182,27 @@ impl<'a> Parser<'a> {
             bp_to_text_end: Vec::new(),
             indent_stack: vec![0], // Start at indent 0
             type_stack: Vec::new(),
+            current_type: None,
             anchors: BTreeMap::new(),
             aliases: BTreeMap::new(),
             in_document: false,
             pending_explicit_key: false,
         }
+    }
+
+    /// Push a type onto the type stack and update the cached current type.
+    #[inline]
+    fn push_type(&mut self, node_type: NodeType) {
+        self.type_stack.push(node_type);
+        self.current_type = Some(node_type);
+    }
+
+    /// Pop a type from the type stack and update the cached current type.
+    #[inline]
+    fn pop_type(&mut self) -> Option<NodeType> {
+        let popped = self.type_stack.pop();
+        self.current_type = self.type_stack.last().copied();
+        popped
     }
 
     /// Set an interest bit at the current position.
@@ -735,11 +753,11 @@ impl<'a> Parser<'a> {
         // The virtual root is at indent_stack[0], so close everything above it
         while self.indent_stack.len() > 1 {
             // If we're closing a mapping that has a pending explicit key, close it first
-            if self.type_stack.last() == Some(&NodeType::Mapping) {
+            if self.current_type == Some(NodeType::Mapping) {
                 self.close_pending_explicit_key();
             }
             self.indent_stack.pop();
-            self.type_stack.pop();
+            self.pop_type();
             self.write_bp_close();
         }
 
@@ -1066,11 +1084,11 @@ impl<'a> Parser<'a> {
             // can be added to them.
             if current_indent > new_indent {
                 // If we're closing a mapping that has a pending explicit key, close it first
-                if self.type_stack.last() == Some(&NodeType::Mapping) {
+                if self.current_type == Some(NodeType::Mapping) {
                     self.close_pending_explicit_key();
                 }
                 self.indent_stack.pop();
-                self.type_stack.pop();
+                self.pop_type();
                 self.write_bp_close();
             } else {
                 break;
@@ -1107,7 +1125,7 @@ impl<'a> Parser<'a> {
                 && below_indent == indent
             {
                 self.indent_stack.pop();
-                self.type_stack.pop();
+                self.pop_type();
                 self.write_bp_close();
             }
         }
@@ -1132,7 +1150,7 @@ impl<'a> Parser<'a> {
         // We need a new sequence if:
         // 1. There's no sequence on the stack, OR
         // 2. The item indent doesn't match the sequence indent
-        let need_new_sequence = self.type_stack.last() != Some(&NodeType::Sequence)
+        let need_new_sequence = self.current_type != Some(NodeType::Sequence)
             || self.indent_stack.last().copied() != Some(indent);
 
         if need_new_sequence {
@@ -1140,7 +1158,7 @@ impl<'a> Parser<'a> {
             self.write_bp_open();
             self.write_ty(true); // 1 = sequence
             self.indent_stack.push(indent);
-            self.type_stack.push(NodeType::Sequence);
+            self.push_type(NodeType::Sequence);
         }
 
         // Open the sequence item node
@@ -1160,7 +1178,7 @@ impl<'a> Parser<'a> {
         // NOTE: This means for `- foo`, the item is at virtual indent 1, so content
         // at indent 2 would be part of the item. But the sequence itself is at indent 0.
         self.indent_stack.push(indent + 1);
-        self.type_stack.push(NodeType::SequenceItem);
+        self.push_type(NodeType::SequenceItem);
 
         // Check what follows
         if self.at_line_end() {
@@ -1202,7 +1220,7 @@ impl<'a> Parser<'a> {
             self.parse_value(indent)?;
             // Close the sequence item for simple values
             self.indent_stack.pop();
-            self.type_stack.pop();
+            self.pop_type();
             self.write_bp_close();
         }
 
@@ -1216,7 +1234,7 @@ impl<'a> Parser<'a> {
         self.write_bp_open();
         self.write_ty(false); // 0 = mapping
         self.indent_stack.push(indent);
-        self.type_stack.push(NodeType::Mapping);
+        self.push_type(NodeType::Mapping);
 
         // Mark key position
         self.set_ib();
@@ -1297,7 +1315,7 @@ impl<'a> Parser<'a> {
         self.close_same_indent_sequence_before_mapping_entry(indent);
 
         // Now check if we need to open a new mapping
-        let need_new_mapping = self.type_stack.last() != Some(&NodeType::Mapping)
+        let need_new_mapping = self.current_type != Some(NodeType::Mapping)
             || self.indent_stack.last().copied() != Some(indent);
 
         if need_new_mapping {
@@ -1305,7 +1323,7 @@ impl<'a> Parser<'a> {
             self.write_bp_open();
             self.write_ty(false); // 0 = mapping
             self.indent_stack.push(indent);
-            self.type_stack.push(NodeType::Mapping);
+            self.push_type(NodeType::Mapping);
         }
 
         // Mark key position
@@ -1571,7 +1589,7 @@ impl<'a> Parser<'a> {
         self.close_pending_explicit_key();
 
         // Check if we need to open a new mapping
-        let need_new_mapping = self.type_stack.last() != Some(&NodeType::Mapping)
+        let need_new_mapping = self.current_type != Some(NodeType::Mapping)
             || self.indent_stack.last().copied() != Some(indent);
 
         if need_new_mapping {
@@ -1579,7 +1597,7 @@ impl<'a> Parser<'a> {
             self.write_bp_open();
             self.write_ty(false); // 0 = mapping
             self.indent_stack.push(indent);
-            self.type_stack.push(NodeType::Mapping);
+            self.push_type(NodeType::Mapping);
         }
 
         // Skip `?`
@@ -1619,7 +1637,7 @@ impl<'a> Parser<'a> {
                 self.write_bp_open();
                 self.write_ty(true); // sequence
                 self.indent_stack.push(indent + 2); // Indent for sequence content
-                self.type_stack.push(NodeType::Sequence);
+                self.push_type(NodeType::Sequence);
 
                 // Parse first sequence item inline
                 self.write_bp_open(); // item node
@@ -1720,7 +1738,7 @@ impl<'a> Parser<'a> {
                 self.write_bp_open();
                 self.write_ty(true); // sequence
                 self.indent_stack.push(indent + 2);
-                self.type_stack.push(NodeType::Sequence);
+                self.push_type(NodeType::Sequence);
 
                 // Parse first sequence item
                 self.write_bp_open(); // item node
@@ -3101,7 +3119,7 @@ impl<'a> Parser<'a> {
         // Position 0 with text position 0
         self.write_bp_open_at(0);
         self.write_ty(true); // Root is a sequence
-        self.type_stack.push(NodeType::Sequence);
+        self.push_type(NodeType::Sequence);
         // Use usize::MAX as a sentinel indent for virtual root
         // This ensures document content at indent 0 creates its own container
         self.indent_stack[0] = usize::MAX;
@@ -3115,7 +3133,7 @@ impl<'a> Parser<'a> {
         self.end_document();
 
         // Close virtual root sequence
-        self.type_stack.pop();
+        self.pop_type();
         self.write_bp_close();
 
         Ok(SemiIndex {
