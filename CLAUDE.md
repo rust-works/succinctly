@@ -229,3 +229,11 @@ For detailed documentation on optimisation techniques used in this project, see 
   - End-to-end tests showed severe regressions instead
   - Modern CPUs (branch prediction, inlining) make threshold tuning counterproductive
   - See [docs/parsing/yaml.md#p28-simd-threshold-tuning---rejected-](docs/parsing/yaml.md#p28-simd-threshold-tuning---rejected-) for full analysis
+- ❌ P3 (Branchless Character Classification): **REJECTED** - 25-44% regression on simple parsing
+  - Replaced `matches!` macros with lookup tables to eliminate branches
+  - Micro-benchmarks showed 3-29% improvement for character classification
+  - End-to-end tests showed catastrophic 25-44% regressions
+  - Modern branch predictors (93-95% accuracy) beat lookup tables
+  - `.map_or()` overhead and cache pollution from 256-byte tables dominated any benefit
+  - Third consecutive optimization where micro-benchmarks mislead (P2.6, P2.8, P3 all failed)
+  - See [docs/parsing/yaml.md#p3-branchless-character-classification---rejected-](docs/parsing/yaml.md#p3-branchless-character-classification---rejected-) for full analysis

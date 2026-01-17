@@ -1348,7 +1348,107 @@ Micro-benchmarks suggested SIMD threshold should be 14-16 bytes.
 
 ---
 
-### P3: NEON `classify_yaml_chars` Port - REJECTED ❌
+### P3: Branchless Character Classification - REJECTED ❌
+
+**Status:** Tested and rejected 2026-01-17
+
+**Hypothesis:** Replace branchy character classification (`matches!` macros with multiple OR conditions) with branchless lookup tables to eliminate branch mispredictions in hot parsing loops.
+
+**Expected Impact:** 2-4% improvement (technique used successfully in simdjson)
+
+**Implementation Details:**
+
+Created 256-byte lookup tables for common character classes:
+- `HORIZONTAL_WHITESPACE`: `b' ' | b'\t'`
+- `WHITESPACE`: `b' ' | b'\t' | b'\n' | b'\r'`
+- `FLOW_TERMINATOR`: `b',' | b']' | b'}'`
+- `FLOW_KEY_TERMINATOR`: `b':' | b',' | b'}' | b']'`
+
+Replaced 20+ instances of branchy checks:
+```rust
+// Before:
+while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+    self.advance();
+}
+
+// After:
+while self.peek().map_or(false, char_class::is_horizontal_whitespace) {
+    self.advance();
+}
+```
+
+**Micro-Benchmark Results (AMD Ryzen 9 7950X):**
+
+| Test | Branchy | Branchless | Result |
+|------|---------|------------|--------|
+| Single char (space) | 593 ps | 573 ps | +3.4% faster ✓ |
+| Single char (letter) | 602 ps | 572 ps | +5.0% faster ✓ |
+| Loop 16 bytes | 7.7 ns | 5.5 ns | **+29% faster** ✓ |
+| Loop 64 bytes | 17.1 ns | 21.3 ns | -25% slower ❌ |
+
+Micro-benchmarks suggested 3-29% improvement on small inputs.
+
+**End-to-End Benchmark Results (AMD Ryzen 9 7950X):**
+
+| Benchmark | Baseline | Branchless | Change |
+|-----------|----------|------------|--------|
+| simple_kv/10 | 679 ns | 850 ns | **+25% regression** ❌ |
+| simple_kv/100 | 3.51 µs | 5.05 µs | **+44% regression** ❌ |
+| simple_kv/1000 | 31.2 µs | 44.6 µs | **+43% regression** ❌ |
+| simple_kv/10000 | 312 µs | 445 µs | **+43% regression** ❌ |
+
+**Catastrophic regressions across all workloads!**
+
+**Why It Failed:**
+
+1. **`.map_or()` overhead dominates**
+   - Option combinator creates function call indirection
+   - Option unwrapping overhead
+   - Closure allocation/inlining complexity
+   - This overhead >> benefit of branchless table lookup
+
+2. **Modern branch predictors are excellent**
+   - AMD Zen 4: 93-95% accuracy on predictable patterns
+   - Whitespace in YAML clusters (indentation, between tokens)
+   - Branch cost < 1 cycle when predicted correctly
+   - Lookup table: always pays 1 L1 cache access
+
+3. **Compiler already optimizes `matches!`**
+   - LLVM converts to efficient 2-4 instruction sequences
+   - Same instruction count as table lookup
+   - But no memory dependency!
+
+4. **Cache line pollution**
+   - 256-byte lookup tables occupy 4 cache lines
+   - Evict hot parser data from L1 cache
+   - Multiple tables increase cache pressure
+
+5. **Inlining broken**
+   - Cross-module function calls harder to inline
+   - `matches!` macro expands at call site (perfect for optimization)
+   - Even `#[inline(always)]` can't match macro inlining
+
+**Conclusion:** "Branchless is faster" techniques from 2000s don't apply to modern CPUs with sophisticated branch predictors. For predictable patterns like YAML parsing, branches are faster than table lookups.
+
+**Key Insight:** This is the **third rejected optimization** showing micro-benchmarks mislead:
+- P2.6 (Prefetching): +30% regression
+- P2.8 (Thresholds): +8-15% regression
+- **P3 (Branchless): +25-44% regression**
+
+All showed micro-benchmark improvements but end-to-end regressions!
+
+**Lessons Learned:**
+- Micro-benchmark wins ≠ real-world improvements (proven three times now!)
+- Modern branch predictors >> lookup tables for predictable patterns
+- Trust compiler optimizations (`matches!` is already optimal)
+- Option combinators have hidden costs in hot loops
+- Cache is precious - don't waste it on lookup tables
+
+**All changes reverted.** Existing `matches!` macros remain unchanged.
+
+---
+
+### P4: NEON `classify_yaml_chars` Port - REJECTED ❌
 
 **Status:** Tested and rejected 2026-01-17
 
@@ -1858,7 +1958,7 @@ unsafe fn is_simple_kv_line(line: &[u8]) -> Option<(usize, usize)> {
 | ~~**P2.6**~~ | ~~Software Prefetching~~ | ~~5-10%~~ | Low | ❌ **REJECTED** (+30% regression!) |
 | ~~**P2.7**~~ | ~~Block Scalar SIMD~~ | ~~10-20%~~ | Medium | ✅ **DONE** (+19-25%) **← Best!** |
 | ~~**P2.8**~~ | ~~SIMD Threshold Tuning~~ | ~~1-3%~~ | Very Low | ❌ **REJECTED** (+8-15% regression!) |
-| **P3** | Branchless Character Classification | 2-4% | Low | **Recommended next** |
+| ~~**P3**~~ | ~~Branchless Character Classification~~ | ~~2-4%~~ | Low | ❌ **REJECTED** (+25-44% regression!) |
 | **P4** | Anchor/Alias SIMD | 5-15% (anchor-heavy) | Medium | Good for k8s |
 | **P5** | BMI2 operations (PDEP/PEXT) | 3-8% | Medium | Experimental |
 | **P6** | Newline Index | 2-5% | Medium | Pending |
