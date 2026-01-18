@@ -670,8 +670,12 @@ pub enum Builtin {
     // Phase 10: Environment
     /// `env` - object of all environment variables
     Env,
-    /// `env.VAR` or `$ENV.VAR` - get environment variable
+    /// `env.VAR` or `$ENV.VAR` - get environment variable (expression-based)
     EnvVar(Box<Expr>),
+    /// `env(VAR_NAME)` - get environment variable by literal name (yq syntax)
+    EnvObject(String),
+    /// `strenv(VAR_NAME)` - get environment variable as string (yq syntax)
+    StrEnv(String),
 
     // Phase 10: Null handling
     /// `null` - the null constant

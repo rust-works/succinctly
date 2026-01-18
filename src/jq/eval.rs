@@ -1149,6 +1149,8 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         // Phase 10: Environment
         Builtin::Env => builtin_env(value, optional),
         Builtin::EnvVar(var) => builtin_envvar(var, value, optional),
+        Builtin::EnvObject(name) => builtin_env_object(name, optional),
+        Builtin::StrEnv(name) => builtin_strenv(name, optional),
 
         // Phase 10: Null handling
         Builtin::NullLit => QueryResult::Owned(OwnedValue::Null),
@@ -4589,6 +4591,8 @@ fn substitute_var_in_builtin(
         }
         Builtin::Env => Builtin::Env,
         Builtin::EnvVar(e) => Builtin::EnvVar(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::EnvObject(name) => Builtin::EnvObject(name.clone()),
+        Builtin::StrEnv(name) => Builtin::StrEnv(name.clone()),
         Builtin::NullLit => Builtin::NullLit,
         Builtin::Trim => Builtin::Trim,
         Builtin::Ltrim => Builtin::Ltrim,
@@ -6580,16 +6584,51 @@ fn builtin_debug_msg<'a, W: Clone + AsRef<[u64]>>(
 // Environment functions
 
 /// Builtin: env - object of all environment variables
+#[cfg(feature = "std")]
+fn builtin_env<'a, W: Clone + AsRef<[u64]>>(
+    _value: StandardJson<'a, W>,
+    _optional: bool,
+) -> QueryResult<'a, W> {
+    let mut env_obj = IndexMap::new();
+    for (key, value) in std::env::vars() {
+        env_obj.insert(key, OwnedValue::String(value));
+    }
+    QueryResult::Owned(OwnedValue::Object(env_obj))
+}
+
+#[cfg(not(feature = "std"))]
 fn builtin_env<'a, W: Clone + AsRef<[u64]>>(
     _value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
     // Return empty object in no_std context
-    // In std context, we could use std::env::vars()
     QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
 }
 
-/// Builtin: env.VAR or $ENV.VAR - get environment variable
+/// Builtin: env.VAR or $ENV.VAR - get environment variable (expression-based)
+#[cfg(feature = "std")]
+fn builtin_envvar<'a, W: Clone + AsRef<[u64]>>(
+    var: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the expression to get the variable name
+    let owned_value = to_owned(&value);
+    let var_result = eval_owned_expr(var, &owned_value, optional);
+    let var_name = match var_result {
+        Ok(OwnedValue::String(s)) => s,
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::new("env variable name must be a string")),
+    };
+
+    match std::env::var(&var_name) {
+        Ok(val) => QueryResult::Owned(OwnedValue::String(val)),
+        Err(_) if optional => QueryResult::None,
+        Err(_) => QueryResult::Owned(OwnedValue::Null),
+    }
+}
+
+#[cfg(not(feature = "std"))]
 fn builtin_envvar<'a, W: Clone + AsRef<[u64]>>(
     _var: &Expr,
     _value: StandardJson<'a, W>,
@@ -6597,6 +6636,63 @@ fn builtin_envvar<'a, W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'a, W> {
     // Return null in no_std context
     QueryResult::Owned(OwnedValue::Null)
+}
+
+/// Builtin: env(VAR_NAME) - get environment variable by literal name (yq syntax)
+#[cfg(feature = "std")]
+fn builtin_env_object<'a, W: Clone + AsRef<[u64]>>(
+    name: &str,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match std::env::var(name) {
+        Ok(val) => QueryResult::Owned(OwnedValue::String(val)),
+        Err(_) if optional => QueryResult::None,
+        Err(_) => QueryResult::Error(EvalError::new(format!(
+            "value for env variable '{}' not provided in env()",
+            name
+        ))),
+    }
+}
+
+#[cfg(not(feature = "std"))]
+fn builtin_env_object<'a, W: Clone + AsRef<[u64]>>(
+    name: &str,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    if optional {
+        QueryResult::None
+    } else {
+        QueryResult::Error(EvalError::new(format!(
+            "value for env variable '{}' not provided in env() (no_std)",
+            name
+        )))
+    }
+}
+
+/// Builtin: strenv(VAR_NAME) - get environment variable as string (yq syntax)
+/// This is the same as env() but explicitly for strings
+#[cfg(feature = "std")]
+fn builtin_strenv<'a, W: Clone + AsRef<[u64]>>(name: &str, optional: bool) -> QueryResult<'a, W> {
+    match std::env::var(name) {
+        Ok(val) => QueryResult::Owned(OwnedValue::String(val)),
+        Err(_) if optional => QueryResult::None,
+        Err(_) => QueryResult::Error(EvalError::new(format!(
+            "value for env variable '{}' not provided in strenv()",
+            name
+        ))),
+    }
+}
+
+#[cfg(not(feature = "std"))]
+fn builtin_strenv<'a, W: Clone + AsRef<[u64]>>(name: &str, optional: bool) -> QueryResult<'a, W> {
+    if optional {
+        QueryResult::None
+    } else {
+        QueryResult::Error(EvalError::new(format!(
+            "value for env variable '{}' not provided in strenv() (no_std)",
+            name
+        )))
+    }
 }
 
 // String functions
@@ -7640,6 +7736,8 @@ fn expand_func_calls_in_builtin(
         Builtin::EnvVar(e) => {
             Builtin::EnvVar(Box::new(expand_func_calls(e, func_name, params, body)))
         }
+        Builtin::EnvObject(name) => Builtin::EnvObject(name.clone()),
+        Builtin::StrEnv(name) => Builtin::StrEnv(name.clone()),
         Builtin::NullLit => Builtin::NullLit,
         Builtin::Trim => Builtin::Trim,
         Builtin::Ltrim => Builtin::Ltrim,
@@ -7810,6 +7908,8 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::DebugMsg(e) => Builtin::DebugMsg(Box::new(substitute_func_param(e, param, arg))),
         Builtin::Env => Builtin::Env,
         Builtin::EnvVar(e) => Builtin::EnvVar(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::EnvObject(name) => Builtin::EnvObject(name.clone()),
+        Builtin::StrEnv(name) => Builtin::StrEnv(name.clone()),
         Builtin::NullLit => Builtin::NullLit,
         Builtin::Trim => Builtin::Trim,
         Builtin::Ltrim => Builtin::Ltrim,
@@ -10087,9 +10187,32 @@ mod tests {
 
     #[test]
     fn test_env() {
-        // env returns empty object in no_std context
+        // env returns object of environment variables (non-empty when std feature is enabled)
         query!(b"null", "env", QueryResult::Owned(OwnedValue::Object(obj)) => {
-            assert!(obj.is_empty());
+            // In std context, env should have at least PATH
+            #[cfg(feature = "std")]
+            assert!(!obj.is_empty(), "env should return non-empty object in std context");
+            #[cfg(not(feature = "std"))]
+            assert!(obj.is_empty(), "env should return empty object in no_std context");
+        });
+    }
+
+    #[test]
+    fn test_env_var() {
+        // env(VAR) returns the environment variable value
+        // This test uses PATH which should always exist
+        query!(b"null", "env(PATH)", QueryResult::Owned(OwnedValue::String(s)) => {
+            #[cfg(feature = "std")]
+            assert!(!s.is_empty(), "PATH should be non-empty");
+        });
+    }
+
+    #[test]
+    fn test_strenv() {
+        // strenv(VAR) returns the environment variable value as string
+        query!(b"null", "strenv(PATH)", QueryResult::Owned(OwnedValue::String(s)) => {
+            #[cfg(feature = "std")]
+            assert!(!s.is_empty(), "PATH should be non-empty");
         });
     }
 
