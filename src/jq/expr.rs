@@ -424,6 +424,26 @@ pub enum Builtin {
     /// `isobject` - returns true if object
     IsObject,
 
+    // Type filter functions (select by type)
+    /// `values` - select non-null values (equivalent to `select(. != null)`)
+    Values,
+    /// `nulls` - select only null values
+    Nulls,
+    /// `booleans` - select only boolean values
+    Booleans,
+    /// `numbers` - select only number values
+    Numbers,
+    /// `strings` - select only string values
+    Strings,
+    /// `arrays` - select only array values
+    Arrays,
+    /// `objects` - select only object values
+    Objects,
+    /// `iterables` - select arrays and objects
+    Iterables,
+    /// `scalars` - select non-iterables (null, bool, number, string)
+    Scalars,
+
     // Length & Keys functions
     /// `length` - string/array/object length
     Length,

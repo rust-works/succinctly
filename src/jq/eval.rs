@@ -1032,6 +1032,87 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(OwnedValue::Bool(matches!(value, StandardJson::Object(_))))
         }
 
+        // Type filter functions (select by type)
+        // These return the input unchanged if the type matches, or nothing otherwise
+        Builtin::Values => {
+            // values - select non-null values
+            if matches!(value, StandardJson::Null) {
+                QueryResult::None
+            } else {
+                QueryResult::One(value)
+            }
+        }
+        Builtin::Nulls => {
+            // nulls - select only null values
+            if matches!(value, StandardJson::Null) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+        Builtin::Booleans => {
+            // booleans - select only boolean values
+            if matches!(value, StandardJson::Bool(_)) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+        Builtin::Numbers => {
+            // numbers - select only number values
+            if matches!(value, StandardJson::Number(_)) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+        Builtin::Strings => {
+            // strings - select only string values
+            if matches!(value, StandardJson::String(_)) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+        Builtin::Arrays => {
+            // arrays - select only array values
+            if matches!(value, StandardJson::Array(_)) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+        Builtin::Objects => {
+            // objects - select only object values
+            if matches!(value, StandardJson::Object(_)) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+        Builtin::Iterables => {
+            // iterables - select arrays and objects
+            if matches!(value, StandardJson::Array(_) | StandardJson::Object(_)) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+        Builtin::Scalars => {
+            // scalars - select non-iterables (null, bool, number, string)
+            if matches!(
+                value,
+                StandardJson::Null
+                    | StandardJson::Bool(_)
+                    | StandardJson::Number(_)
+                    | StandardJson::String(_)
+            ) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+
         // Length & Keys
         Builtin::Length => builtin_length(value, optional),
         Builtin::Utf8ByteLength => builtin_utf8bytelength(value, optional),
@@ -4476,6 +4557,15 @@ fn substitute_var_in_builtin(
         Builtin::IsString => Builtin::IsString,
         Builtin::IsArray => Builtin::IsArray,
         Builtin::IsObject => Builtin::IsObject,
+        Builtin::Values => Builtin::Values,
+        Builtin::Nulls => Builtin::Nulls,
+        Builtin::Booleans => Builtin::Booleans,
+        Builtin::Numbers => Builtin::Numbers,
+        Builtin::Strings => Builtin::Strings,
+        Builtin::Arrays => Builtin::Arrays,
+        Builtin::Objects => Builtin::Objects,
+        Builtin::Iterables => Builtin::Iterables,
+        Builtin::Scalars => Builtin::Scalars,
         Builtin::Length => Builtin::Length,
         Builtin::Utf8ByteLength => Builtin::Utf8ByteLength,
         Builtin::Keys => Builtin::Keys,
@@ -8056,6 +8146,15 @@ fn expand_func_calls_in_builtin(
         Builtin::IsString => Builtin::IsString,
         Builtin::IsArray => Builtin::IsArray,
         Builtin::IsObject => Builtin::IsObject,
+        Builtin::Values => Builtin::Values,
+        Builtin::Nulls => Builtin::Nulls,
+        Builtin::Booleans => Builtin::Booleans,
+        Builtin::Numbers => Builtin::Numbers,
+        Builtin::Strings => Builtin::Strings,
+        Builtin::Arrays => Builtin::Arrays,
+        Builtin::Objects => Builtin::Objects,
+        Builtin::Iterables => Builtin::Iterables,
+        Builtin::Scalars => Builtin::Scalars,
         Builtin::Length => Builtin::Length,
         Builtin::Utf8ByteLength => Builtin::Utf8ByteLength,
         Builtin::Keys => Builtin::Keys,
@@ -8282,6 +8381,15 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::IsString => Builtin::IsString,
         Builtin::IsArray => Builtin::IsArray,
         Builtin::IsObject => Builtin::IsObject,
+        Builtin::Values => Builtin::Values,
+        Builtin::Nulls => Builtin::Nulls,
+        Builtin::Booleans => Builtin::Booleans,
+        Builtin::Numbers => Builtin::Numbers,
+        Builtin::Strings => Builtin::Strings,
+        Builtin::Arrays => Builtin::Arrays,
+        Builtin::Objects => Builtin::Objects,
+        Builtin::Iterables => Builtin::Iterables,
+        Builtin::Scalars => Builtin::Scalars,
         Builtin::Length => Builtin::Length,
         Builtin::Utf8ByteLength => Builtin::Utf8ByteLength,
         Builtin::Keys => Builtin::Keys,

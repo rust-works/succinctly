@@ -52,6 +52,17 @@ The implementation is already production-ready for ~90% of jq use cases.
 - [x] `type` - Returns type name
 - [x] `isnull`, `isboolean`, `isnumber`, `isstring`, `isarray`, `isobject`
 
+### Type Filters
+- [x] `values` - Select non-null values
+- [x] `nulls` - Select only null values
+- [x] `booleans` - Select only boolean values
+- [x] `numbers` - Select only number values
+- [x] `strings` - Select only string values
+- [x] `arrays` - Select only array values
+- [x] `objects` - Select only object values
+- [x] `iterables` - Select arrays and objects
+- [x] `scalars` - Select non-iterables (null, bool, number, string)
+
 ### Selection & Filtering
 - [x] `select(cond)` - Filter by condition
 - [x] `empty` - Output nothing
@@ -171,26 +182,7 @@ The implementation is already production-ready for ~90% of jq use cases.
 
 ## TODO: Missing Features
 
-### Priority 1: Type Filter Builtins
-
-These are commonly used for filtering JSON:
-
-- [ ] `values` - Filter out nulls (equivalent to `select(. != null)`)
-- [ ] `nulls` - Select only null values
-- [ ] `booleans` - Select only boolean values
-- [ ] `numbers` - Select only number values
-- [ ] `strings` - Select only string values
-- [ ] `arrays` - Select only array values
-- [ ] `objects` - Select only object values
-- [ ] `iterables` - Select arrays and objects
-- [ ] `scalars` - Select non-iterables (null, bool, number, string)
-
-**Implementation notes:**
-- These are simple wrappers around `select(type == "...")` or `select(isnull)` etc.
-- Add to `Builtin` enum in `expr.rs`
-- Implement in `eval.rs` using existing `isnull`, `isboolean`, etc.
-
-### Priority 2: JSON String Conversion
+### Priority 1: JSON String Conversion
 
 - [ ] `tojson` - Convert value to JSON string
 - [ ] `fromjson` - Parse JSON string to value
@@ -200,7 +192,7 @@ These are commonly used for filtering JSON:
 - `fromjson` parses a JSON string into a value
 - Useful for working with JSON embedded in strings
 
-### Priority 3: I/O Operations
+### Priority 2: I/O Operations
 
 - [ ] `input` - Read next input from stdin/files
 - [ ] `inputs` - Stream all remaining inputs
@@ -211,7 +203,7 @@ These are commonly used for filtering JSON:
 - Consider adding `EvalContext` struct to hold input state
 - Low priority for single-file JSON processing use case
 
-### Priority 4: Module System
+### Priority 3: Module System
 
 Currently parsed but not evaluated:
 
@@ -225,7 +217,7 @@ Currently parsed but not evaluated:
 - Consider `jq -L` style library paths
 - May want to keep this optional/feature-gated
 
-### Priority 5: Location & Debugging
+### Priority 4: Location & Debugging
 
 - [ ] `$__loc__` - Current source location `{file, line}`
 - [ ] Comments in jq expressions (`#` to end of line)
@@ -234,14 +226,14 @@ Currently parsed but not evaluated:
 - `$__loc__` requires tracking source positions through parsing
 - Comment support needs lexer changes
 
-### Priority 6: Advanced Features
+### Priority 5: Advanced Features
 
 - [ ] Label-break: `label $name | ... | break $name`
 - [ ] Array slicing with steps: `.[::2]` (every other element)
 - [ ] `ascii` - ASCII character code (e.g., `"A" | ascii` → 65)
 - [ ] `now` - Current Unix timestamp
 
-### Priority 7: CLI Enhancements
+### Priority 6: CLI Enhancements
 
 These are CLI-level features, not expression language:
 
@@ -306,3 +298,4 @@ echo '{"a":1}' | succinctly jq '.a'
 | 2026-01-19 | Added pick() function for yq (✅ complete)|
 | 2026-01-19 | Added path (no-arg) for yq (✅ complete)  |
 | 2026-01-19 | Added parent / parent(n) for yq (✅ complete)|
+| 2026-01-19 | Added type filters: values, nulls, booleans, numbers, strings, arrays, objects, iterables, scalars (✅ complete)|

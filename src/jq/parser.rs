@@ -1575,6 +1575,45 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::IsObject));
         }
 
+        // Type filter functions (select by type)
+        if self.matches_keyword("values") {
+            self.consume_keyword("values");
+            return Ok(Some(Builtin::Values));
+        }
+        if self.matches_keyword("nulls") {
+            self.consume_keyword("nulls");
+            return Ok(Some(Builtin::Nulls));
+        }
+        if self.matches_keyword("booleans") {
+            self.consume_keyword("booleans");
+            return Ok(Some(Builtin::Booleans));
+        }
+        if self.matches_keyword("numbers") {
+            self.consume_keyword("numbers");
+            return Ok(Some(Builtin::Numbers));
+        }
+        // Note: "strings" must be checked before "string" in any other context
+        if self.matches_keyword("strings") {
+            self.consume_keyword("strings");
+            return Ok(Some(Builtin::Strings));
+        }
+        if self.matches_keyword("arrays") {
+            self.consume_keyword("arrays");
+            return Ok(Some(Builtin::Arrays));
+        }
+        if self.matches_keyword("objects") {
+            self.consume_keyword("objects");
+            return Ok(Some(Builtin::Objects));
+        }
+        if self.matches_keyword("iterables") {
+            self.consume_keyword("iterables");
+            return Ok(Some(Builtin::Iterables));
+        }
+        if self.matches_keyword("scalars") {
+            self.consume_keyword("scalars");
+            return Ok(Some(Builtin::Scalars));
+        }
+
         // Length & keys (no arguments)
         if self.matches_keyword("length") {
             self.consume_keyword("length");
