@@ -340,12 +340,12 @@ pub fn find_newline(input: &[u8], start: usize) -> Option<usize> {
 /// This is used to quickly skip to the end of `|` (literal) or `>` (folded) block scalars.
 #[inline]
 pub fn find_block_scalar_end(input: &[u8], start: usize, min_indent: usize) -> Option<usize> {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
     {
         x86::find_block_scalar_end(input, start, min_indent)
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(all(target_arch = "x86_64", not(feature = "scalar-yaml"))))]
     {
         find_block_scalar_end_scalar(input, start, min_indent)
     }
@@ -367,12 +367,12 @@ pub fn find_block_scalar_end(input: &[u8], start: usize, min_indent: usize) -> O
 /// This is the main P4 optimization for fast anchor/alias name scanning.
 #[inline]
 pub fn parse_anchor_name(input: &[u8], start: usize) -> usize {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
     {
         x86::parse_anchor_name(input, start)
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(all(target_arch = "x86_64", not(feature = "scalar-yaml"))))]
     {
         parse_anchor_name_scalar(input, start)
     }

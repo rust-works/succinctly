@@ -169,13 +169,7 @@ unsafe fn find_newline_sse2(input: &[u8], start: usize) -> Option<usize> {
     }
 
     // Handle remaining bytes
-    for i in offset..len {
-        if data[i] == b'\n' {
-            return Some(i);
-        }
-    }
-
-    None
+    (offset..len).find(|&i| data[i] == b'\n')
 }
 
 #[cfg(any(test, feature = "std"))]
@@ -213,13 +207,7 @@ unsafe fn find_newline_avx2(input: &[u8], start: usize) -> Option<usize> {
     }
 
     // Handle remaining bytes
-    for i in offset..len {
-        if data[i] == b'\n' {
-            return Some(i);
-        }
-    }
-
-    None
+    (offset..len).find(|&i| data[i] == b'\n')
 }
 
 // ============================================================================
@@ -296,14 +284,10 @@ unsafe fn find_quote_or_escape_sse2(input: &[u8], start: usize, end: usize) -> O
     }
 
     // Handle remaining bytes
-    for i in offset..len {
+    (offset..len).find(|&i| {
         let b = data[i];
-        if b == b'"' || b == b'\\' {
-            return Some(i);
-        }
-    }
-
-    None
+        b == b'"' || b == b'\\'
+    })
 }
 
 #[target_feature(enable = "sse2")]
@@ -331,13 +315,7 @@ unsafe fn find_single_quote_sse2(input: &[u8], start: usize, end: usize) -> Opti
     }
 
     // Handle remaining bytes
-    for i in offset..len {
-        if data[i] == b'\'' {
-            return Some(i);
-        }
-    }
-
-    None
+    (offset..len).find(|&i| data[i] == b'\'')
 }
 
 // ============================================================================
@@ -392,14 +370,10 @@ unsafe fn find_quote_or_escape_avx2(input: &[u8], start: usize, end: usize) -> O
     }
 
     // Handle remaining bytes (< 16)
-    for i in offset..len {
+    (offset..len).find(|&i| {
         let b = data[i];
-        if b == b'"' || b == b'\\' {
-            return Some(i);
-        }
-    }
-
-    None
+        b == b'"' || b == b'\\'
+    })
 }
 
 #[cfg(any(test, feature = "std"))]
@@ -442,13 +416,7 @@ unsafe fn find_single_quote_avx2(input: &[u8], start: usize, end: usize) -> Opti
     }
 
     // Handle remaining bytes (< 16)
-    for i in offset..len {
-        if data[i] == b'\'' {
-            return Some(i);
-        }
-    }
-
-    None
+    (offset..len).find(|&i| data[i] == b'\'')
 }
 
 /// Count leading spaces (indentation) using x86 SIMD.

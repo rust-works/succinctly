@@ -402,7 +402,7 @@ impl<'a> Parser<'a> {
     /// SIMD fast-path for skipping regular characters in unquoted values.
     /// Returns the number of bytes that can be safely skipped, or None if
     /// a potential terminator was found immediately.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
     #[inline]
     fn skip_unquoted_simd(&self, _value_start: usize) -> Option<usize> {
         // Use classify_yaml_chars to scan 32 bytes at once
@@ -926,7 +926,7 @@ impl<'a> Parser<'a> {
                     _ => {
                         // SIMD/broadword fast-path: skip long runs of regular characters
                         // Only use SIMD if we have enough remaining bytes to justify overhead
-                        #[cfg(target_arch = "x86_64")]
+                        #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
                         if self.input.len() - self.pos >= 32 {
                             if let Some(skip) = self.skip_unquoted_simd(start) {
                                 self.advance_by(skip);
@@ -1096,7 +1096,7 @@ impl<'a> Parser<'a> {
                 }
                 _ => {
                     // SIMD/broadword fast-path: skip long runs of regular characters
-                    #[cfg(target_arch = "x86_64")]
+                    #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
                     if self.input.len() - self.pos >= 32 {
                         if let Some(skip) = self.skip_unquoted_simd(start) {
                             self.advance_by(skip);
