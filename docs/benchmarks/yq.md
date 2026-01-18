@@ -97,7 +97,7 @@ cargo bench --bench yq_comparison
 - ✅ **45x faster than yq** on 1MB files (was 4.0x in P9)
 - ✅ **Comprehensive test suite** - 32 tests including 8 direct byte-for-byte comparisons
 
-**See also:** [docs/parsing/yaml.md](parsing/yaml.md) for full P9 and P10 optimization details.
+**See also:** [docs/parsing/yaml.md](../parsing/yaml.md) for full P9 and P10 optimization details.
 
 ---
 
@@ -237,8 +237,8 @@ The YAML parser uses platform-specific SIMD for hot paths:
 - **P9**: Direct YAML-to-JSON streaming - eliminated intermediate DOM for identity queries (8-22% improvement, 2.3x on yq benchmarks)
 
 **Rejected Optimizations:**
-- **P1 (YFSM)**: Table-driven state machine for string parsing tested but showed only 0-2% improvement vs expected 15-25%. YAML strings are too simple compared to JSON (where PFSM succeeded with 33-77% gains). P0+ SIMD already optimal. See [docs/parsing/yaml.md](parsing/yaml.md#p1-yfsm-yaml-finite-state-machine---rejected-) for full analysis.
-- **P2.6, P2.8, P3, P5, P6, P7, P8**: Various optimizations rejected due to micro-benchmark/real-world mismatches, grammar incompatibilities, or memory bottlenecks. See [docs/parsing/yaml.md](parsing/yaml.md) for detailed analyses.
+- **P1 (YFSM)**: Table-driven state machine for string parsing tested but showed only 0-2% improvement vs expected 15-25%. YAML strings are too simple compared to JSON (where PFSM succeeded with 33-77% gains). P0+ SIMD already optimal. See [docs/parsing/yaml.md](../parsing/yaml.md#p1-yfsm-yaml-finite-state-machine---rejected-) for full analysis.
+- **P2.6, P2.8, P3, P5, P6, P7, P8**: Various optimizations rejected due to micro-benchmark/real-world mismatches, grammar incompatibilities, or memory bottlenecks. See [docs/parsing/yaml.md](../parsing/yaml.md) for detailed analyses.
 
 ### Trade-offs
 

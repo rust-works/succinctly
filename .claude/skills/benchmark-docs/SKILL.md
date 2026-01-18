@@ -24,9 +24,9 @@ When adding new benchmark data:
 |--------------------------------|--------------------------------|--------------|
 | `data/bench/generated/`        | Input JSON files               | git-ignored  |
 | `data/bench/results/`          | Benchmark output (JSONL, MD)   | git-ignored  |
-| `docs/jq-comparison.md`        | Curated benchmark documentation| tracked      |
-| `docs/jq-comparison-m1.jsonl`  | Apple M1 Max raw data          | tracked      |
-| `docs/jq-comparison-zen4.jsonl`| AMD Zen 4 raw data             | tracked      |
+| `docs/benchmarks/jq.md`        | Curated benchmark documentation| tracked      |
+| `docs/benchmarks/yq.md`        | yq comparison benchmarks       | tracked      |
+| `docs/benchmarks/dsv.md`       | DSV performance benchmarks     | tracked      |
 | `README.md`                    | Summary benchmarks             | tracked      |
 
 ## Updating Benchmark Documentation
@@ -52,16 +52,16 @@ Check `data/bench/results/jq-bench.md` for the generated markdown tables.
 
 Update in **two places**:
 
-1. **`docs/jq-comparison.md`** - Full benchmark results with all patterns and sizes
+1. **`docs/benchmarks/jq.md`** - Full benchmark results with all patterns and sizes
 2. **`README.md`** - Highlights only (summary table with key patterns/sizes)
-   - Link to `docs/jq-comparison.md` for detailed results
+   - Link to `docs/benchmarks/jq.md` for detailed results
 
 ### Step 4: Guidelines for Curating Results
 
 - Keep platform-specific sections (ARM vs x86_64)
 - Don't replace one platform's data with another
 - README should highlight best-case speedups and representative patterns
-- `docs/jq-comparison.md` should have comprehensive results
+- `docs/benchmarks/jq.md` should have comprehensive results
 
 ## README Table Requirements
 
@@ -71,7 +71,7 @@ Update in **two places**:
 - x86_64 (AMD Ryzen 9 7950X or equivalent)
 - ARM (Apple M1 Max or equivalent)
 
-If a table only shows one platform, add the missing platform's data from `docs/jq-comparison.md`.
+If a table only shows one platform, add the missing platform's data from `docs/benchmarks/jq.md`.
 
 ### Pattern Names
 

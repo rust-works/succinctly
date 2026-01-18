@@ -148,8 +148,8 @@ Community leaders will follow these Community Impact Guidelines in determining t
 
 ### Learning Resources
 * [Contributing Guidelines](CONTRIBUTING.md)
-* [Developer Guide](docs/developer-guide.md)
-* [User Guide](docs/user-guide.md)
+* [Developer Guide](docs/guides/developer.md)
+* [API Guide](docs/guides/api.md)
 * [Project Architecture](CLAUDE.md)
 
 ### Mental Health and Well-being

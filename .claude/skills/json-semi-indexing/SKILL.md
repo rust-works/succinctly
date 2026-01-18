@@ -89,6 +89,6 @@ Test at SIMD chunk boundaries (multiples of 16/32):
 
 - [docs/parsing/json.md](../../../docs/parsing/json.md) - Full JSON parsing documentation
 - [docs/parsing/dsv.md](../../../docs/parsing/dsv.md) - DSV parsing (similar techniques)
-- [docs/optimisations/state-machines.md](../../../docs/optimisations/state-machines.md) - PFSM technique details
-- [docs/optimisations/simd.md](../../../docs/optimisations/simd.md) - SIMD patterns
-- [docs/optimisations/lookup-tables.md](../../../docs/optimisations/lookup-tables.md) - Table-driven parsing
+- [docs/optimizations/state-machines.md](../../../docs/optimizations/state-machines.md) - PFSM technique details
+- [docs/optimizations/simd.md](../../../docs/optimizations/simd.md) - SIMD patterns
+- [docs/optimizations/lookup-tables.md](../../../docs/optimizations/lookup-tables.md) - Table-driven parsing

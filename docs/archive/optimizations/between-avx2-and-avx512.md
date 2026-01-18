@@ -25,7 +25,7 @@ Your CPU has several important instruction sets between AVX2 (2013) and AVX-512 
 
 ### 1. BMI2 - PDEP/PEXT (Bit Deposit/Extract) ⭐⭐⭐
 
-**Status**: Partially used in [src/json/simd/bmi2.rs](../../src/json/simd/bmi2.rs)
+**Status**: Partially used in [src/json/simd/bmi2.rs](../../../src/json/simd/bmi2.rs)
 
 **Current Usage**: BMI2 utilities exist but not actively used in hot paths
 
@@ -349,7 +349,7 @@ unsafe fn process_chunk_bmi1(class: CharClass, state: State, ...) {
 
 ### Implement Now: BMI1 Optimization
 
-**Target**: JSON mask processing in [src/json/simd/](../../src/json/simd/)
+**Target**: JSON mask processing in [src/json/simd/](../../../src/json/simd/)
 
 **Steps**:
 1. Add BMI1-optimized `process_chunk` variant

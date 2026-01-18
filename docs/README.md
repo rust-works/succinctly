@@ -26,7 +26,7 @@ Learn the basics:
 ### Performance Engineers
 **Optimizing performance**:
 - [Optimization Techniques](optimizations/) - 11 comprehensive guides
-- [Quick Reference](optimizations/quick-reference.md) - One-page technique lookup table
+- [Quick Reference](optimizations/README.md#quick-reference) - One-page technique lookup table
 - [Benchmarks](benchmarks/) - Performance comparisons vs other tools
 
 ### Researchers & Deep Divers
