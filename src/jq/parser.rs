@@ -2105,15 +2105,38 @@ impl<'a> Parser<'a> {
 
         // Phase 10: Path Expressions
         // path(expr) - return the path to values selected by expr
+        // path (no-arg, yq) - return the current traversal path
         if self.matches_keyword("path") {
             self.consume_keyword("path");
             self.skip_ws();
-            self.expect('(')?;
+            if self.peek() == Some('(') {
+                // path(expr) - jq style
+                self.next();
+                self.skip_ws();
+                let expr = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::Path(Box::new(expr))));
+            }
+            // path (no-arg) - yq style
+            return Ok(Some(Builtin::PathNoArg));
+        }
+        // parent (no-arg, yq) - return the parent node
+        // parent(n) (yq) - return the nth parent node
+        if self.matches_keyword("parent") {
+            self.consume_keyword("parent");
             self.skip_ws();
-            let expr = self.parse_pipe_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Path(Box::new(expr))));
+            if self.peek() == Some('(') {
+                // parent(n) - nth parent
+                self.next();
+                self.skip_ws();
+                let n = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::ParentN(Box::new(n))));
+            }
+            // parent (no-arg) - immediate parent
+            return Ok(Some(Builtin::Parent));
         }
         // leaf_paths - must check before paths
         if self.matches_keyword("leaf_paths") {

@@ -151,6 +151,32 @@ fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue 
     }
 }
 
+/// Check if an expression contains PathNoArg or Parent builtins that need path context.
+fn needs_path_context(expr: &Expr) -> bool {
+    match expr {
+        Expr::Builtin(Builtin::PathNoArg) => true,
+        Expr::Builtin(Builtin::Parent) => true,
+        Expr::Builtin(Builtin::ParentN(_)) => true,
+        Expr::Pipe(exprs) => exprs.iter().any(needs_path_context),
+        Expr::Paren(inner) => needs_path_context(inner),
+        Expr::Optional(inner) => needs_path_context(inner),
+        Expr::Comma(exprs) => exprs.iter().any(needs_path_context),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            needs_path_context(cond)
+                || needs_path_context(then_branch)
+                || needs_path_context(else_branch)
+        }
+        Expr::Try { expr, catch } => {
+            needs_path_context(expr) || catch.as_ref().is_some_and(|c| needs_path_context(c))
+        }
+        _ => false,
+    }
+}
+
 /// Evaluate a single expression against a JSON value.
 fn eval_single<'a, W: Clone + AsRef<[u64]>>(
     expr: &Expr,
@@ -1101,6 +1127,22 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
 
         // Phase 10: Path Expressions
         Builtin::Path(expr) => builtin_path(expr, value, optional),
+        Builtin::PathNoArg => {
+            // PathNoArg requires path context which is handled in eval_pipe_with_context
+            // When called without context, return empty path (root position)
+            QueryResult::Owned(OwnedValue::Array(vec![]))
+        }
+        Builtin::Parent => {
+            // Parent requires path context which is handled in eval_pipe_with_context
+            // When called without context, return empty object (no parent at root)
+            QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
+        }
+        Builtin::ParentN(n_expr) => {
+            // ParentN requires path context which is handled in eval_pipe_with_context
+            // When called without context, return empty object
+            let _ = n_expr; // Unused here, but evaluated in context version
+            QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
+        }
         Builtin::Paths => builtin_paths(value, optional),
         Builtin::PathsFilter(filter) => builtin_paths_filter(filter, value, optional),
         Builtin::LeafPaths => builtin_leaf_paths(value, optional),
@@ -3536,6 +3578,12 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // Check if any expression in the pipe needs path context (PathNoArg, Parent)
+    if exprs.iter().any(needs_path_context) {
+        let owned = to_owned(&value);
+        return eval_pipe_with_path_context::<W>(exprs, &owned, &[], optional);
+    }
+
     if exprs.is_empty() {
         return QueryResult::One(value);
     }
@@ -4537,6 +4585,9 @@ fn substitute_var_in_builtin(
         Builtin::IsValid(e) => Builtin::IsValid(Box::new(substitute_var(e, var_name, replacement))),
         // Phase 10 builtins
         Builtin::Path(e) => Builtin::Path(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::PathNoArg => Builtin::PathNoArg,
+        Builtin::Parent => Builtin::Parent,
+        Builtin::ParentN(e) => Builtin::ParentN(Box::new(substitute_var(e, var_name, replacement))),
         Builtin::Paths => Builtin::Paths,
         Builtin::PathsFilter(e) => {
             Builtin::PathsFilter(Box::new(substitute_var(e, var_name, replacement)))
@@ -5381,6 +5432,377 @@ fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>>(
 // Phase 10: Path Expressions, Math, Environment, etc.
 // ============================================================================
 
+/// Evaluate a pipe while tracking the traversal path.
+/// This enables PathNoArg and Parent to access the path context.
+fn eval_pipe_with_path_context<'a, W: Clone + AsRef<[u64]>>(
+    exprs: &[Expr],
+    value: &OwnedValue,
+    current_path: &[OwnedValue],
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Call the internal version with root value
+    eval_pipe_with_path_context_internal::<W>(exprs, value, value, current_path, optional)
+}
+
+/// Internal helper that also tracks the root value for parent navigation.
+fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
+    exprs: &[Expr],
+    value: &OwnedValue,
+    root: &OwnedValue,
+    current_path: &[OwnedValue],
+    optional: bool,
+) -> QueryResult<'a, W> {
+    if exprs.is_empty() {
+        return QueryResult::Owned(value.clone());
+    }
+
+    let (first, rest) = exprs.split_first().unwrap();
+
+    // Handle PathNoArg - return the current path
+    if matches!(first, Expr::Builtin(Builtin::PathNoArg)) {
+        let path_result = QueryResult::Owned(OwnedValue::Array(current_path.to_vec()));
+        if rest.is_empty() {
+            return path_result;
+        }
+        // Continue with remaining expressions
+        if let QueryResult::Owned(v) = path_result {
+            return eval_pipe_with_path_context_internal::<W>(
+                rest,
+                &v,
+                root,
+                current_path,
+                optional,
+            );
+        }
+    }
+
+    // Handle Parent - return the parent value
+    if matches!(first, Expr::Builtin(Builtin::Parent)) {
+        let parent_result = if current_path.is_empty() {
+            // At root - return empty object (yq behavior)
+            QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
+        } else {
+            // Get the parent path (all but last element)
+            let parent_path = &current_path[..current_path.len() - 1];
+            // Navigate from root to parent
+            match get_value_at_owned_path(root, parent_path) {
+                Some(parent_value) => QueryResult::Owned(parent_value),
+                None => QueryResult::Owned(OwnedValue::Object(IndexMap::new())),
+            }
+        };
+        if rest.is_empty() {
+            return parent_result;
+        }
+        if let QueryResult::Owned(v) = parent_result {
+            // Parent path is one level up
+            let parent_path = if current_path.is_empty() {
+                vec![]
+            } else {
+                current_path[..current_path.len() - 1].to_vec()
+            };
+            return eval_pipe_with_path_context_internal::<W>(
+                rest,
+                &v,
+                root,
+                &parent_path,
+                optional,
+            );
+        }
+    }
+
+    // Handle ParentN - return the nth parent value
+    if let Expr::Builtin(Builtin::ParentN(n_expr)) = first {
+        // Evaluate n
+        let n = match eval_owned_expr(n_expr, value, optional) {
+            Ok(OwnedValue::Int(i)) => i as usize,
+            Ok(OwnedValue::Float(f)) => f as usize,
+            Ok(_) if optional => return QueryResult::None,
+            Ok(_) => return QueryResult::Error(EvalError::type_error("number", "other")),
+            Err(_) if optional => return QueryResult::None,
+            Err(e) => return QueryResult::Error(e),
+        };
+
+        // Calculate parent path (n levels up)
+        let parent_path = if n >= current_path.len() {
+            vec![]
+        } else {
+            current_path[..current_path.len() - n].to_vec()
+        };
+
+        let parent_result = if parent_path.is_empty() && n > 0 {
+            // Gone past root - return empty object
+            QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
+        } else {
+            match get_value_at_owned_path(root, &parent_path) {
+                Some(parent_value) => QueryResult::Owned(parent_value),
+                None => QueryResult::Owned(OwnedValue::Object(IndexMap::new())),
+            }
+        };
+
+        if rest.is_empty() {
+            return parent_result;
+        }
+        if let QueryResult::Owned(v) = parent_result {
+            return eval_pipe_with_path_context_internal::<W>(
+                rest,
+                &v,
+                root,
+                &parent_path,
+                optional,
+            );
+        }
+    }
+
+    // Evaluate first expression and update path
+    match first {
+        Expr::Identity => {
+            // Identity doesn't change the path
+            eval_pipe_with_path_context_internal::<W>(rest, value, root, current_path, optional)
+        }
+        Expr::Field(name) => {
+            // Extend path with field name
+            let mut new_path = current_path.to_vec();
+            new_path.push(OwnedValue::String(name.clone()));
+
+            // Get the field value
+            if let OwnedValue::Object(entries) = value {
+                if let Some(v) = entries.get(name) {
+                    if rest.is_empty() {
+                        return QueryResult::Owned(v.clone());
+                    }
+                    return eval_pipe_with_path_context_internal::<W>(
+                        rest, v, root, &new_path, optional,
+                    );
+                }
+            }
+            if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(EvalError::field_not_found(name))
+            }
+        }
+        Expr::Index(idx) => {
+            // Extend path with index
+            let mut new_path = current_path.to_vec();
+            new_path.push(OwnedValue::Int(*idx));
+
+            // Get the element value
+            if let OwnedValue::Array(arr) = value {
+                let len = arr.len() as i64;
+                let actual_idx = if *idx < 0 { len + *idx } else { *idx };
+                if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
+                    let v = &arr[actual_idx as usize];
+                    if rest.is_empty() {
+                        return QueryResult::Owned(v.clone());
+                    }
+                    return eval_pipe_with_path_context_internal::<W>(
+                        rest, v, root, &new_path, optional,
+                    );
+                }
+            }
+            if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(EvalError::index_out_of_bounds(
+                    *idx,
+                    if let OwnedValue::Array(arr) = value {
+                        arr.len()
+                    } else {
+                        0
+                    },
+                ))
+            }
+        }
+        Expr::Iterate => {
+            // Iterate produces multiple paths
+            let mut results = Vec::new();
+            match value {
+                OwnedValue::Array(arr) => {
+                    for (i, v) in arr.iter().enumerate() {
+                        let mut new_path = current_path.to_vec();
+                        new_path.push(OwnedValue::Int(i as i64));
+                        if rest.is_empty() {
+                            results.push(v.clone());
+                        } else {
+                            match eval_pipe_with_path_context_internal::<W>(
+                                rest, v, root, &new_path, optional,
+                            ) {
+                                QueryResult::Owned(r) => results.push(r),
+                                QueryResult::ManyOwned(rs) => results.extend(rs),
+                                QueryResult::None => {}
+                                QueryResult::Error(e) => return QueryResult::Error(e),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                OwnedValue::Object(entries) => {
+                    for (key, v) in entries {
+                        let mut new_path = current_path.to_vec();
+                        new_path.push(OwnedValue::String(key.clone()));
+                        if rest.is_empty() {
+                            results.push(v.clone());
+                        } else {
+                            match eval_pipe_with_path_context_internal::<W>(
+                                rest, v, root, &new_path, optional,
+                            ) {
+                                QueryResult::Owned(r) => results.push(r),
+                                QueryResult::ManyOwned(rs) => results.extend(rs),
+                                QueryResult::None => {}
+                                QueryResult::Error(e) => return QueryResult::Error(e),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                _ if optional => return QueryResult::None,
+                _ => {
+                    return QueryResult::Error(EvalError::type_error(
+                        "array or object",
+                        owned_type_name(value),
+                    ))
+                }
+            }
+            if results.is_empty() {
+                QueryResult::None
+            } else if results.len() == 1 {
+                QueryResult::Owned(results.pop().unwrap())
+            } else {
+                QueryResult::ManyOwned(results)
+            }
+        }
+        Expr::Paren(inner) => {
+            // Parentheses don't change path, just evaluate inner
+            if rest.is_empty() {
+                eval_pipe_with_path_context_internal::<W>(
+                    &[(**inner).clone()],
+                    value,
+                    root,
+                    current_path,
+                    optional,
+                )
+            } else {
+                let mut combined = vec![(**inner).clone()];
+                combined.extend(rest.iter().cloned());
+                eval_pipe_with_path_context_internal::<W>(
+                    &combined,
+                    value,
+                    root,
+                    current_path,
+                    optional,
+                )
+            }
+        }
+        Expr::Optional(inner) => {
+            // Optional - evaluate with optional=true
+            if rest.is_empty() {
+                eval_pipe_with_path_context_internal::<W>(
+                    &[(**inner).clone()],
+                    value,
+                    root,
+                    current_path,
+                    true,
+                )
+            } else {
+                let mut combined = vec![(**inner).clone()];
+                combined.extend(rest.iter().cloned());
+                eval_pipe_with_path_context_internal::<W>(
+                    &combined,
+                    value,
+                    root,
+                    current_path,
+                    true,
+                )
+            }
+        }
+        Expr::Pipe(inner_exprs) => {
+            // Flatten nested pipe - combine inner pipe with rest
+            let mut combined = inner_exprs.clone();
+            combined.extend(rest.iter().cloned());
+            eval_pipe_with_path_context_internal::<W>(
+                &combined,
+                value,
+                root,
+                current_path,
+                optional,
+            )
+        }
+        Expr::Builtin(builtin) => {
+            // Handle other builtins that don't need special path handling
+            match eval_builtin_owned(builtin, value, optional) {
+                Ok(result) => {
+                    if rest.is_empty() {
+                        QueryResult::Owned(result)
+                    } else {
+                        eval_pipe_with_path_context_internal::<W>(
+                            rest,
+                            &result,
+                            root,
+                            current_path,
+                            optional,
+                        )
+                    }
+                }
+                Err(_) if optional => QueryResult::None,
+                Err(e) => QueryResult::Error(e),
+            }
+        }
+        Expr::Object(_) | Expr::Array(_) | Expr::Literal(_) => {
+            // Value-constructing expressions reset the path context
+            // because we're now at the "root" of a newly constructed value
+            match eval_owned_expr(first, value, optional) {
+                Ok(result) => {
+                    if rest.is_empty() {
+                        QueryResult::Owned(result)
+                    } else {
+                        // Reset path and root to the new value
+                        eval_pipe_with_path_context_internal::<W>(
+                            rest,
+                            &result,
+                            &result,
+                            &[],
+                            optional,
+                        )
+                    }
+                }
+                Err(_) if optional => QueryResult::None,
+                Err(e) => QueryResult::Error(e),
+            }
+        }
+        _ => {
+            // For other expressions, evaluate normally and continue
+            // Note: This loses path context for complex expressions
+            match eval_owned_expr(first, value, optional) {
+                Ok(result) => {
+                    if rest.is_empty() {
+                        QueryResult::Owned(result)
+                    } else {
+                        eval_pipe_with_path_context_internal::<W>(
+                            rest,
+                            &result,
+                            root,
+                            current_path,
+                            optional,
+                        )
+                    }
+                }
+                Err(_) if optional => QueryResult::None,
+                Err(e) => QueryResult::Error(e),
+            }
+        }
+    }
+}
+
+/// Helper to evaluate a builtin with an OwnedValue
+fn eval_builtin_owned(
+    builtin: &Builtin,
+    value: &OwnedValue,
+    optional: bool,
+) -> Result<OwnedValue, EvalError> {
+    // For most builtins, we can just delegate to eval_owned_expr
+    eval_owned_expr(&Expr::Builtin(builtin.clone()), value, optional)
+}
+
 /// Builtin: path(expr) - return the path to values selected by expr
 /// This evaluates the expression while tracking the path taken to reach each value.
 fn builtin_path<'a, W: Clone + AsRef<[u64]>>(
@@ -5692,6 +6114,12 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>>(
         }
     }
     QueryResult::Owned(OwnedValue::Array(filtered_paths))
+}
+
+/// Helper to get value at a path (alias for convenience)
+#[inline]
+fn get_value_at_owned_path(value: &OwnedValue, path: &[OwnedValue]) -> Option<OwnedValue> {
+    get_value_at_path(value, path)
 }
 
 /// Helper to get value at a path
@@ -7764,6 +8192,11 @@ fn expand_func_calls_in_builtin(
         }
         // Phase 10 builtins
         Builtin::Path(e) => Builtin::Path(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::PathNoArg => Builtin::PathNoArg,
+        Builtin::Parent => Builtin::Parent,
+        Builtin::ParentN(e) => {
+            Builtin::ParentN(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
         Builtin::Paths => Builtin::Paths,
         Builtin::PathsFilter(e) => {
             Builtin::PathsFilter(Box::new(expand_func_calls(e, func_name, params, body)))
@@ -7943,6 +8376,9 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::IsValid(e) => Builtin::IsValid(Box::new(substitute_func_param(e, param, arg))),
         // Phase 10 builtins
         Builtin::Path(e) => Builtin::Path(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::PathNoArg => Builtin::PathNoArg,
+        Builtin::Parent => Builtin::Parent,
+        Builtin::ParentN(e) => Builtin::ParentN(Box::new(substitute_func_param(e, param, arg))),
         Builtin::Paths => Builtin::Paths,
         Builtin::PathsFilter(e) => {
             Builtin::PathsFilter(Box::new(substitute_func_param(e, param, arg)))

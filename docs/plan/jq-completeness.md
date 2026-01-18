@@ -126,9 +126,12 @@ The implementation is already production-ready for ~90% of jq use cases.
 
 ### Path Operations
 - [x] `path(expr)`
+- [x] `path` (no-arg, yq) - returns current traversal path
 - [x] `paths` / `paths(filter)` / `leaf_paths`
 - [x] `getpath(path)` / `setpath(path; value)`
 - [x] `delpaths(paths)` / `del(path)`
+- [x] `parent` (yq) - returns parent node of current position
+- [x] `parent(n)` (yq) - returns nth parent node
 
 ### Math Functions (32 total)
 - [x] Basic: `floor`, `ceil`, `round`, `sqrt`, `fabs`
@@ -301,3 +304,5 @@ echo '{"a":1}' | succinctly jq '.a'
 | 2025-01-19 | Added assignment operators (✅ complete)  |
 | 2025-01-19 | Added env variable access (✅ complete)   |
 | 2026-01-19 | Added pick() function for yq (✅ complete)|
+| 2026-01-19 | Added path (no-arg) for yq (✅ complete)  |
+| 2026-01-19 | Added parent / parent(n) for yq (✅ complete)|

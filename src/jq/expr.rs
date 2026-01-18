@@ -584,6 +584,14 @@ pub enum Builtin {
     // Phase 10: Path Expressions
     /// `path(expr)` - return the path to values selected by expr
     Path(Box<Expr>),
+    /// `path` (no-arg, yq) - return the current traversal path
+    /// Used as `.a.b | path` to get `["a", "b"]`
+    PathNoArg,
+    /// `parent` (no-arg, yq) - return the parent node of the current position
+    /// Used as `.a.b | parent` to get the value at `.a`
+    Parent,
+    /// `parent(n)` (yq) - return the nth parent node (0 = self, 1 = parent, etc.)
+    ParentN(Box<Expr>),
     /// `paths` - all paths to values (excluding empty paths)
     Paths,
     /// `paths(filter)` - paths to values matching filter
