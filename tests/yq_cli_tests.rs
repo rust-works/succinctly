@@ -1,0 +1,607 @@
+//! Integration tests for the succinctly yq CLI command
+//!
+//! These tests verify yq-compatible behavior, especially type preservation
+//! for quoted vs unquoted scalars.
+//!
+//! Run with: cargo test --features cli --test yq_cli_tests
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+use anyhow::Result;
+use tempfile::NamedTempFile;
+
+/// Helper to run yq command with input from stdin
+fn run_yq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(String, i32)> {
+    let mut cmd = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "yq",
+        ])
+        .args(extra_args)
+        .arg(filter)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(input.as_bytes())?;
+    }
+
+    let output = cmd.wait_with_output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    Ok((stdout, exit_code))
+}
+
+/// Helper to run yq command with file input
+fn run_yq_file(filter: &str, file_path: &str, extra_args: &[&str]) -> Result<(String, i32)> {
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "yq",
+        ])
+        .args(extra_args)
+        .arg(filter)
+        .arg(file_path)
+        .output()?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    Ok((stdout, exit_code))
+}
+
+/// Helper to run system yq command with input from stdin
+fn run_system_yq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(String, i32)> {
+    let mut cmd = Command::new("yq")
+        .args(extra_args)
+        .arg(filter)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(input.as_bytes())?;
+    }
+
+    let output = cmd.wait_with_output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    Ok((stdout, exit_code))
+}
+
+/// Check if system yq is available
+fn has_system_yq() -> bool {
+    Command::new("yq")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Compare succinctly yq output with system yq output
+fn compare_yq_output(filter: &str, yaml: &str, args: &[&str]) -> Result<bool> {
+    let (succ_out, succ_code) = run_yq_stdin(filter, yaml, args)?;
+    let (sys_out, sys_code) = run_system_yq_stdin(filter, yaml, args)?;
+
+    Ok(succ_code == sys_code && succ_out == sys_out)
+}
+
+// ============================================================================
+// Type Preservation Tests - Core yq Compatibility
+// ============================================================================
+
+#[test]
+fn test_quoted_numeric_string_preserved() -> Result<()> {
+    let yaml = r#"version: "1.0""#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"version":"1.0"}"#);
+    Ok(())
+}
+
+#[test]
+fn test_quoted_leading_zero_preserved() -> Result<()> {
+    let yaml = r#"id: "001""#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"id":"001"}"#);
+    Ok(())
+}
+
+#[test]
+fn test_unquoted_number_as_number() -> Result<()> {
+    let yaml = r#"count: 123"#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"count":123}"#);
+    Ok(())
+}
+
+#[test]
+fn test_mixed_quoted_unquoted() -> Result<()> {
+    let yaml = r#"
+version: "1.0"
+id: "001"
+count: 123
+price: 19.99
+code: "007"
+"#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    let expected = r#"{"version":"1.0","id":"001","count":123,"price":19.99,"code":"007"}"#;
+    assert_eq!(output.trim(), expected);
+    Ok(())
+}
+
+#[test]
+fn test_single_quoted_string_preserved() -> Result<()> {
+    let yaml = r#"version: '2.0'"#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"version":"2.0"}"#);
+    Ok(())
+}
+
+#[test]
+fn test_double_quoted_decimal_preserved() -> Result<()> {
+    let yaml = r#"value: "3.14159""#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"value":"3.14159"}"#);
+    Ok(())
+}
+
+#[test]
+fn test_field_selection_preserves_type() -> Result<()> {
+    let yaml = r#"
+metadata:
+  version: "1.0"
+  build: 42
+"#;
+    let (output, code) = run_yq_stdin(".metadata.version", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""1.0""#);
+    Ok(())
+}
+
+#[test]
+fn test_array_with_quoted_numbers() -> Result<()> {
+    let yaml = r#"
+codes:
+  - "001"
+  - "002"
+  - "003"
+"#;
+    let (output, code) = run_yq_stdin(".codes", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["001","002","003"]"#);
+    Ok(())
+}
+
+// ============================================================================
+// Argument Format Compatibility Tests
+// ============================================================================
+
+#[test]
+fn test_output_format_equals_syntax() -> Result<()> {
+    let yaml = r#"test: true"#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert!(output.contains(r#"{"test":true}"#));
+    Ok(())
+}
+
+#[test]
+fn test_output_format_space_syntax() -> Result<()> {
+    let yaml = r#"test: true"#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o", "json"])?;
+
+    assert_eq!(code, 0);
+    // Default format is pretty-printed, so check for field presence
+    assert!(output.contains(r#""test""#));
+    assert!(output.contains(r#"true"#));
+    Ok(())
+}
+
+#[test]
+fn test_indent_equals_syntax() -> Result<()> {
+    let yaml = r#"a: 1"#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":1}"#);
+    Ok(())
+}
+
+#[test]
+fn test_indent_space_syntax() -> Result<()> {
+    let yaml = r#"a: 1"#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o", "json", "-I", "0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":1}"#);
+    Ok(())
+}
+
+// ============================================================================
+// File Input Tests
+// ============================================================================
+
+#[test]
+fn test_file_input_type_preservation() -> Result<()> {
+    let mut temp_file = NamedTempFile::new()?;
+    writeln!(temp_file, r#"version: "1.0""#)?;
+    writeln!(temp_file, r#"id: "001""#)?;
+    writeln!(temp_file, r#"count: 123"#)?;
+
+    let path = temp_file.path().to_str().unwrap();
+    let (output, code) = run_yq_file(".", path, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    let expected = r#"{"version":"1.0","id":"001","count":123}"#;
+    assert_eq!(output.trim(), expected);
+    Ok(())
+}
+
+#[test]
+fn test_file_input_field_selection() -> Result<()> {
+    let mut temp_file = NamedTempFile::new()?;
+    writeln!(temp_file, r#"version: "2.5.1""#)?;
+    writeln!(temp_file, r#"build: 999"#)?;
+
+    let path = temp_file.path().to_str().unwrap();
+    let (output, code) = run_yq_file(".version", path, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""2.5.1""#);
+    Ok(())
+}
+
+// ============================================================================
+// YAML Special Values Tests
+// ============================================================================
+
+#[test]
+fn test_null_values() -> Result<()> {
+    // Note: Empty values (c:) without explicit null or flow syntax
+    // may have parsing edge cases in YAML
+    let yaml = r#"
+a: null
+b: ~
+d: "null"
+"#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    let expected = r#"{"a":null,"b":null,"d":"null"}"#;
+    assert_eq!(output.trim(), expected);
+    Ok(())
+}
+
+#[test]
+fn test_boolean_values() -> Result<()> {
+    let yaml = r#"
+a: true
+b: false
+c: "true"
+d: "false"
+"#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    let expected = r#"{"a":true,"b":false,"c":"true","d":"false"}"#;
+    assert_eq!(output.trim(), expected);
+    Ok(())
+}
+
+// ============================================================================
+// Complex Document Tests
+// ============================================================================
+
+#[test]
+fn test_nested_structure_type_preservation() -> Result<()> {
+    let yaml = r#"
+users:
+  - name: "Alice"
+    id: "001"
+    age: 30
+  - name: "Bob"
+    id: "002"
+    age: 25
+"#;
+    let (output, code) = run_yq_stdin(".users[0]", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    let expected = r#"{"name":"Alice","id":"001","age":30}"#;
+    assert_eq!(output.trim(), expected);
+    Ok(())
+}
+
+#[test]
+fn test_deep_nesting_preserves_types() -> Result<()> {
+    let yaml = r#"
+config:
+  database:
+    version: "5.7"
+    port: 3306
+    ssl: "enabled"
+"#;
+    let (output, code) = run_yq_stdin(".config.database", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    let expected = r#"{"version":"5.7","port":3306,"ssl":"enabled"}"#;
+    assert_eq!(output.trim(), expected);
+    Ok(())
+}
+
+// ============================================================================
+// Edge Cases
+// ============================================================================
+
+#[test]
+fn test_empty_string_quoted() -> Result<()> {
+    let yaml = r#"empty: """#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"empty":""}"#);
+    Ok(())
+}
+
+#[test]
+fn test_zero_with_decimal() -> Result<()> {
+    let yaml = r#"value: "0.0""#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"value":"0.0"}"#);
+    Ok(())
+}
+
+#[test]
+fn test_negative_number_quoted() -> Result<()> {
+    let yaml = r#"value: "-123""#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"value":"-123"}"#);
+    Ok(())
+}
+
+#[test]
+fn test_scientific_notation_quoted() -> Result<()> {
+    let yaml = r#"value: "1.5e10""#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"value":"1.5e10"}"#);
+    Ok(())
+}
+
+// ============================================================================
+// Output Format Tests
+// ============================================================================
+
+#[test]
+fn test_yaml_output_format() -> Result<()> {
+    let yaml = r#"version: "1.0""#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=yaml"])?;
+
+    assert_eq!(code, 0);
+    assert!(output.contains("version:"));
+    Ok(())
+}
+
+#[test]
+fn test_compact_json_output() -> Result<()> {
+    let yaml = r#"
+a: 1
+b: 2
+c: 3
+"#;
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    // Compact output should not have newlines between fields
+    assert!(!output.trim().contains("\n"));
+    Ok(())
+}
+
+// ============================================================================
+// Direct yq Comparison Tests (require system yq installed)
+// ============================================================================
+
+#[test]
+fn compare_quoted_string_output() -> Result<()> {
+    if !has_system_yq() {
+        eprintln!("Skipping: system yq not available");
+        return Ok(());
+    }
+
+    let yaml = r#"version: "1.0""#;
+    assert!(
+        compare_yq_output(".", yaml, &["-o=json", "-I=0"])?,
+        "Output differs from system yq for quoted strings"
+    );
+    Ok(())
+}
+
+#[test]
+fn compare_mixed_types_output() -> Result<()> {
+    if !has_system_yq() {
+        eprintln!("Skipping: system yq not available");
+        return Ok(());
+    }
+
+    let yaml = r#"
+version: "1.0"
+id: "001"
+count: 123
+price: 19.99
+"#;
+    assert!(
+        compare_yq_output(".", yaml, &["-o=json", "-I=0"])?,
+        "Output differs from system yq for mixed types"
+    );
+    Ok(())
+}
+
+#[test]
+fn compare_nested_structure_output() -> Result<()> {
+    if !has_system_yq() {
+        eprintln!("Skipping: system yq not available");
+        return Ok(());
+    }
+
+    let yaml = r#"
+users:
+  - name: "Alice"
+    id: "001"
+    age: 30
+  - name: "Bob"
+    id: "002"
+    age: 25
+"#;
+    assert!(
+        compare_yq_output(".users[0]", yaml, &["-o=json", "-I=0"])?,
+        "Output differs from system yq for nested structures"
+    );
+    Ok(())
+}
+
+#[test]
+fn compare_field_selection_output() -> Result<()> {
+    if !has_system_yq() {
+        eprintln!("Skipping: system yq not available");
+        return Ok(());
+    }
+
+    let yaml = r#"
+config:
+  database:
+    version: "5.7"
+    port: 3306
+"#;
+    assert!(
+        compare_yq_output(".config.database.version", yaml, &["-o=json", "-I=0"])?,
+        "Output differs from system yq for field selection"
+    );
+    Ok(())
+}
+
+#[test]
+fn compare_array_iteration_output() -> Result<()> {
+    if !has_system_yq() {
+        eprintln!("Skipping: system yq not available");
+        return Ok(());
+    }
+
+    let yaml = r#"
+items:
+  - "001"
+  - "002"
+  - "003"
+"#;
+    assert!(
+        compare_yq_output(".items", yaml, &["-o=json", "-I=0"])?,
+        "Output differs from system yq for arrays"
+    );
+    Ok(())
+}
+
+#[test]
+fn compare_boolean_values_output() -> Result<()> {
+    if !has_system_yq() {
+        eprintln!("Skipping: system yq not available");
+        return Ok(());
+    }
+
+    let yaml = r#"
+enabled: true
+disabled: false
+quoted: "true"
+"#;
+    assert!(
+        compare_yq_output(".", yaml, &["-o=json", "-I=0"])?,
+        "Output differs from system yq for boolean values"
+    );
+    Ok(())
+}
+
+#[test]
+fn compare_null_values_output() -> Result<()> {
+    if !has_system_yq() {
+        eprintln!("Skipping: system yq not available");
+        return Ok(());
+    }
+
+    let yaml = r#"
+a: null
+b: ~
+c: "null"
+"#;
+    assert!(
+        compare_yq_output(".", yaml, &["-o=json", "-I=0"])?,
+        "Output differs from system yq for null values"
+    );
+    Ok(())
+}
+
+#[test]
+fn compare_complex_document_output() -> Result<()> {
+    if !has_system_yq() {
+        eprintln!("Skipping: system yq not available");
+        return Ok(());
+    }
+
+    let yaml = r#"
+metadata:
+  version: "2.5.1"
+  build: 999
+users:
+  - name: "Alice"
+    id: "001"
+    scores:
+      - 95
+      - 87
+      - 92
+  - name: "Bob"
+    id: "002"
+    scores:
+      - 78
+      - 89
+      - 91
+"#;
+    assert!(
+        compare_yq_output(".", yaml, &["-o=json", "-I=0"])?,
+        "Output differs from system yq for complex documents"
+    );
+    Ok(())
+}

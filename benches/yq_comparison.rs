@@ -71,7 +71,7 @@ fn bench_succinctly_identity(c: &mut Criterion) {
                 |b, (binary, path)| {
                     b.iter(|| {
                         let output = Command::new(binary)
-                            .args(["yq", "-o", "json", "-I", "0", ".", path])
+                            .args(["yq", "-o=json", "-I=0", ".", path])
                             .stdout(Stdio::piped())
                             .stderr(Stdio::null())
                             .output()
@@ -159,7 +159,7 @@ fn bench_yq_comparison(c: &mut Criterion) {
                 |b, (binary, path)| {
                     b.iter(|| {
                         let output = Command::new(binary)
-                            .args(["yq", "-o", "json", "-I", "0", ".", path])
+                            .args(["yq", "-o=json", "-I=0", ".", path])
                             .stdout(Stdio::piped())
                             .stderr(Stdio::null())
                             .output()

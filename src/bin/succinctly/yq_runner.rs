@@ -123,7 +123,13 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> Result<Owned
                 .as_str()
                 .map_err(|e| anyhow::anyhow!("invalid YAML string: {}", e))?;
 
-            // Try to parse as special YAML values
+            // Quoted strings should always be treated as strings (yq-compatible behavior)
+            // Only unquoted scalars should undergo type detection
+            if !s.is_unquoted() {
+                return Ok(OwnedValue::String(str_value.into_owned()));
+            }
+
+            // Type detection for unquoted scalars only
             match str_value.as_ref() {
                 "null" | "~" | "" => return Ok(OwnedValue::Null),
                 "true" | "True" | "TRUE" => return Ok(OwnedValue::Bool(true)),
