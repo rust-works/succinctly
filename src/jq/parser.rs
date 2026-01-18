@@ -2343,10 +2343,34 @@ impl<'a> Parser<'a> {
 
         // Phase 10: Environment
         // $ENV - the full environment object - handled via Var("ENV") after $ is parsed
+        // env(VAR) - get specific environment variable (yq syntax)
         // env.VAR or env (as builtin)
         if self.matches_keyword("env") {
             self.consume_keyword("env");
+            self.skip_ws();
+            // Check for env(VAR) syntax - yq style
+            if self.peek() == Some('(') {
+                self.next(); // consume '('
+                self.skip_ws();
+                // Parse identifier (unquoted variable name)
+                let var_name = self.parse_ident()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::EnvObject(var_name)));
+            }
             return Ok(Some(Builtin::Env));
+        }
+
+        // strenv(VAR) - get environment variable as string (yq specific)
+        if self.matches_keyword("strenv") {
+            self.consume_keyword("strenv");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let var_name = self.parse_ident()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::StrEnv(var_name)));
         }
 
         // Phase 10: String functions
@@ -2390,6 +2414,18 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::ModuleMeta(Box::new(name))));
+        }
+
+        // pick(keys) - yq: select only specified keys from object/array
+        if self.matches_keyword("pick") {
+            self.consume_keyword("pick");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let keys = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Pick(Box::new(keys))));
         }
 
         Ok(None)
