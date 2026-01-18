@@ -2000,7 +2000,7 @@ At actual YAML chunk sizes (64-128B), AVX-512 shows:
 
 **1. JSON Precedent - AVX-512 Was 7-17% Slower**
 
-From `docs/archive/avx512-json-results.md`:
+From the optimization history (see [history.md](../optimizations/history.md)):
 ```markdown
 The AVX-512 JSON parser implementation has been **removed** from the codebase
 because it was consistently **7-17% slower** than AVX2 across all workloads.

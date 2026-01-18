@@ -50,7 +50,6 @@ Learn the basics:
 - [Architecture](architecture/) - Design decisions and core concepts
 - [Parsing Implementation](parsing/) - JSON/YAML/DSV parser internals
 - [Implementation Plans](plan/) - Feature planning documents
-- [Archive](archive/) - Historical context and failed experiments
 
 ### AI-Assisted Development
 - [CLAUDE.md](../CLAUDE.md) - Comprehensive guide for AI assistants
@@ -98,12 +97,6 @@ Performance comparisons:
 ### [plan/](plan/)
 Implementation plans for major features (all implemented).
 
-### [archive/](archive/)
-Historical documentation:
-- Optimization history (successes and failures)
-- Haskell reference implementations
-- Migration notes
-
 ---
 
 ## Finding What You Need
@@ -120,7 +113,7 @@ Historical documentation:
 - **Compare performance** -> [benchmarks/](benchmarks/)
 - **Contribute code** -> [CONTRIBUTING.md](../CONTRIBUTING.md) + [guides/developer.md](guides/developer.md)
 - **Release a new version** -> [guides/release.md](guides/release.md)
-- **Understand why AVX-512 was rejected** -> [archive/optimizations/](archive/optimizations/)
+- **Understand why AVX-512 was rejected** -> [optimizations/history.md](optimizations/history.md)
 
 ---
 

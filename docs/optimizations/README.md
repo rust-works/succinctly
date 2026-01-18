@@ -184,5 +184,5 @@ When adding new optimization documentation:
 
 ## See Also
 
-- [../archive/optimizations/SUMMARY.md](../archive/optimizations/SUMMARY.md) - Historical record of all optimizations applied to succinctly
+- [history.md](history.md) - Complete record of all optimizations attempted (successes and failures with exact measurements)
 - [../../.claude/skills/](../../.claude/skills/) - Claude Code skill files for specific topics

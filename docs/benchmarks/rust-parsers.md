@@ -202,5 +202,5 @@ cargo bench --bench json_parsers
 ## Related Documentation
 
 - [jq.md](jq.md) - Comparison with system `jq` command
-- [archive/optimizations/SUMMARY.md](../archive/optimizations/SUMMARY.md) - Optimization history and learnings
+- [optimizations/history.md](../optimizations/history.md) - Optimization history and learnings
 - [CLAUDE.md](../../CLAUDE.md) - Project architecture and development guide

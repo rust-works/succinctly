@@ -192,4 +192,4 @@ group.bench_function("production", |b| b.iter(|| pfsm_optimized::process(json)))
 - [docs/optimizations/lookup-tables.md](../../../docs/optimizations/lookup-tables.md) - Lookup table patterns
 - [docs/optimizations/hierarchical-structures.md](../../../docs/optimizations/hierarchical-structures.md) - Rank/select structures
 - [docs/optimizations/access-patterns.md](../../../docs/optimizations/access-patterns.md) - Sequential vs random access
-- [docs/archive/optimizations/SUMMARY.md](../../../docs/archive/optimizations/SUMMARY.md) - Historical optimization record
+- [docs/optimizations/history.md](../../../docs/optimizations/history.md) - Historical optimization record

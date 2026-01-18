@@ -195,7 +195,7 @@ Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
 | **x86_64** | Popcount (AVX-512 VPOPCNTDQ) | 96.8 GiB/s |  5.2x vs scalar |
 | **ARM**    | NEON JSON (string-heavy)     |  3.7 GiB/s | 1.69x vs scalar |
 
-See [docs/benchmarks/rust-parsers.md](docs/benchmarks/rust-parsers.md), [docs/benchmarks/jq.md](docs/benchmarks/jq.md), and [docs/archive/optimizations/SUMMARY.md](docs/archive/optimizations/SUMMARY.md) for detailed benchmarks.
+See [docs/benchmarks/rust-parsers.md](docs/benchmarks/rust-parsers.md), [docs/benchmarks/jq.md](docs/benchmarks/jq.md), and [docs/optimizations/history.md](docs/optimizations/history.md) for detailed benchmarks.
 
 ## Feature Flags
 

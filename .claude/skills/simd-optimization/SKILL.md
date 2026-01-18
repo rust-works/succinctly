@@ -179,4 +179,4 @@ cargo bench --bench json_simd
 - [docs/optimizations/simd.md](../../../docs/optimizations/simd.md) - Comprehensive SIMD techniques reference
 - [docs/optimizations/cache-memory.md](../../../docs/optimizations/cache-memory.md) - Memory-bound vs compute-bound analysis
 - [docs/optimizations/branchless.md](../../../docs/optimizations/branchless.md) - SIMD masking techniques
-- [docs/archive/optimizations/SUMMARY.md](../../../docs/archive/optimizations/SUMMARY.md) - Historical optimization record
+- [docs/optimizations/history.md](../../../docs/optimizations/history.md) - Historical optimization record

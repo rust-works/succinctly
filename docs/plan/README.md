@@ -22,7 +22,7 @@ These plans are kept for:
 
 - **Implemented**: Feature exists in codebase, plan reflects final design
 - **Current**: Document describes current code behavior
-- **Archived**: Plan superseded or approach changed (see [archive/](../archive/))
+- **Archived**: Plan superseded or approach changed
 
 ## Using Plans
 

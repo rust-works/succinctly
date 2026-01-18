@@ -12,6 +12,7 @@ Design documentation for succinctly's core data structures and algorithms.
 | [BitVec](bitvec.md) | Bit vector with O(1) rank and O(log n) select |
 | [Balanced Parentheses](balanced-parens.md) | Succinct tree encoding |
 | [Semi-Indexing](semi-indexing.md) | JSON/YAML/DSV parsing approach |
+| [Prior Art](prior-art.md) | Academic foundations and haskell-works heritage |
 
 ## Module Structure
 
