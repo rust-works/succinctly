@@ -44,15 +44,18 @@ cat config.yaml | succinctly yq '.services[].image'
 succinctly yq '.spec.containers[]' deployment.yaml service.yaml
 ```
 
-### Flags (jq-compatible)
+### Flags (yq-compatible)
 
 | Flag | Description |
 |------|-------------|
-| `-r, --raw-output` | Output raw strings without quotes |
-| `-c, --compact-output` | Compact JSON output |
-| `-s, --slurp` | Read all inputs into array |
+| `-r, --unwrapScalar` | Output raw strings without quotes |
+| `-I 0` | Compact output (use indent level 0) |
 | `-n, --null-input` | Don't read input |
 | `-e, --exit-status` | Exit 1 if last output is false/null |
+| `-p, --input-format` | Input format: auto, yaml, json |
+| `-o, --output-format` | Output format: yaml, json, auto |
+| `-i, --inplace` | Update file in place |
+| `-0, --nul-output` | Use NUL separator instead of newline |
 | `--arg NAME VALUE` | Set $NAME to string VALUE |
 | `--argjson NAME JSON` | Set $NAME to JSON VALUE |
 
@@ -321,12 +324,14 @@ ARGS:
 
 INPUT OPTIONS:
     -n, --null-input     Don't read input; use null as input
-    -s, --slurp          Read all inputs into array
+    -p, --input-format   Input format: auto, yaml, json [default: auto]
 
 OUTPUT OPTIONS:
-    -r, --raw-output     Output raw strings without quotes
-    -c, --compact        Compact JSON output (no pretty printing)
-    --output-format <FMT>  Output format: json, yaml [default: json]
+    -r, --unwrapScalar   Output raw strings without quotes
+    -I, --indent <N>     Indent level (0 for compact) [default: 2]
+    -o, --output-format  Output format: yaml, json, auto [default: yaml]
+    -i, --inplace        Update file in place
+    -0, --nul-output     Use NUL separator instead of newline
 
 YAML OPTIONS:
     --explode-anchors    Expand anchor/alias references

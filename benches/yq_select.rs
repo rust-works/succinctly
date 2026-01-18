@@ -135,7 +135,7 @@ fn bench_succinctly_select(c: &mut Criterion) {
             |b, (binary, path, query)| {
                 b.iter(|| {
                     let output = Command::new(binary)
-                        .args(["yq", "-o", "json", "-c", query, path])
+                        .args(["yq", "-o", "json", "-I", "0", query, path])
                         .stdout(Stdio::piped())
                         .stderr(Stdio::null())
                         .output()
@@ -224,7 +224,7 @@ fn bench_succinctly_field(c: &mut Criterion) {
             |b, (binary, path, query)| {
                 b.iter(|| {
                     let output = Command::new(binary)
-                        .args(["yq", "-o", "json", "-c", query, path])
+                        .args(["yq", "-o", "json", "-I", "0", query, path])
                         .stdout(Stdio::piped())
                         .stderr(Stdio::null())
                         .output()
@@ -338,7 +338,7 @@ fn bench_select_comparison(c: &mut Criterion) {
                 |b, (binary, path, query)| {
                     b.iter(|| {
                         let output = Command::new(binary)
-                            .args(["yq", "-o", "json", "-c", query, path])
+                            .args(["yq", "-o", "json", "-I", "0", query, path])
                             .stdout(Stdio::piped())
                             .stderr(Stdio::null())
                             .output()

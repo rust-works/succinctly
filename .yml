@@ -1,8 +1,10 @@
----
-name: John
+name: Alice
 age: 30
+active: true
 items:
-  - apple
-  - banana
+  - one
+  - two
+  - three
 nested:
-  key: value
+  foo: bar
+  baz: 42

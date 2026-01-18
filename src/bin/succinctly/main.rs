@@ -614,6 +614,21 @@ pub enum OutputFormat {
     Auto,
 }
 
+/// Input format for yq command
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum InputFormat {
+    /// Auto-detect based on file extension (default)
+    #[default]
+    #[value(name = "auto", alias = "a")]
+    Auto,
+    /// YAML input
+    #[value(name = "yaml", alias = "y")]
+    Yaml,
+    /// JSON input
+    #[value(name = "json", alias = "j")]
+    Json,
+}
+
 /// Command-line YAML processor (yq-compatible)
 #[derive(Debug, Parser)]
 #[command(name = "yq")]
@@ -632,19 +647,19 @@ pub struct YqCommand {
     #[arg(short = 'n', long)]
     pub null_input: bool,
 
-    /// Read all inputs into an array and use it as the single input value
-    /// Note: yq uses -s for --split-exp; use --slurp for jq-style slurping
-    #[arg(long)]
-    pub slurp: bool,
+    /// Input format type [auto, yaml, json] (default: auto)
+    #[arg(
+        short = 'p',
+        long = "input-format",
+        value_name = "FORMAT",
+        default_value = "auto"
+    )]
+    pub input_format: InputFormat,
 
     // === Output Options ===
     /// Output format type [yaml, json, auto] (default: yaml)
     #[arg(short = 'o', long, value_name = "FORMAT", default_value = "yaml")]
     pub output_format: OutputFormat,
-
-    /// Compact JSON output (no pretty printing, only with -o json)
-    #[arg(short = 'c', long)]
-    pub compact_output: bool,
 
     /// Unwrap scalar values, print without quotes (default for YAML)
     #[arg(short = 'r', long = "unwrapScalar")]
@@ -653,6 +668,10 @@ pub struct YqCommand {
     /// Like -r but don't print newline after each output
     #[arg(short = 'j', long)]
     pub join_output: bool,
+
+    /// Use NUL char to separate values instead of newline
+    #[arg(short = '0', long = "nul-output")]
+    pub nul_output: bool,
 
     /// Output ASCII only, escaping non-ASCII as \uXXXX
     #[arg(short = 'a', long)]
@@ -666,7 +685,7 @@ pub struct YqCommand {
     #[arg(short = 'M', long = "no-colors")]
     pub monochrome_output: bool,
 
-    /// Sort keys of each object on output (JSON only)
+    /// Sort keys of each object on output
     #[arg(short = 'S', long)]
     pub sort_keys: bool,
 
@@ -682,9 +701,13 @@ pub struct YqCommand {
     #[arg(long)]
     pub tab: bool,
 
-    /// Sets indent level for output (default 2)
+    /// Sets indent level for output (default 2). Use 0 for compact output.
     #[arg(short = 'I', long, value_name = "N", default_value = "2", value_parser = clap::value_parser!(u8).range(0..=7))]
     pub indent: u8,
+
+    /// Update the file in place
+    #[arg(short = 'i', long)]
+    pub inplace: bool,
 
     // === Program Input ===
     /// Read filter from file instead of command line

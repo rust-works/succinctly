@@ -13,7 +13,7 @@ use succinctly::json::light::StandardJson;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{YamlIndex, YamlValue};
 
-use super::{OutputFormat, YqCommand};
+use super::{InputFormat, OutputFormat, YqCommand};
 
 /// Exit codes matching jq/yq behavior
 pub mod exit_codes {
@@ -64,11 +64,13 @@ pub struct EvalContext {
 }
 
 /// Output configuration
+#[derive(Clone)]
 struct OutputConfig {
     output_format: OutputFormat,
     compact: bool,
     raw_output: bool,
     join_output: bool,
+    nul_output: bool,
     ascii_output: bool,
     sort_keys: bool,
     no_doc: bool,
@@ -87,7 +89,10 @@ impl OutputConfig {
             atty::is(atty::Stream::Stdout)
         };
 
-        let indent_str = if args.compact_output {
+        // Compact output when indent is 0 (yq-compatible)
+        let compact = args.indent == 0;
+
+        let indent_str = if compact {
             String::new()
         } else if args.tab {
             "\t".to_string()
@@ -97,9 +102,10 @@ impl OutputConfig {
 
         OutputConfig {
             output_format: args.output_format,
-            compact: args.compact_output,
-            raw_output: args.raw_output || args.join_output,
+            compact,
+            raw_output: args.raw_output || args.join_output || args.nul_output,
             join_output: args.join_output,
+            nul_output: args.nul_output,
             ascii_output: args.ascii_output,
             sort_keys: args.sort_keys,
             no_doc: args.no_doc,
@@ -214,7 +220,7 @@ fn value_to_string(value: &OwnedValue) -> String {
     }
 }
 
-/// Read YAML input from stdin.
+/// Read input from stdin.
 fn read_stdin() -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     std::io::stdin()
@@ -223,9 +229,57 @@ fn read_stdin() -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
-/// Read YAML input from a file.
+/// Read input from a file.
 fn read_file(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("failed to read file: {}", path.display()))
+}
+
+/// Detect input format from file extension.
+fn detect_format_from_path(path: &Path) -> InputFormat {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("json") => InputFormat::Json,
+        Some("yaml") | Some("yml") => InputFormat::Yaml,
+        _ => InputFormat::Yaml, // Default to YAML
+    }
+}
+
+/// Get effective input format, resolving Auto to a specific format.
+fn resolve_input_format(format: InputFormat, path: Option<&Path>) -> InputFormat {
+    match format {
+        InputFormat::Auto => path
+            .map(detect_format_from_path)
+            .unwrap_or(InputFormat::Yaml),
+        other => other,
+    }
+}
+
+/// Parse input bytes according to the specified format.
+fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
+    match format {
+        InputFormat::Json => {
+            // Parse as JSON
+            let index = JsonIndex::build(bytes);
+            let cursor = index.root(bytes);
+            Ok(vec![standard_json_to_owned(&cursor.value())])
+        }
+        InputFormat::Yaml | InputFormat::Auto => {
+            // Parse as YAML (Auto defaults to YAML when no extension hint)
+            let index =
+                YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {}", e))?;
+            let root = index.root(bytes);
+
+            match root.value() {
+                YamlValue::Sequence(docs) => {
+                    let mut values = Vec::new();
+                    for doc in docs {
+                        values.push(yaml_to_owned_value(doc)?);
+                    }
+                    Ok(values)
+                }
+                other => Ok(vec![yaml_to_owned_value(other)?]),
+            }
+        }
+    }
 }
 
 /// Evaluate a jq expression on an OwnedValue by converting to JSON and back.
@@ -294,15 +348,23 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) 
     }
 }
 
+/// Write the appropriate line terminator based on output config.
+fn write_terminator<W: Write>(writer: &mut W, config: &OutputConfig) -> Result<()> {
+    if config.nul_output {
+        writer.write_all(&[0])?;
+    } else if !config.join_output {
+        writeln!(writer)?;
+    }
+    Ok(())
+}
+
 /// Format and output a value.
 fn output_value<W: Write>(writer: &mut W, value: &OwnedValue, config: &OutputConfig) -> Result<()> {
     // Handle raw output for scalars
     if config.raw_output {
         if let OwnedValue::String(s) = value {
             write!(writer, "{}", s)?;
-            if !config.join_output {
-                writeln!(writer)?;
-            }
+            write_terminator(writer, config)?;
             return Ok(());
         }
     }
@@ -316,9 +378,7 @@ fn output_value<W: Write>(writer: &mut W, value: &OwnedValue, config: &OutputCon
         } else {
             write!(writer, "{}", output)?;
         }
-        if !config.join_output {
-            writeln!(writer)?;
-        }
+        write_terminator(writer, config)?;
         return Ok(());
     }
 
@@ -336,9 +396,7 @@ fn output_value<W: Write>(writer: &mut W, value: &OwnedValue, config: &OutputCon
         write!(writer, "{}", json_str)?;
     }
 
-    if !config.join_output {
-        writeln!(writer)?;
-    }
+    write_terminator(writer, config)?;
 
     Ok(())
 }
@@ -909,7 +967,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && output_config.compact
         && output_config.output_format == OutputFormat::Json
         && !args.null_input
-        && !args.slurp
+        && !args.inplace
         && context.named.is_empty();
 
     if can_fast_path {
@@ -968,76 +1026,83 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             had_output = true;
             output_value(&mut writer, &result, &output_config)?;
         }
+    } else if args.inplace {
+        // Handle --inplace: process each file and write back to it
+        if args.files.is_empty() {
+            anyhow::bail!("--inplace requires at least one file argument");
+        }
+
+        for file_path in &args.files {
+            let path = Path::new(file_path);
+            let input_bytes = read_file(path)?;
+            let format = resolve_input_format(args.input_format, Some(path));
+            let inputs = parse_input(&input_bytes, format)?;
+
+            // Collect all output into a buffer
+            let mut output_buffer = Vec::new();
+            {
+                let mut buf_writer = BufWriter::new(&mut output_buffer);
+                let is_multi_doc = inputs.len() > 1;
+                for input in &inputs {
+                    if output_config.output_format == OutputFormat::Yaml
+                        && !output_config.no_doc
+                        && is_multi_doc
+                    {
+                        writeln!(buf_writer, "---")?;
+                    }
+                    let results = evaluate_input(input, &program.expr, &context)?;
+                    for result in results {
+                        last_output = Some(result.clone());
+                        had_output = true;
+                        // Write without color for inplace editing
+                        let mut no_color_config = output_config.clone();
+                        no_color_config.use_color = false;
+                        output_value(&mut buf_writer, &result, &no_color_config)?;
+                    }
+                }
+                buf_writer.flush()?;
+            }
+
+            // Write the output back to the file
+            std::fs::write(path, &output_buffer)
+                .with_context(|| format!("failed to write to file: {}", path.display()))?;
+        }
     } else {
         // Standard path: collect inputs via OwnedValue
         let inputs: Vec<OwnedValue> = if args.files.is_empty() {
-            // Read from stdin
-            let yaml_bytes = read_stdin()?;
-            let index = YamlIndex::build(&yaml_bytes)
-                .map_err(|e| anyhow::anyhow!("YAML parse error: {}", e))?;
-            let root = index.root(&yaml_bytes);
-
-            // Get the first document from the document array
-            match root.value() {
-                YamlValue::Sequence(docs) => {
-                    let mut values = Vec::new();
-                    for doc in docs {
-                        values.push(yaml_to_owned_value(doc)?);
-                    }
-                    values
-                }
-                other => vec![yaml_to_owned_value(other)?],
-            }
+            // Read from stdin - use specified format or default to YAML
+            let input_bytes = read_stdin()?;
+            let format = resolve_input_format(args.input_format, None);
+            parse_input(&input_bytes, format)?
         } else {
-            // Read from files
+            // Read from files, respecting input format
             let mut values = Vec::new();
             for file_path in &args.files {
-                let yaml_bytes = read_file(Path::new(file_path))?;
-                let index = YamlIndex::build(&yaml_bytes)
-                    .map_err(|e| anyhow::anyhow!("YAML parse error in {}: {}", file_path, e))?;
-                let root = index.root(&yaml_bytes);
-
-                // Get the first document from the document array
-                match root.value() {
-                    YamlValue::Sequence(docs) => {
-                        for doc in docs {
-                            values.push(yaml_to_owned_value(doc)?);
-                        }
-                    }
-                    other => values.push(yaml_to_owned_value(other)?),
-                }
+                let path = Path::new(file_path);
+                let input_bytes = read_file(path)?;
+                let format = resolve_input_format(args.input_format, Some(path));
+                values.extend(parse_input(&input_bytes, format)?);
             }
             values
         };
 
-        // Handle --slurp
-        if args.slurp {
-            let slurped = OwnedValue::Array(inputs);
-            let results = evaluate_input(&slurped, &program.expr, &context)?;
+        // Process each input document
+        let is_multi_doc = inputs.len() > 1;
+        for input in inputs {
+            // Add document separator in YAML mode for multi-doc
+            // yq adds --- before each document (including the first one) in multi-doc output
+            if output_config.output_format == OutputFormat::Yaml
+                && !output_config.no_doc
+                && is_multi_doc
+            {
+                writeln!(writer, "---")?;
+            }
+
+            let results = evaluate_input(&input, &program.expr, &context)?;
             for result in results {
                 last_output = Some(result.clone());
                 had_output = true;
                 output_value(&mut writer, &result, &output_config)?;
-            }
-        } else {
-            // Process each input document
-            let is_multi_doc = inputs.len() > 1;
-            for input in inputs {
-                // Add document separator in YAML mode for multi-doc
-                // yq adds --- before each document (including the first one) in multi-doc output
-                if output_config.output_format == OutputFormat::Yaml
-                    && !output_config.no_doc
-                    && is_multi_doc
-                {
-                    writeln!(writer, "---")?;
-                }
-
-                let results = evaluate_input(&input, &program.expr, &context)?;
-                for result in results {
-                    last_output = Some(result.clone());
-                    had_output = true;
-                    output_value(&mut writer, &result, &output_config)?;
-                }
             }
         }
     }

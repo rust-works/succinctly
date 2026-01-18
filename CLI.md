@@ -216,6 +216,108 @@ Each section tests specific parsing features:
 - **Unicode**: UTF-8 multibyte sequences
 - **Nesting depth**: Balanced parentheses find_close operations
 
+## yq Command
+
+Query YAML files using a yq-compatible interface (mikefarah/yq).
+
+```bash
+succinctly yq [OPTIONS] <FILTER> [FILES...]
+```
+
+### Basic Usage
+
+```bash
+# Identity filter (pretty-print YAML)
+succinctly yq . input.yaml
+
+# Field access
+succinctly yq '.name' input.yaml
+
+# Array indexing
+succinctly yq '.[0]' input.yaml
+succinctly yq '.users[0].name' input.yaml
+
+# Iterate all elements
+succinctly yq '.[]' input.yaml
+succinctly yq '.users[]' input.yaml
+```
+
+### Output Options
+
+- `-o, --output-format <FORMAT>`: Output format: `yaml` (default), `json`, `auto`
+- `-I, --indent <N>`: Indent level (0 for compact output, default: 2)
+- `-r, --unwrapScalar`: Output raw strings without quotes (default for YAML)
+- `-j, --join-output`: Like -r but no newline after each output
+- `-0, --nul-output`: Use NUL char to separate values instead of newline
+- `-S, --sort-keys`: Sort keys of each object on output
+- `-C, --colors`: Force colorized output
+- `-M, --no-colors`: Disable colorized output
+- `-N, --no-doc`: Don't print document separators (`---`)
+- `-P, --prettyPrint`: Pretty print, expand flow styles to block style
+- `--tab`: Use tabs for indentation
+- `-a, --ascii-output`: Output ASCII only, escaping non-ASCII as `\uXXXX`
+
+### Input Options
+
+- `-n, --null-input`: Don't read any input; use null as the single input value
+- `-p, --input-format <FORMAT>`: Input format: `auto` (default), `yaml`, `json`
+- `-i, --inplace`: Update the file in place
+
+### Variables
+
+- `--arg NAME VALUE`: Set $NAME to the string VALUE
+- `--argjson NAME VALUE`: Set $NAME to the JSON VALUE
+
+### Exit Status
+
+- `-e, --exit-status`: Set exit status based on output (0 if last output != false/null)
+
+### Examples
+
+```bash
+# YAML to JSON conversion
+succinctly yq -o json . config.yaml
+
+# Compact JSON output (use -I 0)
+succinctly yq -o json -I 0 . config.yaml
+
+# Raw string output
+succinctly yq -r '.name' user.yaml
+
+# JSON input with YAML output
+succinctly yq -p json . input.json
+
+# Update file in place
+succinctly yq -i '.version = "2.0"' config.yaml
+
+# NUL-separated output (for xargs -0)
+succinctly yq -0 '.items[]' list.yaml | xargs -0 process
+
+# Multiple files
+succinctly yq '.version' config1.yaml config2.yaml
+
+# Pipe from stdin
+cat data.yaml | succinctly yq '.items[]'
+
+# Multi-document YAML
+succinctly yq '.' multi-doc.yaml
+```
+
+### Differences from jq
+
+The `yq` subcommand uses yq-compatible flags (mikefarah/yq v4):
+
+| Feature | jq | yq (succinctly yq) |
+|---------|----|--------------------|
+| Compact output | `-c` | `-I 0` |
+| Raw output | `-r` | `-r` (--unwrapScalar) |
+| Default output | JSON | YAML |
+| Input format | JSON only | Auto-detect (YAML/JSON) |
+| Inplace edit | N/A | `-i` |
+| NUL separator | N/A | `-0` |
+
+---
+
 ## jq Command
 
 Query JSON files using a jq-compatible interface.
