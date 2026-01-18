@@ -2016,7 +2016,7 @@ Both JSON and YAML parsing are memory-bound:
 - Wider SIMD vectors = more data demand per cycle
 - Memory subsystem can't keep up → stalls
 
-From `docs/optimisations/cache-memory.md`:
+From `docs/optimizations/cache-memory.md`:
 > **This is why AVX-512 JSON parsing was 7-17% slower** - the workload was memory-bound.
 
 **3. Zen 4 Architecture Limitation**
@@ -2827,7 +2827,7 @@ unsafe fn is_simple_kv_line(line: &[u8]) -> Option<(usize, usize)> {
 
 **Warning from JSON experience:**
 > "Wider SIMD != automatically faster (AVX-512 JSON was 10% slower than AVX2)"
-> — [docs/optimisations/README.md](../optimisations/README.md)
+> — [docs/optimizations/README.md](../optimizations/README.md)
 
 **Reasons AVX-512 can be slower:**
 - Frequency throttling (CPU reduces clock speed with AVX-512)
@@ -2963,10 +2963,10 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release --example yaml_profile
 - [BMI2 utilities](../../src/json/simd/bmi2.rs)
 
 **Optimization Documentation:**
-- [SIMD techniques](../optimisations/simd.md)
-- [Bit manipulation](../optimisations/bit-manipulation.md)
-- [State machines](../optimisations/state-machines.md)
-- [Optimization overview](../optimisations/README.md)
+- [SIMD techniques](../optimizations/simd.md)
+- [Bit manipulation](../optimizations/bit-manipulation.md)
+- [State machines](../optimizations/state-machines.md)
+- [Optimization overview](../optimizations/README.md)
 
 ---
 

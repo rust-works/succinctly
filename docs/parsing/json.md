@@ -58,7 +58,7 @@ With IB and BP, navigation becomes bit operations:
 | Parent | `BP: find matching open before current close` |
 | Text position | `IB: select1(BP.rank1(bp_pos))` |
 
-See [hierarchical-structures.md](../optimisations/hierarchical-structures.md) for rank/select implementation details.
+See [hierarchical-structures.md](../optimizations/hierarchical-structures.md) for rank/select implementation details.
 
 ---
 
@@ -136,7 +136,7 @@ fn process_byte(byte: u8, state: u8) -> (u8, u8) {
 
 **Performance**: 40-77% faster than scalar parsing.
 
-See [lookup-tables.md](../optimisations/lookup-tables.md) and [state-machines.md](../optimisations/state-machines.md) for technique details.
+See [lookup-tables.md](../optimizations/lookup-tables.md) and [state-machines.md](../optimizations/state-machines.md) for technique details.
 
 ---
 
@@ -191,7 +191,7 @@ unsafe fn classify_neon(chunk: &[u8; 16]) -> Masks {
 
 This replaces 12+ comparisons with 2 lookups + 1 AND.
 
-See [simd.md](../optimisations/simd.md) for SIMD technique details.
+See [simd.md](../optimizations/simd.md) for SIMD technique details.
 
 ---
 
@@ -223,7 +223,7 @@ impl BitWriter {
 }
 ```
 
-See [zero-copy.md](../optimisations/zero-copy.md) for buffer management techniques.
+See [zero-copy.md](../optimizations/zero-copy.md) for buffer management techniques.
 
 ---
 
@@ -356,13 +356,13 @@ succinctly jq-locate file.json --offset 42 --format json
 
 | Technique | Document | Application |
 |-----------|----------|-------------|
-| Lookup tables | [lookup-tables.md](../optimisations/lookup-tables.md) | PFSM state machine |
-| SIMD classification | [simd.md](../optimisations/simd.md) | Character detection |
-| Nibble lookup | [lookup-tables.md](../optimisations/lookup-tables.md) | NEON classification |
-| Hierarchical indices | [hierarchical-structures.md](../optimisations/hierarchical-structures.md) | Rank/select for BP |
-| Branchless masking | [branchless.md](../optimisations/branchless.md) | SIMD result extraction |
-| Lazy evaluation | [zero-copy.md](../optimisations/zero-copy.md) | Defer value decoding |
-| Exponential search | [access-patterns.md](../optimisations/access-patterns.md) | Sequential select hints |
+| Lookup tables | [lookup-tables.md](../optimizations/lookup-tables.md) | PFSM state machine |
+| SIMD classification | [simd.md](../optimizations/simd.md) | Character detection |
+| Nibble lookup | [lookup-tables.md](../optimizations/lookup-tables.md) | NEON classification |
+| Hierarchical indices | [hierarchical-structures.md](../optimizations/hierarchical-structures.md) | Rank/select for BP |
+| Branchless masking | [branchless.md](../optimizations/branchless.md) | SIMD result extraction |
+| Lazy evaluation | [zero-copy.md](../optimizations/zero-copy.md) | Defer value decoding |
+| Exponential search | [access-patterns.md](../optimizations/access-patterns.md) | Sequential select hints |
 
 ---
 

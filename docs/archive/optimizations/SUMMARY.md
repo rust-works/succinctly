@@ -877,7 +877,7 @@ Before implementing an optimization, ask:
 
 ### Performance Analysis Documents
 
-- [jq-comparison.md](../jq-comparison.md) - jq vs succinctly comparison (Apple M1 Max)
+- [jq.md](../../benchmarks/jq.md) - jq vs succinctly comparison (Apple M1 Max)
 - [avx512-vpopcntdq-results.md](avx512-vpopcntdq-results.md) - Popcount 5.2x speedup
 - [avx512-json-results.md](avx512-json-results.md) - Why AVX2 beats AVX-512 (historical)
 - [failed-optimizations.md](failed-optimizations.md) - Detailed failure analysis

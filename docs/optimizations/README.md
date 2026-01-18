@@ -1,6 +1,6 @@
 # Optimisation Techniques
 
-This directory documents optimisation techniques used in the succinctly library, organised by category. Each document covers the theory, implementation patterns, prior art, and practical lessons learned.
+This directory documents optimization techniques used in the succinctly library, organized by category. Each document covers the theory, implementation patterns, prior art, and practical lessons learned.
 
 ## Quick Reference
 
@@ -107,7 +107,7 @@ AVX-512 is slower than AVX2 for memory-bound workloads. The memory system can't 
 
 ### 4. Algorithmic > Micro
 
-A 627x speedup from cumulative index (algorithmic) dwarfs any SIMD optimisation.
+A 627x speedup from cumulative index (algorithmic) dwarfs any SIMD optimization.
 
 ### 5. Profile Against Production
 
@@ -125,7 +125,7 @@ Micro-benchmarks must reflect real usage patterns, not just measure primitive op
 
 ## Reading Order
 
-For newcomers to performance optimisation:
+For newcomers to performance optimization:
 
 1. **[cache-memory.md](cache-memory.md)** - Understanding memory hierarchy is fundamental
 2. **[access-patterns.md](access-patterns.md)** - How access patterns affect cache
@@ -168,7 +168,7 @@ For newcomers to performance optimisation:
 
 ## Contributing
 
-When adding new optimisation documentation:
+When adding new optimization documentation:
 
 1. Create a new `.md` file in this directory
 2. Follow the existing structure:
@@ -184,5 +184,5 @@ When adding new optimisation documentation:
 
 ## See Also
 
-- [../archive/OPTIMIZATION-SUMMARY.md](../archive/OPTIMIZATION-SUMMARY.md) - Historical record of all optimisations applied to succinctly
+- [../archive/OPTIMIZATION-SUMMARY.md](../archive/OPTIMIZATION-SUMMARY.md) - Historical record of all optimizations applied to succinctly
 - [../../.claude/skills/](../../.claude/skills/) - Claude Code skill files for specific topics

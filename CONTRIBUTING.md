@@ -206,7 +206,7 @@ Requires Intel Ice Lake+ or AMD Zen 4+.
 
 ## Releases
 
-See [RELEASE.md](RELEASE.md) for the release process and checklist. Releases are handled by maintainers.
+See [docs/guides/release.md](docs/guides/release.md) for the release process and checklist. Releases are handled by maintainers.
 
 ## Questions?
 

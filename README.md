@@ -286,12 +286,18 @@ The library uses runtime CPU feature detection to select the best implementation
 
 ## Documentation
 
-- [API Documentation](https://docs.rs/succinctly) - Full API reference on docs.rs
-- [CLAUDE.md](CLAUDE.md) - Detailed architecture guide
-- [docs/rust-json-comparison.md](docs/rust-json-comparison.md) - Comparison with Rust JSON parsers
-- [docs/jq-comparison.md](docs/jq-comparison.md) - Comparison with system jq command
-- [docs/dsv-performance.md](docs/dsv-performance.md) - DSV (CSV/TSV) input performance benchmarks
-- [docs/archive/OPTIMIZATION-SUMMARY.md](docs/archive/OPTIMIZATION-SUMMARY.md) - Performance optimization history
+Choose your path:
+
+- **New to succinctly?** -> [Getting Started](docs/getting-started/)
+- **Using the library?** -> [API Guide](docs/guides/api.md)
+- **Using the CLI?** -> [CLI Guide](docs/guides/cli.md)
+- **Contributing?** -> [CONTRIBUTING.md](CONTRIBUTING.md)
+- **Performance tuning?** -> [Optimization Techniques](docs/optimizations/)
+- **Understanding internals?** -> [Architecture](docs/architecture/)
+- **Benchmarks?** -> [Performance Comparisons](docs/benchmarks/)
+- **Full documentation map** -> [docs/](docs/)
+
+For AI-assisted development, see [CLAUDE.md](CLAUDE.md).
 
 ## Contributing
 

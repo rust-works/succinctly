@@ -115,7 +115,7 @@ let in_quote_mask = prefix_xor(quote_bits) ^ carry_from_previous_chunk;
 let valid_delims = delim_bits & !in_quote_mask;
 ```
 
-See [parallel-prefix.md](../optimisations/parallel-prefix.md) for technique details.
+See [parallel-prefix.md](../optimizations/parallel-prefix.md) for technique details.
 
 ---
 
@@ -158,7 +158,7 @@ After add:      Result fills between quotes automatically
 - Addition handles carry propagation without loops
 - No sequential dependency chain like prefix_xor
 
-See [bit-manipulation.md](../optimisations/bit-manipulation.md) for PDEP/PEXT details.
+See [bit-manipulation.md](../optimizations/bit-manipulation.md) for PDEP/PEXT details.
 
 ---
 
@@ -207,7 +207,7 @@ unsafe fn process_chunk_64_neon(chunk: &[u8; 64]) -> (u64, u64, u64) {
 }
 ```
 
-See [simd.md](../optimisations/simd.md) for SIMD technique details.
+See [simd.md](../optimizations/simd.md) for SIMD technique details.
 
 ---
 
@@ -254,7 +254,7 @@ fn markers_select1(&self, k: usize) -> Option<usize> {
 }
 ```
 
-See [hierarchical-structures.md](../optimisations/hierarchical-structures.md) and [cache-memory.md](../optimisations/cache-memory.md) for why simpler structures win.
+See [hierarchical-structures.md](../optimizations/hierarchical-structures.md) and [cache-memory.md](../optimizations/cache-memory.md) for why simpler structures win.
 
 ---
 
@@ -370,16 +370,16 @@ let psv = DsvConfig::psv();   // pipe delimiter
 
 ---
 
-## Optimisation Techniques Used
+## Optimization Techniques Used
 
 | Technique | Document | Application |
 |-----------|----------|-------------|
-| PDEP carry propagation | [bit-manipulation.md](../optimisations/bit-manipulation.md) | toggle64_bmi2 (10x faster) |
-| Parallel prefix XOR | [parallel-prefix.md](../optimisations/parallel-prefix.md) | Quote state tracking |
-| SIMD comparison | [simd.md](../optimisations/simd.md) | Character detection |
-| Lightweight index | [cache-memory.md](../optimisations/cache-memory.md) | Simple beats complex (5-9x) |
-| Cumulative rank | [hierarchical-structures.md](../optimisations/hierarchical-structures.md) | O(1) rank queries |
-| Binary search select | [access-patterns.md](../optimisations/access-patterns.md) | O(log n) field lookup |
+| PDEP carry propagation | [bit-manipulation.md](../optimizations/bit-manipulation.md) | toggle64_bmi2 (10x faster) |
+| Parallel prefix XOR | [parallel-prefix.md](../optimizations/parallel-prefix.md) | Quote state tracking |
+| SIMD comparison | [simd.md](../optimizations/simd.md) | Character detection |
+| Lightweight index | [cache-memory.md](../optimizations/cache-memory.md) | Simple beats complex (5-9x) |
+| Cumulative rank | [hierarchical-structures.md](../optimizations/hierarchical-structures.md) | O(1) rank queries |
+| Binary search select | [access-patterns.md](../optimizations/access-patterns.md) | O(log n) field lookup |
 
 ---
 
@@ -413,4 +413,4 @@ for chunk in data.chunks(64) {
 
 - RFC 4180: Common Format and MIME Type for CSV Files
 - hw-dsv (Haskell): https://github.com/haskell-works/hw-dsv
-- [DSV Performance Benchmarks](../dsv-performance.md)
+- [DSV Benchmarks](../benchmarks/dsv.md)

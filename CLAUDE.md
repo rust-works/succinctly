@@ -154,11 +154,11 @@ cargo test
 
 | Document                                                          | Purpose                              |
 |-------------------------------------------------------------------|--------------------------------------|
-| [RELEASE.md](RELEASE.md)                                          | Release process and checklist        |
-| [docs/optimisations/](docs/optimisations/)                        | Optimisation techniques reference    |
-| [docs/jq-comparison.md](docs/jq-comparison.md)                    | JSON jq benchmark results            |
-| [docs/yq-comparison.md](docs/yq-comparison.md)                    | YAML yq benchmark results            |
-| [docs/dsv-performance.md](docs/dsv-performance.md)                | DSV input performance benchmarks     |
+| [docs/guides/release.md](docs/guides/release.md)                  | Release process and checklist        |
+| [docs/optimizations/](docs/optimizations/)                        | Optimization techniques reference    |
+| [docs/benchmarks/jq.md](docs/benchmarks/jq.md)                    | JSON jq benchmark results            |
+| [docs/benchmarks/yq.md](docs/benchmarks/yq.md)                    | YAML yq benchmark results            |
+| [docs/benchmarks/dsv.md](docs/benchmarks/dsv.md)                  | DSV input performance benchmarks     |
 
 ## Performance Summary
 
