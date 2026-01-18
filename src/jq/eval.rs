@@ -5376,15 +5376,256 @@ fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>>(
 // ============================================================================
 
 /// Builtin: path(expr) - return the path to values selected by expr
-/// Since we don't track paths during evaluation, we return an empty array (stub)
+/// This evaluates the expression while tracking the path taken to reach each value.
 fn builtin_path<'a, W: Clone + AsRef<[u64]>>(
-    _expr: &Expr,
-    _value: StandardJson<'a, W>,
-    _optional: bool,
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
 ) -> QueryResult<'a, W> {
-    // In a full implementation, path() would track the path to each value.
-    // For now, return an empty array as a stub.
-    QueryResult::Owned(OwnedValue::Array(vec![]))
+    let owned = to_owned(&value);
+    let mut paths = Vec::new();
+    eval_with_path_tracking(expr, &owned, &[], &mut paths, optional);
+
+    if paths.is_empty() {
+        if optional {
+            QueryResult::None
+        } else {
+            QueryResult::Owned(OwnedValue::Array(vec![]))
+        }
+    } else if paths.len() == 1 {
+        QueryResult::Owned(paths.into_iter().next().unwrap())
+    } else {
+        // Multiple paths - return as Many
+        let owned_paths: Vec<OwnedValue> = paths;
+        // Convert to QueryResult::Many by wrapping each path
+        QueryResult::ManyOwned(owned_paths)
+    }
+}
+
+/// Evaluate an expression while tracking the path taken to reach each value.
+/// Each path is collected as an OwnedValue::Array of path components.
+fn eval_with_path_tracking(
+    expr: &Expr,
+    value: &OwnedValue,
+    current_path: &[OwnedValue],
+    paths: &mut Vec<OwnedValue>,
+    optional: bool,
+) {
+    match expr {
+        Expr::Identity => {
+            // Identity returns the current path
+            paths.push(OwnedValue::Array(current_path.to_vec()));
+        }
+        Expr::Field(name) => {
+            // jq's path() returns the path regardless of whether the field exists
+            // This matches jq behavior: path(.missing) returns ["missing"]
+            let mut new_path = current_path.to_vec();
+            new_path.push(OwnedValue::String(name.clone()));
+            paths.push(OwnedValue::Array(new_path));
+        }
+        Expr::Index(idx) => {
+            // jq's path() preserves the original index (including negative)
+            // This matches jq behavior: path(.[-1]) returns [-1]
+            let mut new_path = current_path.to_vec();
+            new_path.push(OwnedValue::Int(*idx));
+            paths.push(OwnedValue::Array(new_path));
+        }
+        Expr::Iterate => match value {
+            OwnedValue::Array(arr) => {
+                for (i, _) in arr.iter().enumerate() {
+                    let mut new_path = current_path.to_vec();
+                    new_path.push(OwnedValue::Int(i as i64));
+                    paths.push(OwnedValue::Array(new_path));
+                }
+            }
+            OwnedValue::Object(entries) => {
+                for (key, _) in entries {
+                    let mut new_path = current_path.to_vec();
+                    new_path.push(OwnedValue::String(key.clone()));
+                    paths.push(OwnedValue::Array(new_path));
+                }
+            }
+            _ => {}
+        },
+        Expr::Pipe(exprs) => {
+            if exprs.is_empty() {
+                paths.push(OwnedValue::Array(current_path.to_vec()));
+                return;
+            }
+            // For pipe, we need to evaluate step by step, tracking paths
+            eval_pipe_with_path_tracking(exprs, value, current_path, paths, optional);
+        }
+        Expr::Optional(inner) => {
+            eval_with_path_tracking(inner, value, current_path, paths, true);
+        }
+        Expr::Paren(inner) => {
+            eval_with_path_tracking(inner, value, current_path, paths, optional);
+        }
+        Expr::Slice { start, end } => {
+            if let OwnedValue::Array(arr) = value {
+                let len = arr.len() as i64;
+                let s = start.unwrap_or(0);
+                let e = end.unwrap_or(len);
+                let actual_start = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
+                let actual_end = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
+                // Slicing doesn't produce a single path - it produces a new value
+                // In jq, path on a slice gives the path to each element in the slice
+                for i in actual_start..actual_end {
+                    let mut new_path = current_path.to_vec();
+                    new_path.push(OwnedValue::Int(i as i64));
+                    paths.push(OwnedValue::Array(new_path));
+                }
+            }
+        }
+        // For complex expressions that don't represent simple paths, we can't track
+        _ => {
+            // For non-path expressions, we don't produce path output
+            // This includes arithmetic, comparisons, etc.
+        }
+    }
+}
+
+/// Evaluate a pipe expression while tracking paths
+fn eval_pipe_with_path_tracking(
+    exprs: &[Expr],
+    value: &OwnedValue,
+    current_path: &[OwnedValue],
+    paths: &mut Vec<OwnedValue>,
+    optional: bool,
+) {
+    if exprs.is_empty() {
+        paths.push(OwnedValue::Array(current_path.to_vec()));
+        return;
+    }
+
+    // For the first expression, get intermediate paths and values
+    let first = &exprs[0];
+    let rest = &exprs[1..];
+
+    if rest.is_empty() {
+        // Last expression - collect final paths
+        eval_with_path_tracking(first, value, current_path, paths, optional);
+        return;
+    }
+
+    // Get intermediate results with their paths
+    let mut intermediate: Vec<(Vec<OwnedValue>, OwnedValue)> = Vec::new();
+    collect_intermediate_with_paths(first, value, current_path, &mut intermediate, optional);
+
+    // Continue with the rest of the pipe for each intermediate result
+    for (path, val) in intermediate {
+        eval_pipe_with_path_tracking(rest, &val, &path, paths, optional);
+    }
+}
+
+/// Collect intermediate values along with their paths for continuing pipe evaluation
+#[allow(clippy::only_used_in_recursion)]
+fn collect_intermediate_with_paths(
+    expr: &Expr,
+    value: &OwnedValue,
+    current_path: &[OwnedValue],
+    results: &mut Vec<(Vec<OwnedValue>, OwnedValue)>,
+    optional: bool,
+) {
+    match expr {
+        Expr::Identity => {
+            results.push((current_path.to_vec(), value.clone()));
+        }
+        Expr::Field(name) => {
+            if let OwnedValue::Object(entries) = value {
+                for (key, val) in entries {
+                    if key == name {
+                        let mut new_path = current_path.to_vec();
+                        new_path.push(OwnedValue::String(name.clone()));
+                        results.push((new_path, val.clone()));
+                        return;
+                    }
+                }
+            }
+        }
+        Expr::Index(idx) => {
+            if let OwnedValue::Array(arr) = value {
+                let len = arr.len() as i64;
+                let actual_idx = if *idx < 0 { len + *idx } else { *idx };
+                if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
+                    let mut new_path = current_path.to_vec();
+                    // Preserve original index (including negative) to match jq behavior
+                    new_path.push(OwnedValue::Int(*idx));
+                    results.push((new_path, arr[actual_idx as usize].clone()));
+                }
+            }
+        }
+        Expr::Iterate => match value {
+            OwnedValue::Array(arr) => {
+                for (i, val) in arr.iter().enumerate() {
+                    let mut new_path = current_path.to_vec();
+                    new_path.push(OwnedValue::Int(i as i64));
+                    results.push((new_path, val.clone()));
+                }
+            }
+            OwnedValue::Object(entries) => {
+                for (key, val) in entries {
+                    let mut new_path = current_path.to_vec();
+                    new_path.push(OwnedValue::String(key.clone()));
+                    results.push((new_path, val.clone()));
+                }
+            }
+            _ => {}
+        },
+        Expr::Optional(inner) => {
+            collect_intermediate_with_paths(inner, value, current_path, results, true);
+        }
+        Expr::Paren(inner) => {
+            collect_intermediate_with_paths(inner, value, current_path, results, optional);
+        }
+        Expr::Pipe(inner_exprs) => {
+            // Nested pipe - flatten it
+            if inner_exprs.is_empty() {
+                results.push((current_path.to_vec(), value.clone()));
+                return;
+            }
+            let mut intermediate: Vec<(Vec<OwnedValue>, OwnedValue)> = Vec::new();
+            collect_intermediate_with_paths(
+                &inner_exprs[0],
+                value,
+                current_path,
+                &mut intermediate,
+                optional,
+            );
+
+            for (path, val) in intermediate {
+                if inner_exprs.len() == 1 {
+                    results.push((path, val));
+                } else {
+                    // Continue with rest
+                    let rest_pipe = Expr::Pipe(inner_exprs[1..].to_vec());
+                    collect_intermediate_with_paths(&rest_pipe, &val, &path, results, optional);
+                }
+            }
+        }
+        Expr::Slice { start, end } => {
+            if let OwnedValue::Array(arr) = value {
+                let len = arr.len() as i64;
+                let s = start.unwrap_or(0);
+                let e = end.unwrap_or(len);
+                let actual_start = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
+                let actual_end = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
+                for (i, item) in arr
+                    .iter()
+                    .enumerate()
+                    .skip(actual_start)
+                    .take(actual_end - actual_start)
+                {
+                    let mut new_path = current_path.to_vec();
+                    new_path.push(OwnedValue::Int(i as i64));
+                    results.push((new_path, item.clone()));
+                }
+            }
+        }
+        _ => {
+            // For non-path expressions, we can't track paths
+        }
+    }
 }
 
 /// Helper to collect all paths recursively
@@ -9865,11 +10106,44 @@ mod tests {
 
     #[test]
     fn test_path_expr() {
-        // path(expr) is a stub that returns empty array
-        // Full implementation would track paths during expression evaluation
+        // path(expr) returns the path components to the value selected by expr
         query!(br#"{"a": 1, "b": 2}"#, "path(.a)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert!(arr.is_empty()); // Stub returns empty
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0], OwnedValue::String("a".into()));
+            }
+        );
+
+        // Test nested path
+        query!(br#"{"a": {"b": {"c": 1}}}"#, "path(.a.b.c)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0], OwnedValue::String("a".into()));
+                assert_eq!(arr[1], OwnedValue::String("b".into()));
+                assert_eq!(arr[2], OwnedValue::String("c".into()));
+            }
+        );
+
+        // Test array index
+        query!(br#"[10, 20, 30]"#, "path(.[1])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0], OwnedValue::Int(1));
+            }
+        );
+
+        // Test negative index (preserved as-is, matching jq)
+        query!(br#"[10, 20, 30]"#, "path(.[-1])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0], OwnedValue::Int(-1));
+            }
+        );
+
+        // Test identity path
+        query!(br#"{"a": 1}"#, "path(.)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty()); // Identity has no path components
             }
         );
     }
