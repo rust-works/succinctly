@@ -513,7 +513,7 @@ impl<'a> Parser<'a> {
         Ok(result)
     }
 
-    /// Parse a bracket expression: `[0]`, `[]`, `[1:3]`, etc.
+    /// Parse a bracket expression: `[0]`, `[]`, `[1:3]`, `["key"]`, etc.
     /// This is for indexing, NOT array construction.
     fn parse_index_bracket(&mut self) -> Result<Expr, ParseError> {
         self.expect('[')?;
@@ -523,6 +523,14 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(']') {
             self.next();
             return Ok(Expr::Iterate);
+        }
+
+        // Check for string key: `["key"]`
+        if self.peek() == Some('"') {
+            let key = self.parse_string_literal()?;
+            self.skip_ws();
+            self.expect(']')?;
+            return Ok(Expr::Field(key));
         }
 
         // Check for slice starting with ':'
@@ -784,9 +792,15 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::Identity);
                 }
 
-                // Field access `.foo`
-                let name = self.parse_ident()?;
-                let mut expr = Expr::Field(name);
+                // Check for quoted field access `."key"`
+                let mut expr = if self.peek() == Some('"') {
+                    let name = self.parse_string_literal()?;
+                    Expr::Field(name)
+                } else {
+                    // Field access `.foo`
+                    let name = self.parse_ident()?;
+                    Expr::Field(name)
+                };
 
                 // Check for optional
                 self.skip_ws();
@@ -2575,6 +2589,19 @@ impl<'a> Parser<'a> {
                     // Check for bracket after dot
                     if self.peek() == Some('[') {
                         chain.push(self.parse_index_bracket_with_optional()?);
+                    } else if self.peek() == Some('"') {
+                        // Quoted field access `."key"`
+                        let name = self.parse_string_literal()?;
+                        let mut field_expr = Expr::Field(name);
+
+                        // Check for optional
+                        self.skip_ws();
+                        if self.peek() == Some('?') {
+                            self.next();
+                            field_expr = Expr::Optional(Box::new(field_expr));
+                        }
+
+                        chain.push(field_expr);
                     } else {
                         // Field access
                         let name = self.parse_ident()?;
@@ -4000,5 +4027,103 @@ mod tests {
         // if with arithmetic
         let expr = parse("if .x > 0 then .x * 2 else .x end").unwrap();
         assert!(matches!(expr, Expr::If { .. }));
+    }
+
+    #[test]
+    fn test_quoted_field_access() {
+        // Basic quoted field access
+        assert_eq!(parse(".\"my-key\"").unwrap(), Expr::Field("my-key".into()));
+        assert_eq!(
+            parse(".\"with spaces\"").unwrap(),
+            Expr::Field("with spaces".into())
+        );
+        assert_eq!(
+            parse(".\"special@chars!\"").unwrap(),
+            Expr::Field("special@chars!".into())
+        );
+
+        // Empty string key
+        assert_eq!(parse(".\"\"").unwrap(), Expr::Field("".into()));
+
+        // Quoted field in chained access
+        assert_eq!(
+            parse(".foo.\"bar-baz\"").unwrap(),
+            Expr::Pipe(vec![
+                Expr::Field("foo".into()),
+                Expr::Field("bar-baz".into()),
+            ])
+        );
+
+        // Multiple quoted fields chained
+        assert_eq!(
+            parse(".\"a-b\".\"c-d\"").unwrap(),
+            Expr::Pipe(vec![Expr::Field("a-b".into()), Expr::Field("c-d".into()),])
+        );
+
+        // Mix of quoted and unquoted fields
+        assert_eq!(
+            parse(".foo.\"my-key\".bar").unwrap(),
+            Expr::Pipe(vec![
+                Expr::Field("foo".into()),
+                Expr::Field("my-key".into()),
+                Expr::Field("bar".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_bracket_string_notation() {
+        // Basic bracket string notation
+        assert_eq!(
+            parse(".[\"my-key\"]").unwrap(),
+            Expr::Field("my-key".into())
+        );
+        assert_eq!(
+            parse(".[\"with spaces\"]").unwrap(),
+            Expr::Field("with spaces".into())
+        );
+
+        // Empty string key
+        assert_eq!(parse(".[\"\"]").unwrap(), Expr::Field("".into()));
+
+        // Bracket string in chained access
+        assert_eq!(
+            parse(".foo[\"bar-baz\"]").unwrap(),
+            Expr::Pipe(vec![
+                Expr::Field("foo".into()),
+                Expr::Field("bar-baz".into()),
+            ])
+        );
+
+        // Multiple bracket notations chained
+        assert_eq!(
+            parse(".[\"a-b\"][\"c-d\"]").unwrap(),
+            Expr::Pipe(vec![Expr::Field("a-b".into()), Expr::Field("c-d".into()),])
+        );
+
+        // Mix of bracket and dot notation
+        assert_eq!(
+            parse(".foo[\"my-key\"].bar").unwrap(),
+            Expr::Pipe(vec![
+                Expr::Field("foo".into()),
+                Expr::Field("my-key".into()),
+                Expr::Field("bar".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_optional_quoted_field() {
+        // Optional quoted field access
+        assert_eq!(
+            parse(".\"my-key\"?").unwrap(),
+            Expr::Optional(Box::new(Expr::Field("my-key".into())))
+        );
+
+        // Optional bracket string notation
+        assert_eq!(
+            parse(".[\"my-key\"]?").unwrap(),
+            Expr::Optional(Box::new(Expr::Field("my-key".into())))
+        );
     }
 }

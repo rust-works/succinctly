@@ -33,6 +33,8 @@ The implementation is already production-ready for ~90% of jq use cases.
 ### Core Path Expressions
 - [x] `.` - Identity
 - [x] `.foo` - Field access
+- [x] `."key"` - Quoted field access (for special characters like kebab-case)
+- [x] `.["key"]` - Bracket notation with string key
 - [x] `.[0]` - Array index (positive and negative)
 - [x] `.[2:5]`, `.[2:]`, `.[:5]` - Array slicing
 - [x] `.[]` - Array/object iteration
@@ -301,3 +303,4 @@ echo '{"a":1}' | succinctly jq '.a'
 | 2026-01-19 | Added YAML metadata functions: tag, anchor, style for yq (✅ partial - tag works fully, anchor/style return defaults)|
 | 2026-01-19 | Added kind function for yq - returns node kind: scalar, seq, map (✅ complete)|
 | 2026-01-19 | Added key function for yq - returns current key when iterating (✅ complete)|
+| 2026-01-19 | Added quoted field access `."key"` and bracket notation `.["key"]` (✅ complete)|
