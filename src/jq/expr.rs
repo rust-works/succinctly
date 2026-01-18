@@ -740,6 +740,8 @@ pub enum Builtin {
     Anchor,
     /// `style` - return scalar style (double, single, literal, folded) or collection style (flow)
     Style,
+    /// `kind` - return node kind: "scalar", "seq", or "map"
+    Kind,
 
     // Phase 11: Path manipulation
     /// `del(path)` - delete value at path

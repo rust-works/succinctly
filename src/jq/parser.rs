@@ -2516,6 +2516,12 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Style));
         }
 
+        // kind - yq: return node kind (scalar, seq, map)
+        if self.matches_keyword("kind") {
+            self.consume_keyword("kind");
+            return Ok(Some(Builtin::Kind));
+        }
+
         Ok(None)
     }
 

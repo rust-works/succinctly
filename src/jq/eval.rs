@@ -1297,6 +1297,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         Builtin::Tag => builtin_tag(value),
         Builtin::Anchor => builtin_anchor(),
         Builtin::Style => builtin_style(value),
+        Builtin::Kind => builtin_kind(value),
 
         // Phase 11: Path manipulation
         Builtin::Del(path) => builtin_del(path, value, optional),
@@ -5156,6 +5157,7 @@ fn substitute_var_in_builtin(
         Builtin::Tag => Builtin::Tag,
         Builtin::Anchor => Builtin::Anchor,
         Builtin::Style => Builtin::Style,
+        Builtin::Kind => Builtin::Kind,
         Builtin::Del(e) => Builtin::Del(Box::new(substitute_var(e, var_name, replacement))),
     }
 }
@@ -7937,6 +7939,18 @@ fn builtin_style<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> Que
     QueryResult::Owned(OwnedValue::String(style.to_string()))
 }
 
+/// `kind` - returns the node kind: "scalar", "seq", or "map"
+/// This is a yq function that returns the YAML node kind.
+fn builtin_kind<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryResult<'a, W> {
+    let kind = match &value {
+        StandardJson::Array(_) => "seq",
+        StandardJson::Object(_) => "map",
+        // All other types are scalars: null, bool, number, string
+        _ => "scalar",
+    };
+    QueryResult::Owned(OwnedValue::String(kind.to_string()))
+}
+
 // ============================================================================
 // Phase 9: Variables & Definitions
 // ============================================================================
@@ -8829,6 +8843,7 @@ fn expand_func_calls_in_builtin(
         Builtin::Tag => Builtin::Tag,
         Builtin::Anchor => Builtin::Anchor,
         Builtin::Style => Builtin::Style,
+        Builtin::Kind => Builtin::Kind,
         Builtin::Del(e) => Builtin::Del(Box::new(expand_func_calls(e, func_name, params, body))),
     }
 }
@@ -9017,6 +9032,7 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::Tag => Builtin::Tag,
         Builtin::Anchor => Builtin::Anchor,
         Builtin::Style => Builtin::Style,
+        Builtin::Kind => Builtin::Kind,
         Builtin::Del(e) => Builtin::Del(Box::new(substitute_func_param(e, param, arg))),
     }
 }
@@ -11767,6 +11783,113 @@ mod tests {
                 assert_eq!(arr[1], OwnedValue::String("!!str".to_string()));
                 assert_eq!(arr[2], OwnedValue::String("!!bool".to_string()));
                 assert_eq!(arr[3], OwnedValue::String("!!null".to_string()));
+            }
+        );
+    }
+
+    // ============================================================================
+    // kind function tests (yq YAML metadata)
+    // ============================================================================
+
+    #[test]
+    fn test_kind_null() {
+        query!(b"null", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "scalar");
+            }
+        );
+    }
+
+    #[test]
+    fn test_kind_bool() {
+        query!(b"true", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "scalar");
+            }
+        );
+        query!(b"false", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "scalar");
+            }
+        );
+    }
+
+    #[test]
+    fn test_kind_number() {
+        query!(b"42", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "scalar");
+            }
+        );
+        query!(b"3.14", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "scalar");
+            }
+        );
+    }
+
+    #[test]
+    fn test_kind_string() {
+        query!(br#""hello""#, "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "scalar");
+            }
+        );
+    }
+
+    #[test]
+    fn test_kind_array() {
+        query!(b"[1, 2, 3]", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "seq");
+            }
+        );
+        query!(b"[]", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "seq");
+            }
+        );
+    }
+
+    #[test]
+    fn test_kind_object() {
+        query!(br#"{"a": 1}"#, "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "map");
+            }
+        );
+        query!(b"{}", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "map");
+            }
+        );
+    }
+
+    #[test]
+    fn test_kind_nested() {
+        // Test kind on nested values
+        query!(br#"{"items": [1, 2]}"#, ".items | kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "seq");
+            }
+        );
+        query!(br#"[{"a": 1}]"#, ".[0] | kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "map");
+            }
+        );
+    }
+
+    #[test]
+    fn test_kind_with_map() {
+        // Test kind with map function
+        query!(br#"[1, "hello", [1,2], {"a": 1}]"#, "map(kind)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 4);
+                assert_eq!(arr[0], OwnedValue::String("scalar".to_string()));
+                assert_eq!(arr[1], OwnedValue::String("scalar".to_string()));
+                assert_eq!(arr[2], OwnedValue::String("seq".to_string()));
+                assert_eq!(arr[3], OwnedValue::String("map".to_string()));
             }
         );
     }
