@@ -25,7 +25,7 @@ Implemented and benchmarked AVX-512 optimizations on AMD Ryzen 9 7950X (Zen 4). 
 
 ### Implementation
 
-- **File**: [src/bits/popcount.rs](../../src/bits/popcount.rs)
+- **File**: [src/bits/popcount.rs](../../../src/bits/popcount.rs)
 - **Instruction**: `_mm512_popcnt_epi64` - hardware popcount for 8 u64 words
 - **Chunk size**: 512 bits (8 u64 words) per iteration
 - **Fallback**: Scalar POPCNT for unaligned remainder
@@ -383,7 +383,7 @@ Complete analysis documents:
    - Memory-bound vs compute-bound
    - Amdahl's Law in practice
 
-3. **[CLAUDE.md](../../CLAUDE.md)** (updated)
+3. **[CLAUDE.md](../../../CLAUDE.md)** (updated)
    - Key learnings section
    - When to use each SIMD level
    - Benchmarking best practices

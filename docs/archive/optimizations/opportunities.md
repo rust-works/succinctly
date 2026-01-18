@@ -79,7 +79,7 @@ Implemented AVX-512 variant of JSON parser processing 64 bytes per iteration (vs
 ## 3. ✅ COMPLETED: AVX-512 VPOPCNTDQ for Rank Operations
 
 ### Status
-**Completed** - Implemented in [src/bits/popcount.rs](../../src/bits/popcount.rs) with runtime dispatch
+**Completed** - Implemented in [src/bits/popcount.rs](../../../src/bits/popcount.rs) with runtime dispatch
 
 ### Implementation
 Uses `_mm512_popcnt_epi64` to count 8 u64 words in parallel with runtime CPU detection:
@@ -109,7 +109,7 @@ See [avx512-vpopcntdq-results.md](avx512-vpopcntdq-results.md) for full analysis
 ## 4. BMI1/BMI2 Integration for Efficient Bit Operations (NEXT PRIORITY)
 
 ### Current State
-- [src/json/simd/bmi2.rs](../../src/json/simd/bmi2.rs) provides utilities but not integrated
+- [src/json/simd/bmi2.rs](../../../src/json/simd/bmi2.rs) provides utilities but not integrated
 - Zen 4 has **fast BMI2** (3-cycle PDEP/PEXT, not 18-cycle like Zen 1/2)
 
 ### Opportunity
@@ -183,7 +183,7 @@ impl BitWriter {
 ## 5. SIMD Prefix Sum for State Machine (HIGH COMPLEXITY, x86 ONLY)
 
 ### Current State
-[src/json/simd/avx2.rs:134-218](../../src/json/simd/avx2.rs) processes classified bytes **serially**:
+[src/json/simd/avx2.rs:134-218](../../../src/json/simd/avx2.rs) processes classified bytes **serially**:
 
 ```rust
 fn process_chunk_standard(...) -> State {
@@ -296,7 +296,7 @@ SIMD multi-word prefix sum could batch excess computation across 4-8 words. Howe
 
 ### Current State
 
-**File:** [src/json/simd/neon.rs](../../src/json/simd/neon.rs)
+**File:** [src/json/simd/neon.rs](../../../src/json/simd/neon.rs)
 
 The NEON JSON parser is already implemented and working:
 
@@ -614,7 +614,7 @@ impl JsonIndex {
 - Random: Binary search **39% faster** (recovers the regression)
 - End-to-end JSON benchmarks: **No regression**
 
-See [implemented-optimizations.md](implemented-optimizations.md#52-exponential-search-for-sequential-select) for details.
+See [implemented.md](implemented.md#52-exponential-search-for-sequential-select) for details.
 
 ---
 
@@ -716,7 +716,7 @@ cargo rustc --release -- --emit asm
 ## Testing Strategy
 
 ### SIMD Level Validation
-Current test: [tests/simd_level_tests.rs](../../tests/simd_level_tests.rs)
+Current test: [tests/simd_level_tests.rs](../../../tests/simd_level_tests.rs)
 
 ```bash
 # Test all SIMD implementations produce identical results

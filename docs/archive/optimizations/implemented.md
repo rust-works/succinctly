@@ -10,7 +10,7 @@ This document catalogs all optimization techniques currently implemented in the 
 
 ### 1.1 Three-Level Rank Directory (Poppy-style)
 
-**File:** [src/bits/rank.rs](../../src/bits/rank.rs)
+**File:** [src/bits/rank.rs](../../../src/bits/rank.rs)
 
 The rank directory enables O(1) rank queries using a hierarchical structure:
 
@@ -37,7 +37,7 @@ let rank = l0[block >> 16]           // Absolute checkpoint
 
 ### 1.2 Cache-Aligned L1+L2 Storage
 
-**File:** [src/bits/rank.rs](../../src/bits/rank.rs)
+**File:** [src/bits/rank.rs](../../../src/bits/rank.rs)
 
 The rank directory uses 64-byte cache-line aligned allocation:
 
@@ -54,7 +54,7 @@ let ptr = alloc::alloc::alloc(layout);
 
 ### 1.3 Sampled Select Index
 
-**File:** [src/bits/select.rs](../../src/bits/select.rs)
+**File:** [src/bits/select.rs](../../../src/bits/select.rs)
 
 Select queries use a sampled index for O(log n) acceleration:
 
@@ -70,7 +70,7 @@ Select queries use a sampled index for O(log n) acceleration:
 
 ### 1.4 Popcount Strategies
 
-**File:** [src/bits/popcount.rs](../../src/bits/popcount.rs)
+**File:** [src/bits/popcount.rs](../../../src/bits/popcount.rs)
 
 Three mutually exclusive implementations selected via feature flags:
 
@@ -90,7 +90,7 @@ total += vaddvq_u32(quads);             // Horizontal sum
 
 ### 1.5 Broadword Select-in-Word
 
-**File:** [src/util/broadword.rs](../../src/util/broadword.rs)
+**File:** [src/util/broadword.rs](../../../src/util/broadword.rs)
 
 Finding the k-th set bit within a single u64 word:
 
@@ -113,7 +113,7 @@ Uses TZCNT instruction on modern x86/ARM, which is single-cycle.
 
 ### 2.1 Byte Lookup Tables
 
-**File:** [src/trees/bp.rs](../../src/trees/bp.rs)
+**File:** [src/trees/bp.rs](../../../src/trees/bp.rs)
 
 Precomputed tables enable ~20x faster word-level excess computation:
 
@@ -129,7 +129,7 @@ const BYTE_TOTAL_EXCESS: [i8; 256] = [...];
 
 ### 2.2 RangeMin Hierarchical Structure
 
-**File:** [src/trees/bp.rs](../../src/trees/bp.rs)
+**File:** [src/trees/bp.rs](../../../src/trees/bp.rs)
 
 Enables O(1) `find_close` via 3-level excess tracking:
 
@@ -153,7 +153,7 @@ Reuses the same Poppy-style 3-level hierarchy as bitvector rank for O(1) rank qu
 
 ### 3.1 Runtime SIMD Dispatch
 
-**Files:** [src/json/simd/](../../src/json/simd/)
+**Files:** [src/json/simd/](../../../src/json/simd/)
 
 Automatic selection of best available instruction set:
 
@@ -189,7 +189,7 @@ let structural_mask = _mm256_movemask_epi8(combined) as u32;
 
 ### 3.3 NEON Nibble Lookup Tables (simdjson technique)
 
-**File:** [src/json/simd/neon.rs](../../src/json/simd/neon.rs)
+**File:** [src/json/simd/neon.rs](../../../src/json/simd/neon.rs)
 
 Character classification using nibble lookup replaces ~12 comparisons + ~8 ORs with just 2 lookups + 1 AND:
 
@@ -231,7 +231,7 @@ The 3x speedup on string-heavy JSON comes from the combination of nibble lookup 
 
 ### 3.4 NEON Custom Movemask (Optimized)
 
-**File:** [src/json/simd/neon.rs](../../src/json/simd/neon.rs)
+**File:** [src/json/simd/neon.rs](../../../src/json/simd/neon.rs)
 
 ARM NEON lacks a direct movemask instruction. Uses multiplication trick instead of slow variable shifts:
 
@@ -257,7 +257,7 @@ unsafe fn neon_movemask(v: uint8x16_t) -> u16 {
 
 ### 3.5 Fast-Path String Scanning
 
-**File:** [src/json/simd/neon.rs](../../src/json/simd/neon.rs)
+**File:** [src/json/simd/neon.rs](../../../src/json/simd/neon.rs)
 
 When inside a string, skip directly to next quote or backslash:
 
@@ -284,7 +284,7 @@ let next_special = special_remaining.trailing_zeros() as usize;
 
 ### 4.1 Batch Zero Writing
 
-**File:** [src/json/bit_writer.rs](../../src/json/bit_writer.rs)
+**File:** [src/json/bit_writer.rs](../../../src/json/bit_writer.rs)
 
 Write multiple zero bits without per-bit iteration:
 
@@ -315,7 +315,7 @@ pub fn write_zeros(&mut self, count: usize) {
 
 ### 4.2 Batch Bit Writing
 
-**File:** [src/json/bit_writer.rs](../../src/json/bit_writer.rs)
+**File:** [src/json/bit_writer.rs](../../../src/json/bit_writer.rs)
 
 Write up to 64 bits in a single operation:
 
@@ -343,7 +343,7 @@ pub fn write_bits(&mut self, bits: u64, count: usize) {
 
 ### 5.1 Cumulative Index for O(log n) Select
 
-**File:** [src/json/light.rs](../../src/json/light.rs)
+**File:** [src/json/light.rs](../../../src/json/light.rs)
 
 The critical optimization that achieved 627x speedup:
 
@@ -383,7 +383,7 @@ fn ib_select1(&self, k: usize) -> Option<usize> {
 
 ### 5.2 Fast Random Access for Array Indexing (get_fast)
 
-**Files:** [src/json/light.rs](../../src/json/light.rs), [src/jq/eval.rs](../../src/jq/eval.rs)
+**Files:** [src/json/light.rs](../../../src/json/light.rs), [src/jq/eval.rs](../../../src/jq/eval.rs)
 
 **Problem:** Array indexing via `JsonElements::get(n)` was calling `value()` (which triggers `text_position()` and IB select) for every intermediate element. Accessing element 100 required 101 IB select operations.
 
@@ -445,7 +445,7 @@ let mut out = BufWriter::new(stdout.lock());
 
 ### 7.1 Cross-SIMD-Level Validation
 
-**File:** [tests/simd_level_tests.rs](../../tests/simd_level_tests.rs)
+**File:** [tests/simd_level_tests.rs](../../../tests/simd_level_tests.rs)
 
 Runtime dispatch only tests the highest available SIMD level on modern hardware. Explicit tests ensure all levels work correctly:
 
@@ -482,7 +482,7 @@ fn test_sse2_matches_scalar() {
 
 ### 5.2 Exponential Search for Sequential Select
 
-**File:** [src/json/light.rs](../../src/json/light.rs)
+**File:** [src/json/light.rs](../../../src/json/light.rs)
 
 When iterating through JSON elements (`.users[]`, `.items[].name`), select queries access sequential positions. Exponential search (galloping) exploits this locality:
 
@@ -554,7 +554,7 @@ Callers should choose the appropriate method based on access pattern:
 
 ### 5.3 BP find_close Byte-Level Lookup Tables
 
-**File:** [src/trees/bp.rs](../../src/trees/bp.rs)
+**File:** [src/trees/bp.rs](../../../src/trees/bp.rs)
 
 The `BalancedParens::find_close` operation uses byte-level lookup tables for fast excess tracking, achieving ~11x speedup over bit-by-bit scanning.
 
@@ -593,7 +593,7 @@ The RangeMin implementation combines the hierarchical skip structure (L0/L1/L2 b
 
 ---
 
-## Not Implemented (See optimization-opportunities.md)
+## Not Implemented (See opportunities.md)
 
 The following optimizations are documented but not yet implemented:
 
@@ -603,6 +603,6 @@ The following optimizations are documented but not yet implemented:
 
 The following were marked as "not implemented" but are now complete:
 
-- ✅ NEON nibble lookup tables (`vqtbl1q_u8`) - implemented in [src/json/simd/neon.rs](../../src/json/simd/neon.rs)
+- ✅ NEON nibble lookup tables (`vqtbl1q_u8`) - implemented in [src/json/simd/neon.rs](../../../src/json/simd/neon.rs)
 - ✅ Optimized movemask for NEON - uses multiplication trick instead of slow variable shifts
 - ✅ Separate binary search select for random access patterns - `ib_select1()` method

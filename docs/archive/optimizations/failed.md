@@ -204,7 +204,7 @@ If you can't answer these confidently, **don't optimize**.
 - AVX-512 detailed analysis: [avx512-json-results.md](avx512-json-results.md)
 - AVX-512 popcount success: [avx512-vpopcntdq-results.md](avx512-vpopcntdq-results.md)
 - BMI1 detailed analysis: `/tmp/bmi1_failure_analysis.md` (temporary)
-- Optimization opportunities (updated): [optimization-opportunities.md](optimization-opportunities.md)
+- Optimization opportunities (updated): [opportunities.md](opportunities.md)
 
 ---
 

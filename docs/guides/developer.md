@@ -111,7 +111,7 @@ Space overhead: ~6% of bitvector size.
 
 ### JSON Semi-Indexing
 
-JSON documents are converted to two bitvectors for efficient navigation without full parsing. See [parsing/json.md](parsing/json.md) for detailed implementation documentation covering:
+JSON documents are converted to two bitvectors for efficient navigation without full parsing. See [parsing/json.md](../parsing/json.md) for detailed implementation documentation covering:
 
 - Semi-index structure (Interest Bits + Balanced Parentheses)
 - PFSM table-driven parser (~950 MiB/s)
@@ -293,7 +293,7 @@ fn rank1(&self, i: usize) -> usize;
 
 ## Release Process
 
-See [RELEASE.md](../RELEASE.md) for detailed release instructions.
+See [release.md](release.md) for detailed release instructions.
 
 Quick summary:
 1. Update version in `Cargo.toml`

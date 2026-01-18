@@ -175,7 +175,7 @@ Memory overhead during parsing/indexing.
 - **Fast mode** (`cursor.children()`): BP-only traversal, no text extraction
 - **Value mode** (`cursor.value()`): Extracts text from original JSON
 
-*See [bench-compare/benches/json_parsers.rs](../bench-compare/benches/json_parsers.rs) for traversal benchmarks.*
+*See [bench-compare/benches/json_parsers.rs](../../bench-compare/benches/json_parsers.rs) for traversal benchmarks.*
 
 ## Benchmark Methodology
 
@@ -203,4 +203,4 @@ cargo bench --bench json_parsers
 
 - [jq.md](jq.md) - Comparison with system `jq` command
 - [archive/optimizations/SUMMARY.md](../archive/optimizations/SUMMARY.md) - Optimization history and learnings
-- [CLAUDE.md](../CLAUDE.md) - Project architecture and development guide
+- [CLAUDE.md](../../CLAUDE.md) - Project architecture and development guide
