@@ -33,7 +33,6 @@ jobs:
             --accept 100..=399
             --exclude-path ./target
             --exclude-path ./data
-            --exclude-path ./docs/plan/documentation-refactor.md
             --exclude '^https://crates\.io/crates/'
             --exclude '^https://docs\.rs/'
             --exclude '^https://www\.intel\.com/'

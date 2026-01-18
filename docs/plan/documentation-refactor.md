@@ -64,10 +64,10 @@ succinctly/
 │   │
 │   ├── guides/                        # Reorganized user/dev guides
 │   │   ├── README.md                  # Guide index
-│   │   ├── user-guide.md              # API usage (streamlined)
-│   │   ├── cli-guide.md               # 📝 Move CLI.md here
-│   │   ├── developer-guide.md         # Contributing to codebase (unchanged)
-│   │   └── release-guide.md           # 📝 Move RELEASE.md here
+│   │   ├── user.md                    # API usage (streamlined)
+│   │   ├── cli.md                     # 📝 Move CLI.md here
+│   │   ├── developer.md               # Contributing to codebase (unchanged)
+│   │   └── release.md                 # 📝 Move RELEASE.md here
 │   │
 │   ├── architecture/                  # 🆕 Design & implementation
 │   │   ├── README.md                  # Architecture overview
@@ -215,10 +215,10 @@ docs/parsing/
 ├── dsv.md                     → ✓ (already clean)
 
 docs/guides/
-├── cli-guide.md               → cli.md ("guide" redundant)
-├── user-guide.md              → user.md OR api.md (directory is "guides")
-├── developer-guide.md         → developer.md
-├── release-guide.md           → release.md
+├── cli.md                     # Simplified from cli-guide.md ("guide" redundant)
+├── user.md                    # Simplified from user-guide.md (directory is "guides")
+├── developer.md               # Simplified from developer-guide.md
+├── release.md                 # Simplified from release-guide.md
 ```
 
 **Filename simplification rules**:
@@ -248,24 +248,24 @@ docs/
 │   └── dsv.md             # new
 │
 └── guides/
-    ├── cli.md             # was: CLI.md (also lowercase)
-    ├── api.md             # was: user-guide.md (clearer for library users)
-    ├── developer.md       # was: developer-guide.md
-    └── release.md         # was: release-guide.md
+    ├── cli.md             # Simplified from CLI.md (lowercase)
+    ├── user.md            # Simplified from user-guide.md
+    ├── developer.md       # Simplified from developer-guide.md
+    └── release.md         # Simplified from release-guide.md
 ```
 
 **Benefits**:
 - Shorter, clearer paths: `docs/plan/jq.md` vs `docs/plan/jq-implementation-plan.md`
 - Less redundancy: directory + filename don't repeat context
-- Easier to remember: `docs/guides/cli.md` vs `docs/guides/cli-guide.md`
+- Easier to remember: `docs/guides/cli.md` vs hypothetical `docs/guides/cli-guide.md`
 - Consistent: all guides/ files are simple names
 
 ### Phase 4: Move & Rename Files
 
 **Step 4.1: Root → docs/guides/**
 ```bash
-git mv CLI.md docs/guides/cli-guide.md
-git mv RELEASE.md docs/guides/release-guide.md
+git mv CLI.md docs/guides/cli.md
+git mv RELEASE.md docs/guides/release.md
 ```
 
 **Step 3.2: Root → docs/plan/**
@@ -341,9 +341,9 @@ git rm docs/dsv-profiling-analysis.md
 ```
 
 **Step 4.2: Streamline CLI documentation**
-- Remove CLI section from `docs/guides/user-guide.md` (lines 383-461)
-- Ensure `docs/guides/cli-guide.md` is comprehensive
-- Add cross-reference at old location: "See [CLI Guide](cli-guide.md)"
+- Remove CLI section from `docs/guides/user.md` (lines 383-461)
+- Ensure `docs/guides/cli.md` is comprehensive
+- Add cross-reference at old location: `See [CLI Guide](cli.md)`
 
 **Step 4.3: US spelling pass**
 
@@ -362,22 +362,22 @@ Update file contents to use US spelling consistently.
 
 **Step 5.1: Update README.md**
 
-Add "Documentation" section before "Contributing":
+Add "Documentation" section before "Contributing". Example structure (paths are relative from repo root):
 ```markdown
 ## Documentation
 
 Choose your path:
 
-- 🚀 **New to succinctly?** → [Getting Started](docs/getting-started/)
-- 📖 **Using the library?** → [User Guide](docs/guides/user-guide.md)
-- 💻 **Using the CLI?** → [CLI Guide](docs/guides/cli-guide.md)
-- 🤝 **Contributing?** → [CONTRIBUTING.md](CONTRIBUTING.md)
-- ⚡ **Performance tuning?** → [Optimization Techniques](docs/optimizations/)
-- 🏗️ **Understanding internals?** → [Architecture](docs/architecture/)
-- 📊 **Benchmarks?** → [Performance Comparisons](docs/benchmarks/)
-- 🗺️ **Full documentation map** → [docs/](docs/)
+- 🚀 **New to succinctly?** → Getting Started (`docs/getting-started/`)
+- 📖 **Using the library?** → User Guide (`docs/guides/user.md`)
+- 💻 **Using the CLI?** → CLI Guide (`docs/guides/cli.md`)
+- 🤝 **Contributing?** → `CONTRIBUTING.md`
+- ⚡ **Performance tuning?** → Optimization Techniques (`docs/optimizations/`)
+- 🏗️ **Understanding internals?** → Architecture (`docs/architecture/`)
+- 📊 **Benchmarks?** → Performance Comparisons (`docs/benchmarks/`)
+- 🗺️ **Full documentation map** → `docs/`
 
-For AI-assisted development, see [CLAUDE.md](CLAUDE.md).
+For AI-assisted development, see `CLAUDE.md`.
 ```
 
 **Step 5.2: Update CONTRIBUTING.md**
@@ -398,13 +398,13 @@ Thank you for your interest! This guide provides the essentials. For deeper tech
 Search and replace across all .md files:
 ```bash
 # CLI.md references
-](CLI.md) → ](docs/guides/cli-guide.md)
-](../CLI.md) → ](../guides/cli-guide.md)
-](../../CLI.md) → ](../../guides/cli-guide.md)
+](CLI.md) → ](docs/guides/cli.md)
+](../CLI.md) → ](../guides/cli.md)
+](../../CLI.md) → ](../../guides/cli.md)
 
 # RELEASE.md references
-](RELEASE.md) → ](docs/guides/release-guide.md)
-](../RELEASE.md) → ](../guides/release-guide.md)
+](RELEASE.md) → ](docs/guides/release.md)
+](../RELEASE.md) → ](../guides/release.md)
 
 # PLAN-JQ.md references
 ](PLAN-JQ.md) → ](docs/plan/jq-implementation.md)
@@ -448,12 +448,14 @@ Beginner-friendly navigation:
 
 **Step 6.3: Create docs/optimizations/quick-reference.md**
 
-Single-page reference table:
+Single-page reference table (example format using relative paths within `docs/optimizations/`):
 | Technique | When to Use | Speedup | Document |
 |-----------|-------------|---------|----------|
-| Cumulative Index | Random access to sorted data | 627x | [hierarchical-structures.md](hierarchical-structures.md#cumulative-index) |
-| RangeMin Index | Tree navigation | 40x | [hierarchical-structures.md](hierarchical-structures.md#rangemin) |
+| Cumulative Index | Random access to sorted data | 627x | `hierarchical-structures.md#cumulative-index` |
+| RangeMin Index | Tree navigation | 40x | `hierarchical-structures.md#rangemin` |
 | ... | ... | ... | ... |
+
+**Path convention**: Within `docs/optimizations/`, use relative links to sibling files (e.g., `[hierarchical-structures.md](hierarchical-structures.md)`).
 
 **Step 6.4: Create docs/plan/README.md**
 
@@ -592,7 +594,7 @@ For each doc with code examples:
 
 **Step 8.2: Verify CLI commands work**
 
-Test every command mentioned in cli-guide.md:
+Test every command mentioned in `docs/guides/cli.md`:
 ```bash
 # Build CLI
 cargo build --release --features cli
@@ -602,7 +604,7 @@ cargo build --release --features cli
 ./target/release/succinctly jq '.name' test.json
 ./target/release/succinctly yq '.name' test.yaml
 ./target/release/succinctly jq-locate test.json --offset 42
-# ... etc for all commands in CLI.md/cli-guide.md
+# ... etc for all commands in docs/guides/cli.md
 ```
 
 **Step 8.3: Verify module structure claims**
@@ -733,8 +735,8 @@ Learn the basics in 5 minutes:
 
 ### 📖 Library Users
 **Using succinctly in your Rust project**:
-- [User Guide](guides/user-guide.md) - Comprehensive API reference with examples
-- [CLI Guide](guides/cli-guide.md) - Command-line tool reference
+- User Guide (`guides/user.md`) - Comprehensive API reference with examples
+- CLI Guide (`guides/cli.md`) - Command-line tool reference
 
 ### 🤝 Contributors
 **Want to contribute?**
@@ -767,10 +769,10 @@ Quick tutorials for new users. Start here if you've never used succinctly.
 
 ### [guides/](guides/)
 Practical how-to documentation:
-- API usage (user-guide.md)
-- CLI tool (cli-guide.md)
-- Development (developer-guide.md)
-- Releases (release-guide.md)
+- API usage (`user.md`)
+- CLI tool (`cli.md`)
+- Development (`developer.md`)
+- Releases (`release.md`)
 
 ### [architecture/](architecture/)
 Design documentation:
@@ -815,8 +817,8 @@ Historical documentation:
 
 - ✅ **Install and try succinctly** → [getting-started/](getting-started/)
 - ✅ **Use BitVec or BalancedParens** → [guides/user-guide.md](guides/user-guide.md)
-- ✅ **Query JSON files** → [guides/cli-guide.md](guides/cli-guide.md#jq-command)
-- ✅ **Query YAML files** → [guides/cli-guide.md](guides/cli-guide.md#yq-command)
+- ✅ **Query JSON files** → `guides/cli.md#jq-command`
+- ✅ **Query YAML files** → `guides/cli.md#yq-command`
 - ✅ **Understand how JSON indexing works** → [parsing/json.md](parsing/json.md)
 - ✅ **See YAML optimization journey** → [parsing/yaml.md](parsing/yaml.md)
 - ✅ **Learn SIMD techniques** → [optimizations/simd.md](optimizations/simd.md)
@@ -853,7 +855,7 @@ Documentation follows these conventions:
 - Archive clearly separated with README explaining purpose
 
 ✅ **Reduced Redundancy**
-- CLI documented once (cli-guide.md), linked from user-guide
+- CLI documented once (`cli.md`), linked from user guide
 - DSV consolidated: parsing/dsv.md (implementation), benchmarks/dsv.md (numbers)
 - Planning docs in docs/plan/ (all implemented)
 - Benchmark docs in docs/benchmarks/ (6 files, clear purpose)
@@ -910,8 +912,8 @@ Documentation follows these conventions:
 - [ ] Create docs/archive/README.md
 
 ### Phase 3: Move & Rename
-- [ ] git mv CLI.md docs/guides/cli-guide.md
-- [ ] git mv RELEASE.md docs/guides/release-guide.md
+- [ ] git mv CLI.md docs/guides/cli.md
+- [ ] git mv RELEASE.md docs/guides/release.md
 - [ ] git mv PLAN-JQ.md docs/plan/jq-implementation.md
 - [ ] git mv docs/jq-comparison.md docs/benchmarks/jq.md
 - [ ] git mv docs/yq-comparison.md docs/benchmarks/yq.md
@@ -934,7 +936,7 @@ Documentation follows these conventions:
 - [ ] git rm docs/dsv-performance.md
 - [ ] git rm docs/dsv-profiling-analysis.md
 - [ ] Remove CLI section from user-guide.md (lines 383-461)
-- [ ] Add cross-reference to cli-guide.md
+- [ ] Add cross-reference to cli.md
 
 ### Phase 6: US Spelling Pass
 - [ ] Find/replace: optimisation → optimization (all .md files in docs/)
@@ -950,8 +952,8 @@ Documentation follows these conventions:
 - [ ] Update README.md (add Documentation section)
 - [ ] Update CONTRIBUTING.md (link to developer-guide, release-guide)
 - [ ] Update .github/pull_request_template.md
-- [ ] Find/replace: `](CLI.md)` → `](docs/guides/cli-guide.md)`
-- [ ] Find/replace: `](RELEASE.md)` → `](docs/guides/release-guide.md)`
+- [ ] Find/replace: `](CLI.md)` → `](docs/guides/cli.md)`
+- [ ] Find/replace: `](RELEASE.md)` → `](docs/guides/release.md)`
 - [ ] Find/replace: `](PLAN-JQ.md)` → `](docs/plan/jq-implementation.md)`
 - [ ] Find/replace: `](docs/optimisations/)` → `](docs/optimizations/)`
 - [ ] Find/replace: `](docs/jq-comparison.md)` → `](docs/benchmarks/jq.md)`
