@@ -2069,6 +2069,130 @@ Wider SIMD is not automatically faster. For memory-bound workloads like sequenti
 
 ---
 
+### P9: Direct YAML-to-JSON Streaming - ACCEPTED ✅
+
+**Status:** Implemented and accepted 2026-01-15
+
+**Hypothesis:** The `yq` identity query (`yq '.'`) was bottlenecked by converting YAML → OwnedValue DOM → JSON. Direct streaming from YAML cursor to JSON output should bypass the intermediate representation and significantly improve throughput.
+
+**Problem Analysis:**
+
+Old approach had 3 phases:
+1. **Parse YAML** → Build semi-index (285µs for 100KB)
+2. **Convert to DOM** → Traverse index, build OwnedValue tree (952µs) ← **Bottleneck**
+3. **Serialize JSON** → Format OwnedValue as JSON string (690µs)
+
+**Total:** 1.93ms (47.7 MiB/s)
+
+**Implementation Details:**
+
+Created direct streaming path in [`src/yaml/light.rs`](../../src/yaml/light.rs):
+
+**New API:**
+```rust
+impl YamlCursor {
+    /// Convert entire YAML document to JSON string
+    pub fn to_json_document(&self) -> String;
+
+    /// Stream YAML value to JSON output
+    pub fn to_json(&self) -> String;
+
+    /// Write YAML value as JSON to output buffer
+    fn write_json_to(&self, output: &mut String);
+}
+```
+
+**Key techniques:**
+
+1. **Single-pass transcoding** - Convert YAML escape sequences directly to JSON escapes without intermediate string allocation
+2. **Inline type coercion** - Handle YAML special values (`null`, `true`, `.inf`, `.nan`) during streaming
+3. **Cursor-based iteration** - Use `uncons_cursor()` to iterate sequences/mappings without materializing arrays
+
+**Escape sequence mapping:**
+```rust
+// YAML → JSON escape translation (single pass)
+'\n' → "\n"    // newline (same)
+'\t' → "\t"    // tab (same)
+'\"' → "\""    // quote (same)
+'\\' → "\\"    // backslash (same)
+'\a' → "\u0007" // bell → JSON unicode
+'\x41' → "A"    // hex → decoded character
+'\u0041' → "A"  // 4-digit unicode → decoded
+'\U0001F600' → "\uD83D\uDE00" // 8-digit → surrogate pair
+```
+
+**Fast path in yq_runner:**
+```rust
+// Before: YAML → OwnedValue → JSON (3 steps)
+let owned = yaml_to_owned_value(root.value());
+let json = owned.to_json();
+
+// After: YAML → JSON (1 step)
+let json = root.to_json_document();
+```
+
+**End-to-End Results (AMD Ryzen 9 7950X):**
+
+| File Size | OLD (3-phase) | NEW (streaming) | Speedup | Throughput Improvement |
+|-----------|---------------|-----------------|---------|------------------------|
+| **10 KB** | 257µs (38.1 MiB/s) | 108µs (90.5 MiB/s) | **2.37x** | **+137%** ✅ |
+| **100 KB** | 1.93ms (47.7 MiB/s) | 828µs (111.1 MiB/s) | **2.33x** | **+133%** ✅ |
+
+**Phase breakdown (100KB file):**
+
+| Phase | OLD Time | OLD % | NEW Time | NEW % |
+|-------|----------|-------|----------|-------|
+| Parse | 285µs | 14.8% | 334µs | 40.3% |
+| Convert | 952µs | 49.4% | 494µs | 59.7% |
+| Serialize | 690µs | 35.8% | — | — |
+| **Total** | **1.93ms** | **100%** | **828µs** | **100%** |
+
+**Micro-Benchmark Results (benches/yaml_transcode_micro.rs):**
+
+| Workload | Throughput | Notes |
+|----------|------------|-------|
+| **Realistic config** | 276 MiB/s | YAML with quoted strings, escapes |
+| **Escape-heavy** | 263 MiB/s | Many `\n`, `\t`, `\"`, `\U` escapes |
+| **Double-quoted** | 328-518 MiB/s | Scales with escape complexity |
+| **Single-quoted** | 343-368 MiB/s | Simpler escape rules |
+| **Large (500 items)** | 284 MiB/s | Realistic multi-document workload |
+
+**Key Achievements:**
+
+1. ✅ **2.3x faster end-to-end** for `yq` identity queries
+2. ✅ **Eliminated intermediate DOM** - no OwnedValue allocation
+3. ✅ **Single-pass escape handling** - direct YAML→JSON transcoding
+4. ✅ **No correctness issues** - all type coercions handled inline
+5. ✅ **Parsing now 40% of total time** (was 15%) - shifts bottleneck to index building
+
+**Bottleneck Shift:**
+
+Before P9: **DOM conversion was 49% of time** (slow path)
+After P9: **Parsing is 40% of time** (new bottleneck)
+
+This makes further **parsing optimizations more valuable**, but analysis shows:
+- All rejected parsing optimizations (P2.6, P2.8, P3, P5, P6, P7, P8) were rejected for fundamental reasons (grammar incompatibility, CPU beats manual optimization, wrong data patterns)
+- None of those reasons change just because parsing is a bigger fraction of total time
+- Current parsing throughput (559 MiB/s) is already excellent with P0+/P2.5/P2.7/P4
+
+**Why P9 Succeeded:**
+
+Unlike P2.6/P2.8/P3 micro-optimizations that regressed:
+- **Algorithmic improvement** - Eliminated entire DOM conversion phase
+- **No hidden costs** - Direct streaming has no cache pollution, branch misprediction, or overhead
+- **Real bottleneck** - DOM conversion was genuinely slow (952µs for 100KB)
+- **Proven technique** - Zero-copy streaming is established optimization pattern
+
+**Files Modified:**
+- [`src/yaml/light.rs`](../../src/yaml/light.rs) - Added `to_json_document()`, `to_json()`, `write_json_to()`, `write_json_string()`
+- [`src/bin/succinctly/yq_runner.rs`](../../src/bin/succinctly/yq_runner.rs) - Fast path for identity filter
+- [`benches/yaml_transcode_micro.rs`](../../benches/yaml_transcode_micro.rs) - Comprehensive transcoding benchmarks
+- [`examples/yaml_profile.rs`](../../examples/yaml_profile.rs) - Old vs new approach comparison
+
+**Commit:** a045669 (2026-01-15)
+
+---
+
 ### P4: NEON `classify_yaml_chars` Port - REJECTED ❌
 
 **Status:** Tested and rejected 2026-01-17

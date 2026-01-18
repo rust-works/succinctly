@@ -204,12 +204,13 @@ For detailed documentation on optimisation techniques used in this project, see 
 
 **Key insights** (see [docs/optimisations/README.md](docs/optimisations/README.md) for full details):
 - Wider SIMD != automatically faster (AVX-512 JSON was 10% slower than AVX2)
-- Algorithmic improvements beat micro-optimisations (cumulative index: 627x speedup)
+- Algorithmic improvements beat micro-optimisations (cumulative index: 627x speedup; YAML streaming: 2.3x speedup)
 - Simpler data structures often outperform complex ones due to cache behaviour
 - Caching hot values eliminates repeated lookups (type checking: 1-17% improvement)
 - Hardware prefetchers beat software prefetch for sequential access (prefetch: +30% regression!)
 - SIMD newline scanning + indentation checking enables fast block boundary detection (block scalars: 19-25% improvement!)
 - Micro-benchmark wins ≠ real-world improvements (threshold tuning: +8-15% regression despite micro-bench suggesting improvement)
+- Eliminating phases beats optimizing them (YAML streaming: removed DOM conversion entirely for 2.3x gain)
 
 **Recent YAML optimizations:**
 - ✅ P2.5 (Cached Type Checking): 1-17% improvement depending on nesting depth
@@ -299,3 +300,11 @@ For detailed documentation on optimisation techniques used in this project, see 
   - **Pattern recognition**: P5/P6/P7/P8 all rejected for mismatch (size/grammar/use case/benchmark)
   - **Key lesson**: Wider SIMD ≠ faster for memory-bound workloads (AVX2 already saturates RAM bandwidth)
   - See [docs/parsing/yaml.md#p8-avx-512-variants---rejected-](docs/parsing/yaml.md#p8-avx-512-variants---rejected-) for full analysis
+- ✅ P9 (Direct YAML-to-JSON Streaming): **2.3x improvement** on `yq` identity queries - **largest Phase 2 optimization!**
+  - Eliminated intermediate OwnedValue DOM by streaming directly from YAML cursor to JSON
+  - 10KB: 257µs → 108µs (38.1 → 90.5 MiB/s, **+137%**)
+  - 100KB: 1.93ms → 828µs (47.7 → 111.1 MiB/s, **+133%**)
+  - Single-pass YAML→JSON escape transcoding without intermediate string allocation
+  - **Bottleneck shift**: Parsing now 40% of time (was 15%), DOM conversion eliminated
+  - Best for: `yq '.'` identity queries, format conversion, streaming output
+  - See [docs/parsing/yaml.md#p9-direct-yaml-to-json-streaming---accepted-](docs/parsing/yaml.md#p9-direct-yaml-to-json-streaming---accepted-) for full analysis
