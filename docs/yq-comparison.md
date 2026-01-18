@@ -234,16 +234,54 @@ The YAML parser uses platform-specific SIMD for hot paths:
 
 ---
 
+## Selection Benchmarks (Lazy Evaluation)
+
+The `yq_select` benchmark demonstrates lazy evaluation benefits when selecting partial data (~5% of input).
+
+### Query Types
+
+**5% Slice Selection** - Extract first ~5% of array elements:
+- `.users[:4]` (4 of 75 users from 10KB)
+- `.users[:37]` (37 of 742 users from 100KB)
+- `.users[:377]` (377 of 7540 users from 1MB)
+
+**Single Field Extraction** - Navigate to specific elements:
+- `.users[0].name` (first user)
+- `.users[3770]` (middle of 1MB file)
+- `.users[7000]` (near end of 1MB file)
+
+### Why Selection is Faster
+
+With lazy evaluation, succinctly only materializes the requested subset:
+1. **Semi-index navigation**: O(1) skip to array element N using BP tree
+2. **Partial parsing**: Only parses values that are output
+3. **No DOM construction**: Streams directly from source bytes
+
+Traditional parsers (like yq) must parse the entire document before selection.
+
+Run with:
+```bash
+cargo bench --bench yq_select
+```
+
+---
+
 ## Reproducing Benchmarks
 
 ```bash
 # Build release binary
 cargo build --release --features cli
 
-# Run criterion benchmarks
+# Generate benchmark files
+cargo run --release --features cli -- yaml generate-suite
+
+# Run identity comparison benchmarks
 cargo bench --bench yq_comparison
 
+# Run selection/lazy evaluation benchmarks
+cargo bench --bench yq_select
+
 # Or use the CLI for manual testing
-./target/release/succinctly yq . input.yaml
-time yq . input.yaml
+./target/release/succinctly yq -o json -I 0 . input.yaml
+time yq -o json -I 0 . input.yaml
 ```
