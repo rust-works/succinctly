@@ -37,17 +37,17 @@ cargo bench --bench yq_comparison
 
 | Size      | succinctly   | yq           | Speedup       |
 |-----------|--------------|--------------|---------------|
-| **10KB**  |   4.0 ms     |   7.2 ms     | **1.8x**      |
-| **100KB** |   8.8 ms     |  19.9 ms     | **2.3x**      |
-| **1MB**   |  55.0 ms     | 117.1 ms     | **2.1x**      |
+| **10KB**  |   3.9 ms     |   7.5 ms     | **1.9x**      |
+| **100KB** |   4.7 ms     |  19.5 ms     | **4.1x**      |
+| **1MB**   |  13.3 ms     | 115.7 ms     | **8.7x**      |
 
 #### Throughput Comparison (ARM)
 
 | Size      | succinctly      | yq             | Ratio         |
 |-----------|-----------------|----------------|---------------|
 | **10KB**  |   2.5 MiB/s     |   1.3 MiB/s    | **1.9x**      |
-| **100KB** |  10.5 MiB/s     |   4.6 MiB/s    | **2.3x**      |
-| **1MB**   |  16.8 MiB/s     |   7.9 MiB/s    | **2.1x**      |
+| **100KB** |  19.5 MiB/s     |   4.7 MiB/s    | **4.1x**      |
+| **1MB**   |  69.2 MiB/s     |   8.0 MiB/s    | **8.7x**      |
 
 ### x86_64 (AMD Ryzen 9 7950X) - yq Identity Comparison (P10 Optimized)
 
@@ -110,9 +110,9 @@ Mixed YAML content with various features.
 | Size      | succinctly             | yq                     | Speedup    |
 |-----------|------------------------|------------------------|------------|
 | **1KB**   |   3.5 ms (350 KiB/s)   |   6.3 ms (197 KiB/s)   | **1.8x**   |
-| **10KB**  |   4.1 ms (2.4 MiB/s)   |   7.4 ms (1.3 MiB/s)   | **1.8x**   |
-| **100KB** |   8.9 ms (10.3 MiB/s)  |  20.0 ms (4.6 MiB/s)   | **2.2x**   |
-| **1MB**   |  53.9 ms (17.1 MiB/s)  | 116.0 ms (7.9 MiB/s)   | **2.2x**   |
+| **10KB**  |   3.9 ms (2.5 MiB/s)   |   7.5 ms (1.3 MiB/s)   | **1.9x**   |
+| **100KB** |   4.7 ms (19.5 MiB/s)  |  19.5 ms (4.7 MiB/s)   | **4.1x**   |
+| **1MB**   |  13.3 ms (69.2 MiB/s)  | 115.7 ms (8.0 MiB/s)   | **8.7x**   |
 
 ### Pattern: users
 
@@ -350,8 +350,10 @@ $ echo 'id: "001"' | succinctly yq -o json '.'
 ### Performance Benefits
 
 `succinctly yq` offers significant performance advantages over `yq`:
-- **4.0x faster** on 1MB files (AMD Ryzen 9 7950X)
-- **31x faster** on 10KB files (AMD Ryzen 9 7950X)
+- **8.7x faster** on 1MB files (Apple M1 Max)
+- **4.1x faster** on 100KB files (Apple M1 Max)
+- **45x faster** on 1MB files (AMD Ryzen 9 7950X with P10 optimizations)
+- **687x faster** on 10KB files (AMD Ryzen 9 7950X with P10 optimizations)
 - **Lower memory usage** on large files
 - **Streaming architecture** for better scalability
 - **Full yq compatibility** for type preservation
