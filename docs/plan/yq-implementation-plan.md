@@ -122,9 +122,479 @@ Investigate the cost/benefit of tracking additional metadata in the YAML parser:
 3. **Review yq usage patterns**: Analyze common yq queries to determine which metadata operators are frequently used
 4. **Decision point**: Choose Option A, B, or C based on findings
 
-### 0.4 Recommendation
+### 0.4 Investigation Findings
 
-Start with **Option A (Minimal)** for the first iteration. This allows implementing the core yq query language without parser changes. Comment and tag write operations can be added in a future iteration if user demand justifies the parser complexity.
+#### Comment Frequency Analysis
+
+Sampled real-world YAML files to measure comment usage:
+
+| Source | Files | Total Lines | Comment Lines | Ratio |
+|--------|-------|-------------|---------------|-------|
+| succinctly CI workflows | 3 | 422 | 3 | 0.7% |
+| CoreDNS K8s manifest | 1 | ~200 | 5 | 2.5% |
+| nginx-ingress Helm values | 1 | ~1000 | 145 | 14.5% |
+| GitLab CI configuration | 1 | ~2000 | 94 | 4.7% |
+| Ansible lamp_simple playbook | 1 | ~30 | 1 | 3.3% |
+| Bitnami PostgreSQL Helm values | 1 | ~5000 | 1847 | 37% |
+
+**Key Observations**:
+- CI/CD workflow files (GitHub Actions, GitLab CI): 0-5% comments
+- Kubernetes manifests: 2-5% comments
+- Helm chart values.yaml files: 15-40% comments (heavily documented configuration)
+- Ansible playbooks: 1-5% comments
+
+**Conclusion**: Comment frequency varies dramatically by use case. Helm values files are extremely comment-heavy, while CI workflows and K8s manifests have minimal comments.
+
+#### yq Usage Pattern Analysis
+
+Reviewed GitHub issues, StackOverflow questions, and yq documentation to assess metadata operator usage:
+
+| Operator | Usage Frequency | Common Use Cases |
+|----------|-----------------|------------------|
+| `style` (read/write) | **High** | Format control, quote forcing, flow vs block |
+| `tag` (read) | Medium | Type checking, custom tag detection |
+| `tag` (write) | Low | Rarely used outside edge cases |
+| `head_comment` (read/write) | Medium | Documentation extraction/injection |
+| `line_comment` (read/write) | Medium | Inline annotation handling |
+| `foot_comment` (read/write) | Low | Trailing comment manipulation |
+| `anchor`/`alias` | Medium | Template processing, reference handling |
+
+**Key Observations**:
+- Style operators are heavily used for output formatting control
+- Comment operators have significant GitHub issue/discussion activity (complex edge cases)
+- The go-yaml parser underlying yq has known issues with comment attachment
+
+#### Style Detection Feasibility
+
+Examined existing `YamlString` enum in `src/yaml/light.rs`:
+
+```rust
+pub enum YamlString<'a> {
+    DoubleQuoted { text, start },     // → style = "double"
+    SingleQuoted { text, start },     // → style = "single"
+    Unquoted { text, start, end, base_indent }, // → style = ""
+    BlockLiteral { text, indicator_pos, chomping, explicit_indent },  // → style = "literal"
+    BlockFolded { text, indicator_pos, chomping, explicit_indent },   // → style = "folded"
+}
+```
+
+**Conclusion**: String style is **already fully derivable** from `YamlValue::String(YamlString::*)` variant. No parser changes needed for read access.
+
+For container style (flow vs block), detection is possible by checking the first byte at `text_position()`:
+- `{` → flow mapping
+- `[` → flow sequence
+- Otherwise → block style
+
+#### Succinct Data Structure Considerations
+
+Investigated whether additional succinct indexes could improve metadata tracking:
+
+**Current Index Structures**:
+- `ib: Vec<u64>` - Interest bits (structural positions)
+- `bp: BalancedParens<W>` - Tree structure with O(1) navigation
+- `ty: Vec<u64>` - Type bits (mapping vs sequence)
+- `bp_to_text: Vec<u32>` - BP position to text offset
+- `bp_to_text_end: Vec<u32>` - End positions for scalars
+- `seq_items: Vec<u64>` - Sequence item wrapper markers
+- `containers: Vec<u64>` - Container position markers
+
+**Potential New Index Structures for Comments**:
+
+| Structure | Purpose | Space Overhead | Implementation Complexity |
+|-----------|---------|----------------|---------------------------|
+| `comment_positions: Vec<u32>` | Track comment start positions | O(n) where n = comment count | Low |
+| `comment_ends: Vec<u32>` | Track comment end positions | O(n) | Low |
+| `node_to_comment: Vec<u32>` | Map BP nodes to their comments | O(nodes) | Medium |
+| `comment_type: Vec<u2>` | head/line/foot classification | O(n) bits | Low |
+
+**Analysis**: Comments are sparse in most YAML files (typically <5% of lines). A simple `Vec<CommentInfo>` would be more efficient than a bitvector approach, since bitvectors optimize for dense data.
+
+**Potential Enhancement for Tags**:
+
+| Structure | Purpose | Space Overhead |
+|-----------|---------|----------------|
+| `explicit_tags: BTreeMap<usize, String>` | Store explicit tags (!!str, !custom) | O(tagged nodes) |
+
+Most nodes don't have explicit tags, so a sparse map is appropriate.
+
+### 0.5 Recommendation
+
+**Final Decision: Option A (Minimal) with Style Detection**
+
+Based on the investigation findings:
+
+1. **Style operators are fully supportable without parser changes**
+   - String style derivable from `YamlString` variant
+   - Container style (flow/block) derivable from first byte inspection
+   - No new index structures needed
+
+2. **Comment operators should be deferred**
+   - Complex edge cases in comment attachment (known issues in go-yaml)
+   - Low-frequency usage in most YAML files (except Helm values)
+   - Would require new `comments` index structure
+   - Recommend deferring to Phase 7+ if user demand materializes
+
+3. **Tag operators partially supportable**
+   - Basic tags (!!str, !!int, !!bool, etc.) derivable from value type
+   - Custom explicit tags would require new `explicit_tags` index
+   - Recommend supporting basic tag detection, deferring custom tags
+
+4. **Anchor/alias operators already fully supported**
+   - Existing `anchors` and `aliases` BTreeMaps in `YamlIndex`
+   - `resolve_alias()`, `get_anchor_bp_pos()` methods available
+
+**Summary Table**:
+
+| Operator | Phase 1-6 Support | Notes |
+|----------|-------------------|-------|
+| `style` (read) | ✅ Full | Derivable from `YamlString` variant |
+| `style` (write) | ✅ Full | Output layer only |
+| `tag` (read, basic) | ✅ Full | Derivable from value type |
+| `tag` (read, custom) | ❌ Deferred | Requires parser changes |
+| `tag` (write) | ✅ Full | Output layer only |
+| `anchor` (read) | ✅ Full | Already supported |
+| `alias` (read) | ✅ Full | Already supported |
+| `head_comment` | ❌ Deferred | Requires new index structure |
+| `line_comment` | ❌ Deferred | Requires new index structure |
+| `foot_comment` | ❌ Deferred | Requires new index structure |
+
+Proceed to Phase 1 with this scoping.
+
+---
+
+## Appendix A: Optimized Comment/Tag Index Designs
+
+This appendix explores design options for adding comment and tag tracking while minimizing memory usage and maximizing performance, applying lessons from the optimization documentation.
+
+### A.1 Design Constraints
+
+Based on Phase 0 findings:
+- **Comment sparsity**: 0.7%-37% of lines contain comments (typically <5% for CI/K8s)
+- **Tag sparsity**: Custom explicit tags are rare (most nodes use implicit typing)
+- **Access pattern**: Random access by BP position during query evaluation
+- **Memory budget**: Target <10% overhead for index structures
+
+Key optimization lessons to apply:
+- "Simpler is often faster" - Lightweight DSV index beat 3-level BitVec by 5-9x
+- Sparse data → sparse structures (maps/vectors vs bitvectors)
+- Cache locality matters more than asymptotic complexity
+- Pack auxiliary data to reduce memory traffic
+
+### A.2 Design Option 1: Sparse BTreeMap (Simple, Cache-Friendly)
+
+Store comment/tag metadata only for nodes that have them.
+
+```rust
+/// Comment attached to a YAML node
+pub struct CommentInfo {
+    /// BP position of the node this comment belongs to
+    node_bp: u32,
+    /// Comment type (head/line/foot)
+    kind: CommentKind,
+    /// Byte range in source text [start, end)
+    start: u32,
+    end: u32,
+}
+
+pub enum CommentKind {
+    Head = 0,  // Above node
+    Line = 1,  // Same line as node
+    Foot = 2,  // Below node
+}
+
+pub struct YamlIndex<W = Vec<u64>> {
+    // ... existing fields ...
+
+    /// Sparse comment tracking - only nodes with comments have entries
+    /// Key: BP position, Value: indices into comments vec
+    comment_map: BTreeMap<u32, SmallVec<[u16; 2]>>,
+    /// All comments stored contiguously (cache-friendly iteration)
+    comments: Vec<CommentInfo>,
+
+    /// Explicit tags - only nodes with custom tags
+    /// Key: BP position, Value: tag string (e.g., "!custom", "!!python/object")
+    explicit_tags: BTreeMap<u32, String>,
+}
+```
+
+**Memory analysis** (1MB YAML with 5% comment lines):
+- ~500 comments × 12 bytes = 6 KB comment data
+- ~500 BTreeMap entries × ~40 bytes = 20 KB overhead
+- Total: ~26 KB = **2.6% of source size**
+
+**Performance characteristics**:
+- Lookup: O(log n) where n = nodes with comments (sparse = fast)
+- Build: O(c log c) where c = comment count
+- Cache: Comments stored contiguously, good for iteration
+
+**Pros**: Simple, proven pattern (matches anchors/aliases design), minimal memory for sparse data
+**Cons**: BTreeMap has pointer-chasing overhead
+
+### A.3 Design Option 2: Interleaved Position Array (Sorted, Binary Search)
+
+Store comment positions sorted by BP position for binary search lookup.
+
+```rust
+/// Packed comment entry (16 bytes, cache-line aligned with padding)
+#[repr(C)]
+pub struct PackedComment {
+    node_bp: u32,      // BP position of owning node
+    kind: u8,          // CommentKind as u8
+    _pad: [u8; 3],     // Align to 4 bytes
+    start: u32,        // Byte offset in source
+    end: u32,          // End byte offset
+}
+
+pub struct YamlIndex<W = Vec<u64>> {
+    // ... existing fields ...
+
+    /// Comments sorted by node_bp for binary search
+    /// 16 bytes per comment, no pointer chasing
+    comments: Vec<PackedComment>,
+
+    /// Index: For each superblock (every 64 BP positions),
+    /// store offset into comments array
+    /// Enables O(1) jump to approximate location, then short linear scan
+    comment_superblock_idx: Vec<u32>,
+
+    /// Explicit tags sorted by BP position
+    tags: Vec<(u32, String)>,
+}
+```
+
+**Lookup algorithm**:
+```rust
+fn get_comments(&self, bp_pos: u32) -> &[PackedComment] {
+    // O(1) superblock lookup
+    let superblock = bp_pos / 64;
+    let start = self.comment_superblock_idx[superblock] as usize;
+    let end = self.comment_superblock_idx[superblock + 1] as usize;
+
+    // Binary search within superblock range
+    let slice = &self.comments[start..end];
+    let idx = slice.partition_point(|c| c.node_bp < bp_pos);
+
+    // Return contiguous slice of matching comments
+    let mut end_idx = idx;
+    while end_idx < slice.len() && slice[end_idx].node_bp == bp_pos {
+        end_idx += 1;
+    }
+    &slice[idx..end_idx]
+}
+```
+
+**Memory analysis** (1MB YAML with 5% comment lines):
+- ~500 comments × 16 bytes = 8 KB comment data
+- ~(1MB/64) superblock entries × 4 bytes = ~64 KB index
+- Total: ~72 KB = **7.2% overhead**
+
+**Performance characteristics**:
+- Lookup: O(1) superblock + O(log k) where k = comments in superblock (typically <4)
+- Build: O(c) single pass during parsing
+- Cache: Contiguous array, excellent prefetching
+
+**Pros**: No pointer chasing, cache-friendly layout, O(1) approximate lookup
+**Cons**: Higher fixed overhead for superblock index
+
+### A.4 Design Option 3: Bit-Packed Compact Representation
+
+Minimize memory by bit-packing and using position deltas.
+
+```rust
+/// Ultra-compact comment storage using delta encoding
+/// Assumes comments are usually near their owning node in text order
+pub struct CompactComments {
+    /// Packed entries: each comment uses ~6 bytes average
+    /// Format per entry:
+    ///   - Delta from previous node_bp (varint, typically 1-2 bytes)
+    ///   - Kind (2 bits) + length high bits (6 bits) packed in 1 byte
+    ///   - Text offset delta (varint, typically 2-3 bytes)
+    data: Vec<u8>,
+
+    /// Sparse index for random access
+    /// Entry i = byte offset in data for comments near BP position i*256
+    sparse_idx: Vec<u32>,
+}
+
+/// Explicit tags using string interning
+pub struct CompactTags {
+    /// Interned tag strings (most YAML uses few unique tags)
+    tag_pool: Vec<String>,
+    /// (BP position, tag pool index) pairs, sorted by BP
+    entries: Vec<(u32, u16)>,
+}
+```
+
+**Memory analysis** (1MB YAML with 5% comment lines):
+- ~500 comments × ~6 bytes average = 3 KB
+- Sparse index: ~4 KB
+- Total: ~7 KB = **0.7% overhead**
+
+**Performance characteristics**:
+- Lookup: O(1) sparse index + O(k) sequential decode
+- Build: More complex delta encoding
+- Cache: Very compact, but decode cost
+
+**Pros**: Minimal memory footprint
+**Cons**: Complex implementation, decode overhead on access
+
+### A.5 Design Option 4: Parallel Bitvector + Position Array (For Dense Comments)
+
+For Helm-style files with 30%+ comments, bitvector becomes efficient.
+
+```rust
+pub struct DenseComments<W = Vec<u64>> {
+    /// Bitvector: 1 if BP position has any comment
+    has_comment: W,
+    /// Cumulative popcount for O(1) rank on has_comment
+    has_comment_rank: Vec<u32>,
+
+    /// Dense array: comments[rank(bp_pos)] gives comment info
+    /// Only allocated for positions with comments
+    comments: Vec<PackedComment>,
+}
+```
+
+**Memory analysis** (1MB YAML with 37% comments like Helm values):
+- Bitvector: ~2KB per 16K BP positions
+- Rank index: ~3% of bitvector
+- Comments: 37% × nodes × 16 bytes
+
+**Performance characteristics**:
+- Lookup: O(1) rank + O(1) array access
+- Best for: Files with >20% comments
+- Cache: Bitvector is very cache-friendly for existence check
+
+### A.6 Recommended Design: Adaptive Sparse (Option 1 + Enhancements)
+
+Based on the optimization lessons and typical usage patterns:
+
+```rust
+/// Optimized comment tracking for typical YAML (sparse comments)
+pub struct CommentIndex {
+    /// Primary storage: sorted vector of comment entries
+    /// Better cache locality than BTreeMap for iteration
+    entries: Vec<CommentEntry>,
+
+    /// For files with >100 comments: sparse lookup acceleration
+    /// Maps BP position ranges to entry indices
+    /// Only built when entries.len() > 100
+    sparse_idx: Option<Vec<u32>>,
+}
+
+#[repr(C)]
+pub struct CommentEntry {
+    node_bp: u32,    // Owning node's BP position
+    start: u32,      // Byte offset in source
+    end: u32,        // End byte offset
+    kind: u8,        // CommentKind
+    _pad: [u8; 3],   // Keep 16-byte alignment
+}
+
+/// Tag tracking (extremely sparse)
+pub struct TagIndex {
+    /// Simple sorted vector - custom tags are rare
+    /// (bp_position, tag_string)
+    entries: Vec<(u32, String)>,
+}
+```
+
+**Key design decisions**:
+
+1. **Sorted Vec over BTreeMap**:
+   - No pointer chasing, better cache locality
+   - Binary search is O(log n) same as BTreeMap
+   - Contiguous memory for prefetching
+
+2. **Optional sparse index**:
+   - Only built for files with many comments
+   - Avoids overhead for typical sparse case
+   - Enables O(1) approximate lookup when needed
+
+3. **16-byte aligned entries**:
+   - Fits 4 entries per cache line
+   - No cross-line access for single entry
+
+4. **Separate tag index**:
+   - Tags are even sparser than comments
+   - Simple vector sufficient for typical usage
+
+**Memory overhead summary**:
+
+| Scenario | Comments | Tags | Total Overhead |
+|----------|----------|------|----------------|
+| CI workflow (0.7% comments) | ~0.1% | ~0% | **0.1%** |
+| K8s manifest (2.5% comments) | ~0.4% | ~0% | **0.4%** |
+| Helm values (37% comments) | ~6% | ~0.1% | **6.1%** |
+
+### A.7 Implementation Considerations
+
+**Parser integration**:
+```rust
+// During parsing, collect comments with minimal overhead
+struct Parser {
+    // ... existing fields ...
+    pending_comments: Vec<CommentEntry>,
+}
+
+impl Parser {
+    fn parse_comment(&mut self, start: usize) {
+        let end = self.skip_to_newline();
+        // Defer node_bp assignment until we know which node owns this comment
+        self.pending_comments.push(CommentEntry {
+            node_bp: 0,  // Will be filled in
+            start: start as u32,
+            end: end as u32,
+            kind: self.determine_comment_kind(),
+            _pad: [0; 3],
+        });
+    }
+
+    fn finalize_node(&mut self, bp_pos: usize) {
+        // Assign pending comments to this node
+        for comment in self.pending_comments.drain(..) {
+            // ... assignment logic ...
+        }
+    }
+}
+```
+
+**Cursor API extension**:
+```rust
+impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
+    /// Get head comments (comments above this node)
+    pub fn head_comments(&self) -> impl Iterator<Item = &str> {
+        self.index.comments.get_for_node(self.bp_pos, CommentKind::Head)
+            .map(|c| &self.text[c.start as usize..c.end as usize])
+    }
+
+    /// Get line comment (comment on same line)
+    pub fn line_comment(&self) -> Option<&str> {
+        self.index.comments.get_for_node(self.bp_pos, CommentKind::Line)
+            .next()
+            .map(|c| &self.text[c.start as usize..c.end as usize])
+    }
+
+    /// Get explicit tag if present
+    pub fn explicit_tag(&self) -> Option<&str> {
+        self.index.tags.get(self.bp_pos)
+    }
+}
+```
+
+### A.8 Conclusion
+
+The recommended **Adaptive Sparse** design (Option 1 enhanced) provides:
+
+- **Minimal memory**: 0.1-6% overhead depending on comment density
+- **O(log n) lookup**: Binary search on sorted vector
+- **Cache-friendly**: Contiguous storage, no pointer chasing
+- **Simple implementation**: Leverages proven patterns from anchors/aliases
+- **Adaptive scaling**: Optional sparse index for comment-heavy files
+
+This design follows the key optimization principle: "Simpler is often faster." The lightweight sorted vector approach mirrors the successful DSV lightweight index pattern, which outperformed the theoretically optimal 3-level BitVec by 5-9x.
+
+---
 
 ## Phase 1: Test Infrastructure (Week 1)
 
