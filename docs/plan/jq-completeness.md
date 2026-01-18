@@ -99,6 +99,7 @@ The implementation is already production-ready for ~90% of jq use cases.
 - [x] `split(s)` / `join(s)`
 - [x] `contains(x)` / `inside(x)`
 - [x] `tostring` / `tonumber`
+- [x] `tojson` / `fromjson` - JSON string conversion
 - [x] `explode` / `implode`
 - [x] `utf8bytelength`
 - [x] `indices(s)` / `index(s)` / `rindex(s)`
@@ -182,17 +183,7 @@ The implementation is already production-ready for ~90% of jq use cases.
 
 ## TODO: Missing Features
 
-### Priority 1: JSON String Conversion
-
-- [ ] `tojson` - Convert value to JSON string
-- [ ] `fromjson` - Parse JSON string to value
-
-**Implementation notes:**
-- `tojson` serializes a value to a JSON string (like `@json` but returns string)
-- `fromjson` parses a JSON string into a value
-- Useful for working with JSON embedded in strings
-
-### Priority 2: I/O Operations
+### Priority 1: I/O Operations
 
 - [ ] `input` - Read next input from stdin/files
 - [ ] `inputs` - Stream all remaining inputs
@@ -203,7 +194,7 @@ The implementation is already production-ready for ~90% of jq use cases.
 - Consider adding `EvalContext` struct to hold input state
 - Low priority for single-file JSON processing use case
 
-### Priority 3: Module System
+### Priority 2: Module System
 
 Currently parsed but not evaluated:
 
@@ -217,7 +208,7 @@ Currently parsed but not evaluated:
 - Consider `jq -L` style library paths
 - May want to keep this optional/feature-gated
 
-### Priority 4: Location & Debugging
+### Priority 3: Location & Debugging
 
 - [ ] `$__loc__` - Current source location `{file, line}`
 - [ ] Comments in jq expressions (`#` to end of line)
@@ -226,14 +217,14 @@ Currently parsed but not evaluated:
 - `$__loc__` requires tracking source positions through parsing
 - Comment support needs lexer changes
 
-### Priority 5: Advanced Features
+### Priority 4: Advanced Features
 
 - [ ] Label-break: `label $name | ... | break $name`
 - [ ] Array slicing with steps: `.[::2]` (every other element)
 - [ ] `ascii` - ASCII character code (e.g., `"A" | ascii` → 65)
 - [ ] `now` - Current Unix timestamp
 
-### Priority 6: CLI Enhancements
+### Priority 5: CLI Enhancements
 
 These are CLI-level features, not expression language:
 
@@ -299,3 +290,4 @@ echo '{"a":1}' | succinctly jq '.a'
 | 2026-01-19 | Added path (no-arg) for yq (✅ complete)  |
 | 2026-01-19 | Added parent / parent(n) for yq (✅ complete)|
 | 2026-01-19 | Added type filters: values, nulls, booleans, numbers, strings, arrays, objects, iterables, scalars (✅ complete)|
+| 2026-01-19 | Added tojson / fromjson for JSON string conversion (✅ complete)|

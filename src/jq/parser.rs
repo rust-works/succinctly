@@ -1932,6 +1932,14 @@ impl<'a> Parser<'a> {
             self.consume_keyword("tonumber");
             return Ok(Some(Builtin::ToNumber));
         }
+        if self.matches_keyword("tojson") {
+            self.consume_keyword("tojson");
+            return Ok(Some(Builtin::ToJson));
+        }
+        if self.matches_keyword("fromjson") {
+            self.consume_keyword("fromjson");
+            return Ok(Some(Builtin::FromJson));
+        }
 
         // Phase 6: Additional String Functions
         if self.matches_keyword("explode") {

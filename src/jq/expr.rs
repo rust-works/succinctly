@@ -545,6 +545,10 @@ pub enum Builtin {
     ToString,
     /// `tonumber` - convert to number
     ToNumber,
+    /// `tojson` - convert value to JSON string
+    ToJson,
+    /// `fromjson` - parse JSON string to value
+    FromJson,
 
     // Phase 6: Additional String Functions
     /// `explode` - string to array of codepoints

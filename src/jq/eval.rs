@@ -1171,6 +1171,8 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         // Phase 6: Type Conversions
         Builtin::ToString => builtin_tostring(value, optional),
         Builtin::ToNumber => builtin_tonumber(value, optional),
+        Builtin::ToJson => builtin_tojson(value, optional),
+        Builtin::FromJson => builtin_fromjson(value, optional),
 
         // Phase 6: Additional String Functions
         Builtin::Explode => builtin_explode(value, optional),
@@ -2935,6 +2937,405 @@ fn builtin_tonumber<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Builtin: tojson - convert any value to JSON string
+fn builtin_tojson<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    _optional: bool,
+) -> QueryResult<'a, W> {
+    let owned = to_owned(&value);
+    let json_string = owned.to_json();
+    QueryResult::Owned(OwnedValue::String(json_string))
+}
+
+/// Builtin: fromjson - parse JSON string to value
+fn builtin_fromjson<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match &value {
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                let json_str = cow.as_ref();
+                // Parse the JSON string
+                match parse_json_string(json_str) {
+                    Ok(owned) => QueryResult::Owned(owned),
+                    Err(_) if optional => QueryResult::None,
+                    Err(e) => QueryResult::Error(EvalError::new(format!("fromjson: {}", e))),
+                }
+            } else if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(EvalError::new("invalid string"))
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    }
+}
+
+/// Parse a JSON string into an OwnedValue
+fn parse_json_string(s: &str) -> Result<OwnedValue, String> {
+    let bytes = s.as_bytes();
+    let mut pos = 0;
+
+    // Skip whitespace
+    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
+        pos += 1;
+    }
+
+    if pos >= bytes.len() {
+        return Err("empty input".to_string());
+    }
+
+    parse_json_value(bytes, &mut pos)
+}
+
+/// Parse a JSON value starting at the given position
+fn parse_json_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+    // Skip whitespace
+    while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+        *pos += 1;
+    }
+
+    if *pos >= bytes.len() {
+        return Err("unexpected end of input".to_string());
+    }
+
+    match bytes[*pos] {
+        b'n' => {
+            // null
+            if bytes[*pos..].starts_with(b"null") {
+                *pos += 4;
+                Ok(OwnedValue::Null)
+            } else {
+                Err("expected 'null'".to_string())
+            }
+        }
+        b't' => {
+            // true
+            if bytes[*pos..].starts_with(b"true") {
+                *pos += 4;
+                Ok(OwnedValue::Bool(true))
+            } else {
+                Err("expected 'true'".to_string())
+            }
+        }
+        b'f' => {
+            // false
+            if bytes[*pos..].starts_with(b"false") {
+                *pos += 5;
+                Ok(OwnedValue::Bool(false))
+            } else {
+                Err("expected 'false'".to_string())
+            }
+        }
+        b'"' => {
+            // string
+            parse_json_string_value(bytes, pos)
+        }
+        b'[' => {
+            // array
+            parse_json_array(bytes, pos)
+        }
+        b'{' => {
+            // object
+            parse_json_object(bytes, pos)
+        }
+        b'-' | b'0'..=b'9' => {
+            // number
+            parse_json_number(bytes, pos)
+        }
+        c => Err(format!("unexpected character: '{}'", c as char)),
+    }
+}
+
+/// Parse a JSON string value
+fn parse_json_string_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+    if bytes[*pos] != b'"' {
+        return Err("expected '\"'".to_string());
+    }
+    *pos += 1;
+
+    let mut result = String::new();
+    while *pos < bytes.len() {
+        match bytes[*pos] {
+            b'"' => {
+                *pos += 1;
+                return Ok(OwnedValue::String(result));
+            }
+            b'\\' => {
+                *pos += 1;
+                if *pos >= bytes.len() {
+                    return Err("unexpected end of string".to_string());
+                }
+                match bytes[*pos] {
+                    b'"' => result.push('"'),
+                    b'\\' => result.push('\\'),
+                    b'/' => result.push('/'),
+                    b'b' => result.push('\x08'),
+                    b'f' => result.push('\x0C'),
+                    b'n' => result.push('\n'),
+                    b'r' => result.push('\r'),
+                    b't' => result.push('\t'),
+                    b'u' => {
+                        // Unicode escape
+                        *pos += 1;
+                        if *pos + 4 > bytes.len() {
+                            return Err("invalid unicode escape".to_string());
+                        }
+                        let hex = core::str::from_utf8(&bytes[*pos..*pos + 4])
+                            .map_err(|_| "invalid unicode escape")?;
+                        let codepoint =
+                            u32::from_str_radix(hex, 16).map_err(|_| "invalid unicode escape")?;
+
+                        // Handle surrogate pairs
+                        if (0xD800..=0xDBFF).contains(&codepoint) {
+                            // High surrogate - look for low surrogate
+                            *pos += 4;
+                            if *pos + 6 <= bytes.len()
+                                && bytes[*pos] == b'\\'
+                                && bytes[*pos + 1] == b'u'
+                            {
+                                let hex2 = core::str::from_utf8(&bytes[*pos + 2..*pos + 6])
+                                    .map_err(|_| "invalid unicode escape")?;
+                                let low = u32::from_str_radix(hex2, 16)
+                                    .map_err(|_| "invalid unicode escape")?;
+                                if (0xDC00..=0xDFFF).contains(&low) {
+                                    // Valid surrogate pair
+                                    let combined =
+                                        0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00);
+                                    if let Some(c) = char::from_u32(combined) {
+                                        result.push(c);
+                                    }
+                                    *pos += 5; // Move past the low surrogate (will be incremented again below)
+                                } else {
+                                    // Lone high surrogate - use replacement character
+                                    result.push('\u{FFFD}');
+                                    *pos -= 1; // Back up so we don't skip the next escape
+                                }
+                            } else {
+                                // Lone high surrogate
+                                result.push('\u{FFFD}');
+                                *pos -= 1;
+                            }
+                        } else if let Some(c) = char::from_u32(codepoint) {
+                            result.push(c);
+                            *pos += 3; // Move past the hex digits (will be incremented again below)
+                        } else {
+                            return Err("invalid unicode codepoint".to_string());
+                        }
+                    }
+                    c => return Err(format!("invalid escape sequence: \\{}", c as char)),
+                }
+                *pos += 1;
+            }
+            c => {
+                // Regular character - handle UTF-8
+                let remaining = &bytes[*pos..];
+                if let Ok(s) = core::str::from_utf8(remaining) {
+                    if let Some(c) = s.chars().next() {
+                        result.push(c);
+                        *pos += c.len_utf8();
+                    } else {
+                        return Err("unexpected end of string".to_string());
+                    }
+                } else {
+                    // Try to get just the next character
+                    result.push(c as char);
+                    *pos += 1;
+                }
+            }
+        }
+    }
+    Err("unterminated string".to_string())
+}
+
+/// Parse a JSON array
+fn parse_json_array(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+    if bytes[*pos] != b'[' {
+        return Err("expected '['".to_string());
+    }
+    *pos += 1;
+
+    let mut elements = Vec::new();
+
+    // Skip whitespace
+    while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+        *pos += 1;
+    }
+
+    // Check for empty array
+    if *pos < bytes.len() && bytes[*pos] == b']' {
+        *pos += 1;
+        return Ok(OwnedValue::Array(elements));
+    }
+
+    loop {
+        let value = parse_json_value(bytes, pos)?;
+        elements.push(value);
+
+        // Skip whitespace
+        while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+            *pos += 1;
+        }
+
+        if *pos >= bytes.len() {
+            return Err("unterminated array".to_string());
+        }
+
+        match bytes[*pos] {
+            b']' => {
+                *pos += 1;
+                return Ok(OwnedValue::Array(elements));
+            }
+            b',' => {
+                *pos += 1;
+            }
+            c => return Err(format!("expected ',' or ']', got '{}'", c as char)),
+        }
+    }
+}
+
+/// Parse a JSON object
+fn parse_json_object(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+    if bytes[*pos] != b'{' {
+        return Err("expected '{{'".to_string());
+    }
+    *pos += 1;
+
+    let mut entries = IndexMap::new();
+
+    // Skip whitespace
+    while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+        *pos += 1;
+    }
+
+    // Check for empty object
+    if *pos < bytes.len() && bytes[*pos] == b'}' {
+        *pos += 1;
+        return Ok(OwnedValue::Object(entries));
+    }
+
+    loop {
+        // Skip whitespace
+        while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+            *pos += 1;
+        }
+
+        // Parse key (must be a string)
+        let key = match parse_json_string_value(bytes, pos)? {
+            OwnedValue::String(s) => s,
+            _ => return Err("object key must be a string".to_string()),
+        };
+
+        // Skip whitespace
+        while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+            *pos += 1;
+        }
+
+        // Expect colon
+        if *pos >= bytes.len() || bytes[*pos] != b':' {
+            return Err("expected ':'".to_string());
+        }
+        *pos += 1;
+
+        // Parse value
+        let value = parse_json_value(bytes, pos)?;
+        entries.insert(key, value);
+
+        // Skip whitespace
+        while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+            *pos += 1;
+        }
+
+        if *pos >= bytes.len() {
+            return Err("unterminated object".to_string());
+        }
+
+        match bytes[*pos] {
+            b'}' => {
+                *pos += 1;
+                return Ok(OwnedValue::Object(entries));
+            }
+            b',' => {
+                *pos += 1;
+            }
+            c => return Err(format!("expected ',' or '}}', got '{}'", c as char)),
+        }
+    }
+}
+
+/// Parse a JSON number
+fn parse_json_number(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+    let start = *pos;
+
+    // Optional minus sign
+    if *pos < bytes.len() && bytes[*pos] == b'-' {
+        *pos += 1;
+    }
+
+    // Integer part
+    if *pos >= bytes.len() {
+        return Err("expected number".to_string());
+    }
+
+    if bytes[*pos] == b'0' {
+        *pos += 1;
+    } else if bytes[*pos].is_ascii_digit() {
+        while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
+            *pos += 1;
+        }
+    } else {
+        return Err("expected digit".to_string());
+    }
+
+    let mut is_float = false;
+
+    // Fractional part
+    if *pos < bytes.len() && bytes[*pos] == b'.' {
+        is_float = true;
+        *pos += 1;
+        if *pos >= bytes.len() || !bytes[*pos].is_ascii_digit() {
+            return Err("expected digit after decimal point".to_string());
+        }
+        while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
+            *pos += 1;
+        }
+    }
+
+    // Exponent part
+    if *pos < bytes.len() && matches!(bytes[*pos], b'e' | b'E') {
+        is_float = true;
+        *pos += 1;
+        if *pos < bytes.len() && matches!(bytes[*pos], b'+' | b'-') {
+            *pos += 1;
+        }
+        if *pos >= bytes.len() || !bytes[*pos].is_ascii_digit() {
+            return Err("expected digit in exponent".to_string());
+        }
+        while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
+            *pos += 1;
+        }
+    }
+
+    let num_str =
+        core::str::from_utf8(&bytes[start..*pos]).map_err(|_| "invalid number encoding")?;
+
+    if is_float {
+        let f: f64 = num_str.parse().map_err(|_| "invalid float")?;
+        Ok(OwnedValue::Float(f))
+    } else {
+        // Try integer first
+        if let Ok(i) = num_str.parse::<i64>() {
+            Ok(OwnedValue::Int(i))
+        } else {
+            // Fall back to float for large numbers
+            let f: f64 = num_str.parse().map_err(|_| "invalid number")?;
+            Ok(OwnedValue::Float(f))
+        }
+    }
+}
+
 // =============================================================================
 // Phase 6: Additional String Builtins
 // =============================================================================
@@ -4627,6 +5028,8 @@ fn substitute_var_in_builtin(
         }
         Builtin::ToString => Builtin::ToString,
         Builtin::ToNumber => Builtin::ToNumber,
+        Builtin::ToJson => Builtin::ToJson,
+        Builtin::FromJson => Builtin::FromJson,
         Builtin::Explode => Builtin::Explode,
         Builtin::Implode => Builtin::Implode,
         Builtin::Test(e) => Builtin::Test(Box::new(substitute_var(e, var_name, replacement))),
@@ -8230,6 +8633,8 @@ fn expand_func_calls_in_builtin(
         }
         Builtin::ToString => Builtin::ToString,
         Builtin::ToNumber => Builtin::ToNumber,
+        Builtin::ToJson => Builtin::ToJson,
+        Builtin::FromJson => Builtin::FromJson,
         Builtin::Explode => Builtin::Explode,
         Builtin::Implode => Builtin::Implode,
         Builtin::Test(e) => Builtin::Test(Box::new(expand_func_calls(e, func_name, params, body))),
@@ -8439,6 +8844,8 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         }
         Builtin::ToString => Builtin::ToString,
         Builtin::ToNumber => Builtin::ToNumber,
+        Builtin::ToJson => Builtin::ToJson,
+        Builtin::FromJson => Builtin::FromJson,
         Builtin::Explode => Builtin::Explode,
         Builtin::Implode => Builtin::Implode,
         Builtin::Test(e) => Builtin::Test(Box::new(substitute_func_param(e, param, arg))),
