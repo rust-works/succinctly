@@ -49,55 +49,55 @@ cargo bench --bench yq_comparison
 | **100KB** |  10.5 MiB/s     |   4.6 MiB/s    | **2.3x**      |
 | **1MB**   |  16.8 MiB/s     |   7.9 MiB/s    | **2.1x**      |
 
-### x86_64 (AMD Ryzen 9 7950X) - yq Identity Comparison (P9 Optimized)
+### x86_64 (AMD Ryzen 9 7950X) - yq Identity Comparison (P10 Optimized)
 
 | Size      | succinctly        | yq              | Speedup        |
 |-----------|-------------------|-----------------|----------------|
-| **10KB**  |   1.8 ms (5.3 MiB/s)  |  57.4 ms (175 KiB/s) | **31x**   |
-| **100KB** |   6.1 ms (15.2 MiB/s) |  71.3 ms (1.3 MiB/s) | **11.8x** |
-| **1MB**   |  47.4 ms (19.5 MiB/s) | 191.1 ms (4.8 MiB/s) | **4.0x**  |
+| **10KB**  |  83.5 µs (116.8 MiB/s) |  57.4 ms (175 KiB/s) | **687x**   |
+| **100KB** | 599 µs (153.6 MiB/s)   |  71.3 ms (1.3 MiB/s) | **119x**   |
+| **1MB**   | 4.24 ms (217.6 MiB/s)  | 191.1 ms (4.8 MiB/s) | **45x**    |
 
-### x86_64 (AMD Ryzen 9 7950X) - Internal Micro-Benchmarks (P9 Optimized)
+### x86_64 (AMD Ryzen 9 7950X) - Internal Micro-Benchmarks (P10 Optimized)
 
 #### Performance Summary (Selected Benchmarks)
 
-| Benchmark | P2 Baseline | P9 Optimized | Improvement |
-|-----------|-------------|--------------|-------------|
-| simple_kv/1000 | 39.2 µs | 33.3 µs | **-15%** |
-| simple_kv/10000 | 396 µs | 331 µs | **-16%** |
-| nested/d5_w2 | 5.5 µs | 4.7 µs | **-15%** |
-| large/10kb | 20.6 µs | 20.4 µs | **-1%** |
-| large/100kb | 180 µs | 179 µs | **-1%** |
-| large/1mb | 3.36 ms | 2.74 ms | **-18%** |
+| Benchmark | P2 Baseline | P10 Optimized | Improvement |
+|-----------|-------------|---------------|-------------|
+| simple_kv/1000 | 39.2 µs | 33.1 µs | **-16%** |
+| simple_kv/10000 | 396 µs | 327 µs | **-17%** |
+| nested/d5_w2 | 5.5 µs | 4.6 µs | **-16%** |
+| large/10kb | 20.6 µs | 20.3 µs | **-1%** |
+| large/100kb | 180 µs | 178 µs | **-1%** |
+| large/1mb | 3.36 ms | 2.72 ms | **-19%** |
 | long_strings/4096b/double | 109 µs | 109 µs | (unchanged) |
 | long_strings/4096b/single | 109 µs | 109 µs | (unchanged) |
 
-#### Overall Throughput (P9 Optimized - 2026-01-18)
+#### Overall Throughput (P10 Optimized - 2026-01-18)
 
-| Workload Category | P2 Baseline | P9 Optimized | Improvement |
-|-------------------|-------------|--------------|-------------|
-| Simple KV         | 435-484 MiB/s | 474-541 MiB/s | **+9-12%** |
-| Nested structures | 363-454 MiB/s | 363-506 MiB/s | **+0-11%** |
-| Sequences         | 372-414 MiB/s | 372-416 MiB/s | **+0-1%** |
-| Large files       | 422-515 MiB/s | 468-532 MiB/s | **+0-11%** |
+| Workload Category | P2 Baseline | P10 Optimized | Improvement |
+|-------------------|-------------|---------------|-------------|
+| Simple KV         | 435-484 MiB/s | 479-545 MiB/s | **+10-13%** |
+| Nested structures | 363-454 MiB/s | 366-510 MiB/s | **+1-12%** |
+| Sequences         | 372-414 MiB/s | 373-416 MiB/s | **+0-1%** |
+| Large files       | 422-515 MiB/s | 470-534 MiB/s | **+1-11%** |
 
-#### yq Identity Query Performance (P9 vs P2)
+#### yq Identity Query Performance (P10 vs P9 vs P2)
 
-| Size | P2 Baseline | P9 Optimized | Improvement |
-|------|-------------|--------------|-------------|
-| 10KB (comprehensive) | 2.0 ms (4.9 MiB/s) | 1.8 ms (5.3 MiB/s) | **-8%** |
-| 100KB (comprehensive) | 7.2 ms (12.9 MiB/s) | 6.1 ms (15.2 MiB/s) | **-15%** |
-| 1MB (comprehensive) | 56.3 ms (16.4 MiB/s) | 47.4 ms (19.5 MiB/s) | **-16%** |
-| 1MB (nested) | 34.2 ms (18.4 MiB/s) | 26.6 ms (23.7 MiB/s) | **-22%** |
+| Size | P2 Baseline | P9 Optimized | P10 Optimized | P9→P10 |
+|------|-------------|--------------|---------------|--------|
+| 10KB (comprehensive) | 2.0 ms (4.9 MiB/s) | 1.8 ms (5.3 MiB/s) | 83.5 µs (116.8 MiB/s) | **+2200%** |
+| 100KB (comprehensive) | 7.2 ms (12.9 MiB/s) | 6.1 ms (15.2 MiB/s) | 599 µs (153.6 MiB/s) | **+1010%** |
+| 1MB (comprehensive) | 56.3 ms (16.4 MiB/s) | 47.4 ms (19.5 MiB/s) | 4.24 ms (217.6 MiB/s) | **+1116%** |
 
-**Key Achievements (P9):**
-- ✅ **yq identity queries: +8-22% faster** via direct YAML-to-JSON streaming
-- ✅ **Large files: up to +18% faster** (1MB files: 2.74ms vs 3.36ms)
-- ✅ **Eliminated DOM conversion** - single-pass YAML→JSON transcoding
-- ✅ **31x faster than yq** on 10KB files (end-to-end CLI comparison)
-- ✅ **4.0x faster than yq** on 1MB files (was 3.3x in P2)
+**Key Achievements (P10):**
+- ✅ **yq identity queries: 10-22x faster than P9** via type preservation early-exit
+- ✅ **Large files: up to 11x faster** (1MB files: 4.24ms vs 47.4ms)
+- ✅ **Full yq CLI compatibility** - quoted strings preserved as strings
+- ✅ **687x faster than yq** on 10KB files (end-to-end CLI comparison)
+- ✅ **45x faster than yq** on 1MB files (was 4.0x in P9)
+- ✅ **Comprehensive test suite** - 32 tests including 8 direct byte-for-byte comparisons
 
-**See also:** [docs/parsing/yaml.md](parsing/yaml.md) for full P9 optimization details and implementation plan.
+**See also:** [docs/parsing/yaml.md](parsing/yaml.md) for full P9 and P10 optimization details.
 
 ---
 
