@@ -47,6 +47,7 @@
 //! The oracle handles block style (indentation-based), flow style
 //! (bracket-based like JSON), anchors, aliases, and block scalars uniformly.
 
+mod comment;
 mod error;
 mod index;
 mod light;
@@ -54,6 +55,7 @@ mod locate;
 mod parser;
 mod simd;
 
+pub use comment::{CommentEntry, CommentIndex, CommentKind, TagIndex};
 pub use error::YamlError;
 pub use index::YamlIndex;
 pub use light::{

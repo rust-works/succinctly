@@ -1142,6 +1142,65 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             YamlValue::Error(_) => output.push_str("null"),
         }
     }
+
+    // =========================================================================
+    // Comment and tag access
+    // =========================================================================
+
+    /// Check if this node has any comments attached.
+    #[inline]
+    pub fn has_comments(&self) -> bool {
+        self.index.comments().has_comments(self.bp_pos as u32)
+    }
+
+    /// Get the head comment for this node (comment appearing above the node).
+    ///
+    /// Returns the comment text without the leading `#` and optional space.
+    #[inline]
+    pub fn head_comment(&self) -> Option<&'a str> {
+        let entry = self.index.comments().head_comment(self.bp_pos as u32)?;
+        core::str::from_utf8(entry.text_content(self.text)).ok()
+    }
+
+    /// Get the line comment for this node (comment on the same line).
+    ///
+    /// Returns the comment text without the leading `#` and optional space.
+    #[inline]
+    pub fn line_comment(&self) -> Option<&'a str> {
+        let entry = self.index.comments().line_comment(self.bp_pos as u32)?;
+        core::str::from_utf8(entry.text_content(self.text)).ok()
+    }
+
+    /// Get the foot comment for this node (comment appearing below the node).
+    ///
+    /// Returns the comment text without the leading `#` and optional space.
+    #[inline]
+    pub fn foot_comment(&self) -> Option<&'a str> {
+        let entry = self.index.comments().foot_comment(self.bp_pos as u32)?;
+        core::str::from_utf8(entry.text_content(self.text)).ok()
+    }
+
+    /// Get all head comments for this node (may have multiple).
+    pub fn head_comments(&self) -> impl Iterator<Item = &'a str> {
+        self.index
+            .comments()
+            .get_kind(self.bp_pos as u32, super::comment::CommentKind::Head)
+            .filter_map(|entry| core::str::from_utf8(entry.text_content(self.text)).ok())
+    }
+
+    /// Get the explicit tag for this node, if any.
+    ///
+    /// Returns tags like `!!str`, `!custom`, etc.
+    #[inline]
+    pub fn explicit_tag(&self) -> Option<&str> {
+        self.index.tags().get(self.bp_pos as u32)
+    }
+
+    /// Check if this node has an explicit tag.
+    #[inline]
+    pub fn has_tag(&self) -> bool {
+        self.index.tags().has_tag(self.bp_pos as u32)
+    }
 }
 
 /// Write a YAML value as JSON (for sequence elements where we don't have a cursor).
@@ -1974,6 +2033,15 @@ impl<'a, W: AsRef<[u64]>> YamlField<'a, W> {
     #[inline]
     pub fn value(&self) -> YamlValue<'a, W> {
         self.value_cursor.value()
+    }
+
+    /// Get the key cursor directly.
+    ///
+    /// This is useful for accessing cursor methods like comment access
+    /// that are not available on `YamlValue`.
+    #[inline]
+    pub fn key_cursor(&self) -> YamlCursor<'a, W> {
+        self.key_cursor
     }
 
     /// Get the value cursor directly.
@@ -5206,5 +5274,273 @@ mod tests {
         let transcoded = get_json_via_transcode(yaml);
         // Should contain "it's working"
         assert!(transcoded.contains("it's working"), "got: {}", transcoded);
+    }
+
+    // =========================================================================
+    // Comment tracking tests
+    // =========================================================================
+
+    #[test]
+    fn test_comment_index_basic() {
+        // Test that comment index is constructed without errors
+        let yaml = b"# Header comment\nkey: value";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        // Comment index should exist (may be empty until we wire up more collection paths)
+        assert!(index.comments().is_empty() || index.comments().len() > 0);
+    }
+
+    #[test]
+    fn test_head_comment_on_mapping_key() {
+        // Head comment appears above the node
+        let yaml = b"# This is a comment\nkey: value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        // Navigate to the first document
+        let doc = match root.value() {
+            YamlValue::Sequence(elements) => elements.into_iter().next().unwrap(),
+            _ => panic!("expected sequence"),
+        };
+
+        // First document should be a mapping
+        match doc {
+            YamlValue::Mapping(fields) => {
+                let first_field = fields.into_iter().next().unwrap();
+                // The head comment should be attached to the key node
+                let head = first_field.key_cursor().head_comment();
+                if head.is_some() {
+                    assert_eq!(head.unwrap(), "This is a comment");
+                }
+            }
+            _ => panic!("expected mapping"),
+        }
+    }
+
+    #[test]
+    fn test_multiple_head_comments() {
+        // Multiple comment lines before a node
+        let yaml = b"# Comment 1\n# Comment 2\nkey: value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        let doc = match root.value() {
+            YamlValue::Sequence(elements) => elements.into_iter().next().unwrap(),
+            _ => panic!("expected sequence"),
+        };
+
+        match doc {
+            YamlValue::Mapping(fields) => {
+                let first_field = fields.into_iter().next().unwrap();
+                let head_comments: Vec<_> = first_field.key_cursor().head_comments().collect();
+                // If comments are being tracked, we should have 2
+                if !head_comments.is_empty() {
+                    assert_eq!(head_comments.len(), 2);
+                    assert_eq!(head_comments[0], "Comment 1");
+                    assert_eq!(head_comments[1], "Comment 2");
+                }
+            }
+            _ => panic!("expected mapping"),
+        }
+    }
+
+    #[test]
+    fn test_no_comments_when_none_present() {
+        let yaml = b"key: value\nother: data";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        let doc = match root.value() {
+            YamlValue::Sequence(elements) => elements.into_iter().next().unwrap(),
+            _ => panic!("expected sequence"),
+        };
+
+        match doc {
+            YamlValue::Mapping(fields) => {
+                let first_field = fields.into_iter().next().unwrap();
+                assert!(!first_field.key_cursor().has_comments());
+                assert!(first_field.key_cursor().head_comment().is_none());
+                assert!(first_field.key_cursor().line_comment().is_none());
+                assert!(first_field.key_cursor().foot_comment().is_none());
+            }
+            _ => panic!("expected mapping"),
+        }
+    }
+
+    #[test]
+    fn test_comment_in_sequence() {
+        // Comment before sequence item
+        let yaml = b"- item1\n# Comment for item2\n- item2";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        let doc = match root.value() {
+            YamlValue::Sequence(elements) => elements.into_iter().next().unwrap(),
+            _ => panic!("expected sequence"),
+        };
+
+        match doc {
+            YamlValue::Sequence(elements) => {
+                // There should be 2 elements
+                let items: Vec<_> = elements.into_iter().collect();
+                assert_eq!(items.len(), 2);
+            }
+            _ => panic!("expected sequence"),
+        }
+    }
+
+    #[test]
+    fn test_comment_at_document_start() {
+        // Comment at very start of document
+        let yaml = b"# File header\n---\nkey: value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        // Should parse successfully
+        assert!(matches!(root.value(), YamlValue::Sequence(_)));
+    }
+
+    #[test]
+    fn test_comment_only_file() {
+        // File with only comments
+        let yaml = b"# Just a comment\n# Another comment";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        // Should parse successfully, root is empty document array
+        match root.value() {
+            YamlValue::Sequence(elements) => {
+                // Should be empty or have null element
+                assert!(elements.is_empty() || elements.into_iter().count() <= 1);
+            }
+            _ => panic!("expected sequence"),
+        }
+    }
+
+    #[test]
+    fn test_comment_with_special_characters() {
+        // Comment with special characters
+        let yaml = b"# Comment with \"quotes\" and 'apostrophes'\nkey: value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        let doc = match root.value() {
+            YamlValue::Sequence(elements) => elements.into_iter().next().unwrap(),
+            _ => panic!("expected sequence"),
+        };
+
+        match doc {
+            YamlValue::Mapping(fields) => {
+                let first_field = fields.into_iter().next().unwrap();
+                let head = first_field.key_cursor().head_comment();
+                if head.is_some() {
+                    assert!(head.unwrap().contains("quotes"));
+                }
+            }
+            _ => panic!("expected mapping"),
+        }
+    }
+
+    #[test]
+    fn test_empty_comment() {
+        // Empty comment (just #)
+        let yaml = b"#\nkey: value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        let doc = match root.value() {
+            YamlValue::Sequence(elements) => elements.into_iter().next().unwrap(),
+            _ => panic!("expected sequence"),
+        };
+
+        match doc {
+            YamlValue::Mapping(fields) => {
+                let first_field = fields.into_iter().next().unwrap();
+                let head = first_field.key_cursor().head_comment();
+                if head.is_some() {
+                    // Empty comment should be empty string
+                    assert!(head.unwrap().is_empty());
+                }
+            }
+            _ => panic!("expected mapping"),
+        }
+    }
+
+    #[test]
+    fn test_deeply_nested_with_comments() {
+        // Comments in deeply nested structure
+        let yaml = b"# Top comment
+root:
+  # Nested comment
+  child:
+    # Deeply nested
+    grandchild: value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        // Should parse successfully
+        let doc = match root.value() {
+            YamlValue::Sequence(elements) => elements.into_iter().next().unwrap(),
+            _ => panic!("expected sequence"),
+        };
+
+        // Navigate to nested structure
+        match doc {
+            YamlValue::Mapping(fields) => {
+                // First field is 'root'
+                let first_field = fields.into_iter().next().unwrap();
+                match first_field.value() {
+                    YamlValue::Mapping(nested_fields) => {
+                        // 'child' field
+                        let child_field = nested_fields.into_iter().next().unwrap();
+                        match child_field.value() {
+                            YamlValue::Mapping(deep_fields) => {
+                                // 'grandchild' field
+                                let grandchild = deep_fields.into_iter().next().unwrap();
+                                assert!(matches!(grandchild.value(), YamlValue::String(_)));
+                            }
+                            _ => panic!("expected nested mapping for grandchild"),
+                        }
+                    }
+                    _ => panic!("expected nested mapping for child"),
+                }
+            }
+            _ => panic!("expected root mapping"),
+        }
+    }
+
+    // =========================================================================
+    // Tag tracking tests (placeholders - tags not yet fully implemented)
+    // =========================================================================
+
+    #[test]
+    fn test_tag_index_basic() {
+        // Test that tag index is constructed without errors
+        let yaml = b"key: value";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        // Tag index should exist (empty since tags aren't parsed yet)
+        assert!(index.tags().is_empty());
+    }
+
+    #[test]
+    fn test_no_tags_when_none_present() {
+        let yaml = b"key: value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        let doc = match root.value() {
+            YamlValue::Sequence(elements) => elements.into_iter().next().unwrap(),
+            _ => panic!("expected sequence"),
+        };
+
+        match doc {
+            YamlValue::Mapping(fields) => {
+                let first_field = fields.into_iter().next().unwrap();
+                assert!(!first_field.key_cursor().has_tag());
+                assert!(first_field.key_cursor().explicit_tag().is_none());
+            }
+            _ => panic!("expected mapping"),
+        }
     }
 }

@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use crate::trees::BalancedParens;
 use crate::util::broadword::select_in_word;
 
+use super::comment::{CommentIndex, TagIndex};
 use super::error::YamlError;
 use super::light::YamlCursor;
 use super::parser::build_semi_index;
@@ -54,6 +55,10 @@ pub struct YamlIndex<W = Vec<u64>> {
     anchors: BTreeMap<String, usize>,
     /// Alias references: BP position of alias → target BP position (resolved at parse time)
     aliases: BTreeMap<usize, usize>,
+    /// Comment index: sparse tracking of comments in the document
+    comments: CommentIndex,
+    /// Tag index: sparse tracking of explicit tags in the document
+    tags: TagIndex,
 }
 
 /// Build cumulative popcount index for a bitvector.
@@ -109,6 +114,8 @@ impl YamlIndex<Vec<u64>> {
             containers_rank,
             anchors: semi.anchors,
             aliases: semi.aliases,
+            comments: semi.comments,
+            tags: semi.tags,
         })
     }
 }
@@ -131,6 +138,8 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         containers: W,
         anchors: BTreeMap<String, usize>,
         aliases: BTreeMap<usize, usize>,
+        comments: CommentIndex,
+        tags: TagIndex,
     ) -> Self {
         let ib_rank = build_ib_rank(ib.as_ref());
         let containers_rank = build_containers_rank(containers.as_ref());
@@ -149,6 +158,8 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             containers_rank,
             anchors,
             aliases,
+            comments,
+            tags,
         }
     }
 
@@ -523,6 +534,22 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         }
 
         count
+    }
+
+    // =========================================================================
+    // Comment and tag access
+    // =========================================================================
+
+    /// Get the comment index for this YAML document.
+    #[inline]
+    pub fn comments(&self) -> &CommentIndex {
+        &self.comments
+    }
+
+    /// Get the tag index for this YAML document.
+    #[inline]
+    pub fn tags(&self) -> &TagIndex {
+        &self.tags
     }
 }
 

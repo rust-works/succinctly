@@ -32,6 +32,7 @@ use alloc::{
 #[cfg(test)]
 use std::collections::BTreeMap;
 
+use super::comment::{CommentEntry, CommentIndex, CommentKind, TagIndex};
 use super::error::YamlError;
 use super::simd;
 
@@ -115,6 +116,10 @@ pub struct SemiIndex {
     pub anchors: BTreeMap<String, usize>,
     /// Alias references: BP position of alias → target BP position (resolved at parse time)
     pub aliases: BTreeMap<usize, usize>,
+    /// Comment index: sparse tracking of comments in the document
+    pub comments: CommentIndex,
+    /// Tag index: sparse tracking of explicit tags in the document
+    pub tags: TagIndex,
 }
 
 /// Parser state for the YAML-lite oracle.
@@ -158,6 +163,16 @@ struct Parser<'a> {
     // Explicit key tracking
     /// Whether we have a pending explicit key that needs a value (null if not followed by `:`)
     pending_explicit_key: bool,
+
+    // Comment and tag tracking
+    /// Pending head comments (collected before a node)
+    pending_head_comments: Vec<(u32, u32)>, // (start, end) byte ranges
+    /// Last node's BP position (for attaching line/foot comments)
+    last_node_bp: Option<u32>,
+    /// Comment index being built
+    comments: CommentIndex,
+    /// Tag index being built
+    tags: TagIndex,
 }
 
 impl<'a> Parser<'a> {
@@ -187,6 +202,10 @@ impl<'a> Parser<'a> {
             aliases: BTreeMap::new(),
             in_document: false,
             pending_explicit_key: false,
+            pending_head_comments: Vec::new(),
+            last_node_bp: None,
+            comments: CommentIndex::new(),
+            tags: TagIndex::new(),
         }
     }
 
@@ -235,6 +254,7 @@ impl<'a> Parser<'a> {
     /// Write an open parenthesis (1) to BP at a specific text position.
     #[inline]
     fn write_bp_open_at(&mut self, text_pos: usize) {
+        let bp_pos = self.bp_pos as u32;
         let word_idx = self.bp_pos / 64;
         let bit_idx = self.bp_pos % 64;
         // Ensure capacity
@@ -247,6 +267,11 @@ impl<'a> Parser<'a> {
         // Placeholder for end position (will be set by set_bp_text_end for scalars)
         self.bp_to_text_end.push(0);
         self.bp_pos += 1;
+
+        // Attach any pending head comments to this node
+        self.attach_head_comments(bp_pos);
+        // Track this as the last opened node for line comment attachment
+        self.last_node_bp = Some(bp_pos);
     }
 
     /// Set the end text position for the most recently opened BP node.
@@ -607,14 +632,59 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Skip to end of line and return comment range if found.
+    /// Returns Some((start, end)) if a comment was found (starting with `#`).
+    #[inline]
+    fn skip_to_eol_tracking_comment(&mut self) -> Option<(u32, u32)> {
+        // Check if we're at a comment
+        if self.pos < self.input.len() && self.input[self.pos] == b'#' {
+            let start = self.pos as u32;
+            self.skip_to_eol();
+            Some((start, self.pos as u32))
+        } else {
+            self.skip_to_eol();
+            None
+        }
+    }
+
+    /// Collect a line comment after the current position (on the same line).
+    /// Should be called after parsing a value, before consuming the newline.
+    #[inline]
+    fn collect_line_comment(&mut self) {
+        self.skip_inline_whitespace();
+        if let Some(b'#') = self.peek() {
+            if let Some(bp) = self.last_node_bp {
+                let start = self.pos as u32;
+                self.skip_to_eol();
+                let end = self.pos as u32;
+                self.comments
+                    .push(CommentEntry::new(bp, start, end, CommentKind::Line));
+            } else {
+                self.skip_to_eol();
+            }
+        }
+    }
+
+    /// Attach pending head comments to the given BP position.
+    #[inline]
+    fn attach_head_comments(&mut self, bp_pos: u32) {
+        for (start, end) in self.pending_head_comments.drain(..) {
+            self.comments
+                .push(CommentEntry::new(bp_pos, start, end, CommentKind::Head));
+        }
+    }
+
     /// Skip newline and empty/comment lines.
     fn skip_newlines(&mut self) {
         while let Some(b) = self.peek() {
             if b == b'\n' {
                 self.advance();
             } else if b == b'#' {
-                // Comment line
+                // Comment line - track as potential head comment for next node
+                let start = self.pos as u32;
                 self.skip_to_eol();
+                let end = self.pos as u32;
+                self.pending_head_comments.push((start, end));
             } else if b == b' ' {
                 // Check if rest of line is whitespace or comment
                 let start = self.pos;
@@ -622,7 +692,12 @@ impl<'a> Parser<'a> {
                 if self.peek() == Some(b'\n') || self.peek() == Some(b'#') || self.peek().is_none()
                 {
                     if self.peek() == Some(b'#') {
+                        // Track this comment as potential head comment
+                        let comment_start = self.pos as u32;
                         self.skip_to_eol();
+                        let comment_end = self.pos as u32;
+                        self.pending_head_comments
+                            .push((comment_start, comment_end));
                     }
                     continue;
                 } else {
@@ -3159,6 +3234,10 @@ impl<'a> Parser<'a> {
         self.pop_type();
         self.write_bp_close();
 
+        // Finalize comment and tag indexes
+        self.comments.finalize(self.bp_pos);
+        self.tags.finalize();
+
         Ok(SemiIndex {
             ib: self.ib_words.clone(),
             bp: self.bp_words.clone(),
@@ -3172,6 +3251,8 @@ impl<'a> Parser<'a> {
             ty_len: self.ty_pos,
             anchors: core::mem::take(&mut self.anchors),
             aliases: core::mem::take(&mut self.aliases),
+            comments: core::mem::take(&mut self.comments),
+            tags: core::mem::take(&mut self.tags),
         })
     }
 
