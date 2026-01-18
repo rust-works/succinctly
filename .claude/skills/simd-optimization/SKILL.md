@@ -7,7 +7,7 @@ description: SIMD optimization patterns and learnings for x86_64 and ARM. Use wh
 
 Patterns and learnings from SIMD optimization in this codebase.
 
-**Comprehensive documentation**: See [docs/optimisations/simd.md](../../../docs/optimisations/simd.md) for full details on SIMD techniques.
+**Comprehensive documentation**: See [docs/optimizations/simd.md](../../../docs/optimizations/simd.md) for full details on SIMD techniques.
 
 ## Key Insight: Wider SIMD != Automatically Faster
 
@@ -176,7 +176,7 @@ cargo bench --bench json_simd
 
 ## See Also
 
-- [docs/optimisations/simd.md](../../../docs/optimisations/simd.md) - Comprehensive SIMD techniques reference
-- [docs/optimisations/cache-memory.md](../../../docs/optimisations/cache-memory.md) - Memory-bound vs compute-bound analysis
-- [docs/optimisations/branchless.md](../../../docs/optimisations/branchless.md) - SIMD masking techniques
-- [docs/archive/OPTIMIZATION-SUMMARY.md](../../../docs/archive/OPTIMIZATION-SUMMARY.md) - Historical optimization record
+- [docs/optimizations/simd.md](../../../docs/optimizations/simd.md) - Comprehensive SIMD techniques reference
+- [docs/optimizations/cache-memory.md](../../../docs/optimizations/cache-memory.md) - Memory-bound vs compute-bound analysis
+- [docs/optimizations/branchless.md](../../../docs/optimizations/branchless.md) - SIMD masking techniques
+- [docs/optimizations/history.md](../../../docs/optimizations/history.md) - Historical optimization record

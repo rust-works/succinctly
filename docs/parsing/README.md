@@ -42,16 +42,16 @@ Input → Bit Index → Lazy Navigation → Query
 
 ## Common Techniques
 
-Both parsers share optimisation techniques:
+Both parsers share optimization techniques:
 
 | Technique | JSON | DSV | Document |
 |-----------|------|-----|----------|
-| SIMD character detection | AVX2, NEON | AVX2, NEON | [simd.md](../optimisations/simd.md) |
-| Lookup tables | PFSM tables | - | [lookup-tables.md](../optimisations/lookup-tables.md) |
-| State machine | 4-state FSM | Quote toggle | [state-machines.md](../optimisations/state-machines.md) |
-| Rank/select indices | BP navigation | Field lookup | [hierarchical-structures.md](../optimisations/hierarchical-structures.md) |
-| Parallel prefix | - | Quote masking | [parallel-prefix.md](../optimisations/parallel-prefix.md) |
-| PDEP/PEXT | - | toggle64_bmi2 | [bit-manipulation.md](../optimisations/bit-manipulation.md) |
+| SIMD character detection | AVX2, NEON | AVX2, NEON | [simd.md](../optimizations/simd.md) |
+| Lookup tables | PFSM tables | - | [lookup-tables.md](../optimizations/lookup-tables.md) |
+| State machine | 4-state FSM | Quote toggle | [state-machines.md](../optimizations/state-machines.md) |
+| Rank/select indices | BP navigation | Field lookup | [hierarchical-structures.md](../optimizations/hierarchical-structures.md) |
+| Parallel prefix | - | Quote masking | [parallel-prefix.md](../optimizations/parallel-prefix.md) |
+| PDEP/PEXT | - | toggle64_bmi2 | [bit-manipulation.md](../optimizations/bit-manipulation.md) |
 
 ---
 
@@ -84,13 +84,13 @@ Both parsers share optimisation techniques:
 
 ### Optimisation Techniques
 
-- [simd.md](../optimisations/simd.md) - AVX2, NEON character detection
-- [lookup-tables.md](../optimisations/lookup-tables.md) - PFSM state tables
-- [state-machines.md](../optimisations/state-machines.md) - Parser state machines
-- [parallel-prefix.md](../optimisations/parallel-prefix.md) - Quote state with prefix XOR
-- [bit-manipulation.md](../optimisations/bit-manipulation.md) - PDEP for 10x faster quotes
-- [hierarchical-structures.md](../optimisations/hierarchical-structures.md) - Rank/select indices
-- [cache-memory.md](../optimisations/cache-memory.md) - Why lightweight index wins
+- [simd.md](../optimizations/simd.md) - AVX2, NEON character detection
+- [lookup-tables.md](../optimizations/lookup-tables.md) - PFSM state tables
+- [state-machines.md](../optimizations/state-machines.md) - Parser state machines
+- [parallel-prefix.md](../optimizations/parallel-prefix.md) - Quote state with prefix XOR
+- [bit-manipulation.md](../optimizations/bit-manipulation.md) - PDEP for 10x faster quotes
+- [hierarchical-structures.md](../optimizations/hierarchical-structures.md) - Rank/select indices
+- [cache-memory.md](../optimizations/cache-memory.md) - Why lightweight index wins
 
 ---
 

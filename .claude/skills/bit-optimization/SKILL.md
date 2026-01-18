@@ -7,10 +7,10 @@ description: Bit-level optimization patterns for succinct data structures. Use w
 
 Learnings from optimizing succinct data structure operations.
 
-**Comprehensive documentation**: See [docs/optimisations/](../../../docs/optimisations/) for full technique reference:
-- [bit-manipulation.md](../../../docs/optimisations/bit-manipulation.md) - Popcount, CTZ, PDEP/PEXT
-- [lookup-tables.md](../../../docs/optimisations/lookup-tables.md) - Byte-level lookup tables
-- [hierarchical-structures.md](../../../docs/optimisations/hierarchical-structures.md) - Rank/select indices
+**Comprehensive documentation**: See [docs/optimizations/](../../../docs/optimizations/) for full technique reference:
+- [bit-manipulation.md](../../../docs/optimizations/bit-manipulation.md) - Popcount, CTZ, PDEP/PEXT
+- [lookup-tables.md](../../../docs/optimizations/lookup-tables.md) - Byte-level lookup tables
+- [hierarchical-structures.md](../../../docs/optimizations/hierarchical-structures.md) - Rank/select indices
 
 ## Byte-Level Lookup Tables
 
@@ -188,8 +188,8 @@ group.bench_function("production", |b| b.iter(|| pfsm_optimized::process(json)))
 
 ## See Also
 
-- [docs/optimisations/bit-manipulation.md](../../../docs/optimisations/bit-manipulation.md) - Bit manipulation techniques
-- [docs/optimisations/lookup-tables.md](../../../docs/optimisations/lookup-tables.md) - Lookup table patterns
-- [docs/optimisations/hierarchical-structures.md](../../../docs/optimisations/hierarchical-structures.md) - Rank/select structures
-- [docs/optimisations/access-patterns.md](../../../docs/optimisations/access-patterns.md) - Sequential vs random access
-- [docs/archive/OPTIMIZATION-SUMMARY.md](../../../docs/archive/OPTIMIZATION-SUMMARY.md) - Historical optimization record
+- [docs/optimizations/bit-manipulation.md](../../../docs/optimizations/bit-manipulation.md) - Bit manipulation techniques
+- [docs/optimizations/lookup-tables.md](../../../docs/optimizations/lookup-tables.md) - Lookup table patterns
+- [docs/optimizations/hierarchical-structures.md](../../../docs/optimizations/hierarchical-structures.md) - Rank/select structures
+- [docs/optimizations/access-patterns.md](../../../docs/optimizations/access-patterns.md) - Sequential vs random access
+- [docs/optimizations/history.md](../../../docs/optimizations/history.md) - Historical optimization record

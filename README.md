@@ -131,7 +131,7 @@ Benchmark comparing succinctly against popular Rust JSON libraries (x86_64, 1MB 
 - **Competitive parsing speed**: Only 1.6x slower than fastest DOM parser
 - **3-5x faster** than serde_json and simd-json
 
-See [docs/rust-json-comparison.md](docs/rust-json-comparison.md) for detailed benchmarks across all file sizes.
+See [docs/benchmarks/rust-parsers.md](docs/benchmarks/rust-parsers.md) for detailed benchmarks across all file sizes.
 
 ### JSON Semi-Indexing
 
@@ -195,7 +195,7 @@ Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
 | **x86_64** | Popcount (AVX-512 VPOPCNTDQ) | 96.8 GiB/s |  5.2x vs scalar |
 | **ARM**    | NEON JSON (string-heavy)     |  3.7 GiB/s | 1.69x vs scalar |
 
-See [docs/rust-json-comparison.md](docs/rust-json-comparison.md), [docs/jq-comparison.md](docs/jq-comparison.md), and [docs/archive/OPTIMIZATION-SUMMARY.md](docs/archive/OPTIMIZATION-SUMMARY.md) for detailed benchmarks.
+See [docs/benchmarks/rust-parsers.md](docs/benchmarks/rust-parsers.md), [docs/benchmarks/jq.md](docs/benchmarks/jq.md), and [docs/optimizations/history.md](docs/optimizations/history.md) for detailed benchmarks.
 
 ## Feature Flags
 
@@ -286,12 +286,18 @@ The library uses runtime CPU feature detection to select the best implementation
 
 ## Documentation
 
-- [API Documentation](https://docs.rs/succinctly) - Full API reference on docs.rs
-- [CLAUDE.md](CLAUDE.md) - Detailed architecture guide
-- [docs/rust-json-comparison.md](docs/rust-json-comparison.md) - Comparison with Rust JSON parsers
-- [docs/jq-comparison.md](docs/jq-comparison.md) - Comparison with system jq command
-- [docs/dsv-performance.md](docs/dsv-performance.md) - DSV (CSV/TSV) input performance benchmarks
-- [docs/archive/OPTIMIZATION-SUMMARY.md](docs/archive/OPTIMIZATION-SUMMARY.md) - Performance optimization history
+Choose your path:
+
+- **New to succinctly?** -> [Getting Started](docs/getting-started/)
+- **Using the library?** -> [API Guide](docs/guides/api.md)
+- **Using the CLI?** -> [CLI Guide](docs/guides/cli.md)
+- **Contributing?** -> [CONTRIBUTING.md](CONTRIBUTING.md)
+- **Performance tuning?** -> [Optimization Techniques](docs/optimizations/)
+- **Understanding internals?** -> [Architecture](docs/architecture/)
+- **Benchmarks?** -> [Performance Comparisons](docs/benchmarks/)
+- **Full documentation map** -> [docs/](docs/)
+
+For AI-assisted development, see [CLAUDE.md](CLAUDE.md).
 
 ## Contributing
 

@@ -154,11 +154,11 @@ cargo test
 
 | Document                                                          | Purpose                              |
 |-------------------------------------------------------------------|--------------------------------------|
-| [RELEASE.md](RELEASE.md)                                          | Release process and checklist        |
-| [docs/optimisations/](docs/optimisations/)                        | Optimisation techniques reference    |
-| [docs/jq-comparison.md](docs/jq-comparison.md)                    | JSON jq benchmark results            |
-| [docs/yq-comparison.md](docs/yq-comparison.md)                    | YAML yq benchmark results            |
-| [docs/dsv-performance.md](docs/dsv-performance.md)                | DSV input performance benchmarks     |
+| [docs/guides/release.md](docs/guides/release.md)                  | Release process and checklist        |
+| [docs/optimizations/](docs/optimizations/)                        | Optimization techniques reference    |
+| [docs/benchmarks/jq.md](docs/benchmarks/jq.md)                    | JSON jq benchmark results            |
+| [docs/benchmarks/yq.md](docs/benchmarks/yq.md)                    | YAML yq benchmark results            |
+| [docs/benchmarks/dsv.md](docs/benchmarks/dsv.md)                  | DSV input performance benchmarks     |
 
 ## Performance Summary
 
@@ -190,21 +190,21 @@ To regenerate: `cargo bench --bench jq_comparison`
 
 To regenerate: `cargo bench --bench yq_comparison`
 
-### Optimisation Techniques
+### Optimization Techniques
 
-For detailed documentation on optimisation techniques used in this project, see [docs/optimisations/](docs/optimisations/):
+For detailed documentation on optimization techniques used in this project, see [docs/optimizations/](docs/optimizations/):
 
 | Category | Document | Key Techniques |
 |----------|----------|----------------|
-| Bit-level | [bit-manipulation.md](docs/optimisations/bit-manipulation.md) | Popcount, CTZ, PDEP/PEXT |
-| SIMD | [simd.md](docs/optimisations/simd.md) | AVX2, AVX-512, NEON |
-| Memory | [cache-memory.md](docs/optimisations/cache-memory.md) | Alignment, prefetching |
-| Data structures | [hierarchical-structures.md](docs/optimisations/hierarchical-structures.md) | Rank/select indices |
-| Parsing | [state-machines.md](docs/optimisations/state-machines.md) | PFSM, lookup tables |
+| Bit-level | [bit-manipulation.md](docs/optimizations/bit-manipulation.md) | Popcount, CTZ, PDEP/PEXT |
+| SIMD | [simd.md](docs/optimizations/simd.md) | AVX2, AVX-512, NEON |
+| Memory | [cache-memory.md](docs/optimizations/cache-memory.md) | Alignment, prefetching |
+| Data structures | [hierarchical-structures.md](docs/optimizations/hierarchical-structures.md) | Rank/select indices |
+| Parsing | [state-machines.md](docs/optimizations/state-machines.md) | PFSM, lookup tables |
 
-**Key insights** (see [docs/optimisations/README.md](docs/optimisations/README.md) for full details):
+**Key insights** (see [docs/optimizations/README.md](docs/optimizations/README.md) for full details):
 - Wider SIMD != automatically faster (AVX-512 JSON was 10% slower than AVX2)
-- Algorithmic improvements beat micro-optimisations (cumulative index: 627x speedup; YAML streaming: 2.3x speedup)
+- Algorithmic improvements beat micro-optimizations (cumulative index: 627x speedup; YAML streaming: 2.3x speedup)
 - Simpler data structures often outperform complex ones due to cache behaviour
 - Caching hot values eliminates repeated lookups (type checking: 1-17% improvement)
 - Hardware prefetchers beat software prefetch for sequential access (prefetch: +30% regression!)
