@@ -186,6 +186,22 @@ impl<'a> Parser<'a> {
         !matches!(next_char, Some(c) if c.is_alphanumeric() || c == '_')
     }
 
+    /// Check if after consuming a keyword, the next non-whitespace character is '('.
+    /// This is used to determine if a no-arg builtin should be parsed as a builtin
+    /// or as a user-defined function call.
+    fn peek_after_keyword_is_paren(&self, keyword: &str) -> bool {
+        let after = self.pos + keyword.len();
+        // Skip whitespace after keyword
+        let rest = &self.input[after..];
+        for c in rest.chars() {
+            if c.is_whitespace() {
+                continue;
+            }
+            return c == '(';
+        }
+        false
+    }
+
     /// Consume a keyword.
     fn consume_keyword(&mut self, keyword: &str) {
         self.pos += keyword.len();
@@ -1826,15 +1842,16 @@ impl<'a> Parser<'a> {
         }
 
         // Reduction functions (no arguments)
-        if self.matches_keyword("add") {
+        // Note: If followed by '(', these should be parsed as user-defined function calls
+        if self.matches_keyword("add") && !self.peek_after_keyword_is_paren("add") {
             self.consume_keyword("add");
             return Ok(Some(Builtin::Add));
         }
-        if self.matches_keyword("any") {
+        if self.matches_keyword("any") && !self.peek_after_keyword_is_paren("any") {
             self.consume_keyword("any");
             return Ok(Some(Builtin::Any));
         }
-        if self.matches_keyword("all") {
+        if self.matches_keyword("all") && !self.peek_after_keyword_is_paren("all") {
             self.consume_keyword("all");
             return Ok(Some(Builtin::All));
         }
@@ -1849,7 +1866,7 @@ impl<'a> Parser<'a> {
             self.expect(')')?;
             return Ok(Some(Builtin::MinBy(Box::new(f))));
         }
-        if self.matches_keyword("min") {
+        if self.matches_keyword("min") && !self.peek_after_keyword_is_paren("min") {
             self.consume_keyword("min");
             return Ok(Some(Builtin::Min));
         }
@@ -1864,7 +1881,7 @@ impl<'a> Parser<'a> {
             self.expect(')')?;
             return Ok(Some(Builtin::MaxBy(Box::new(f))));
         }
-        if self.matches_keyword("max") {
+        if self.matches_keyword("max") && !self.peek_after_keyword_is_paren("max") {
             self.consume_keyword("max");
             return Ok(Some(Builtin::Max));
         }

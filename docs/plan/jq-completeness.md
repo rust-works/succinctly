@@ -22,7 +22,7 @@ The implementation is already production-ready for ~90% of jq use cases.
 | Variable binding    | Fully implemented   | 95%      |
 | User functions      | Fully implemented   | 85%      |
 | Regex functions     | Fully implemented   | 100%     |
-| Module system       | Parsed only         | 10%      |
+| Module system       | Fully implemented   | 95%      |
 | I/O operations      | Won't implement     | N/A      |
 | Assignment operators| Fully implemented   | 100%     |
 
@@ -198,27 +198,42 @@ The implementation is already production-ready for ~90% of jq use cases.
 - [x] `kind` - return node kind (scalar, seq, map) - fully working
 - [x] `key` - return current key when iterating (string for objects, int for arrays) - fully working
 
+### Module System
+- [x] `import "path" as name;` - Import module with namespace
+- [x] `include "path";` - Include module definitions into current scope
+- [x] `module {...}` - Module metadata (parsed)
+- [x] `-L path` / `--library-path` CLI option
+- [x] `JQ_LIBRARY_PATH` environment variable
+- [x] `~/.jq` auto-loading (file or directory)
+- [x] `namespace::func` - Namespaced function calls
+- [x] Parameterized functions in modules
+
 ---
 
 ## TODO: Missing Features
 
-### Priority 1: Module System
+### Priority 1: Module System ✅
 
-Currently parsed but not evaluated:
+Module system is now fully implemented:
 
-- [ ] `import "path" as name;` - Import module
-- [ ] `include "path";` - Include module inline
-- [ ] `module {...}` - Module metadata
+- [x] `import "path" as name;` - Import module with namespace
+- [x] `include "path";` - Include module inline
+- [x] `module {...}` - Module metadata (parsed, stub implementation)
+- [x] `-L path` / `--library-path` - Add library search paths
+- [x] `JQ_LIBRARY_PATH` environment variable support
+- [x] `~/.jq` auto-loading (file: auto-load definitions, directory: add to search path)
+- [x] Namespaced function calls (`module::func`)
+- [x] Functions with parameters preserved across modules
 
-**Implementation notes:**
-- Requires file system access
-- Need module resolution strategy (relative paths, library paths)
-- Consider `jq -L` style library paths
-- May want to keep this optional/feature-gated
+**Remaining limitations:**
+- `module {...}` metadata is parsed but not used at runtime
+- No `$__PROGDIR__` or module-relative paths yet
 
-### Priority 2: Advanced Features
+### Priority 2: Advanced Features ✅
 
-No remaining advanced features - label-break has been implemented!
+All advanced features have been implemented:
+
+- [x] `label $name | expr` / `break $name` - Non-local control flow
 
 **Note:** Array slicing with steps (`.[::2]`) was removed - it's Python syntax, not jq. Use `[range(0; length; 2) as $i | .[$i]]` instead.
 
@@ -307,3 +322,4 @@ echo '{"a":1}' | succinctly jq '.a'
 | 2026-01-19 | Verified `$__loc__` already implemented - returns `{file, line}` at source location (✅ complete)|
 | 2026-01-19 | Removed `.[::2]` step slicing from TODO - it's Python syntax, not jq|
 | 2026-01-20 | Added `label $name | expr` / `break $name` for non-local control flow (✅ complete)|
+| 2026-01-20 | Module system fully implemented: import, include, -L, JQ_LIBRARY_PATH, ~/.jq, namespaced calls, parameterized functions (✅ complete)|
