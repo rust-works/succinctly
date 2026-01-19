@@ -829,6 +829,14 @@ pub enum Builtin {
     Splits(Box<Expr>),
     /// `splitsFlags(re; flags)` - split string by regex with flags, outputting as stream
     SplitsFlags(Box<Expr>, Box<Expr>),
+
+    // Phase 17: Combinations
+    /// `combinations` - generate all combinations from array of arrays
+    /// Input: [[1,2], [3,4]] -> outputs [1,3], [1,4], [2,3], [2,4]
+    Combinations,
+    /// `combinations(n)` - generate n-way combinations (Cartesian product with itself n times)
+    /// Input with n=2: [1,2] -> outputs [1,1], [1,2], [2,1], [2,2]
+    CombinationsN(Box<Expr>),
 }
 
 /// Arithmetic operators.

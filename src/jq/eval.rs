@@ -1388,6 +1388,10 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         Builtin::Fromdate => builtin_fromdate(value, optional),
         Builtin::Todateiso8601 => builtin_todate(value, optional), // alias for todate
         Builtin::Fromdateiso8601 => builtin_fromdate(value, optional), // alias for fromdate
+
+        // Phase 17: Combinations
+        Builtin::Combinations => builtin_combinations(value, optional),
+        Builtin::CombinationsN(n) => builtin_combinations_n(n, value, optional),
     }
 }
 
@@ -5847,6 +5851,12 @@ fn substitute_var_in_builtin(
         Builtin::Fromdate => Builtin::Fromdate,
         Builtin::Todateiso8601 => Builtin::Todateiso8601,
         Builtin::Fromdateiso8601 => Builtin::Fromdateiso8601,
+
+        // Phase 17: Combinations
+        Builtin::Combinations => Builtin::Combinations,
+        Builtin::CombinationsN(e) => {
+            Builtin::CombinationsN(Box::new(substitute_var(e, var_name, replacement)))
+        }
     }
 }
 
@@ -8744,6 +8754,133 @@ fn parse_iso8601(input: &str) -> Result<f64, String> {
     Ok(timestamp as f64)
 }
 
+// Phase 17: Combinations
+
+/// Builtin: combinations - generate all combinations from array of arrays
+/// Input: [[1,2], [3,4]] -> outputs [1,3], [1,4], [2,3], [2,4]
+fn builtin_combinations<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Input must be an array of arrays
+    let arrays = match &value {
+        StandardJson::Array(elements) => {
+            let mut arrays: Vec<Vec<OwnedValue>> = Vec::new();
+            for elem in *elements {
+                match elem {
+                    StandardJson::Array(inner) => {
+                        let inner_values: Vec<OwnedValue> = inner.map(|v| to_owned(&v)).collect();
+                        arrays.push(inner_values);
+                    }
+                    _ if optional => return QueryResult::None,
+                    _ => {
+                        return QueryResult::Error(EvalError::type_error("array", type_name(&elem)))
+                    }
+                }
+            }
+            arrays
+        }
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    };
+
+    // If any array is empty, return no results
+    if arrays.iter().any(|a| a.is_empty()) {
+        return QueryResult::None;
+    }
+
+    // If no arrays, return empty array
+    if arrays.is_empty() {
+        return QueryResult::Owned(OwnedValue::Array(Vec::new()));
+    }
+
+    // Generate Cartesian product
+    let results = cartesian_product(&arrays);
+    QueryResult::ManyOwned(results)
+}
+
+/// Builtin: combinations(n) - generate n-way combinations (Cartesian product with itself n times)
+/// Input with n=2: [1,2] -> outputs [1,1], [1,2], [2,1], [2,2]
+fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>>(
+    n_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get n
+    let n = match result_to_owned(eval_single(n_expr, value.clone(), optional)) {
+        Ok(OwnedValue::Int(i)) if i >= 0 => i as usize,
+        Ok(OwnedValue::Int(_)) if optional => return QueryResult::None,
+        Ok(OwnedValue::Int(_)) => {
+            return QueryResult::Error(EvalError::new("combinations(n): n must be non-negative"))
+        }
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("number", "n")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Input must be an array
+    let base_array = match &value {
+        StandardJson::Array(elements) => (*elements).map(|v| to_owned(&v)).collect::<Vec<_>>(),
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    };
+
+    // n=0 returns single empty array
+    if n == 0 {
+        return QueryResult::Owned(OwnedValue::Array(Vec::new()));
+    }
+
+    // If base array is empty and n > 0, return no results
+    if base_array.is_empty() {
+        return QueryResult::None;
+    }
+
+    // Create n copies of the base array and compute Cartesian product
+    let arrays: Vec<Vec<OwnedValue>> = (0..n).map(|_| base_array.clone()).collect();
+    let results = cartesian_product(&arrays);
+    QueryResult::ManyOwned(results)
+}
+
+/// Compute the Cartesian product of a list of arrays
+fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Vec<OwnedValue> {
+    if arrays.is_empty() {
+        return vec![OwnedValue::Array(Vec::new())];
+    }
+
+    let mut results = Vec::new();
+    let mut indices = vec![0usize; arrays.len()];
+
+    loop {
+        // Build current combination
+        let combination: Vec<OwnedValue> = indices
+            .iter()
+            .enumerate()
+            .map(|(i, &idx)| arrays[i][idx].clone())
+            .collect();
+        results.push(OwnedValue::Array(combination));
+
+        // Increment indices (like counting in mixed radix)
+        let mut carry = true;
+        for i in (0..arrays.len()).rev() {
+            if carry {
+                indices[i] += 1;
+                if indices[i] >= arrays[i].len() {
+                    indices[i] = 0;
+                } else {
+                    carry = false;
+                }
+            }
+        }
+
+        // If we carried all the way through, we're done
+        if carry {
+            break;
+        }
+    }
+
+    results
+}
+
 /// Builtin: builtins - list all builtin function names
 fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
     // Return a sorted array of all builtin function names with their arity
@@ -8917,6 +9054,9 @@ fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
         "fromdate/0",
         "todateiso8601/0",
         "fromdateiso8601/0",
+        // Combinations (arity 0-1)
+        "combinations/0",
+        "combinations/1",
         // Meta (arity 0-1)
         "builtins/0",
         "modulemeta/1",
@@ -11269,6 +11409,12 @@ fn expand_func_calls_in_builtin(
         Builtin::Fromdate => Builtin::Fromdate,
         Builtin::Todateiso8601 => Builtin::Todateiso8601,
         Builtin::Fromdateiso8601 => Builtin::Fromdateiso8601,
+
+        // Phase 17: Combinations
+        Builtin::Combinations => Builtin::Combinations,
+        Builtin::CombinationsN(e) => {
+            Builtin::CombinationsN(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
     }
 }
 
@@ -11524,6 +11670,12 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::Fromdate => Builtin::Fromdate,
         Builtin::Todateiso8601 => Builtin::Todateiso8601,
         Builtin::Fromdateiso8601 => Builtin::Fromdateiso8601,
+
+        // Phase 17: Combinations
+        Builtin::Combinations => Builtin::Combinations,
+        Builtin::CombinationsN(e) => {
+            Builtin::CombinationsN(Box::new(substitute_func_param(e, param, arg)))
+        }
     }
 }
 

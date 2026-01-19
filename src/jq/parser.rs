@@ -2856,6 +2856,21 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Fromdate));
         }
 
+        // Phase 17: Combinations
+        if self.matches_keyword("combinations") {
+            self.consume_keyword("combinations");
+            self.skip_ws();
+            if self.peek() == Some('(') {
+                self.next(); // consume '('
+                self.skip_ws();
+                let n = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::CombinationsN(Box::new(n))));
+            }
+            return Ok(Some(Builtin::Combinations));
+        }
+
         Ok(None)
     }
 
