@@ -1041,16 +1041,15 @@ fn test_include_directive() -> Result<()> {
         .stderr(Stdio::piped())
         .output()?;
 
-    let _stdout = String::from_utf8(output.stdout)?;
+    let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
 
-    // Note: This test may fail if include isn't fully implemented yet
-    // For now, just verify parsing works (no parse error)
     assert!(
         !stderr.contains("compile error"),
         "Should parse include directive without error: {}",
         stderr
     );
+    assert_eq!(stdout.trim(), "42", "21 | double should equal 42");
     Ok(())
 }
 
@@ -1061,7 +1060,7 @@ fn test_import_directive() -> Result<()> {
     let module_path = temp_dir.path().join("mymod.jq");
     std::fs::write(&module_path, "def triple: . * 3;")?;
 
-    // Test import directive
+    // Test import directive with namespaced function call
     let output = Command::new("cargo")
         .args([
             "run",
@@ -1075,19 +1074,20 @@ fn test_import_directive() -> Result<()> {
             "-L",
         ])
         .arg(temp_dir.path())
-        .arg(r#"import "mymod" as m; 10"#)
+        .arg(r#"import "mymod" as m; 10 | m::triple"#)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
 
+    let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
 
-    // Verify parsing works (no parse error)
     assert!(
         !stderr.contains("compile error"),
         "Should parse import directive without error: {}",
         stderr
     );
+    assert_eq!(stdout.trim(), "30", "10 | m::triple should equal 30");
     Ok(())
 }
 
@@ -1141,15 +1141,15 @@ fn test_jq_library_path_env() -> Result<()> {
         .stderr(Stdio::piped())
         .output()?;
 
+    let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
 
-    // Verify parsing works and module is found
     assert!(
         !stderr.contains("compile error"),
         "Should parse include directive without error: {}",
         stderr
     );
-    // Note: The actual execution may fail if the function isn't fully integrated
+    assert_eq!(stdout.trim(), "20", "5 | quadruple should equal 20");
     Ok(())
 }
 
@@ -1284,14 +1284,15 @@ fn test_home_jq_dir_search_path() -> Result<()> {
         .stderr(Stdio::piped())
         .output()?;
 
+    let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
 
-    // Should parse without error
     assert!(
         !stderr.contains("compile error") && !stderr.contains("module error"),
         "Should find module in ~/.jq directory: {}",
         stderr
     );
+    assert_eq!(stdout.trim(), "1007", "7 | home_func should equal 1007");
     Ok(())
 }
 

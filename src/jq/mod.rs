@@ -81,5 +81,7 @@ pub use expr::{
     ModuleMeta, ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,
 };
 pub use lazy::JqValue;
-pub use parser::{parse, parse_program, ParseError};
+pub use parser::{
+    parse, parse_program, parse_program_with_mode, parse_with_mode, ParseError, ParserMode,
+};
 pub use value::OwnedValue;

@@ -131,6 +131,18 @@ pub enum Expr {
     /// Variable reference: `$x`
     Var(String),
 
+    /// Location reference: `$__loc__`
+    /// Returns `{"file": "<stdin>", "line": N}` where N is the 1-based line number
+    /// in the jq filter source where `$__loc__` appears.
+    Loc {
+        /// 1-based line number in the jq source
+        line: usize,
+    },
+
+    /// Environment variables: `$ENV`
+    /// Returns an object containing all environment variables.
+    Env,
+
     /// Reduce: `reduce .[] as $x (0; . + $x)`
     Reduce {
         /// Input expression (what to iterate over)
@@ -189,6 +201,19 @@ pub enum Expr {
         to: Option<Box<Expr>>,
         step: Option<Box<Expr>>,
     },
+
+    /// Label for non-local control flow: `label $name | expr`
+    /// Establishes a scope that can be exited early with `break $name`
+    Label {
+        /// Label name (without the $)
+        name: String,
+        /// Body expression
+        body: Box<Expr>,
+    },
+
+    /// Break from a labeled scope: `break $name`
+    /// Exits the nearest enclosing `label $name` scope
+    Break(String),
 
     // Phase 9: Variables & Definitions
     /// Destructuring variable binding: `. as {name: $n, age: $a} | ...`
@@ -403,6 +428,8 @@ pub enum FormatType {
     Html,
     /// @sh - shell quote
     Sh,
+    /// @urid - URI decode (percent decoding)
+    Urid,
 }
 
 /// Builtin functions supported by jq.
@@ -423,6 +450,26 @@ pub enum Builtin {
     IsArray,
     /// `isobject` - returns true if object
     IsObject,
+
+    // Type filter functions (select by type)
+    /// `values` - select non-null values (equivalent to `select(. != null)`)
+    Values,
+    /// `nulls` - select only null values
+    Nulls,
+    /// `booleans` - select only boolean values
+    Booleans,
+    /// `numbers` - select only number values
+    Numbers,
+    /// `strings` - select only string values
+    Strings,
+    /// `arrays` - select only array values
+    Arrays,
+    /// `objects` - select only object values
+    Objects,
+    /// `iterables` - select arrays and objects
+    Iterables,
+    /// `scalars` - select non-iterables (null, bool, number, string)
+    Scalars,
 
     // Length & Keys functions
     /// `length` - string/array/object length
@@ -525,6 +572,10 @@ pub enum Builtin {
     ToString,
     /// `tonumber` - convert to number
     ToNumber,
+    /// `tojson` - convert value to JSON string
+    ToJson,
+    /// `fromjson` - parse JSON string to value
+    FromJson,
 
     // Phase 6: Additional String Functions
     /// `explode` - string to array of codepoints
@@ -545,29 +596,6 @@ pub enum Builtin {
     FromJsonStream,
     /// `getpath(path)` - get value at path
     GetPath(Box<Expr>),
-
-    // Phase 7: Regular Expression Functions (requires "regex" feature)
-    /// `match(re)` or `match(re; flags)` - return match object
-    #[cfg(feature = "regex")]
-    Match(Box<Expr>, Option<String>),
-    /// `capture(re)` - return named captures as object
-    #[cfg(feature = "regex")]
-    Capture(Box<Expr>),
-    /// `scan(re)` - find all matches
-    #[cfg(feature = "regex")]
-    Scan(Box<Expr>),
-    /// `splits(re)` - split by regex (iterator version)
-    #[cfg(feature = "regex")]
-    Splits(Box<Expr>),
-    /// `sub(re; replacement)` - replace first match
-    #[cfg(feature = "regex")]
-    Sub(Box<Expr>, Box<Expr>),
-    /// `gsub(re; replacement)` - replace all matches
-    #[cfg(feature = "regex")]
-    Gsub(Box<Expr>, Box<Expr>),
-    /// `test(re; flags)` - test with flags (extends basic test)
-    #[cfg(feature = "regex")]
-    TestWithFlags(Box<Expr>, String),
 
     // Phase 8: Advanced Control Flow Builtins
     /// `recurse` - recursively apply .[] (same as recurse(.[];true))
@@ -709,9 +737,137 @@ pub enum Builtin {
     /// `pick(keys)` - select only specified keys from object/array (yq)
     Pick(Box<Expr>),
 
+    // YAML metadata functions (yq)
+    /// `tag` - return YAML type tag (!!str, !!int, !!map, etc.)
+    Tag,
+    /// `anchor` - return anchor name if present, or empty string
+    Anchor,
+    /// `style` - return scalar style (double, single, literal, folded) or collection style (flow)
+    Style,
+    /// `kind` - return node kind: "scalar", "seq", or "map"
+    Kind,
+    /// `key` - return the current key when iterating (yq)
+    Key,
+
     // Phase 11: Path manipulation
     /// `del(path)` - delete value at path
     Del(Box<Expr>),
+
+    // Phase 12: Additional builtins
+    /// `now` - current Unix timestamp
+    Now,
+    /// `abs` - absolute value (alias for fabs)
+    Abs,
+    /// `builtins` - list all builtin function names
+    Builtins,
+    /// `normals` - select only normal numbers (not zero, infinite, NaN, or subnormal)
+    Normals,
+    /// `finites` - select only finite numbers (not infinite or NaN)
+    Finites,
+
+    // Phase 13: Iteration control
+    /// `limit(n; expr)` - output at most n values from expr
+    Limit(Box<Expr>, Box<Expr>),
+    /// `first(expr)` - output only the first value from expr (sugar for limit(1; expr))
+    /// Note: no-arg `first` uses `Builtin::First` from Phase 5
+    FirstStream(Box<Expr>),
+    /// `last(expr)` - output only the last value from expr
+    /// Note: no-arg `last` uses `Builtin::Last` from Phase 5
+    LastStream(Box<Expr>),
+    /// `nth(n; expr)` - output only the nth value from expr (0-indexed)
+    /// Note: no-arg `nth(n)` uses `Builtin::Nth` from Phase 5
+    NthStream(Box<Expr>, Box<Expr>),
+    /// `range(n)` - generate integers from 0 to n-1
+    Range(Box<Expr>),
+    /// `range(from; upto)` - generate integers from `from` to `upto-1`
+    RangeFromTo(Box<Expr>, Box<Expr>),
+    /// `range(from; upto; by)` - generate integers from `from` to `upto-1` stepping by `by`
+    RangeFromToBy(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `isempty(expr)` - returns true if expr produces no outputs
+    IsEmpty(Box<Expr>),
+
+    // Phase 14: Recursive traversal (extends Phase 8)
+    /// `recurse_down` - recurse downward (alias for recurse)
+    RecurseDown,
+
+    // Phase 15: Date/Time functions
+    /// `gmtime` - convert Unix timestamp to broken-down UTC time
+    /// Returns [year, month(0-11), day(1-31), hour, minute, second, weekday(0-6), yearday(0-365)]
+    Gmtime,
+    /// `localtime` - convert Unix timestamp to broken-down local time
+    /// Returns [year, month(0-11), day(1-31), hour, minute, second, weekday(0-6), yearday(0-365)]
+    Localtime,
+    /// `mktime` - convert broken-down time to Unix timestamp
+    Mktime,
+    /// `strftime(fmt)` - format broken-down time as string
+    Strftime(Box<Expr>),
+    /// `strptime(fmt)` - parse string to broken-down time
+    Strptime(Box<Expr>),
+    /// `todate` - convert Unix timestamp to ISO 8601 date string (alias for todateiso8601)
+    Todate,
+    /// `fromdate` - parse ISO 8601 date string to Unix timestamp (alias for fromdateiso8601)
+    Fromdate,
+    /// `todateiso8601` - convert Unix timestamp to ISO 8601 date string
+    Todateiso8601,
+    /// `fromdateiso8601` - parse ISO 8601 date string to Unix timestamp
+    Fromdateiso8601,
+
+    // Phase 16: Regex functions
+    /// `test(re; flags)` - test if regex matches with flags
+    /// Flags: "i" (case insensitive), "x" (extended), "s" (single-line), "m" (multi-line), "g" (global)
+    TestFlags(Box<Expr>, Box<Expr>),
+    /// `match(re)` - find first regex match, returning {offset, length, string, captures}
+    Match(Box<Expr>),
+    /// `match(re; flags)` - find regex match(es) with flags
+    MatchFlags(Box<Expr>, Box<Expr>),
+    /// `capture(re)` - capture named groups from first match, returning {name: value, ...}
+    Capture(Box<Expr>),
+    /// `capture(re; flags)` - capture named groups with flags
+    CaptureFlags(Box<Expr>, Box<Expr>),
+    /// `sub(re; replacement)` - replace first match
+    Sub(Box<Expr>, Box<Expr>),
+    /// `sub(re; replacement; flags)` - replace first match with flags
+    SubFlags(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `gsub(re; replacement)` - replace all matches
+    Gsub(Box<Expr>, Box<Expr>),
+    /// `gsub(re; replacement; flags)` - replace all matches with flags
+    GsubFlags(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `scan(re)` - find all matches, outputting each as a stream
+    Scan(Box<Expr>),
+    /// `scan(re; flags)` - find all matches with flags
+    ScanFlags(Box<Expr>, Box<Expr>),
+    /// `split(re; flags)` - split string by regex with flags
+    SplitRegex(Box<Expr>, Box<Expr>),
+    /// `splits(re)` - split string by regex, outputting as stream
+    Splits(Box<Expr>),
+    /// `splitsFlags(re; flags)` - split string by regex with flags, outputting as stream
+    SplitsFlags(Box<Expr>, Box<Expr>),
+
+    // Phase 17: Combinations
+    /// `combinations` - generate all combinations from array of arrays
+    ///
+    /// Input: `[[1,2], [3,4]]` -> outputs `[1,3]`, `[1,4]`, `[2,3]`, `[2,4]`
+    Combinations,
+    /// `combinations(n)` - generate n-way combinations (Cartesian product with itself n times)
+    ///
+    /// Input with n=2: `[1,2]` -> outputs `[1,1]`, `[1,2]`, `[2,1]`, `[2,2]`
+    CombinationsN(Box<Expr>),
+
+    // Phase 18: Additional math functions
+    /// `trunc` - truncate toward zero (remove fractional part)
+    /// 2.7 -> 2, -2.7 -> -2
+    Trunc,
+
+    // Phase 19: Type conversion
+    /// `toboolean` - convert to boolean
+    /// Accepts: true, false, "true", "false"
+    /// Errors on other types
+    ToBoolean,
+
+    // Phase 20: Iteration control extension
+    /// `skip(n; expr)` - skip first n outputs from expr
+    /// Outputs all remaining values after skipping the first n
+    Skip(Box<Expr>, Box<Expr>),
 }
 
 /// Arithmetic operators.

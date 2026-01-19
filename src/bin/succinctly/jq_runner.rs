@@ -91,10 +91,10 @@ pub struct EvalContext {
 pub struct ModuleLoader {
     /// Search path for modules (in order of priority)
     search_path: Vec<PathBuf>,
-    /// Loaded modules (path -> function definitions)
-    loaded_modules: BTreeMap<String, Vec<(String, Expr)>>,
-    /// Auto-loaded ~/.jq file definitions (if file exists)
-    auto_loaded_defs: Vec<(String, Expr)>,
+    /// Loaded modules (path -> function definitions: name, params, body)
+    loaded_modules: BTreeMap<String, Vec<(String, Vec<String>, Expr)>>,
+    /// Auto-loaded ~/.jq file definitions (if file exists): name, params, body
+    auto_loaded_defs: Vec<(String, Vec<String>, Expr)>,
 }
 
 impl ModuleLoader {
@@ -163,8 +163,8 @@ impl ModuleLoader {
         None
     }
 
-    /// Load a module and return its function definitions.
-    pub fn load_module(&mut self, module_path: &str) -> Result<Vec<(String, Expr)>> {
+    /// Load a module and return its function definitions (name, params, body).
+    pub fn load_module(&mut self, module_path: &str) -> Result<Vec<(String, Vec<String>, Expr)>> {
         // Check if already loaded
         if let Some(defs) = self.loaded_modules.get(module_path) {
             return Ok(defs.clone());
@@ -198,10 +198,10 @@ impl ModuleLoader {
         let mut expr = program.expr.clone();
 
         // First, prepend auto-loaded ~/.jq definitions (lowest priority, can be overridden)
-        for (name, body) in self.auto_loaded_defs.clone().into_iter().rev() {
+        for (name, params, body) in self.auto_loaded_defs.clone().into_iter().rev() {
             expr = Expr::FuncDef {
                 name,
-                params: Vec::new(),
+                params,
                 body: Box::new(body),
                 then: Box::new(expr),
             };
@@ -211,10 +211,10 @@ impl ModuleLoader {
         for include in &program.includes {
             let defs = self.load_module(&include.path)?;
             // Wrap expression with function definitions from the included module
-            for (name, body) in defs.into_iter().rev() {
+            for (name, params, body) in defs.into_iter().rev() {
                 expr = Expr::FuncDef {
                     name,
-                    params: Vec::new(), // We'll need to extract params too
+                    params,
                     body: Box::new(body),
                     then: Box::new(expr),
                 };
@@ -228,11 +228,11 @@ impl ModuleLoader {
             let namespace = &import.alias;
 
             // Add each function with a namespaced name (namespace::funcname)
-            for (name, body) in defs.into_iter().rev() {
+            for (name, params, body) in defs.into_iter().rev() {
                 let namespaced_name = format!("{}::{}", namespace, name);
                 expr = Expr::FuncDef {
                     name: namespaced_name,
-                    params: Vec::new(),
+                    params,
                     body: Box::new(body),
                     then: Box::new(expr),
                 };
@@ -433,6 +433,12 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             path: Box::new(rewrite_namespaced_calls(*path)),
             value: Box::new(rewrite_namespaced_calls(*value)),
         },
+        // Label-break
+        Expr::Label { name, body } => Expr::Label {
+            name,
+            body: Box::new(rewrite_namespaced_calls(*body)),
+        },
+        Expr::Break(name) => Expr::Break(name),
         // Expressions that don't contain sub-expressions - return as-is
         Expr::Identity
         | Expr::Field(_)
@@ -442,22 +448,27 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
         | Expr::RecursiveDescent
         | Expr::Literal(_)
         | Expr::Var(_)
+        | Expr::Loc { .. }
+        | Expr::Env
         | Expr::Not
         | Expr::Format(_)
         | Expr::Builtin(_) => expr,
     }
 }
 
-/// Extract function definitions from an expression.
-fn extract_func_defs(expr: &Expr) -> Vec<(String, Expr)> {
+/// Extract function definitions from an expression, preserving parameters.
+fn extract_func_defs(expr: &Expr) -> Vec<(String, Vec<String>, Expr)> {
     let mut defs = Vec::new();
 
-    fn extract_inner(expr: &Expr, defs: &mut Vec<(String, Expr)>) {
+    fn extract_inner(expr: &Expr, defs: &mut Vec<(String, Vec<String>, Expr)>) {
         if let Expr::FuncDef {
-            name, body, then, ..
+            name,
+            params,
+            body,
+            then,
         } = expr
         {
-            defs.push((name.clone(), (**body).clone()));
+            defs.push((name.clone(), params.clone(), (**body).clone()));
             extract_inner(then, defs);
         }
     }
@@ -1293,6 +1304,10 @@ fn evaluate_input(
         }
         QueryResult::Owned(v) => Ok(vec![v]),
         QueryResult::ManyOwned(vs) => Ok(vs),
+        QueryResult::Break(label) => {
+            eprintln!("jq: error: break ${} not in label", label);
+            Ok(vec![])
+        }
     }
 }
 
@@ -1368,6 +1383,10 @@ fn query_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         }
         QueryResult::Owned(v) => vec![JqValue::from_owned(v)],
         QueryResult::ManyOwned(vs) => vs.into_iter().map(JqValue::from_owned).collect(),
+        QueryResult::Break(label) => {
+            eprintln!("jq: error: break ${} not in label", label);
+            vec![]
+        }
     }
 }
 

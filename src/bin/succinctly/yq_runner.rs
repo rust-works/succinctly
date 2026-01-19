@@ -316,6 +316,10 @@ fn evaluate_input(
         }
         QueryResult::Owned(v) => Ok(vec![v]),
         QueryResult::ManyOwned(vs) => Ok(vs),
+        QueryResult::Break(label) => {
+            eprintln!("yq: error: break ${} not in label", label);
+            Ok(vec![])
+        }
     }
 }
 
@@ -948,9 +952,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         args.filter.clone().unwrap_or_else(|| ".".to_string())
     };
 
-    // Parse the jq program
-    let program =
-        jq::parse_program(&filter_str).map_err(|e| anyhow::anyhow!("parse error: {}", e))?;
+    // Parse the jq program (use Yq mode for extended identifier syntax like kebab-case)
+    let program = jq::parse_program_with_mode(&filter_str, jq::ParserMode::Yq)
+        .map_err(|e| anyhow::anyhow!("parse error: {}", e))?;
 
     // Parse variables
     let context = parse_variables(&args)?;

@@ -50,6 +50,10 @@ pub enum QueryResult<'a, W = Vec<u64>> {
 
     /// Multiple owned values.
     ManyOwned(Vec<OwnedValue>),
+
+    /// Break from a labeled scope.
+    /// Contains the label name to match against enclosing Label expressions.
+    Break(String),
 }
 
 impl<'a, W: Clone + AsRef<[u64]>> QueryResult<'a, W> {
@@ -151,12 +155,13 @@ fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue 
     }
 }
 
-/// Check if an expression contains PathNoArg or Parent builtins that need path context.
+/// Check if an expression contains PathNoArg, Parent, or Key builtins that need path context.
 fn needs_path_context(expr: &Expr) -> bool {
     match expr {
         Expr::Builtin(Builtin::PathNoArg) => true,
         Expr::Builtin(Builtin::Parent) => true,
         Expr::Builtin(Builtin::ParentN(_)) => true,
+        Expr::Builtin(Builtin::Key) => true,
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_context),
         Expr::Paren(inner) => needs_path_context(inner),
         Expr::Optional(inner) => needs_path_context(inner),
@@ -283,6 +288,18 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
             // In practice, variables are resolved by eval_as which substitutes them
             QueryResult::Error(EvalError::new(format!("undefined variable: ${}", name)))
         }
+        Expr::Loc { line } => {
+            // $__loc__ returns {"file": "<stdin>", "line": N}
+            // where N is the 1-based line number in the jq filter source
+            let mut obj = IndexMap::new();
+            obj.insert("file".into(), OwnedValue::String("<stdin>".into()));
+            obj.insert("line".into(), OwnedValue::Int(*line as i64));
+            QueryResult::Owned(OwnedValue::Object(obj))
+        }
+        Expr::Env => {
+            // $ENV returns an object containing all environment variables
+            eval_env(optional)
+        }
         Expr::Reduce {
             input,
             var,
@@ -352,6 +369,10 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
         Expr::AlternativeAssign { path, value: val } => {
             eval_alternative_assign(path, val, value, optional)
         }
+
+        // Label-break for non-local control flow
+        Expr::Label { name, body } => eval_label(name, body, value, optional),
+        Expr::Break(name) => QueryResult::Break(name.clone()),
     }
 }
 
@@ -397,6 +418,7 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>>(
             }
             QueryResult::None => {}
             QueryResult::Error(e) => return QueryResult::Error(e),
+            QueryResult::Break(label) => return QueryResult::Break(label),
         }
     }
 
@@ -433,6 +455,7 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::ManyOwned(vs) => vs,
         QueryResult::None => vec![],
         QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
     };
 
     QueryResult::Owned(OwnedValue::Array(items))
@@ -462,6 +485,7 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>>(
                     }
                     QueryResult::Owned(OwnedValue::String(s)) => s,
                     QueryResult::Error(e) => return QueryResult::Error(e),
+                    QueryResult::Break(label) => return QueryResult::Break(label),
                     _ => {
                         return QueryResult::Error(EvalError::new("key must be a string"));
                     }
@@ -492,6 +516,7 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>>(
             }
             QueryResult::None => OwnedValue::Null,
             QueryResult::Error(e) => return QueryResult::Error(e),
+            QueryResult::Break(label) => return QueryResult::Break(label),
         };
 
         map.insert(key_str, owned_val);
@@ -555,6 +580,7 @@ fn result_to_owned<W: Clone + AsRef<[u64]>>(
         }
         QueryResult::None => Err(EvalError::new("no value")),
         QueryResult::Error(e) => Err(e),
+        QueryResult::Break(label) => Err(EvalError::new(format!("break ${} not in label", label))),
     }
 }
 
@@ -913,6 +939,7 @@ fn eval_alternative<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::ManyOwned(vs) => vs.first().map(|v| v.is_truthy()).unwrap_or(false),
         QueryResult::None => false,
         QueryResult::Error(_) => false,
+        QueryResult::Break(label) => return QueryResult::Break(label.clone()),
     };
 
     if is_truthy {
@@ -942,6 +969,7 @@ fn eval_if<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::ManyOwned(vs) => vs.first().map(|v| v.is_truthy()).unwrap_or(false),
         QueryResult::None => false,
         QueryResult::Error(e) => return QueryResult::Error(e.clone()),
+        QueryResult::Break(label) => return QueryResult::Break(label.clone()),
     };
 
     if is_truthy {
@@ -968,6 +996,23 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>>(
             None => QueryResult::None,
         },
         // Non-error results pass through
+        other => other,
+    }
+}
+
+/// Evaluate label expression.
+/// `label $name | expr` establishes a scope that can be exited with `break $name`.
+fn eval_label<'a, W: Clone + AsRef<[u64]>>(
+    name: &str,
+    body: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let result = eval_single(body, value, optional);
+    match result {
+        // If we get a Break with matching label, convert to empty output
+        QueryResult::Break(label) if label == name => QueryResult::None,
+        // Non-matching breaks propagate up
         other => other,
     }
 }
@@ -1032,6 +1077,87 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(OwnedValue::Bool(matches!(value, StandardJson::Object(_))))
         }
 
+        // Type filter functions (select by type)
+        // These return the input unchanged if the type matches, or nothing otherwise
+        Builtin::Values => {
+            // values - select non-null values
+            if matches!(value, StandardJson::Null) {
+                QueryResult::None
+            } else {
+                QueryResult::One(value)
+            }
+        }
+        Builtin::Nulls => {
+            // nulls - select only null values
+            if matches!(value, StandardJson::Null) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+        Builtin::Booleans => {
+            // booleans - select only boolean values
+            if matches!(value, StandardJson::Bool(_)) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+        Builtin::Numbers => {
+            // numbers - select only number values
+            if matches!(value, StandardJson::Number(_)) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+        Builtin::Strings => {
+            // strings - select only string values
+            if matches!(value, StandardJson::String(_)) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+        Builtin::Arrays => {
+            // arrays - select only array values
+            if matches!(value, StandardJson::Array(_)) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+        Builtin::Objects => {
+            // objects - select only object values
+            if matches!(value, StandardJson::Object(_)) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+        Builtin::Iterables => {
+            // iterables - select arrays and objects
+            if matches!(value, StandardJson::Array(_) | StandardJson::Object(_)) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+        Builtin::Scalars => {
+            // scalars - select non-iterables (null, bool, number, string)
+            if matches!(
+                value,
+                StandardJson::Null
+                    | StandardJson::Bool(_)
+                    | StandardJson::Number(_)
+                    | StandardJson::String(_)
+            ) {
+                QueryResult::One(value)
+            } else {
+                QueryResult::None
+            }
+        }
+
         // Length & Keys
         Builtin::Length => builtin_length(value, optional),
         Builtin::Utf8ByteLength => builtin_utf8bytelength(value, optional),
@@ -1090,6 +1216,8 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         // Phase 6: Type Conversions
         Builtin::ToString => builtin_tostring(value, optional),
         Builtin::ToNumber => builtin_tonumber(value, optional),
+        Builtin::ToJson => builtin_tojson(value, optional),
+        Builtin::FromJson => builtin_fromjson(value, optional),
 
         // Phase 6: Additional String Functions
         Builtin::Explode => builtin_explode(value, optional),
@@ -1102,21 +1230,57 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         Builtin::FromJsonStream => builtin_fromjsonstream(value, optional),
         Builtin::GetPath(path) => builtin_getpath(path, value, optional),
 
-        // Phase 7: Regex Functions (requires "regex" feature)
+        // Phase 16: Regex Functions
         #[cfg(feature = "regex")]
-        Builtin::Match(re, flags) => builtin_match(re, flags.as_deref(), value, optional),
+        Builtin::TestFlags(re, flags) => builtin_test_flags(re, flags, value, optional),
+        #[cfg(feature = "regex")]
+        Builtin::Match(re) => builtin_match(re, None, value, optional),
+        #[cfg(feature = "regex")]
+        Builtin::MatchFlags(re, flags) => builtin_match_flags(re, flags, value, optional),
         #[cfg(feature = "regex")]
         Builtin::Capture(re) => builtin_capture(re, value, optional),
         #[cfg(feature = "regex")]
-        Builtin::Scan(re) => builtin_scan(re, value, optional),
-        #[cfg(feature = "regex")]
-        Builtin::Splits(re) => builtin_splits(re, value, optional),
+        Builtin::CaptureFlags(re, flags) => builtin_capture_flags(re, flags, value, optional),
         #[cfg(feature = "regex")]
         Builtin::Sub(re, replacement) => builtin_sub(re, replacement, value, optional),
         #[cfg(feature = "regex")]
+        Builtin::SubFlags(re, replacement, flags) => {
+            builtin_sub_flags(re, replacement, flags, value, optional)
+        }
+        #[cfg(feature = "regex")]
         Builtin::Gsub(re, replacement) => builtin_gsub(re, replacement, value, optional),
         #[cfg(feature = "regex")]
-        Builtin::TestWithFlags(re, flags) => builtin_test_with_flags(re, flags, value, optional),
+        Builtin::GsubFlags(re, replacement, flags) => {
+            builtin_gsub_flags(re, replacement, flags, value, optional)
+        }
+        #[cfg(feature = "regex")]
+        Builtin::Scan(re) => builtin_scan(re, value, optional),
+        #[cfg(feature = "regex")]
+        Builtin::ScanFlags(re, flags) => builtin_scan_flags(re, flags, value, optional),
+        #[cfg(feature = "regex")]
+        Builtin::SplitRegex(re, flags) => builtin_split_regex(re, flags, value, optional),
+        #[cfg(feature = "regex")]
+        Builtin::Splits(re) => builtin_splits(re, value, optional),
+        #[cfg(feature = "regex")]
+        Builtin::SplitsFlags(re, flags) => builtin_splits_flags(re, flags, value, optional),
+        // Non-regex fallbacks for when regex feature is not enabled
+        #[cfg(not(feature = "regex"))]
+        Builtin::TestFlags(_, _)
+        | Builtin::Match(_)
+        | Builtin::MatchFlags(_, _)
+        | Builtin::Capture(_)
+        | Builtin::CaptureFlags(_, _)
+        | Builtin::Sub(_, _)
+        | Builtin::SubFlags(_, _, _)
+        | Builtin::Gsub(_, _)
+        | Builtin::GsubFlags(_, _, _)
+        | Builtin::Scan(_)
+        | Builtin::ScanFlags(_, _)
+        | Builtin::SplitRegex(_, _)
+        | Builtin::Splits(_)
+        | Builtin::SplitsFlags(_, _) => {
+            QueryResult::Error(EvalError::new("regex feature not enabled"))
+        }
 
         // Phase 8: Advanced Control Flow Builtins
         Builtin::Recurse => builtin_recurse(value, optional),
@@ -1210,8 +1374,65 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         Builtin::ModuleMeta(name) => builtin_modulemeta(name, value, optional),
         Builtin::Pick(keys) => builtin_pick(keys, value, optional),
 
+        // YAML metadata functions (yq)
+        Builtin::Tag => builtin_tag(value),
+        Builtin::Anchor => builtin_anchor(),
+        Builtin::Style => builtin_style(value),
+        Builtin::Kind => builtin_kind(value),
+        Builtin::Key => {
+            // Key requires path context which is handled in eval_pipe_with_context
+            // If we reach here without context, return null (at root level)
+            QueryResult::Owned(OwnedValue::Null)
+        }
+
         // Phase 11: Path manipulation
         Builtin::Del(path) => builtin_del(path, value, optional),
+
+        // Phase 12: Additional builtins
+        Builtin::Now => builtin_now(),
+        Builtin::Abs => builtin_fabs(value, optional), // abs is an alias for fabs
+        Builtin::Builtins => builtin_builtins(),
+        Builtin::Normals => builtin_normals(value),
+        Builtin::Finites => builtin_finites(value),
+
+        // Phase 13: Iteration control
+        Builtin::Limit(n_expr, expr) => builtin_limit(n_expr, expr, value, optional),
+        Builtin::FirstStream(expr) => builtin_first_stream(expr, value, optional),
+        Builtin::LastStream(expr) => builtin_last_stream(expr, value, optional),
+        Builtin::NthStream(n_expr, expr) => builtin_nth_stream(n_expr, expr, value, optional),
+        Builtin::Range(n) => builtin_range(n, value, optional),
+        Builtin::RangeFromTo(from, to) => builtin_range_from_to(from, to, value, optional),
+        Builtin::RangeFromToBy(from, to, by) => {
+            builtin_range_from_to_by(from, to, by, value, optional)
+        }
+        Builtin::IsEmpty(expr) => builtin_isempty(expr, value, optional),
+
+        // Phase 14: Recursive traversal (extends Phase 8)
+        Builtin::RecurseDown => builtin_recurse(value, optional), // alias for recurse
+
+        // Phase 15: Date/Time functions
+        Builtin::Gmtime => builtin_gmtime(value, optional),
+        Builtin::Localtime => builtin_localtime(value, optional),
+        Builtin::Mktime => builtin_mktime(value, optional),
+        Builtin::Strftime(fmt) => builtin_strftime(fmt, value, optional),
+        Builtin::Strptime(fmt) => builtin_strptime(fmt, value, optional),
+        Builtin::Todate => builtin_todate(value, optional),
+        Builtin::Fromdate => builtin_fromdate(value, optional),
+        Builtin::Todateiso8601 => builtin_todate(value, optional), // alias for todate
+        Builtin::Fromdateiso8601 => builtin_fromdate(value, optional), // alias for fromdate
+
+        // Phase 17: Combinations
+        Builtin::Combinations => builtin_combinations(value, optional),
+        Builtin::CombinationsN(n) => builtin_combinations_n(n, value, optional),
+
+        // Phase 18: Additional math functions
+        Builtin::Trunc => builtin_trunc(value, optional),
+
+        // Phase 19: Type conversion
+        Builtin::ToBoolean => builtin_toboolean(value, optional),
+
+        // Phase 20: Iteration control extension
+        Builtin::Skip(n_expr, expr) => builtin_skip(n_expr, expr, value, optional),
     }
 }
 
@@ -1424,6 +1645,7 @@ fn builtin_select<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::ManyOwned(vs) => vs.first().map(|v| v.is_truthy()).unwrap_or(false),
         QueryResult::None => false,
         QueryResult::Error(e) => return QueryResult::Error(e.clone()),
+        QueryResult::Break(label) => return QueryResult::Break(label.clone()),
     };
 
     if is_truthy {
@@ -1452,6 +1674,7 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>>(
                     QueryResult::ManyOwned(vs) => results.extend(vs),
                     QueryResult::None => {}
                     QueryResult::Error(e) => return QueryResult::Error(e),
+                    QueryResult::Break(label) => return QueryResult::Break(label),
                 }
             }
             QueryResult::Owned(OwnedValue::Array(results))
@@ -1504,6 +1727,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>>(
                     }
                     QueryResult::None => {}
                     QueryResult::Error(e) => return QueryResult::Error(e),
+                    QueryResult::Break(label) => return QueryResult::Break(label),
                 }
             }
             QueryResult::Owned(OwnedValue::Object(result_map))
@@ -1528,6 +1752,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>>(
                     }
                     QueryResult::None => {}
                     QueryResult::Error(e) => return QueryResult::Error(e),
+                    QueryResult::Break(label) => return QueryResult::Break(label),
                 }
             }
             QueryResult::Owned(OwnedValue::Array(results))
@@ -2436,6 +2661,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>>(
                     QueryResult::ManyOwned(vs) => transformed.extend(vs),
                     QueryResult::None => {}
                     QueryResult::Error(e) => return QueryResult::Error(e),
+                    QueryResult::Break(label) => return QueryResult::Break(label),
                 }
             }
 
@@ -2509,6 +2735,7 @@ fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>>(
                     }
                     QueryResult::None => String::new(),
                     QueryResult::Error(e) => return QueryResult::Error(e),
+                    QueryResult::Break(label) => return QueryResult::Break(label),
                 };
                 result.push_str(&s);
             }
@@ -2550,6 +2777,7 @@ fn eval_format<'a, W: Clone + AsRef<[u64]>>(
         FormatType::Base64d => format_base64d(&owned, optional),
         FormatType::Html => format_html(&owned, optional),
         FormatType::Sh => format_sh(&owned, optional),
+        FormatType::Urid => format_urid(&owned, optional),
     };
 
     match result {
@@ -2581,6 +2809,37 @@ fn format_uri(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
                         result.push_str(&format!("%{:02X}", b));
                     }
                 }
+            }
+            Ok(result)
+        }
+        _ if optional => Ok(String::new()),
+        _ => Err(EvalError::type_error("string", value.type_name())),
+    }
+}
+
+/// @urid - URI/percent decode
+fn format_urid(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+    match value {
+        OwnedValue::String(s) => {
+            let mut result = String::new();
+            let bytes = s.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' && i + 2 < bytes.len() {
+                    // Try to parse the next two characters as hex
+                    if let (Some(h1), Some(h2)) = (
+                        (bytes[i + 1] as char).to_digit(16),
+                        (bytes[i + 2] as char).to_digit(16),
+                    ) {
+                        let decoded = (h1 * 16 + h2) as u8;
+                        result.push(decoded as char);
+                        i += 3;
+                        continue;
+                    }
+                }
+                // Not a valid percent-encoded sequence, just copy the character
+                result.push(bytes[i] as char);
+                i += 1;
             }
             Ok(result)
         }
@@ -2854,6 +3113,512 @@ fn builtin_tonumber<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Builtin: toboolean - convert to boolean
+/// Accepts: true, false, "true", "false"
+fn builtin_toboolean<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match &value {
+        StandardJson::Bool(b) => QueryResult::Owned(OwnedValue::Bool(*b)),
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                match cow.as_ref() {
+                    "true" => QueryResult::Owned(OwnedValue::Bool(true)),
+                    "false" => QueryResult::Owned(OwnedValue::Bool(false)),
+                    _ if optional => QueryResult::None,
+                    other => QueryResult::Error(EvalError::new(format!(
+                        "string ({:?}) cannot be parsed as a boolean",
+                        other
+                    ))),
+                }
+            } else if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(EvalError::new("invalid string"))
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::new(format!(
+            "{} cannot be parsed as a boolean",
+            type_name(&value)
+        ))),
+    }
+}
+
+/// Builtin: skip(n; expr) - skip first n outputs from expr
+fn builtin_skip<'a, W: Clone + AsRef<[u64]>>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate n
+    let n_result = eval_single(n_expr, value.clone(), optional);
+    let n = match n_result {
+        QueryResult::One(v) => {
+            if let StandardJson::Number(num) = v {
+                num.as_i64().unwrap_or(0) as usize
+            } else {
+                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
+            }
+        }
+        QueryResult::Owned(OwnedValue::Int(i)) => i as usize,
+        QueryResult::Owned(OwnedValue::Float(f)) => f as usize,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
+    };
+
+    // Evaluate expr and skip first n results
+    let result = eval_single(expr, value, optional);
+    match result {
+        QueryResult::One(v) => {
+            if n == 0 {
+                QueryResult::Owned(to_owned(&v))
+            } else {
+                QueryResult::None
+            }
+        }
+        QueryResult::OneCursor(c) => {
+            if n == 0 {
+                QueryResult::Owned(to_owned(&c.value()))
+            } else {
+                QueryResult::None
+            }
+        }
+        QueryResult::Owned(v) => {
+            if n == 0 {
+                QueryResult::Owned(v)
+            } else {
+                QueryResult::None
+            }
+        }
+        QueryResult::Many(results) => {
+            let skipped: Vec<OwnedValue> =
+                results.into_iter().skip(n).map(|v| to_owned(&v)).collect();
+            if skipped.is_empty() {
+                QueryResult::None
+            } else if skipped.len() == 1 {
+                QueryResult::Owned(skipped.into_iter().next().unwrap())
+            } else {
+                QueryResult::ManyOwned(skipped)
+            }
+        }
+        QueryResult::ManyOwned(results) => {
+            let skipped: Vec<OwnedValue> = results.into_iter().skip(n).collect();
+            if skipped.is_empty() {
+                QueryResult::None
+            } else if skipped.len() == 1 {
+                QueryResult::Owned(skipped.into_iter().next().unwrap())
+            } else {
+                QueryResult::ManyOwned(skipped)
+            }
+        }
+        QueryResult::None => QueryResult::None,
+        QueryResult::Error(e) => QueryResult::Error(e),
+        QueryResult::Break(label) => QueryResult::Break(label),
+    }
+}
+
+/// Builtin: tojson - convert any value to JSON string
+fn builtin_tojson<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    _optional: bool,
+) -> QueryResult<'a, W> {
+    let owned = to_owned(&value);
+    let json_string = owned.to_json();
+    QueryResult::Owned(OwnedValue::String(json_string))
+}
+
+/// Builtin: fromjson - parse JSON string to value
+fn builtin_fromjson<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match &value {
+        StandardJson::String(s) => {
+            if let Ok(cow) = s.as_str() {
+                let json_str = cow.as_ref();
+                // Parse the JSON string
+                match parse_json_string(json_str) {
+                    Ok(owned) => QueryResult::Owned(owned),
+                    Err(_) if optional => QueryResult::None,
+                    Err(e) => QueryResult::Error(EvalError::new(format!("fromjson: {}", e))),
+                }
+            } else if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(EvalError::new("invalid string"))
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    }
+}
+
+/// Parse a JSON string into an OwnedValue
+fn parse_json_string(s: &str) -> Result<OwnedValue, String> {
+    let bytes = s.as_bytes();
+    let mut pos = 0;
+
+    // Skip whitespace
+    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
+        pos += 1;
+    }
+
+    if pos >= bytes.len() {
+        return Err("empty input".to_string());
+    }
+
+    parse_json_value(bytes, &mut pos)
+}
+
+/// Parse a JSON value starting at the given position
+fn parse_json_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+    // Skip whitespace
+    while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+        *pos += 1;
+    }
+
+    if *pos >= bytes.len() {
+        return Err("unexpected end of input".to_string());
+    }
+
+    match bytes[*pos] {
+        b'n' => {
+            // null
+            if bytes[*pos..].starts_with(b"null") {
+                *pos += 4;
+                Ok(OwnedValue::Null)
+            } else {
+                Err("expected 'null'".to_string())
+            }
+        }
+        b't' => {
+            // true
+            if bytes[*pos..].starts_with(b"true") {
+                *pos += 4;
+                Ok(OwnedValue::Bool(true))
+            } else {
+                Err("expected 'true'".to_string())
+            }
+        }
+        b'f' => {
+            // false
+            if bytes[*pos..].starts_with(b"false") {
+                *pos += 5;
+                Ok(OwnedValue::Bool(false))
+            } else {
+                Err("expected 'false'".to_string())
+            }
+        }
+        b'"' => {
+            // string
+            parse_json_string_value(bytes, pos)
+        }
+        b'[' => {
+            // array
+            parse_json_array(bytes, pos)
+        }
+        b'{' => {
+            // object
+            parse_json_object(bytes, pos)
+        }
+        b'-' | b'0'..=b'9' => {
+            // number
+            parse_json_number(bytes, pos)
+        }
+        c => Err(format!("unexpected character: '{}'", c as char)),
+    }
+}
+
+/// Parse a JSON string value
+fn parse_json_string_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+    if bytes[*pos] != b'"' {
+        return Err("expected '\"'".to_string());
+    }
+    *pos += 1;
+
+    let mut result = String::new();
+    while *pos < bytes.len() {
+        match bytes[*pos] {
+            b'"' => {
+                *pos += 1;
+                return Ok(OwnedValue::String(result));
+            }
+            b'\\' => {
+                *pos += 1;
+                if *pos >= bytes.len() {
+                    return Err("unexpected end of string".to_string());
+                }
+                match bytes[*pos] {
+                    b'"' => result.push('"'),
+                    b'\\' => result.push('\\'),
+                    b'/' => result.push('/'),
+                    b'b' => result.push('\x08'),
+                    b'f' => result.push('\x0C'),
+                    b'n' => result.push('\n'),
+                    b'r' => result.push('\r'),
+                    b't' => result.push('\t'),
+                    b'u' => {
+                        // Unicode escape
+                        *pos += 1;
+                        if *pos + 4 > bytes.len() {
+                            return Err("invalid unicode escape".to_string());
+                        }
+                        let hex = core::str::from_utf8(&bytes[*pos..*pos + 4])
+                            .map_err(|_| "invalid unicode escape")?;
+                        let codepoint =
+                            u32::from_str_radix(hex, 16).map_err(|_| "invalid unicode escape")?;
+
+                        // Handle surrogate pairs
+                        if (0xD800..=0xDBFF).contains(&codepoint) {
+                            // High surrogate - look for low surrogate
+                            *pos += 4;
+                            if *pos + 6 <= bytes.len()
+                                && bytes[*pos] == b'\\'
+                                && bytes[*pos + 1] == b'u'
+                            {
+                                let hex2 = core::str::from_utf8(&bytes[*pos + 2..*pos + 6])
+                                    .map_err(|_| "invalid unicode escape")?;
+                                let low = u32::from_str_radix(hex2, 16)
+                                    .map_err(|_| "invalid unicode escape")?;
+                                if (0xDC00..=0xDFFF).contains(&low) {
+                                    // Valid surrogate pair
+                                    let combined =
+                                        0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00);
+                                    if let Some(c) = char::from_u32(combined) {
+                                        result.push(c);
+                                    }
+                                    *pos += 5; // Move past the low surrogate (will be incremented again below)
+                                } else {
+                                    // Lone high surrogate - use replacement character
+                                    result.push('\u{FFFD}');
+                                    *pos -= 1; // Back up so we don't skip the next escape
+                                }
+                            } else {
+                                // Lone high surrogate
+                                result.push('\u{FFFD}');
+                                *pos -= 1;
+                            }
+                        } else if let Some(c) = char::from_u32(codepoint) {
+                            result.push(c);
+                            *pos += 3; // Move past the hex digits (will be incremented again below)
+                        } else {
+                            return Err("invalid unicode codepoint".to_string());
+                        }
+                    }
+                    c => return Err(format!("invalid escape sequence: \\{}", c as char)),
+                }
+                *pos += 1;
+            }
+            c => {
+                // Regular character - handle UTF-8
+                let remaining = &bytes[*pos..];
+                if let Ok(s) = core::str::from_utf8(remaining) {
+                    if let Some(c) = s.chars().next() {
+                        result.push(c);
+                        *pos += c.len_utf8();
+                    } else {
+                        return Err("unexpected end of string".to_string());
+                    }
+                } else {
+                    // Try to get just the next character
+                    result.push(c as char);
+                    *pos += 1;
+                }
+            }
+        }
+    }
+    Err("unterminated string".to_string())
+}
+
+/// Parse a JSON array
+fn parse_json_array(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+    if bytes[*pos] != b'[' {
+        return Err("expected '['".to_string());
+    }
+    *pos += 1;
+
+    let mut elements = Vec::new();
+
+    // Skip whitespace
+    while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+        *pos += 1;
+    }
+
+    // Check for empty array
+    if *pos < bytes.len() && bytes[*pos] == b']' {
+        *pos += 1;
+        return Ok(OwnedValue::Array(elements));
+    }
+
+    loop {
+        let value = parse_json_value(bytes, pos)?;
+        elements.push(value);
+
+        // Skip whitespace
+        while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+            *pos += 1;
+        }
+
+        if *pos >= bytes.len() {
+            return Err("unterminated array".to_string());
+        }
+
+        match bytes[*pos] {
+            b']' => {
+                *pos += 1;
+                return Ok(OwnedValue::Array(elements));
+            }
+            b',' => {
+                *pos += 1;
+            }
+            c => return Err(format!("expected ',' or ']', got '{}'", c as char)),
+        }
+    }
+}
+
+/// Parse a JSON object
+fn parse_json_object(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+    if bytes[*pos] != b'{' {
+        return Err("expected '{{'".to_string());
+    }
+    *pos += 1;
+
+    let mut entries = IndexMap::new();
+
+    // Skip whitespace
+    while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+        *pos += 1;
+    }
+
+    // Check for empty object
+    if *pos < bytes.len() && bytes[*pos] == b'}' {
+        *pos += 1;
+        return Ok(OwnedValue::Object(entries));
+    }
+
+    loop {
+        // Skip whitespace
+        while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+            *pos += 1;
+        }
+
+        // Parse key (must be a string)
+        let key = match parse_json_string_value(bytes, pos)? {
+            OwnedValue::String(s) => s,
+            _ => return Err("object key must be a string".to_string()),
+        };
+
+        // Skip whitespace
+        while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+            *pos += 1;
+        }
+
+        // Expect colon
+        if *pos >= bytes.len() || bytes[*pos] != b':' {
+            return Err("expected ':'".to_string());
+        }
+        *pos += 1;
+
+        // Parse value
+        let value = parse_json_value(bytes, pos)?;
+        entries.insert(key, value);
+
+        // Skip whitespace
+        while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
+            *pos += 1;
+        }
+
+        if *pos >= bytes.len() {
+            return Err("unterminated object".to_string());
+        }
+
+        match bytes[*pos] {
+            b'}' => {
+                *pos += 1;
+                return Ok(OwnedValue::Object(entries));
+            }
+            b',' => {
+                *pos += 1;
+            }
+            c => return Err(format!("expected ',' or '}}', got '{}'", c as char)),
+        }
+    }
+}
+
+/// Parse a JSON number
+fn parse_json_number(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+    let start = *pos;
+
+    // Optional minus sign
+    if *pos < bytes.len() && bytes[*pos] == b'-' {
+        *pos += 1;
+    }
+
+    // Integer part
+    if *pos >= bytes.len() {
+        return Err("expected number".to_string());
+    }
+
+    if bytes[*pos] == b'0' {
+        *pos += 1;
+    } else if bytes[*pos].is_ascii_digit() {
+        while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
+            *pos += 1;
+        }
+    } else {
+        return Err("expected digit".to_string());
+    }
+
+    let mut is_float = false;
+
+    // Fractional part
+    if *pos < bytes.len() && bytes[*pos] == b'.' {
+        is_float = true;
+        *pos += 1;
+        if *pos >= bytes.len() || !bytes[*pos].is_ascii_digit() {
+            return Err("expected digit after decimal point".to_string());
+        }
+        while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
+            *pos += 1;
+        }
+    }
+
+    // Exponent part
+    if *pos < bytes.len() && matches!(bytes[*pos], b'e' | b'E') {
+        is_float = true;
+        *pos += 1;
+        if *pos < bytes.len() && matches!(bytes[*pos], b'+' | b'-') {
+            *pos += 1;
+        }
+        if *pos >= bytes.len() || !bytes[*pos].is_ascii_digit() {
+            return Err("expected digit in exponent".to_string());
+        }
+        while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
+            *pos += 1;
+        }
+    }
+
+    let num_str =
+        core::str::from_utf8(&bytes[start..*pos]).map_err(|_| "invalid number encoding")?;
+
+    if is_float {
+        let f: f64 = num_str.parse().map_err(|_| "invalid float")?;
+        Ok(OwnedValue::Float(f))
+    } else {
+        // Try integer first
+        if let Ok(i) = num_str.parse::<i64>() {
+            Ok(OwnedValue::Int(i))
+        } else {
+            // Fall back to float for large numbers
+            let f: f64 = num_str.parse().map_err(|_| "invalid number")?;
+            Ok(OwnedValue::Float(f))
+        }
+    }
+}
+
 // =============================================================================
 // Phase 6: Additional String Builtins
 // =============================================================================
@@ -2943,26 +3708,30 @@ fn builtin_test<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// Builtin: indices(s) - find all indices of substring s
+/// Builtin: indices(s) - find all indices of substring/element s
 fn builtin_indices<'a, W: Clone + AsRef<[u64]>>(
     s_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the pattern
+    // Evaluate the pattern (can be any type for arrays, must be string for strings)
     let pattern = match result_to_owned(eval_single(s_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
 
     match &value {
         StandardJson::String(s) => {
+            // For strings, pattern must be a string
+            let pattern_str = match &pattern {
+                OwnedValue::String(p) => p,
+                _ if optional => return QueryResult::None,
+                _ => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+            };
             if let Ok(cow) = s.as_str() {
                 let mut indices = Vec::new();
                 let mut start = 0;
-                while let Some(pos) = cow[start..].find(&pattern) {
+                while let Some(pos) = cow[start..].find(pattern_str.as_str()) {
                     indices.push(OwnedValue::Int((start + pos) as i64));
                     start += pos + 1;
                     if start >= cow.len() {
@@ -2977,11 +3746,10 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>>(
             }
         }
         StandardJson::Array(elements) => {
-            // For arrays, find indices where element equals the pattern
-            let pattern_owned = OwnedValue::String(pattern);
+            // For arrays, find indices where element equals the pattern (any type)
             let mut indices = Vec::new();
             for (i, elem) in (*elements).enumerate() {
-                if to_owned(&elem) == pattern_owned {
+                if to_owned(&elem) == pattern {
                     indices.push(OwnedValue::Int(i as i64));
                 }
             }
@@ -2992,24 +3760,28 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// Builtin: index(s) - first index of substring s, or null
+/// Builtin: index(s) - first index of substring/element s, or null
 fn builtin_index<'a, W: Clone + AsRef<[u64]>>(
     s_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the pattern
+    // Evaluate the pattern (can be any type for arrays, must be string for strings)
     let pattern = match result_to_owned(eval_single(s_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
 
     match &value {
         StandardJson::String(s) => {
+            // For strings, pattern must be a string
+            let pattern_str = match &pattern {
+                OwnedValue::String(p) => p,
+                _ if optional => return QueryResult::None,
+                _ => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+            };
             if let Ok(cow) = s.as_str() {
-                if let Some(pos) = cow.find(&pattern) {
+                if let Some(pos) = cow.find(pattern_str.as_str()) {
                     QueryResult::Owned(OwnedValue::Int(pos as i64))
                 } else {
                     QueryResult::Owned(OwnedValue::Null)
@@ -3021,9 +3793,9 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>>(
             }
         }
         StandardJson::Array(elements) => {
-            let pattern_owned = OwnedValue::String(pattern);
+            // For arrays, pattern can be any type
             for (i, elem) in (*elements).enumerate() {
-                if to_owned(&elem) == pattern_owned {
+                if to_owned(&elem) == pattern {
                     return QueryResult::Owned(OwnedValue::Int(i as i64));
                 }
             }
@@ -3034,24 +3806,28 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// Builtin: rindex(s) - last index of substring s, or null
+/// Builtin: rindex(s) - last index of substring/element s, or null
 fn builtin_rindex<'a, W: Clone + AsRef<[u64]>>(
     s_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the pattern
+    // Evaluate the pattern (can be any type for arrays, must be string for strings)
     let pattern = match result_to_owned(eval_single(s_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
 
     match &value {
         StandardJson::String(s) => {
+            // For strings, pattern must be a string
+            let pattern_str = match &pattern {
+                OwnedValue::String(p) => p,
+                _ if optional => return QueryResult::None,
+                _ => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+            };
             if let Ok(cow) = s.as_str() {
-                if let Some(pos) = cow.rfind(&pattern) {
+                if let Some(pos) = cow.rfind(pattern_str.as_str()) {
                     QueryResult::Owned(OwnedValue::Int(pos as i64))
                 } else {
                     QueryResult::Owned(OwnedValue::Null)
@@ -3063,10 +3839,10 @@ fn builtin_rindex<'a, W: Clone + AsRef<[u64]>>(
             }
         }
         StandardJson::Array(elements) => {
-            let pattern_owned = OwnedValue::String(pattern);
+            // For arrays, pattern can be any type
             let items: Vec<_> = (*elements).collect();
             for (i, elem) in items.iter().enumerate().rev() {
-                if to_owned(elem) == pattern_owned {
+                if to_owned(elem) == pattern {
                     return QueryResult::Owned(OwnedValue::Int(i as i64));
                 }
             }
@@ -3534,11 +4310,95 @@ fn builtin_gsub<'a, W: Clone + AsRef<[u64]>>(
     QueryResult::Owned(OwnedValue::String(result.into_owned()))
 }
 
-/// Builtin: test(re; flags) - test with flags
+/// Builtin: test(re; flags) - test with flags expression
 #[cfg(feature = "regex")]
-fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>>(
     re_expr: &Expr,
-    flags: &str,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the pattern
+    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the input string
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    };
+
+    // Build regex with flags
+    let re = match build_regex(&pattern, Some(&flags)) {
+        Ok(r) => r,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Test if regex matches
+    QueryResult::Owned(OwnedValue::Bool(re.is_match(&input)))
+}
+
+/// Builtin: match(re; flags) - match with flags expression
+#[cfg(feature = "regex")]
+fn builtin_match_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    builtin_match(re_expr, Some(&flags), value, optional)
+}
+
+/// Builtin: capture(re; flags) - capture with flags expression
+#[cfg(feature = "regex")]
+fn builtin_capture_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    builtin_capture_with_flags(re_expr, Some(&flags), value, optional)
+}
+
+/// Builtin: capture(re) or capture(re; flags) - capture named groups
+#[cfg(feature = "regex")]
+fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags: Option<&str>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -3562,14 +4422,414 @@ fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Build regex
-    let re = match build_regex(&pattern, Some(flags)) {
+    let re = match build_regex(&pattern, flags) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
         Err(e) => return QueryResult::Error(e),
     };
 
-    // Test if regex matches
-    QueryResult::Owned(OwnedValue::Bool(re.is_match(&input)))
+    // Find first match and extract named captures
+    if let Some(caps) = re.captures(&input) {
+        let mut entries = IndexMap::new();
+        for name in re.capture_names().flatten() {
+            if let Some(m) = caps.name(name) {
+                entries.insert(name.to_string(), OwnedValue::String(m.as_str().to_string()));
+            }
+        }
+        QueryResult::Owned(OwnedValue::Object(entries))
+    } else if optional {
+        QueryResult::None
+    } else {
+        // jq returns empty object when no match
+        QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
+    }
+}
+
+/// Builtin: sub(re; replacement; flags) - replace first match with flags
+#[cfg(feature = "regex")]
+fn builtin_sub_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    replacement_expr: &Expr,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    builtin_sub_with_flags(re_expr, replacement_expr, Some(&flags), value, optional)
+}
+
+/// Builtin: sub(re; replacement) or sub(re; replacement; flags) - replace first match
+#[cfg(feature = "regex")]
+fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    replacement_expr: &Expr,
+    flags: Option<&str>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the pattern
+    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the replacement
+    let replacement = match result_to_owned(eval_single(replacement_expr, value.clone(), optional))
+    {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the input string
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    };
+
+    // Build regex
+    let re = match build_regex(&pattern, flags) {
+        Ok(r) => r,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Convert jq replacement syntax (\(.name)) to regex replacement syntax ($name)
+    let replacement = convert_jq_replacement(&replacement);
+
+    // Replace first match
+    let result = re.replace(&input, replacement.as_str());
+    QueryResult::Owned(OwnedValue::String(result.into_owned()))
+}
+
+/// Builtin: gsub(re; replacement; flags) - replace all matches with flags
+#[cfg(feature = "regex")]
+fn builtin_gsub_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    replacement_expr: &Expr,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    builtin_gsub_with_flags(re_expr, replacement_expr, Some(&flags), value, optional)
+}
+
+/// Builtin: gsub(re; replacement) or gsub(re; replacement; flags) - replace all matches
+#[cfg(feature = "regex")]
+fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    replacement_expr: &Expr,
+    flags: Option<&str>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the pattern
+    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the replacement
+    let replacement = match result_to_owned(eval_single(replacement_expr, value.clone(), optional))
+    {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the input string
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    };
+
+    // Build regex
+    let re = match build_regex(&pattern, flags) {
+        Ok(r) => r,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Convert jq replacement syntax (\(.name)) to regex replacement syntax ($name)
+    let replacement = convert_jq_replacement(&replacement);
+
+    // Replace all matches
+    let result = re.replace_all(&input, replacement.as_str());
+    QueryResult::Owned(OwnedValue::String(result.into_owned()))
+}
+
+/// Builtin: scan(re; flags) - find all matches with flags
+#[cfg(feature = "regex")]
+fn builtin_scan_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    builtin_scan_with_flags(re_expr, Some(&flags), value, optional)
+}
+
+/// Builtin: scan(re) or scan(re; flags) - find all matches
+#[cfg(feature = "regex")]
+fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags: Option<&str>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the pattern
+    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the input string
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    };
+
+    // Build regex
+    let re = match build_regex(&pattern, flags) {
+        Ok(r) => r,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Find all matches
+    let mut results = Vec::new();
+    let capture_count = re.captures_len();
+
+    for caps in re.captures_iter(&input) {
+        if capture_count > 1 {
+            // Has capture groups - return array of captured strings
+            let mut captured = Vec::new();
+            for i in 1..capture_count {
+                if let Some(m) = caps.get(i) {
+                    captured.push(OwnedValue::String(m.as_str().to_string()));
+                }
+            }
+            results.push(OwnedValue::Array(captured));
+        } else {
+            // No capture groups - return the matched string
+            if let Some(m) = caps.get(0) {
+                results.push(OwnedValue::String(m.as_str().to_string()));
+            }
+        }
+    }
+
+    if results.is_empty() {
+        QueryResult::None
+    } else {
+        QueryResult::ManyOwned(results)
+    }
+}
+
+/// Builtin: split(re; flags) - split by regex with flags
+#[cfg(feature = "regex")]
+fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the pattern
+    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the input string
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    };
+
+    // Build regex
+    let re = match build_regex(&pattern, Some(&flags)) {
+        Ok(r) => r,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Split by regex
+    let parts: Vec<OwnedValue> = re
+        .split(&input)
+        .map(|s| OwnedValue::String(s.to_string()))
+        .collect();
+
+    QueryResult::Owned(OwnedValue::Array(parts))
+}
+
+/// Builtin: splits(re; flags) - split by regex with flags as stream
+#[cfg(feature = "regex")]
+fn builtin_splits_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    builtin_splits_with_flags(re_expr, Some(&flags), value, optional)
+}
+
+/// Builtin: splits(re) or splits(re; flags) - split by regex as stream
+#[cfg(feature = "regex")]
+fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags: Option<&str>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the pattern
+    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the input string
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    };
+
+    // Build regex
+    let re = match build_regex(&pattern, flags) {
+        Ok(r) => r,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Split by regex and return as stream
+    let parts: Vec<OwnedValue> = re
+        .split(&input)
+        .map(|s| OwnedValue::String(s.to_string()))
+        .collect();
+
+    if parts.is_empty() {
+        QueryResult::None
+    } else {
+        QueryResult::ManyOwned(parts)
+    }
+}
+
+/// Convert jq replacement syntax to regex replacement syntax
+/// jq uses \(.name) for backreferences, regex crate uses $name or ${name}
+#[cfg(feature = "regex")]
+fn convert_jq_replacement(replacement: &str) -> String {
+    // Simple conversion: \(.name) -> ${name}
+    // This is a simplified version; full jq supports arbitrary expressions
+    let mut result = String::new();
+    let mut chars = replacement.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if chars.peek() == Some(&'(') {
+                chars.next(); // consume '('
+                let mut name = String::new();
+                while let Some(&nc) = chars.peek() {
+                    if nc == ')' {
+                        chars.next(); // consume ')'
+                        break;
+                    }
+                    name.push(nc);
+                    chars.next();
+                }
+                // Check if it's a simple variable reference like .name
+                if let Some(stripped) = name.strip_prefix('.') {
+                    result.push_str("${");
+                    result.push_str(stripped);
+                    result.push('}');
+                } else {
+                    // Not a simple reference, just output literally
+                    result.push_str("\\(");
+                    result.push_str(&name);
+                    result.push(')');
+                }
+            } else {
+                result.push(c);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
 }
 
 /// Evaluate a pipe (chain) of expressions.
@@ -3610,6 +4870,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>>(
                     QueryResult::Many(rs) => all_results.extend(rs),
                     QueryResult::None => {}
                     QueryResult::Error(e) => return QueryResult::Error(e),
+                    QueryResult::Break(label) => return QueryResult::Break(label),
                     QueryResult::Owned(_) | QueryResult::ManyOwned(_) => {
                         // TODO: Handle owned values in pipe properly
                         // For now, skip (this would need refactoring)
@@ -3620,6 +4881,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>>(
         }
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
+        QueryResult::Break(label) => QueryResult::Break(label),
         QueryResult::Owned(v) => {
             // Continue piping with owned value using eval_owned_pipe
             eval_owned_pipe::<W>(rest, v, optional)
@@ -3636,6 +4898,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>>(
                     QueryResult::Many(rs) => all_results.extend(rs.iter().map(to_owned)),
                     QueryResult::None => {}
                     QueryResult::Error(e) => return QueryResult::Error(e),
+                    QueryResult::Break(label) => return QueryResult::Break(label),
                 }
             }
             if all_results.is_empty() {
@@ -3785,6 +5048,7 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::Error(_) => Vec::new(),
         QueryResult::Owned(_) => Vec::new(), // Owned values not returned as StandardJson
         QueryResult::ManyOwned(_) => Vec::new(),
+        QueryResult::Break(_) => Vec::new(), // Break without matching label
     }
 }
 
@@ -3822,6 +5086,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>>(
             }
         }
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
+        QueryResult::Break(label) => return QueryResult::Break(label),
     };
 
     // Convert input to owned for modification
@@ -4186,6 +5451,8 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
     match expr {
         Expr::Var(name) if name == var_name => owned_to_expr(replacement),
         Expr::Var(_) => expr.clone(),
+        Expr::Loc { line } => Expr::Loc { line: *line },
+        Expr::Env => Expr::Env,
         Expr::Identity => Expr::Identity,
         Expr::Field(name) => Expr::Field(name.clone()),
         Expr::Index(i) => Expr::Index(*i),
@@ -4448,6 +5715,20 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
             path: Box::new(substitute_var(path, var_name, replacement)),
             value: Box::new(substitute_var(value, var_name, replacement)),
         },
+
+        // Label-break
+        Expr::Label { name, body } => {
+            // Don't substitute if the label shadows our variable
+            if name == var_name {
+                expr.clone()
+            } else {
+                Expr::Label {
+                    name: name.clone(),
+                    body: Box::new(substitute_var(body, var_name, replacement)),
+                }
+            }
+        }
+        Expr::Break(name) => Expr::Break(name.clone()),
     }
 }
 
@@ -4476,6 +5757,15 @@ fn substitute_var_in_builtin(
         Builtin::IsString => Builtin::IsString,
         Builtin::IsArray => Builtin::IsArray,
         Builtin::IsObject => Builtin::IsObject,
+        Builtin::Values => Builtin::Values,
+        Builtin::Nulls => Builtin::Nulls,
+        Builtin::Booleans => Builtin::Booleans,
+        Builtin::Numbers => Builtin::Numbers,
+        Builtin::Strings => Builtin::Strings,
+        Builtin::Arrays => Builtin::Arrays,
+        Builtin::Objects => Builtin::Objects,
+        Builtin::Iterables => Builtin::Iterables,
+        Builtin::Scalars => Builtin::Scalars,
         Builtin::Length => Builtin::Length,
         Builtin::Utf8ByteLength => Builtin::Utf8ByteLength,
         Builtin::Keys => Builtin::Keys,
@@ -4537,6 +5827,8 @@ fn substitute_var_in_builtin(
         }
         Builtin::ToString => Builtin::ToString,
         Builtin::ToNumber => Builtin::ToNumber,
+        Builtin::ToJson => Builtin::ToJson,
+        Builtin::FromJson => Builtin::FromJson,
         Builtin::Explode => Builtin::Explode,
         Builtin::Implode => Builtin::Implode,
         Builtin::Test(e) => Builtin::Test(Box::new(substitute_var(e, var_name, replacement))),
@@ -4546,31 +5838,54 @@ fn substitute_var_in_builtin(
         Builtin::ToJsonStream => Builtin::ToJsonStream,
         Builtin::FromJsonStream => Builtin::FromJsonStream,
         Builtin::GetPath(e) => Builtin::GetPath(Box::new(substitute_var(e, var_name, replacement))),
-        #[cfg(feature = "regex")]
-        Builtin::Match(re, flags) => Builtin::Match(
+        // Phase 16: Regex Functions
+        Builtin::TestFlags(re, flags) => Builtin::TestFlags(
             Box::new(substitute_var(re, var_name, replacement)),
-            flags.clone(),
+            Box::new(substitute_var(flags, var_name, replacement)),
         ),
-        #[cfg(feature = "regex")]
-        Builtin::Capture(e) => Builtin::Capture(Box::new(substitute_var(e, var_name, replacement))),
-        #[cfg(feature = "regex")]
-        Builtin::Scan(e) => Builtin::Scan(Box::new(substitute_var(e, var_name, replacement))),
-        #[cfg(feature = "regex")]
-        Builtin::Splits(e) => Builtin::Splits(Box::new(substitute_var(e, var_name, replacement))),
-        #[cfg(feature = "regex")]
+        Builtin::Match(re) => Builtin::Match(Box::new(substitute_var(re, var_name, replacement))),
+        Builtin::MatchFlags(re, flags) => Builtin::MatchFlags(
+            Box::new(substitute_var(re, var_name, replacement)),
+            Box::new(substitute_var(flags, var_name, replacement)),
+        ),
+        Builtin::Capture(re) => {
+            Builtin::Capture(Box::new(substitute_var(re, var_name, replacement)))
+        }
+        Builtin::CaptureFlags(re, flags) => Builtin::CaptureFlags(
+            Box::new(substitute_var(re, var_name, replacement)),
+            Box::new(substitute_var(flags, var_name, replacement)),
+        ),
         Builtin::Sub(re, repl) => Builtin::Sub(
             Box::new(substitute_var(re, var_name, replacement)),
             Box::new(substitute_var(repl, var_name, replacement)),
         ),
-        #[cfg(feature = "regex")]
+        Builtin::SubFlags(re, repl, flags) => Builtin::SubFlags(
+            Box::new(substitute_var(re, var_name, replacement)),
+            Box::new(substitute_var(repl, var_name, replacement)),
+            Box::new(substitute_var(flags, var_name, replacement)),
+        ),
         Builtin::Gsub(re, repl) => Builtin::Gsub(
             Box::new(substitute_var(re, var_name, replacement)),
             Box::new(substitute_var(repl, var_name, replacement)),
         ),
-        #[cfg(feature = "regex")]
-        Builtin::TestWithFlags(re, flags) => Builtin::TestWithFlags(
+        Builtin::GsubFlags(re, repl, flags) => Builtin::GsubFlags(
             Box::new(substitute_var(re, var_name, replacement)),
-            flags.clone(),
+            Box::new(substitute_var(repl, var_name, replacement)),
+            Box::new(substitute_var(flags, var_name, replacement)),
+        ),
+        Builtin::Scan(re) => Builtin::Scan(Box::new(substitute_var(re, var_name, replacement))),
+        Builtin::ScanFlags(re, flags) => Builtin::ScanFlags(
+            Box::new(substitute_var(re, var_name, replacement)),
+            Box::new(substitute_var(flags, var_name, replacement)),
+        ),
+        Builtin::SplitRegex(re, flags) => Builtin::SplitRegex(
+            Box::new(substitute_var(re, var_name, replacement)),
+            Box::new(substitute_var(flags, var_name, replacement)),
+        ),
+        Builtin::Splits(re) => Builtin::Splits(Box::new(substitute_var(re, var_name, replacement))),
+        Builtin::SplitsFlags(re, flags) => Builtin::SplitsFlags(
+            Box::new(substitute_var(re, var_name, replacement)),
+            Box::new(substitute_var(flags, var_name, replacement)),
         ),
         // Phase 8 builtins
         Builtin::Recurse => Builtin::Recurse,
@@ -4655,7 +5970,78 @@ fn substitute_var_in_builtin(
             Builtin::ModuleMeta(Box::new(substitute_var(e, var_name, replacement)))
         }
         Builtin::Pick(e) => Builtin::Pick(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::Tag => Builtin::Tag,
+        Builtin::Anchor => Builtin::Anchor,
+        Builtin::Style => Builtin::Style,
+        Builtin::Kind => Builtin::Kind,
+        Builtin::Key => Builtin::Key,
         Builtin::Del(e) => Builtin::Del(Box::new(substitute_var(e, var_name, replacement))),
+        // Phase 12 builtins (no args to substitute)
+        Builtin::Now => Builtin::Now,
+        Builtin::Abs => Builtin::Abs,
+        Builtin::Builtins => Builtin::Builtins,
+        Builtin::Normals => Builtin::Normals,
+        Builtin::Finites => Builtin::Finites,
+        // Phase 13: Iteration control
+        Builtin::Limit(n, e) => Builtin::Limit(
+            Box::new(substitute_var(n, var_name, replacement)),
+            Box::new(substitute_var(e, var_name, replacement)),
+        ),
+        Builtin::FirstStream(e) => {
+            Builtin::FirstStream(Box::new(substitute_var(e, var_name, replacement)))
+        }
+        Builtin::LastStream(e) => {
+            Builtin::LastStream(Box::new(substitute_var(e, var_name, replacement)))
+        }
+        Builtin::NthStream(n, e) => Builtin::NthStream(
+            Box::new(substitute_var(n, var_name, replacement)),
+            Box::new(substitute_var(e, var_name, replacement)),
+        ),
+        Builtin::Range(n) => Builtin::Range(Box::new(substitute_var(n, var_name, replacement))),
+        Builtin::RangeFromTo(from, to) => Builtin::RangeFromTo(
+            Box::new(substitute_var(from, var_name, replacement)),
+            Box::new(substitute_var(to, var_name, replacement)),
+        ),
+        Builtin::RangeFromToBy(from, to, by) => Builtin::RangeFromToBy(
+            Box::new(substitute_var(from, var_name, replacement)),
+            Box::new(substitute_var(to, var_name, replacement)),
+            Box::new(substitute_var(by, var_name, replacement)),
+        ),
+        Builtin::IsEmpty(e) => Builtin::IsEmpty(Box::new(substitute_var(e, var_name, replacement))),
+        // Phase 14: Recursive traversal (extends Phase 8)
+        Builtin::RecurseDown => Builtin::RecurseDown,
+        // Phase 15: Date/Time functions
+        Builtin::Gmtime => Builtin::Gmtime,
+        Builtin::Localtime => Builtin::Localtime,
+        Builtin::Mktime => Builtin::Mktime,
+        Builtin::Strftime(e) => {
+            Builtin::Strftime(Box::new(substitute_var(e, var_name, replacement)))
+        }
+        Builtin::Strptime(e) => {
+            Builtin::Strptime(Box::new(substitute_var(e, var_name, replacement)))
+        }
+        Builtin::Todate => Builtin::Todate,
+        Builtin::Fromdate => Builtin::Fromdate,
+        Builtin::Todateiso8601 => Builtin::Todateiso8601,
+        Builtin::Fromdateiso8601 => Builtin::Fromdateiso8601,
+
+        // Phase 17: Combinations
+        Builtin::Combinations => Builtin::Combinations,
+        Builtin::CombinationsN(e) => {
+            Builtin::CombinationsN(Box::new(substitute_var(e, var_name, replacement)))
+        }
+
+        // Phase 18: Additional math functions
+        Builtin::Trunc => Builtin::Trunc,
+
+        // Phase 19: Type conversion
+        Builtin::ToBoolean => Builtin::ToBoolean,
+
+        // Phase 20: Iteration control extension
+        Builtin::Skip(n, e) => Builtin::Skip(
+            Box::new(substitute_var(n, var_name, replacement)),
+            Box::new(substitute_var(e, var_name, replacement)),
+        ),
     }
 }
 
@@ -4710,6 +6096,7 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::ManyOwned(vs) => vs,
         QueryResult::None => return QueryResult::None,
         QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
     };
 
     // For each bound value, substitute and evaluate the body
@@ -4725,6 +6112,7 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>>(
             QueryResult::ManyOwned(vs) => all_results.extend(vs),
             QueryResult::None => {}
             QueryResult::Error(e) => return QueryResult::Error(e),
+            QueryResult::Break(label) => return QueryResult::Break(label),
         }
     }
 
@@ -4756,6 +6144,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::ManyOwned(vs) => vs,
         QueryResult::None => Vec::new(),
         QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
     };
 
     // Evaluate initial accumulator
@@ -4817,6 +6206,7 @@ fn eval_owned_expr(
         }
         QueryResult::None => Ok(OwnedValue::Null),
         QueryResult::Error(e) => Err(e),
+        QueryResult::Break(label) => Err(EvalError::new(format!("break ${} not in label", label))),
     }
 }
 
@@ -4901,6 +6291,7 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::ManyOwned(vs) => vs,
         QueryResult::None => Vec::new(),
         QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
     };
 
     // Evaluate initial state
@@ -5022,6 +6413,7 @@ fn eval_first_expr<'a, W: Clone + AsRef<[u64]>>(
         }
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
+        QueryResult::Break(label) => QueryResult::Break(label),
     }
 }
 
@@ -5052,6 +6444,7 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>>(
         }
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
+        QueryResult::Break(label) => QueryResult::Break(label),
     }
 }
 
@@ -5095,6 +6488,7 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>>(
         }
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
+        QueryResult::Break(label) => QueryResult::Break(label),
     }
 }
 
@@ -5170,21 +6564,24 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// Evaluate `repeat(expr)` - repeatedly apply expr.
-/// Note: This produces an infinite stream, so we limit it.
+/// Evaluate `repeat(expr)` - repeatedly evaluate expr with the original input.
+/// In jq, `repeat(expr)` evaluates `expr` with the original input each time,
+/// producing an infinite stream of outputs. This is different from feeding
+/// the output back as input.
+/// Note: This produces an infinite stream, so it should be used with `limit`.
 fn eval_repeat<'a, W: Clone + AsRef<[u64]>>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let mut current = to_owned(&value);
+    let owned = to_owned(&value);
     let mut outputs: Vec<OwnedValue> = Vec::new();
     const MAX_ITERATIONS: usize = 1000; // Limit to prevent infinite loops
 
     for _ in 0..MAX_ITERATIONS {
-        outputs.push(current.clone());
-        match eval_owned_expr(expr, &current, optional) {
-            Ok(new_val) => current = new_val,
+        // Evaluate expr with the original input each time
+        match eval_owned_expr(expr, &owned, optional) {
+            Ok(new_val) => outputs.push(new_val),
             Err(_) => break, // Stop on error
         }
     }
@@ -5466,6 +6863,30 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
         }
         // Continue with remaining expressions
         if let QueryResult::Owned(v) = path_result {
+            return eval_pipe_with_path_context_internal::<W>(
+                rest,
+                &v,
+                root,
+                current_path,
+                optional,
+            );
+        }
+    }
+
+    // Handle Key - return the last element of current path (current key)
+    if matches!(first, Expr::Builtin(Builtin::Key)) {
+        let key_result = if current_path.is_empty() {
+            // At root - return null (yq behavior)
+            QueryResult::Owned(OwnedValue::Null)
+        } else {
+            // Get the last element of the path (the current key)
+            QueryResult::Owned(current_path.last().unwrap().clone())
+        };
+        if rest.is_empty() {
+            return key_result;
+        }
+        // Continue with remaining expressions
+        if let QueryResult::Owned(v) = key_result {
             return eval_pipe_with_path_context_internal::<W>(
                 rest,
                 &v,
@@ -6080,6 +7501,7 @@ fn collect_paths(value: &OwnedValue, current_path: &[OwnedValue], paths: &mut Ve
 }
 
 /// Builtin: paths - all paths to values (excluding empty paths)
+/// Returns each path as a separate output (streaming), matching jq behavior
 fn builtin_paths<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     _optional: bool,
@@ -6087,10 +7509,18 @@ fn builtin_paths<'a, W: Clone + AsRef<[u64]>>(
     let owned = to_owned(&value);
     let mut paths = Vec::new();
     collect_paths(&owned, &[], &mut paths);
-    QueryResult::Owned(OwnedValue::Array(paths))
+    // Stream individual paths instead of wrapping in array
+    if paths.is_empty() {
+        QueryResult::None
+    } else if paths.len() == 1 {
+        QueryResult::Owned(paths.pop().unwrap())
+    } else {
+        QueryResult::ManyOwned(paths)
+    }
 }
 
 /// Builtin: paths(filter) - paths to values matching filter
+/// Returns each path as a separate output (streaming), matching jq behavior
 fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>>(
     filter: &Expr,
     value: StandardJson<'a, W>,
@@ -6113,7 +7543,14 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>>(
             }
         }
     }
-    QueryResult::Owned(OwnedValue::Array(filtered_paths))
+    // Stream individual paths instead of wrapping in array
+    if filtered_paths.is_empty() {
+        QueryResult::None
+    } else if filtered_paths.len() == 1 {
+        QueryResult::Owned(filtered_paths.pop().unwrap())
+    } else {
+        QueryResult::ManyOwned(filtered_paths)
+    }
 }
 
 /// Helper to get value at a path (alias for convenience)
@@ -6188,6 +7625,7 @@ fn collect_leaf_paths(
 }
 
 /// Builtin: leaf_paths - paths to scalar (non-container) values
+/// Returns each path as a separate output (streaming), matching jq's paths(scalars) behavior
 fn builtin_leaf_paths<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     _optional: bool,
@@ -6195,7 +7633,14 @@ fn builtin_leaf_paths<'a, W: Clone + AsRef<[u64]>>(
     let owned = to_owned(&value);
     let mut paths = Vec::new();
     collect_leaf_paths(&owned, &[], &mut paths);
-    QueryResult::Owned(OwnedValue::Array(paths))
+    // Stream individual paths instead of wrapping in array
+    if paths.is_empty() {
+        QueryResult::None
+    } else if paths.len() == 1 {
+        QueryResult::Owned(paths.pop().unwrap())
+    } else {
+        QueryResult::ManyOwned(paths)
+    }
 }
 
 /// Helper to set a value at a path
@@ -6489,6 +7934,1731 @@ fn delete_at_path(
     }
 }
 
+// Phase 12: Additional builtins
+
+/// Builtin: now - current Unix timestamp
+fn builtin_now<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+    #[cfg(feature = "std")]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => QueryResult::Owned(OwnedValue::Float(duration.as_secs_f64())),
+            Err(_) => QueryResult::Error(EvalError::new("failed to get current time")),
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        // no_std environment - return 0.0 as a fallback
+        QueryResult::Owned(OwnedValue::Float(0.0))
+    }
+}
+
+/// Builtin: gmtime - convert Unix timestamp to broken-down UTC time
+/// Returns [year, month(0-11), day(1-31), hour, minute, second, weekday(0-6, Sunday=0), yearday(0-365)]
+fn builtin_gmtime<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let timestamp = match get_float_value(&value, optional) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+
+    // Convert Unix timestamp to broken-down time (UTC)
+    let secs = timestamp.trunc() as i64;
+
+    // Days since Unix epoch (Jan 1, 1970)
+    let days = if secs >= 0 {
+        secs / 86400
+    } else {
+        (secs - 86399) / 86400
+    };
+    let time_of_day = ((secs % 86400) + 86400) % 86400;
+    let hour = (time_of_day / 3600) as i64;
+    let minute = ((time_of_day % 3600) / 60) as i64;
+    let second = (time_of_day % 60) as i64;
+
+    // Calculate year, month, day from days since epoch
+    // Using algorithm from Howard Hinnant's date library
+    let z = days + 719468; // days since Mar 1, 0000
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month [0, 11] starting from March
+    let day = (doy - (153 * mp + 2) / 5 + 1) as i64;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+
+    // Calculate weekday (0 = Sunday, 6 = Saturday)
+    // Jan 1, 1970 was a Thursday (4)
+    let weekday = ((days % 7 + 4 + 7) % 7) as i64;
+
+    // Calculate day of year (0-365, 0 = Jan 1)
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let month_days: [i64; 12] = if is_leap {
+        [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
+    } else {
+        [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    };
+    let yearday = month_days[(month - 1) as usize] + day - 1;
+
+    let result = vec![
+        OwnedValue::Int(year),
+        OwnedValue::Int((month - 1) as i64), // 0-indexed month
+        OwnedValue::Int(day),
+        OwnedValue::Int(hour),
+        OwnedValue::Int(minute),
+        OwnedValue::Int(second),
+        OwnedValue::Int(weekday),
+        OwnedValue::Int(yearday),
+    ];
+
+    QueryResult::Owned(OwnedValue::Array(result))
+}
+
+/// Builtin: localtime - convert Unix timestamp to broken-down local time
+/// Returns [year, month(0-11), day(1-31), hour, minute, second, weekday(0-6, Sunday=0), yearday(0-365)]
+fn builtin_localtime<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    #[cfg(feature = "std")]
+    {
+        let timestamp = match get_float_value(&value, optional) {
+            Ok(f) => f,
+            Err(r) => return r,
+        };
+
+        // Get local timezone offset using chrono if available, otherwise fall back to gmtime
+        // For now, we'll compute it manually using the libc-style approach
+        // This is a simplified implementation that uses a heuristic for timezone offset
+
+        // Get the current local time offset by comparing system time with UTC
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_utc = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // We need to compute the local offset. A simple approach is to use environment TZ,
+        // but that's complex. For simplicity, we'll compute gmtime and apply a local offset.
+        // This implementation uses the system's local time approximation.
+
+        // For a proper implementation, we'd need platform-specific code or a crate like chrono.
+        // For now, we'll approximate by using a simple offset calculation.
+
+        // Actually, let's just use gmtime logic with an offset.
+        // Try to get the timezone offset from the system.
+
+        // Simplified: compute based on the offset from UTC
+        // In practice, this should use libc::localtime_r or similar
+        // For now, we'll attempt to detect offset using the current time
+
+        // Get offset: (local_now - utc_now) rounded to nearest minute
+        // This is a hack - proper implementation needs platform time APIs
+
+        // Fallback: Use UTC for now (same as gmtime)
+        // A proper implementation would use platform-specific APIs or chrono crate
+        let secs = timestamp.trunc() as i64;
+
+        // Try to estimate local offset by looking at current system time
+        // This gives us the offset at the current moment (may differ from timestamp's offset due to DST)
+        let local_offset = estimate_local_offset(now_utc);
+        let local_secs = secs + local_offset;
+
+        // Days since Unix epoch
+        let days = if local_secs >= 0 {
+            local_secs / 86400
+        } else {
+            (local_secs - 86399) / 86400
+        };
+        let time_of_day = ((local_secs % 86400) + 86400) % 86400;
+        let hour = (time_of_day / 3600) as i64;
+        let minute = ((time_of_day % 3600) / 60) as i64;
+        let second = (time_of_day % 60) as i64;
+
+        // Calculate year, month, day from days since epoch
+        let z = days + 719468;
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = (z - era * 146097) as u32;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = (doy - (153 * mp + 2) / 5 + 1) as i64;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = y + if month <= 2 { 1 } else { 0 };
+
+        let weekday = ((days % 7 + 4 + 7) % 7) as i64;
+
+        let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let month_days: [i64; 12] = if is_leap {
+            [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
+        } else {
+            [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+        };
+        let yearday = month_days[(month - 1) as usize] + day - 1;
+
+        let result = vec![
+            OwnedValue::Int(year),
+            OwnedValue::Int((month - 1) as i64),
+            OwnedValue::Int(day),
+            OwnedValue::Int(hour),
+            OwnedValue::Int(minute),
+            OwnedValue::Int(second),
+            OwnedValue::Int(weekday),
+            OwnedValue::Int(yearday),
+        ];
+
+        QueryResult::Owned(OwnedValue::Array(result))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        // In no_std, fall back to gmtime (UTC)
+        builtin_gmtime(value, optional)
+    }
+}
+
+/// Estimate local timezone offset in seconds from UTC
+#[cfg(feature = "std")]
+fn estimate_local_offset(utc_secs: i64) -> i64 {
+    // This is a simplified estimation that works for most common cases
+    // A proper implementation would use platform-specific APIs
+
+    // Try to get TZ from environment
+    if let Ok(tz) = std::env::var("TZ") {
+        // Parse simple TZ formats like "EST5EDT" or "PST8PDT"
+        // Format: STDoffset[DST[offset][,rule]]
+        if let Some(offset) = parse_simple_tz_offset(&tz) {
+            return offset;
+        }
+    }
+
+    // Fallback: try to detect from system
+    // On many systems, we can compute the offset by comparing local and UTC representations
+    // For a portable solution without external crates, we'll return 0 (UTC)
+    // Users needing accurate local time should ensure TZ is set correctly
+    let _ = utc_secs; // silence unused warning
+    0
+}
+
+/// Parse a simple TZ offset like "EST5" or "PST8" and return offset in seconds
+#[cfg(feature = "std")]
+fn parse_simple_tz_offset(tz: &str) -> Option<i64> {
+    // Skip the timezone name (letters)
+    let offset_start = tz.find(|c: char| c.is_ascii_digit() || c == '-' || c == '+')?;
+    let offset_part = &tz[offset_start..];
+
+    // Find where the offset ends (at DST name or end of string)
+    let offset_end = offset_part
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(offset_part.len());
+    let offset_str = &offset_part[..offset_end];
+
+    // Parse the offset (hours, optionally minutes)
+    let negative = offset_str.starts_with('-');
+    let offset_str = offset_str.trim_start_matches(['+', '-']);
+
+    let parts: Vec<&str> = offset_str.split(':').collect();
+    let hours: i64 = parts.first()?.parse().ok()?;
+    let minutes: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    // TZ offset is positive for west of UTC, but we want seconds to add
+    let offset_secs = (hours * 3600 + minutes * 60) * if negative { 1 } else { -1 };
+    Some(offset_secs)
+}
+
+/// Builtin: mktime - convert broken-down time to Unix timestamp
+fn builtin_mktime<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let arr = match to_owned(&value) {
+        OwnedValue::Array(a) => a,
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("array", "mktime")),
+    };
+
+    // Need at least 6 elements: [year, month, day, hour, minute, second]
+    if arr.len() < 6 {
+        if optional {
+            return QueryResult::None;
+        }
+        return QueryResult::Error(EvalError::new(
+            "mktime requires array with at least 6 elements",
+        ));
+    }
+
+    let get_int = |idx: usize| -> Result<i64, EvalError> {
+        match arr.get(idx) {
+            Some(OwnedValue::Int(n)) => Ok(*n),
+            Some(OwnedValue::Float(f)) => Ok(*f as i64),
+            _ => Err(EvalError::new(format!(
+                "mktime: element {} must be a number",
+                idx
+            ))),
+        }
+    };
+
+    let year = match get_int(0) {
+        Ok(y) => y,
+        Err(_) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+    let month = match get_int(1) {
+        Ok(m) => m + 1, // jq uses 0-indexed months
+        Err(_) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+    let day = match get_int(2) {
+        Ok(d) => d,
+        Err(_) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+    let hour = match get_int(3) {
+        Ok(h) => h,
+        Err(_) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+    let minute = match get_int(4) {
+        Ok(m) => m,
+        Err(_) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+    let second = match get_int(5) {
+        Ok(s) => s,
+        Err(_) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Convert to Unix timestamp using inverse of the gmtime algorithm
+    // Algorithm from Howard Hinnant's date library (civil_from_days inverse)
+    let y = year - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32; // year of era [0, 399]
+    let m = month as u32;
+    let d = day as u32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // day of year [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // day of era [0, 146096]
+    let days = era * 146097 + doe as i64 - 719468; // days since Unix epoch
+
+    let timestamp = days * 86400 + hour * 3600 + minute * 60 + second;
+
+    QueryResult::Owned(OwnedValue::Float(timestamp as f64))
+}
+
+/// Builtin: strftime(fmt) - format broken-down time as string
+fn builtin_strftime<'a, W: Clone + AsRef<[u64]>>(
+    fmt_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // First get the format string
+    let fmt = match result_to_owned(eval_single(fmt_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "strftime format")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Value should be a broken-down time array
+    let arr = match to_owned(&value) {
+        OwnedValue::Array(a) => a,
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("array", "strftime")),
+    };
+
+    if arr.len() < 6 {
+        if optional {
+            return QueryResult::None;
+        }
+        return QueryResult::Error(EvalError::new(
+            "strftime requires array with at least 6 elements",
+        ));
+    }
+
+    let get_int = |idx: usize| -> i64 {
+        match arr.get(idx) {
+            Some(OwnedValue::Int(n)) => *n,
+            Some(OwnedValue::Float(f)) => *f as i64,
+            _ => 0,
+        }
+    };
+
+    let year = get_int(0);
+    let month = get_int(1) + 1; // jq uses 0-indexed
+    let day = get_int(2);
+    let hour = get_int(3);
+    let minute = get_int(4);
+    let second = get_int(5);
+    let weekday = if arr.len() > 6 { get_int(6) } else { 0 };
+    let yearday = if arr.len() > 7 { get_int(7) } else { 0 };
+
+    let result = format_strftime(
+        &fmt, year, month, day, hour, minute, second, weekday, yearday,
+    );
+    QueryResult::Owned(OwnedValue::String(result))
+}
+
+/// Format a time according to strftime format specifiers
+#[allow(clippy::too_many_arguments)]
+fn format_strftime(
+    fmt: &str,
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    weekday: i64,
+    yearday: i64,
+) -> String {
+    let mut result = String::new();
+    let mut chars = fmt.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.next() {
+                Some('%') => result.push('%'),
+                Some('Y') => result.push_str(&format!("{:04}", year)),
+                Some('y') => result.push_str(&format!("{:02}", year % 100)),
+                Some('m') => result.push_str(&format!("{:02}", month)),
+                Some('d') => result.push_str(&format!("{:02}", day)),
+                Some('e') => result.push_str(&format!("{:2}", day)),
+                Some('H') => result.push_str(&format!("{:02}", hour)),
+                Some('I') => result.push_str(&format!(
+                    "{:02}",
+                    if hour == 0 {
+                        12
+                    } else if hour > 12 {
+                        hour - 12
+                    } else {
+                        hour
+                    }
+                )),
+                Some('M') => result.push_str(&format!("{:02}", minute)),
+                Some('S') => result.push_str(&format!("{:02}", second)),
+                Some('p') => result.push_str(if hour < 12 { "AM" } else { "PM" }),
+                Some('P') => result.push_str(if hour < 12 { "am" } else { "pm" }),
+                Some('j') => result.push_str(&format!("{:03}", yearday + 1)), // 1-indexed
+                Some('w') => result.push_str(&format!("{}", weekday)),
+                Some('u') => {
+                    result.push_str(&format!("{}", if weekday == 0 { 7 } else { weekday }))
+                } // Monday=1
+                Some('a') => {
+                    let names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+                    result.push_str(names[weekday as usize % 7]);
+                }
+                Some('A') => {
+                    let names = [
+                        "Sunday",
+                        "Monday",
+                        "Tuesday",
+                        "Wednesday",
+                        "Thursday",
+                        "Friday",
+                        "Saturday",
+                    ];
+                    result.push_str(names[weekday as usize % 7]);
+                }
+                Some('b') | Some('h') => {
+                    let names = [
+                        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
+                        "Nov", "Dec",
+                    ];
+                    result.push_str(names[(month - 1) as usize % 12]);
+                }
+                Some('B') => {
+                    let names = [
+                        "January",
+                        "February",
+                        "March",
+                        "April",
+                        "May",
+                        "June",
+                        "July",
+                        "August",
+                        "September",
+                        "October",
+                        "November",
+                        "December",
+                    ];
+                    result.push_str(names[(month - 1) as usize % 12]);
+                }
+                Some('C') => result.push_str(&format!("{:02}", year / 100)),
+                Some('D') => result.push_str(&format!("{:02}/{:02}/{:02}", month, day, year % 100)),
+                Some('F') => result.push_str(&format!("{:04}-{:02}-{:02}", year, month, day)),
+                Some('R') => result.push_str(&format!("{:02}:{:02}", hour, minute)),
+                Some('T') => result.push_str(&format!("{:02}:{:02}:{:02}", hour, minute, second)),
+                Some('n') => result.push('\n'),
+                Some('t') => result.push('\t'),
+                Some('z') => result.push_str("+0000"), // UTC offset (we're always UTC for gmtime)
+                Some('Z') => result.push_str("UTC"),
+                Some(other) => {
+                    result.push('%');
+                    result.push(other);
+                }
+                None => result.push('%'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+/// Builtin: strptime(fmt) - parse string to broken-down time
+fn builtin_strptime<'a, W: Clone + AsRef<[u64]>>(
+    fmt_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // First get the format string
+    let fmt = match result_to_owned(eval_single(fmt_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "strptime format")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Value should be a string
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("string", "strptime")),
+    };
+
+    match parse_strptime(&input, &fmt) {
+        Ok(t) => {
+            let result = vec![
+                OwnedValue::Int(t.year),
+                OwnedValue::Int(t.month - 1), // 0-indexed
+                OwnedValue::Int(t.day),
+                OwnedValue::Int(t.hour),
+                OwnedValue::Int(t.minute),
+                OwnedValue::Int(t.second),
+                OwnedValue::Int(t.weekday),
+                OwnedValue::Int(t.yearday),
+            ];
+            QueryResult::Owned(OwnedValue::Array(result))
+        }
+        Err(_) if optional => QueryResult::None,
+        Err(e) => QueryResult::Error(EvalError::new(e)),
+    }
+}
+
+/// Broken-down time representation (matches jq's format)
+struct BrokenDownTime {
+    year: i64,
+    month: i64, // 1-indexed (1-12)
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    weekday: i64, // 0=Sunday
+    yearday: i64, // 0-indexed (0-365)
+}
+
+/// Parse a time string according to strptime format specifiers
+#[allow(clippy::type_complexity)]
+fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
+    let mut year: i64 = 1970;
+    let mut month: i64 = 1;
+    let mut day: i64 = 1;
+    let mut hour: i64 = 0;
+    let mut minute: i64 = 0;
+    let mut second: i64 = 0;
+    // weekday and yearday are parsed from format specifiers like %w, %j, %u,
+    // but then recalculated at the end for consistency with the parsed date.
+    // This matches jq's behavior where weekday/yearday in output are always
+    // computed from the date, not taken from the parsed input.
+    #[allow(unused_variables, unused_assignments)]
+    let mut weekday: i64 = 4; // Thursday (Jan 1, 1970)
+    #[allow(unused_variables, unused_assignments)]
+    let mut yearday: i64 = 0;
+
+    let mut input_iter = input.chars().peekable();
+    let mut fmt_iter = fmt.chars().peekable();
+
+    while let Some(fc) = fmt_iter.next() {
+        if fc == '%' {
+            match fmt_iter.next() {
+                Some('%') => {
+                    if input_iter.next() != Some('%') {
+                        return Err("expected '%'".to_string());
+                    }
+                }
+                Some('Y') => {
+                    year = parse_digits(&mut input_iter, 4)?;
+                }
+                Some('y') => {
+                    let y = parse_digits(&mut input_iter, 2)?;
+                    year = if y >= 69 { 1900 + y } else { 2000 + y };
+                }
+                Some('m') => {
+                    month = parse_digits(&mut input_iter, 2)?;
+                }
+                Some('d') => {
+                    day = parse_digits(&mut input_iter, 2)?;
+                }
+                Some('e') => {
+                    // Skip leading space if present
+                    if input_iter.peek() == Some(&' ') {
+                        input_iter.next();
+                    }
+                    day = parse_digits(&mut input_iter, 2)?;
+                }
+                Some('H') => {
+                    hour = parse_digits(&mut input_iter, 2)?;
+                }
+                Some('I') => {
+                    hour = parse_digits(&mut input_iter, 2)?;
+                    // Will be adjusted by %p if present
+                }
+                Some('M') => {
+                    minute = parse_digits(&mut input_iter, 2)?;
+                }
+                Some('S') => {
+                    second = parse_digits(&mut input_iter, 2)?;
+                }
+                Some('p') | Some('P') => {
+                    let mut ampm = String::new();
+                    while let Some(&c) = input_iter.peek() {
+                        if c.is_ascii_alphabetic() {
+                            ampm.push(c);
+                            input_iter.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    let ampm_lower = ampm.to_lowercase();
+                    if ampm_lower == "pm" && hour < 12 {
+                        hour += 12;
+                    } else if ampm_lower == "am" && hour == 12 {
+                        hour = 0;
+                    }
+                }
+                #[allow(unused_assignments)]
+                Some('j') => {
+                    // Parse day-of-year, but we recalculate it from the date for consistency
+                    yearday = parse_digits(&mut input_iter, 3)? - 1; // Convert to 0-indexed
+                }
+                #[allow(unused_assignments)]
+                Some('w') => {
+                    // Parse weekday, but we recalculate it from the date for consistency
+                    weekday = parse_digits(&mut input_iter, 1)?;
+                }
+                #[allow(unused_assignments)]
+                Some('u') => {
+                    // Parse ISO weekday (1=Monday, 7=Sunday), convert to 0=Sunday
+                    let w = parse_digits(&mut input_iter, 1)?;
+                    weekday = if w == 7 { 0 } else { w };
+                }
+                Some('a') | Some('A') => {
+                    // Skip day name
+                    while let Some(&c) = input_iter.peek() {
+                        if c.is_ascii_alphabetic() {
+                            input_iter.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                Some('b') | Some('B') | Some('h') => {
+                    let mut name = String::new();
+                    while let Some(&c) = input_iter.peek() {
+                        if c.is_ascii_alphabetic() {
+                            name.push(c);
+                            input_iter.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    let name_lower = name.to_lowercase();
+                    let months = [
+                        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
+                        "nov", "dec",
+                    ];
+                    for (i, m) in months.iter().enumerate() {
+                        if name_lower.starts_with(m) {
+                            month = (i + 1) as i64;
+                            break;
+                        }
+                    }
+                }
+                Some('C') => {
+                    let century = parse_digits(&mut input_iter, 2)?;
+                    year = century * 100 + (year % 100);
+                }
+                Some('D') => {
+                    // mm/dd/yy
+                    month = parse_digits(&mut input_iter, 2)?;
+                    if input_iter.next() != Some('/') {
+                        return Err("expected '/'".to_string());
+                    }
+                    day = parse_digits(&mut input_iter, 2)?;
+                    if input_iter.next() != Some('/') {
+                        return Err("expected '/'".to_string());
+                    }
+                    let y = parse_digits(&mut input_iter, 2)?;
+                    year = if y >= 69 { 1900 + y } else { 2000 + y };
+                }
+                Some('F') => {
+                    // yyyy-mm-dd
+                    year = parse_digits(&mut input_iter, 4)?;
+                    if input_iter.next() != Some('-') {
+                        return Err("expected '-'".to_string());
+                    }
+                    month = parse_digits(&mut input_iter, 2)?;
+                    if input_iter.next() != Some('-') {
+                        return Err("expected '-'".to_string());
+                    }
+                    day = parse_digits(&mut input_iter, 2)?;
+                }
+                Some('R') => {
+                    // HH:MM
+                    hour = parse_digits(&mut input_iter, 2)?;
+                    if input_iter.next() != Some(':') {
+                        return Err("expected ':'".to_string());
+                    }
+                    minute = parse_digits(&mut input_iter, 2)?;
+                }
+                Some('T') => {
+                    // HH:MM:SS
+                    hour = parse_digits(&mut input_iter, 2)?;
+                    if input_iter.next() != Some(':') {
+                        return Err("expected ':'".to_string());
+                    }
+                    minute = parse_digits(&mut input_iter, 2)?;
+                    if input_iter.next() != Some(':') {
+                        return Err("expected ':'".to_string());
+                    }
+                    second = parse_digits(&mut input_iter, 2)?;
+                }
+                Some('n') | Some('t') => {
+                    // Skip whitespace
+                    while let Some(&c) = input_iter.peek() {
+                        if c.is_whitespace() {
+                            input_iter.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                Some('z') => {
+                    // Skip timezone offset like +0000 or -0500
+                    if let Some(&c) = input_iter.peek() {
+                        if c == '+' || c == '-' {
+                            input_iter.next();
+                            for _ in 0..4 {
+                                if input_iter
+                                    .peek()
+                                    .map(|c| c.is_ascii_digit())
+                                    .unwrap_or(false)
+                                {
+                                    input_iter.next();
+                                }
+                            }
+                        }
+                    }
+                }
+                Some('Z') => {
+                    // Skip timezone name
+                    while let Some(&c) = input_iter.peek() {
+                        if c.is_ascii_alphabetic() {
+                            input_iter.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                Some(other) => {
+                    // Unknown specifier - skip % and match literal
+                    if input_iter.next() != Some(other) {
+                        return Err(format!("expected '{}'", other));
+                    }
+                }
+                None => {
+                    // Trailing % - match literal
+                    if input_iter.next() != Some('%') {
+                        return Err("expected '%'".to_string());
+                    }
+                }
+            }
+        } else if fc.is_whitespace() {
+            // Skip any whitespace in input
+            while let Some(&c) = input_iter.peek() {
+                if c.is_whitespace() {
+                    input_iter.next();
+                } else {
+                    break;
+                }
+            }
+        } else {
+            // Match literal character
+            match input_iter.next() {
+                Some(c) if c == fc => {}
+                Some(c) => return Err(format!("expected '{}', got '{}'", fc, c)),
+                None => return Err(format!("expected '{}', got end of input", fc)),
+            }
+        }
+    }
+
+    // Calculate weekday if not explicitly set
+    // Using Zeller's congruence or similar
+    let y = year - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let m = month as u32;
+    let d = day as u32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe as i64 - 719468;
+
+    // Calculate weekday from days
+    weekday = (days % 7 + 4 + 7) % 7;
+
+    // Calculate yearday
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let month_days: [i64; 12] = if is_leap {
+        [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
+    } else {
+        [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    };
+    let yearday = month_days[(month - 1) as usize] + day - 1;
+
+    Ok(BrokenDownTime {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        weekday,
+        yearday,
+    })
+}
+
+/// Parse up to n digits from input
+fn parse_digits(
+    input: &mut core::iter::Peekable<core::str::Chars>,
+    max_digits: usize,
+) -> Result<i64, String> {
+    let mut s = String::new();
+    for _ in 0..max_digits {
+        if let Some(&c) = input.peek() {
+            if c.is_ascii_digit() {
+                s.push(c);
+                input.next();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    if s.is_empty() {
+        return Err("expected digits".to_string());
+    }
+    s.parse().map_err(|_| "invalid number".to_string())
+}
+
+/// Builtin: todate - convert Unix timestamp to ISO 8601 date string
+fn builtin_todate<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let timestamp = match get_float_value(&value, optional) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+
+    // Convert to broken-down time first
+    let secs = timestamp.trunc() as i64;
+    let days = if secs >= 0 {
+        secs / 86400
+    } else {
+        (secs - 86399) / 86400
+    };
+    let time_of_day = ((secs % 86400) + 86400) % 86400;
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+
+    let result = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hour, minute, second
+    );
+
+    QueryResult::Owned(OwnedValue::String(result))
+}
+
+/// Builtin: fromdate - parse ISO 8601 date string to Unix timestamp
+fn builtin_fromdate<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("string", "fromdate")),
+    };
+
+    // Parse ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+HH:MM
+    match parse_iso8601(&input) {
+        Ok(timestamp) => QueryResult::Owned(OwnedValue::Float(timestamp)),
+        Err(_) if optional => QueryResult::None,
+        Err(e) => QueryResult::Error(EvalError::new(e)),
+    }
+}
+
+/// Parse ISO 8601 date string to Unix timestamp
+fn parse_iso8601(input: &str) -> Result<f64, String> {
+    // Handle common ISO 8601 formats:
+    // YYYY-MM-DDTHH:MM:SSZ
+    // YYYY-MM-DDTHH:MM:SS.sssZ
+    // YYYY-MM-DDTHH:MM:SS+HH:MM
+    // YYYY-MM-DD
+
+    let input = input.trim();
+
+    // Try to parse with strptime-like logic
+    let mut chars = input.chars().peekable();
+
+    // Year
+    let year: i64 = parse_digits(&mut chars, 4)?;
+
+    if chars.next() != Some('-') {
+        return Err("expected '-' after year".to_string());
+    }
+
+    // Month
+    let month: i64 = parse_digits(&mut chars, 2)?;
+
+    if chars.next() != Some('-') {
+        return Err("expected '-' after month".to_string());
+    }
+
+    // Day
+    let day: i64 = parse_digits(&mut chars, 2)?;
+
+    // Check for time component
+    let (hour, minute, second, tz_offset) =
+        if chars.peek() == Some(&'T') || chars.peek() == Some(&'t') || chars.peek() == Some(&' ') {
+            chars.next(); // Skip T or space
+
+            let hour: i64 = parse_digits(&mut chars, 2)?;
+
+            if chars.next() != Some(':') {
+                return Err("expected ':' after hour".to_string());
+            }
+
+            let minute: i64 = parse_digits(&mut chars, 2)?;
+
+            let second = if chars.peek() == Some(&':') {
+                chars.next();
+                let s = parse_digits(&mut chars, 2)?;
+                // Skip fractional seconds
+                if chars.peek() == Some(&'.') {
+                    chars.next();
+                    while chars.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                        chars.next();
+                    }
+                }
+                s
+            } else {
+                0
+            };
+
+            // Parse timezone
+            let tz_offset = match chars.peek() {
+                Some('Z') | Some('z') => {
+                    chars.next();
+                    0
+                }
+                Some('+') => {
+                    chars.next();
+                    let h = parse_digits(&mut chars, 2)?;
+                    let m = if chars.peek() == Some(&':') {
+                        chars.next();
+                        parse_digits(&mut chars, 2)?
+                    } else if chars.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                        parse_digits(&mut chars, 2)?
+                    } else {
+                        0
+                    };
+                    -(h * 3600 + m * 60) // Positive offset means behind UTC
+                }
+                Some('-') => {
+                    chars.next();
+                    let h = parse_digits(&mut chars, 2)?;
+                    let m = if chars.peek() == Some(&':') {
+                        chars.next();
+                        parse_digits(&mut chars, 2)?
+                    } else if chars.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                        parse_digits(&mut chars, 2)?
+                    } else {
+                        0
+                    };
+                    h * 3600 + m * 60 // Negative offset means ahead of UTC
+                }
+                _ => 0, // Assume UTC if no timezone
+            };
+
+            (hour, minute, second, tz_offset)
+        } else {
+            (0, 0, 0, 0)
+        };
+
+    // Convert to Unix timestamp
+    let y = year - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let m = month as u32;
+    let d = day as u32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe as i64 - 719468;
+
+    let timestamp = days * 86400 + hour * 3600 + minute * 60 + second + tz_offset;
+
+    Ok(timestamp as f64)
+}
+
+// Phase 17: Combinations
+
+/// Builtin: combinations - generate all combinations from array of arrays
+/// Input: [[1,2], [3,4]] -> outputs [1,3], [1,4], [2,3], [2,4]
+fn builtin_combinations<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Input must be an array of arrays
+    let arrays = match &value {
+        StandardJson::Array(elements) => {
+            let mut arrays: Vec<Vec<OwnedValue>> = Vec::new();
+            for elem in *elements {
+                match elem {
+                    StandardJson::Array(inner) => {
+                        let inner_values: Vec<OwnedValue> = inner.map(|v| to_owned(&v)).collect();
+                        arrays.push(inner_values);
+                    }
+                    _ if optional => return QueryResult::None,
+                    _ => {
+                        return QueryResult::Error(EvalError::type_error("array", type_name(&elem)))
+                    }
+                }
+            }
+            arrays
+        }
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    };
+
+    // If any array is empty, return no results
+    if arrays.iter().any(|a| a.is_empty()) {
+        return QueryResult::None;
+    }
+
+    // If no arrays, return empty array
+    if arrays.is_empty() {
+        return QueryResult::Owned(OwnedValue::Array(Vec::new()));
+    }
+
+    // Generate Cartesian product
+    let results = cartesian_product(&arrays);
+    QueryResult::ManyOwned(results)
+}
+
+/// Builtin: combinations(n) - generate n-way combinations (Cartesian product with itself n times)
+/// Input with n=2: [1,2] -> outputs [1,1], [1,2], [2,1], [2,2]
+fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>>(
+    n_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get n
+    let n = match result_to_owned(eval_single(n_expr, value.clone(), optional)) {
+        Ok(OwnedValue::Int(i)) if i >= 0 => i as usize,
+        Ok(OwnedValue::Int(_)) if optional => return QueryResult::None,
+        Ok(OwnedValue::Int(_)) => {
+            return QueryResult::Error(EvalError::new("combinations(n): n must be non-negative"))
+        }
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("number", "n")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Input must be an array
+    let base_array = match &value {
+        StandardJson::Array(elements) => (*elements).map(|v| to_owned(&v)).collect::<Vec<_>>(),
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    };
+
+    // n=0 returns single empty array
+    if n == 0 {
+        return QueryResult::Owned(OwnedValue::Array(Vec::new()));
+    }
+
+    // If base array is empty and n > 0, return no results
+    if base_array.is_empty() {
+        return QueryResult::None;
+    }
+
+    // Create n copies of the base array and compute Cartesian product
+    let arrays: Vec<Vec<OwnedValue>> = (0..n).map(|_| base_array.clone()).collect();
+    let results = cartesian_product(&arrays);
+    QueryResult::ManyOwned(results)
+}
+
+/// Compute the Cartesian product of a list of arrays
+fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Vec<OwnedValue> {
+    if arrays.is_empty() {
+        return vec![OwnedValue::Array(Vec::new())];
+    }
+
+    let mut results = Vec::new();
+    let mut indices = vec![0usize; arrays.len()];
+
+    loop {
+        // Build current combination
+        let combination: Vec<OwnedValue> = indices
+            .iter()
+            .enumerate()
+            .map(|(i, &idx)| arrays[i][idx].clone())
+            .collect();
+        results.push(OwnedValue::Array(combination));
+
+        // Increment indices (like counting in mixed radix)
+        let mut carry = true;
+        for i in (0..arrays.len()).rev() {
+            if carry {
+                indices[i] += 1;
+                if indices[i] >= arrays[i].len() {
+                    indices[i] = 0;
+                } else {
+                    carry = false;
+                }
+            }
+        }
+
+        // If we carried all the way through, we're done
+        if carry {
+            break;
+        }
+    }
+
+    results
+}
+
+/// Builtin: builtins - list all builtin function names
+fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+    // Return a sorted array of all builtin function names with their arity
+    let builtins = vec![
+        // Type functions (arity 0)
+        "type/0",
+        "isnull/0",
+        "isboolean/0",
+        "isnumber/0",
+        "isstring/0",
+        "isarray/0",
+        "isobject/0",
+        // Type filters (arity 0)
+        "values/0",
+        "nulls/0",
+        "booleans/0",
+        "numbers/0",
+        "strings/0",
+        "arrays/0",
+        "objects/0",
+        "iterables/0",
+        "scalars/0",
+        "normals/0",
+        "finites/0",
+        // Length & keys (arity 0)
+        "length/0",
+        "utf8bytelength/0",
+        "keys/0",
+        "keys_unsorted/0",
+        // has/in (arity 1)
+        "has/1",
+        "in/1",
+        // Selection (arity 0-1)
+        "select/1",
+        "empty/0",
+        // Map/Iteration (arity 1)
+        "map/1",
+        "map_values/1",
+        // Reduction (arity 0-1)
+        "add/0",
+        "any/0",
+        "all/0",
+        "min/0",
+        "max/0",
+        "min_by/1",
+        "max_by/1",
+        // String functions (arity 0-1)
+        "ascii_downcase/0",
+        "ascii_upcase/0",
+        "ltrimstr/1",
+        "rtrimstr/1",
+        "startswith/1",
+        "endswith/1",
+        "split/1",
+        "join/1",
+        "contains/1",
+        "inside/1",
+        "trim/0",
+        "ltrim/0",
+        "rtrim/0",
+        // Array functions (arity 0-1)
+        "first/0",
+        "last/0",
+        "nth/1",
+        "reverse/0",
+        "flatten/0",
+        "flatten/1",
+        "group_by/1",
+        "unique/0",
+        "unique_by/1",
+        "sort/0",
+        "sort_by/1",
+        "transpose/0",
+        "bsearch/1",
+        // Object functions (arity 0-1)
+        "to_entries/0",
+        "from_entries/0",
+        "with_entries/1",
+        "pick/1",
+        // Type conversions (arity 0)
+        "tostring/0",
+        "tonumber/0",
+        "tojson/0",
+        "fromjson/0",
+        // String functions (arity 0-1)
+        "explode/0",
+        "implode/0",
+        "test/1",
+        "indices/1",
+        "index/1",
+        "rindex/1",
+        "tojsonstream/0",
+        "fromjsonstream/0",
+        // Path operations (arity 0-2)
+        "path/1",
+        "paths/0",
+        "paths/1",
+        "leaf_paths/0",
+        "getpath/1",
+        "setpath/2",
+        "delpaths/1",
+        "del/1",
+        // Math functions (arity 0-2)
+        "floor/0",
+        "ceil/0",
+        "round/0",
+        "sqrt/0",
+        "fabs/0",
+        "abs/0",
+        "log/0",
+        "log10/0",
+        "log2/0",
+        "exp/0",
+        "exp10/0",
+        "exp2/0",
+        "pow/2",
+        "sin/0",
+        "cos/0",
+        "tan/0",
+        "asin/0",
+        "acos/0",
+        "atan/0",
+        "atan2/2",
+        "sinh/0",
+        "cosh/0",
+        "tanh/0",
+        "asinh/0",
+        "acosh/0",
+        "atanh/0",
+        // Number classification (arity 0)
+        "infinite/0",
+        "nan/0",
+        "isinfinite/0",
+        "isnan/0",
+        "isnormal/0",
+        "isfinite/0",
+        // Control flow (arity 1-2)
+        "recurse/0",
+        "recurse/1",
+        "recurse/2",
+        "walk/1",
+        "isvalid/1",
+        "limit/2",
+        "skip/2",
+        "first/1",
+        "last/1",
+        "nth/2",
+        "until/2",
+        "while/2",
+        "repeat/1",
+        "range/1",
+        "range/2",
+        "range/3",
+        "reduce/3",
+        "foreach/3",
+        "foreach/4",
+        // Debug (arity 0-1)
+        "debug/0",
+        "debug/1",
+        // Environment (arity 0-1)
+        "env/0",
+        "env/1",
+        "strenv/1",
+        // Time (arity 0-1)
+        "now/0",
+        "gmtime/0",
+        "localtime/0",
+        "mktime/0",
+        "strftime/1",
+        "strptime/1",
+        "todate/0",
+        "fromdate/0",
+        "todateiso8601/0",
+        "fromdateiso8601/0",
+        // Combinations (arity 0-1)
+        "combinations/0",
+        "combinations/1",
+        // Additional math (arity 0)
+        "trunc/0",
+        // Type conversion (arity 0)
+        "toboolean/0",
+        // Meta (arity 0-1)
+        "builtins/0",
+        "modulemeta/1",
+        // Error handling (arity 0-1)
+        "error/0",
+        "error/1",
+        // YAML metadata (yq, arity 0)
+        "tag/0",
+        "anchor/0",
+        "style/0",
+        "kind/0",
+        "key/0",
+        "parent/0",
+        "parent/1",
+    ];
+
+    let arr: Vec<OwnedValue> = builtins
+        .iter()
+        .map(|s| OwnedValue::String((*s).to_string()))
+        .collect();
+
+    QueryResult::Owned(OwnedValue::Array(arr))
+}
+
+/// Builtin: normals - select only normal numbers (not zero, infinite, NaN, or subnormal)
+fn builtin_normals<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryResult<'a, W> {
+    if let StandardJson::Number(n) = &value {
+        if let Ok(f) = n.as_f64() {
+            if f.is_normal() {
+                return QueryResult::One(value);
+            }
+        }
+    }
+    QueryResult::None
+}
+
+/// Builtin: finites - select only finite numbers (not infinite or NaN)
+fn builtin_finites<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryResult<'a, W> {
+    if let StandardJson::Number(n) = &value {
+        if let Ok(f) = n.as_f64() {
+            if f.is_finite() {
+                return QueryResult::One(value);
+            }
+        }
+    }
+    QueryResult::None
+}
+
+// Phase 13: Iteration control
+
+/// Builtin: limit(n; expr) - output at most n values from expr
+fn builtin_limit<'a, W: Clone + AsRef<[u64]>>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate n
+    let n_result = eval_single(n_expr, value.clone(), optional);
+    let n = match n_result {
+        QueryResult::One(v) => {
+            if let StandardJson::Number(num) = v {
+                num.as_i64().unwrap_or(0) as usize
+            } else {
+                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
+            }
+        }
+        QueryResult::Owned(OwnedValue::Int(i)) => i as usize,
+        QueryResult::Owned(OwnedValue::Float(f)) => f as usize,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
+    };
+
+    if n == 0 {
+        return QueryResult::None;
+    }
+
+    // Evaluate expr and take at most n results
+    let result = eval_single(expr, value, optional);
+    match result {
+        QueryResult::One(v) => QueryResult::Owned(to_owned(&v)),
+        QueryResult::OneCursor(c) => QueryResult::Owned(to_owned(&c.value())),
+        QueryResult::Owned(v) => QueryResult::Owned(v),
+        QueryResult::Many(results) => {
+            let limited: Vec<OwnedValue> =
+                results.into_iter().take(n).map(|v| to_owned(&v)).collect();
+            if limited.is_empty() {
+                QueryResult::None
+            } else if limited.len() == 1 {
+                QueryResult::Owned(limited.into_iter().next().unwrap())
+            } else {
+                QueryResult::ManyOwned(limited)
+            }
+        }
+        QueryResult::ManyOwned(results) => {
+            let limited: Vec<OwnedValue> = results.into_iter().take(n).collect();
+            if limited.is_empty() {
+                QueryResult::None
+            } else if limited.len() == 1 {
+                QueryResult::Owned(limited.into_iter().next().unwrap())
+            } else {
+                QueryResult::ManyOwned(limited)
+            }
+        }
+        QueryResult::None => QueryResult::None,
+        QueryResult::Error(e) => QueryResult::Error(e),
+        QueryResult::Break(label) => QueryResult::Break(label),
+    }
+}
+
+/// Builtin: first(expr) - output only the first value from expr (stream version)
+fn builtin_first_stream<'a, W: Clone + AsRef<[u64]>>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let result = eval_single(expr, value, optional);
+    match result {
+        QueryResult::One(v) => QueryResult::Owned(to_owned(&v)),
+        QueryResult::OneCursor(c) => QueryResult::Owned(to_owned(&c.value())),
+        QueryResult::Owned(v) => QueryResult::Owned(v),
+        QueryResult::Many(results) => {
+            if let Some(first) = results.into_iter().next() {
+                QueryResult::Owned(to_owned(&first))
+            } else {
+                QueryResult::None
+            }
+        }
+        QueryResult::ManyOwned(results) => {
+            if let Some(first) = results.into_iter().next() {
+                QueryResult::Owned(first)
+            } else {
+                QueryResult::None
+            }
+        }
+        QueryResult::None => QueryResult::None,
+        QueryResult::Error(e) => QueryResult::Error(e),
+        QueryResult::Break(label) => QueryResult::Break(label),
+    }
+}
+
+/// Builtin: last(expr) - output only the last value from expr (stream version)
+fn builtin_last_stream<'a, W: Clone + AsRef<[u64]>>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let result = eval_single(expr, value, optional);
+    match result {
+        QueryResult::One(v) => QueryResult::Owned(to_owned(&v)),
+        QueryResult::OneCursor(c) => QueryResult::Owned(to_owned(&c.value())),
+        QueryResult::Owned(v) => QueryResult::Owned(v),
+        QueryResult::Many(results) => {
+            if let Some(last) = results.into_iter().last() {
+                QueryResult::Owned(to_owned(&last))
+            } else {
+                QueryResult::None
+            }
+        }
+        QueryResult::ManyOwned(results) => {
+            if let Some(last) = results.into_iter().last() {
+                QueryResult::Owned(last)
+            } else {
+                QueryResult::None
+            }
+        }
+        QueryResult::None => QueryResult::None,
+        QueryResult::Error(e) => QueryResult::Error(e),
+        QueryResult::Break(label) => QueryResult::Break(label),
+    }
+}
+
+/// Builtin: nth(n; expr) - output only the nth value from expr (0-indexed, stream version)
+fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate n
+    let n_result = eval_single(n_expr, value.clone(), optional);
+    let n = match n_result {
+        QueryResult::One(v) => {
+            if let StandardJson::Number(num) = v {
+                num.as_i64().unwrap_or(0) as usize
+            } else {
+                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
+            }
+        }
+        QueryResult::Owned(OwnedValue::Int(i)) => i as usize,
+        QueryResult::Owned(OwnedValue::Float(f)) => f as usize,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
+    };
+
+    // Evaluate expr and get the nth result
+    let result = eval_single(expr, value, optional);
+    match result {
+        QueryResult::One(v) if n == 0 => QueryResult::Owned(to_owned(&v)),
+        QueryResult::OneCursor(c) if n == 0 => QueryResult::Owned(to_owned(&c.value())),
+        QueryResult::Owned(v) if n == 0 => QueryResult::Owned(v),
+        QueryResult::Many(results) => {
+            if let Some(nth) = results.into_iter().nth(n) {
+                QueryResult::Owned(to_owned(&nth))
+            } else {
+                QueryResult::None
+            }
+        }
+        QueryResult::ManyOwned(results) => {
+            if let Some(nth) = results.into_iter().nth(n) {
+                QueryResult::Owned(nth)
+            } else {
+                QueryResult::None
+            }
+        }
+        _ => QueryResult::None,
+    }
+}
+
+/// Builtin: range(n) - generate integers from 0 to n-1
+fn builtin_range<'a, W: Clone + AsRef<[u64]>>(
+    n_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate n
+    let n_result = eval_single(n_expr, value, optional);
+    let n = match n_result {
+        QueryResult::One(v) => {
+            if let StandardJson::Number(num) = v {
+                num.as_i64().unwrap_or(0)
+            } else {
+                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
+            }
+        }
+        QueryResult::Owned(OwnedValue::Int(i)) => i,
+        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
+    };
+
+    if n <= 0 {
+        return QueryResult::None;
+    }
+
+    let results: Vec<OwnedValue> = (0..n).map(OwnedValue::Int).collect();
+    if results.len() == 1 {
+        QueryResult::Owned(results.into_iter().next().unwrap())
+    } else {
+        QueryResult::ManyOwned(results)
+    }
+}
+
+/// Builtin: range(from; upto) - generate integers from `from` to `upto-1`
+fn builtin_range_from_to<'a, W: Clone + AsRef<[u64]>>(
+    from_expr: &Expr,
+    to_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate from
+    let from_result = eval_single(from_expr, value.clone(), optional);
+    let from = match from_result {
+        QueryResult::One(v) => {
+            if let StandardJson::Number(num) = v {
+                num.as_i64().unwrap_or(0)
+            } else {
+                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
+            }
+        }
+        QueryResult::Owned(OwnedValue::Int(i)) => i,
+        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
+    };
+
+    // Evaluate to
+    let to_result = eval_single(to_expr, value, optional);
+    let to = match to_result {
+        QueryResult::One(v) => {
+            if let StandardJson::Number(num) = v {
+                num.as_i64().unwrap_or(0)
+            } else {
+                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
+            }
+        }
+        QueryResult::Owned(OwnedValue::Int(i)) => i,
+        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
+    };
+
+    if from >= to {
+        return QueryResult::None;
+    }
+
+    let results: Vec<OwnedValue> = (from..to).map(OwnedValue::Int).collect();
+    if results.len() == 1 {
+        QueryResult::Owned(results.into_iter().next().unwrap())
+    } else {
+        QueryResult::ManyOwned(results)
+    }
+}
+
+/// Builtin: range(from; upto; by) - generate integers from `from` to `upto-1` stepping by `by`
+fn builtin_range_from_to_by<'a, W: Clone + AsRef<[u64]>>(
+    from_expr: &Expr,
+    to_expr: &Expr,
+    by_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate from
+    let from_result = eval_single(from_expr, value.clone(), optional);
+    let from = match from_result {
+        QueryResult::One(v) => {
+            if let StandardJson::Number(num) = v {
+                num.as_i64().unwrap_or(0)
+            } else {
+                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
+            }
+        }
+        QueryResult::Owned(OwnedValue::Int(i)) => i,
+        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
+    };
+
+    // Evaluate to
+    let to_result = eval_single(to_expr, value.clone(), optional);
+    let to = match to_result {
+        QueryResult::One(v) => {
+            if let StandardJson::Number(num) = v {
+                num.as_i64().unwrap_or(0)
+            } else {
+                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
+            }
+        }
+        QueryResult::Owned(OwnedValue::Int(i)) => i,
+        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
+    };
+
+    // Evaluate by
+    let by_result = eval_single(by_expr, value, optional);
+    let by = match by_result {
+        QueryResult::One(v) => {
+            if let StandardJson::Number(num) = v {
+                num.as_i64().unwrap_or(1)
+            } else {
+                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
+            }
+        }
+        QueryResult::Owned(OwnedValue::Int(i)) => i,
+        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
+    };
+
+    if by == 0 {
+        return QueryResult::Error(EvalError::new("range step cannot be zero"));
+    }
+
+    let mut results = Vec::new();
+    let mut i = from;
+    if by > 0 {
+        while i < to {
+            results.push(OwnedValue::Int(i));
+            i += by;
+        }
+    } else {
+        while i > to {
+            results.push(OwnedValue::Int(i));
+            i += by;
+        }
+    }
+
+    if results.is_empty() {
+        QueryResult::None
+    } else if results.len() == 1 {
+        QueryResult::Owned(results.into_iter().next().unwrap())
+    } else {
+        QueryResult::ManyOwned(results)
+    }
+}
+
+/// Builtin: isempty(expr) - returns true if expr produces no outputs
+fn builtin_isempty<'a, W: Clone + AsRef<[u64]>>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let result = eval_single(expr, value, optional);
+    let is_empty = match result {
+        QueryResult::None => true,
+        QueryResult::Many(ref v) if v.is_empty() => true,
+        QueryResult::ManyOwned(ref v) if v.is_empty() => true,
+        QueryResult::Error(_) => true, // Errors count as empty
+        _ => false,
+    };
+    QueryResult::Owned(OwnedValue::Bool(is_empty))
+}
+
 /// Builtin: delpaths(paths) - delete multiple paths
 fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>>(
     paths_expr: &Expr,
@@ -6627,6 +9797,17 @@ fn builtin_round<'a, W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'a, W> {
     match get_float_value(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Int(round_f64(n) as i64)),
+        Err(r) => r,
+    }
+}
+
+/// Builtin: trunc - truncate toward zero
+fn builtin_trunc<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match get_float_value(&value, optional) {
+        Ok(n) => QueryResult::Owned(OwnedValue::Int(libm::trunc(n) as i64)),
         Err(r) => r,
     }
 }
@@ -7013,6 +10194,22 @@ fn builtin_debug_msg<'a, W: Clone + AsRef<[u64]>>(
 
 // Environment functions
 
+/// $ENV expression - returns object of all environment variables
+#[cfg(feature = "std")]
+fn eval_env<'a, W: Clone + AsRef<[u64]>>(_optional: bool) -> QueryResult<'a, W> {
+    let mut env_obj = IndexMap::new();
+    for (key, value) in std::env::vars() {
+        env_obj.insert(key, OwnedValue::String(value));
+    }
+    QueryResult::Owned(OwnedValue::Object(env_obj))
+}
+
+#[cfg(not(feature = "std"))]
+fn eval_env<'a, W: Clone + AsRef<[u64]>>(_optional: bool) -> QueryResult<'a, W> {
+    // Return empty object in no_std context
+    QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
+}
+
 /// Builtin: env - object of all environment variables
 #[cfg(feature = "std")]
 fn builtin_env<'a, W: Clone + AsRef<[u64]>>(
@@ -7323,6 +10520,7 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>>(
             return QueryResult::Error(EvalError::new("pick: keys expression produced no output"))
         }
         QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
         QueryResult::None if optional => return QueryResult::None,
         QueryResult::None => {
             return QueryResult::Error(EvalError::new("pick: keys expression produced no output"))
@@ -7390,6 +10588,64 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
+// Builtin: tag - return YAML type tag (!!str, !!int, !!map, etc.)
+// Since we evaluate on JSON/OwnedValue (not raw YAML), we derive the tag from the JSON type.
+fn builtin_tag<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryResult<'a, W> {
+    let tag = match &value {
+        StandardJson::Null => "!!null",
+        StandardJson::Bool(_) => "!!bool",
+        StandardJson::Number(n) => {
+            // Distinguish int from float
+            if n.as_i64().is_ok() {
+                "!!int"
+            } else {
+                "!!float"
+            }
+        }
+        StandardJson::String(_) => "!!str",
+        StandardJson::Array(_) => "!!seq",
+        StandardJson::Object(_) => "!!map",
+        StandardJson::Error(_) => "!!null",
+    };
+    QueryResult::Owned(OwnedValue::String(tag.to_string()))
+}
+
+// Builtin: anchor - return anchor name if present
+// Since YAML metadata is lost during conversion to OwnedValue, this always returns empty string.
+// In a full yq implementation, this would require tracking anchor metadata through the pipeline.
+fn builtin_anchor<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+    // Currently YAML anchors are not preserved through the OwnedValue conversion.
+    // Return empty string to match yq behavior for values without anchors.
+    QueryResult::Owned(OwnedValue::String(String::new()))
+}
+
+// Builtin: style - return scalar/collection style
+// Since YAML style metadata is lost during conversion to OwnedValue, this returns
+// reasonable defaults based on the JSON structure.
+fn builtin_style<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryResult<'a, W> {
+    let style = match &value {
+        // Collections: yq returns "flow" for flow-style, empty for block-style
+        // Since we lose this info, we return empty string (block-style is more common)
+        StandardJson::Array(_) | StandardJson::Object(_) => "",
+        // Scalars: yq returns "double", "single", "literal", "folded", or empty for plain
+        // Since we lose quote info, we return empty string (plain scalar)
+        _ => "",
+    };
+    QueryResult::Owned(OwnedValue::String(style.to_string()))
+}
+
+/// `kind` - returns the node kind: "scalar", "seq", or "map"
+/// This is a yq function that returns the YAML node kind.
+fn builtin_kind<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryResult<'a, W> {
+    let kind = match &value {
+        StandardJson::Array(_) => "seq",
+        StandardJson::Object(_) => "map",
+        // All other types are scalars: null, bool, number, string
+        _ => "scalar",
+    };
+    QueryResult::Owned(OwnedValue::String(kind.to_string()))
+}
+
 // ============================================================================
 // Phase 9: Variables & Definitions
 // ============================================================================
@@ -7413,6 +10669,7 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::ManyOwned(vs) => vs,
         QueryResult::None => return QueryResult::None,
         QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
     };
 
     let mut all_results: Vec<OwnedValue> = Vec::new();
@@ -7438,6 +10695,7 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>>(
             QueryResult::ManyOwned(vs) => all_results.extend(vs),
             QueryResult::None => {}
             QueryResult::Error(e) => return QueryResult::Error(e),
+            QueryResult::Break(label) => return QueryResult::Break(label),
         }
     }
 
@@ -7630,6 +10888,8 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
         ),
         Expr::Format(f) => Expr::Format(f.clone()),
         Expr::Var(v) => Expr::Var(v.clone()),
+        Expr::Loc { line } => Expr::Loc { line: *line },
+        Expr::Env => Expr::Env,
         Expr::As {
             expr,
             var,
@@ -7764,6 +11024,13 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
             path: Box::new(expand_func_calls(path, func_name, params, body)),
             value: Box::new(expand_func_calls(value, func_name, params, body)),
         },
+
+        // Label-break
+        Expr::Label { name, body: lbody } => Expr::Label {
+            name: name.clone(),
+            body: Box::new(expand_func_calls(lbody, func_name, params, body)),
+        },
+        Expr::Break(name) => Expr::Break(name.clone()),
     }
 }
 
@@ -7773,6 +11040,8 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
         // A variable reference to the parameter becomes the argument expression
         Expr::Var(name) if name == param => arg.clone(),
         Expr::Var(_) => expr.clone(),
+        Expr::Loc { line } => Expr::Loc { line: *line },
+        Expr::Env => Expr::Env,
         Expr::Identity => Expr::Identity,
         Expr::Field(name) => Expr::Field(name.clone()),
         Expr::Index(i) => Expr::Index(*i),
@@ -8038,6 +11307,13 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
             path: Box::new(substitute_func_param(path, param, arg)),
             value: Box::new(substitute_func_param(value, param, arg)),
         },
+
+        // Label-break
+        Expr::Label { name, body } => Expr::Label {
+            name: name.clone(),
+            body: Box::new(substitute_func_param(body, param, arg)),
+        },
+        Expr::Break(name) => Expr::Break(name.clone()),
     }
 }
 
@@ -8056,6 +11332,15 @@ fn expand_func_calls_in_builtin(
         Builtin::IsString => Builtin::IsString,
         Builtin::IsArray => Builtin::IsArray,
         Builtin::IsObject => Builtin::IsObject,
+        Builtin::Values => Builtin::Values,
+        Builtin::Nulls => Builtin::Nulls,
+        Builtin::Booleans => Builtin::Booleans,
+        Builtin::Numbers => Builtin::Numbers,
+        Builtin::Strings => Builtin::Strings,
+        Builtin::Arrays => Builtin::Arrays,
+        Builtin::Objects => Builtin::Objects,
+        Builtin::Iterables => Builtin::Iterables,
+        Builtin::Scalars => Builtin::Scalars,
         Builtin::Length => Builtin::Length,
         Builtin::Utf8ByteLength => Builtin::Utf8ByteLength,
         Builtin::Keys => Builtin::Keys,
@@ -8131,6 +11416,8 @@ fn expand_func_calls_in_builtin(
         }
         Builtin::ToString => Builtin::ToString,
         Builtin::ToNumber => Builtin::ToNumber,
+        Builtin::ToJson => Builtin::ToJson,
+        Builtin::FromJson => Builtin::FromJson,
         Builtin::Explode => Builtin::Explode,
         Builtin::Implode => Builtin::Implode,
         Builtin::Test(e) => Builtin::Test(Box::new(expand_func_calls(e, func_name, params, body))),
@@ -8148,35 +11435,60 @@ fn expand_func_calls_in_builtin(
         Builtin::GetPath(e) => {
             Builtin::GetPath(Box::new(expand_func_calls(e, func_name, params, body)))
         }
-        #[cfg(feature = "regex")]
-        Builtin::Match(re, flags) => Builtin::Match(
+        // Phase 16: Regex Functions
+        Builtin::TestFlags(re, flags) => Builtin::TestFlags(
             Box::new(expand_func_calls(re, func_name, params, body)),
-            flags.clone(),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
         ),
-        #[cfg(feature = "regex")]
+        Builtin::Match(re) => {
+            Builtin::Match(Box::new(expand_func_calls(re, func_name, params, body)))
+        }
+        Builtin::MatchFlags(re, flags) => Builtin::MatchFlags(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
+        ),
         Builtin::Capture(e) => {
             Builtin::Capture(Box::new(expand_func_calls(e, func_name, params, body)))
         }
-        #[cfg(feature = "regex")]
-        Builtin::Scan(e) => Builtin::Scan(Box::new(expand_func_calls(e, func_name, params, body))),
-        #[cfg(feature = "regex")]
-        Builtin::Splits(e) => {
-            Builtin::Splits(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        #[cfg(feature = "regex")]
+        Builtin::CaptureFlags(re, flags) => Builtin::CaptureFlags(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
+        ),
         Builtin::Sub(re, repl) => Builtin::Sub(
             Box::new(expand_func_calls(re, func_name, params, body)),
             Box::new(expand_func_calls(repl, func_name, params, body)),
         ),
-        #[cfg(feature = "regex")]
+        Builtin::SubFlags(re, repl, flags) => Builtin::SubFlags(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            Box::new(expand_func_calls(repl, func_name, params, body)),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
+        ),
         Builtin::Gsub(re, repl) => Builtin::Gsub(
             Box::new(expand_func_calls(re, func_name, params, body)),
             Box::new(expand_func_calls(repl, func_name, params, body)),
         ),
-        #[cfg(feature = "regex")]
-        Builtin::TestWithFlags(re, flags) => Builtin::TestWithFlags(
+        Builtin::GsubFlags(re, repl, flags) => Builtin::GsubFlags(
             Box::new(expand_func_calls(re, func_name, params, body)),
-            flags.clone(),
+            Box::new(expand_func_calls(repl, func_name, params, body)),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
+        ),
+        Builtin::Scan(re) => {
+            Builtin::Scan(Box::new(expand_func_calls(re, func_name, params, body)))
+        }
+        Builtin::ScanFlags(re, flags) => Builtin::ScanFlags(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
+        ),
+        Builtin::SplitRegex(re, flags) => Builtin::SplitRegex(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
+        ),
+        Builtin::Splits(re) => {
+            Builtin::Splits(Box::new(expand_func_calls(re, func_name, params, body)))
+        }
+        Builtin::SplitsFlags(re, flags) => Builtin::SplitsFlags(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
         ),
         Builtin::Recurse => Builtin::Recurse,
         Builtin::RecurseF(f) => {
@@ -8268,7 +11580,82 @@ fn expand_func_calls_in_builtin(
             Builtin::ModuleMeta(Box::new(expand_func_calls(e, func_name, params, body)))
         }
         Builtin::Pick(e) => Builtin::Pick(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::Tag => Builtin::Tag,
+        Builtin::Anchor => Builtin::Anchor,
+        Builtin::Style => Builtin::Style,
+        Builtin::Kind => Builtin::Kind,
+        Builtin::Key => Builtin::Key,
         Builtin::Del(e) => Builtin::Del(Box::new(expand_func_calls(e, func_name, params, body))),
+        // Phase 12 builtins (no args to expand)
+        Builtin::Now => Builtin::Now,
+        Builtin::Abs => Builtin::Abs,
+        Builtin::Builtins => Builtin::Builtins,
+        Builtin::Normals => Builtin::Normals,
+        Builtin::Finites => Builtin::Finites,
+        // Phase 13: Iteration control
+        Builtin::Limit(n, e) => Builtin::Limit(
+            Box::new(expand_func_calls(n, func_name, params, body)),
+            Box::new(expand_func_calls(e, func_name, params, body)),
+        ),
+        Builtin::FirstStream(e) => {
+            Builtin::FirstStream(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::LastStream(e) => {
+            Builtin::LastStream(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::NthStream(n, e) => Builtin::NthStream(
+            Box::new(expand_func_calls(n, func_name, params, body)),
+            Box::new(expand_func_calls(e, func_name, params, body)),
+        ),
+        Builtin::Range(n) => {
+            Builtin::Range(Box::new(expand_func_calls(n, func_name, params, body)))
+        }
+        Builtin::RangeFromTo(from, to) => Builtin::RangeFromTo(
+            Box::new(expand_func_calls(from, func_name, params, body)),
+            Box::new(expand_func_calls(to, func_name, params, body)),
+        ),
+        Builtin::RangeFromToBy(from, to, by) => Builtin::RangeFromToBy(
+            Box::new(expand_func_calls(from, func_name, params, body)),
+            Box::new(expand_func_calls(to, func_name, params, body)),
+            Box::new(expand_func_calls(by, func_name, params, body)),
+        ),
+        Builtin::IsEmpty(e) => {
+            Builtin::IsEmpty(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        // Phase 14: Recursive traversal (extends Phase 8)
+        Builtin::RecurseDown => Builtin::RecurseDown,
+        // Phase 15: Date/Time functions
+        Builtin::Gmtime => Builtin::Gmtime,
+        Builtin::Localtime => Builtin::Localtime,
+        Builtin::Mktime => Builtin::Mktime,
+        Builtin::Strftime(e) => {
+            Builtin::Strftime(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::Strptime(e) => {
+            Builtin::Strptime(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::Todate => Builtin::Todate,
+        Builtin::Fromdate => Builtin::Fromdate,
+        Builtin::Todateiso8601 => Builtin::Todateiso8601,
+        Builtin::Fromdateiso8601 => Builtin::Fromdateiso8601,
+
+        // Phase 17: Combinations
+        Builtin::Combinations => Builtin::Combinations,
+        Builtin::CombinationsN(e) => {
+            Builtin::CombinationsN(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+
+        // Phase 18: Additional math functions
+        Builtin::Trunc => Builtin::Trunc,
+
+        // Phase 19: Type conversion
+        Builtin::ToBoolean => Builtin::ToBoolean,
+
+        // Phase 20: Iteration control extension
+        Builtin::Skip(n, e) => Builtin::Skip(
+            Box::new(expand_func_calls(n, func_name, params, body)),
+            Box::new(expand_func_calls(e, func_name, params, body)),
+        ),
     }
 }
 
@@ -8282,6 +11669,15 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::IsString => Builtin::IsString,
         Builtin::IsArray => Builtin::IsArray,
         Builtin::IsObject => Builtin::IsObject,
+        Builtin::Values => Builtin::Values,
+        Builtin::Nulls => Builtin::Nulls,
+        Builtin::Booleans => Builtin::Booleans,
+        Builtin::Numbers => Builtin::Numbers,
+        Builtin::Strings => Builtin::Strings,
+        Builtin::Arrays => Builtin::Arrays,
+        Builtin::Objects => Builtin::Objects,
+        Builtin::Iterables => Builtin::Iterables,
+        Builtin::Scalars => Builtin::Scalars,
         Builtin::Length => Builtin::Length,
         Builtin::Utf8ByteLength => Builtin::Utf8ByteLength,
         Builtin::Keys => Builtin::Keys,
@@ -8331,6 +11727,8 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         }
         Builtin::ToString => Builtin::ToString,
         Builtin::ToNumber => Builtin::ToNumber,
+        Builtin::ToJson => Builtin::ToJson,
+        Builtin::FromJson => Builtin::FromJson,
         Builtin::Explode => Builtin::Explode,
         Builtin::Implode => Builtin::Implode,
         Builtin::Test(e) => Builtin::Test(Box::new(substitute_func_param(e, param, arg))),
@@ -8340,31 +11738,52 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::ToJsonStream => Builtin::ToJsonStream,
         Builtin::FromJsonStream => Builtin::FromJsonStream,
         Builtin::GetPath(e) => Builtin::GetPath(Box::new(substitute_func_param(e, param, arg))),
-        #[cfg(feature = "regex")]
-        Builtin::Match(re, flags) => Builtin::Match(
+        // Phase 16: Regex Functions
+        Builtin::TestFlags(re, flags) => Builtin::TestFlags(
             Box::new(substitute_func_param(re, param, arg)),
-            flags.clone(),
+            Box::new(substitute_func_param(flags, param, arg)),
         ),
-        #[cfg(feature = "regex")]
+        Builtin::Match(re) => Builtin::Match(Box::new(substitute_func_param(re, param, arg))),
+        Builtin::MatchFlags(re, flags) => Builtin::MatchFlags(
+            Box::new(substitute_func_param(re, param, arg)),
+            Box::new(substitute_func_param(flags, param, arg)),
+        ),
         Builtin::Capture(e) => Builtin::Capture(Box::new(substitute_func_param(e, param, arg))),
-        #[cfg(feature = "regex")]
-        Builtin::Scan(e) => Builtin::Scan(Box::new(substitute_func_param(e, param, arg))),
-        #[cfg(feature = "regex")]
-        Builtin::Splits(e) => Builtin::Splits(Box::new(substitute_func_param(e, param, arg))),
-        #[cfg(feature = "regex")]
+        Builtin::CaptureFlags(re, flags) => Builtin::CaptureFlags(
+            Box::new(substitute_func_param(re, param, arg)),
+            Box::new(substitute_func_param(flags, param, arg)),
+        ),
         Builtin::Sub(re, repl) => Builtin::Sub(
             Box::new(substitute_func_param(re, param, arg)),
             Box::new(substitute_func_param(repl, param, arg)),
         ),
-        #[cfg(feature = "regex")]
+        Builtin::SubFlags(re, repl, flags) => Builtin::SubFlags(
+            Box::new(substitute_func_param(re, param, arg)),
+            Box::new(substitute_func_param(repl, param, arg)),
+            Box::new(substitute_func_param(flags, param, arg)),
+        ),
         Builtin::Gsub(re, repl) => Builtin::Gsub(
             Box::new(substitute_func_param(re, param, arg)),
             Box::new(substitute_func_param(repl, param, arg)),
         ),
-        #[cfg(feature = "regex")]
-        Builtin::TestWithFlags(re, flags) => Builtin::TestWithFlags(
+        Builtin::GsubFlags(re, repl, flags) => Builtin::GsubFlags(
             Box::new(substitute_func_param(re, param, arg)),
-            flags.clone(),
+            Box::new(substitute_func_param(repl, param, arg)),
+            Box::new(substitute_func_param(flags, param, arg)),
+        ),
+        Builtin::Scan(re) => Builtin::Scan(Box::new(substitute_func_param(re, param, arg))),
+        Builtin::ScanFlags(re, flags) => Builtin::ScanFlags(
+            Box::new(substitute_func_param(re, param, arg)),
+            Box::new(substitute_func_param(flags, param, arg)),
+        ),
+        Builtin::SplitRegex(re, flags) => Builtin::SplitRegex(
+            Box::new(substitute_func_param(re, param, arg)),
+            Box::new(substitute_func_param(flags, param, arg)),
+        ),
+        Builtin::Splits(re) => Builtin::Splits(Box::new(substitute_func_param(re, param, arg))),
+        Builtin::SplitsFlags(re, flags) => Builtin::SplitsFlags(
+            Box::new(substitute_func_param(re, param, arg)),
+            Box::new(substitute_func_param(flags, param, arg)),
         ),
         Builtin::Recurse => Builtin::Recurse,
         Builtin::RecurseF(f) => Builtin::RecurseF(Box::new(substitute_func_param(f, param, arg))),
@@ -8442,7 +11861,74 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
             Builtin::ModuleMeta(Box::new(substitute_func_param(e, param, arg)))
         }
         Builtin::Pick(e) => Builtin::Pick(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Tag => Builtin::Tag,
+        Builtin::Anchor => Builtin::Anchor,
+        Builtin::Style => Builtin::Style,
+        Builtin::Kind => Builtin::Kind,
+        Builtin::Key => Builtin::Key,
         Builtin::Del(e) => Builtin::Del(Box::new(substitute_func_param(e, param, arg))),
+        // Phase 12 builtins (no args to substitute)
+        Builtin::Now => Builtin::Now,
+        Builtin::Abs => Builtin::Abs,
+        Builtin::Builtins => Builtin::Builtins,
+        Builtin::Normals => Builtin::Normals,
+        Builtin::Finites => Builtin::Finites,
+        // Phase 13: Iteration control
+        Builtin::Limit(n, e) => Builtin::Limit(
+            Box::new(substitute_func_param(n, param, arg)),
+            Box::new(substitute_func_param(e, param, arg)),
+        ),
+        Builtin::FirstStream(e) => {
+            Builtin::FirstStream(Box::new(substitute_func_param(e, param, arg)))
+        }
+        Builtin::LastStream(e) => {
+            Builtin::LastStream(Box::new(substitute_func_param(e, param, arg)))
+        }
+        Builtin::NthStream(n, e) => Builtin::NthStream(
+            Box::new(substitute_func_param(n, param, arg)),
+            Box::new(substitute_func_param(e, param, arg)),
+        ),
+        Builtin::Range(n) => Builtin::Range(Box::new(substitute_func_param(n, param, arg))),
+        Builtin::RangeFromTo(from, to) => Builtin::RangeFromTo(
+            Box::new(substitute_func_param(from, param, arg)),
+            Box::new(substitute_func_param(to, param, arg)),
+        ),
+        Builtin::RangeFromToBy(from, to, by) => Builtin::RangeFromToBy(
+            Box::new(substitute_func_param(from, param, arg)),
+            Box::new(substitute_func_param(to, param, arg)),
+            Box::new(substitute_func_param(by, param, arg)),
+        ),
+        Builtin::IsEmpty(e) => Builtin::IsEmpty(Box::new(substitute_func_param(e, param, arg))),
+        // Phase 14: Recursive traversal (extends Phase 8)
+        Builtin::RecurseDown => Builtin::RecurseDown,
+        // Phase 15: Date/Time functions
+        Builtin::Gmtime => Builtin::Gmtime,
+        Builtin::Localtime => Builtin::Localtime,
+        Builtin::Mktime => Builtin::Mktime,
+        Builtin::Strftime(e) => Builtin::Strftime(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Strptime(e) => Builtin::Strptime(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Todate => Builtin::Todate,
+        Builtin::Fromdate => Builtin::Fromdate,
+        Builtin::Todateiso8601 => Builtin::Todateiso8601,
+        Builtin::Fromdateiso8601 => Builtin::Fromdateiso8601,
+
+        // Phase 17: Combinations
+        Builtin::Combinations => Builtin::Combinations,
+        Builtin::CombinationsN(e) => {
+            Builtin::CombinationsN(Box::new(substitute_func_param(e, param, arg)))
+        }
+
+        // Phase 18: Additional math functions
+        Builtin::Trunc => Builtin::Trunc,
+
+        // Phase 19: Type conversion
+        Builtin::ToBoolean => Builtin::ToBoolean,
+
+        // Phase 20: Iteration control extension
+        Builtin::Skip(n, e) => Builtin::Skip(
+            Box::new(substitute_func_param(n, param, arg)),
+            Box::new(substitute_func_param(e, param, arg)),
+        ),
     }
 }
 
@@ -10079,6 +13565,26 @@ mod tests {
                 assert_eq!(n, 2);
             }
         );
+
+        // Negative index support
+        query!(br#"[1, 2, 3]"#, r#"getpath([-1])"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 3);
+            }
+        );
+
+        query!(br#"[1, 2, 3]"#, r#"getpath([-2])"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 2);
+            }
+        );
+
+        // Nested with negative index
+        query!(br#"{"a": [10, 20, 30]}"#, r#"getpath(["a", -1])"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 30);
+            }
+        );
     }
 
     // =========================================================================
@@ -10301,6 +13807,37 @@ mod tests {
                     OwnedValue::Int(2),
                     OwnedValue::Int(4),
                     OwnedValue::Int(8),
+                ]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_repeat() {
+        // repeat(expr) - repeatedly evaluate expr with original input
+        // jq behavior: repeat(. * 2) on input 1 produces 2, 2, 2, ...
+        query!(br#"1"#, r#"[limit(5; repeat(. * 2))]"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![
+                    OwnedValue::Int(2),
+                    OwnedValue::Int(2),
+                    OwnedValue::Int(2),
+                    OwnedValue::Int(2),
+                    OwnedValue::Int(2),
+                ]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_repeat_identity() {
+        // repeat(.) produces the same value infinitely
+        query!(br#""hello""#, r#"[limit(3; repeat(.))]"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![
+                    OwnedValue::String("hello".into()),
+                    OwnedValue::String("hello".into()),
+                    OwnedValue::String("hello".into()),
                 ]);
             }
         );
@@ -10595,19 +14132,93 @@ mod tests {
 
     #[test]
     fn test_paths() {
+        // paths streams individual paths (matching jq behavior)
         query!(br#"{"a": 1, "b": {"c": 2}}"#, "paths",
-            QueryResult::Owned(OwnedValue::Array(paths)) => {
+            QueryResult::ManyOwned(paths) => {
                 // Should have paths: ["a"], ["b"], ["b", "c"]
                 assert_eq!(paths.len(), 3);
+                assert_eq!(paths[0], OwnedValue::Array(vec![OwnedValue::String("a".into())]));
+                assert_eq!(paths[1], OwnedValue::Array(vec![OwnedValue::String("b".into())]));
+                assert_eq!(paths[2], OwnedValue::Array(vec![
+                    OwnedValue::String("b".into()),
+                    OwnedValue::String("c".into())
+                ]));
+            }
+        );
+    }
+
+    #[test]
+    fn test_paths_single() {
+        // Single path returns single Owned result
+        query!(br#"{"a": 1}"#, "paths",
+            QueryResult::Owned(OwnedValue::Array(path)) => {
+                assert_eq!(path, vec![OwnedValue::String("a".into())]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_paths_collected() {
+        // Collected with [...] matches jq's [paths]
+        query!(br#"{"a": 1, "b": 2}"#, "[paths]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
             }
         );
     }
 
     #[test]
     fn test_leaf_paths() {
+        // leaf_paths streams individual paths (like paths(scalars) in jq)
         query!(br#"{"a": 1, "b": {"c": 2}}"#, "leaf_paths",
-            QueryResult::Owned(OwnedValue::Array(paths)) => {
+            QueryResult::ManyOwned(paths) => {
                 // Should have paths: ["a"], ["b", "c"]
+                assert_eq!(paths.len(), 2);
+                assert_eq!(paths[0], OwnedValue::Array(vec![OwnedValue::String("a".into())]));
+                assert_eq!(paths[1], OwnedValue::Array(vec![
+                    OwnedValue::String("b".into()),
+                    OwnedValue::String("c".into())
+                ]));
+            }
+        );
+    }
+
+    #[test]
+    fn test_leaf_paths_single() {
+        // Single leaf returns single Owned result
+        query!(br#"{"a": 1}"#, "leaf_paths",
+            QueryResult::Owned(OwnedValue::Array(path)) => {
+                assert_eq!(path, vec![OwnedValue::String("a".into())]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_leaf_paths_array() {
+        // Arrays also work
+        query!(br#"[1, [2, 3]]"#, "[leaf_paths]",
+            QueryResult::Owned(OwnedValue::Array(paths)) => {
+                // Paths: [0], [1, 0], [1, 1]
+                assert_eq!(paths.len(), 3);
+            }
+        );
+    }
+
+    #[test]
+    fn test_leaf_paths_with_null() {
+        // null is included as a leaf (unlike jq's paths(scalars) which excludes it)
+        query!(br#"{"a": null, "b": 1}"#, "[leaf_paths]",
+            QueryResult::Owned(OwnedValue::Array(paths)) => {
+                assert_eq!(paths.len(), 2);
+            }
+        );
+    }
+
+    #[test]
+    fn test_leaf_paths_empty_containers() {
+        // Empty containers are considered leaves
+        query!(br#"{"a": [], "b": {}}"#, "[leaf_paths]",
+            QueryResult::Owned(OwnedValue::Array(paths)) => {
                 assert_eq!(paths.len(), 2);
             }
         );
@@ -10721,6 +14332,46 @@ mod tests {
     }
 
     #[test]
+    fn test_dollar_env() {
+        // $ENV returns object of environment variables (same as env builtin)
+        query!(b"null", "$ENV", QueryResult::Owned(OwnedValue::Object(obj)) => {
+            // In std context, $ENV should have at least PATH
+            #[cfg(feature = "std")]
+            assert!(!obj.is_empty(), "$ENV should return non-empty object in std context");
+            #[cfg(not(feature = "std"))]
+            assert!(obj.is_empty(), "$ENV should return empty object in no_std context");
+        });
+    }
+
+    #[test]
+    fn test_dollar_env_field_access() {
+        // $ENV.VAR should return the environment variable value
+        query!(b"null", "$ENV.PATH", QueryResult::Owned(OwnedValue::String(s)) => {
+            #[cfg(feature = "std")]
+            assert!(!s.is_empty(), "PATH should be non-empty");
+        });
+    }
+
+    #[test]
+    fn test_dollar_env_missing_var() {
+        // $ENV.NONEXISTENT_VAR_12345 returns null with optional syntax
+        // Note: jq returns null for missing fields, but our implementation returns error
+        // Using optional syntax to get null instead
+        query!(b"null", "$ENV.NONEXISTENT_VAR_12345?",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    #[test]
+    fn test_dollar_env_bracket_access() {
+        // $ENV["PATH"] should also work
+        query!(b"null", r#"$ENV["PATH"]"#, QueryResult::Owned(OwnedValue::String(s)) => {
+            #[cfg(feature = "std")]
+            assert!(!s.is_empty(), "PATH should be non-empty");
+        });
+    }
+
+    #[test]
     fn test_env_var() {
         // env(VAR) returns the environment variable value
         // This test uses PATH which should always exist
@@ -10737,6 +14388,32 @@ mod tests {
             #[cfg(feature = "std")]
             assert!(!s.is_empty(), "PATH should be non-empty");
         });
+    }
+
+    #[test]
+    fn test_env_field_access() {
+        // env.VAR should return the environment variable value (like $ENV.VAR)
+        query!(b"null", "env.PATH", QueryResult::Owned(OwnedValue::String(s)) => {
+            #[cfg(feature = "std")]
+            assert!(!s.is_empty(), "PATH should be non-empty");
+        });
+    }
+
+    #[test]
+    fn test_env_bracket_access() {
+        // env["PATH"] should also work (like $ENV["PATH"])
+        query!(b"null", r#"env["PATH"]"#, QueryResult::Owned(OwnedValue::String(s)) => {
+            #[cfg(feature = "std")]
+            assert!(!s.is_empty(), "PATH should be non-empty");
+        });
+    }
+
+    #[test]
+    fn test_env_missing_var() {
+        // env.NONEXISTENT_VAR_12345? returns null with optional syntax
+        query!(b"null", "env.NONEXISTENT_VAR_12345?",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
     }
 
     #[test]
@@ -10796,11 +14473,41 @@ mod tests {
 
     #[test]
     fn test_paths_filter() {
-        // paths(filter) returns paths where values match filter
+        // paths(filter) streams paths where values match filter
         query!(br#"{"a": 1, "b": "hello", "c": 2}"#, "paths(type == \"number\")",
-            QueryResult::Owned(OwnedValue::Array(paths)) => {
+            QueryResult::ManyOwned(paths) => {
                 // Should have paths to "a" and "c" (both numbers)
                 assert_eq!(paths.len(), 2);
+                assert_eq!(paths[0], OwnedValue::Array(vec![OwnedValue::String("a".into())]));
+                assert_eq!(paths[1], OwnedValue::Array(vec![OwnedValue::String("c".into())]));
+            }
+        );
+    }
+
+    #[test]
+    fn test_paths_filter_single() {
+        // Single match returns single Owned result
+        query!(br#"{"a": 1, "b": "hello"}"#, "paths(type == \"number\")",
+            QueryResult::Owned(OwnedValue::Array(path)) => {
+                assert_eq!(path, vec![OwnedValue::String("a".into())]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_paths_filter_none() {
+        // No matches returns None
+        query!(br#"{"a": "x", "b": "y"}"#, "paths(type == \"number\")",
+            QueryResult::None => {}
+        );
+    }
+
+    #[test]
+    fn test_paths_filter_collected() {
+        // Collected with [...] matches jq
+        query!(br#"{"a": 1, "b": "hello", "c": 2}"#, "[paths(type == \"number\")]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
             }
         );
     }
@@ -10866,6 +14573,118 @@ mod tests {
         query!(b"42", r#"debug("test message")"#, QueryResult::Owned(OwnedValue::Int(n)) => {
             assert_eq!(n, 42);
         });
+    }
+
+    // =============================================
+    // Date/Time function tests (Phase 15)
+    // =============================================
+
+    #[test]
+    fn test_gmtime() {
+        // Unix epoch (Jan 1, 1970 00:00:00 UTC)
+        query!(b"0", r#"gmtime"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 8);
+                assert_eq!(arr[0], OwnedValue::Int(1970)); // year
+                assert_eq!(arr[1], OwnedValue::Int(0));    // month (0-indexed)
+                assert_eq!(arr[2], OwnedValue::Int(1));    // day
+                assert_eq!(arr[3], OwnedValue::Int(0));    // hour
+                assert_eq!(arr[4], OwnedValue::Int(0));    // minute
+                assert_eq!(arr[5], OwnedValue::Int(0));    // second
+                assert_eq!(arr[6], OwnedValue::Int(4));    // weekday (Thursday)
+                assert_eq!(arr[7], OwnedValue::Int(0));    // yearday
+            }
+        );
+    }
+
+    #[test]
+    fn test_mktime() {
+        // Round-trip: gmtime | mktime should return original timestamp
+        query!(b"[1970,0,1,0,0,0,4,0]", r#"mktime"#,
+            QueryResult::Owned(OwnedValue::Float(n)) => {
+                assert_eq!(n, 0.0);
+            }
+        );
+
+        // Jan 15, 2024 10:30:00 UTC
+        query!(b"[2024,0,15,10,30,0,1,14]", r#"mktime"#,
+            QueryResult::Owned(OwnedValue::Float(n)) => {
+                assert_eq!(n, 1705314600.0);
+            }
+        );
+    }
+
+    #[test]
+    fn test_strftime() {
+        query!(b"[2024,0,15,10,30,0,1,14]", r#"strftime("%Y-%m-%d")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15");
+            }
+        );
+
+        query!(b"[2024,0,15,10,30,0,1,14]", r#"strftime("%Y-%m-%dT%H:%M:%SZ")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T10:30:00Z");
+            }
+        );
+    }
+
+    #[test]
+    fn test_strptime() {
+        query!(br#""2024-01-15T10:30:00Z""#, r#"strptime("%Y-%m-%dT%H:%M:%SZ")"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 8);
+                assert_eq!(arr[0], OwnedValue::Int(2024)); // year
+                assert_eq!(arr[1], OwnedValue::Int(0));    // month (0-indexed)
+                assert_eq!(arr[2], OwnedValue::Int(15));   // day
+                assert_eq!(arr[3], OwnedValue::Int(10));   // hour
+                assert_eq!(arr[4], OwnedValue::Int(30));   // minute
+                assert_eq!(arr[5], OwnedValue::Int(0));    // second
+            }
+        );
+    }
+
+    #[test]
+    fn test_todate() {
+        // todate converts timestamp to ISO 8601 string
+        query!(b"0", r#"todate"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1970-01-01T00:00:00Z");
+            }
+        );
+    }
+
+    #[test]
+    fn test_fromdate() {
+        // fromdate parses ISO 8601 string to timestamp
+        query!(br#""1970-01-01T00:00:00Z""#, r#"fromdate"#,
+            QueryResult::Owned(OwnedValue::Float(n)) => {
+                assert_eq!(n, 0.0);
+            }
+        );
+
+        query!(br#""2024-01-15T10:30:00Z""#, r#"fromdate"#,
+            QueryResult::Owned(OwnedValue::Float(n)) => {
+                assert_eq!(n, 1705314600.0);
+            }
+        );
+    }
+
+    #[test]
+    fn test_date_roundtrip() {
+        // gmtime | mktime should return original value
+        query!(b"1705314600", r#"gmtime | mktime"#,
+            QueryResult::Owned(OwnedValue::Float(n)) => {
+                assert_eq!(n, 1705314600.0);
+            }
+        );
+
+        // todate | fromdate should return original value
+        query!(b"1705314600", r#"todate | fromdate"#,
+            QueryResult::Owned(OwnedValue::Float(n)) => {
+                assert_eq!(n, 1705314600.0);
+            }
+        );
     }
 
     // =============================================
@@ -11066,6 +14885,850 @@ mod tests {
                 assert_eq!(*a, OwnedValue::Int(1));
                 let b = obj.get("b").unwrap();
                 assert_eq!(*b, OwnedValue::Int(2));
+            }
+        );
+    }
+
+    // ========================================================================
+    // YAML Metadata Functions (yq)
+    // ========================================================================
+
+    #[test]
+    fn test_tag_null() {
+        query!(br#"null"#, "tag",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "!!null");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tag_bool() {
+        query!(br#"true"#, "tag",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "!!bool");
+            }
+        );
+        query!(br#"false"#, "tag",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "!!bool");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tag_int() {
+        query!(br#"42"#, "tag",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "!!int");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tag_float() {
+        query!(br#"3.14"#, "tag",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "!!float");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tag_string() {
+        query!(br#""hello""#, "tag",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "!!str");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tag_array() {
+        query!(br#"[1, 2, 3]"#, "tag",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "!!seq");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tag_object() {
+        query!(br#"{"a": 1}"#, "tag",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "!!map");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tag_nested() {
+        // Test tag on nested values
+        query!(br#"{"value": 42}"#, ".value | tag",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "!!int");
+            }
+        );
+    }
+
+    #[test]
+    fn test_anchor_returns_empty() {
+        // anchor always returns empty string (metadata not preserved)
+        query!(br#"{"a": 1}"#, "anchor",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "");
+            }
+        );
+    }
+
+    #[test]
+    fn test_style_returns_empty() {
+        // style always returns empty string (metadata not preserved)
+        query!(br#""hello""#, "style",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "");
+            }
+        );
+        query!(br#"[1, 2, 3]"#, "style",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "");
+            }
+        );
+        query!(br#"{"a": 1}"#, "style",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tag_with_map() {
+        // Test tag with map function
+        query!(br#"[1, "hello", true, null]"#, "map(tag)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 4);
+                assert_eq!(arr[0], OwnedValue::String("!!int".to_string()));
+                assert_eq!(arr[1], OwnedValue::String("!!str".to_string()));
+                assert_eq!(arr[2], OwnedValue::String("!!bool".to_string()));
+                assert_eq!(arr[3], OwnedValue::String("!!null".to_string()));
+            }
+        );
+    }
+
+    // ============================================================================
+    // kind function tests (yq YAML metadata)
+    // ============================================================================
+
+    #[test]
+    fn test_kind_null() {
+        query!(b"null", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "scalar");
+            }
+        );
+    }
+
+    #[test]
+    fn test_kind_bool() {
+        query!(b"true", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "scalar");
+            }
+        );
+        query!(b"false", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "scalar");
+            }
+        );
+    }
+
+    #[test]
+    fn test_kind_number() {
+        query!(b"42", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "scalar");
+            }
+        );
+        query!(b"3.14", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "scalar");
+            }
+        );
+    }
+
+    #[test]
+    fn test_kind_string() {
+        query!(br#""hello""#, "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "scalar");
+            }
+        );
+    }
+
+    #[test]
+    fn test_kind_array() {
+        query!(b"[1, 2, 3]", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "seq");
+            }
+        );
+        query!(b"[]", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "seq");
+            }
+        );
+    }
+
+    #[test]
+    fn test_kind_object() {
+        query!(br#"{"a": 1}"#, "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "map");
+            }
+        );
+        query!(b"{}", "kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "map");
+            }
+        );
+    }
+
+    #[test]
+    fn test_kind_nested() {
+        // Test kind on nested values
+        query!(br#"{"items": [1, 2]}"#, ".items | kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "seq");
+            }
+        );
+        query!(br#"[{"a": 1}]"#, ".[0] | kind",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "map");
+            }
+        );
+    }
+
+    #[test]
+    fn test_kind_with_map() {
+        // Test kind with map function
+        query!(br#"[1, "hello", [1,2], {"a": 1}]"#, "map(kind)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 4);
+                assert_eq!(arr[0], OwnedValue::String("scalar".to_string()));
+                assert_eq!(arr[1], OwnedValue::String("scalar".to_string()));
+                assert_eq!(arr[2], OwnedValue::String("seq".to_string()));
+                assert_eq!(arr[3], OwnedValue::String("map".to_string()));
+            }
+        );
+    }
+
+    // ============================================================================
+    // key function tests (yq)
+    // ============================================================================
+
+    #[test]
+    fn test_key_object() {
+        // Test key on object iteration
+        query!(br#"{"a": 1, "b": 2, "c": 3}"#, ".[] | key",
+            QueryResult::ManyOwned(results) => {
+                assert_eq!(results.len(), 3);
+                // Check that all results are string keys
+                let keys: Vec<String> = results.iter().filter_map(|v| {
+                    if let OwnedValue::String(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                }).collect();
+                assert!(keys.contains(&"a".to_string()));
+                assert!(keys.contains(&"b".to_string()));
+                assert!(keys.contains(&"c".to_string()));
+            }
+        );
+    }
+
+    #[test]
+    fn test_key_array() {
+        // Test key on array iteration - returns indices
+        query!(b"[10, 20, 30]", ".[] | key",
+            QueryResult::ManyOwned(results) => {
+                assert_eq!(results.len(), 3);
+                // Check that we get indices 0, 1, 2
+                let indices: Vec<i64> = results.iter().filter_map(|v| {
+                    if let OwnedValue::Int(i) = v {
+                        Some(*i)
+                    } else {
+                        None
+                    }
+                }).collect();
+                assert_eq!(indices, vec![0, 1, 2]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_key_at_root() {
+        // Test key at root level - returns null
+        query!(br#"{"a": 1}"#, "key",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    #[test]
+    fn test_key_nested() {
+        // Test key on nested access
+        query!(br#"{"outer": {"inner": 42}}"#, ".outer | .[] | key",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "inner");
+            }
+        );
+    }
+
+    // Phase 12 tests: Additional builtins
+
+    #[test]
+    fn test_now() {
+        // now returns current Unix timestamp as a float
+        query!(b"null", "now",
+            QueryResult::Owned(OwnedValue::Float(n)) => {
+                // Should be a reasonable Unix timestamp (after year 2020)
+                assert!(n > 1577836800.0, "timestamp should be after 2020");
+                // Should be before year 2100
+                assert!(n < 4102444800.0, "timestamp should be before 2100");
+            }
+        );
+    }
+
+    #[test]
+    fn test_abs() {
+        // abs is an alias for fabs
+        query!(b"-5", "abs", QueryResult::Owned(OwnedValue::Float(n)) => {
+            assert!((n - 5.0).abs() < f64::EPSILON);
+        });
+        query!(b"5", "abs", QueryResult::Owned(OwnedValue::Float(n)) => {
+            assert!((n - 5.0).abs() < f64::EPSILON);
+        });
+        query!(b"-7.25", "abs", QueryResult::Owned(OwnedValue::Float(n)) => {
+            assert!((n - 7.25).abs() < f64::EPSILON);
+        });
+    }
+
+    #[test]
+    fn test_builtins() {
+        // builtins returns an array of builtin function names
+        query!(b"null", "builtins | length",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                // Should have many builtins (at least 100)
+                assert!(n > 100, "should have many builtins, got {}", n);
+            }
+        );
+        // Check some known builtins exist
+        query!(b"null", r#"builtins | map(select(startswith("now"))) | length"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert!(n >= 1, "should have now builtin");
+            }
+        );
+    }
+
+    #[test]
+    fn test_normals() {
+        // normals selects only normal numbers (not 0, inf, nan, subnormal)
+        query!(b"5", "normals", QueryResult::One(_) => {});
+        query!(b"-3.14", "normals", QueryResult::One(_) => {});
+        query!(b"0", "normals", QueryResult::None => {}); // 0 is not normal
+        query!(b"null", "normals", QueryResult::None => {}); // null is not a number
+        query!(br#""string""#, "normals", QueryResult::None => {}); // string is not a number
+    }
+
+    #[test]
+    fn test_finites() {
+        // finites selects only finite numbers (not inf or nan)
+        query!(b"5", "finites", QueryResult::One(_) => {});
+        query!(b"-3.14", "finites", QueryResult::One(_) => {});
+        query!(b"0", "finites", QueryResult::One(_) => {}); // 0 is finite
+        query!(b"null", "finites", QueryResult::None => {}); // null is not a number
+        query!(br#""string""#, "finites", QueryResult::None => {}); // string is not a number
+    }
+
+    #[test]
+    fn test_format_urid() {
+        // @urid decodes URI/percent encoding
+        query!(br#""hello%20world""#, "@urid",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "hello world");
+            }
+        );
+        query!(br#""foo%2Fbar""#, "@urid",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "foo/bar");
+            }
+        );
+        // Test roundtrip with @uri
+        query!(br#""hello world""#, "@uri | @urid",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "hello world");
+            }
+        );
+        // Invalid percent encoding should pass through
+        query!(br#""hello%GGworld""#, "@urid",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "hello%GGworld");
+            }
+        );
+    }
+
+    #[test]
+    fn test_loc_basic() {
+        // $__loc__ returns {"file": "<stdin>", "line": N}
+        query!(b"null", "$__loc__",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("file"), Some(&OwnedValue::String("<stdin>".into())));
+                assert_eq!(obj.get("line"), Some(&OwnedValue::Int(1)));
+            }
+        );
+    }
+
+    #[test]
+    fn test_loc_line_number() {
+        // $__loc__ should report line 1 for single-line filter
+        query!(b"null", "$__loc__.line",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1);
+            }
+        );
+    }
+
+    #[test]
+    fn test_loc_file() {
+        // $__loc__.file should be "<stdin>"
+        query!(b"null", "$__loc__.file",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "<stdin>");
+            }
+        );
+    }
+
+    #[test]
+    fn test_loc_multiline() {
+        // Multi-line filter: $__loc__ on line 2 should report line 2
+        let filter = ".\n| $__loc__.line";
+        let json = b"null";
+        let index = crate::json::JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = crate::jq::parse(filter).unwrap();
+        match eval(&expr, cursor) {
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 2, "expected line 2 for $__loc__ on second line");
+            }
+            other => panic!("expected Int, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_loc_multiline_line3() {
+        // $__loc__ on line 3 should report line 3
+        // Use valid jq syntax: pipe identity on separate lines
+        let filter = ".\n|\n$__loc__.line";
+        let json = b"null";
+        let index = crate::json::JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = crate::jq::parse(filter).unwrap();
+        match eval(&expr, cursor) {
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 3, "expected line 3 for $__loc__ on third line");
+            }
+            other => panic!("expected Int, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_loc_in_function_def() {
+        // $__loc__ inside a function should report the line where it appears
+        let filter = "def f: $__loc__.line; f";
+        let json = b"null";
+        let index = crate::json::JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = crate::jq::parse(filter).unwrap();
+        match eval(&expr, cursor) {
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1, "expected line 1 for $__loc__ in function on line 1");
+            }
+            other => panic!("expected Int, got {:?}", other),
+        }
+    }
+
+    // ============================================================================
+    // Phase 13: Iteration control tests
+    // ============================================================================
+
+    #[test]
+    fn test_limit_stream() {
+        // limit(2; .[]) - take first 2 elements
+        // Use [limit(2; .[])] to collect into array
+        query!(b"[1, 2, 3, 4, 5]", "[limit(2; .[])]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                assert_eq!(arr[0], OwnedValue::Int(1));
+                assert_eq!(arr[1], OwnedValue::Int(2));
+            }
+        );
+    }
+
+    #[test]
+    fn test_limit_zero() {
+        // limit(0; .[]) - take no elements
+        query!(b"[1, 2, 3]", "[limit(0; .[])]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 0);
+            }
+        );
+    }
+
+    #[test]
+    fn test_limit_exceeds() {
+        // limit(10; .[]) - limit exceeds array length
+        query!(b"[1, 2]", "[limit(10; .[])]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                assert_eq!(arr[0], OwnedValue::Int(1));
+                assert_eq!(arr[1], OwnedValue::Int(2));
+            }
+        );
+    }
+
+    #[test]
+    fn test_first_stream() {
+        // first(.[]) - get first element
+        query!(b"[1, 2, 3]", "first(.[])",
+            QueryResult::One(StandardJson::Number(n)) => {
+                assert_eq!(n.as_i64().unwrap(), 1);
+            }
+        );
+    }
+
+    #[test]
+    fn test_first_no_arg() {
+        // first (no arg) - get first element of array
+        query!(b"[1, 2, 3]", "first",
+            QueryResult::One(StandardJson::Number(n)) => {
+                assert_eq!(n.as_i64().unwrap(), 1);
+            }
+        );
+    }
+
+    #[test]
+    fn test_last_stream() {
+        // last(.[]) - get last element
+        query!(b"[1, 2, 3]", "last(.[])",
+            QueryResult::One(StandardJson::Number(n)) => {
+                assert_eq!(n.as_i64().unwrap(), 3);
+            }
+        );
+    }
+
+    #[test]
+    fn test_last_no_arg() {
+        // last (no arg) - get last element of array
+        // Note: last collects all elements to find the last, so returns Owned
+        query!(b"[1, 2, 3]", "last",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 3);
+            }
+        );
+    }
+
+    #[test]
+    fn test_nth_stream() {
+        // nth(1; .[]) - get second element (0-indexed)
+        query!(b"[10, 20, 30]", "nth(1; .[])",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 20);
+            }
+        );
+    }
+
+    #[test]
+    fn test_nth_no_arg() {
+        // nth(1) (no second arg) - get second element of array
+        query!(b"[10, 20, 30]", "nth(1)",
+            QueryResult::One(StandardJson::Number(n)) => {
+                assert_eq!(n.as_i64().unwrap(), 20);
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_simple() {
+        // range(3) - generate 0, 1, 2
+        query!(b"null", "[range(3)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0], OwnedValue::Int(0));
+                assert_eq!(arr[1], OwnedValue::Int(1));
+                assert_eq!(arr[2], OwnedValue::Int(2));
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_from_to() {
+        // range(2; 5) - generate 2, 3, 4
+        query!(b"null", "[range(2; 5)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0], OwnedValue::Int(2));
+                assert_eq!(arr[1], OwnedValue::Int(3));
+                assert_eq!(arr[2], OwnedValue::Int(4));
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_from_to_by() {
+        // range(0; 10; 3) - generate 0, 3, 6, 9
+        query!(b"null", "[range(0; 10; 3)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 4);
+                assert_eq!(arr[0], OwnedValue::Int(0));
+                assert_eq!(arr[1], OwnedValue::Int(3));
+                assert_eq!(arr[2], OwnedValue::Int(6));
+                assert_eq!(arr[3], OwnedValue::Int(9));
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_negative_step() {
+        // range(5; 0; -2) - generate 5, 3, 1
+        query!(b"null", "[range(5; 0; -2)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0], OwnedValue::Int(5));
+                assert_eq!(arr[1], OwnedValue::Int(3));
+                assert_eq!(arr[2], OwnedValue::Int(1));
+            }
+        );
+    }
+
+    #[test]
+    fn test_isempty_false() {
+        // isempty(.[]) on non-empty array
+        query!(b"[1, 2, 3]", "isempty(.[])",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+    }
+
+    #[test]
+    fn test_isempty_true() {
+        // isempty(.[]) on empty array
+        query!(b"[]", "isempty(.[])",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+    }
+
+    #[test]
+    fn test_first_with_select() {
+        // first(.[] | select(. > 2)) - get first element > 2
+        query!(b"[1, 2, 3, 4, 5]", "first(.[] | select(. > 2))",
+            QueryResult::One(StandardJson::Number(n)) => {
+                assert_eq!(n.as_i64().unwrap(), 3);
+            }
+        );
+    }
+
+    // =========================================================================
+    // Phase 14 Tests: Recursive Traversal
+    // =========================================================================
+
+    #[test]
+    fn test_recurse_down() {
+        // recurse_down is an alias for recurse
+        // Just verify it parses and returns the expected structure
+        query!(br#"{"a": 1}"#, "[recurse_down]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                // Should return the original object and the number 1
+                assert_eq!(arr.len(), 2);
+            }
+        );
+    }
+
+    #[test]
+    fn test_recurse_with_filter() {
+        // recurse(.children[]?) - follow .children at each level
+        query!(br#"{"name": "root", "children": [{"name": "a", "children": [{"name": "b"}]}, {"name": "c"}]}"#,
+            "[recurse(.children[]?) | .name]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                // Should collect: root, a, b, c
+                assert_eq!(arr.len(), 4);
+            }
+        );
+    }
+
+    #[test]
+    fn test_recurse_with_condition() {
+        // recurse(f; cond) - recurse while condition is true
+        // Stop when value >= 5
+        query!(b"1", "[recurse(. + 1; . < 5)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                // Should produce: 1, 2, 3, 4
+                assert_eq!(arr.len(), 4);
+                assert_eq!(arr[0], OwnedValue::Int(1));
+                assert_eq!(arr[3], OwnedValue::Int(4));
+            }
+        );
+    }
+
+    #[test]
+    fn test_walk_strings() {
+        // walk to uppercase all strings
+        query!(br#"{"name": "alice", "nested": {"value": "bob"}}"#,
+            "walk(if type == \"string\" then ascii_upcase else . end)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("name"), Some(&OwnedValue::String("ALICE".into())));
+                if let Some(OwnedValue::Object(nested)) = obj.get("nested") {
+                    assert_eq!(nested.get("value"), Some(&OwnedValue::String("BOB".into())));
+                } else {
+                    panic!("expected nested object");
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn test_walk_arrays() {
+        // walk to reverse all arrays
+        query!(br#"{"items": [1, 2, 3], "nested": {"more": [4, 5]}}"#,
+            "walk(if type == \"array\" then reverse else . end)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                if let Some(OwnedValue::Array(items)) = obj.get("items") {
+                    assert_eq!(items[0], OwnedValue::Int(3));
+                    assert_eq!(items[1], OwnedValue::Int(2));
+                    assert_eq!(items[2], OwnedValue::Int(1));
+                } else {
+                    panic!("expected items array");
+                }
+            }
+        );
+    }
+
+    // Tests for indices/index/rindex
+
+    #[test]
+    fn test_indices_string() {
+        // Find all occurrences of substring in string
+        query!(br#""abcabc""#, r#"indices("bc")"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(4)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_indices_array() {
+        // Find all occurrences of element in array
+        query!(br#"[1, 2, 3, 1, 2]"#, "indices(1)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(0), OwnedValue::Int(3)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_indices_array_string() {
+        // Find all occurrences of string element in array
+        query!(br#"["a", "b", "a", "c"]"#, r#"indices("a")"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(0), OwnedValue::Int(2)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_indices_not_found() {
+        // No occurrences returns empty array
+        query!(br#""abc""#, r#"indices("xyz")"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty());
+            }
+        );
+    }
+
+    #[test]
+    fn test_index_string() {
+        // First occurrence of substring
+        query!(br#""abcabc""#, r#"index("bc")"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1);
+            }
+        );
+    }
+
+    #[test]
+    fn test_index_array() {
+        // First occurrence of element in array
+        query!(br#"[1, 2, 3, 1, 2]"#, "index(2)",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1);
+            }
+        );
+    }
+
+    #[test]
+    fn test_index_not_found() {
+        // Not found returns null
+        query!(br#""abc""#, r#"index("xyz")"#,
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    #[test]
+    fn test_rindex_string() {
+        // Last occurrence of substring
+        query!(br#""abcabc""#, r#"rindex("bc")"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 4);
+            }
+        );
+    }
+
+    #[test]
+    fn test_rindex_array() {
+        // Last occurrence of element in array
+        query!(br#"[1, 2, 3, 1, 2]"#, "rindex(2)",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 4);
+            }
+        );
+    }
+
+    #[test]
+    fn test_rindex_not_found() {
+        // Not found returns null
+        query!(br#""abc""#, r#"rindex("xyz")"#,
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    #[test]
+    fn test_indices_array_object() {
+        // Find objects in array
+        query!(br#"[{"a":1}, {"b":2}, {"a":1}]"#, r#"indices({"a":1})"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(0), OwnedValue::Int(2)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_index_array_null() {
+        // Find null in array
+        query!(br#"[1, null, 2, null]"#, "index(null)",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1);
             }
         );
     }

@@ -38,6 +38,16 @@ use super::expr::{
     ModuleMeta, ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,
 };
 
+/// Parser mode controls syntax differences between jq and yq.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParserMode {
+    /// Standard jq mode: `-` is subtraction, identifiers are alphanumeric + underscore
+    #[default]
+    Jq,
+    /// yq mode: `-` allowed in identifiers (e.g., `.my-key`), matches yq behavior
+    Yq,
+}
+
 /// Error that occurs during parsing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
@@ -68,11 +78,25 @@ impl core::fmt::Display for ParseError {
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
+    mode: ParserMode,
 }
 
 impl<'a> Parser<'a> {
+    #[allow(dead_code)] // kept for tests and future use
     fn new(input: &'a str) -> Self {
-        Parser { input, pos: 0 }
+        Parser {
+            input,
+            pos: 0,
+            mode: ParserMode::Jq,
+        }
+    }
+
+    fn with_mode(input: &'a str, mode: ParserMode) -> Self {
+        Parser {
+            input,
+            pos: 0,
+            mode,
+        }
     }
 
     /// Peek at the current character without consuming it.
@@ -93,13 +117,25 @@ impl<'a> Parser<'a> {
         Some(c)
     }
 
-    /// Skip whitespace.
+    /// Skip whitespace and comments.
+    /// Comments start with `#` and run to the end of the line.
     fn skip_ws(&mut self) {
-        while let Some(c) = self.peek() {
-            if c.is_whitespace() {
-                self.next();
-            } else {
-                break;
+        loop {
+            match self.peek() {
+                Some(c) if c.is_whitespace() => {
+                    self.next();
+                }
+                Some('#') => {
+                    // Skip comment until end of line
+                    self.next(); // consume '#'
+                    while let Some(c) = self.peek() {
+                        self.next();
+                        if c == '\n' {
+                            break;
+                        }
+                    }
+                }
+                _ => break,
             }
         }
     }
@@ -107,6 +143,14 @@ impl<'a> Parser<'a> {
     /// Check if we're at the end of input.
     fn is_eof(&self) -> bool {
         self.pos >= self.input.len()
+    }
+
+    /// Get the 1-based line number at the current position.
+    fn current_line(&self) -> usize {
+        1 + self.input[..self.pos]
+            .bytes()
+            .filter(|&b| b == b'\n')
+            .count()
     }
 
     /// Consume a specific character or return error.
@@ -142,6 +186,22 @@ impl<'a> Parser<'a> {
         !matches!(next_char, Some(c) if c.is_alphanumeric() || c == '_')
     }
 
+    /// Check if after consuming a keyword, the next non-whitespace character is '('.
+    /// This is used to determine if a no-arg builtin should be parsed as a builtin
+    /// or as a user-defined function call.
+    fn peek_after_keyword_is_paren(&self, keyword: &str) -> bool {
+        let after = self.pos + keyword.len();
+        // Skip whitespace after keyword
+        let rest = &self.input[after..];
+        for c in rest.chars() {
+            if c.is_whitespace() {
+                continue;
+            }
+            return c == '(';
+        }
+        false
+    }
+
     /// Consume a keyword.
     fn consume_keyword(&mut self, keyword: &str) {
         self.pos += keyword.len();
@@ -171,9 +231,23 @@ impl<'a> Parser<'a> {
         }
 
         // Subsequent characters can be alphanumeric or underscore
+        // In Yq mode, also allow hyphens (but not at the end)
         while let Some(c) = self.peek() {
             if c.is_alphanumeric() || c == '_' {
                 self.next();
+            } else if self.mode == ParserMode::Yq && c == '-' {
+                // In Yq mode, allow hyphen if followed by valid ident char
+                // Peek ahead to check if there's a valid continuation
+                let remaining = &self.input[self.pos + 1..];
+                if let Some(next_c) = remaining.chars().next() {
+                    if next_c.is_alphanumeric() || next_c == '_' {
+                        self.next(); // consume the hyphen
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             } else {
                 break;
             }
@@ -513,7 +587,7 @@ impl<'a> Parser<'a> {
         Ok(result)
     }
 
-    /// Parse a bracket expression: `[0]`, `[]`, `[1:3]`, etc.
+    /// Parse a bracket expression: `[0]`, `[]`, `[1:3]`, `["key"]`, etc.
     /// This is for indexing, NOT array construction.
     fn parse_index_bracket(&mut self) -> Result<Expr, ParseError> {
         self.expect('[')?;
@@ -523,6 +597,14 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(']') {
             self.next();
             return Ok(Expr::Iterate);
+        }
+
+        // Check for string key: `["key"]`
+        if self.peek() == Some('"') {
+            let key = self.parse_string_literal()?;
+            self.skip_ws();
+            self.expect(']')?;
+            return Ok(Expr::Field(key));
         }
 
         // Check for slice starting with ':'
@@ -784,9 +866,15 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::Identity);
                 }
 
-                // Field access `.foo`
-                let name = self.parse_ident()?;
-                let mut expr = Expr::Field(name);
+                // Check for quoted field access `."key"`
+                let mut expr = if self.peek() == Some('"') {
+                    let name = self.parse_string_literal()?;
+                    Expr::Field(name)
+                } else {
+                    // Field access `.foo`
+                    let name = self.parse_ident()?;
+                    Expr::Field(name)
+                };
 
                 // Check for optional
                 self.skip_ws();
@@ -798,11 +886,19 @@ impl<'a> Parser<'a> {
                 self.parse_postfix(expr)
             }
 
-            // Variable reference: $varname
+            // Variable reference: $varname, $__loc__, or $ENV
             Some('$') => {
+                let line = self.current_line();
                 self.next();
                 let name = self.parse_ident()?;
-                Ok(Expr::Var(name))
+                let expr = if name == "__loc__" {
+                    Expr::Loc { line }
+                } else if name == "ENV" {
+                    Expr::Env
+                } else {
+                    Expr::Var(name)
+                };
+                self.parse_postfix(expr)
             }
 
             // Keywords: null, true, false, not, if, try, error, reduce, foreach, etc.
@@ -846,8 +942,13 @@ impl<'a> Parser<'a> {
                 } else if self.matches_keyword("def") {
                     // Phase 9: Function definition
                     self.parse_def_expr()
+                } else if self.matches_keyword("label") {
+                    self.parse_label_expr()
+                } else if self.matches_keyword("break") {
+                    self.parse_break_expr()
                 } else if let Some(builtin) = self.try_parse_builtin()? {
-                    Ok(Expr::Builtin(builtin))
+                    // Allow postfix operations after builtins (e.g., env.PATH, keys[0])
+                    self.parse_postfix(Expr::Builtin(builtin))
                 } else {
                     // Phase 9: Try to parse as function call
                     self.parse_func_call_or_error()
@@ -1359,6 +1460,52 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a label expression.
+    /// Syntax: label $name | expr
+    fn parse_label_expr(&mut self) -> Result<Expr, ParseError> {
+        self.consume_keyword("label");
+        self.skip_ws();
+
+        // Expect $name
+        if self.peek() != Some('$') {
+            return Err(ParseError::new("expected '$' after 'label'", self.pos));
+        }
+        self.next();
+        let name = self.parse_ident()?;
+        self.skip_ws();
+
+        // Expect '|'
+        if self.peek() != Some('|') {
+            return Err(ParseError::new("expected '|' after label name", self.pos));
+        }
+        self.next();
+        self.skip_ws();
+
+        // Parse body expression
+        let body = self.parse_pipe_expr()?;
+
+        Ok(Expr::Label {
+            name,
+            body: Box::new(body),
+        })
+    }
+
+    /// Parse a break expression.
+    /// Syntax: break $name
+    fn parse_break_expr(&mut self) -> Result<Expr, ParseError> {
+        self.consume_keyword("break");
+        self.skip_ws();
+
+        // Expect $name
+        if self.peek() != Some('$') {
+            return Err(ParseError::new("expected '$' after 'break'", self.pos));
+        }
+        self.next();
+        let name = self.parse_ident()?;
+
+        Ok(Expr::Break(name))
+    }
+
     /// Parse a function definition.
     /// Syntax: def NAME: BODY; or def NAME(PARAMS): BODY;
     fn parse_def_expr(&mut self) -> Result<Expr, ParseError> {
@@ -1531,6 +1678,7 @@ impl<'a> Parser<'a> {
             "base64d" => FormatType::Base64d,
             "html" => FormatType::Html,
             "sh" => FormatType::Sh,
+            "urid" => FormatType::Urid,
             _ => {
                 return Err(ParseError::new(
                     format!("unknown format '@{}'", format_name),
@@ -1573,6 +1721,54 @@ impl<'a> Parser<'a> {
         if self.matches_keyword("isobject") {
             self.consume_keyword("isobject");
             return Ok(Some(Builtin::IsObject));
+        }
+
+        // Type filter functions (select by type)
+        if self.matches_keyword("values") {
+            self.consume_keyword("values");
+            return Ok(Some(Builtin::Values));
+        }
+        if self.matches_keyword("nulls") {
+            self.consume_keyword("nulls");
+            return Ok(Some(Builtin::Nulls));
+        }
+        if self.matches_keyword("booleans") {
+            self.consume_keyword("booleans");
+            return Ok(Some(Builtin::Booleans));
+        }
+        if self.matches_keyword("numbers") {
+            self.consume_keyword("numbers");
+            return Ok(Some(Builtin::Numbers));
+        }
+        // Note: "strings" must be checked before "string" in any other context
+        if self.matches_keyword("strings") {
+            self.consume_keyword("strings");
+            return Ok(Some(Builtin::Strings));
+        }
+        if self.matches_keyword("arrays") {
+            self.consume_keyword("arrays");
+            return Ok(Some(Builtin::Arrays));
+        }
+        if self.matches_keyword("objects") {
+            self.consume_keyword("objects");
+            return Ok(Some(Builtin::Objects));
+        }
+        if self.matches_keyword("iterables") {
+            self.consume_keyword("iterables");
+            return Ok(Some(Builtin::Iterables));
+        }
+        if self.matches_keyword("scalars") {
+            self.consume_keyword("scalars");
+            return Ok(Some(Builtin::Scalars));
+        }
+        // Additional numeric type filters
+        if self.matches_keyword("normals") {
+            self.consume_keyword("normals");
+            return Ok(Some(Builtin::Normals));
+        }
+        if self.matches_keyword("finites") {
+            self.consume_keyword("finites");
+            return Ok(Some(Builtin::Finites));
         }
 
         // Length & keys (no arguments)
@@ -1646,15 +1842,16 @@ impl<'a> Parser<'a> {
         }
 
         // Reduction functions (no arguments)
-        if self.matches_keyword("add") {
+        // Note: If followed by '(', these should be parsed as user-defined function calls
+        if self.matches_keyword("add") && !self.peek_after_keyword_is_paren("add") {
             self.consume_keyword("add");
             return Ok(Some(Builtin::Add));
         }
-        if self.matches_keyword("any") {
+        if self.matches_keyword("any") && !self.peek_after_keyword_is_paren("any") {
             self.consume_keyword("any");
             return Ok(Some(Builtin::Any));
         }
-        if self.matches_keyword("all") {
+        if self.matches_keyword("all") && !self.peek_after_keyword_is_paren("all") {
             self.consume_keyword("all");
             return Ok(Some(Builtin::All));
         }
@@ -1669,7 +1866,7 @@ impl<'a> Parser<'a> {
             self.expect(')')?;
             return Ok(Some(Builtin::MinBy(Box::new(f))));
         }
-        if self.matches_keyword("min") {
+        if self.matches_keyword("min") && !self.peek_after_keyword_is_paren("min") {
             self.consume_keyword("min");
             return Ok(Some(Builtin::Min));
         }
@@ -1684,7 +1881,7 @@ impl<'a> Parser<'a> {
             self.expect(')')?;
             return Ok(Some(Builtin::MaxBy(Box::new(f))));
         }
-        if self.matches_keyword("max") {
+        if self.matches_keyword("max") && !self.peek_after_keyword_is_paren("max") {
             self.consume_keyword("max");
             return Ok(Some(Builtin::Max));
         }
@@ -1751,6 +1948,25 @@ impl<'a> Parser<'a> {
             self.expect(')')?;
             return Ok(Some(Builtin::Endswith(Box::new(s))));
         }
+        // Check splits before split since split is a prefix of splits
+        if self.matches_keyword("splits") {
+            self.consume_keyword("splits");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let re = self.parse_pipe_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::SplitsFlags(Box::new(re), Box::new(flags))));
+            }
+            self.expect(')')?;
+            return Ok(Some(Builtin::Splits(Box::new(re))));
+        }
         if self.matches_keyword("split") {
             self.consume_keyword("split");
             self.skip_ws();
@@ -1758,8 +1974,127 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let s = self.parse_pipe_expr()?;
             self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::SplitRegex(Box::new(s), Box::new(flags))));
+            }
             self.expect(')')?;
             return Ok(Some(Builtin::Split(Box::new(s))));
+        }
+        // match function - regex matching
+        if self.matches_keyword("match") {
+            self.consume_keyword("match");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let re = self.parse_pipe_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::MatchFlags(Box::new(re), Box::new(flags))));
+            }
+            self.expect(')')?;
+            return Ok(Some(Builtin::Match(Box::new(re))));
+        }
+        // capture function - named capture groups
+        if self.matches_keyword("capture") {
+            self.consume_keyword("capture");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let re = self.parse_pipe_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::CaptureFlags(Box::new(re), Box::new(flags))));
+            }
+            self.expect(')')?;
+            return Ok(Some(Builtin::Capture(Box::new(re))));
+        }
+        // sub function - replace first match
+        if self.matches_keyword("sub") {
+            self.consume_keyword("sub");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let re = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(';')?;
+            self.skip_ws();
+            let replacement = self.parse_pipe_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::SubFlags(
+                    Box::new(re),
+                    Box::new(replacement),
+                    Box::new(flags),
+                )));
+            }
+            self.expect(')')?;
+            return Ok(Some(Builtin::Sub(Box::new(re), Box::new(replacement))));
+        }
+        // gsub function - replace all matches
+        if self.matches_keyword("gsub") {
+            self.consume_keyword("gsub");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let re = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(';')?;
+            self.skip_ws();
+            let replacement = self.parse_pipe_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::GsubFlags(
+                    Box::new(re),
+                    Box::new(replacement),
+                    Box::new(flags),
+                )));
+            }
+            self.expect(')')?;
+            return Ok(Some(Builtin::Gsub(Box::new(re), Box::new(replacement))));
+        }
+        // scan function - find all matches
+        if self.matches_keyword("scan") {
+            self.consume_keyword("scan");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let re = self.parse_pipe_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::ScanFlags(Box::new(re), Box::new(flags))));
+            }
+            self.expect(')')?;
+            return Ok(Some(Builtin::Scan(Box::new(re))));
         }
         if self.matches_keyword("join") {
             self.consume_keyword("join");
@@ -1795,16 +2130,7 @@ impl<'a> Parser<'a> {
         // Phase 5: Array Functions
         // Note: first, last are handled in parse_primary before try_parse_builtin
         // to support both first/last (no args) and first(expr)/last(expr)
-        if self.matches_keyword("nth") {
-            self.consume_keyword("nth");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let n = self.parse_pipe_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Nth(Box::new(n))));
-        }
+        // Note: nth is handled in Phase 13 section to support both nth(n) and nth(n; expr)
         if self.matches_keyword("reverse") {
             self.consume_keyword("reverse");
             return Ok(Some(Builtin::Reverse));
@@ -1893,6 +2219,14 @@ impl<'a> Parser<'a> {
             self.consume_keyword("tonumber");
             return Ok(Some(Builtin::ToNumber));
         }
+        if self.matches_keyword("tojson") {
+            self.consume_keyword("tojson");
+            return Ok(Some(Builtin::ToJson));
+        }
+        if self.matches_keyword("fromjson") {
+            self.consume_keyword("fromjson");
+            return Ok(Some(Builtin::FromJson));
+        }
 
         // Phase 6: Additional String Functions
         if self.matches_keyword("explode") {
@@ -1910,6 +2244,14 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let re = self.parse_pipe_expr()?;
             self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::TestFlags(Box::new(re), Box::new(flags))));
+            }
             self.expect(')')?;
             return Ok(Some(Builtin::Test(Box::new(re))));
         }
@@ -1961,98 +2303,6 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::GetPath(Box::new(path))));
-        }
-
-        // Phase 7: Regex Functions (requires "regex" feature)
-        #[cfg(feature = "regex")]
-        {
-            // match(re) or match(re; flags)
-            if self.matches_keyword("match") {
-                self.consume_keyword("match");
-                self.skip_ws();
-                self.expect('(')?;
-                self.skip_ws();
-                let re = self.parse_pipe_expr()?;
-                self.skip_ws();
-                let flags = if self.peek() == Some(';') {
-                    self.next();
-                    self.skip_ws();
-                    Some(self.parse_string_literal()?)
-                } else {
-                    None
-                };
-                self.skip_ws();
-                self.expect(')')?;
-                return Ok(Some(Builtin::Match(Box::new(re), flags)));
-            }
-
-            // capture(re)
-            if self.matches_keyword("capture") {
-                self.consume_keyword("capture");
-                self.skip_ws();
-                self.expect('(')?;
-                self.skip_ws();
-                let re = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(')')?;
-                return Ok(Some(Builtin::Capture(Box::new(re))));
-            }
-
-            // scan(re)
-            if self.matches_keyword("scan") {
-                self.consume_keyword("scan");
-                self.skip_ws();
-                self.expect('(')?;
-                self.skip_ws();
-                let re = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(')')?;
-                return Ok(Some(Builtin::Scan(Box::new(re))));
-            }
-
-            // splits(re) - regex split (as opposed to split which is string-based)
-            if self.matches_keyword("splits") {
-                self.consume_keyword("splits");
-                self.skip_ws();
-                self.expect('(')?;
-                self.skip_ws();
-                let re = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(')')?;
-                return Ok(Some(Builtin::Splits(Box::new(re))));
-            }
-
-            // gsub(re; replacement) - must come before sub
-            if self.matches_keyword("gsub") {
-                self.consume_keyword("gsub");
-                self.skip_ws();
-                self.expect('(')?;
-                self.skip_ws();
-                let re = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(';')?;
-                self.skip_ws();
-                let replacement = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(')')?;
-                return Ok(Some(Builtin::Gsub(Box::new(re), Box::new(replacement))));
-            }
-
-            // sub(re; replacement)
-            if self.matches_keyword("sub") {
-                self.consume_keyword("sub");
-                self.skip_ws();
-                self.expect('(')?;
-                self.skip_ws();
-                let re = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(';')?;
-                self.skip_ws();
-                let replacement = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(')')?;
-                return Ok(Some(Builtin::Sub(Box::new(re), Box::new(replacement))));
-            }
         }
 
         // Phase 8: Advanced Control Flow Builtins
@@ -2451,6 +2701,271 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Pick(Box::new(keys))));
         }
 
+        // tag - yq: return YAML type tag (!!str, !!int, !!map, etc.)
+        if self.matches_keyword("tag") {
+            self.consume_keyword("tag");
+            return Ok(Some(Builtin::Tag));
+        }
+
+        // anchor - yq: return anchor name if present
+        if self.matches_keyword("anchor") {
+            self.consume_keyword("anchor");
+            return Ok(Some(Builtin::Anchor));
+        }
+
+        // style - yq: return scalar/collection style
+        if self.matches_keyword("style") {
+            self.consume_keyword("style");
+            return Ok(Some(Builtin::Style));
+        }
+
+        // kind - yq: return node kind (scalar, seq, map)
+        if self.matches_keyword("kind") {
+            self.consume_keyword("kind");
+            return Ok(Some(Builtin::Kind));
+        }
+
+        // key - yq: return current key when iterating
+        if self.matches_keyword("key") {
+            self.consume_keyword("key");
+            return Ok(Some(Builtin::Key));
+        }
+
+        // Phase 12: Additional builtins
+        if self.matches_keyword("now") {
+            self.consume_keyword("now");
+            return Ok(Some(Builtin::Now));
+        }
+        if self.matches_keyword("abs") {
+            self.consume_keyword("abs");
+            return Ok(Some(Builtin::Abs));
+        }
+        if self.matches_keyword("builtins") {
+            self.consume_keyword("builtins");
+            return Ok(Some(Builtin::Builtins));
+        }
+
+        // Phase 13: Iteration control
+        // limit(n; expr) - output at most n values from expr
+        if self.matches_keyword("limit") {
+            self.consume_keyword("limit");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let n = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(';')?;
+            self.skip_ws();
+            let expr = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Limit(Box::new(n), Box::new(expr))));
+        }
+
+        // skip(n; expr) - skip first n outputs from expr
+        if self.matches_keyword("skip") {
+            self.consume_keyword("skip");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let n = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(';')?;
+            self.skip_ws();
+            let expr = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Skip(Box::new(n), Box::new(expr))));
+        }
+
+        // first(expr) or first - output only the first value
+        // first without args is already handled by Phase 5 Builtin::First
+        // first(expr) uses stream version
+        if self.matches_keyword("first") {
+            self.consume_keyword("first");
+            self.skip_ws();
+            if self.peek() == Some('(') {
+                self.next();
+                self.skip_ws();
+                let expr = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::FirstStream(Box::new(expr))));
+            }
+            // No-arg first is already handled by Phase 5 Builtin::First
+            return Ok(Some(Builtin::First));
+        }
+
+        // last(expr) or last - output only the last value
+        // last without args is already handled by Phase 5 Builtin::Last
+        if self.matches_keyword("last") {
+            self.consume_keyword("last");
+            self.skip_ws();
+            if self.peek() == Some('(') {
+                self.next();
+                self.skip_ws();
+                let expr = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::LastStream(Box::new(expr))));
+            }
+            // No-arg last is already handled by Phase 5 Builtin::Last
+            return Ok(Some(Builtin::Last));
+        }
+
+        // nth(n; expr) or nth(n) - output only the nth value (0-indexed)
+        // nth(n) without second arg is already handled by Phase 5 Builtin::Nth
+        if self.matches_keyword("nth") {
+            self.consume_keyword("nth");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let n = self.parse_pipe_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next();
+                self.skip_ws();
+                let expr = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::NthStream(Box::new(n), Box::new(expr))));
+            }
+            self.expect(')')?;
+            // No-arg nth(n) is already handled by Phase 5 Builtin::Nth
+            return Ok(Some(Builtin::Nth(Box::new(n))));
+        }
+
+        // range(n), range(from; upto), range(from; upto; by)
+        if self.matches_keyword("range") {
+            self.consume_keyword("range");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let first = self.parse_pipe_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next();
+                self.skip_ws();
+                let second = self.parse_pipe_expr()?;
+                self.skip_ws();
+                if self.peek() == Some(';') {
+                    self.next();
+                    self.skip_ws();
+                    let third = self.parse_pipe_expr()?;
+                    self.skip_ws();
+                    self.expect(')')?;
+                    return Ok(Some(Builtin::RangeFromToBy(
+                        Box::new(first),
+                        Box::new(second),
+                        Box::new(third),
+                    )));
+                }
+                self.expect(')')?;
+                return Ok(Some(Builtin::RangeFromTo(
+                    Box::new(first),
+                    Box::new(second),
+                )));
+            }
+            self.expect(')')?;
+            return Ok(Some(Builtin::Range(Box::new(first))));
+        }
+
+        // isempty(expr) - returns true if expr produces no outputs
+        if self.matches_keyword("isempty") {
+            self.consume_keyword("isempty");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let expr = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::IsEmpty(Box::new(expr))));
+        }
+
+        // Phase 14: Recursive traversal (extends Phase 8)
+        // recurse_down is an alias for recurse
+        if self.matches_keyword("recurse_down") {
+            self.consume_keyword("recurse_down");
+            return Ok(Some(Builtin::RecurseDown));
+        }
+
+        // Phase 15: Date/Time functions
+        if self.matches_keyword("gmtime") {
+            self.consume_keyword("gmtime");
+            return Ok(Some(Builtin::Gmtime));
+        }
+        if self.matches_keyword("localtime") {
+            self.consume_keyword("localtime");
+            return Ok(Some(Builtin::Localtime));
+        }
+        if self.matches_keyword("mktime") {
+            self.consume_keyword("mktime");
+            return Ok(Some(Builtin::Mktime));
+        }
+        if self.matches_keyword("strftime") {
+            self.consume_keyword("strftime");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let fmt = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Strftime(Box::new(fmt))));
+        }
+        if self.matches_keyword("strptime") {
+            self.consume_keyword("strptime");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let fmt = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Strptime(Box::new(fmt))));
+        }
+        if self.matches_keyword("todateiso8601") {
+            self.consume_keyword("todateiso8601");
+            return Ok(Some(Builtin::Todateiso8601));
+        }
+        if self.matches_keyword("fromdateiso8601") {
+            self.consume_keyword("fromdateiso8601");
+            return Ok(Some(Builtin::Fromdateiso8601));
+        }
+        if self.matches_keyword("todate") {
+            self.consume_keyword("todate");
+            return Ok(Some(Builtin::Todate));
+        }
+        if self.matches_keyword("fromdate") {
+            self.consume_keyword("fromdate");
+            return Ok(Some(Builtin::Fromdate));
+        }
+
+        // Phase 17: Combinations
+        if self.matches_keyword("combinations") {
+            self.consume_keyword("combinations");
+            self.skip_ws();
+            if self.peek() == Some('(') {
+                self.next(); // consume '('
+                self.skip_ws();
+                let n = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::CombinationsN(Box::new(n))));
+            }
+            return Ok(Some(Builtin::Combinations));
+        }
+
+        // Phase 18: Additional math functions
+        if self.matches_keyword("trunc") {
+            self.consume_keyword("trunc");
+            return Ok(Some(Builtin::Trunc));
+        }
+
+        // Phase 19: Type conversion
+        if self.matches_keyword("toboolean") {
+            self.consume_keyword("toboolean");
+            return Ok(Some(Builtin::ToBoolean));
+        }
+
         Ok(None)
     }
 
@@ -2498,6 +3013,19 @@ impl<'a> Parser<'a> {
                     // Check for bracket after dot
                     if self.peek() == Some('[') {
                         chain.push(self.parse_index_bracket_with_optional()?);
+                    } else if self.peek() == Some('"') {
+                        // Quoted field access `."key"`
+                        let name = self.parse_string_literal()?;
+                        let mut field_expr = Expr::Field(name);
+
+                        // Check for optional
+                        self.skip_ws();
+                        if self.peek() == Some('?') {
+                            self.next();
+                            field_expr = Expr::Optional(Box::new(field_expr));
+                        }
+
+                        chain.push(field_expr);
                     } else {
                         // Field access
                         let name = self.parse_ident()?;
@@ -3284,7 +3812,14 @@ impl<'a> Parser<'a> {
 /// let expr = parse("{name: .name, age: .age}").unwrap();
 /// ```
 pub fn parse(input: &str) -> Result<Expr, ParseError> {
-    let mut parser = Parser::new(input);
+    parse_with_mode(input, ParserMode::Jq)
+}
+
+/// Parse a jq expression with a specific parser mode.
+///
+/// Use `ParserMode::Yq` to allow kebab-case identifiers like `.my-key`.
+pub fn parse_with_mode(input: &str, mode: ParserMode) -> Result<Expr, ParseError> {
+    let mut parser = Parser::with_mode(input, mode);
     let expr = parser.parse_expr()?;
 
     // Ensure we consumed all input
@@ -3325,7 +3860,14 @@ pub fn parse(input: &str) -> Result<Expr, ParseError> {
 /// assert_eq!(prog.imports[0].alias, "u");
 /// ```
 pub fn parse_program(input: &str) -> Result<Program, ParseError> {
-    let mut parser = Parser::new(input);
+    parse_program_with_mode(input, ParserMode::Jq)
+}
+
+/// Parse a complete jq program with a specific parser mode.
+///
+/// Use `ParserMode::Yq` to allow kebab-case identifiers like `.my-key`.
+pub fn parse_program_with_mode(input: &str, mode: ParserMode) -> Result<Program, ParseError> {
+    let mut parser = Parser::with_mode(input, mode);
     let program = parser.parse_program()?;
 
     // Ensure we consumed all input
@@ -3923,5 +4465,212 @@ mod tests {
         // if with arithmetic
         let expr = parse("if .x > 0 then .x * 2 else .x end").unwrap();
         assert!(matches!(expr, Expr::If { .. }));
+    }
+
+    #[test]
+    fn test_quoted_field_access() {
+        // Basic quoted field access
+        assert_eq!(parse(".\"my-key\"").unwrap(), Expr::Field("my-key".into()));
+        assert_eq!(
+            parse(".\"with spaces\"").unwrap(),
+            Expr::Field("with spaces".into())
+        );
+        assert_eq!(
+            parse(".\"special@chars!\"").unwrap(),
+            Expr::Field("special@chars!".into())
+        );
+
+        // Empty string key
+        assert_eq!(parse(".\"\"").unwrap(), Expr::Field("".into()));
+
+        // Quoted field in chained access
+        assert_eq!(
+            parse(".foo.\"bar-baz\"").unwrap(),
+            Expr::Pipe(vec![
+                Expr::Field("foo".into()),
+                Expr::Field("bar-baz".into()),
+            ])
+        );
+
+        // Multiple quoted fields chained
+        assert_eq!(
+            parse(".\"a-b\".\"c-d\"").unwrap(),
+            Expr::Pipe(vec![Expr::Field("a-b".into()), Expr::Field("c-d".into()),])
+        );
+
+        // Mix of quoted and unquoted fields
+        assert_eq!(
+            parse(".foo.\"my-key\".bar").unwrap(),
+            Expr::Pipe(vec![
+                Expr::Field("foo".into()),
+                Expr::Field("my-key".into()),
+                Expr::Field("bar".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_bracket_string_notation() {
+        // Basic bracket string notation
+        assert_eq!(
+            parse(".[\"my-key\"]").unwrap(),
+            Expr::Field("my-key".into())
+        );
+        assert_eq!(
+            parse(".[\"with spaces\"]").unwrap(),
+            Expr::Field("with spaces".into())
+        );
+
+        // Empty string key
+        assert_eq!(parse(".[\"\"]").unwrap(), Expr::Field("".into()));
+
+        // Bracket string in chained access
+        assert_eq!(
+            parse(".foo[\"bar-baz\"]").unwrap(),
+            Expr::Pipe(vec![
+                Expr::Field("foo".into()),
+                Expr::Field("bar-baz".into()),
+            ])
+        );
+
+        // Multiple bracket notations chained
+        assert_eq!(
+            parse(".[\"a-b\"][\"c-d\"]").unwrap(),
+            Expr::Pipe(vec![Expr::Field("a-b".into()), Expr::Field("c-d".into()),])
+        );
+
+        // Mix of bracket and dot notation
+        assert_eq!(
+            parse(".foo[\"my-key\"].bar").unwrap(),
+            Expr::Pipe(vec![
+                Expr::Field("foo".into()),
+                Expr::Field("my-key".into()),
+                Expr::Field("bar".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_optional_quoted_field() {
+        // Optional quoted field access
+        assert_eq!(
+            parse(".\"my-key\"?").unwrap(),
+            Expr::Optional(Box::new(Expr::Field("my-key".into())))
+        );
+
+        // Optional bracket string notation
+        assert_eq!(
+            parse(".[\"my-key\"]?").unwrap(),
+            Expr::Optional(Box::new(Expr::Field("my-key".into())))
+        );
+    }
+
+    #[test]
+    fn test_yq_mode_kebab_case() {
+        // In Yq mode, bare kebab-case identifiers are allowed
+        assert_eq!(
+            parse_with_mode(".my-key", ParserMode::Yq).unwrap(),
+            Expr::Field("my-key".into())
+        );
+        assert_eq!(
+            parse_with_mode(".foo-bar-baz", ParserMode::Yq).unwrap(),
+            Expr::Field("foo-bar-baz".into())
+        );
+
+        // Chained kebab-case
+        assert_eq!(
+            parse_with_mode(".my-key.other-key", ParserMode::Yq).unwrap(),
+            Expr::Pipe(vec![
+                Expr::Field("my-key".into()),
+                Expr::Field("other-key".into()),
+            ])
+        );
+
+        // Mix of kebab-case and regular identifiers
+        assert_eq!(
+            parse_with_mode(".foo.my-key.bar", ParserMode::Yq).unwrap(),
+            Expr::Pipe(vec![
+                Expr::Field("foo".into()),
+                Expr::Field("my-key".into()),
+                Expr::Field("bar".into()),
+            ])
+        );
+
+        // Kebab-case with array index
+        assert_eq!(
+            parse_with_mode(".my-key[0]", ParserMode::Yq).unwrap(),
+            Expr::Pipe(vec![Expr::Field("my-key".into()), Expr::Index(0),])
+        );
+
+        // Kebab-case with optional
+        assert_eq!(
+            parse_with_mode(".my-key?", ParserMode::Yq).unwrap(),
+            Expr::Optional(Box::new(Expr::Field("my-key".into())))
+        );
+    }
+
+    #[test]
+    fn test_jq_mode_kebab_case_is_subtraction() {
+        // In Jq mode (default), .foo-bar is parsed as .foo minus bar
+        let expr = parse(".foo-bar").unwrap();
+        match expr {
+            Expr::Arithmetic { left, op, right } => {
+                assert_eq!(*left, Expr::Field("foo".into()));
+                assert_eq!(op, ArithOp::Sub);
+                // 'bar' is parsed as a bare identifier - FuncCall or Var
+                match &*right {
+                    Expr::FuncCall { name, .. } => {
+                        assert_eq!(name, "bar");
+                    }
+                    Expr::Var(name) => {
+                        assert_eq!(name, "bar");
+                    }
+                    other => panic!("expected FuncCall or Var, got {:?}", other),
+                }
+            }
+            _ => panic!("expected subtraction, got {:?}", expr),
+        }
+    }
+
+    #[test]
+    fn test_comments() {
+        // Inline comment at end
+        assert_eq!(parse(".foo # comment").unwrap(), Expr::Field("foo".into()));
+
+        // Comment on its own line
+        assert_eq!(parse("# comment\n.foo").unwrap(), Expr::Field("foo".into()));
+
+        // Multiple comments
+        assert_eq!(
+            parse("# first\n.foo # second").unwrap(),
+            Expr::Field("foo".into())
+        );
+
+        // Comment between expressions
+        assert_eq!(
+            parse(".foo # get foo\n| .bar # then bar").unwrap(),
+            Expr::Pipe(vec![Expr::Field("foo".into()), Expr::Field("bar".into()),])
+        );
+
+        // Comment with special characters
+        assert_eq!(
+            parse(".foo # comment with $pecial ch@rs!").unwrap(),
+            Expr::Field("foo".into())
+        );
+
+        // Empty comment
+        assert_eq!(
+            parse(".foo #\n| .bar").unwrap(),
+            Expr::Pipe(vec![Expr::Field("foo".into()), Expr::Field("bar".into()),])
+        );
+
+        // Comment-only input should fail (no expression)
+        assert!(parse("# just a comment").is_err());
+
+        // Hash in string is not a comment
+        assert_eq!(
+            parse("\"hello # world\"").unwrap(),
+            Expr::Literal(Literal::String("hello # world".into()))
+        );
     }
 }
