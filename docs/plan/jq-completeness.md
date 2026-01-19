@@ -193,10 +193,18 @@ The implementation is already production-ready for ~90% of jq use cases.
 
 ### YAML Metadata Functions (yq)
 - [x] `tag` - return YAML type tag (!!str, !!int, !!map, etc.) - fully working
-- [x] `anchor` - return anchor name (returns empty string; metadata not preserved)
-- [x] `style` - return scalar/collection style (returns empty string; metadata not preserved)
+- [x] `anchor` - return anchor name - fully working at cursor level (YamlCursor::anchor())
+- [x] `style` - return scalar/collection style (double, single, literal, folded, flow, or empty) - fully working at cursor level (YamlCursor::style())
 - [x] `kind` - return node kind (scalar, seq, map) - fully working
 - [x] `key` - return current key when iterating (string for objects, int for arrays) - fully working
+
+**Note on anchor/style metadata**: The YamlCursor type now has full metadata access methods:
+- `cursor.anchor()` returns `Option<&str>` with the anchor name (e.g., "myanchor" for `&myanchor value`)
+- `cursor.style()` returns `&'static str` indicating the style ("double", "single", "literal", "folded", "flow", or "" for plain)
+- `cursor.tag()` returns `&'static str` with the inferred YAML type tag
+- `cursor.kind()` returns `&'static str` indicating the structural kind ("scalar", "seq", "map")
+
+The jq builtins return empty string for anchor/style because metadata is lost during YAML→OwnedValue→JSON conversion for evaluation. Direct YAML cursor access preserves all metadata.
 
 ### Module System
 - [x] `import "path" as name;` - Import module with namespace
@@ -323,3 +331,5 @@ echo '{"a":1}' | succinctly jq '.a'
 | 2026-01-19 | Removed `.[::2]` step slicing from TODO - it's Python syntax, not jq|
 | 2026-01-20 | Added `label $name | expr` / `break $name` for non-local control flow (✅ complete)|
 | 2026-01-20 | Module system fully implemented: import, include, -L, JQ_LIBRARY_PATH, ~/.jq, namespaced calls, parameterized functions (✅ complete)|
+| 2026-01-20 | Added YAML cursor metadata access: YamlCursor::anchor(), style(), tag(), kind() methods (✅ complete)|
+| 2026-01-20 | Added reverse anchor mapping (bp_pos → anchor_name) to YamlIndex for O(1) anchor lookup|

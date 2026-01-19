@@ -54,6 +54,8 @@ pub struct YamlIndex<W = Vec<u64>> {
     containers_rank: Vec<u32>,
     /// Anchor definitions: anchor name → BP position of the anchored value
     anchors: BTreeMap<String, usize>,
+    /// Reverse anchor mapping: BP position → anchor name (for metadata access)
+    bp_to_anchor: BTreeMap<usize, String>,
     /// Alias references: BP position of alias → target BP position (resolved at parse time)
     aliases: BTreeMap<usize, usize>,
     /// Newline positions for fast line/column lookup.
@@ -146,6 +148,13 @@ impl YamlIndex<Vec<u64>> {
         // Build newline index for fast line/column lookup
         let newlines = build_newline_index(yaml);
 
+        // Build reverse anchor mapping (bp_pos → anchor_name)
+        let bp_to_anchor: BTreeMap<usize, String> = semi
+            .anchors
+            .iter()
+            .map(|(name, &bp_pos)| (bp_pos, name.clone()))
+            .collect();
+
         Ok(Self {
             ib: semi.ib,
             ib_len,
@@ -159,6 +168,7 @@ impl YamlIndex<Vec<u64>> {
             containers: semi.containers,
             containers_rank,
             anchors: semi.anchors,
+            bp_to_anchor,
             aliases: semi.aliases,
             newlines,
         })
@@ -187,6 +197,12 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         let ib_rank = build_ib_rank(ib.as_ref());
         let containers_rank = build_containers_rank(containers.as_ref());
 
+        // Build reverse anchor mapping
+        let bp_to_anchor: BTreeMap<usize, String> = anchors
+            .iter()
+            .map(|(name, &bp_pos)| (bp_pos, name.clone()))
+            .collect();
+
         Self {
             ib,
             ib_len,
@@ -200,6 +216,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             containers,
             containers_rank,
             anchors,
+            bp_to_anchor,
             aliases,
             newlines: crate::bits::BitVec::new(),
         }
@@ -227,6 +244,12 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         let ib_rank = build_ib_rank(ib.as_ref());
         let containers_rank = build_containers_rank(containers.as_ref());
 
+        // Build reverse anchor mapping
+        let bp_to_anchor: BTreeMap<usize, String> = anchors
+            .iter()
+            .map(|(name, &bp_pos)| (bp_pos, name.clone()))
+            .collect();
+
         Self {
             ib,
             ib_len,
@@ -240,6 +263,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             containers,
             containers_rank,
             anchors,
+            bp_to_anchor,
             aliases,
             newlines,
         }
@@ -453,6 +477,14 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     #[inline]
     pub fn get_anchor_bp_pos(&self, anchor_name: &str) -> Option<usize> {
         self.anchors.get(anchor_name).copied()
+    }
+
+    /// Get the anchor name for a BP position.
+    ///
+    /// Returns `None` if the position does not have an anchor.
+    #[inline]
+    pub fn get_anchor_name(&self, bp_pos: usize) -> Option<&str> {
+        self.bp_to_anchor.get(&bp_pos).map(|s| s.as_str())
     }
 
     /// Resolve an alias at the given BP position to a cursor pointing to
