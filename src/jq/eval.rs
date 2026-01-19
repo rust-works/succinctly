@@ -1398,6 +1398,9 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
 
         // Phase 19: Type conversion
         Builtin::ToBoolean => builtin_toboolean(value, optional),
+
+        // Phase 20: Iteration control extension
+        Builtin::Skip(n_expr, expr) => builtin_skip(n_expr, expr, value, optional),
     }
 }
 
@@ -3102,6 +3105,79 @@ fn builtin_toboolean<'a, W: Clone + AsRef<[u64]>>(
             "{} cannot be parsed as a boolean",
             type_name(&value)
         ))),
+    }
+}
+
+/// Builtin: skip(n; expr) - skip first n outputs from expr
+fn builtin_skip<'a, W: Clone + AsRef<[u64]>>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate n
+    let n_result = eval_single(n_expr, value.clone(), optional);
+    let n = match n_result {
+        QueryResult::One(v) => {
+            if let StandardJson::Number(num) = v {
+                num.as_i64().unwrap_or(0) as usize
+            } else {
+                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
+            }
+        }
+        QueryResult::Owned(OwnedValue::Int(i)) => i as usize,
+        QueryResult::Owned(OwnedValue::Float(f)) => f as usize,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
+    };
+
+    // Evaluate expr and skip first n results
+    let result = eval_single(expr, value, optional);
+    match result {
+        QueryResult::One(v) => {
+            if n == 0 {
+                QueryResult::Owned(to_owned(&v))
+            } else {
+                QueryResult::None
+            }
+        }
+        QueryResult::OneCursor(c) => {
+            if n == 0 {
+                QueryResult::Owned(to_owned(&c.value()))
+            } else {
+                QueryResult::None
+            }
+        }
+        QueryResult::Owned(v) => {
+            if n == 0 {
+                QueryResult::Owned(v)
+            } else {
+                QueryResult::None
+            }
+        }
+        QueryResult::Many(results) => {
+            let skipped: Vec<OwnedValue> =
+                results.into_iter().skip(n).map(|v| to_owned(&v)).collect();
+            if skipped.is_empty() {
+                QueryResult::None
+            } else if skipped.len() == 1 {
+                QueryResult::Owned(skipped.into_iter().next().unwrap())
+            } else {
+                QueryResult::ManyOwned(skipped)
+            }
+        }
+        QueryResult::ManyOwned(results) => {
+            let skipped: Vec<OwnedValue> = results.into_iter().skip(n).collect();
+            if skipped.is_empty() {
+                QueryResult::None
+            } else if skipped.len() == 1 {
+                QueryResult::Owned(skipped.into_iter().next().unwrap())
+            } else {
+                QueryResult::ManyOwned(skipped)
+            }
+        }
+        QueryResult::None => QueryResult::None,
+        QueryResult::Error(e) => QueryResult::Error(e),
     }
 }
 
@@ -5902,6 +5978,12 @@ fn substitute_var_in_builtin(
 
         // Phase 19: Type conversion
         Builtin::ToBoolean => Builtin::ToBoolean,
+
+        // Phase 20: Iteration control extension
+        Builtin::Skip(n, e) => Builtin::Skip(
+            Box::new(substitute_var(n, var_name, replacement)),
+            Box::new(substitute_var(e, var_name, replacement)),
+        ),
     }
 }
 
@@ -9069,6 +9151,7 @@ fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
         "walk/1",
         "isvalid/1",
         "limit/2",
+        "skip/2",
         "first/1",
         "last/1",
         "nth/2",
@@ -11481,6 +11564,12 @@ fn expand_func_calls_in_builtin(
 
         // Phase 19: Type conversion
         Builtin::ToBoolean => Builtin::ToBoolean,
+
+        // Phase 20: Iteration control extension
+        Builtin::Skip(n, e) => Builtin::Skip(
+            Box::new(expand_func_calls(n, func_name, params, body)),
+            Box::new(expand_func_calls(e, func_name, params, body)),
+        ),
     }
 }
 
@@ -11748,6 +11837,12 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
 
         // Phase 19: Type conversion
         Builtin::ToBoolean => Builtin::ToBoolean,
+
+        // Phase 20: Iteration control extension
+        Builtin::Skip(n, e) => Builtin::Skip(
+            Box::new(substitute_func_param(n, param, arg)),
+            Box::new(substitute_func_param(e, param, arg)),
+        ),
     }
 }
 

@@ -848,6 +848,11 @@ pub enum Builtin {
     /// Accepts: true, false, "true", "false"
     /// Errors on other types
     ToBoolean,
+
+    // Phase 20: Iteration control extension
+    /// `skip(n; expr)` - skip first n outputs from expr
+    /// Outputs all remaining values after skipping the first n
+    Skip(Box<Expr>, Box<Expr>),
 }
 
 /// Arithmetic operators.

@@ -2695,6 +2695,22 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Limit(Box::new(n), Box::new(expr))));
         }
 
+        // skip(n; expr) - skip first n outputs from expr
+        if self.matches_keyword("skip") {
+            self.consume_keyword("skip");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let n = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(';')?;
+            self.skip_ws();
+            let expr = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Skip(Box::new(n), Box::new(expr))));
+        }
+
         // first(expr) or first - output only the first value
         // first without args is already handled by Phase 5 Builtin::First
         // first(expr) uses stream version
