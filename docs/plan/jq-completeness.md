@@ -162,6 +162,8 @@ The implementation is already production-ready for ~90% of jq use cases.
 
 ### I/O & Debug
 - [x] `debug` / `debug(msg)`
+- [x] `$__loc__` - Current source location `{file, line}` where `$__loc__` appears
+- [x] Comments in jq expressions (`#` to end of line)
 - [x] `env`, `$ENV.VAR`, `env(VAR)`, `strenv(VAR)`
 - [x] `now` - Current Unix timestamp
 - [x] `builtins` - List all builtin function names
@@ -213,20 +215,12 @@ Currently parsed but not evaluated:
 - Consider `jq -L` style library paths
 - May want to keep this optional/feature-gated
 
-### Priority 2: Location & Debugging
-
-- [ ] `$__loc__` - Current source location `{file, line}`
-- [x] Comments in jq expressions (`#` to end of line) ✅
-
-**Implementation notes:**
-- `$__loc__` requires tracking source positions through parsing
-
-### Priority 3: Advanced Features
+### Priority 2: Advanced Features
 
 - [ ] Label-break: `label $name | ... | break $name`
 - [ ] Array slicing with steps: `.[::2]` (every other element)
 
-### Priority 4: CLI Enhancements
+### Priority 3: CLI Enhancements
 
 These are CLI-level features, not expression language:
 
@@ -308,3 +302,4 @@ echo '{"a":1}' | succinctly jq '.a'
 | 2026-01-19 | Added `toboolean` type conversion function (✅ complete)|
 | 2026-01-19 | Added `skip(n; expr)` iteration control - skip first n outputs (✅ complete)|
 | 2026-01-19 | Moved `input`/`inputs`/`input_line_number` to "Won't implement" - conflicts with succinct data structure architecture|
+| 2026-01-19 | Verified `$__loc__` already implemented - returns `{file, line}` at source location (✅ complete)|
