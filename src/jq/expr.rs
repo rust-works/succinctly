@@ -584,29 +584,6 @@ pub enum Builtin {
     /// `getpath(path)` - get value at path
     GetPath(Box<Expr>),
 
-    // Phase 7: Regular Expression Functions (requires "regex" feature)
-    /// `match(re)` or `match(re; flags)` - return match object
-    #[cfg(feature = "regex")]
-    Match(Box<Expr>, Option<String>),
-    /// `capture(re)` - return named captures as object
-    #[cfg(feature = "regex")]
-    Capture(Box<Expr>),
-    /// `scan(re)` - find all matches
-    #[cfg(feature = "regex")]
-    Scan(Box<Expr>),
-    /// `splits(re)` - split by regex (iterator version)
-    #[cfg(feature = "regex")]
-    Splits(Box<Expr>),
-    /// `sub(re; replacement)` - replace first match
-    #[cfg(feature = "regex")]
-    Sub(Box<Expr>, Box<Expr>),
-    /// `gsub(re; replacement)` - replace all matches
-    #[cfg(feature = "regex")]
-    Gsub(Box<Expr>, Box<Expr>),
-    /// `test(re; flags)` - test with flags (extends basic test)
-    #[cfg(feature = "regex")]
-    TestWithFlags(Box<Expr>, String),
-
     // Phase 8: Advanced Control Flow Builtins
     /// `recurse` - recursively apply .[] (same as recurse(.[];true))
     Recurse,
@@ -821,6 +798,37 @@ pub enum Builtin {
     Todateiso8601,
     /// `fromdateiso8601` - parse ISO 8601 date string to Unix timestamp
     Fromdateiso8601,
+
+    // Phase 16: Regex functions
+    /// `test(re; flags)` - test if regex matches with flags
+    /// Flags: "i" (case insensitive), "x" (extended), "s" (single-line), "m" (multi-line), "g" (global)
+    TestFlags(Box<Expr>, Box<Expr>),
+    /// `match(re)` - find first regex match, returning {offset, length, string, captures}
+    Match(Box<Expr>),
+    /// `match(re; flags)` - find regex match(es) with flags
+    MatchFlags(Box<Expr>, Box<Expr>),
+    /// `capture(re)` - capture named groups from first match, returning {name: value, ...}
+    Capture(Box<Expr>),
+    /// `capture(re; flags)` - capture named groups with flags
+    CaptureFlags(Box<Expr>, Box<Expr>),
+    /// `sub(re; replacement)` - replace first match
+    Sub(Box<Expr>, Box<Expr>),
+    /// `sub(re; replacement; flags)` - replace first match with flags
+    SubFlags(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `gsub(re; replacement)` - replace all matches
+    Gsub(Box<Expr>, Box<Expr>),
+    /// `gsub(re; replacement; flags)` - replace all matches with flags
+    GsubFlags(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `scan(re)` - find all matches, outputting each as a stream
+    Scan(Box<Expr>),
+    /// `scan(re; flags)` - find all matches with flags
+    ScanFlags(Box<Expr>, Box<Expr>),
+    /// `split(re; flags)` - split string by regex with flags
+    SplitRegex(Box<Expr>, Box<Expr>),
+    /// `splits(re)` - split string by regex, outputting as stream
+    Splits(Box<Expr>),
+    /// `splitsFlags(re; flags)` - split string by regex with flags, outputting as stream
+    SplitsFlags(Box<Expr>, Box<Expr>),
 }
 
 /// Arithmetic operators.

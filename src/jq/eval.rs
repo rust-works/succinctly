@@ -1198,21 +1198,57 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         Builtin::FromJsonStream => builtin_fromjsonstream(value, optional),
         Builtin::GetPath(path) => builtin_getpath(path, value, optional),
 
-        // Phase 7: Regex Functions (requires "regex" feature)
+        // Phase 16: Regex Functions
         #[cfg(feature = "regex")]
-        Builtin::Match(re, flags) => builtin_match(re, flags.as_deref(), value, optional),
+        Builtin::TestFlags(re, flags) => builtin_test_flags(re, flags, value, optional),
+        #[cfg(feature = "regex")]
+        Builtin::Match(re) => builtin_match(re, None, value, optional),
+        #[cfg(feature = "regex")]
+        Builtin::MatchFlags(re, flags) => builtin_match_flags(re, flags, value, optional),
         #[cfg(feature = "regex")]
         Builtin::Capture(re) => builtin_capture(re, value, optional),
         #[cfg(feature = "regex")]
-        Builtin::Scan(re) => builtin_scan(re, value, optional),
-        #[cfg(feature = "regex")]
-        Builtin::Splits(re) => builtin_splits(re, value, optional),
+        Builtin::CaptureFlags(re, flags) => builtin_capture_flags(re, flags, value, optional),
         #[cfg(feature = "regex")]
         Builtin::Sub(re, replacement) => builtin_sub(re, replacement, value, optional),
         #[cfg(feature = "regex")]
+        Builtin::SubFlags(re, replacement, flags) => {
+            builtin_sub_flags(re, replacement, flags, value, optional)
+        }
+        #[cfg(feature = "regex")]
         Builtin::Gsub(re, replacement) => builtin_gsub(re, replacement, value, optional),
         #[cfg(feature = "regex")]
-        Builtin::TestWithFlags(re, flags) => builtin_test_with_flags(re, flags, value, optional),
+        Builtin::GsubFlags(re, replacement, flags) => {
+            builtin_gsub_flags(re, replacement, flags, value, optional)
+        }
+        #[cfg(feature = "regex")]
+        Builtin::Scan(re) => builtin_scan(re, value, optional),
+        #[cfg(feature = "regex")]
+        Builtin::ScanFlags(re, flags) => builtin_scan_flags(re, flags, value, optional),
+        #[cfg(feature = "regex")]
+        Builtin::SplitRegex(re, flags) => builtin_split_regex(re, flags, value, optional),
+        #[cfg(feature = "regex")]
+        Builtin::Splits(re) => builtin_splits(re, value, optional),
+        #[cfg(feature = "regex")]
+        Builtin::SplitsFlags(re, flags) => builtin_splits_flags(re, flags, value, optional),
+        // Non-regex fallbacks for when regex feature is not enabled
+        #[cfg(not(feature = "regex"))]
+        Builtin::TestFlags(_, _)
+        | Builtin::Match(_)
+        | Builtin::MatchFlags(_, _)
+        | Builtin::Capture(_)
+        | Builtin::CaptureFlags(_, _)
+        | Builtin::Sub(_, _)
+        | Builtin::SubFlags(_, _, _)
+        | Builtin::Gsub(_, _)
+        | Builtin::GsubFlags(_, _, _)
+        | Builtin::Scan(_)
+        | Builtin::ScanFlags(_, _)
+        | Builtin::SplitRegex(_, _)
+        | Builtin::Splits(_)
+        | Builtin::SplitsFlags(_, _) => {
+            QueryResult::Error(EvalError::new("regex feature not enabled"))
+        }
 
         // Phase 8: Advanced Control Flow Builtins
         Builtin::Recurse => builtin_recurse(value, optional),
@@ -4116,11 +4152,95 @@ fn builtin_gsub<'a, W: Clone + AsRef<[u64]>>(
     QueryResult::Owned(OwnedValue::String(result.into_owned()))
 }
 
-/// Builtin: test(re; flags) - test with flags
+/// Builtin: test(re; flags) - test with flags expression
 #[cfg(feature = "regex")]
-fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>>(
     re_expr: &Expr,
-    flags: &str,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the pattern
+    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the input string
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    };
+
+    // Build regex with flags
+    let re = match build_regex(&pattern, Some(&flags)) {
+        Ok(r) => r,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Test if regex matches
+    QueryResult::Owned(OwnedValue::Bool(re.is_match(&input)))
+}
+
+/// Builtin: match(re; flags) - match with flags expression
+#[cfg(feature = "regex")]
+fn builtin_match_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    builtin_match(re_expr, Some(&flags), value, optional)
+}
+
+/// Builtin: capture(re; flags) - capture with flags expression
+#[cfg(feature = "regex")]
+fn builtin_capture_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    builtin_capture_with_flags(re_expr, Some(&flags), value, optional)
+}
+
+/// Builtin: capture(re) or capture(re; flags) - capture named groups
+#[cfg(feature = "regex")]
+fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags: Option<&str>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -4144,14 +4264,414 @@ fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Build regex
-    let re = match build_regex(&pattern, Some(flags)) {
+    let re = match build_regex(&pattern, flags) {
         Ok(r) => r,
         Err(_e) if optional => return QueryResult::None,
         Err(e) => return QueryResult::Error(e),
     };
 
-    // Test if regex matches
-    QueryResult::Owned(OwnedValue::Bool(re.is_match(&input)))
+    // Find first match and extract named captures
+    if let Some(caps) = re.captures(&input) {
+        let mut entries = IndexMap::new();
+        for name in re.capture_names().flatten() {
+            if let Some(m) = caps.name(name) {
+                entries.insert(name.to_string(), OwnedValue::String(m.as_str().to_string()));
+            }
+        }
+        QueryResult::Owned(OwnedValue::Object(entries))
+    } else if optional {
+        QueryResult::None
+    } else {
+        // jq returns empty object when no match
+        QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
+    }
+}
+
+/// Builtin: sub(re; replacement; flags) - replace first match with flags
+#[cfg(feature = "regex")]
+fn builtin_sub_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    replacement_expr: &Expr,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    builtin_sub_with_flags(re_expr, replacement_expr, Some(&flags), value, optional)
+}
+
+/// Builtin: sub(re; replacement) or sub(re; replacement; flags) - replace first match
+#[cfg(feature = "regex")]
+fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    replacement_expr: &Expr,
+    flags: Option<&str>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the pattern
+    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the replacement
+    let replacement = match result_to_owned(eval_single(replacement_expr, value.clone(), optional))
+    {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the input string
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    };
+
+    // Build regex
+    let re = match build_regex(&pattern, flags) {
+        Ok(r) => r,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Convert jq replacement syntax (\(.name)) to regex replacement syntax ($name)
+    let replacement = convert_jq_replacement(&replacement);
+
+    // Replace first match
+    let result = re.replace(&input, replacement.as_str());
+    QueryResult::Owned(OwnedValue::String(result.into_owned()))
+}
+
+/// Builtin: gsub(re; replacement; flags) - replace all matches with flags
+#[cfg(feature = "regex")]
+fn builtin_gsub_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    replacement_expr: &Expr,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    builtin_gsub_with_flags(re_expr, replacement_expr, Some(&flags), value, optional)
+}
+
+/// Builtin: gsub(re; replacement) or gsub(re; replacement; flags) - replace all matches
+#[cfg(feature = "regex")]
+fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    replacement_expr: &Expr,
+    flags: Option<&str>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the pattern
+    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the replacement
+    let replacement = match result_to_owned(eval_single(replacement_expr, value.clone(), optional))
+    {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the input string
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    };
+
+    // Build regex
+    let re = match build_regex(&pattern, flags) {
+        Ok(r) => r,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Convert jq replacement syntax (\(.name)) to regex replacement syntax ($name)
+    let replacement = convert_jq_replacement(&replacement);
+
+    // Replace all matches
+    let result = re.replace_all(&input, replacement.as_str());
+    QueryResult::Owned(OwnedValue::String(result.into_owned()))
+}
+
+/// Builtin: scan(re; flags) - find all matches with flags
+#[cfg(feature = "regex")]
+fn builtin_scan_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    builtin_scan_with_flags(re_expr, Some(&flags), value, optional)
+}
+
+/// Builtin: scan(re) or scan(re; flags) - find all matches
+#[cfg(feature = "regex")]
+fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags: Option<&str>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the pattern
+    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the input string
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    };
+
+    // Build regex
+    let re = match build_regex(&pattern, flags) {
+        Ok(r) => r,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Find all matches
+    let mut results = Vec::new();
+    let capture_count = re.captures_len();
+
+    for caps in re.captures_iter(&input) {
+        if capture_count > 1 {
+            // Has capture groups - return array of captured strings
+            let mut captured = Vec::new();
+            for i in 1..capture_count {
+                if let Some(m) = caps.get(i) {
+                    captured.push(OwnedValue::String(m.as_str().to_string()));
+                }
+            }
+            results.push(OwnedValue::Array(captured));
+        } else {
+            // No capture groups - return the matched string
+            if let Some(m) = caps.get(0) {
+                results.push(OwnedValue::String(m.as_str().to_string()));
+            }
+        }
+    }
+
+    if results.is_empty() {
+        QueryResult::None
+    } else {
+        QueryResult::ManyOwned(results)
+    }
+}
+
+/// Builtin: split(re; flags) - split by regex with flags
+#[cfg(feature = "regex")]
+fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the pattern
+    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the input string
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    };
+
+    // Build regex
+    let re = match build_regex(&pattern, Some(&flags)) {
+        Ok(r) => r,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Split by regex
+    let parts: Vec<OwnedValue> = re
+        .split(&input)
+        .map(|s| OwnedValue::String(s.to_string()))
+        .collect();
+
+    QueryResult::Owned(OwnedValue::Array(parts))
+}
+
+/// Builtin: splits(re; flags) - split by regex with flags as stream
+#[cfg(feature = "regex")]
+fn builtin_splits_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the flags expression
+    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    builtin_splits_with_flags(re_expr, Some(&flags), value, optional)
+}
+
+/// Builtin: splits(re) or splits(re; flags) - split by regex as stream
+#[cfg(feature = "regex")]
+fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>>(
+    re_expr: &Expr,
+    flags: Option<&str>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the pattern
+    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the input string
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    };
+
+    // Build regex
+    let re = match build_regex(&pattern, flags) {
+        Ok(r) => r,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Split by regex and return as stream
+    let parts: Vec<OwnedValue> = re
+        .split(&input)
+        .map(|s| OwnedValue::String(s.to_string()))
+        .collect();
+
+    if parts.is_empty() {
+        QueryResult::None
+    } else {
+        QueryResult::ManyOwned(parts)
+    }
+}
+
+/// Convert jq replacement syntax to regex replacement syntax
+/// jq uses \(.name) for backreferences, regex crate uses $name or ${name}
+#[cfg(feature = "regex")]
+fn convert_jq_replacement(replacement: &str) -> String {
+    // Simple conversion: \(.name) -> ${name}
+    // This is a simplified version; full jq supports arbitrary expressions
+    let mut result = String::new();
+    let mut chars = replacement.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if chars.peek() == Some(&'(') {
+                chars.next(); // consume '('
+                let mut name = String::new();
+                while let Some(&nc) = chars.peek() {
+                    if nc == ')' {
+                        chars.next(); // consume ')'
+                        break;
+                    }
+                    name.push(nc);
+                    chars.next();
+                }
+                // Check if it's a simple variable reference like .name
+                if let Some(stripped) = name.strip_prefix('.') {
+                    result.push_str("${");
+                    result.push_str(stripped);
+                    result.push('}');
+                } else {
+                    // Not a simple reference, just output literally
+                    result.push_str("\\(");
+                    result.push_str(&name);
+                    result.push(')');
+                }
+            } else {
+                result.push(c);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
 }
 
 /// Evaluate a pipe (chain) of expressions.
@@ -5141,31 +5661,54 @@ fn substitute_var_in_builtin(
         Builtin::ToJsonStream => Builtin::ToJsonStream,
         Builtin::FromJsonStream => Builtin::FromJsonStream,
         Builtin::GetPath(e) => Builtin::GetPath(Box::new(substitute_var(e, var_name, replacement))),
-        #[cfg(feature = "regex")]
-        Builtin::Match(re, flags) => Builtin::Match(
+        // Phase 16: Regex Functions
+        Builtin::TestFlags(re, flags) => Builtin::TestFlags(
             Box::new(substitute_var(re, var_name, replacement)),
-            flags.clone(),
+            Box::new(substitute_var(flags, var_name, replacement)),
         ),
-        #[cfg(feature = "regex")]
-        Builtin::Capture(e) => Builtin::Capture(Box::new(substitute_var(e, var_name, replacement))),
-        #[cfg(feature = "regex")]
-        Builtin::Scan(e) => Builtin::Scan(Box::new(substitute_var(e, var_name, replacement))),
-        #[cfg(feature = "regex")]
-        Builtin::Splits(e) => Builtin::Splits(Box::new(substitute_var(e, var_name, replacement))),
-        #[cfg(feature = "regex")]
+        Builtin::Match(re) => Builtin::Match(Box::new(substitute_var(re, var_name, replacement))),
+        Builtin::MatchFlags(re, flags) => Builtin::MatchFlags(
+            Box::new(substitute_var(re, var_name, replacement)),
+            Box::new(substitute_var(flags, var_name, replacement)),
+        ),
+        Builtin::Capture(re) => {
+            Builtin::Capture(Box::new(substitute_var(re, var_name, replacement)))
+        }
+        Builtin::CaptureFlags(re, flags) => Builtin::CaptureFlags(
+            Box::new(substitute_var(re, var_name, replacement)),
+            Box::new(substitute_var(flags, var_name, replacement)),
+        ),
         Builtin::Sub(re, repl) => Builtin::Sub(
             Box::new(substitute_var(re, var_name, replacement)),
             Box::new(substitute_var(repl, var_name, replacement)),
         ),
-        #[cfg(feature = "regex")]
+        Builtin::SubFlags(re, repl, flags) => Builtin::SubFlags(
+            Box::new(substitute_var(re, var_name, replacement)),
+            Box::new(substitute_var(repl, var_name, replacement)),
+            Box::new(substitute_var(flags, var_name, replacement)),
+        ),
         Builtin::Gsub(re, repl) => Builtin::Gsub(
             Box::new(substitute_var(re, var_name, replacement)),
             Box::new(substitute_var(repl, var_name, replacement)),
         ),
-        #[cfg(feature = "regex")]
-        Builtin::TestWithFlags(re, flags) => Builtin::TestWithFlags(
+        Builtin::GsubFlags(re, repl, flags) => Builtin::GsubFlags(
             Box::new(substitute_var(re, var_name, replacement)),
-            flags.clone(),
+            Box::new(substitute_var(repl, var_name, replacement)),
+            Box::new(substitute_var(flags, var_name, replacement)),
+        ),
+        Builtin::Scan(re) => Builtin::Scan(Box::new(substitute_var(re, var_name, replacement))),
+        Builtin::ScanFlags(re, flags) => Builtin::ScanFlags(
+            Box::new(substitute_var(re, var_name, replacement)),
+            Box::new(substitute_var(flags, var_name, replacement)),
+        ),
+        Builtin::SplitRegex(re, flags) => Builtin::SplitRegex(
+            Box::new(substitute_var(re, var_name, replacement)),
+            Box::new(substitute_var(flags, var_name, replacement)),
+        ),
+        Builtin::Splits(re) => Builtin::Splits(Box::new(substitute_var(re, var_name, replacement))),
+        Builtin::SplitsFlags(re, flags) => Builtin::SplitsFlags(
+            Box::new(substitute_var(re, var_name, replacement)),
+            Box::new(substitute_var(flags, var_name, replacement)),
         ),
         // Phase 8 builtins
         Builtin::Recurse => Builtin::Recurse,
@@ -10523,35 +11066,60 @@ fn expand_func_calls_in_builtin(
         Builtin::GetPath(e) => {
             Builtin::GetPath(Box::new(expand_func_calls(e, func_name, params, body)))
         }
-        #[cfg(feature = "regex")]
-        Builtin::Match(re, flags) => Builtin::Match(
+        // Phase 16: Regex Functions
+        Builtin::TestFlags(re, flags) => Builtin::TestFlags(
             Box::new(expand_func_calls(re, func_name, params, body)),
-            flags.clone(),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
         ),
-        #[cfg(feature = "regex")]
+        Builtin::Match(re) => {
+            Builtin::Match(Box::new(expand_func_calls(re, func_name, params, body)))
+        }
+        Builtin::MatchFlags(re, flags) => Builtin::MatchFlags(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
+        ),
         Builtin::Capture(e) => {
             Builtin::Capture(Box::new(expand_func_calls(e, func_name, params, body)))
         }
-        #[cfg(feature = "regex")]
-        Builtin::Scan(e) => Builtin::Scan(Box::new(expand_func_calls(e, func_name, params, body))),
-        #[cfg(feature = "regex")]
-        Builtin::Splits(e) => {
-            Builtin::Splits(Box::new(expand_func_calls(e, func_name, params, body)))
-        }
-        #[cfg(feature = "regex")]
+        Builtin::CaptureFlags(re, flags) => Builtin::CaptureFlags(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
+        ),
         Builtin::Sub(re, repl) => Builtin::Sub(
             Box::new(expand_func_calls(re, func_name, params, body)),
             Box::new(expand_func_calls(repl, func_name, params, body)),
         ),
-        #[cfg(feature = "regex")]
+        Builtin::SubFlags(re, repl, flags) => Builtin::SubFlags(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            Box::new(expand_func_calls(repl, func_name, params, body)),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
+        ),
         Builtin::Gsub(re, repl) => Builtin::Gsub(
             Box::new(expand_func_calls(re, func_name, params, body)),
             Box::new(expand_func_calls(repl, func_name, params, body)),
         ),
-        #[cfg(feature = "regex")]
-        Builtin::TestWithFlags(re, flags) => Builtin::TestWithFlags(
+        Builtin::GsubFlags(re, repl, flags) => Builtin::GsubFlags(
             Box::new(expand_func_calls(re, func_name, params, body)),
-            flags.clone(),
+            Box::new(expand_func_calls(repl, func_name, params, body)),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
+        ),
+        Builtin::Scan(re) => {
+            Builtin::Scan(Box::new(expand_func_calls(re, func_name, params, body)))
+        }
+        Builtin::ScanFlags(re, flags) => Builtin::ScanFlags(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
+        ),
+        Builtin::SplitRegex(re, flags) => Builtin::SplitRegex(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
+        ),
+        Builtin::Splits(re) => {
+            Builtin::Splits(Box::new(expand_func_calls(re, func_name, params, body)))
+        }
+        Builtin::SplitsFlags(re, flags) => Builtin::SplitsFlags(
+            Box::new(expand_func_calls(re, func_name, params, body)),
+            Box::new(expand_func_calls(flags, func_name, params, body)),
         ),
         Builtin::Recurse => Builtin::Recurse,
         Builtin::RecurseF(f) => {
@@ -10783,31 +11351,52 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::ToJsonStream => Builtin::ToJsonStream,
         Builtin::FromJsonStream => Builtin::FromJsonStream,
         Builtin::GetPath(e) => Builtin::GetPath(Box::new(substitute_func_param(e, param, arg))),
-        #[cfg(feature = "regex")]
-        Builtin::Match(re, flags) => Builtin::Match(
+        // Phase 16: Regex Functions
+        Builtin::TestFlags(re, flags) => Builtin::TestFlags(
             Box::new(substitute_func_param(re, param, arg)),
-            flags.clone(),
+            Box::new(substitute_func_param(flags, param, arg)),
         ),
-        #[cfg(feature = "regex")]
+        Builtin::Match(re) => Builtin::Match(Box::new(substitute_func_param(re, param, arg))),
+        Builtin::MatchFlags(re, flags) => Builtin::MatchFlags(
+            Box::new(substitute_func_param(re, param, arg)),
+            Box::new(substitute_func_param(flags, param, arg)),
+        ),
         Builtin::Capture(e) => Builtin::Capture(Box::new(substitute_func_param(e, param, arg))),
-        #[cfg(feature = "regex")]
-        Builtin::Scan(e) => Builtin::Scan(Box::new(substitute_func_param(e, param, arg))),
-        #[cfg(feature = "regex")]
-        Builtin::Splits(e) => Builtin::Splits(Box::new(substitute_func_param(e, param, arg))),
-        #[cfg(feature = "regex")]
+        Builtin::CaptureFlags(re, flags) => Builtin::CaptureFlags(
+            Box::new(substitute_func_param(re, param, arg)),
+            Box::new(substitute_func_param(flags, param, arg)),
+        ),
         Builtin::Sub(re, repl) => Builtin::Sub(
             Box::new(substitute_func_param(re, param, arg)),
             Box::new(substitute_func_param(repl, param, arg)),
         ),
-        #[cfg(feature = "regex")]
+        Builtin::SubFlags(re, repl, flags) => Builtin::SubFlags(
+            Box::new(substitute_func_param(re, param, arg)),
+            Box::new(substitute_func_param(repl, param, arg)),
+            Box::new(substitute_func_param(flags, param, arg)),
+        ),
         Builtin::Gsub(re, repl) => Builtin::Gsub(
             Box::new(substitute_func_param(re, param, arg)),
             Box::new(substitute_func_param(repl, param, arg)),
         ),
-        #[cfg(feature = "regex")]
-        Builtin::TestWithFlags(re, flags) => Builtin::TestWithFlags(
+        Builtin::GsubFlags(re, repl, flags) => Builtin::GsubFlags(
             Box::new(substitute_func_param(re, param, arg)),
-            flags.clone(),
+            Box::new(substitute_func_param(repl, param, arg)),
+            Box::new(substitute_func_param(flags, param, arg)),
+        ),
+        Builtin::Scan(re) => Builtin::Scan(Box::new(substitute_func_param(re, param, arg))),
+        Builtin::ScanFlags(re, flags) => Builtin::ScanFlags(
+            Box::new(substitute_func_param(re, param, arg)),
+            Box::new(substitute_func_param(flags, param, arg)),
+        ),
+        Builtin::SplitRegex(re, flags) => Builtin::SplitRegex(
+            Box::new(substitute_func_param(re, param, arg)),
+            Box::new(substitute_func_param(flags, param, arg)),
+        ),
+        Builtin::Splits(re) => Builtin::Splits(Box::new(substitute_func_param(re, param, arg))),
+        Builtin::SplitsFlags(re, flags) => Builtin::SplitsFlags(
+            Box::new(substitute_func_param(re, param, arg)),
+            Box::new(substitute_func_param(flags, param, arg)),
         ),
         Builtin::Recurse => Builtin::Recurse,
         Builtin::RecurseF(f) => Builtin::RecurseF(Box::new(substitute_func_param(f, param, arg))),

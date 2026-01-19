@@ -1881,6 +1881,25 @@ impl<'a> Parser<'a> {
             self.expect(')')?;
             return Ok(Some(Builtin::Endswith(Box::new(s))));
         }
+        // Check splits before split since split is a prefix of splits
+        if self.matches_keyword("splits") {
+            self.consume_keyword("splits");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let re = self.parse_pipe_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::SplitsFlags(Box::new(re), Box::new(flags))));
+            }
+            self.expect(')')?;
+            return Ok(Some(Builtin::Splits(Box::new(re))));
+        }
         if self.matches_keyword("split") {
             self.consume_keyword("split");
             self.skip_ws();
@@ -1888,8 +1907,127 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let s = self.parse_pipe_expr()?;
             self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::SplitRegex(Box::new(s), Box::new(flags))));
+            }
             self.expect(')')?;
             return Ok(Some(Builtin::Split(Box::new(s))));
+        }
+        // match function - regex matching
+        if self.matches_keyword("match") {
+            self.consume_keyword("match");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let re = self.parse_pipe_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::MatchFlags(Box::new(re), Box::new(flags))));
+            }
+            self.expect(')')?;
+            return Ok(Some(Builtin::Match(Box::new(re))));
+        }
+        // capture function - named capture groups
+        if self.matches_keyword("capture") {
+            self.consume_keyword("capture");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let re = self.parse_pipe_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::CaptureFlags(Box::new(re), Box::new(flags))));
+            }
+            self.expect(')')?;
+            return Ok(Some(Builtin::Capture(Box::new(re))));
+        }
+        // sub function - replace first match
+        if self.matches_keyword("sub") {
+            self.consume_keyword("sub");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let re = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(';')?;
+            self.skip_ws();
+            let replacement = self.parse_pipe_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::SubFlags(
+                    Box::new(re),
+                    Box::new(replacement),
+                    Box::new(flags),
+                )));
+            }
+            self.expect(')')?;
+            return Ok(Some(Builtin::Sub(Box::new(re), Box::new(replacement))));
+        }
+        // gsub function - replace all matches
+        if self.matches_keyword("gsub") {
+            self.consume_keyword("gsub");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let re = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(';')?;
+            self.skip_ws();
+            let replacement = self.parse_pipe_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::GsubFlags(
+                    Box::new(re),
+                    Box::new(replacement),
+                    Box::new(flags),
+                )));
+            }
+            self.expect(')')?;
+            return Ok(Some(Builtin::Gsub(Box::new(re), Box::new(replacement))));
+        }
+        // scan function - find all matches
+        if self.matches_keyword("scan") {
+            self.consume_keyword("scan");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let re = self.parse_pipe_expr()?;
+            self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::ScanFlags(Box::new(re), Box::new(flags))));
+            }
+            self.expect(')')?;
+            return Ok(Some(Builtin::Scan(Box::new(re))));
         }
         if self.matches_keyword("join") {
             self.consume_keyword("join");
@@ -2039,6 +2177,14 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let re = self.parse_pipe_expr()?;
             self.skip_ws();
+            if self.peek() == Some(';') {
+                self.next(); // consume ';'
+                self.skip_ws();
+                let flags = self.parse_pipe_expr()?;
+                self.skip_ws();
+                self.expect(')')?;
+                return Ok(Some(Builtin::TestFlags(Box::new(re), Box::new(flags))));
+            }
             self.expect(')')?;
             return Ok(Some(Builtin::Test(Box::new(re))));
         }
@@ -2090,98 +2236,6 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::GetPath(Box::new(path))));
-        }
-
-        // Phase 7: Regex Functions (requires "regex" feature)
-        #[cfg(feature = "regex")]
-        {
-            // match(re) or match(re; flags)
-            if self.matches_keyword("match") {
-                self.consume_keyword("match");
-                self.skip_ws();
-                self.expect('(')?;
-                self.skip_ws();
-                let re = self.parse_pipe_expr()?;
-                self.skip_ws();
-                let flags = if self.peek() == Some(';') {
-                    self.next();
-                    self.skip_ws();
-                    Some(self.parse_string_literal()?)
-                } else {
-                    None
-                };
-                self.skip_ws();
-                self.expect(')')?;
-                return Ok(Some(Builtin::Match(Box::new(re), flags)));
-            }
-
-            // capture(re)
-            if self.matches_keyword("capture") {
-                self.consume_keyword("capture");
-                self.skip_ws();
-                self.expect('(')?;
-                self.skip_ws();
-                let re = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(')')?;
-                return Ok(Some(Builtin::Capture(Box::new(re))));
-            }
-
-            // scan(re)
-            if self.matches_keyword("scan") {
-                self.consume_keyword("scan");
-                self.skip_ws();
-                self.expect('(')?;
-                self.skip_ws();
-                let re = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(')')?;
-                return Ok(Some(Builtin::Scan(Box::new(re))));
-            }
-
-            // splits(re) - regex split (as opposed to split which is string-based)
-            if self.matches_keyword("splits") {
-                self.consume_keyword("splits");
-                self.skip_ws();
-                self.expect('(')?;
-                self.skip_ws();
-                let re = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(')')?;
-                return Ok(Some(Builtin::Splits(Box::new(re))));
-            }
-
-            // gsub(re; replacement) - must come before sub
-            if self.matches_keyword("gsub") {
-                self.consume_keyword("gsub");
-                self.skip_ws();
-                self.expect('(')?;
-                self.skip_ws();
-                let re = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(';')?;
-                self.skip_ws();
-                let replacement = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(')')?;
-                return Ok(Some(Builtin::Gsub(Box::new(re), Box::new(replacement))));
-            }
-
-            // sub(re; replacement)
-            if self.matches_keyword("sub") {
-                self.consume_keyword("sub");
-                self.skip_ws();
-                self.expect('(')?;
-                self.skip_ws();
-                let re = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(';')?;
-                self.skip_ws();
-                let replacement = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(')')?;
-                return Ok(Some(Builtin::Sub(Box::new(re), Box::new(replacement))));
-            }
         }
 
         // Phase 8: Advanced Control Flow Builtins
