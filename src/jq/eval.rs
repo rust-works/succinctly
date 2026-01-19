@@ -1392,6 +1392,9 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         // Phase 17: Combinations
         Builtin::Combinations => builtin_combinations(value, optional),
         Builtin::CombinationsN(n) => builtin_combinations_n(n, value, optional),
+
+        // Phase 18: Additional math functions
+        Builtin::Trunc => builtin_trunc(value, optional),
     }
 }
 
@@ -5857,6 +5860,9 @@ fn substitute_var_in_builtin(
         Builtin::CombinationsN(e) => {
             Builtin::CombinationsN(Box::new(substitute_var(e, var_name, replacement)))
         }
+
+        // Phase 18: Additional math functions
+        Builtin::Trunc => Builtin::Trunc,
     }
 }
 
@@ -9057,6 +9063,8 @@ fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
         // Combinations (arity 0-1)
         "combinations/0",
         "combinations/1",
+        // Additional math (arity 0)
+        "trunc/0",
         // Meta (arity 0-1)
         "builtins/0",
         "modulemeta/1",
@@ -9596,6 +9604,17 @@ fn builtin_round<'a, W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'a, W> {
     match get_float_value(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Int(round_f64(n) as i64)),
+        Err(r) => r,
+    }
+}
+
+/// Builtin: trunc - truncate toward zero
+fn builtin_trunc<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match get_float_value(&value, optional) {
+        Ok(n) => QueryResult::Owned(OwnedValue::Int(libm::trunc(n) as i64)),
         Err(r) => r,
     }
 }
@@ -11415,6 +11434,9 @@ fn expand_func_calls_in_builtin(
         Builtin::CombinationsN(e) => {
             Builtin::CombinationsN(Box::new(expand_func_calls(e, func_name, params, body)))
         }
+
+        // Phase 18: Additional math functions
+        Builtin::Trunc => Builtin::Trunc,
     }
 }
 
@@ -11676,6 +11698,9 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::CombinationsN(e) => {
             Builtin::CombinationsN(Box::new(substitute_func_param(e, param, arg)))
         }
+
+        // Phase 18: Additional math functions
+        Builtin::Trunc => Builtin::Trunc,
     }
 }
 

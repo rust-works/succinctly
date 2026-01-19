@@ -837,6 +837,11 @@ pub enum Builtin {
     /// `combinations(n)` - generate n-way combinations (Cartesian product with itself n times)
     /// Input with n=2: [1,2] -> outputs [1,1], [1,2], [2,1], [2,2]
     CombinationsN(Box<Expr>),
+
+    // Phase 18: Additional math functions
+    /// `trunc` - truncate toward zero (remove fractional part)
+    /// 2.7 -> 2, -2.7 -> -2
+    Trunc,
 }
 
 /// Arithmetic operators.

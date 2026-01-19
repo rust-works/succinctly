@@ -2871,6 +2871,12 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Combinations));
         }
 
+        // Phase 18: Additional math functions
+        if self.matches_keyword("trunc") {
+            self.consume_keyword("trunc");
+            return Ok(Some(Builtin::Trunc));
+        }
+
         Ok(None)
     }
 
