@@ -8748,7 +8748,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
 
 /// Parse up to n digits from input
 fn parse_digits(
-    input: &mut std::iter::Peekable<std::str::Chars>,
+    input: &mut core::iter::Peekable<core::str::Chars>,
     max_digits: usize,
 ) -> Result<i64, String> {
     let mut s = String::new();

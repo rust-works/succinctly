@@ -3,6 +3,8 @@
 //! Holds the semi-index (IB, BP, TY) and provides rank/select operations.
 
 #[cfg(not(test))]
+use alloc::vec;
+#[cfg(not(test))]
 use alloc::{string::String, vec::Vec};
 
 #[cfg(not(test))]

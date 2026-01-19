@@ -40,6 +40,8 @@
 //! ```
 
 #[cfg(not(test))]
+use alloc::vec;
+#[cfg(not(test))]
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
 #[cfg(test)]
