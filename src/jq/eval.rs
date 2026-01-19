@@ -3503,26 +3503,30 @@ fn builtin_test<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// Builtin: indices(s) - find all indices of substring s
+/// Builtin: indices(s) - find all indices of substring/element s
 fn builtin_indices<'a, W: Clone + AsRef<[u64]>>(
     s_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the pattern
+    // Evaluate the pattern (can be any type for arrays, must be string for strings)
     let pattern = match result_to_owned(eval_single(s_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
 
     match &value {
         StandardJson::String(s) => {
+            // For strings, pattern must be a string
+            let pattern_str = match &pattern {
+                OwnedValue::String(p) => p,
+                _ if optional => return QueryResult::None,
+                _ => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+            };
             if let Ok(cow) = s.as_str() {
                 let mut indices = Vec::new();
                 let mut start = 0;
-                while let Some(pos) = cow[start..].find(&pattern) {
+                while let Some(pos) = cow[start..].find(pattern_str.as_str()) {
                     indices.push(OwnedValue::Int((start + pos) as i64));
                     start += pos + 1;
                     if start >= cow.len() {
@@ -3537,11 +3541,10 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>>(
             }
         }
         StandardJson::Array(elements) => {
-            // For arrays, find indices where element equals the pattern
-            let pattern_owned = OwnedValue::String(pattern);
+            // For arrays, find indices where element equals the pattern (any type)
             let mut indices = Vec::new();
             for (i, elem) in (*elements).enumerate() {
-                if to_owned(&elem) == pattern_owned {
+                if to_owned(&elem) == pattern {
                     indices.push(OwnedValue::Int(i as i64));
                 }
             }
@@ -3552,24 +3555,28 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// Builtin: index(s) - first index of substring s, or null
+/// Builtin: index(s) - first index of substring/element s, or null
 fn builtin_index<'a, W: Clone + AsRef<[u64]>>(
     s_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the pattern
+    // Evaluate the pattern (can be any type for arrays, must be string for strings)
     let pattern = match result_to_owned(eval_single(s_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
 
     match &value {
         StandardJson::String(s) => {
+            // For strings, pattern must be a string
+            let pattern_str = match &pattern {
+                OwnedValue::String(p) => p,
+                _ if optional => return QueryResult::None,
+                _ => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+            };
             if let Ok(cow) = s.as_str() {
-                if let Some(pos) = cow.find(&pattern) {
+                if let Some(pos) = cow.find(pattern_str.as_str()) {
                     QueryResult::Owned(OwnedValue::Int(pos as i64))
                 } else {
                     QueryResult::Owned(OwnedValue::Null)
@@ -3581,9 +3588,9 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>>(
             }
         }
         StandardJson::Array(elements) => {
-            let pattern_owned = OwnedValue::String(pattern);
+            // For arrays, pattern can be any type
             for (i, elem) in (*elements).enumerate() {
-                if to_owned(&elem) == pattern_owned {
+                if to_owned(&elem) == pattern {
                     return QueryResult::Owned(OwnedValue::Int(i as i64));
                 }
             }
@@ -3594,24 +3601,28 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// Builtin: rindex(s) - last index of substring s, or null
+/// Builtin: rindex(s) - last index of substring/element s, or null
 fn builtin_rindex<'a, W: Clone + AsRef<[u64]>>(
     s_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the pattern
+    // Evaluate the pattern (can be any type for arrays, must be string for strings)
     let pattern = match result_to_owned(eval_single(s_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
 
     match &value {
         StandardJson::String(s) => {
+            // For strings, pattern must be a string
+            let pattern_str = match &pattern {
+                OwnedValue::String(p) => p,
+                _ if optional => return QueryResult::None,
+                _ => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+            };
             if let Ok(cow) = s.as_str() {
-                if let Some(pos) = cow.rfind(&pattern) {
+                if let Some(pos) = cow.rfind(pattern_str.as_str()) {
                     QueryResult::Owned(OwnedValue::Int(pos as i64))
                 } else {
                     QueryResult::Owned(OwnedValue::Null)
@@ -3623,10 +3634,10 @@ fn builtin_rindex<'a, W: Clone + AsRef<[u64]>>(
             }
         }
         StandardJson::Array(elements) => {
-            let pattern_owned = OwnedValue::String(pattern);
+            // For arrays, pattern can be any type
             let items: Vec<_> = (*elements).collect();
             for (i, elem) in items.iter().enumerate().rev() {
-                if to_owned(elem) == pattern_owned {
+                if to_owned(elem) == pattern {
                     return QueryResult::Owned(OwnedValue::Int(i as i64));
                 }
             }
@@ -13315,6 +13326,124 @@ mod tests {
                 } else {
                     panic!("expected items array");
                 }
+            }
+        );
+    }
+
+    // Tests for indices/index/rindex
+
+    #[test]
+    fn test_indices_string() {
+        // Find all occurrences of substring in string
+        query!(br#""abcabc""#, r#"indices("bc")"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(4)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_indices_array() {
+        // Find all occurrences of element in array
+        query!(br#"[1, 2, 3, 1, 2]"#, "indices(1)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(0), OwnedValue::Int(3)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_indices_array_string() {
+        // Find all occurrences of string element in array
+        query!(br#"["a", "b", "a", "c"]"#, r#"indices("a")"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(0), OwnedValue::Int(2)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_indices_not_found() {
+        // No occurrences returns empty array
+        query!(br#""abc""#, r#"indices("xyz")"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty());
+            }
+        );
+    }
+
+    #[test]
+    fn test_index_string() {
+        // First occurrence of substring
+        query!(br#""abcabc""#, r#"index("bc")"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1);
+            }
+        );
+    }
+
+    #[test]
+    fn test_index_array() {
+        // First occurrence of element in array
+        query!(br#"[1, 2, 3, 1, 2]"#, "index(2)",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1);
+            }
+        );
+    }
+
+    #[test]
+    fn test_index_not_found() {
+        // Not found returns null
+        query!(br#""abc""#, r#"index("xyz")"#,
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    #[test]
+    fn test_rindex_string() {
+        // Last occurrence of substring
+        query!(br#""abcabc""#, r#"rindex("bc")"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 4);
+            }
+        );
+    }
+
+    #[test]
+    fn test_rindex_array() {
+        // Last occurrence of element in array
+        query!(br#"[1, 2, 3, 1, 2]"#, "rindex(2)",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 4);
+            }
+        );
+    }
+
+    #[test]
+    fn test_rindex_not_found() {
+        // Not found returns null
+        query!(br#""abc""#, r#"rindex("xyz")"#,
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    #[test]
+    fn test_indices_array_object() {
+        // Find objects in array
+        query!(br#"[{"a":1}, {"b":2}, {"a":1}]"#, r#"indices({"a":1})"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(0), OwnedValue::Int(2)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_index_array_null() {
+        // Find null in array
+        query!(br#"[1, null, 2, null]"#, "index(null)",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1);
             }
         );
     }
