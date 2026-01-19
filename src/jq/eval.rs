@@ -6824,6 +6824,7 @@ fn collect_leaf_paths(
 }
 
 /// Builtin: leaf_paths - paths to scalar (non-container) values
+/// Returns each path as a separate output (streaming), matching jq's paths(scalars) behavior
 fn builtin_leaf_paths<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     _optional: bool,
@@ -6831,7 +6832,14 @@ fn builtin_leaf_paths<'a, W: Clone + AsRef<[u64]>>(
     let owned = to_owned(&value);
     let mut paths = Vec::new();
     collect_leaf_paths(&owned, &[], &mut paths);
-    QueryResult::Owned(OwnedValue::Array(paths))
+    // Stream individual paths instead of wrapping in array
+    if paths.is_empty() {
+        QueryResult::None
+    } else if paths.len() == 1 {
+        QueryResult::Owned(paths.pop().unwrap())
+    } else {
+        QueryResult::ManyOwned(paths)
+    }
 }
 
 /// Helper to set a value at a path
@@ -12007,9 +12015,56 @@ mod tests {
 
     #[test]
     fn test_leaf_paths() {
+        // leaf_paths streams individual paths (like paths(scalars) in jq)
         query!(br#"{"a": 1, "b": {"c": 2}}"#, "leaf_paths",
-            QueryResult::Owned(OwnedValue::Array(paths)) => {
+            QueryResult::ManyOwned(paths) => {
                 // Should have paths: ["a"], ["b", "c"]
+                assert_eq!(paths.len(), 2);
+                assert_eq!(paths[0], OwnedValue::Array(vec![OwnedValue::String("a".into())]));
+                assert_eq!(paths[1], OwnedValue::Array(vec![
+                    OwnedValue::String("b".into()),
+                    OwnedValue::String("c".into())
+                ]));
+            }
+        );
+    }
+
+    #[test]
+    fn test_leaf_paths_single() {
+        // Single leaf returns single Owned result
+        query!(br#"{"a": 1}"#, "leaf_paths",
+            QueryResult::Owned(OwnedValue::Array(path)) => {
+                assert_eq!(path, vec![OwnedValue::String("a".into())]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_leaf_paths_array() {
+        // Arrays also work
+        query!(br#"[1, [2, 3]]"#, "[leaf_paths]",
+            QueryResult::Owned(OwnedValue::Array(paths)) => {
+                // Paths: [0], [1, 0], [1, 1]
+                assert_eq!(paths.len(), 3);
+            }
+        );
+    }
+
+    #[test]
+    fn test_leaf_paths_with_null() {
+        // null is included as a leaf (unlike jq's paths(scalars) which excludes it)
+        query!(br#"{"a": null, "b": 1}"#, "[leaf_paths]",
+            QueryResult::Owned(OwnedValue::Array(paths)) => {
+                assert_eq!(paths.len(), 2);
+            }
+        );
+    }
+
+    #[test]
+    fn test_leaf_paths_empty_containers() {
+        // Empty containers are considered leaves
+        query!(br#"{"a": [], "b": {}}"#, "[leaf_paths]",
+            QueryResult::Owned(OwnedValue::Array(paths)) => {
                 assert_eq!(paths.len(), 2);
             }
         );
