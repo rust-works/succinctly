@@ -70,6 +70,9 @@ pub struct JsonIndex<W = Vec<u64>> {
     ib_rank: Vec<u32>,
     /// Balanced parentheses - encodes the JSON structure as a tree
     bp: BalancedParens<W>,
+    /// Newline positions for fast line/column lookup.
+    /// Bit i is set if position i is the start of a new line (immediately after a line terminator).
+    newlines: crate::bits::BitVec,
 }
 
 /// Build cumulative popcount index for IB.
@@ -85,11 +88,54 @@ fn build_ib_rank(words: &[u64]) -> Vec<u32> {
     rank
 }
 
+/// Build newline index from text.
+/// Sets bit i if position i is the start of a new line (immediately after a line terminator).
+/// Handles Unix (LF), Windows (CRLF), and classic Mac (CR) line endings.
+fn build_newline_index(text: &[u8]) -> crate::bits::BitVec {
+    if text.is_empty() {
+        return crate::bits::BitVec::new();
+    }
+
+    let mut bits = vec![0u64; text.len().div_ceil(64)];
+    let mut i = 0;
+
+    while i < text.len() {
+        match text[i] {
+            b'\n' => {
+                // LF: next byte starts a new line
+                let next = i + 1;
+                if next < text.len() {
+                    bits[next / 64] |= 1 << (next % 64);
+                }
+                i += 1;
+            }
+            b'\r' => {
+                // CR: check for CRLF
+                let next = if i + 1 < text.len() && text[i + 1] == b'\n' {
+                    // CRLF: skip both, new line starts after \n
+                    i + 2
+                } else {
+                    // Standalone CR (classic Mac): new line starts after \r
+                    i + 1
+                };
+                if next < text.len() {
+                    bits[next / 64] |= 1 << (next % 64);
+                }
+                i = next;
+            }
+            _ => i += 1,
+        }
+    }
+
+    crate::bits::BitVec::from_words(bits, text.len())
+}
+
 impl JsonIndex<Vec<u64>> {
     /// Build a JSON index from JSON text.
     ///
     /// This parses the JSON to build the interest bits (IB) and balanced
-    /// parentheses (BP) index structures.
+    /// parentheses (BP) index structures, plus newline positions for
+    /// fast line/column lookup.
     ///
     /// On supported platforms (aarch64, x86_64), this automatically uses
     /// SIMD-accelerated indexing for better performance.
@@ -108,11 +154,15 @@ impl JsonIndex<Vec<u64>> {
         // Build cumulative popcount index for IB
         let ib_rank = build_ib_rank(&semi.ib);
 
+        // Build newline index for fast line/column lookup
+        let newlines = build_newline_index(json);
+
         Self {
             ib: semi.ib,
             ib_len,
             ib_rank,
             bp: BalancedParens::new(semi.bp, bp_bit_count),
+            newlines,
         }
     }
 }
@@ -121,6 +171,8 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     /// Create a JSON index from pre-existing IB and BP data.
     ///
     /// This is useful for loading serialized index data, e.g., from mmap.
+    /// Note: This creates an empty newline index. For line/column lookup,
+    /// use `from_parts_with_newlines` or rebuild with `build`.
     ///
     /// # Arguments
     ///
@@ -137,6 +189,34 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
             ib_len,
             ib_rank,
             bp: BalancedParens::from_words(bp, bp_len),
+            newlines: crate::bits::BitVec::new(),
+        }
+    }
+
+    /// Create a JSON index from pre-existing IB, BP, and newline data.
+    ///
+    /// # Arguments
+    ///
+    /// * `ib` - Interest bits data
+    /// * `ib_len` - Number of valid bits in IB (typically == JSON text length)
+    /// * `bp` - Balanced parentheses data
+    /// * `bp_len` - Number of valid bits in BP
+    /// * `newlines` - Newline position bitvector
+    pub fn from_parts_with_newlines(
+        ib: W,
+        ib_len: usize,
+        bp: W,
+        bp_len: usize,
+        newlines: crate::bits::BitVec,
+    ) -> Self {
+        let ib_rank = build_ib_rank(ib.as_ref());
+
+        Self {
+            ib,
+            ib_len,
+            ib_rank,
+            bp: BalancedParens::from_words(bp, bp_len),
+            newlines,
         }
     }
 
@@ -156,6 +236,70 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     #[inline]
     pub fn bp(&self) -> &BalancedParens<W> {
         &self.bp
+    }
+
+    /// Convert byte offset to 1-indexed line and column.
+    ///
+    /// Returns (line, column) where both are 1-indexed.
+    /// Useful for error reporting and `$__loc__` implementation.
+    ///
+    /// # Performance
+    ///
+    /// O(1) using rank on the newline bitvector.
+    #[inline]
+    pub fn to_line_column(&self, offset: usize) -> (usize, usize) {
+        use crate::RankSelect;
+
+        if self.newlines.is_empty() {
+            return (1, offset + 1);
+        }
+
+        // Line-start markers are at positions immediately after line terminators.
+        // rank1(offset + 1) gives the count of line-start markers in [0, offset],
+        // which equals the number of lines before the current line.
+        // So line number = 1 + rank1(offset + 1).
+        let markers_before_or_at = self.newlines.rank1(offset + 1);
+        let line = 1 + markers_before_or_at;
+
+        // Column = offset - start of this line + 1
+        let line_start = if line == 1 {
+            0
+        } else {
+            // The start of line N is at the (N-2)th marker (0-indexed select)
+            // because line 1 has no marker, line 2 has marker 0, line 3 has marker 1, etc.
+            self.newlines.select1(line - 2).unwrap_or(0)
+        };
+
+        let column = offset - line_start + 1;
+        (line, column)
+    }
+
+    /// Convert 1-indexed line and column to byte offset.
+    ///
+    /// Column is 1-indexed byte offset within the line.
+    /// Returns `None` if line/column is 0 or if the position is out of bounds.
+    #[inline]
+    pub fn to_offset(&self, line: usize, column: usize) -> Option<usize> {
+        use crate::RankSelect;
+
+        if line == 0 || column == 0 {
+            return None;
+        }
+
+        let line_start = if line == 1 {
+            // First line starts at offset 0
+            0
+        } else {
+            // Line N starts at the (N-1)th line-start marker (0-indexed select)
+            self.newlines.select1(line - 2)?
+        };
+
+        let offset = line_start + column - 1;
+        if offset < self.ib_len {
+            Some(offset)
+        } else {
+            None
+        }
     }
 
     /// Create a cursor at the root of the JSON document.
@@ -2332,5 +2476,130 @@ mod tests {
         //     3 value (1)
         // Total: 9 nodes
         assert_eq!(count_all(root), 9);
+    }
+
+    // ========================================================================
+    // Newline index tests
+    // ========================================================================
+
+    #[test]
+    fn test_newline_index_single_line() {
+        let json = br#"{"name": "Alice"}"#;
+        let index = JsonIndex::build(json);
+
+        // All positions on line 1
+        assert_eq!(index.to_line_column(0), (1, 1)); // '{'
+        assert_eq!(index.to_line_column(8), (1, 9)); // ' '
+        assert_eq!(index.to_line_column(16), (1, 17)); // '}'
+
+        // Reverse lookup
+        assert_eq!(index.to_offset(1, 1), Some(0));
+        assert_eq!(index.to_offset(1, 9), Some(8));
+        assert_eq!(index.to_offset(2, 1), None); // No line 2
+    }
+
+    #[test]
+    fn test_newline_index_multi_line() {
+        let json = b"{\n  \"name\": \"Alice\"\n}";
+        let index = JsonIndex::build(json);
+
+        // Line 1: position 0 ('{')
+        assert_eq!(index.to_line_column(0), (1, 1));
+        assert_eq!(index.to_line_column(1), (1, 2)); // '\n'
+
+        // Line 2: positions 2-18 ('  "name": "Alice"')
+        assert_eq!(index.to_line_column(2), (2, 1)); // first space
+        assert_eq!(index.to_line_column(4), (2, 3)); // '"'
+
+        // Line 3: position 20 ('}')
+        assert_eq!(index.to_line_column(20), (3, 1));
+
+        // Reverse lookup
+        assert_eq!(index.to_offset(1, 1), Some(0));
+        assert_eq!(index.to_offset(2, 1), Some(2));
+        assert_eq!(index.to_offset(3, 1), Some(20));
+    }
+
+    #[test]
+    fn test_newline_index_array() {
+        // Layout: "[\n  1,\n  2,\n  3\n]"
+        // Pos 0: '[' (line 1)
+        // Pos 1: '\n'
+        // Pos 2-5: '  1,' (line 2)
+        // Pos 6: '\n'
+        // Pos 7-10: '  2,' (line 3)
+        // Pos 11: '\n'
+        // Pos 12-14: '  3' (line 4)
+        // Pos 15: '\n'
+        // Pos 16: ']' (line 5)
+        let json = b"[\n  1,\n  2,\n  3\n]";
+        let index = JsonIndex::build(json);
+
+        // Line 1: '['
+        assert_eq!(index.to_line_column(0), (1, 1));
+
+        // Line 2: '  1,' starts at position 2
+        assert_eq!(index.to_line_column(2), (2, 1));
+        assert_eq!(index.to_line_column(5), (2, 4)); // the comma
+
+        // Line 3: '  2,' starts at position 7
+        assert_eq!(index.to_line_column(7), (3, 1));
+
+        // Line 4: '  3' starts at position 12
+        assert_eq!(index.to_line_column(12), (4, 1));
+
+        // Line 5: ']' starts at position 16
+        assert_eq!(index.to_line_column(16), (5, 1));
+
+        // Reverse lookup
+        assert_eq!(index.to_offset(1, 1), Some(0));
+        assert_eq!(index.to_offset(2, 1), Some(2));
+        assert_eq!(index.to_offset(3, 1), Some(7));
+        assert_eq!(index.to_offset(5, 1), Some(16));
+    }
+
+    #[test]
+    fn test_newline_index_crlf() {
+        let json = b"{\r\n\"a\": 1\r\n}";
+        let index = JsonIndex::build(json);
+
+        // Line 1: '{'
+        assert_eq!(index.to_line_column(0), (1, 1));
+
+        // Line 2: '"a": 1' (starts at position 3, after \r\n)
+        assert_eq!(index.to_line_column(3), (2, 1));
+        assert_eq!(index.to_offset(2, 1), Some(3));
+
+        // Line 3: '}' (starts at position 11, after \r\n)
+        assert_eq!(index.to_line_column(11), (3, 1));
+        assert_eq!(index.to_offset(3, 1), Some(11));
+    }
+
+    #[test]
+    fn test_newline_index_invalid_inputs() {
+        let json = b"{\n\"a\": 1\n}";
+        let index = JsonIndex::build(json);
+
+        assert_eq!(index.to_offset(0, 1), None); // line 0 invalid
+        assert_eq!(index.to_offset(1, 0), None); // column 0 invalid
+    }
+
+    #[test]
+    fn test_newline_index_round_trip() {
+        let json =
+            b"{\n  \"users\": [\n    {\"name\": \"Alice\"},\n    {\"name\": \"Bob\"}\n  ]\n}";
+        let index = JsonIndex::build(json);
+
+        // Test round-trip: offset -> line/column -> offset
+        for offset in 0..json.len() {
+            let (line, col) = index.to_line_column(offset);
+            let result = index.to_offset(line, col);
+            assert_eq!(
+                result,
+                Some(offset),
+                "Round-trip failed for offset {}",
+                offset
+            );
+        }
     }
 }

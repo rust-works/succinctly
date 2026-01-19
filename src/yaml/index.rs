@@ -54,6 +54,9 @@ pub struct YamlIndex<W = Vec<u64>> {
     anchors: BTreeMap<String, usize>,
     /// Alias references: BP position of alias → target BP position (resolved at parse time)
     aliases: BTreeMap<usize, usize>,
+    /// Newline positions for fast line/column lookup.
+    /// Bit i is set if position i is the start of a new line (immediately after a line terminator).
+    newlines: crate::bits::BitVec,
 }
 
 /// Build cumulative popcount index for a bitvector.
@@ -83,17 +86,63 @@ fn build_containers_rank(words: &[u64]) -> Vec<u32> {
     build_cumulative_rank(words)
 }
 
+/// Build newline index from text.
+/// Sets bit i if position i is the start of a new line (immediately after a line terminator).
+/// Handles Unix (LF), Windows (CRLF), and classic Mac (CR) line endings.
+fn build_newline_index(text: &[u8]) -> crate::bits::BitVec {
+    if text.is_empty() {
+        return crate::bits::BitVec::new();
+    }
+
+    let mut bits = vec![0u64; text.len().div_ceil(64)];
+    let mut i = 0;
+
+    while i < text.len() {
+        match text[i] {
+            b'\n' => {
+                // LF: next byte starts a new line
+                let next = i + 1;
+                if next < text.len() {
+                    bits[next / 64] |= 1 << (next % 64);
+                }
+                i += 1;
+            }
+            b'\r' => {
+                // CR: check for CRLF
+                let next = if i + 1 < text.len() && text[i + 1] == b'\n' {
+                    // CRLF: skip both, new line starts after \n
+                    i + 2
+                } else {
+                    // Standalone CR (classic Mac): new line starts after \r
+                    i + 1
+                };
+                if next < text.len() {
+                    bits[next / 64] |= 1 << (next % 64);
+                }
+                i = next;
+            }
+            _ => i += 1,
+        }
+    }
+
+    crate::bits::BitVec::from_words(bits, text.len())
+}
+
 impl YamlIndex<Vec<u64>> {
     /// Build a YAML index from YAML text.
     ///
     /// This parses the YAML to build the interest bits (IB), balanced
-    /// parentheses (BP), and type bits (TY) index structures.
+    /// parentheses (BP), and type bits (TY) index structures, plus
+    /// newline positions for fast line/column lookup.
     pub fn build(yaml: &[u8]) -> Result<Self, YamlError> {
         let semi = build_semi_index(yaml)?;
 
         let ib_len = yaml.len();
         let ib_rank = build_ib_rank(&semi.ib);
         let containers_rank = build_containers_rank(&semi.containers);
+
+        // Build newline index for fast line/column lookup
+        let newlines = build_newline_index(yaml);
 
         Ok(Self {
             ib: semi.ib,
@@ -109,6 +158,7 @@ impl YamlIndex<Vec<u64>> {
             containers_rank,
             anchors: semi.anchors,
             aliases: semi.aliases,
+            newlines,
         })
     }
 }
@@ -149,6 +199,47 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             containers_rank,
             anchors,
             aliases,
+            newlines: crate::bits::BitVec::new(),
+        }
+    }
+
+    /// Create a YAML index from pre-existing data including newlines.
+    ///
+    /// This is useful for loading serialized index data with full line/column support.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts_with_newlines(
+        ib: W,
+        ib_len: usize,
+        bp: W,
+        bp_len: usize,
+        ty: W,
+        ty_len: usize,
+        bp_to_text: Vec<u32>,
+        bp_to_text_end: Vec<u32>,
+        seq_items: W,
+        containers: W,
+        anchors: BTreeMap<String, usize>,
+        aliases: BTreeMap<usize, usize>,
+        newlines: crate::bits::BitVec,
+    ) -> Self {
+        let ib_rank = build_ib_rank(ib.as_ref());
+        let containers_rank = build_containers_rank(containers.as_ref());
+
+        Self {
+            ib,
+            ib_len,
+            ib_rank,
+            bp: BalancedParens::from_words(bp, bp_len),
+            ty,
+            ty_len,
+            bp_to_text,
+            bp_to_text_end,
+            seq_items,
+            containers,
+            containers_rank,
+            anchors,
+            aliases,
+            newlines,
         }
     }
 
@@ -524,6 +615,106 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
 
         count
     }
+
+    /// Convert a byte offset to (line, column) using the newline index.
+    ///
+    /// Lines and columns are 1-based to match common editor conventions.
+    /// Returns (1, offset+1) if newline index is empty.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use succinctly::yaml::YamlIndex;
+    ///
+    /// let yaml = b"name: Alice\nage: 30";
+    /// let index = YamlIndex::build(yaml).unwrap();
+    ///
+    /// // Position 0 is line 1, column 1
+    /// assert_eq!(index.to_line_column(0), (1, 1));
+    ///
+    /// // Position 12 is line 2, column 1 (right after the newline)
+    /// assert_eq!(index.to_line_column(12), (2, 1));
+    /// ```
+    #[inline]
+    pub fn to_line_column(&self, offset: usize) -> (usize, usize) {
+        use crate::RankSelect;
+
+        if self.newlines.is_empty() {
+            return (1, offset + 1);
+        }
+
+        // Line-start markers are at positions immediately after line terminators.
+        // rank1(offset + 1) gives the count of line-start markers in [0, offset],
+        // which equals the number of lines before the current line.
+        // So line number = 1 + rank1(offset + 1).
+        let markers_before_or_at = self.newlines.rank1(offset + 1);
+        let line = 1 + markers_before_or_at;
+
+        // Column = offset - start of this line + 1
+        let line_start = if line == 1 {
+            0
+        } else {
+            // The start of line N is at the (N-2)th marker (0-indexed select)
+            // because line 1 has no marker, line 2 has marker 0, line 3 has marker 1, etc.
+            self.newlines.select1(line - 2).unwrap_or(0)
+        };
+
+        let column = offset - line_start + 1;
+        (line, column)
+    }
+
+    /// Convert (line, column) to a byte offset using the newline index.
+    ///
+    /// Lines and columns are 1-based to match common editor conventions.
+    /// Returns None if the line/column is out of bounds or the newline index is empty.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use succinctly::yaml::YamlIndex;
+    ///
+    /// let yaml = b"name: Alice\nage: 30";
+    /// let index = YamlIndex::build(yaml).unwrap();
+    ///
+    /// // Line 1, column 1 is offset 0
+    /// assert_eq!(index.to_offset(1, 1), Some(0));
+    ///
+    /// // Line 2, column 1 is offset 12 (first char after newline)
+    /// assert_eq!(index.to_offset(2, 1), Some(12));
+    /// ```
+    #[inline]
+    pub fn to_offset(&self, line: usize, column: usize) -> Option<usize> {
+        use crate::RankSelect;
+
+        if line == 0 || column == 0 {
+            return None;
+        }
+
+        if self.newlines.is_empty() {
+            // No newline markers means single-line document
+            if line == 1 {
+                return Some(column - 1);
+            } else {
+                return None;
+            }
+        }
+
+        // Line 1 starts at offset 0
+        // Line N starts at the (N-2)th line-start marker (0-indexed select)
+        let line_start = if line == 1 {
+            0
+        } else {
+            self.newlines.select1(line - 2)?
+        };
+
+        Some(line_start + column - 1)
+    }
+
+    /// Get a reference to the newline bitvector.
+    #[inline]
+    pub fn newlines(&self) -> &crate::bits::BitVec {
+        &self.newlines
+    }
 }
 
 #[cfg(test)]
@@ -550,5 +741,118 @@ mod tests {
         let index = YamlIndex::build(yaml).unwrap();
         let root = index.root(yaml);
         assert_eq!(root.bp_position(), 0);
+    }
+
+    // ------------------------------------------------------------------------
+    // Newline index tests
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_newline_index_single_line() {
+        let yaml = b"name: Alice";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        // All positions on line 1
+        assert_eq!(index.to_line_column(0), (1, 1)); // 'n'
+        assert_eq!(index.to_line_column(5), (1, 6)); // ' '
+        assert_eq!(index.to_line_column(10), (1, 11)); // 'e'
+
+        // Reverse lookup
+        assert_eq!(index.to_offset(1, 1), Some(0));
+        assert_eq!(index.to_offset(1, 6), Some(5));
+        assert_eq!(index.to_offset(2, 1), None); // No line 2
+    }
+
+    #[test]
+    fn test_newline_index_multi_line_unix() {
+        let yaml = b"name: Alice\nage: 30";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        // Line 1: positions 0-10 (name: Alice)
+        assert_eq!(index.to_line_column(0), (1, 1)); // 'n'
+        assert_eq!(index.to_line_column(10), (1, 11)); // 'e'
+        assert_eq!(index.to_line_column(11), (1, 12)); // '\n'
+
+        // Line 2: positions 12-18 (age: 30)
+        assert_eq!(index.to_line_column(12), (2, 1)); // 'a'
+        assert_eq!(index.to_line_column(17), (2, 6)); // '3'
+        assert_eq!(index.to_line_column(18), (2, 7)); // '0'
+
+        // Reverse lookup
+        assert_eq!(index.to_offset(1, 1), Some(0));
+        assert_eq!(index.to_offset(2, 1), Some(12));
+        assert_eq!(index.to_offset(2, 6), Some(17));
+    }
+
+    #[test]
+    fn test_newline_index_sequence() {
+        let yaml = b"- item1\n- item2\n- item3";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        // Line 1: positions 0-6 (- item1)
+        assert_eq!(index.to_line_column(0), (1, 1));
+        assert_eq!(index.to_line_column(7), (1, 8)); // '\n'
+
+        // Line 2: positions 8-14 (- item2)
+        assert_eq!(index.to_line_column(8), (2, 1));
+
+        // Line 3: positions 16-22 (- item3)
+        assert_eq!(index.to_line_column(16), (3, 1));
+
+        // Reverse lookup
+        assert_eq!(index.to_offset(1, 1), Some(0));
+        assert_eq!(index.to_offset(2, 1), Some(8));
+        assert_eq!(index.to_offset(3, 1), Some(16));
+    }
+
+    #[test]
+    fn test_newline_index_crlf() {
+        let yaml = b"name: Alice\r\nage: 30";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        // Line 1: positions 0-10 (name: Alice)
+        assert_eq!(index.to_line_column(0), (1, 1));
+        assert_eq!(index.to_line_column(10), (1, 11));
+
+        // Line 2: positions 13-19 (age: 30) - after \r\n
+        assert_eq!(index.to_line_column(13), (2, 1));
+        assert_eq!(index.to_offset(2, 1), Some(13));
+    }
+
+    #[test]
+    fn test_newline_index_classic_mac_cr() {
+        let yaml = b"name: Alice\rage: 30";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        // Line 2: position 12 (age: 30) - after \r
+        assert_eq!(index.to_line_column(12), (2, 1));
+        assert_eq!(index.to_offset(2, 1), Some(12));
+    }
+
+    #[test]
+    fn test_newline_index_invalid_inputs() {
+        let yaml = b"name: Alice\nage: 30";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        assert_eq!(index.to_offset(0, 1), None); // line 0 invalid
+        assert_eq!(index.to_offset(1, 0), None); // column 0 invalid
+    }
+
+    #[test]
+    fn test_newline_index_round_trip() {
+        let yaml = b"users:\n  - name: Alice\n    age: 30\n  - name: Bob\n    age: 25";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        // Test round-trip: offset -> line/column -> offset
+        for offset in 0..yaml.len() {
+            let (line, col) = index.to_line_column(offset);
+            let result = index.to_offset(line, col);
+            assert_eq!(
+                result,
+                Some(offset),
+                "Round-trip failed for offset {}",
+                offset
+            );
+        }
     }
 }
