@@ -23,7 +23,7 @@ The implementation is already production-ready for ~90% of jq use cases.
 | User functions      | Fully implemented   | 85%      |
 | Regex functions     | Fully implemented   | 100%     |
 | Module system       | Parsed only         | 10%      |
-| I/O operations      | Limited             | 40%      |
+| I/O operations      | Won't implement     | N/A      |
 | Assignment operators| Fully implemented   | 100%     |
 
 ---
@@ -199,18 +199,7 @@ The implementation is already production-ready for ~90% of jq use cases.
 
 ## TODO: Missing Features
 
-### Priority 1: I/O Operations
-
-- [ ] `input` - Read next input from stdin/files
-- [ ] `inputs` - Stream all remaining inputs
-- [ ] `input_line_number` - Current line number
-
-**Implementation notes:**
-- Requires CLI integration to pass input iterator to evaluator
-- Consider adding `EvalContext` struct to hold input state
-- Low priority for single-file JSON processing use case
-
-### Priority 2: Module System
+### Priority 1: Module System
 
 Currently parsed but not evaluated:
 
@@ -224,7 +213,7 @@ Currently parsed but not evaluated:
 - Consider `jq -L` style library paths
 - May want to keep this optional/feature-gated
 
-### Priority 3: Location & Debugging
+### Priority 2: Location & Debugging
 
 - [ ] `$__loc__` - Current source location `{file, line}`
 - [x] Comments in jq expressions (`#` to end of line) ✅
@@ -232,12 +221,12 @@ Currently parsed but not evaluated:
 **Implementation notes:**
 - `$__loc__` requires tracking source positions through parsing
 
-### Priority 4: Advanced Features
+### Priority 3: Advanced Features
 
 - [ ] Label-break: `label $name | ... | break $name`
 - [ ] Array slicing with steps: `.[::2]` (every other element)
 
-### Priority 5: CLI Enhancements
+### Priority 4: CLI Enhancements
 
 These are CLI-level features, not expression language:
 
@@ -255,8 +244,8 @@ These are CLI-level features, not expression language:
 
 1. **SQL-style operators** - Not in standard jq
 2. **Multi-precision integers** - Uses Rust's i64/f64
-3. **Streaming across multiple files** - Single-file focus
-4. **Full jq module library** - Just core builtins
+3. **Full jq module library** - Just core builtins
+4. **`input` / `inputs` / `input_line_number`** - The succinct data structure approach builds a semi-index per document for efficient repeated queries. Streaming multiple documents within an expression conflicts with this architecture. Multiple input files are better handled at the CLI level, where each file gets its own optimized index. Users needing NDJSON/JSON Lines streaming should use standard `jq`.
 
 ### Partial Implementation Notes
 
@@ -318,3 +307,4 @@ echo '{"a":1}' | succinctly jq '.a'
 | 2026-01-19 | Added `trunc` math function - truncate toward zero (✅ complete)|
 | 2026-01-19 | Added `toboolean` type conversion function (✅ complete)|
 | 2026-01-19 | Added `skip(n; expr)` iteration control - skip first n outputs (✅ complete)|
+| 2026-01-19 | Moved `input`/`inputs`/`input_line_number` to "Won't implement" - conflicts with succinct data structure architecture|
