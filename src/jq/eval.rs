@@ -11519,6 +11519,26 @@ mod tests {
                 assert_eq!(n, 2);
             }
         );
+
+        // Negative index support
+        query!(br#"[1, 2, 3]"#, r#"getpath([-1])"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 3);
+            }
+        );
+
+        query!(br#"[1, 2, 3]"#, r#"getpath([-2])"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 2);
+            }
+        );
+
+        // Nested with negative index
+        query!(br#"{"a": [10, 20, 30]}"#, r#"getpath(["a", -1])"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 30);
+            }
+        );
     }
 
     // =========================================================================
