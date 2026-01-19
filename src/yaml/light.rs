@@ -1152,6 +1152,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// Returns the anchor name (without the `&` prefix) if this node was
     /// defined with an anchor, e.g., `&myanchor value` returns `"myanchor"`.
     ///
+    /// Note: For alias nodes (`*name`), this returns `None`. Use `alias()` to
+    /// get the referenced anchor name for alias nodes.
+    ///
     /// # Example
     /// ```ignore
     /// let yaml = b"default: &def value";
@@ -1161,6 +1164,30 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     #[inline]
     pub fn anchor(&self) -> Option<&str> {
         self.index.get_anchor_name(self.bp_pos)
+    }
+
+    /// Get the anchor name that this alias references.
+    ///
+    /// Returns the anchor name (without the `*` prefix) if this node is an alias,
+    /// e.g., `*myanchor` returns `Some("myanchor")`.
+    ///
+    /// Returns `None` if this node is not an alias. This matches yq's `alias` function.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let yaml = b"default: &def value\nref: *def";
+    /// let index = YamlIndex::build(yaml).unwrap();
+    /// // Navigate to ref and call .alias() to get "def"
+    /// ```
+    #[inline]
+    pub fn alias(&self) -> Option<&str> {
+        self.index.get_alias_anchor_name(self.bp_pos)
+    }
+
+    /// Check if this node is an alias.
+    #[inline]
+    pub fn is_alias(&self) -> bool {
+        self.index.is_alias(self.bp_pos)
     }
 
     /// Get the style of this node.
@@ -1279,18 +1306,19 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// - `"scalar"` for scalar values (strings, numbers, booleans, null)
     /// - `"seq"` for sequences (arrays)
     /// - `"map"` for mappings (objects)
+    /// - `"alias"` for unexploded alias references (`*name`)
+    ///
+    /// Note: This matches yq's `kind` function which reports aliases as a distinct kind.
     pub fn kind(&self) -> &'static str {
+        // Check if this is an alias first (before resolving the value)
+        if self.is_alias() {
+            return "alias";
+        }
         match self.value() {
             YamlValue::Null | YamlValue::String(_) => "scalar",
             YamlValue::Sequence(_) => "seq",
             YamlValue::Mapping(_) => "map",
-            YamlValue::Alias { target, .. } => {
-                if let Some(t) = target {
-                    t.kind()
-                } else {
-                    "scalar"
-                }
-            }
+            YamlValue::Alias { .. } => "alias",
             YamlValue::Error(_) => "scalar",
         }
     }
@@ -5693,5 +5721,134 @@ mod tests {
             }
         }
         panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_anchor_on_anchored_value() {
+        let yaml = b"default: &myanchor value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                // Anchored value should return the anchor name
+                assert_eq!(cursor.anchor(), Some("myanchor"));
+                // Not an alias
+                assert!(!cursor.is_alias());
+                assert_eq!(cursor.alias(), None);
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_alias_returns_anchor_name() {
+        let yaml = b"default: &myanchor value\nref: *myanchor";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(mut fields) = first_doc(root) {
+            // Skip first field (default), get second field (ref)
+            fields.next();
+            if let Some(field) = fields.next() {
+                let cursor = field.value_cursor();
+                // Alias should return the referenced anchor name
+                assert!(cursor.is_alias());
+                assert_eq!(cursor.alias(), Some("myanchor"));
+                // Alias does not have its own anchor (no &name on the alias itself)
+                assert_eq!(cursor.anchor(), None);
+                return;
+            }
+        }
+        panic!("Could not find alias");
+    }
+
+    #[test]
+    fn test_kind_alias() {
+        let yaml = b"default: &myanchor value\nref: *myanchor";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(mut fields) = first_doc(root) {
+            // Skip first field (default), get second field (ref)
+            fields.next();
+            if let Some(field) = fields.next() {
+                let cursor = field.value_cursor();
+                // yq returns "alias" for alias nodes
+                assert_eq!(cursor.kind(), "alias");
+                return;
+            }
+        }
+        panic!("Could not find alias");
+    }
+
+    #[test]
+    fn test_alias_on_non_alias() {
+        let yaml = b"key: value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                // Not an alias
+                assert!(!cursor.is_alias());
+                assert_eq!(cursor.alias(), None);
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_alias_to_sequence() {
+        let yaml = b"items: &list\n  - a\n  - b\nref: *list";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(mut fields) = first_doc(root) {
+            // First field: items (anchored sequence)
+            if let Some(field) = fields.next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.anchor(), Some("list"));
+                assert_eq!(cursor.kind(), "seq");
+            }
+            // Second field: ref (alias to sequence)
+            if let Some(field) = fields.next() {
+                let cursor = field.value_cursor();
+                assert!(cursor.is_alias());
+                assert_eq!(cursor.alias(), Some("list"));
+                assert_eq!(cursor.kind(), "alias");
+                return;
+            }
+        }
+        panic!("Could not find alias");
+    }
+
+    #[test]
+    fn test_alias_to_mapping() {
+        let yaml = b"defaults: &defaults\n  host: localhost\nproduction: *defaults";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(mut fields) = first_doc(root) {
+            // First field: defaults (anchored mapping)
+            if let Some(field) = fields.next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.anchor(), Some("defaults"));
+                assert_eq!(cursor.kind(), "map");
+            }
+            // Second field: production (alias to mapping)
+            if let Some(field) = fields.next() {
+                let cursor = field.value_cursor();
+                assert!(cursor.is_alias());
+                assert_eq!(cursor.alias(), Some("defaults"));
+                assert_eq!(cursor.kind(), "alias");
+                return;
+            }
+        }
+        panic!("Could not find alias");
     }
 }

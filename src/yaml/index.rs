@@ -471,6 +471,16 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         self.aliases.get(&bp_pos).copied()
     }
 
+    /// Get the anchor name that an alias at the given BP position references.
+    ///
+    /// Returns `None` if the position is not an alias.
+    /// This is equivalent to yq's `alias` function.
+    #[inline]
+    pub fn get_alias_anchor_name(&self, bp_pos: usize) -> Option<&str> {
+        let target_bp_pos = self.aliases.get(&bp_pos)?;
+        self.bp_to_anchor.get(target_bp_pos).map(|s| s.as_str())
+    }
+
     /// Get the BP position of an anchor by name.
     ///
     /// Returns `None` if the anchor is not defined.
