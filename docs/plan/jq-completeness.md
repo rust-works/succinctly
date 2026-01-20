@@ -272,7 +272,7 @@ All advanced features have been implemented:
 These are CLI-level features, not expression language:
 
 - [x] `-s` / `--slurp` - Read all inputs into array
-- [ ] `-R` / `--raw-input` - Read lines as strings
+- [x] `-R` / `--raw-input` - Read lines as strings
 - [x] `-n` / `--null-input` - Don't read input, use null
 - [x] `--tab` - Use tabs for indentation
 - [ ] `--argjson` / `--slurpfile` / `--rawfile` enhancements
@@ -361,3 +361,4 @@ echo '{"a":1}' | succinctly jq '.a'
 | 2026-01-20 | Added `line` and `column` jq builtins (return 0 in evaluation, full support at cursor level)|
 | 2026-01-20 | Added `-s`/`--slurp` CLI option for yq (✅ complete)|
 | 2026-01-20 | Added `from_unix`, `to_unix`, `tz(zone)` yq date/time extensions (✅ complete)|
+| 2026-01-20 | Added `-R`/`--raw-input` CLI option for yq (✅ complete)|

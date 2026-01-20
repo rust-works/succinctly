@@ -81,6 +81,7 @@ succinctly yq '.spec.containers[]' deployment.yaml service.yaml
 | `--tab` | Use tabs for indentation | ✅ |
 | `--arg NAME VALUE` | Set $NAME to string VALUE | ✅ |
 | `--argjson NAME JSON` | Set $NAME to JSON VALUE | ✅ |
+| `-R, --raw-input` | Read lines as strings instead of YAML | ✅ |
 
 ### YAML-Specific Flags
 
@@ -618,3 +619,4 @@ This plan depends on the YAML parser implementation phases defined in [parsing/y
 | 2026-01-20 | Added `--slurp` CLI option |
 | 2026-01-20 | Generic evaluator wired into main CLI path |
 | 2026-01-20 | Phase 1-4 marked complete, updated status tables |
+| 2026-01-20 | Added `-R`/`--raw-input` CLI option |

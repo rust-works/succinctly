@@ -647,6 +647,10 @@ pub struct YqCommand {
     #[arg(short = 'n', long)]
     pub null_input: bool,
 
+    /// Read each line as a string instead of parsing as YAML/JSON
+    #[arg(short = 'R', long)]
+    pub raw_input: bool,
+
     /// Read all inputs into an array and use it as the single input value
     #[arg(short = 's', long)]
     pub slurp: bool,

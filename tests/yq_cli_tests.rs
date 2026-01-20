@@ -605,3 +605,102 @@ users:
     );
     Ok(())
 }
+
+// ==========================================================================
+// Raw input tests (-R / --raw-input)
+// ==========================================================================
+
+#[test]
+fn test_raw_input_identity() -> Result<()> {
+    let input = "line one\nline two\nline three";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-R"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "line one\nline two\nline three\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_json_output() -> Result<()> {
+    let input = "line one\nline two";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-R", "-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "\"line one\"\n\"line two\"\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_slurp() -> Result<()> {
+    let input = "line one\nline two\nline three";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-R", "-s"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "- line one\n- line two\n- line three\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_slurp_json() -> Result<()> {
+    let input = "a\nb\nc";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-R", "-s", "-o", "json", "-I", "0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "[\"a\",\"b\",\"c\"]\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_slurp_length() -> Result<()> {
+    let input = "one\ntwo\nthree";
+    let (output, exit_code) = run_yq_stdin("length", input, &["-R", "-s"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "3");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_per_line_length() -> Result<()> {
+    let input = "hello\nhi\nworld";
+    let (output, exit_code) = run_yq_stdin("length", input, &["-R"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "5\n2\n5\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_split() -> Result<()> {
+    let input = "hello world\nfoo bar";
+    let (output, exit_code) = run_yq_stdin("split(\" \") | .[0]", input, &["-R"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "hello\nfoo\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_select() -> Result<()> {
+    let input = "apple\nbanana\navocado\ncherry";
+    let (output, exit_code) = run_yq_stdin("select(startswith(\"a\"))", input, &["-R"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "apple\navocado\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_empty_lines() -> Result<()> {
+    let input = "line1\n\nline2\n\n\nline3";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-R"])?;
+    assert_eq!(exit_code, 0);
+    // Empty lines become empty strings, which are quoted in YAML output
+    assert_eq!(output, "line1\n''\nline2\n''\n''\nline3\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_slurp_filter_empty() -> Result<()> {
+    let input = "line1\n\nline2\n\nline3";
+    let (output, exit_code) = run_yq_stdin(
+        "map(select(. != \"\"))",
+        input,
+        &["-R", "-s", "-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "[\"line1\",\"line2\",\"line3\"]\n");
+    Ok(())
+}

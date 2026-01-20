@@ -227,11 +227,20 @@ fn value_to_string(value: &OwnedValue) -> String {
     }
 }
 
-/// Read input from stdin.
+/// Read input from stdin as bytes.
 fn read_stdin() -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     std::io::stdin()
         .read_to_end(&mut buffer)
+        .context("failed to read from stdin")?;
+    Ok(buffer)
+}
+
+/// Read input from stdin as a string.
+fn read_stdin_string() -> Result<String> {
+    let mut buffer = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buffer)
         .context("failed to read from stdin")?;
     Ok(buffer)
 }
@@ -1071,6 +1080,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && output_config.compact
         && output_config.output_format == OutputFormat::Json
         && !args.null_input
+        && !args.raw_input
         && !args.slurp
         && !args.inplace
         && context.named.is_empty();
@@ -1130,6 +1140,45 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             last_output = Some(result.clone());
             had_output = true;
             output_value(&mut writer, &result, &output_config)?;
+        }
+    } else if args.raw_input {
+        // Handle --raw-input: read each line as a string instead of parsing as YAML
+        let input_content = if args.files.is_empty() {
+            read_stdin_string()?
+        } else {
+            let mut content = String::new();
+            for file_path in &args.files {
+                let file_content = std::fs::read_to_string(file_path)
+                    .with_context(|| format!("failed to read file: {}", file_path))?;
+                content.push_str(&file_content);
+            }
+            content
+        };
+
+        if args.slurp {
+            // With --slurp, collect all lines into an array
+            let lines: Vec<OwnedValue> = input_content
+                .lines()
+                .map(|line| OwnedValue::String(line.to_string()))
+                .collect();
+            let slurped = OwnedValue::Array(lines);
+            let results = evaluate_input(&slurped, &program.expr, &context)?;
+            for result in results {
+                last_output = Some(result.clone());
+                had_output = true;
+                output_value(&mut writer, &result, &output_config)?;
+            }
+        } else {
+            // Without --slurp, process each line independently
+            for line in input_content.lines() {
+                let input = OwnedValue::String(line.to_string());
+                let results = evaluate_input(&input, &program.expr, &context)?;
+                for result in results {
+                    last_output = Some(result.clone());
+                    had_output = true;
+                    output_value(&mut writer, &result, &output_config)?;
+                }
+            }
         }
     } else if args.slurp {
         // Handle --slurp: collect all documents from all inputs into an array
