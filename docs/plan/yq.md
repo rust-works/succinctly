@@ -267,13 +267,13 @@ select(document_index == 1)  # → only second document
 
 **Goal**: Date/time manipulation operators from yq.
 
-These operators use Go's time format strings (not POSIX strftime).
+These operators use POSIX strftime format strings (jq-compatible).
 
 | Operator | Description | Priority | Status |
 |----------|-------------|----------|--------|
 | `now` | Current Unix timestamp (float) | High | ✅ |
-| `strftime(fmt)` | Format timestamp as string | High | ❌ |
-| `strptime(fmt)` | Parse string to timestamp | High | ❌ |
+| `strftime(fmt)` | Format broken-down time as string | High | ✅ |
+| `strptime(fmt)` | Parse string to broken-down time | High | ✅ |
 | `from_unix` | Convert Unix epoch to datetime | Medium | ❌ |
 | `to_unix` | Convert datetime to Unix epoch | Medium | ❌ |
 | `tz(zone)` | Convert to timezone | Medium | ❌ |
@@ -287,16 +287,17 @@ now  # → 1705766400.123456 (seconds since Unix epoch)
 .timestamp = now
 ```
 
-**`strftime(fmt)`** - Format datetime to string
+**`strftime(fmt)`** - Format broken-down time array as string (jq-compatible) ✅
 ```bash
-# Go time format: "2006-01-02T15:04:05Z07:00"
-.date | strftime("2006-01-02")  # → "2024-01-20"
-.date | strftime("Monday, 02-Jan-06")  # → "Saturday, 20-Jan-24"
+# Uses POSIX strftime format specifiers (%Y, %m, %d, etc.)
+now | gmtime | strftime("%Y-%m-%d")  # → "2026-01-20"
+now | gmtime | strftime("%Y-%m-%dT%H:%M:%SZ")  # → "2026-01-20T15:04:05Z"
 ```
 
-**`strptime(fmt)`** - Parse string to datetime
+**`strptime(fmt)`** - Parse string to broken-down time array (jq-compatible) ✅
 ```bash
-"2024-01-20" | strptime("2006-01-02")  # → datetime object
+"2024-01-15" | strptime("%Y-%m-%d")  # → [2024,0,15,0,0,0,1,14]
+# Returns [year, month(0-11), day, hour, min, sec, weekday(0-6), yearday]
 ```
 
 **`from_unix`** - Unix epoch to datetime
@@ -323,10 +324,10 @@ now | tz("local")  # system timezone
 ```
 
 **Implementation Notes:**
-- Go time format uses "2006-01-02 15:04:05" as reference date
-- Requires `chrono` crate for Rust implementation
-- Timezone handling via `chrono-tz` crate
-- Duration parsing: "1h", "30m", "2h30m", etc.
+- `now`, `strftime`, `strptime`, `gmtime`, `mktime` are jq-compatible (already implemented)
+- Uses POSIX strftime format specifiers: `%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, etc.
+- Broken-down time format: `[year, month(0-11), day, hour, min, sec, weekday, yearday]`
+- `from_unix`/`to_unix`/`tz` are yq-specific extensions (not yet implemented)
 
 ---
 
