@@ -1722,10 +1722,67 @@ impl<'a> Parser<'a> {
 
         // Check what the key is
         if self.at_line_end() {
-            // Key is on next line(s) - it could be a complex structure
-            // For now, the next line will parse as the key content
-            // and the `:` line will provide the value
+            // Key content might be on next line(s), or this could be an empty key
+            // Save position for potential empty key emission (after the `?`)
+            let key_pos = self.pos;
             self.skip_to_eol();
+
+            // Look ahead to see what's on the next line
+            self.skip_newlines();
+            if self.peek().is_none() {
+                // EOF - empty key (null) with implicit null value
+                // Emit empty key node using the position after `?`
+                self.pos = key_pos;
+                self.set_ib();
+                self.write_bp_open();
+                self.write_bp_close();
+                self.pending_explicit_key = true;
+                return Ok(());
+            }
+
+            let next_indent = self.count_indent().unwrap_or(0);
+
+            // Check if next line starts with `:` at same indent (explicit value)
+            // or has other content at same/lower indent (meaning empty key)
+            let saved_pos = self.pos;
+            self.advance_by(next_indent);
+            let next_char = self.peek();
+            self.pos = saved_pos;
+
+            if next_indent <= indent {
+                // Next content is at same or lower indent
+                if next_char == Some(b':')
+                    && (next_indent == indent)
+                    && matches!(
+                        self.input.get(saved_pos + next_indent + 1).copied(),
+                        Some(b' ') | Some(b'\t') | Some(b'\n') | None
+                    )
+                {
+                    // `: value` at same indent - empty key (null), value follows
+                    // Emit empty key node using the position after `?`
+                    self.pos = key_pos;
+                    self.set_ib();
+                    self.write_bp_open();
+                    self.write_bp_close();
+                    // Restore position for main loop to process `: value`
+                    self.pos = saved_pos;
+                    self.pending_explicit_key = true;
+                    return Ok(());
+                }
+                // Other content at same/lower indent - empty key (null) with implicit null value
+                // Emit empty key node using the position after `?`
+                self.pos = key_pos;
+                self.set_ib();
+                self.write_bp_open();
+                self.write_bp_close();
+                // Restore position for main loop to process next content
+                self.pos = saved_pos;
+                self.pending_explicit_key = true;
+                return Ok(());
+            }
+
+            // Content at deeper indent - that's the key content
+            // Let the main loop parse it (don't restore position - stay at content start)
             return Ok(());
         }
 
@@ -4069,5 +4126,55 @@ mod tests {
             "empty key in flow sequence should parse: {:?}",
             result
         );
+    }
+
+    #[test]
+    fn test_explicit_empty_key() {
+        // Test: `?\n: value` should parse as {null: "value"}
+        use crate::jq::document::DocumentValue;
+        use crate::jq::eval_generic::to_owned;
+        use crate::yaml::light::YamlValue;
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"?\n: value\n";
+        let index = YamlIndex::build(yaml).expect("parse failed");
+
+        // Debug: print BP structure
+        eprintln!("BP len: {}", index.bp().len());
+        for i in 0..index.bp().len() {
+            let is_open = index.bp().is_open(i);
+            eprintln!("BP {}: {}", i, if is_open { "OPEN" } else { "CLOSE" });
+        }
+
+        // Get the first document
+        let doc_cursor = index.root(yaml).first_child().expect("no document");
+        eprintln!("Doc value: {:?}", doc_cursor.value());
+
+        // Check that it's a mapping
+        match doc_cursor.value() {
+            YamlValue::Mapping(fields) => {
+                let mut count = 0;
+                for field in fields {
+                    let key_val = field.key();
+                    eprintln!("Field: key={:?}, value={:?}", key_val, field.value());
+                    // Test as_str on the key
+                    eprintln!("  key.as_str() = {:?}", key_val.as_str());
+                    eprintln!("  key.is_null() = {:?}", key_val.is_null());
+                    count += 1;
+                }
+                eprintln!("Field count: {}", count);
+                assert!(
+                    count > 0,
+                    "mapping should have at least one field, but has {}",
+                    count
+                );
+
+                // Now test to_owned conversion
+                eprintln!("\n=== Testing to_owned conversion ===");
+                let owned = to_owned(&doc_cursor.value());
+                eprintln!("to_owned result: {:?}", owned);
+            }
+            other => panic!("expected mapping, got {:?}", other),
+        }
     }
 }
