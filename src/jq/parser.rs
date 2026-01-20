@@ -2701,6 +2701,18 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Pick(Box::new(keys))));
         }
 
+        // omit(keys) - yq: remove specified keys from object/indices from array
+        if self.matches_keyword("omit") {
+            self.consume_keyword("omit");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let keys = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Omit(Box::new(keys))));
+        }
+
         // tag - yq: return YAML type tag (!!str, !!int, !!map, etc.)
         if self.matches_keyword("tag") {
             self.consume_keyword("tag");

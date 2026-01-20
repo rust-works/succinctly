@@ -616,8 +616,11 @@ fn eval_builtin<V: DocumentValue>(
             }
         }
 
-        // For other builtins, convert to owned
-        _ => GenericResult::Owned(to_owned(&value)),
+        // For other builtins, fall back to full evaluator via JSON
+        _ => {
+            let owned = to_owned(&value);
+            eval_on_owned(&Expr::Builtin(builtin.clone()), owned)
+        }
     }
 }
 

@@ -1377,6 +1377,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         // Phase 10: Object functions
         Builtin::ModuleMeta(name) => builtin_modulemeta(name, value, optional),
         Builtin::Pick(keys) => builtin_pick(keys, value, optional),
+        Builtin::Omit(keys) => builtin_omit(keys, value, optional),
 
         // YAML metadata functions (yq)
         Builtin::Tag => builtin_tag(value),
@@ -5976,6 +5977,7 @@ fn substitute_var_in_builtin(
             Builtin::ModuleMeta(Box::new(substitute_var(e, var_name, replacement)))
         }
         Builtin::Pick(e) => Builtin::Pick(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::Omit(e) => Builtin::Omit(Box::new(substitute_var(e, var_name, replacement))),
         Builtin::Tag => Builtin::Tag,
         Builtin::Anchor => Builtin::Anchor,
         Builtin::Style => Builtin::Style,
@@ -10598,6 +10600,112 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Builtin: omit(keys) - remove specified keys from object/indices from array
+/// Inverse of `pick`: keeps all keys/indices except those specified.
+fn builtin_omit<'a, W: Clone + AsRef<[u64]>>(
+    keys_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the keys expression to get the array of keys to omit
+    let keys_owned = match eval_single(keys_expr, value.clone(), optional) {
+        QueryResult::One(v) => to_owned(&v),
+        QueryResult::OneCursor(c) => to_owned(&c.value()),
+        QueryResult::Owned(v) => v,
+        QueryResult::ManyOwned(v) if !v.is_empty() => v.into_iter().next().unwrap(),
+        QueryResult::ManyOwned(_) => {
+            return QueryResult::Error(EvalError::new("omit: keys expression produced no output"))
+        }
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::None if optional => return QueryResult::None,
+        QueryResult::None => {
+            return QueryResult::Error(EvalError::new("omit: keys expression produced no output"))
+        }
+        QueryResult::Many(v) if !v.is_empty() => to_owned(&v.into_iter().next().unwrap()),
+        QueryResult::Many(_) => {
+            return QueryResult::Error(EvalError::new("omit: keys expression produced no output"))
+        }
+    };
+
+    // Keys must be an array
+    let keys = match &keys_owned {
+        OwnedValue::Array(arr) => arr,
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::new("omit: argument must be an array of keys")),
+    };
+
+    match &value {
+        StandardJson::Object(fields) => {
+            // For objects, keep all keys except those in the omit list
+            // Use a Vec for no_std compatibility (typical omit lists are small)
+            let omit_keys: Vec<&str> = keys
+                .iter()
+                .filter_map(|k| {
+                    if let OwnedValue::String(s) = k {
+                        Some(s.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let mut result = IndexMap::new();
+            for field in *fields {
+                if let StandardJson::String(key_str) = field.key() {
+                    if let Ok(cow) = key_str.as_str() {
+                        let key = cow.as_ref();
+                        if !omit_keys.contains(&key) {
+                            result.insert(key.to_string(), to_owned(&field.value()));
+                        }
+                    }
+                }
+            }
+            QueryResult::Owned(OwnedValue::Object(result))
+        }
+        StandardJson::Array(elements) => {
+            // For arrays, keep all indices except those in the omit list
+            let arr: Vec<_> = (*elements).collect();
+            let len = arr.len() as i64;
+
+            // Use a Vec for no_std compatibility (typical omit lists are small)
+            let omit_indices: Vec<usize> = keys
+                .iter()
+                .filter_map(|k| {
+                    let idx = match k {
+                        OwnedValue::Int(i) => *i,
+                        OwnedValue::Float(f) => *f as i64,
+                        _ => return None,
+                    };
+                    // Handle negative indices
+                    let actual_idx = if idx < 0 { len + idx } else { idx };
+                    if actual_idx >= 0 && actual_idx < len {
+                        Some(actual_idx as usize)
+                    } else {
+                        None // Out of bounds indices are ignored
+                    }
+                })
+                .collect();
+
+            let result: Vec<OwnedValue> = arr
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| {
+                    if omit_indices.contains(&i) {
+                        None
+                    } else {
+                        Some(to_owned(v))
+                    }
+                })
+                .collect();
+
+            QueryResult::Owned(OwnedValue::Array(result))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::new("omit: input must be an object or array")),
+    }
+}
+
 // Builtin: tag - return YAML type tag (!!str, !!int, !!map, etc.)
 // Since we evaluate on JSON/OwnedValue (not raw YAML), we derive the tag from the JSON type.
 fn builtin_tag<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryResult<'a, W> {
@@ -11608,6 +11716,7 @@ fn expand_func_calls_in_builtin(
             Builtin::ModuleMeta(Box::new(expand_func_calls(e, func_name, params, body)))
         }
         Builtin::Pick(e) => Builtin::Pick(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::Omit(e) => Builtin::Omit(Box::new(expand_func_calls(e, func_name, params, body))),
         Builtin::Tag => Builtin::Tag,
         Builtin::Anchor => Builtin::Anchor,
         Builtin::Style => Builtin::Style,
@@ -11891,6 +12000,7 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
             Builtin::ModuleMeta(Box::new(substitute_func_param(e, param, arg)))
         }
         Builtin::Pick(e) => Builtin::Pick(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Omit(e) => Builtin::Omit(Box::new(substitute_func_param(e, param, arg))),
         Builtin::Tag => Builtin::Tag,
         Builtin::Anchor => Builtin::Anchor,
         Builtin::Style => Builtin::Style,
@@ -15761,6 +15871,98 @@ mod tests {
         query!(br#"[1, null, 2, null]"#, "index(null)",
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 1);
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_object() {
+        // Remove keys from object
+        query!(br#"{"a":1, "b":2, "c":3}"#, r#"omit(["a", "c"])"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 1);
+                assert_eq!(obj.get("b"), Some(&OwnedValue::Int(2)));
+                assert!(obj.get("a").is_none());
+                assert!(obj.get("c").is_none());
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_object_nonexistent_keys() {
+        // Gracefully ignore non-existent keys
+        query!(br#"{"a":1, "b":2}"#, r#"omit(["c", "d"])"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 2);
+                assert_eq!(obj.get("a"), Some(&OwnedValue::Int(1)));
+                assert_eq!(obj.get("b"), Some(&OwnedValue::Int(2)));
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_array() {
+        // Remove indices from array
+        query!(br#"["a", "b", "c", "d"]"#, "omit([0, 2])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                assert_eq!(arr[0], OwnedValue::String("b".to_string()));
+                assert_eq!(arr[1], OwnedValue::String("d".to_string()));
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_array_negative_index() {
+        // Remove negative indices from array
+        query!(br#"["a", "b", "c", "d"]"#, "omit([-1])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0], OwnedValue::String("a".to_string()));
+                assert_eq!(arr[1], OwnedValue::String("b".to_string()));
+                assert_eq!(arr[2], OwnedValue::String("c".to_string()));
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_array_out_of_bounds() {
+        // Out of bounds indices are silently ignored
+        query!(br#"["a", "b", "c"]"#, "omit([10, -10])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                // No indices removed - all out of bounds
+                assert_eq!(arr.len(), 3);
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_empty_keys() {
+        // Empty keys array returns full object
+        query!(br#"{"a":1, "b":2}"#, "omit([])",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 2);
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_all_keys() {
+        // Omit all keys returns empty object
+        query!(br#"{"a":1, "b":2}"#, r#"omit(["a", "b"])"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 0);
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_preserves_order() {
+        // Object key order is preserved (remaining keys)
+        query!(br#"{"c":3, "a":1, "b":2, "d":4}"#, r#"omit(["a", "d"])"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                let keys: Vec<&String> = obj.keys().collect();
+                assert_eq!(keys, vec!["c", "b"]);
             }
         );
     }

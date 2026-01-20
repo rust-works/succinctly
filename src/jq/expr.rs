@@ -736,6 +736,9 @@ pub enum Builtin {
     ModuleMeta(Box<Expr>),
     /// `pick(keys)` - select only specified keys from object/array (yq)
     Pick(Box<Expr>),
+    /// `omit(keys)` - remove specified keys from object/indices from array (yq)
+    /// Inverse of `pick`: keeps all keys/indices except those specified.
+    Omit(Box<Expr>),
 
     // YAML metadata functions (yq)
     /// `tag` - return YAML type tag (!!str, !!int, !!map, etc.)
