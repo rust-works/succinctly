@@ -64,7 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance
 
 - YAML identity queries: 90-217 MiB/s (2.3x improvement with direct streaming)
-- yq vs system yq: 45-687x faster on x86_64, 1.8-8.7x faster on ARM
+- yq vs system yq: 16-40x faster on x86_64, 1.9-8.7x faster on ARM
 
 ## [0.2.0] - 2026-01-18
 
