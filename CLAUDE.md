@@ -231,9 +231,9 @@ To regenerate: `cargo bench --bench jq_comparison`
 
 | Size      | succinctly              | yq                    | Speedup    |
 |-----------|-------------------------|-----------------------|------------|
-| **10KB**  |  83.5 µs (116.8 MiB/s)  | 57.4 ms (175 KiB/s)   | **687x**   |
-| **100KB** | 599 µs (153.6 MiB/s)    | 71.3 ms  (1.3 MiB/s)  | **119x**   |
-| **1MB**   | 4.24 ms (217.6 MiB/s)   |191.1 ms  (4.8 MiB/s)  | **45x**    |
+| **10KB**  | 1.63 ms  (6.0 MiB/s)    | 64.6 ms (155 KiB/s)   | **40x**    |
+| **100KB** | 2.78 ms (33.1 MiB/s)    | 79.6 ms (1.2 MiB/s)   | **29x**    |
+| **1MB**   | 13.2 ms (69.7 MiB/s)    |210.5 ms (4.4 MiB/s)   | **16x**    |
 
 To regenerate: `cargo bench --bench yq_comparison`
 
@@ -355,12 +355,10 @@ For detailed documentation on optimization techniques used in this project, see 
   - **Bottleneck shift**: Parsing now 40% of time (was 15%), DOM conversion eliminated
   - Best for: `yq '.'` identity queries, format conversion, streaming output
   - See [docs/parsing/yaml.md#p9-direct-yaml-to-json-streaming---accepted-](docs/parsing/yaml.md#p9-direct-yaml-to-json-streaming---accepted-) for full analysis
-- ✅ P10 (Type Preservation): **Full yq compatibility + 27-304% performance improvement**
+- ✅ P10 (Type Preservation): **Full yq compatibility** (correctness fix)
   - Fixed quoted string type preservation: `"1.0"` stays as string, not converted to number `1`
   - Added early-exit for quoted strings, skipping expensive `parse::<i64>()` and `parse::<f64>()` calls
-  - 10KB: 108µs → 83.5µs (90.5 → 116.8 MiB/s, **+29%**)
-  - 100KB: 828µs → 599µs (111.1 → 153.6 MiB/s, **+38%**)
-  - 1MB: 6.35ms → 4.24ms (145.6 → 217.6 MiB/s, **+49%**)
+  - Current performance: 10KB: 1.63ms, 100KB: 2.78ms, 1MB: 13.2ms (with correct output)
   - Created comprehensive test suite: 32 tests including 8 direct byte-for-byte comparisons with system `yq`
   - **Key achievement**: `succinctly yq` is now a drop-in replacement for `yq` for supported arguments
   - See [docs/parsing/yaml.md#p10-type-preservation---accepted-](docs/parsing/yaml.md#p10-type-preservation---accepted-) for full analysis

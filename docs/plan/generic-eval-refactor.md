@@ -54,23 +54,17 @@ cargo bench --bench jq_comparison 2>&1 | tee .ai/scratch/baseline-jq-comparison.
 cargo bench 2>&1 | tee .ai/scratch/baseline-full-bench.txt
 ```
 
-Expected baseline (Apple M1 Max from docs):
+Expected baseline (AMD Ryzen 9 7950X from docs):
 
 | Size | succinctly yq | yq | Speedup |
 |------|---------------|-----|---------|
-| 10KB | 83.5 µs (116.8 MiB/s) | 57.4 ms | 687x |
-| 100KB | 599 µs (153.6 MiB/s) | 71.3 ms | 119x |
-| 1MB | 4.24 ms (217.6 MiB/s) | 191.1 ms | 45x |
+| 10KB | 1.63 ms (6.0 MiB/s) | 64.6 ms | 40x |
+| 100KB | 2.78 ms (33.1 MiB/s) | 79.6 ms | 29x |
+| 1MB | 13.2 ms (69.7 MiB/s) | 210.5 ms | 16x |
 
 ### Post-refactor Target
 
-With direct YAML evaluation (similar to P9's 2.3x gain):
-
-| Size | Target | Improvement |
-|------|--------|-------------|
-| 10KB | ~40 µs (~240 MiB/s) | ~2x |
-| 100KB | ~300 µs (~300 MiB/s) | ~2x |
-| 1MB | ~2 ms (~460 MiB/s) | ~2x |
+The generic evaluator refactor has been completed. See Performance Results below for actual achieved results.
 
 ## Implementation Phases
 

@@ -49,55 +49,23 @@ cargo bench --bench yq_comparison
 | **100KB** |  19.5 MiB/s     |   4.7 MiB/s    | **4.1x**      |
 | **1MB**   |  69.2 MiB/s     |   8.0 MiB/s    | **8.7x**      |
 
-### x86_64 (AMD Ryzen 9 7950X) - yq Identity Comparison (P10 Optimized)
+### x86_64 (AMD Ryzen 9 7950X) - yq Identity Comparison
 
-| Size      | succinctly        | yq              | Speedup        |
-|-----------|-------------------|-----------------|----------------|
-| **10KB**  |  83.5 µs (116.8 MiB/s) |  57.4 ms (175 KiB/s) | **687x**   |
-| **100KB** | 599 µs (153.6 MiB/s)   |  71.3 ms (1.3 MiB/s) | **119x**   |
-| **1MB**   | 4.24 ms (217.6 MiB/s)  | 191.1 ms (4.8 MiB/s) | **45x**    |
+| Size      | succinctly             | yq                     | Speedup    |
+|-----------|------------------------|------------------------|------------|
+| **10KB**  | 1.63 ms (6.0 MiB/s)    | 64.6 ms (155 KiB/s)    | **40x**    |
+| **100KB** | 2.78 ms (33.1 MiB/s)   | 79.6 ms (1.2 MiB/s)    | **29x**    |
+| **1MB**   | 13.2 ms (69.7 MiB/s)   | 210.5 ms (4.4 MiB/s)   | **16x**    |
 
-### x86_64 (AMD Ryzen 9 7950X) - Internal Micro-Benchmarks (P10 Optimized)
+### x86_64 (AMD Ryzen 9 7950X) - Key Achievements
 
-#### Performance Summary (Selected Benchmarks)
-
-| Benchmark | P2 Baseline | P10 Optimized | Improvement |
-|-----------|-------------|---------------|-------------|
-| simple_kv/1000 | 39.2 µs | 33.1 µs | **-16%** |
-| simple_kv/10000 | 396 µs | 327 µs | **-17%** |
-| nested/d5_w2 | 5.5 µs | 4.6 µs | **-16%** |
-| large/10kb | 20.6 µs | 20.3 µs | **-1%** |
-| large/100kb | 180 µs | 178 µs | **-1%** |
-| large/1mb | 3.36 ms | 2.72 ms | **-19%** |
-| long_strings/4096b/double | 109 µs | 109 µs | (unchanged) |
-| long_strings/4096b/single | 109 µs | 109 µs | (unchanged) |
-
-#### Overall Throughput (P10 Optimized - 2026-01-18)
-
-| Workload Category | P2 Baseline | P10 Optimized | Improvement |
-|-------------------|-------------|---------------|-------------|
-| Simple KV         | 435-484 MiB/s | 479-545 MiB/s | **+10-13%** |
-| Nested structures | 363-454 MiB/s | 366-510 MiB/s | **+1-12%** |
-| Sequences         | 372-414 MiB/s | 373-416 MiB/s | **+0-1%** |
-| Large files       | 422-515 MiB/s | 470-534 MiB/s | **+1-11%** |
-
-#### yq Identity Query Performance (P10 vs P9 vs P2)
-
-| Size | P2 Baseline | P9 Optimized | P10 Optimized | P9→P10 |
-|------|-------------|--------------|---------------|--------|
-| 10KB (comprehensive) | 2.0 ms (4.9 MiB/s) | 1.8 ms (5.3 MiB/s) | 83.5 µs (116.8 MiB/s) | **+2200%** |
-| 100KB (comprehensive) | 7.2 ms (12.9 MiB/s) | 6.1 ms (15.2 MiB/s) | 599 µs (153.6 MiB/s) | **+1010%** |
-| 1MB (comprehensive) | 56.3 ms (16.4 MiB/s) | 47.4 ms (19.5 MiB/s) | 4.24 ms (217.6 MiB/s) | **+1116%** |
-
-**Key Achievements (P10):**
-- ✅ **yq identity queries: 10-22x faster than P9** via type preservation early-exit
-- ✅ **Large files: up to 11x faster** (1MB files: 4.24ms vs 47.4ms)
+**Key Achievements:**
 - ✅ **Full yq CLI compatibility** - quoted strings preserved as strings
-- ✅ **687x faster than yq** on 10KB files (end-to-end CLI comparison)
-- ✅ **45x faster than yq** on 1MB files (was 4.0x in P9)
+- ✅ **40x faster than yq** on 10KB files (end-to-end CLI comparison)
+- ✅ **16x faster than yq** on 1MB files
 - ✅ **Comprehensive test suite** - 32 tests including 8 direct byte-for-byte comparisons
 
-**See also:** [docs/parsing/yaml.md](../parsing/yaml.md) for full P9 and P10 optimization details.
+**See also:** [docs/parsing/yaml.md](../parsing/yaml.md) for optimization details.
 
 ---
 
@@ -224,9 +192,9 @@ The YAML parser uses platform-specific SIMD for hot paths:
 - large/1mb: **-17% faster** (2.18ms → 1.82ms)
 
 **End-to-end yq comparison (x86_64):**
-- 10KB files: **31x faster** than yq (1.8ms vs 57.4ms)
-- 100KB files: **11.8x faster** than yq (6.1ms vs 71.3ms)
-- 1MB files: **4.0x faster** than yq (47.4ms vs 191.1ms)
+- 10KB files: **40x faster** than yq (1.6ms vs 64.6ms)
+- 100KB files: **29x faster** than yq (2.8ms vs 79.6ms)
+- 1MB files: **16x faster** than yq (13.2ms vs 210.5ms)
 
 **Optimizations (cumulative):**
 - **P0**: Multi-character classification infrastructure (8 types in parallel)
@@ -352,8 +320,8 @@ $ echo 'id: "001"' | succinctly yq -o json '.'
 `succinctly yq` offers significant performance advantages over `yq`:
 - **8.7x faster** on 1MB files (Apple M1 Max)
 - **4.1x faster** on 100KB files (Apple M1 Max)
-- **45x faster** on 1MB files (AMD Ryzen 9 7950X with P10 optimizations)
-- **687x faster** on 10KB files (AMD Ryzen 9 7950X with P10 optimizations)
+- **16x faster** on 1MB files (AMD Ryzen 9 7950X)
+- **40x faster** on 10KB files (AMD Ryzen 9 7950X)
 - **Lower memory usage** on large files
 - **Streaming architecture** for better scalability
 - **Full yq compatibility** for type preservation

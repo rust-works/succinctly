@@ -119,7 +119,7 @@ Semi-indexing delivers significant memory and speed improvements over traditiona
 | vs serde_json | **18x less** | 3x faster |
 | vs simd-json | **46x less** | 3x faster |
 | vs jq | **5-25x less** | 1.2-6.3x faster |
-| vs yq | similar | **45-687x faster** |
+| vs yq | similar | **16-40x faster** |
 
 The index overhead (3-6%) is dwarfed by the memory savings from not materializing the entire document.
 
