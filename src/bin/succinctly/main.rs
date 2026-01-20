@@ -701,6 +701,10 @@ pub struct YqCommand {
     #[arg(short = 'N', long = "no-doc")]
     pub no_doc: bool,
 
+    /// Select specific document by 0-based index from multi-document stream
+    #[arg(long = "doc", value_name = "N")]
+    pub document: Option<usize>,
+
     /// Pretty print, expand flow styles to block style
     #[arg(short = 'P', long = "prettyPrint")]
     pub pretty_print: bool,

@@ -334,7 +334,15 @@ fn parse_and_evaluate_yaml(bytes: &[u8], expr: &Expr) -> Result<Vec<OwnedValue>>
 /// This processes YAML documents directly without intermediate OwnedValue conversion,
 /// preserving position metadata for `line` and `column` builtins. Returns results
 /// grouped by document for proper multi-doc handling (with `---` separators).
-fn evaluate_yaml_direct(bytes: &[u8], expr: &Expr) -> Result<Vec<Vec<OwnedValue>>> {
+///
+/// If `doc_filter` is Some((target_doc, global_offset)), only the document at global index
+/// `target_doc` will be evaluated (where global index = global_offset + local_doc_index).
+/// Returns the number of documents in this file for proper global index tracking.
+fn evaluate_yaml_direct_filtered(
+    bytes: &[u8],
+    expr: &Expr,
+    doc_filter: Option<(usize, usize)>,
+) -> Result<(Vec<Vec<OwnedValue>>, usize)> {
     let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {}", e))?;
     let root = index.root(bytes);
 
@@ -342,24 +350,55 @@ fn evaluate_yaml_direct(bytes: &[u8], expr: &Expr) -> Result<Vec<Vec<OwnedValue>
     match root.value() {
         YamlValue::Sequence(mut docs) => {
             let mut doc_results = Vec::new();
+            let mut local_idx = 0;
             while let Some((cursor, rest)) = docs.uncons_cursor() {
-                let results = evaluate_yaml_cursor(cursor, expr)?;
-                doc_results.push(results);
+                // Check if this document should be evaluated
+                let should_eval = match doc_filter {
+                    Some((target_doc, global_offset)) => global_offset + local_idx == target_doc,
+                    None => true,
+                };
+
+                if should_eval {
+                    let results = evaluate_yaml_cursor(cursor, expr)?;
+                    doc_results.push(results);
+                }
+
+                local_idx += 1;
                 docs = rest;
             }
-            Ok(doc_results)
+            Ok((doc_results, local_idx))
         }
         _ => {
             // Single document - navigate to actual content
-            if let Some(content_cursor) = root.first_child() {
-                let results = evaluate_yaml_cursor(content_cursor, expr)?;
-                Ok(vec![results])
+            let should_eval = match doc_filter {
+                Some((target_doc, global_offset)) => global_offset == target_doc,
+                None => true,
+            };
+
+            if should_eval {
+                if let Some(content_cursor) = root.first_child() {
+                    let results = evaluate_yaml_cursor(content_cursor, expr)?;
+                    Ok((vec![results], 1))
+                } else {
+                    // Empty document
+                    Ok((vec![vec![]], 1))
+                }
             } else {
-                // Empty document
-                Ok(vec![vec![]])
+                Ok((vec![], 1))
             }
         }
     }
+}
+
+/// Evaluate YAML input directly using the generic evaluator with per-document processing.
+///
+/// This processes YAML documents directly without intermediate OwnedValue conversion,
+/// preserving position metadata for `line` and `column` builtins. Returns results
+/// grouped by document for proper multi-doc handling (with `---` separators).
+#[allow(dead_code)] // Used by tests and may be used directly in future
+fn evaluate_yaml_direct(bytes: &[u8], expr: &Expr) -> Result<Vec<Vec<OwnedValue>>> {
+    let (results, _) = evaluate_yaml_direct_filtered(bytes, expr, None)?;
+    Ok(results)
 }
 
 /// Evaluate a jq expression on an OwnedValue by converting to JSON and back.
@@ -1055,6 +1094,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         args.filter.clone().unwrap_or_else(|| ".".to_string())
     };
 
+    // Validate flag compatibility
+    if args.document.is_some() && args.raw_input {
+        anyhow::bail!("--doc and --raw-input are incompatible");
+    }
+
     // Parse the jq program (use Yq mode for extended identifier syntax like kebab-case)
     let program = jq::parse_program_with_mode(&filter_str, jq::ParserMode::Yq)
         .map_err(|e| anyhow::anyhow!("parse error: {}", e))?;
@@ -1087,6 +1131,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
     if can_fast_path {
         // Direct YAML → JSON streaming
+        // Track global document index across all files for --doc filtering
+        let mut global_doc_index: usize = 0;
+
         if args.files.is_empty() {
             let yaml_bytes = read_stdin()?;
             let index = YamlIndex::build(&yaml_bytes)
@@ -1097,16 +1144,29 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             match root.value() {
                 YamlValue::Sequence(mut docs) => {
                     while let Some((cursor, rest)) = docs.uncons_cursor() {
-                        had_output = true;
-                        let json = cursor.to_json();
-                        writeln!(writer, "{}", json)?;
+                        // Apply --doc filter if specified
+                        if let Some(target_doc) = args.document {
+                            if global_doc_index == target_doc {
+                                had_output = true;
+                                let json = cursor.to_json();
+                                writeln!(writer, "{}", json)?;
+                            }
+                        } else {
+                            had_output = true;
+                            let json = cursor.to_json();
+                            writeln!(writer, "{}", json)?;
+                        }
+                        global_doc_index += 1;
                         docs = rest;
                     }
                 }
                 _ => {
-                    had_output = true;
-                    let json = root.to_json_document();
-                    writeln!(writer, "{}", json)?;
+                    // Single document case
+                    if args.document.is_none() || args.document == Some(0) {
+                        had_output = true;
+                        let json = root.to_json_document();
+                        writeln!(writer, "{}", json)?;
+                    }
                 }
             }
         } else {
@@ -1119,16 +1179,30 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 match root.value() {
                     YamlValue::Sequence(mut docs) => {
                         while let Some((cursor, rest)) = docs.uncons_cursor() {
-                            had_output = true;
-                            let json = cursor.to_json();
-                            writeln!(writer, "{}", json)?;
+                            // Apply --doc filter if specified
+                            if let Some(target_doc) = args.document {
+                                if global_doc_index == target_doc {
+                                    had_output = true;
+                                    let json = cursor.to_json();
+                                    writeln!(writer, "{}", json)?;
+                                }
+                            } else {
+                                had_output = true;
+                                let json = cursor.to_json();
+                                writeln!(writer, "{}", json)?;
+                            }
+                            global_doc_index += 1;
                             docs = rest;
                         }
                     }
                     _ => {
-                        had_output = true;
-                        let json = root.to_json_document();
-                        writeln!(writer, "{}", json)?;
+                        // Single document case
+                        if args.document.is_none() || args.document == Some(global_doc_index) {
+                            had_output = true;
+                            let json = root.to_json_document();
+                            writeln!(writer, "{}", json)?;
+                        }
+                        global_doc_index += 1;
                     }
                 }
             }
@@ -1201,9 +1275,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         };
 
         // Parse all inputs and collect documents
+        let mut global_doc_index: usize = 0;
         for (bytes, format) in &input_sources {
             let inputs = parse_input(bytes, *format)?;
-            all_docs.extend(inputs);
+            for input in inputs {
+                // Apply --doc filter if specified
+                if let Some(target_doc) = args.document {
+                    if global_doc_index == target_doc {
+                        all_docs.push(input);
+                    }
+                } else {
+                    all_docs.push(input);
+                }
+                global_doc_index += 1;
+            }
         }
 
         // Create slurped array and evaluate
@@ -1220,6 +1305,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             anyhow::bail!("--inplace requires at least one file argument");
         }
 
+        let mut global_doc_index: usize = 0;
         for file_path in &args.files {
             let path = Path::new(file_path);
             let input_bytes = read_file(path)?;
@@ -1230,8 +1316,27 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             let mut output_buffer = Vec::new();
             {
                 let mut buf_writer = BufWriter::new(&mut output_buffer);
-                let is_multi_doc = inputs.len() > 1;
-                for input in &inputs {
+                // Count matching docs for multi-doc separator logic
+                let matching_docs: usize = if let Some(target_doc) = args.document {
+                    if (global_doc_index..global_doc_index + inputs.len()).contains(&target_doc) {
+                        1
+                    } else {
+                        0
+                    }
+                } else {
+                    inputs.len()
+                };
+                let is_multi_doc = matching_docs > 1;
+
+                for (local_idx, input) in inputs.iter().enumerate() {
+                    let current_doc_index = global_doc_index + local_idx;
+                    // Apply --doc filter if specified
+                    if let Some(target_doc) = args.document {
+                        if current_doc_index != target_doc {
+                            continue;
+                        }
+                    }
+
                     if output_config.output_format == OutputFormat::Yaml
                         && !output_config.no_doc
                         && is_multi_doc
@@ -1250,6 +1355,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 }
                 buf_writer.flush()?;
             }
+            global_doc_index += inputs.len();
 
             // Write the output back to the file
             std::fs::write(path, &output_buffer)
@@ -1278,12 +1384,19 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
         // Process all inputs first to collect results, then determine multi-doc status
         // This avoids double-parsing YAML for document counting
+        // Each entry in all_results is a Vec of document results from one file
         let mut all_results: Vec<Vec<Vec<OwnedValue>>> = Vec::new();
+        let mut global_doc_index: usize = 0;
         for (bytes, format) in &input_sources {
             match format {
                 InputFormat::Yaml | InputFormat::Auto => {
                     // Use direct YAML evaluation to preserve position metadata
-                    let doc_results = evaluate_yaml_direct(bytes, &program.expr)?;
+                    // Filter at evaluation time to avoid evaluating (and printing errors for)
+                    // documents that don't match the --doc filter
+                    let doc_filter = args.document.map(|target| (target, global_doc_index));
+                    let (doc_results, num_docs) =
+                        evaluate_yaml_direct_filtered(bytes, &program.expr, doc_filter)?;
+                    global_doc_index += num_docs;
                     all_results.push(doc_results);
                 }
                 InputFormat::Json => {
@@ -1291,15 +1404,23 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     let inputs = parse_input(bytes, InputFormat::Json)?;
                     let mut json_results = Vec::new();
                     for input in inputs {
+                        // Apply --doc filter if specified
+                        if let Some(target_doc) = args.document {
+                            if global_doc_index != target_doc {
+                                global_doc_index += 1;
+                                continue;
+                            }
+                        }
                         let results = evaluate_input(&input, &program.expr, &context)?;
                         json_results.push(results);
+                        global_doc_index += 1;
                     }
                     all_results.push(json_results);
                 }
             }
         }
 
-        // Count total documents from collected results
+        // Count total documents from collected results (after filtering)
         let total_docs: usize = all_results.iter().map(|docs| docs.len()).sum();
         let is_multi_doc = total_docs > 1;
 

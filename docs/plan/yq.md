@@ -91,7 +91,7 @@ succinctly yq '.spec.containers[]' deployment.yaml service.yaml
 | `--no-doc` | Omit document separators (`---`) | ✅ |
 | `--preserve-comments` | Preserve comments in YAML output | ❌ Not planned |
 | `--explode-anchors` | Expand anchor/alias references | ❌ Not planned |
-| `--document N` | Select Nth document from multi-doc stream | ❌ Not planned |
+| `--doc N` | Select Nth document from multi-doc stream (0-indexed) | ✅ |
 | `--all-documents` | Process all documents | ✅ Default behavior |
 
 ## Implementation Phases
@@ -620,3 +620,4 @@ This plan depends on the YAML parser implementation phases defined in [parsing/y
 | 2026-01-20 | Generic evaluator wired into main CLI path |
 | 2026-01-20 | Phase 1-4 marked complete, updated status tables |
 | 2026-01-20 | Added `-R`/`--raw-input` CLI option |
+| 2026-01-20 | Added `--doc N` CLI option for selecting specific document from multi-doc stream |

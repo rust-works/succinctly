@@ -275,6 +275,7 @@ These are CLI-level features, not expression language:
 - [x] `-R` / `--raw-input` - Read lines as strings
 - [x] `-n` / `--null-input` - Don't read input, use null
 - [x] `--tab` - Use tabs for indentation
+- [x] `--doc N` - Select specific document from multi-doc stream (yq only)
 - [ ] `--argjson` / `--slurpfile` / `--rawfile` enhancements
 
 ---
@@ -362,3 +363,4 @@ echo '{"a":1}' | succinctly jq '.a'
 | 2026-01-20 | Added `-s`/`--slurp` CLI option for yq (✅ complete)|
 | 2026-01-20 | Added `from_unix`, `to_unix`, `tz(zone)` yq date/time extensions (✅ complete)|
 | 2026-01-20 | Added `-R`/`--raw-input` CLI option for yq (✅ complete)|
+| 2026-01-20 | Added `--doc N` CLI option for yq document selection (✅ complete)|

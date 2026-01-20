@@ -704,3 +704,102 @@ fn test_raw_input_slurp_filter_empty() -> Result<()> {
     assert_eq!(output, "[\"line1\",\"line2\",\"line3\"]\n");
     Ok(())
 }
+
+// ============================================================================
+// --doc N tests (document selection)
+// ============================================================================
+
+#[test]
+fn test_doc_select_first() -> Result<()> {
+    let input = "---\na: 1\n---\nb: 2\n---\nc: 3";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: 1\n");
+    Ok(())
+}
+
+#[test]
+fn test_doc_select_middle() -> Result<()> {
+    let input = "---\na: 1\n---\nb: 2\n---\nc: 3";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "1"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "b: 2\n");
+    Ok(())
+}
+
+#[test]
+fn test_doc_select_last() -> Result<()> {
+    let input = "---\na: 1\n---\nb: 2\n---\nc: 3";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "2"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "c: 3\n");
+    Ok(())
+}
+
+#[test]
+fn test_doc_select_out_of_range() -> Result<()> {
+    let input = "---\na: 1\n---\nb: 2";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "5"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, ""); // No output for out of range
+    Ok(())
+}
+
+#[test]
+fn test_doc_select_with_query() -> Result<()> {
+    let input = "---\nname: Alice\nage: 30\n---\nname: Bob\nage: 25";
+    let (output, exit_code) = run_yq_stdin(".name", input, &["--doc", "1"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "Bob\n");
+    Ok(())
+}
+
+#[test]
+fn test_doc_select_json_output() -> Result<()> {
+    let input = "---\na: 1\n---\nb: 2";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "0", "-o", "json", "-I", "0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "{\"a\":1}\n");
+    Ok(())
+}
+
+#[test]
+fn test_doc_select_single_doc() -> Result<()> {
+    // Single document (no separators) - --doc 0 should work
+    let input = "a: 1\nb: 2";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: 1\nb: 2\n");
+    Ok(())
+}
+
+#[test]
+fn test_doc_select_single_doc_out_of_range() -> Result<()> {
+    // Single document - --doc 1 should return nothing
+    let input = "a: 1";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "1"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "");
+    Ok(())
+}
+
+#[test]
+fn test_doc_incompatible_with_raw_input() -> Result<()> {
+    let input = "line1\nline2";
+    let (_, exit_code) = run_yq_stdin(".", input, &["--doc", "0", "-R"])?;
+    // Should fail with non-zero exit code
+    assert_ne!(exit_code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_doc_with_slurp() -> Result<()> {
+    // --doc with --slurp filters before slurping
+    let input = "---\na: 1\n---\nb: 2\n---\nc: 3";
+    let (output, exit_code) =
+        run_yq_stdin(".", input, &["--doc", "1", "-s", "-o", "json", "-I", "0"])?;
+    assert_eq!(exit_code, 0);
+    // Should slurp only the selected document into an array
+    assert_eq!(output, "[{\"b\":2}]\n");
+    Ok(())
+}
