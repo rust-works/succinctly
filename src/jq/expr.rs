@@ -903,6 +903,12 @@ pub enum Builtin {
     /// Input: now | tz("America/New_York") -> "2024-01-20T11:00:00-05:00"
     /// Supported zones: "UTC", "local", or IANA timezone names
     Tz(Box<Expr>),
+
+    // Phase 22: File operations (yq)
+    /// `load(file)` - load external YAML/JSON file and return its parsed content
+    /// Input: load("config.yaml") -> {parsed content}
+    /// Supports both YAML and JSON files (auto-detected by extension)
+    Load(Box<Expr>),
 }
 
 /// Arithmetic operators.

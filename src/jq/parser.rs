@@ -3040,6 +3040,18 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::ToBoolean));
         }
 
+        // Phase 22: File operations (yq)
+        if self.matches_keyword("load") {
+            self.consume_keyword("load");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let file_expr = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Load(Box::new(file_expr))));
+        }
+
         Ok(None)
     }
 

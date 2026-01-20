@@ -1453,6 +1453,9 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         Builtin::FromUnix => builtin_from_unix(value, optional),
         Builtin::ToUnix => builtin_to_unix(value, optional),
         Builtin::Tz(zone) => builtin_tz(zone, value, optional),
+
+        // Phase 22: File operations (yq)
+        Builtin::Load(file_expr) => builtin_load(file_expr, value, optional),
     }
 }
 
@@ -6261,6 +6264,9 @@ fn substitute_var_in_builtin(
         Builtin::FromUnix => Builtin::FromUnix,
         Builtin::ToUnix => Builtin::ToUnix,
         Builtin::Tz(e) => Builtin::Tz(Box::new(substitute_var(e, var_name, replacement))),
+
+        // Phase 22: File operations (yq)
+        Builtin::Load(e) => Builtin::Load(Box::new(substitute_var(e, var_name, replacement))),
     }
 }
 
@@ -9518,6 +9524,186 @@ fn builtin_tz<'a, W: Clone + AsRef<[u64]>>(
     QueryResult::Owned(OwnedValue::String(result))
 }
 
+// Phase 22: File operations (yq)
+
+/// Builtin: load(file) - load external YAML/JSON file and return its parsed content
+/// This function is only available with the "std" feature enabled.
+#[cfg(feature = "std")]
+fn builtin_load<'a, W: Clone + AsRef<[u64]>>(
+    file_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    use std::path::Path;
+
+    // Evaluate the file expression to get the filename
+    let filename = match result_to_owned(eval_single(file_expr, value, optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "load filename")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Read the file contents
+    let file_bytes = match std::fs::read(&filename) {
+        Ok(bytes) => bytes,
+        Err(_) if optional => {
+            // In optional mode, return null for file errors
+            return QueryResult::None;
+        }
+        Err(e) => {
+            return QueryResult::Error(EvalError::new(format!(
+                "load: failed to read file '{}': {}",
+                filename, e
+            )));
+        }
+    };
+
+    // Detect format from file extension
+    let path = Path::new(&filename);
+    let is_json = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    if is_json {
+        // Parse as JSON
+        let index = crate::json::JsonIndex::build(&file_bytes);
+        let cursor = index.root(&file_bytes);
+        QueryResult::Owned(to_owned(&cursor.value()))
+    } else {
+        // Parse as YAML (default)
+        match crate::yaml::YamlIndex::build(&file_bytes) {
+            Ok(index) => {
+                let root = index.root(&file_bytes);
+                // YAML documents are wrapped in a sequence at the root
+                match root.value() {
+                    crate::yaml::YamlValue::Sequence(docs) => {
+                        // If single document, return it directly; otherwise return array
+                        let doc_values: Vec<OwnedValue> =
+                            docs.into_iter().map(|v| yaml_value_to_owned(v)).collect();
+                        if doc_values.len() == 1 {
+                            QueryResult::Owned(doc_values.into_iter().next().unwrap())
+                        } else {
+                            QueryResult::Owned(OwnedValue::Array(doc_values))
+                        }
+                    }
+                    other => {
+                        // Single value at root
+                        QueryResult::Owned(yaml_value_to_owned(other))
+                    }
+                }
+            }
+            Err(_) if optional => QueryResult::None,
+            Err(e) => QueryResult::Error(EvalError::new(format!(
+                "load: failed to parse YAML file '{}': {}",
+                filename, e
+            ))),
+        }
+    }
+}
+
+/// Convert a YAML value to OwnedValue (helper for load)
+#[cfg(feature = "std")]
+fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
+    value: crate::yaml::YamlValue<'_, W>,
+) -> OwnedValue {
+    use crate::yaml::YamlValue;
+
+    match value {
+        YamlValue::Null => OwnedValue::Null,
+        YamlValue::String(s) => {
+            // Get the string value
+            let str_value = match s.as_str() {
+                Ok(cow) => cow.into_owned(),
+                Err(_) => return OwnedValue::Null,
+            };
+
+            // Quoted strings are kept as strings
+            if !s.is_unquoted() {
+                return OwnedValue::String(str_value);
+            }
+
+            // Type detection for unquoted scalars
+            match str_value.as_str() {
+                "null" | "~" | "" => return OwnedValue::Null,
+                "true" | "True" | "TRUE" => return OwnedValue::Bool(true),
+                "false" | "False" | "FALSE" => return OwnedValue::Bool(false),
+                _ => {}
+            }
+
+            // Try to parse as number
+            if let Ok(n) = str_value.parse::<i64>() {
+                return OwnedValue::Int(n);
+            }
+            if let Ok(f) = str_value.parse::<f64>() {
+                if !f.is_nan() {
+                    return OwnedValue::Float(f);
+                }
+            }
+
+            // Check for special float literals
+            match str_value.as_str() {
+                ".inf" | ".Inf" | ".INF" => return OwnedValue::Float(f64::INFINITY),
+                "-.inf" | "-.Inf" | "-.INF" => return OwnedValue::Float(f64::NEG_INFINITY),
+                ".nan" | ".NaN" | ".NAN" => return OwnedValue::Float(f64::NAN),
+                _ => {}
+            }
+
+            OwnedValue::String(str_value)
+        }
+        YamlValue::Sequence(elements) => {
+            let items: Vec<OwnedValue> = elements.into_iter().map(yaml_value_to_owned).collect();
+            OwnedValue::Array(items)
+        }
+        YamlValue::Mapping(fields) => {
+            let mut map = indexmap::IndexMap::new();
+            for field in fields {
+                let key = match field.key() {
+                    YamlValue::String(s) => match s.as_str() {
+                        Ok(cow) => cow.into_owned(),
+                        Err(_) => continue,
+                    },
+                    other => {
+                        // Non-string keys - convert to string representation
+                        let v = yaml_value_to_owned(other);
+                        v.to_json()
+                    }
+                };
+                let value = yaml_value_to_owned(field.value());
+                map.insert(key, value);
+            }
+            OwnedValue::Object(map)
+        }
+        YamlValue::Alias { target, .. } => {
+            // Resolve alias by following the target cursor
+            if let Some(target_cursor) = target {
+                yaml_value_to_owned(target_cursor.value())
+            } else {
+                OwnedValue::Null
+            }
+        }
+        YamlValue::Error(_) => OwnedValue::Null,
+    }
+}
+
+/// Builtin: load(file) - stub for no_std builds (returns error)
+#[cfg(not(feature = "std"))]
+fn builtin_load<'a, W: Clone + AsRef<[u64]>>(
+    _file_expr: &Expr,
+    _value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    if optional {
+        QueryResult::None
+    } else {
+        QueryResult::Error(EvalError::new(
+            "load() requires the 'std' feature to be enabled".to_string(),
+        ))
+    }
+}
+
 // Phase 17: Combinations
 
 /// Builtin: combinations - generate all combinations from array of arrays
@@ -12529,6 +12715,9 @@ fn expand_func_calls_in_builtin(
         Builtin::FromUnix => Builtin::FromUnix,
         Builtin::ToUnix => Builtin::ToUnix,
         Builtin::Tz(e) => Builtin::Tz(Box::new(expand_func_calls(e, func_name, params, body))),
+
+        // Phase 22: File operations (yq)
+        Builtin::Load(e) => Builtin::Load(Box::new(expand_func_calls(e, func_name, params, body))),
     }
 }
 
@@ -12814,6 +13003,9 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::FromUnix => Builtin::FromUnix,
         Builtin::ToUnix => Builtin::ToUnix,
         Builtin::Tz(e) => Builtin::Tz(Box::new(substitute_func_param(e, param, arg))),
+
+        // Phase 22: File operations (yq)
+        Builtin::Load(e) => Builtin::Load(Box::new(substitute_func_param(e, param, arg))),
     }
 }
 
@@ -17310,5 +17502,223 @@ mod tests {
                 assert_eq!(arr[1], OwnedValue::Array(vec![OwnedValue::Int(3), OwnedValue::Int(4)]));
             }
         );
+    }
+
+    // ========== Phase 22: load(file) tests ==========
+
+    #[cfg(feature = "std")]
+    mod load_tests {
+        use super::*;
+        use std::fs;
+
+        fn with_temp_file<F, R>(name: &str, content: &str, f: F) -> R
+        where
+            F: FnOnce(&str) -> R,
+        {
+            let path = format!("/tmp/succinctly_test_{}", name);
+            fs::write(&path, content).unwrap();
+            let result = f(&path);
+            let _ = fs::remove_file(&path);
+            result
+        }
+
+        #[test]
+        fn test_load_json_file() {
+            with_temp_file(
+                "load_test.json",
+                r#"{"name": "test", "value": 42}"#,
+                |path| {
+                    let json_bytes: &[u8] = b"null";
+                    let index = JsonIndex::build(json_bytes);
+                    let cursor = index.root(json_bytes);
+                    let query = format!(r#"load("{}")"#, path);
+                    let expr = parse(&query).unwrap();
+                    match eval(&expr, cursor) {
+                        QueryResult::Owned(OwnedValue::Object(obj)) => {
+                            assert_eq!(
+                                obj.get("name"),
+                                Some(&OwnedValue::String("test".to_string()))
+                            );
+                            assert_eq!(obj.get("value"), Some(&OwnedValue::Int(42)));
+                        }
+                        other => panic!("unexpected result: {:?}", other),
+                    }
+                },
+            );
+        }
+
+        #[test]
+        fn test_load_yaml_file() {
+            with_temp_file("load_test.yaml", "name: test\nvalue: 42\n", |path| {
+                let json_bytes: &[u8] = b"null";
+                let index = JsonIndex::build(json_bytes);
+                let cursor = index.root(json_bytes);
+                let query = format!(r#"load("{}")"#, path);
+                let expr = parse(&query).unwrap();
+                match eval(&expr, cursor) {
+                    QueryResult::Owned(OwnedValue::Object(obj)) => {
+                        assert_eq!(
+                            obj.get("name"),
+                            Some(&OwnedValue::String("test".to_string()))
+                        );
+                        assert_eq!(obj.get("value"), Some(&OwnedValue::Int(42)));
+                    }
+                    other => panic!("unexpected result: {:?}", other),
+                }
+            });
+        }
+
+        #[test]
+        fn test_load_yml_extension() {
+            with_temp_file("load_test.yml", "items:\n  - a\n  - b\n", |path| {
+                let json_bytes: &[u8] = b"null";
+                let index = JsonIndex::build(json_bytes);
+                let cursor = index.root(json_bytes);
+                let query = format!(r#"load("{}")"#, path);
+                let expr = parse(&query).unwrap();
+                match eval(&expr, cursor) {
+                    QueryResult::Owned(OwnedValue::Object(obj)) => {
+                        let items = obj.get("items").unwrap();
+                        match items {
+                            OwnedValue::Array(arr) => {
+                                assert_eq!(arr.len(), 2);
+                                assert_eq!(arr[0], OwnedValue::String("a".to_string()));
+                                assert_eq!(arr[1], OwnedValue::String("b".to_string()));
+                            }
+                            _ => panic!("expected array"),
+                        }
+                    }
+                    other => panic!("unexpected result: {:?}", other),
+                }
+            });
+        }
+
+        #[test]
+        fn test_load_nonexistent_file() {
+            let json_bytes: &[u8] = b"null";
+            let index = JsonIndex::build(json_bytes);
+            let cursor = index.root(json_bytes);
+            let expr = parse(r#"load("/tmp/nonexistent_file_12345.yaml")"#).unwrap();
+            match eval(&expr, cursor) {
+                QueryResult::Error(err) => {
+                    assert!(
+                        err.message.contains("Failed to read file")
+                            || err.message.contains("No such file")
+                    );
+                }
+                other => panic!("expected error, got: {:?}", other),
+            }
+        }
+
+        #[test]
+        fn test_load_optional_nonexistent() {
+            // Use try-catch for optional behavior since ? operator applies to field access
+            let json_bytes: &[u8] = b"null";
+            let index = JsonIndex::build(json_bytes);
+            let cursor = index.root(json_bytes);
+            let expr = parse(r#"try load("/tmp/nonexistent_file_12345.yaml") catch null"#).unwrap();
+            match eval(&expr, cursor) {
+                QueryResult::Owned(OwnedValue::Null) => {}
+                other => panic!("expected null, got: {:?}", other),
+            }
+        }
+
+        #[test]
+        fn test_load_with_try_catch() {
+            let json_bytes: &[u8] = b"null";
+            let index = JsonIndex::build(json_bytes);
+            let cursor = index.root(json_bytes);
+            let expr =
+                parse(r#"try load("/tmp/nonexistent_file_12345.yaml") catch "not found""#).unwrap();
+            match eval(&expr, cursor) {
+                QueryResult::Owned(OwnedValue::String(s)) => {
+                    assert_eq!(s, "not found");
+                }
+                other => panic!("expected 'not found', got: {:?}", other),
+            }
+        }
+
+        #[test]
+        fn test_load_combined_with_input() {
+            with_temp_file("config.yaml", "setting: enabled\n", |path| {
+                let json_bytes: &[u8] = br#"{"name": "main"}"#;
+                let index = JsonIndex::build(json_bytes);
+                let cursor = index.root(json_bytes);
+                let query = format!(r#". + {{config: load("{}")}}"#, path);
+                let expr = parse(&query).unwrap();
+                match eval(&expr, cursor) {
+                    QueryResult::Owned(OwnedValue::Object(obj)) => {
+                        assert_eq!(
+                            obj.get("name"),
+                            Some(&OwnedValue::String("main".to_string()))
+                        );
+                        let config = obj.get("config").unwrap();
+                        match config {
+                            OwnedValue::Object(cfg) => {
+                                assert_eq!(
+                                    cfg.get("setting"),
+                                    Some(&OwnedValue::String("enabled".to_string()))
+                                );
+                            }
+                            _ => panic!("expected config to be object"),
+                        }
+                    }
+                    other => panic!("unexpected result: {:?}", other),
+                }
+            });
+        }
+
+        #[test]
+        fn test_load_multi_document_yaml() {
+            with_temp_file("multi.yaml", "---\nname: doc1\n---\nname: doc2\n", |path| {
+                let json_bytes: &[u8] = b"null";
+                let index = JsonIndex::build(json_bytes);
+                let cursor = index.root(json_bytes);
+                let query = format!(r#"load("{}")"#, path);
+                let expr = parse(&query).unwrap();
+                match eval(&expr, cursor) {
+                    QueryResult::Owned(OwnedValue::Array(arr)) => {
+                        assert_eq!(arr.len(), 2);
+                        match &arr[0] {
+                            OwnedValue::Object(obj) => {
+                                assert_eq!(
+                                    obj.get("name"),
+                                    Some(&OwnedValue::String("doc1".to_string()))
+                                );
+                            }
+                            _ => panic!("expected first doc to be object"),
+                        }
+                        match &arr[1] {
+                            OwnedValue::Object(obj) => {
+                                assert_eq!(
+                                    obj.get("name"),
+                                    Some(&OwnedValue::String("doc2".to_string()))
+                                );
+                            }
+                            _ => panic!("expected second doc to be object"),
+                        }
+                    }
+                    other => panic!("expected array of documents, got: {:?}", other),
+                }
+            });
+        }
+
+        #[test]
+        fn test_load_with_dynamic_path() {
+            with_temp_file("dynamic.json", r#"{"loaded": true}"#, |path| {
+                // Input contains the path to load
+                let json_bytes = format!(r#"{{"path": "{}"}}"#, path);
+                let json_bytes = json_bytes.as_bytes();
+                let index = JsonIndex::build(json_bytes);
+                let cursor = index.root(json_bytes);
+                let expr = parse(r#"load(.path)"#).unwrap();
+                match eval(&expr, cursor) {
+                    QueryResult::Owned(OwnedValue::Object(obj)) => {
+                        assert_eq!(obj.get("loaded"), Some(&OwnedValue::Bool(true)));
+                    }
+                    other => panic!("unexpected result: {:?}", other),
+                }
+            });
+        }
     }
 }

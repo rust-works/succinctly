@@ -1247,7 +1247,8 @@ fn contains_split_doc(expr: &Expr) -> bool {
             | Builtin::Splits(e)
             | Builtin::Range(e)
             | Builtin::CombinationsN(e)
-            | Builtin::Tz(e) => contains_split_doc(e),
+            | Builtin::Tz(e)
+            | Builtin::Load(e) => contains_split_doc(e),
             Builtin::RecurseCond(e1, e2)
             | Builtin::SetPath(e1, e2)
             | Builtin::Pow(e1, e2)

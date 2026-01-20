@@ -199,7 +199,7 @@ These operators extend jq compatibility with yq-specific functionality commonly 
 | `pivot` | Transpose arrays/objects (SQL-style) | Medium | ✅ |
 | `document_index` / `di` | Get 0-indexed document position | High | ✅ |
 | `split_doc` | Split into multiple YAML documents | Low | ✅ |
-| `load(file)` | Load external YAML file | Low | ❌ |
+| `load(file)` | Load external YAML/JSON file | Low | ✅ |
 | `eval(expr)` | Evaluate string as expression | Low | ❌ |
 
 #### Operator Details
@@ -256,11 +256,33 @@ select(document_index == 1)  # → only second document
 # c
 ```
 
+**`load(file)`** - Load external YAML or JSON file ✅
+```bash
+# Load YAML file
+load("config.yaml")  # → {parsed YAML content}
+
+# Load JSON file (auto-detected by extension)
+load("data.json")  # → {parsed JSON content}
+
+# Combine with input
+. + {config: load("config.yaml")}
+
+# Dynamic path from input
+load(.config_path)
+
+# Multi-document YAML returns array
+load("multi.yaml")  # → [doc1, doc2, ...] or single doc if only one
+
+# Error handling with try-catch
+try load("optional.yaml") catch {default: "value"}
+```
+
 **Implementation Notes:**
 - `omit` is inverse of jq's `pick` (if implemented)
 - `shuffle` uses non-cryptographic RNG
 - `pivot` requires handling heterogeneous arrays
 - `document_index` requires tracking document context during evaluation
+- `load` auto-detects format from extension (.json vs .yaml/.yml)
 
 ---
 
@@ -631,3 +653,4 @@ This plan depends on the YAML parser implementation phases defined in [parsing/y
 | 2026-01-20 | Added `--doc N` CLI option for selecting specific document from multi-doc stream |
 | 2026-01-20 | Added `@props` format encoder for Java properties output |
 | 2026-01-20 | Added `split_doc` operator for outputting results as separate YAML documents |
+| 2026-01-20 | Added `load(file)` operator to load external YAML/JSON files |
