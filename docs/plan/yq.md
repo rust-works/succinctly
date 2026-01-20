@@ -11,9 +11,9 @@ This document outlines the plan to add a `yq` subcommand to succinctly for query
 | **3** | Anchors, aliases, YAML output | ✅ Mostly complete |
 | **4** | Multi-document streams | ✅ Mostly complete |
 | **5** | YAML-specific query extensions | 🔄 Partial |
-| **6** | yq-specific operators | ❌ Not planned |
-| **7** | Date/time operators | ❌ Not planned |
-| **8** | Additional format encoders | ❌ Not planned |
+| **6** | yq-specific operators | 🔜 In scope |
+| **7** | Date/time operators | 🔜 In scope |
+| **8** | Additional format encoders | 🔜 In scope |
 
 ### Performance (Apple M1 Max)
 
@@ -185,51 +185,195 @@ succinctly yq '.spec.containers[]' deployment.yaml service.yaml
 
 ---
 
-### Phase 6: yq-Specific Operators ❌ NOT PLANNED
+### Phase 6: yq-Specific Operators 🔜 IN SCOPE
 
 **Goal**: Operators unique to yq (Mike Farah's) not in standard jq.
 
-These operators are yq-specific extensions that go beyond jq compatibility. Implement on demand if users request them.
+These operators extend jq compatibility with yq-specific functionality commonly used in DevOps workflows.
 
-| Operator | Description | Priority |
-|----------|-------------|----------|
-| `omit(keys)` | Remove keys from object | Low |
-| `shuffle` | Randomize array order | Low |
-| `pivot` | Transpose arrays/objects | Low |
-| `split_doc` | Split into multiple documents | Low |
-| `document_index` | Get current document index | Low |
-| `load(file)` | Load external YAML file | Low |
-| `eval(expr)` | Evaluate string as expression | Low |
+| Operator | Description | Priority | Status |
+|----------|-------------|----------|--------|
+| `omit(keys)` | Remove keys from object/indices from array | High | ❌ |
+| `shuffle` | Randomize array order | Medium | ❌ |
+| `pivot` | Transpose arrays/objects (SQL-style) | Medium | ❌ |
+| `document_index` / `di` | Get 0-indexed document position | High | ❌ |
+| `split_doc` | Split into multiple YAML documents | Low | ❌ |
+| `load(file)` | Load external YAML file | Low | ❌ |
+| `eval(expr)` | Evaluate string as expression | Low | ❌ |
+
+#### Operator Details
+
+**`omit(keys)`** - Remove keys from object or indices from array
+```bash
+# Remove keys from object
+{a: 1, b: 2, c: 3} | omit(["a", "c"])  # → {b: 2}
+
+# Remove indices from array
+[a, b, c, d] | omit([0, 2])  # → [b, d]
+
+# Gracefully ignores non-existent keys
+{a: 1} | omit(["b", "c"])  # → {a: 1}
+```
+
+**`shuffle`** - Randomize array element order
+```bash
+[1, 2, 3, 4, 5] | shuffle  # → [3, 1, 5, 2, 4] (random)
+```
+
+**`pivot`** - Transpose data structures (SQL PIVOT emulation)
+```bash
+# Transpose sequences
+[[a, b], [x, y]] | pivot  # → [[a, x], [b, y]]
+
+# Transpose objects (collect values by key)
+[{name: "Alice", age: 30}, {name: "Bob", age: 25}] | pivot
+# → {name: ["Alice", "Bob"], age: [30, 25]}
+
+# Handles missing keys with null padding
+[{a: 1}, {a: 2, b: 3}] | pivot  # → {a: [1, 2], b: [null, 3]}
+```
+
+**`document_index`** / **`di`** - Get document position in multi-doc stream
+```bash
+# Multi-doc YAML with ---
+# Returns 0 for first doc, 1 for second, etc.
+document_index  # or: di
+
+# Filter by document index
+select(document_index == 1)  # → only second document
+```
+
+**`split_doc`** - Split results into separate YAML documents
+```bash
+# Input: [a, b, c]
+.[] | split_doc
+# Output:
+# a
+# ---
+# b
+# ---
+# c
+```
+
+**Implementation Notes:**
+- `omit` is inverse of jq's `pick` (if implemented)
+- `shuffle` uses non-cryptographic RNG
+- `pivot` requires handling heterogeneous arrays
+- `document_index` requires tracking document context during evaluation
 
 ---
 
-### Phase 7: Date/Time Operators ❌ NOT PLANNED
+### Phase 7: Date/Time Operators 🔜 IN SCOPE
 
 **Goal**: Date/time manipulation operators from yq.
 
-| Operator | Description | Priority |
-|----------|-------------|----------|
-| `now` | Current Unix timestamp | Low |
-| `strftime(fmt)` | Format timestamp as string | Low |
-| `strptime(fmt)` | Parse string to timestamp | Low |
-| `from_unix` | Convert Unix timestamp | Low |
-| `to_unix` | Convert to Unix timestamp | Low |
-| `tz(zone)` | Convert timezone | Low |
-| `with_dtf(fmt)` | Set date format | Low |
+These operators use Go's time format strings (not POSIX strftime).
+
+| Operator | Description | Priority | Status |
+|----------|-------------|----------|--------|
+| `now` | Current timestamp (RFC3339) | High | ❌ |
+| `strftime(fmt)` | Format timestamp as string | High | ❌ |
+| `strptime(fmt)` | Parse string to timestamp | High | ❌ |
+| `from_unix` | Convert Unix epoch to datetime | Medium | ❌ |
+| `to_unix` | Convert datetime to Unix epoch | Medium | ❌ |
+| `tz(zone)` | Convert to timezone | Medium | ❌ |
+| `with_dtf(fmt)` | Set datetime format context | Low | ❌ |
+
+#### Operator Details
+
+**`now`** - Current timestamp in RFC3339 format
+```bash
+now  # → "2024-01-20T15:04:05Z"
+.timestamp = now
+```
+
+**`strftime(fmt)`** - Format datetime to string
+```bash
+# Go time format: "2006-01-02T15:04:05Z07:00"
+.date | strftime("2006-01-02")  # → "2024-01-20"
+.date | strftime("Monday, 02-Jan-06")  # → "Saturday, 20-Jan-24"
+```
+
+**`strptime(fmt)`** - Parse string to datetime
+```bash
+"2024-01-20" | strptime("2006-01-02")  # → datetime object
+```
+
+**`from_unix`** - Unix epoch to datetime
+```bash
+1705766400 | from_unix  # → "2024-01-20T16:00:00Z"
+```
+
+**`to_unix`** - Datetime to Unix epoch
+```bash
+now | to_unix  # → 1705766400
+```
+
+**`tz(zone)`** - Convert to timezone
+```bash
+now | tz("America/New_York")
+now | tz("UTC")
+now | tz("local")  # system timezone
+```
+
+**Date Arithmetic:**
+```bash
+.time += "3h10m"   # Add duration
+.time -= "24h"     # Subtract duration
+```
+
+**Implementation Notes:**
+- Go time format uses "2006-01-02 15:04:05" as reference date
+- Requires `chrono` crate for Rust implementation
+- Timezone handling via `chrono-tz` crate
+- Duration parsing: "1h", "30m", "2h30m", etc.
 
 ---
 
-### Phase 8: Additional Format Encoders ❌ NOT PLANNED
+### Phase 8: Additional Format Encoders 🔜 IN SCOPE
 
 **Goal**: Format conversion operators beyond standard jq.
 
-| Operator | Description | Priority |
-|----------|-------------|----------|
-| `@yaml` | Encode as YAML string | Medium |
-| `@xml` | Encode as XML string | Low |
-| `@props` | Encode as Java properties | Low |
+| Operator | Description | Priority | Status |
+|----------|-------------|----------|--------|
+| `@yaml` / `to_yaml` | Encode as YAML string | High | ❌ |
+| `@props` / `to_props` | Encode as Java properties | Medium | ❌ |
+| `@xml` / `to_xml` | Encode as XML string | Low | ❌ |
 
-**Note**: `@yaml` could be useful for YAML-to-YAML transformations.
+#### Operator Details
+
+**`@yaml`** / **`to_yaml`** - Encode value as YAML string
+```bash
+{a: 1, b: 2} | @yaml
+# → "a: 1\nb: 2\n"
+
+# With custom indentation
+{a: 1} | to_yaml(4)  # 4-space indent
+
+# Embedding YAML in YAML (common use case)
+.config = (.data | @yaml)
+```
+
+**`@props`** / **`to_props`** - Encode as Java properties
+```bash
+{database: "postgres", port: 5432} | @props
+# → "database = postgres\nport = 5432\n"
+```
+
+**`@xml`** / **`to_xml`** - Encode as XML
+```bash
+{root: {item: "value"}} | @xml
+# → "<root><item>value</item></root>"
+
+# Compact (single line)
+{root: {item: "value"}} | to_xml(0)
+```
+
+**Implementation Notes:**
+- `@yaml` reuses existing YAML output formatting
+- `@props` is straightforward key=value formatting
+- `@xml` requires handling attributes (prefix convention: `+@attr`)
+- All encoders should handle nested structures
 
 ---
 
@@ -460,6 +604,7 @@ This plan depends on the YAML parser implementation phases defined in [parsing/y
 
 | Date | Change |
 |------|--------|
+| 2026-01-20 | Phase 6-8 brought into scope with detailed operator specs |
 | 2026-01-20 | Added Phase 6-8 for yq-specific features (not planned) |
 | 2026-01-20 | Added `--slurp` CLI option |
 | 2026-01-20 | Generic evaluator wired into main CLI path |
