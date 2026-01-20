@@ -885,6 +885,18 @@ pub enum Builtin {
     /// `skip(n; expr)` - skip first n outputs from expr
     /// Outputs all remaining values after skipping the first n
     Skip(Box<Expr>, Box<Expr>),
+
+    // Phase 21: Extended Date/Time functions (yq)
+    /// `from_unix` - convert Unix epoch to ISO 8601 date string
+    /// Input: 1705766400 -> "2024-01-20T16:00:00Z"
+    FromUnix,
+    /// `to_unix` - convert ISO 8601 date string to Unix epoch
+    /// Input: "2024-01-20T16:00:00Z" -> 1705766400
+    ToUnix,
+    /// `tz(zone)` - convert Unix timestamp to datetime in specified timezone
+    /// Input: now | tz("America/New_York") -> "2024-01-20T11:00:00-05:00"
+    /// Supported zones: "UTC", "local", or IANA timezone names
+    Tz(Box<Expr>),
 }
 
 /// Arithmetic operators.

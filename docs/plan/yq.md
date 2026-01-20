@@ -11,8 +11,8 @@ This document outlines the plan to add a `yq` subcommand to succinctly for query
 | **3** | Anchors, aliases, YAML output | ✅ Mostly complete |
 | **4** | Multi-document streams | ✅ Mostly complete |
 | **5** | YAML-specific query extensions | 🔄 Partial |
-| **6** | yq-specific operators | 🔜 In scope |
-| **7** | Date/time operators | 🔄 Partial |
+| **6** | yq-specific operators | ✅ Mostly complete |
+| **7** | Date/time operators | ✅ Mostly complete |
 | **8** | Additional format encoders | 🔜 In scope |
 
 ### Performance (Apple M1 Max)
@@ -263,7 +263,7 @@ select(document_index == 1)  # → only second document
 
 ---
 
-### Phase 7: Date/Time Operators 🔜 IN SCOPE
+### Phase 7: Date/Time Operators ✅ MOSTLY COMPLETE
 
 **Goal**: Date/time manipulation operators from yq.
 
@@ -274,9 +274,9 @@ These operators use POSIX strftime format strings (jq-compatible).
 | `now` | Current Unix timestamp (float) | High | ✅ |
 | `strftime(fmt)` | Format broken-down time as string | High | ✅ |
 | `strptime(fmt)` | Parse string to broken-down time | High | ✅ |
-| `from_unix` | Convert Unix epoch to datetime | Medium | ❌ |
-| `to_unix` | Convert datetime to Unix epoch | Medium | ❌ |
-| `tz(zone)` | Convert to timezone | Medium | ❌ |
+| `from_unix` | Convert Unix epoch to datetime | Medium | ✅ |
+| `to_unix` | Convert datetime to Unix epoch | Medium | ✅ |
+| `tz(zone)` | Convert to timezone | Medium | ✅ |
 | `with_dtf(fmt)` | Set datetime format context | Low | ❌ |
 
 #### Operator Details
@@ -300,24 +300,32 @@ now | gmtime | strftime("%Y-%m-%dT%H:%M:%SZ")  # → "2026-01-20T15:04:05Z"
 # Returns [year, month(0-11), day, hour, min, sec, weekday(0-6), yearday]
 ```
 
-**`from_unix`** - Unix epoch to datetime
+**`from_unix`** - Unix epoch to datetime ✅
 ```bash
 1705766400 | from_unix  # → "2024-01-20T16:00:00Z"
 ```
 
-**`to_unix`** - Datetime to Unix epoch
+**`to_unix`** - Datetime to Unix epoch ✅
 ```bash
-now | to_unix  # → 1705766400
+"2024-01-20T16:00:00Z" | to_unix  # → 1705766400
 ```
 
-**`tz(zone)`** - Convert to timezone
+**`tz(zone)`** - Convert to timezone ✅
 ```bash
-now | tz("America/New_York")
-now | tz("UTC")
-now | tz("local")  # system timezone
+1705314600 | tz("America/New_York")  # → "2024-01-15T05:30:00-05:00"
+1705314600 | tz("Asia/Tokyo")        # → "2024-01-15T19:30:00+09:00"
+1705314600 | tz("UTC")               # → "2024-01-15T10:30:00Z"
+1705314600 | tz("+05:30")            # → "2024-01-15T16:00:00+05:30"
+1705314600 | tz("PST")               # → "2024-01-15T02:30:00-08:00"
 ```
 
-**Date Arithmetic:**
+Supported timezone formats:
+- IANA names: `America/New_York`, `Europe/London`, `Asia/Tokyo`, etc.
+- Abbreviations: `EST`, `PST`, `JST`, `CET`, `UTC`, `GMT`, etc.
+- Numeric offsets: `+05:30`, `-0800`, `+09`
+- Special: `local` (returns UTC, full local support requires platform-specific code)
+
+**Date Arithmetic:** (not yet implemented)
 ```bash
 .time += "3h10m"   # Add duration
 .time -= "24h"     # Subtract duration
@@ -327,7 +335,8 @@ now | tz("local")  # system timezone
 - `now`, `strftime`, `strptime`, `gmtime`, `mktime` are jq-compatible (already implemented)
 - Uses POSIX strftime format specifiers: `%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, etc.
 - Broken-down time format: `[year, month(0-11), day, hour, min, sec, weekday, yearday]`
-- `from_unix`/`to_unix`/`tz` are yq-specific extensions (not yet implemented)
+- `from_unix`/`to_unix`/`tz` are yq-specific extensions (now implemented)
+- DST is approximated for major timezones (US, Europe, Australia)
 
 ---
 

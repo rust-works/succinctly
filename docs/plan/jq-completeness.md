@@ -191,6 +191,21 @@ The implementation is already production-ready for ~90% of jq use cases.
 - [x] `tojsonstream` / `fromjsonstream`
 - [x] `map(f)` / `map_values(f)`
 
+### Date/Time Functions
+- [x] `now` - Current Unix timestamp as float
+- [x] `gmtime` - Convert Unix timestamp to broken-down UTC time
+- [x] `localtime` - Convert Unix timestamp to broken-down local time
+- [x] `mktime` - Convert broken-down time to Unix timestamp
+- [x] `strftime(fmt)` - Format broken-down time as string
+- [x] `strptime(fmt)` - Parse string to broken-down time
+- [x] `todate` / `todateiso8601` - Convert Unix timestamp to ISO 8601 string
+- [x] `fromdate` / `fromdateiso8601` - Parse ISO 8601 string to Unix timestamp
+- [x] `from_unix` - Convert Unix epoch to ISO 8601 string (yq extension)
+- [x] `to_unix` - Parse ISO 8601 string to Unix epoch (yq extension)
+- [x] `tz(zone)` - Convert Unix timestamp to datetime in specified timezone (yq extension)
+
+**Timezone support**: IANA names (`America/New_York`), abbreviations (`EST`, `PST`, `JST`), numeric offsets (`+05:30`, `-0800`), and `UTC`/`GMT`.
+
 ### YAML Metadata Functions (yq)
 - [x] `tag` - return YAML type tag (!!str, !!int, !!map, etc.) - fully working
 - [x] `anchor` - return anchor name for nodes with anchors (`&name`) - fully working at cursor level
@@ -345,3 +360,4 @@ echo '{"a":1}' | succinctly jq '.a'
 | 2026-01-20 | Added YamlCursor::line() and column() methods for yq position metadata (✅ complete)|
 | 2026-01-20 | Added `line` and `column` jq builtins (return 0 in evaluation, full support at cursor level)|
 | 2026-01-20 | Added `-s`/`--slurp` CLI option for yq (✅ complete)|
+| 2026-01-20 | Added `from_unix`, `to_unix`, `tz(zone)` yq date/time extensions (✅ complete)|

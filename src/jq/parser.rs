@@ -2986,6 +2986,26 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Fromdate));
         }
 
+        // Phase 21: Extended Date/Time functions (yq)
+        if self.matches_keyword("from_unix") {
+            self.consume_keyword("from_unix");
+            return Ok(Some(Builtin::FromUnix));
+        }
+        if self.matches_keyword("to_unix") {
+            self.consume_keyword("to_unix");
+            return Ok(Some(Builtin::ToUnix));
+        }
+        if self.matches_keyword("tz") {
+            self.consume_keyword("tz");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let zone = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Tz(Box::new(zone))));
+        }
+
         // Phase 17: Combinations
         if self.matches_keyword("combinations") {
             self.consume_keyword("combinations");

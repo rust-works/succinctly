@@ -1443,6 +1443,11 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
 
         // Phase 20: Iteration control extension
         Builtin::Skip(n_expr, expr) => builtin_skip(n_expr, expr, value, optional),
+
+        // Phase 21: Extended Date/Time functions (yq)
+        Builtin::FromUnix => builtin_from_unix(value, optional),
+        Builtin::ToUnix => builtin_to_unix(value, optional),
+        Builtin::Tz(zone) => builtin_tz(zone, value, optional),
     }
 }
 
@@ -6164,6 +6169,11 @@ fn substitute_var_in_builtin(
             Box::new(substitute_var(n, var_name, replacement)),
             Box::new(substitute_var(e, var_name, replacement)),
         ),
+
+        // Phase 21: Extended Date/Time functions (yq)
+        Builtin::FromUnix => Builtin::FromUnix,
+        Builtin::ToUnix => Builtin::ToUnix,
+        Builtin::Tz(e) => Builtin::Tz(Box::new(substitute_var(e, var_name, replacement))),
     }
 }
 
@@ -9067,6 +9077,358 @@ fn parse_iso8601(input: &str) -> Result<f64, String> {
     let timestamp = days * 86400 + hour * 3600 + minute * 60 + second + tz_offset;
 
     Ok(timestamp as f64)
+}
+
+// Phase 21: Extended Date/Time functions (yq)
+
+/// Builtin: from_unix - convert Unix epoch to ISO 8601 date string
+/// This is semantically identical to todate/todateiso8601 but with yq naming convention
+fn builtin_from_unix<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // from_unix is the same as todate - converts Unix timestamp to ISO 8601 string
+    builtin_todate(value, optional)
+}
+
+/// Builtin: to_unix - convert ISO 8601 date string to Unix epoch
+/// This is semantically identical to fromdate/fromdateiso8601 but with yq naming convention
+fn builtin_to_unix<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // to_unix is the same as fromdate - parses ISO 8601 string to Unix timestamp
+    builtin_fromdate(value, optional)
+}
+
+/// Format Unix timestamp to ISO 8601 string with timezone offset
+fn format_datetime_with_offset(timestamp: f64, offset_seconds: i64) -> String {
+    // Apply the timezone offset to the timestamp
+    let adjusted_secs = timestamp.trunc() as i64 + offset_seconds;
+
+    let days = if adjusted_secs >= 0 {
+        adjusted_secs / 86400
+    } else {
+        (adjusted_secs - 86399) / 86400
+    };
+    let time_of_day = ((adjusted_secs % 86400) + 86400) % 86400;
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+
+    if offset_seconds == 0 {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            year, month, day, hour, minute, second
+        )
+    } else {
+        let offset_hours = offset_seconds.abs() / 3600;
+        let offset_mins = (offset_seconds.abs() % 3600) / 60;
+        let sign = if offset_seconds >= 0 { '+' } else { '-' };
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
+            year, month, day, hour, minute, second, sign, offset_hours, offset_mins
+        )
+    }
+}
+
+/// Get timezone offset in seconds for a given IANA timezone name
+/// Returns Ok(offset_seconds) or Err(error_message)
+fn get_timezone_offset(zone: &str, timestamp: f64) -> Result<i64, String> {
+    match zone.to_lowercase().as_str() {
+        "utc" | "z" | "gmt" => Ok(0),
+        "local" => {
+            // Get local timezone offset
+            // In a no_std-compatible library, we can't reliably get local timezone
+            // without platform-specific code or external dependencies.
+            // Return UTC offset (0) as a fallback - users should use explicit timezone names
+            let _ = timestamp; // Suppress unused warning
+            Ok(0)
+        }
+        _ => {
+            // Try to parse common IANA timezone abbreviations
+            // This is a simplified subset - full IANA support would require a timezone database
+            let offset = match zone.to_uppercase().as_str() {
+                // US timezones
+                "EST" => -5 * 3600,
+                "EDT" => -4 * 3600,
+                "CST" => -6 * 3600,
+                "CDT" => -5 * 3600,
+                "MST" => -7 * 3600,
+                "MDT" => -6 * 3600,
+                "PST" => -8 * 3600,
+                "PDT" => -7 * 3600,
+                "AKST" => -9 * 3600,
+                "AKDT" => -8 * 3600,
+                "HST" => -10 * 3600,
+                // European timezones
+                "WET" => 0,
+                "WEST" => 3600,
+                "CET" => 3600,
+                "CEST" => 2 * 3600,
+                "EET" => 2 * 3600,
+                "EEST" => 3 * 3600,
+                // Asian timezones
+                "JST" => 9 * 3600,
+                "KST" => 9 * 3600,
+                "CST_CHINA" => 8 * 3600,
+                "IST" => 5 * 3600 + 30 * 60, // India: +5:30
+                // Australian timezones
+                "AEST" => 10 * 3600,
+                "AEDT" => 13600,
+                "ACST" => 9 * 3600 + 30 * 60,
+                "ACDT" => 10 * 3600 + 30 * 60,
+                "AWST" => 8 * 3600,
+                _ => {
+                    // Try to parse IANA-style timezone names
+                    // Common patterns: America/New_York, Europe/London, Asia/Tokyo
+                    let offset = match zone {
+                        // Americas
+                        "America/New_York" | "US/Eastern" => {
+                            // EDT/EST - simplified, always using standard time
+                            if is_dst_us_eastern(timestamp) {
+                                -4 * 3600
+                            } else {
+                                -5 * 3600
+                            }
+                        }
+                        "America/Chicago" | "US/Central" => {
+                            if is_dst_us_eastern(timestamp) {
+                                -5 * 3600
+                            } else {
+                                -6 * 3600
+                            }
+                        }
+                        "America/Denver" | "US/Mountain" => {
+                            if is_dst_us_eastern(timestamp) {
+                                -6 * 3600
+                            } else {
+                                -7 * 3600
+                            }
+                        }
+                        "America/Los_Angeles" | "US/Pacific" => {
+                            if is_dst_us_eastern(timestamp) {
+                                -7 * 3600
+                            } else {
+                                -8 * 3600
+                            }
+                        }
+                        "America/Anchorage" | "US/Alaska" => {
+                            if is_dst_us_eastern(timestamp) {
+                                -8 * 3600
+                            } else {
+                                -9 * 3600
+                            }
+                        }
+                        "Pacific/Honolulu" | "US/Hawaii" => -10 * 3600,
+                        // Europe
+                        "Europe/London" | "GB" => {
+                            if is_dst_europe(timestamp) {
+                                3600
+                            } else {
+                                0
+                            }
+                        }
+                        "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" => {
+                            if is_dst_europe(timestamp) {
+                                2 * 3600
+                            } else {
+                                3600
+                            }
+                        }
+                        "Europe/Moscow" => 3 * 3600,
+                        // Asia
+                        "Asia/Tokyo" | "Japan" => 9 * 3600,
+                        "Asia/Seoul" | "ROK" => 9 * 3600,
+                        "Asia/Shanghai" | "Asia/Hong_Kong" | "PRC" => 8 * 3600,
+                        "Asia/Kolkata" | "Asia/Calcutta" => 5 * 3600 + 30 * 60,
+                        "Asia/Dubai" => 4 * 3600,
+                        "Asia/Singapore" => 8 * 3600,
+                        // Australia
+                        "Australia/Sydney" => {
+                            if is_dst_australia(timestamp) {
+                                13600
+                            } else {
+                                10 * 3600
+                            }
+                        }
+                        "Australia/Melbourne" => {
+                            if is_dst_australia(timestamp) {
+                                13600
+                            } else {
+                                10 * 3600
+                            }
+                        }
+                        "Australia/Perth" => 8 * 3600,
+                        // UTC aliases
+                        "Etc/UTC" | "Etc/GMT" | "UTC" | "GMT" => 0,
+                        _ => {
+                            // Try parsing numeric offset like "+05:30" or "-08:00"
+                            if let Some(offset) = parse_numeric_offset(zone) {
+                                return Ok(offset);
+                            }
+                            return Err(format!("unknown timezone: {}", zone));
+                        }
+                    };
+                    return Ok(offset);
+                }
+            };
+            Ok(offset)
+        }
+    }
+}
+
+/// Parse numeric timezone offset like "+05:30" or "-0800"
+fn parse_numeric_offset(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    let (sign, rest) = match s.chars().next() {
+        Some('+') => (1i64, &s[1..]),
+        Some('-') => (-1i64, &s[1..]),
+        _ => return None,
+    };
+
+    // Try HH:MM format
+    if rest.len() == 5 && rest.chars().nth(2) == Some(':') {
+        let hours: i64 = rest[..2].parse().ok()?;
+        let mins: i64 = rest[3..].parse().ok()?;
+        return Some(sign * (hours * 3600 + mins * 60));
+    }
+
+    // Try HHMM format
+    if rest.len() == 4 && rest.chars().all(|c| c.is_ascii_digit()) {
+        let hours: i64 = rest[..2].parse().ok()?;
+        let mins: i64 = rest[2..].parse().ok()?;
+        return Some(sign * (hours * 3600 + mins * 60));
+    }
+
+    // Try HH format
+    if rest.len() == 2 && rest.chars().all(|c| c.is_ascii_digit()) {
+        let hours: i64 = rest.parse().ok()?;
+        return Some(sign * hours * 3600);
+    }
+
+    None
+}
+
+/// Simplified DST check for US Eastern timezone
+/// DST starts 2nd Sunday of March, ends 1st Sunday of November (since 2007)
+fn is_dst_us_eastern(timestamp: f64) -> bool {
+    // Convert to days since epoch and calculate approximate month/day
+    let secs = timestamp.trunc() as i64;
+    let days = secs / 86400;
+
+    // Get year, month, day from days since epoch
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as i32;
+
+    // Approximate DST: March 8-14 to November 1-7 (simplified)
+    // More accurate would check actual Sunday dates
+    match month {
+        3 => day >= 8,  // After ~2nd week of March
+        4..=10 => true, // April through October
+        11 => day < 7,  // First week of November
+        _ => false,     // December through February
+    }
+}
+
+/// Simplified DST check for European timezones
+/// DST starts last Sunday of March, ends last Sunday of October
+fn is_dst_europe(timestamp: f64) -> bool {
+    let secs = timestamp.trunc() as i64;
+    let days = secs / 86400;
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as i32;
+
+    match month {
+        3 => day >= 25, // Last week of March
+        4..=9 => true,  // April through September
+        10 => day < 25, // Before last week of October
+        _ => false,
+    }
+}
+
+/// Simplified DST check for Australian Eastern timezones
+/// DST starts first Sunday of October, ends first Sunday of April
+fn is_dst_australia(timestamp: f64) -> bool {
+    let secs = timestamp.trunc() as i64;
+    let days = secs / 86400;
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as i32;
+
+    // Australian DST is opposite to Northern Hemisphere
+    match month {
+        10 => day >= 7,              // After first Sunday of October
+        11 | 12 | 1 | 2 | 3 => true, // November through March
+        4 => day < 7,                // Before first Sunday of April
+        _ => false,
+    }
+}
+
+/// Builtin: tz(zone) - convert Unix timestamp to datetime in specified timezone
+fn builtin_tz<'a, W: Clone + AsRef<[u64]>>(
+    zone_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the timestamp from input
+    let timestamp = match get_float_value(&value, optional) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+
+    // Evaluate the timezone expression to get the zone name
+    let zone_str = match result_to_owned(eval_single(zone_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "tz zone argument")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the timezone offset
+    let offset = match get_timezone_offset(&zone_str, timestamp) {
+        Ok(o) => o,
+        Err(_) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(EvalError::new(e)),
+    };
+
+    // Format the datetime with the timezone offset
+    let result = format_datetime_with_offset(timestamp, offset);
+    QueryResult::Owned(OwnedValue::String(result))
 }
 
 // Phase 17: Combinations
@@ -12074,6 +12436,11 @@ fn expand_func_calls_in_builtin(
             Box::new(expand_func_calls(n, func_name, params, body)),
             Box::new(expand_func_calls(e, func_name, params, body)),
         ),
+
+        // Phase 21: Extended Date/Time functions (yq)
+        Builtin::FromUnix => Builtin::FromUnix,
+        Builtin::ToUnix => Builtin::ToUnix,
+        Builtin::Tz(e) => Builtin::Tz(Box::new(expand_func_calls(e, func_name, params, body))),
     }
 }
 
@@ -12353,6 +12720,11 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
             Box::new(substitute_func_param(n, param, arg)),
             Box::new(substitute_func_param(e, param, arg)),
         ),
+
+        // Phase 21: Extended Date/Time functions (yq)
+        Builtin::FromUnix => Builtin::FromUnix,
+        Builtin::ToUnix => Builtin::ToUnix,
+        Builtin::Tz(e) => Builtin::Tz(Box::new(substitute_func_param(e, param, arg))),
     }
 }
 
@@ -15165,6 +15537,169 @@ mod tests {
         query!(b"1705314600", r#"todate | fromdate"#,
             QueryResult::Owned(OwnedValue::Float(n)) => {
                 assert_eq!(n, 1705314600.0);
+            }
+        );
+    }
+
+    // =============================================
+    // Phase 21: Extended Date/Time functions (yq)
+    // =============================================
+
+    #[test]
+    fn test_from_unix() {
+        // from_unix converts timestamp to ISO 8601 string (same as todate)
+        query!(b"0", r#"from_unix"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1970-01-01T00:00:00Z");
+            }
+        );
+
+        query!(b"1705314600", r#"from_unix"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T10:30:00Z");
+            }
+        );
+    }
+
+    #[test]
+    fn test_to_unix() {
+        // to_unix parses ISO 8601 string to timestamp (same as fromdate)
+        query!(br#""1970-01-01T00:00:00Z""#, r#"to_unix"#,
+            QueryResult::Owned(OwnedValue::Float(n)) => {
+                assert_eq!(n, 0.0);
+            }
+        );
+
+        query!(br#""2024-01-15T10:30:00Z""#, r#"to_unix"#,
+            QueryResult::Owned(OwnedValue::Float(n)) => {
+                assert_eq!(n, 1705314600.0);
+            }
+        );
+    }
+
+    #[test]
+    fn test_from_unix_to_unix_roundtrip() {
+        // from_unix | to_unix should return original value
+        query!(b"1705314600", r#"from_unix | to_unix"#,
+            QueryResult::Owned(OwnedValue::Float(n)) => {
+                assert_eq!(n, 1705314600.0);
+            }
+        );
+    }
+
+    #[test]
+    fn test_tz_utc() {
+        // tz("UTC") should work like todate
+        query!(b"1705314600", r#"tz("UTC")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T10:30:00Z");
+            }
+        );
+
+        // tz("GMT") is an alias for UTC
+        query!(b"1705314600", r#"tz("GMT")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T10:30:00Z");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tz_abbreviations() {
+        // Test common timezone abbreviations
+        // 1705314600 = 2024-01-15T10:30:00Z
+
+        // EST is UTC-5
+        query!(b"1705314600", r#"tz("EST")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T05:30:00-05:00");
+            }
+        );
+
+        // PST is UTC-8
+        query!(b"1705314600", r#"tz("PST")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T02:30:00-08:00");
+            }
+        );
+
+        // JST is UTC+9
+        query!(b"1705314600", r#"tz("JST")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T19:30:00+09:00");
+            }
+        );
+
+        // CET is UTC+1
+        query!(b"1705314600", r#"tz("CET")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T11:30:00+01:00");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tz_iana_names() {
+        // Test IANA-style timezone names
+        // 1705314600 = 2024-01-15T10:30:00Z (January, so standard time in most places)
+
+        query!(b"1705314600", r#"tz("Asia/Tokyo")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T19:30:00+09:00");
+            }
+        );
+
+        query!(b"1705314600", r#"tz("Europe/Moscow")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T13:30:00+03:00");
+            }
+        );
+
+        query!(b"1705314600", r#"tz("Pacific/Honolulu")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T00:30:00-10:00");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tz_numeric_offset() {
+        // Test numeric offset format
+        query!(b"1705314600", r#"tz("+05:30")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T16:00:00+05:30");
+            }
+        );
+
+        query!(b"1705314600", r#"tz("-0800")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T02:30:00-08:00");
+            }
+        );
+
+        query!(b"1705314600", r#"tz("+09")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T19:30:00+09:00");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tz_unknown_error() {
+        // Unknown timezone should error
+        query!(b"1705314600", r#"tz("Unknown/Timezone")"#,
+            QueryResult::Error(e) => {
+                assert!(e.to_string().contains("unknown timezone"));
+            }
+        );
+    }
+
+    #[test]
+    fn test_tz_with_variable() {
+        // tz should work with a variable expression
+        query!(b"1705314600", r#""JST" as $tz | tz($tz)"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T19:30:00+09:00");
             }
         );
     }
