@@ -256,10 +256,10 @@ All advanced features have been implemented:
 
 These are CLI-level features, not expression language:
 
-- [ ] `-s` / `--slurp` - Read all inputs into array
+- [x] `-s` / `--slurp` - Read all inputs into array
 - [ ] `-R` / `--raw-input` - Read lines as strings
-- [ ] `-n` / `--null-input` - Don't read input, use null
-- [ ] `--tab` - Use tabs for indentation
+- [x] `-n` / `--null-input` - Don't read input, use null
+- [x] `--tab` - Use tabs for indentation
 - [ ] `--argjson` / `--slurpfile` / `--rawfile` enhancements
 
 ---
@@ -344,3 +344,4 @@ echo '{"a":1}' | succinctly jq '.a'
 | 2026-01-20 | Updated kind() to return "alias" for alias nodes, matching yq behavior (✅ complete)|
 | 2026-01-20 | Added YamlCursor::line() and column() methods for yq position metadata (✅ complete)|
 | 2026-01-20 | Added `line` and `column` jq builtins (return 0 in evaluation, full support at cursor level)|
+| 2026-01-20 | Added `-s`/`--slurp` CLI option for yq (✅ complete)|

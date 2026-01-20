@@ -1071,6 +1071,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && output_config.compact
         && output_config.output_format == OutputFormat::Json
         && !args.null_input
+        && !args.slurp
         && !args.inplace
         && context.named.is_empty();
 
@@ -1125,6 +1126,40 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     } else if args.null_input {
         // Handle --null-input
         let results = evaluate_input(&OwnedValue::Null, &program.expr, &context)?;
+        for result in results {
+            last_output = Some(result.clone());
+            had_output = true;
+            output_value(&mut writer, &result, &output_config)?;
+        }
+    } else if args.slurp {
+        // Handle --slurp: collect all documents from all inputs into an array
+        let mut all_docs: Vec<OwnedValue> = Vec::new();
+
+        // Collect input sources
+        let input_sources: Vec<(Vec<u8>, InputFormat)> = if args.files.is_empty() {
+            let input_bytes = read_stdin()?;
+            let format = resolve_input_format(args.input_format, None);
+            vec![(input_bytes, format)]
+        } else {
+            let mut sources = Vec::new();
+            for file_path in &args.files {
+                let path = Path::new(file_path);
+                let input_bytes = read_file(path)?;
+                let format = resolve_input_format(args.input_format, Some(path));
+                sources.push((input_bytes, format));
+            }
+            sources
+        };
+
+        // Parse all inputs and collect documents
+        for (bytes, format) in &input_sources {
+            let inputs = parse_input(bytes, *format)?;
+            all_docs.extend(inputs);
+        }
+
+        // Create slurped array and evaluate
+        let slurped = OwnedValue::Array(all_docs);
+        let results = evaluate_input(&slurped, &program.expr, &context)?;
         for result in results {
             last_output = Some(result.clone());
             had_output = true;
@@ -1529,5 +1564,63 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], OwnedValue::String("Alice".to_string()));
+    }
+
+    #[test]
+    fn test_slurp_multi_doc_yaml() {
+        // Test slurp behavior by parsing multi-doc YAML manually
+        let yaml = b"---\nname: Alice\n---\nname: Bob\n---\nname: Charlie";
+        let inputs = parse_input(yaml, InputFormat::Yaml).unwrap();
+
+        // Multi-doc YAML should parse into 3 documents
+        assert_eq!(inputs.len(), 3);
+
+        // When slurped, they become an array
+        let slurped = OwnedValue::Array(inputs);
+        if let OwnedValue::Array(arr) = slurped {
+            assert_eq!(arr.len(), 3);
+
+            // Verify each document
+            if let OwnedValue::Object(map) = &arr[0] {
+                assert_eq!(
+                    map.get("name"),
+                    Some(&OwnedValue::String("Alice".to_string()))
+                );
+            } else {
+                panic!("expected object");
+            }
+            if let OwnedValue::Object(map) = &arr[1] {
+                assert_eq!(
+                    map.get("name"),
+                    Some(&OwnedValue::String("Bob".to_string()))
+                );
+            } else {
+                panic!("expected object");
+            }
+            if let OwnedValue::Object(map) = &arr[2] {
+                assert_eq!(
+                    map.get("name"),
+                    Some(&OwnedValue::String("Charlie".to_string()))
+                );
+            } else {
+                panic!("expected object");
+            }
+        } else {
+            panic!("expected array");
+        }
+    }
+
+    #[test]
+    fn test_slurp_with_length() {
+        // Test that slurped docs can have length computed
+        let yaml = b"---\nname: Alice\n---\nname: Bob\n---\nname: Charlie";
+        let inputs = parse_input(yaml, InputFormat::Yaml).unwrap();
+        let slurped = OwnedValue::Array(inputs);
+
+        let expr = succinctly::jq::parse("length").unwrap();
+        let results = evaluate_input(&slurped, &expr, &EvalContext::default()).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], OwnedValue::Int(3));
     }
 }

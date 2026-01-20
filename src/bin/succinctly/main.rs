@@ -647,6 +647,10 @@ pub struct YqCommand {
     #[arg(short = 'n', long)]
     pub null_input: bool,
 
+    /// Read all inputs into an array and use it as the single input value
+    #[arg(short = 's', long)]
+    pub slurp: bool,
+
     /// Input format type [auto, yaml, json] (default: auto)
     #[arg(
         short = 'p',
