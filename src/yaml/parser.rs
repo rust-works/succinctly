@@ -1328,6 +1328,36 @@ impl<'a> Parser<'a> {
         if self.at_line_end() {
             // Value is on next line or implicit null
             self.skip_to_eol();
+
+            // Look ahead to determine if this is a null value or a nested structure
+            self.skip_newlines();
+            if self.peek().is_none() {
+                // EOF - null value: emit empty value node
+                self.set_ib();
+                self.write_bp_open();
+                self.write_bp_close();
+            } else {
+                let next_indent = self.count_indent().unwrap_or(0);
+
+                // Check if next content is a sequence indicator
+                let saved_pos = self.pos;
+                self.advance_by(next_indent);
+                let is_sequence_indicator = matches!(self.peek(), Some(b'-'))
+                    && matches!(
+                        self.peek_at(1),
+                        Some(b' ') | Some(b'\t') | Some(b'\n') | None
+                    );
+                self.pos = saved_pos;
+
+                if next_indent < indent || (next_indent == indent && !is_sequence_indicator) {
+                    // Next line is at lower indent, or same indent but not a sequence
+                    // - null value: emit empty value node
+                    self.set_ib();
+                    self.write_bp_open();
+                    self.write_bp_close();
+                }
+                // Otherwise, value is a nested structure - main loop will handle it
+            }
         } else {
             // Inline value
             self.check_unsupported()?;
@@ -1472,19 +1502,45 @@ impl<'a> Parser<'a> {
             // Look ahead to see what the next content line looks like
             self.skip_newlines();
             if self.peek().is_none() {
-                // EOF - null value
+                // EOF - null value: emit empty value node
+                self.set_ib();
+                self.write_bp_open();
+                self.write_bp_close();
                 return Ok(());
             }
 
             // Count indentation of next line
             let next_indent = self.count_indent().unwrap_or(0);
-            if next_indent <= indent {
-                // Next line is at same or lower indent - null value
+
+            // Check what's at the next line's content position
+            let saved_pos = self.pos;
+            self.advance_by(next_indent);
+            let next_char = self.peek();
+            let is_sequence_indicator = matches!(next_char, Some(b'-'))
+                && matches!(
+                    self.peek_at(1),
+                    Some(b' ') | Some(b'\t') | Some(b'\n') | None
+                );
+            self.pos = saved_pos;
+
+            if next_indent < indent {
+                // Next line is at lower indent - definitely null value
+                self.set_ib();
+                self.write_bp_open();
+                self.write_bp_close();
                 return Ok(());
             }
 
-            // Skip to the content position
-            let saved_pos = self.pos;
+            if next_indent == indent && !is_sequence_indicator {
+                // Next line is at same indent but NOT a sequence - null value
+                // (If it were a sequence, the sequence is the value of this key)
+                self.set_ib();
+                self.write_bp_open();
+                self.write_bp_close();
+                return Ok(());
+            }
+
+            // Re-advance to content position for the remaining checks
             self.advance_by(next_indent);
 
             // Check if this is a nested structure or a plain scalar value
