@@ -2794,6 +2794,7 @@ fn eval_format<'a, W: Clone + AsRef<[u64]>>(
         FormatType::Sh => format_sh(&owned, optional),
         FormatType::Urid => format_urid(&owned, optional),
         FormatType::Yaml => format_yaml(&owned),
+        FormatType::Props => format_props(&owned),
     };
 
     match result {
@@ -3071,6 +3072,86 @@ fn format_sh(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
 /// @yaml - Format value as YAML string (yq)
 fn format_yaml(value: &OwnedValue) -> Result<String, EvalError> {
     Ok(owned_to_yaml(value))
+}
+
+/// @props - Format value as Java properties format (yq)
+///
+/// Objects are flattened with dot-notation keys:
+/// `{database: "postgres", nested: {a: 1}}` → `database = postgres\nnested.a = 1`
+///
+/// Arrays use numeric indices:
+/// `{arr: [1, 2, 3]}` → `arr.0 = 1\narr.1 = 2\narr.2 = 3`
+///
+/// Non-objects are converted to strings.
+fn format_props(value: &OwnedValue) -> Result<String, EvalError> {
+    let mut lines = Vec::new();
+    format_props_recursive(value, String::new(), &mut lines);
+    Ok(lines.join("\n"))
+}
+
+/// Recursively format a value into Java properties lines
+fn format_props_recursive(value: &OwnedValue, prefix: String, lines: &mut Vec<String>) {
+    match value {
+        OwnedValue::Object(obj) => {
+            for (key, val) in obj.iter() {
+                let new_prefix = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", prefix, key)
+                };
+                format_props_recursive(val, new_prefix, lines);
+            }
+        }
+        OwnedValue::Array(arr) => {
+            for (idx, val) in arr.iter().enumerate() {
+                let new_prefix = if prefix.is_empty() {
+                    format!("{}", idx)
+                } else {
+                    format!("{}.{}", prefix, idx)
+                };
+                format_props_recursive(val, new_prefix, lines);
+            }
+        }
+        _ => {
+            // Scalar value - output as "key = value"
+            let value_str = props_value_to_string(value);
+            if prefix.is_empty() {
+                // Top-level scalar without key
+                lines.push(value_str);
+            } else {
+                lines.push(format!("{} = {}", prefix, value_str));
+            }
+        }
+    }
+}
+
+/// Convert a scalar value to its properties string representation
+fn props_value_to_string(value: &OwnedValue) -> String {
+    match value {
+        OwnedValue::Null => "null".to_string(),
+        OwnedValue::Bool(true) => "true".to_string(),
+        OwnedValue::Bool(false) => "false".to_string(),
+        OwnedValue::Int(n) => format!("{}", n),
+        OwnedValue::Float(f) => {
+            if f.is_nan() {
+                ".nan".to_string()
+            } else if f.is_infinite() {
+                if *f > 0.0 {
+                    ".inf".to_string()
+                } else {
+                    "-.inf".to_string()
+                }
+            } else {
+                format!("{}", f)
+            }
+        }
+        OwnedValue::String(s) => {
+            // Replace newlines with spaces, as yq does
+            s.replace(['\n', '\r'], " ")
+        }
+        // Objects and arrays should not reach here, but handle gracefully
+        OwnedValue::Object(_) | OwnedValue::Array(_) => value.to_json(),
+    }
 }
 
 /// Convert OwnedValue to YAML flow-style (compact, single-line like JSON).
@@ -14282,6 +14363,79 @@ mod tests {
         query!(br#"3.14"#, "@yaml",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "3.14");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_props() {
+        // Simple object
+        query!(br#"{"database": "postgres", "port": 5432}"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "database = postgres\nport = 5432");
+            }
+        );
+
+        // Nested object
+        query!(br#"{"nested": {"a": 1, "b": 2}, "top": "value"}"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "nested.a = 1\nnested.b = 2\ntop = value");
+            }
+        );
+
+        // Array
+        query!(br#"{"arr": [1, 2, 3]}"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "arr.0 = 1\narr.1 = 2\narr.2 = 3");
+            }
+        );
+
+        // Deeply nested
+        query!(br#"{"a": {"b": {"c": 42}}}"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "a.b.c = 42");
+            }
+        );
+
+        // Top-level scalar
+        query!(br#""just a string""#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "just a string");
+            }
+        );
+
+        // Null
+        query!(br#"null"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "null");
+            }
+        );
+
+        // Boolean values
+        query!(br#"{"enabled": true, "disabled": false}"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "enabled = true\ndisabled = false");
+            }
+        );
+
+        // Special characters in values (preserved)
+        query!(br#"{"key": "value=with=equals"}"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "key = value=with=equals");
+            }
+        );
+
+        // Empty object
+        query!(br#"{}"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "");
+            }
+        );
+
+        // Top-level array
+        query!(br#"[1, 2, 3]"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "0 = 1\n1 = 2\n2 = 3");
             }
         );
     }

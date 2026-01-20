@@ -1680,6 +1680,7 @@ impl<'a> Parser<'a> {
             "sh" => FormatType::Sh,
             "urid" => FormatType::Urid,
             "yaml" => FormatType::Yaml,
+            "props" => FormatType::Props,
             _ => {
                 return Err(ParseError::new(
                     format!("unknown format '@{}'", format_name),

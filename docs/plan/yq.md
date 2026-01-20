@@ -348,7 +348,7 @@ Supported timezone formats:
 | Operator | Description | Priority | Status |
 |----------|-------------|----------|--------|
 | `@yaml` / `to_yaml` | Encode as YAML string | High | ✅ |
-| `@props` / `to_props` | Encode as Java properties | Medium | ❌ |
+| `@props` / `to_props` | Encode as Java properties | Medium | ✅ |
 | `@xml` / `to_xml` | Encode as XML string | Low | ❌ |
 
 #### Operator Details
@@ -364,10 +364,18 @@ Supported timezone formats:
 
 **Note**: Our `@yaml` outputs flow-style (compact) YAML, matching yq's `to_yaml(0)` behavior.
 
-**`@props`** / **`to_props`** - Encode as Java properties
+**`@props`** / **`to_props`** - Encode as Java properties ✅
 ```bash
 {database: "postgres", port: 5432} | @props
-# → "database = postgres\nport = 5432\n"
+# → "database = postgres\nport = 5432"
+
+# Nested objects use dot-notation
+{nested: {a: 1, b: 2}} | @props
+# → "nested.a = 1\nnested.b = 2"
+
+# Arrays use numeric indices
+{arr: [1, 2, 3]} | @props
+# → "arr.0 = 1\narr.1 = 2\narr.2 = 3"
 ```
 
 **`@xml`** / **`to_xml`** - Encode as XML
@@ -621,3 +629,4 @@ This plan depends on the YAML parser implementation phases defined in [parsing/y
 | 2026-01-20 | Phase 1-4 marked complete, updated status tables |
 | 2026-01-20 | Added `-R`/`--raw-input` CLI option |
 | 2026-01-20 | Added `--doc N` CLI option for selecting specific document from multi-doc stream |
+| 2026-01-20 | Added `@props` format encoder for Java properties output |

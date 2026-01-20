@@ -432,6 +432,8 @@ pub enum FormatType {
     Urid,
     /// @yaml - format as YAML string (yq)
     Yaml,
+    /// @props - Java properties format (yq)
+    Props,
 }
 
 /// Builtin functions supported by jq.
