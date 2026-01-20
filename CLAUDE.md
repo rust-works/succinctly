@@ -46,13 +46,30 @@ cargo bench                              # Run benchmarks
 ```bash
 cargo build --release --features cli
 
+# JSON operations
 ./target/release/succinctly json generate 10mb -o benchmark.json
 ./target/release/succinctly jq '.users[].name' input.json
 ./target/release/succinctly jq -r '.users[] | [.name, .age] | @csv' input.json
 ./target/release/succinctly jq -r '.users[] | [.name, .age] | @dsv("|")' input.json
 ./target/release/succinctly jq-locate input.json --offset 42
 ./target/release/succinctly jq-locate input.json --line 5 --column 10
+
+# YAML operations
+./target/release/succinctly yq '.users[].name' config.yaml
+./target/release/succinctly yq -o json '.' config.yaml         # Output as JSON
+./target/release/succinctly yq '.spec.containers[]' k8s.yaml
+./target/release/succinctly yq --doc 0 '.' multi-doc.yaml      # First document only
+./target/release/succinctly yq-locate config.yaml --offset 42
+./target/release/succinctly yq-locate config.yaml --line 5 --column 10
+
+# DSV/CSV operations
+./target/release/succinctly jq --input-dsv ',' '.[] | select(.[0] == "Alice")' data.csv
+./target/release/succinctly dsv generate users 1000 -o users.csv
+
+# Benchmarks
 ./target/release/succinctly dev bench jq
+./target/release/succinctly dev bench yq
+./target/release/succinctly dev bench dsv
 ```
 
 ## Code Architecture
@@ -66,8 +83,9 @@ src/
 ├── trees/              # Balanced parentheses
 ├── json/               # JSON semi-indexing (PFSM default)
 ├── yaml/               # YAML semi-indexing (oracle parser)
-├── jq/                 # jq query language
-└── bin/                # CLI tool
+├── dsv/                # DSV/CSV semi-indexing (BMI2/SIMD)
+├── jq/                 # jq query language and evaluator
+└── bin/                # CLI tool (jq, yq, jq-locate, yq-locate)
 ```
 
 ### Public API
@@ -77,6 +95,7 @@ use succinctly::bits::BitVec;
 use succinctly::trees::BalancedParens;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::YamlIndex;
+use succinctly::dsv::DsvIndex;
 use succinctly::jq::{parse, eval};
 ```
 

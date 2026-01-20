@@ -14,7 +14,9 @@ Succinctly provides space-efficient data structures with fast rank and select op
 - **Bitvector with O(1) rank and O(log n) select** - Poppy-style 3-level directory with ~3% space overhead
 - **Balanced parentheses for tree navigation** - RangeMin structure with O(1) operations and ~6% overhead
 - **JSON semi-indexing with SIMD acceleration** - Up to 950 MiB/s throughput on x86_64 (AMD Zen 4) with table-driven PFSM parser
-- **jq-style query expressions** - Navigate JSON without full parsing
+- **YAML semi-indexing** - Complete YAML 1.2 parser with anchor/alias resolution (~250-400 MiB/s)
+- **DSV/CSV semi-indexing** - High-performance CSV/TSV parsing (85-1676 MiB/s) with BMI2 acceleration
+- **jq/yq-style query expressions** - Navigate JSON and YAML without full parsing
 - **`no_std` compatible** - Works in embedded and WASM environments
 - **Cross-platform SIMD** - Runtime detection for AVX2, AVX-512, SSE4.2, and ARM NEON
 
@@ -24,7 +26,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-succinctly = "0.1"
+succinctly = "0.2"
 ```
 
 Or with cargo:
@@ -226,35 +228,40 @@ See [docs/benchmarks/rust-parsers.md](docs/benchmarks/rust-parsers.md), [docs/be
 
 ## CLI Tool
 
-The library includes a CLI tool for JSON and DSV operations:
+The library includes CLI tools for JSON, YAML, and DSV operations:
 
 ```bash
 # Build the CLI
 cargo build --release --features cli
 
-# Generate synthetic JSON for benchmarking
+# Generate synthetic JSON/YAML for benchmarking
 ./target/release/succinctly json generate 10mb -o benchmark.json
+./target/release/succinctly yaml generate 10kb -o benchmark.yaml
 
-# Query JSON files (jq-compatible output by default)
+# Query JSON files (jq-compatible)
 ./target/release/succinctly jq '.users[].name' input.json
 ./target/release/succinctly jq -r '.users[0]' input.json
 
-# Preserve original input formatting (numbers, escapes)
-./target/release/succinctly jq --preserve-input . input.json
+# Query YAML files (yq-compatible)
+./target/release/succinctly yq '.users[].name' config.yaml
+./target/release/succinctly yq -o json '.' config.yaml          # Output as JSON
+./target/release/succinctly yq '.spec.containers[]' k8s.yaml
+./target/release/succinctly yq --doc 0 '.' multi-doc.yaml       # First document only
 
 # Query CSV/TSV files (converted to JSON on-the-fly)
-./target/release/succinctly jq --input-dsv ',' '.[] | .name' users.csv
+./target/release/succinctly jq --input-dsv ',' '.[] | .[0]' users.csv
 ./target/release/succinctly jq --input-dsv '\t' '.[0]' data.tsv
 
-# Output JSON as CSV/TSV/DSV
+# Output as CSV/TSV/DSV
 ./target/release/succinctly jq -r '.users[] | [.name, .age] | @csv' data.json
-./target/release/succinctly jq -r '.users[] | [.name, .age] | @tsv' data.json
 ./target/release/succinctly jq -r '.users[] | [.name, .age] | @dsv("|")' data.json
+./target/release/succinctly yq -r '.users[] | [.name, .age] | @csv' data.yaml
 
-# Find jq expression for a position in JSON (useful for editor integration)
-./target/release/succinctly jq-locate input.json --offset 42      # by byte offset (0-indexed)
-./target/release/succinctly jq-locate input.json --line 5 --column 10  # by line/column (1-indexed)
-./target/release/succinctly jq-locate input.json --offset 42 --format json  # detailed output
+# Find jq/yq expression for a position (useful for editor integration)
+./target/release/succinctly jq-locate input.json --offset 42
+./target/release/succinctly jq-locate input.json --line 5 --column 10
+./target/release/succinctly yq-locate config.yaml --offset 42
+./target/release/succinctly yq-locate config.yaml --line 5 --column 10
 ```
 
 ## Architecture
@@ -266,7 +273,9 @@ succinctly
 ├── bits         # Bitvector with rank/select
 ├── trees        # Tree encodings (balanced parentheses)
 ├── json         # JSON semi-indexing
-└── jq           # jq query language
+├── yaml         # YAML semi-indexing
+├── dsv          # DSV/CSV semi-indexing
+└── jq           # jq/yq query language evaluator
 ```
 
 ### Core Data Structures
@@ -274,6 +283,8 @@ succinctly
 - **`bits::BitVec`** - Bitvector with 3-level Poppy-style rank directory (~3% overhead) and sampled select index (~1-3% overhead)
 - **`trees::BalancedParens`** - Hierarchical min-excess structure for O(1) tree navigation (~6% overhead)
 - **`json::JsonIndex`** - Semi-index combining Interest Bits (IB) and Balanced Parentheses (BP) for fast JSON navigation
+- **`yaml::YamlIndex`** - YAML semi-index with anchor/alias resolution and multi-document support
+- **`dsv::DsvIndex`** - Lightweight DSV semi-index with BMI2-accelerated quote masking
 
 ### SIMD Support
 

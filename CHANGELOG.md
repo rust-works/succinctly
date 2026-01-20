@@ -14,35 +14,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **YAML Semi-Indexing**
   - Complete YAML parser with oracle-style parsing (~250-400 MiB/s)
   - `yq` CLI command for YAML processing with jq syntax
+  - `yq-locate` command for finding YAML positions by offset or line/column
   - Direct YAML-to-JSON streaming (2.3x faster than DOM conversion)
-  - Multi-document stream support with virtual root wrapper
+  - Multi-document stream support with `--doc N` and `--slurp` options
   - Anchor and alias resolution at parse time
   - Block scalar support (literal `|` and folded `>` styles)
   - Flow style parsing (inline arrays and objects)
-  - Explicit key/value indicators (`?` and `:`)
+  - Quoted string type preservation (yq-compatible)
+  - YAML metadata access: `tag`, `anchor`, `alias`, `style`, `kind`, `line`, `column`
   - SIMD optimizations: anchor/alias scanning (6-17% improvement), block scalar parsing (19-25% improvement)
 
 - **DSV/CSV Semi-Indexing**
   - High-performance CSV/TSV parser with succinct indexing (85-1676 MiB/s API, 11-169 MiB/s CLI)
+  - `--input-dsv` flag for jq command to read CSV/TSV input
   - `@dsv(delimiter)` format function for custom delimiter output
   - BMI2 PDEP acceleration for quote masking on x86_64
   - Lightweight cumulative rank index (1.8-4.3x faster than BitVec)
   - SIMD-accelerated parsing on both x86_64 (AVX2) and ARM (NEON)
 
-- **jq Enhancements**
-  - `jq-locate` command for finding JSON positions by offset or line/column
-  - Lazy evaluation with identity fast path (zero-allocation for `.` queries)
+- **jq Language Enhancements**
+  - Assignment operators: `=`, `|=`, `+=`, `-=`, `*=`, `/=`, `%=`, `//=`, `del()`
   - Module system with `import`, `include`, and namespace support
-  - JSON sequence format (RFC 7464) support
-  - ASCII escaping (`-a` flag) and ANSI color syntax highlighting (`-C` flag)
-  - `$ARGS` variable and positional argument support
-  - Unary minus operator for expression negation
+  - Non-local control flow with `label $name | ... | break $name`
+  - Regular expressions: `match`, `capture`, `scan`, `splits`, `sub`, `gsub`
+  - Date/time functions: `now`, `gmtime`, `localtime`, `strftime`, `strptime`, `todate`, `fromdate`
+  - yq date extensions: `from_unix`, `to_unix`, `tz(zone)` with IANA timezone support
+  - Path operations: `path()`, `paths`, `leaf_paths`, `getpath`, `setpath`, `delpaths`
+  - Format strings: `@yaml`, `@props`, `@dsv(delimiter)`
+  - yq-specific operators: `omit`, `shuffle`, `pivot`, `document_index`/`di`, `split_doc`, `load(file)`
+  - Type filters: `values`, `nulls`, `booleans`, `numbers`, `strings`, `arrays`, `objects`, `scalars`, `iterables`
+  - Math functions: `trunc`, all 34 standard jq math functions
+  - Advanced control flow: `combinations`, `skip(n; expr)`, `label`/`break`
+  - Comment support with `#` hash syntax
+  - `$__loc__` for source location tracking, `$ENV` for environment access
 
 - **CLI Improvements**
-  - YAML output format support in `yq` command
-  - Input format selection and in-place editing for `yq`
-  - Build configuration reporting flag
-  - Color customization and `NO_COLOR` support
+  - `jq-locate` command for finding JSON positions by offset or line/column
+  - `yq-locate` command for finding YAML positions by offset or line/column
+  - `--raw-input` (`-R`) option for line-by-line processing in yq
+  - `--slurp` (`-s`) option for collecting all inputs into array
+  - `--doc N` option for multi-document selection in yq
+  - JSON sequence format (RFC 7464) support with `--seq`
+  - ASCII escaping (`-a` flag) and ANSI color syntax highlighting (`-C` flag)
+  - `$ARGS` variable and positional argument support (`--args`, `--jsonargs`)
+  - Build configuration reporting flag (`--build-configuration`)
 
 - **SIMD Enhancements**
   - Portable broadword module for non-SIMD platforms
