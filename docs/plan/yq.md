@@ -9,11 +9,11 @@ This document outlines the plan to add a `yq` subcommand to succinctly for query
 | **1** | Basic yq command | ✅ Complete |
 | **2** | Full YAML 1.2 structural support | ✅ Complete |
 | **3** | Anchors, aliases, YAML output | ✅ Mostly complete |
-| **4** | Multi-document streams | ✅ Mostly complete |
-| **5** | YAML-specific query extensions | 🔄 Partial |
+| **4** | Multi-document streams | ✅ Complete |
+| **5** | YAML-specific query extensions | ✅ Mostly complete |
 | **6** | yq-specific operators | ✅ Mostly complete |
-| **7** | Date/time operators | ✅ Mostly complete |
-| **8** | Additional format encoders | 🔜 In scope |
+| **7** | Date/time operators | ✅ Complete |
+| **8** | Additional format encoders | ✅ Complete |
 
 ### Performance (Apple M1 Max)
 
@@ -161,28 +161,31 @@ succinctly yq '.spec.containers[]' deployment.yaml service.yaml
 | Multi doc | `--slurp` | All documents as array |
 | Multi doc | `--no-doc` | No `---` separators in output |
 
-**Not Implemented** (low priority):
-- [ ] `--document N` to select specific document
+**Completed**:
+- [x] `--doc N` to select specific document (0-indexed)
 
 ---
 
-### Phase 5: YAML-Specific Query Extensions 🔄 PARTIAL
+### Phase 5: YAML-Specific Query Extensions ✅ MOSTLY COMPLETE
 
 **Goal**: Add YAML-aware operators beyond standard jq.
 
 **Implemented**:
 - [x] `line` - Get 1-based line number of node
 - [x] `column` - Get 1-based column number of node
+- [x] `tag` - Return YAML type tag (!!str, !!int, !!map, etc.)
+- [x] `anchor` - Return anchor name for nodes with anchors (`&name`)
+- [x] `alias` - Return referenced anchor name for alias nodes (`*name`)
+- [x] `style` - Return scalar/collection style (double, single, literal, folded, flow, or empty)
+- [x] `kind` - Return node kind (scalar, seq, map, alias)
+- [x] `key` - Return current key when iterating (string for objects, int for arrays)
 
-**Not Implemented** (implement on demand):
+**Not Implemented** (low priority):
 
 | Operator | Description | Status |
 |----------|-------------|--------|
-| `anchor` | Get anchor name if present | ❌ |
-| `has_anchor` | Check if node has anchor | ❌ |
-| `tag` | Get explicit tag | ❌ |
-| `style` | Get scalar style | ❌ |
-| `comments` | Get associated comments | ❌ |
+| `has_anchor` | Check if node has anchor | ❌ (use `anchor != ""`) |
+| `comments` | Get associated comments | ❌ (not stored in index) |
 
 ---
 

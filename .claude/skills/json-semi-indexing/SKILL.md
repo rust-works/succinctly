@@ -18,7 +18,7 @@ Implementation details for JSON semi-indexing using succinct data structures.
 
 See [docs/parsing/json.md](../../../docs/parsing/json.md) for details on:
 - State machine outputs (Phi values)
-- PFSM table-driven parser (950 MiB/s)
+- PFSM table-driven parser (950 MiB/s on x86_64 AMD Zen 4)
 - SIMD character classification
 
 ## Key SIMD Intrinsics

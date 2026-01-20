@@ -335,11 +335,11 @@ succinctly jq-locate file.json --offset 42 --format json
 
 ### Parsing Throughput
 
-| Platform | Method | Throughput |
-|----------|--------|------------|
-| x86_64 | PFSM + BMI2 | ~950 MiB/s |
-| x86_64 | AVX2 | ~730 MiB/s |
-| ARM64 | NEON | ~570 MiB/s |
+| Platform | CPU | Method | Throughput |
+|----------|-----|--------|------------|
+| x86_64 | AMD Ryzen 9 7950X (Zen 4) | PFSM + BMI2 | ~950 MiB/s |
+| x86_64 | AMD Ryzen 9 7950X (Zen 4) | AVX2 | ~730 MiB/s |
+| ARM64 | Apple M1 Max | NEON | ~570 MiB/s |
 
 ### Navigation
 

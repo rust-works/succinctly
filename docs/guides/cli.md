@@ -260,8 +260,11 @@ succinctly yq '.users[]' input.yaml
 ### Input Options
 
 - `-n, --null-input`: Don't read any input; use null as the single input value
+- `-R, --raw-input`: Read each line as a string instead of parsing as YAML/JSON
+- `-s, --slurp`: Read all inputs into an array and use it as the single input value
 - `-p, --input-format <FORMAT>`: Input format: `auto` (default), `yaml`, `json`
 - `-i, --inplace`: Update the file in place
+- `--doc <N>`: Select specific document by 0-based index from multi-document stream
 
 ### Variables
 
@@ -377,6 +380,7 @@ SUCCINCTLY_PRESERVE_INPUT=1 succinctly jq . input.json
 - `-n, --null-input`: Don't read any input; use null as the single input value
 - `-R, --raw-input`: Read each line as a string instead of JSON
 - `-s, --slurp`: Read all inputs into an array
+- `--input-dsv <DELIMITER>`: Read input as DSV (delimiter-separated values); each row becomes a JSON array of strings
 
 ### Variables
 
@@ -465,6 +469,72 @@ echo '{"user": {"name": "Alice", "age": 30}}' | succinctly jq '.user.age += 1'
 | `%=`     | `.path %= value`   | Modulo of current value                             |
 | `//=`    | `.path //= value`  | Set only if current value is null or false          |
 | `del()`  | `del(.path)`       | Delete field or array element                       |
+
+## jq-locate Command
+
+Find the jq expression for a position in a JSON file. Useful for editor integration and debugging.
+
+```bash
+succinctly jq-locate <FILE> [OPTIONS]
+```
+
+### Options
+
+- `--offset <OFFSET>`: Byte offset in file (0-indexed)
+- `--line <LINE>`: Line number (1-indexed)
+- `--column <COLUMN>`: Column number (1-indexed, byte offset within line)
+- `--format <FORMAT>`: Output format: `expression` (default) or `json`
+
+### Examples
+
+```bash
+# Find expression by byte offset
+succinctly jq-locate input.json --offset 42
+# Output: .users[0].name
+
+# Find expression by line/column
+succinctly jq-locate input.json --line 5 --column 10
+# Output: .config.version
+
+# Detailed JSON output
+succinctly jq-locate input.json --offset 42 --format json
+# Output: {"expression":".users[0].name","type":"string","start":38,"end":52}
+```
+
+---
+
+## yq-locate Command
+
+Find the yq expression for a position in a YAML file. Useful for editor integration and debugging.
+
+```bash
+succinctly yq-locate <FILE> [OPTIONS]
+```
+
+### Options
+
+- `--offset <OFFSET>`: Byte offset in file (0-indexed)
+- `--line <LINE>`: Line number (1-indexed)
+- `--column <COLUMN>`: Column number (1-indexed, byte offset within line)
+- `--format <FORMAT>`: Output format: `expression` (default) or `json`
+
+### Examples
+
+```bash
+# Find expression by byte offset
+succinctly yq-locate config.yaml --offset 42
+# Output: .users[0].name
+
+# Find expression by line/column
+succinctly yq-locate config.yaml --line 5 --column 10
+# Output: .spec.containers[0]
+
+# Detailed JSON output
+succinctly yq-locate config.yaml --offset 42 --format json
+# Output: {"expression":".users[0].name","type":"string","start":38,"end":52}
+```
+
+---
 
 ## Development
 

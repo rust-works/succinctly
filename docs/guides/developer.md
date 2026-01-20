@@ -114,7 +114,7 @@ Space overhead: ~6% of bitvector size.
 JSON documents are converted to two bitvectors for efficient navigation without full parsing. See [parsing/json.md](../parsing/json.md) for detailed implementation documentation covering:
 
 - Semi-index structure (Interest Bits + Balanced Parentheses)
-- PFSM table-driven parser (~950 MiB/s)
+- PFSM table-driven parser (~950 MiB/s on x86_64 AMD Zen 4)
 - SIMD character classification
 - Navigation cursor API
 

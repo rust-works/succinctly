@@ -134,7 +134,7 @@ We use [Conventional Commits](https://www.conventionalcommits.org/) format:
 feat(json): add PFSM table-driven parser
 
 Implements parallel finite state machine approach from hw-json-simd.
-Achieves 950 MiB/s throughput, 40-77% faster than scalar.
+Achieves 950 MiB/s throughput on x86_64 (AMD Zen 4), 40-77% faster than scalar.
 ```
 
 ```
