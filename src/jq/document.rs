@@ -34,6 +34,28 @@ pub trait DocumentCursor: Sized + Copy + Clone {
 
     /// Get the byte position in the source text.
     fn text_position(&self) -> Option<usize>;
+
+    /// Get the 1-based line number of this node's position.
+    ///
+    /// Returns 0 if position information is not available.
+    fn line(&self) -> usize {
+        0
+    }
+
+    /// Get the 1-based column number of this node's position.
+    ///
+    /// Returns 0 if position information is not available.
+    fn column(&self) -> usize {
+        0
+    }
+
+    /// Get the 0-indexed document position in a multi-document stream.
+    ///
+    /// Returns 0 for single-document files or the first document.
+    /// Returns None if document index tracking is not available.
+    fn document_index(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// A value from a document (JSON value or YAML value).
@@ -78,6 +100,44 @@ pub trait DocumentValue: Sized + Clone {
 
     /// Get error message if this is an error.
     fn error_message(&self) -> Option<&'static str>;
+
+    // ========== Helper type-checking methods ==========
+
+    /// Check if this value is a boolean.
+    #[inline]
+    fn is_bool(&self) -> bool {
+        self.as_bool().is_some()
+    }
+
+    /// Check if this value is a number (integer or float).
+    #[inline]
+    fn is_number(&self) -> bool {
+        self.as_i64().is_some() || self.as_f64().is_some()
+    }
+
+    /// Check if this value is a string.
+    #[inline]
+    fn is_string(&self) -> bool {
+        self.as_str().is_some()
+    }
+
+    /// Check if this value is an array.
+    #[inline]
+    fn is_array(&self) -> bool {
+        self.as_array().is_some()
+    }
+
+    /// Check if this value is an object.
+    #[inline]
+    fn is_object(&self) -> bool {
+        self.as_object().is_some()
+    }
+
+    /// Check if this value is iterable (array or object).
+    #[inline]
+    fn is_iterable(&self) -> bool {
+        self.is_array() || self.is_object()
+    }
 }
 
 /// Iterator-like access to object fields.

@@ -430,6 +430,10 @@ pub enum FormatType {
     Sh,
     /// @urid - URI decode (percent decoding)
     Urid,
+    /// @yaml - format as YAML string (yq)
+    Yaml,
+    /// @props - Java properties format (yq)
+    Props,
 }
 
 /// Builtin functions supported by jq.
@@ -736,6 +740,9 @@ pub enum Builtin {
     ModuleMeta(Box<Expr>),
     /// `pick(keys)` - select only specified keys from object/array (yq)
     Pick(Box<Expr>),
+    /// `omit(keys)` - remove specified keys from object/indices from array (yq)
+    /// Inverse of `pick`: keeps all keys/indices except those specified.
+    Omit(Box<Expr>),
 
     // YAML metadata functions (yq)
     /// `tag` - return YAML type tag (!!str, !!int, !!map, etc.)
@@ -748,6 +755,22 @@ pub enum Builtin {
     Kind,
     /// `key` - return the current key when iterating (yq)
     Key,
+    /// `line` - return the 1-based line number of the current node (yq)
+    Line,
+    /// `column` - return the 1-based column number of the current node (yq)
+    Column,
+    /// `document_index` / `di` - return the 0-indexed document position in multi-doc stream (yq)
+    DocumentIndex,
+    /// `shuffle` - randomly shuffle array elements (yq)
+    Shuffle,
+    /// `pivot` - transpose arrays/objects (yq)
+    /// For array of arrays: transposes rows/columns
+    /// For array of objects: collects values by key
+    Pivot,
+    /// `split_doc` - marks outputs as separate YAML documents (yq)
+    /// Each output from this operator should be printed with `---` separator.
+    /// Semantically returns the input unchanged, but signals document boundary.
+    SplitDoc,
 
     // Phase 11: Path manipulation
     /// `del(path)` - delete value at path
@@ -868,6 +891,24 @@ pub enum Builtin {
     /// `skip(n; expr)` - skip first n outputs from expr
     /// Outputs all remaining values after skipping the first n
     Skip(Box<Expr>, Box<Expr>),
+
+    // Phase 21: Extended Date/Time functions (yq)
+    /// `from_unix` - convert Unix epoch to ISO 8601 date string
+    /// Input: 1705766400 -> "2024-01-20T16:00:00Z"
+    FromUnix,
+    /// `to_unix` - convert ISO 8601 date string to Unix epoch
+    /// Input: "2024-01-20T16:00:00Z" -> 1705766400
+    ToUnix,
+    /// `tz(zone)` - convert Unix timestamp to datetime in specified timezone
+    /// Input: now | tz("America/New_York") -> "2024-01-20T11:00:00-05:00"
+    /// Supported zones: "UTC", "local", or IANA timezone names
+    Tz(Box<Expr>),
+
+    // Phase 22: File operations (yq)
+    /// `load(file)` - load external YAML/JSON file and return its parsed content
+    /// Input: load("config.yaml") -> {parsed content}
+    /// Supports both YAML and JSON files (auto-detected by extension)
+    Load(Box<Expr>),
 }
 
 /// Arithmetic operators.

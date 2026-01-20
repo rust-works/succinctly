@@ -1142,6 +1142,309 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             YamlValue::Error(_) => output.push_str("null"),
         }
     }
+
+    // =========================================================================
+    // YAML Metadata Access
+    // =========================================================================
+
+    /// Get the anchor name for this node, if any.
+    ///
+    /// Returns the anchor name (without the `&` prefix) if this node was
+    /// defined with an anchor, e.g., `&myanchor value` returns `"myanchor"`.
+    ///
+    /// Note: For alias nodes (`*name`), this returns `None`. Use `alias()` to
+    /// get the referenced anchor name for alias nodes.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let yaml = b"default: &def value";
+    /// let index = YamlIndex::build(yaml).unwrap();
+    /// // Navigate to the anchored value and call .anchor()
+    /// ```
+    #[inline]
+    pub fn anchor(&self) -> Option<&str> {
+        self.index.get_anchor_name(self.bp_pos)
+    }
+
+    /// Get the anchor name that this alias references.
+    ///
+    /// Returns the anchor name (without the `*` prefix) if this node is an alias,
+    /// e.g., `*myanchor` returns `Some("myanchor")`.
+    ///
+    /// Returns `None` if this node is not an alias. This matches yq's `alias` function.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let yaml = b"default: &def value\nref: *def";
+    /// let index = YamlIndex::build(yaml).unwrap();
+    /// // Navigate to ref and call .alias() to get "def"
+    /// ```
+    #[inline]
+    pub fn alias(&self) -> Option<&str> {
+        self.index.get_alias_anchor_name(self.bp_pos)
+    }
+
+    /// Check if this node is an alias.
+    #[inline]
+    pub fn is_alias(&self) -> bool {
+        self.index.is_alias(self.bp_pos)
+    }
+
+    /// Get the 1-based line number of this node's position in the YAML text.
+    ///
+    /// Returns the line number where this value starts. Line numbers are 1-based
+    /// to match common editor conventions and yq's `line` function.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use succinctly::yaml::YamlIndex;
+    ///
+    /// let yaml = b"name: Alice\nage: 30";
+    /// let index = YamlIndex::build(yaml).unwrap();
+    /// let root = index.root(yaml);
+    ///
+    /// // Root mapping is on line 1
+    /// assert_eq!(root.line(), 1);
+    /// ```
+    #[inline]
+    pub fn line(&self) -> usize {
+        let offset = self.text_position().unwrap_or(0);
+        let (line, _column) = self.index.to_line_column(offset);
+        line
+    }
+
+    /// Get the 1-based column number of this node's position in the YAML text.
+    ///
+    /// Returns the column number where this value starts. Column numbers are 1-based
+    /// to match common editor conventions and yq's `column` function.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use succinctly::yaml::YamlIndex;
+    ///
+    /// let yaml = b"name: Alice\nage: 30";
+    /// let index = YamlIndex::build(yaml).unwrap();
+    /// let root = index.root(yaml);
+    ///
+    /// // Root mapping starts at column 1
+    /// assert_eq!(root.column(), 1);
+    /// ```
+    #[inline]
+    pub fn column(&self) -> usize {
+        let offset = self.text_position().unwrap_or(0);
+        let (_line, column) = self.index.to_line_column(offset);
+        column
+    }
+
+    /// Get the 0-indexed document position in a multi-document stream.
+    ///
+    /// Returns the document index (0 for first document, 1 for second, etc.)
+    /// for multi-document YAML files. For single-document files, returns 0.
+    ///
+    /// This navigates up to find the document-level ancestor (direct child of
+    /// the implicit root sequence), then counts preceding siblings to determine
+    /// the document index.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use succinctly::yaml::YamlIndex;
+    ///
+    /// let yaml = b"---\nname: Alice\n---\nname: Bob";
+    /// let index = YamlIndex::build(yaml).unwrap();
+    /// let root = index.root(yaml);
+    ///
+    /// // Navigate to first document's content
+    /// if let Some(doc1) = root.first_child() {
+    ///     assert_eq!(doc1.document_index(), Some(0));
+    /// }
+    /// ```
+    pub fn document_index(&self) -> Option<usize> {
+        // If we're at the root (bp_pos=0), there's no document index
+        if self.bp_pos == 0 {
+            return None;
+        }
+
+        // Find the document-level ancestor (direct child of root)
+        // Navigate up until parent is root (bp_pos=0)
+        let mut doc_ancestor = *self;
+        while let Some(parent) = doc_ancestor.parent() {
+            if parent.bp_pos == 0 {
+                // doc_ancestor is now the document-level node
+                break;
+            }
+            doc_ancestor = parent;
+        }
+
+        // Count preceding siblings to get the document index
+        // Start from root's first child and count until we reach doc_ancestor
+        let root = YamlCursor::new(self.index, self.text, 0);
+        let mut current = root.first_child()?;
+        let mut index = 0;
+
+        loop {
+            if current.bp_pos == doc_ancestor.bp_pos {
+                return Some(index);
+            }
+            match current.next_sibling() {
+                Some(next) => {
+                    current = next;
+                    index += 1;
+                }
+                None => {
+                    // Shouldn't happen if doc_ancestor is valid, but safety fallback
+                    return Some(0);
+                }
+            }
+        }
+    }
+
+    /// Get the style of this node.
+    ///
+    /// Returns the YAML style indicator:
+    /// - `""` for block style (the default for most values)
+    /// - `"flow"` for flow mappings `{}` or sequences `[]`
+    /// - `"double"` for double-quoted strings
+    /// - `"single"` for single-quoted strings
+    /// - `"literal"` for literal block scalars `|`
+    /// - `"folded"` for folded block scalars `>`
+    ///
+    /// Note: This is a simplified implementation that infers style from
+    /// the text representation rather than preserving original metadata.
+    pub fn style(&self) -> &'static str {
+        let Some(text_pos) = self.text_position() else {
+            return "";
+        };
+
+        if text_pos >= self.text.len() {
+            return "";
+        }
+
+        // Skip anchor if present
+        let effective_pos = if self.text[text_pos] == b'&' {
+            self.skip_anchor_and_whitespace(text_pos)
+        } else {
+            text_pos
+        };
+
+        if effective_pos >= self.text.len() {
+            return "";
+        }
+
+        match self.text[effective_pos] {
+            b'"' => "double",
+            b'\'' => "single",
+            b'|' => "literal",
+            b'>' => "folded",
+            b'{' | b'[' => "flow",
+            _ => "",
+        }
+    }
+
+    /// Get the YAML type tag for this node.
+    ///
+    /// Returns the inferred YAML type tag based on the value type:
+    /// - `"!!null"` for null values
+    /// - `"!!bool"` for boolean values (true/false)
+    /// - `"!!int"` for integer values
+    /// - `"!!float"` for floating-point values
+    /// - `"!!str"` for string values
+    /// - `"!!seq"` for sequences (arrays)
+    /// - `"!!map"` for mappings (objects)
+    ///
+    /// Note: This returns inferred tags. Explicit tags in the YAML source
+    /// (like `!mytag`) are not currently preserved.
+    pub fn tag(&self) -> &'static str {
+        match self.value() {
+            YamlValue::Null => "!!null",
+            YamlValue::String(s) => {
+                // Try to infer type from unquoted scalars
+                if s.is_unquoted() {
+                    if let Ok(str_val) = s.as_str() {
+                        let s = str_val.as_ref();
+                        // Check for null
+                        if matches!(s, "null" | "~" | "") {
+                            return "!!null";
+                        }
+                        // Check for bool
+                        if matches!(s, "true" | "True" | "TRUE" | "false" | "False" | "FALSE") {
+                            return "!!bool";
+                        }
+                        // Check for int
+                        if s.parse::<i64>().is_ok() {
+                            return "!!int";
+                        }
+                        // Check for float (including special values)
+                        if s.parse::<f64>().is_ok()
+                            || matches!(
+                                s,
+                                ".inf"
+                                    | ".Inf"
+                                    | ".INF"
+                                    | "-.inf"
+                                    | "-.Inf"
+                                    | "-.INF"
+                                    | ".nan"
+                                    | ".NaN"
+                                    | ".NAN"
+                            )
+                        {
+                            return "!!float";
+                        }
+                    }
+                }
+                "!!str"
+            }
+            YamlValue::Mapping(_) => "!!map",
+            YamlValue::Sequence(_) => "!!seq",
+            YamlValue::Alias { target, .. } => {
+                // Return tag of target
+                if let Some(t) = target {
+                    t.tag()
+                } else {
+                    "!!null"
+                }
+            }
+            YamlValue::Error(_) => "!!null",
+        }
+    }
+
+    /// Get the kind of this node.
+    ///
+    /// Returns the structural kind of the node:
+    /// - `"scalar"` for scalar values (strings, numbers, booleans, null)
+    /// - `"seq"` for sequences (arrays)
+    /// - `"map"` for mappings (objects)
+    /// - `"alias"` for unexploded alias references (`*name`)
+    ///
+    /// Note: This matches yq's `kind` function which reports aliases as a distinct kind.
+    pub fn kind(&self) -> &'static str {
+        // Check if this is an alias first (before resolving the value)
+        if self.is_alias() {
+            return "alias";
+        }
+        match self.value() {
+            YamlValue::Null | YamlValue::String(_) => "scalar",
+            YamlValue::Sequence(_) => "seq",
+            YamlValue::Mapping(_) => "map",
+            YamlValue::Alias { .. } => "alias",
+            YamlValue::Error(_) => "scalar",
+        }
+    }
+
+    /// Get a reference to the underlying YAML index.
+    #[inline]
+    pub fn index(&self) -> &YamlIndex<W> {
+        self.index
+    }
+
+    /// Get a reference to the underlying YAML text.
+    #[inline]
+    pub fn text(&self) -> &'a [u8] {
+        self.text
+    }
 }
 
 /// Write a YAML value as JSON (for sequence elements where we don't have a cursor).
@@ -3368,6 +3671,21 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     fn text_position(&self) -> Option<usize> {
         YamlCursor::text_position(self)
     }
+
+    #[inline]
+    fn line(&self) -> usize {
+        YamlCursor::line(self)
+    }
+
+    #[inline]
+    fn column(&self) -> usize {
+        YamlCursor::column(self)
+    }
+
+    #[inline]
+    fn document_index(&self) -> Option<usize> {
+        YamlCursor::document_index(self)
+    }
 }
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
@@ -5206,5 +5524,591 @@ mod tests {
         let transcoded = get_json_via_transcode(yaml);
         // Should contain "it's working"
         assert!(transcoded.contains("it's working"), "got: {}", transcoded);
+    }
+
+    // =========================================================================
+    // YAML Metadata Tests
+    // =========================================================================
+
+    #[test]
+    fn test_anchor_metadata() {
+        let yaml = b"default: &myanchor value\nref: *myanchor";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        // Navigate to the anchored value
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            // Find the "default" field which has the anchor
+            for field in fields {
+                if let YamlValue::String(k) = field.key() {
+                    let key = k.as_str().unwrap();
+                    if key.as_ref() == "default" {
+                        // Get the cursor for the value
+                        let cursor = field.value_cursor();
+                        // Check the anchor name
+                        assert_eq!(cursor.anchor(), Some("myanchor"));
+                        return;
+                    }
+                }
+            }
+        }
+        panic!("Could not find anchored value");
+    }
+
+    #[test]
+    fn test_style_double_quoted() {
+        let yaml = b"key: \"value\"";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.style(), "double");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_style_single_quoted() {
+        let yaml = b"key: 'value'";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.style(), "single");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_style_literal_block() {
+        let yaml = b"key: |\n  line1\n  line2";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.style(), "literal");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_style_folded_block() {
+        let yaml = b"key: >\n  line1\n  line2";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.style(), "folded");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_style_flow_sequence() {
+        let yaml = b"key: [a, b, c]";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.style(), "flow");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_style_flow_mapping() {
+        let yaml = b"key: {a: 1, b: 2}";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.style(), "flow");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_style_plain() {
+        let yaml = b"key: plain_value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                // Plain scalars have empty style
+                assert_eq!(cursor.style(), "");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_tag_string() {
+        let yaml = b"key: hello";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.tag(), "!!str");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_tag_int() {
+        let yaml = b"key: 42";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.tag(), "!!int");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_tag_bool() {
+        let yaml = b"key: true";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.tag(), "!!bool");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_tag_null() {
+        let yaml = b"key: null";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.tag(), "!!null");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_tag_float() {
+        let yaml = b"key: 3.14";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.tag(), "!!float");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_tag_seq() {
+        let yaml = b"key:\n  - a\n  - b";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        // Navigate: root -> doc item -> mapping -> value (which is a sequence)
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.tag(), "!!seq");
+                return;
+            }
+        }
+        panic!("Could not find sequence");
+    }
+
+    #[test]
+    fn test_tag_map() {
+        let yaml = b"outer:\n  inner: value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        // Navigate: root -> doc item -> outer mapping -> value (which is inner mapping)
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.tag(), "!!map");
+                return;
+            }
+        }
+        panic!("Could not find nested mapping");
+    }
+
+    #[test]
+    fn test_kind_scalar() {
+        let yaml = b"key: value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.kind(), "scalar");
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_kind_seq() {
+        let yaml = b"key:\n  - a\n  - b";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        // Navigate: root -> doc item -> mapping -> value (which is a sequence)
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.kind(), "seq");
+                return;
+            }
+        }
+        panic!("Could not find sequence");
+    }
+
+    #[test]
+    fn test_kind_map() {
+        let yaml = b"outer:\n  inner: value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        // Navigate: root -> doc item -> outer mapping -> value (which is inner mapping)
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.kind(), "map");
+                return;
+            }
+        }
+        panic!("Could not find nested mapping");
+    }
+
+    #[test]
+    fn test_no_anchor() {
+        let yaml = b"key: value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                // No anchor, should return None
+                assert_eq!(cursor.anchor(), None);
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_anchor_on_anchored_value() {
+        let yaml = b"default: &myanchor value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                // Anchored value should return the anchor name
+                assert_eq!(cursor.anchor(), Some("myanchor"));
+                // Not an alias
+                assert!(!cursor.is_alias());
+                assert_eq!(cursor.alias(), None);
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_alias_returns_anchor_name() {
+        let yaml = b"default: &myanchor value\nref: *myanchor";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(mut fields) = first_doc(root) {
+            // Skip first field (default), get second field (ref)
+            fields.next();
+            if let Some(field) = fields.next() {
+                let cursor = field.value_cursor();
+                // Alias should return the referenced anchor name
+                assert!(cursor.is_alias());
+                assert_eq!(cursor.alias(), Some("myanchor"));
+                // Alias does not have its own anchor (no &name on the alias itself)
+                assert_eq!(cursor.anchor(), None);
+                return;
+            }
+        }
+        panic!("Could not find alias");
+    }
+
+    #[test]
+    fn test_kind_alias() {
+        let yaml = b"default: &myanchor value\nref: *myanchor";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(mut fields) = first_doc(root) {
+            // Skip first field (default), get second field (ref)
+            fields.next();
+            if let Some(field) = fields.next() {
+                let cursor = field.value_cursor();
+                // yq returns "alias" for alias nodes
+                assert_eq!(cursor.kind(), "alias");
+                return;
+            }
+        }
+        panic!("Could not find alias");
+    }
+
+    #[test]
+    fn test_alias_on_non_alias() {
+        let yaml = b"key: value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                let cursor = field.value_cursor();
+                // Not an alias
+                assert!(!cursor.is_alias());
+                assert_eq!(cursor.alias(), None);
+                return;
+            }
+        }
+        panic!("Could not find value");
+    }
+
+    #[test]
+    fn test_alias_to_sequence() {
+        let yaml = b"items: &list\n  - a\n  - b\nref: *list";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(mut fields) = first_doc(root) {
+            // First field: items (anchored sequence)
+            if let Some(field) = fields.next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.anchor(), Some("list"));
+                assert_eq!(cursor.kind(), "seq");
+            }
+            // Second field: ref (alias to sequence)
+            if let Some(field) = fields.next() {
+                let cursor = field.value_cursor();
+                assert!(cursor.is_alias());
+                assert_eq!(cursor.alias(), Some("list"));
+                assert_eq!(cursor.kind(), "alias");
+                return;
+            }
+        }
+        panic!("Could not find alias");
+    }
+
+    #[test]
+    fn test_alias_to_mapping() {
+        let yaml = b"defaults: &defaults\n  host: localhost\nproduction: *defaults";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(mut fields) = first_doc(root) {
+            // First field: defaults (anchored mapping)
+            if let Some(field) = fields.next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.anchor(), Some("defaults"));
+                assert_eq!(cursor.kind(), "map");
+            }
+            // Second field: production (alias to mapping)
+            if let Some(field) = fields.next() {
+                let cursor = field.value_cursor();
+                assert!(cursor.is_alias());
+                assert_eq!(cursor.alias(), Some("defaults"));
+                assert_eq!(cursor.kind(), "alias");
+                return;
+            }
+        }
+        panic!("Could not find alias");
+    }
+
+    // =========================================================================
+    // Line and Column Tests
+    // =========================================================================
+
+    #[test]
+    fn test_line_basic() {
+        let yaml = b"name: Alice\nage: 30";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        // Root mapping is on line 1
+        assert_eq!(root.line(), 1);
+    }
+
+    #[test]
+    fn test_line_multiline() {
+        let yaml = b"first: one\nsecond: two\nthird: three";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(mut fields) = first_doc(root) {
+            // First field value: line 1
+            if let Some(field) = fields.next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.line(), 1);
+            }
+            // Second field value: line 2
+            if let Some(field) = fields.next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.line(), 2);
+            }
+            // Third field value: line 3
+            if let Some(field) = fields.next() {
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.line(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn test_column_basic() {
+        let yaml = b"name: Alice";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        // Root mapping starts at column 1
+        assert_eq!(root.column(), 1);
+
+        if let YamlValue::Mapping(mut fields) = first_doc(root) {
+            if let Some(field) = fields.next() {
+                // The value "Alice" starts at column 7 (after "name: ")
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.column(), 7);
+            }
+        }
+    }
+
+    #[test]
+    fn test_column_sequence() {
+        let yaml = b"- first\n- second";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Sequence(elements) = first_doc(root) {
+            // The cursor for a sequence element points to the element start position
+            // which is where the "-" indicator is, at column 1
+            let mut cursor = elements.element_cursor.unwrap();
+            assert_eq!(cursor.column(), 1);
+            assert_eq!(cursor.line(), 1);
+
+            // Second element is on line 2, also at column 1 (the "-" position)
+            cursor = cursor.next_sibling().unwrap();
+            assert_eq!(cursor.column(), 1);
+            assert_eq!(cursor.line(), 2);
+        }
+    }
+
+    #[test]
+    fn test_line_and_column_nested() {
+        let yaml = b"outer:\n  inner: value";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(mut fields) = first_doc(root) {
+            if let Some(outer_field) = fields.next() {
+                // outer's value (a mapping) is on line 2, column 3
+                let outer_cursor = outer_field.value_cursor();
+                assert_eq!(outer_cursor.line(), 2);
+                assert_eq!(outer_cursor.column(), 3);
+
+                if let YamlValue::Mapping(mut inner_fields) = outer_field.value() {
+                    if let Some(inner_field) = inner_fields.next() {
+                        // inner's value "value" is on line 2, column 10
+                        let inner_cursor = inner_field.value_cursor();
+                        assert_eq!(inner_cursor.line(), 2);
+                        assert_eq!(inner_cursor.column(), 10);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_line_flow_collection() {
+        let yaml = b"items: [a, b, c]";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(mut fields) = first_doc(root) {
+            if let Some(field) = fields.next() {
+                // Flow collection starts at column 8
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.line(), 1);
+                assert_eq!(cursor.column(), 8);
+            }
+        }
+    }
+
+    #[test]
+    fn test_line_block_scalar() {
+        let yaml = b"text: |\n  line one\n  line two";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(mut fields) = first_doc(root) {
+            if let Some(field) = fields.next() {
+                // Block scalar indicator is at column 7
+                let cursor = field.value_cursor();
+                assert_eq!(cursor.line(), 1);
+                assert_eq!(cursor.column(), 7);
+            }
+        }
     }
 }

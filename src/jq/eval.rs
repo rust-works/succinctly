@@ -75,21 +75,25 @@ pub struct EvalError {
 }
 
 impl EvalError {
-    fn new(message: impl Into<String>) -> Self {
+    /// Create a new evaluation error with a message.
+    pub fn new(message: impl Into<String>) -> Self {
         EvalError {
             message: message.into(),
         }
     }
 
-    fn type_error(expected: &str, got: &str) -> Self {
+    /// Create a type error.
+    pub fn type_error(expected: &str, got: &str) -> Self {
         EvalError::new(format!("expected {}, got {}", expected, got))
     }
 
-    fn field_not_found(name: &str) -> Self {
+    /// Create a field not found error.
+    pub fn field_not_found(name: &str) -> Self {
         EvalError::new(format!("field '{}' not found", name))
     }
 
-    fn index_out_of_bounds(index: i64, len: usize) -> Self {
+    /// Create an index out of bounds error.
+    pub fn index_out_of_bounds(index: i64, len: usize) -> Self {
         EvalError::new(format!("index {} out of bounds (length {})", index, len))
     }
 }
@@ -1373,12 +1377,23 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         // Phase 10: Object functions
         Builtin::ModuleMeta(name) => builtin_modulemeta(name, value, optional),
         Builtin::Pick(keys) => builtin_pick(keys, value, optional),
+        Builtin::Omit(keys) => builtin_omit(keys, value, optional),
 
         // YAML metadata functions (yq)
         Builtin::Tag => builtin_tag(value),
         Builtin::Anchor => builtin_anchor(),
         Builtin::Style => builtin_style(value),
         Builtin::Kind => builtin_kind(value),
+        Builtin::Line => builtin_line(),
+        Builtin::Column => builtin_column(),
+        Builtin::DocumentIndex => builtin_document_index(),
+        Builtin::Shuffle => builtin_shuffle(value, optional),
+        Builtin::Pivot => builtin_pivot(value, optional),
+        Builtin::SplitDoc => {
+            // split_doc is identity - the output formatting (--- separators)
+            // is handled by the yq runner, not here
+            QueryResult::One(value.clone())
+        }
         Builtin::Key => {
             // Key requires path context which is handled in eval_pipe_with_context
             // If we reach here without context, return null (at root level)
@@ -1433,6 +1448,14 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
 
         // Phase 20: Iteration control extension
         Builtin::Skip(n_expr, expr) => builtin_skip(n_expr, expr, value, optional),
+
+        // Phase 21: Extended Date/Time functions (yq)
+        Builtin::FromUnix => builtin_from_unix(value, optional),
+        Builtin::ToUnix => builtin_to_unix(value, optional),
+        Builtin::Tz(zone) => builtin_tz(zone, value, optional),
+
+        // Phase 22: File operations (yq)
+        Builtin::Load(file_expr) => builtin_load(file_expr, value, optional),
     }
 }
 
@@ -2778,6 +2801,8 @@ fn eval_format<'a, W: Clone + AsRef<[u64]>>(
         FormatType::Html => format_html(&owned, optional),
         FormatType::Sh => format_sh(&owned, optional),
         FormatType::Urid => format_urid(&owned, optional),
+        FormatType::Yaml => format_yaml(&owned),
+        FormatType::Props => format_props(&owned),
     };
 
     match result {
@@ -3049,6 +3074,191 @@ fn format_sh(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
         }
         _ if optional => Ok(String::new()),
         _ => Err(EvalError::type_error("string", value.type_name())),
+    }
+}
+
+/// @yaml - Format value as YAML string (yq)
+fn format_yaml(value: &OwnedValue) -> Result<String, EvalError> {
+    Ok(owned_to_yaml(value))
+}
+
+/// @props - Format value as Java properties format (yq)
+///
+/// Objects are flattened with dot-notation keys:
+/// `{database: "postgres", nested: {a: 1}}` → `database = postgres\nnested.a = 1`
+///
+/// Arrays use numeric indices:
+/// `{arr: [1, 2, 3]}` → `arr.0 = 1\narr.1 = 2\narr.2 = 3`
+///
+/// Non-objects are converted to strings.
+fn format_props(value: &OwnedValue) -> Result<String, EvalError> {
+    let mut lines = Vec::new();
+    format_props_recursive(value, String::new(), &mut lines);
+    Ok(lines.join("\n"))
+}
+
+/// Recursively format a value into Java properties lines
+fn format_props_recursive(value: &OwnedValue, prefix: String, lines: &mut Vec<String>) {
+    match value {
+        OwnedValue::Object(obj) => {
+            for (key, val) in obj.iter() {
+                let new_prefix = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", prefix, key)
+                };
+                format_props_recursive(val, new_prefix, lines);
+            }
+        }
+        OwnedValue::Array(arr) => {
+            for (idx, val) in arr.iter().enumerate() {
+                let new_prefix = if prefix.is_empty() {
+                    format!("{}", idx)
+                } else {
+                    format!("{}.{}", prefix, idx)
+                };
+                format_props_recursive(val, new_prefix, lines);
+            }
+        }
+        _ => {
+            // Scalar value - output as "key = value"
+            let value_str = props_value_to_string(value);
+            if prefix.is_empty() {
+                // Top-level scalar without key
+                lines.push(value_str);
+            } else {
+                lines.push(format!("{} = {}", prefix, value_str));
+            }
+        }
+    }
+}
+
+/// Convert a scalar value to its properties string representation
+fn props_value_to_string(value: &OwnedValue) -> String {
+    match value {
+        OwnedValue::Null => "null".to_string(),
+        OwnedValue::Bool(true) => "true".to_string(),
+        OwnedValue::Bool(false) => "false".to_string(),
+        OwnedValue::Int(n) => format!("{}", n),
+        OwnedValue::Float(f) => {
+            if f.is_nan() {
+                ".nan".to_string()
+            } else if f.is_infinite() {
+                if *f > 0.0 {
+                    ".inf".to_string()
+                } else {
+                    "-.inf".to_string()
+                }
+            } else {
+                format!("{}", f)
+            }
+        }
+        OwnedValue::String(s) => {
+            // Replace newlines with spaces, as yq does
+            s.replace(['\n', '\r'], " ")
+        }
+        // Objects and arrays should not reach here, but handle gracefully
+        OwnedValue::Object(_) | OwnedValue::Array(_) => value.to_json(),
+    }
+}
+
+/// Convert OwnedValue to YAML flow-style (compact, single-line like JSON).
+/// This matches yq's @yaml behavior which outputs flow-style YAML.
+fn owned_to_yaml(value: &OwnedValue) -> String {
+    match value {
+        OwnedValue::Null => "null".to_string(),
+        OwnedValue::Bool(true) => "true".to_string(),
+        OwnedValue::Bool(false) => "false".to_string(),
+        OwnedValue::Int(n) => format!("{}", n),
+        OwnedValue::Float(f) => {
+            if f.is_nan() {
+                ".nan".to_string()
+            } else if f.is_infinite() {
+                if *f > 0.0 {
+                    ".inf".to_string()
+                } else {
+                    "-.inf".to_string()
+                }
+            } else {
+                format!("{}", f)
+            }
+        }
+        OwnedValue::String(s) => yaml_quote_string(s),
+        OwnedValue::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(owned_to_yaml).collect();
+            format!("[{}]", items.join(", "))
+        }
+        OwnedValue::Object(obj) => {
+            let pairs: Vec<String> = obj
+                .iter()
+                .map(|(k, v)| format!("{}: {}", yaml_quote_string(k), owned_to_yaml(v)))
+                .collect();
+            format!("{{{}}}", pairs.join(", "))
+        }
+    }
+}
+
+/// Quote a string for YAML output if necessary
+fn yaml_quote_string(s: &str) -> String {
+    // Check if string needs quoting
+    let needs_quoting = s.is_empty()
+        || s.starts_with(' ')
+        || s.ends_with(' ')
+        || s.contains(':')
+        || s.contains('#')
+        || s.contains('\n')
+        || s.contains('\r')
+        || s.contains('\t')
+        || s.contains('"')
+        || s.contains('\'')
+        || s.contains('\\')
+        || s.starts_with('-')
+        || s.starts_with('?')
+        || s.starts_with('*')
+        || s.starts_with('&')
+        || s.starts_with('!')
+        || s.starts_with('|')
+        || s.starts_with('>')
+        || s.starts_with('%')
+        || s.starts_with('@')
+        || s.starts_with('`')
+        || s.starts_with('{')
+        || s.starts_with('}')
+        || s.starts_with('[')
+        || s.starts_with(']')
+        || s.starts_with(',')
+        || s == "true"
+        || s == "false"
+        || s == "null"
+        || s == "~"
+        || s == "yes"
+        || s == "no"
+        || s == "on"
+        || s == "off"
+        || s.parse::<i64>().is_ok()
+        || s.parse::<f64>().is_ok();
+
+    if needs_quoting {
+        // Use double quotes and escape special characters
+        let mut result = String::with_capacity(s.len() + 2);
+        result.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => result.push_str("\\\""),
+                '\\' => result.push_str("\\\\"),
+                '\n' => result.push_str("\\n"),
+                '\r' => result.push_str("\\r"),
+                '\t' => result.push_str("\\t"),
+                c if c.is_control() => {
+                    result.push_str(&format!("\\x{:02x}", c as u32));
+                }
+                c => result.push(c),
+            }
+        }
+        result.push('"');
+        result
+    } else {
+        s.to_string()
     }
 }
 
@@ -5970,11 +6180,18 @@ fn substitute_var_in_builtin(
             Builtin::ModuleMeta(Box::new(substitute_var(e, var_name, replacement)))
         }
         Builtin::Pick(e) => Builtin::Pick(Box::new(substitute_var(e, var_name, replacement))),
+        Builtin::Omit(e) => Builtin::Omit(Box::new(substitute_var(e, var_name, replacement))),
         Builtin::Tag => Builtin::Tag,
         Builtin::Anchor => Builtin::Anchor,
         Builtin::Style => Builtin::Style,
         Builtin::Kind => Builtin::Kind,
         Builtin::Key => Builtin::Key,
+        Builtin::Line => Builtin::Line,
+        Builtin::Column => Builtin::Column,
+        Builtin::DocumentIndex => Builtin::DocumentIndex,
+        Builtin::Shuffle => Builtin::Shuffle,
+        Builtin::Pivot => Builtin::Pivot,
+        Builtin::SplitDoc => Builtin::SplitDoc,
         Builtin::Del(e) => Builtin::Del(Box::new(substitute_var(e, var_name, replacement))),
         // Phase 12 builtins (no args to substitute)
         Builtin::Now => Builtin::Now,
@@ -6042,6 +6259,14 @@ fn substitute_var_in_builtin(
             Box::new(substitute_var(n, var_name, replacement)),
             Box::new(substitute_var(e, var_name, replacement)),
         ),
+
+        // Phase 21: Extended Date/Time functions (yq)
+        Builtin::FromUnix => Builtin::FromUnix,
+        Builtin::ToUnix => Builtin::ToUnix,
+        Builtin::Tz(e) => Builtin::Tz(Box::new(substitute_var(e, var_name, replacement))),
+
+        // Phase 22: File operations (yq)
+        Builtin::Load(e) => Builtin::Load(Box::new(substitute_var(e, var_name, replacement))),
     }
 }
 
@@ -8947,6 +9172,538 @@ fn parse_iso8601(input: &str) -> Result<f64, String> {
     Ok(timestamp as f64)
 }
 
+// Phase 21: Extended Date/Time functions (yq)
+
+/// Builtin: from_unix - convert Unix epoch to ISO 8601 date string
+/// This is semantically identical to todate/todateiso8601 but with yq naming convention
+fn builtin_from_unix<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // from_unix is the same as todate - converts Unix timestamp to ISO 8601 string
+    builtin_todate(value, optional)
+}
+
+/// Builtin: to_unix - convert ISO 8601 date string to Unix epoch
+/// This is semantically identical to fromdate/fromdateiso8601 but with yq naming convention
+fn builtin_to_unix<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // to_unix is the same as fromdate - parses ISO 8601 string to Unix timestamp
+    builtin_fromdate(value, optional)
+}
+
+/// Format Unix timestamp to ISO 8601 string with timezone offset
+fn format_datetime_with_offset(timestamp: f64, offset_seconds: i64) -> String {
+    // Apply the timezone offset to the timestamp
+    let adjusted_secs = timestamp.trunc() as i64 + offset_seconds;
+
+    let days = if adjusted_secs >= 0 {
+        adjusted_secs / 86400
+    } else {
+        (adjusted_secs - 86399) / 86400
+    };
+    let time_of_day = ((adjusted_secs % 86400) + 86400) % 86400;
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+
+    if offset_seconds == 0 {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            year, month, day, hour, minute, second
+        )
+    } else {
+        let offset_hours = offset_seconds.abs() / 3600;
+        let offset_mins = (offset_seconds.abs() % 3600) / 60;
+        let sign = if offset_seconds >= 0 { '+' } else { '-' };
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
+            year, month, day, hour, minute, second, sign, offset_hours, offset_mins
+        )
+    }
+}
+
+/// Get timezone offset in seconds for a given IANA timezone name
+/// Returns Ok(offset_seconds) or Err(error_message)
+fn get_timezone_offset(zone: &str, timestamp: f64) -> Result<i64, String> {
+    match zone.to_lowercase().as_str() {
+        "utc" | "z" | "gmt" => Ok(0),
+        "local" => {
+            // Get local timezone offset
+            // In a no_std-compatible library, we can't reliably get local timezone
+            // without platform-specific code or external dependencies.
+            // Return UTC offset (0) as a fallback - users should use explicit timezone names
+            let _ = timestamp; // Suppress unused warning
+            Ok(0)
+        }
+        _ => {
+            // Try to parse common IANA timezone abbreviations
+            // This is a simplified subset - full IANA support would require a timezone database
+            let offset = match zone.to_uppercase().as_str() {
+                // US timezones
+                "EST" => -5 * 3600,
+                "EDT" => -4 * 3600,
+                "CST" => -6 * 3600,
+                "CDT" => -5 * 3600,
+                "MST" => -7 * 3600,
+                "MDT" => -6 * 3600,
+                "PST" => -8 * 3600,
+                "PDT" => -7 * 3600,
+                "AKST" => -9 * 3600,
+                "AKDT" => -8 * 3600,
+                "HST" => -10 * 3600,
+                // European timezones
+                "WET" => 0,
+                "WEST" => 3600,
+                "CET" => 3600,
+                "CEST" => 2 * 3600,
+                "EET" => 2 * 3600,
+                "EEST" => 3 * 3600,
+                // Asian timezones
+                "JST" => 9 * 3600,
+                "KST" => 9 * 3600,
+                "CST_CHINA" => 8 * 3600,
+                "IST" => 5 * 3600 + 30 * 60, // India: +5:30
+                // Australian timezones
+                "AEST" => 10 * 3600,
+                "AEDT" => 13600,
+                "ACST" => 9 * 3600 + 30 * 60,
+                "ACDT" => 10 * 3600 + 30 * 60,
+                "AWST" => 8 * 3600,
+                _ => {
+                    // Try to parse IANA-style timezone names
+                    // Common patterns: America/New_York, Europe/London, Asia/Tokyo
+                    let offset = match zone {
+                        // Americas
+                        "America/New_York" | "US/Eastern" => {
+                            // EDT/EST - simplified, always using standard time
+                            if is_dst_us_eastern(timestamp) {
+                                -4 * 3600
+                            } else {
+                                -5 * 3600
+                            }
+                        }
+                        "America/Chicago" | "US/Central" => {
+                            if is_dst_us_eastern(timestamp) {
+                                -5 * 3600
+                            } else {
+                                -6 * 3600
+                            }
+                        }
+                        "America/Denver" | "US/Mountain" => {
+                            if is_dst_us_eastern(timestamp) {
+                                -6 * 3600
+                            } else {
+                                -7 * 3600
+                            }
+                        }
+                        "America/Los_Angeles" | "US/Pacific" => {
+                            if is_dst_us_eastern(timestamp) {
+                                -7 * 3600
+                            } else {
+                                -8 * 3600
+                            }
+                        }
+                        "America/Anchorage" | "US/Alaska" => {
+                            if is_dst_us_eastern(timestamp) {
+                                -8 * 3600
+                            } else {
+                                -9 * 3600
+                            }
+                        }
+                        "Pacific/Honolulu" | "US/Hawaii" => -10 * 3600,
+                        // Europe
+                        "Europe/London" | "GB" => {
+                            if is_dst_europe(timestamp) {
+                                3600
+                            } else {
+                                0
+                            }
+                        }
+                        "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" => {
+                            if is_dst_europe(timestamp) {
+                                2 * 3600
+                            } else {
+                                3600
+                            }
+                        }
+                        "Europe/Moscow" => 3 * 3600,
+                        // Asia
+                        "Asia/Tokyo" | "Japan" => 9 * 3600,
+                        "Asia/Seoul" | "ROK" => 9 * 3600,
+                        "Asia/Shanghai" | "Asia/Hong_Kong" | "PRC" => 8 * 3600,
+                        "Asia/Kolkata" | "Asia/Calcutta" => 5 * 3600 + 30 * 60,
+                        "Asia/Dubai" => 4 * 3600,
+                        "Asia/Singapore" => 8 * 3600,
+                        // Australia
+                        "Australia/Sydney" => {
+                            if is_dst_australia(timestamp) {
+                                13600
+                            } else {
+                                10 * 3600
+                            }
+                        }
+                        "Australia/Melbourne" => {
+                            if is_dst_australia(timestamp) {
+                                13600
+                            } else {
+                                10 * 3600
+                            }
+                        }
+                        "Australia/Perth" => 8 * 3600,
+                        // UTC aliases
+                        "Etc/UTC" | "Etc/GMT" | "UTC" | "GMT" => 0,
+                        _ => {
+                            // Try parsing numeric offset like "+05:30" or "-08:00"
+                            if let Some(offset) = parse_numeric_offset(zone) {
+                                return Ok(offset);
+                            }
+                            return Err(format!("unknown timezone: {}", zone));
+                        }
+                    };
+                    return Ok(offset);
+                }
+            };
+            Ok(offset)
+        }
+    }
+}
+
+/// Parse numeric timezone offset like "+05:30" or "-0800"
+fn parse_numeric_offset(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    let (sign, rest) = match s.chars().next() {
+        Some('+') => (1i64, &s[1..]),
+        Some('-') => (-1i64, &s[1..]),
+        _ => return None,
+    };
+
+    // Try HH:MM format
+    if rest.len() == 5 && rest.chars().nth(2) == Some(':') {
+        let hours: i64 = rest[..2].parse().ok()?;
+        let mins: i64 = rest[3..].parse().ok()?;
+        return Some(sign * (hours * 3600 + mins * 60));
+    }
+
+    // Try HHMM format
+    if rest.len() == 4 && rest.chars().all(|c| c.is_ascii_digit()) {
+        let hours: i64 = rest[..2].parse().ok()?;
+        let mins: i64 = rest[2..].parse().ok()?;
+        return Some(sign * (hours * 3600 + mins * 60));
+    }
+
+    // Try HH format
+    if rest.len() == 2 && rest.chars().all(|c| c.is_ascii_digit()) {
+        let hours: i64 = rest.parse().ok()?;
+        return Some(sign * hours * 3600);
+    }
+
+    None
+}
+
+/// Simplified DST check for US Eastern timezone
+/// DST starts 2nd Sunday of March, ends 1st Sunday of November (since 2007)
+fn is_dst_us_eastern(timestamp: f64) -> bool {
+    // Convert to days since epoch and calculate approximate month/day
+    let secs = timestamp.trunc() as i64;
+    let days = secs / 86400;
+
+    // Get year, month, day from days since epoch
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as i32;
+
+    // Approximate DST: March 8-14 to November 1-7 (simplified)
+    // More accurate would check actual Sunday dates
+    match month {
+        3 => day >= 8,  // After ~2nd week of March
+        4..=10 => true, // April through October
+        11 => day < 7,  // First week of November
+        _ => false,     // December through February
+    }
+}
+
+/// Simplified DST check for European timezones
+/// DST starts last Sunday of March, ends last Sunday of October
+fn is_dst_europe(timestamp: f64) -> bool {
+    let secs = timestamp.trunc() as i64;
+    let days = secs / 86400;
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as i32;
+
+    match month {
+        3 => day >= 25, // Last week of March
+        4..=9 => true,  // April through September
+        10 => day < 25, // Before last week of October
+        _ => false,
+    }
+}
+
+/// Simplified DST check for Australian Eastern timezones
+/// DST starts first Sunday of October, ends first Sunday of April
+fn is_dst_australia(timestamp: f64) -> bool {
+    let secs = timestamp.trunc() as i64;
+    let days = secs / 86400;
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as i32;
+
+    // Australian DST is opposite to Northern Hemisphere
+    match month {
+        10 => day >= 7,              // After first Sunday of October
+        11 | 12 | 1 | 2 | 3 => true, // November through March
+        4 => day < 7,                // Before first Sunday of April
+        _ => false,
+    }
+}
+
+/// Builtin: tz(zone) - convert Unix timestamp to datetime in specified timezone
+fn builtin_tz<'a, W: Clone + AsRef<[u64]>>(
+    zone_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Get the timestamp from input
+    let timestamp = match get_float_value(&value, optional) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+
+    // Evaluate the timezone expression to get the zone name
+    let zone_str = match result_to_owned(eval_single(zone_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "tz zone argument")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the timezone offset
+    let offset = match get_timezone_offset(&zone_str, timestamp) {
+        Ok(o) => o,
+        Err(_) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(EvalError::new(e)),
+    };
+
+    // Format the datetime with the timezone offset
+    let result = format_datetime_with_offset(timestamp, offset);
+    QueryResult::Owned(OwnedValue::String(result))
+}
+
+// Phase 22: File operations (yq)
+
+/// Builtin: load(file) - load external YAML/JSON file and return its parsed content
+/// This function is only available with the "std" feature enabled.
+#[cfg(feature = "std")]
+fn builtin_load<'a, W: Clone + AsRef<[u64]>>(
+    file_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    use std::path::Path;
+
+    // Evaluate the file expression to get the filename
+    let filename = match result_to_owned(eval_single(file_expr, value, optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "load filename")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Read the file contents
+    let file_bytes = match std::fs::read(&filename) {
+        Ok(bytes) => bytes,
+        Err(_) if optional => {
+            // In optional mode, return null for file errors
+            return QueryResult::None;
+        }
+        Err(e) => {
+            return QueryResult::Error(EvalError::new(format!(
+                "load: failed to read file '{}': {}",
+                filename, e
+            )));
+        }
+    };
+
+    // Detect format from file extension
+    let path = Path::new(&filename);
+    let is_json = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    if is_json {
+        // Parse as JSON
+        let index = crate::json::JsonIndex::build(&file_bytes);
+        let cursor = index.root(&file_bytes);
+        QueryResult::Owned(to_owned(&cursor.value()))
+    } else {
+        // Parse as YAML (default)
+        match crate::yaml::YamlIndex::build(&file_bytes) {
+            Ok(index) => {
+                let root = index.root(&file_bytes);
+                // YAML documents are wrapped in a sequence at the root
+                match root.value() {
+                    crate::yaml::YamlValue::Sequence(docs) => {
+                        // If single document, return it directly; otherwise return array
+                        let doc_values: Vec<OwnedValue> =
+                            docs.into_iter().map(|v| yaml_value_to_owned(v)).collect();
+                        if doc_values.len() == 1 {
+                            QueryResult::Owned(doc_values.into_iter().next().unwrap())
+                        } else {
+                            QueryResult::Owned(OwnedValue::Array(doc_values))
+                        }
+                    }
+                    other => {
+                        // Single value at root
+                        QueryResult::Owned(yaml_value_to_owned(other))
+                    }
+                }
+            }
+            Err(_) if optional => QueryResult::None,
+            Err(e) => QueryResult::Error(EvalError::new(format!(
+                "load: failed to parse YAML file '{}': {}",
+                filename, e
+            ))),
+        }
+    }
+}
+
+/// Convert a YAML value to OwnedValue (helper for load)
+#[cfg(feature = "std")]
+fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
+    value: crate::yaml::YamlValue<'_, W>,
+) -> OwnedValue {
+    use crate::yaml::YamlValue;
+
+    match value {
+        YamlValue::Null => OwnedValue::Null,
+        YamlValue::String(s) => {
+            // Get the string value
+            let str_value = match s.as_str() {
+                Ok(cow) => cow.into_owned(),
+                Err(_) => return OwnedValue::Null,
+            };
+
+            // Quoted strings are kept as strings
+            if !s.is_unquoted() {
+                return OwnedValue::String(str_value);
+            }
+
+            // Type detection for unquoted scalars
+            match str_value.as_str() {
+                "null" | "~" | "" => return OwnedValue::Null,
+                "true" | "True" | "TRUE" => return OwnedValue::Bool(true),
+                "false" | "False" | "FALSE" => return OwnedValue::Bool(false),
+                _ => {}
+            }
+
+            // Try to parse as number
+            if let Ok(n) = str_value.parse::<i64>() {
+                return OwnedValue::Int(n);
+            }
+            if let Ok(f) = str_value.parse::<f64>() {
+                if !f.is_nan() {
+                    return OwnedValue::Float(f);
+                }
+            }
+
+            // Check for special float literals
+            match str_value.as_str() {
+                ".inf" | ".Inf" | ".INF" => return OwnedValue::Float(f64::INFINITY),
+                "-.inf" | "-.Inf" | "-.INF" => return OwnedValue::Float(f64::NEG_INFINITY),
+                ".nan" | ".NaN" | ".NAN" => return OwnedValue::Float(f64::NAN),
+                _ => {}
+            }
+
+            OwnedValue::String(str_value)
+        }
+        YamlValue::Sequence(elements) => {
+            let items: Vec<OwnedValue> = elements.into_iter().map(yaml_value_to_owned).collect();
+            OwnedValue::Array(items)
+        }
+        YamlValue::Mapping(fields) => {
+            let mut map = indexmap::IndexMap::new();
+            for field in fields {
+                let key = match field.key() {
+                    YamlValue::String(s) => match s.as_str() {
+                        Ok(cow) => cow.into_owned(),
+                        Err(_) => continue,
+                    },
+                    other => {
+                        // Non-string keys - convert to string representation
+                        let v = yaml_value_to_owned(other);
+                        v.to_json()
+                    }
+                };
+                let value = yaml_value_to_owned(field.value());
+                map.insert(key, value);
+            }
+            OwnedValue::Object(map)
+        }
+        YamlValue::Alias { target, .. } => {
+            // Resolve alias by following the target cursor
+            if let Some(target_cursor) = target {
+                yaml_value_to_owned(target_cursor.value())
+            } else {
+                OwnedValue::Null
+            }
+        }
+        YamlValue::Error(_) => OwnedValue::Null,
+    }
+}
+
+/// Builtin: load(file) - stub for no_std builds (returns error)
+#[cfg(not(feature = "std"))]
+fn builtin_load<'a, W: Clone + AsRef<[u64]>>(
+    _file_expr: &Expr,
+    _value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    if optional {
+        QueryResult::None
+    } else {
+        QueryResult::Error(EvalError::new(
+            "load() requires the 'std' feature to be enabled".to_string(),
+        ))
+    }
+}
+
 // Phase 17: Combinations
 
 /// Builtin: combinations - generate all combinations from array of arrays
@@ -9267,6 +10024,8 @@ fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
         "style/0",
         "kind/0",
         "key/0",
+        "line/0",
+        "column/0",
         "parent/0",
         "parent/1",
     ];
@@ -10588,6 +11347,112 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Builtin: omit(keys) - remove specified keys from object/indices from array
+/// Inverse of `pick`: keeps all keys/indices except those specified.
+fn builtin_omit<'a, W: Clone + AsRef<[u64]>>(
+    keys_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the keys expression to get the array of keys to omit
+    let keys_owned = match eval_single(keys_expr, value.clone(), optional) {
+        QueryResult::One(v) => to_owned(&v),
+        QueryResult::OneCursor(c) => to_owned(&c.value()),
+        QueryResult::Owned(v) => v,
+        QueryResult::ManyOwned(v) if !v.is_empty() => v.into_iter().next().unwrap(),
+        QueryResult::ManyOwned(_) => {
+            return QueryResult::Error(EvalError::new("omit: keys expression produced no output"))
+        }
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::None if optional => return QueryResult::None,
+        QueryResult::None => {
+            return QueryResult::Error(EvalError::new("omit: keys expression produced no output"))
+        }
+        QueryResult::Many(v) if !v.is_empty() => to_owned(&v.into_iter().next().unwrap()),
+        QueryResult::Many(_) => {
+            return QueryResult::Error(EvalError::new("omit: keys expression produced no output"))
+        }
+    };
+
+    // Keys must be an array
+    let keys = match &keys_owned {
+        OwnedValue::Array(arr) => arr,
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::new("omit: argument must be an array of keys")),
+    };
+
+    match &value {
+        StandardJson::Object(fields) => {
+            // For objects, keep all keys except those in the omit list
+            // Use a Vec for no_std compatibility (typical omit lists are small)
+            let omit_keys: Vec<&str> = keys
+                .iter()
+                .filter_map(|k| {
+                    if let OwnedValue::String(s) = k {
+                        Some(s.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let mut result = IndexMap::new();
+            for field in *fields {
+                if let StandardJson::String(key_str) = field.key() {
+                    if let Ok(cow) = key_str.as_str() {
+                        let key = cow.as_ref();
+                        if !omit_keys.contains(&key) {
+                            result.insert(key.to_string(), to_owned(&field.value()));
+                        }
+                    }
+                }
+            }
+            QueryResult::Owned(OwnedValue::Object(result))
+        }
+        StandardJson::Array(elements) => {
+            // For arrays, keep all indices except those in the omit list
+            let arr: Vec<_> = (*elements).collect();
+            let len = arr.len() as i64;
+
+            // Use a Vec for no_std compatibility (typical omit lists are small)
+            let omit_indices: Vec<usize> = keys
+                .iter()
+                .filter_map(|k| {
+                    let idx = match k {
+                        OwnedValue::Int(i) => *i,
+                        OwnedValue::Float(f) => *f as i64,
+                        _ => return None,
+                    };
+                    // Handle negative indices
+                    let actual_idx = if idx < 0 { len + idx } else { idx };
+                    if actual_idx >= 0 && actual_idx < len {
+                        Some(actual_idx as usize)
+                    } else {
+                        None // Out of bounds indices are ignored
+                    }
+                })
+                .collect();
+
+            let result: Vec<OwnedValue> = arr
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| {
+                    if omit_indices.contains(&i) {
+                        None
+                    } else {
+                        Some(to_owned(v))
+                    }
+                })
+                .collect();
+
+            QueryResult::Owned(OwnedValue::Array(result))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::new("omit: input must be an object or array")),
+    }
+}
+
 // Builtin: tag - return YAML type tag (!!str, !!int, !!map, etc.)
 // Since we evaluate on JSON/OwnedValue (not raw YAML), we derive the tag from the JSON type.
 fn builtin_tag<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryResult<'a, W> {
@@ -10644,6 +11509,188 @@ fn builtin_kind<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> Quer
         _ => "scalar",
     };
     QueryResult::Owned(OwnedValue::String(kind.to_string()))
+}
+
+/// `line` - returns the 1-based line number of the current node (yq)
+/// Since YAML position metadata is lost during conversion to OwnedValue, this returns 0.
+/// In a full yq implementation, this would require tracking source positions through the pipeline.
+fn builtin_line<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+    // Currently source positions are not preserved through the OwnedValue conversion.
+    // Return 0 to indicate position is unknown (yq returns 1 for actual positions).
+    QueryResult::Owned(OwnedValue::Int(0))
+}
+
+/// `column` - returns the 1-based column number of the current node (yq)
+/// Since YAML position metadata is lost during conversion to OwnedValue, this returns 0.
+/// In a full yq implementation, this would require tracking source positions through the pipeline.
+fn builtin_column<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+    // Currently source positions are not preserved through the OwnedValue conversion.
+    // Return 0 to indicate position is unknown (yq returns 1 for actual positions).
+    QueryResult::Owned(OwnedValue::Int(0))
+}
+
+/// `document_index` / `di` - returns the 0-indexed document position in multi-doc stream (yq)
+/// Since document context is lost during conversion to OwnedValue for JSON processing,
+/// this returns 0. The actual document index is preserved through the generic evaluator
+/// when processing YAML directly.
+fn builtin_document_index<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
+    // For JSON input or when document context is lost, return 0 (single document assumed).
+    // The generic evaluator handles this properly for YAML with cursor metadata.
+    QueryResult::Owned(OwnedValue::Int(0))
+}
+
+/// `shuffle` - randomly shuffle array elements (yq)
+/// Uses non-cryptographic RNG for performance.
+#[cfg(feature = "cli")]
+fn builtin_shuffle<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    use rand::seq::SliceRandom;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
+    match value {
+        StandardJson::Array(elements) => {
+            let mut items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
+            // Use a seeded RNG for reproducibility in tests if needed,
+            // but seed from system entropy for actual randomness
+            let mut rng = ChaCha8Rng::from_entropy();
+            items.shuffle(&mut rng);
+            QueryResult::Owned(OwnedValue::Array(items))
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    }
+}
+
+/// `shuffle` - fallback when cli feature is not enabled
+#[cfg(not(feature = "cli"))]
+fn builtin_shuffle<'a, W: Clone + AsRef<[u64]>>(
+    _value: StandardJson<'a, W>,
+    _optional: bool,
+) -> QueryResult<'a, W> {
+    QueryResult::Error(EvalError::new(
+        "shuffle requires the 'cli' feature to be enabled",
+    ))
+}
+
+/// `pivot` - transpose arrays/objects (yq)
+///
+/// For array of arrays: transposes rows/columns
+///   [[a, b], [x, y]] | pivot  → [[a, x], [b, y]]
+///
+/// For array of objects: collects values by key
+///   [{name: "Alice", age: 30}, {name: "Bob", age: 25}] | pivot
+///   → {name: ["Alice", "Bob"], age: [30, 25]}
+///
+/// Handles missing keys with null padding.
+fn builtin_pivot<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
+        StandardJson::Array(elements) => {
+            let items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
+
+            if items.is_empty() {
+                // Empty array pivots to empty array
+                return QueryResult::Owned(OwnedValue::Array(vec![]));
+            }
+
+            // Check if all elements are arrays (array-of-arrays case)
+            let all_arrays = items.iter().all(|v| matches!(v, OwnedValue::Array(_)));
+            // Check if all elements are objects (array-of-objects case)
+            let all_objects = items.iter().all(|v| matches!(v, OwnedValue::Object(_)));
+
+            if all_arrays {
+                // Transpose array of arrays
+                pivot_arrays(&items)
+            } else if all_objects {
+                // Transpose array of objects
+                pivot_objects(&items)
+            } else {
+                // Mixed or unsupported types
+                if optional {
+                    QueryResult::None
+                } else {
+                    QueryResult::Error(EvalError::new(
+                        "pivot requires array of arrays or array of objects",
+                    ))
+                }
+            }
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+    }
+}
+
+/// Transpose array of arrays: [[a, b], [x, y]] → [[a, x], [b, y]]
+fn pivot_arrays<'a, W: Clone + AsRef<[u64]>>(items: &[OwnedValue]) -> QueryResult<'a, W> {
+    // Get the maximum row length
+    let max_len = items
+        .iter()
+        .filter_map(|v| {
+            if let OwnedValue::Array(arr) = v {
+                Some(arr.len())
+            } else {
+                None
+            }
+        })
+        .max()
+        .unwrap_or(0);
+
+    if max_len == 0 {
+        return QueryResult::Owned(OwnedValue::Array(vec![]));
+    }
+
+    // Build transposed array
+    let mut result = Vec::with_capacity(max_len);
+    for col_idx in 0..max_len {
+        let mut column = Vec::with_capacity(items.len());
+        for item in items {
+            if let OwnedValue::Array(arr) = item {
+                // Get element at col_idx, or null if missing
+                column.push(arr.get(col_idx).cloned().unwrap_or(OwnedValue::Null));
+            } else {
+                column.push(OwnedValue::Null);
+            }
+        }
+        result.push(OwnedValue::Array(column));
+    }
+
+    QueryResult::Owned(OwnedValue::Array(result))
+}
+
+/// Transpose array of objects: [{a: 1}, {a: 2, b: 3}] → {a: [1, 2], b: [null, 3]}
+fn pivot_objects<'a, W: Clone + AsRef<[u64]>>(items: &[OwnedValue]) -> QueryResult<'a, W> {
+    // Collect all unique keys in order of first appearance
+    let mut all_keys: Vec<String> = Vec::new();
+    for item in items {
+        if let OwnedValue::Object(obj) = item {
+            for key in obj.keys() {
+                if !all_keys.contains(key) {
+                    all_keys.push(key.clone());
+                }
+            }
+        }
+    }
+
+    // Build result object with arrays for each key
+    let mut result = IndexMap::new();
+    for key in &all_keys {
+        let mut values = Vec::with_capacity(items.len());
+        for item in items {
+            if let OwnedValue::Object(obj) = item {
+                values.push(obj.get(key).cloned().unwrap_or(OwnedValue::Null));
+            } else {
+                values.push(OwnedValue::Null);
+            }
+        }
+        result.insert(key.clone(), OwnedValue::Array(values));
+    }
+
+    QueryResult::Owned(OwnedValue::Object(result))
 }
 
 // ============================================================================
@@ -11580,11 +12627,18 @@ fn expand_func_calls_in_builtin(
             Builtin::ModuleMeta(Box::new(expand_func_calls(e, func_name, params, body)))
         }
         Builtin::Pick(e) => Builtin::Pick(Box::new(expand_func_calls(e, func_name, params, body))),
+        Builtin::Omit(e) => Builtin::Omit(Box::new(expand_func_calls(e, func_name, params, body))),
         Builtin::Tag => Builtin::Tag,
         Builtin::Anchor => Builtin::Anchor,
         Builtin::Style => Builtin::Style,
         Builtin::Kind => Builtin::Kind,
         Builtin::Key => Builtin::Key,
+        Builtin::Line => Builtin::Line,
+        Builtin::Column => Builtin::Column,
+        Builtin::DocumentIndex => Builtin::DocumentIndex,
+        Builtin::Shuffle => Builtin::Shuffle,
+        Builtin::Pivot => Builtin::Pivot,
+        Builtin::SplitDoc => Builtin::SplitDoc,
         Builtin::Del(e) => Builtin::Del(Box::new(expand_func_calls(e, func_name, params, body))),
         // Phase 12 builtins (no args to expand)
         Builtin::Now => Builtin::Now,
@@ -11656,6 +12710,14 @@ fn expand_func_calls_in_builtin(
             Box::new(expand_func_calls(n, func_name, params, body)),
             Box::new(expand_func_calls(e, func_name, params, body)),
         ),
+
+        // Phase 21: Extended Date/Time functions (yq)
+        Builtin::FromUnix => Builtin::FromUnix,
+        Builtin::ToUnix => Builtin::ToUnix,
+        Builtin::Tz(e) => Builtin::Tz(Box::new(expand_func_calls(e, func_name, params, body))),
+
+        // Phase 22: File operations (yq)
+        Builtin::Load(e) => Builtin::Load(Box::new(expand_func_calls(e, func_name, params, body))),
     }
 }
 
@@ -11861,11 +12923,18 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
             Builtin::ModuleMeta(Box::new(substitute_func_param(e, param, arg)))
         }
         Builtin::Pick(e) => Builtin::Pick(Box::new(substitute_func_param(e, param, arg))),
+        Builtin::Omit(e) => Builtin::Omit(Box::new(substitute_func_param(e, param, arg))),
         Builtin::Tag => Builtin::Tag,
         Builtin::Anchor => Builtin::Anchor,
         Builtin::Style => Builtin::Style,
         Builtin::Kind => Builtin::Kind,
         Builtin::Key => Builtin::Key,
+        Builtin::Line => Builtin::Line,
+        Builtin::Column => Builtin::Column,
+        Builtin::DocumentIndex => Builtin::DocumentIndex,
+        Builtin::Shuffle => Builtin::Shuffle,
+        Builtin::Pivot => Builtin::Pivot,
+        Builtin::SplitDoc => Builtin::SplitDoc,
         Builtin::Del(e) => Builtin::Del(Box::new(substitute_func_param(e, param, arg))),
         // Phase 12 builtins (no args to substitute)
         Builtin::Now => Builtin::Now,
@@ -11929,6 +12998,14 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
             Box::new(substitute_func_param(n, param, arg)),
             Box::new(substitute_func_param(e, param, arg)),
         ),
+
+        // Phase 21: Extended Date/Time functions (yq)
+        Builtin::FromUnix => Builtin::FromUnix,
+        Builtin::ToUnix => Builtin::ToUnix,
+        Builtin::Tz(e) => Builtin::Tz(Box::new(substitute_func_param(e, param, arg))),
+
+        // Phase 22: File operations (yq)
+        Builtin::Load(e) => Builtin::Load(Box::new(substitute_func_param(e, param, arg))),
     }
 }
 
@@ -13432,6 +14509,137 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_format_yaml() {
+        // Simple object
+        query!(br#"{"a": 1, "b": 2}"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "{a: 1, b: 2}");
+            }
+        );
+
+        // Array
+        query!(br#"[1, 2, 3]"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "[1, 2, 3]");
+            }
+        );
+
+        // Nested structure
+        query!(br#"{"name": "test", "items": [1, 2]}"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "{name: test, items: [1, 2]}");
+            }
+        );
+
+        // String that needs quoting (reserved word)
+        query!(br#"{"value": "true"}"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "{value: \"true\"}");
+            }
+        );
+
+        // Null and boolean
+        query!(br#"{"flag": true, "nothing": null}"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "{flag: true, nothing: null}");
+            }
+        );
+
+        // Empty containers
+        query!(br#"[]"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "[]");
+            }
+        );
+
+        query!(br#"{}"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "{}");
+            }
+        );
+
+        // Float values
+        query!(br#"3.14"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "3.14");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_props() {
+        // Simple object
+        query!(br#"{"database": "postgres", "port": 5432}"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "database = postgres\nport = 5432");
+            }
+        );
+
+        // Nested object
+        query!(br#"{"nested": {"a": 1, "b": 2}, "top": "value"}"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "nested.a = 1\nnested.b = 2\ntop = value");
+            }
+        );
+
+        // Array
+        query!(br#"{"arr": [1, 2, 3]}"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "arr.0 = 1\narr.1 = 2\narr.2 = 3");
+            }
+        );
+
+        // Deeply nested
+        query!(br#"{"a": {"b": {"c": 42}}}"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "a.b.c = 42");
+            }
+        );
+
+        // Top-level scalar
+        query!(br#""just a string""#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "just a string");
+            }
+        );
+
+        // Null
+        query!(br#"null"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "null");
+            }
+        );
+
+        // Boolean values
+        query!(br#"{"enabled": true, "disabled": false}"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "enabled = true\ndisabled = false");
+            }
+        );
+
+        // Special characters in values (preserved)
+        query!(br#"{"key": "value=with=equals"}"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "key = value=with=equals");
+            }
+        );
+
+        // Empty object
+        query!(br#"{}"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "");
+            }
+        );
+
+        // Top-level array
+        query!(br#"[1, 2, 3]"#, "@props",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "0 = 1\n1 = 2\n2 = 3");
+            }
+        );
+    }
+
     // =========================================================================
     // Phase 6: Type Conversion Builtins
     // =========================================================================
@@ -14688,6 +15896,169 @@ mod tests {
     }
 
     // =============================================
+    // Phase 21: Extended Date/Time functions (yq)
+    // =============================================
+
+    #[test]
+    fn test_from_unix() {
+        // from_unix converts timestamp to ISO 8601 string (same as todate)
+        query!(b"0", r#"from_unix"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1970-01-01T00:00:00Z");
+            }
+        );
+
+        query!(b"1705314600", r#"from_unix"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T10:30:00Z");
+            }
+        );
+    }
+
+    #[test]
+    fn test_to_unix() {
+        // to_unix parses ISO 8601 string to timestamp (same as fromdate)
+        query!(br#""1970-01-01T00:00:00Z""#, r#"to_unix"#,
+            QueryResult::Owned(OwnedValue::Float(n)) => {
+                assert_eq!(n, 0.0);
+            }
+        );
+
+        query!(br#""2024-01-15T10:30:00Z""#, r#"to_unix"#,
+            QueryResult::Owned(OwnedValue::Float(n)) => {
+                assert_eq!(n, 1705314600.0);
+            }
+        );
+    }
+
+    #[test]
+    fn test_from_unix_to_unix_roundtrip() {
+        // from_unix | to_unix should return original value
+        query!(b"1705314600", r#"from_unix | to_unix"#,
+            QueryResult::Owned(OwnedValue::Float(n)) => {
+                assert_eq!(n, 1705314600.0);
+            }
+        );
+    }
+
+    #[test]
+    fn test_tz_utc() {
+        // tz("UTC") should work like todate
+        query!(b"1705314600", r#"tz("UTC")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T10:30:00Z");
+            }
+        );
+
+        // tz("GMT") is an alias for UTC
+        query!(b"1705314600", r#"tz("GMT")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T10:30:00Z");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tz_abbreviations() {
+        // Test common timezone abbreviations
+        // 1705314600 = 2024-01-15T10:30:00Z
+
+        // EST is UTC-5
+        query!(b"1705314600", r#"tz("EST")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T05:30:00-05:00");
+            }
+        );
+
+        // PST is UTC-8
+        query!(b"1705314600", r#"tz("PST")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T02:30:00-08:00");
+            }
+        );
+
+        // JST is UTC+9
+        query!(b"1705314600", r#"tz("JST")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T19:30:00+09:00");
+            }
+        );
+
+        // CET is UTC+1
+        query!(b"1705314600", r#"tz("CET")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T11:30:00+01:00");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tz_iana_names() {
+        // Test IANA-style timezone names
+        // 1705314600 = 2024-01-15T10:30:00Z (January, so standard time in most places)
+
+        query!(b"1705314600", r#"tz("Asia/Tokyo")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T19:30:00+09:00");
+            }
+        );
+
+        query!(b"1705314600", r#"tz("Europe/Moscow")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T13:30:00+03:00");
+            }
+        );
+
+        query!(b"1705314600", r#"tz("Pacific/Honolulu")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T00:30:00-10:00");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tz_numeric_offset() {
+        // Test numeric offset format
+        query!(b"1705314600", r#"tz("+05:30")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T16:00:00+05:30");
+            }
+        );
+
+        query!(b"1705314600", r#"tz("-0800")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T02:30:00-08:00");
+            }
+        );
+
+        query!(b"1705314600", r#"tz("+09")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T19:30:00+09:00");
+            }
+        );
+    }
+
+    #[test]
+    fn test_tz_unknown_error() {
+        // Unknown timezone should error
+        query!(b"1705314600", r#"tz("Unknown/Timezone")"#,
+            QueryResult::Error(e) => {
+                assert!(e.to_string().contains("unknown timezone"));
+            }
+        );
+    }
+
+    #[test]
+    fn test_tz_with_variable() {
+        // tz should work with a variable expression
+        query!(b"1705314600", r#""JST" as $tz | tz($tz)"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T19:30:00+09:00");
+            }
+        );
+    }
+
+    // =============================================
     // Assignment operator tests
     // =============================================
 
@@ -15731,5 +17102,623 @@ mod tests {
                 assert_eq!(n, 1);
             }
         );
+    }
+
+    #[test]
+    fn test_omit_object() {
+        // Remove keys from object
+        query!(br#"{"a":1, "b":2, "c":3}"#, r#"omit(["a", "c"])"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 1);
+                assert_eq!(obj.get("b"), Some(&OwnedValue::Int(2)));
+                assert!(obj.get("a").is_none());
+                assert!(obj.get("c").is_none());
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_object_nonexistent_keys() {
+        // Gracefully ignore non-existent keys
+        query!(br#"{"a":1, "b":2}"#, r#"omit(["c", "d"])"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 2);
+                assert_eq!(obj.get("a"), Some(&OwnedValue::Int(1)));
+                assert_eq!(obj.get("b"), Some(&OwnedValue::Int(2)));
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_array() {
+        // Remove indices from array
+        query!(br#"["a", "b", "c", "d"]"#, "omit([0, 2])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                assert_eq!(arr[0], OwnedValue::String("b".to_string()));
+                assert_eq!(arr[1], OwnedValue::String("d".to_string()));
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_array_negative_index() {
+        // Remove negative indices from array
+        query!(br#"["a", "b", "c", "d"]"#, "omit([-1])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0], OwnedValue::String("a".to_string()));
+                assert_eq!(arr[1], OwnedValue::String("b".to_string()));
+                assert_eq!(arr[2], OwnedValue::String("c".to_string()));
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_array_out_of_bounds() {
+        // Out of bounds indices are silently ignored
+        query!(br#"["a", "b", "c"]"#, "omit([10, -10])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                // No indices removed - all out of bounds
+                assert_eq!(arr.len(), 3);
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_empty_keys() {
+        // Empty keys array returns full object
+        query!(br#"{"a":1, "b":2}"#, "omit([])",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 2);
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_all_keys() {
+        // Omit all keys returns empty object
+        query!(br#"{"a":1, "b":2}"#, r#"omit(["a", "b"])"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 0);
+            }
+        );
+    }
+
+    #[test]
+    fn test_omit_preserves_order() {
+        // Object key order is preserved (remaining keys)
+        query!(br#"{"c":3, "a":1, "b":2, "d":4}"#, r#"omit(["a", "d"])"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                let keys: Vec<&String> = obj.keys().collect();
+                assert_eq!(keys, vec!["c", "b"]);
+            }
+        );
+    }
+
+    // ============================================================================
+    // document_index / di tests
+    // ============================================================================
+
+    #[test]
+    fn test_document_index_parses() {
+        // Test that document_index parses correctly
+        let expr = crate::jq::parse("document_index").unwrap();
+        assert!(matches!(
+            expr,
+            crate::jq::Expr::Builtin(crate::jq::Builtin::DocumentIndex)
+        ));
+    }
+
+    #[test]
+    fn test_di_parses() {
+        // Test that di (shorthand) parses correctly
+        let expr = crate::jq::parse("di").unwrap();
+        assert!(matches!(
+            expr,
+            crate::jq::Expr::Builtin(crate::jq::Builtin::DocumentIndex)
+        ));
+    }
+
+    #[test]
+    fn test_document_index_json_returns_zero() {
+        // For JSON input, document_index returns 0 (single document assumed)
+        query!(br#"{"name": "test"}"#, "document_index",
+            QueryResult::Owned(OwnedValue::Int(0)) => {}
+        );
+    }
+
+    #[test]
+    fn test_di_json_returns_zero() {
+        // For JSON input, di returns 0 (single document assumed)
+        query!(br#"[1, 2, 3]"#, "di",
+            QueryResult::Owned(OwnedValue::Int(0)) => {}
+        );
+    }
+
+    #[test]
+    fn test_document_index_in_select() {
+        // document_index can be used in select expressions
+        let expr = crate::jq::parse("select(document_index == 0)").unwrap();
+        // Verify it parses without error
+        assert!(matches!(expr, crate::jq::Expr::Builtin(_)));
+    }
+
+    // ============================================================================
+    // shuffle tests
+    // ============================================================================
+
+    #[test]
+    fn test_shuffle_parses() {
+        // Test that shuffle parses correctly
+        let expr = crate::jq::parse("shuffle").unwrap();
+        assert!(matches!(
+            expr,
+            crate::jq::Expr::Builtin(crate::jq::Builtin::Shuffle)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn test_shuffle_returns_array_same_length() {
+        // shuffle should return an array with the same length
+        query!(br#"[1, 2, 3, 4, 5]"#, "shuffle",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 5);
+                // All original elements should be present (just reordered)
+                assert!(arr.contains(&OwnedValue::Int(1)));
+                assert!(arr.contains(&OwnedValue::Int(2)));
+                assert!(arr.contains(&OwnedValue::Int(3)));
+                assert!(arr.contains(&OwnedValue::Int(4)));
+                assert!(arr.contains(&OwnedValue::Int(5)));
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn test_shuffle_preserves_element_types() {
+        // shuffle should preserve element types (strings, numbers, objects)
+        query!(br#"["a", 1, true, null]"#, "shuffle",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 4);
+                assert!(arr.contains(&OwnedValue::String("a".to_string())));
+                assert!(arr.contains(&OwnedValue::Int(1)));
+                assert!(arr.contains(&OwnedValue::Bool(true)));
+                assert!(arr.contains(&OwnedValue::Null));
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn test_shuffle_empty_array() {
+        // shuffle of empty array should return empty array
+        query!(br#"[]"#, "shuffle",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty());
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn test_shuffle_single_element() {
+        // shuffle of single element should return the same element
+        query!(br#"[42]"#, "shuffle",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(42)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_shuffle_type_error_on_non_array() {
+        // shuffle requires array input
+        query!(br#""not an array""#, "shuffle",
+            QueryResult::Error(err) => {
+                let msg = format!("{}", err);
+                assert!(msg.contains("array") || msg.contains("cli"));
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cli")]
+    fn test_shuffle_in_pipeline() {
+        // shuffle can be used in a pipeline
+        query!(br#"[3, 1, 2]"#, "shuffle | length",
+            QueryResult::Owned(OwnedValue::Int(3)) => {}
+        );
+    }
+
+    // ============================================================================
+    // pivot tests
+    // ============================================================================
+
+    #[test]
+    fn test_pivot_parses() {
+        // Test that pivot parses correctly
+        let expr = crate::jq::parse("pivot").unwrap();
+        assert!(matches!(
+            expr,
+            crate::jq::Expr::Builtin(crate::jq::Builtin::Pivot)
+        ));
+    }
+
+    #[test]
+    fn test_pivot_array_of_arrays() {
+        // Transpose array of arrays: [[a, b], [x, y]] → [[a, x], [b, y]]
+        query!(br#"[[1, 2], [3, 4]]"#, "pivot",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                assert_eq!(arr[0], OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(3)]));
+                assert_eq!(arr[1], OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(4)]));
+            }
+        );
+    }
+
+    #[test]
+    fn test_pivot_array_of_arrays_3x3() {
+        // 3x3 matrix transpose
+        query!(br#"[[1, 2, 3], [4, 5, 6], [7, 8, 9]]"#, "pivot",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0], OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(4), OwnedValue::Int(7)]));
+                assert_eq!(arr[1], OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(5), OwnedValue::Int(8)]));
+                assert_eq!(arr[2], OwnedValue::Array(vec![OwnedValue::Int(3), OwnedValue::Int(6), OwnedValue::Int(9)]));
+            }
+        );
+    }
+
+    #[test]
+    fn test_pivot_array_of_arrays_ragged() {
+        // Ragged arrays get null padding: [[1, 2], [3]] → [[1, 3], [2, null]]
+        query!(br#"[[1, 2], [3]]"#, "pivot",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                assert_eq!(arr[0], OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(3)]));
+                assert_eq!(arr[1], OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Null]));
+            }
+        );
+    }
+
+    #[test]
+    fn test_pivot_array_of_objects() {
+        // Transpose array of objects: [{a: 1}, {a: 2}] → {a: [1, 2]}
+        query!(br#"[{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]"#, "pivot",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 2);
+                assert_eq!(obj.get("name"), Some(&OwnedValue::Array(vec![
+                    OwnedValue::String("Alice".to_string()),
+                    OwnedValue::String("Bob".to_string())
+                ])));
+                assert_eq!(obj.get("age"), Some(&OwnedValue::Array(vec![
+                    OwnedValue::Int(30),
+                    OwnedValue::Int(25)
+                ])));
+            }
+        );
+    }
+
+    #[test]
+    fn test_pivot_array_of_objects_missing_keys() {
+        // Missing keys get null: [{a: 1}, {a: 2, b: 3}] → {a: [1, 2], b: [null, 3]}
+        query!(br#"[{"a": 1}, {"a": 2, "b": 3}]"#, "pivot",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 2);
+                assert_eq!(obj.get("a"), Some(&OwnedValue::Array(vec![
+                    OwnedValue::Int(1),
+                    OwnedValue::Int(2)
+                ])));
+                assert_eq!(obj.get("b"), Some(&OwnedValue::Array(vec![
+                    OwnedValue::Null,
+                    OwnedValue::Int(3)
+                ])));
+            }
+        );
+    }
+
+    #[test]
+    fn test_pivot_empty_array() {
+        // Empty array returns empty array
+        query!(br#"[]"#, "pivot",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty());
+            }
+        );
+    }
+
+    #[test]
+    fn test_pivot_array_of_empty_arrays() {
+        // Array of empty arrays returns empty array
+        query!(br#"[[], []]"#, "pivot",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty());
+            }
+        );
+    }
+
+    #[test]
+    fn test_pivot_array_of_empty_objects() {
+        // Array of empty objects returns empty object
+        query!(br#"[{}, {}]"#, "pivot",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert!(obj.is_empty());
+            }
+        );
+    }
+
+    #[test]
+    fn test_pivot_type_error_on_non_array() {
+        // pivot requires array input
+        query!(br#""not an array""#, "pivot",
+            QueryResult::Error(err) => {
+                let msg = format!("{}", err);
+                assert!(msg.contains("array"));
+            }
+        );
+    }
+
+    #[test]
+    fn test_pivot_error_on_mixed_types() {
+        // pivot requires all arrays or all objects, not mixed
+        query!(br#"[[1], {"a": 2}]"#, "pivot",
+            QueryResult::Error(err) => {
+                let msg = format!("{}", err);
+                assert!(msg.contains("array of arrays") || msg.contains("array of objects"));
+            }
+        );
+    }
+
+    #[test]
+    fn test_pivot_error_on_scalars() {
+        // pivot requires arrays or objects, not scalar values
+        query!(br#"[1, 2, 3]"#, "pivot",
+            QueryResult::Error(err) => {
+                let msg = format!("{}", err);
+                assert!(msg.contains("array of arrays") || msg.contains("array of objects"));
+            }
+        );
+    }
+
+    #[test]
+    fn test_pivot_in_pipeline() {
+        // pivot can be used in a pipeline
+        query!(br#"[[1, 2], [3, 4]]"#, "pivot | .[0]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(3)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_pivot_double_pivot_identity() {
+        // Double pivot should return original for square matrices
+        query!(br#"[[1, 2], [3, 4]]"#, "pivot | pivot",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                assert_eq!(arr[0], OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]));
+                assert_eq!(arr[1], OwnedValue::Array(vec![OwnedValue::Int(3), OwnedValue::Int(4)]));
+            }
+        );
+    }
+
+    // ========== Phase 22: load(file) tests ==========
+
+    #[cfg(feature = "std")]
+    mod load_tests {
+        use super::*;
+        use std::fs;
+
+        fn with_temp_file<F, R>(name: &str, content: &str, f: F) -> R
+        where
+            F: FnOnce(&str) -> R,
+        {
+            let path = format!("/tmp/succinctly_test_{}", name);
+            fs::write(&path, content).unwrap();
+            let result = f(&path);
+            let _ = fs::remove_file(&path);
+            result
+        }
+
+        #[test]
+        fn test_load_json_file() {
+            with_temp_file(
+                "load_test.json",
+                r#"{"name": "test", "value": 42}"#,
+                |path| {
+                    let json_bytes: &[u8] = b"null";
+                    let index = JsonIndex::build(json_bytes);
+                    let cursor = index.root(json_bytes);
+                    let query = format!(r#"load("{}")"#, path);
+                    let expr = parse(&query).unwrap();
+                    match eval(&expr, cursor) {
+                        QueryResult::Owned(OwnedValue::Object(obj)) => {
+                            assert_eq!(
+                                obj.get("name"),
+                                Some(&OwnedValue::String("test".to_string()))
+                            );
+                            assert_eq!(obj.get("value"), Some(&OwnedValue::Int(42)));
+                        }
+                        other => panic!("unexpected result: {:?}", other),
+                    }
+                },
+            );
+        }
+
+        #[test]
+        fn test_load_yaml_file() {
+            with_temp_file("load_test.yaml", "name: test\nvalue: 42\n", |path| {
+                let json_bytes: &[u8] = b"null";
+                let index = JsonIndex::build(json_bytes);
+                let cursor = index.root(json_bytes);
+                let query = format!(r#"load("{}")"#, path);
+                let expr = parse(&query).unwrap();
+                match eval(&expr, cursor) {
+                    QueryResult::Owned(OwnedValue::Object(obj)) => {
+                        assert_eq!(
+                            obj.get("name"),
+                            Some(&OwnedValue::String("test".to_string()))
+                        );
+                        assert_eq!(obj.get("value"), Some(&OwnedValue::Int(42)));
+                    }
+                    other => panic!("unexpected result: {:?}", other),
+                }
+            });
+        }
+
+        #[test]
+        fn test_load_yml_extension() {
+            with_temp_file("load_test.yml", "items:\n  - a\n  - b\n", |path| {
+                let json_bytes: &[u8] = b"null";
+                let index = JsonIndex::build(json_bytes);
+                let cursor = index.root(json_bytes);
+                let query = format!(r#"load("{}")"#, path);
+                let expr = parse(&query).unwrap();
+                match eval(&expr, cursor) {
+                    QueryResult::Owned(OwnedValue::Object(obj)) => {
+                        let items = obj.get("items").unwrap();
+                        match items {
+                            OwnedValue::Array(arr) => {
+                                assert_eq!(arr.len(), 2);
+                                assert_eq!(arr[0], OwnedValue::String("a".to_string()));
+                                assert_eq!(arr[1], OwnedValue::String("b".to_string()));
+                            }
+                            _ => panic!("expected array"),
+                        }
+                    }
+                    other => panic!("unexpected result: {:?}", other),
+                }
+            });
+        }
+
+        #[test]
+        fn test_load_nonexistent_file() {
+            let json_bytes: &[u8] = b"null";
+            let index = JsonIndex::build(json_bytes);
+            let cursor = index.root(json_bytes);
+            let expr = parse(r#"load("/tmp/nonexistent_file_12345.yaml")"#).unwrap();
+            match eval(&expr, cursor) {
+                QueryResult::Error(err) => {
+                    assert!(
+                        err.message.contains("Failed to read file")
+                            || err.message.contains("No such file")
+                    );
+                }
+                other => panic!("expected error, got: {:?}", other),
+            }
+        }
+
+        #[test]
+        fn test_load_optional_nonexistent() {
+            // Use try-catch for optional behavior since ? operator applies to field access
+            let json_bytes: &[u8] = b"null";
+            let index = JsonIndex::build(json_bytes);
+            let cursor = index.root(json_bytes);
+            let expr = parse(r#"try load("/tmp/nonexistent_file_12345.yaml") catch null"#).unwrap();
+            match eval(&expr, cursor) {
+                QueryResult::Owned(OwnedValue::Null) => {}
+                other => panic!("expected null, got: {:?}", other),
+            }
+        }
+
+        #[test]
+        fn test_load_with_try_catch() {
+            let json_bytes: &[u8] = b"null";
+            let index = JsonIndex::build(json_bytes);
+            let cursor = index.root(json_bytes);
+            let expr =
+                parse(r#"try load("/tmp/nonexistent_file_12345.yaml") catch "not found""#).unwrap();
+            match eval(&expr, cursor) {
+                QueryResult::Owned(OwnedValue::String(s)) => {
+                    assert_eq!(s, "not found");
+                }
+                other => panic!("expected 'not found', got: {:?}", other),
+            }
+        }
+
+        #[test]
+        fn test_load_combined_with_input() {
+            with_temp_file("config.yaml", "setting: enabled\n", |path| {
+                let json_bytes: &[u8] = br#"{"name": "main"}"#;
+                let index = JsonIndex::build(json_bytes);
+                let cursor = index.root(json_bytes);
+                let query = format!(r#". + {{config: load("{}")}}"#, path);
+                let expr = parse(&query).unwrap();
+                match eval(&expr, cursor) {
+                    QueryResult::Owned(OwnedValue::Object(obj)) => {
+                        assert_eq!(
+                            obj.get("name"),
+                            Some(&OwnedValue::String("main".to_string()))
+                        );
+                        let config = obj.get("config").unwrap();
+                        match config {
+                            OwnedValue::Object(cfg) => {
+                                assert_eq!(
+                                    cfg.get("setting"),
+                                    Some(&OwnedValue::String("enabled".to_string()))
+                                );
+                            }
+                            _ => panic!("expected config to be object"),
+                        }
+                    }
+                    other => panic!("unexpected result: {:?}", other),
+                }
+            });
+        }
+
+        #[test]
+        fn test_load_multi_document_yaml() {
+            with_temp_file("multi.yaml", "---\nname: doc1\n---\nname: doc2\n", |path| {
+                let json_bytes: &[u8] = b"null";
+                let index = JsonIndex::build(json_bytes);
+                let cursor = index.root(json_bytes);
+                let query = format!(r#"load("{}")"#, path);
+                let expr = parse(&query).unwrap();
+                match eval(&expr, cursor) {
+                    QueryResult::Owned(OwnedValue::Array(arr)) => {
+                        assert_eq!(arr.len(), 2);
+                        match &arr[0] {
+                            OwnedValue::Object(obj) => {
+                                assert_eq!(
+                                    obj.get("name"),
+                                    Some(&OwnedValue::String("doc1".to_string()))
+                                );
+                            }
+                            _ => panic!("expected first doc to be object"),
+                        }
+                        match &arr[1] {
+                            OwnedValue::Object(obj) => {
+                                assert_eq!(
+                                    obj.get("name"),
+                                    Some(&OwnedValue::String("doc2".to_string()))
+                                );
+                            }
+                            _ => panic!("expected second doc to be object"),
+                        }
+                    }
+                    other => panic!("expected array of documents, got: {:?}", other),
+                }
+            });
+        }
+
+        #[test]
+        fn test_load_with_dynamic_path() {
+            with_temp_file("dynamic.json", r#"{"loaded": true}"#, |path| {
+                // Input contains the path to load
+                let json_bytes = format!(r#"{{"path": "{}"}}"#, path);
+                let json_bytes = json_bytes.as_bytes();
+                let index = JsonIndex::build(json_bytes);
+                let cursor = index.root(json_bytes);
+                let expr = parse(r#"load(.path)"#).unwrap();
+                match eval(&expr, cursor) {
+                    QueryResult::Owned(OwnedValue::Object(obj)) => {
+                        assert_eq!(obj.get("loaded"), Some(&OwnedValue::Bool(true)));
+                    }
+                    other => panic!("unexpected result: {:?}", other),
+                }
+            });
+        }
     }
 }

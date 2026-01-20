@@ -647,6 +647,14 @@ pub struct YqCommand {
     #[arg(short = 'n', long)]
     pub null_input: bool,
 
+    /// Read each line as a string instead of parsing as YAML/JSON
+    #[arg(short = 'R', long)]
+    pub raw_input: bool,
+
+    /// Read all inputs into an array and use it as the single input value
+    #[arg(short = 's', long)]
+    pub slurp: bool,
+
     /// Input format type [auto, yaml, json] (default: auto)
     #[arg(
         short = 'p',
@@ -692,6 +700,10 @@ pub struct YqCommand {
     /// Don't print document separators (---)
     #[arg(short = 'N', long = "no-doc")]
     pub no_doc: bool,
+
+    /// Select specific document by 0-based index from multi-document stream
+    #[arg(long = "doc", value_name = "N")]
+    pub document: Option<usize>,
 
     /// Pretty print, expand flow styles to block style
     #[arg(short = 'P', long = "prettyPrint")]

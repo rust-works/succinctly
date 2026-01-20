@@ -191,12 +191,42 @@ The implementation is already production-ready for ~90% of jq use cases.
 - [x] `tojsonstream` / `fromjsonstream`
 - [x] `map(f)` / `map_values(f)`
 
+### Date/Time Functions
+- [x] `now` - Current Unix timestamp as float
+- [x] `gmtime` - Convert Unix timestamp to broken-down UTC time
+- [x] `localtime` - Convert Unix timestamp to broken-down local time
+- [x] `mktime` - Convert broken-down time to Unix timestamp
+- [x] `strftime(fmt)` - Format broken-down time as string
+- [x] `strptime(fmt)` - Parse string to broken-down time
+- [x] `todate` / `todateiso8601` - Convert Unix timestamp to ISO 8601 string
+- [x] `fromdate` / `fromdateiso8601` - Parse ISO 8601 string to Unix timestamp
+- [x] `from_unix` - Convert Unix epoch to ISO 8601 string (yq extension)
+- [x] `to_unix` - Parse ISO 8601 string to Unix epoch (yq extension)
+- [x] `tz(zone)` - Convert Unix timestamp to datetime in specified timezone (yq extension)
+
+**Timezone support**: IANA names (`America/New_York`), abbreviations (`EST`, `PST`, `JST`), numeric offsets (`+05:30`, `-0800`), and `UTC`/`GMT`.
+
 ### YAML Metadata Functions (yq)
 - [x] `tag` - return YAML type tag (!!str, !!int, !!map, etc.) - fully working
-- [x] `anchor` - return anchor name (returns empty string; metadata not preserved)
-- [x] `style` - return scalar/collection style (returns empty string; metadata not preserved)
-- [x] `kind` - return node kind (scalar, seq, map) - fully working
+- [x] `anchor` - return anchor name for nodes with anchors (`&name`) - fully working at cursor level
+- [x] `alias` - return referenced anchor name for alias nodes (`*name`) - fully working at cursor level
+- [x] `style` - return scalar/collection style (double, single, literal, folded, flow, or empty) - fully working at cursor level
+- [x] `kind` - return node kind (scalar, seq, map, alias) - fully working, matches yq behavior
 - [x] `key` - return current key when iterating (string for objects, int for arrays) - fully working
+- [x] `line` - return 1-based line number of current node - fully working at cursor level
+- [x] `column` - return 1-based column number of current node - fully working at cursor level
+
+**Note on anchor/alias/style/line/column metadata**: The YamlCursor type has full metadata access methods:
+- `cursor.anchor()` returns `Option<&str>` with the anchor name (e.g., "myanchor" for `&myanchor value`)
+- `cursor.alias()` returns `Option<&str>` with the referenced anchor name for alias nodes (e.g., "myanchor" for `*myanchor`)
+- `cursor.is_alias()` returns `bool` indicating if the node is an alias
+- `cursor.style()` returns `&'static str` indicating the style ("double", "single", "literal", "folded", "flow", or "" for plain)
+- `cursor.tag()` returns `&'static str` with the inferred YAML type tag
+- `cursor.kind()` returns `&'static str` indicating the structural kind ("scalar", "seq", "map", "alias")
+- `cursor.line()` returns `usize` with the 1-based line number of the node
+- `cursor.column()` returns `usize` with the 1-based column number of the node
+
+The jq builtins return empty string for anchor/style and 0 for line/column because metadata is lost during YAML→OwnedValue→JSON conversion for evaluation. Direct YAML cursor access preserves all metadata.
 
 ### Module System
 - [x] `import "path" as name;` - Import module with namespace
@@ -241,10 +271,11 @@ All advanced features have been implemented:
 
 These are CLI-level features, not expression language:
 
-- [ ] `-s` / `--slurp` - Read all inputs into array
-- [ ] `-R` / `--raw-input` - Read lines as strings
-- [ ] `-n` / `--null-input` - Don't read input, use null
-- [ ] `--tab` - Use tabs for indentation
+- [x] `-s` / `--slurp` - Read all inputs into array
+- [x] `-R` / `--raw-input` - Read lines as strings
+- [x] `-n` / `--null-input` - Don't read input, use null
+- [x] `--tab` - Use tabs for indentation
+- [x] `--doc N` - Select specific document from multi-doc stream (yq only)
 - [ ] `--argjson` / `--slurpfile` / `--rawfile` enhancements
 
 ---
@@ -323,3 +354,15 @@ echo '{"a":1}' | succinctly jq '.a'
 | 2026-01-19 | Removed `.[::2]` step slicing from TODO - it's Python syntax, not jq|
 | 2026-01-20 | Added `label $name | expr` / `break $name` for non-local control flow (✅ complete)|
 | 2026-01-20 | Module system fully implemented: import, include, -L, JQ_LIBRARY_PATH, ~/.jq, namespaced calls, parameterized functions (✅ complete)|
+| 2026-01-20 | Added YAML cursor metadata access: YamlCursor::anchor(), style(), tag(), kind() methods (✅ complete)|
+| 2026-01-20 | Added reverse anchor mapping (bp_pos → anchor_name) to YamlIndex for O(1) anchor lookup|
+| 2026-01-20 | Added YamlCursor::alias() and is_alias() methods to match yq's alias function (✅ complete)|
+| 2026-01-20 | Updated kind() to return "alias" for alias nodes, matching yq behavior (✅ complete)|
+| 2026-01-20 | Added YamlCursor::line() and column() methods for yq position metadata (✅ complete)|
+| 2026-01-20 | Added `line` and `column` jq builtins (return 0 in evaluation, full support at cursor level)|
+| 2026-01-20 | Added `-s`/`--slurp` CLI option for yq (✅ complete)|
+| 2026-01-20 | Added `from_unix`, `to_unix`, `tz(zone)` yq date/time extensions (✅ complete)|
+| 2026-01-20 | Added `-R`/`--raw-input` CLI option for yq (✅ complete)|
+| 2026-01-20 | Added `--doc N` CLI option for yq document selection (✅ complete)|
+| 2026-01-20 | Added `split_doc` yq operator for outputting results as separate documents (✅ complete)|
+| 2026-01-20 | Fixed `select(di == N)` to work correctly - added Select and Compare to generic evaluator (✅ complete)|

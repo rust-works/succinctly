@@ -605,3 +605,304 @@ users:
     );
     Ok(())
 }
+
+// ==========================================================================
+// Raw input tests (-R / --raw-input)
+// ==========================================================================
+
+#[test]
+fn test_raw_input_identity() -> Result<()> {
+    let input = "line one\nline two\nline three";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-R"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "line one\nline two\nline three\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_json_output() -> Result<()> {
+    let input = "line one\nline two";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-R", "-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "\"line one\"\n\"line two\"\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_slurp() -> Result<()> {
+    let input = "line one\nline two\nline three";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-R", "-s"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "- line one\n- line two\n- line three\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_slurp_json() -> Result<()> {
+    let input = "a\nb\nc";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-R", "-s", "-o", "json", "-I", "0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "[\"a\",\"b\",\"c\"]\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_slurp_length() -> Result<()> {
+    let input = "one\ntwo\nthree";
+    let (output, exit_code) = run_yq_stdin("length", input, &["-R", "-s"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "3");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_per_line_length() -> Result<()> {
+    let input = "hello\nhi\nworld";
+    let (output, exit_code) = run_yq_stdin("length", input, &["-R"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "5\n2\n5\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_split() -> Result<()> {
+    let input = "hello world\nfoo bar";
+    let (output, exit_code) = run_yq_stdin("split(\" \") | .[0]", input, &["-R"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "hello\nfoo\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_select() -> Result<()> {
+    let input = "apple\nbanana\navocado\ncherry";
+    let (output, exit_code) = run_yq_stdin("select(startswith(\"a\"))", input, &["-R"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "apple\navocado\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_empty_lines() -> Result<()> {
+    let input = "line1\n\nline2\n\n\nline3";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-R"])?;
+    assert_eq!(exit_code, 0);
+    // Empty lines become empty strings, which are quoted in YAML output
+    assert_eq!(output, "line1\n''\nline2\n''\n''\nline3\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_slurp_filter_empty() -> Result<()> {
+    let input = "line1\n\nline2\n\nline3";
+    let (output, exit_code) = run_yq_stdin(
+        "map(select(. != \"\"))",
+        input,
+        &["-R", "-s", "-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "[\"line1\",\"line2\",\"line3\"]\n");
+    Ok(())
+}
+
+// ============================================================================
+// --doc N tests (document selection)
+// ============================================================================
+
+#[test]
+fn test_doc_select_first() -> Result<()> {
+    let input = "---\na: 1\n---\nb: 2\n---\nc: 3";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: 1\n");
+    Ok(())
+}
+
+#[test]
+fn test_doc_select_middle() -> Result<()> {
+    let input = "---\na: 1\n---\nb: 2\n---\nc: 3";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "1"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "b: 2\n");
+    Ok(())
+}
+
+#[test]
+fn test_doc_select_last() -> Result<()> {
+    let input = "---\na: 1\n---\nb: 2\n---\nc: 3";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "2"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "c: 3\n");
+    Ok(())
+}
+
+#[test]
+fn test_doc_select_out_of_range() -> Result<()> {
+    let input = "---\na: 1\n---\nb: 2";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "5"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, ""); // No output for out of range
+    Ok(())
+}
+
+#[test]
+fn test_doc_select_with_query() -> Result<()> {
+    let input = "---\nname: Alice\nage: 30\n---\nname: Bob\nage: 25";
+    let (output, exit_code) = run_yq_stdin(".name", input, &["--doc", "1"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "Bob\n");
+    Ok(())
+}
+
+#[test]
+fn test_doc_select_json_output() -> Result<()> {
+    let input = "---\na: 1\n---\nb: 2";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "0", "-o", "json", "-I", "0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "{\"a\":1}\n");
+    Ok(())
+}
+
+#[test]
+fn test_doc_select_single_doc() -> Result<()> {
+    // Single document (no separators) - --doc 0 should work
+    let input = "a: 1\nb: 2";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: 1\nb: 2\n");
+    Ok(())
+}
+
+#[test]
+fn test_doc_select_single_doc_out_of_range() -> Result<()> {
+    // Single document - --doc 1 should return nothing
+    let input = "a: 1";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "1"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "");
+    Ok(())
+}
+
+#[test]
+fn test_doc_incompatible_with_raw_input() -> Result<()> {
+    let input = "line1\nline2";
+    let (_, exit_code) = run_yq_stdin(".", input, &["--doc", "0", "-R"])?;
+    // Should fail with non-zero exit code
+    assert_ne!(exit_code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_doc_with_slurp() -> Result<()> {
+    // --doc with --slurp filters before slurping
+    let input = "---\na: 1\n---\nb: 2\n---\nc: 3";
+    let (output, exit_code) =
+        run_yq_stdin(".", input, &["--doc", "1", "-s", "-o", "json", "-I", "0"])?;
+    assert_eq!(exit_code, 0);
+    // Should slurp only the selected document into an array
+    assert_eq!(output, "[{\"b\":2}]\n");
+    Ok(())
+}
+
+// ============================================================================
+// split_doc tests
+// ============================================================================
+
+#[test]
+fn test_split_doc_basic_array() -> Result<()> {
+    // split_doc should add --- between results
+    let input = "[1, 2, 3]";
+    let (output, exit_code) = run_yq_stdin(".[] | split_doc", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "1\n---\n2\n---\n3\n");
+    Ok(())
+}
+
+#[test]
+fn test_split_doc_with_strings() -> Result<()> {
+    let input = "[\"hello\", \"world\"]";
+    let (output, exit_code) = run_yq_stdin(".[] | split_doc", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "hello\n---\nworld\n");
+    Ok(())
+}
+
+#[test]
+fn test_split_doc_with_objects() -> Result<()> {
+    let input = "[{name: alice}, {name: bob}]";
+    let (output, exit_code) = run_yq_stdin(".[] | split_doc", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "name: alice\n---\nname: bob\n");
+    Ok(())
+}
+
+#[test]
+fn test_split_doc_single_result() -> Result<()> {
+    // With only one result, no separator should be added
+    let input = "[42]";
+    let (output, exit_code) = run_yq_stdin(".[] | split_doc", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "42\n");
+    Ok(())
+}
+
+#[test]
+fn test_split_doc_with_no_doc_flag() -> Result<()> {
+    // --no-doc should suppress document separators
+    let input = "[1, 2, 3]";
+    let (output, exit_code) = run_yq_stdin(".[] | split_doc", input, &["--no-doc"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "1\n2\n3\n");
+    Ok(())
+}
+
+#[test]
+fn test_split_doc_json_output() -> Result<()> {
+    // JSON output should not get --- separators
+    let input = "[1, 2, 3]";
+    let (output, exit_code) = run_yq_stdin(".[] | split_doc", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "1\n2\n3\n");
+    Ok(())
+}
+
+#[test]
+fn test_split_doc_with_filter() -> Result<()> {
+    // split_doc can be combined with other filters
+    let input = "[1, 2, 3, 4, 5]";
+    let (output, exit_code) = run_yq_stdin(".[] | select(. > 2) | split_doc", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "3\n---\n4\n---\n5\n");
+    Ok(())
+}
+
+#[test]
+fn test_split_doc_empty_array() -> Result<()> {
+    // Empty array should produce no output
+    let input = "[]";
+    let (output, exit_code) = run_yq_stdin(".[] | split_doc", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "");
+    Ok(())
+}
+
+#[test]
+fn test_split_doc_nested_arrays() -> Result<()> {
+    // split_doc on nested structure
+    let input = "[[1, 2], [3, 4]]";
+    let (output, exit_code) = run_yq_stdin(".[] | split_doc", input, &[])?;
+    assert_eq!(exit_code, 0);
+    // Each sub-array is output as a YAML sequence
+    assert_eq!(output, "- 1\n- 2\n---\n- 3\n- 4\n");
+    Ok(())
+}
+
+#[test]
+fn test_split_doc_identity_passthrough() -> Result<()> {
+    // split_doc is semantically identity - just changes output formatting
+    let input = "42";
+    let (output, exit_code) = run_yq_stdin("split_doc", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "42\n");
+    Ok(())
+}

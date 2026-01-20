@@ -70,6 +70,7 @@
 
 pub mod document;
 mod eval;
+pub mod eval_generic;
 mod expr;
 mod lazy;
 mod parser;

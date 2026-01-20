@@ -605,3 +605,32 @@ fn test_config_file_pattern() {
         }
     );
 }
+
+// =============================================================================
+// Date/Time builtin tests (Phase 7)
+// =============================================================================
+
+#[test]
+fn test_now_returns_timestamp() {
+    // now returns the current Unix timestamp as a float
+    query!(b"null", "now",
+        QueryResult::Owned(succinctly::jq::OwnedValue::Float(ts)) => {
+            // Verify it's a reasonable timestamp (after 2024-01-01 and not too far in the future)
+            let jan_2024 = 1704067200.0; // 2024-01-01 00:00:00 UTC
+            let jan_2100 = 4102444800.0; // 2100-01-01 00:00:00 UTC
+            assert!(ts > jan_2024, "timestamp {} should be after 2024-01-01", ts);
+            assert!(ts < jan_2100, "timestamp {} should be before 2100-01-01", ts);
+        }
+    );
+}
+
+#[test]
+fn test_now_ignores_input() {
+    // now ignores its input
+    query!(br#"{"foo": "bar"}"#, "now",
+        QueryResult::Owned(succinctly::jq::OwnedValue::Float(ts)) => {
+            let jan_2024 = 1704067200.0;
+            assert!(ts > jan_2024, "timestamp {} should be after 2024-01-01", ts);
+        }
+    );
+}

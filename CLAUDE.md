@@ -106,6 +106,8 @@ The jq implementation supports format functions for converting values to strings
 | **@base64d** | `@base64d`          | Base64 decoding                                   | `hello`             |
 | **@html**    | `@html`             | HTML entity escaping                              | `&lt;script&gt;`    |
 | **@sh**      | `@sh`               | Shell quoting                                     | `'hello world'`     |
+| **@yaml**    | `@yaml`             | YAML flow-style encoding (yq)                     | `{a: 1, b: 2}`      |
+| **@props**   | `@props`            | Java properties format (yq)                       | `key = value`       |
 
 **@dsv(delimiter) specifics:**
 - Custom delimiters: Any single or multi-character string

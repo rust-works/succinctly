@@ -1679,6 +1679,8 @@ impl<'a> Parser<'a> {
             "html" => FormatType::Html,
             "sh" => FormatType::Sh,
             "urid" => FormatType::Urid,
+            "yaml" => FormatType::Yaml,
+            "props" => FormatType::Props,
             _ => {
                 return Err(ParseError::new(
                     format!("unknown format '@{}'", format_name),
@@ -2701,6 +2703,18 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Pick(Box::new(keys))));
         }
 
+        // omit(keys) - yq: remove specified keys from object/indices from array
+        if self.matches_keyword("omit") {
+            self.consume_keyword("omit");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let keys = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Omit(Box::new(keys))));
+        }
+
         // tag - yq: return YAML type tag (!!str, !!int, !!map, etc.)
         if self.matches_keyword("tag") {
             self.consume_keyword("tag");
@@ -2729,6 +2743,46 @@ impl<'a> Parser<'a> {
         if self.matches_keyword("key") {
             self.consume_keyword("key");
             return Ok(Some(Builtin::Key));
+        }
+
+        // line - yq: return 1-based line number
+        if self.matches_keyword("line") {
+            self.consume_keyword("line");
+            return Ok(Some(Builtin::Line));
+        }
+
+        // column - yq: return 1-based column number
+        if self.matches_keyword("column") {
+            self.consume_keyword("column");
+            return Ok(Some(Builtin::Column));
+        }
+
+        // document_index / di - yq: return 0-indexed document position in multi-doc stream
+        if self.matches_keyword("document_index") {
+            self.consume_keyword("document_index");
+            return Ok(Some(Builtin::DocumentIndex));
+        }
+        if self.matches_keyword("di") {
+            self.consume_keyword("di");
+            return Ok(Some(Builtin::DocumentIndex));
+        }
+
+        // shuffle - yq: randomly shuffle array elements
+        if self.matches_keyword("shuffle") {
+            self.consume_keyword("shuffle");
+            return Ok(Some(Builtin::Shuffle));
+        }
+
+        // pivot - yq: transpose arrays/objects
+        if self.matches_keyword("pivot") {
+            self.consume_keyword("pivot");
+            return Ok(Some(Builtin::Pivot));
+        }
+
+        // split_doc - yq: mark output as separate YAML documents
+        if self.matches_keyword("split_doc") {
+            self.consume_keyword("split_doc");
+            return Ok(Some(Builtin::SplitDoc));
         }
 
         // Phase 12: Additional builtins
@@ -2939,6 +2993,26 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Fromdate));
         }
 
+        // Phase 21: Extended Date/Time functions (yq)
+        if self.matches_keyword("from_unix") {
+            self.consume_keyword("from_unix");
+            return Ok(Some(Builtin::FromUnix));
+        }
+        if self.matches_keyword("to_unix") {
+            self.consume_keyword("to_unix");
+            return Ok(Some(Builtin::ToUnix));
+        }
+        if self.matches_keyword("tz") {
+            self.consume_keyword("tz");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let zone = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Tz(Box::new(zone))));
+        }
+
         // Phase 17: Combinations
         if self.matches_keyword("combinations") {
             self.consume_keyword("combinations");
@@ -2964,6 +3038,18 @@ impl<'a> Parser<'a> {
         if self.matches_keyword("toboolean") {
             self.consume_keyword("toboolean");
             return Ok(Some(Builtin::ToBoolean));
+        }
+
+        // Phase 22: File operations (yq)
+        if self.matches_keyword("load") {
+            self.consume_keyword("load");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let file_expr = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::Load(Box::new(file_expr))));
         }
 
         Ok(None)
