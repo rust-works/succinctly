@@ -11,6 +11,9 @@ This document outlines the plan to add a `yq` subcommand to succinctly for query
 | **3** | Anchors, aliases, YAML output | ✅ Mostly complete |
 | **4** | Multi-document streams | ✅ Mostly complete |
 | **5** | YAML-specific query extensions | 🔄 Partial |
+| **6** | yq-specific operators | ❌ Not planned |
+| **7** | Date/time operators | ❌ Not planned |
+| **8** | Additional format encoders | ❌ Not planned |
 
 ### Performance (Apple M1 Max)
 
@@ -179,6 +182,54 @@ succinctly yq '.spec.containers[]' deployment.yaml service.yaml
 | `tag` | Get explicit tag | ❌ |
 | `style` | Get scalar style | ❌ |
 | `comments` | Get associated comments | ❌ |
+
+---
+
+### Phase 6: yq-Specific Operators ❌ NOT PLANNED
+
+**Goal**: Operators unique to yq (Mike Farah's) not in standard jq.
+
+These operators are yq-specific extensions that go beyond jq compatibility. Implement on demand if users request them.
+
+| Operator | Description | Priority |
+|----------|-------------|----------|
+| `omit(keys)` | Remove keys from object | Low |
+| `shuffle` | Randomize array order | Low |
+| `pivot` | Transpose arrays/objects | Low |
+| `split_doc` | Split into multiple documents | Low |
+| `document_index` | Get current document index | Low |
+| `load(file)` | Load external YAML file | Low |
+| `eval(expr)` | Evaluate string as expression | Low |
+
+---
+
+### Phase 7: Date/Time Operators ❌ NOT PLANNED
+
+**Goal**: Date/time manipulation operators from yq.
+
+| Operator | Description | Priority |
+|----------|-------------|----------|
+| `now` | Current Unix timestamp | Low |
+| `strftime(fmt)` | Format timestamp as string | Low |
+| `strptime(fmt)` | Parse string to timestamp | Low |
+| `from_unix` | Convert Unix timestamp | Low |
+| `to_unix` | Convert to Unix timestamp | Low |
+| `tz(zone)` | Convert timezone | Low |
+| `with_dtf(fmt)` | Set date format | Low |
+
+---
+
+### Phase 8: Additional Format Encoders ❌ NOT PLANNED
+
+**Goal**: Format conversion operators beyond standard jq.
+
+| Operator | Description | Priority |
+|----------|-------------|----------|
+| `@yaml` | Encode as YAML string | Medium |
+| `@xml` | Encode as XML string | Low |
+| `@props` | Encode as Java properties | Low |
+
+**Note**: `@yaml` could be useful for YAML-to-YAML transformations.
 
 ---
 
@@ -409,6 +460,7 @@ This plan depends on the YAML parser implementation phases defined in [parsing/y
 
 | Date | Change |
 |------|--------|
+| 2026-01-20 | Added Phase 6-8 for yq-specific features (not planned) |
 | 2026-01-20 | Added `--slurp` CLI option |
 | 2026-01-20 | Generic evaluator wired into main CLI path |
 | 2026-01-20 | Phase 1-4 marked complete, updated status tables |
