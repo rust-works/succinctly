@@ -2788,6 +2788,7 @@ fn eval_format<'a, W: Clone + AsRef<[u64]>>(
         FormatType::Html => format_html(&owned, optional),
         FormatType::Sh => format_sh(&owned, optional),
         FormatType::Urid => format_urid(&owned, optional),
+        FormatType::Yaml => format_yaml(&owned),
     };
 
     match result {
@@ -3059,6 +3060,111 @@ fn format_sh(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
         }
         _ if optional => Ok(String::new()),
         _ => Err(EvalError::type_error("string", value.type_name())),
+    }
+}
+
+/// @yaml - Format value as YAML string (yq)
+fn format_yaml(value: &OwnedValue) -> Result<String, EvalError> {
+    Ok(owned_to_yaml(value))
+}
+
+/// Convert OwnedValue to YAML flow-style (compact, single-line like JSON).
+/// This matches yq's @yaml behavior which outputs flow-style YAML.
+fn owned_to_yaml(value: &OwnedValue) -> String {
+    match value {
+        OwnedValue::Null => "null".to_string(),
+        OwnedValue::Bool(true) => "true".to_string(),
+        OwnedValue::Bool(false) => "false".to_string(),
+        OwnedValue::Int(n) => format!("{}", n),
+        OwnedValue::Float(f) => {
+            if f.is_nan() {
+                ".nan".to_string()
+            } else if f.is_infinite() {
+                if *f > 0.0 {
+                    ".inf".to_string()
+                } else {
+                    "-.inf".to_string()
+                }
+            } else {
+                format!("{}", f)
+            }
+        }
+        OwnedValue::String(s) => yaml_quote_string(s),
+        OwnedValue::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(owned_to_yaml).collect();
+            format!("[{}]", items.join(", "))
+        }
+        OwnedValue::Object(obj) => {
+            let pairs: Vec<String> = obj
+                .iter()
+                .map(|(k, v)| format!("{}: {}", yaml_quote_string(k), owned_to_yaml(v)))
+                .collect();
+            format!("{{{}}}", pairs.join(", "))
+        }
+    }
+}
+
+/// Quote a string for YAML output if necessary
+fn yaml_quote_string(s: &str) -> String {
+    // Check if string needs quoting
+    let needs_quoting = s.is_empty()
+        || s.starts_with(' ')
+        || s.ends_with(' ')
+        || s.contains(':')
+        || s.contains('#')
+        || s.contains('\n')
+        || s.contains('\r')
+        || s.contains('\t')
+        || s.contains('"')
+        || s.contains('\'')
+        || s.contains('\\')
+        || s.starts_with('-')
+        || s.starts_with('?')
+        || s.starts_with('*')
+        || s.starts_with('&')
+        || s.starts_with('!')
+        || s.starts_with('|')
+        || s.starts_with('>')
+        || s.starts_with('%')
+        || s.starts_with('@')
+        || s.starts_with('`')
+        || s.starts_with('{')
+        || s.starts_with('}')
+        || s.starts_with('[')
+        || s.starts_with(']')
+        || s.starts_with(',')
+        || s == "true"
+        || s == "false"
+        || s == "null"
+        || s == "~"
+        || s == "yes"
+        || s == "no"
+        || s == "on"
+        || s == "off"
+        || s.parse::<i64>().is_ok()
+        || s.parse::<f64>().is_ok();
+
+    if needs_quoting {
+        // Use double quotes and escape special characters
+        let mut result = String::with_capacity(s.len() + 2);
+        result.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => result.push_str("\\\""),
+                '\\' => result.push_str("\\\\"),
+                '\n' => result.push_str("\\n"),
+                '\r' => result.push_str("\\r"),
+                '\t' => result.push_str("\\t"),
+                c if c.is_control() => {
+                    result.push_str(&format!("\\x{:02x}", c as u32));
+                }
+                c => result.push(c),
+            }
+        }
+        result.push('"');
+        result
+    } else {
+        s.to_string()
     }
 }
 
@@ -13746,6 +13852,64 @@ mod tests {
         query!(br#""it's a test""#, "@sh",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "'it'\\''s a test'");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_yaml() {
+        // Simple object
+        query!(br#"{"a": 1, "b": 2}"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "{a: 1, b: 2}");
+            }
+        );
+
+        // Array
+        query!(br#"[1, 2, 3]"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "[1, 2, 3]");
+            }
+        );
+
+        // Nested structure
+        query!(br#"{"name": "test", "items": [1, 2]}"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "{name: test, items: [1, 2]}");
+            }
+        );
+
+        // String that needs quoting (reserved word)
+        query!(br#"{"value": "true"}"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "{value: \"true\"}");
+            }
+        );
+
+        // Null and boolean
+        query!(br#"{"flag": true, "nothing": null}"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "{flag: true, nothing: null}");
+            }
+        );
+
+        // Empty containers
+        query!(br#"[]"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "[]");
+            }
+        );
+
+        query!(br#"{}"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "{}");
+            }
+        );
+
+        // Float values
+        query!(br#"3.14"#, "@yaml",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "3.14");
             }
         );
     }

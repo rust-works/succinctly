@@ -336,23 +336,22 @@ now | tz("local")  # system timezone
 
 | Operator | Description | Priority | Status |
 |----------|-------------|----------|--------|
-| `@yaml` / `to_yaml` | Encode as YAML string | High | ❌ |
+| `@yaml` / `to_yaml` | Encode as YAML string | High | ✅ |
 | `@props` / `to_props` | Encode as Java properties | Medium | ❌ |
 | `@xml` / `to_xml` | Encode as XML string | Low | ❌ |
 
 #### Operator Details
 
-**`@yaml`** / **`to_yaml`** - Encode value as YAML string
+**`@yaml`** / **`to_yaml`** - Encode value as YAML string ✅
 ```bash
 {a: 1, b: 2} | @yaml
-# → "a: 1\nb: 2\n"
-
-# With custom indentation
-{a: 1} | to_yaml(4)  # 4-space indent
+# → "{a: 1, b: 2}"  (flow-style YAML)
 
 # Embedding YAML in YAML (common use case)
 .config = (.data | @yaml)
 ```
+
+**Note**: Our `@yaml` outputs flow-style (compact) YAML, matching yq's `to_yaml(0)` behavior.
 
 **`@props`** / **`to_props`** - Encode as Java properties
 ```bash

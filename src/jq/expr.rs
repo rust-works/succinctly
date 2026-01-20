@@ -430,6 +430,8 @@ pub enum FormatType {
     Sh,
     /// @urid - URI decode (percent decoding)
     Urid,
+    /// @yaml - format as YAML string (yq)
+    Yaml,
 }
 
 /// Builtin functions supported by jq.
