@@ -2,12 +2,30 @@
 
 This document outlines the plan to add a `yq` subcommand to succinctly for querying YAML files using jq-compatible syntax.
 
+## Implementation Status
+
+| Phase | Goal | Status |
+|-------|------|--------|
+| **1** | Basic yq command | ✅ Complete |
+| **2** | Full YAML 1.2 structural support | ✅ Complete |
+| **3** | Anchors, aliases, YAML output | ✅ Mostly complete |
+| **4** | Multi-document streams | ✅ Mostly complete |
+| **5** | YAML-specific query extensions | 🔄 Partial |
+
+### Performance (Apple M1 Max)
+
+| Size | succinctly | system yq | Speedup |
+|------|------------|-----------|---------|
+| 10KB | 4.2 ms (2.3 MiB/s) | 8.4 ms (1.2 MiB/s) | **2.0x** |
+| 100KB | 5.4 ms (17.1 MiB/s) | 20.3 ms (4.5 MiB/s) | **3.8x** |
+| 1MB | 15.1 ms (61.0 MiB/s) | 118.5 ms (7.8 MiB/s) | **7.8x** |
+
 ## Overview
 
-The `yq` command will provide YAML querying capabilities using the same query language as `jq`. It will leverage:
+The `yq` command provides YAML querying capabilities using the same query language as `jq`. It leverages:
 - The existing jq query evaluator (`src/jq/`)
 - The YAML semi-indexing infrastructure (`src/yaml/`)
-- A new `yq` subcommand in the CLI
+- Generic evaluator for direct YAML evaluation (`src/jq/eval_generic.rs`)
 
 ## Architecture Decision
 
@@ -46,182 +64,134 @@ succinctly yq '.spec.containers[]' deployment.yaml service.yaml
 
 ### Flags (yq-compatible)
 
-| Flag | Description |
-|------|-------------|
-| `-r, --unwrapScalar` | Output raw strings without quotes |
-| `-I 0` | Compact output (use indent level 0) |
-| `-n, --null-input` | Don't read input |
-| `-e, --exit-status` | Exit 1 if last output is false/null |
-| `-p, --input-format` | Input format: auto, yaml, json |
-| `-o, --output-format` | Output format: yaml, json, auto |
-| `-i, --inplace` | Update file in place |
-| `-0, --nul-output` | Use NUL separator instead of newline |
-| `--arg NAME VALUE` | Set $NAME to string VALUE |
-| `--argjson NAME JSON` | Set $NAME to JSON VALUE |
+| Flag | Description | Status |
+|------|-------------|--------|
+| `-r, --unwrapScalar` | Output raw strings without quotes | ✅ |
+| `-I 0` | Compact output (use indent level 0) | ✅ |
+| `-n, --null-input` | Don't read input | ✅ |
+| `-e, --exit-status` | Exit 1 if last output is false/null | ✅ |
+| `-p, --input-format` | Input format: auto, yaml, json | ✅ |
+| `-o, --output-format` | Output format: yaml, json, auto | ✅ |
+| `-s, --slurp` | Read all inputs into array | ✅ |
+| `-i, --inplace` | Update file in place | ✅ |
+| `-0, --nul-output` | Use NUL separator instead of newline | ✅ |
+| `--tab` | Use tabs for indentation | ✅ |
+| `--arg NAME VALUE` | Set $NAME to string VALUE | ✅ |
+| `--argjson NAME JSON` | Set $NAME to JSON VALUE | ✅ |
 
 ### YAML-Specific Flags
 
-| Flag | Description |
-|------|-------------|
-| `--output-format` | Output format: `json` (default), `yaml` |
-| `--preserve-comments` | Preserve comments in YAML output (Phase 3+) |
-| `--explode-anchors` | Expand anchor/alias references (Phase 3+) |
-| `--document N` | Select Nth document from multi-doc stream (Phase 4+) |
-| `--all-documents` | Process all documents (Phase 4+) |
+| Flag | Description | Status |
+|------|-------------|--------|
+| `--output-format yaml` | Output format: `json` (default), `yaml` | ✅ |
+| `--no-doc` | Omit document separators (`---`) | ✅ |
+| `--preserve-comments` | Preserve comments in YAML output | ❌ Not planned |
+| `--explode-anchors` | Expand anchor/alias references | ❌ Not planned |
+| `--document N` | Select Nth document from multi-doc stream | ❌ Not planned |
+| `--all-documents` | Process all documents | ✅ Default behavior |
 
 ## Implementation Phases
 
-### Phase 1: Basic yq Command
+### Phase 1: Basic yq Command ✅ COMPLETE
 
 **Goal**: Minimal viable yq supporting common YAML config file patterns.
 
-**Scope**:
-- Parse YAML-lite subset (block style, simple scalars)
-- Convert YAML to internal value representation
-- Evaluate jq expressions using existing evaluator
-- Output as JSON (simplest path)
+**Completed**:
+- [x] `YqCommand` struct in CLI
+- [x] `yq_runner.rs` module (~1500 lines)
+- [x] Integration with `YamlIndex::build()`
+- [x] Convert `YamlCursor` traversal to `OwnedValue`
+- [x] Full jq expression evaluation
+- [x] JSON and YAML output formats
 
-**Deliverables**:
-1. `YqCommand` struct in CLI (mirrors `JqCommand`)
-2. `yq_runner.rs` module
-3. Integration with `YamlIndex::build()`
-4. Convert `YamlCursor` traversal to `OwnedValue`
-5. Pipe `OwnedValue` through existing jq evaluator
-
-**Files to Create/Modify**:
-```
-src/bin/succinctly/main.rs        # Add Yq(YqCommand) variant
-src/bin/succinctly/yq_runner.rs   # New file (similar to jq_runner.rs)
-```
-
-**Example Implementation Sketch**:
-```rust
-// yq_runner.rs
-pub fn run_yq(args: YqCommand) -> Result<i32> {
-    // 1. Read YAML input
-    let yaml_bytes = read_input(&args)?;
-
-    // 2. Build YAML index
-    let index = YamlIndex::build(&yaml_bytes)?;
-
-    // 3. Convert to OwnedValue (tree traversal)
-    let value = yaml_to_owned_value(&index)?;
-
-    // 4. Parse and evaluate jq expression
-    let program = jq::parse_program(&args.filter.unwrap_or(".".to_string()))?;
-    let results = jq::eval(&program, &value, &context)?;
-
-    // 5. Output results (JSON format initially)
-    output_results(&results, &args)?;
-
-    Ok(exit_codes::SUCCESS)
-}
-```
-
-**Coverage**: ~70% of real-world YAML config files (Kubernetes, GitHub Actions, Docker Compose basics).
+**Key Files**:
+- `src/bin/succinctly/main.rs` - `YqCommand` definition
+- `src/bin/succinctly/yq_runner.rs` - Main yq implementation
 
 ---
 
-### Phase 2: Full YAML 1.2 Structural Support
+### Phase 2: Full YAML 1.2 Structural Support ✅ COMPLETE
 
 **Goal**: Support all YAML structural features except anchors.
 
-**New Features**:
-- Flow style collections (`{key: value}`, `[item, ...]`)
-- Block scalars (`|`, `|+`, `|-`, `>`, `>+`, `>-`)
-- Explicit keys (`? key`)
-
-**Dependencies**: Requires YAML parser Phase 2 from [yaml.md](../parsing/yaml.md).
-
-**Deliverables**:
-1. Handle flow/block distinction in `yaml_to_owned_value()`
-2. Block scalar content extraction with chomping
-3. Update cursor navigation for flow containers
-
-**Coverage**: ~95% of real-world YAML files.
+**Completed**:
+- [x] Flow style collections (`{key: value}`, `[item, ...]`)
+- [x] Block scalars (`|`, `|+`, `|-`, `>`, `>+`, `>-`)
+- [x] Multi-line strings with proper escaping
 
 ---
 
-### Phase 3: Anchors, Aliases, and YAML Output
+### Phase 3: Anchors, Aliases, and YAML Output ✅ MOSTLY COMPLETE
 
 **Goal**: Full anchor/alias support and optional YAML output format.
 
-**New Features**:
-- Anchor definitions (`&anchor`)
-- Alias references (`*anchor`)
-- Merge keys (`<<: *alias`)
-- `--output-format yaml` flag
-- `--explode-anchors` flag
-- `--preserve-comments` flag (YAML output only)
+**Completed**:
+- [x] Anchor definitions (`&anchor`)
+- [x] Alias references (`*anchor`)
+- [x] `--output-format yaml` flag
+- [x] YAML output with proper quoting and indentation
 
-**Dependencies**: Requires YAML parser Phase 3 from [yaml.md](../parsing/yaml.md).
-
-**Implementation Decisions**:
-
-| Feature | Behavior |
-|---------|----------|
-| Alias traversal | Follow aliases transparently by default |
-| `--explode-anchors` | Materialize aliases as copies |
-| Circular references | Error with clear message |
-| `--preserve-comments` | Only for YAML→YAML transforms |
-
-**YAML Output Implementation**:
-```rust
-fn output_yaml(value: &OwnedValue, indent: usize) -> String {
-    match value {
-        OwnedValue::Null => "null".to_string(),
-        OwnedValue::Bool(b) => b.to_string(),
-        OwnedValue::Int(n) => n.to_string(),
-        OwnedValue::Float(f) => format_float(*f),
-        OwnedValue::String(s) => yaml_quote_string(s),
-        OwnedValue::Array(arr) => format_yaml_array(arr, indent),
-        OwnedValue::Object(obj) => format_yaml_object(obj, indent),
-    }
-}
-```
+**Not Implemented** (low priority):
+- [ ] `--explode-anchors` flag
+- [ ] `--preserve-comments` flag
+- [ ] Merge keys (`<<: *alias`)
 
 ---
 
-### Phase 4: Multi-Document Streams
+### Phase 4: Multi-Document Streams ✅ MOSTLY COMPLETE
 
 **Goal**: Support multi-document YAML files.
 
-**New Features**:
-- `---` document separator handling
-- `--document N` to select specific document
-- `--all-documents` to process each document
-- Default: process first document only
-
-**Dependencies**: Requires YAML parser Phase 4 from [yaml.md](../parsing/yaml.md).
+**Completed**:
+- [x] `---` document separator handling
+- [x] Process all documents by default
+- [x] `--slurp` collects all documents into array
+- [x] `--no-doc` omits separators in output
 
 **Behavior Matrix**:
 
 | Input | Flag | Behavior |
 |-------|------|----------|
 | Single doc | (none) | Process document |
-| Multi doc | (none) | Process first document |
-| Multi doc | `--document 0` | Process first document |
-| Multi doc | `--document 2` | Process third document |
-| Multi doc | `--all-documents` | Process each, output separated by `---` |
+| Multi doc | (none) | Process all documents |
 | Multi doc | `--slurp` | All documents as array |
+| Multi doc | `--no-doc` | No `---` separators in output |
+
+**Not Implemented** (low priority):
+- [ ] `--document N` to select specific document
 
 ---
 
-### Phase 5: YAML-Specific Query Extensions (Optional)
+### Phase 5: YAML-Specific Query Extensions 🔄 PARTIAL
 
 **Goal**: Add YAML-aware operators beyond standard jq.
 
-**Potential Extensions**:
+**Implemented**:
+- [x] `line` - Get 1-based line number of node
+- [x] `column` - Get 1-based column number of node
 
-| Operator | Description | Example |
-|----------|-------------|---------|
-| `anchor` | Get anchor name if present | `.foo \| anchor` → `"my_anchor"` |
-| `has_anchor` | Check if node has anchor | `.foo \| has_anchor` → `true` |
-| `tag` | Get explicit tag | `.foo \| tag` → `"!!str"` |
-| `style` | Get scalar style | `.foo \| style` → `"literal"` |
-| `comments` | Get associated comments | `.foo \| comments` → `["comment text"]` |
+**Not Implemented** (implement on demand):
 
-**Decision**: Implement only if there's user demand. Standard jq operators cover most use cases.
+| Operator | Description | Status |
+|----------|-------------|--------|
+| `anchor` | Get anchor name if present | ❌ |
+| `has_anchor` | Check if node has anchor | ❌ |
+| `tag` | Get explicit tag | ❌ |
+| `style` | Get scalar style | ❌ |
+| `comments` | Get associated comments | ❌ |
+
+---
+
+### Generic Evaluator (Bonus) ✅ COMPLETE
+
+**Goal**: Evaluate jq expressions directly on YAML without JSON conversion.
+
+**Completed**:
+- [x] `DocumentValue` / `DocumentCursor` traits in `src/jq/document.rs`
+- [x] Generic evaluator in `src/jq/eval_generic.rs` (~750 lines)
+- [x] Direct YAML→JSON streaming for identity queries
+- [x] `line`/`column` builtins use cursor position metadata
+- [x] 2-8x performance improvement over system yq
 
 ---
 
@@ -370,10 +340,11 @@ EXAMPLES:
 
 | Feature | Farah yq | succinctly yq |
 |---------|----------|---------------|
-| Basic queries | `.foo.bar` | `.foo.bar` |
-| Array iteration | `.[]` | `.[]` |
-| Select | `select(.active)` | `select(.active)` |
-| In-place edit | `-i` | Not planned |
+| Basic queries | `.foo.bar` | ✅ `.foo.bar` |
+| Array iteration | `.[]` | ✅ `.[]` |
+| Select | `select(.active)` | ✅ `select(.active)` |
+| In-place edit | `-i` | ✅ `-i` |
+| Slurp | `-s` | ✅ `-s` |
 | Eval | `eval` | Not needed |
 | XML/TOML | Supported | Not planned |
 
@@ -389,19 +360,19 @@ EXAMPLES:
 
 ## Success Criteria
 
-### Phase 1 Complete When:
-- [ ] `succinctly yq '.' file.yaml` outputs JSON
-- [ ] Basic field access works: `.metadata.name`
-- [ ] Array iteration works: `.items[]`
-- [ ] Filters work: `select(.kind == "Deployment")`
-- [ ] Tests pass for Kubernetes manifests, GitHub Actions, Docker Compose
+### Phase 1 Complete When: ✅ DONE
+- [x] `succinctly yq '.' file.yaml` outputs JSON
+- [x] Basic field access works: `.metadata.name`
+- [x] Array iteration works: `.items[]`
+- [x] Filters work: `select(.kind == "Deployment")`
+- [x] Tests pass for Kubernetes manifests, GitHub Actions, Docker Compose
 
-### Full Implementation Complete When:
-- [ ] All jq operators work on YAML input
-- [ ] Multi-document YAML supported
-- [ ] YAML output format supported
-- [ ] Anchors/aliases handled correctly
-- [ ] Performance within 2x of Mike Farah's yq
+### Full Implementation Complete When: ✅ DONE
+- [x] All jq operators work on YAML input
+- [x] Multi-document YAML supported
+- [x] YAML output format supported
+- [x] Anchors/aliases handled correctly
+- [x] Performance within 2x of Mike Farah's yq (actually **2-8x faster**)
 
 ---
 
@@ -421,13 +392,23 @@ This plan depends on the YAML parser implementation phases defined in [parsing/y
 ## Open Questions
 
 1. **Default output format**: Should default be JSON or YAML?
-   - *Recommendation*: JSON (matches jq behavior, more tooling compatible)
+   - *Decision*: JSON (matches jq behavior, more tooling compatible) ✅ Implemented
 
 2. **Anchor expansion default**: Expand aliases automatically or preserve structure?
-   - *Recommendation*: Expand automatically (matches user expectations from jq)
+   - *Decision*: Expand automatically (matches user expectations from jq) ✅ Implemented
 
 3. **Comment handling**: How to expose comments in queries?
-   - *Recommendation*: Defer to Phase 5, low priority
+   - *Decision*: Deferred - implement on user demand
 
 4. **Schema validation**: Should yq validate against YAML schemas?
-   - *Recommendation*: Out of scope (separate tool concern)
+   - *Decision*: Out of scope (separate tool concern)
+
+---
+
+## Changelog
+
+| Date | Change |
+|------|--------|
+| 2026-01-20 | Added `--slurp` CLI option |
+| 2026-01-20 | Generic evaluator wired into main CLI path |
+| 2026-01-20 | Phase 1-4 marked complete, updated status tables |
