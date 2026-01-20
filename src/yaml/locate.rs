@@ -180,10 +180,12 @@ fn find_key_for_value<W: AsRef<[u64]>>(
         let key_bp = child_bp;
         let value_bp = index.bp().next_sibling(key_bp)?;
 
-        if key_bp == target_bp {
+        // Check if target is the key itself or within key's subtree
+        if key_bp == target_bp || is_ancestor(index, key_bp, target_bp) {
             return Some((key_bp, value_bp));
         }
 
+        // Check if target is the value or within value's subtree
         if value_bp == target_bp || is_ancestor(index, value_bp, target_bp) {
             return Some((key_bp, value_bp));
         }
@@ -217,6 +219,13 @@ pub fn path_to_bp<W: AsRef<[u64]>>(
     let mut current_bp = target_bp;
 
     while let Some(parent_bp) = index.bp().parent(current_bp) {
+        // Skip sequence item wrappers - they don't contribute to the path
+        // Sequence items are transparent; the path goes directly to the sequence
+        if index.is_seq_item(parent_bp) {
+            current_bp = parent_bp;
+            continue;
+        }
+
         if is_sequence(index, text, parent_bp) {
             // Parent is a sequence
             let idx = count_siblings_before(index, parent_bp, current_bp);
@@ -285,7 +294,6 @@ pub fn locate_offset<W: AsRef<[u64]>>(
 
 /// Result of locating a position in YAML.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct LocateResult {
     /// The jq-like expression to navigate to this position
     pub expression: String,
@@ -296,7 +304,6 @@ pub struct LocateResult {
 }
 
 /// Find detailed location info for a byte offset in YAML text.
-#[allow(dead_code)]
 pub fn locate_offset_detailed<W: AsRef<[u64]>>(
     index: &YamlIndex<W>,
     text: &[u8],

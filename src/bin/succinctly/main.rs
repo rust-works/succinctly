@@ -27,6 +27,8 @@ enum Command {
     Yq(YqCommand),
     /// Find jq expression for a position in a JSON file
     JqLocate(jq_locate::JqLocateArgs),
+    /// Find yq expression for a position in a YAML file
+    YqLocate(yq_locate::YqLocateArgs),
     /// Developer tools (benchmarking, profiling)
     Dev(DevCommand),
 }
@@ -815,6 +817,10 @@ fn main() -> Result<()> {
             let exit_code = jq_locate::run_jq_locate(args)?;
             std::process::exit(exit_code);
         }
+        Command::YqLocate(args) => {
+            let exit_code = yq_locate::run_yq_locate(args)?;
+            std::process::exit(exit_code);
+        }
         Command::Json(json_cmd) => match json_cmd.command {
             JsonSubcommand::Generate(args) => {
                 let json = generate_json(
@@ -1380,6 +1386,7 @@ mod jq_bench;
 mod jq_locate;
 mod jq_runner;
 mod yaml_generators;
+mod yq_locate;
 mod yq_runner;
 use generators::generate_json;
 

@@ -60,4 +60,4 @@ pub use light::{
     ChompingIndicator, YamlCursor, YamlElements, YamlField, YamlFields, YamlNumber, YamlString,
     YamlValue,
 };
-pub use locate::locate_offset;
+pub use locate::{locate_offset, locate_offset_detailed, LocateResult};

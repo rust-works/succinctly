@@ -2033,4 +2033,46 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], OwnedValue::Int(3));
     }
+
+    #[test]
+    fn test_explicit_empty_key() {
+        // Test explicit key syntax with empty key
+        // YAML: ?\n: value
+        let yaml = b"?\n: value\n";
+        let inputs = parse_input(yaml, InputFormat::Yaml).unwrap();
+
+        assert_eq!(inputs.len(), 1);
+        if let OwnedValue::Object(map) = &inputs[0] {
+            println!("map len: {}", map.len());
+            for (k, v) in map.iter() {
+                println!("  key={:?}, value={:?}", k, v);
+            }
+            assert_eq!(map.len(), 1);
+            // Empty key (null key in YAML becomes empty string in our representation)
+            // The key should be preserved - could be "" or "null" depending on conversion
+            // Let's check what we have
+            assert!(map.contains_key("") || map.contains_key("null"));
+        } else {
+            panic!("expected object, got {:?}", inputs[0]);
+        }
+    }
+
+    #[test]
+    fn test_explicit_empty_key_direct_eval() {
+        // Test explicit key syntax with direct YAML evaluation
+        let yaml = b"?\n: value\n";
+        let expr = Expr::Identity;
+        let results = parse_and_evaluate_yaml(yaml, &expr).unwrap();
+
+        assert_eq!(results.len(), 1);
+        if let OwnedValue::Object(map) = &results[0] {
+            println!("direct eval map len: {}", map.len());
+            for (k, v) in map.iter() {
+                println!("  key={:?}, value={:?}", k, v);
+            }
+            assert_eq!(map.len(), 1, "expected 1 key but got {} keys", map.len());
+        } else {
+            panic!("expected object, got {:?}", results[0]);
+        }
+    }
 }
