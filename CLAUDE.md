@@ -219,6 +219,14 @@ cargo test
 
 To regenerate: `cargo bench --bench jq_comparison`
 
+### jq Query Performance (ARM Neoverse-V1)
+
+| Size      | succinctly            | jq                    | Speedup    |
+|-----------|-----------------------|-----------------------|------------|
+| **10KB**  |  1.4 ms  (6.7 MiB/s)  |  2.6 ms  (3.6 MiB/s)  | **1.8x**   |
+| **100KB** |  4.0 ms (21.5 MiB/s)  |  6.4 ms (13.3 MiB/s)  | **1.6x**   |
+| **1MB**   | 27.9 ms (29.0 MiB/s)  | 45.6 ms (17.7 MiB/s)  | **1.6x**   |
+
 ### yq Query Performance (Apple M1 Max)
 
 | Size      | succinctly            | yq                    | Speedup    |
@@ -226,6 +234,16 @@ To regenerate: `cargo bench --bench jq_comparison`
 | **10KB**  |  4.0 ms  (2.5 MiB/s)  |  7.2 ms  (1.3 MiB/s)  | **1.8x**   |
 | **100KB** |  8.8 ms (10.5 MiB/s)  | 19.9 ms  (4.6 MiB/s)  | **2.3x**   |
 | **1MB**   | 55.0 ms (16.8 MiB/s)  |117.1 ms  (7.9 MiB/s)  | **2.1x**   |
+
+### yq Query Performance (ARM Neoverse-V1)
+
+Note: System `yq` not installed; showing succinctly-only performance.
+
+| Size      | succinctly              |
+|-----------|-------------------------|
+| **10KB**  | 1.27 ms  (7.7 MiB/s)    |
+| **100KB** | 2.87 ms (32.0 MiB/s)    |
+| **1MB**   | 17.7 ms (52.1 MiB/s)    |
 
 ### yq Query Performance (AMD Ryzen 9 7950X)
 

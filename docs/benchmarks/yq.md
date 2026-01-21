@@ -4,7 +4,15 @@ Benchmarks comparing `succinctly yq .` (identity filter) vs `yq .` (Mike Farah's
 
 ## Platforms
 
-### Platform 1: ARM (Apple Silicon)
+### Platform 1: ARM (AWS Graviton - Neoverse-V1)
+
+**CPU**: ARM Neoverse-V1 (4 cores)
+**OS**: Linux 6.14.0-1018-aws
+**yq version**: Not installed (succinctly-only benchmarks)
+**succinctly**: Built with `--release --features cli`
+**SIMD**: NEON (128-bit), SVE (256-bit vectors)
+
+### Platform 2: ARM (Apple Silicon)
 
 **CPU**: Apple M1 Max
 **OS**: macOS Darwin 25.1.0
@@ -12,7 +20,7 @@ Benchmarks comparing `succinctly yq .` (identity filter) vs `yq .` (Mike Farah's
 **succinctly**: Built with `--release --features cli`
 **SIMD**: ARM NEON (16 bytes/iteration for string scanning)
 
-### Platform 2: x86_64 (AMD Zen 4)
+### Platform 3: x86_64 (AMD Zen 4)
 
 **CPU**: AMD Ryzen 9 7950X (Zen 4)
 **OS**: Linux 6.6.87.2-microsoft-standard-WSL2 (WSL2)
@@ -32,6 +40,23 @@ cargo bench --bench yq_comparison
 ---
 
 ## Summary Results
+
+### ARM (Neoverse-V1) - succinctly yq Performance
+
+Note: System `yq` was not installed for comparison. Results show succinctly performance only.
+
+| Size      | succinctly Time | Throughput     |
+|-----------|-----------------|----------------|
+| **1KB**   | 1.11 ms         | 1.09 MiB/s     |
+| **10KB**  | 1.27 ms         | 7.71 MiB/s     |
+| **100KB** | 2.87 ms         | 32.0 MiB/s     |
+| **1MB**   | 17.71 ms        | 52.1 MiB/s     |
+
+**Key metrics:**
+- ✅ NEON SIMD optimizations active
+- ✅ 52 MiB/s throughput on 1MB files
+- ✅ Scales well: 1MB throughput 47x higher than 1KB
+- ✅ SVE-capable CPU (256-bit vectors)
 
 ### ARM (Apple M1 Max) - yq Identity Comparison (comprehensive pattern)
 
