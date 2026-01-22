@@ -19,7 +19,13 @@
 //!
 //! ## ARM
 //!
-//! On ARM aarch64, NEON intrinsics process 16 bytes at a time (mandatory).
+//! On ARM aarch64:
+//! - **NEON** (default): 16 bytes/iteration with nibble lookup tables, mandatory on all aarch64
+//! - **SVE2** (experimental): Character comparisons with predication
+//!   - AWS Graviton 4 (Neoverse V2): 128-bit SVE2 vectors
+//!   - **36% slower than NEON** on 128-bit implementations due to expensive predicate-to-bitmask conversion
+//!   - May be faster on wider SVE2 implementations (256-bit, 512-bit)
+//!   - Enable with `SUCCINCTLY_SVE2=1` environment variable (not recommended)
 //!
 //! ## Cursor Algorithms
 //!
@@ -29,6 +35,9 @@
 
 #[cfg(target_arch = "aarch64")]
 pub mod neon;
+
+#[cfg(target_arch = "aarch64")]
+pub mod sve2;
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86;
@@ -43,13 +52,40 @@ pub mod avx2;
 pub mod bmi2;
 
 // ============================================================================
-// ARM exports (NEON only)
+// ARM exports with optional runtime dispatch to SVE2 (requires std)
 // ============================================================================
 
-#[cfg(target_arch = "aarch64")]
+// Runtime dispatch when std is available
+// Priority: SVE2 > NEON (SVE2 is experimental, may not be faster)
+#[cfg(all(target_arch = "aarch64", any(test, feature = "std")))]
+pub fn build_semi_index_standard(json: &[u8]) -> crate::json::standard::SemiIndex {
+    // SVE2 dispatch disabled by default - enable with SUCCINCTLY_SVE2=1
+    // SVE2 on 128-bit implementations may not be faster than NEON
+    #[cfg(feature = "std")]
+    if std::env::var("SUCCINCTLY_SVE2").is_ok_and(|v| v == "1")
+        && std::arch::is_aarch64_feature_detected!("sve2")
+    {
+        return unsafe { sve2::build_semi_index_standard(json) };
+    }
+    neon::build_semi_index_standard(json)
+}
+
+#[cfg(all(target_arch = "aarch64", any(test, feature = "std")))]
+pub fn build_semi_index_simple(json: &[u8]) -> crate::json::simple::SemiIndex {
+    #[cfg(feature = "std")]
+    if std::env::var("SUCCINCTLY_SVE2").is_ok_and(|v| v == "1")
+        && std::arch::is_aarch64_feature_detected!("sve2")
+    {
+        return unsafe { sve2::build_semi_index_simple(json) };
+    }
+    neon::build_semi_index_simple(json)
+}
+
+// Without std feature, default to NEON (universally available on aarch64)
+#[cfg(all(target_arch = "aarch64", not(any(test, feature = "std"))))]
 pub use neon::build_semi_index_simple;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(any(test, feature = "std"))))]
 pub use neon::build_semi_index_standard;
 
 // ============================================================================

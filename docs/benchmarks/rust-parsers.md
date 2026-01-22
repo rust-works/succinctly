@@ -5,6 +5,8 @@ Benchmark comparison of succinctly against other popular Rust JSON parsers.
 **Platform**: x86_64 (AMD Ryzen 9 7950X, Zen 4)
 **Date**: 2026-01-11
 
+> **Note**: ARM benchmarks available for end-to-end performance. See [jq.md](jq.md) and [yq.md](yq.md) for Neoverse-V2 (Graviton 4) and Neoverse-V1 (Graviton 3) performance data.
+
 ## Libraries Compared
 
 | Library       | Version | Type                  | Key Features                                    |

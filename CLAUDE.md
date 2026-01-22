@@ -213,19 +213,45 @@ cargo test
 
 | Size      | succinctly            | jq                    | Speedup    |
 |-----------|-----------------------|-----------------------|------------|
-| **10KB**  |  4.1 ms  (2.3 MiB/s)  |  4.1 ms  (2.3 MiB/s)  | **1.0x**   |
-| **100KB** |  6.6 ms (13.0 MiB/s)  |  8.4 ms (10.2 MiB/s)  | **1.3x**   |
-| **1MB**   | 28.3 ms (28.5 MiB/s)  | 45.8 ms (17.6 MiB/s)  | **1.6x**   |
+| **10KB**  |  4.1 ms  (2.3 MiB/s)  |  4.8 ms  (2.0 MiB/s)  | **1.2x**   |
+| **100KB** |  6.6 ms (12.9 MiB/s)  |  9.0 ms  (9.4 MiB/s)  | **1.4x**   |
+| **1MB**   | 29.6 ms (27.3 MiB/s)  | 45.3 ms (17.8 MiB/s)  | **1.5x**   |
 
 To regenerate: `cargo bench --bench jq_comparison`
+
+### jq Query Performance (ARM Neoverse-V1)
+
+| Size      | succinctly            | jq                    | Speedup    |
+|-----------|-----------------------|-----------------------|------------|
+| **10KB**  |  1.4 ms  (6.7 MiB/s)  |  2.6 ms  (3.6 MiB/s)  | **1.8x**   |
+| **100KB** |  4.0 ms (21.5 MiB/s)  |  6.4 ms (13.3 MiB/s)  | **1.6x**   |
+| **1MB**   | 27.9 ms (29.0 MiB/s)  | 45.6 ms (17.7 MiB/s)  | **1.6x**   |
 
 ### yq Query Performance (Apple M1 Max)
 
 | Size      | succinctly            | yq                    | Speedup    |
 |-----------|-----------------------|-----------------------|------------|
-| **10KB**  |  4.0 ms  (2.5 MiB/s)  |  7.2 ms  (1.3 MiB/s)  | **1.8x**   |
-| **100KB** |  8.8 ms (10.5 MiB/s)  | 19.9 ms  (4.6 MiB/s)  | **2.3x**   |
-| **1MB**   | 55.0 ms (16.8 MiB/s)  |117.1 ms  (7.9 MiB/s)  | **2.1x**   |
+| **10KB**  |  4.2 ms  (2.3 MiB/s)  |  8.4 ms  (1.2 MiB/s)  | **2.0x**   |
+| **100KB** |  5.5 ms (16.8 MiB/s)  | 20.6 ms  (4.5 MiB/s)  | **3.8x**   |
+| **1MB**   | 15.3 ms (60.2 MiB/s)  |120.7 ms  (7.6 MiB/s)  | **7.9x**   |
+
+### yq Query Performance (ARM Neoverse-V2)
+
+| Size      | succinctly              | yq                    | Speedup    |
+|-----------|-------------------------|-----------------------|------------|
+| **10KB**  | 0.99 ms  (9.9 MiB/s)    | 4.46 ms (2.2 MiB/s)   | **4.5x**   |
+| **100KB** | 2.20 ms (41.8 MiB/s)    | 20.1 ms (4.6 MiB/s)   | **9.1x**   |
+| **1MB**   | 13.6 ms (68.0 MiB/s)    | 154 ms (6.0 MiB/s)    | **11.4x**  |
+
+### yq Query Performance (ARM Neoverse-V1)
+
+Note: System `yq` not installed; showing succinctly-only performance.
+
+| Size      | succinctly              |
+|-----------|-------------------------|
+| **10KB**  | 1.27 ms  (7.7 MiB/s)    |
+| **100KB** | 2.87 ms (32.0 MiB/s)    |
+| **1MB**   | 17.7 ms (52.1 MiB/s)    |
 
 ### yq Query Performance (AMD Ryzen 9 7950X)
 

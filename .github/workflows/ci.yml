@@ -69,6 +69,14 @@ jobs:
             target/
           key: ${{ runner.os }}-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Check CPU features (SVE2)
+        run: |
+          echo "=== CPU Info ==="
+          lscpu | grep -E "Model name|Architecture|CPU|Flags" || true
+          echo "=== SVE/SVE2 Detection ==="
+          if grep -q sve2 /proc/cpuinfo 2>/dev/null; then echo "SVE2: supported"; else echo "SVE2: not detected"; fi
+          if grep -q svebitperm /proc/cpuinfo 2>/dev/null; then echo "SVE2-BITPERM: supported"; else echo "SVE2-BITPERM: not detected"; fi
+
       - name: Build
         run: cargo build --verbose
 
@@ -160,9 +168,12 @@ jobs:
             echo "=== Feature Detection ==="
             if grep -q avx2 /proc/cpuinfo 2>/dev/null; then echo "AVX2: supported"; else echo "AVX2: not detected"; fi
             if grep -q popcnt /proc/cpuinfo 2>/dev/null; then echo "POPCNT: supported"; else echo "POPCNT: not detected"; fi
+            if grep -q sve2 /proc/cpuinfo 2>/dev/null; then echo "SVE2: supported"; else echo "SVE2: not detected"; fi
+            if grep -q svebitperm /proc/cpuinfo 2>/dev/null; then echo "SVE2-BITPERM: supported"; else echo "SVE2-BITPERM: not detected"; fi
           elif [[ "$RUNNER_OS" == "macOS" ]]; then
             sysctl -n machdep.cpu.brand_string || true
             system_profiler SPHardwareDataType | grep -E "Chip|Cores" || true
+            echo "Note: Apple Silicon does not support SVE/SVE2"
           fi
 
       - name: Run benchmarks (default)

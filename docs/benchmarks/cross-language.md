@@ -16,6 +16,17 @@ Comprehensive benchmarks comparing **succinctly** against other Rust JSON parser
 - **Rust**: 1.89.0
 - **Date**: 2026-01-08
 
+### ARM Neoverse-V2 (AWS Graviton 4)
+- **CPU**: ARM Neoverse-V2 (AWS Graviton 4)
+- **OS**: Linux 6.14.0-1018-aws
+- **SIMD**: NEON, SVE2 (128-bit), SVEBITPERM
+- **Status**: End-to-end benchmarks available
+- **Note**: See [jq.md](jq.md) and [yq.md](yq.md) for Neoverse-V2 performance
+
+### ARM Neoverse-V1 (AWS Graviton 3)
+- **Status**: End-to-end benchmarks available
+- **Note**: See [jq.md](jq.md) and [yq.md](yq.md) for Neoverse-V1 performance
+
 ## Parsers Tested
 
 | Parser         | Version | Description                                  |

@@ -143,10 +143,10 @@ unsafe fn process_chunk_64(
     let quote_mask = quote_mask0 | (quote_mask1 << 16) | (quote_mask2 << 32) | (quote_mask3 << 48);
     let nl_mask = nl_mask0 | (nl_mask1 << 16) | (nl_mask2 << 32) | (nl_mask3 << 48);
 
-    // Compute the in-quote mask using prefix XOR
+    // Compute the in-quote mask using prefix XOR (via NEON PMULL)
     // The prefix XOR of the quote mask tells us which positions are inside quotes.
     // If in_quote is true, we XOR with all 1s to flip the mask.
-    let quote_xor = prefix_xor(quote_mask);
+    let quote_xor = prefix_xor_neon(quote_mask);
     let in_quote_mask = if in_quote { !quote_xor } else { quote_xor };
 
     // Delimiters and newlines are valid only outside quotes
@@ -201,7 +201,7 @@ unsafe fn neon_movemask(v: uint8x16_t) -> u16 {
     (low_packed as u16) | ((high_packed as u16) << 8)
 }
 
-/// Compute inclusive prefix XOR (cumulative XOR) of a 64-bit mask.
+/// Compute inclusive prefix XOR (cumulative XOR) of a 64-bit mask using NEON PMULL.
 ///
 /// The prefix XOR at position i is the XOR of all bits at positions 0..=i.
 /// This tells us the "parity" of quotes seen so far (including current),
@@ -215,11 +215,38 @@ unsafe fn neon_movemask(v: uint8x16_t) -> u16 {
 /// quote_mask = 0b100100 (bits 2 and 5 set)
 /// prefix_xor = 0b011100 (bits 2,3,4 are "inside" quotes)
 ///
-/// The parallel prefix XOR algorithm uses doubling with LEFT shifts.
-/// Left shifts propagate information from low bits to high bits,
-/// which is what we need for prefix operations in LSB-first ordering.
+/// ## Implementation
+///
+/// Uses carryless multiplication (PMULL instruction) which computes prefix XOR
+/// in O(1) operations instead of O(log n) shifts.
+///
+/// The key insight: `prefix_xor(x) = clmul(x, 0xFFFFFFFFFFFFFFFF)` truncated to 64 bits.
+/// This is because carryless multiplication by all-1s propagates each bit to all
+/// higher positions via XOR, which is exactly the prefix XOR operation.
 #[inline]
-fn prefix_xor(x: u64) -> u64 {
+#[target_feature(enable = "neon")]
+unsafe fn prefix_xor_neon(x: u64) -> u64 {
+    use core::arch::aarch64::*;
+
+    // Load x into a NEON register (low 64 bits of poly64x2)
+    let a = vreinterpretq_p64_u64(vdupq_n_u64(x));
+
+    // Load the all-1s constant for carryless multiplication
+    let b = vreinterpretq_p64_u64(vdupq_n_u64(!0u64));
+
+    // Carryless multiply: result = x * 0xFFFF...FFFF in GF(2)
+    // This produces a 128-bit result, but we only need the low 64 bits
+    // vmull_p64 multiplies the low lane of each operand
+    let product = vmull_p64(vgetq_lane_p64::<0>(a), vgetq_lane_p64::<0>(b));
+
+    // Extract the low 64 bits which contains the prefix XOR result
+    vgetq_lane_u64::<0>(vreinterpretq_u64_p128(product))
+}
+
+/// Scalar fallback for prefix XOR (used in tests for comparison).
+#[inline]
+#[allow(dead_code)]
+fn prefix_xor_scalar(x: u64) -> u64 {
     // Parallel prefix XOR using doubling with left shifts
     // After step k, each bit i contains XOR of bits max(0, i-2^k+1)..=i
     // After all steps, each bit i contains XOR of bits 0..=i
@@ -238,33 +265,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_prefix_xor() {
-        // No quotes
-        assert_eq!(prefix_xor(0b0), 0b0);
+    fn test_prefix_xor_neon() {
+        // SAFETY: NEON is mandatory on aarch64
+        unsafe {
+            // No quotes
+            assert_eq!(prefix_xor_neon(0b0), 0b0);
 
-        // Single quote at position 0
-        assert_eq!(prefix_xor(0b1), !0u64); // All bits after are "inside"
+            // Single quote at position 0
+            assert_eq!(prefix_xor_neon(0b1), !0u64); // All bits after are "inside"
 
-        // Quote at position 2
-        // prefix_xor should set all bits from position 2 onwards
-        let q = 0b100u64;
-        let px = prefix_xor(q);
-        // Bits 0,1 should be 0 (outside), bits 2+ should be 1 (inside)
-        assert_eq!(px & 0b11, 0);
-        assert_eq!(px & 0b100, 0b100);
+            // Quote at position 2
+            // prefix_xor should set all bits from position 2 onwards
+            let q = 0b100u64;
+            let px = prefix_xor_neon(q);
+            // Bits 0,1 should be 0 (outside), bits 2+ should be 1 (inside)
+            assert_eq!(px & 0b11, 0);
+            assert_eq!(px & 0b100, 0b100);
 
-        // Quotes at positions 2 and 5 (entering and exiting)
-        // Bits 2,3,4 should be inside, bits 0,1,5+ should be outside
-        let q = 0b100100u64; // positions 2 and 5
-        let px = prefix_xor(q);
-        // After prefix XOR: bit i = XOR of bits 0..=i
-        // pos 0: 0
-        // pos 1: 0
-        // pos 2: 1 (quote at 2)
-        // pos 3: 1
-        // pos 4: 1
-        // pos 5: 0 (quote at 5 XORs with accumulated 1)
-        assert_eq!(px & 0b111111, 0b011100);
+            // Quotes at positions 2 and 5 (entering and exiting)
+            // Bits 2,3,4 should be inside, bits 0,1,5+ should be outside
+            let q = 0b100100u64; // positions 2 and 5
+            let px = prefix_xor_neon(q);
+            // After prefix XOR: bit i = XOR of bits 0..=i
+            // pos 0: 0
+            // pos 1: 0
+            // pos 2: 1 (quote at 2)
+            // pos 3: 1
+            // pos 4: 1
+            // pos 5: 0 (quote at 5 XORs with accumulated 1)
+            assert_eq!(px & 0b111111, 0b011100);
+        }
+    }
+
+    #[test]
+    fn test_prefix_xor_neon_matches_scalar() {
+        // Test that NEON PMULL implementation matches scalar implementation
+        let test_patterns = [
+            0u64,
+            1,
+            0b11,
+            0b101,
+            0b1001,
+            0x8000_0000_0000_0000,
+            0xAAAA_AAAA_AAAA_AAAA,
+            0x5555_5555_5555_5555,
+            0xFF00_FF00_FF00_FF00,
+            0x0123_4567_89AB_CDEF,
+            !0u64,
+        ];
+
+        for &pattern in &test_patterns {
+            let scalar_result = prefix_xor_scalar(pattern);
+            let neon_result = unsafe { prefix_xor_neon(pattern) };
+            assert_eq!(
+                neon_result, scalar_result,
+                "Mismatch for pattern {:#018x}: NEON={:#018x}, scalar={:#018x}",
+                pattern, neon_result, scalar_result
+            );
+        }
     }
 
     #[test]

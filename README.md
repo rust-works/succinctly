@@ -145,6 +145,7 @@ See [docs/benchmarks/rust-parsers.md](docs/benchmarks/rust-parsers.md) for detai
 | **ARM** (Apple M1 Max)         | NEON           | **574 MiB/s** | 32 bytes/iteration           |
 |                                | Scalar (PFSM)  | 557 MiB/s     | Table-driven                 |
 |                                | Scalar         | 405 MiB/s     | Baseline                     |
+| **ARM** (Neoverse-V1)          | NEON/PFSM      | **~500 MiB/s**| Estimated based on jq perf   |
 
 ### Rank/Select Operations
 
@@ -171,6 +172,16 @@ Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
 | **arrays**        |  738.2ms | **388.9ms**   | **1.9x** |  367 MB |    17 MB |      0.05x |
 | **literals**      |  279.5ms | **228.7ms**   | **1.2x** |   50 MB |    16 MB |      0.33x |
 
+#### ARM (Neoverse-V1, 1MB files)
+
+| Pattern           | jq       | succinctly    | Speedup  |
+|-------------------|----------|---------------|----------|
+| **nested**        |   23.8ms |  **8.8ms**    | **2.7x** |
+| **strings**       |   21.2ms |  **9.4ms**    | **2.3x** |
+| **arrays**        |   80.1ms |  **42.5ms**   | **1.9x** |
+| **users**         |   28.8ms |  **17.4ms**   | **1.7x** |
+| **comprehensive** |   45.6ms |  **27.9ms**   | **1.6x** |
+
 #### ARM (Apple M1 Max, 10MB files)
 
 | Pattern           | jq       | succinctly    | Speedup  | jq Mem  | succ Mem | Mem Ratio  |
@@ -192,10 +203,12 @@ Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
 
 ### Platform-Specific Optimizations
 
-| Platform   | Operation                    | Throughput | Speedup         |
-|------------|------------------------------|------------|-----------------|
-| **x86_64** | Popcount (AVX-512 VPOPCNTDQ) | 96.8 GiB/s |  5.2x vs scalar |
-| **ARM**    | NEON JSON (string-heavy)     |  3.7 GiB/s | 1.69x vs scalar |
+| Platform             | Operation                    | Throughput | Speedup         |
+|----------------------|------------------------------|------------|-----------------|
+| **x86_64**           | Popcount (AVX-512 VPOPCNTDQ) | 96.8 GiB/s |  5.2x vs scalar |
+| **ARM (M1 Max)**     | NEON JSON (string-heavy)     |  3.7 GiB/s | 1.69x vs scalar |
+| **ARM (Neoverse-V1)**| Popcount (NEON)              | 46.5 GiB/s |  N/A            |
+|                      | NEON movemask (parallel)     |  1.37 ns   | 2.5x vs serial  |
 
 See [docs/benchmarks/rust-parsers.md](docs/benchmarks/rust-parsers.md), [docs/benchmarks/jq.md](docs/benchmarks/jq.md), and [docs/optimizations/history.md](docs/optimizations/history.md) for detailed benchmarks.
 

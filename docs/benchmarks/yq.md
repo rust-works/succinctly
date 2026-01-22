@@ -4,7 +4,23 @@ Benchmarks comparing `succinctly yq .` (identity filter) vs `yq .` (Mike Farah's
 
 ## Platforms
 
-### Platform 1: ARM (Apple Silicon)
+### Platform 1: ARM (AWS Graviton 4 - Neoverse-V2)
+
+**CPU**: ARM Neoverse-V2 (AWS Graviton 4)
+**OS**: Linux 6.14.0-1018-aws
+**yq version**: v4.48.1 (https://github.com/mikefarah/yq/)
+**succinctly**: Built with `--release --features cli`
+**SIMD**: NEON (128-bit), SVE2 (128-bit vectors), SVEBITPERM (BDEP/BEXT)
+
+### Platform 2: ARM (AWS Graviton 3 - Neoverse-V1)
+
+**CPU**: ARM Neoverse-V1 (4 cores)
+**OS**: Linux 6.14.0-1018-aws
+**yq version**: Not installed (succinctly-only benchmarks)
+**succinctly**: Built with `--release --features cli`
+**SIMD**: NEON (128-bit), SVE (256-bit vectors)
+
+### Platform 4: ARM (Apple Silicon)
 
 **CPU**: Apple M1 Max
 **OS**: macOS Darwin 25.1.0
@@ -12,7 +28,7 @@ Benchmarks comparing `succinctly yq .` (identity filter) vs `yq .` (Mike Farah's
 **succinctly**: Built with `--release --features cli`
 **SIMD**: ARM NEON (16 bytes/iteration for string scanning)
 
-### Platform 2: x86_64 (AMD Zen 4)
+### Platform 5: x86_64 (AMD Zen 4)
 
 **CPU**: AMD Ryzen 9 7950X (Zen 4)
 **OS**: Linux 6.6.87.2-microsoft-standard-WSL2 (WSL2)
@@ -33,21 +49,53 @@ cargo bench --bench yq_comparison
 
 ## Summary Results
 
+### ARM (Neoverse-V2 / Graviton 4) - yq Identity Comparison
+
+| Size      | succinctly             | yq                     | Speedup    |
+|-----------|------------------------|------------------------|------------|
+| **10KB**  | 0.99 ms (9.9 MiB/s)    | 4.46 ms (2.2 MiB/s)    | **4.5x**   |
+| **100KB** | 2.20 ms (41.8 MiB/s)   | 20.1 ms (4.6 MiB/s)    | **9.1x**   |
+| **1MB**   | 13.6 ms (68.0 MiB/s)   | 154 ms (6.0 MiB/s)     | **11.4x**  |
+
+**Key metrics:**
+- ✅ NEON SIMD optimizations active (block scalar + anchor parsing)
+- ✅ SVE2 with SVEBITPERM support (BDEP/BEXT for DSV)
+- ✅ **11.4x faster** than yq on 1MB files
+- ✅ 68 MiB/s throughput vs yq's 6 MiB/s
+- ✅ ~20% faster than Neoverse-V1 due to improved microarchitecture
+
+### ARM (Neoverse-V1 / Graviton 3) - succinctly yq Performance
+
+Note: System `yq` was not installed for comparison. Results show succinctly performance only.
+
+| Size      | succinctly Time | Throughput     |
+|-----------|-----------------|----------------|
+| **1KB**   | 1.11 ms         | 1.09 MiB/s     |
+| **10KB**  | 1.27 ms         | 7.71 MiB/s     |
+| **100KB** | 2.87 ms         | 32.0 MiB/s     |
+| **1MB**   | 17.71 ms        | 52.1 MiB/s     |
+
+**Key metrics:**
+- ✅ NEON SIMD optimizations active
+- ✅ 52 MiB/s throughput on 1MB files
+- ✅ Scales well: 1MB throughput 47x higher than 1KB
+- ✅ SVE-capable CPU (256-bit vectors)
+
 ### ARM (Apple M1 Max) - yq Identity Comparison (comprehensive pattern)
 
 | Size      | succinctly   | yq           | Speedup       |
 |-----------|--------------|--------------|---------------|
-| **10KB**  |   3.9 ms     |   7.5 ms     | **1.9x**      |
-| **100KB** |   4.7 ms     |  19.5 ms     | **4.1x**      |
-| **1MB**   |  13.3 ms     | 115.7 ms     | **8.7x**      |
+| **10KB**  |   4.2 ms     |   8.4 ms     | **2.0x**      |
+| **100KB** |   5.5 ms     |  20.6 ms     | **3.8x**      |
+| **1MB**   |  15.3 ms     | 120.7 ms     | **7.9x**      |
 
 #### Throughput Comparison (ARM)
 
 | Size      | succinctly      | yq             | Ratio         |
 |-----------|-----------------|----------------|---------------|
-| **10KB**  |   2.5 MiB/s     |   1.3 MiB/s    | **1.9x**      |
-| **100KB** |  19.5 MiB/s     |   4.7 MiB/s    | **4.1x**      |
-| **1MB**   |  69.2 MiB/s     |   8.0 MiB/s    | **8.7x**      |
+| **10KB**  |   2.3 MiB/s     |   1.2 MiB/s    | **2.0x**      |
+| **100KB** |  16.8 MiB/s     |   4.5 MiB/s    | **3.8x**      |
+| **1MB**   |  60.2 MiB/s     |   7.6 MiB/s    | **7.9x**      |
 
 ### x86_64 (AMD Ryzen 9 7950X) - yq Identity Comparison
 
@@ -318,8 +366,8 @@ $ echo 'id: "001"' | succinctly yq -o json '.'
 ### Performance Benefits
 
 `succinctly yq` offers significant performance advantages over `yq`:
-- **8.7x faster** on 1MB files (Apple M1 Max)
-- **4.1x faster** on 100KB files (Apple M1 Max)
+- **7.9x faster** on 1MB files (Apple M1 Max)
+- **3.8x faster** on 100KB files (Apple M1 Max)
 - **16x faster** on 1MB files (AMD Ryzen 9 7950X)
 - **40x faster** on 10KB files (AMD Ryzen 9 7950X)
 - **Lower memory usage** on large files

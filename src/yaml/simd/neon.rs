@@ -392,6 +392,262 @@ pub fn find_newline_broadword(input: &[u8], start: usize) -> Option<usize> {
         .map(|pos| offset + pos)
 }
 
+// ============================================================================
+// P4 Optimization: Anchor/Alias SIMD Parsing
+// ============================================================================
+
+/// Parse anchor/alias name using NEON SIMD to find terminator characters.
+///
+/// Searches for YAML anchor name terminators:
+/// - Whitespace: space, tab, newline, CR
+/// - Flow indicators: [ ] { } ,
+/// - Colons (terminates anchor names)
+///
+/// Returns the position of the first terminator, or end of input.
+#[inline]
+pub fn parse_anchor_name_neon(input: &[u8], start: usize) -> usize {
+    if start >= input.len() {
+        return start;
+    }
+
+    // Use NEON for 16+ bytes
+    if start + 16 <= input.len() {
+        // SAFETY: NEON is mandatory on aarch64
+        unsafe { parse_anchor_name_neon_impl(input, start) }
+    } else {
+        parse_anchor_name_scalar(input, start)
+    }
+}
+
+#[target_feature(enable = "neon")]
+unsafe fn parse_anchor_name_neon_impl(input: &[u8], start: usize) -> usize {
+    let len = input.len();
+    let mut pos = start;
+
+    // Create comparison vectors for terminator characters
+    // Note: We don't include colon here because it's only a terminator
+    // if followed by whitespace. We'll check that in the scalar fallback.
+    let space = vdupq_n_u8(b' ');
+    let tab = vdupq_n_u8(b'\t');
+    let newline = vdupq_n_u8(b'\n');
+    let cr = vdupq_n_u8(b'\r');
+    let lbracket = vdupq_n_u8(b'[');
+    let rbracket = vdupq_n_u8(b']');
+    let lbrace = vdupq_n_u8(b'{');
+    let rbrace = vdupq_n_u8(b'}');
+    let comma = vdupq_n_u8(b',');
+    let colon = vdupq_n_u8(b':');
+
+    // Process 16 bytes at a time
+    while pos + 16 <= len {
+        let chunk = vld1q_u8(input.as_ptr().add(pos));
+
+        // Check for all terminator types (except colon which needs special handling)
+        let is_space = vceqq_u8(chunk, space);
+        let is_tab = vceqq_u8(chunk, tab);
+        let is_newline = vceqq_u8(chunk, newline);
+        let is_cr = vceqq_u8(chunk, cr);
+        let is_lbracket = vceqq_u8(chunk, lbracket);
+        let is_rbracket = vceqq_u8(chunk, rbracket);
+        let is_lbrace = vceqq_u8(chunk, lbrace);
+        let is_rbrace = vceqq_u8(chunk, rbrace);
+        let is_comma = vceqq_u8(chunk, comma);
+        let is_colon = vceqq_u8(chunk, colon);
+
+        // Combine all terminator checks (whitespace and flow indicators are definite terminators)
+        let ws = vorrq_u8(is_space, is_tab);
+        let ws = vorrq_u8(ws, is_newline);
+        let ws = vorrq_u8(ws, is_cr);
+
+        let flow = vorrq_u8(is_lbracket, is_rbracket);
+        let flow = vorrq_u8(flow, is_lbrace);
+        let flow = vorrq_u8(flow, is_rbrace);
+        let flow = vorrq_u8(flow, is_comma);
+
+        let definite_terminators = vorrq_u8(ws, flow);
+
+        // Check for definite terminators first
+        let definite_mask = neon_movemask(definite_terminators);
+        let colon_mask = neon_movemask(is_colon);
+
+        if definite_mask != 0 || colon_mask != 0 {
+            // Found potential terminator - need to check each position
+            let combined_mask = definite_mask | colon_mask;
+            let first_pos = combined_mask.trailing_zeros() as usize;
+
+            // If it's a definite terminator, return immediately
+            if (definite_mask >> first_pos) & 1 != 0 {
+                return pos + first_pos;
+            }
+
+            // It's a colon - check if followed by whitespace
+            let colon_pos = pos + first_pos;
+            if colon_pos + 1 < len {
+                let next = input[colon_pos + 1];
+                if next == b' ' || next == b'\t' || next == b'\n' || next == b'\r' {
+                    return colon_pos;
+                }
+            }
+
+            // Colon not followed by whitespace - continue scanning from colon_pos + 1
+            // Use scalar to handle the complex colon logic correctly
+            return parse_anchor_name_scalar(input, colon_pos + 1);
+        }
+
+        pos += 16;
+    }
+
+    // Handle remaining bytes with scalar fallback
+    parse_anchor_name_scalar(input, pos)
+}
+
+/// Scalar fallback for parsing anchor names.
+fn parse_anchor_name_scalar(input: &[u8], start: usize) -> usize {
+    let mut pos = start;
+    while pos < input.len() {
+        let b = input[pos];
+        match b {
+            // Stop at flow indicators, whitespace, and newlines
+            b' ' | b'\t' | b'\n' | b'\r' | b'[' | b']' | b'{' | b'}' | b',' => break,
+            // Colon is allowed in anchor names if not followed by whitespace
+            b':' => {
+                if pos + 1 < input.len() {
+                    let next = input[pos + 1];
+                    if next == b' ' || next == b'\t' || next == b'\n' || next == b'\r' {
+                        break;
+                    }
+                }
+                pos += 1;
+            }
+            _ => pos += 1,
+        }
+    }
+    pos
+}
+
+// ============================================================================
+// P2.7 Optimization: Block Scalar SIMD Parsing
+// ============================================================================
+
+/// Find the end of a block scalar using NEON SIMD.
+///
+/// Scans for newlines and checks indentation on each line.
+/// Returns the position where the block ends (start of line with insufficient indent),
+/// or input.len() if EOF is reached.
+#[inline]
+pub fn find_block_scalar_end_neon(input: &[u8], start: usize, min_indent: usize) -> usize {
+    if start >= input.len() {
+        return input.len();
+    }
+
+    // SAFETY: NEON is mandatory on aarch64
+    unsafe { find_block_scalar_end_neon_impl(input, start, min_indent) }
+}
+
+#[target_feature(enable = "neon")]
+unsafe fn find_block_scalar_end_neon_impl(input: &[u8], start: usize, min_indent: usize) -> usize {
+    let newline_vec = vdupq_n_u8(b'\n');
+    let space_vec = vdupq_n_u8(b' ');
+
+    let mut pos = start;
+
+    // Process in 16-byte chunks, looking for newlines
+    while pos + 16 < input.len() {
+        let chunk = vld1q_u8(input.as_ptr().add(pos));
+        let nl_matches = vceqq_u8(chunk, newline_vec);
+        let mut nl_mask = neon_movemask(nl_matches);
+
+        if nl_mask != 0 {
+            // Found newline(s) in this chunk - check indentation after each
+            while nl_mask != 0 {
+                let offset = nl_mask.trailing_zeros() as usize;
+                let line_start = pos + offset + 1; // Position after newline
+
+                if line_start >= input.len() {
+                    return input.len(); // EOF
+                }
+
+                // Count leading spaces on next line
+                let mut indent = 0;
+                let remaining = input.len() - line_start;
+
+                // Use SIMD to count spaces if we have 16+ bytes
+                if remaining >= 16 {
+                    let next_chunk = vld1q_u8(input.as_ptr().add(line_start));
+                    let space_matches = vceqq_u8(next_chunk, space_vec);
+                    let space_mask = neon_movemask(space_matches);
+
+                    if space_mask != 0xFFFF {
+                        indent = (!space_mask).trailing_zeros() as usize;
+                    } else {
+                        indent = 16;
+                        // Continue counting if all 16 were spaces
+                        let mut check_pos = line_start + 16;
+                        while check_pos < input.len() && input[check_pos] == b' ' {
+                            indent += 1;
+                            check_pos += 1;
+                        }
+                    }
+                } else {
+                    // Less than 16 bytes remaining, count scalar
+                    while line_start + indent < input.len() && input[line_start + indent] == b' ' {
+                        indent += 1;
+                    }
+                }
+
+                // Check if this line has sufficient indent
+                if line_start + indent < input.len() {
+                    let next_char = input[line_start + indent];
+                    if next_char != b'\n' && next_char != b'\r' && indent < min_indent {
+                        // Content at insufficient indent - block ends here
+                        return line_start;
+                    }
+                }
+
+                // Clear this bit and check next newline
+                nl_mask &= nl_mask - 1;
+            }
+        }
+
+        pos += 16;
+    }
+
+    // Handle remainder with scalar code
+    find_block_scalar_end_scalar(input, pos, min_indent)
+}
+
+/// Scalar fallback for find_block_scalar_end.
+fn find_block_scalar_end_scalar(input: &[u8], start: usize, min_indent: usize) -> usize {
+    let mut pos = start;
+
+    while pos < input.len() {
+        if input[pos] == b'\n' {
+            let line_start = pos + 1;
+
+            if line_start >= input.len() {
+                return input.len();
+            }
+
+            // Count leading spaces
+            let mut indent = 0;
+            while line_start + indent < input.len() && input[line_start + indent] == b' ' {
+                indent += 1;
+            }
+
+            // Check if this line has content at insufficient indent
+            if line_start + indent < input.len() {
+                let next_char = input[line_start + indent];
+                if next_char != b'\n' && next_char != b'\r' && indent < min_indent {
+                    return line_start;
+                }
+            }
+        }
+        pos += 1;
+    }
+
+    input.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,5 +821,128 @@ mod tests {
         // Should have colon at 5 and space at 6
         assert!(terminators & (1 << 5) != 0);
         assert!(terminators & (1 << 6) != 0);
+    }
+
+    // ========================================================================
+    // P4: Anchor/Alias NEON tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_anchor_name_basic() {
+        // Simple anchor name terminated by space
+        assert_eq!(parse_anchor_name_neon(b"anchor_name value", 0), 11);
+
+        // Colon NOT followed by whitespace - NOT a terminator (colon allowed in anchor names)
+        assert_eq!(parse_anchor_name_neon(b"anchor:value", 0), 12);
+
+        // Colon followed by space - IS a terminator
+        assert_eq!(parse_anchor_name_neon(b"anchor: value", 0), 6);
+
+        // Colon followed by newline - IS a terminator
+        assert_eq!(parse_anchor_name_neon(b"anchor:\nvalue", 0), 6);
+
+        // Terminated by newline
+        assert_eq!(parse_anchor_name_neon(b"anchor\nvalue", 0), 6);
+
+        // Terminated by tab
+        assert_eq!(parse_anchor_name_neon(b"anchor\tvalue", 0), 6);
+    }
+
+    #[test]
+    fn test_parse_anchor_name_flow_indicators() {
+        // Terminated by flow indicators
+        assert_eq!(parse_anchor_name_neon(b"anchor[0]", 0), 6);
+        assert_eq!(parse_anchor_name_neon(b"anchor]end", 0), 6);
+        assert_eq!(parse_anchor_name_neon(b"anchor{key}", 0), 6);
+        assert_eq!(parse_anchor_name_neon(b"anchor}end", 0), 6);
+        assert_eq!(parse_anchor_name_neon(b"anchor,next", 0), 6);
+    }
+
+    #[test]
+    fn test_parse_anchor_name_long() {
+        // Long anchor name (>16 bytes to exercise SIMD path)
+        let mut input = vec![b'a'; 50];
+        input.push(b' ');
+        input.extend_from_slice(b"value");
+        assert_eq!(parse_anchor_name_neon(&input, 0), 50);
+    }
+
+    #[test]
+    fn test_parse_anchor_name_no_terminator() {
+        // No terminator - should return end of input
+        assert_eq!(parse_anchor_name_neon(b"anchor_name", 0), 11);
+    }
+
+    #[test]
+    fn test_parse_anchor_name_with_offset() {
+        // Start from offset
+        assert_eq!(parse_anchor_name_neon(b"&anchor_name value", 1), 12);
+    }
+
+    // ========================================================================
+    // P2.7: Block Scalar NEON tests
+    // ========================================================================
+
+    #[test]
+    fn test_find_block_scalar_end_basic() {
+        // Block scalar with proper indentation
+        let input = b"|\n  line1\n  line2\nnext_key:";
+        // min_indent=2, so "next_key:" (indent=0) should terminate
+        let result = find_block_scalar_end_neon(input, 2, 2);
+        assert_eq!(result, 18); // Position of 'n' in "next_key"
+    }
+
+    #[test]
+    fn test_find_block_scalar_end_eof() {
+        // Block scalar that ends at EOF
+        let input = b"|\n  line1\n  line2";
+        let result = find_block_scalar_end_neon(input, 2, 2);
+        assert_eq!(result, input.len());
+    }
+
+    #[test]
+    fn test_find_block_scalar_end_long() {
+        // Long block scalar (>16 bytes per line to exercise SIMD path)
+        let mut input = b"|\n".to_vec();
+        for _ in 0..5 {
+            input.extend_from_slice(b"  ");
+            input.extend_from_slice(&[b'x'; 20]);
+            input.push(b'\n');
+        }
+        input.extend_from_slice(b"next:");
+
+        let result = find_block_scalar_end_neon(&input, 2, 2);
+        // Should find "next:" at the end
+        assert_eq!(result, input.len() - 5);
+    }
+
+    #[test]
+    fn test_find_block_scalar_end_empty_lines() {
+        // Empty lines should be ignored
+        let input = b"|\n  line1\n\n  line2\nnext:";
+        let result = find_block_scalar_end_neon(input, 2, 2);
+        assert_eq!(result, 19); // Position of 'n' in "next:"
+    }
+
+    #[test]
+    fn test_find_block_scalar_matches_scalar() {
+        // Compare NEON vs scalar for various inputs
+        let test_cases: &[(&[u8], usize)] = &[
+            (b"|\n  line1\n  line2\nnext:", 2),
+            (b"|\n    deep\n    indent\nshallow:", 4),
+            (b"|\n  a\n  b\n  c\n", 2),
+        ];
+
+        for &(input, min_indent) in test_cases {
+            let neon_result = find_block_scalar_end_neon(input, 2, min_indent);
+            let scalar_result = find_block_scalar_end_scalar(input, 2, min_indent);
+            assert_eq!(
+                neon_result,
+                scalar_result,
+                "Mismatch for input {:?} with min_indent={}",
+                String::from_utf8_lossy(input),
+                min_indent
+            );
+        }
     }
 }

@@ -12,7 +12,7 @@
 //!
 //! For each 64-byte chunk:
 //! 1. Find all quote, delimiter, and newline positions using SIMD comparisons
-//! 2. Compute the "in-quote" mask using prefix XOR (or BMI2 PDEP on supported CPUs)
+//! 2. Compute the "in-quote" mask using prefix XOR (or BMI2 PDEP / SVE2 BDEP on supported CPUs)
 //! 3. Mask out delimiters and newlines that are inside quotes
 //!
 //! ## x86_64 Instruction Sets
@@ -21,13 +21,20 @@
 //! - **AVX2** (fast): 32 bytes/iteration with prefix_xor, ~95% availability (2013+)
 //! - **SSE2** (baseline): 16 bytes/iteration, universal availability
 //!
-//! ## ARM
+//! ## ARM aarch64
 //!
-//! On ARM aarch64, NEON intrinsics process 16 bytes at a time with prefix_xor.
-//! ARM has no equivalent to BMI2 PDEP, so prefix_xor is the only option.
+//! - **SVE2-BITPERM + NEON** (fastest): Uses BDEP for quote masking, ~10x faster than prefix_xor
+//!   - Supported: Azure Cobalt 100, AWS Graviton 4, Neoverse N2/V2
+//! - **NEON** (baseline): 16 bytes/iteration with prefix_xor, universal on aarch64
+
+#[cfg(all(target_arch = "aarch64", feature = "std"))]
+use std::arch::is_aarch64_feature_detected;
 
 #[cfg(target_arch = "aarch64")]
 pub mod neon;
+
+#[cfg(target_arch = "aarch64")]
+pub mod sve2;
 
 #[cfg(target_arch = "x86_64")]
 pub mod avx2;
@@ -39,10 +46,27 @@ pub mod bmi2;
 pub mod sse2;
 
 // ============================================================================
-// ARM exports (NEON)
+// ARM exports with runtime dispatch (SVE2 > NEON)
 // ============================================================================
 
-#[cfg(target_arch = "aarch64")]
+/// Build a DSV index using the fastest available SIMD implementation.
+///
+/// Runtime dispatch order (fastest to slowest):
+/// 1. SVE2-BITPERM + NEON: Uses BDEP for quote masking (~10x faster)
+/// 2. NEON: Uses prefix_xor for quote masking (fallback)
+#[cfg(all(target_arch = "aarch64", feature = "std"))]
+pub fn build_index_simd(text: &[u8], config: &super::DsvConfig) -> super::DsvIndex {
+    // Check for SVE2-BITPERM (fastest path on ARM)
+    if is_aarch64_feature_detected!("sve2-bitperm") {
+        return sve2::build_index_simd(text, config);
+    }
+
+    // Fall back to NEON with prefix_xor
+    neon::build_index_simd(text, config)
+}
+
+// Without std feature, default to NEON (can't do runtime detection)
+#[cfg(all(target_arch = "aarch64", not(feature = "std")))]
 pub use neon::build_index_simd;
 
 // ============================================================================

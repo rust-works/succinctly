@@ -1250,10 +1250,36 @@ This is the **largest single improvement** in YAML Phase 2!
 - SIMD amortizes better with larger blocks
 
 **Code Locations:**
-- SIMD implementation: [`src/yaml/simd/x86.rs:760-950`](../../src/yaml/simd/x86.rs#L760-L950)
+- SIMD implementation (x86): [`src/yaml/simd/x86.rs:760-950`](../../src/yaml/simd/x86.rs#L760-L950)
+- SIMD implementation (NEON): [`src/yaml/simd/neon.rs`](../../src/yaml/simd/neon.rs)
 - Scalar fallback: [`src/yaml/simd/mod.rs:180-220`](../../src/yaml/simd/mod.rs#L180-L220)
 - Parser integration: [`src/yaml/parser.rs:2888-2889`](../../src/yaml/parser.rs#L2888-L2889)
 - Benchmarks: [`benches/yaml_bench.rs:295-333`](../../benches/yaml_bench.rs#L295-L333)
+
+#### ARM64 NEON Results (Apple M1 Max) - 2026-01-22
+
+NEON implementation ported from AVX2, using 16-byte chunks:
+
+**Performance Results:**
+
+| Benchmark               | Before      | After      | Improvement | Speedup  |
+|-------------------------|-------------|------------|-------------|----------|
+| **10x10lines**          | 8.4 µs      | 7.5 µs     | **-10.9%**  | **1.12x** |
+| **50x50lines**          | 176 µs      | 152 µs     | **-13.8%**  | **1.16x** |
+| **100x100lines**        | 699 µs      | 606 µs     | **-13.3%**  | **1.15x** |
+| **10x1000lines**        | 693 µs      | 591 µs     | **-14.1%**  | **1.16x** |
+| **long_10x100lines**    | 172 µs      | 132 µs     | **-23.2%**  | **1.30x** |
+| **long_50x100lines**    | 786 µs      | 671 µs     | **-14.7%**  | **1.17x** |
+| **long_100x100lines**   | 1.58 ms     | 1.36 ms    | **-14.3%**  | **1.17x** |
+
+**NEON vs AVX2 Comparison:**
+
+| Platform | Vector Width | Best Improvement | Avg Improvement |
+|----------|--------------|------------------|-----------------|
+| AVX2 (x86_64) | 32 bytes | 21.1% | 19-20% |
+| NEON (ARM64) | 16 bytes | 23.2% | 11-15% |
+
+NEON shows excellent improvements despite smaller vector width. The 23.2% gain on `long_10x100lines` matches AVX2's best results.
 
 ---
 
@@ -1576,10 +1602,36 @@ This is the **first optimization since P2.7 (Block Scalar SIMD)** to show end-to
 
 **Files Modified:**
 - [`src/yaml/simd/x86.rs`](../../src/yaml/simd/x86.rs) - Added `parse_anchor_name_avx2()`, `parse_anchor_name_scalar()`, `parse_anchor_name()`
+- [`src/yaml/simd/neon.rs`](../../src/yaml/simd/neon.rs) - Added `parse_anchor_name_neon()` for ARM64
 - [`src/yaml/simd/mod.rs`](../../src/yaml/simd/mod.rs) - Exported `parse_anchor_name()` public API
 - [`src/yaml/parser.rs:3061`](../../src/yaml/parser.rs#L3061) - Replaced scalar loop with SIMD call
 
 **Changes committed:** Optimization accepted and retained.
+
+#### ARM64 NEON Results (Apple M1 Max) - 2026-01-22
+
+NEON implementation ported from AVX2, using 16-byte chunks:
+
+**End-to-End Benchmark Results:**
+
+| Benchmark | Before | After | Time Change | Throughput Gain |
+|-----------|--------|-------|-------------|-----------------|
+| **anchors/10** | 3.76 µs | 3.64 µs | **-3.1%** | **+3.2%** ✅ |
+| **anchors/100** | 28.8 µs | 27.2 µs | **-5.8%** | **+6.1%** ✅ |
+| **anchors/1000** | 314 µs | 299 µs | **-4.7%** | **+4.9%** ✅ |
+| **anchors/5000** | 1.67 ms | 1.61 ms | **-3.8%** | **+4.0%** ✅ |
+| **k8s_10** | 8.25 µs | 7.85 µs | **-4.9%** | **+5.1%** ✅ |
+| **k8s_50** | 32.5 µs | 30.6 µs | **-5.1%** | **+5.4%** ✅ |
+| **k8s_100** | 64.1 µs | 60.9 µs | **-5.0%** | **+5.2%** ✅ |
+
+**NEON vs AVX2 Comparison:**
+
+| Platform | Vector Width | Best Improvement |
+|----------|--------------|------------------|
+| AVX2 (x86_64) | 32 bytes | 14-17% |
+| NEON (ARM64) | 16 bytes | 5-6% |
+
+The smaller NEON improvement is expected: 16-byte chunks vs 32-byte AVX2 chunks means NEON processes half as much data per iteration. However, the optimization is still beneficial for typical Kubernetes and CI/CD YAML files with anchor-heavy configurations.
 
 ---
 

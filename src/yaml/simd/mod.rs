@@ -345,7 +345,23 @@ pub fn find_block_scalar_end(input: &[u8], start: usize, min_indent: usize) -> O
         x86::find_block_scalar_end(input, start, min_indent)
     }
 
-    #[cfg(not(all(target_arch = "x86_64", not(feature = "scalar-yaml"))))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(feature = "broadword-yaml"),
+        not(feature = "scalar-yaml")
+    ))]
+    {
+        Some(neon::find_block_scalar_end_neon(input, start, min_indent))
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "x86_64", not(feature = "scalar-yaml")),
+        all(
+            target_arch = "aarch64",
+            not(feature = "broadword-yaml"),
+            not(feature = "scalar-yaml")
+        )
+    )))]
     {
         find_block_scalar_end_scalar(input, start, min_indent)
     }
@@ -372,7 +388,23 @@ pub fn parse_anchor_name(input: &[u8], start: usize) -> usize {
         x86::parse_anchor_name(input, start)
     }
 
-    #[cfg(not(all(target_arch = "x86_64", not(feature = "scalar-yaml"))))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(feature = "broadword-yaml"),
+        not(feature = "scalar-yaml")
+    ))]
+    {
+        neon::parse_anchor_name_neon(input, start)
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "x86_64", not(feature = "scalar-yaml")),
+        all(
+            target_arch = "aarch64",
+            not(feature = "broadword-yaml"),
+            not(feature = "scalar-yaml")
+        )
+    )))]
     {
         parse_anchor_name_scalar(input, start)
     }

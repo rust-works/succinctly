@@ -12,6 +12,7 @@ SIMD enables parallel processing of multiple data elements with a single instruc
 | AVX-512      | 512-bit | x86_64   | VPOPCNTDQ, masked ops      | Compute-bound only    |
 | BMI2         | 64-bit  | x86_64   | PDEP, PEXT                 | Bit manipulation      |
 | NEON         | 128-bit | ARM64    | TBL, CNT, parallel ops     | ARM baseline          |
+| PMULL        | 64→128  | ARM64    | Carryless multiply         | Prefix XOR (DSV)      |
 
 ---
 
@@ -190,6 +191,33 @@ unsafe fn nibble_classify(chars: uint8x16_t) -> uint8x16_t {
 
 **Result**: Replaces 13 comparisons with 6 operations.
 
+### NEON PMULL for Prefix XOR (2026-01-22)
+
+Carryless multiplication computes prefix XOR in O(1) instead of O(log n):
+
+```rust
+#[target_feature(enable = "neon")]
+unsafe fn prefix_xor_neon(x: u64) -> u64 {
+    use core::arch::aarch64::*;
+
+    // Load x into polynomial register
+    let a = vreinterpretq_p64_u64(vdupq_n_u64(x));
+    let b = vreinterpretq_p64_u64(vdupq_n_u64(!0u64));
+
+    // Carryless multiply: prefix_xor(x) = clmul(x, 0xFFFF...FFFF)
+    let product = vmull_p64(vgetq_lane_p64::<0>(a), vgetq_lane_p64::<0>(b));
+
+    vgetq_lane_u64::<0>(vreinterpretq_u64_p128(product))
+}
+```
+
+**Why it works**: Carryless multiplication by all-1s propagates each bit to all higher positions via XOR,
+which is exactly the prefix XOR operation (cumulative XOR from bit 0 to bit i).
+
+**Result**: 25% faster DSV index building on ARM64 (3.18 → 3.84 GiB/s on Graviton 4).
+
+**Platform support**: Works on ALL ARM64 (ARMv8 Cryptography Extension is mandatory since ARMv8.0).
+
 ### NEON Popcount
 
 ```rust
@@ -336,6 +364,84 @@ while offset + 16 <= len {
 | 10 KB  | 28.9 µs      | 28.3 µs      | **+3.8%**       |
 | 100 KB | 264 µs       | 257 µs       | **+5.2%**       |
 | 1 MB   | 2.51 ms      | 2.33 ms      | **+8.3%**       |
+
+### YAML Block Scalar SIMD (NEON) - 11-23% Improvement
+
+**Pattern**: Use NEON to scan for newlines in block scalars, then verify indentation.
+
+```rust
+// NEON implementation - scan for newlines in 16-byte chunks
+let newline_vec = vdupq_n_u8(b'\n');
+
+while offset + 16 <= len {
+    let chunk = vld1q_u8(data.as_ptr().add(offset));
+    let newlines = vceqq_u8(chunk, newline_vec);
+    let mask = neon_movemask(newlines);
+
+    if mask != 0 {
+        // Found newline - check indentation of next line
+        let nl_pos = offset + mask.trailing_zeros() as usize;
+        // ... indentation validation
+    }
+    offset += 16;
+}
+```
+
+**Benchmark results** (Apple M1 Max - block scalar parsing):
+
+| Benchmark                 | Before       | After        | Improvement     |
+|---------------------------|--------------|--------------|-----------------|
+| block_scalars/10x10       | 8.4 µs       | 7.5 µs       | **+10.9%**      |
+| block_scalars/50x50       | 176 µs       | 152 µs       | **+13.8%**      |
+| block_scalars/100x100     | 699 µs       | 606 µs       | **+13.3%**      |
+| block_scalars/10x1000     | 693 µs       | 591 µs       | **+14.1%**      |
+| block_scalars/long_10x100 | 172 µs       | 132 µs       | **+23.2%**      |
+| block_scalars/long_50x100 | 786 µs       | 671 µs       | **+14.7%**      |
+
+**Why it works**: Block scalars contain long runs of content where the only structural
+character is the newline at line boundaries. SIMD efficiently skips content bytes.
+
+### YAML Anchor/Alias SIMD (NEON) - 3-6% Improvement
+
+**Pattern**: Use NEON to scan for anchor name terminators (space, newline, colon, etc.).
+
+```rust
+// NEON implementation - find anchor name end
+let space_vec = vdupq_n_u8(b' ');
+let newline_vec = vdupq_n_u8(b'\n');
+let colon_vec = vdupq_n_u8(b':');
+
+while offset + 16 <= len {
+    let chunk = vld1q_u8(data.as_ptr().add(offset));
+
+    let spaces = vceqq_u8(chunk, space_vec);
+    let newlines = vceqq_u8(chunk, newline_vec);
+    let colons = vceqq_u8(chunk, colon_vec);
+
+    let matches = vorrq_u8(vorrq_u8(spaces, newlines), colons);
+    let mask = neon_movemask(matches);
+
+    if mask != 0 {
+        return offset + mask.trailing_zeros() as usize;
+    }
+    offset += 16;
+}
+```
+
+**Benchmark results** (Apple M1 Max - anchor-heavy YAML):
+
+| Benchmark       | Before       | After        | Improvement     |
+|-----------------|--------------|--------------|-----------------|
+| anchors/10      | 3.76 µs      | 3.64 µs      | **+3.1%**       |
+| anchors/100     | 28.8 µs      | 27.2 µs      | **+5.8%**       |
+| anchors/1000    | 314 µs       | 299 µs       | **+4.7%**       |
+| anchors/5000    | 1.67 ms      | 1.61 ms      | **+3.8%**       |
+| anchors/k8s_10  | 8.25 µs      | 7.85 µs      | **+4.9%**       |
+| anchors/k8s_50  | 32.5 µs      | 30.6 µs      | **+5.1%**       |
+| anchors/k8s_100 | 64.1 µs      | 60.9 µs      | **+5.0%**       |
+
+**Why it works**: Anchor names in Kubernetes-style YAML (like `&default-config`)
+are typically 15-30 characters, making SIMD worthwhile for scanning to the terminator.
 
 **Why it works** (unlike previous YAML SIMD attempts):
 
@@ -486,6 +592,8 @@ isolation but cause regression when integrated due to real-world data characteri
 | NEON       | `json/simd/neon.rs`     | ARM JSON parsing         | 1.11x   |
 | NEON       | `dsv/simd/neon.rs`      | ARM DSV parsing          | 1.8x    |
 | NEON/AVX2  | `yaml/simd/`            | YAML unquoted structural | 3-8%    |
+| NEON       | `yaml/simd/neon.rs`     | Block scalar scanning    | 11-23%  |
+| NEON       | `yaml/simd/neon.rs`     | Anchor name scanning     | 3-6%    |
 
 ---
 

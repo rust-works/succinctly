@@ -110,6 +110,12 @@ fn popcount_words_portable(words: &[u64]) -> u32 {
 }
 
 /// NEON-accelerated popcount for word slices.
+///
+/// Note: SVE2 was tested but showed 5-10% regression on Neoverse-V2 (128-bit vectors).
+/// The per-iteration horizontal reduction (UADDV + FMOV) is more expensive than
+/// NEON's batched approach which processes 64 bytes with deferred reduction.
+/// Since SVE2 vectors on V2 are the same width as NEON (128-bit), there's no
+/// throughput advantage to offset the predication overhead.
 #[cfg(all(
     feature = "simd",
     target_arch = "aarch64",

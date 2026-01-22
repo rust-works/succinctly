@@ -109,6 +109,19 @@ Direct API usage without JSON serialization overhead.
 
 ## Optimization Impact
 
+### NEON PMULL Prefix XOR (2026-01-22)
+
+Replaced scalar prefix XOR (6 shifts + 6 XORs) with carryless multiplication via NEON PMULL instruction:
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| 10MB index build | 3.18 GiB/s | 3.84 GiB/s | **+25%** |
+| 10MB index+iterate | 0.93 GiB/s | 1.00 GiB/s | **+8%** |
+
+**Key insight**: `prefix_xor(x) = clmul(x, 0xFFFF...FFFF)` in GF(2). Carryless multiplication by all-1s propagates each bit to all higher positions via XOR, computing prefix XOR in O(1) instead of O(log n).
+
+**Platform support**: Works on all ARM64 with NEON (Apple M1+, Graviton 2+, all aarch64).
+
 ### Lightweight Index (2026-01-12)
 
 Replaced full BitVec with simple cumulative rank arrays:
