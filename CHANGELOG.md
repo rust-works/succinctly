@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-01-23
+
+### Added
+
+- **ARM SIMD Enhancements**
+  - NEON SIMD optimizations for YAML block scalar parsing (11-23% improvement)
+  - NEON SIMD optimizations for YAML anchor/alias name scanning (3-6% improvement)
+  - NEON PMULL carryless multiply for DSV prefix XOR optimization
+  - Experimental SVE2 JSON semi-indexing with runtime dispatch
+  - SVE2 BDEP/BEXT for ARM64 DSV parsing
+
+### Fixed
+
+- CI link checker exclusions for ARM and Agner URLs
+
+### Documentation
+
+- Added ARM Graviton 4 (Neoverse-V2) benchmark results
+- Added ARM Neoverse-V1 benchmark results for jq and yq
+- Added CPU target optimization guide for ARM Neoverse-V2
+- Documented NEON SIMD optimizations for block scalars and anchors
+- Documented SVE2 optimization plan and popcount regression analysis
+
 ## [0.3.0] - 2026-01-21
 
 ### Added
@@ -187,7 +210,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Select queries: ~50 ns (O(log n))
 - Popcount: 96.8 GiB/s (AVX-512), 18.5 GiB/s (scalar)
 
-[Unreleased]: https://github.com/rust-works/succinctly/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/rust-works/succinctly/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/rust-works/succinctly/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/rust-works/succinctly/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rust-works/succinctly/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rust-works/succinctly/releases/tag/v0.1.0
