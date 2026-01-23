@@ -616,7 +616,7 @@ isolation but cause regression when integrated due to real-world data characteri
 | SSE4.2     | `json/simd/sse42.rs`    | String matching          | 1.38x   |
 | NEON       | `json/simd/neon.rs`     | ARM JSON parsing         | 1.11x   |
 | NEON       | `dsv/simd/neon.rs`      | ARM DSV parsing          | 1.8x    |
-| NEON       | `trees/bp.rs`           | BP L1 index (VMINV)      | 2.8x    |
+| NEON       | `trees/bp.rs`           | BP L1/L2 index (VMINV)   | 2.8x (L1), 1-3% (L2) |
 | NEON       | `bits/popcount.rs`      | 256-byte unrolling       | 1.15x   |
 | NEON/AVX2  | `yaml/simd/`            | YAML unquoted structural | 3-8%    |
 | NEON       | `yaml/simd/neon.rs`     | Block scalar scanning    | 11-23%  |

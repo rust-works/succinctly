@@ -20,13 +20,14 @@ This document records all optimization attempts in the succinctly library, showi
 | NEON Nibble Lookup        | **1.02-1.06x**                             | ARM      | Deployed |
 | NEON 256-byte Popcount    | **1.10-1.15x** (micro), **1.02-1.04x** (e2e) | ARM    | Deployed |
 | NEON VMINV L1 Building    | **2.8x** (BP construction)                 | ARM      | Deployed |
+| NEON VMINV L2 Building    | **1-3%** (large data, 100M+ nodes)         | ARM      | Deployed |
 | DSV Lightweight Index ARM | **1.8x** (avg), **4.3x** (wide)            | ARM      | Deployed |
 | BP Byte Lookup Tables     | **11x**                                    | All      | Deployed |
 | Hierarchical RangeMin     | **40x**                                    | All      | Deployed |
 | Cumulative Index          | **627x**                                   | All      | Deployed |
 | Dual Select Methods       | **3.1x** (seq), **1.39x** (rand)           | All      | Deployed |
 
-**Total Successful**: 13 optimizations
+**Total Successful**: 14 optimizations
 **Best Result**: Cumulative index (627x)
 
 ### Failed Optimizations
@@ -430,6 +431,25 @@ Before implementing an optimization, ask:
 
 **Key insight**: The VMINV instruction finds the minimum across a vector in a single operation, eliminating the scalar min-finding loop. Combined with SIMD prefix sums, this dramatically accelerates the L1 index construction which aggregates per-word statistics into per-block statistics.
 
+### ✅ NEON VMINV for L2 Index Building (January 2026)
+
+**Status**: Implemented and deployed in [src/trees/bp.rs](../../src/trees/bp.rs)
+
+**Technique**: Same SIMD pattern as L1, but for L2 index building (processing L1 entries instead of L0).
+Added for code consistency and benefit at large data sizes.
+
+**Benchmark Results** (AWS Graviton 4 / Neoverse-V2):
+
+| Size | Nodes | L2 Entries | Scalar | SIMD | Improvement |
+|------|-------|------------|--------|------|-------------|
+| ~2.5MB | 10M | ~10K | 1.91ms | 1.91ms | ~0% (noise) |
+| ~25MB | 100M | ~100K | 19.70ms | 19.44ms | **1.3%** |
+| ~125MB | 500M | ~488K | 153.78ms | 148.73ms | **3.4%** |
+
+**Key insight**: L2 SIMD benefit scales with data size. At 500M nodes, L2 has ~488K entries
+(comparable to L1 at ~1M nodes), making SIMD worthwhile. No regression at smaller sizes,
+so kept for consistency with L1.
+
 ---
 
 ## Future Optimization Opportunities
@@ -463,7 +483,7 @@ Based on analysis of ARM NEON instructions for indexing and data structures (Jan
 | ADDV (`vaddvq_*`) | Horizontal sum | ✅ Deployed |
 | **Unrolled lookup** | BP min excess | ✅ **Deployed (BP, +17%)** |
 | **256B loop unroll** | Popcount ILP | ✅ **Deployed (popcount, +10-15%)** |
-| **MINV** (`vminvq_s16`) | L1 block minimum | ✅ **Deployed (BP L1 building, +2.8x)** |
+| **MINV** (`vminvq_s16`) | L1/L2 block minimum | ✅ **Deployed (BP L1: +2.8x, L2: +1-3% at scale)** |
 | **Vector CLZ** | First match position | ❌ Not yet used (BP opportunity) |
 
 See [docs/plan/sve2-optimizations.md](../plan/sve2-optimizations.md#future-neon-optimization-opportunities) for detailed analysis.

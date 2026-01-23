@@ -13,6 +13,47 @@ This document analyzes all current x86 and ARM NEON optimizations in the Succinc
 
 ---
 
+## SVE2 Inline Assembly Benchmark Results (January 2026)
+
+**IMPORTANT FINDING**: SVE2 with inline assembly is **~50% slower** than NEON intrinsics on Graviton 4.
+
+### Experiment: find_block_scalar_end
+
+Tested SVE2 predicates (`whilelt`, `ld1b`, `cmpeq`, `brkb`, `cntp`) vs NEON intrinsics:
+
+| Test Case | NEON | SVE2 | Speedup |
+|-----------|------|------|---------|
+| 10 lines, 4 indent | 95 ns | 154 ns | **0.62x** |
+| 100 lines, 4 indent | 1052 ns | 1745 ns | **0.60x** |
+| 1000 lines, 4 indent | 10605 ns | 17617 ns | **0.60x** |
+
+### Experiment: Multi-character search (SVE2 MATCH approach)
+
+Tested SVE2 for finding newline, colon, or hash characters:
+
+| Size | NEON | SVE2 | Speedup |
+|------|------|------|---------|
+| 64B | 5.6 ns (11.5 GiB/s) | 10.3 ns (6.2 GiB/s) | **0.54x** |
+| 1KB | 85 ns (12.0 GiB/s) | 156 ns (6.5 GiB/s) | **0.54x** |
+| 16KB | 1345 ns (12.2 GiB/s) | 2483 ns (6.6 GiB/s) | **0.54x** |
+
+### Why SVE2 Inline Assembly is Slower
+
+1. **Same vector width**: SVE2 on Graviton 4 uses 128-bit vectors (identical to NEON)
+2. **Inline assembly overhead**: `core::arch::asm!` blocks prevent:
+   - Register allocation optimization
+   - Instruction scheduling
+   - Loop unrolling
+3. **Predicate management cost**: SVE2 predicates add instructions that NEON handles more efficiently with masks
+
+### Conclusion
+
+**Do NOT use SVE2 inline assembly for YAML parsing on Graviton 4.**
+
+The only beneficial SVE2 feature is **SVEBITPERM** (BDEP/BEXT instructions), which is already used in DSV parsing. For regular SIMD operations, NEON intrinsics remain superior until Rust SVE2 intrinsics stabilize.
+
+---
+
 ## Current Optimization Inventory
 
 ### 1. x86_64 SIMD Hierarchy
@@ -499,6 +540,27 @@ combined with SIMD prefix sums for dramatic speedup.
 
 ---
 
+### ✅ NEON VMINV for L2 Index Building (IMPLEMENTED - January 2026)
+
+**Status**: ✅ **Implemented and deployed**
+
+**Implementation** ([src/trees/bp.rs](../../src/trees/bp.rs)):
+- Same SIMD pattern as L1, processing 8 L1 entries at a time
+- Added for code consistency and benefit at large data sizes
+
+**Benchmark Results** (AWS Graviton 4 / Neoverse-V2):
+
+| Size | Nodes | L2 Entries | Scalar | SIMD | Improvement |
+|------|-------|------------|--------|------|-------------|
+| ~2.5MB | 10M | ~10K | 1.91ms | 1.91ms | ~0% (noise) |
+| ~25MB | 100M | ~100K | 19.70ms | 19.44ms | **1.3%** |
+| ~125MB | 500M | ~488K | 153.78ms | 148.73ms | **3.4%** |
+
+**Key insight**: L2 SIMD benefit scales with data size. At 500M nodes, L2 has ~488K entries
+(comparable to L1 at ~1M nodes). No regression at smaller sizes, kept for consistency.
+
+---
+
 ### Low Confidence: Anchor Terminator Nibble Tables
 
 **Current State** ([src/yaml/simd/neon.rs](../../src/yaml/simd/neon.rs#L422-L498)):
@@ -554,7 +616,7 @@ Based on research papers and production systems, these NEON instructions have pr
 | **PMULL** (`vmull_p64`) | Prefix XOR | 25% faster DSV index (deployed) |
 | **CLZ** (scalar) | First set bit | Single cycle |
 | **EXT** (`vextq_*`) | Sliding window | Essential for text parsing |
-| **MINV** (`vminvq_s16`) | L1 block minimum | ✅ **2.8x faster BP construction (deployed)** |
+| **MINV** (`vminvq_s16`) | L1/L2 block minimum | ✅ **Deployed (L1: +2.8x, L2: +1-3% at scale)** |
 
 **Instructions NOT applicable to this codebase**:
 - **SDOT/UDOT**: No quantized embedding vectors
@@ -589,3 +651,12 @@ The YAML optimization history (see [docs/parsing/yaml.md](../parsing/yaml.md)) d
    - Processing 3+ character types simultaneously
    - Using specialized instructions (PMULL for prefix XOR, VMINV for reductions)
    - Compute-bound operations (popcount, index building - not parsing)
+
+**Key lesson for SVE2**:
+5. **Inline assembly defeats optimization** - SVE2 via `core::arch::asm!` is ~50% slower than NEON intrinsics due to:
+   - Lost register allocation optimization
+   - Prevented instruction scheduling
+   - Blocked loop unrolling
+   - Extra predicate management overhead
+6. **Wait for stable intrinsics** - Only use SVE2 when Rust stabilizes `#![feature(stdarch_aarch64_sve)]`
+7. **SVE2 value is in specialized instructions** - BDEP/BEXT (via SVEBITPERM) is the only current win; general ops lose to optimized NEON

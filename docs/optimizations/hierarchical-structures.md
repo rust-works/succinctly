@@ -266,7 +266,10 @@ unsafe fn build_l1_neon(l0_min: &[i8], l0_excess: &[i16]) -> (Vec<i16>, Vec<i16>
 }
 ```
 
-**Result**: 2.8x faster BP index construction on ARM (Graviton 4).
+**Result**: 2.8x faster L1 index construction on ARM (Graviton 4).
+
+The same SIMD pattern is also applied to L2 index building, providing 1-3%
+improvement at large scales (100M+ nodes) with no regression at smaller sizes.
 
 ### Prior Art
 
