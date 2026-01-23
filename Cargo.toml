@@ -161,3 +161,7 @@ harness = false
 [[bench]]
 name = "yq_select"
 harness = false
+
+[[bench]]
+name = "bp_select_micro"
+harness = false
