@@ -29,6 +29,14 @@ This document analyzes all current x86 and ARM NEON optimizations in the Succinc
 | SVE2-BITPERM BDEP select | `util/broadword.rs` | 5-17x micro, 2-5% e2e | 2026-01-23 |
 | SSE4.1 PHMINPOSUW BP L1/L2 | `trees/bp.rs` | 1-3% (large data) | 2026-01-24 |
 
+### ✅ Algorithmic Optimizations (non-SIMD)
+
+| Optimization | Location | Speedup | Date |
+|--------------|----------|---------|------|
+| Indexed find_open | `trees/bp.rs` | 16-492x | 2026-01-23 |
+
+*Note: Indexed find_open uses hierarchical max-excess indices and byte lookup tables (scalar code, no SIMD).*
+
 ### ❌ Rejected Optimizations
 
 | Attempt | Result | Reason |
