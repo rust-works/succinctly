@@ -28,6 +28,14 @@ This document analyzes all current x86 and ARM NEON optimizations in the Succinc
 | NEON popcount unrolling | `bits/popcount.rs` | 15% | 2026-01 |
 | SVE2-BITPERM BDEP select | `util/broadword.rs` | 5-17x micro, 2-5% e2e | 2026-01-23 |
 
+### ✅ Algorithmic Optimizations (non-SIMD)
+
+| Optimization | Location | Speedup | Date |
+|--------------|----------|---------|------|
+| Indexed find_open | `trees/bp.rs` | 16-492x | 2026-01-23 |
+
+*Note: Indexed find_open uses hierarchical max-excess indices and byte lookup tables (scalar code, no SIMD).*
+
 ### ❌ Rejected Optimizations
 
 | Attempt | Result | Reason |

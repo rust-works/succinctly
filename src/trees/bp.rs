@@ -147,6 +147,45 @@ const BYTE_FIND_CLOSE: [[u8; 16]; 256] = {
     table
 };
 
+/// Lookup table to find position where excess rises to target when scanning a byte backwards.
+/// Index: byte_value * 16 + target_excess (target_excess 1-16 mapped to 0-15)
+/// Value: bit position (0-7) where excess first reaches target, or 8 if not found.
+///
+/// When scanning backwards (bits 7 down to 0), we track excess:
+/// - 1-bit (open) adds +1 to excess
+/// - 0-bit (close) adds -1 to excess
+///
+/// This enables O(1) find_open within a byte instead of bit-by-bit scanning.
+const BYTE_FIND_OPEN_REV: [[u8; 16]; 256] = {
+    let mut table = [[8u8; 16]; 256];
+    let mut byte_val: usize = 0;
+    while byte_val < 256 {
+        // For each possible target excess (1-16)
+        let mut target_idx: usize = 0;
+        while target_idx < 16 {
+            let target = (target_idx + 1) as i8; // Map 0-15 to 1-16
+            let mut excess: i8 = 0;
+            let mut bit: i8 = 7;
+            while bit >= 0 {
+                if (byte_val >> bit) & 1 == 1 {
+                    excess += 1;
+                    if excess == target {
+                        table[byte_val][target_idx] = bit as u8;
+                        break;
+                    }
+                } else {
+                    excess -= 1;
+                }
+                bit -= 1;
+            }
+            // If we didn't find a match, table stays at 8
+            target_idx += 1;
+        }
+        byte_val += 1;
+    }
+    table
+};
+
 // ============================================================================
 // Unrolled Scalar Optimization
 // ============================================================================
@@ -219,14 +258,77 @@ fn word_min_excess_unrolled(word: u64) -> (i8, i16) {
     (min_clamped, total)
 }
 
-/// Build L0 index (per-word min excess and total excess).
+/// Optimized computation of max excess when scanning a 64-bit word backwards.
+///
+/// Computes the maximum running excess reached when scanning bits 63 down to 0.
+/// This is used for find_open/enclose to determine if a word contains the target.
+#[inline]
+fn word_max_excess_rev_unrolled(word: u64) -> i8 {
+    // Get bytes as array
+    let bytes = word.to_le_bytes();
+
+    // Load lookup values for all 8 bytes at once
+    let b0 = bytes[0] as usize;
+    let b1 = bytes[1] as usize;
+    let b2 = bytes[2] as usize;
+    let b3 = bytes[3] as usize;
+    let b4 = bytes[4] as usize;
+    let b5 = bytes[5] as usize;
+    let b6 = bytes[6] as usize;
+    let b7 = bytes[7] as usize;
+
+    // Get max excess for each byte when scanning backwards
+    let m7 = BYTE_MAX_EXCESS_REV[b7] as i16;
+    let m6 = BYTE_MAX_EXCESS_REV[b6] as i16;
+    let m5 = BYTE_MAX_EXCESS_REV[b5] as i16;
+    let m4 = BYTE_MAX_EXCESS_REV[b4] as i16;
+    let m3 = BYTE_MAX_EXCESS_REV[b3] as i16;
+    let m2 = BYTE_MAX_EXCESS_REV[b2] as i16;
+    let m1 = BYTE_MAX_EXCESS_REV[b1] as i16;
+    let m0 = BYTE_MAX_EXCESS_REV[b0] as i16;
+
+    // Get total excess for each byte
+    let t7 = BYTE_TOTAL_EXCESS[b7] as i16;
+    let t6 = BYTE_TOTAL_EXCESS[b6] as i16;
+    let t5 = BYTE_TOTAL_EXCESS[b5] as i16;
+    let t4 = BYTE_TOTAL_EXCESS[b4] as i16;
+    let t3 = BYTE_TOTAL_EXCESS[b3] as i16;
+    let t2 = BYTE_TOTAL_EXCESS[b2] as i16;
+    let t1 = BYTE_TOTAL_EXCESS[b1] as i16;
+    let _t0 = BYTE_TOTAL_EXCESS[b0] as i16;
+
+    // Compute prefix sums when scanning backwards (starting from byte 7)
+    let _p7: i16 = 0;
+    let p6 = t7;
+    let p5 = p6 + t6;
+    let p4 = p5 + t5;
+    let p3 = p4 + t4;
+    let p2 = p3 + t3;
+    let p1 = p2 + t2;
+    let p0 = p1 + t1;
+
+    // Compute global maximum: max of (prefix + byte_max) for each byte
+    let mut global_max = m7; // p7 + m7 = 0 + m7 = m7
+    global_max = global_max.max(p6 + m6);
+    global_max = global_max.max(p5 + m5);
+    global_max = global_max.max(p4 + m4);
+    global_max = global_max.max(p3 + m3);
+    global_max = global_max.max(p2 + m2);
+    global_max = global_max.max(p1 + m1);
+    global_max = global_max.max(p0 + m0);
+
+    global_max.clamp(-128, 127) as i8
+}
+
+/// Build L0 index (per-word min excess, total excess, and max excess for reverse scanning).
 ///
 /// Uses the unrolled scalar optimization which provides ~17-21% speedup
 /// over a naive loop on x86_64. This is a pure scalar optimization that
 /// benefits from loop unrolling and batched table lookups.
-fn build_l0_index(words: &[u64], len: usize, num_words: usize) -> (Vec<i8>, Vec<i16>) {
+fn build_l0_index(words: &[u64], len: usize, num_words: usize) -> (Vec<i8>, Vec<i16>, Vec<i8>) {
     let mut l0_min_excess = Vec::with_capacity(num_words);
     let mut l0_word_excess = Vec::with_capacity(num_words);
+    let mut l0_max_excess_rev = Vec::with_capacity(num_words);
 
     // Process all full words with unrolled optimization
     let full_words = if len % 64 == 0 {
@@ -237,19 +339,45 @@ fn build_l0_index(words: &[u64], len: usize, num_words: usize) -> (Vec<i8>, Vec<
 
     for &word in words.iter().take(full_words) {
         let (min_e, total_e) = word_min_excess_unrolled(word);
+        let max_e_rev = word_max_excess_rev_unrolled(word);
         l0_min_excess.push(min_e);
         l0_word_excess.push(total_e);
+        l0_max_excess_rev.push(max_e_rev);
     }
 
     // Handle last partial word with generic code (handles partial bit counts)
     if full_words < num_words {
         let valid_bits = len % 64;
         let (min_e, total_e) = word_min_excess(words[num_words - 1], valid_bits);
+        let max_e_rev = word_max_excess_rev_partial(words[num_words - 1], valid_bits);
         l0_min_excess.push(min_e);
         l0_word_excess.push(total_e);
+        l0_max_excess_rev.push(max_e_rev);
     }
 
-    (l0_min_excess, l0_word_excess)
+    (l0_min_excess, l0_word_excess, l0_max_excess_rev)
+}
+
+/// Compute max excess when scanning a partial word backwards.
+fn word_max_excess_rev_partial(word: u64, valid_bits: usize) -> i8 {
+    if valid_bits == 0 {
+        return 0;
+    }
+
+    let mut running_excess: i16 = 0;
+    let mut global_max: i16 = 0;
+
+    // Scan bits from high to low within valid range
+    for bit in (0..valid_bits).rev() {
+        if (word >> bit) & 1 == 1 {
+            running_excess += 1;
+            global_max = global_max.max(running_excess);
+        } else {
+            running_excess -= 1;
+        }
+    }
+
+    global_max.clamp(-128, 127) as i8
 }
 
 /// Build L1 index using NEON SIMD with prefix sums and VMINV.
@@ -428,6 +556,179 @@ fn build_l2_index_neon(
     (l2_min_excess, l2_block_excess)
 }
 
+/// Build L1 reverse index using NEON SIMD with prefix sums and VMAXV.
+///
+/// Processes 8 words at a time in reverse order using SIMD operations:
+/// 1. Load max_excess_rev and word_excess vectors (in reverse)
+/// 2. Compute prefix sums of word_excess (backwards)
+/// 3. Add prefix sums to max_excess_rev
+/// 4. Find block maximum using vmaxvq_s16
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+fn build_l1_index_rev_neon(
+    l0_max_excess_rev: &[i8],
+    l0_word_excess: &[i16],
+    num_l1: usize,
+) -> Vec<i16> {
+    use core::arch::aarch64::*;
+
+    let mut l1_max_excess_rev = Vec::with_capacity(num_l1);
+    let num_words = l0_max_excess_rev.len();
+
+    for block_idx in 0..num_l1 {
+        let start = block_idx * FACTOR_L1;
+        let end = (start + FACTOR_L1).min(num_words);
+        let block_len = end - start;
+        let mut block_max: i16 = 0;
+        let mut running_excess: i16 = 0;
+
+        // Process 8 words at a time with SIMD, scanning in reverse
+        let mut remaining = block_len;
+        while remaining >= 8 {
+            let chunk_start = start + remaining - 8;
+
+            // SAFETY: We verified bounds above
+            unsafe {
+                // Load 8 max_excess_rev values (i8) and widen to i16
+                let max_ptr = l0_max_excess_rev.as_ptr().add(chunk_start);
+                let max_i8 = vld1_s8(max_ptr);
+                let max_lo = vmovl_s8(max_i8);
+
+                // Load 8 word_excess values (i16)
+                let excess_ptr = l0_word_excess.as_ptr().add(chunk_start);
+                let excess = vld1q_s16(excess_ptr);
+
+                // Reverse the vectors for backward prefix sum
+                let max_rev = vrev64q_s16(max_lo);
+                let max_rev = vcombine_s16(vget_high_s16(max_rev), vget_low_s16(max_rev));
+                let excess_rev = vrev64q_s16(excess);
+                let excess_rev = vcombine_s16(vget_high_s16(excess_rev), vget_low_s16(excess_rev));
+
+                // Compute prefix sum of excess using parallel prefix pattern
+                let shifted1 = vextq_s16(vdupq_n_s16(0), excess_rev, 7);
+                let sum1 = vaddq_s16(excess_rev, shifted1);
+                let shifted2 = vextq_s16(vdupq_n_s16(0), sum1, 6);
+                let sum2 = vaddq_s16(sum1, shifted2);
+                let shifted4 = vextq_s16(vdupq_n_s16(0), sum2, 4);
+                let prefix_sum = vaddq_s16(sum2, shifted4);
+
+                // Add running_excess offset to prefix sum
+                let offset = vdupq_n_s16(running_excess);
+                let adjusted_prefix = vaddq_s16(prefix_sum, offset);
+
+                // Exclusive prefix sum for max calculation
+                let exclusive_prefix = vextq_s16(offset, adjusted_prefix, 7);
+
+                // Add to max_excess_rev
+                let adjusted_max = vaddq_s16(max_rev, exclusive_prefix);
+
+                // Find maximum using vmaxvq_s16
+                let chunk_max = vmaxvq_s16(adjusted_max);
+                block_max = block_max.max(chunk_max);
+
+                // Update running excess with sum of all 8 values
+                running_excess += vaddvq_s16(excess_rev);
+            }
+            remaining -= 8;
+        }
+
+        // Handle remaining words (< 8) with scalar code, in reverse order
+        for i in (start..start + remaining).rev() {
+            let word_max = l0_max_excess_rev[i] as i16;
+            let word_excess = l0_word_excess[i];
+            block_max = block_max.max(running_excess + word_max);
+            running_excess += word_excess;
+        }
+
+        l1_max_excess_rev.push(block_max);
+    }
+
+    l1_max_excess_rev
+}
+
+/// NEON-accelerated L2 reverse index building.
+///
+/// Uses the same SIMD pattern as L1 reverse but processes L1 entries (all i16).
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+fn build_l2_index_rev_neon(
+    l1_max_excess_rev: &[i16],
+    l1_block_excess: &[i16],
+    num_l2: usize,
+) -> Vec<i16> {
+    use core::arch::aarch64::*;
+
+    let mut l2_max_excess_rev = Vec::with_capacity(num_l2);
+    let num_l1 = l1_max_excess_rev.len();
+
+    for block_idx in 0..num_l2 {
+        let start = block_idx * FACTOR_L2;
+        let end = (start + FACTOR_L2).min(num_l1);
+        let block_len = end - start;
+        let mut block_max: i16 = 0;
+        let mut running_excess: i16 = 0;
+
+        // Process 8 L1 blocks at a time with SIMD, scanning in reverse
+        let mut remaining = block_len;
+        while remaining >= 8 {
+            let chunk_start = start + remaining - 8;
+
+            // SAFETY: We verified bounds above
+            unsafe {
+                // Load 8 max_excess_rev values (i16)
+                let max_ptr = l1_max_excess_rev.as_ptr().add(chunk_start);
+                let max_vals = vld1q_s16(max_ptr);
+
+                // Load 8 block_excess values (i16)
+                let excess_ptr = l1_block_excess.as_ptr().add(chunk_start);
+                let excess = vld1q_s16(excess_ptr);
+
+                // Reverse the vectors for backward prefix sum
+                let max_rev = vrev64q_s16(max_vals);
+                let max_rev = vcombine_s16(vget_high_s16(max_rev), vget_low_s16(max_rev));
+                let excess_rev = vrev64q_s16(excess);
+                let excess_rev = vcombine_s16(vget_high_s16(excess_rev), vget_low_s16(excess_rev));
+
+                // Compute prefix sum of excess using parallel prefix pattern
+                let shifted1 = vextq_s16(vdupq_n_s16(0), excess_rev, 7);
+                let sum1 = vaddq_s16(excess_rev, shifted1);
+                let shifted2 = vextq_s16(vdupq_n_s16(0), sum1, 6);
+                let sum2 = vaddq_s16(sum1, shifted2);
+                let shifted4 = vextq_s16(vdupq_n_s16(0), sum2, 4);
+                let prefix_sum = vaddq_s16(sum2, shifted4);
+
+                // Add running_excess offset to prefix sum
+                let offset = vdupq_n_s16(running_excess);
+                let adjusted_prefix = vaddq_s16(prefix_sum, offset);
+
+                // Exclusive prefix sum for max calculation
+                let exclusive_prefix = vextq_s16(offset, adjusted_prefix, 7);
+
+                // Add to max_excess_rev
+                let adjusted_max = vaddq_s16(max_rev, exclusive_prefix);
+
+                // Find maximum using vmaxvq_s16
+                let chunk_max = vmaxvq_s16(adjusted_max);
+                block_max = block_max.max(chunk_max);
+
+                // Update running excess with sum of all 8 values
+                running_excess += vaddvq_s16(excess_rev);
+            }
+            remaining -= 8;
+        }
+
+        // Handle remaining L1 blocks (< 8) with scalar code, in reverse order
+        for i in (start..start + remaining).rev() {
+            let l1_max = l1_max_excess_rev[i];
+            let l1_excess = l1_block_excess[i];
+            block_max = block_max.max(running_excess + l1_max);
+            running_excess += l1_excess;
+        }
+
+        l2_max_excess_rev.push(block_max);
+    }
+
+    l2_max_excess_rev
+}
+
 /// Fast byte-level scan to find where excess drops to 0.
 ///
 /// Given a word starting at `start_bit`, scans bytes using lookup tables
@@ -529,6 +830,97 @@ fn find_close_in_word_fast(
                 }
             }
         }
+    }
+
+    None
+}
+
+/// Fast byte-level scan to find where excess rises to target when scanning backwards.
+///
+/// Given a word, scans bytes backwards from `end_bit-1` down to 0 using lookup tables
+/// to find where excess first reaches the target.
+///
+/// Returns `Some(bit_position)` if found, or `None` if not found.
+///
+/// # Arguments
+/// * `word` - The 64-bit word to scan
+/// * `end_bit` - Ending bit position (exclusive) - we scan from end_bit-1 down to 0
+/// * `target_excess` - The target excess value we want to reach (must be >= 1)
+#[inline]
+fn find_open_in_word_fast(word: u64, end_bit: usize, target_excess: i32) -> Option<usize> {
+    if end_bit == 0 || target_excess <= 0 {
+        return None;
+    }
+
+    let bytes = word.to_le_bytes();
+    let mut excess: i32 = 0;
+
+    // Determine the byte range to scan
+    let last_byte_idx = (end_bit - 1) / 8;
+    let last_bit_in_byte = (end_bit - 1) % 8;
+
+    // Handle partial last byte (scanning backwards, this is first in our scan)
+    if last_bit_in_byte < 7 {
+        let byte_val = bytes[last_byte_idx];
+        // Scan bits from last_bit_in_byte down to 0
+        for bit in (0..=last_bit_in_byte).rev() {
+            if (byte_val >> bit) & 1 == 1 {
+                excess += 1;
+                if excess == target_excess {
+                    return Some(last_byte_idx * 8 + bit);
+                }
+            } else {
+                excess -= 1;
+            }
+        }
+        // If only had partial byte, we're done with this byte
+        if last_byte_idx == 0 {
+            return None;
+        }
+    }
+
+    // Determine starting byte for full-byte processing
+    let start_byte = if last_bit_in_byte < 7 {
+        if last_byte_idx == 0 {
+            return None;
+        }
+        last_byte_idx - 1
+    } else {
+        last_byte_idx
+    };
+
+    // Process full bytes using lookup table (from start_byte down to 0)
+    for byte_idx in (0..=start_byte).rev() {
+        let byte_val = bytes[byte_idx] as usize;
+
+        // Check if target excess can be reached in this byte
+        let max_excess_in_byte = BYTE_MAX_EXCESS_REV[byte_val] as i32;
+        let needed = target_excess - excess;
+
+        if max_excess_in_byte >= needed {
+            // Match might be in this byte - check lookup table
+            if (1..=16).contains(&needed) {
+                let lookup_idx = (needed - 1) as usize;
+                let match_pos = BYTE_FIND_OPEN_REV[byte_val][lookup_idx];
+                if match_pos < 8 {
+                    return Some(byte_idx * 8 + match_pos as usize);
+                }
+            }
+            // Fallback: bit-by-bit scan for this byte (needed > 16 or lookup failed)
+            let mut e = excess;
+            for bit in (0..8).rev() {
+                if (byte_val >> bit) & 1 == 1 {
+                    e += 1;
+                    if e == target_excess {
+                        return Some(byte_idx * 8 + bit);
+                    }
+                } else {
+                    e -= 1;
+                }
+            }
+        }
+
+        excess += BYTE_TOTAL_EXCESS[byte_val] as i32;
     }
 
     None
@@ -1066,6 +1458,16 @@ pub struct BalancedParens<W = Vec<u64>> {
     /// L2: Per-1024-word block excess (total excess within this block)
     l2_block_excess: Vec<i16>,
 
+    // --- Max-excess indices for find_open/enclose (reverse scanning) ---
+    /// L0: Per-word max excess when scanning backwards (signed, relative to end of word)
+    l0_max_excess_rev: Vec<i8>,
+
+    /// L1: Per-32-word block max excess when scanning backwards
+    l1_max_excess_rev: Vec<i16>,
+
+    /// L2: Per-1024-word block max excess when scanning backwards
+    l2_max_excess_rev: Vec<i16>,
+
     // --- Cumulative rank directory for O(1) rank1() ---
     /// Cumulative 1-bit count at the start of each 512-bit block (8 words)
     /// This is an absolute value from position 0.
@@ -1082,17 +1484,23 @@ fn build_bp_index(
     words: &[u64],
     len: usize,
 ) -> (
-    Vec<i8>,
-    Vec<i16>,
-    Vec<i16>,
-    Vec<i16>,
-    Vec<i16>,
-    Vec<i16>,
-    Vec<u32>,
-    Vec<u64>,
+    Vec<i8>,  // l0_min_excess
+    Vec<i16>, // l0_word_excess
+    Vec<i16>, // l1_min_excess
+    Vec<i16>, // l1_block_excess
+    Vec<i16>, // l2_min_excess
+    Vec<i16>, // l2_block_excess
+    Vec<i8>,  // l0_max_excess_rev
+    Vec<i16>, // l1_max_excess_rev
+    Vec<i16>, // l2_max_excess_rev
+    Vec<u32>, // rank_l1
+    Vec<u64>, // rank_l2
 ) {
     if words.is_empty() || len == 0 {
         return (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1109,9 +1517,8 @@ fn build_bp_index(
     let num_l2 = num_l1.div_ceil(FACTOR_L2);
     let num_rank_blocks = num_words.div_ceil(WORDS_PER_RANK_BLOCK);
 
-    // Build L0: per-word statistics
-    // Use NEON-optimized path on aarch64 with simd feature
-    let (l0_min_excess, l0_word_excess) = build_l0_index(words, len, num_words);
+    // Build L0: per-word statistics (forward min, total, reverse max)
+    let (l0_min_excess, l0_word_excess, l0_max_excess_rev) = build_l0_index(words, len, num_words);
 
     // Build L1: per-32-word block statistics
     // Use NEON SIMD with VMINV on aarch64 for faster prefix-sum and min finding
@@ -1180,6 +1587,70 @@ fn build_bp_index(
         }
     };
 
+    // Build L1 reverse: per-32-word block max excess when scanning backwards
+    // Use NEON SIMD with VMAXV on aarch64 for faster prefix-sum and max finding
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    let l1_max_excess_rev = build_l1_index_rev_neon(&l0_max_excess_rev, &l0_word_excess, num_l1);
+
+    #[cfg(not(all(feature = "simd", target_arch = "aarch64")))]
+    let l1_max_excess_rev = {
+        let mut l1_max = Vec::with_capacity(num_l1);
+
+        for block_idx in 0..num_l1 {
+            let start = block_idx * FACTOR_L1;
+            let end = (start + FACTOR_L1).min(num_words);
+
+            let mut block_max: i16 = 0;
+            let mut running_excess: i16 = 0;
+
+            // Scan words in reverse order within block
+            for i in (start..end).rev() {
+                let word_max = l0_max_excess_rev[i] as i16;
+                let word_excess = l0_word_excess[i];
+                block_max = block_max.max(running_excess + word_max);
+                running_excess += word_excess;
+            }
+
+            l1_max.push(block_max);
+        }
+
+        l1_max
+    };
+
+    // Build L2 reverse: per-1024-word block max excess when scanning backwards
+    // Use SIMD on ARM for consistency with L1 (benefit scales with data size)
+    let l2_max_excess_rev = {
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        {
+            build_l2_index_rev_neon(&l1_max_excess_rev, &l1_block_excess, num_l2)
+        }
+
+        #[cfg(not(all(feature = "simd", target_arch = "aarch64")))]
+        {
+            let mut l2_max = Vec::with_capacity(num_l2);
+
+            for block_idx in 0..num_l2 {
+                let start = block_idx * FACTOR_L2;
+                let end = (start + FACTOR_L2).min(num_l1);
+
+                let mut block_max: i16 = 0;
+                let mut running_excess: i16 = 0;
+
+                // Scan L1 blocks in reverse order
+                for i in (start..end).rev() {
+                    let l1_max = l1_max_excess_rev[i];
+                    let l1_excess = l1_block_excess[i];
+                    block_max = block_max.max(running_excess + l1_max);
+                    running_excess += l1_excess;
+                }
+
+                l2_max.push(block_max);
+            }
+
+            l2_max
+        }
+    };
+
     // Build rank directory with ABSOLUTE cumulative values
     let mut rank_l1 = Vec::with_capacity(num_rank_blocks);
     let mut rank_l2 = Vec::with_capacity(num_rank_blocks);
@@ -1216,6 +1687,9 @@ fn build_bp_index(
         l1_block_excess,
         l2_min_excess,
         l2_block_excess,
+        l0_max_excess_rev,
+        l1_max_excess_rev,
+        l2_max_excess_rev,
         rank_l1,
         rank_l2,
     )
@@ -1231,6 +1705,9 @@ impl BalancedParens<Vec<u64>> {
             l1_block_excess,
             l2_min_excess,
             l2_block_excess,
+            l0_max_excess_rev,
+            l1_max_excess_rev,
+            l2_max_excess_rev,
             rank_l1,
             rank_l2,
         ) = build_bp_index(&words, len);
@@ -1244,6 +1721,9 @@ impl BalancedParens<Vec<u64>> {
             l1_block_excess,
             l2_min_excess,
             l2_block_excess,
+            l0_max_excess_rev,
+            l1_max_excess_rev,
+            l2_max_excess_rev,
             rank_l1,
             rank_l2,
         }
@@ -1262,6 +1742,9 @@ impl<W: AsRef<[u64]>> BalancedParens<W> {
             l1_block_excess,
             l2_min_excess,
             l2_block_excess,
+            l0_max_excess_rev,
+            l1_max_excess_rev,
+            l2_max_excess_rev,
             rank_l1,
             rank_l2,
         ) = build_bp_index(words.as_ref(), len);
@@ -1275,6 +1758,9 @@ impl<W: AsRef<[u64]>> BalancedParens<W> {
             l1_block_excess,
             l2_min_excess,
             l2_block_excess,
+            l0_max_excess_rev,
+            l1_max_excess_rev,
+            l2_max_excess_rev,
             rank_l1,
             rank_l2,
         }
@@ -1593,12 +2079,210 @@ impl<W: AsRef<[u64]>> BalancedParens<W> {
     ///
     /// Given a close parenthesis at position `p`, returns the position
     /// of its matching open.
+    ///
+    /// Uses the hierarchical max-excess index for O(1) average performance.
     pub fn find_open(&self, p: usize) -> Option<usize> {
         if p >= self.len || self.is_open(p) {
             return None;
         }
 
-        find_open(self.words.as_ref(), self.len, p)
+        // Start scanning backwards from position p-1 (exclusive of the close itself)
+        // Initial excess = -1 because we've seen one close (at position p)
+        // Target excess = 0 (when we find the matching open)
+        // Equivalently: start with excess = 0, target = 1, scanning from p
+        self.find_open_from(p, 1)
+    }
+
+    /// Internal: find position (scanning backwards) where excess rises to target.
+    ///
+    /// Uses byte-level lookup tables and hierarchical max-excess indices for fast scanning.
+    fn find_open_from(&self, start_pos: usize, target_excess: i32) -> Option<usize> {
+        if start_pos == 0 {
+            return None;
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum State {
+            ScanWord,
+            CheckL0,
+            CheckL1,
+            CheckL2,
+            FromL0,
+            FromL1,
+            FromL2,
+        }
+
+        let words = self.words.as_ref();
+        let mut state = State::FromL0;
+        let mut excess: i32 = 0;
+        // pos is the exclusive upper bound - we scan from pos-1 down to 0
+        let mut pos = start_pos;
+
+        loop {
+            match state {
+                State::ScanWord => {
+                    // Fast path: scan current word backwards using byte-level lookup tables
+                    if pos == 0 {
+                        return None;
+                    }
+
+                    let word_idx = (pos - 1) / 64;
+                    let word = words[word_idx];
+
+                    // Determine the bit range to scan in this word
+                    // If pos is word-aligned, scan the entire previous word (bits 63..0)
+                    // Otherwise, scan from (pos-1) % 64 down to 0
+                    let end_bit = if pos % 64 == 0 { 64 } else { pos % 64 };
+
+                    // Use fast byte-level scan
+                    let needed = target_excess - excess;
+                    if let Some(match_bit) = find_open_in_word_fast(word, end_bit, needed) {
+                        return Some(word_idx * 64 + match_bit);
+                    }
+
+                    // No match in this word - compute excess change and move to previous word
+                    // Count bits from end_bit-1 down to 0
+                    let mask = if end_bit == 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << end_bit) - 1
+                    };
+                    let masked_word = word & mask;
+                    let ones = masked_word.count_ones() as i32;
+                    let bits_scanned = end_bit as i32;
+                    // When scanning backwards: opens add +1, closes add -1
+                    excess += 2 * ones - bits_scanned;
+
+                    // Move to end of previous word
+                    pos = word_idx * 64;
+                    state = State::FromL0;
+                }
+
+                State::CheckL0 => {
+                    // pos is word-aligned, check if match is in this word
+                    debug_assert!(pos % 64 == 0);
+
+                    if pos == 0 {
+                        return None;
+                    }
+
+                    let word_idx = pos / 64 - 1; // Previous word
+                    if word_idx >= self.l0_max_excess_rev.len() {
+                        return None;
+                    }
+
+                    let max_e = self.l0_max_excess_rev[word_idx] as i32;
+                    let needed = target_excess - excess;
+
+                    if max_e >= needed {
+                        // Match might be in this word - scan it
+                        state = State::ScanWord;
+                    } else {
+                        // Skip this word entirely
+                        let word_excess = self.l0_word_excess[word_idx] as i32;
+                        excess += word_excess;
+                        pos = word_idx * 64;
+                        state = State::FromL0;
+                    }
+                }
+
+                State::CheckL1 => {
+                    // pos is L1-block-aligned, check if match is in this L1 block
+                    debug_assert!(pos % (64 * FACTOR_L1) == 0);
+
+                    if pos == 0 {
+                        return None;
+                    }
+
+                    let l1_idx = pos / (64 * FACTOR_L1) - 1; // Previous L1 block
+                    if l1_idx >= self.l1_max_excess_rev.len() {
+                        return None;
+                    }
+
+                    let max_e = self.l1_max_excess_rev[l1_idx] as i32;
+                    let needed = target_excess - excess;
+
+                    if max_e >= needed {
+                        // Match might be in this L1 block - descend to L0
+                        state = State::CheckL0;
+                    } else {
+                        // Skip this L1 block entirely
+                        let l1_excess = self.l1_block_excess[l1_idx] as i32;
+                        excess += l1_excess;
+                        pos = l1_idx * 64 * FACTOR_L1;
+                        state = State::FromL1;
+                    }
+                }
+
+                State::CheckL2 => {
+                    // pos is L2-block-aligned, check if match is in this L2 block
+                    if pos == 0 {
+                        return None;
+                    }
+
+                    let l2_idx = pos / (64 * FACTOR_L1 * FACTOR_L2) - 1; // Previous L2 block
+                    if l2_idx >= self.l2_max_excess_rev.len() {
+                        return None;
+                    }
+
+                    let max_e = self.l2_max_excess_rev[l2_idx] as i32;
+                    let needed = target_excess - excess;
+
+                    if max_e >= needed {
+                        // Match might be in this L2 block - descend to L1
+                        state = State::CheckL1;
+                    } else {
+                        // Skip this L2 block entirely
+                        let l2_excess = self.l2_block_excess[l2_idx] as i32;
+                        excess += l2_excess;
+                        pos = l2_idx * 64 * FACTOR_L1 * FACTOR_L2;
+                        state = State::FromL2;
+                    }
+                }
+
+                State::FromL0 => {
+                    if pos == 0 {
+                        return None;
+                    }
+
+                    if pos % 64 == 0 {
+                        // Word-aligned, check if we should go to L1
+                        state = State::FromL1;
+                    } else {
+                        // Not word-aligned, need to scan partial word
+                        state = State::ScanWord;
+                    }
+                }
+
+                State::FromL1 => {
+                    if pos == 0 {
+                        return None;
+                    }
+
+                    if pos % (64 * FACTOR_L1) == 0 {
+                        // L1-aligned, check if we should go to L2
+                        state = State::FromL2;
+                    } else {
+                        // Within an L1 block, check individual words
+                        state = State::CheckL0;
+                    }
+                }
+
+                State::FromL2 => {
+                    if pos == 0 {
+                        return None;
+                    }
+
+                    if pos % (64 * FACTOR_L1 * FACTOR_L2) == 0 {
+                        // L2-aligned, check this L2 block
+                        state = State::CheckL2;
+                    } else {
+                        // Within an L2 block, descend to L1
+                        state = State::CheckL1;
+                    }
+                }
+            }
+        }
     }
 
     /// Find enclosing open parenthesis (parent node).
@@ -1610,6 +2294,9 @@ impl<W: AsRef<[u64]>> BalancedParens<W> {
             return None;
         }
 
+        // enclose(p) finds the first unmatched open before position p.
+        // The parent is typically very close (1-2 bits back), so linear
+        // scanning beats the indexed version due to lower overhead.
         enclose(self.words.as_ref(), self.len, p)
     }
 
