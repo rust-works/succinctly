@@ -33,6 +33,7 @@ This directory documents optimization techniques used in the succinctly library,
 | AVX-512 VPOPCNTDQ | **5.2x** | SIMD | [simd.md](simd.md) |
 | Exponential Search | **3.1x** | Access patterns | [access-patterns.md](access-patterns.md) |
 | NEON VMINV L1 Building | **2.8x** | SIMD | [simd.md](simd.md) |
+| SSE4.1 PHMINPOSUW L1/L2 | **1-3%** (10M+) | SIMD | [simd.md](simd.md) |
 | AVX2 JSON Parser | **1.78x** | SIMD | [simd.md](simd.md) |
 | PFSM Tables | **1.77x** | State machines | [state-machines.md](state-machines.md) |
 | NEON DSV Index | **1.8x** | SIMD | [simd.md](simd.md) |

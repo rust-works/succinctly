@@ -21,13 +21,14 @@ This document records all optimization attempts in the succinctly library, showi
 | NEON 256-byte Popcount    | **1.10-1.15x** (micro), **1.02-1.04x** (e2e) | ARM    | Deployed |
 | NEON VMINV L1 Building    | **2.8x** (BP construction)                 | ARM      | Deployed |
 | NEON VMINV L2 Building    | **1-3%** (large data, 100M+ nodes)         | ARM      | Deployed |
+| SSE4.1 PHMINPOSUW L1/L2   | **1-3%** (10M+ nodes)                      | x86_64   | Deployed |
 | DSV Lightweight Index ARM | **1.8x** (avg), **4.3x** (wide)            | ARM      | Deployed |
 | BP Byte Lookup Tables     | **11x**                                    | All      | Deployed |
 | Hierarchical RangeMin     | **40x**                                    | All      | Deployed |
 | Cumulative Index          | **627x**                                   | All      | Deployed |
 | Dual Select Methods       | **3.1x** (seq), **1.39x** (rand)           | All      | Deployed |
 
-**Total Successful**: 14 optimizations
+**Total Successful**: 15 optimizations
 **Best Result**: Cumulative index (627x)
 
 ### Failed Optimizations
@@ -449,6 +450,50 @@ Added for code consistency and benefit at large data sizes.
 **Key insight**: L2 SIMD benefit scales with data size. At 500M nodes, L2 has ~488K entries
 (comparable to L1 at ~1M nodes), making SIMD worthwhile. No regression at smaller sizes,
 so kept for consistency with L1.
+
+### ⚠️ SSE4.1 PHMINPOSUW for L1/L2 Index Building (January 2026)
+
+**Status**: Implemented and deployed in [src/trees/bp.rs](../../src/trees/bp.rs) — marginal benefit
+
+**Technique**: x86_64 equivalent of NEON VMINV using SSE4.1's `PHMINPOSUW` (`_mm_minpos_epu16`).
+The key challenge is that PHMINPOSUW only works on **unsigned** 16-bit values, while min_excess can be negative.
+
+**Bias Trick Solution**:
+```rust
+// Bias by 0x8000 to convert signed [-32768, 32767] to unsigned [0, 65535]
+let bias = _mm_set1_epi16(i16::MIN);
+let biased = _mm_add_epi16(values, bias);
+let minpos = _mm_minpos_epu16(biased);
+let biased_min = _mm_extract_epi16(minpos, 0) as i16;
+let result = biased_min.wrapping_add(i16::MIN);  // Unbias
+```
+
+**Benchmark Results** (AMD Ryzen 9 7950X, Zen 4):
+
+| Size | Scalar | SSE4.1 | Improvement |
+|------|--------|--------|-------------|
+| 10K nodes | 1.97 µs | 1.98 µs | ~0% (neutral) |
+| 100K nodes | 18.96 µs | 18.97 µs | ~0% (neutral) |
+| 1M nodes | 188.0 µs | 197.2 µs | **-5% (regression)** |
+| 10M nodes | 3.15 ms | 3.05 ms | **+3%** |
+| 100M nodes | 31.98 ms | 31.36 ms | **+2%** |
+| 500M nodes | 253.8 ms | 250.6 ms | **+1%** |
+
+**Why SSE4.1 shows much less improvement than NEON (2.8x)**:
+
+| Factor | ARM NEON | x86 SSE4.1 |
+|--------|----------|------------|
+| Horizontal min | `vminvq_s16` (signed direct) | `_mm_minpos_epu16` (unsigned only) |
+| Horizontal sum | `vaddvq_s16` (single instruction) | Multiple shifts + adds |
+| Bias overhead | None needed | +2 ops per block |
+
+**Key insight**: ARM's `vminvq_s16` handles signed values directly. SSE4.1's unsigned-only
+PHMINPOSUW requires bias/unbias operations that add significant overhead, negating most benefit
+at typical data sizes. Only at 10M+ nodes is the improvement measurable.
+
+**Future opportunity**: AVX-512 provides `_mm512_reduce_min_epi16` which handles signed 16-bit
+values directly and processes 32 lanes. This could provide better results on CPUs with efficient
+AVX-512 execution (though memory bandwidth may still limit gains for this workload).
 
 ---
 

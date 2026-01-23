@@ -428,6 +428,310 @@ fn build_l2_index_neon(
     (l2_min_excess, l2_block_excess)
 }
 
+/// Build L1 index using SSE4.1 SIMD with prefix sums and PHMINPOSUW.
+///
+/// Processes 8 words at a time using SIMD operations:
+/// 1. Load min_excess and word_excess vectors
+/// 2. Compute prefix sums of word_excess
+/// 3. Add prefix sums to min_excess
+/// 4. Find block minimum using PHMINPOSUW (with bias trick for signed values)
+///
+/// # SSE4.1 Signed Minimum Workaround
+///
+/// PHMINPOSUW (`_mm_minpos_epu16`) only works on **unsigned** 16-bit values.
+/// Since min_excess can be negative, we bias values by adding 32768 before
+/// the minimum operation, then unbias the result.
+///
+/// This gives the same result as ARM NEON's `vminvq_s16` which handles signed
+/// values directly.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.1")]
+unsafe fn build_l1_index_sse41_impl(
+    l0_min_excess: &[i8],
+    l0_word_excess: &[i16],
+    num_l1: usize,
+) -> (Vec<i16>, Vec<i16>) {
+    use core::arch::x86_64::*;
+
+    let mut l1_min_excess = Vec::with_capacity(num_l1);
+    let mut l1_block_excess = Vec::with_capacity(num_l1);
+
+    let num_words = l0_min_excess.len();
+
+    // Bias constant for signed->unsigned conversion (0x8000 = 32768)
+    let bias = _mm_set1_epi16(i16::MIN); // 0x8000 as i16 = -32768, but bit pattern is 0x8000
+
+    for block_idx in 0..num_l1 {
+        let start = block_idx * FACTOR_L1;
+        let end = (start + FACTOR_L1).min(num_words);
+        let mut block_min: i16 = 0;
+        let mut running_excess: i16 = 0;
+
+        // Process 8 words at a time with SIMD
+        let mut i = start;
+        while i + 8 <= end {
+            // Load 8 min_excess values (i8) and widen to i16
+            let min_ptr = l0_min_excess.as_ptr().add(i);
+            let min_i8 = _mm_loadl_epi64(min_ptr as *const __m128i); // Load 8 bytes into low 64 bits
+            let min_lo = _mm_cvtepi8_epi16(min_i8); // Sign-extend i8 -> i16
+
+            // Load 8 word_excess values (i16)
+            let excess_ptr = l0_word_excess.as_ptr().add(i);
+            let excess = _mm_loadu_si128(excess_ptr as *const __m128i);
+
+            // Compute prefix sum of excess using parallel prefix pattern
+            // SSE doesn't have VEXT, so we use shuffles and shifts
+
+            // Step 1: Add adjacent pairs
+            // shifted1 = [0, e0, e1, e2, e3, e4, e5, e6]
+            let shifted1 = _mm_slli_si128(excess, 2); // Shift left by 2 bytes (1 i16)
+            let sum1 = _mm_add_epi16(excess, shifted1);
+
+            // Step 2: Add pairs of pairs
+            // shifted2 = [0, 0, s0, s1, s2, s3, s4, s5]
+            let shifted2 = _mm_slli_si128(sum1, 4); // Shift left by 4 bytes (2 i16)
+            let sum2 = _mm_add_epi16(sum1, shifted2);
+
+            // Step 3: Add quads
+            // shifted4 = [0, 0, 0, 0, s0, s1, s2, s3]
+            let shifted4 = _mm_slli_si128(sum2, 8); // Shift left by 8 bytes (4 i16)
+            let prefix_sum = _mm_add_epi16(sum2, shifted4);
+
+            // Add running_excess offset to prefix sum
+            let offset = _mm_set1_epi16(running_excess);
+            let adjusted_prefix = _mm_add_epi16(prefix_sum, offset);
+
+            // We need exclusive prefix sum for min calculation
+            // exclusive_prefix[i] = running_excess + sum(excess[0..i])
+            // The prefix_sum is inclusive, so we shift right and insert running_excess
+            let exclusive_prefix = _mm_slli_si128(adjusted_prefix, 2);
+            // Insert running_excess at position 0
+            let exclusive_prefix = _mm_insert_epi16(exclusive_prefix, running_excess as i32, 0);
+
+            // Add to min_excess: min[i] + exclusive_prefix[i]
+            let adjusted_min = _mm_add_epi16(min_lo, exclusive_prefix);
+
+            // Find minimum using PHMINPOSUW with bias trick
+            // 1. Add bias (0x8000) to convert signed -> unsigned range
+            // 2. Find unsigned minimum with PHMINPOSUW
+            // 3. Subtract bias to convert back to signed
+            let biased = _mm_add_epi16(adjusted_min, bias);
+            let minpos = _mm_minpos_epu16(biased);
+            // minpos[0] contains the minimum value (still biased)
+            let biased_min = _mm_extract_epi16(minpos, 0) as i16;
+            // Unbias: subtract 0x8000 (add 0x8000 in signed arithmetic wraps correctly)
+            let chunk_min = biased_min.wrapping_add(i16::MIN);
+
+            block_min = block_min.min(chunk_min);
+
+            // Update running excess with sum of all 8 values
+            // Use horizontal add or extract and sum
+            // SSE doesn't have vaddvq equivalent, so we reduce manually
+            let sum_lo = _mm_add_epi16(excess, _mm_srli_si128(excess, 8)); // Add high 4 to low 4
+            let sum_lo = _mm_add_epi16(sum_lo, _mm_srli_si128(sum_lo, 4)); // Add pairs
+            let sum_lo = _mm_add_epi16(sum_lo, _mm_srli_si128(sum_lo, 2)); // Add final pair
+            running_excess += _mm_extract_epi16(sum_lo, 0) as i16;
+
+            i += 8;
+        }
+
+        // Handle remaining words (< 8) with scalar code
+        while i < end {
+            let word_min = l0_min_excess[i] as i16;
+            let word_excess = l0_word_excess[i];
+            block_min = block_min.min(running_excess + word_min);
+            running_excess += word_excess;
+            i += 1;
+        }
+
+        l1_min_excess.push(block_min);
+        l1_block_excess.push(running_excess);
+    }
+
+    (l1_min_excess, l1_block_excess)
+}
+
+/// Safe wrapper for SSE4.1 L1 index building.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+fn build_l1_index_sse41(
+    l0_min_excess: &[i8],
+    l0_word_excess: &[i16],
+    num_l1: usize,
+) -> (Vec<i16>, Vec<i16>) {
+    // SAFETY: We check for SSE4.1 support before calling
+    unsafe { build_l1_index_sse41_impl(l0_min_excess, l0_word_excess, num_l1) }
+}
+
+/// Build L2 index using SSE4.1 SIMD.
+///
+/// Uses the same SIMD pattern as L1 but processes L1 entries (all i16).
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.1")]
+unsafe fn build_l2_index_sse41_impl(
+    l1_min_excess: &[i16],
+    l1_block_excess: &[i16],
+    num_l2: usize,
+) -> (Vec<i16>, Vec<i16>) {
+    use core::arch::x86_64::*;
+
+    let mut l2_min_excess = Vec::with_capacity(num_l2);
+    let mut l2_block_excess = Vec::with_capacity(num_l2);
+
+    let num_l1 = l1_min_excess.len();
+
+    // Bias constant for signed->unsigned conversion
+    let bias = _mm_set1_epi16(i16::MIN);
+
+    for block_idx in 0..num_l2 {
+        let start = block_idx * FACTOR_L2;
+        let end = (start + FACTOR_L2).min(num_l1);
+        let mut block_min: i16 = 0;
+        let mut running_excess: i16 = 0;
+
+        // Process 8 L1 blocks at a time with SIMD
+        let mut i = start;
+        while i + 8 <= end {
+            // Load 8 min_excess values (i16)
+            let min_ptr = l1_min_excess.as_ptr().add(i);
+            let min_vals = _mm_loadu_si128(min_ptr as *const __m128i);
+
+            // Load 8 block_excess values (i16)
+            let excess_ptr = l1_block_excess.as_ptr().add(i);
+            let excess = _mm_loadu_si128(excess_ptr as *const __m128i);
+
+            // Compute prefix sum using parallel prefix pattern
+            let shifted1 = _mm_slli_si128(excess, 2);
+            let sum1 = _mm_add_epi16(excess, shifted1);
+
+            let shifted2 = _mm_slli_si128(sum1, 4);
+            let sum2 = _mm_add_epi16(sum1, shifted2);
+
+            let shifted4 = _mm_slli_si128(sum2, 8);
+            let prefix_sum = _mm_add_epi16(sum2, shifted4);
+
+            // Add running_excess offset
+            let offset = _mm_set1_epi16(running_excess);
+            let adjusted_prefix = _mm_add_epi16(prefix_sum, offset);
+
+            // Exclusive prefix sum
+            let exclusive_prefix = _mm_slli_si128(adjusted_prefix, 2);
+            let exclusive_prefix = _mm_insert_epi16(exclusive_prefix, running_excess as i32, 0);
+
+            // Add to min_excess
+            let adjusted_min = _mm_add_epi16(min_vals, exclusive_prefix);
+
+            // Find minimum with bias trick
+            let biased = _mm_add_epi16(adjusted_min, bias);
+            let minpos = _mm_minpos_epu16(biased);
+            let biased_min = _mm_extract_epi16(minpos, 0) as i16;
+            let chunk_min = biased_min.wrapping_add(i16::MIN);
+
+            block_min = block_min.min(chunk_min);
+
+            // Horizontal sum for running excess
+            let sum_lo = _mm_add_epi16(excess, _mm_srli_si128(excess, 8));
+            let sum_lo = _mm_add_epi16(sum_lo, _mm_srli_si128(sum_lo, 4));
+            let sum_lo = _mm_add_epi16(sum_lo, _mm_srli_si128(sum_lo, 2));
+            running_excess += _mm_extract_epi16(sum_lo, 0) as i16;
+
+            i += 8;
+        }
+
+        // Handle remaining L1 blocks (< 8) with scalar code
+        while i < end {
+            let l1_min = l1_min_excess[i];
+            let l1_excess = l1_block_excess[i];
+            block_min = block_min.min(running_excess + l1_min);
+            running_excess += l1_excess;
+            i += 1;
+        }
+
+        l2_min_excess.push(block_min);
+        l2_block_excess.push(running_excess);
+    }
+
+    (l2_min_excess, l2_block_excess)
+}
+
+/// Safe wrapper for SSE4.1 L2 index building.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+fn build_l2_index_sse41(
+    l1_min_excess: &[i16],
+    l1_block_excess: &[i16],
+    num_l2: usize,
+) -> (Vec<i16>, Vec<i16>) {
+    // SAFETY: We check for SSE4.1 support before calling
+    unsafe { build_l2_index_sse41_impl(l1_min_excess, l1_block_excess, num_l2) }
+}
+
+/// Scalar implementation of L1 index building for testing.
+///
+/// This is the reference implementation that SSE4.1 and NEON should match exactly.
+#[cfg(test)]
+fn build_l1_index_scalar(
+    l0_min_excess: &[i8],
+    l0_word_excess: &[i16],
+    num_l1: usize,
+) -> (Vec<i16>, Vec<i16>) {
+    let mut l1_min_excess = Vec::with_capacity(num_l1);
+    let mut l1_block_excess = Vec::with_capacity(num_l1);
+
+    let num_words = l0_min_excess.len();
+
+    for block_idx in 0..num_l1 {
+        let start = block_idx * FACTOR_L1;
+        let end = (start + FACTOR_L1).min(num_words);
+
+        let mut block_min: i16 = 0;
+        let mut running_excess: i16 = 0;
+
+        for i in start..end {
+            let word_min = l0_min_excess[i] as i16;
+            let word_excess = l0_word_excess[i];
+            block_min = block_min.min(running_excess + word_min);
+            running_excess += word_excess;
+        }
+
+        l1_min_excess.push(block_min);
+        l1_block_excess.push(running_excess);
+    }
+
+    (l1_min_excess, l1_block_excess)
+}
+
+/// Scalar implementation of L2 index building for testing.
+#[cfg(test)]
+fn build_l2_index_scalar(
+    l1_min_excess: &[i16],
+    l1_block_excess: &[i16],
+    num_l2: usize,
+) -> (Vec<i16>, Vec<i16>) {
+    let mut l2_min_excess = Vec::with_capacity(num_l2);
+    let mut l2_block_excess = Vec::with_capacity(num_l2);
+
+    let num_l1 = l1_min_excess.len();
+
+    for block_idx in 0..num_l2 {
+        let start = block_idx * FACTOR_L2;
+        let end = (start + FACTOR_L2).min(num_l1);
+
+        let mut block_min: i16 = 0;
+        let mut running_excess: i16 = 0;
+
+        for i in start..end {
+            let l1_min = l1_min_excess[i];
+            let l1_excess = l1_block_excess[i];
+            block_min = block_min.min(running_excess + l1_min);
+            running_excess += l1_excess;
+        }
+
+        l2_min_excess.push(block_min);
+        l2_block_excess.push(running_excess);
+    }
+
+    (l2_min_excess, l2_block_excess)
+}
+
 /// Fast byte-level scan to find where excess drops to 0.
 ///
 /// Given a word starting at `start_bit`, scans bytes using lookup tables
@@ -1114,12 +1418,46 @@ fn build_bp_index(
     let (l0_min_excess, l0_word_excess) = build_l0_index(words, len, num_words);
 
     // Build L1: per-32-word block statistics
-    // Use NEON SIMD with VMINV on aarch64 for faster prefix-sum and min finding
+    // Use NEON SIMD with VMINV on aarch64, SSE4.1 with PHMINPOSUW on x86_64
     #[cfg(all(feature = "simd", target_arch = "aarch64"))]
     let (l1_min_excess, l1_block_excess) =
         build_l1_index_neon(&l0_min_excess, &l0_word_excess, num_l1);
 
-    #[cfg(not(all(feature = "simd", target_arch = "aarch64")))]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    let (l1_min_excess, l1_block_excess) = {
+        if is_x86_feature_detected!("sse4.1") {
+            build_l1_index_sse41(&l0_min_excess, &l0_word_excess, num_l1)
+        } else {
+            // Fallback to scalar
+            let mut l1_min_excess = Vec::with_capacity(num_l1);
+            let mut l1_block_excess = Vec::with_capacity(num_l1);
+
+            for block_idx in 0..num_l1 {
+                let start = block_idx * FACTOR_L1;
+                let end = (start + FACTOR_L1).min(num_words);
+
+                let mut block_min: i16 = 0;
+                let mut running_excess: i16 = 0;
+
+                for i in start..end {
+                    let word_min = l0_min_excess[i] as i16;
+                    let word_excess = l0_word_excess[i];
+                    block_min = block_min.min(running_excess + word_min);
+                    running_excess += word_excess;
+                }
+
+                l1_min_excess.push(block_min);
+                l1_block_excess.push(running_excess);
+            }
+
+            (l1_min_excess, l1_block_excess)
+        }
+    };
+
+    #[cfg(not(any(
+        all(feature = "simd", target_arch = "aarch64"),
+        all(feature = "simd", target_arch = "x86_64")
+    )))]
     let (l1_min_excess, l1_block_excess) = {
         let mut l1_min_excess = Vec::with_capacity(num_l1);
         let mut l1_block_excess = Vec::with_capacity(num_l1);
@@ -1146,15 +1484,17 @@ fn build_bp_index(
     };
 
     // Build L2: per-1024-word block statistics
-    // Use SIMD on ARM for consistency with L1 (benefit scales with data size)
-    let (l2_min_excess, l2_block_excess) = {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-        {
-            build_l2_index_neon(&l1_min_excess, &l1_block_excess, num_l2)
-        }
+    // Use SIMD on ARM/x86 for consistency with L1 (benefit scales with data size)
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    let (l2_min_excess, l2_block_excess) =
+        build_l2_index_neon(&l1_min_excess, &l1_block_excess, num_l2);
 
-        #[cfg(not(all(feature = "simd", target_arch = "aarch64")))]
-        {
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    let (l2_min_excess, l2_block_excess) = {
+        if is_x86_feature_detected!("sse4.1") {
+            build_l2_index_sse41(&l1_min_excess, &l1_block_excess, num_l2)
+        } else {
+            // Fallback to scalar
             let mut l2_min_excess = Vec::with_capacity(num_l2);
             let mut l2_block_excess = Vec::with_capacity(num_l2);
 
@@ -1178,6 +1518,35 @@ fn build_bp_index(
 
             (l2_min_excess, l2_block_excess)
         }
+    };
+
+    #[cfg(not(any(
+        all(feature = "simd", target_arch = "aarch64"),
+        all(feature = "simd", target_arch = "x86_64")
+    )))]
+    let (l2_min_excess, l2_block_excess) = {
+        let mut l2_min_excess = Vec::with_capacity(num_l2);
+        let mut l2_block_excess = Vec::with_capacity(num_l2);
+
+        for block_idx in 0..num_l2 {
+            let start = block_idx * FACTOR_L2;
+            let end = (start + FACTOR_L2).min(num_l1);
+
+            let mut block_min: i16 = 0;
+            let mut running_excess: i16 = 0;
+
+            for i in start..end {
+                let l1_min = l1_min_excess[i];
+                let l1_excess = l1_block_excess[i];
+                block_min = block_min.min(running_excess + l1_min);
+                running_excess += l1_excess;
+            }
+
+            l2_min_excess.push(block_min);
+            l2_block_excess.push(running_excess);
+        }
+
+        (l2_min_excess, l2_block_excess)
     };
 
     // Build rank directory with ABSOLUTE cumulative values
@@ -2725,5 +3094,336 @@ mod tests {
             word2_excess, 0,
             "Word 2 excess should be 0 (this is what triggered the bug)"
         );
+    }
+
+    // ========================================================================
+    // SSE4.1 vs Scalar Equivalence Tests
+    // ========================================================================
+
+    /// Test that SSE4.1 L1 index building produces identical results to scalar.
+    #[test]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    fn test_sse41_l1_matches_scalar_simple() {
+        if !is_x86_feature_detected!("sse4.1") {
+            println!("SSE4.1 not available, skipping test");
+            return;
+        }
+
+        // Simple case: 32 words (exactly 1 L1 block)
+        let words: Vec<u64> = (0..32).map(|_| 0x5555555555555555u64).collect();
+        let (l0_min, l0_excess) = build_l0_index(&words, 32 * 64, 32);
+        let num_l1 = 1;
+
+        let (scalar_min, scalar_excess) = build_l1_index_scalar(&l0_min, &l0_excess, num_l1);
+        let (sse41_min, sse41_excess) = build_l1_index_sse41(&l0_min, &l0_excess, num_l1);
+
+        assert_eq!(
+            scalar_min, sse41_min,
+            "L1 min_excess mismatch: scalar={:?}, sse41={:?}",
+            scalar_min, sse41_min
+        );
+        assert_eq!(
+            scalar_excess, sse41_excess,
+            "L1 block_excess mismatch: scalar={:?}, sse41={:?}",
+            scalar_excess, sse41_excess
+        );
+    }
+
+    /// Test SSE4.1 L1 with multiple blocks and partial blocks.
+    #[test]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    fn test_sse41_l1_matches_scalar_multiple_blocks() {
+        if !is_x86_feature_detected!("sse4.1") {
+            println!("SSE4.1 not available, skipping test");
+            return;
+        }
+
+        // 100 words = 3 L1 blocks (32 + 32 + 36) with partial last block
+        let words: Vec<u64> = (0..100)
+            .map(|i| if i % 2 == 0 { u64::MAX } else { 0 })
+            .collect();
+        let (l0_min, l0_excess) = build_l0_index(&words, 100 * 64, 100);
+        let num_l1 = 100usize.div_ceil(FACTOR_L1);
+
+        let (scalar_min, scalar_excess) = build_l1_index_scalar(&l0_min, &l0_excess, num_l1);
+        let (sse41_min, sse41_excess) = build_l1_index_sse41(&l0_min, &l0_excess, num_l1);
+
+        assert_eq!(
+            scalar_min, sse41_min,
+            "L1 min_excess mismatch for {} blocks",
+            num_l1
+        );
+        assert_eq!(
+            scalar_excess, sse41_excess,
+            "L1 block_excess mismatch for {} blocks",
+            num_l1
+        );
+    }
+
+    /// Test SSE4.1 L1 with negative excess values (all closes).
+    #[test]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    fn test_sse41_l1_matches_scalar_negative_excess() {
+        if !is_x86_feature_detected!("sse4.1") {
+            println!("SSE4.1 not available, skipping test");
+            return;
+        }
+
+        // All closes = all zeros, so each word has excess -64
+        let words: Vec<u64> = vec![0u64; 64];
+        let (l0_min, l0_excess) = build_l0_index(&words, 64 * 64, 64);
+        let num_l1 = 64usize.div_ceil(FACTOR_L1);
+
+        let (scalar_min, scalar_excess) = build_l1_index_scalar(&l0_min, &l0_excess, num_l1);
+        let (sse41_min, sse41_excess) = build_l1_index_sse41(&l0_min, &l0_excess, num_l1);
+
+        assert_eq!(scalar_min, sse41_min);
+        assert_eq!(scalar_excess, sse41_excess);
+
+        // Verify expected values: each L1 block of 32 words should have
+        // block_excess = 32 * (-64) = -2048
+        assert_eq!(sse41_excess[0], -2048);
+        assert_eq!(sse41_excess[1], -2048);
+    }
+
+    /// Test SSE4.1 L1 with mixed positive and negative excess.
+    #[test]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    fn test_sse41_l1_matches_scalar_mixed_excess() {
+        if !is_x86_feature_detected!("sse4.1") {
+            println!("SSE4.1 not available, skipping test");
+            return;
+        }
+
+        // Alternating pattern: opens then closes
+        let mut words = Vec::new();
+        // First 16 words: all opens
+        words.extend(std::iter::repeat_n(u64::MAX, 16));
+        // Next 16 words: all closes
+        words.extend(std::iter::repeat_n(0u64, 16));
+        // Repeat for second L1 block
+        words.extend(std::iter::repeat_n(u64::MAX, 16));
+        words.extend(std::iter::repeat_n(0u64, 16));
+
+        let (l0_min, l0_excess) = build_l0_index(&words, 64 * 64, 64);
+        let num_l1 = 64usize.div_ceil(FACTOR_L1);
+
+        let (scalar_min, scalar_excess) = build_l1_index_scalar(&l0_min, &l0_excess, num_l1);
+        let (sse41_min, sse41_excess) = build_l1_index_sse41(&l0_min, &l0_excess, num_l1);
+
+        assert_eq!(scalar_min, sse41_min);
+        assert_eq!(scalar_excess, sse41_excess);
+    }
+
+    /// Test SSE4.1 L2 index building produces identical results to scalar.
+    #[test]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    fn test_sse41_l2_matches_scalar() {
+        if !is_x86_feature_detected!("sse4.1") {
+            println!("SSE4.1 not available, skipping test");
+            return;
+        }
+
+        // Create enough L1 blocks to need L2 index (32+ L1 blocks)
+        // 32 L1 blocks * 32 words = 1024 words
+        let words: Vec<u64> = (0..1024)
+            .map(|i| {
+                if i % 3 == 0 {
+                    u64::MAX
+                } else {
+                    0x5555555555555555
+                }
+            })
+            .collect();
+        let (l0_min, l0_excess) = build_l0_index(&words, 1024 * 64, 1024);
+        let num_l1 = 1024usize.div_ceil(FACTOR_L1);
+        let num_l2 = num_l1.div_ceil(FACTOR_L2);
+
+        // Build L1 first (using scalar for consistency)
+        let (l1_min, l1_excess) = build_l1_index_scalar(&l0_min, &l0_excess, num_l1);
+
+        let (scalar_min, scalar_excess) = build_l2_index_scalar(&l1_min, &l1_excess, num_l2);
+        let (sse41_min, sse41_excess) = build_l2_index_sse41(&l1_min, &l1_excess, num_l2);
+
+        assert_eq!(
+            scalar_min, sse41_min,
+            "L2 min_excess mismatch: scalar={:?}, sse41={:?}",
+            scalar_min, sse41_min
+        );
+        assert_eq!(
+            scalar_excess, sse41_excess,
+            "L2 block_excess mismatch: scalar={:?}, sse41={:?}",
+            scalar_excess, sse41_excess
+        );
+    }
+
+    /// Test that full BalancedParens construction with SSE4.1 produces correct results.
+    #[test]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    fn test_sse41_full_construction_correctness() {
+        if !is_x86_feature_detected!("sse4.1") {
+            println!("SSE4.1 not available, skipping test");
+            return;
+        }
+
+        // Large balanced sequence spanning multiple L1/L2 blocks
+        let mut words = Vec::new();
+        // Opens for first half
+        words.extend(std::iter::repeat_n(u64::MAX, 64));
+        // Closes for second half
+        words.extend(std::iter::repeat_n(0u64, 64));
+        let len = 128 * 64;
+
+        let bp = BalancedParens::new(words.clone(), len);
+
+        // Test find_close on various positions
+        for i in 0..64 * 64 {
+            if let Some(close) = bp.find_close(i) {
+                // The matching close should be at the mirror position
+                let expected = len - 1 - i;
+                assert_eq!(
+                    close, expected,
+                    "find_close({}) = {}, expected {}",
+                    i, close, expected
+                );
+            }
+        }
+    }
+
+    /// Test SSE4.1 L1 with edge case: exactly 8 words (one SIMD iteration).
+    #[test]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    fn test_sse41_l1_single_simd_iteration() {
+        if !is_x86_feature_detected!("sse4.1") {
+            println!("SSE4.1 not available, skipping test");
+            return;
+        }
+
+        // Exactly 8 words, so one SIMD iteration with no scalar tail
+        let words: Vec<u64> = vec![
+            u64::MAX,           // +64
+            0,                  // -64
+            0x5555555555555555, // 0
+            0xAAAAAAAAAAAAAAAA, // 0
+            u64::MAX,           // +64
+            u64::MAX,           // +64
+            0,                  // -64
+            0,                  // -64
+        ];
+        let (l0_min, l0_excess) = build_l0_index(&words, 8 * 64, 8);
+        let num_l1 = 1;
+
+        let (scalar_min, scalar_excess) = build_l1_index_scalar(&l0_min, &l0_excess, num_l1);
+        let (sse41_min, sse41_excess) = build_l1_index_sse41(&l0_min, &l0_excess, num_l1);
+
+        assert_eq!(scalar_min, sse41_min);
+        assert_eq!(scalar_excess, sse41_excess);
+    }
+
+    /// Test SSE4.1 L1 with non-aligned block sizes (exercises scalar tail).
+    #[test]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    fn test_sse41_l1_with_scalar_tail() {
+        if !is_x86_feature_detected!("sse4.1") {
+            println!("SSE4.1 not available, skipping test");
+            return;
+        }
+
+        // 37 words = 1 L1 block with 32 words + 5 words in second block
+        // First block: 32 words = 4 SIMD iterations
+        // Second block: 5 words = no SIMD iterations, all scalar
+        let words: Vec<u64> = (0..37)
+            .map(|i| if i % 2 == 0 { u64::MAX } else { 0 })
+            .collect();
+        let (l0_min, l0_excess) = build_l0_index(&words, 37 * 64, 37);
+        let num_l1 = 37usize.div_ceil(FACTOR_L1);
+
+        let (scalar_min, scalar_excess) = build_l1_index_scalar(&l0_min, &l0_excess, num_l1);
+        let (sse41_min, sse41_excess) = build_l1_index_sse41(&l0_min, &l0_excess, num_l1);
+
+        assert_eq!(scalar_min, sse41_min);
+        assert_eq!(scalar_excess, sse41_excess);
+    }
+
+    /// Test SSE4.1 with extreme excess values near i16 limits.
+    #[test]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    fn test_sse41_l1_extreme_excess_values() {
+        if !is_x86_feature_detected!("sse4.1") {
+            println!("SSE4.1 not available, skipping test");
+            return;
+        }
+
+        // Create a sequence with very negative excess
+        // 512 words of all closes = -32768 total excess
+        let words: Vec<u64> = vec![0u64; 512];
+        let (l0_min, l0_excess) = build_l0_index(&words, 512 * 64, 512);
+        let num_l1 = 512usize.div_ceil(FACTOR_L1);
+
+        let (scalar_min, scalar_excess) = build_l1_index_scalar(&l0_min, &l0_excess, num_l1);
+        let (sse41_min, sse41_excess) = build_l1_index_sse41(&l0_min, &l0_excess, num_l1);
+
+        assert_eq!(scalar_min, sse41_min);
+        assert_eq!(scalar_excess, sse41_excess);
+    }
+
+    /// Fuzz-style test: random patterns should produce same results.
+    #[test]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    fn test_sse41_l1_random_patterns() {
+        if !is_x86_feature_detected!("sse4.1") {
+            println!("SSE4.1 not available, skipping test");
+            return;
+        }
+
+        // Generate various patterns
+        let patterns: Vec<Vec<u64>> = vec![
+            // Pattern 1: all ones
+            vec![u64::MAX; 100],
+            // Pattern 2: all zeros
+            vec![0u64; 100],
+            // Pattern 3: alternating words
+            (0..100)
+                .map(|i| if i % 2 == 0 { u64::MAX } else { 0 })
+                .collect(),
+            // Pattern 4: mixed pattern based on index
+            (0..100)
+                .map(|i| {
+                    let shift = i % 64;
+                    (1u64 << shift).wrapping_sub(1)
+                })
+                .collect(),
+            // Pattern 5: pseudo-random using xorshift
+            {
+                let mut state = 0xDEADBEEFu64;
+                (0..100)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state
+                    })
+                    .collect()
+            },
+        ];
+
+        for (pattern_idx, words) in patterns.iter().enumerate() {
+            let (l0_min, l0_excess) = build_l0_index(words, words.len() * 64, words.len());
+            let num_l1 = words.len().div_ceil(FACTOR_L1);
+
+            let (scalar_min, scalar_excess) = build_l1_index_scalar(&l0_min, &l0_excess, num_l1);
+            let (sse41_min, sse41_excess) = build_l1_index_sse41(&l0_min, &l0_excess, num_l1);
+
+            assert_eq!(
+                scalar_min, sse41_min,
+                "L1 min_excess mismatch for pattern {}",
+                pattern_idx
+            );
+            assert_eq!(
+                scalar_excess, sse41_excess,
+                "L1 block_excess mismatch for pattern {}",
+                pattern_idx
+            );
+        }
     }
 }

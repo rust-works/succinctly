@@ -314,6 +314,62 @@ pub unsafe fn select_in_word_bdep(x: u64, k: u32) -> u32 {
 
 ---
 
+## x86 SSE4.1 Horizontal Minimum (PHMINPOSUW)
+
+SSE4.1 provides `PHMINPOSUW` (`_mm_minpos_epu16`) for finding the minimum across 8 unsigned 16-bit values. This is the x86 equivalent of ARM NEON's `vminvq_s16`, but with a key limitation: **unsigned only**.
+
+### Bias Trick for Signed Values
+
+To use PHMINPOSUW with signed i16 values (like min_excess which can be negative):
+
+```rust
+use core::arch::x86_64::*;
+
+#[target_feature(enable = "sse4.1")]
+unsafe fn horizontal_min_i16(values: __m128i) -> i16 {
+    // Bias by 0x8000 to convert signed range [-32768, 32767] to unsigned [0, 65535]
+    let bias = _mm_set1_epi16(i16::MIN);  // 0x8000
+    let biased = _mm_add_epi16(values, bias);
+
+    // Find unsigned minimum with PHMINPOSUW
+    let minpos = _mm_minpos_epu16(biased);
+    let biased_min = _mm_extract_epi16(minpos, 0) as i16;
+
+    // Unbias: wrapping add converts back to signed
+    biased_min.wrapping_add(i16::MIN)
+}
+```
+
+### Application: BP L1/L2 Index Building (2026-01-24)
+
+Used SSE4.1 to accelerate balanced parentheses index construction, mirroring the NEON VMINV optimization.
+
+**Benchmark Results** (AMD Ryzen 9 7950X, Zen 4):
+
+| Size | Scalar | SSE4.1 | Improvement |
+|------|--------|--------|-------------|
+| 10K nodes | 1.97 µs | 1.98 µs | ~0% (neutral) |
+| 100K nodes | 18.96 µs | 18.97 µs | ~0% (neutral) |
+| 1M nodes | 188.0 µs | 197.2 µs | **-5% (regression)** |
+| 10M nodes | 3.15 ms | 3.05 ms | **+3%** |
+| 100M nodes | 31.98 ms | 31.36 ms | **+2%** |
+| 500M nodes | 253.8 ms | 250.6 ms | **+1%** |
+
+**Why SSE4.1 is less effective than ARM NEON**:
+
+| Factor | ARM NEON | x86 SSE4.1 |
+|--------|----------|------------|
+| Horizontal min | `vminvq_s16` (signed direct) | `_mm_minpos_epu16` (unsigned only) |
+| Horizontal sum | `vaddvq_s16` (single instruction) | Multiple shifts + adds |
+| Bias overhead | None needed | +2 ops per block |
+| Result | **2.8x improvement** | **1-3% improvement (large data)** |
+
+**Key insight**: ARM's `vminvq_s16` handles signed values directly in a single instruction. SSE4.1's unsigned-only PHMINPOSUW requires bias/unbias overhead that negates most benefit at typical data sizes. Only at 10M+ nodes does the SSE4.1 path show measurable improvement.
+
+**Future opportunity**: AVX-512 provides `_mm512_reduce_min_epi16` which handles signed 16-bit values directly and processes 32 lanes. This could provide better results on CPUs with efficient AVX-512 execution.
+
+---
+
 ## Runtime Feature Detection
 
 ### x86_64
@@ -666,6 +722,7 @@ isolation but cause regression when integrated due to real-world data characteri
 | NEON       | `json/simd/neon.rs`     | ARM JSON parsing         | 1.11x   |
 | NEON       | `dsv/simd/neon.rs`      | ARM DSV parsing          | 1.8x    |
 | NEON       | `trees/bp.rs`           | BP L1/L2 index (VMINV)   | 2.8x (L1), 1-3% (L2) |
+| SSE4.1     | `trees/bp.rs`           | BP L1/L2 index (PHMINPOSUW) | 1-3% (10M+ nodes) |
 | NEON       | `bits/popcount.rs`      | 256-byte unrolling       | 1.15x   |
 | NEON/AVX2  | `yaml/simd/`            | YAML unquoted structural | 3-8%    |
 | NEON       | `yaml/simd/neon.rs`     | Block scalar scanning    | 11-23%  |

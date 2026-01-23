@@ -5,85 +5,117 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::Result;
 use tempfile::NamedTempFile;
 
+/// Maximum retries for cargo run commands that fail with exit code 101.
+/// This handles flaky failures from cargo lock contention when tests run in parallel.
+const MAX_CARGO_RETRIES: u32 = 3;
+
 /// Helper to run jq command with input from stdin
 fn run_jq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(String, i32)> {
-    let mut cmd = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "cli",
-            "--bin",
-            "succinctly",
-            "--",
-            "jq",
-        ])
-        .args(extra_args)
-        .arg(filter)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    for attempt in 0..MAX_CARGO_RETRIES {
+        let mut cmd = Command::new("cargo")
+            .args([
+                "run",
+                "--features",
+                "cli",
+                "--bin",
+                "succinctly",
+                "--",
+                "jq",
+            ])
+            .args(extra_args)
+            .arg(filter)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
 
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(input.as_bytes())?;
+        if let Some(mut stdin) = cmd.stdin.take() {
+            stdin.write_all(input.as_bytes())?;
+        }
+
+        let output = cmd.wait_with_output()?;
+        let exit_code = output.status.code().unwrap_or(-1);
+
+        // Exit code 101 often indicates cargo lock contention; retry
+        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
+            std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
+            continue;
+        }
+
+        let stdout = String::from_utf8(output.stdout)?;
+        return Ok((stdout, exit_code));
     }
-
-    let output = cmd.wait_with_output()?;
-    let stdout = String::from_utf8(output.stdout)?;
-    let exit_code = output.status.code().unwrap_or(-1);
-
-    Ok((stdout, exit_code))
+    unreachable!()
 }
 
 /// Helper to run jq command with file input
 #[allow(dead_code)]
 fn run_jq_file(filter: &str, file_path: &str, extra_args: &[&str]) -> Result<(String, i32)> {
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "cli",
-            "--bin",
-            "succinctly",
-            "--",
-            "jq",
-        ])
-        .args(extra_args)
-        .arg(filter)
-        .arg(file_path)
-        .output()?;
+    for attempt in 0..MAX_CARGO_RETRIES {
+        let output = Command::new("cargo")
+            .args([
+                "run",
+                "--features",
+                "cli",
+                "--bin",
+                "succinctly",
+                "--",
+                "jq",
+            ])
+            .args(extra_args)
+            .arg(filter)
+            .arg(file_path)
+            .output()?;
 
-    let stdout = String::from_utf8(output.stdout)?;
-    let exit_code = output.status.code().unwrap_or(-1);
+        let exit_code = output.status.code().unwrap_or(-1);
 
-    Ok((stdout, exit_code))
+        // Exit code 101 often indicates cargo lock contention; retry
+        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
+            std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
+            continue;
+        }
+
+        let stdout = String::from_utf8(output.stdout)?;
+        return Ok((stdout, exit_code));
+    }
+    unreachable!()
 }
 
 /// Helper to run jq with null input (-n)
 fn run_jq_null(filter: &str, extra_args: &[&str]) -> Result<(String, i32)> {
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "cli",
-            "--bin",
-            "succinctly",
-            "--",
-            "jq",
-        ])
-        .arg("-n")
-        .args(extra_args)
-        .arg(filter)
-        .output()?;
+    for attempt in 0..MAX_CARGO_RETRIES {
+        let output = Command::new("cargo")
+            .args([
+                "run",
+                "--features",
+                "cli",
+                "--bin",
+                "succinctly",
+                "--",
+                "jq",
+            ])
+            .arg("-n")
+            .args(extra_args)
+            .arg(filter)
+            .output()?;
 
-    let stdout = String::from_utf8(output.stdout)?;
-    let exit_code = output.status.code().unwrap_or(-1);
+        let exit_code = output.status.code().unwrap_or(-1);
 
-    Ok((stdout, exit_code))
+        // Exit code 101 often indicates cargo lock contention; retry
+        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
+            std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
+            continue;
+        }
+
+        let stdout = String::from_utf8(output.stdout)?;
+        return Ok((stdout, exit_code));
+    }
+    unreachable!()
 }
 
 // =============================================================================

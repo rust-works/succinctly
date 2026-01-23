@@ -99,6 +99,19 @@ BP:   ( ( ( ) ( ) ) )
 - RangeMin: O(n) or O(n log n) depending on variant
 - Total: ~6% overhead with optimized RangeMin
 
+## Implementation Optimizations
+
+The RangeMin index construction uses SIMD acceleration on supported platforms:
+
+| Platform | Instruction | Speedup | Notes |
+|----------|-------------|---------|-------|
+| ARM64 | NEON VMINV | **2.8x** | Direct signed horizontal minimum |
+| x86_64 | SSE4.1 PHMINPOSUW | **1-3%** (large data) | Requires bias trick for signed values |
+
+ARM NEON provides `vminvq_s16` which directly computes the minimum across 8 signed 16-bit values. SSE4.1's `PHMINPOSUW` only handles unsigned values, requiring a bias/unbias workaround that adds overhead.
+
+See [SIMD Optimizations](../optimizations/simd.md#x86-sse41-horizontal-minimum-phminposuw) for implementation details.
+
 ## See Also
 
 - [Core Concepts](core-concepts.md) - Theory background

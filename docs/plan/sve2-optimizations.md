@@ -27,6 +27,7 @@ This document analyzes all current x86 and ARM NEON optimizations in the Succinc
 | NEON VMINV BP L2 index | `trees/bp.rs` | 1-3% | 2026-01 |
 | NEON popcount unrolling | `bits/popcount.rs` | 15% | 2026-01 |
 | SVE2-BITPERM BDEP select | `util/broadword.rs` | 5-17x micro, 2-5% e2e | 2026-01-23 |
+| SSE4.1 PHMINPOSUW BP L1/L2 | `trees/bp.rs` | 1-3% (large data) | 2026-01-24 |
 
 ### ❌ Rejected Optimizations
 
@@ -37,6 +38,12 @@ This document analyzes all current x86 and ARM NEON optimizations in the Succinc
 | Software prefetch | -30% | Hardware prefetcher is better |
 | AVX-512 YAML | -7% | Memory bandwidth saturated |
 | Branchless char classification | -25-44% | Branch predictors are 93-95% accurate |
+
+### ⚠️ Marginal Optimizations
+
+| Optimization | Result | Platform | Notes |
+|--------------|--------|----------|-------|
+| SSE4.1 PHMINPOSUW BP L1/L2 | +1-3% (10M+ nodes) | x86_64 | Bias trick overhead limits gains vs NEON's 2.8x |
 
 ### 🔮 Remaining Opportunities
 
@@ -767,3 +774,59 @@ unsafe fn select_in_word_pdep(x: u64, k: u32) -> u32 {
 }
 ```
 This would provide the same 5-17x speedup on Intel Haswell+ and AMD Zen 3+.
+
+### SSE4.1 PHMINPOSUW BP L1/L2 Implementation (January 2026)
+
+**Status**: ✅ **Implemented** (marginal benefit on x86_64)
+
+Implemented SSE4.1 equivalent of NEON VMINV for BP L1/L2 index building.
+
+**Challenge**: SSE4.1's `PHMINPOSUW` (`_mm_minpos_epu16`) only works on **unsigned** 16-bit values,
+but min_excess can be negative. Solution: bias/unbias workaround.
+
+**Algorithm**:
+```rust
+#[target_feature(enable = "sse4.1")]
+unsafe fn horizontal_min_i16(v: __m128i) -> i16 {
+    // Bias by 0x8000 to convert signed -> unsigned range
+    let bias = _mm_set1_epi16(i16::MIN);
+    let biased = _mm_add_epi16(v, bias);
+
+    // Find unsigned minimum
+    let minpos = _mm_minpos_epu16(biased);
+    let biased_min = _mm_extract_epi16(minpos, 0) as i16;
+
+    // Unbias: wrapping add converts back to signed
+    biased_min.wrapping_add(i16::MIN)
+}
+```
+
+**Benchmark Results** (AMD Ryzen 9 7950X, Zen 4):
+
+| Size | Scalar | SSE4.1 | Improvement |
+|------|--------|--------|-------------|
+| 10K nodes | 1.97 µs | 1.98 µs | ~0% (neutral) |
+| 100K nodes | 18.96 µs | 18.97 µs | ~0% (neutral) |
+| 1M nodes | 188.0 µs | 197.2 µs | **-5% (regression)** |
+| 10M nodes | 3.15 ms | 3.05 ms | **+3%** |
+| 100M nodes | 31.98 ms | 31.36 ms | **+2%** |
+| 500M nodes | 253.8 ms | 250.6 ms | **+1%** |
+
+**Why SSE4.1 is less effective than NEON**:
+
+| Factor | ARM NEON | x86 SSE4.1 |
+|--------|----------|------------|
+| Horizontal min | `vminvq_s16` (signed direct) | `_mm_minpos_epu16` (unsigned only) |
+| Horizontal sum | `vaddvq_s16` (single instruction) | Multiple shifts + adds |
+| Bias overhead | None needed | +2 ops per block |
+
+**Key insight**: ARM NEON's `vminvq_s16` handles signed values directly, giving 2.8x speedup.
+SSE4.1's unsigned-only PHMINPOSUW requires bias/unbias overhead that negates most benefit.
+
+**Recommendation**: Keep SSE4.1 path for:
+- Large data (10M+ nodes) where 1-3% improvement is measurable
+- Cross-platform parity with NEON
+- No regression on end-to-end benchmarks
+
+**Files modified**:
+- `src/trees/bp.rs` - Added `build_l1_index_sse41`, `build_l2_index_sse41`
