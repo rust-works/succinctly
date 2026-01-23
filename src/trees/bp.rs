@@ -668,6 +668,7 @@ fn build_l2_index_sse41(
 ///
 /// This is the reference implementation that SSE4.1 and NEON should match exactly.
 #[cfg(test)]
+#[allow(dead_code)]
 fn build_l1_index_scalar(
     l0_min_excess: &[i8],
     l0_word_excess: &[i16],
@@ -701,6 +702,7 @@ fn build_l1_index_scalar(
 
 /// Scalar implementation of L2 index building for testing.
 #[cfg(test)]
+#[allow(dead_code)]
 fn build_l2_index_scalar(
     l1_min_excess: &[i16],
     l1_block_excess: &[i16],
