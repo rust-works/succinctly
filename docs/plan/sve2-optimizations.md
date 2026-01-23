@@ -1,15 +1,65 @@
 # SVE2 Optimization Plan for Succinctly
 
-**Status**: Updated 2026-01-22 - NEON PMULL approach outperforms SVE2 for most ARM platforms
+**Status**: Updated 2026-01-23 - Graviton 4 optimizations complete, low-hanging fruit exhausted
 
 ## Executive Summary
 
 This document analyzes all current x86 and ARM NEON optimizations in the Succinctly codebase and plans SVE2 equivalents for ARM CPUs that support it (Azure Cobalt 100/Neoverse N2, AWS Graviton 3+, etc.).
 
 **Key finding**: SVE2 on Neoverse N2 (GitHub Actions ARM runners) has **128-bit vectors** - the same width as NEON. Therefore, SVE2's value comes from:
-1. **BDEP/BEXT instructions** - equivalent to x86 BMI2 PDEP/PEXT (currently software-emulated on ARM)
-2. **Predicated operations** - cleaner handling of tail bytes without scalar fallbacks
-3. **First-fault loads** - potential for speculative scanning
+1. **BDEP/BEXT instructions** - equivalent to x86 BMI2 PDEP/PEXT ✅ **Implemented**
+2. **Predicated operations** - cleaner handling of tail bytes without scalar fallbacks ❌ **Rejected** (50% slower)
+3. **First-fault loads** - potential for speculative scanning ❌ **Not pursued** (complexity vs benefit)
+
+---
+
+## Graviton 4 Optimization Status (January 2026)
+
+### ✅ Completed Optimizations
+
+| Optimization | Location | Speedup | Date |
+|--------------|----------|---------|------|
+| NEON JSON parsing | `json/simd/neon.rs` | 1.11x | Pre-2026 |
+| NEON YAML block scalars | `yaml/simd/neon.rs` | 11-23% | 2026-01 |
+| NEON YAML anchors | `yaml/simd/neon.rs` | 3-6% | 2026-01 |
+| NEON PMULL prefix XOR | `dsv/simd/neon.rs` | 25% | 2026-01-22 |
+| NEON VMINV BP L1 index | `trees/bp.rs` | 2.8x | 2026-01 |
+| NEON VMINV BP L2 index | `trees/bp.rs` | 1-3% | 2026-01 |
+| NEON popcount unrolling | `bits/popcount.rs` | 15% | 2026-01 |
+| SVE2-BITPERM BDEP select | `util/broadword.rs` | 5-17x micro, 2-5% e2e | 2026-01-23 |
+
+### ❌ Rejected Optimizations
+
+| Attempt | Result | Reason |
+|---------|--------|--------|
+| SVE2 inline assembly (block scalars) | -40% | Compiler can't optimize asm blocks |
+| SVE2 MATCH (multi-char search) | -46% | Same vector width as NEON, more overhead |
+| Software prefetch | -30% | Hardware prefetcher is better |
+| AVX-512 YAML | -7% | Memory bandwidth saturated |
+| Branchless char classification | -25-44% | Branch predictors are 93-95% accurate |
+
+### 🔮 Remaining Opportunities
+
+| Opportunity | Expected Gain | Effort | Platform |
+|-------------|---------------|--------|----------|
+| x86 PDEP select_in_word | 5-17x micro | Low | x86_64 only |
+| LTO (Link-Time Optimization) | 2-5% | Low | All |
+| PGO (Profile-Guided Optimization) | 5-10% | Medium | All |
+| Dead code cleanup (json/simd/bmi2.rs) | 0% (cleanliness) | Low | All |
+
+### Conclusion
+
+**For Graviton 4 (Neoverse-V2), the low-hanging SIMD fruit is exhausted.**
+
+- 128-bit SVE2 vectors don't provide wider-than-NEON benefits
+- SVE2 inline assembly is 40-50% slower than NEON intrinsics
+- Specialized instructions (BDEP via SVEBITPERM) are the only SVE2 win
+- Further gains require algorithmic changes, not SIMD optimizations
+
+**Next steps** (if pursuing further optimization):
+1. Profile real workloads to identify new hotspots
+2. Consider LTO for release builds
+3. Implement x86 PDEP select_in_word for cross-platform parity
 
 ---
 
@@ -702,3 +752,18 @@ End-to-end improvements are modest (2-5%) because:
 **Files modified**:
 - `src/util/simd/sve2.rs` - Added `select_in_word_bdep` function
 - `src/util/broadword.rs` - Added runtime dispatch to BDEP on supported CPUs
+
+**Future work**: Add x86 PDEP equivalent for cross-platform parity:
+```rust
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn select_in_word_pdep(x: u64, k: u32) -> u32 {
+    if x == 0 { return 64; }
+    let pop = x.count_ones();
+    if k >= pop { return 64; }
+    let mask = if k >= 63 { u64::MAX } else { (1u64 << (k + 1)) - 1 };
+    let scattered = _pdep_u64(mask, x);
+    63 - scattered.leading_zeros()
+}
+```
+This would provide the same 5-17x speedup on Intel Haswell+ and AMD Zen 3+.
