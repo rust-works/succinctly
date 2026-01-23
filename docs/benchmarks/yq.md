@@ -251,6 +251,7 @@ The YAML parser uses platform-specific SIMD for hot paths:
 - **P2.7**: Block scalar SIMD - AVX2 newline scanning + indentation checking (19-25% improvement)
 - **P4**: Anchor/Alias SIMD - AVX2 scans for anchor name terminators (6-17% improvement on anchor-heavy workloads)
 - **P9**: Direct YAML-to-JSON streaming - eliminated intermediate DOM for identity queries (8-22% improvement, 2.3x on yq benchmarks)
+- **P11**: BP Select1 for yq-locate - zero-cost generic select support for O(1) offset-to-BP lookups (2.5-5.9x faster select1, fixes issue #26)
 
 **Rejected Optimizations:**
 - **P1 (YFSM)**: Table-driven state machine for string parsing tested but showed only 0-2% improvement vs expected 15-25%. YAML strings are too simple compared to JSON (where PFSM succeeded with 33-77% gains). P0+ SIMD already optimal. See [docs/parsing/yaml.md](../parsing/yaml.md#p1-yfsm-yaml-finite-state-machine---rejected-) for full analysis.
@@ -373,6 +374,37 @@ $ echo 'id: "001"' | succinctly yq -o json '.'
 - **Lower memory usage** on large files
 - **Streaming architecture** for better scalability
 - **Full yq compatibility** for type preservation
+
+---
+
+## BP Select1 Micro-benchmark (P11)
+
+The `bp_select_micro` benchmark measures the performance of select1 queries on balanced parentheses, comparing the new sampled select index (WithSelect) against the old binary search on rank1 approach.
+
+### Results (Apple M1 Max, 10K queries each)
+
+| BP Size    | select1 (new) | binary_search_rank1 (old) | Speedup  |
+|------------|---------------|---------------------------|----------|
+| 1K opens   | 326 µs        | 820 µs                    | **2.5x** |
+| 10K opens  | 318 µs        | 1.31 ms                   | **4.1x** |
+| 100K opens | 308 µs        | 1.68 ms                   | **5.4x** |
+| 1M opens   | 356 µs        | 2.10 ms                   | **5.9x** |
+
+### Key Observations
+
+- **select1 stays nearly constant**: ~310-356 µs regardless of BP size (O(1) amortized)
+- **binary_search scales with log(n)**: 820 µs → 2.10 ms as BP grows from 1K to 1M
+- **Larger documents benefit more**: 5.9x speedup at 1M opens vs 2.5x at 1K
+
+### Why It Matters
+
+This optimization enables fast `yq-locate` queries on large YAML documents. The `find_bp_at_text_pos()` function uses select1 to convert from an index in `bp_to_text` back to a BP position.
+
+Run with:
+```bash
+cargo bench --bench bp_select_micro
+```
+
 ---
 
 ## Reproducing Benchmarks
@@ -389,6 +421,9 @@ cargo bench --bench yq_comparison
 
 # Run selection/lazy evaluation benchmarks
 cargo bench --bench yq_select
+
+# Run BP select1 micro-benchmark
+cargo bench --bench bp_select_micro
 
 # Or use the CLI for manual testing
 ./target/release/succinctly yq -o json -I 0 . input.yaml

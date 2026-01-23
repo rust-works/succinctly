@@ -33,6 +33,91 @@ use alloc::vec::Vec;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+use crate::bits::popcount::popcount_word;
+use crate::bits::SelectIndex;
+use crate::util::broadword::select_in_word;
+
+// ============================================================================
+// Select support traits for zero-cost abstraction
+// ============================================================================
+
+/// Trait for optional select support on balanced parentheses.
+///
+/// This enables zero-cost abstraction: JSON uses `NoSelect` (ZST, no overhead),
+/// while YAML uses `WithSelect` for O(1) select1 queries.
+pub trait SelectSupport: Clone + Default {
+    /// Build select support from word data.
+    fn build(words: &[u64], total_ones: usize) -> Self;
+
+    /// Perform select1 query: find the position of the k-th 1-bit (0-indexed).
+    /// Returns None if k >= total_ones.
+    fn select1(&self, words: &[u64], len: usize, total_ones: usize, k: usize) -> Option<usize>;
+}
+
+/// No select support (zero-sized type for JSON).
+///
+/// This is a ZST that adds no memory overhead. The select1 method falls back
+/// to binary search using rank1 when needed.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct NoSelect;
+
+impl SelectSupport for NoSelect {
+    #[inline]
+    fn build(_words: &[u64], _total_ones: usize) -> Self {
+        NoSelect
+    }
+
+    #[inline]
+    fn select1(&self, _words: &[u64], _len: usize, _total_ones: usize, _k: usize) -> Option<usize> {
+        // NoSelect doesn't support select1 - caller should use binary search on rank1
+        None
+    }
+}
+
+/// Select support using sampled index (for YAML).
+///
+/// Uses the existing SelectIndex from bits module for O(1) jump + short scan.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct WithSelect {
+    select_idx: SelectIndex,
+}
+
+impl SelectSupport for WithSelect {
+    fn build(words: &[u64], total_ones: usize) -> Self {
+        // Use default sample rate of 256 for ~3% overhead
+        WithSelect {
+            select_idx: SelectIndex::build(words, total_ones, 256),
+        }
+    }
+
+    fn select1(&self, words: &[u64], len: usize, total_ones: usize, k: usize) -> Option<usize> {
+        if k >= total_ones {
+            return None;
+        }
+
+        // Use select index to jump to approximate position
+        let (start_word, mut remaining) = self.select_idx.jump_to(k);
+
+        // Scan words from the starting position
+        for (word_idx, &word) in words.iter().enumerate().skip(start_word) {
+            let pop = popcount_word(word) as usize;
+
+            if pop > remaining {
+                // Found the target word
+                let bit_pos = select_in_word(word, remaining as u32) as usize;
+                let result = word_idx * 64 + bit_pos;
+                return if result < len { Some(result) } else { None };
+            }
+
+            remaining -= pop;
+        }
+
+        None
+    }
+}
+
 // ============================================================================
 // Byte lookup tables for fast word_min_excess computation
 // ============================================================================
@@ -668,6 +753,7 @@ fn build_l2_index_sse41(
 ///
 /// This is the reference implementation that SSE4.1 and NEON should match exactly.
 #[cfg(test)]
+#[allow(dead_code)]
 fn build_l1_index_scalar(
     l0_min_excess: &[i8],
     l0_word_excess: &[i16],
@@ -701,6 +787,7 @@ fn build_l1_index_scalar(
 
 /// Scalar implementation of L2 index building for testing.
 #[cfg(test)]
+#[allow(dead_code)]
 fn build_l2_index_scalar(
     l1_min_excess: &[i16],
     l1_block_excess: &[i16],
@@ -1348,11 +1435,13 @@ const FACTOR_L2: usize = 32;
 /// ```
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct BalancedParens<W = Vec<u64>> {
+pub struct BalancedParens<W = Vec<u64>, S: SelectSupport = NoSelect> {
     /// The underlying bit vector (1=open, 0=close)
     words: W,
     /// Number of valid bits
     len: usize,
+    /// Total number of 1-bits (open parentheses)
+    total_ones: usize,
 
     // --- Min-excess indices for find_close (same as original) ---
     /// L0: Per-word min excess (signed, relative to start of word)
@@ -1378,9 +1467,15 @@ pub struct BalancedParens<W = Vec<u64>> {
     /// Cumulative 1-bit count within each 512-bit block (7 x 9-bit offsets packed)
     /// rank_l2[block] contains offsets for words 1-7 within the block.
     rank_l2: Vec<u64>,
+
+    // --- Optional select support (zero-cost when NoSelect) ---
+    /// Select index for O(1) select1 queries (ZST for NoSelect)
+    select: S,
 }
 
 /// Build the V2 index structures with absolute cumulative rank.
+/// Returns (l0_min_excess, l0_word_excess, l1_min_excess, l1_block_excess,
+///          l2_min_excess, l2_block_excess, rank_l1, rank_l2, total_ones)
 #[allow(clippy::type_complexity)]
 fn build_bp_index(
     words: &[u64],
@@ -1394,6 +1489,7 @@ fn build_bp_index(
     Vec<i16>,
     Vec<u32>,
     Vec<u64>,
+    usize,
 ) {
     if words.is_empty() || len == 0 {
         return (
@@ -1405,6 +1501,7 @@ fn build_bp_index(
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            0,
         );
     }
 
@@ -1587,11 +1684,14 @@ fn build_bp_index(
         l2_block_excess,
         rank_l1,
         rank_l2,
+        cumulative_rank as usize,
     )
 }
 
-impl BalancedParens<Vec<u64>> {
+impl BalancedParens<Vec<u64>, NoSelect> {
     /// Build from an owned bitvector representing balanced parentheses.
+    ///
+    /// Creates a BalancedParens without select support (default for JSON).
     pub fn new(words: Vec<u64>, len: usize) -> Self {
         let (
             l0_min_excess,
@@ -1602,11 +1702,13 @@ impl BalancedParens<Vec<u64>> {
             l2_block_excess,
             rank_l1,
             rank_l2,
+            total_ones,
         ) = build_bp_index(&words, len);
 
         Self {
             words,
             len,
+            total_ones,
             l0_min_excess,
             l0_word_excess,
             l1_min_excess,
@@ -1615,13 +1717,51 @@ impl BalancedParens<Vec<u64>> {
             l2_block_excess,
             rank_l1,
             rank_l2,
+            select: NoSelect,
         }
     }
 }
 
-impl<W: AsRef<[u64]>> BalancedParens<W> {
+impl BalancedParens<Vec<u64>, WithSelect> {
+    /// Build from an owned bitvector with select support enabled.
+    ///
+    /// Creates a BalancedParens with O(1) select1 support (for YAML).
+    pub fn new_with_select(words: Vec<u64>, len: usize) -> Self {
+        let (
+            l0_min_excess,
+            l0_word_excess,
+            l1_min_excess,
+            l1_block_excess,
+            l2_min_excess,
+            l2_block_excess,
+            rank_l1,
+            rank_l2,
+            total_ones,
+        ) = build_bp_index(&words, len);
+
+        let select = WithSelect::build(&words, total_ones);
+
+        Self {
+            words,
+            len,
+            total_ones,
+            l0_min_excess,
+            l0_word_excess,
+            l1_min_excess,
+            l1_block_excess,
+            l2_min_excess,
+            l2_block_excess,
+            rank_l1,
+            rank_l2,
+            select,
+        }
+    }
+}
+
+impl<W: AsRef<[u64]>> BalancedParens<W, NoSelect> {
     /// Build from a generic storage type representing balanced parentheses.
     ///
+    /// Creates a BalancedParens without select support (default for JSON).
     /// This is useful for borrowed data, e.g., from mmap.
     pub fn from_words(words: W, len: usize) -> Self {
         let (
@@ -1633,11 +1773,13 @@ impl<W: AsRef<[u64]>> BalancedParens<W> {
             l2_block_excess,
             rank_l1,
             rank_l2,
+            total_ones,
         ) = build_bp_index(words.as_ref(), len);
 
         Self {
             words,
             len,
+            total_ones,
             l0_min_excess,
             l0_word_excess,
             l1_min_excess,
@@ -1646,9 +1788,49 @@ impl<W: AsRef<[u64]>> BalancedParens<W> {
             l2_block_excess,
             rank_l1,
             rank_l2,
+            select: NoSelect,
         }
     }
+}
 
+impl<W: AsRef<[u64]>> BalancedParens<W, WithSelect> {
+    /// Build from a generic storage type with select support enabled.
+    ///
+    /// Creates a BalancedParens with O(1) select1 support (for YAML).
+    /// This is useful for borrowed data, e.g., from mmap.
+    pub fn from_words_with_select(words: W, len: usize) -> Self {
+        let (
+            l0_min_excess,
+            l0_word_excess,
+            l1_min_excess,
+            l1_block_excess,
+            l2_min_excess,
+            l2_block_excess,
+            rank_l1,
+            rank_l2,
+            total_ones,
+        ) = build_bp_index(words.as_ref(), len);
+
+        let select = WithSelect::build(words.as_ref(), total_ones);
+
+        Self {
+            words,
+            len,
+            total_ones,
+            l0_min_excess,
+            l0_word_excess,
+            l1_min_excess,
+            l1_block_excess,
+            l2_min_excess,
+            l2_block_excess,
+            rank_l1,
+            rank_l2,
+            select,
+        }
+    }
+}
+
+impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
     /// Get the length in bits.
     #[inline]
     pub fn len(&self) -> usize {
@@ -1665,6 +1847,22 @@ impl<W: AsRef<[u64]>> BalancedParens<W> {
     #[inline]
     pub fn words(&self) -> &[u64] {
         self.words.as_ref()
+    }
+
+    /// Get the total number of 1-bits (open parentheses).
+    #[inline]
+    pub fn total_ones(&self) -> usize {
+        self.total_ones
+    }
+
+    /// Find the position of the k-th 1-bit (0-indexed).
+    ///
+    /// Returns `None` if k >= total_ones.
+    /// Uses the select index if available (WithSelect), otherwise returns None.
+    #[inline]
+    pub fn select1(&self, k: usize) -> Option<usize> {
+        self.select
+            .select1(self.words.as_ref(), self.len, self.total_ones, k)
     }
 
     /// Check if the bit at position p is a 1 (open parenthesis).

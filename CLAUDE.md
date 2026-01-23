@@ -388,3 +388,16 @@ For detailed documentation on optimization techniques used in this project, see 
   - Created comprehensive test suite: 32 tests including 8 direct byte-for-byte comparisons with system `yq`
   - **Key achievement**: `succinctly yq` is now a drop-in replacement for `yq` for supported arguments
   - See [docs/parsing/yaml.md#p10-type-preservation---accepted-](docs/parsing/yaml.md#p10-type-preservation---accepted-) for full analysis
+- ✅ P11 (BP Select1 for yq-locate): **2.5-5.9x faster** select1 queries, fixes issue #26
+  - Added zero-cost generic `SelectSupport` trait to `BalancedParens<W, S>` (NoSelect for JSON, WithSelect for YAML)
+  - `find_bp_at_text_pos()` now uses O(1) sampled select1 instead of O(log n) binary search on rank1
+  - **Micro-benchmark speedups** (10K queries):
+    - 1K opens: 326µs vs 820µs (**2.5x** faster)
+    - 10K opens: 318µs vs 1.31ms (**4.1x** faster)
+    - 100K opens: 308µs vs 1.68ms (**5.4x** faster)
+    - 1M opens: 356µs vs 2.10ms (**5.9x** faster)
+  - **End-to-end yq benchmarks**: 1MB identity query 3.1% faster (14.45ms → 14.00ms)
+  - **Trade-off**: 2-4% regression in yaml_bench (SelectIndex build cost) but benefits `yq-locate` use case
+  - **Zero-cost for JSON**: Uses `NoSelect` (ZST) - no memory or runtime overhead
+  - **Fixes GitHub issue #26**: YAML `at_offset` and `yq-locate` now return correct nodes
+  - See [docs/parsing/yaml.md#p11-bp-select1-for-yq-locate---accepted-](docs/parsing/yaml.md#p11-bp-select1-for-yq-locate---accepted-) for full analysis

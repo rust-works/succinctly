@@ -71,34 +71,8 @@ fn escape_jq_string(s: &str) -> String {
     result
 }
 
-/// Convert an IB index to a BP position.
-fn ib_index_to_bp_pos<W: AsRef<[u64]>>(index: &YamlIndex<W>, ib_idx: usize) -> Option<usize> {
-    let bp = index.bp();
-    let bp_len = bp.len();
-
-    if bp_len == 0 {
-        return None;
-    }
-
-    let mut lo = 0;
-    let mut hi = bp_len;
-
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let count = bp.rank1(mid + 1);
-        if count <= ib_idx {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-
-    if lo < bp_len && bp.rank1(lo + 1) == ib_idx + 1 {
-        Some(lo)
-    } else {
-        None
-    }
-}
+// text_pos_to_bp_pos is now implemented as YamlIndex::find_bp_at_text_pos
+// which uses binary search on bp_to_text for O(log n) lookup.
 
 /// Find the BP position of the structural node containing a byte offset.
 fn find_node_at_offset<W: AsRef<[u64]>>(
@@ -110,23 +84,28 @@ fn find_node_at_offset<W: AsRef<[u64]>>(
         return None;
     }
 
+    // Get the rank at this position (count of IB bits in [0, offset))
     let rank = index.ib_rank1(offset);
 
-    let ib_idx = if let Some(struct_pos) = index.ib_select1(rank) {
+    // Determine which structural element contains this offset
+    let struct_text_pos = if let Some(struct_pos) = index.ib_select1(rank) {
         if struct_pos == offset {
-            rank
+            // We're exactly at a structural position - use this one
+            struct_pos
         } else if rank > 0 {
-            rank - 1
+            // We're inside a value - the containing node started at the previous IB bit
+            index.ib_select1(rank - 1)?
         } else {
             return None;
         }
     } else if rank > 0 {
-        rank - 1
+        index.ib_select1(rank - 1)?
     } else {
         return None;
     };
 
-    ib_index_to_bp_pos(index, ib_idx)
+    // Find the BP position for this text position using binary search
+    index.find_bp_at_text_pos(struct_text_pos)
 }
 
 /// Count siblings before target_bp in a container.

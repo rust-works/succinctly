@@ -13,7 +13,7 @@ use alloc::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeMap;
 
-use crate::trees::BalancedParens;
+use crate::trees::{BalancedParens, WithSelect};
 use crate::util::broadword::select_in_word;
 
 use super::error::YamlError;
@@ -25,6 +25,10 @@ use super::parser::build_semi_index;
 /// The type parameter `W` controls how the underlying data is stored:
 /// - `Vec<u64>` for owned data (built from YAML text)
 /// - `&[u64]` for borrowed data (e.g., from mmap)
+///
+/// Unlike JSON, YAML uses `WithSelect` for the balanced parentheses structure
+/// because YAML has more BP opens than IB bits (containers don't have IB bits),
+/// requiring efficient select1 queries for offset-to-BP lookups.
 #[derive(Clone, Debug)]
 pub struct YamlIndex<W = Vec<u64>> {
     /// Interest bits - marks positions of structural elements
@@ -33,8 +37,9 @@ pub struct YamlIndex<W = Vec<u64>> {
     ib_len: usize,
     /// Cumulative popcount per word (for fast rank/select on IB)
     ib_rank: Vec<u32>,
-    /// Balanced parentheses - encodes the YAML structure as a tree
-    bp: BalancedParens<W>,
+    /// Balanced parentheses - encodes the YAML structure as a tree.
+    /// Uses WithSelect for O(1) select1 queries needed by find_bp_at_text_pos.
+    bp: BalancedParens<W, WithSelect>,
     /// Type bits - 0 = mapping, 1 = sequence at each container position
     ty: W,
     /// Number of valid bits in TY
@@ -159,7 +164,7 @@ impl YamlIndex<Vec<u64>> {
             ib: semi.ib,
             ib_len,
             ib_rank,
-            bp: BalancedParens::new(semi.bp, semi.bp_len),
+            bp: BalancedParens::new_with_select(semi.bp, semi.bp_len),
             ty: semi.ty,
             ty_len: semi.ty_len,
             bp_to_text: semi.bp_to_text,
@@ -207,7 +212,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             ib,
             ib_len,
             ib_rank,
-            bp: BalancedParens::from_words(bp, bp_len),
+            bp: BalancedParens::from_words_with_select(bp, bp_len),
             ty,
             ty_len,
             bp_to_text,
@@ -254,7 +259,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             ib,
             ib_len,
             ib_rank,
-            bp: BalancedParens::from_words(bp, bp_len),
+            bp: BalancedParens::from_words_with_select(bp, bp_len),
             ty,
             ty_len,
             bp_to_text,
@@ -311,7 +316,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
 
     /// Get a reference to the balanced parentheses.
     #[inline]
-    pub fn bp(&self) -> &BalancedParens<W> {
+    pub fn bp(&self) -> &BalancedParens<W, WithSelect> {
         &self.bp
     }
 
@@ -461,6 +466,51 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     #[cfg(test)]
     pub fn debug_bp_to_text(&self) -> &[u32] {
         &self.bp_to_text
+    }
+
+    /// Get a reference to the bp_to_text array.
+    ///
+    /// This array maps BP open index to text byte offset. It is sorted in
+    /// non-decreasing order (multiple opens can have the same text position
+    /// when containers share position with their first child).
+    #[inline]
+    pub fn bp_to_text(&self) -> &[u32] {
+        &self.bp_to_text
+    }
+
+    /// Find the BP position for the deepest node starting at a given text position.
+    ///
+    /// Uses binary search on bp_to_text to find the last open_idx with matching
+    /// text position, then O(1) select1 to convert to BP position.
+    /// Returns None if no match found.
+    pub fn find_bp_at_text_pos(&self, text_pos: usize) -> Option<usize> {
+        let bp_to_text = &self.bp_to_text;
+        if bp_to_text.is_empty() {
+            return None;
+        }
+
+        let text_pos_u32 = text_pos as u32;
+
+        // Binary search to find any matching position
+        let search_result = bp_to_text.binary_search(&text_pos_u32);
+
+        // Find the last (rightmost) index with this text position
+        // (deepest node when multiple nodes share the same text position)
+        let last_match_idx = match search_result {
+            Ok(idx) => {
+                // Found a match, scan right to find the last one
+                let mut last = idx;
+                while last + 1 < bp_to_text.len() && bp_to_text[last + 1] == text_pos_u32 {
+                    last += 1;
+                }
+                last
+            }
+            Err(_) => return None, // No match found
+        };
+
+        // Convert open_idx to bp_pos using O(1) select1
+        // select1(k) returns the position of the k-th 1-bit (0-indexed)
+        self.bp.select1(last_match_idx)
     }
 
     /// Get the target BP position for an alias at the given BP position.

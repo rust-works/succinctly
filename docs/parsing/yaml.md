@@ -3995,6 +3995,149 @@ Both `succinctly yq` and system `yq` now use the exact same CLI arguments in ben
 
 ---
 
+## P11: BP Select1 for yq-locate - ACCEPTED ✅
+
+### Problem Statement
+
+GitHub issue #26 reported that `yq-locate` and `at_offset` returned incorrect nodes for certain byte offsets. Investigation revealed that YAML has more BP opens than IB bits (containers don't have IB bits), causing the naive IB-to-BP mapping to fail.
+
+The fix required an efficient way to convert from `open_idx` (index into `bp_to_text`) back to `bp_pos` (position in the BP bitvector).
+
+### Root Cause
+
+YAML's BP structure differs from JSON:
+- **JSON**: 1:1 correspondence between IB bits and BP opens
+- **YAML**: Containers (mappings/sequences) don't have IB bits, only values do
+
+Formula discovered: `open_idx = ib_idx + containers_before(bp_pos)`
+
+This means we can't simply use `ib_idx` as `open_idx` - we need to account for containers.
+
+### Solution: Zero-Cost Generic SelectSupport
+
+Added a generic `SelectSupport` trait to `BalancedParens`:
+
+```rust
+pub trait SelectSupport: Clone + Default {
+    fn build(words: &[u64], total_ones: usize) -> Self;
+    fn select1(&self, words: &[u64], len: usize, total_ones: usize, k: usize) -> Option<usize>;
+}
+
+// Zero-sized type for JSON (no overhead)
+pub struct NoSelect;
+
+// Sampled select index for YAML
+pub struct WithSelect {
+    select_idx: SelectIndex,  // Samples every 256th 1-bit
+}
+
+// BP is now generic over select support
+pub struct BalancedParens<W = Vec<u64>, S: SelectSupport = NoSelect> { ... }
+```
+
+### Why Zero-Cost for JSON
+
+- `NoSelect` is a zero-sized type (ZST) - occupies 0 bytes in the struct
+- Rust monomorphizes: `BalancedParens<Vec<u64>, NoSelect>` generates separate code with no select overhead
+- JSON continues using `BalancedParens::new()` which defaults to `NoSelect`
+- YAML uses `BalancedParens::new_with_select()` to enable select support
+
+### Implementation Details
+
+**WithSelect** uses a sampled select index:
+- Stores position of every 256th 1-bit
+- `select1(k)` = O(1) jump to sample + O(sample_rate/64) scan ≈ O(1) amortized
+- Memory overhead: ~3% (8 bytes per 256 ones)
+
+**find_bp_at_text_pos** simplified from:
+```rust
+// OLD: O(log n) binary search on rank1
+let mut lo = 0;
+let mut hi = bp_len;
+while lo < hi {
+    let mid = lo + (hi - lo) / 2;
+    if bp.rank1(mid + 1) < target_rank { lo = mid + 1; }
+    else { hi = mid; }
+}
+```
+
+To:
+```rust
+// NEW: O(1) select1
+self.bp.select1(last_match_idx)
+```
+
+### Benchmark Results
+
+#### Micro-benchmark: BP select1 vs binary search on rank1 (10K queries)
+
+| BP Size    | select1 (new) | binary_search_rank1 (old) | Speedup  |
+|------------|---------------|---------------------------|----------|
+| 1K opens   | 326 µs        | 820 µs                    | **2.5x** |
+| 10K opens  | 318 µs        | 1.31 ms                   | **4.1x** |
+| 100K opens | 308 µs        | 1.68 ms                   | **5.4x** |
+| 1M opens   | 356 µs        | 2.10 ms                   | **5.9x** |
+
+Key observation: select1 time stays nearly constant (~310-356 µs) while binary search scales with O(log n).
+
+#### End-to-end: yq_comparison (Apple M1 Max)
+
+| Size | Change |
+|------|--------|
+| 10KB | +2.4% improvement |
+| 100KB | within noise |
+| 1MB (succinctly) | **-3.1% improvement** (14.45ms → 14.00ms) |
+
+#### End-to-end: yaml_bench (Apple M1 Max)
+
+| Workload | Change |
+|----------|--------|
+| anchors/100 | +4.3% regression |
+| anchors/1000 | no change |
+| anchors/5000 | +2.7% regression |
+| k8s_10 | +2.4% regression |
+| k8s_50 | no change |
+| k8s_100 | no change |
+
+### Trade-offs
+
+**Benefits:**
+- ✅ Fixes issue #26 (correct `yq-locate` output)
+- ✅ 2.5-5.9x faster select1 queries
+- ✅ Zero cost for JSON (uses NoSelect ZST)
+- ✅ 3.1% faster yq identity queries on large files
+
+**Costs:**
+- ⚠️ 2-4% regression in yaml_bench (SelectIndex build cost)
+- ⚠️ ~3% additional memory for YAML's SelectIndex
+
+### When to Use
+
+The optimization benefits:
+- `yq-locate` CLI tool (offset-to-path lookups)
+- Any code calling `find_bp_at_text_pos()` repeatedly
+- Large YAML documents where log(n) binary search iterations matter
+
+The build cost is acceptable because:
+- `yq-locate` is the primary use case for `find_bp_at_text_pos`
+- SelectIndex build is O(n) but amortizes over multiple queries
+- Most YAML processing doesn't need select1 at all (uses cursor navigation)
+
+### Files Modified
+
+- `src/trees/bp.rs` - Added `SelectSupport`, `NoSelect`, `WithSelect`, generic `BalancedParens<W, S>`
+- `src/trees/mod.rs` - Exported new types
+- `src/yaml/index.rs` - Changed to `BalancedParens<W, WithSelect>`, simplified `find_bp_at_text_pos()`
+- `benches/bp_select_micro.rs` - New micro-benchmark for select1 performance
+
+### Key Learnings
+
+1. **Zero-cost abstractions work**: Rust's monomorphization eliminates all overhead for the NoSelect case
+2. **Trade-off is acceptable**: Small build cost for correct functionality + faster lookups
+3. **Sampled select is "good enough"**: True O(1) select requires more memory; sampled approach is practical
+
+---
+
 ## References
 
 ### YAML Specification
