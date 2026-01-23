@@ -659,4 +659,46 @@ The YAML optimization history (see [docs/parsing/yaml.md](../parsing/yaml.md)) d
    - Blocked loop unrolling
    - Extra predicate management overhead
 6. **Wait for stable intrinsics** - Only use SVE2 when Rust stabilizes `#![feature(stdarch_aarch64_sve)]`
-7. **SVE2 value is in specialized instructions** - BDEP/BEXT (via SVEBITPERM) is the only current win; general ops lose to optimized NEON
+7. **SVE2 value is in specialized instructions** - BDEP/BEXT (via SVEBITPERM) provides wins; general ops lose to optimized NEON
+8. **BDEP wins for select_in_word** - 5-17x faster than CTZ loop for k > 0 (✅ implemented January 2026)
+
+### SVE2 BDEP select_in_word Implementation (January 2026)
+
+**Status**: ✅ **Implemented and deployed**
+
+Used SVE2 BDEP instruction to accelerate the `select_in_word` function which finds the k-th set bit in a 64-bit word.
+
+**Algorithm** (PDEP-style):
+```rust
+let mask = (1u64 << (k + 1)) - 1;  // k+1 low bits set
+let scattered = bdep(mask, x);     // Scatter to bit positions
+63 - scattered.leading_zeros()     // Find highest bit
+```
+
+**Benchmark Results** (AWS Graviton 4):
+
+| Scenario | CTZ Loop | BDEP | Speedup |
+|----------|----------|------|---------|
+| sparse (k=0) | 0.88 ns | 1.78 ns | 0.5x |
+| dense (all bits) | 20.4 ns | 1.7 ns | **12x** |
+| high_k (k=32-63) | 30.8 ns | 1.8 ns | **17x** |
+| mixed patterns | 9.6 ns | 1.8 ns | **5.4x** |
+
+**Key insight**: CTZ loop is O(k) while BDEP is O(1). For bitvectors with varied densities, BDEP wins decisively.
+
+**End-to-end benchmark results** (full select1 operations):
+
+| Benchmark | Change | Notes |
+|-----------|--------|-------|
+| select1/1M/90% | **-4.9%** | Dense bitvectors benefit most |
+| select1/10M/50% | **-1.8%** | Modest improvement |
+| select_in_word/alternating | **-2.6%** | Per-call improvement visible |
+
+End-to-end improvements are modest (2-5%) because:
+1. SelectIndex provides O(1) jump to approximate position
+2. Most selects only need 1-2 select_in_word calls
+3. Dense patterns (90%) show best improvement where k values are higher
+
+**Files modified**:
+- `src/util/simd/sve2.rs` - Added `select_in_word_bdep` function
+- `src/util/broadword.rs` - Added runtime dispatch to BDEP on supported CPUs

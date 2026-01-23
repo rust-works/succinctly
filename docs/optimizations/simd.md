@@ -13,6 +13,7 @@ SIMD enables parallel processing of multiple data elements with a single instruc
 | BMI2         | 64-bit  | x86_64   | PDEP, PEXT                 | Bit manipulation      |
 | NEON         | 128-bit | ARM64    | TBL, CNT, parallel ops     | ARM baseline          |
 | PMULL        | 64→128  | ARM64    | Carryless multiply         | Prefix XOR (DSV)      |
+| SVE2-BITPERM | 64-bit  | ARM64    | BDEP, BEXT                 | Bit deposit/extract   |
 
 ---
 
@@ -262,6 +263,54 @@ block minimums in a single instruction instead of a scalar loop.
 2. Compute prefix sums using parallel prefix (3 shuffle+add steps)
 3. Add offset to all values
 4. Use VMINV/VMAXV to find min/max in one instruction
+
+---
+
+## ARM SVE2-BITPERM (Graviton 4+)
+
+SVE2-BITPERM provides BDEP (bit deposit) and BEXT (bit extract) instructions equivalent to x86 BMI2 PDEP/PEXT. Available on Neoverse-V2 (AWS Graviton 4) and Azure Cobalt 100.
+
+### BDEP for select_in_word (2026-01-23)
+
+The `select_in_word(x, k)` function finds the position of the k-th set bit in a 64-bit word. The BDEP implementation provides O(1) complexity vs O(k) for the CTZ loop:
+
+```rust
+#[target_feature(enable = "sve2-bitperm")]
+pub unsafe fn select_in_word_bdep(x: u64, k: u32) -> u32 {
+    if x == 0 { return 64; }
+    let pop = x.count_ones();
+    if k >= pop { return 64; }
+
+    // Create mask with k+1 low bits set
+    let mask = if k >= 63 { u64::MAX } else { (1u64 << (k + 1)) - 1 };
+
+    // BDEP scatters the mask bits to positions where x has set bits
+    let scattered = bdep_u64(mask, x);
+
+    // Find highest set bit (the k-th bit position)
+    63 - scattered.leading_zeros()
+}
+```
+
+**Micro-benchmark results** (AWS Graviton 4):
+
+| Pattern | CTZ Loop | BDEP | Speedup |
+|---------|----------|------|---------|
+| sparse (k=0) | 0.88 ns | 1.78 ns | 0.5x (CTZ wins) |
+| dense (64 bits) | 20.4 ns | 1.7 ns | **12x** |
+| high_k (k=32-63) | 30.8 ns | 1.8 ns | **17x** |
+| mixed patterns | 9.6 ns | 1.8 ns | **5.4x** |
+
+**End-to-end results** (full select1 operations):
+
+| Benchmark | Change | Notes |
+|-----------|--------|-------|
+| select1/1M/90% | **-4.9%** | Dense bitvectors benefit most |
+| select1/10M/50% | **-1.8%** | Modest improvement |
+
+**Why modest end-to-end improvement**: SelectIndex provides O(1) jump to approximate position, so most selects only need 1-2 `select_in_word` calls. The optimization benefits dense patterns most.
+
+**Platform support**: Requires SVE2-BITPERM (Graviton 4+). Falls back to CTZ loop on older CPUs.
 
 ---
 
@@ -621,6 +670,7 @@ isolation but cause regression when integrated due to real-world data characteri
 | NEON/AVX2  | `yaml/simd/`            | YAML unquoted structural | 3-8%    |
 | NEON       | `yaml/simd/neon.rs`     | Block scalar scanning    | 11-23%  |
 | NEON       | `yaml/simd/neon.rs`     | Anchor name scanning     | 3-6%    |
+| SVE2-BDEP  | `util/broadword.rs`     | select_in_word           | 5-17x (micro), 2-5% (e2e) |
 
 ---
 
@@ -634,6 +684,7 @@ isolation but cause regression when integrated due to real-world data characteri
 6. **SIMD setup cost matters**: For short operations (<16 bytes), scalar wins
 7. **Isolation benchmarks can mislead**: A function can be 5x faster in isolation but cause regression when integrated (colon-space detection won for 46+ byte scans, but real YAML keys are 5-15 bytes)
 8. **Know your data characteristics**: Benchmark with realistic data sizes, not arbitrary test cases
+9. **Specialized instructions win**: SVE2 inline assembly for general ops is 50% slower than NEON, but BDEP (SVE2-BITPERM) provides 5-17x speedup for select_in_word
 
 ---
 
