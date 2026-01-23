@@ -418,3 +418,172 @@ These patterns should be extended for SVE2:
 #[target_feature(enable = "sve2-bitperm")]
 unsafe fn toggle64_sve2(carry: u64, w: u64) -> (u64, u64) { ... }
 ```
+
+---
+
+## Future NEON Optimization Opportunities
+
+Based on analysis of ARM NEON instructions for indexing and data structures (January 2026), the following opportunities have been identified. These are organized by confidence level.
+
+### ✅ Balanced Parentheses Unrolled Lookup (IMPLEMENTED - January 2026)
+
+**Status**: ✅ **Implemented and deployed**
+
+**Implementation** ([src/trees/bp.rs](../../src/trees/bp.rs)):
+- Added `word_min_excess_unrolled()` function with fully unrolled lookup table access
+- Batches all 8 byte lookups before computing prefix sums and global minimum
+- Enabled via `--features simd` flag
+
+**Benchmark Results** (Apple M1 Max):
+
+| Size | Without Optimization | With Optimization | Improvement |
+|------|---------------------|-------------------|-------------|
+| 10K nodes | 2.41 µs | 2.00 µs | **17%** |
+| 100K nodes | 20.70 µs | 17.07 µs | **18%** |
+| 1M nodes | 207.21 µs | 171.96 µs | **17%** |
+
+**Key insight**: The optimization doesn't use NEON intrinsics directly. Instead, it benefits from:
+1. **Loop unrolling** - eliminates branch overhead
+2. **Batched lookups** - better cache locality for lookup tables
+3. **Better instruction scheduling** - compiler can optimize independent operations
+
+**Why the original SIMD approach was not used**:
+- Min excess computation requires sequential prefix sums (each byte's excess depends on previous bytes)
+- True SIMD parallelism would need a parallel prefix scan, which adds complexity
+- The unrolled scalar approach achieves similar benefit with simpler code
+
+**Remaining opportunities** (not yet implemented):
+- `vminq_i8` for RangeMin tree queries (parallel min across 16 bytes)
+- `find_open` and `enclose` could benefit from similar unrolling
+
+---
+
+### Medium Confidence: Popcount Loop Unrolling
+
+**Current State** ([src/bits/popcount.rs](../../src/bits/popcount.rs#L125-L150)):
+```rust
+// Process 64-byte chunks with NEON
+while offset + 64 <= byte_len {
+    let count = unsafe { popcount_64bytes_neon(ptr.add(offset)) };
+    total += count;
+    offset += 64;
+}
+```
+
+**Opportunity**: Unroll to 256 bytes with interleaved accumulation for better ILP:
+```rust
+// Process 256-byte chunks with better instruction-level parallelism
+while offset + 256 <= byte_len {
+    let c0 = popcount_64bytes_neon(ptr.add(offset));
+    let c1 = popcount_64bytes_neon(ptr.add(offset + 64));
+    let c2 = popcount_64bytes_neon(ptr.add(offset + 128));
+    let c3 = popcount_64bytes_neon(ptr.add(offset + 192));
+    total += c0 + c1 + c2 + c3;
+    offset += 256;
+}
+```
+
+**Expected Impact**: 5-8% on large bitvector operations
+
+**Why this might work**:
+- Proven approach (AVX-512 VPOPCNTDQ already processes 512 bits/iteration)
+- Increases instruction-level parallelism
+- Reduces loop overhead (branch predictions, counter updates)
+
+**Risk**: Low - straightforward extension of existing pattern
+
+**Files to modify**:
+- `src/bits/popcount.rs` - Extend `popcount_words_neon` with 256-byte unrolling
+
+---
+
+### Low Confidence: Anchor Terminator Nibble Tables
+
+**Current State** ([src/yaml/simd/neon.rs](../../src/yaml/simd/neon.rs#L422-L498)):
+```rust
+// 10 separate CMEQ comparisons + 9 ORR operations
+let is_space = vceqq_u8(chunk, space);
+let is_tab = vceqq_u8(chunk, tab);
+let is_newline = vceqq_u8(chunk, newline);
+// ... 7 more comparisons
+let flow = vorrq_u8(is_lbracket, is_rbracket);
+// ... more ORRs
+```
+
+**Opportunity**: Replace 10 CMEQ + 9 ORR with 2 TBL + 1 AND (nibble table approach):
+```rust
+// Proposed: 2 table lookups + 1 AND (like JSON does)
+let lo_nibble = vandq_u8(chunk, vdupq_n_u8(0x0F));
+let hi_nibble = vshrq_n_u8::<4>(chunk);
+let lo_result = vqtbl1q_u8(anchor_lo_table, lo_nibble);
+let hi_result = vqtbl1q_u8(anchor_hi_table, hi_nibble);
+let terminators = vandq_u8(lo_result, hi_result);
+```
+
+**Expected Impact**: 5-10% on anchor-heavy workloads (if validated)
+
+**⚠️ WARNING**: This approach was **rejected** for YAML character classification:
+> "NEON nibble lookup for YAML: -12-15% penalty (only 2-3 chars searched)"
+
+**However**, anchor parsing searches for **10 characters** (space, tab, newline, CR, `[`, `]`, `{`, `}`, `,`, `:`), not 2-3. The crossover point where nibble tables win may be different.
+
+**Validation required before implementation**:
+1. Micro-benchmark 10-terminator nibble lookup vs 10-CMEQ approach
+2. Only implement if micro-benchmark shows **2x+ improvement**
+3. Run end-to-end `yq` benchmarks to validate (learned from P2.8, P3 failures)
+
+**Risk**: High - similar approach rejected for 2-3 character YAML classification
+
+**Files to modify (only if validated)**:
+- `src/yaml/simd/neon.rs` - Replace `parse_anchor_name_neon_impl` inner loop
+
+---
+
+### Reference: NEON Instructions for Indexing
+
+Based on research papers and production systems, these NEON instructions have proven utility for indexing:
+
+| Instruction | Use Case | Proven Performance |
+|-------------|----------|-------------------|
+| **CNT** (`vcntq_u8`) | Rank/popcount | 6.7x faster (Redis) |
+| **CMEQ** (`vceqq_*`) | Character classification | 4+ GB/s JSON parsing (simdjson) |
+| **TBL** (`vqtbl1q_u8`) | Byte classification | Replaces 13 comparisons with 6 ops |
+| **ADDV** (`vaddvq_*`) | Horizontal sum | Essential for popcount reduction |
+| **PMULL** (`vmull_p64`) | Prefix XOR | 25% faster DSV index (deployed) |
+| **CLZ** (scalar) | First set bit | Single cycle |
+| **EXT** (`vextq_*`) | Sliding window | Essential for text parsing |
+| **MINV/MAXV** | Range queries | Potential for RangeMin tree |
+
+**Instructions NOT applicable to this codebase**:
+- **SDOT/UDOT**: No quantized embedding vectors
+- **SMMLA/UMMLA**: No matrix operations
+- **BFMMLA/BFDOT**: No neural network inference
+- **FCMLA/FCADD**: No complex number processing
+- **Gather/Scatter**: Not available on Apple Silicon (no SVE)
+
+---
+
+### Lessons from Failed NEON Optimizations
+
+The YAML optimization history (see [docs/parsing/yaml.md](../parsing/yaml.md)) documents 9 rejected optimizations with a common pattern:
+
+| Rejected Optimization | Penalty | Key Lesson |
+|----------------------|---------|------------|
+| P1: YFSM | N/A | YAML strings too simple for FSM |
+| P2.6: Software prefetch | **+30%** | Hardware prefetcher is better |
+| P2.8: SIMD threshold tuning | **+8-15%** | Modern CPUs handle branches well |
+| P3: Branchless char class | **+25-44%** | Branch predictors are 93-95% accurate |
+| P5: Flow collection fast path | N/A | Real flow collections too small (<30B) |
+| P6: BMI2 PDEP/PEXT | N/A | YAML grammar prevents DSV-style indexing |
+| P7: Newline index | N/A | CLI feature, not parsing optimization |
+| P8: AVX-512 | **+7%** | Memory bandwidth saturated at AVX2 |
+
+**Key lessons for future NEON optimization**:
+1. **Micro-benchmarks lie** - P2.6/P2.8/P3/P8 all showed micro-bench improvements but regressed end-to-end
+2. **Memory bandwidth saturates** - Sequential text parsing can't benefit from wider SIMD
+3. **Branch predictors are excellent** - Branchless code often loses (93-95% prediction accuracy)
+4. **SIMD only wins when**:
+   - Scanning long runs (30+ bytes average)
+   - Processing 3+ character types simultaneously
+   - Using specialized instructions (PMULL for prefix XOR)
+   - Compute-bound operations (popcount, not parsing)

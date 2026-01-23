@@ -147,6 +147,126 @@ const BYTE_FIND_CLOSE: [[u8; 16]; 256] = {
     table
 };
 
+// ============================================================================
+// SIMD-Optimized Functions (NEON)
+// ============================================================================
+
+/// Optimized computation of min excess and total excess for a full 64-bit word.
+///
+/// This version unrolls the loop and batches the lookup table accesses,
+/// which can be faster than the generic version due to better instruction scheduling.
+/// Despite the name, this doesn't use NEON intrinsics - the unrolling itself is the optimization.
+#[cfg(feature = "simd")]
+#[inline]
+fn word_min_excess_unrolled(word: u64) -> (i8, i16) {
+    // Get bytes as array
+    let bytes = word.to_le_bytes();
+
+    // Load lookup values for all 8 bytes at once
+    // Batching lookups helps with cache locality
+    let b0 = bytes[0] as usize;
+    let b1 = bytes[1] as usize;
+    let b2 = bytes[2] as usize;
+    let b3 = bytes[3] as usize;
+    let b4 = bytes[4] as usize;
+    let b5 = bytes[5] as usize;
+    let b6 = bytes[6] as usize;
+    let b7 = bytes[7] as usize;
+
+    // Get min excess for each byte
+    let m0 = BYTE_MIN_EXCESS[b0] as i16;
+    let m1 = BYTE_MIN_EXCESS[b1] as i16;
+    let m2 = BYTE_MIN_EXCESS[b2] as i16;
+    let m3 = BYTE_MIN_EXCESS[b3] as i16;
+    let m4 = BYTE_MIN_EXCESS[b4] as i16;
+    let m5 = BYTE_MIN_EXCESS[b5] as i16;
+    let m6 = BYTE_MIN_EXCESS[b6] as i16;
+    let m7 = BYTE_MIN_EXCESS[b7] as i16;
+
+    // Get total excess for each byte
+    let t0 = BYTE_TOTAL_EXCESS[b0] as i16;
+    let t1 = BYTE_TOTAL_EXCESS[b1] as i16;
+    let t2 = BYTE_TOTAL_EXCESS[b2] as i16;
+    let t3 = BYTE_TOTAL_EXCESS[b3] as i16;
+    let t4 = BYTE_TOTAL_EXCESS[b4] as i16;
+    let t5 = BYTE_TOTAL_EXCESS[b5] as i16;
+    let t6 = BYTE_TOTAL_EXCESS[b6] as i16;
+    let t7 = BYTE_TOTAL_EXCESS[b7] as i16;
+
+    // Compute prefix sums (running excess at each byte boundary)
+    let _p0: i16 = 0;
+    let p1 = t0;
+    let p2 = p1 + t1;
+    let p3 = p2 + t2;
+    let p4 = p3 + t3;
+    let p5 = p4 + t4;
+    let p6 = p5 + t5;
+    let p7 = p6 + t6;
+    let total = p7 + t7;
+
+    // Compute global minimum: min of (prefix + byte_min) for each byte
+    // Unrolled for better branch prediction
+    let mut global_min = m0; // p0 + m0 = 0 + m0 = m0
+    global_min = global_min.min(p1 + m1);
+    global_min = global_min.min(p2 + m2);
+    global_min = global_min.min(p3 + m3);
+    global_min = global_min.min(p4 + m4);
+    global_min = global_min.min(p5 + m5);
+    global_min = global_min.min(p6 + m6);
+    global_min = global_min.min(p7 + m7);
+
+    let min_clamped = global_min.clamp(-128, 127) as i8;
+    (min_clamped, total)
+}
+
+/// Build L0 index (per-word min excess and total excess).
+///
+/// Uses unrolled lookup path when simd feature is enabled.
+#[cfg(feature = "simd")]
+fn build_l0_index(words: &[u64], len: usize, num_words: usize) -> (Vec<i8>, Vec<i16>) {
+    let mut l0_min_excess = Vec::with_capacity(num_words);
+    let mut l0_word_excess = Vec::with_capacity(num_words);
+
+    // Process all full words with unrolled optimization
+    let full_words = if len % 64 == 0 { num_words } else { num_words - 1 };
+
+    for &word in words.iter().take(full_words) {
+        let (min_e, total_e) = word_min_excess_unrolled(word);
+        l0_min_excess.push(min_e);
+        l0_word_excess.push(total_e);
+    }
+
+    // Handle last partial word with scalar code
+    if full_words < num_words {
+        let valid_bits = len % 64;
+        let (min_e, total_e) = word_min_excess(words[num_words - 1], valid_bits);
+        l0_min_excess.push(min_e);
+        l0_word_excess.push(total_e);
+    }
+
+    (l0_min_excess, l0_word_excess)
+}
+
+/// Build L0 index (per-word min excess and total excess) - scalar fallback.
+#[cfg(not(feature = "simd"))]
+fn build_l0_index(words: &[u64], len: usize, num_words: usize) -> (Vec<i8>, Vec<i16>) {
+    let mut l0_min_excess = Vec::with_capacity(num_words);
+    let mut l0_word_excess = Vec::with_capacity(num_words);
+
+    for (i, &word) in words.iter().enumerate() {
+        let valid_bits = if i == num_words - 1 && len % 64 != 0 {
+            len % 64
+        } else {
+            64
+        };
+        let (min_e, total_e) = word_min_excess(word, valid_bits);
+        l0_min_excess.push(min_e);
+        l0_word_excess.push(total_e);
+    }
+
+    (l0_min_excess, l0_word_excess)
+}
+
 /// Fast byte-level scan to find where excess drops to 0.
 ///
 /// Given a word starting at `start_bit`, scans bytes using lookup tables
@@ -828,20 +948,9 @@ fn build_bp_index(
     let num_l2 = num_l1.div_ceil(FACTOR_L2);
     let num_rank_blocks = num_words.div_ceil(WORDS_PER_RANK_BLOCK);
 
-    // Build L0: per-word statistics (same as original)
-    let mut l0_min_excess = Vec::with_capacity(num_words);
-    let mut l0_word_excess = Vec::with_capacity(num_words);
-
-    for (i, &word) in words.iter().enumerate() {
-        let valid_bits = if i == num_words - 1 && len % 64 != 0 {
-            len % 64
-        } else {
-            64
-        };
-        let (min_e, total_e) = word_min_excess(word, valid_bits);
-        l0_min_excess.push(min_e);
-        l0_word_excess.push(total_e);
-    }
+    // Build L0: per-word statistics
+    // Use NEON-optimized path on aarch64 with simd feature
+    let (l0_min_excess, l0_word_excess) = build_l0_index(words, len, num_words);
 
     // Build L1: per-32-word block statistics (same as original)
     let mut l1_min_excess = Vec::with_capacity(num_l1);

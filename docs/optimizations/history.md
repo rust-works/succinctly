@@ -373,4 +373,65 @@ Before implementing an optimization, ask:
 
 ---
 
-*Last Updated: 2026-01-18*
+## Recent Optimizations
+
+### ✅ Balanced Parentheses Unrolled Lookup (January 2026)
+
+**Status**: Implemented and deployed in [src/trees/bp.rs](../../src/trees/bp.rs)
+
+**Technique**: Fully unrolled lookup table access for `word_min_excess` computation.
+
+**Benchmark Results** (Apple M1 Max):
+
+| Size | Before | After | Improvement |
+|------|--------|-------|-------------|
+| 10K nodes | 2.41 µs | 2.00 µs | **17%** |
+| 100K nodes | 20.70 µs | 17.07 µs | **18%** |
+| 1M nodes | 207.21 µs | 171.96 µs | **17%** |
+
+**Key insight**: Loop unrolling and batched lookups provide better instruction scheduling and cache locality, without needing SIMD intrinsics.
+
+---
+
+## Future Optimization Opportunities
+
+Based on analysis of ARM NEON instructions for indexing and data structures (January 2026):
+
+### Medium Priority: Popcount Loop Unrolling
+
+**Current state**: [src/bits/popcount.rs](../../src/bits/popcount.rs) processes 64 bytes per iteration.
+
+**Opportunity**: Unroll to 256 bytes (4x) for better instruction-level parallelism.
+
+**Expected improvement**: 5-8% on large bitvectors
+
+**Risk**: Low - straightforward extension of existing pattern
+
+### Low Priority: Anchor Nibble Tables
+
+**Current state**: [src/yaml/simd/neon.rs](../../src/yaml/simd/neon.rs) uses 10 CMEQ + 9 ORR for anchor terminators.
+
+**Opportunity**: Replace with 2 TBL + 1 AND (nibble table approach like JSON).
+
+**⚠️ Warning**: Similar approach was rejected for YAML char classification (-12-15% penalty). Only implement if micro-benchmark shows 2x+ improvement for 10-character set.
+
+**Risk**: High - needs validation before implementation
+
+### Reference: Applicable NEON Instructions
+
+| Instruction | Use Case | Status in Codebase |
+|-------------|----------|-------------------|
+| CNT (`vcntq_u8`) | Popcount | ✅ Deployed |
+| CMEQ (`vceqq_*`) | Char classification | ✅ Deployed (JSON/YAML/DSV) |
+| TBL (`vqtbl1q_u8`) | Nibble lookup | ✅ Deployed (JSON only) |
+| PMULL (`vmull_p64`) | Prefix XOR | ✅ Deployed (DSV, +25%) |
+| ADDV (`vaddvq_*`) | Horizontal sum | ✅ Deployed |
+| **Unrolled lookup** | BP min excess | ✅ **Deployed (BP, +17%)** |
+| **MINV/MAXV** | Range queries | ❌ Not yet used (BP opportunity) |
+| **Vector CLZ** | First match position | ❌ Not yet used (BP opportunity) |
+
+See [docs/plan/sve2-optimizations.md](../plan/sve2-optimizations.md#future-neon-optimization-opportunities) for detailed analysis.
+
+---
+
+*Last Updated: 2026-01-23*
