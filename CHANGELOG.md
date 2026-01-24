@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-01-24
+
+### Added
+
+- **jq Language Enhancements**
+  - `at_offset(n)` builtin for position-based navigation to node at byte offset
+  - `at_position(line; col)` builtin for navigation to node at line/column position
+
+- **SIMD Optimizations**
+  - SSE4.1 PHMINPOSUW optimization for balanced parentheses index building on x86_64
+  - SVE2 BDEP `select_in_word` with runtime dispatch on ARM64
+  - NEON VMINV L1/L2 index building optimizations for ARM64
+  - 256-byte popcount unrolling for improved ARM performance
+  - NEON PMULL carryless multiply for prefix XOR optimization
+
+- **Balanced Parentheses Enhancements**
+  - Zero-cost `SelectSupport` trait abstraction (`NoSelect` for JSON, `WithSelect` for YAML)
+  - O(log n) BP lookup via binary search on `bp_to_text` mapping
+  - Unrolled lookup optimization for min excess computation
+
+### Fixed
+
+- YAML `yq-locate` text-position-to-BP mapping now returns correct nodes (issue #26)
+- Flaky `cargo run` in jq CLI tests with retry logic
+
+### Performance
+
+- BP select1 queries: 2.5-5.9x faster with sampled select index
+- `yq-locate` offset queries: 16-492x speedup with indexed `find_open`
+
 ## [0.3.0] - 2026-01-21
 
 ### Added
@@ -187,7 +217,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Select queries: ~50 ns (O(log n))
 - Popcount: 96.8 GiB/s (AVX-512), 18.5 GiB/s (scalar)
 
-[Unreleased]: https://github.com/rust-works/succinctly/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/rust-works/succinctly/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/rust-works/succinctly/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rust-works/succinctly/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rust-works/succinctly/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rust-works/succinctly/releases/tag/v0.1.0
