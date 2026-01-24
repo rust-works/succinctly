@@ -390,14 +390,14 @@ The `bp_select_micro` benchmark measures the performance of select1 queries on b
 | 100K opens | 308 µs        | 1.68 ms                   | **5.4x** |
 | 1M opens   | 356 µs        | 2.10 ms                   | **5.9x** |
 
-### Results (AMD Ryzen 9 7950X, 10K queries each)
+### Results (ARM Neoverse-V2, 10K queries each)
 
-| BP Size    | select1 (new) | binary_search_rank1 (old) | Speedup  |
-|------------|---------------|---------------------------|----------|
-| 1K opens   | 213 µs        | 548 µs                    | **2.6x** |
-| 10K opens  | 211 µs        | 783 µs                    | **3.7x** |
-| 100K opens | 211 µs        | 986 µs                    | **4.7x** |
-| 1M opens   | 240 µs        | 1.22 ms                   | **5.1x** |
+| BP Size    | select1 (new) | binary_search_rank1 (old) | Speedup   |
+|------------|---------------|---------------------------|-----------|
+| 1K opens   | 191 µs        | 780 µs                    | **4.1x**  |
+| 10K opens  | 160 µs        | 1.15 ms                   | **7.2x**  |
+| 100K opens | 185 µs        | 1.45 ms                   | **7.8x**  |
+| 1M opens   | 196 µs        | 1.75 ms                   | **8.9x**  |
 
 ### Key Observations
 

@@ -10,7 +10,8 @@ Hierarchical structures enable O(1) or O(log n) queries by organizing auxiliary 
 | Sampled index       | O(n/k)     | 1/k            | Infrequent queries    |
 | 2-level hierarchy   | O(1)       | ~3%            | Frequent queries      |
 | 3-level hierarchy   | O(1)       | ~3%            | Very large datasets   |
-| RangeMin structure  | O(1)       | ~6%            | Tree navigation       |
+| RangeMin structure  | O(1)       | ~6%            | Tree nav (find_close) |
+| RangeMax structure  | O(1)       | ~1.5%          | Tree nav (find_open)  |
 
 ---
 
@@ -271,6 +272,68 @@ unsafe fn build_l1_neon(l0_min: &[i8], l0_excess: &[i16]) -> (Vec<i16>, Vec<i16>
 The same SIMD pattern is also applied to L2 index building, providing 1-3%
 improvement at large scales (100M+ nodes) with no regression at smaller sizes.
 
+### Indexed find_open (January 2026)
+
+The `find_close` operation uses hierarchical **min-excess** indices to skip blocks
+where excess won't drop to zero. The symmetric `find_open` operation (find matching
+open for a close) requires scanning **backwards**, needing **max-excess** indices.
+
+**Problem**: `find_open` was O(d) bit-by-bit scanning, while `find_close` was O(1).
+
+**Solution**: Add reverse max-excess indices at all three levels:
+
+```rust
+struct BalancedParens {
+    // Forward scanning (find_close) - existing
+    l0_min_excess: Vec<i8>,      // Per-word min excess
+    l1_min_excess: Vec<i16>,     // Per-32-word block min excess
+    l2_min_excess: Vec<i16>,     // Per-1024-word block min excess
+
+    // Reverse scanning (find_open) - new
+    l0_max_excess_rev: Vec<i8>,  // Per-word max excess (backwards)
+    l1_max_excess_rev: Vec<i16>, // Per-32-word block max excess (backwards)
+    l2_max_excess_rev: Vec<i16>, // Per-1024-word block max excess (backwards)
+}
+```
+
+**State machine**: Mirrors `find_close_from` but scans backwards:
+
+```rust
+fn find_open_from(&self, start_pos: usize, target_excess: i32) -> Option<usize> {
+    // States: ScanWord, CheckL0, CheckL1, CheckL2, FromL0, FromL1, FromL2
+
+    // Skip condition (reversed):
+    // - find_close: excess + block_min_excess <= 0  (might drop to zero)
+    // - find_open:  excess + block_max_excess_rev >= target  (might rise to target)
+
+    // If block can't reach target, skip entire block:
+    excess += block_total_excess;
+    pos = previous_block_boundary;
+}
+```
+
+**Byte lookup table** for O(1) in-word scanning:
+
+```rust
+// BYTE_FIND_OPEN_REV[byte_val][target-1] = bit position where excess
+// first reaches target when scanning bits 7→0, or 8 if not found
+const BYTE_FIND_OPEN_REV: [[u8; 16]; 256] = { /* precomputed */ };
+```
+
+**Benchmark results** (1000 queries, ARM Graviton 4):
+
+| Size | Indexed | Linear (O(d)) | Speedup |
+|------|---------|---------------|---------|
+| 10K  | 11.3 µs | 183.8 µs      | **16x** |
+| 100K | 10.2 µs | 886.3 µs      | **87x** |
+| 1M   | 9.3 µs  | 4,573 µs      | **492x** |
+
+**Note on `enclose`**: The `enclose` operation (find parent) was kept as linear
+scan because the parent is typically very close (1-2 bits away). The indexed
+version added overhead without benefit for nearby targets.
+
+**Space overhead**: ~1.5 bytes per word additional (3 new i8/i16 vectors).
+
 ### Prior Art
 
 - **Munro & Raman (2001)**: "Succinct Representation of Balanced Parentheses"
@@ -352,13 +415,14 @@ Fewer levels / larger blocks:
 
 ## Usage in Succinctly
 
-| Structure           | Location              | Purpose               | Overhead |
-|---------------------|-----------------------|-----------------------|----------|
-| 3-level RankDir     | `bits/rank.rs`        | O(1) rank queries     | ~3%      |
-| SelectIndex         | `bits/select.rs`      | Accelerated select    | ~3%      |
-| CumulativeIndex     | `json/light.rs`       | Fast IB select        | ~4%      |
-| RangeMinIndex       | `trees/bp.rs`         | Tree navigation       | ~6%      |
-| LightweightIndex    | `dsv/index_*.rs`      | DSV iteration         | ~0.8%    |
+| Structure           | Location              | Purpose                    | Overhead |
+|---------------------|-----------------------|----------------------------|----------|
+| 3-level RankDir     | `bits/rank.rs`        | O(1) rank queries          | ~3%      |
+| SelectIndex         | `bits/select.rs`      | Accelerated select         | ~3%      |
+| CumulativeIndex     | `json/light.rs`       | Fast IB select             | ~4%      |
+| RangeMinIndex       | `trees/bp.rs`         | O(1) find_close            | ~6%      |
+| RangeMaxRevIndex    | `trees/bp.rs`         | O(1) find_open (16-492x)   | ~1.5%    |
+| LightweightIndex    | `dsv/index_*.rs`      | DSV iteration              | ~0.8%    |
 
 ---
 
@@ -369,6 +433,7 @@ Fewer levels / larger blocks:
 3. **Simpler can be faster**: Cache effects dominate for moderate sizes
 4. **Match structure to access pattern**: Random vs sequential needs different designs
 5. **Pack auxiliary data**: Bit-packing reduces memory traffic
+6. **Symmetric operations need symmetric indices**: Forward scan uses min, backward uses max
 
 ---
 
