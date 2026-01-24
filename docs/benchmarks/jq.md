@@ -13,7 +13,6 @@ Before reviewing the benchmarks, it's important to understand the fundamental di
 | **Architecture** | Semi-indexer                      | Full parser                     |
 | **Approach**     | Build structural index, lazy eval | Parse entire document into DOM  |
 | **Memory model** | ~3-6% index overhead              | Full DOM in memory (6-8x input) |
-| **Best for**     | Fast queries on large files       | Complex transformations         |
 
 **What this means for benchmarks**: The performance and memory differences shown below come from architectural choices:
 
@@ -23,7 +22,7 @@ Before reviewing the benchmarks, it's important to understand the fundamental di
 
 3. **Streaming output**: succinctly writes JSON directly to output without building intermediate String objects.
 
-**Trade-off**: jq supports more complex transformations and has a larger feature set. succinctly focuses on fast navigation and extraction queries.
+succinctly supports most common jq queries including path navigation, array slicing, filtering, and piping. See [CLAUDE.md](../../CLAUDE.md) for supported operators.
 
 For detailed architectural documentation, see [Semi-Indexing Architecture](../architecture/semi-indexing.md).
 

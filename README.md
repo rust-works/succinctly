@@ -28,7 +28,7 @@ Unlike traditional parsers that build a complete in-memory representation (DOM) 
 - **Faster queries** because only accessed values are materialized
 - **Streaming output** without intermediate allocations
 
-**Trade-off**: Semi-indexing is optimized for navigation and extraction queries on valid input. For complex transformations or when you need full validation, traditional parsers (jq, yq, serde_json) may be more appropriate. See [Architecture](docs/architecture/semi-indexing.md) for details.
+**Trade-off**: Semi-indexing performs minimal validation compared to full parsers. For strict validation or features like YAML tags, use traditional tools. See [Architecture](docs/architecture/semi-indexing.md) for details.
 
 ## Installation
 
