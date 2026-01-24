@@ -162,6 +162,15 @@ struct BenchYqArgs {
     #[arg(short, long, default_value = "all")]
     sizes: String,
 
+    /// Query types to benchmark (comma-separated, or "all")
+    /// Available: identity (.), first_element (.[0]), iteration (.[]), length
+    #[arg(short, long, default_value = "identity")]
+    queries: String,
+
+    /// Memory-focused benchmark mode (emphasizes memory comparison)
+    #[arg(long)]
+    memory: bool,
+
     /// Number of warmup runs before benchmarking
     #[arg(long, default_value = "1")]
     warmup: usize,
@@ -455,6 +464,8 @@ enum YamlPatternArg {
     Unicode,
     /// Worst case for parsing (maximum depth and density)
     Pathological,
+    /// Top-level array for M2 navigation benchmarks (.[0], .[], .[0].name)
+    Navigation,
 }
 
 impl From<YamlPatternArg> for yaml_generators::YamlPattern {
@@ -470,6 +481,7 @@ impl From<YamlPatternArg> for yaml_generators::YamlPattern {
             YamlPatternArg::Config => yaml_generators::YamlPattern::Config,
             YamlPatternArg::Unicode => yaml_generators::YamlPattern::Unicode,
             YamlPatternArg::Pathological => yaml_generators::YamlPattern::Pathological,
+            YamlPatternArg::Navigation => yaml_generators::YamlPattern::Navigation,
         }
     }
 }
@@ -1033,6 +1045,7 @@ fn run_yq_benchmark(args: BenchYqArgs) -> Result<()> {
         "comprehensive",
         "config",
         "mixed",
+        "navigation",
         "nested",
         "numbers",
         "pathological",
@@ -1061,13 +1074,31 @@ fn run_yq_benchmark(args: BenchYqArgs) -> Result<()> {
             .collect()
     };
 
+    // Parse query types
+    let queries: Vec<yq_bench::QueryType> = if args.queries == "all" {
+        yq_bench::QueryType::all().to_vec()
+    } else {
+        args.queries
+            .split(',')
+            .filter_map(|s| yq_bench::QueryType::from_str(s.trim()))
+            .collect()
+    };
+
+    if queries.is_empty() {
+        anyhow::bail!(
+            "No valid query types specified. Available: identity, first_element, iteration, length"
+        );
+    }
+
     let config = yq_bench::BenchConfig {
         data_dir: args.data_dir,
         patterns,
         sizes,
+        queries,
         succinctly_binary: args.binary,
         warmup_runs: args.warmup,
         benchmark_runs: args.runs,
+        memory_mode: args.memory,
     };
 
     // Use default output paths if not specified
@@ -1386,6 +1417,7 @@ const YAML_SUITE_PATTERNS: &[(&str, yaml_generators::YamlPattern)] = &[
     ("config", yaml_generators::YamlPattern::Config),
     ("unicode", yaml_generators::YamlPattern::Unicode),
     ("pathological", yaml_generators::YamlPattern::Pathological),
+    ("navigation", yaml_generators::YamlPattern::Navigation),
 ];
 
 fn generate_yaml_suite(args: GenerateYamlSuite) -> Result<()> {

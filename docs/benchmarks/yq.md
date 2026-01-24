@@ -521,13 +521,74 @@ cargo bench --bench bp_select_micro
 
 ---
 
+## M2 Streaming Navigation Benchmarks
+
+The M2 streaming optimization enables fast navigation queries without building an intermediate DOM. This section documents how to benchmark and compare different query types.
+
+### Query Types and Execution Paths
+
+| Query Type | Example | Execution Path | Description |
+|------------|---------|----------------|-------------|
+| **Identity** | `.` | P9 streaming | Full document streaming output |
+| **First Element** | `.[0]` | M2 streaming | Navigate to first array element |
+| **Iteration** | `.[]` | M2 streaming | Iterate over array elements |
+| **Length** | `length` | OwnedValue | Requires full DOM construction |
+
+### Benchmark Results (Apple M1 Max, 100MB navigation file)
+
+| Query       | Path          | succinctly | yq       | Speedup     | succ Mem | yq Mem  |
+|-------------|---------------|------------|----------|-------------|----------|---------|
+| `.`         | P9 streaming  | 1.18s      | 12.06s   | **10.2x**   | 532 MB   | 7 GB    |
+| `.[0]`      | M2 streaming  | 479ms      | 6.05s    | **12.6x**   | 532 MB   | 5 GB    |
+| `.[]`       | M2 streaming  | 3.48s      | 13.80s   | **4.0x**    | 1 GB     | 8 GB    |
+| `length`    | OwnedValue    | 480ms      | 6.04s    | **12.6x**   | 529 MB   | 5 GB    |
+
+**Key insights**:
+- **M2 streaming (`.[0]`) is 2.5x faster than identity (`.`)** on the same file
+- **succinctly uses 10-15x less memory** than yq across all query types
+- Navigation queries benefit from M2's lazy evaluation - only accessed elements are materialized
+- `length` and `.[0]` show similar performance because both only need to count/access the first level
+
+### Running M2-Focused Benchmarks
+
+```bash
+# Benchmark all query types on the navigation pattern
+./target/release/succinctly dev bench yq --patterns navigation --queries all
+
+# Compare identity vs navigation queries
+./target/release/succinctly dev bench yq --queries identity,first_element --sizes 10mb,100mb
+
+# Memory-focused comparison
+./target/release/succinctly dev bench yq --memory --queries all --sizes 100mb
+
+# Available query types: identity, first_element, iteration, length
+```
+
+### When M2 Streaming Helps
+
+M2 streaming provides the greatest benefit when:
+1. **Extracting single elements**: `.[0]`, `.users[5]`
+2. **Field access**: `.config`, `.users`
+3. **Iteration**: `.[]`, `.users[]`
+4. **Chained navigation**: `.[0].name`, `.users[].email`
+
+### When OwnedValue is Required
+
+Some operations require the full DOM (OwnedValue path):
+- `length`, `keys`, `values` builtins
+- Complex filters: `select(.age > 30)`
+- Arithmetic on document values
+- Any operation needing multiple passes
+
+---
+
 ## Reproducing Benchmarks
 
 ```bash
 # Build release binary
 cargo build --release --features cli
 
-# Generate benchmark files
+# Generate benchmark files (includes navigation pattern for M2 testing)
 cargo run --release --features cli -- yaml generate-suite
 
 # Run CLI benchmark tool (recommended - includes memory measurement)
@@ -535,6 +596,12 @@ cargo run --release --features cli -- yaml generate-suite
 
 # Run with specific patterns/sizes
 ./target/release/succinctly dev bench yq --patterns comprehensive,nested --sizes 1mb,10mb
+
+# Run navigation-focused benchmarks (M2 streaming)
+./target/release/succinctly dev bench yq --patterns navigation --queries all --sizes 10mb,100mb
+
+# Run memory-focused comparison
+./target/release/succinctly dev bench yq --memory --queries identity,first_element,length
 
 # Run Criterion benchmarks (wall time only)
 cargo bench --bench yq_comparison

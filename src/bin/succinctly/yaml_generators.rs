@@ -27,6 +27,9 @@ pub enum YamlPattern {
     Unicode,
     /// Worst case for parsing (maximum depth and density)
     Pathological,
+    /// Top-level array designed for M2 navigation benchmarks
+    /// (supports .[0], .[], .[0].name queries)
+    Navigation,
 }
 
 /// Generate YAML of approximately target_size bytes
@@ -42,6 +45,7 @@ pub fn generate_yaml(target_size: usize, pattern: YamlPattern, seed: Option<u64>
         YamlPattern::Config => generate_config(target_size, seed),
         YamlPattern::Unicode => generate_unicode(target_size, seed),
         YamlPattern::Pathological => generate_pathological(target_size, seed),
+        YamlPattern::Navigation => generate_navigation(target_size, seed),
     }
 }
 
@@ -277,6 +281,124 @@ fn generate_pathological(target_size: usize, seed: Option<u64>) -> String {
         2,
         max_depth,
     );
+
+    yaml
+}
+
+/// Generate navigation-optimized content (top-level array for M2 streaming benchmarks)
+///
+/// This pattern generates a top-level array of objects, designed specifically for
+/// testing M2 streaming navigation queries like:
+/// - `.[0]` - first element access
+/// - `.[]` - iteration
+/// - `.[0].name` - chained navigation
+/// - `length` - builtin that requires OwnedValue
+fn generate_navigation(target_size: usize, seed: Option<u64>) -> String {
+    let mut rng = seed.map(ChaCha8Rng::seed_from_u64);
+    let mut yaml = String::with_capacity(target_size);
+
+    yaml.push_str("# Navigation benchmark data (top-level array)\n");
+    yaml.push_str("# Designed for M2 streaming queries: .[0], .[], .[0].name\n");
+
+    let start_len = yaml.len();
+    let mut count = 0;
+
+    let first_names = [
+        "Alice", "Bob", "Charlie", "Diana", "Eve", "Frank", "Grace", "Henry", "Ivy", "Jack",
+        "Kate", "Leo", "Mia", "Noah", "Olivia", "Paul",
+    ];
+    let last_names = [
+        "Smith",
+        "Johnson",
+        "Williams",
+        "Brown",
+        "Jones",
+        "Garcia",
+        "Miller",
+        "Davis",
+        "Rodriguez",
+        "Martinez",
+        "Hernandez",
+        "Lopez",
+        "Gonzalez",
+    ];
+    let cities = [
+        "New York",
+        "Los Angeles",
+        "Chicago",
+        "Houston",
+        "Phoenix",
+        "Seattle",
+        "Boston",
+        "Denver",
+        "Miami",
+        "Atlanta",
+        "Portland",
+        "Austin",
+    ];
+    let departments = [
+        "Engineering",
+        "Marketing",
+        "Sales",
+        "Support",
+        "Finance",
+        "HR",
+        "Operations",
+        "Research",
+        "Design",
+        "Legal",
+    ];
+
+    while yaml.len().saturating_sub(start_len) < target_size {
+        let first = first_names[count % first_names.len()];
+        let last = last_names[(count / 16) % last_names.len()];
+        let city = cities[count % cities.len()];
+        let dept = departments[count % departments.len()];
+        let age = rng
+            .as_mut()
+            .map(|r| r.gen_range(22..65))
+            .unwrap_or(25 + count % 40);
+        let salary = rng
+            .as_mut()
+            .map(|r| r.gen_range(50000..200000))
+            .unwrap_or(60000 + count * 1000);
+        let years = rng
+            .as_mut()
+            .map(|r| r.gen_range(1..20))
+            .unwrap_or(1 + count % 15);
+
+        // Top-level array item (block style)
+        yaml.push_str("- \n");
+        yaml.push_str(&format!("  id: {}\n", count));
+        yaml.push_str(&format!("  name: {} {}\n", first, last));
+        yaml.push_str(&format!(
+            "  email: {}.{}@example.com\n",
+            first.to_lowercase(),
+            last.to_lowercase()
+        ));
+        yaml.push_str(&format!("  age: {}\n", age));
+        yaml.push_str(&format!("  city: {}\n", city));
+        yaml.push_str(&format!("  department: {}\n", dept));
+        yaml.push_str(&format!("  salary: {}\n", salary));
+        yaml.push_str(&format!("  years_employed: {}\n", years));
+        yaml.push_str(&format!("  active: {}\n", count % 10 != 0));
+
+        // Add nested structure for chained navigation tests
+        yaml.push_str("  metadata:\n");
+        yaml.push_str(&format!(
+            "    created_at: \"2024-01-{:02}T12:00:00Z\"\n",
+            (count % 28) + 1
+        ));
+        yaml.push_str(&format!(
+            "    updated_at: \"2024-06-{:02}T15:30:00Z\"\n",
+            (count % 28) + 1
+        ));
+        yaml.push_str("    tags:\n");
+        yaml.push_str(&format!("      - tag_{}\n", count % 5));
+        yaml.push_str(&format!("      - category_{}\n", count % 3));
+
+        count += 1;
+    }
 
     yaml
 }
@@ -689,5 +811,16 @@ mod tests {
         let yaml1 = generate_yaml(1024, YamlPattern::Users, Some(42));
         let yaml2 = generate_yaml(1024, YamlPattern::Users, Some(123));
         assert_ne!(yaml1, yaml2);
+    }
+
+    #[test]
+    fn test_generate_navigation() {
+        let yaml = generate_yaml(1024, YamlPattern::Navigation, Some(42));
+        // Navigation pattern has top-level array items
+        assert!(yaml.contains("- \n"));
+        assert!(yaml.contains("  id:"));
+        assert!(yaml.contains("  name:"));
+        assert!(yaml.contains("  metadata:"));
+        assert!(yaml.contains("    tags:"));
     }
 }

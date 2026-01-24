@@ -130,9 +130,13 @@ Wait for CPU load to settle (ideally below 1.0) before running benchmarks.
 # Generate benchmark data
 ./target/release/succinctly json generate-suite
 ./target/release/succinctly json generate-suite --max-size 10mb
+./target/release/succinctly yaml generate-suite  # Includes navigation pattern for M2
 
 # Run jq comparison benchmarks (recommended)
 ./target/release/succinctly dev bench jq
+
+# Run yq comparison benchmarks (includes M2 streaming by default)
+./target/release/succinctly dev bench yq
 
 # Run criterion benchmarks
 cargo bench --bench json_simd
@@ -142,6 +146,52 @@ cargo bench --bench jq_comparison
 # JSON parser comparison (in bench-compare/)
 cd bench-compare && cargo bench --bench json_parsers
 ```
+
+## yq Benchmark Query Types
+
+The yq benchmark supports multiple query types to exercise different execution paths:
+
+| Query Type     | Example    | Execution Path | Description                      |
+|----------------|------------|----------------|----------------------------------|
+| `identity`     | `.`        | P9 streaming   | Full document streaming output   |
+| `first_element`| `.[0]`     | M2 streaming   | Navigate to first array element  |
+| `iteration`    | `.[]`      | M2 streaming   | Iterate over array elements      |
+| `length`       | `length`   | OwnedValue     | Requires full DOM construction   |
+
+### Running yq Benchmarks
+
+```bash
+# Run all query types (default) - exercises P9, M2, and OwnedValue paths
+./target/release/succinctly dev bench yq
+
+# Run specific query types
+./target/release/succinctly dev bench yq --queries identity
+./target/release/succinctly dev bench yq --queries identity,first_element
+./target/release/succinctly dev bench yq --queries first_element,iteration,length
+
+# Use "all" to explicitly run all query types
+./target/release/succinctly dev bench yq --queries all
+
+# Focus on M2 streaming with the navigation pattern
+./target/release/succinctly dev bench yq --patterns navigation --sizes 10mb,100mb
+
+# Memory-focused comparison
+./target/release/succinctly dev bench yq --memory
+
+# Combine options
+./target/release/succinctly dev bench yq --patterns navigation --queries all --memory --sizes 100mb
+```
+
+### Query Type Aliases
+
+Multiple aliases are accepted for each query type:
+
+| Query Type     | Aliases                          |
+|----------------|----------------------------------|
+| `identity`     | `identity`, `.`                  |
+| `first_element`| `first_element`, `first`, `.[0]` |
+| `iteration`    | `iteration`, `iter`, `.[]`       |
+| `length`       | `length`                         |
 
 ## Running bench-compare Benchmarks
 
