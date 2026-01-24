@@ -5,7 +5,10 @@
 
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
+use memmap2::Mmap;
+use std::fs::File;
 use std::io::{BufWriter, Read, Write};
+use std::ops::Deref;
 use std::path::Path;
 
 use succinctly::jq::eval_generic::{eval_with_cursor, to_owned, GenericResult};
@@ -15,6 +18,24 @@ use succinctly::json::JsonIndex;
 use succinctly::yaml::{YamlCursor, YamlIndex, YamlValue};
 
 use super::{InputFormat, OutputFormat, YqCommand};
+
+/// Input bytes that can be either owned (from stdin) or memory-mapped (from file).
+/// Memory-mapping files avoids allocating a contiguous buffer, reducing peak memory.
+enum InputBytes {
+    Owned(Vec<u8>),
+    Mmap(Mmap),
+}
+
+impl Deref for InputBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            InputBytes::Owned(v) => v,
+            InputBytes::Mmap(m) => m,
+        }
+    }
+}
 
 /// Adapter to use `std::io::Write` with `core::fmt::Write` methods.
 /// This enables streaming JSON output without intermediate String allocation.
@@ -255,9 +276,16 @@ fn read_stdin_string() -> Result<String> {
     Ok(buffer)
 }
 
-/// Read input from a file.
-fn read_file(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).with_context(|| format!("failed to read file: {}", path.display()))
+/// Read input from a file using memory mapping.
+/// This avoids allocating a contiguous buffer, reducing peak memory for large files.
+fn mmap_file(path: &Path) -> Result<InputBytes> {
+    let file =
+        File::open(path).with_context(|| format!("failed to open file: {}", path.display()))?;
+    // SAFETY: We don't modify the file while it's mapped, and the Mmap is dropped
+    // before we return from the function that uses it.
+    let mmap = unsafe { Mmap::map(&file) }
+        .with_context(|| format!("failed to memory-map file: {}", path.display()))?;
+    Ok(InputBytes::Mmap(mmap))
 }
 
 /// Detect input format from file extension.
@@ -1410,7 +1438,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             }
         } else {
             for file_path in &args.files {
-                let yaml_bytes = read_file(Path::new(file_path))?;
+                let yaml_bytes = mmap_file(Path::new(file_path))?;
                 let index = YamlIndex::build(&yaml_bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error in {}: {}", file_path, e))?;
                 let root = index.root(&yaml_bytes);
@@ -1508,15 +1536,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         let mut all_docs: Vec<OwnedValue> = Vec::new();
 
         // Collect input sources
-        let input_sources: Vec<(Vec<u8>, InputFormat)> = if args.files.is_empty() {
-            let input_bytes = read_stdin()?;
+        let input_sources: Vec<(InputBytes, InputFormat)> = if args.files.is_empty() {
+            let input_bytes = InputBytes::Owned(read_stdin()?);
             let format = resolve_input_format(args.input_format, None);
             vec![(input_bytes, format)]
         } else {
             let mut sources = Vec::new();
             for file_path in &args.files {
                 let path = Path::new(file_path);
-                let input_bytes = read_file(path)?;
+                let input_bytes = mmap_file(path)?;
                 let format = resolve_input_format(args.input_format, Some(path));
                 sources.push((input_bytes, format));
             }
@@ -1559,7 +1587,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         let mut global_doc_index: usize = 0;
         for file_path in &args.files {
             let path = Path::new(file_path);
-            let input_bytes = read_file(path)?;
+            let input_bytes = mmap_file(path)?;
             let format = resolve_input_format(args.input_format, Some(path));
             let inputs = parse_input(&input_bytes, format)?;
 
@@ -1622,15 +1650,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // For JSON inputs, use the OwnedValue path
 
         // Collect input sources with their bytes and formats
-        let input_sources: Vec<(Vec<u8>, InputFormat)> = if args.files.is_empty() {
-            let input_bytes = read_stdin()?;
+        let input_sources: Vec<(InputBytes, InputFormat)> = if args.files.is_empty() {
+            let input_bytes = InputBytes::Owned(read_stdin()?);
             let format = resolve_input_format(args.input_format, None);
             vec![(input_bytes, format)]
         } else {
             let mut sources = Vec::new();
             for file_path in &args.files {
                 let path = Path::new(file_path);
-                let input_bytes = read_file(path)?;
+                let input_bytes = mmap_file(path)?;
                 let format = resolve_input_format(args.input_format, Some(path));
                 sources.push((input_bytes, format));
             }
