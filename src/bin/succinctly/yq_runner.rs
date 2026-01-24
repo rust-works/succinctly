@@ -1344,8 +1344,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     let stdout = std::io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
 
-    // Track last output for exit status
-    let mut last_output: Option<OwnedValue> = None;
+    // Track last output for exit status (only need to know if it was falsy, not the full value)
+    let mut last_was_falsy = false;
     let mut had_output = false;
 
     // Check if expression contains split_doc - if so, each result is a separate document
@@ -1457,7 +1457,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         let results = evaluate_input(&OwnedValue::Null, &program.expr, &context)?;
         for result in results {
             split_doc_state.write_separator(&mut writer, &output_config)?;
-            last_output = Some(result.clone());
+            last_was_falsy = matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
             had_output = true;
             output_value(&mut writer, &result, &output_config)?;
         }
@@ -1486,7 +1486,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             let results = evaluate_input(&slurped, &program.expr, &context)?;
             for result in results {
                 split_doc_state.write_separator(&mut writer, &output_config)?;
-                last_output = Some(result.clone());
+                last_was_falsy = matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                 had_output = true;
                 output_value(&mut writer, &result, &output_config)?;
             }
@@ -1497,7 +1497,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 let results = evaluate_input(&input, &program.expr, &context)?;
                 for result in results {
                     split_doc_state.write_separator(&mut writer, &output_config)?;
-                    last_output = Some(result.clone());
+                    last_was_falsy = matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                     had_output = true;
                     output_value(&mut writer, &result, &output_config)?;
                 }
@@ -1546,7 +1546,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         let mut split_doc_state = SplitDocState::new(has_split_doc);
         for result in results {
             split_doc_state.write_separator(&mut writer, &output_config)?;
-            last_output = Some(result.clone());
+            last_was_falsy = matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
             had_output = true;
             output_value(&mut writer, &result, &output_config)?;
         }
@@ -1603,7 +1603,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     no_color_config.use_color = false;
                     for result in results {
                         split_doc_state.write_separator(&mut buf_writer, &no_color_config)?;
-                        last_output = Some(result.clone());
+                        last_was_falsy =
+                            matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                         had_output = true;
                         output_value(&mut buf_writer, &result, &no_color_config)?;
                     }
@@ -1695,7 +1696,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 }
                 for result in results {
                     split_doc_state.write_separator(&mut writer, &output_config)?;
-                    last_output = Some(result.clone());
+                    last_was_falsy = matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                     had_output = true;
                     output_value(&mut writer, &result, &output_config)?;
                 }
@@ -1710,7 +1711,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         if !had_output {
             return Ok(exit_codes::NO_OUTPUT);
         }
-        if let Some(OwnedValue::Null | OwnedValue::Bool(false)) = last_output {
+        if last_was_falsy {
             return Ok(exit_codes::FALSE_OR_NULL);
         }
     }

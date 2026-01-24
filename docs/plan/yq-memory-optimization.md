@@ -522,7 +522,7 @@ pub fn stream_yaml_from_cursor<W: core::fmt::Write>(
 | `.[]`                      | ✅ Yes      | Returns Many(cursors)              |
 | `.users[].name`            | ✅ Yes      | Chained navigation                 |
 | `.users \| .[0]`           | ✅ Yes      | Pipe of navigations                |
-| `select(.age > 30)`        | ⚠️ Partial | Filter can stream, condition can't |
+| `select(.age > 30)`        | ⚠️ Partial  | Filter can stream, condition can't |
 | `.a + .b`                  | ❌ No       | Arithmetic requires values         |
 | `[.a, .b]`                 | ❌ No       | Array construction                 |
 | `{name: .n}`               | ❌ No       | Object construction                |
@@ -693,14 +693,27 @@ struct InternedString {
 
 ## Implementation Priority
 
-| Phase | Impact    | Complexity  | Priority                     |
-|-------|-----------|-------------|------------------------------|
-| M3    | Low       | Low         | **P1** (quick win)           |
-| M4    | Medium    | Low-Medium  | **P1** (quick win)           |
-| M1    | High      | Medium      | **P2** (major improvement)   |
-| M2    | Very High | High        | **P3** (requires design work)|
-| M5    | Medium    | Medium      | **P4** (nice to have)        |
-| M6    | Medium    | Medium-High | **P4** (nice to have)        |
+| Phase | Impact    | Complexity  | Priority                     | Status      |
+|-------|-----------|-------------|------------------------------|-------------|
+| M3    | Low       | Low         | **P1** (quick win)           | ✅ Done     |
+| M4    | Medium    | Low-Medium  | **P1** (quick win)           | Pending     |
+| M1    | High      | Medium      | **P2** (major improvement)   | Pending     |
+| M2    | Very High | High        | **P3** (requires design work)| Pending     |
+| M5    | Medium    | Medium      | **P4** (nice to have)        | Pending     |
+| M6    | Medium    | Medium-High | **P4** (nice to have)        | Pending     |
+
+### M3 Results
+
+**Completed**: 2026-01-24
+
+Replaced `last_output: Option<OwnedValue>` with `last_was_falsy: bool` to eliminate cloning for exit status tracking. The clone only occurred once per result loop (on the final iteration), not for every result, so **no measurable memory or performance improvement** was observed in benchmarks. However, the change simplifies the code and removes unnecessary allocations.
+
+**Benchmark comparison** (100MB users file, `.users[]` query):
+- Baseline: 1390 MB, 3.93s
+- Optimized: 1390 MB, 3.99s
+- Difference: ~0%
+
+The real memory overhead comes from OwnedValue DOM materialization (M2) and result buffering (M1), not from exit status cloning.
 
 ## Expected Results
 
@@ -741,7 +754,8 @@ The goal is to bring standard path closer to fast path performance.
 
 ## Changelog
 
-| Date       | Change                                                     |
-|------------|------------------------------------------------------------|
-| 2026-01-24 | Added detailed M2 implementation plan with 5 sub-phases    |
-| 2026-01-24 | Initial analysis and optimization plan                     |
+| Date       | Change                                                            |
+|------------|-------------------------------------------------------------------|
+| 2026-01-24 | **M3 completed**: Eliminated exit status cloning (no perf impact) |
+| 2026-01-24 | Added detailed M2 implementation plan with 5 sub-phases           |
+| 2026-01-24 | Initial analysis and optimization plan                            |
