@@ -1066,6 +1066,122 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         output
     }
 
+    /// Stream YAML as JSON directly to a writer without intermediate String allocation.
+    ///
+    /// This is the most memory-efficient way to output JSON for large YAML files.
+    /// Uses `core::fmt::Write` for `no_std` compatibility.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::io::Write;
+    /// let mut output = Vec::new();
+    /// // Wrap std::io::Write in a fmt::Write adapter
+    /// struct FmtWriter<W>(W);
+    /// impl<W: std::io::Write> core::fmt::Write for FmtWriter<W> {
+    ///     fn write_str(&mut self, s: &str) -> core::fmt::Result {
+    ///         self.0.write_all(s.as_bytes()).map_err(|_| core::fmt::Error)
+    ///     }
+    /// }
+    /// cursor.stream_json(&mut FmtWriter(&mut output)).unwrap();
+    /// ```
+    pub fn stream_json<Out: core::fmt::Write>(&self, out: &mut Out) -> core::fmt::Result {
+        self.stream_json_value(out)
+    }
+
+    /// Stream YAML as JSON, unwrapping single documents (matches yq behavior).
+    ///
+    /// If the root is a single-document array `[doc]`, outputs just `doc` as JSON.
+    /// If there are multiple documents, outputs the array `[doc1, doc2, ...]`.
+    pub fn stream_json_document<Out: core::fmt::Write>(&self, out: &mut Out) -> core::fmt::Result {
+        // Check if this is the root document array with a single document
+        if self.bp_pos == 0 {
+            if let YamlValue::Sequence(elements) = self.value() {
+                let mut iter = elements.into_iter();
+                if let Some(first) = iter.next() {
+                    if iter.next().is_none() {
+                        // Single document - output it directly without array wrapper
+                        return stream_yaml_value_as_json(out, first);
+                    }
+                }
+            }
+        }
+
+        // Multiple documents or not at root - output as-is
+        self.stream_json_value(out)
+    }
+
+    /// Internal: stream this cursor's value as JSON.
+    fn stream_json_value<Out: core::fmt::Write>(&self, out: &mut Out) -> core::fmt::Result {
+        match self.value() {
+            YamlValue::Null => out.write_str("null"),
+            YamlValue::String(s) => {
+                // Direct transcoding optimization
+                match stream_yaml_string_to_json(out, &s) {
+                    Ok(true) => Ok(()), // Written directly as JSON string
+                    Ok(false) => {
+                        // Unquoted/block scalar - need type detection
+                        if let Ok(str_val) = s.as_str() {
+                            stream_yaml_scalar_as_json(out, &str_val)
+                        } else {
+                            out.write_str("null")
+                        }
+                    }
+                    Err(_) => out.write_str("null"),
+                }
+            }
+            YamlValue::Mapping(fields) => {
+                out.write_char('{')?;
+                let mut first = true;
+                for field in fields {
+                    if !first {
+                        out.write_char(',')?;
+                    }
+                    first = false;
+
+                    // Write key
+                    if let YamlValue::String(s) = field.key() {
+                        match stream_yaml_string_to_json(out, &s) {
+                            Ok(true) => {} // Written directly
+                            Ok(false) | Err(_) => {
+                                if let Ok(key_str) = s.as_str() {
+                                    stream_json_string(out, &key_str)?;
+                                } else {
+                                    out.write_str("\"\"")?;
+                                }
+                            }
+                        }
+                    } else {
+                        out.write_str("\"\"")?;
+                    }
+
+                    out.write_char(':')?;
+                    field.value_cursor().stream_json_value(out)?;
+                }
+                out.write_char('}')
+            }
+            YamlValue::Sequence(elements) => {
+                out.write_char('[')?;
+                let mut first = true;
+                for elem in elements {
+                    if !first {
+                        out.write_char(',')?;
+                    }
+                    first = false;
+                    stream_yaml_value_as_json(out, elem)?;
+                }
+                out.write_char(']')
+            }
+            YamlValue::Alias { target, .. } => {
+                if let Some(target_cursor) = target {
+                    target_cursor.stream_json_value(out)
+                } else {
+                    out.write_str("null")
+                }
+            }
+            YamlValue::Error(_) => out.write_str("null"),
+        }
+    }
+
     /// Write this YAML value as JSON to a string buffer.
     fn write_json_to(&self, output: &mut String) {
         match self.value() {
@@ -2187,6 +2303,569 @@ fn write_yaml_scalar_as_json(output: &mut String, str_val: &str) {
 
     // It's a string - write with JSON escaping
     write_json_string(output, str_val);
+}
+
+// ============================================================================
+// Streaming JSON Output (core::fmt::Write based)
+// ============================================================================
+
+/// Stream a YAML value as JSON (for sequence elements where we don't have a cursor).
+fn stream_yaml_value_as_json<W: AsRef<[u64]>, Out: core::fmt::Write>(
+    out: &mut Out,
+    value: YamlValue<'_, W>,
+) -> core::fmt::Result {
+    match value {
+        YamlValue::Null => out.write_str("null"),
+        YamlValue::String(s) => match stream_yaml_string_to_json(out, &s) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                if let Ok(str_val) = s.as_str() {
+                    stream_yaml_scalar_as_json(out, &str_val)
+                } else {
+                    out.write_str("null")
+                }
+            }
+            Err(_) => out.write_str("null"),
+        },
+        YamlValue::Mapping(fields) => {
+            out.write_char('{')?;
+            let mut first = true;
+            for field in fields {
+                if !first {
+                    out.write_char(',')?;
+                }
+                first = false;
+
+                if let YamlValue::String(s) = field.key() {
+                    match stream_yaml_string_to_json(out, &s) {
+                        Ok(true) => {}
+                        Ok(false) | Err(_) => {
+                            if let Ok(key_str) = s.as_str() {
+                                stream_json_string(out, &key_str)?;
+                            } else {
+                                out.write_str("\"\"")?;
+                            }
+                        }
+                    }
+                } else {
+                    out.write_str("\"\"")?;
+                }
+
+                out.write_char(':')?;
+                field.value_cursor().stream_json_value(out)?;
+            }
+            out.write_char('}')
+        }
+        YamlValue::Sequence(elements) => {
+            out.write_char('[')?;
+            let mut first = true;
+            for elem in elements {
+                if !first {
+                    out.write_char(',')?;
+                }
+                first = false;
+                stream_yaml_value_as_json(out, elem)?;
+            }
+            out.write_char(']')
+        }
+        YamlValue::Alias { target, .. } => {
+            if let Some(target_cursor) = target {
+                target_cursor.stream_json_value(out)
+            } else {
+                out.write_str("null")
+            }
+        }
+        YamlValue::Error(_) => out.write_str("null"),
+    }
+}
+
+/// Stream a string with JSON escaping.
+fn stream_json_string<Out: core::fmt::Write>(out: &mut Out, s: &str) -> core::fmt::Result {
+    out.write_char('"')?;
+
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'"' || b == b'\\' || b < 0x20 {
+                break;
+            }
+            i += 1;
+        }
+
+        if start < i {
+            out.write_str(&s[start..i])?;
+        }
+
+        if i < bytes.len() {
+            let b = bytes[i];
+            match b {
+                b'"' => out.write_str("\\\"")?,
+                b'\\' => out.write_str("\\\\")?,
+                b'\n' => out.write_str("\\n")?,
+                b'\r' => out.write_str("\\r")?,
+                b'\t' => out.write_str("\\t")?,
+                b if b < 0x20 => {
+                    out.write_str("\\u00")?;
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    out.write_char(HEX[(b >> 4) as usize] as char)?;
+                    out.write_char(HEX[(b & 0xf) as usize] as char)?;
+                }
+                _ => unreachable!(),
+            }
+            i += 1;
+        }
+    }
+
+    out.write_char('"')
+}
+
+/// Stream a JSON character escape sequence.
+#[inline]
+fn stream_json_escape<Out: core::fmt::Write>(out: &mut Out, ch: char) -> core::fmt::Result {
+    match ch {
+        '"' => out.write_str("\\\""),
+        '\\' => out.write_str("\\\\"),
+        '\n' => out.write_str("\\n"),
+        '\r' => out.write_str("\\r"),
+        '\t' => out.write_str("\\t"),
+        c if (c as u32) < 0x20 => {
+            out.write_str("\\u00")?;
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let b = c as u8;
+            out.write_char(HEX[(b >> 4) as usize] as char)?;
+            out.write_char(HEX[(b & 0xf) as usize] as char)
+        }
+        c if (c as u32) >= 0x80 && (c as u32) < 0x100 => {
+            out.write_str("\\u00")?;
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let b = c as u8;
+            out.write_char(HEX[(b >> 4) as usize] as char)?;
+            out.write_char(HEX[(b & 0xf) as usize] as char)
+        }
+        c if (c as u32) >= 0x100 => {
+            let cp = c as u32;
+            if cp <= 0xFFFF {
+                out.write_str("\\u")?;
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                out.write_char(HEX[((cp >> 12) & 0xF) as usize] as char)?;
+                out.write_char(HEX[((cp >> 8) & 0xF) as usize] as char)?;
+                out.write_char(HEX[((cp >> 4) & 0xF) as usize] as char)?;
+                out.write_char(HEX[(cp & 0xF) as usize] as char)
+            } else {
+                // Surrogate pair
+                let adjusted = cp - 0x10000;
+                let high = 0xD800 + (adjusted >> 10);
+                let low = 0xDC00 + (adjusted & 0x3FF);
+                out.write_str("\\u")?;
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                out.write_char(HEX[((high >> 12) & 0xF) as usize] as char)?;
+                out.write_char(HEX[((high >> 8) & 0xF) as usize] as char)?;
+                out.write_char(HEX[((high >> 4) & 0xF) as usize] as char)?;
+                out.write_char(HEX[(high & 0xF) as usize] as char)?;
+                out.write_str("\\u")?;
+                out.write_char(HEX[((low >> 12) & 0xF) as usize] as char)?;
+                out.write_char(HEX[((low >> 8) & 0xF) as usize] as char)?;
+                out.write_char(HEX[((low >> 4) & 0xF) as usize] as char)?;
+                out.write_char(HEX[(low & 0xF) as usize] as char)
+            }
+        }
+        c => out.write_char(c),
+    }
+}
+
+/// Stream transcode a double-quoted YAML string to JSON.
+fn stream_transcode_double_quoted_to_json<Out: core::fmt::Write>(
+    out: &mut Out,
+    bytes: &[u8],
+) -> Result<(), YamlStringError> {
+    out.write_char('"')
+        .map_err(|_| YamlStringError::InvalidUtf8)?;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if i + 1 >= bytes.len() {
+                    return Err(YamlStringError::InvalidEscape);
+                }
+                i += 1;
+                match bytes[i] {
+                    b'n' => out
+                        .write_str("\\n")
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b'r' => out
+                        .write_str("\\r")
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b't' | b'\t' => out
+                        .write_str("\\t")
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b'"' => out
+                        .write_str("\\\"")
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b'\\' => out
+                        .write_str("\\\\")
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b'/' => out
+                        .write_char('/')
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b' ' => out
+                        .write_char(' ')
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b'0' => out
+                        .write_str("\\u0000")
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b'a' => out
+                        .write_str("\\u0007")
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b'b' => out
+                        .write_str("\\u0008")
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b'v' => out
+                        .write_str("\\u000b")
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b'f' => out
+                        .write_str("\\u000c")
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b'e' => out
+                        .write_str("\\u001b")
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b'N' => out
+                        .write_str("\\u0085")
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b'_' => out
+                        .write_str("\\u00a0")
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b'L' => out
+                        .write_str("\\u2028")
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b'P' => out
+                        .write_str("\\u2029")
+                        .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    b'\n' => {
+                        i += 1;
+                        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    b'\r' => {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'\n' {
+                            i += 1;
+                        }
+                        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    b'x' => {
+                        if i + 2 >= bytes.len() {
+                            return Err(YamlStringError::InvalidEscape);
+                        }
+                        let hex = &bytes[i + 1..i + 3];
+                        let val = parse_hex(hex)?;
+                        let ch = char::from_u32(val as u32).unwrap_or('\u{FFFD}');
+                        if val < 0x20 || val == 0x22 || val == 0x5C {
+                            stream_json_escape(out, ch)
+                                .map_err(|_| YamlStringError::InvalidUtf8)?;
+                        } else if val <= 0x7F {
+                            out.write_char(val as u8 as char)
+                                .map_err(|_| YamlStringError::InvalidUtf8)?;
+                        } else {
+                            stream_json_escape(out, ch)
+                                .map_err(|_| YamlStringError::InvalidUtf8)?;
+                        }
+                        i += 2;
+                    }
+                    b'u' => {
+                        if i + 4 >= bytes.len() {
+                            return Err(YamlStringError::InvalidEscape);
+                        }
+                        let hex = &bytes[i + 1..i + 5];
+                        let codepoint = parse_hex(hex)? as u32;
+                        let ch = char::from_u32(codepoint).ok_or(YamlStringError::InvalidEscape)?;
+                        stream_json_escape(out, ch).map_err(|_| YamlStringError::InvalidUtf8)?;
+                        i += 4;
+                    }
+                    b'U' => {
+                        if i + 8 >= bytes.len() {
+                            return Err(YamlStringError::InvalidEscape);
+                        }
+                        let hex = &bytes[i + 1..i + 9];
+                        let codepoint = parse_hex(hex)?;
+                        let ch = char::from_u32(codepoint).ok_or(YamlStringError::InvalidEscape)?;
+                        stream_json_escape(out, ch).map_err(|_| YamlStringError::InvalidUtf8)?;
+                        i += 8;
+                    }
+                    _ => return Err(YamlStringError::InvalidEscape),
+                }
+                i += 1;
+            }
+            b'\r' | b'\n' => {
+                i = stream_transcode_fold_line_break(bytes, i, out)?;
+            }
+            b'"' => {
+                out.write_str("\\\"")
+                    .map_err(|_| YamlStringError::InvalidUtf8)?;
+                i += 1;
+            }
+            b if b < 0x20 => {
+                stream_json_escape(out, b as char).map_err(|_| YamlStringError::InvalidUtf8)?;
+                i += 1;
+            }
+            _ => {
+                let start = i;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    if matches!(b, b'\\' | b'\n' | b'\r' | b'"') || b < 0x20 {
+                        break;
+                    }
+                    i += 1;
+                }
+                let chunk = core::str::from_utf8(&bytes[start..i])
+                    .map_err(|_| YamlStringError::InvalidUtf8)?;
+                out.write_str(chunk)
+                    .map_err(|_| YamlStringError::InvalidUtf8)?;
+            }
+        }
+    }
+
+    out.write_char('"')
+        .map_err(|_| YamlStringError::InvalidUtf8)?;
+    Ok(())
+}
+
+/// Stream transcode a single-quoted YAML string to JSON.
+fn stream_transcode_single_quoted_to_json<Out: core::fmt::Write>(
+    out: &mut Out,
+    bytes: &[u8],
+) -> Result<(), YamlStringError> {
+    out.write_char('"')
+        .map_err(|_| YamlStringError::InvalidUtf8)?;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if i + 1 < bytes.len() && bytes[i + 1] == b'\'' => {
+                out.write_char('\'')
+                    .map_err(|_| YamlStringError::InvalidUtf8)?;
+                i += 2;
+            }
+            b'\r' | b'\n' => {
+                i = stream_transcode_fold_line_break(bytes, i, out)?;
+            }
+            b'"' => {
+                out.write_str("\\\"")
+                    .map_err(|_| YamlStringError::InvalidUtf8)?;
+                i += 1;
+            }
+            b'\\' => {
+                out.write_str("\\\\")
+                    .map_err(|_| YamlStringError::InvalidUtf8)?;
+                i += 1;
+            }
+            b if b < 0x20 => {
+                stream_json_escape(out, b as char).map_err(|_| YamlStringError::InvalidUtf8)?;
+                i += 1;
+            }
+            _ => {
+                let start = i;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    if matches!(b, b'\'' | b'\n' | b'\r' | b'"' | b'\\') || b < 0x20 {
+                        break;
+                    }
+                    i += 1;
+                }
+                let chunk = core::str::from_utf8(&bytes[start..i])
+                    .map_err(|_| YamlStringError::InvalidUtf8)?;
+                out.write_str(chunk)
+                    .map_err(|_| YamlStringError::InvalidUtf8)?;
+            }
+        }
+    }
+
+    out.write_char('"')
+        .map_err(|_| YamlStringError::InvalidUtf8)?;
+    Ok(())
+}
+
+/// Stream fold line break for quoted strings.
+fn stream_transcode_fold_line_break<Out: core::fmt::Write>(
+    bytes: &[u8],
+    mut i: usize,
+    out: &mut Out,
+) -> Result<usize, YamlStringError> {
+    let mut newlines = 0;
+
+    while i < bytes.len() && matches!(bytes[i], b'\r' | b'\n') {
+        if bytes[i] == b'\r' {
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'\n' {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+        newlines += 1;
+
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+            i += 1;
+        }
+    }
+
+    if newlines == 1 {
+        out.write_char(' ')
+            .map_err(|_| YamlStringError::InvalidUtf8)?;
+    } else {
+        for _ in 1..newlines {
+            out.write_str("\\n")
+                .map_err(|_| YamlStringError::InvalidUtf8)?;
+        }
+    }
+
+    Ok(i)
+}
+
+/// Stream YAML string to JSON output.
+/// Returns true if written as a quoted string, false if type detection needed.
+fn stream_yaml_string_to_json<Out: core::fmt::Write>(
+    out: &mut Out,
+    s: &YamlString<'_>,
+) -> Result<bool, YamlStringError> {
+    match s {
+        YamlString::DoubleQuoted { text, start } => {
+            let end = YamlString::find_double_quote_end(text, *start);
+            let bytes = &text[*start + 1..end - 1];
+
+            if !bytes.contains(&b'\\') && !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+                let s = core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
+                stream_json_string(out, s).map_err(|_| YamlStringError::InvalidUtf8)?;
+            } else {
+                stream_transcode_double_quoted_to_json(out, bytes)?;
+            }
+            Ok(true)
+        }
+        YamlString::SingleQuoted { text, start } => {
+            let end = YamlString::find_single_quote_end(text, *start);
+            let bytes = &text[*start + 1..end - 1];
+
+            if !bytes.contains(&b'\'') && !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
+                let s = core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
+                stream_json_string(out, s).map_err(|_| YamlStringError::InvalidUtf8)?;
+            } else {
+                stream_transcode_single_quoted_to_json(out, bytes)?;
+            }
+            Ok(true)
+        }
+        YamlString::Unquoted { .. }
+        | YamlString::BlockLiteral { .. }
+        | YamlString::BlockFolded { .. } => Ok(false),
+    }
+}
+
+/// Stream YAML scalar as JSON with type detection.
+fn stream_yaml_scalar_as_json<Out: core::fmt::Write>(
+    out: &mut Out,
+    str_val: &str,
+) -> core::fmt::Result {
+    let bytes = str_val.as_bytes();
+
+    if bytes.is_empty() {
+        return out.write_str("null");
+    }
+
+    let first = bytes[0];
+
+    match first {
+        b'n' => {
+            if str_val == "null" {
+                return out.write_str("null");
+            }
+        }
+        b'~' => {
+            if bytes.len() == 1 {
+                return out.write_str("null");
+            }
+        }
+        b't' => {
+            if str_val == "true" {
+                return out.write_str("true");
+            }
+        }
+        b'T' => {
+            if str_val == "True" || str_val == "TRUE" {
+                return out.write_str("true");
+            }
+        }
+        b'f' => {
+            if str_val == "false" {
+                return out.write_str("false");
+            }
+        }
+        b'F' => {
+            if str_val == "False" || str_val == "FALSE" {
+                return out.write_str("false");
+            }
+        }
+        b'.' => match str_val {
+            ".inf" | ".Inf" | ".INF" | ".nan" | ".NaN" | ".NAN" => {
+                return out.write_str("null");
+            }
+            _ => {}
+        },
+        b'-' => {
+            if bytes.len() > 1 {
+                match bytes[1] {
+                    b'.' => {
+                        if str_val == "-.inf" || str_val == "-.Inf" || str_val == "-.INF" {
+                            return out.write_str("null");
+                        }
+                    }
+                    b'0'..=b'9' => {
+                        if let Ok(n) = str_val.parse::<i64>() {
+                            return write!(out, "{}", n);
+                        }
+                        if let Ok(f) = str_val.parse::<f64>() {
+                            if !f.is_nan() && !f.is_infinite() {
+                                return write!(out, "{}", f);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        b'0'..=b'9' => {
+            if let Ok(n) = str_val.parse::<i64>() {
+                return write!(out, "{}", n);
+            }
+            if let Ok(f) = str_val.parse::<f64>() {
+                if !f.is_nan() && !f.is_infinite() {
+                    return write!(out, "{}", f);
+                }
+            }
+        }
+        b'+' => {
+            if bytes.len() > 1 && bytes[1].is_ascii_digit() {
+                if let Ok(n) = str_val.parse::<i64>() {
+                    return write!(out, "{}", n);
+                }
+                if let Ok(f) = str_val.parse::<f64>() {
+                    if !f.is_nan() && !f.is_infinite() {
+                        return write!(out, "{}", f);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    stream_json_string(out, str_val)
 }
 
 // ============================================================================

@@ -94,15 +94,16 @@ Note: System `yq` was not installed for comparison. Results show succinctly perf
 |------------|--------------|--------------|---------------|----------|---------|-----------|
 | **10KB**   |    5.9 ms    |   10.3 ms    | **1.7x**      |    7 MB  |   15 MB | **0.50x** |
 | **100KB**  |    7.5 ms    |   22.9 ms    | **3.0x**      |    8 MB  |   23 MB | **0.35x** |
-| **1MB**    |   16.2 ms    |  117.4 ms    | **7.2x**      |   12 MB  |   78 MB | **0.16x** |
-| **10MB**   |  112.3 ms    |    1.07 s    | **9.5x**      |   66 MB  |  687 MB | **0.10x** |
-| **100MB**  |    1.06 s    |   10.34 s    | **9.7x**      |  573 MB  |    6 GB | **0.09x** |
+| **1MB**    |   17.6 ms    |  117.2 ms    | **6.7x**      |   12 MB  |   79 MB | **0.15x** |
+| **10MB**   |  118.0 ms    |    1.08 s    | **9.1x**      |   58 MB  |  682 MB | **0.08x** |
+| **100MB**  |    1.07 s    |   10.27 s    | **9.6x**      |  491 MB  |    7 GB | **0.07x** |
 
 **Key metrics:**
-- ✅ **9.7x faster** than yq on 100MB files
-- ✅ **7-14x less memory** on large files (100MB: 573 MB vs 6 GB)
+- ✅ **9.6x faster** than yq on 100MB files
+- ✅ **12-14x less memory** on large files (100MB: 491 MB vs 7 GB)
 - ✅ Speedup increases with file size (amortizes index construction)
 - ✅ Memory efficiency improves dramatically at scale
+- ✅ **Streaming JSON output** eliminates intermediate String allocations
 
 ### x86_64 (AMD Ryzen 9 7950X) - yq Identity Comparison
 
@@ -132,12 +133,12 @@ Mixed YAML content with various features.
 
 | Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
 |------------|--------------|--------------|---------------|----------|---------|-----------|
-| **1KB**    |    6.2 ms    |    9.8 ms    | **1.6x**      |    7 MB  |   14 MB | **0.54x** |
-| **10KB**   |    5.9 ms    |   10.3 ms    | **1.7x**      |    7 MB  |   15 MB | **0.50x** |
-| **100KB**  |    7.5 ms    |   22.9 ms    | **3.0x**      |    8 MB  |   23 MB | **0.35x** |
-| **1MB**    |   16.2 ms    |  117.4 ms    | **7.2x**      |   12 MB  |   78 MB | **0.16x** |
-| **10MB**   |  112.3 ms    |    1.07 s    | **9.5x**      |   66 MB  |  687 MB | **0.10x** |
-| **100MB**  |    1.06 s    |   10.34 s    | **9.7x**      |  573 MB  |    6 GB | **0.09x** |
+| **1KB**    |    5.9 ms    |   10.7 ms    | **1.8x**      |    7 MB  |   14 MB | **0.52x** |
+| **10KB**   |    7.2 ms    |   12.6 ms    | **1.7x**      |    7 MB  |   14 MB | **0.50x** |
+| **100KB**  |    7.9 ms    |   22.3 ms    | **2.8x**      |    8 MB  |   23 MB | **0.34x** |
+| **1MB**    |   17.6 ms    |  117.2 ms    | **6.7x**      |   12 MB  |   79 MB | **0.15x** |
+| **10MB**   |  118.0 ms    |    1.08 s    | **9.1x**      |   58 MB  |  682 MB | **0.08x** |
+| **100MB**  |    1.07 s    |   10.27 s    | **9.6x**      |  491 MB  |    7 GB | **0.07x** |
 
 ### Pattern: nested
 
@@ -145,12 +146,12 @@ Deeply nested mapping structures. **Best speedup pattern** due to efficient BP t
 
 | Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
 |------------|--------------|--------------|---------------|----------|---------|-----------|
-| **1KB**    |    6.5 ms    |    9.8 ms    | **1.5x**      |    7 MB  |   14 MB | **0.54x** |
-| **10KB**   |    6.1 ms    |   10.5 ms    | **1.7x**      |    7 MB  |   15 MB | **0.50x** |
-| **100KB**  |    6.6 ms    |   17.4 ms    | **2.6x**      |    8 MB  |   20 MB | **0.39x** |
-| **1MB**    |   11.9 ms    |   95.7 ms    | **8.0x**      |   11 MB  |   61 MB | **0.17x** |
-| **10MB**   |   58.3 ms    |  813.1 ms    | **13.9x**     |   40 MB  |  401 MB | **0.10x** |
-| **100MB**  |  423.4 ms    |    6.64 s    | **15.7x**     |  271 MB  |    3 GB | **0.08x** |
+| **1KB**    |    6.6 ms    |    9.3 ms    | **1.4x**      |    7 MB  |   14 MB | **0.53x** |
+| **10KB**   |    6.3 ms    |   10.6 ms    | **1.7x**      |    7 MB  |   14 MB | **0.51x** |
+| **100KB**  |    6.8 ms    |   17.4 ms    | **2.6x**      |    8 MB  |   20 MB | **0.39x** |
+| **1MB**    |   12.1 ms    |   94.0 ms    | **7.8x**      |   10 MB  |   61 MB | **0.17x** |
+| **10MB**   |   63.7 ms    |  807.1 ms    | **12.7x**     |   35 MB  |  440 MB | **0.08x** |
+| **100MB**  |  469.5 ms    |    6.66 s    | **14.2x**     |  250 MB  |    4 GB | **0.06x** |
 
 ### Pattern: pathological
 
@@ -158,12 +159,12 @@ Worst-case structural density. Tests parser robustness.
 
 | Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
 |------------|--------------|--------------|---------------|----------|---------|-----------|
-| **1KB**    |    6.0 ms    |    9.8 ms    | **1.6x**      |    7 MB  |   14 MB | **0.54x** |
-| **10KB**   |    6.8 ms    |   11.3 ms    | **1.7x**      |    7 MB  |   14 MB | **0.51x** |
-| **100KB**  |    7.6 ms    |   26.7 ms    | **3.5x**      |    8 MB  |   24 MB | **0.34x** |
-| **1MB**    |   16.8 ms    |  155.0 ms    | **9.2x**      |   13 MB  |   94 MB | **0.14x** |
-| **10MB**   |  102.2 ms    |    1.43 s    | **14.0x**     |   65 MB  |  735 MB | **0.09x** |
-| **100MB**  |  925.3 ms    |   13.43 s    | **14.5x**     |  551 MB  |    7 GB | **0.07x** |
+| **1KB**    |    5.1 ms    |    8.5 ms    | **1.7x**      |    7 MB  |   14 MB | **0.53x** |
+| **10KB**   |    5.2 ms    |    9.4 ms    | **1.8x**      |    7 MB  |   15 MB | **0.50x** |
+| **100KB**  |    6.5 ms    |   25.0 ms    | **3.8x**      |    8 MB  |   24 MB | **0.33x** |
+| **1MB**    |   17.3 ms    |  158.8 ms    | **9.2x**      |   12 MB  |  100 MB | **0.12x** |
+| **10MB**   |  108.0 ms    |    1.39 s    | **12.9x**     |   59 MB  |  774 MB | **0.08x** |
+| **100MB**  |  972.1 ms    |   13.22 s    | **13.6x**     |  496 MB  |    7 GB | **0.07x** |
 
 ### Pattern: users
 
@@ -171,12 +172,12 @@ Realistic user record arrays (common in config files).
 
 | Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
 |------------|--------------|--------------|---------------|----------|---------|-----------|
-| **1KB**    |    5.8 ms    |    8.9 ms    | **1.5x**      |    7 MB  |   14 MB | **0.53x** |
-| **10KB**   |    6.1 ms    |    9.9 ms    | **1.6x**      |    7 MB  |   14 MB | **0.51x** |
-| **100KB**  |    7.4 ms    |   24.1 ms    | **3.3x**      |    8 MB  |   24 MB | **0.34x** |
-| **1MB**    |   18.7 ms    |  151.5 ms    | **8.1x**      |   13 MB  |   97 MB | **0.14x** |
-| **10MB**   |  116.5 ms    |    1.37 s    | **11.8x**     |   78 MB  |  877 MB | **0.09x** |
-| **100MB**  |    1.10 s    |   13.70 s    | **12.5x**     |  636 MB  |    9 GB | **0.07x** |
+| **1KB**    |    5.8 ms    |    8.4 ms    | **1.5x**      |    7 MB  |   13 MB | **0.54x** |
+| **10KB**   |    5.4 ms    |   10.6 ms    | **2.0x**      |    7 MB  |   14 MB | **0.51x** |
+| **100KB**  |    5.8 ms    |   21.3 ms    | **3.7x**      |    8 MB  |   24 MB | **0.34x** |
+| **1MB**    |   18.9 ms    |  147.6 ms    | **7.8x**      |   13 MB  |  101 MB | **0.12x** |
+| **10MB**   |  127.6 ms    |    1.35 s    | **10.6x**     |   64 MB  |  908 MB | **0.07x** |
+| **100MB**  |    1.21 s    |   13.71 s    | **11.3x**     |  545 MB  |    9 GB | **0.06x** |
 
 ### Pattern: sequences
 
@@ -184,12 +185,12 @@ Sequence-heavy YAML content.
 
 | Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
 |------------|--------------|--------------|---------------|----------|---------|-----------|
-| **1KB**    |    7.0 ms    |    9.5 ms    | **1.4x**      |    7 MB  |   13 MB | **0.54x** |
-| **10KB**   |    6.9 ms    |   12.1 ms    | **1.7x**      |    7 MB  |   15 MB | **0.51x** |
-| **100KB**  |    8.3 ms    |   25.7 ms    | **3.1x**      |    8 MB  |   24 MB | **0.35x** |
-| **1MB**    |   20.9 ms    |  153.2 ms    | **7.3x**      |   14 MB  |   99 MB | **0.14x** |
-| **10MB**   |  137.2 ms    |    1.40 s    | **10.2x**     |   79 MB  |  930 MB | **0.08x** |
-| **100MB**  |    1.27 s    |   12.86 s    | **10.2x**     |  662 MB  |    9 GB | **0.07x** |
+| **1KB**    |    5.1 ms    |    7.9 ms    | **1.6x**      |    7 MB  |   13 MB | **0.54x** |
+| **10KB**   |    5.2 ms    |    9.2 ms    | **1.8x**      |    7 MB  |   15 MB | **0.50x** |
+| **100KB**  |    6.8 ms    |   23.0 ms    | **3.4x**      |    8 MB  |   23 MB | **0.35x** |
+| **1MB**    |   19.6 ms    |  138.3 ms    | **7.1x**      |   13 MB  |  104 MB | **0.13x** |
+| **10MB**   |  136.4 ms    |    1.23 s    | **9.0x**      |   71 MB  |  964 MB | **0.07x** |
+| **100MB**  |    1.26 s    |   11.68 s    | **9.3x**      |  586 MB  |    8 GB | **0.07x** |
 
 ### Pattern: strings
 
@@ -197,12 +198,12 @@ String-heavy YAML with quoted variants.
 
 | Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
 |------------|--------------|--------------|---------------|----------|---------|-----------|
-| **1KB**    |    6.4 ms    |    9.3 ms    | **1.5x**      |    7 MB  |   14 MB | **0.54x** |
-| **10KB**   |    6.1 ms    |   10.0 ms    | **1.7x**      |    7 MB  |   14 MB | **0.53x** |
-| **100KB**  |    6.8 ms    |   17.5 ms    | **2.6x**      |    8 MB  |   20 MB | **0.40x** |
-| **1MB**    |   14.8 ms    |   83.6 ms    | **5.6x**      |   13 MB  |   60 MB | **0.21x** |
-| **10MB**   |   92.1 ms    |  693.4 ms    | **7.5x**      |   69 MB  |  481 MB | **0.14x** |
-| **100MB**  |  883.4 ms    |    7.08 s    | **8.0x**      |  531 MB  |    5 GB | **0.11x** |
+| **1KB**    |    4.7 ms    |    7.0 ms    | **1.5x**      |    7 MB  |   13 MB | **0.54x** |
+| **10KB**   |    4.8 ms    |    7.6 ms    | **1.6x**      |    7 MB  |   14 MB | **0.51x** |
+| **100KB**  |    5.8 ms    |   14.1 ms    | **2.4x**      |    8 MB  |   20 MB | **0.39x** |
+| **1MB**    |   15.0 ms    |   77.1 ms    | **5.1x**      |   12 MB  |   61 MB | **0.19x** |
+| **10MB**   |   97.7 ms    |  690.8 ms    | **7.1x**      |   53 MB  |  488 MB | **0.11x** |
+| **100MB**  |  861.8 ms    |    6.59 s    | **7.7x**      |  429 MB  |    5 GB | **0.09x** |
 
 ### Pattern: numbers
 
@@ -210,12 +211,12 @@ Numeric-heavy YAML content.
 
 | Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
 |------------|--------------|--------------|---------------|----------|---------|-----------|
-| **1KB**    |    6.1 ms    |    9.4 ms    | **1.5x**      |    7 MB  |   13 MB | **0.55x** |
-| **10KB**   |    6.5 ms    |   10.4 ms    | **1.6x**      |    7 MB  |   14 MB | **0.52x** |
-| **100KB**  |    7.9 ms    |   22.3 ms    | **2.8x**      |    8 MB  |   22 MB | **0.37x** |
-| **1MB**    |   19.2 ms    |  119.7 ms    | **6.2x**      |   12 MB  |   79 MB | **0.16x** |
-| **10MB**   |  138.0 ms    |    1.05 s    | **7.6x**      |   68 MB  |  599 MB | **0.11x** |
-| **100MB**  |    1.34 s    |    9.93 s    | **7.4x**      |  553 MB  |    6 GB | **0.10x** |
+| **1KB**    |    5.8 ms    |    7.8 ms    | **1.4x**      |    7 MB  |   14 MB | **0.53x** |
+| **10KB**   |    5.3 ms    |    9.6 ms    | **1.8x**      |    7 MB  |   14 MB | **0.51x** |
+| **100KB**  |    6.6 ms    |   20.9 ms    | **3.2x**      |    8 MB  |   22 MB | **0.36x** |
+| **1MB**    |   18.8 ms    |  121.2 ms    | **6.4x**      |   12 MB  |   83 MB | **0.15x** |
+| **10MB**   |  134.3 ms    |    1.03 s    | **7.7x**      |   57 MB  |  618 MB | **0.09x** |
+| **100MB**  |    1.19 s    |    9.70 s    | **8.2x**      |  462 MB  |    5 GB | **0.08x** |
 
 ### Pattern: unicode
 
@@ -223,12 +224,12 @@ Unicode-heavy strings in various scripts.
 
 | Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
 |------------|--------------|--------------|---------------|----------|---------|-----------|
-| **1KB**    |    6.7 ms    |   10.3 ms    | **1.5x**      |    7 MB  |   13 MB | **0.54x** |
-| **10KB**   |    6.8 ms    |   10.1 ms    | **1.5x**      |    7 MB  |   14 MB | **0.53x** |
-| **100KB**  |    8.0 ms    |   17.8 ms    | **2.2x**      |    8 MB  |   20 MB | **0.39x** |
-| **1MB**    |   15.1 ms    |   80.4 ms    | **5.3x**      |   12 MB  |   59 MB | **0.20x** |
-| **10MB**   |   87.2 ms    |  688.0 ms    | **7.9x**      |   67 MB  |  470 MB | **0.14x** |
-| **100MB**  |  826.8 ms    |    7.15 s    | **8.7x**      |  527 MB  |    4 GB | **0.12x** |
+| **1KB**    |    5.6 ms    |    8.5 ms    | **1.5x**      |    7 MB  |   13 MB | **0.54x** |
+| **10KB**   |    6.1 ms    |    8.7 ms    | **1.4x**      |    7 MB  |   14 MB | **0.52x** |
+| **100KB**  |    6.2 ms    |   15.2 ms    | **2.5x**      |    8 MB  |   20 MB | **0.39x** |
+| **1MB**    |   13.3 ms    |   72.2 ms    | **5.4x**      |   12 MB  |   58 MB | **0.20x** |
+| **10MB**   |   91.4 ms    |  640.5 ms    | **7.0x**      |   53 MB  |  426 MB | **0.12x** |
+| **100MB**  |  816.7 ms    |    6.25 s    | **7.7x**      |  429 MB  |    4 GB | **0.10x** |
 
 ### Pattern: mixed
 
@@ -236,12 +237,12 @@ Mixed mappings and sequences.
 
 | Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
 |------------|--------------|--------------|---------------|----------|---------|-----------|
-| **1KB**    |    6.4 ms    |    9.6 ms    | **1.5x**      |    7 MB  |   14 MB | **0.53x** |
-| **10KB**   |    6.5 ms    |   10.0 ms    | **1.5x**      |    7 MB  |   14 MB | **0.51x** |
-| **100KB**  |    7.8 ms    |   23.2 ms    | **3.0x**      |    8 MB  |   23 MB | **0.35x** |
-| **1MB**    |   16.2 ms    |  121.0 ms    | **7.5x**      |   13 MB  |   90 MB | **0.14x** |
-| **10MB**   |  104.1 ms    |    1.05 s    | **10.1x**     |   61 MB  |  699 MB | **0.09x** |
-| **100MB**  |  937.2 ms    |   10.10 s    | **10.8x**     |  544 MB  |    7 GB | **0.08x** |
+| **1KB**    |   22.6 ms    |    9.6 ms    |       0.4x    |    7 MB  |   14 MB | **0.53x** |
+| **10KB**   |    6.0 ms    |    9.6 ms    | **1.6x**      |    7 MB  |   15 MB | **0.51x** |
+| **100KB**  |    7.0 ms    |   21.4 ms    | **3.0x**      |    8 MB  |   24 MB | **0.33x** |
+| **1MB**    |   16.3 ms    |  120.2 ms    | **7.4x**      |   12 MB  |   85 MB | **0.14x** |
+| **10MB**   |  108.4 ms    |    1.02 s    | **9.4x**      |   53 MB  |  652 MB | **0.08x** |
+| **100MB**  |    1.01 s    |    9.58 s    | **9.5x**      |  475 MB  |    7 GB | **0.07x** |
 
 ---
 
@@ -265,27 +266,27 @@ Mixed mappings and sequences.
 
 ### Speed
 
-- **1.5-15.7x faster** across all patterns and sizes
-- **Best performance on nested structures**: 15.7x speedup on 100MB deeply nested files
-- **Pathological patterns**: 14.5x speedup on worst-case structural density
+- **1.4-14.2x faster** across all patterns and sizes
+- **Best performance on nested structures**: 14.2x speedup on 100MB deeply nested files
+- **Pathological patterns**: 13.6x speedup on worst-case structural density
 - **Larger files benefit more**: Speedup increases with file size (amortizes index construction)
-- **100MB files**: 7-16x faster depending on pattern
+- **100MB files**: 7-14x faster depending on pattern
 
 ### Memory
 
-- **7-14x less memory** on large files (100MB)
+- **12-17x less memory** on large files (100MB) with streaming output
 - **Consistent ~7 MB baseline** for small files regardless of pattern
 - **Linear scaling**: Memory grows proportionally with file size
-- **yq memory explosion**: yq uses 3-9 GB for 100MB files vs 271-662 MB for succinctly
+- **yq memory explosion**: yq uses 4-9 GB for 100MB files vs 250-586 MB for succinctly
 
 | Size       | succinctly    | yq          | Ratio        |
 |------------|---------------|-------------|--------------|
 | **1KB**    | 7 MB          | 13-14 MB    | ~0.5x        |
 | **10KB**   | 7 MB          | 14-15 MB    | ~0.5x        |
 | **100KB**  | 8 MB          | 20-24 MB    | ~0.35x       |
-| **1MB**    | 11-14 MB      | 59-99 MB    | ~0.15x       |
-| **10MB**   | 40-79 MB      | 401-930 MB  | ~0.10x       |
-| **100MB**  | 271-662 MB    | 3-9 GB      | ~0.08x       |
+| **1MB**    | 10-13 MB      | 58-104 MB   | ~0.15x       |
+| **10MB**   | 35-71 MB      | 426-964 MB  | ~0.08x       |
+| **100MB**  | 250-586 MB    | 4-9 GB      | ~0.07x       |
 
 ### Why succinctly is faster
 
@@ -293,7 +294,7 @@ Mixed mappings and sequences.
 2. **Direct YAML→JSON transcoding**: Escape sequences are translated directly without intermediate string allocation
 3. **SIMD string scanning**: ARM NEON accelerates quoted string parsing (6-9% faster than scalar)
 4. **SIMD indentation counting**: Vectorized space counting for block-style parsing (10-24% faster on small files)
-5. **Streaming output**: For identity queries, outputs directly from source without building intermediate structures
+5. **Streaming JSON output**: Writes JSON directly to output without building intermediate `String` objects, reducing memory by 12-14% on large files
 6. **Lazy evaluation**: Only materializes values that are actually accessed
 
 ### SIMD Optimizations

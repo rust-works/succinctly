@@ -16,6 +16,16 @@ use succinctly::yaml::{YamlCursor, YamlIndex, YamlValue};
 
 use super::{InputFormat, OutputFormat, YqCommand};
 
+/// Adapter to use `std::io::Write` with `core::fmt::Write` methods.
+/// This enables streaming JSON output without intermediate String allocation.
+struct FmtWriter<W>(W);
+
+impl<W: Write> core::fmt::Write for FmtWriter<W> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.0.write_all(s.as_bytes()).map_err(|_| core::fmt::Error)
+    }
+}
+
 /// Exit codes matching jq/yq behavior
 pub mod exit_codes {
     pub const SUCCESS: i32 = 0;
@@ -1364,7 +1374,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 .map_err(|e| anyhow::anyhow!("YAML parse error: {}", e))?;
             let root = index.root(&yaml_bytes);
 
-            // Output each document directly using cursor iteration
+            // Output each document directly using cursor iteration with streaming
             match root.value() {
                 YamlValue::Sequence(mut docs) => {
                     while let Some((cursor, rest)) = docs.uncons_cursor() {
@@ -1372,13 +1382,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         if let Some(target_doc) = args.document {
                             if global_doc_index == target_doc {
                                 had_output = true;
-                                let json = cursor.to_json();
-                                writeln!(writer, "{}", json)?;
+                                cursor
+                                    .stream_json(&mut FmtWriter(&mut writer))
+                                    .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                writeln!(writer)?;
                             }
                         } else {
                             had_output = true;
-                            let json = cursor.to_json();
-                            writeln!(writer, "{}", json)?;
+                            cursor
+                                .stream_json(&mut FmtWriter(&mut writer))
+                                .map_err(|_| anyhow::anyhow!("Write error"))?;
+                            writeln!(writer)?;
                         }
                         global_doc_index += 1;
                         docs = rest;
@@ -1388,8 +1402,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     // Single document case
                     if args.document.is_none() || args.document == Some(0) {
                         had_output = true;
-                        let json = root.to_json_document();
-                        writeln!(writer, "{}", json)?;
+                        root.stream_json_document(&mut FmtWriter(&mut writer))
+                            .map_err(|_| anyhow::anyhow!("Write error"))?;
+                        writeln!(writer)?;
                     }
                 }
             }
@@ -1407,13 +1422,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             if let Some(target_doc) = args.document {
                                 if global_doc_index == target_doc {
                                     had_output = true;
-                                    let json = cursor.to_json();
-                                    writeln!(writer, "{}", json)?;
+                                    cursor
+                                        .stream_json(&mut FmtWriter(&mut writer))
+                                        .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                    writeln!(writer)?;
                                 }
                             } else {
                                 had_output = true;
-                                let json = cursor.to_json();
-                                writeln!(writer, "{}", json)?;
+                                cursor
+                                    .stream_json(&mut FmtWriter(&mut writer))
+                                    .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                writeln!(writer)?;
                             }
                             global_doc_index += 1;
                             docs = rest;
@@ -1423,8 +1442,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         // Single document case
                         if args.document.is_none() || args.document == Some(global_doc_index) {
                             had_output = true;
-                            let json = root.to_json_document();
-                            writeln!(writer, "{}", json)?;
+                            root.stream_json_document(&mut FmtWriter(&mut writer))
+                                .map_err(|_| anyhow::anyhow!("Write error"))?;
+                            writeln!(writer)?;
                         }
                         global_doc_index += 1;
                     }
