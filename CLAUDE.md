@@ -69,6 +69,7 @@ cargo build --release --features cli
 # Benchmarks
 ./target/release/succinctly dev bench jq
 ./target/release/succinctly dev bench yq
+./target/release/succinctly dev bench yq --queries all --memory  # M2 streaming comparison
 ./target/release/succinctly dev bench dsv
 ```
 
@@ -312,6 +313,18 @@ Note: System `yq` not installed; showing succinctly-only performance.
 | **1MB**   | 13.2 ms (69.7 MiB/s)    |210.5 ms (4.4 MiB/s)   | **16x**    |
 
 To regenerate: `succinctly dev bench yq` (includes memory) or `cargo bench --bench yq_comparison` (time only)
+
+### M2 Streaming Navigation Performance (100MB file)
+
+| Query               | Path         | Peak Memory | Time  | vs Identity     |
+|---------------------|--------------|-------------|-------|-----------------|
+| `.` (identity)      | P9 streaming | 549 MB      | 1.29s | 1.0x            |
+| `.[0]` (navigation) | M2 streaming | 549 MB      | 0.43s | **3.0x faster** |
+| `length` (builtin)  | OwnedValue   | 1.95 GB     | 4.46s | 0.3x            |
+
+M2 streaming uses **3.5× less memory** than OwnedValue for navigation queries.
+
+To benchmark: `succinctly dev bench yq --queries all --memory`
 
 ### Optimization Techniques
 

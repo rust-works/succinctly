@@ -521,13 +521,71 @@ cargo bench --bench bp_select_micro
 
 ---
 
+## M2 Streaming Navigation Benchmarks
+
+The M2 streaming optimization enables fast navigation queries without building an intermediate DOM. This section documents how to benchmark and compare different query types.
+
+### Query Types and Execution Paths
+
+| Query Type | Example | Execution Path | Description |
+|------------|---------|----------------|-------------|
+| **Identity** | `.` | P9 streaming | Full document streaming output |
+| **First Element** | `.[0]` | M2 streaming | Navigate to first array element |
+| **Iteration** | `.[]` | M2 streaming | Iterate over array elements |
+| **Length** | `length` | OwnedValue | Requires full DOM construction |
+
+### Manual Benchmark Results (100MB JSON)
+
+Using a 100MB comprehensive test file:
+
+| Query | Path | Peak Memory | Time | vs Identity |
+|-------|------|-------------|------|-------------|
+| `.` (identity) | P9 streaming | 549 MB | 1.29s | 1.0x |
+| `.[0]` (navigation) | M2 streaming | 549 MB | 0.43s | **3.0x faster** |
+| `length` (builtin) | OwnedValue | 1.95 GB | 4.46s | 0.3x |
+
+**Key insight**: M2 streaming uses **3.5× less memory** than the OwnedValue path while being significantly faster for navigation queries.
+
+### Running M2-Focused Benchmarks
+
+```bash
+# Benchmark all query types on the navigation pattern
+./target/release/succinctly dev bench yq --patterns navigation --queries all
+
+# Compare identity vs navigation queries
+./target/release/succinctly dev bench yq --queries identity,first_element --sizes 10mb,100mb
+
+# Memory-focused comparison
+./target/release/succinctly dev bench yq --memory --queries all --sizes 100mb
+
+# Available query types: identity, first_element, iteration, length
+```
+
+### When M2 Streaming Helps
+
+M2 streaming provides the greatest benefit when:
+1. **Extracting single elements**: `.[0]`, `.users[5]`
+2. **Field access**: `.config`, `.users`
+3. **Iteration**: `.[]`, `.users[]`
+4. **Chained navigation**: `.[0].name`, `.users[].email`
+
+### When OwnedValue is Required
+
+Some operations require the full DOM (OwnedValue path):
+- `length`, `keys`, `values` builtins
+- Complex filters: `select(.age > 30)`
+- Arithmetic on document values
+- Any operation needing multiple passes
+
+---
+
 ## Reproducing Benchmarks
 
 ```bash
 # Build release binary
 cargo build --release --features cli
 
-# Generate benchmark files
+# Generate benchmark files (includes navigation pattern for M2 testing)
 cargo run --release --features cli -- yaml generate-suite
 
 # Run CLI benchmark tool (recommended - includes memory measurement)
@@ -535,6 +593,12 @@ cargo run --release --features cli -- yaml generate-suite
 
 # Run with specific patterns/sizes
 ./target/release/succinctly dev bench yq --patterns comprehensive,nested --sizes 1mb,10mb
+
+# Run navigation-focused benchmarks (M2 streaming)
+./target/release/succinctly dev bench yq --patterns navigation --queries all --sizes 10mb,100mb
+
+# Run memory-focused comparison
+./target/release/succinctly dev bench yq --memory --queries identity,first_element,length
 
 # Run Criterion benchmarks (wall time only)
 cargo bench --bench yq_comparison

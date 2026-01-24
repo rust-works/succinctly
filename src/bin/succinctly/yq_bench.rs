@@ -1,4 +1,9 @@
 //! yq benchmarking module - compares succinctly yq vs system yq.
+//!
+//! Supports multiple query types to benchmark different execution paths:
+//! - Identity (`.`): Uses P9 streaming fast path
+//! - Navigation (`.[0]`, `.users`): Uses M2 streaming path
+//! - Builtins (`length`): Uses OwnedValue path
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -9,6 +14,72 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Query types for benchmarking different execution paths
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryType {
+    /// Identity query (`.`) - uses P9 streaming
+    Identity,
+    /// First element (`.[0]`) - uses M2 streaming
+    FirstElement,
+    /// Iteration (`.[]`) - uses M2 streaming
+    Iteration,
+    /// Length builtin (`length`) - uses OwnedValue path
+    Length,
+}
+
+impl QueryType {
+    /// Get the jq query string for this query type
+    pub fn query(&self) -> &'static str {
+        match self {
+            QueryType::Identity => ".",
+            QueryType::FirstElement => ".[0]",
+            QueryType::Iteration => ".[]",
+            QueryType::Length => "length",
+        }
+    }
+
+    /// Get a human-readable name for display
+    pub fn name(&self) -> &'static str {
+        match self {
+            QueryType::Identity => "identity",
+            QueryType::FirstElement => "first_element",
+            QueryType::Iteration => "iteration",
+            QueryType::Length => "length",
+        }
+    }
+
+    /// Get the execution path description
+    pub fn path_description(&self) -> &'static str {
+        match self {
+            QueryType::Identity => "P9 streaming",
+            QueryType::FirstElement => "M2 streaming",
+            QueryType::Iteration => "M2 streaming",
+            QueryType::Length => "OwnedValue",
+        }
+    }
+
+    /// Parse query type from string
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "identity" | "." => Some(QueryType::Identity),
+            "first_element" | "first" | ".[0]" => Some(QueryType::FirstElement),
+            "iteration" | "iter" | ".[]" => Some(QueryType::Iteration),
+            "length" => Some(QueryType::Length),
+            _ => None,
+        }
+    }
+
+    /// Get all available query types
+    pub fn all() -> &'static [QueryType] {
+        &[
+            QueryType::Identity,
+            QueryType::FirstElement,
+            QueryType::Iteration,
+            QueryType::Length,
+        ]
+    }
+}
+
 /// Benchmark result for a single run
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkResult {
@@ -16,6 +87,8 @@ pub struct BenchmarkResult {
     pub pattern: String,
     pub size: String,
     pub filesize: u64,
+    pub query: String,
+    pub query_path: String,
     pub status: String,
     pub yq: ToolResult,
     pub succinctly: ToolResult,
@@ -38,9 +111,12 @@ pub struct BenchConfig {
     pub data_dir: PathBuf,
     pub patterns: Vec<String>,
     pub sizes: Vec<String>,
+    pub queries: Vec<QueryType>,
     pub succinctly_binary: PathBuf,
     pub warmup_runs: usize,
     pub benchmark_runs: usize,
+    /// Memory-focused mode: shows detailed memory comparison
+    pub memory_mode: bool,
 }
 
 impl Default for BenchConfig {
@@ -51,6 +127,7 @@ impl Default for BenchConfig {
                 "comprehensive".into(),
                 "config".into(),
                 "mixed".into(),
+                "navigation".into(),
                 "nested".into(),
                 "numbers".into(),
                 "pathological".into(),
@@ -67,9 +144,11 @@ impl Default for BenchConfig {
                 "10mb".into(),
                 "100mb".into(),
             ],
+            queries: QueryType::all().to_vec(),
             succinctly_binary: PathBuf::from("./target/release/succinctly"),
             warmup_runs: 1,
             benchmark_runs: 3,
+            memory_mode: false,
         }
     }
 }
@@ -112,6 +191,18 @@ pub fn run_benchmark(
             "not found (succinctly-only benchmarks)"
         }
     );
+    eprintln!(
+        "  Queries: {}",
+        config
+            .queries
+            .iter()
+            .map(|q| format!("{} ({})", q.name(), q.query()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if config.memory_mode {
+        eprintln!("  Mode: memory-focused comparison");
+    }
     eprintln!("  Warmup runs: {}", config.warmup_runs);
     eprintln!("  Benchmark runs: {}", config.benchmark_runs);
     eprintln!();
@@ -123,70 +214,100 @@ pub fn run_benchmark(
         })
         .transpose()?;
 
-    'outer: for pattern in &config.patterns {
-        for size in &config.sizes {
-            // Check for Ctrl+C
-            if interrupted.load(Ordering::SeqCst) {
-                break 'outer;
-            }
+    'outer: for query_type in &config.queries {
+        eprintln!(
+            "Query: {} ({}, {})",
+            query_type.query(),
+            query_type.name(),
+            query_type.path_description()
+        );
 
-            let file_path = config.data_dir.join(pattern).join(format!("{}.yaml", size));
-
-            if !file_path.exists() {
-                eprintln!("  Skipping {} (not found)", file_path.display());
-                continue;
-            }
-
-            let filesize = std::fs::metadata(&file_path)?.len();
-
-            eprint!(
-                "  {} {} ({})... ",
-                pattern,
-                size,
-                format_bytes(filesize as usize)
-            );
-            std::io::stderr().flush()?;
-
-            // Run benchmark
-            match benchmark_file(&file_path, config, has_yq) {
-                Ok(result) => {
-                    if has_yq {
-                        let status_icon = if result.status == "match" {
-                            "✓"
-                        } else {
-                            "✗"
-                        };
-                        let speedup = result.yq.wall_time_ms / result.succinctly.wall_time_ms;
-                        eprintln!(
-                            "{} yq={:.1}ms succ={:.1}ms ({:.2}x)",
-                            status_icon,
-                            result.yq.wall_time_ms,
-                            result.succinctly.wall_time_ms,
-                            speedup
-                        );
-                    } else {
-                        eprintln!("{:.1}ms", result.succinctly.wall_time_ms);
-                    }
-
-                    // Write to JSONL file immediately
-                    if let Some(ref mut f) = jsonl_file {
-                        writeln!(f, "{}", serde_json::to_string(&result)?)?;
-                    }
-
-                    results.push(result);
+        for pattern in &config.patterns {
+            for size in &config.sizes {
+                // Check for Ctrl+C
+                if interrupted.load(Ordering::SeqCst) {
+                    break 'outer;
                 }
-                Err(e) => {
-                    eprintln!("ERROR: {}", e);
+
+                let file_path = config.data_dir.join(pattern).join(format!("{}.yaml", size));
+
+                if !file_path.exists() {
+                    eprintln!("  Skipping {} (not found)", file_path.display());
+                    continue;
+                }
+
+                let filesize = std::fs::metadata(&file_path)?.len();
+
+                eprint!(
+                    "  {} {} ({})... ",
+                    pattern,
+                    size,
+                    format_bytes(filesize as usize)
+                );
+                std::io::stderr().flush()?;
+
+                // Run benchmark
+                match benchmark_file(&file_path, config, has_yq, *query_type) {
+                    Ok(result) => {
+                        if config.memory_mode {
+                            // Memory-focused output
+                            let succ_mem = format_memory_fixed(result.succinctly.peak_memory_bytes);
+                            if has_yq {
+                                let yq_mem = format_memory_fixed(result.yq.peak_memory_bytes);
+                                let mem_ratio = if result.yq.peak_memory_bytes > 0 {
+                                    result.succinctly.peak_memory_bytes as f64
+                                        / result.yq.peak_memory_bytes as f64
+                                } else {
+                                    0.0
+                                };
+                                eprintln!(
+                                    "succ={} yq={} ({:.2}x)",
+                                    succ_mem.trim(),
+                                    yq_mem.trim(),
+                                    mem_ratio
+                                );
+                            } else {
+                                eprintln!("mem={}", succ_mem.trim());
+                            }
+                        } else if has_yq {
+                            let status_icon = if result.status == "match" {
+                                "✓"
+                            } else {
+                                "✗"
+                            };
+                            let speedup = result.yq.wall_time_ms / result.succinctly.wall_time_ms;
+                            eprintln!(
+                                "{} yq={:.1}ms succ={:.1}ms ({:.2}x)",
+                                status_icon,
+                                result.yq.wall_time_ms,
+                                result.succinctly.wall_time_ms,
+                                speedup
+                            );
+                        } else {
+                            eprintln!("{:.1}ms", result.succinctly.wall_time_ms);
+                        }
+
+                        // Write to JSONL file immediately
+                        if let Some(ref mut f) = jsonl_file {
+                            writeln!(f, "{}", serde_json::to_string(&result)?)?;
+                        }
+
+                        results.push(result);
+                    }
+                    Err(e) => {
+                        eprintln!("ERROR: {}", e);
+                    }
                 }
             }
         }
+        eprintln!();
     }
 
     let was_interrupted = interrupted.load(Ordering::SeqCst);
 
     // Generate markdown output (even if interrupted)
     if let Some(md_path) = output_md {
-        let markdown = generate_markdown(&results, has_yq);
+        let markdown = generate_markdown(&results, has_yq, config.memory_mode);
         std::fs::write(md_path, markdown)?;
     }
 
@@ -195,9 +316,9 @@ pub fn run_benchmark(
 
     // Print summary
     if was_interrupted {
-        eprintln!("\nBenchmark interrupted: {} files processed", results.len());
+        eprintln!("Benchmark interrupted: {} results collected", results.len());
     } else {
-        eprintln!("\nBenchmark complete: {} files processed", results.len());
+        eprintln!("Benchmark complete: {} results collected", results.len());
     }
 
     // Print paths to generated files
@@ -216,8 +337,8 @@ pub fn run_benchmark(
         eprintln!("\nHash mismatches detected ({}):", mismatches.len());
         for m in &mismatches {
             eprintln!(
-                "  {} {}: yq={} succinctly={}",
-                m.pattern, m.size, m.yq.hash, m.succinctly.hash
+                "  {} {} ({}): yq={} succinctly={}",
+                m.pattern, m.size, m.query, m.yq.hash, m.succinctly.hash
             );
         }
         // Note: Don't fail for yq since output formats may differ
@@ -228,8 +349,13 @@ pub fn run_benchmark(
     Ok(results)
 }
 
-/// Benchmark a single file
-fn benchmark_file(file_path: &Path, config: &BenchConfig, has_yq: bool) -> Result<BenchmarkResult> {
+/// Benchmark a single file with a specific query
+fn benchmark_file(
+    file_path: &Path,
+    config: &BenchConfig,
+    has_yq: bool,
+    query_type: QueryType,
+) -> Result<BenchmarkResult> {
     let file_str = file_path.to_string_lossy().to_string();
     let pattern = file_path
         .parent()
@@ -241,20 +367,21 @@ fn benchmark_file(file_path: &Path, config: &BenchConfig, has_yq: bool) -> Resul
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
     let filesize = std::fs::metadata(file_path)?.len();
+    let query = query_type.query();
 
     // Warmup runs
     for _ in 0..config.warmup_runs {
         if has_yq {
-            let _ = run_yq(file_path);
+            let _ = run_yq(file_path, query);
         }
-        let _ = run_succinctly(file_path, &config.succinctly_binary);
+        let _ = run_succinctly(file_path, &config.succinctly_binary, query);
     }
 
     // Benchmark runs for yq (if available)
     let yq_result = if has_yq {
         let mut yq_results = Vec::new();
         for _ in 0..config.benchmark_runs {
-            yq_results.push(run_yq(file_path)?);
+            yq_results.push(run_yq(file_path, query)?);
         }
         select_median(yq_results)
     } else {
@@ -272,7 +399,7 @@ fn benchmark_file(file_path: &Path, config: &BenchConfig, has_yq: bool) -> Resul
     // Benchmark runs for succinctly
     let mut succ_results = Vec::new();
     for _ in 0..config.benchmark_runs {
-        succ_results.push(run_succinctly(file_path, &config.succinctly_binary)?);
+        succ_results.push(run_succinctly(file_path, &config.succinctly_binary, query)?);
     }
 
     // Take median of wall time
@@ -292,6 +419,8 @@ fn benchmark_file(file_path: &Path, config: &BenchConfig, has_yq: bool) -> Resul
         pattern,
         size,
         filesize,
+        query: query.to_string(),
+        query_path: query_type.path_description().to_string(),
         status,
         yq: yq_result,
         succinctly: succ_result,
@@ -308,16 +437,16 @@ fn select_median(mut results: Vec<ToolResult>) -> ToolResult {
 }
 
 /// Run system yq and measure (outputs JSON for comparison)
-fn run_yq(file_path: &Path) -> Result<ToolResult> {
+fn run_yq(file_path: &Path, query: &str) -> Result<ToolResult> {
     // Use -o json -I 0 for compact JSON output (matches succinctly's default)
     run_command_with_timing(
         "yq",
-        &["-o", "json", "-I", "0", ".", file_path.to_str().unwrap()],
+        &["-o", "json", "-I", "0", query, file_path.to_str().unwrap()],
     )
 }
 
 /// Run succinctly yq and measure
-fn run_succinctly(file_path: &Path, binary: &Path) -> Result<ToolResult> {
+fn run_succinctly(file_path: &Path, binary: &Path, query: &str) -> Result<ToolResult> {
     // Use -o json -I 0 for compact JSON output
     run_command_with_timing(
         binary.to_str().unwrap(),
@@ -327,7 +456,7 @@ fn run_succinctly(file_path: &Path, binary: &Path) -> Result<ToolResult> {
             "json",
             "-I",
             "0",
-            ".",
+            query,
             file_path.to_str().unwrap(),
         ],
     )
@@ -536,7 +665,7 @@ fn get_yq_version() -> String {
 }
 
 /// Generate markdown tables from results
-pub fn generate_markdown(results: &[BenchmarkResult], has_yq: bool) -> String {
+pub fn generate_markdown(results: &[BenchmarkResult], has_yq: bool, memory_mode: bool) -> String {
     let mut md = String::new();
 
     md.push_str("# yq vs succinctly Benchmark Results\n\n");
@@ -554,11 +683,20 @@ pub fn generate_markdown(results: &[BenchmarkResult], has_yq: bool) -> String {
     }
     md.push('\n');
 
+    // Collect unique queries from results
+    let queries: Vec<_> = results
+        .iter()
+        .map(|r| (r.query.as_str(), r.query_path.as_str()))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
     // Group by pattern (alphabetical order)
     let patterns = [
         "comprehensive",
         "config",
         "mixed",
+        "navigation",
         "nested",
         "numbers",
         "pathological",
@@ -571,132 +709,266 @@ pub fn generate_markdown(results: &[BenchmarkResult], has_yq: bool) -> String {
     // Size order: largest to smallest
     let size_order = ["100mb", "10mb", "1mb", "100kb", "10kb", "1kb"];
 
-    if has_yq {
-        // Full comparison table with yq
-        for pattern in patterns {
-            let pattern_results: Vec<_> = results.iter().filter(|r| r.pattern == pattern).collect();
+    // If multiple queries, group by query first
+    if queries.len() > 1 {
+        for (query, query_path) in &queries {
+            md.push_str(&format!("## Query: `{}` ({})\n\n", query, query_path));
 
-            if pattern_results.is_empty() {
-                continue;
-            }
+            let query_results: Vec<_> = results.iter().filter(|r| r.query == *query).collect();
+            generate_pattern_tables(
+                &mut md,
+                &query_results,
+                &patterns,
+                &size_order,
+                has_yq,
+                memory_mode,
+            );
+        }
+    } else {
+        // Single query - just show pattern tables
+        if let Some((query, query_path)) = queries.first() {
+            md.push_str(&format!("**Query**: `{}` ({})\n\n", query, query_path));
+        }
+        let all_results: Vec<_> = results.iter().collect();
+        generate_pattern_tables(
+            &mut md,
+            &all_results,
+            &patterns,
+            &size_order,
+            has_yq,
+            memory_mode,
+        );
+    }
 
-            md.push_str(&format!("## Pattern: {}\n\n", pattern));
-            md.push_str("| Size      | yq       | succinctly   | Speedup       | yq Mem  | succ Mem | Mem Ratio  |\n");
-            md.push_str("|-----------|----------|--------------|---------------|---------|----------|------------|\n");
+    md
+}
 
-            // Sort by size (largest first)
-            let mut sorted = pattern_results.clone();
-            sorted.sort_by(|a, b| {
-                let idx_a = size_order.iter().position(|s| *s == a.size).unwrap_or(999);
-                let idx_b = size_order.iter().position(|s| *s == b.size).unwrap_or(999);
-                idx_a.cmp(&idx_b)
-            });
+/// Generate pattern-based tables for markdown output
+fn generate_pattern_tables(
+    md: &mut String,
+    results: &[&BenchmarkResult],
+    patterns: &[&str],
+    size_order: &[&str],
+    has_yq: bool,
+    memory_mode: bool,
+) {
+    if memory_mode {
+        generate_memory_tables(md, results, patterns, size_order, has_yq);
+    } else if has_yq {
+        generate_comparison_tables(md, results, patterns, size_order);
+    } else {
+        generate_succinctly_only_tables(md, results, patterns, size_order);
+    }
+}
 
-            for r in sorted {
-                let speedup = r.yq.wall_time_ms / r.succinctly.wall_time_ms;
+/// Generate memory-focused comparison tables
+fn generate_memory_tables(
+    md: &mut String,
+    results: &[&BenchmarkResult],
+    patterns: &[&str],
+    size_order: &[&str],
+    has_yq: bool,
+) {
+    for pattern in patterns {
+        let pattern_results: Vec<_> = results
+            .iter()
+            .filter(|r| r.pattern == *pattern)
+            .copied()
+            .collect();
+
+        if pattern_results.is_empty() {
+            continue;
+        }
+
+        md.push_str(&format!("### Pattern: {}\n\n", pattern));
+
+        if has_yq {
+            md.push_str("| Size      | succ Mem | yq Mem  | Mem Ratio  | succ Time | yq Time  | Speedup    |\n");
+            md.push_str("|-----------|----------|---------|------------|-----------|----------|------------|\n");
+        } else {
+            md.push_str("| Size      | Memory   | Time     | Throughput   |\n");
+            md.push_str("|-----------|----------|----------|--------------|");
+        }
+
+        // Sort by size (largest first)
+        let mut sorted = pattern_results;
+        sorted.sort_by(|a, b| {
+            let idx_a = size_order.iter().position(|s| *s == a.size).unwrap_or(999);
+            let idx_b = size_order.iter().position(|s| *s == b.size).unwrap_or(999);
+            idx_a.cmp(&idx_b)
+        });
+
+        for r in sorted {
+            let succ_mem = format_memory_fixed(r.succinctly.peak_memory_bytes);
+            let succ_time = format_time_fixed(r.succinctly.wall_time_ms);
+            let size_bold = format!("**{}**", r.size);
+            let size_col = format!("{:<9}", size_bold);
+
+            if has_yq {
+                let yq_mem = format_memory_fixed(r.yq.peak_memory_bytes);
+                let yq_time = format_time_fixed(r.yq.wall_time_ms);
                 let mem_ratio = if r.yq.peak_memory_bytes > 0 {
                     r.succinctly.peak_memory_bytes as f64 / r.yq.peak_memory_bytes as f64
                 } else {
                     0.0
                 };
-
-                // Format values
-                let yq_time = format_time_fixed(r.yq.wall_time_ms);
-                let succ_time = format_time_fixed(r.succinctly.wall_time_ms);
-                let yq_mem = format_memory_fixed(r.yq.peak_memory_bytes);
-                let succ_mem = format_memory_fixed(r.succinctly.peak_memory_bytes);
-
-                // Size column: **name** with trailing padding (9 chars total)
-                let size_bold = format!("**{}**", r.size);
-                let size_col = format!("{:<9}", size_bold);
-
-                // yq time column
-                let yq_col = yq_time;
-
-                // Succinctly time column: bold if faster (12 chars total)
-                let succ_col = if speedup >= 1.0 {
-                    let trimmed = succ_time.trim_start();
-                    let padding = succ_time.len() - trimmed.len();
-                    format!("{}**{}**", " ".repeat(padding), trimmed)
-                } else {
-                    format!("  {}  ", succ_time)
-                };
-
-                // Speedup column: bold if >= 1.0 (13 chars visual width)
-                let speedup_str = format!("{:.1}x", speedup);
-                let speedup_col = if speedup >= 1.0 {
-                    let padded = format!("{:>9}", speedup_str);
-                    let trimmed = padded.trim_start();
-                    let padding = padded.len() - trimmed.len();
-                    format!("{}**{}**", " ".repeat(padding), trimmed)
-                } else {
-                    format!("{:>13}", speedup_str)
-                };
-
-                // Memory columns
-                let yq_mem_col = yq_mem;
-                let succ_mem_col = format!("{:>8}", succ_mem);
-                let mem_ratio_col = format!("{:>9.2}x", mem_ratio);
+                let speedup = r.yq.wall_time_ms / r.succinctly.wall_time_ms;
 
                 md.push_str(&format!(
-                    "| {} | {} | {} | {} | {} | {} | {} |\n",
-                    size_col,
-                    yq_col,
-                    succ_col,
-                    speedup_col,
-                    yq_mem_col,
-                    succ_mem_col,
-                    mem_ratio_col
+                    "| {} | {} | {} | **{:.2}x** | {} | {} | **{:.1}x** |\n",
+                    size_col, succ_mem, yq_mem, mem_ratio, succ_time, yq_time, speedup
                 ));
-            }
-
-            md.push('\n');
-        }
-    } else {
-        // Succinctly-only table (no yq comparison)
-        for pattern in patterns {
-            let pattern_results: Vec<_> = results.iter().filter(|r| r.pattern == pattern).collect();
-
-            if pattern_results.is_empty() {
-                continue;
-            }
-
-            md.push_str(&format!("## Pattern: {}\n\n", pattern));
-            md.push_str("| Size      | Time     | Throughput   | Memory   |\n");
-            md.push_str("|-----------|----------|--------------|----------|\n");
-
-            // Sort by size (largest first)
-            let mut sorted = pattern_results.clone();
-            sorted.sort_by(|a, b| {
-                let idx_a = size_order.iter().position(|s| *s == a.size).unwrap_or(999);
-                let idx_b = size_order.iter().position(|s| *s == b.size).unwrap_or(999);
-                idx_a.cmp(&idx_b)
-            });
-
-            for r in sorted {
+            } else {
                 let throughput =
                     r.filesize as f64 / (r.succinctly.wall_time_ms / 1000.0) / (1024.0 * 1024.0);
-
-                // Format values
-                let time = format_time_fixed(r.succinctly.wall_time_ms);
-                let throughput_str = format!("{:.1} MiB/s", throughput);
-                let mem = format_memory_fixed(r.succinctly.peak_memory_bytes);
-
-                // Size column
-                let size_bold = format!("**{}**", r.size);
-                let size_col = format!("{:<9}", size_bold);
-
                 md.push_str(&format!(
-                    "| {} | {} | {:>12} | {} |\n",
-                    size_col, time, throughput_str, mem
+                    "| {} | {} | {} | {:>12.1} MiB/s |\n",
+                    size_col, succ_mem, succ_time, throughput
                 ));
             }
-
-            md.push('\n');
         }
-    }
 
-    md
+        md.push('\n');
+    }
+}
+
+/// Generate full comparison tables with yq
+fn generate_comparison_tables(
+    md: &mut String,
+    results: &[&BenchmarkResult],
+    patterns: &[&str],
+    size_order: &[&str],
+) {
+    for pattern in patterns {
+        let pattern_results: Vec<_> = results
+            .iter()
+            .filter(|r| r.pattern == *pattern)
+            .copied()
+            .collect();
+
+        if pattern_results.is_empty() {
+            continue;
+        }
+
+        md.push_str(&format!("### Pattern: {}\n\n", pattern));
+        md.push_str("| Size      | yq       | succinctly   | Speedup       | yq Mem  | succ Mem | Mem Ratio  |\n");
+        md.push_str("|-----------|----------|--------------|---------------|---------|----------|------------|\n");
+
+        // Sort by size (largest first)
+        let mut sorted = pattern_results;
+        sorted.sort_by(|a, b| {
+            let idx_a = size_order.iter().position(|s| *s == a.size).unwrap_or(999);
+            let idx_b = size_order.iter().position(|s| *s == b.size).unwrap_or(999);
+            idx_a.cmp(&idx_b)
+        });
+
+        for r in sorted {
+            let speedup = r.yq.wall_time_ms / r.succinctly.wall_time_ms;
+            let mem_ratio = if r.yq.peak_memory_bytes > 0 {
+                r.succinctly.peak_memory_bytes as f64 / r.yq.peak_memory_bytes as f64
+            } else {
+                0.0
+            };
+
+            // Format values
+            let yq_time = format_time_fixed(r.yq.wall_time_ms);
+            let succ_time = format_time_fixed(r.succinctly.wall_time_ms);
+            let yq_mem = format_memory_fixed(r.yq.peak_memory_bytes);
+            let succ_mem = format_memory_fixed(r.succinctly.peak_memory_bytes);
+
+            // Size column: **name** with trailing padding (9 chars total)
+            let size_bold = format!("**{}**", r.size);
+            let size_col = format!("{:<9}", size_bold);
+
+            // yq time column
+            let yq_col = yq_time;
+
+            // Succinctly time column: bold if faster (12 chars total)
+            let succ_col = if speedup >= 1.0 {
+                let trimmed = succ_time.trim_start();
+                let padding = succ_time.len() - trimmed.len();
+                format!("{}**{}**", " ".repeat(padding), trimmed)
+            } else {
+                format!("  {}  ", succ_time)
+            };
+
+            // Speedup column: bold if >= 1.0 (13 chars visual width)
+            let speedup_str = format!("{:.1}x", speedup);
+            let speedup_col = if speedup >= 1.0 {
+                let padded = format!("{:>9}", speedup_str);
+                let trimmed = padded.trim_start();
+                let padding = padded.len() - trimmed.len();
+                format!("{}**{}**", " ".repeat(padding), trimmed)
+            } else {
+                format!("{:>13}", speedup_str)
+            };
+
+            // Memory columns
+            let yq_mem_col = yq_mem;
+            let succ_mem_col = format!("{:>8}", succ_mem);
+            let mem_ratio_col = format!("{:>9.2}x", mem_ratio);
+
+            md.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                size_col, yq_col, succ_col, speedup_col, yq_mem_col, succ_mem_col, mem_ratio_col
+            ));
+        }
+
+        md.push('\n');
+    }
+}
+
+/// Generate succinctly-only tables
+fn generate_succinctly_only_tables(
+    md: &mut String,
+    results: &[&BenchmarkResult],
+    patterns: &[&str],
+    size_order: &[&str],
+) {
+    for pattern in patterns {
+        let pattern_results: Vec<_> = results
+            .iter()
+            .filter(|r| r.pattern == *pattern)
+            .copied()
+            .collect();
+
+        if pattern_results.is_empty() {
+            continue;
+        }
+
+        md.push_str(&format!("### Pattern: {}\n\n", pattern));
+        md.push_str("| Size      | Time     | Throughput   | Memory   |\n");
+        md.push_str("|-----------|----------|--------------|----------|\n");
+
+        // Sort by size (largest first)
+        let mut sorted = pattern_results;
+        sorted.sort_by(|a, b| {
+            let idx_a = size_order.iter().position(|s| *s == a.size).unwrap_or(999);
+            let idx_b = size_order.iter().position(|s| *s == b.size).unwrap_or(999);
+            idx_a.cmp(&idx_b)
+        });
+
+        for r in sorted {
+            let throughput =
+                r.filesize as f64 / (r.succinctly.wall_time_ms / 1000.0) / (1024.0 * 1024.0);
+
+            // Format values
+            let time = format_time_fixed(r.succinctly.wall_time_ms);
+            let throughput_str = format!("{:.1} MiB/s", throughput);
+            let mem = format_memory_fixed(r.succinctly.peak_memory_bytes);
+
+            // Size column
+            let size_bold = format!("**{}**", r.size);
+            let size_col = format!("{:<9}", size_bold);
+
+            md.push_str(&format!(
+                "| {} | {} | {:>12} | {} |\n",
+                size_col, time, throughput_str, mem
+            ));
+        }
+
+        md.push('\n');
+    }
 }
 
 /// Format time with fixed width (8 chars total)
