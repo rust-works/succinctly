@@ -14,9 +14,8 @@ Before reviewing the benchmarks, it's important to understand the fundamental di
 | **Approach**         | Build structural index, lazy eval | Parse entire document into DOM    |
 | **Validation**       | Minimal (syntax only)             | Full YAML validation              |
 | **Tags**             | Not supported                     | Full support (`!custom`, `!!str`) |
-| **Anchors/Aliases**  | Parsed, not resolved              | Full resolution                   |
+| **Anchors/Aliases**  | Supported                         | Supported                         |
 | **Memory model**     | ~3-6% index overhead              | Full DOM in memory                |
-| **Best for**         | Fast queries on large files       | Full YAML manipulation            |
 
 **What this means for benchmarks**: The performance differences shown below come from two sources:
 
@@ -24,9 +23,7 @@ Before reviewing the benchmarks, it's important to understand the fundamental di
 
 2. **Less validation work**: succinctly performs minimal validation compared to yq's full YAML validation. This is a deliberate trade-off for speed.
 
-**When to use succinctly**: You need fast queries on valid YAML and don't require full validation, tag support, or anchor resolution.
-
-**When to use yq**: You need complete YAML support including tags, anchor resolution, or want validation errors on malformed input.
+succinctly supports most yq query patterns and can serve as a drop-in replacement for common use cases. The main limitation is tags. See [Compatibility with yq](#compatibility-with-yq) below for details.
 
 For detailed architectural documentation, see [Semi-Indexing Architecture](../architecture/semi-indexing.md).
 
@@ -455,15 +452,15 @@ code: "007"      # Quoted string
 
 ✓ **All standard yq query patterns produce identical output**:
 
-| Pattern           | Example                        | Notes                   |
-|-------------------|--------------------------------|-------------------------|
-| Identity          | `.`                            | Full document output    |
-| Field selection   | `.users[].name`                | String and number fields|
-| Filtering         | `.users[] \| select(.age > 30)`| Comparison operations   |
-| Boolean selection | `.users[] \| select(.active)`  | Boolean values          |
-| Array indexing    | `.users[0]`                    | Array element access    |
-| Nested paths      | `.config.version`              | Preserves quoted strings|
-| Number fields     | `.scores.total`                | Unquoted numbers        |
+| Pattern           | Example                        | Notes                       |
+|-------------------|--------------------------------|-----------------------------|
+| Identity          | `.`                            | Full document output        |
+| Field selection   | `.users[].name`                | String and number fields    |
+| Filtering         | `.users[] \| select(.age > 30)`| Comparison operations       |
+| Boolean selection | `.users[] \| select(.active)`  | Boolean values              |
+| Array indexing    | `.users[0]`                    | Array element access        |
+| Nested paths      | `.config.version`              | Preserves quoted strings    |
+| Number fields     | `.scores.total`                | Unquoted numbers            |
 | Quoted numbers    | `.id`                          | Preserves `"001"` as string |
 
 ### Migration from yq
