@@ -390,11 +390,21 @@ The `bp_select_micro` benchmark measures the performance of select1 queries on b
 | 100K opens | 308 µs        | 1.68 ms                   | **5.4x** |
 | 1M opens   | 356 µs        | 2.10 ms                   | **5.9x** |
 
+### Results (AMD Ryzen 9 7950X, 10K queries each)
+
+| BP Size    | select1 (new) | binary_search_rank1 (old) | Speedup  |
+|------------|---------------|---------------------------|----------|
+| 1K opens   | 213 µs        | 548 µs                    | **2.6x** |
+| 10K opens  | 211 µs        | 783 µs                    | **3.7x** |
+| 100K opens | 211 µs        | 986 µs                    | **4.7x** |
+| 1M opens   | 240 µs        | 1.22 ms                   | **5.1x** |
+
 ### Key Observations
 
-- **select1 stays nearly constant**: ~310-356 µs regardless of BP size (O(1) amortized)
-- **binary_search scales with log(n)**: 820 µs → 2.10 ms as BP grows from 1K to 1M
-- **Larger documents benefit more**: 5.9x speedup at 1M opens vs 2.5x at 1K
+- **select1 stays nearly constant**: ~210-356 µs regardless of BP size (O(1) amortized)
+- **binary_search scales with log(n)**: 548-820 µs → 1.2-2.1 ms as BP grows from 1K to 1M
+- **Larger documents benefit more**: 5.1-5.9x speedup at 1M opens vs 2.5-2.6x at 1K
+- **Ryzen 9 faster overall**: ~35% faster than M1 Max due to higher clock speed
 
 ### Why It Matters
 
