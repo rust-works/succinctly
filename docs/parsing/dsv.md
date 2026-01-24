@@ -6,11 +6,11 @@ This document describes how the succinctly library parses and indexes delimiter-
 
 The DSV parser creates a **semi-index** that marks field and row boundaries without materializing the data. This enables streaming access with minimal memory overhead.
 
-| Component | Purpose | Size |
-|-----------|---------|------|
-| Markers | Delimiter and newline positions | ~1 bit/byte |
-| Newlines | Row boundary positions | ~1 bit/64 bytes |
-| Rank indices | Enable O(1) field lookup | ~3-4% of input |
+| Component    | Purpose                         | Size            |
+|--------------|--------------------------------|-----------------|
+| Markers      | Delimiter and newline positions | ~1 bit/byte     |
+| Newlines     | Row boundary positions          | ~1 bit/64 bytes |
+| Rank indices | Enable O(1) field lookup        | ~3-4% of input  |
 
 **Total overhead**: ~3-4% of input size vs 6-40x for materialized parsers.
 
@@ -73,11 +73,11 @@ Outside quotes: mark delimiters
 
 ### Three Implementation Approaches
 
-| Method | Platform | Speed | Technique |
-|--------|----------|-------|-----------|
-| toggle64_bmi2 | x86 BMI2 | 10x baseline | PDEP + carry propagation |
-| prefix_xor | AVX2/SSE/NEON | baseline | Parallel prefix XOR |
-| Scalar | All | ~35x slower | Byte-by-byte loop |
+| Method        | Platform      | Speed        | Technique                |
+|---------------|---------------|--------------|--------------------------|
+| toggle64_bmi2 | x86 BMI2      | 10x baseline | PDEP + carry propagation |
+| prefix_xor    | AVX2/SSE/NEON | baseline     | Parallel prefix XOR      |
+| Scalar        | All           | ~35x slower  | Byte-by-byte loop        |
 
 ---
 
@@ -328,17 +328,17 @@ let psv = DsvConfig::psv();   // pipe delimiter
 
 ## File Locations
 
-| File | Purpose |
-|------|---------|
-| `src/dsv/mod.rs` | Module exports, Dsv/DsvRef types |
-| `src/dsv/config.rs` | DsvConfig |
-| `src/dsv/parser.rs` | Scalar parser (fallback) |
-| `src/dsv/index_lightweight.rs` | Lightweight index implementation |
-| `src/dsv/cursor.rs` | Navigation APIs |
-| `src/dsv/simd/mod.rs` | Runtime dispatch |
-| `src/dsv/simd/bmi2.rs` | toggle64_bmi2 (PDEP) |
-| `src/dsv/simd/avx2.rs` | prefix_xor (AVX2) |
-| `src/dsv/simd/neon.rs` | NEON implementation |
+| File                          | Purpose                          |
+|-------------------------------|----------------------------------|
+| `src/dsv/mod.rs`              | Module exports, Dsv/DsvRef types |
+| `src/dsv/config.rs`           | DsvConfig                        |
+| `src/dsv/parser.rs`           | Scalar parser (fallback)         |
+| `src/dsv/index_lightweight.rs`| Lightweight index implementation |
+| `src/dsv/cursor.rs`           | Navigation APIs                  |
+| `src/dsv/simd/mod.rs`         | Runtime dispatch                 |
+| `src/dsv/simd/bmi2.rs`        | toggle64_bmi2 (PDEP)             |
+| `src/dsv/simd/avx2.rs`        | prefix_xor (AVX2)                |
+| `src/dsv/simd/neon.rs`        | NEON implementation              |
 
 ---
 
@@ -346,40 +346,40 @@ let psv = DsvConfig::psv();   // pipe delimiter
 
 ### Parsing Throughput
 
-| Platform | Method | Throughput |
-|----------|--------|------------|
-| x86_64 | BMI2 + AVX2 | 1.3-3.7 GB/s |
-| x86_64 | AVX2 only | ~1.0 GB/s |
-| ARM64 | NEON | ~0.8 GB/s |
-| All | Scalar | ~100 MiB/s |
+| Platform | Method      | Throughput   |
+|----------|-------------|--------------|
+| x86_64   | BMI2 + AVX2 | 1.3-3.7 GB/s |
+| x86_64   | AVX2 only   | ~1.0 GB/s    |
+| ARM64    | NEON        | ~0.8 GB/s    |
+| All      | Scalar      | ~100 MiB/s   |
 
 ### Field Iteration
 
-| Pattern | Throughput |
-|---------|------------|
+| Pattern                 | Throughput     |
+|-------------------------|----------------|
 | Sequential (all fields) | 792-1331 MiB/s |
-| Random access | 93-173 ns/field |
+| Random access           | 93-173 ns/field|
 
 ### Memory Comparison
 
-| Approach | Memory (100MB CSV) |
-|----------|-------------------|
-| Materialized | 600MB - 4GB |
-| Semi-index | ~104 MB |
-| Streaming | ~3-4 MB |
+| Approach     | Memory (100MB CSV) |
+|--------------|-------------------|
+| Materialized | 600MB - 4GB       |
+| Semi-index   | ~104 MB           |
+| Streaming    | ~3-4 MB           |
 
 ---
 
 ## Optimization Techniques Used
 
-| Technique | Document | Application |
-|-----------|----------|-------------|
-| PDEP carry propagation | [bit-manipulation.md](../optimizations/bit-manipulation.md) | toggle64_bmi2 (10x faster) |
-| Parallel prefix XOR | [parallel-prefix.md](../optimizations/parallel-prefix.md) | Quote state tracking |
-| SIMD comparison | [simd.md](../optimizations/simd.md) | Character detection |
-| Lightweight index | [cache-memory.md](../optimizations/cache-memory.md) | Simple beats complex (5-9x) |
-| Cumulative rank | [hierarchical-structures.md](../optimizations/hierarchical-structures.md) | O(1) rank queries |
-| Binary search select | [access-patterns.md](../optimizations/access-patterns.md) | O(log n) field lookup |
+| Technique              | Document                                                        | Application                |
+|------------------------|-----------------------------------------------------------------|----------------------------|
+| PDEP carry propagation | [bit-manipulation.md](../optimizations/bit-manipulation.md)     | toggle64_bmi2 (10x faster) |
+| Parallel prefix XOR    | [parallel-prefix.md](../optimizations/parallel-prefix.md)       | Quote state tracking       |
+| SIMD comparison        | [simd.md](../optimizations/simd.md)                             | Character detection        |
+| Lightweight index      | [cache-memory.md](../optimizations/cache-memory.md)             | Simple beats complex (5-9x)|
+| Cumulative rank        | [hierarchical-structures.md](../optimizations/hierarchical-structures.md) | O(1) rank queries          |
+| Binary search select   | [access-patterns.md](../optimizations/access-patterns.md)       | O(log n) field lookup      |
 
 ---
 

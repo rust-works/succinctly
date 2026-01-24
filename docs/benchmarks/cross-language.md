@@ -91,10 +91,10 @@ For succinctly, two traversal approaches are tested:
 
 ### Parse + Traverse - x86_64 (AMD Zen 4)
 
-| Size   | sonic-rs      | succinctly (fast) | simd-json     | serde_json    | succinctly (value) |
-|--------|---------------|-------------------|---------------|---------------|--------------------|
-| 10MB   | **450 MiB/s** | 302 MiB/s         | 242 MiB/s     | 157 MiB/s     | 114 MiB/s          |
-| 100MB  | -             | -                 | 124 MiB/s     | 138 MiB/s     | -                  |
+| Size  | sonic-rs      | succinctly (fast) | simd-json | serde_json | succinctly (value) |
+|-------|---------------|-------------------|-----------|------------|--------------------|
+| 10MB  | **450 MiB/s** | 302 MiB/s         | 242 MiB/s | 157 MiB/s  | 114 MiB/s          |
+| 100MB | -             | -                 | 124 MiB/s | 138 MiB/s  | -                  |
 
 **Note on 100MB x86_64 results**: Some parsers timed out during the 100MB parse+traverse benchmark:
 
@@ -107,14 +107,14 @@ For succinctly, two traversal approaches are tested:
 
 ### Peak Memory Usage - Apple Silicon (M-series)
 
-| Size   | succinctly            | sonic-rs           | serde_json         | simd-json           |
-|--------|-----------------------|--------------------|--------------------|---------------------|
-| 1KB    |   **0.75 KB** (0.47x) |   9.22 KB  (5.71x) |  15.45 KB  (9.57x) |   28.78 KB (17.82x) |
-| 10KB   |   **4.46 KB** (0.46x) |  70.21 KB  (7.30x) | 103.04 KB (10.71x) |  196.59 KB (20.44x) |
-| 100KB  |  **40.42 KB** (0.46x) | 387.98 KB  (4.44x) | 924.17 KB (10.57x) |    1.82 MB (21.33x) |
-| 1MB    | **382.33 KB** (0.46x) |   9.97 MB (12.34x) |   7.00 MB  (8.66x) |   17.12 MB (21.17x) |
-| 10MB   |   **3.69 MB** (0.46x) |  97.02 MB (12.12x) |  63.89 MB  (7.98x) |  167.42 MB (20.91x) |
-| 100MB  |  **36.89 MB** (0.46x) | 954.51 MB (11.93x) | 655.18 MB  (8.19x) | 1653.90 MB (20.67x) |
+| Size  | succinctly            | sonic-rs           | serde_json         | simd-json            |
+|-------|-----------------------|--------------------|--------------------|----------------------|
+| 1KB   |   **0.75 KB** (0.47x) |   9.22 KB  (5.71x) |  15.45 KB  (9.57x) |   28.78 KB (17.82x)  |
+| 10KB  |   **4.46 KB** (0.46x) |  70.21 KB  (7.30x) | 103.04 KB (10.71x) |  196.59 KB (20.44x)  |
+| 100KB |  **40.42 KB** (0.46x) | 387.98 KB  (4.44x) | 924.17 KB (10.57x) |    1.82 MB (21.33x)  |
+| 1MB   | **382.33 KB** (0.46x) |   9.97 MB (12.34x) |   7.00 MB  (8.66x) |   17.12 MB (21.17x)  |
+| 10MB  |   **3.69 MB** (0.46x) |  97.02 MB (12.12x) |  63.89 MB  (7.98x) |  167.42 MB (20.91x)  |
+| 100MB |  **36.89 MB** (0.46x) | 954.51 MB (11.93x) | 655.18 MB  (8.19x) | 1653.90 MB (20.67x)  |
 
 Note: Numbers in parentheses show ratio to original JSON size. Succinctly uses ~46% of the original JSON size for its index, while DOM parsers use 8-21x the original size.
 
@@ -136,12 +136,12 @@ Note: Numbers in parentheses show ratio to original JSON size. Succinctly uses ~
 
 ### Memory Efficiency Summary
 
-| Parser       | Memory Overhead  | Notes                                    |
-|--------------|------------------|------------------------------------------|
-| succinctly   | **~46%** of JSON | Two bitvectors (IB + BP) with indices    |
-| sonic-rs     | 4-12x JSON       | Arena allocation, more compact than DOM  |
-| serde_json   | 8-11x JSON       | Full DOM with allocations per node       |
-| simd-json    | 17-21x JSON      | Full DOM, higher overhead than serde     |
+| Parser     | Memory Overhead  | Notes                                   |
+|------------|------------------|-----------------------------------------|
+| succinctly | **~46%** of JSON | Two bitvectors (IB + BP) with indices   |
+| sonic-rs   | 4-12x JSON       | Arena allocation, more compact than DOM |
+| serde_json | 8-11x JSON       | Full DOM with allocations per node      |
+| simd-json  | 17-21x JSON      | Full DOM, higher overhead than serde    |
 
 ### API Choice Matters
 
@@ -151,12 +151,12 @@ Note: Numbers in parentheses show ratio to original JSON size. Succinctly uses ~
 
 ## Architecture Comparison
 
-| Metric                    | Apple Silicon | x86_64 (Zen 4) | Notes                            |
-|---------------------------|---------------|----------------|----------------------------------|
-| Parse-only (10MB)         | 544 MiB/s     | 539 MiB/s      | Very similar performance         |
-| Parse+traverse (10MB)     | 284 MiB/s     | 302 MiB/s      | x86 slightly faster              |
-| simd-json relative perf   | Better        | Worse          | ARM NEON handles simd-json well  |
-| Memory efficiency         | Same          | Same           | ~46% overhead on both            |
+| Metric                  | Apple Silicon | x86_64 (Zen 4) | Notes                           |
+|-------------------------|---------------|----------------|---------------------------------|
+| Parse-only (10MB)       | 544 MiB/s     | 539 MiB/s      | Very similar performance        |
+| Parse+traverse (10MB)   | 284 MiB/s     | 302 MiB/s      | x86 slightly faster             |
+| simd-json relative perf | Better        | Worse          | ARM NEON handles simd-json well |
+| Memory efficiency       | Same          | Same           | ~46% overhead on both           |
 
 ## Detailed x86_64 Results
 
@@ -175,11 +175,11 @@ Note: Numbers in parentheses show ratio to original JSON size. Succinctly uses ~
 #### Parse Only - 10MB Detailed Comparison
 
 | Parser         | Throughput (MiB/s) | vs Succinctly | vs Baseline |
-|----------------|--------------------|---------------|-------------|
-| **sonic-rs**   | **723**            | 1.34x         | **4.06x**   |
-| **succinctly** | **539**            | baseline      | **3.03x**   |
-| serde_json     |   178              | 0.33x         | baseline    |
-| simd-json      |   117              | 0.22x         |   0.66x     |
+|----------------|-------------------:|---------------|-------------|
+| **sonic-rs**   |            **723** | 1.34x         | **4.06x**   |
+| **succinctly** |            **539** | baseline      | **3.03x**   |
+| serde_json     |                178 | 0.33x         | baseline    |
+| simd-json      |                117 | 0.22x         | 0.66x       |
 
 **Key Findings (10MB):**
 - Sonic-rs is fastest overall (custom SIMD + arena allocation)
@@ -189,11 +189,11 @@ Note: Numbers in parentheses show ratio to original JSON size. Succinctly uses ~
 #### Parse Only - 100MB Detailed Comparison
 
 | Parser         | Throughput (MiB/s) | vs Succinctly | vs Baseline |
-|----------------|--------------------|---------------|-------------|
-| **sonic-rs**   | **710**            | 1.29x         | **4.73x**   |
-| **succinctly** | **550**            | baseline      | **3.67x**   |
-| serde_json     |   150              | 0.27x         | baseline    |
-| simd-json      |   126              | 0.23x         |   0.84x     |
+|----------------|-------------------:|---------------|-------------|
+| **sonic-rs**   |            **710** | 1.29x         | **4.73x**   |
+| **succinctly** |            **550** | baseline      | **3.67x**   |
+| serde_json     |                150 | 0.27x         | baseline    |
+| simd-json      |                126 | 0.23x         | 0.84x       |
 
 **Key Findings (100MB):**
 - Performance scales consistently from 10MB to 100MB
@@ -215,12 +215,12 @@ Note: Numbers in parentheses show ratio to original JSON size. Succinctly uses ~
 #### Parse + Traverse - 10MB Detailed Comparison
 
 | Parser                | Throughput (MiB/s) | vs Succinctly Fast | vs Baseline |
-|-----------------------|--------------------|--------------------|-------------|
-| **sonic-rs**          | **450**            | 1.49x              | **2.87x**   |
-| **succinctly (fast)** | **302**            | baseline           | **1.92x**   |
-| simd-json             |   242              | 0.80x              |   1.54x     |
-| serde_json            |   157              | 0.52x              | baseline    |
-| succinctly (value)    |   114              | 0.38x              |   0.73x     |
+|-----------------------|-------------------:|-------------------:|-------------|
+| **sonic-rs**          |            **450** |              1.49x | **2.87x**   |
+| **succinctly (fast)** |            **302** |           baseline | **1.92x**   |
+| simd-json             |                242 |              0.80x | 1.54x       |
+| serde_json            |                157 |              0.52x | baseline    |
+| succinctly (value)    |                114 |              0.38x | 0.73x       |
 
 ### Pattern: Pathological (Deeply Nested)
 
@@ -445,18 +445,18 @@ cargo bench --bench json_parsers -- "100mb"
 
 ### Apple Silicon (M-series)
 
-| Metric                    | Ranking | Throughput | Notes                                        |
-|---------------------------|---------|------------|----------------------------------------------|
-| **Parse-Only (10MB)**     | **2nd** | 544 MiB/s  | 81% of sonic-rs, 3.4x faster than serde_json |
-| **Parse-Only (100MB)**    | **2nd** | 554 MiB/s  | 80% of sonic-rs, 3.5x faster than serde_json |
-| **Parse+Traverse (10MB)** | **2nd** | 284 MiB/s  | 65% of sonic-rs, 1.9x faster than serde_json |
-| **Parse+Traverse (100MB)**| **2nd** | 290 MiB/s  | 66% of sonic-rs, 2.1x faster than serde_json |
-| **Memory Overhead**       | **1st** | 46%        | 17-46x less than DOM parsers                 |
+| Metric                     | Ranking | Throughput | Notes                                        |
+|----------------------------|---------|------------|----------------------------------------------|
+| **Parse-Only (10MB)**      | **2nd** | 544 MiB/s  | 81% of sonic-rs, 3.4x faster than serde_json |
+| **Parse-Only (100MB)**     | **2nd** | 554 MiB/s  | 80% of sonic-rs, 3.5x faster than serde_json |
+| **Parse+Traverse (10MB)**  | **2nd** | 284 MiB/s  | 65% of sonic-rs, 1.9x faster than serde_json |
+| **Parse+Traverse (100MB)** | **2nd** | 290 MiB/s  | 66% of sonic-rs, 2.1x faster than serde_json |
+| **Memory Overhead**        | **1st** | 46%        | 17-46x less than DOM parsers                 |
 
 ### x86_64 (AMD Zen 4)
 
 | Metric                    | Ranking | Throughput | Notes                                        |
-|-------------------------|-------|----------|--------------------------------------------|
+|---------------------------|---------|------------|----------------------------------------------|
 | **Parse-Only (10MB)**     | **2nd** | 539 MiB/s  | 74% of sonic-rs, 3x faster than serde_json   |
 | **Parse-Only (100MB)**    | **2nd** | 550 MiB/s  | 77% of sonic-rs, 3.7x faster than serde_json |
 | **Parse+Traverse (10MB)** | **2nd** | 302 MiB/s  | 67% of sonic-rs, 1.9x faster than serde_json |

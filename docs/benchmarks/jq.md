@@ -403,18 +403,18 @@ Run with:
 
 ## Pattern Descriptions
 
-| Pattern           | Description                                    |
-|-------------------|------------------------------------------------|
-| **arrays**        | Arrays of arrays (tests iteration performance) |
-| **comprehensive** | Mixed content with all JSON features           |
-| **literals**      | Mix of null, true, false literals              |
-| **mixed**         | Heterogeneous nested structures                |
-| **nested**        | Deeply nested objects (tests tree navigation)  |
-| **numbers**       | Number-heavy documents with various formats    |
-| **pathological**  | Worst-case patterns (deep nesting, escapes)    |
-| **strings**       | String-heavy with escape sequences             |
-| **unicode**       | UTF-8 multibyte sequences                      |
-| **users**         | Realistic user record objects                  |
+| Pattern           | Description                                     |
+|-------------------|-------------------------------------------------|
+| **arrays**        | Arrays of arrays (tests iteration performance)  |
+| **comprehensive** | Mixed content with all JSON features            |
+| **literals**      | Mix of null, true, false literals               |
+| **mixed**         | Heterogeneous nested structures                 |
+| **nested**        | Deeply nested objects (tests tree navigation)   |
+| **numbers**       | Number-heavy documents with various formats     |
+| **pathological**  | Worst-case patterns (deep nesting, escapes)     |
+| **strings**       | String-heavy with escape sequences              |
+| **unicode**       | UTF-8 multibyte sequences                       |
+| **users**         | Realistic user record objects                   |
 
 ## Key Findings
 

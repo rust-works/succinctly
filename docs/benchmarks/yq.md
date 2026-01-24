@@ -178,13 +178,13 @@ String-heavy YAML with quoted variants.
 
 ## Pattern Descriptions
 
-| Pattern           | Description                                    |
-|-------------------|------------------------------------------------|
-| **comprehensive** | Mixed content with various YAML features       |
-| **users**         | Realistic user record objects (config-like)    |
-| **nested**        | Deeply nested mappings (tests tree navigation) |
-| **sequences**     | Sequence-heavy content (arrays)                |
-| **strings**       | String-heavy with quoted variants              |
+| Pattern           | Description                                     |
+|-------------------|-------------------------------------------------|
+| **comprehensive** | Mixed content with various YAML features        |
+| **users**         | Realistic user record objects (config-like)     |
+| **nested**        | Deeply nested mappings (tests tree navigation)  |
+| **sequences**     | Sequence-heavy content (arrays)                 |
+| **strings**       | String-heavy with quoted variants               |
 
 ---
 
@@ -210,10 +210,10 @@ String-heavy YAML with quoted variants.
 
 The YAML parser uses platform-specific SIMD for hot paths:
 
-| Platform | Instruction Set | Width            | Operations                                    | Status |
-|----------|-----------------|------------------|-----------------------------------------------|--------|
-| ARM64    | NEON            | 16 bytes/iter    | String scanning, indentation count            | ✓ |
-| x86_64   | SSE2/AVX2       | 16-32 bytes/iter | String scanning, indentation, multi-char classification | ✓ P0 |
+| Platform | Instruction Set | Width            | Operations                                               | Status |
+|----------|-----------------|------------------|----------------------------------------------------------|--------|
+| ARM64    | NEON            | 16 bytes/iter    | String scanning, indentation count                       | ✓      |
+| x86_64   | SSE2/AVX2       | 16-32 bytes/iter | String scanning, indentation, multi-char classification  | ✓ P0   |
 
 #### ARM64 (NEON) Results
 
@@ -335,16 +335,16 @@ code: "007"      # Quoted string
 
 ✓ **All standard yq query patterns produce identical output**:
 
-| Pattern | Example | Notes |
-|---------|---------|-------|
-| Identity | `.` | Full document output |
-| Field selection | `.users[].name` | String and number fields |
-| Filtering | `.users[] \| select(.age > 30)` | Comparison operations |
-| Boolean selection | `.users[] \| select(.active)` | Boolean values |
-| Array indexing | `.users[0]` | Array element access |
-| Nested paths | `.config.version` | Preserves quoted strings |
-| Number fields | `.scores.total` | Unquoted numbers |
-| Quoted numbers | `.id` | Preserves `"001"` as string |
+| Pattern           | Example                        | Notes                   |
+|-------------------|--------------------------------|-------------------------|
+| Identity          | `.`                            | Full document output    |
+| Field selection   | `.users[].name`                | String and number fields|
+| Filtering         | `.users[] \| select(.age > 30)`| Comparison operations   |
+| Boolean selection | `.users[] \| select(.active)`  | Boolean values          |
+| Array indexing    | `.users[0]`                    | Array element access    |
+| Nested paths      | `.config.version`              | Preserves quoted strings|
+| Number fields     | `.scores.total`                | Unquoted numbers        |
+| Quoted numbers    | `.id`                          | Preserves `"001"` as string |
 
 ### Migration from yq
 

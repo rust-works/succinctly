@@ -9,12 +9,12 @@ Benchmark comparison of succinctly against other popular Rust JSON parsers.
 
 ## Libraries Compared
 
-| Library       | Version | Type                  | Key Features                                    |
-|---------------|---------|------------------------|------------------------------------------------|
-| **succinctly**| 0.1.0   | Semi-index (streaming) | Balanced parentheses + interest bits, minimal memory |
-| **sonic-rs**  | 0.3.x   | DOM (arena-based)      | SIMD + arena allocation, fastest DOM parser    |
-| **serde_json**| 1.0.x   | DOM (standard)         | Most popular, standard library integration     |
-| **simd-json** | 0.13.x  | DOM (SIMD-accelerated) | Port of simdjson, requires mutable input      |
+| Library        | Version | Type                   | Key Features                                          |
+|----------------|---------|------------------------|-------------------------------------------------------|
+| **succinctly** | 0.1.0   | Semi-index (streaming) | Balanced parentheses + interest bits, minimal memory  |
+| **sonic-rs**   | 0.3.x   | DOM (arena-based)      | SIMD + arena allocation, fastest DOM parser           |
+| **serde_json** | 1.0.x   | DOM (standard)         | Most popular, standard library integration            |
+| **simd-json**  | 0.13.x  | DOM (SIMD-accelerated) | Port of simdjson, requires mutable input              |
 
 ## Parse-Only Performance
 
@@ -22,68 +22,68 @@ Time to build the index/parse the document (no traversal).
 
 ### Summary Table (1MB file)
 
-| Library        | Time     | Throughput | vs sonic-rs | vs succinctly |
-|----------------|----------|------------|-------------|---------------|
-| **sonic-rs**   | 0.998 ms | 810 MiB/s  | baseline    | **1.59x faster** |
-| **succinctly** | 1.583 ms | 510 MiB/s  | 1.59x slower| baseline      |
-| serde_json     | 4.832 ms | 167 MiB/s  | 4.84x slower| 3.05x slower  |
-| simd-json      | 5.100 ms | 158 MiB/s  | 5.11x slower| 3.22x slower  |
+| Library        | Time     | Throughput | vs sonic-rs  | vs succinctly    |
+|----------------|----------|------------|--------------|------------------|
+| **sonic-rs**   | 0.998 ms | 810 MiB/s  | baseline     | **1.59x faster** |
+| **succinctly** | 1.583 ms | 510 MiB/s  | 1.59x slower | baseline         |
+| serde_json     | 4.832 ms | 167 MiB/s  | 4.84x slower | 3.05x slower     |
+| simd-json      | 5.100 ms | 158 MiB/s  | 5.11x slower | 3.22x slower     |
 
 ### Detailed Results by File Size
 
 #### 1KB Files
 
-| Library        | Time      | Throughput | vs succinctly |
-|----------------|-----------|------------|---------------|
-| **sonic-rs**   |  1.78 µs  | 887 MiB/s  | **1.50x faster** |
-| **succinctly** |  2.66 µs  | 593 MiB/s  | baseline      |
-| simd-json      |  6.24 µs  | 253 MiB/s  | 2.35x slower  |
-| serde_json     |  7.61 µs  | 207 MiB/s  | 2.86x slower  |
+| Library        | Time     | Throughput | vs succinctly    |
+|----------------|----------|------------|------------------|
+| **sonic-rs**   | 1.78 µs  | 887 MiB/s  | **1.50x faster** |
+| **succinctly** | 2.66 µs  | 593 MiB/s  | baseline         |
+| simd-json      | 6.24 µs  | 253 MiB/s  | 2.35x slower     |
+| serde_json     | 7.61 µs  | 207 MiB/s  | 2.86x slower     |
 
 #### 10KB Files
 
-| Library        | Time      | Throughput | vs succinctly |
-|----------------|-----------|------------|---------------|
-| **sonic-rs**   | 11.12 µs  | 845 MiB/s  | **1.52x faster** |
-| **succinctly** | 16.91 µs  | 556 MiB/s  | baseline      |
-| simd-json      | 40.76 µs  | 231 MiB/s  | 2.41x slower  |
-| serde_json     | 52.55 µs  | 179 MiB/s  | 3.11x slower  |
+| Library        | Time     | Throughput | vs succinctly    |
+|----------------|----------|------------|------------------|
+| **sonic-rs**   | 11.12 µs | 845 MiB/s  | **1.52x faster** |
+| **succinctly** | 16.91 µs | 556 MiB/s  | baseline         |
+| simd-json      | 40.76 µs | 231 MiB/s  | 2.41x slower     |
+| serde_json     | 52.55 µs | 179 MiB/s  | 3.11x slower     |
 
 #### 100KB Files
 
-| Library        | Time      | Throughput | vs succinctly |
-|----------------|-----------|------------|---------------|
-| **sonic-rs**   | 105.6 µs  | 808 MiB/s  | **1.66x faster** |
-| **succinctly** | 174.9 µs  | 488 MiB/s  | baseline      |
-| simd-json      | 390.1 µs  | 219 MiB/s  | 2.23x slower  |
-| serde_json     | 492.0 µs  | 173 MiB/s  | 2.81x slower  |
+| Library        | Time     | Throughput | vs succinctly    |
+|----------------|----------|------------|------------------|
+| **sonic-rs**   | 105.6 µs | 808 MiB/s  | **1.66x faster** |
+| **succinctly** | 174.9 µs | 488 MiB/s  | baseline         |
+| simd-json      | 390.1 µs | 219 MiB/s  | 2.23x slower     |
+| serde_json     | 492.0 µs | 173 MiB/s  | 2.81x slower     |
 
 #### 1MB Files
 
-| Library        | Time     | Throughput | vs succinctly |
-|----------------|----------|------------|---------------|
+| Library        | Time     | Throughput | vs succinctly    |
+|----------------|----------|------------|------------------|
 | **sonic-rs**   | 0.998 ms | 810 MiB/s  | **1.59x faster** |
-| **succinctly** | 1.583 ms | 510 MiB/s  | baseline      |
-| serde_json     | 4.832 ms | 167 MiB/s  | 3.05x slower  |
-| simd-json      | 5.100 ms | 158 MiB/s  | 3.22x slower  |
+| **succinctly** | 1.583 ms | 510 MiB/s  | baseline         |
+| serde_json     | 4.832 ms | 167 MiB/s  | 3.05x slower     |
+| simd-json      | 5.100 ms | 158 MiB/s  | 3.22x slower     |
 
 #### 10MB Files
 
-| Library        | Time      | Throughput | vs succinctly |
-|----------------|-----------|------------|---------------|
-| **sonic-rs**   | 11.40 ms  | 702 MiB/s  | **1.34x faster** |
-| **succinctly** | 15.32 ms  | 522 MiB/s  | baseline      |
-| serde_json     | 52.21 ms  | 153 MiB/s  | 3.41x slower  |
-| simd-json      | 59.59 ms  | 134 MiB/s  | 3.89x slower  |
+| Library        | Time     | Throughput | vs succinctly    |
+|----------------|----------|------------|------------------|
+| **sonic-rs**   | 11.40 ms | 702 MiB/s  | **1.34x faster** |
+| **succinctly** | 15.32 ms | 522 MiB/s  | baseline         |
+| serde_json     | 52.21 ms | 153 MiB/s  | 3.41x slower     |
+| simd-json      | 59.59 ms | 134 MiB/s  | 3.89x slower     |
 
 #### 100MB Files
 
-| Library        | Time      | Throughput | vs succinctly |
-|----------------|-----------|------------|---------------|
-| **sonic-rs**   | 115.7 ms  | 692 MiB/s  | **1.35x faster** |
-| **succinctly** | 155.6 ms  | 514 MiB/s  | baseline      |
-| serde_json     | 526.1 ms  | 152 MiB/s  | 3.38x slower  |
-| simd-json      | 826.9 ms  |  97 MiB/s  | 5.31x slower  |
+| Library        | Time     | Throughput | vs succinctly    |
+|----------------|----------|------------|------------------|
+| **sonic-rs**   | 115.7 ms | 692 MiB/s  | **1.35x faster** |
+| **succinctly** | 155.6 ms | 514 MiB/s  | baseline         |
+| serde_json     | 526.1 ms | 152 MiB/s  | 3.38x slower     |
+| simd-json      | 826.9 ms | 97 MiB/s   | 5.31x slower     |
 
 ## Peak Memory Usage
 
@@ -113,12 +113,12 @@ Memory overhead during parsing/indexing.
 
 ### Memory Comparison (1MB file)
 
-| Library        | Peak Memory | vs JSON Size | vs succinctly          |
-|----------------|-------------|--------------|------------------------|
-| **succinctly** | **382 KB**  | **0.46x**    | baseline               |
-| sonic-rs       | 9.97 MB     | 12.34x       | **26.7x more memory**  |
-| serde_json     | 7.00 MB     | 8.66x        | **18.7x more memory**  |
-| simd-json      | 17.12 MB    | 21.17x       | **45.8x more memory**  |
+| Library        | Peak Memory | vs JSON Size | vs succinctly         |
+|----------------|-------------|--------------|-----------------------|
+| **succinctly** | **382 KB**  | **0.46x**    | baseline              |
+| sonic-rs       | 9.97 MB     | 12.34x       | **26.7x more memory** |
+| serde_json     | 7.00 MB     | 8.66x        | **18.7x more memory** |
+| simd-json      | 17.12 MB    | 21.17x       | **45.8x more memory** |
 
 ## Key Findings
 
@@ -161,15 +161,15 @@ Memory overhead during parsing/indexing.
 
 ### Use Case Recommendations
 
-| Use Case                           | Recommendation | Why                                            |
-|---------------------------------------|----------------|------------------------------------------------|
-| **Low memory / streaming**            | **succinctly** | 18-46x less memory, streaming-friendly         |
-| **Maximum parse speed**               | sonic-rs       | Fastest parser, 1.3-1.7x faster than succinctly|
-| **Serde ecosystem integration**       | serde_json     | Standard library, most compatible              |
-| **Selective JSON extraction**         | **succinctly** | Navigate without parsing entire document       |
-| **In-place modification**             | simd-json      | Mutable API for in-place editing               |
-| **Large files (>10MB)**               | **succinctly** | Memory usage stays manageable (46% overhead)   |
-| **Many small requests**               | sonic-rs       | Fast parsing, arena allocator reduces overhead |
+| Use Case                      | Recommendation | Why                                             |
+|-------------------------------|----------------|-------------------------------------------------|
+| **Low memory / streaming**    | **succinctly** | 18-46x less memory, streaming-friendly          |
+| **Maximum parse speed**       | sonic-rs       | Fastest parser, 1.3-1.7x faster than succinctly |
+| **Serde ecosystem**           | serde_json     | Standard library, most compatible               |
+| **Selective JSON extraction** | **succinctly** | Navigate without parsing entire document        |
+| **In-place modification**     | simd-json      | Mutable API for in-place editing                |
+| **Large files (>10MB)**       | **succinctly** | Memory usage stays manageable (46% overhead)    |
+| **Many small requests**       | sonic-rs       | Fast parsing, arena allocator reduces overhead  |
 
 ## Traversal Performance
 

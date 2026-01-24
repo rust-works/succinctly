@@ -6,11 +6,11 @@ Performance benchmarks for DSV parsing via `succinctly jq --input-dsv`.
 
 ## Summary
 
-| Metric | ARM (M1 Max) | x86_64 (Ryzen 9) |
-|--------|--------------|------------------|
-| **CLI Throughput** | 6-29 MiB/s | 9-40 MiB/s |
-| **API Iteration** | - | 85-1676 MiB/s |
-| **Parse Speed** | ~0.8 GB/s | 1.3-3.7 GB/s |
+| Metric             | ARM (M1 Max) | x86_64 (Ryzen 9) |
+|--------------------|--------------|------------------|
+| **CLI Throughput** | 6-29 MiB/s   | 9-40 MiB/s       |
+| **API Iteration**  | -            | 85-1676 MiB/s    |
+| **Parse Speed**    | ~0.8 GB/s    | 1.3-3.7 GB/s     |
 
 ## Platforms
 
@@ -30,44 +30,44 @@ Full jq pipeline including DSV parsing, iteration, and JSON output.
 
 ### ARM (M1 Max) - 10MB Files
 
-| Pattern | Time | Throughput |
-|---------|------|------------|
-| strings | 352ms | 28.4 MiB/s |
-| multiline | 503ms | 19.9 MiB/s |
-| quoted | 627ms | 16.0 MiB/s |
+| Pattern      | Time  | Throughput |
+|--------------|-------|------------|
+| strings      | 352ms | 28.4 MiB/s |
+| multiline    | 503ms | 19.9 MiB/s |
+| quoted       | 627ms | 16.0 MiB/s |
 | pathological | 716ms | 14.0 MiB/s |
-| tabular | 908ms | 11.0 MiB/s |
-| users | 954ms | 10.5 MiB/s |
-| numeric | 957ms | 10.5 MiB/s |
-| mixed | 949ms | 10.5 MiB/s |
-| wide | 1.40s | 7.2 MiB/s |
-| long | 1.57s | 6.4 MiB/s |
+| tabular      | 908ms | 11.0 MiB/s |
+| users        | 954ms | 10.5 MiB/s |
+| numeric      | 957ms | 10.5 MiB/s |
+| mixed        | 949ms | 10.5 MiB/s |
+| wide         | 1.40s | 7.2 MiB/s  |
+| long         | 1.57s | 6.4 MiB/s  |
 
 ### x86_64 (Ryzen 9) - 10MB Files
 
-| Pattern | Time | Throughput |
-|---------|------|------------|
-| strings | 254ms | 39.4 MiB/s |
-| multiline | 336ms | 29.7 MiB/s |
-| quoted | 369ms | 27.1 MiB/s |
-| tabular | 548ms | 18.2 MiB/s |
-| users | 587ms | 17.0 MiB/s |
-| numeric | 585ms | 17.1 MiB/s |
-| mixed | 549ms | 18.2 MiB/s |
+| Pattern      | Time  | Throughput |
+|--------------|-------|------------|
+| strings      | 254ms | 39.4 MiB/s |
+| multiline    | 336ms | 29.7 MiB/s |
+| quoted       | 369ms | 27.1 MiB/s |
+| tabular      | 548ms | 18.2 MiB/s |
+| users        | 587ms | 17.0 MiB/s |
+| numeric      | 585ms | 17.1 MiB/s |
+| mixed        | 549ms | 18.2 MiB/s |
 | pathological | 544ms | 18.4 MiB/s |
-| wide | 1.09s | 9.1 MiB/s |
-| long | 918ms | 10.9 MiB/s |
+| wide         | 1.09s | 9.1 MiB/s  |
+| long         | 918ms | 10.9 MiB/s |
 
 ## Query Comparison
 
 Single column selection (`.[0]`) vs full output (`.`) - x86_64:
 
-| Pattern | Full Output | Single Column | Speedup |
-|---------|-------------|---------------|---------|
-| wide | 44.7 MiB/s | 83.8 MiB/s | **1.88x** |
-| users | 22.1 MiB/s | 41.0 MiB/s | **1.85x** |
-| tabular | 19.5 MiB/s | 34.9 MiB/s | **1.79x** |
-| strings | 126.4 MiB/s | 169.0 MiB/s | **1.34x** |
+| Pattern | Full Output | Single Column | Speedup   |
+|---------|-------------|---------------|-----------|
+| wide    | 44.7 MiB/s  | 83.8 MiB/s    | **1.88x** |
+| users   | 22.1 MiB/s  | 41.0 MiB/s    | **1.85x** |
+| tabular | 19.5 MiB/s  | 34.9 MiB/s    | **1.79x** |
+| strings | 126.4 MiB/s | 169.0 MiB/s   | **1.34x** |
 
 **Average speedup**: 1.67x for single column selection.
 
@@ -101,9 +101,9 @@ Direct API usage without JSON serialization overhead.
 
 | File Size | Peak Memory |
 |-----------|-------------|
-| 1 MB | 5-9 MB |
-| 10 MB | 17-21 MB |
-| 100 MB | 138-143 MB |
+| 1 MB      | 5-9 MB      |
+| 10 MB     | 17-21 MB    |
+| 100 MB    | 138-143 MB  |
 
 **Index overhead**: ~3-4% of input size.
 
@@ -113,10 +113,10 @@ Direct API usage without JSON serialization overhead.
 
 Replaced scalar prefix XOR (6 shifts + 6 XORs) with carryless multiplication via NEON PMULL instruction:
 
-| Metric | Before | After | Improvement |
-|--------|--------|-------|-------------|
-| 10MB index build | 3.18 GiB/s | 3.84 GiB/s | **+25%** |
-| 10MB index+iterate | 0.93 GiB/s | 1.00 GiB/s | **+8%** |
+| Metric             | Before     | After      | Improvement |
+|--------------------|------------|------------|-------------|
+| 10MB index build   | 3.18 GiB/s | 3.84 GiB/s | **+25%**    |
+| 10MB index+iterate | 0.93 GiB/s | 1.00 GiB/s | **+8%**     |
 
 **Key insight**: `prefix_xor(x) = clmul(x, 0xFFFF...FFFF)` in GF(2). Carryless multiplication by all-1s propagates each bit to all higher positions via XOR, computing prefix XOR in O(1) instead of O(log n).
 
@@ -126,10 +126,10 @@ Replaced scalar prefix XOR (6 shifts + 6 XORs) with carryless multiplication via
 
 Replaced full BitVec with simple cumulative rank arrays:
 
-| Metric | Before | After | Improvement |
-|--------|--------|-------|-------------|
-| Field iteration | 145 MiB/s | 792-1331 MiB/s | **5-9x** |
-| Memory overhead | ~6% | ~3-4% | **50% less** |
+| Metric          | Before    | After          | Improvement  |
+|-----------------|-----------|----------------|--------------|
+| Field iteration | 145 MiB/s | 792-1331 MiB/s | **5-9x**     |
+| Memory overhead | ~6%       | ~3-4%          | **50% less** |
 
 ## Running Benchmarks
 

@@ -6,12 +6,12 @@ This document investigates whether succinctly's semi-indexing techniques can be 
 
 **Conclusion**: YAML semi-indexing is theoretically possible but significantly more complex than JSON due to context-sensitive grammar and character ambiguity.
 
-| Aspect | JSON | YAML |
-|--------|------|------|
-| Character disambiguation | Trivial | Requires oracle |
-| SIMD parallelization | Full (simdjson: 2+ GB/s) | Limited (rapidyaml: ~150 MB/s) |
-| Extra index storage | None | 1-2 bits per structural position |
-| Implementation complexity | Moderate | High |
+| Aspect                   | JSON                     | YAML                             |
+|--------------------------|--------------------------|----------------------------------|
+| Character disambiguation | Trivial                  | Requires oracle                  |
+| SIMD parallelization     | Full (simdjson: 2+ GB/s) | Limited (rapidyaml: ~150 MB/s)   |
+| Extra index storage      | None                     | 1-2 bits per structural position |
+| Implementation complexity| Moderate                 | High                             |
 
 ---
 
@@ -85,12 +85,12 @@ The virtual brackets don't exist in the source - they're recorded in the BP inde
 
 ### Indentation Rules
 
-| Indentation Change | Virtual Bracket |
-|-------------------|-----------------|
-| Increase | Open `(` - entering new container |
-| Decrease | Close `)` - returning to parent |
-| Same level | Sibling - no bracket |
-| Sequence `-` | Open item within sequence |
+| Indentation Change | Virtual Bracket                   |
+|--------------------|-----------------------------------|
+| Increase           | Open `(` - entering new container |
+| Decrease           | Close `)` - returning to parent   |
+| Same level         | Sibling - no bracket              |
+| Sequence `-`       | Open item within sequence         |
 
 ---
 
@@ -100,84 +100,84 @@ Unlike JSON where each structural character has unambiguous meaning, YAML charac
 
 ### 1. Colon `:` - Most Ambiguous
 
-| Context | Meaning | Example |
-|---------|---------|---------|
-| After key, before value | Mapping indicator | `name: Alice` |
-| In flow context with space | Mapping indicator | `{a: 1}` |
-| Inside unquoted scalar | Literal character | `time: 12:30:00` |
-| Inside quoted string | Literal character | `"a:b"` |
-| In URL | Literal character | `url: http://x.com` |
+| Context                    | Meaning           | Example             |
+|----------------------------|-------------------|---------------------|
+| After key, before value    | Mapping indicator | `name: Alice`       |
+| In flow context with space | Mapping indicator | `{a: 1}`            |
+| Inside unquoted scalar     | Literal character | `time: 12:30:00`    |
+| Inside quoted string       | Literal character | `"a:b"`             |
+| In URL                     | Literal character | `url: http://x.com` |
 
 **Resolution**: Oracle must track whether we're in a scalar context and whether `:` is followed by whitespace or end-of-line.
 
 ### 2. Hyphen `-` - Sequence vs Scalar
 
-| Context | Meaning | Example |
-|---------|---------|---------|
-| At line start + space | Sequence item | `- item` |
-| In flow sequence | Not structural | `[a, b, c]` |
-| Negative number | Literal | `value: -5` |
-| Date component | Literal | `date: 2024-01-15` |
-| In string | Literal | `name: foo-bar` |
-| Block scalar indicator | Chomping modifier | `\|-` or `>-` |
+| Context                | Meaning           | Example            |
+|------------------------|-------------------|--------------------|
+| At line start + space  | Sequence item     | `- item`           |
+| In flow sequence       | Not structural    | `[a, b, c]`        |
+| Negative number        | Literal           | `value: -5`        |
+| Date component         | Literal           | `date: 2024-01-15` |
+| In string              | Literal           | `name: foo-bar`    |
+| Block scalar indicator | Chomping modifier | `\|-` or `>-`      |
 
 **Resolution**: Oracle checks line position, preceding whitespace, and current block context.
 
 ### 3. Question Mark `?` - Explicit Key
 
-| Context | Meaning | Example |
-|---------|---------|---------|
+| Context               | Meaning                | Example         |
+|-----------------------|------------------------|-----------------|
 | At line start + space | Explicit key indicator | `? complex key` |
-| Inside scalar | Literal | `query: what?` |
+| Inside scalar         | Literal                | `query: what?`  |
 
 **Resolution**: Same as `-`, check line position and whitespace.
 
 ### 4. Hash `#` - Comment
 
-| Context | Meaning | Example |
-|---------|---------|---------|
-| After whitespace | Comment start | `value # comment` |
-| Inside quoted string | Literal | `"#hashtag"` |
-| Inside unquoted (no prior space) | Literal | `color: #ff0000` |
+| Context                          | Meaning       | Example           |
+|----------------------------------|---------------|-------------------|
+| After whitespace                 | Comment start | `value # comment` |
+| Inside quoted string             | Literal       | `"#hashtag"`      |
+| Inside unquoted (no prior space) | Literal       | `color: #ff0000`  |
 
 **Resolution**: Oracle tracks quote state and preceding whitespace.
 
 ### 5. Flow Delimiters `[` `]` `{` `}` `,`
 
-| Context | Meaning | Example |
-|---------|---------|---------|
-| Flow context | Structural | `items: [1, 2, 3]` |
-| Inside quoted string | Literal | `"array[0]"` |
-| Inside unquoted scalar | Depends | Implementation-specific |
+| Context                | Meaning    | Example                 |
+|------------------------|------------|-------------------------|
+| Flow context           | Structural | `items: [1, 2, 3]`      |
+| Inside quoted string   | Literal    | `"array[0]"`            |
+| Inside unquoted scalar | Depends    | Implementation-specific |
 
 **Resolution**: Oracle tracks flow nesting depth and quote state.
 
 ### 6. Block Scalar Indicators `|` `>`
 
-| Context | Meaning | Example |
-|---------|---------|---------|
-| After key, alone | Block scalar start | `text: \|` |
-| With modifier | Block + chomping | `text: \|+` |
-| Inside scalar | Literal | `cmd: a \| b` |
+| Context          | Meaning            | Example       |
+|------------------|--------------------|---------------|
+| After key, alone | Block scalar start | `text: \|`    |
+| With modifier    | Block + chomping   | `text: \|+`   |
+| Inside scalar    | Literal            | `cmd: a \| b` |
 
 **Resolution**: Oracle checks position relative to `:` and line structure.
 
 ### 7. Anchors/Aliases `&` `*`
 
-| Context | Meaning | Example |
-|---------|---------|---------|
-| Before node | Anchor/alias | `&anchor value` |
-| Inside scalar | Literal | `expr: a & b` |
+| Context       | Meaning      | Example         |
+|---------------|--------------|-----------------|
+| Before node   | Anchor/alias | `&anchor value` |
+| Inside scalar | Literal      | `expr: a & b`   |
 
 **Resolution**: Oracle checks preceding characters.
 
 ### 8. Newline + Indentation
 
-| Context | Meaning | Example |
-|---------|---------|---------|
-| Normal context | Structure boundary | Child/sibling/parent |
-| Inside block scalar | Content continuation | Multi-line string |
-| Inside flow context | Ignored | `{a: 1,`<br>`b: 2}` |
+| Context             | Meaning              | Example              |
+|---------------------|----------------------|----------------------|
+| Normal context      | Structure boundary   | Child/sibling/parent |
+| Inside block scalar | Content continuation | Multi-line string    |
+| Inside flow context | Ignored              | `{a: 1,`<br>`b: 2}`  |
 
 **Resolution**: Oracle tracks block scalar state and flow depth.
 
@@ -191,21 +191,21 @@ Unlike JSON where BP + IB are sufficient, YAML requires extra type information.
 
 One extra bit per structural position:
 
-| TY[k] | Meaning |
-|-------|---------|
-| 0 | Mapping (object-like) |
-| 1 | Sequence (array-like) |
+| TY[k] | Meaning               |
+|-------|-----------------------|
+| 0     | Mapping (object-like) |
+| 1     | Sequence (array-like) |
 
 **Overhead**: +1 bit per structural position (~0.1% of input)
 
 ### Option 2: Two-Bit Type Field
 
-| Code | Meaning |
-|------|---------|
-| 00 | Block mapping |
-| 01 | Block sequence |
-| 10 | Flow mapping |
-| 11 | Flow sequence |
+| Code | Meaning        |
+|------|----------------|
+| 00   | Block mapping  |
+| 01   | Block sequence |
+| 10   | Flow mapping   |
+| 11   | Flow sequence  |
 
 **Overhead**: +2 bits per structural position (~0.2% of input)
 
@@ -226,14 +226,14 @@ The TY bits resolve this without rescanning context.
 
 ## Comparison: JSON vs YAML Semi-Indexing
 
-| Component | JSON | YAML |
-|-----------|------|------|
-| **IB (Interest Bits)** | Marks `{`, `}`, `[`, `]`, value starts | Marks indent changes, `-`, `:`, key starts |
-| **BP (Balanced Parens)** | Direct from brackets | Virtual from indentation |
-| **TY (Type Bits)** | Not needed | Mapping vs Sequence per position |
-| **ib_select1(k)** | Returns byte offset | Returns byte offset |
-| **bp[k]** | Open/close | Open/close |
-| **source[ib_select1(k)]** | Unambiguous character | Ambiguous - needs TY[k] |
+| Component                 | JSON                                       | YAML                                        |
+|---------------------------|--------------------------------------------|--------------------------------------------|
+| **IB (Interest Bits)**    | Marks `{`, `}`, `[`, `]`, value starts     | Marks indent changes, `-`, `:`, key starts |
+| **BP (Balanced Parens)**  | Direct from brackets                       | Virtual from indentation                   |
+| **TY (Type Bits)**        | Not needed                                 | Mapping vs Sequence per position           |
+| **ib_select1(k)**         | Returns byte offset                        | Returns byte offset                        |
+| **bp[k]**                 | Open/close                                 | Open/close                                 |
+| **source[ib_select1(k)]** | Unambiguous character                      | Ambiguous - needs TY[k]                    |
 
 ---
 
@@ -241,24 +241,24 @@ The TY bits resolve this without rescanning context.
 
 ### Oracle (Index Building)
 
-| Parser | Language | Throughput |
-|--------|----------|------------|
-| rapidyaml | C++ | ~150 MB/s (YAML), ~450 MB/s (JSON mode) |
-| libyaml | C | ~114 MB/s |
-| VYaml | C# | 6x faster than YamlDotNet |
-| simdjson | C++ | 2-3 GB/s (JSON only) |
+| Parser    | Language | Throughput                              |
+|-----------|----------|-----------------------------------------|
+| rapidyaml | C++      | ~150 MB/s (YAML), ~450 MB/s (JSON mode) |
+| libyaml   | C        | ~114 MB/s                               |
+| VYaml     | C#       | 6x faster than YamlDotNet               |
+| simdjson  | C++      | 2-3 GB/s (JSON only)                    |
 
 The oracle would likely achieve ~100-200 MB/s, similar to rapidyaml.
 
 ### Index Queries (Post-Oracle)
 
-| Operation | Complexity | Notes |
-|-----------|------------|-------|
-| `parent(k)` | O(1) amortized | Same as JSON |
-| `first_child(k)` | O(1) | Same as JSON |
-| `next_sibling(k)` | O(1) | Same as JSON |
-| `locate_offset(n)` | O(depth) | Same as JSON |
-| `is_sequence(k)` | O(1) | Requires TY lookup |
+| Operation          | Complexity     | Notes              |
+|--------------------|----------------|--------------------|
+| `parent(k)`        | O(1) amortized | Same as JSON       |
+| `first_child(k)`   | O(1)           | Same as JSON       |
+| `next_sibling(k)`  | O(1)           | Same as JSON       |
+| `locate_offset(n)` | O(depth)       | Same as JSON       |
+| `is_sequence(k)`   | O(1)           | Requires TY lookup |
 
 ---
 
@@ -290,11 +290,11 @@ Whitespace defines nesting. This requires:
 
 ### 4. Specification Complexity
 
-| Metric | JSON | YAML 1.2 |
-|--------|------|----------|
-| Spec word count | 1,969 | 23,449 |
-| String syntaxes | 1 | 63 (!) |
-| Test suite cases | ~300 | ~3,000+ |
+| Metric           | JSON  | YAML 1.2 |
+|------------------|-------|----------|
+| Spec word count  | 1,969 | 23,449   |
+| String syntaxes  | 1     | 63 (!)   |
+| Test suite cases | ~300  | ~3,000+  |
 
 ---
 
@@ -333,12 +333,12 @@ Full YAML 1.2 parser optimized for index emission:
 
 ### SIMD-Accelerated Components
 
-| Component | Technique |
-|-----------|-----------|
-| Newline detection | SIMD compare + movemask |
-| Whitespace counting | SIMD compare + popcount |
-| Quote boundary detection | Same as JSON |
-| Comment detection | SIMD search for `#` after whitespace |
+| Component                | Technique                            |
+|--------------------------|--------------------------------------|
+| Newline detection        | SIMD compare + movemask              |
+| Whitespace counting      | SIMD compare + popcount              |
+| Quote boundary detection | Same as JSON                         |
+| Comment detection        | SIMD search for `#` after whitespace |
 
 ### Speculative Parsing
 
@@ -398,11 +398,11 @@ production:
 
 **Trade-offs**:
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| No expansion (chosen) | Preserves source structure, low memory, accurate `locate_offset()` | Higher-level code must resolve aliases |
-| Expand during indexing | Simpler queries, tree structure | Memory overhead, lose source fidelity |
-| Reject anchors | Simplest implementation | Incompatible with many real YAML files |
+| Approach               | Pros                                                               | Cons                                    |
+|------------------------|--------------------------------------------------------------------|-----------------------------------------|
+| No expansion (chosen)  | Preserves source structure, low memory, accurate `locate_offset()` | Higher-level code must resolve aliases  |
+| Expand during indexing | Simpler queries, tree structure                                    | Memory overhead, lose source fidelity   |
+| Reject anchors         | Simplest implementation                                            | Incompatible with many real YAML files  |
 
 The cursor API will expose `is_anchor()`, `is_alias()`, and `resolve_alias()` methods. Expansion can be implemented at a higher level if needed.
 
@@ -424,11 +424,11 @@ The oracle must track:
 
 **Trade-offs for close bracket placement**:
 
-| Placement | Pros | Cons |
-|-----------|------|------|
-| At last content line | Byte range matches visible content | Requires lookahead to determine end |
-| At first dedent | Natural parsing boundary | May include trailing newlines |
-| At indicator position (degenerate) | Simple | Loses content boundary info |
+| Placement                          | Pros                               | Cons                                |
+|------------------------------------|-----------------------------------|-------------------------------------|
+| At last content line               | Byte range matches visible content | Requires lookahead to determine end |
+| At first dedent                    | Natural parsing boundary           | May include trailing newlines       |
+| At indicator position (degenerate) | Simple                             | Loses content boundary info         |
 
 **Decision**: Place close bracket at the byte position of the last content character (before chomping). This gives accurate byte ranges for `locate_offset()` and content extraction.
 
@@ -454,11 +454,11 @@ doc2: value
 
 **Trade-offs**:
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| Array wrapper (chosen) | Uniform API, consistent navigation | Extra root node, paths start with `[0]` |
-| Separate indices | Independent documents | Multiple index structures, complex API |
-| Reject multi-doc | Simple | Incompatible with many YAML files |
+| Approach              | Pros                                | Cons                                    |
+|-----------------------|-------------------------------------|-----------------------------------------|
+| Array wrapper (chosen)| Uniform API, consistent navigation  | Extra root node, paths start with `[0]` |
+| Separate indices      | Independent documents               | Multiple index structures, complex API  |
+| Reject multi-doc      | Simple                              | Incompatible with many YAML files       |
 
 The array wrapper approach means `.` always refers to the document array, and `.[0]` is the first document. This matches common tools like `yq`.
 
@@ -472,13 +472,13 @@ JSON keys are quoted strings with defined boundaries. YAML keys can be:
 
 **Proposed Solutions**:
 
-| Key Type | Extraction Strategy |
-|----------|---------------------|
+| Key Type        | Extraction Strategy                                      |
+|-----------------|----------------------------------------------------------|
 | Unquoted simple | Scan from IB position to `:` (minus trailing whitespace) |
-| Double-quoted | Same as JSON: scan for closing `"`, handle escapes |
-| Single-quoted | Scan for closing `'`, handle `''` escape |
-| Explicit (`?`) | IB marks `?`, scan to next `:` at same indent |
-| Complex | Store key byte range in auxiliary structure |
+| Double-quoted   | Same as JSON: scan for closing `"`, handle escapes       |
+| Single-quoted   | Scan for closing `'`, handle `''` escape                 |
+| Explicit (`?`)  | IB marks `?`, scan to next `:` at same indent            |
+| Complex         | Store key byte range in auxiliary structure              |
 
 **Index Augmentation**:
 
@@ -493,12 +493,12 @@ For efficient key extraction, store key end positions:
 
 **Decision**: Target YAML 1.2 exclusively.
 
-| Feature | YAML 1.1 | YAML 1.2 (chosen) |
-|---------|----------|-------------------|
-| Boolean literals | `yes`, `no`, `on`, `off`, `y`, `n` | Only `true`, `false` |
-| Octal numbers | `010` = 8 | `0o10` = 8 |
-| Sexagesimal | `1:30:00` = 5400 | Literal string |
-| JSON compatibility | Partial | Full superset |
+| Feature            | YAML 1.1                             | YAML 1.2 (chosen)    |
+|--------------------|--------------------------------------|----------------------|
+| Boolean literals   | `yes`, `no`, `on`, `off`, `y`, `n`   | Only `true`, `false` |
+| Octal numbers      | `010` = 8                            | `0o10` = 8           |
+| Sexagesimal        | `1:30:00` = 5400                     | Literal string       |
+| JSON compatibility | Partial                              | Full superset        |
 
 **Rationale**:
 - YAML 1.2 is cleaner and more predictable
@@ -532,14 +532,14 @@ The cursor does **not** provide:
 
 **Rationale**:
 
-| Concern | Cursor API | Higher-level API |
-|---------|------------|------------------|
-| Structure navigation | ✓ | ✓ |
-| Byte ranges | ✓ | ✓ |
-| Raw value access | ✓ | ✓ |
-| Tag presence | ✓ | ✓ |
-| Type coercion | ✗ | ✓ |
-| Schema validation | ✗ | ✓ |
+| Concern              | Cursor API | Higher-level API |
+|----------------------|------------|------------------|
+| Structure navigation | ✓          | ✓                |
+| Byte ranges          | ✓          | ✓                |
+| Raw value access     | ✓          | ✓                |
+| Tag presence         | ✓          | ✓                |
+| Type coercion        | ✗          | ✓                |
+| Schema validation    | ✗          | ✓                |
 
 This separation keeps the index small and fast. A higher-level `YamlValue` type can implement schema-aware parsing on top of the cursor.
 
@@ -549,12 +549,12 @@ This separation keeps the index small and fast. A higher-level `YamlValue` type 
 
 **Test Sources**:
 
-| Source | Cases | Usage |
-|--------|-------|-------|
-| YAML Test Suite | ~300 YAML 1.2 cases | Conformance testing |
-| Property tests | Generated | Round-trip verification |
-| Fuzzing | Random | Robustness |
-| Real-world files | Curated | Practical coverage |
+| Source           | Cases              | Usage                    |
+|------------------|--------------------|--------------------------|
+| YAML Test Suite  | ~300 YAML 1.2 cases| Conformance testing      |
+| Property tests   | Generated          | Round-trip verification  |
+| Fuzzing          | Random             | Robustness               |
+| Real-world files | Curated            | Practical coverage       |
 
 **YAML Test Suite Integration**:
 - Use only YAML 1.2 compatible tests (skip 1.1-specific edge cases)
@@ -602,11 +602,11 @@ Errors include byte offset and line number for IDE integration.
 
 ### 9. Performance Targets
 
-| Component | Target | Rationale |
-|-----------|--------|-----------|
-| Oracle (indexing) | 100-200 MB/s | Match rapidyaml |
-| Queries | O(1) | Match JSON implementation |
-| Memory overhead | <5% of input | IB + BP + TY |
+| Component         | Target       | Rationale                 |
+|-------------------|--------------|---------------------------|
+| Oracle (indexing) | 100-200 MB/s | Match rapidyaml           |
+| Queries           | O(1)         | Match JSON implementation |
+| Memory overhead   | <5% of input | IB + BP + TY              |
 
 ### 10. Phased Implementation Plan
 
@@ -725,13 +725,13 @@ See [High-Performance Pure Rust Oracle](#high-performance-pure-rust-oracle) sect
 
 #### Phase Summary
 
-| Phase | Features | Estimated Coverage | Complexity |
-|-------|----------|-------------------|------------|
-| 1 | Block style, simple scalars | 70% | Low |
-| 2 | Flow style, block scalars | 95% | Medium |
-| 3 | Anchors/aliases | 99% | Medium |
-| 4 | Multi-document | 100% | Low |
-| 5 | SIMD optimization | 100% | High |
+| Phase | Features                    | Estimated Coverage | Complexity |
+|-------|-----------------------------|--------------------|------------|
+| 1     | Block style, simple scalars | 70%                | Low        |
+| 2     | Flow style, block scalars   | 95%                | Medium     |
+| 3     | Anchors/aliases             | 99%                | Medium     |
+| 4     | Multi-document              | 100%               | Low        |
+| 5     | SIMD optimization           | 100%               | High       |
 
 Each phase is independently useful and can be released separately.
 
@@ -786,23 +786,23 @@ let high_packed = (high_u64.wrapping_mul(MAGIC) >> 56) as u8;
 
 ##### String Scanning
 
-| Benchmark              | Scalar         | SIMD           | Improvement    |
-|------------------------|----------------|----------------|----------------|
-| yaml/quoted/double/10  | 1.57µs         | 1.44µs         | **8-9% faster**|
-| yaml/quoted/double/100 | 7.57µs         | 6.97µs         | **8-9% faster**|
-| yaml/quoted/double/1000| 67.1µs (688 MiB/s) | 63.0µs (738 MiB/s) | **7.3% throughput** |
+| Benchmark               | Scalar             | SIMD               | Improvement         |
+|-------------------------|--------------------|--------------------|---------------------|
+| yaml/quoted/double/10   | 1.57µs             | 1.44µs             | **8-9% faster**     |
+| yaml/quoted/double/100  | 7.57µs             | 6.97µs             | **8-9% faster**     |
+| yaml/quoted/double/1000 | 67.1µs (688 MiB/s) | 63.0µs (738 MiB/s) | **7.3% throughput** |
 
 ##### Indentation Scanning
 
 End-to-end yq identity filter benchmarks after adding SIMD indentation:
 
-| Pattern       | Size  | Before       | After        | Improvement     |
-|---------------|-------|--------------|--------------|-----------------|
-| comprehensive | 1KB   | 4.15 ms      | 3.58 ms      | **+14-24% faster** |
-| comprehensive | 10KB  | 4.91 ms      | 4.23 ms      | **+14-18% faster** |
-| comprehensive | 100KB | 11.40 ms     | 10.73 ms     | **+5-8% faster**   |
-| users         | 1KB   | 3.91 ms      | 3.43 ms      | **+12-16% faster** |
-| users         | 10KB  | 4.76 ms      | 4.26 ms      | **+10-14% faster** |
+| Pattern       | Size  | Before   | After    | Improvement        |
+|---------------|-------|----------|----------|--------------------|
+| comprehensive | 1KB   | 4.15 ms  | 3.58 ms  | **+14-24% faster** |
+| comprehensive | 10KB  | 4.91 ms  | 4.23 ms  | **+14-18% faster** |
+| comprehensive | 100KB | 11.40 ms | 10.73 ms | **+5-8% faster**   |
+| users         | 1KB   | 3.91 ms  | 3.43 ms  | **+12-16% faster** |
+| users         | 10KB  | 4.76 ms  | 4.26 ms  | **+10-14% faster** |
 
 ##### Unquoted Structural Scanning (Chunked Skip)
 
@@ -810,19 +810,19 @@ SIMD search for `\n`, `#`, `:` in unquoted values (`find_unquoted_structural`):
 
 **Parser-level benchmarks (yaml/large):**
 
-| Size   | Before       | After        | Improvement     |
-|--------|--------------|--------------|-----------------|
-| 1 KB   | 4.09 µs      | 3.99 µs      | ~1.5% (noise)   |
-| 10 KB  | 28.9 µs      | 28.3 µs      | **+3.8%**       |
-| 100 KB | 264 µs       | 257 µs       | **+5.2%**       |
-| 1 MB   | 2.51 ms      | 2.33 ms      | **+8.3%**       |
+| Size   | Before  | After   | Improvement   |
+|--------|---------|---------|---------------|
+| 1 KB   | 4.09 µs | 3.99 µs | ~1.5% (noise) |
+| 10 KB  | 28.9 µs | 28.3 µs | **+3.8%**     |
+| 100 KB | 264 µs  | 257 µs  | **+5.2%**     |
+| 1 MB   | 2.51 ms | 2.33 ms | **+8.3%**     |
 
 **End-to-end yq identity benchmarks:**
 
-| Size   | Before       | After        | Improvement     |
-|--------|--------------|--------------|-----------------|
-| 100 KB | 11.8 ms      | 10.8 ms      | **+7.8%**       |
-| 1 MB   | 73.7 ms      | 71.4 ms      | **+2.7%**       |
+| Size   | Before  | After   | Improvement |
+|--------|---------|---------|-------------|
+| 100 KB | 11.8 ms | 10.8 ms | **+7.8%**   |
+| 1 MB   | 73.7 ms | 71.4 ms | **+2.7%**   |
 
 The optimization scales with file size - larger files benefit more because SIMD setup cost is amortized over more data and unquoted values tend to be longer.
 
@@ -844,57 +844,57 @@ See [Tuning Opportunities](#unquoted-structural-scanning-tuning) below for propo
 **Compiler:** rustc with `-C target-cpu=native`
 
 ##### Simple Key-Value Pairs
-| Count  | Time      | Throughput   |
-|--------|-----------|--------------|
-| 10     | 702 ns    | 176 MiB/s    |
-| 100    | 3.72 µs   | 379 MiB/s    |
-| 1,000  | 34.98 µs  | 457 MiB/s    |
-| 10,000 | 364 µs    | 491 MiB/s    |
+| Count  | Time     | Throughput |
+|--------|----------|------------|
+| 10     | 702 ns   | 176 MiB/s  |
+| 100    | 3.72 µs  | 379 MiB/s  |
+| 1,000  | 34.98 µs | 457 MiB/s  |
+| 10,000 | 364 µs   | 491 MiB/s  |
 
 ##### Nested Structures
-| Depth | Width | Time      | Throughput   |
-|-------|-------|-----------|--------------|
-| 3     | 3     | 3.31 µs   | 300 MiB/s    |
-| 5     | 2     | 4.98 µs   | 340 MiB/s    |
-| 10    | 2     | 196.6 µs  | 427 MiB/s    |
-| 3     | 5     | 12.54 µs  | 342 MiB/s    |
+| Depth | Width | Time     | Throughput |
+|-------|-------|----------|------------|
+| 3     | 3     | 3.31 µs  | 300 MiB/s  |
+| 5     | 2     | 4.98 µs  | 340 MiB/s  |
+| 10    | 2     | 196.6 µs | 427 MiB/s  |
+| 3     | 5     | 12.54 µs | 342 MiB/s  |
 
 ##### Sequences
-| Items  | Time     | Throughput   |
-|--------|----------|--------------|
-| 10     | 678 ns   | 112 MiB/s    |
-| 100    | 3.28 µs  | 258 MiB/s    |
-| 1,000  | 31.51 µs | 284 MiB/s    |
-| 10,000 | 309 µs   | 290 MiB/s    |
+| Items  | Time     | Throughput |
+|--------|----------|------------|
+| 10     | 678 ns   | 112 MiB/s  |
+| 100    | 3.28 µs  | 258 MiB/s  |
+| 1,000  | 31.51 µs | 284 MiB/s  |
+| 10,000 | 309 µs   | 290 MiB/s  |
 
 ##### Quoted Strings (Regular)
-| Count | Type   | Time     | Throughput   |
-|-------|--------|----------|--------------|
-| 10    | Double | 712 ns   | 163 MiB/s    |
-| 10    | Single | 698 ns   | 166 MiB/s    |
-| 100   | Double | 4.56 µs  | 331 MiB/s    |
-| 100   | Single | 4.41 µs  | 343 MiB/s    |
-| 1,000 | Double | 42.1 µs  | 361 MiB/s    |
-| 1,000 | Single | 41.3 µs  | 368 MiB/s    |
+| Count | Type   | Time    | Throughput |
+|-------|--------|---------|------------|
+| 10    | Double | 712 ns  | 163 MiB/s  |
+| 10    | Single | 698 ns  | 166 MiB/s  |
+| 100   | Double | 4.56 µs | 331 MiB/s  |
+| 100   | Single | 4.41 µs | 343 MiB/s  |
+| 1,000 | Double | 42.1 µs | 361 MiB/s  |
+| 1,000 | Single | 41.3 µs | 368 MiB/s  |
 
 ##### Long Quoted Strings (100 strings each)
-| String Length | Type   | Time      | Throughput   |
-|---------------|--------|-----------|--------------|
-| 64 bytes      | Double | 5.39 µs   | 1.27 GiB/s   |
-| 64 bytes      | Single | 5.41 µs   | 1.27 GiB/s   |
-| 256 bytes     | Double | 11.56 µs  | 2.14 GiB/s   |
-| 256 bytes     | Single | 11.32 µs  | 2.19 GiB/s   |
-| 1024 bytes    | Double | 34.24 µs  | 2.81 GiB/s   |
-| 1024 bytes    | Single | 34.27 µs  | 2.81 GiB/s   |
-| 4096 bytes    | Double | 128.8 µs  | 2.97 GiB/s   |
-| 4096 bytes    | Single | 128.5 µs  | 2.98 GiB/s   |
+| String Length | Type   | Time     | Throughput |
+|---------------|--------|----------|------------|
+| 64 bytes      | Double | 5.39 µs  | 1.27 GiB/s |
+| 64 bytes      | Single | 5.41 µs  | 1.27 GiB/s |
+| 256 bytes     | Double | 11.56 µs | 2.14 GiB/s |
+| 256 bytes     | Single | 11.32 µs | 2.19 GiB/s |
+| 1024 bytes    | Double | 34.24 µs | 2.81 GiB/s |
+| 1024 bytes    | Single | 34.27 µs | 2.81 GiB/s |
+| 4096 bytes    | Double | 128.8 µs | 2.97 GiB/s |
+| 4096 bytes    | Single | 128.5 µs | 2.98 GiB/s |
 
 ##### Large Files
-| Size   | Time      | Throughput   |
-|--------|-----------|--------------|
-| 1 KB   | 2.79 µs   | 342 MiB/s    |
-| 10 KB  | 21.3 µs   | 448 MiB/s    |
-| 100 KB | 194.3 µs  | 491 MiB/s    |
+| Size   | Time     | Throughput |
+|--------|----------|------------|
+| 1 KB   | 2.79 µs  | 342 MiB/s  |
+| 10 KB  | 21.3 µs  | 448 MiB/s  |
+| 100 KB | 194.3 µs | 491 MiB/s  |
 
 **Summary:** Baseline throughput ranges from 176-491 MiB/s for structured data, with string scanning achieving 2.8-3.0 GiB/s. This establishes a performance baseline before AVX2/AVX-512 optimizations.
 
@@ -906,14 +906,14 @@ See [Tuning Opportunities](#unquoted-structural-scanning-tuning) below for propo
 
 ##### Performance Improvements vs Baseline
 
-| Workload Category | Baseline Range | P0+ Optimized Range | Improvement |
-|-------------------|----------------|---------------------|-------------|
-| Simple KV         | 176-491 MiB/s  | 187-550 MiB/s       | **+4-7%** |
-| Nested structures | 300-427 MiB/s  | 326-456 MiB/s       | **+9-10%** |
-| Sequences         | 112-290 MiB/s  | 121-378 MiB/s       | **+7-8%** |
-| Quoted strings    | 163-368 MiB/s  | 180-405 MiB/s       | **+10-11%** |
-| Long strings      | 2.8-3.0 GiB/s  | 3.4-3.8 GiB/s       | **+2-21%** |
-| Large files       | 342-491 MiB/s  | 378-559 MiB/s       | **+6-8%** |
+| Workload Category | Baseline Range | P0+ Optimized Range | Improvement  |
+|-------------------|----------------|---------------------|--------------|
+| Simple KV         | 176-491 MiB/s  | 187-550 MiB/s       | **+4-7%**    |
+| Nested structures | 300-427 MiB/s  | 326-456 MiB/s       | **+9-10%**   |
+| Sequences         | 112-290 MiB/s  | 121-378 MiB/s       | **+7-8%**    |
+| Quoted strings    | 163-368 MiB/s  | 180-405 MiB/s       | **+10-11%**  |
+| Long strings      | 2.8-3.0 GiB/s  | 3.4-3.8 GiB/s       | **+2-21%**   |
+| Large files       | 342-491 MiB/s  | 378-559 MiB/s       | **+6-8%**    |
 
 **Key Achievements:**
 - ✅ **Structured data: +4-7% faster** (hybrid SIMD space skipping in hot paths)
@@ -924,17 +924,17 @@ See [Tuning Opportunities](#unquoted-structural-scanning-tuning) below for propo
 
 ##### Selected Benchmark Improvements
 
-| Benchmark | Baseline | P0+ Optimized | Speedup |
-|-----------|----------|---------------|---------|
-| simple_kv/10000 | 364 µs (491 MiB/s) | 326 µs (550 MiB/s) | **+7.1%** |
-| sequences/10000 | 309 µs (290 MiB/s) | 274 µs (366 MiB/s) | **+6.8%** |
-| nested/d3_w5 | 12.54 µs (342 MiB/s) | 11.26 µs (380 MiB/s) | **+10.2%** |
-| quoted/double/1000 | 42.1 µs (361 MiB/s) | 37.9 µs (405 MiB/s) | **+11.1%** |
-| long_strings/4096b/double | 128.8 µs (2.97 GiB/s) | 105.2 µs (3.63 GiB/s) | **+18.3%** |
-| long_strings/4096b/single | 128.5 µs (2.98 GiB/s) | 100.6 µs (3.79 GiB/s) | **+21.7%** |
-| large/100kb | 194.3 µs (491 MiB/s) | 170.4 µs (559 MiB/s) | **+12.3%** |
-| large/10kb | 21.3 µs (448 MiB/s) | 19.6 µs (487 MiB/s) | **+8.0%** |
-| large/1kb | 2.79 µs (342 MiB/s) | 2.52 µs (378 MiB/s) | **+9.7%** |
+| Benchmark                 | Baseline               | P0+ Optimized          | Speedup    |
+|---------------------------|------------------------|------------------------|------------|
+| simple_kv/10000           | 364 µs (491 MiB/s)     | 326 µs (550 MiB/s)     | **+7.1%**  |
+| sequences/10000           | 309 µs (290 MiB/s)     | 274 µs (366 MiB/s)     | **+6.8%**  |
+| nested/d3_w5              | 12.54 µs (342 MiB/s)   | 11.26 µs (380 MiB/s)   | **+10.2%** |
+| quoted/double/1000        | 42.1 µs (361 MiB/s)    | 37.9 µs (405 MiB/s)    | **+11.1%** |
+| long_strings/4096b/double | 128.8 µs (2.97 GiB/s)  | 105.2 µs (3.63 GiB/s)  | **+18.3%** |
+| long_strings/4096b/single | 128.5 µs (2.98 GiB/s)  | 100.6 µs (3.79 GiB/s)  | **+21.7%** |
+| large/100kb               | 194.3 µs (491 MiB/s)   | 170.4 µs (559 MiB/s)   | **+12.3%** |
+| large/10kb                | 21.3 µs (448 MiB/s)    | 19.6 µs (487 MiB/s)    | **+8.0%**  |
+| large/1kb                 | 2.79 µs (342 MiB/s)    | 2.52 µs (378 MiB/s)    | **+9.7%**  |
 
 ##### Implementation Details
 
@@ -965,12 +965,12 @@ Attempted to replicate JSON's PFSM success (33-77% improvement) by implementing 
 
 **Performance Results (AMD Ryzen 9 7950X):**
 
-| Benchmark | P0+ Baseline | YFSM | Change |
-|-----------|-------------|------|--------|
-| quoted/double/1000 | 46.898 µs @ 990.95 MiB/s | 47.073 µs @ 987.64 MiB/s | **-0.3%** |
-| quoted/single/1000 | 50.073 µs @ 851.24 MiB/s | 50.250 µs @ 849.27 MiB/s | **-0.4%** |
-| long_strings/double/64b | 7.6155 µs @ 923.71 MiB/s | 7.4822 µs @ 939.83 MiB/s | **+1.7%** |
-| long_strings/double/256b | 19.577 µs @ 1.2548 GiB/s | 19.384 µs @ 1.2770 GiB/s | **+1.0%** |
+| Benchmark                 | P0+ Baseline              | YFSM                      | Change     |
+|---------------------------|---------------------------|---------------------------|------------|
+| quoted/double/1000        | 46.898 µs @ 990.95 MiB/s  | 47.073 µs @ 987.64 MiB/s  | **-0.3%**  |
+| quoted/single/1000        | 50.073 µs @ 851.24 MiB/s  | 50.250 µs @ 849.27 MiB/s  | **-0.4%**  |
+| long_strings/double/64b   | 7.6155 µs @ 923.71 MiB/s  | 7.4822 µs @ 939.83 MiB/s  | **+1.7%**  |
+| long_strings/double/256b  | 19.577 µs @ 1.2548 GiB/s  | 19.384 µs @ 1.2770 GiB/s  | **+1.0%**  |
 
 **Conclusion:** YFSM provides **0-2% improvement** vs expected **15-25%**. Rejected because:
 
@@ -981,12 +981,12 @@ Attempted to replicate JSON's PFSM success (33-77% improvement) by implementing 
 
 **Why YFSM Failed:**
 
-| Factor | JSON (PFSM Success) | YAML (YFSM Failure) |
-|--------|---------------------|---------------------|
-| String complexity | High (nested, escapes, surrogates) | Low (flat, simple escapes) |
-| Baseline performance | ~600 MiB/s | ~990 MiB/s (P0+ SIMD) |
-| SIMD applicability | Moderate (complex patterns) | High (simple quote/escape) |
-| Table lookup cost | Worth it (complex logic) | Not worth it (simple SIMD wins) |
+| Factor               | JSON (PFSM Success)                   | YAML (YFSM Failure)                 |
+|----------------------|---------------------------------------|-------------------------------------|
+| String complexity    | High (nested, escapes, surrogates)    | Low (flat, simple escapes)          |
+| Baseline performance | ~600 MiB/s                            | ~990 MiB/s (P0+ SIMD)               |
+| SIMD applicability   | Moderate (complex patterns)           | High (simple quote/escape)          |
+| Table lookup cost    | Worth it (complex logic)              | Not worth it (simple SIMD wins)     |
 
 ---
 
@@ -1034,16 +1034,16 @@ fn pop_type(&mut self) -> Option<NodeType> {
 
 **Performance Results (AMD Ryzen 9 7950X):**
 
-| Workload | Baseline | Optimized | Improvement | Note |
-|----------|----------|-----------|-------------|------|
-| Deeply nested (100 levels) | 16.5 µs | 13.7 µs | **-16.8%** | **Best case** |
-| Deeply nested (50 levels) | 5.34 µs | 4.93 µs | **-7.9%** | Strong |
-| Deeply nested (20 levels) | 1.58 µs | 1.55 µs | **-3.5%** | Good |
-| Wide structure (500 width) | 13.5 µs | 13.3 µs | **-2.2%** | Modest |
-| Simple KV (1kb) | 2.54 µs | 2.47 µs | **-2.0%** | End-to-end |
-| Simple KV (10kb) | 19.2 µs | 18.9 µs | **-1.4%** | End-to-end |
-| Simple KV (100kb) | 170 µs | 168 µs | **-1.1%** | End-to-end |
-| Simple KV (1mb) | 1.55 ms | 1.56 ms | +0.6% | Neutral (large) |
+| Workload                   | Baseline | Optimized | Improvement | Note             |
+|----------------------------|----------|-----------|-------------|------------------|
+| Deeply nested (100 levels) | 16.5 µs  | 13.7 µs   | **-16.8%**  | **Best case**    |
+| Deeply nested (50 levels)  | 5.34 µs  | 4.93 µs   | **-7.9%**   | Strong           |
+| Deeply nested (20 levels)  | 1.58 µs  | 1.55 µs   | **-3.5%**   | Good             |
+| Wide structure (500 width) | 13.5 µs  | 13.3 µs   | **-2.2%**   | Modest           |
+| Simple KV (1kb)            | 2.54 µs  | 2.47 µs   | **-2.0%**   | End-to-end       |
+| Simple KV (10kb)           | 19.2 µs  | 18.9 µs   | **-1.4%**   | End-to-end       |
+| Simple KV (100kb)          | 170 µs   | 168 µs    | **-1.1%**   | End-to-end       |
+| Simple KV (1mb)            | 1.55 ms  | 1.56 ms   | +0.6%       | Neutral (large)  |
 
 **Key Findings:**
 - **Deeply nested YAML** (100 levels): 16.8% faster - excellent for Kubernetes configs with deep nesting
@@ -1090,12 +1090,12 @@ if self.pos + 256 < self.input.len() {
 
 **Performance Results (AMD Ryzen 9 7950X):**
 
-| File Size | Baseline | With Prefetch | Change | Note |
-|-----------|----------|---------------|--------|------|
-| 1kb       | 2.91 µs  | 2.93 µs       | +0.5%  | Neutral (noise) |
-| 10kb      | 19.9 µs  | 20.6 µs       | **+3.7%** ❌ | Regression |
-| 100kb     | 177 µs   | 179 µs        | +0.8%  | Neutral (noise) |
-| **1mb**   | **2.58 ms** | **3.36 ms**   | **+30.3%** ❌ | **Severe regression** |
+| File Size | Baseline    | With Prefetch | Change        | Note                   |
+|-----------|-------------|---------------|---------------|------------------------|
+| 1kb       | 2.91 µs     | 2.93 µs       | +0.5%         | Neutral (noise)        |
+| 10kb      | 19.9 µs     | 20.6 µs       | **+3.7%** ❌  | Regression             |
+| 100kb     | 177 µs      | 179 µs        | +0.8%         | Neutral (noise)        |
+| **1mb**   | **2.58 ms** | **3.36 ms**   | **+30.3%** ❌ | **Severe regression**  |
 
 **Conclusion:** Software prefetching is **counterproductive** for YAML parsing. The **30% regression on 1MB files** proves that hardware prefetchers are superior for sequential workloads.
 
@@ -1195,26 +1195,26 @@ pub fn find_block_scalar_end(
 
 **Performance Results (AMD Ryzen 9 7950X):**
 
-| Benchmark               | Baseline    | SIMD       | Improvement | Speedup  |
-|-------------------------|-------------|------------|-------------|----------|
-| 10x10lines              | 2.81 µs     | 2.77 µs    | -1.4%       | 1.01x    |
-| **50x50lines**          | 61.26 µs    | 50.97 µs   | **-16.8%**  | **1.20x** |
-| **100x100lines**        | 247.41 µs   | 195.25 µs  | **-21.1%**  | **1.27x** |
-| **10x1000lines**        | 237.86 µs   | 193.56 µs  | **-18.6%**  | **1.23x** |
-| **long_10x100lines**    | 56.12 µs    | 45.11 µs   | **-19.6%**  | **1.24x** |
-| **long_50x100lines**    | 280.98 µs   | 223.93 µs  | **-20.3%**  | **1.25x** |
-| **long_100x100lines**   | 556.38 µs   | 443.33 µs  | **-20.3%**  | **1.26x** |
+| Benchmark             | Baseline   | SIMD       | Improvement | Speedup   |
+|-----------------------|------------|------------|-------------|-----------|
+| 10x10lines            | 2.81 µs    | 2.77 µs    | -1.4%       | 1.01x     |
+| **50x50lines**        | 61.26 µs   | 50.97 µs   | **-16.8%**  | **1.20x** |
+| **100x100lines**      | 247.41 µs  | 195.25 µs  | **-21.1%**  | **1.27x** |
+| **10x1000lines**      | 237.86 µs  | 193.56 µs  | **-18.6%**  | **1.23x** |
+| **long_10x100lines**  | 56.12 µs   | 45.11 µs   | **-19.6%**  | **1.24x** |
+| **long_50x100lines**  | 280.98 µs  | 223.93 µs  | **-20.3%**  | **1.25x** |
+| **long_100x100lines** | 556.38 µs  | 443.33 µs  | **-20.3%**  | **1.26x** |
 
 **Throughput Gains:**
 
-| Benchmark               | Baseline      | SIMD          | Improvement |
-|-------------------------|---------------|---------------|-------------|
-| 50x50lines              | 1.40 GiB/s    | 1.68 GiB/s    | **+20%**    |
-| 100x100lines            | 1.39 GiB/s    | 1.76 GiB/s    | **+27%**    |
-| 10x1000lines            | 1.44 GiB/s    | 1.77 GiB/s    | **+23%**    |
-| long_10x100lines        | 1.38 GiB/s    | 1.72 GiB/s    | **+25%**    |
-| long_50x100lines        | 1.38 GiB/s    | 1.73 GiB/s    | **+25%**    |
-| long_100x100lines       | 1.39 GiB/s    | 1.75 GiB/s    | **+26%**    |
+| Benchmark         | Baseline   | SIMD       | Improvement |
+|-------------------|------------|------------|-------------|
+| 50x50lines        | 1.40 GiB/s | 1.68 GiB/s | **+20%**    |
+| 100x100lines      | 1.39 GiB/s | 1.76 GiB/s | **+27%**    |
+| 10x1000lines      | 1.44 GiB/s | 1.77 GiB/s | **+23%**    |
+| long_10x100lines  | 1.38 GiB/s | 1.72 GiB/s | **+25%**    |
+| long_50x100lines  | 1.38 GiB/s | 1.73 GiB/s | **+25%**    |
+| long_100x100lines | 1.39 GiB/s | 1.75 GiB/s | **+26%**    |
 
 **Key Findings:**
 - **Small blocks** (10x10): Minimal benefit (-1.4%) - SIMD overhead dominates
@@ -1232,14 +1232,14 @@ pub fn find_block_scalar_end(
 
 **Comparison to Other Phase 2 Optimizations:**
 
-| Optimization | Impact | Status |
-|--------------|--------|--------|
-| P2.1 Indentation SIMD | ~3-5% | ✅ Accepted |
-| P2.2 Classify chars SIMD | ~2-4% | ✅ Accepted |
-| P2.3 String scanning SIMD | ~10-15% | ✅ Accepted |
-| P2.5 Cached type checking | ~1-17% | ✅ Accepted |
-| P2.6 Software prefetching | **+30% regression** | ❌ **Rejected** |
-| **P2.7 Block scalar SIMD** | **19-25%** | ✅ **Accepted** ← **Best!** |
+| Optimization               | Impact               | Status                        |
+|----------------------------|----------------------|-------------------------------|
+| P2.1 Indentation SIMD      | ~3-5%                | ✅ Accepted                   |
+| P2.2 Classify chars SIMD   | ~2-4%                | ✅ Accepted                   |
+| P2.3 String scanning SIMD  | ~10-15%              | ✅ Accepted                   |
+| P2.5 Cached type checking  | ~1-17%               | ✅ Accepted                   |
+| P2.6 Software prefetching  | **+30% regression**  | ❌ **Rejected**               |
+| **P2.7 Block scalar SIMD** | **19-25%**           | ✅ **Accepted** ← **Best!**   |
 
 This is the **largest single improvement** in YAML Phase 2!
 
@@ -1262,22 +1262,22 @@ NEON implementation ported from AVX2, using 16-byte chunks:
 
 **Performance Results:**
 
-| Benchmark               | Before      | After      | Improvement | Speedup  |
-|-------------------------|-------------|------------|-------------|----------|
-| **10x10lines**          | 8.4 µs      | 7.5 µs     | **-10.9%**  | **1.12x** |
-| **50x50lines**          | 176 µs      | 152 µs     | **-13.8%**  | **1.16x** |
-| **100x100lines**        | 699 µs      | 606 µs     | **-13.3%**  | **1.15x** |
-| **10x1000lines**        | 693 µs      | 591 µs     | **-14.1%**  | **1.16x** |
-| **long_10x100lines**    | 172 µs      | 132 µs     | **-23.2%**  | **1.30x** |
-| **long_50x100lines**    | 786 µs      | 671 µs     | **-14.7%**  | **1.17x** |
-| **long_100x100lines**   | 1.58 ms     | 1.36 ms    | **-14.3%**  | **1.17x** |
+| Benchmark             | Before  | After   | Improvement | Speedup   |
+|-----------------------|---------|---------|-------------|-----------|
+| **10x10lines**        | 8.4 µs  | 7.5 µs  | **-10.9%**  | **1.12x** |
+| **50x50lines**        | 176 µs  | 152 µs  | **-13.8%**  | **1.16x** |
+| **100x100lines**      | 699 µs  | 606 µs  | **-13.3%**  | **1.15x** |
+| **10x1000lines**      | 693 µs  | 591 µs  | **-14.1%**  | **1.16x** |
+| **long_10x100lines**  | 172 µs  | 132 µs  | **-23.2%**  | **1.30x** |
+| **long_50x100lines**  | 786 µs  | 671 µs  | **-14.7%**  | **1.17x** |
+| **long_100x100lines** | 1.58 ms | 1.36 ms | **-14.3%**  | **1.17x** |
 
 **NEON vs AVX2 Comparison:**
 
-| Platform | Vector Width | Best Improvement | Avg Improvement |
-|----------|--------------|------------------|-----------------|
-| AVX2 (x86_64) | 32 bytes | 21.1% | 19-20% |
-| NEON (ARM64) | 16 bytes | 23.2% | 11-15% |
+| Platform      | Vector Width | Best Improvement | Avg Improvement |
+|---------------|--------------|------------------|-----------------|
+| AVX2 (x86_64) | 32 bytes     | 21.1%            | 19-20%          |
+| NEON (ARM64)  | 16 bytes     | 23.2%            | 11-15%          |
 
 NEON shows excellent improvements despite smaller vector width. The 23.2% gain on `long_10x100lines` matches AVX2's best results.
 
@@ -1307,24 +1307,24 @@ Based on micro-benchmark data, implemented three threshold changes:
 
 **Micro-Benchmark Results (AMD Ryzen 9 7950X):**
 
-| Operation | Size | Scalar | SIMD | Winner | Speedup |
-|-----------|------|--------|------|--------|---------|
-| count_spaces | 8 | 3.02 ns | 3.24 ns | Scalar | 0.93x |
-| count_spaces | **16** | 5.47 ns | 1.52 ns | **SIMD** | **3.60x** |
-| find_quote | 12 | 3.96 ns | 6.82 ns | Scalar | 0.58x |
-| find_quote | **16** | 5.12 ns | 2.09 ns | **SIMD** | **2.45x** |
+| Operation    | Size   | Scalar  | SIMD    | Winner   | Speedup    |
+|--------------|--------|---------|---------|----------|------------|
+| count_spaces | 8      | 3.02 ns | 3.24 ns | Scalar   | 0.93x      |
+| count_spaces | **16** | 5.47 ns | 1.52 ns | **SIMD** | **3.60x**  |
+| find_quote   | 12     | 3.96 ns | 6.82 ns | Scalar   | 0.58x      |
+| find_quote   | **16** | 5.12 ns | 2.09 ns | **SIMD** | **2.45x**  |
 
 Micro-benchmarks suggested SIMD threshold should be 14-16 bytes.
 
 **End-to-End Benchmark Results (AMD Ryzen 9 7950X):**
 
-| Benchmark | Baseline | After Tuning | Change |
-|-----------|----------|--------------|--------|
-| quoted/double/10 | 740 ns | 817 ns | **+10.5%** ❌ |
-| quoted/single/10 | 713 ns | 823 ns | **+15.5%** ❌ |
-| quoted/double/100 | 4.27 µs | 4.61 µs | **+8.0%** ❌ |
-| quoted/single/100 | 4.20 µs | 4.54 µs | **+8.1%** ❌ |
-| quoted/double/1000 | 37.7 µs | 38.8 µs | **+3.0%** ❌ |
+| Benchmark          | Baseline | After Tuning | Change         |
+|--------------------|----------|--------------|----------------|
+| quoted/double/10   | 740 ns   | 817 ns       | **+10.5%** ❌  |
+| quoted/single/10   | 713 ns   | 823 ns       | **+15.5%** ❌  |
+| quoted/double/100  | 4.27 µs  | 4.61 µs      | **+8.0%** ❌   |
+| quoted/single/100  | 4.20 µs  | 4.54 µs      | **+8.1%** ❌   |
+| quoted/double/1000 | 37.7 µs  | 38.8 µs      | **+3.0%** ❌   |
 
 **Severe regressions across all workloads!**
 
@@ -1401,23 +1401,23 @@ while self.peek().map_or(false, char_class::is_horizontal_whitespace) {
 
 **Micro-Benchmark Results (AMD Ryzen 9 7950X):**
 
-| Test | Branchy | Branchless | Result |
-|------|---------|------------|--------|
-| Single char (space) | 593 ps | 573 ps | +3.4% faster ✓ |
-| Single char (letter) | 602 ps | 572 ps | +5.0% faster ✓ |
-| Loop 16 bytes | 7.7 ns | 5.5 ns | **+29% faster** ✓ |
-| Loop 64 bytes | 17.1 ns | 21.3 ns | -25% slower ❌ |
+| Test                 | Branchy | Branchless | Result             |
+|----------------------|---------|------------|--------------------|
+| Single char (space)  | 593 ps  | 573 ps     | +3.4% faster ✓     |
+| Single char (letter) | 602 ps  | 572 ps     | +5.0% faster ✓     |
+| Loop 16 bytes        | 7.7 ns  | 5.5 ns     | **+29% faster** ✓  |
+| Loop 64 bytes        | 17.1 ns | 21.3 ns    | -25% slower ❌     |
 
 Micro-benchmarks suggested 3-29% improvement on small inputs.
 
 **End-to-End Benchmark Results (AMD Ryzen 9 7950X):**
 
-| Benchmark | Baseline | Branchless | Change |
-|-----------|----------|------------|--------|
-| simple_kv/10 | 679 ns | 850 ns | **+25% regression** ❌ |
-| simple_kv/100 | 3.51 µs | 5.05 µs | **+44% regression** ❌ |
-| simple_kv/1000 | 31.2 µs | 44.6 µs | **+43% regression** ❌ |
-| simple_kv/10000 | 312 µs | 445 µs | **+43% regression** ❌ |
+| Benchmark       | Baseline | Branchless | Change                  |
+|-----------------|----------|------------|-------------------------|
+| simple_kv/10    | 679 ns   | 850 ns     | **+25% regression** ❌  |
+| simple_kv/100   | 3.51 µs  | 5.05 µs    | **+44% regression** ❌  |
+| simple_kv/1000  | 31.2 µs  | 44.6 µs    | **+43% regression** ❌  |
+| simple_kv/10000 | 312 µs   | 445 µs     | **+43% regression** ❌  |
 
 **Catastrophic regressions across all workloads!**
 
@@ -1532,31 +1532,31 @@ self.pos = end;
 
 **Micro-Benchmark Results (AMD Ryzen 9 7950X):**
 
-| Anchor Name Length | Scalar | SIMD | Speedup |
-|--------------------|--------|------|---------|
-| short_4 | 3.11 ns (1.20 GiB/s) | 2.88 ns (1.29 GiB/s) | 1.08x |
-| medium_16 | 9.76 ns (1.53 GiB/s) | 8.72 ns (1.71 GiB/s) | 1.12x |
-| long_32 | 18.21 ns (1.58 GiB/s) | 1.99 ns (14.53 GiB/s) | **9.16x** ✅ |
-| very_long_64 | 40.63 ns (1.47 GiB/s) | 3.38 ns (17.64 GiB/s) | **12.03x** ✅ |
+| Anchor Name Length | Scalar                | SIMD                   | Speedup        |
+|--------------------|-----------------------|------------------------|----------------|
+| short_4            | 3.11 ns (1.20 GiB/s)  | 2.88 ns (1.29 GiB/s)   | 1.08x          |
+| medium_16          | 9.76 ns (1.53 GiB/s)  | 8.72 ns (1.71 GiB/s)   | 1.12x          |
+| long_32            | 18.21 ns (1.58 GiB/s) | 1.99 ns (14.53 GiB/s)  | **9.16x** ✅   |
+| very_long_64       | 40.63 ns (1.47 GiB/s) | 3.38 ns (17.64 GiB/s)  | **12.03x** ✅  |
 
 Character scanning (finding `&` and `*`):
 
-| Input Size | Scalar | SIMD | Speedup |
-|------------|--------|------|---------|
-| small_100 | 3.18 ns (20.2 GiB/s) | 2.33 ns (27.6 GiB/s) | 1.37x |
-| medium_1kb | 24.49 ns (27.6 GiB/s) | 13.66 ns (49.6 GiB/s) | **1.79x** ✅ |
+| Input Size | Scalar                 | SIMD                   | Speedup       |
+|------------|------------------------|------------------------|---------------|
+| small_100  | 3.18 ns (20.2 GiB/s)   | 2.33 ns (27.6 GiB/s)   | 1.37x         |
+| medium_1kb | 24.49 ns (27.6 GiB/s)  | 13.66 ns (49.6 GiB/s)  | **1.79x** ✅  |
 
 **End-to-End Benchmark Results (AMD Ryzen 9 7950X):**
 
-| Benchmark | Baseline | P4 SIMD | Time Change | Throughput Gain |
-|-----------|----------|---------|-------------|-----------------|
-| **anchors/10** | 1.530 µs (293 MiB/s) | 1.387 µs (323 MiB/s) | **-9.9%** | **+11%** ✅ |
-| **anchors/100** | 13.60 µs (319 MiB/s) | 11.65 µs (372 MiB/s) | **-14.6%** | **+17%** ✅ |
-| **anchors/1000** | 155.5 µs (293 MiB/s) | 139.2 µs (327 MiB/s) | **-10.1%** | **+11%** ✅ |
-| **anchors/5000** | 794.7 µs (301 MiB/s) | 749.5 µs (319 MiB/s) | **-6.2%** | **+6.6%** ✅ |
-| **k8s_10** | 4.077 µs (334 MiB/s) | 3.965 µs (343 MiB/s) | **-2.9%** | **+3%** ✅ |
-| **k8s_50** | 16.37 µs (384 MiB/s) | 16.24 µs (387 MiB/s) | **-1.1%** | **+1.1%** ✅ |
-| **k8s_100** | 33.92 µs (367 MiB/s) | 31.40 µs (396 MiB/s) | **-7.4%** | **+8%** ✅ |
+| Benchmark        | Baseline               | P4 SIMD                | Time Change | Throughput Gain |
+|------------------|------------------------|------------------------|-------------|-----------------|
+| **anchors/10**   | 1.530 µs (293 MiB/s)   | 1.387 µs (323 MiB/s)   | **-9.9%**   | **+11%** ✅     |
+| **anchors/100**  | 13.60 µs (319 MiB/s)   | 11.65 µs (372 MiB/s)   | **-14.6%**  | **+17%** ✅     |
+| **anchors/1000** | 155.5 µs (293 MiB/s)   | 139.2 µs (327 MiB/s)   | **-10.1%**  | **+11%** ✅     |
+| **anchors/5000** | 794.7 µs (301 MiB/s)   | 749.5 µs (319 MiB/s)   | **-6.2%**   | **+6.6%** ✅    |
+| **k8s_10**       | 4.077 µs (334 MiB/s)   | 3.965 µs (343 MiB/s)   | **-2.9%**   | **+3%** ✅      |
+| **k8s_50**       | 16.37 µs (384 MiB/s)   | 16.24 µs (387 MiB/s)   | **-1.1%**   | **+1.1%** ✅    |
+| **k8s_100**      | 33.92 µs (367 MiB/s)   | 31.40 µs (396 MiB/s)   | **-7.4%**   | **+8%** ✅      |
 
 **Consistent improvements across all anchor-heavy workloads!**
 
@@ -1614,22 +1614,22 @@ NEON implementation ported from AVX2, using 16-byte chunks:
 
 **End-to-End Benchmark Results:**
 
-| Benchmark | Before | After | Time Change | Throughput Gain |
-|-----------|--------|-------|-------------|-----------------|
-| **anchors/10** | 3.76 µs | 3.64 µs | **-3.1%** | **+3.2%** ✅ |
-| **anchors/100** | 28.8 µs | 27.2 µs | **-5.8%** | **+6.1%** ✅ |
-| **anchors/1000** | 314 µs | 299 µs | **-4.7%** | **+4.9%** ✅ |
-| **anchors/5000** | 1.67 ms | 1.61 ms | **-3.8%** | **+4.0%** ✅ |
-| **k8s_10** | 8.25 µs | 7.85 µs | **-4.9%** | **+5.1%** ✅ |
-| **k8s_50** | 32.5 µs | 30.6 µs | **-5.1%** | **+5.4%** ✅ |
-| **k8s_100** | 64.1 µs | 60.9 µs | **-5.0%** | **+5.2%** ✅ |
+| Benchmark        | Before   | After    | Time Change | Throughput Gain |
+|------------------|----------|----------|-------------|-----------------|
+| **anchors/10**   | 3.76 µs  | 3.64 µs  | **-3.1%**   | **+3.2%** ✅    |
+| **anchors/100**  | 28.8 µs  | 27.2 µs  | **-5.8%**   | **+6.1%** ✅    |
+| **anchors/1000** | 314 µs   | 299 µs   | **-4.7%**   | **+4.9%** ✅    |
+| **anchors/5000** | 1.67 ms  | 1.61 ms  | **-3.8%**   | **+4.0%** ✅    |
+| **k8s_10**       | 8.25 µs  | 7.85 µs  | **-4.9%**   | **+5.1%** ✅    |
+| **k8s_50**       | 32.5 µs  | 30.6 µs  | **-5.1%**   | **+5.4%** ✅    |
+| **k8s_100**      | 64.1 µs  | 60.9 µs  | **-5.0%**   | **+5.2%** ✅    |
 
 **NEON vs AVX2 Comparison:**
 
-| Platform | Vector Width | Best Improvement |
-|----------|--------------|------------------|
-| AVX2 (x86_64) | 32 bytes | 14-17% |
-| NEON (ARM64) | 16 bytes | 5-6% |
+| Platform      | Vector Width | Best Improvement |
+|---------------|--------------|------------------|
+| AVX2 (x86_64) | 32 bytes     | 14-17%           |
+| NEON (ARM64)  | 16 bytes     | 5-6%             |
 
 The smaller NEON improvement is expected: 16-byte chunks vs 32-byte AVX2 chunks means NEON processes half as much data per iteration. However, the optimization is still beneficial for typical Kubernetes and CI/CD YAML files with anchor-heavy configurations.
 
@@ -1647,20 +1647,20 @@ The smaller NEON improvement is expected: 16-byte chunks vs 32-byte AVX2 chunks 
 
 **Skip Whitespace:**
 
-| Size | Scalar | SIMD | Speedup |
-|------|--------|------|---------|
-| 4 bytes | 1.37 ns | 1.50 ns | 0.91x (scalar wins) ❌ |
-| 16 bytes | 6.43 ns | 6.48 ns | 0.99x (tie) |
-| 64 bytes | 25.9 ns | 1.84 ns | **14.1x faster** ✅ |
-| 128 bytes | 43.3 ns | 3.48 ns | **12.4x faster** ✅ |
+| Size      | Scalar  | SIMD    | Speedup               |
+|-----------|---------|---------|-----------------------|
+| 4 bytes   | 1.37 ns | 1.50 ns | 0.91x (scalar wins) ❌|
+| 16 bytes  | 6.43 ns | 6.48 ns | 0.99x (tie)           |
+| 64 bytes  | 25.9 ns | 1.84 ns | **14.1x faster** ✅   |
+| 128 bytes | 43.3 ns | 3.48 ns | **12.4x faster** ✅   |
 
 **Find Structural Characters:**
 
-| Size | Scalar | SIMD | Speedup |
-|------|--------|------|---------|
-| 8 bytes | 3.85 ns | 3.70 ns | 1.04x (tiny win) |
-| 32 bytes | 12.5 ns | 1.43 ns | **8.7x faster** ✅ |
-| 128 bytes | 53.8 ns | 5.04 ns | **10.7x faster** ✅ |
+| Size      | Scalar  | SIMD    | Speedup              |
+|-----------|---------|---------|----------------------|
+| 8 bytes   | 3.85 ns | 3.70 ns | 1.04x (tiny win)     |
+| 32 bytes  | 12.5 ns | 1.43 ns | **8.7x faster** ✅   |
+| 128 bytes | 53.8 ns | 5.04 ns | **10.7x faster** ✅  |
 
 **Micro-benchmarks showed massive SIMD wins for large inputs (8-14x faster)!**
 
@@ -1689,11 +1689,11 @@ data: {users: [{name: Alice}, {name: Bob}]} # 44 bytes
 
 **This is the P2.8/P3 Pattern:**
 
-| Optimization | Micro Win | Real Data | Expected Result |
-|--------------|-----------|-----------|-----------------|
-| P2.8 (Thresholds) | 2-4% on large | Most < 16 bytes | +8-15% regression ❌ |
-| P3 (Branchless) | 3-29% on loops | Predictable | +25-44% regression ❌ |
-| **P5 (Flow SIMD)** | **8-14x on 64+ bytes** | **Most < 30 bytes** | Predicted regression ⚠️ |
+| Optimization       | Micro Win            | Real Data           | Expected Result          |
+|--------------------|----------------------|---------------------|--------------------------|
+| P2.8 (Thresholds)  | 2-4% on large        | Most < 16 bytes     | +8-15% regression ❌     |
+| P3 (Branchless)    | 3-29% on loops       | Predictable         | +25-44% regression ❌    |
+| **P5 (Flow SIMD)** | **8-14x on 64+ bytes**| **Most < 30 bytes**| Predicted regression ⚠️  |
 
 **Decision Rationale:**
 
@@ -1727,13 +1727,13 @@ Analyzing real data sizes BEFORE implementation saved significant development ti
 
 **Micro-Benchmark Results (AMD Ryzen 9 7950X):**
 
-| String Size | Type | Scalar | SIMD+Scalar | BMI2 | BMI2 vs SIMD |
-|-------------|------|--------|-------------|------|--------------|
-| **12B** | no escape | 5.99ns | **3.51ns** | 3.83ns | **1.1x slower** ❌ |
-| **30B** | dense escape | 7.44ns | 8.87ns | **7.22ns** | 1.2x vs scalar |
-| **102B** | no escape | 55.97ns | 4.76ns | **3.25ns** | **1.5x faster** ✅ |
-| **103B** | sparse escape | 62.84ns | 4.88ns | **4.08ns** | **1.2x faster** ✅ |
-| **1002B** | no escape | 561.58ns | **26.84ns** | 29.82ns | **1.1x slower** ❌ |
+| String Size | Type         | Scalar    | SIMD+Scalar | BMI2       | BMI2 vs SIMD        |
+|-------------|--------------|-----------|-------------|------------|---------------------|
+| **12B**     | no escape    | 5.99ns    | **3.51ns**  | 3.83ns     | **1.1x slower** ❌  |
+| **30B**     | dense escape | 7.44ns    | 8.87ns      | **7.22ns** | 1.2x vs scalar      |
+| **102B**    | no escape    | 55.97ns   | 4.76ns      | **3.25ns** | **1.5x faster** ✅  |
+| **103B**    | sparse escape| 62.84ns   | 4.88ns      | **4.08ns** | **1.2x faster** ✅  |
+| **1002B**   | no escape    | 561.58ns  | **26.84ns** | 29.82ns    | **1.1x slower** ❌  |
 
 **BMI2 Sweet Spot:** 100-200 byte strings (1.2-1.5x faster than SIMD+Scalar)
 
@@ -1775,14 +1775,14 @@ key1: "This is a quoted string with value 1"  # 45 bytes total, 36 bytes content
 
 **Comparison to DSV (Where BMI2 Succeeded):**
 
-| Aspect | DSV (Success) | YAML (Cannot Apply) |
-|--------|---------------|---------------------|
-| **Use case** | Build quote state index | Individual string parsing |
-| **Quote grammar** | Context-free (`""` escape) | Context-sensitive (`\"` escape) |
-| **Index feasibility** | ✅ One pass | ❌ Needs escape preprocessing |
-| **BMI2 application** | `toggle64` for quote state | Would need escape mask first |
-| **Algorithm** | PDEP scatter + carry | Circular dependency |
-| **Data independence** | Processes all data | Early-exit on individual strings |
+| Aspect               | DSV (Success)                  | YAML (Cannot Apply)               |
+|----------------------|--------------------------------|-----------------------------------|
+| **Use case**         | Build quote state index        | Individual string parsing         |
+| **Quote grammar**    | Context-free (`""` escape)     | Context-sensitive (`\"` escape)   |
+| **Index feasibility**| ✅ One pass                    | ❌ Needs escape preprocessing     |
+| **BMI2 application** | `toggle64` for quote state     | Would need escape mask first      |
+| **Algorithm**        | PDEP scatter + carry           | Circular dependency               |
+| **Data independence**| Processes all data             | Early-exit on individual strings  |
 
 **Why DSV BMI2 Works But YAML Cannot Use Same Approach:**
 
@@ -1829,13 +1829,13 @@ Result: 3 passes slower than current 1 pass with early-exit SIMD
 
 **Comparison to P5:**
 
-| Aspect | P5 (Flow SIMD) | P6 (BMI2) |
-|--------|---------------|-----------|
-| **Sweet spot** | 64-128 bytes (8-14x win) | 100-200 bytes (1.2-1.5x win) |
-| **Real data** | 10-30 bytes | 32-50 bytes |
-| **Mismatch severity** | Severe (10x gap) | Moderate (3x gap) |
-| **Correctness** | Correct | Has bugs |
-| **Expected gain** | Regression | 0-5% |
+| Aspect              | P5 (Flow SIMD)             | P6 (BMI2)                     |
+|---------------------|----------------------------|-------------------------------|
+| **Sweet spot**      | 64-128 bytes (8-14x win)   | 100-200 bytes (1.2-1.5x win)  |
+| **Real data**       | 10-30 bytes                | 32-50 bytes                   |
+| **Mismatch severity**| Severe (10x gap)          | Moderate (3x gap)             |
+| **Correctness**     | Correct                    | Has bugs                      |
+| **Expected gain**   | Regression                 | 0-5%                          |
 
 P6 is less severe than P5, but still not worth implementing.
 
@@ -1935,12 +1935,12 @@ fn current_line(&self) -> usize {
 
 **Critical differences from JSON:**
 
-| Aspect | JSON | YAML |
-|--------|------|------|
-| **Builds NewlineIndex during parse?** | ❌ No | ❌ No (would be mistake) |
-| **Uses in benchmarks?** | ❌ No | ❌ No |
-| **Uses in CLI tools?** | ✅ Yes (`jq-locate`) | ❓ No `yq-locate` yet |
-| **Line number for errors** | Lazy O(n) scan | Lazy O(n) scan |
+| Aspect                              | JSON                   | YAML                         |
+|-------------------------------------|------------------------|------------------------------|
+| **Builds NewlineIndex during parse?**| ❌ No                 | ❌ No (would be mistake)     |
+| **Uses in benchmarks?**             | ❌ No                  | ❌ No                        |
+| **Uses in CLI tools?**              | ✅ Yes (`jq-locate`)   | ❓ No `yq-locate` yet        |
+| **Line number for errors**          | Lazy O(n) scan         | Lazy O(n) scan               |
 
 **Why Option B would fail:**
 
@@ -1959,11 +1959,11 @@ fn current_line(&self) -> usize {
 
 **Why this differs from P5/P6:**
 
-| Optimization | Issue |
-|--------------|-------|
-| P5 (Flow SIMD) | Size mismatch (SIMD sweet spot vs real data) |
-| P6 (BMI2) | Grammar mismatch (can't apply DSV techniques) |
-| **P7 (Newline Index)** | **Use case mismatch** (CLI feature, not parsing optimization) |
+| Optimization           | Issue                                                    |
+|------------------------|----------------------------------------------------------|
+| P5 (Flow SIMD)         | Size mismatch (SIMD sweet spot vs real data)             |
+| P6 (BMI2)              | Grammar mismatch (can't apply DSV techniques)            |
+| **P7 (Newline Index)** | **Use case mismatch** (CLI feature, not parsing opt)     |
 
 **Decision: REJECT P7 as a performance optimization**
 
@@ -2004,14 +2004,14 @@ Attempted to use AVX-512 (64-byte SIMD) instead of AVX2 (32-byte) for YAML primi
 
 **Character Classification (classify_yaml_chars):**
 
-| Size | AVX2 Time | AVX2 Throughput | AVX-512 Time | AVX-512 Throughput | Speedup |
-|------|-----------|-----------------|--------------|-------------------|---------|
-| 32B  | 17.49 ns  | 1.70 GiB/s      | 1.66 ns      | 17.92 GiB/s       | **10.5x** ❌ *Invalid (optimization artifact)* |
-| 64B  | 17.34 ns  | 3.44 GiB/s      | 18.59 ns     | 3.21 GiB/s        | **0.93x (7% slower)** ❌ |
-| 128B | 18.95 ns  | 6.29 GiB/s      | 18.94 ns     | 6.30 GiB/s        | **1.00x (neutral)** |
-| 256B | 58.33 ns  | 4.09 GiB/s      | 29.05 ns     | 8.21 GiB/s        | **2.01x faster** ⚠️ *Misleading* |
-| 1KB  | 164.74 ns | 5.79 GiB/s      | 138.97 ns    | 6.86 GiB/s        | **1.19x faster** ⚠️ *Misleading* |
-| 4KB  | 422.42 ns | 9.03 GiB/s      | 380.55 ns    | 10.02 GiB/s       | **1.11x faster** ⚠️ *Misleading* |
+| Size | AVX2 Time  | AVX2 Throughput | AVX-512 Time | AVX-512 Throughput | Speedup                                       |
+|------|------------|-----------------|--------------|-------------------|-----------------------------------------------|
+| 32B  | 17.49 ns   | 1.70 GiB/s      | 1.66 ns      | 17.92 GiB/s        | **10.5x** ❌ *Invalid (optimization artifact)* |
+| 64B  | 17.34 ns   | 3.44 GiB/s      | 18.59 ns     | 3.21 GiB/s         | **0.93x (7% slower)** ❌                      |
+| 128B | 18.95 ns   | 6.29 GiB/s      | 18.94 ns     | 6.30 GiB/s         | **1.00x (neutral)**                           |
+| 256B | 58.33 ns   | 4.09 GiB/s      | 29.05 ns     | 8.21 GiB/s         | **2.01x faster** ⚠️ *Misleading*             |
+| 1KB  | 164.74 ns  | 5.79 GiB/s      | 138.97 ns    | 6.86 GiB/s         | **1.19x faster** ⚠️ *Misleading*             |
+| 4KB  | 422.42 ns  | 9.03 GiB/s      | 380.55 ns    | 10.02 GiB/s        | **1.11x faster** ⚠️ *Misleading*             |
 
 **Critical Issue: Flawed Benchmark Design**
 
@@ -2185,29 +2185,29 @@ let json = root.to_json_document();
 
 **End-to-End Results (AMD Ryzen 9 7950X):**
 
-| File Size | OLD (3-phase) | NEW (streaming) | Speedup | Throughput Improvement |
-|-----------|---------------|-----------------|---------|------------------------|
-| **10 KB** | 257µs (38.1 MiB/s) | 108µs (90.5 MiB/s) | **2.37x** | **+137%** ✅ |
-| **100 KB** | 1.93ms (47.7 MiB/s) | 828µs (111.1 MiB/s) | **2.33x** | **+133%** ✅ |
+| File Size  | OLD (3-phase)        | NEW (streaming)       | Speedup   | Throughput Improvement |
+|------------|----------------------|-----------------------|-----------|------------------------|
+| **10 KB**  | 257µs (38.1 MiB/s)   | 108µs (90.5 MiB/s)    | **2.37x** | **+137%** ✅           |
+| **100 KB** | 1.93ms (47.7 MiB/s)  | 828µs (111.1 MiB/s)   | **2.33x** | **+133%** ✅           |
 
 **Phase breakdown (100KB file):**
 
-| Phase | OLD Time | OLD % | NEW Time | NEW % |
-|-------|----------|-------|----------|-------|
-| Parse | 285µs | 14.8% | 334µs | 40.3% |
-| Convert | 952µs | 49.4% | 494µs | 59.7% |
-| Serialize | 690µs | 35.8% | — | — |
-| **Total** | **1.93ms** | **100%** | **828µs** | **100%** |
+| Phase       | OLD Time   | OLD %   | NEW Time  | NEW %   |
+|-------------|------------|---------|-----------|---------|
+| Parse       | 285µs      | 14.8%   | 334µs     | 40.3%   |
+| Convert     | 952µs      | 49.4%   | 494µs     | 59.7%   |
+| Serialize   | 690µs      | 35.8%   | —         | —       |
+| **Total**   | **1.93ms** | **100%**| **828µs** | **100%**|
 
 **Micro-Benchmark Results (benches/yaml_transcode_micro.rs):**
 
-| Workload | Throughput | Notes |
-|----------|------------|-------|
-| **Realistic config** | 276 MiB/s | YAML with quoted strings, escapes |
-| **Escape-heavy** | 263 MiB/s | Many `\n`, `\t`, `\"`, `\U` escapes |
-| **Double-quoted** | 328-518 MiB/s | Scales with escape complexity |
-| **Single-quoted** | 343-368 MiB/s | Simpler escape rules |
-| **Large (500 items)** | 284 MiB/s | Realistic multi-document workload |
+| Workload             | Throughput    | Notes                               |
+|----------------------|---------------|-------------------------------------|
+| **Realistic config** | 276 MiB/s     | YAML with quoted strings, escapes   |
+| **Escape-heavy**     | 263 MiB/s     | Many `\n`, `\t`, `\"`, `\U` escapes |
+| **Double-quoted**    | 328-518 MiB/s | Scales with escape complexity       |
+| **Single-quoted**    | 343-368 MiB/s | Simpler escape rules                |
+| **Large (500 items)**| 284 MiB/s     | Realistic multi-document workload   |
 
 **Key Achievements:**
 
@@ -2260,15 +2260,15 @@ Attempted to port x86's successful P0 `classify_yaml_chars` optimization to ARM6
 
 **Performance Results (Apple M1 Max):**
 
-| Benchmark           | Baseline     | NEON Classify | Change       |
-|---------------------|--------------|---------------|--------------|
-| simple_kv/100       | 3.74 µs      | 4.50 µs       | **+20.3%** ❌ |
-| simple_kv/1000      | 33.8 µs      | 42.0 µs       | **+24.3%** ❌ |
-| simple_kv/10000     | 333 µs       | 416 µs        | **+25.0%** ❌ |
-| nested/d5_w2        | 4.98 µs      | 5.52 µs       | **+10.8%** ❌ |
-| large/10kb          | 21.9 µs      | 26.4 µs       | **+20.3%** ❌ |
-| large/100kb         | 196 µs       | 230 µs        | **+17.3%** ❌ |
-| large/1mb           | 1.91 ms      | 2.22 ms       | **+16.2%** ❌ |
+| Benchmark       | Baseline | NEON Classify | Change         |
+|-----------------|----------|---------------|----------------|
+| simple_kv/100   | 3.74 µs  | 4.50 µs       | **+20.3%** ❌  |
+| simple_kv/1000  | 33.8 µs  | 42.0 µs       | **+24.3%** ❌  |
+| simple_kv/10000 | 333 µs   | 416 µs        | **+25.0%** ❌  |
+| nested/d5_w2    | 4.98 µs  | 5.52 µs       | **+10.8%** ❌  |
+| large/10kb      | 21.9 µs  | 26.4 µs       | **+20.3%** ❌  |
+| large/100kb     | 196 µs   | 230 µs        | **+17.3%** ❌  |
+| large/1mb       | 1.91 ms  | 2.22 ms       | **+16.2%** ❌  |
 
 **Root Cause: NEON lacks native `movemask`**
 
@@ -2295,22 +2295,22 @@ unsafe fn neon_movemask(v: uint8x16_t) -> u16 {
 
 **Cost Analysis:**
 
-| Platform | Instruction | Cost       | Operations for 8-class classify |
-|----------|-------------|------------|--------------------------------|
-| x86_64   | `movemask`  | 1 cycle    | 8 movemask = ~8 cycles         |
-| ARM64    | Emulation   | 5-8 cycles | 8 emulations = **40-64 cycles** |
+| Platform | Instruction | Cost       | Operations for 8-class classify  |
+|----------|-------------|------------|----------------------------------|
+| x86_64   | `movemask`  | 1 cycle    | 8 movemask = ~8 cycles           |
+| ARM64    | Emulation   | 5-8 cycles | 8 emulations = **40-64 cycles**  |
 
 The `classify_yaml_chars` function calls `neon_movemask` 8 times (once per character class), making the overhead **5-8x worse** than x86.
 
 **Why NEON Classify Failed:**
 
-| Factor                    | x86_64 (Success)           | ARM64 (Failure)              |
-|---------------------------|----------------------------|------------------------------|
-| `movemask` cost           | 1 instruction              | ~10 instructions             |
-| 8-class classification    | ~8 cycles                  | ~40-64 cycles                |
-| SIMD→scalar transfers     | Cheap (`movemask` is fast) | Expensive (lane extraction)  |
-| Multiplication overhead   | None                       | 2 multiplies per movemask    |
-| Break-even point          | ~4 bytes                   | >64 bytes (if at all)        |
+| Factor                  | x86_64 (Success)           | ARM64 (Failure)             |
+|-------------------------|----------------------------|-----------------------------|
+| `movemask` cost         | 1 instruction              | ~10 instructions            |
+| 8-class classification  | ~8 cycles                  | ~40-64 cycles               |
+| SIMD→scalar transfers   | Cheap (`movemask` is fast) | Expensive (lane extraction) |
+| Multiplication overhead | None                       | 2 multiplies per movemask   |
+| Break-even point        | ~4 bytes                   | >64 bytes (if at all)       |
 
 **Attempted Mitigations (All Failed):**
 
@@ -2351,18 +2351,18 @@ Following the P3 NEON rejection, we implemented a pure broadword (SWAR) approach
 
 **Micro-Benchmark Results (Apple M1 Max):**
 
-| Benchmark | Baseline | Broadword | Change |
-|-----------|----------|-----------|--------|
-| simple_kv/10 | 1.54 µs | 1.63 µs | **+6%** ❌ |
-| simple_kv/100 | 5.9 µs | 6.7 µs | **+14%** ❌ |
-| simple_kv/1000 | 48.3 µs | 55.2 µs | **+14%** ❌ |
-| large/1kb | 5.0 µs | 5.0 µs | **0%** |
-| large/10kb | 33.8 µs | 33.8 µs | **0%** |
-| large/100kb | 301 µs | 301 µs | **0%** |
-| large/1mb | 2.71 ms | 2.71 ms | **0%** |
-| long_strings/double/64b | 8.8 µs | 8.5 µs | **-3%** ✅ |
-| long_strings/double/1024b | 40.6 µs | 40.4 µs | **-0.5%** |
-| long_strings/double/4096b | 151 µs | 150 µs | **-1%** |
+| Benchmark                  | Baseline | Broadword | Change      |
+|----------------------------|----------|-----------|-------------|
+| simple_kv/10               | 1.54 µs  | 1.63 µs   | **+6%** ❌  |
+| simple_kv/100              | 5.9 µs   | 6.7 µs    | **+14%** ❌ |
+| simple_kv/1000             | 48.3 µs  | 55.2 µs   | **+14%** ❌ |
+| large/1kb                  | 5.0 µs   | 5.0 µs    | **0%**      |
+| large/10kb                 | 33.8 µs  | 33.8 µs   | **0%**      |
+| large/100kb                | 301 µs   | 301 µs    | **0%**      |
+| large/1mb                  | 2.71 ms  | 2.71 ms   | **0%**      |
+| long_strings/double/64b    | 8.8 µs   | 8.5 µs    | **-3%** ✅  |
+| long_strings/double/1024b  | 40.6 µs  | 40.4 µs   | **-0.5%**   |
+| long_strings/double/4096b  | 151 µs   | 150 µs    | **-1%**     |
 
 **Analysis:**
 
@@ -2377,13 +2377,13 @@ Following the P3 NEON rejection, we implemented a pure broadword (SWAR) approach
 
 **Why Broadword Failed to Help:**
 
-| Factor | Expected | Reality |
-|--------|----------|---------|
-| Bytes per operation | 16 | 16 (same as NEON) |
-| Operations per classify | ~24 arithmetic ops | ~24 (correct) |
-| Overhead vs scalar | Lower (no intrinsics) | Similar (still function call + branching) |
-| Break-even point | ~16 bytes | >64 bytes |
-| Typical YAML value length | 5-30 bytes | Too short to benefit |
+| Factor                     | Expected                  | Reality                                    |
+|----------------------------|---------------------------|--------------------------------------------|
+| Bytes per operation        | 16                        | 16 (same as NEON)                          |
+| Operations per classify    | ~24 arithmetic ops        | ~24 (correct)                              |
+| Overhead vs scalar         | Lower (no intrinsics)     | Similar (still function call + branching)  |
+| Break-even point           | ~16 bytes                 | >64 bytes                                  |
+| Typical YAML value length  | 5-30 bytes                | Too short to benefit                       |
 
 **Conclusion:** The broadword approach is algorithmically correct and faster than NEON movemask emulation, but:
 
@@ -2423,29 +2423,29 @@ broadword-yaml = []  # Use broadword instead of NEON on ARM64
 
 **ARM64 Benchmark Results (Broadword vs NEON):**
 
-| Benchmark | NEON | Broadword | Change |
-|-----------|------|-----------|--------|
-| simple_kv/10 | 1.57 µs | 1.53 µs | **-2.9%** ✅ |
-| simple_kv/100 | 6.0 µs | 5.79 µs | **-3.8%** ✅ |
-| simple_kv/1000 | 47.9 µs | 47.1 µs | **-1.8%** ✅ |
-| simple_kv/10000 | 503 µs | 491 µs | **-2.4%** ✅ |
-| nested/d5_w2 | 6.5 µs | 6.7 µs | **+3.0%** ❌ |
-| sequences/10000 | 397 µs | 381 µs | **-3.9%** ✅ |
-| quoted/double/100 | 6.7 µs | 6.6 µs | **-2.4%** ✅ |
-| long_strings/double/1024b | 41.3 µs | 44.7 µs | **+7.8%** ❌ |
-| long_strings/double/4096b | 146.5 µs | 162.4 µs | **+11%** ❌ |
-| large/1kb | 4.4 µs | 4.4 µs | **-1.2%** ✅ |
-| large/10kb | 29.6 µs | 28.8 µs | **-2.5%** ✅ |
-| large/100kb | 266 µs | 263 µs | **-1.0%** ⚖️ |
-| large/1mb | 2.46 ms | 2.45 ms | **-0.1%** ⚖️ |
+| Benchmark                  | NEON     | Broadword | Change         |
+|----------------------------|----------|-----------|----------------|
+| simple_kv/10               | 1.57 µs  | 1.53 µs   | **-2.9%** ✅   |
+| simple_kv/100              | 6.0 µs   | 5.79 µs   | **-3.8%** ✅   |
+| simple_kv/1000             | 47.9 µs  | 47.1 µs   | **-1.8%** ✅   |
+| simple_kv/10000            | 503 µs   | 491 µs    | **-2.4%** ✅   |
+| nested/d5_w2               | 6.5 µs   | 6.7 µs    | **+3.0%** ❌   |
+| sequences/10000            | 397 µs   | 381 µs    | **-3.9%** ✅   |
+| quoted/double/100          | 6.7 µs   | 6.6 µs    | **-2.4%** ✅   |
+| long_strings/double/1024b  | 41.3 µs  | 44.7 µs   | **+7.8%** ❌   |
+| long_strings/double/4096b  | 146.5 µs | 162.4 µs  | **+11%** ❌    |
+| large/1kb                  | 4.4 µs   | 4.4 µs    | **-1.2%** ✅   |
+| large/10kb                 | 29.6 µs  | 28.8 µs   | **-2.5%** ✅   |
+| large/100kb                | 266 µs   | 263 µs    | **-1.0%** ⚖️  |
+| large/1mb                  | 2.46 ms  | 2.45 ms   | **-0.1%** ⚖️  |
 
 **End-to-End Benchmarks (yq_comparison):**
 
-| Benchmark | NEON | Broadword | Change |
-|-----------|------|-----------|--------|
-| succinctly/10kb | 4.17 ms | 4.24 ms | **+1.6%** ⚖️ |
-| succinctly/100kb | 9.0 ms | 9.3 ms | **+3.4%** ❌ |
-| succinctly/1mb | 53.1 ms | 54.3 ms | **+2.3%** ❌ |
+| Benchmark        | NEON    | Broadword | Change         |
+|------------------|---------|-----------|----------------|
+| succinctly/10kb  | 4.17 ms | 4.24 ms   | **+1.6%** ⚖️   |
+| succinctly/100kb | 9.0 ms  | 9.3 ms    | **+3.4%** ❌   |
+| succinctly/1mb   | 53.1 ms | 54.3 ms   | **+2.3%** ❌   |
 
 **Analysis:**
 
@@ -2488,42 +2488,42 @@ scalar-yaml = []     # Use pure scalar (byte-by-byte) - baseline
 
 **ARM64 Micro-Benchmark Results (Broadword vs Scalar):**
 
-| Benchmark | Broadword | Scalar | Broadword Speedup |
-|-----------|-----------|--------|-------------------|
-| simple_kv/10 | 1.63 µs | 1.54 µs | -5% ❌ |
-| simple_kv/100 | 5.89 µs | 5.64 µs | -4% ❌ |
-| simple_kv/1000 | 49.2 µs | 46.8 µs | -5% ❌ |
-| simple_kv/10000 | 501 µs | 497 µs | -1% ⚖️ |
-| nested/d10_w2 | 220 µs | 237 µs | **+7%** ✅ |
-| sequences/100 | 5.12 µs | 4.84 µs | -5% ❌ |
-| sequences/1000 | 38.6 µs | 41.7 µs | **+7%** ✅ |
-| sequences/10000 | 388 µs | 379 µs | -2% ⚖️ |
-| **quoted/double/100** | 6.51 µs | 7.60 µs | **+15%** ✅ |
-| **quoted/single/100** | 6.63 µs | 6.85 µs | **+3%** ✅ |
-| **quoted/double/1000** | 56.0 µs | 66.1 µs | **+15%** ✅ |
-| **quoted/single/1000** | 54.5 µs | 57.1 µs | **+5%** ✅ |
-| **long_strings/double/64b** | 7.70 µs | 9.61 µs | **+20%** ✅ |
-| **long_strings/single/64b** | 7.52 µs | 8.74 µs | **+14%** ✅ |
-| **long_strings/double/256b** | 14.7 µs | 25.2 µs | **+42%** ✅ |
-| **long_strings/single/256b** | 13.96 µs | 22.0 µs | **+37%** ✅ |
-| **long_strings/double/1024b** | 45.0 µs | 85.1 µs | **+47%** ✅ |
-| **long_strings/single/1024b** | 42.1 µs | 68.3 µs | **+38%** ✅ |
-| **long_strings/double/4096b** | 164 µs | 332 µs | **+51%** ✅ |
-| **long_strings/single/4096b** | 154 µs | 271 µs | **+43%** ✅ |
-| large/1kb | 4.46 µs | 4.37 µs | -2% ⚖️ |
-| large/10kb | 29.4 µs | 28.1 µs | -4% ❌ |
-| large/100kb | 269 µs | 267 µs | -1% ⚖️ |
-| large/1mb | 2.51 ms | 2.60 ms | **+4%** ✅ |
+| Benchmark                      | Broadword | Scalar   | Broadword Speedup |
+|--------------------------------|-----------|----------|-------------------|
+| simple_kv/10                   | 1.63 µs   | 1.54 µs  | -5% ❌            |
+| simple_kv/100                  | 5.89 µs   | 5.64 µs  | -4% ❌            |
+| simple_kv/1000                 | 49.2 µs   | 46.8 µs  | -5% ❌            |
+| simple_kv/10000                | 501 µs    | 497 µs   | -1% ⚖️           |
+| nested/d10_w2                  | 220 µs    | 237 µs   | **+7%** ✅        |
+| sequences/100                  | 5.12 µs   | 4.84 µs  | -5% ❌            |
+| sequences/1000                 | 38.6 µs   | 41.7 µs  | **+7%** ✅        |
+| sequences/10000                | 388 µs    | 379 µs   | -2% ⚖️           |
+| **quoted/double/100**          | 6.51 µs   | 7.60 µs  | **+15%** ✅       |
+| **quoted/single/100**          | 6.63 µs   | 6.85 µs  | **+3%** ✅        |
+| **quoted/double/1000**         | 56.0 µs   | 66.1 µs  | **+15%** ✅       |
+| **quoted/single/1000**         | 54.5 µs   | 57.1 µs  | **+5%** ✅        |
+| **long_strings/double/64b**    | 7.70 µs   | 9.61 µs  | **+20%** ✅       |
+| **long_strings/single/64b**    | 7.52 µs   | 8.74 µs  | **+14%** ✅       |
+| **long_strings/double/256b**   | 14.7 µs   | 25.2 µs  | **+42%** ✅       |
+| **long_strings/single/256b**   | 13.96 µs  | 22.0 µs  | **+37%** ✅       |
+| **long_strings/double/1024b**  | 45.0 µs   | 85.1 µs  | **+47%** ✅       |
+| **long_strings/single/1024b**  | 42.1 µs   | 68.3 µs  | **+38%** ✅       |
+| **long_strings/double/4096b**  | 164 µs    | 332 µs   | **+51%** ✅       |
+| **long_strings/single/4096b**  | 154 µs    | 271 µs   | **+43%** ✅       |
+| large/1kb                      | 4.46 µs   | 4.37 µs  | -2% ⚖️           |
+| large/10kb                     | 29.4 µs   | 28.1 µs  | -4% ❌            |
+| large/100kb                    | 269 µs    | 267 µs   | -1% ⚖️           |
+| large/1mb                      | 2.51 ms   | 2.60 ms  | **+4%** ✅        |
 
 **End-to-End Benchmarks (yq_comparison):**
 
-| Benchmark | Broadword | Scalar | Broadword Speedup |
-|-----------|-----------|--------|-------------------|
-| succinctly/10kb | 4.25 ms | 4.24 ms | 0% ⚖️ |
-| succinctly/100kb | 8.96 ms | 9.77 ms | **+8%** ✅ |
-| succinctly/1mb | 54.8 ms | 55.4 ms | **+1%** ⚖️ |
-| nested/1kb (broadword) | 3.55 ms | 3.75 ms | **+5%** ✅ |
-| nested/10kb (broadword) | 3.88 ms | 4.09 ms | **+5%** ✅ |
+| Benchmark              | Broadword | Scalar  | Broadword Speedup |
+|------------------------|-----------|---------|-------------------|
+| succinctly/10kb        | 4.25 ms   | 4.24 ms | 0% ⚖️             |
+| succinctly/100kb       | 8.96 ms   | 9.77 ms | **+8%** ✅        |
+| succinctly/1mb         | 54.8 ms   | 55.4 ms | **+1%** ⚖️        |
+| nested/1kb (broadword) | 3.55 ms   | 3.75 ms | **+5%** ✅        |
+| nested/10kb (broadword)| 3.88 ms   | 4.09 ms | **+5%** ✅        |
 
 **Analysis:**
 
@@ -2568,13 +2568,13 @@ This section details planned and implemented SIMD optimizations for x86_64 (AMD 
 
 The YAML parser now includes enhanced SIMD operations in [`src/yaml/simd/x86.rs`](../../src/yaml/simd/x86.rs):
 
-| Function | SSE2 | AVX2 | Usage | Speedup (Measured) |
-|----------|------|------|-------|-------------------|
-| `find_quote_or_escape` | ✓ | ✓ | Double-quoted string scanning | **+11-18%** |
-| `find_single_quote` | ✓ | ✓ | Single-quoted string scanning | **+13-23%** |
-| `count_leading_spaces` | ✓ | ✓ | Indentation counting | **+14-24%** |
-| `classify_yaml_chars` | ✓ | ✓ | Bulk character classification (8 types) | **(infrastructure)** |
-| `find_newline` | ✓ | ✓ | Newline detection | **(infrastructure)** |
+| Function               | SSE2 | AVX2 | Usage                                  | Speedup (Measured)    |
+|------------------------|------|------|----------------------------------------|-----------------------|
+| `find_quote_or_escape` | ✓    | ✓    | Double-quoted string scanning          | **+11-18%**           |
+| `find_single_quote`    | ✓    | ✓    | Single-quoted string scanning          | **+13-23%**           |
+| `count_leading_spaces` | ✓    | ✓    | Indentation counting                   | **+14-24%**           |
+| `classify_yaml_chars`  | ✓    | ✓    | Bulk character classification (8 types)| **(infrastructure)**  |
+| `find_newline`         | ✓    | ✓    | Newline detection                      | **(infrastructure)**  |
 
 **Throughput:** 16 bytes/iteration (SSE2), 32 bytes/iteration (AVX2)
 
@@ -2673,17 +2673,17 @@ Based on baseline benchmarks and JSON techniques, here are high-value optimizati
 **Approach:** Classify YAML structural characters in bulk, similar to JSON.
 
 **YAML Structural Characters:**
-| Character(s) | Meaning | Detection |
-|-------------|---------|-----------|
-| `:` + space | Mapping separator | Compare + AND with shifted space mask |
-| `-` + space | Sequence item | Compare + AND with shifted space mask |
-| `#` | Comment start | Compare |
-| `"`, `'` | Quote delimiters | Compare (already done) |
-| `\n` | Line boundary | Compare |
-| ` ` (space) | Indentation/whitespace | Compare (already done) |
-| `{`, `}`, `[`, `]` | Flow style | Compare |
-| `\|`, `>` | Block scalars | Compare |
-| `&`, `*` | Anchors/aliases | Compare |
+| Character(s)       | Meaning                | Detection                             |
+|--------------------|------------------------|---------------------------------------|
+| `:` + space        | Mapping separator      | Compare + AND with shifted space mask |
+| `-` + space        | Sequence item          | Compare + AND with shifted space mask |
+| `#`                | Comment start          | Compare                               |
+| `"`, `'`           | Quote delimiters       | Compare (already done)                |
+| `\n`               | Line boundary          | Compare                               |
+| ` ` (space)        | Indentation/whitespace | Compare (already done)                |
+| `{`, `}`, `[`, `]` | Flow style             | Compare                               |
+| `\|`, `>`          | Block scalars          | Compare                               |
+| `&`, `*`           | Anchors/aliases        | Compare                               |
 
 **Implementation:**
 
@@ -2899,22 +2899,22 @@ unsafe fn is_simple_kv_line(line: &[u8]) -> Option<(usize, usize)> {
 
 ### Implementation Priority
 
-| Priority | Optimization | Expected Gain | Complexity | Status |
-|----------|--------------|---------------|------------|--------|
-| ~~**P0**~~ | ~~Multi-Character Classification~~ | ~~10-20%~~ | Medium | ✅ **DONE** (+4-10%) |
-| ~~**P0+**~~ | ~~Hybrid Scalar/SIMD Integration~~ | ~~5-10%~~ | Low | ✅ **DONE** (+4-7%) |
-| ~~**P1**~~ | ~~YFSM Tables~~ | ~~15-25%~~ | High | ❌ **REJECTED** (0-2%) |
-| ~~**P2**~~ | ~~Integrate classify_yaml_chars~~ | ~~5-10%~~ | Medium | ✅ **DONE** (+8-17%) |
-| ~~**P2.5**~~ | ~~Cached Type Checking~~ | ~~1-2%~~ | Low | ✅ **DONE** (+1-17%) |
-| ~~**P2.6**~~ | ~~Software Prefetching~~ | ~~5-10%~~ | Low | ❌ **REJECTED** (+30% regression!) |
-| ~~**P2.7**~~ | ~~Block Scalar SIMD~~ | ~~10-20%~~ | Medium | ✅ **DONE** (+19-25%) **← Best!** |
-| ~~**P2.8**~~ | ~~SIMD Threshold Tuning~~ | ~~1-3%~~ | Very Low | ❌ **REJECTED** (+8-15% regression!) |
-| ~~**P3**~~ | ~~Branchless Character Classification~~ | ~~2-4%~~ | Low | ❌ **REJECTED** (+25-44% regression!) |
-| ~~**P4**~~ | ~~Anchor/Alias SIMD~~ | ~~5-15%~~ | Medium | ✅ **DONE** (+6-17%) |
-| ~~**P5**~~ | ~~Flow Collection Fast Path~~ | ~~10-20%~~ | Medium | ❌ **REJECTED** (size mismatch - aborted at analysis) |
-| ~~**P6**~~ | ~~BMI2 operations (PDEP/PEXT)~~ | ~~3-8%~~ | Medium | ❌ **REJECTED** (grammar mismatch - aborted at analysis) |
-| ~~**P7**~~ | ~~Newline Index~~ | ~~2-5%~~ | Medium | ❌ **REJECTED** (use case mismatch - CLI feature, not optimization) |
-| ~~**P8**~~ | ~~AVX-512 variants~~ | ~~0-10%~~ | Medium | ❌ **REJECTED** (benchmark mismatch + JSON precedent - micro-benchmarked, 7% slower at 64B) |
+| Priority     | Optimization                           | Expected Gain | Complexity | Status                                                              |
+|--------------|----------------------------------------|---------------|------------|---------------------------------------------------------------------|
+| ~~**P0**~~   | ~~Multi-Character Classification~~     | ~~10-20%~~    | Medium     | ✅ **DONE** (+4-10%)                                                |
+| ~~**P0+**~~  | ~~Hybrid Scalar/SIMD Integration~~     | ~~5-10%~~     | Low        | ✅ **DONE** (+4-7%)                                                 |
+| ~~**P1**~~   | ~~YFSM Tables~~                        | ~~15-25%~~    | High       | ❌ **REJECTED** (0-2%)                                              |
+| ~~**P2**~~   | ~~Integrate classify_yaml_chars~~      | ~~5-10%~~     | Medium     | ✅ **DONE** (+8-17%)                                                |
+| ~~**P2.5**~~ | ~~Cached Type Checking~~               | ~~1-2%~~      | Low        | ✅ **DONE** (+1-17%)                                                |
+| ~~**P2.6**~~ | ~~Software Prefetching~~               | ~~5-10%~~     | Low        | ❌ **REJECTED** (+30% regression!)                                  |
+| ~~**P2.7**~~ | ~~Block Scalar SIMD~~                  | ~~10-20%~~    | Medium     | ✅ **DONE** (+19-25%) **← Best!**                                   |
+| ~~**P2.8**~~ | ~~SIMD Threshold Tuning~~              | ~~1-3%~~      | Very Low   | ❌ **REJECTED** (+8-15% regression!)                                |
+| ~~**P3**~~   | ~~Branchless Character Classification~~| ~~2-4%~~      | Low        | ❌ **REJECTED** (+25-44% regression!)                               |
+| ~~**P4**~~   | ~~Anchor/Alias SIMD~~                  | ~~5-15%~~     | Medium     | ✅ **DONE** (+6-17%)                                                |
+| ~~**P5**~~   | ~~Flow Collection Fast Path~~          | ~~10-20%~~    | Medium     | ❌ **REJECTED** (size mismatch - aborted at analysis)               |
+| ~~**P6**~~   | ~~BMI2 operations (PDEP/PEXT)~~        | ~~3-8%~~      | Medium     | ❌ **REJECTED** (grammar mismatch - aborted at analysis)            |
+| ~~**P7**~~   | ~~Newline Index~~                      | ~~2-5%~~      | Medium     | ❌ **REJECTED** (use case mismatch - CLI feature, not optimization) |
+| ~~**P8**~~   | ~~AVX-512 variants~~                   | ~~0-10%~~     | Medium     | ❌ **REJECTED** (benchmark mismatch + JSON precedent)               |
 
 **Achieved So Far:** P0 + P0+ + P2 + P2.5 + P2.7 + P4 = **+34-59% overall** improvement, **largest single gain: Block Scalar SIMD (+19-25%)**
 
@@ -3213,13 +3213,13 @@ fn parse_unquoted_value_with_indent(&mut self, start_indent: usize) -> usize {
 
 #### Implementation Status
 
-| Opportunity | Status | Expected Impact |
-|-------------|--------|-----------------|
-| 1. Minimum threshold | Proposed | High |
-| 2. Scalar fast-path | Proposed | High |
-| 3. Continue from position+1 | Proposed | Medium |
-| 4. Newline-only fast path | Proposed | Medium |
-| 5. Bounded search range | Proposed | Low |
+| Opportunity                 | Status   | Expected Impact |
+|-----------------------------|----------|-----------------|
+| 1. Minimum threshold        | Proposed | High            |
+| 2. Scalar fast-path         | Proposed | High            |
+| 3. Continue from position+1 | Proposed | Medium          |
+| 4. Newline-only fast path   | Proposed | Medium          |
+| 5. Bounded search range     | Proposed | Low             |
 
 ---
 
@@ -3259,12 +3259,12 @@ fn next_structural(&self, pos: usize) -> Option<usize> {
 
 **Comparison with current approach:**
 
-| Aspect | Per-value SIMD | Pre-indexed |
-|--------|----------------|-------------|
-| Setup cost | Per call | Once |
-| Memory | None | ~n/8 + rank |
-| Short values | High overhead | Still needs context check |
-| Long values | Efficient | More efficient |
+| Aspect       | Per-value SIMD | Pre-indexed               |
+|--------------|----------------|---------------------------|
+| Setup cost   | Per call       | Once                      |
+| Memory       | None           | ~n/8 + rank               |
+| Short values | High overhead  | Still needs context check |
+| Long values  | Efficient      | More efficient            |
 
 #### Better Alternative: Batch Classification
 
@@ -3657,13 +3657,13 @@ fn parse_line(&mut self, line: &[u8], line_start: usize) {
 
 ### Performance Projection
 
-| Component | rapidyaml | succinctly YAML (projected) |
-|-----------|-----------|----------------------------|
-| Character classification | Scalar | SIMD (1.8x faster) |
-| State transitions | Manual | YFSM tables (1.3-1.7x faster) |
-| Tree construction | Flat array | Same + BP bits |
-| String handling | Zero-copy | Same |
-| Indentation | O(log n) lookup | O(1) with lightweight index |
+| Component                | rapidyaml       | succinctly YAML (projected)     |
+|--------------------------|-----------------|--------------------------------|
+| Character classification | Scalar          | SIMD (1.8x faster)             |
+| State transitions        | Manual          | YFSM tables (1.3-1.7x faster)  |
+| Tree construction        | Flat array      | Same + BP bits                 |
+| String handling          | Zero-copy       | Same                           |
+| Indentation              | O(log n) lookup | O(1) with lightweight index    |
 
 **Conservative estimate**: 150-200 MB/s for YAML 1.2 parsing with full index construction.
 
@@ -3693,26 +3693,26 @@ Having parsing and indexing in the same codebase enables optimizations impossibl
 
 Profiling the end-to-end pipeline on 1MB YAML files reveals:
 
-| Phase | Time | Throughput | Description |
-|-------|------|------------|-------------|
-| **Read** | 0.2ms | - | File I/O |
-| **Build** | 3.0ms | 329 MiB/s | Parse + index construction |
-| **Cursor** | ~0ms | - | Create root cursor |
-| **To JSON** | 28.9ms | 35 MiB/s | Traverse + serialize |
+| Phase       | Time   | Throughput | Description                |
+|-------------|--------|------------|----------------------------|
+| **Read**    | 0.2ms  | -          | File I/O                   |
+| **Build**   | 3.0ms  | 329 MiB/s  | Parse + index construction |
+| **Cursor**  | ~0ms   | -          | Create root cursor         |
+| **To JSON** | 28.9ms | 35 MiB/s   | Traverse + serialize       |
 
 **Key insight**: The To JSON phase takes **10x longer** than Build. Optimization efforts should focus on traversal and serialization, not parsing.
 
 ### Current Succinct Data Structures
 
-| Structure | Description | Rank/Select Index |
-|-----------|-------------|-------------------|
-| **IB** (Interest Bits) | Mark structural positions | ✓ `ib_rank` cumulative |
-| **BP** (Balanced Parens) | Tree structure | ✓ RangeMin for O(1) `find_close` |
-| **TY** (Type Bits) | 0=mapping, 1=sequence | ✗ Linear scan |
-| **seq_items** | Sequence item markers | ✗ Linear scan |
-| **containers** | Container markers | ✓ `containers_rank` cumulative |
-| **bp_to_text** | BP position → text start offset | ✓ Dense array O(1) |
-| **bp_to_text_end** | BP position → text end offset | ✓ Dense array O(1) |
+| Structure               | Description                     | Rank/Select Index                |
+|-------------------------|--------------------------------|----------------------------------|
+| **IB** (Interest Bits)  | Mark structural positions      | ✓ `ib_rank` cumulative           |
+| **BP** (Balanced Parens)| Tree structure                 | ✓ RangeMin for O(1) `find_close` |
+| **TY** (Type Bits)      | 0=mapping, 1=sequence          | ✗ Linear scan                    |
+| **seq_items**           | Sequence item markers          | ✗ Linear scan                    |
+| **containers**          | Container markers              | ✓ `containers_rank` cumulative   |
+| **bp_to_text**          | BP position → text start offset| ✓ Dense array O(1)               |
+| **bp_to_text_end**      | BP position → text end offset  | ✓ Dense array O(1)               |
 
 ### Opportunity 1: Cumulative Index for `containers` ✓ IMPLEMENTED
 
@@ -3767,11 +3767,11 @@ The To JSON phase previously spent significant time in:
 
 **Measured Impact**: ~5-7% improvement in yq identity benchmarks (10KB files).
 
-| Benchmark | Before | After | Improvement |
-|-----------|--------|-------|-------------|
-| yq_identity/10kb | 4.4 ms | 4.1 ms | **+7%** |
-| yq_identity/100kb | 10.8 ms | 10.7 ms | **+1%** |
-| yq_identity/1mb | 72.5 ms | 71.5 ms | **+1%** |
+| Benchmark          | Before  | After   | Improvement |
+|--------------------|---------|---------|-------------|
+| yq_identity/10kb   | 4.4 ms  | 4.1 ms  | **+7%**     |
+| yq_identity/100kb  | 10.8 ms | 10.7 ms | **+1%**     |
+| yq_identity/1mb    | 72.5 ms | 71.5 ms | **+1%**     |
 
 The improvement is most significant for smaller files where per-scalar overhead is more noticeable. Larger files are dominated by other costs (I/O, string serialization).
 
@@ -3815,23 +3815,23 @@ for (start, end) in structural_segments {
 
 ### Priority Ranking
 
-| Opportunity | Effort | Impact | Priority | Status |
-|-------------|--------|--------|----------|--------|
-| 1. `containers_rank` | Low | Medium | **P1** | ✓ Done |
-| 4. String boundaries | Medium | High | **P1** | ✓ Done |
-| 3. Pack flag in bp_to_text | Low | Low | **P2** | Pending |
-| 5. SIMD JSON escaping | Medium | Medium | **P2** | Pending |
-| 2. `seq_items_rank` | Low | Low | **P3** | Pending |
-| 6. Streaming identity | High | High | **P3** | Pending |
+| Opportunity                | Effort | Impact | Priority | Status  |
+|----------------------------|--------|--------|----------|---------|
+| 1. `containers_rank`       | Low    | Medium | **P1**   | ✓ Done  |
+| 4. String boundaries       | Medium | High   | **P1**   | ✓ Done  |
+| 3. Pack flag in bp_to_text | Low    | Low    | **P2**   | Pending |
+| 5. SIMD JSON escaping      | Medium | Medium | **P2**   | Pending |
+| 2. `seq_items_rank`        | Low    | Low    | **P3**   | Pending |
+| 6. Streaming identity      | High   | High   | **P3**   | Pending |
 
 ### Detailed Bottleneck Analysis
 
 Profiling 1MB YAML (111,529 nodes, 93% strings) reveals:
 
-| Component | Time | % of Total | Notes |
-|-----------|------|------------|-------|
-| Tree traversal (`value()` calls) | ~25 ms | 90% | The dominant cost |
-| String formatting overhead | ~2.7 ms | 10% | Much smaller than expected |
+| Component                        | Time    | % of Total | Notes                      |
+|----------------------------------|---------|------------|----------------------------|
+| Tree traversal (`value()` calls) | ~25 ms  | 90%        | The dominant cost          |
+| String formatting overhead       | ~2.7 ms | 10%        | Much smaller than expected |
 
 **Per-node breakdown** (104,091 string nodes):
 - Time per node: ~225 ns
@@ -3905,11 +3905,11 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> Result<Owned
 
 #### yq Identity Benchmarks (AMD Ryzen 9 7950X)
 
-| Size   | Before    | After     | Time Reduction | Throughput Gain |
-|--------|-----------|-----------|----------------|-----------------|
-| 10KB   | 1.84 ms   | **1.45 ms** | **-21.3%** | **+27.0%** |
-| 100KB  | 5.96 ms   | **2.40 ms** | **-59.7%** | **+148%** |
-| 1MB    | 47.4 ms   | **11.7 ms** | **-75.3%** | **+304%** |
+| Size  | Before  | After       | Time Reduction | Throughput Gain |
+|-------|---------|-------------|----------------|-----------------|
+| 10KB  | 1.84 ms | **1.45 ms** | **-21.3%**     | **+27.0%**      |
+| 100KB | 5.96 ms | **2.40 ms** | **-59.7%**     | **+148%**       |
+| 1MB   | 47.4 ms | **11.7 ms** | **-75.3%**     | **+304%**       |
 
 #### Internal YAML Parsing (yaml_bench)
 
@@ -4082,22 +4082,22 @@ Key observation: select1 time stays nearly constant (~310-356 µs) while binary 
 
 #### End-to-end: yq_comparison (Apple M1 Max)
 
-| Size | Change |
-|------|--------|
-| 10KB | +2.4% improvement |
-| 100KB | within noise |
+| Size             | Change                                    |
+|------------------|-------------------------------------------|
+| 10KB             | +2.4% improvement                         |
+| 100KB            | within noise                              |
 | 1MB (succinctly) | **-3.1% improvement** (14.45ms → 14.00ms) |
 
 #### End-to-end: yaml_bench (Apple M1 Max)
 
-| Workload | Change |
-|----------|--------|
-| anchors/100 | +4.3% regression |
-| anchors/1000 | no change |
+| Workload     | Change           |
+|--------------|------------------|
+| anchors/100  | +4.3% regression |
+| anchors/1000 | no change        |
 | anchors/5000 | +2.7% regression |
-| k8s_10 | +2.4% regression |
-| k8s_50 | no change |
-| k8s_100 | no change |
+| k8s_10       | +2.4% regression |
+| k8s_50       | no change        |
+| k8s_100      | no change        |
 
 ### Trade-offs
 

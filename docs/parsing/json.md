@@ -6,11 +6,11 @@ This document describes how the succinctly library parses and indexes JSON docum
 
 Unlike traditional JSON parsers that build a DOM tree, succinctly creates a **semi-index**: a compact bit-vector representation that enables O(1) navigation without materializing the parse tree.
 
-| Component | Purpose | Size |
-|-----------|---------|------|
-| Interest Bits (IB) | Mark structural positions | ~0.5% of input |
-| Balanced Parentheses (BP) | Encode tree structure | ~0.5% of input |
-| Rank/Select indices | Enable O(1) queries | ~2-3% of input |
+| Component                | Purpose                   | Size           |
+|--------------------------|---------------------------|----------------|
+| Interest Bits (IB)       | Mark structural positions | ~0.5% of input |
+| Balanced Parentheses (BP)| Encode tree structure     | ~0.5% of input |
+| Rank/Select indices      | Enable O(1) queries       | ~2-3% of input |
 
 **Total overhead**: ~3-4% of input size vs 10-50x for DOM parsers.
 
@@ -51,12 +51,12 @@ The BP sequence forms a valid balanced parentheses string where each node (objec
 
 With IB and BP, navigation becomes bit operations:
 
-| Operation | Implementation |
-|-----------|----------------|
-| First child | `BP: find next 1 after current position` |
-| Next sibling | `BP: find_close(current) + 1` |
-| Parent | `BP: find matching open before current close` |
-| Text position | `IB: select1(BP.rank1(bp_pos))` |
+| Operation     | Implementation                              |
+|---------------|---------------------------------------------|
+| First child   | `BP: find next 1 after current position`    |
+| Next sibling  | `BP: find_close(current) + 1`               |
+| Parent        | `BP: find matching open before current close`|
+| Text position | `IB: select1(BP.rank1(bp_pos))`             |
 
 See [hierarchical-structures.md](../optimizations/hierarchical-structures.md) for rank/select implementation details.
 
@@ -84,25 +84,25 @@ JsonIndex (ready for queries)
 
 The parser uses a 4-state finite state machine:
 
-| State | Description | Transitions |
-|-------|-------------|-------------|
-| **InJson** | Outside strings/values | `"` → InString, digit/letter → InValue |
-| **InString** | Inside quoted string | `"` → InJson, `\` → InEscape |
-| **InEscape** | After backslash | any → InString |
-| **InValue** | Inside unquoted value | whitespace/delimiter → InJson |
+| State        | Description            | Transitions                             |
+|--------------|------------------------|-----------------------------------------|
+| **InJson**   | Outside strings/values | `"` → InString, digit/letter → InValue  |
+| **InString** | Inside quoted string   | `"` → InJson, `\` → InEscape            |
+| **InEscape** | After backslash        | any → InString                          |
+| **InValue**  | Inside unquoted value  | whitespace/delimiter → InJson           |
 
 ### Output (Phi Values)
 
 Each byte produces 0-3 output bits:
 
-| Character | State | IB | BP |
-|-----------|-------|----|----|
-| `{` or `[` | InJson | 1 | open |
-| `}` or `]` | InJson | 0 | close |
-| `"` (opening) | InJson | 1 | open+close |
-| `"` (closing) | InString | 0 | - |
-| digit (first) | InJson | 1 | open+close |
-| other | any | 0 | - |
+| Character     | State    | IB | BP         |
+|---------------|----------|----|-----------:|
+| `{` or `[`    | InJson   |  1 | open       |
+| `}` or `]`    | InJson   |  0 | close      |
+| `"` (opening) | InJson   |  1 | open+close |
+| `"` (closing) | InString |  0 | -          |
+| digit (first) | InJson   |  1 | open+close |
+| other         | any      |  0 | -          |
 
 ---
 
@@ -316,18 +316,18 @@ succinctly jq-locate file.json --offset 42 --format json
 
 ## File Locations
 
-| File | Purpose |
-|------|---------|
-| `src/json/mod.rs` | Module exports |
-| `src/json/pfsm_tables.rs` | TRANSITION_TABLE, PHI_TABLE |
-| `src/json/pfsm_optimized.rs` | Single-pass PFSM processor |
-| `src/json/standard.rs` | 4-state cursor algorithm |
-| `src/json/light.rs` | JsonIndex, JsonCursor APIs |
-| `src/json/locate.rs` | Path location (jq-locate CLI) |
-| `src/json/bit_writer.rs` | BitWriter implementation |
-| `src/json/simd/avx2.rs` | AVX2 classification |
-| `src/json/simd/neon.rs` | NEON nibble lookup |
-| `src/trees/bp.rs` | Balanced parentheses operations |
+| File                        | Purpose                        |
+|-----------------------------|--------------------------------|
+| `src/json/mod.rs`           | Module exports                 |
+| `src/json/pfsm_tables.rs`   | TRANSITION_TABLE, PHI_TABLE    |
+| `src/json/pfsm_optimized.rs`| Single-pass PFSM processor     |
+| `src/json/standard.rs`      | 4-state cursor algorithm       |
+| `src/json/light.rs`         | JsonIndex, JsonCursor APIs     |
+| `src/json/locate.rs`        | Path location (jq-locate CLI)  |
+| `src/json/bit_writer.rs`    | BitWriter implementation       |
+| `src/json/simd/avx2.rs`     | AVX2 classification            |
+| `src/json/simd/neon.rs`     | NEON nibble lookup             |
+| `src/trees/bp.rs`           | Balanced parentheses operations|
 
 ---
 
@@ -335,34 +335,34 @@ succinctly jq-locate file.json --offset 42 --format json
 
 ### Parsing Throughput
 
-| Platform | CPU | Method | Throughput |
-|----------|-----|--------|------------|
-| x86_64 | AMD Ryzen 9 7950X (Zen 4) | PFSM + BMI2 | ~880 MiB/s |
-| x86_64 | AMD Ryzen 9 7950X (Zen 4) | AVX2 | ~730 MiB/s |
-| ARM64 | Apple M1 Max | NEON | ~570 MiB/s |
+| Platform | CPU                       | Method      | Throughput |
+|----------|---------------------------|-------------|------------|
+| x86_64   | AMD Ryzen 9 7950X (Zen 4) | PFSM + BMI2 | ~880 MiB/s |
+| x86_64   | AMD Ryzen 9 7950X (Zen 4) | AVX2        | ~730 MiB/s |
+| ARM64    | Apple M1 Max              | NEON        | ~570 MiB/s |
 
 ### Navigation
 
-| Operation | Complexity |
-|-----------|------------|
-| First child | O(1) |
-| Next sibling | O(1) amortized |
-| Random field access | O(log n) |
+| Operation            | Complexity       |
+|----------------------|------------------|
+| First child          | O(1)             |
+| Next sibling         | O(1) amortized   |
+| Random field access  | O(log n)         |
 | Sequential iteration | O(1) per element |
 
 ---
 
 ## Optimisation Techniques Used
 
-| Technique | Document | Application |
-|-----------|----------|-------------|
-| Lookup tables | [lookup-tables.md](../optimizations/lookup-tables.md) | PFSM state machine |
-| SIMD classification | [simd.md](../optimizations/simd.md) | Character detection |
-| Nibble lookup | [lookup-tables.md](../optimizations/lookup-tables.md) | NEON classification |
+| Technique            | Document                                                       | Application             |
+|----------------------|----------------------------------------------------------------|-------------------------|
+| Lookup tables        | [lookup-tables.md](../optimizations/lookup-tables.md)          | PFSM state machine      |
+| SIMD classification  | [simd.md](../optimizations/simd.md)                            | Character detection     |
+| Nibble lookup        | [lookup-tables.md](../optimizations/lookup-tables.md)          | NEON classification     |
 | Hierarchical indices | [hierarchical-structures.md](../optimizations/hierarchical-structures.md) | Rank/select for BP |
-| Branchless masking | [branchless.md](../optimizations/branchless.md) | SIMD result extraction |
-| Lazy evaluation | [zero-copy.md](../optimizations/zero-copy.md) | Defer value decoding |
-| Exponential search | [access-patterns.md](../optimizations/access-patterns.md) | Sequential select hints |
+| Branchless masking   | [branchless.md](../optimizations/branchless.md)                | SIMD result extraction  |
+| Lazy evaluation      | [zero-copy.md](../optimizations/zero-copy.md)                  | Defer value decoding    |
+| Exponential search   | [access-patterns.md](../optimizations/access-patterns.md)      | Sequential select hints |
 
 ---
 
