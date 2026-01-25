@@ -267,6 +267,155 @@ impl<V: DocumentValue> GenericResult<V> {
             _ => None,
         }
     }
+
+    /// Stream results as JSON to the output writer.
+    ///
+    /// This is the M2 streaming fast path that avoids OwnedValue materialization
+    /// for cursor-based results. For owned results, uses the StreamableValue impl.
+    ///
+    /// Returns the number of values streamed and whether the last was falsy.
+    pub fn stream_json<W: core::fmt::Write>(
+        &self,
+        out: &mut W,
+        mut on_value: impl FnMut(&mut W) -> core::fmt::Result,
+    ) -> Result<crate::jq::stream::StreamStats, core::fmt::Error> {
+        use crate::jq::stream::{StreamStats, StreamableValue};
+
+        let mut stats = StreamStats::default();
+
+        match self {
+            GenericResult::One(v) => {
+                // Convert to owned for streaming
+                let owned = to_owned(v);
+                owned.stream_json(out)?;
+                on_value(out)?;
+                stats.count = 1;
+                stats.last_was_falsy = owned.is_falsy();
+            }
+            GenericResult::OneCursor(c) => {
+                // Stream directly from cursor using DocumentCursor trait
+                c.stream_json(out)?;
+                on_value(out)?;
+                stats.count = 1;
+                stats.last_was_falsy = c.is_falsy();
+            }
+            GenericResult::Many(vs) => {
+                for v in vs {
+                    let owned = to_owned(v);
+                    owned.stream_json(out)?;
+                    on_value(out)?;
+                    stats.last_was_falsy = owned.is_falsy();
+                }
+                stats.count = vs.len();
+            }
+            GenericResult::None => {
+                // No output
+            }
+            GenericResult::Error(e) => {
+                // Write error message (like jq does)
+                write!(out, "jq: error: {}", e)?;
+                on_value(out)?;
+            }
+            GenericResult::Owned(o) => {
+                o.stream_json(out)?;
+                on_value(out)?;
+                stats.count = 1;
+                stats.last_was_falsy = o.is_falsy();
+            }
+            GenericResult::ManyOwned(os) => {
+                for o in os {
+                    o.stream_json(out)?;
+                    on_value(out)?;
+                    stats.last_was_falsy = o.is_falsy();
+                }
+                stats.count = os.len();
+            }
+            GenericResult::Break(label) => {
+                write!(out, "jq: error: break ${} not in label", label)?;
+                on_value(out)?;
+            }
+        }
+
+        Ok(stats)
+    }
+
+    /// Check if this result produces a single streamable cursor result.
+    ///
+    /// This is used to detect if M2 streaming can be applied for navigation queries.
+    pub fn is_single_cursor(&self) -> bool {
+        matches!(self, GenericResult::OneCursor(_))
+    }
+
+    /// Stream results as YAML to the output writer.
+    ///
+    /// This is the M2.5 streaming fast path for YAML output that avoids OwnedValue
+    /// materialization for cursor-based results.
+    ///
+    /// Returns the number of values streamed and whether the last was falsy.
+    pub fn stream_yaml<W: core::fmt::Write>(
+        &self,
+        out: &mut W,
+        indent_spaces: usize,
+        mut on_value: impl FnMut(&mut W) -> core::fmt::Result,
+    ) -> Result<crate::jq::stream::StreamStats, core::fmt::Error> {
+        use crate::jq::stream::{StreamStats, StreamableValue};
+
+        let mut stats = StreamStats::default();
+
+        match self {
+            GenericResult::One(v) => {
+                let owned = to_owned(v);
+                owned.stream_yaml(out, indent_spaces)?;
+                on_value(out)?;
+                stats.count = 1;
+                stats.last_was_falsy = owned.is_falsy();
+            }
+            GenericResult::OneCursor(c) => {
+                // Stream directly from cursor using DocumentCursor trait
+                c.stream_yaml(out, indent_spaces)?;
+                on_value(out)?;
+                stats.count = 1;
+                stats.last_was_falsy = c.is_falsy();
+            }
+            GenericResult::Many(vs) => {
+                for v in vs {
+                    let owned = to_owned(v);
+                    owned.stream_yaml(out, indent_spaces)?;
+                    on_value(out)?;
+                    stats.last_was_falsy = owned.is_falsy();
+                }
+                stats.count = vs.len();
+            }
+            GenericResult::None => {
+                // No output
+            }
+            GenericResult::Error(e) => {
+                // Write error message (like yq does)
+                write!(out, "yq: error: {}", e)?;
+                on_value(out)?;
+            }
+            GenericResult::Owned(o) => {
+                o.stream_yaml(out, indent_spaces)?;
+                on_value(out)?;
+                stats.count = 1;
+                stats.last_was_falsy = o.is_falsy();
+            }
+            GenericResult::ManyOwned(os) => {
+                for o in os {
+                    o.stream_yaml(out, indent_spaces)?;
+                    on_value(out)?;
+                    stats.last_was_falsy = o.is_falsy();
+                }
+                stats.count = os.len();
+            }
+            GenericResult::Break(label) => {
+                write!(out, "yq: error: break ${} not in label", label)?;
+                on_value(out)?;
+            }
+        }
+
+        Ok(stats)
+    }
 }
 
 /// Evaluate an expression against a document value.

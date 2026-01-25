@@ -368,9 +368,10 @@ The YAML parser uses platform-specific SIMD for hot paths:
 - **P4**: Anchor/Alias SIMD - AVX2 scans for anchor name terminators (6-17% improvement on anchor-heavy workloads)
 - **P9**: Direct YAML-to-JSON streaming - eliminated intermediate DOM for identity queries (8-22% improvement, 2.3x on yq benchmarks)
 - **P11**: BP Select1 for yq-locate - zero-cost generic select support for O(1) offset-to-BP lookups (2.5-5.9x faster select1, fixes issue #26)
+- **M2**: Navigation streaming - cursor-based streaming for navigation queries, supports both JSON and YAML output
 
 **Rejected Optimizations:**
-- **P1 (YFSM)**: Table-driven state machine for string parsing tested but showed only 0-2% improvement vs expected 15-25%. YAML strings are too simple compared to JSON (where PFSM succeeded with 33-77% gains). P0+ SIMD already optimal. See [docs/parsing/yaml.md](../parsing/yaml.md#p1-yfsm-yaml-finite-state-machine---rejected) for full analysis.
+- **P1 (YFSM)**: Table-driven state machine for string parsing tested but showed only 0-2% improvement vs expected 15-25%. YAML strings are too simple compared to JSON (where PFSM succeeded with 33-77% gains). P0+ SIMD already optimal. See [docs/parsing/yaml.md](../parsing/yaml.md) for full analysis.
 - **P2.6, P2.8, P3, P5, P6, P7, P8**: Various optimizations rejected due to micro-benchmark/real-world mismatches, grammar incompatibilities, or memory bottlenecks. See [docs/parsing/yaml.md](../parsing/yaml.md) for detailed analyses.
 
 ### Trade-offs
@@ -548,29 +549,45 @@ cargo bench --bench bp_select_micro
 
 ## M2 Streaming Navigation Benchmarks
 
-The M2 streaming optimization enables fast navigation queries without building an intermediate DOM. This section documents how to benchmark and compare different query types.
+The M2 streaming optimization enables fast navigation queries without building an intermediate DOM. M2 supports both JSON (`-o json -I0`) and YAML (`-I0`) output formats.
 
 ### Query Types and Execution Paths
 
-| Query Type | Example | Execution Path | Description |
-|------------|---------|----------------|-------------|
-| **Identity** | `.` | P9 streaming | Full document streaming output |
-| **First Element** | `.[0]` | M2 streaming | Navigate to first array element |
-| **Iteration** | `.[]` | M2 streaming | Iterate over array elements |
-| **Length** | `length` | OwnedValue | Requires full DOM construction |
+| Query Type        | Example  | Execution Path | Output Format | Description                                     |
+|-------------------|----------|----------------|---------------|-------------------------------------------------|
+| **Identity**      | `.`      | P9 streaming   | JSON or YAML  | Full document streaming output                  |
+| **First Element** | `.[0]`   | M2 streaming   | JSON or YAML  | Navigate to first array element                 |
+| **Iteration**     | `.[]`    | M2 streaming   | JSON or YAML  | Iterate over array elements                     |
+| **Length**        | `length` | OwnedValue     | JSON or YAML  | Produces computed value (not cursor-streamable) |
 
-### Benchmark Results (Apple M1 Max, 100MB navigation file)
+M2 avoids OwnedValue DOM construction for navigation queries, streaming directly from the YAML cursor to output.
 
-| Query       | Path          | succinctly | yq       | Speedup     | succ Mem | yq Mem  |
-|-------------|---------------|------------|----------|-------------|----------|---------|
-| `.`         | P9 streaming  | 1.18s      | 12.06s   | **10.2x**   | 532 MB   | 7 GB    |
-| `.[0]`      | M2 streaming  | 479ms      | 6.05s    | **12.6x**   | 532 MB   | 5 GB    |
-| `.[]`       | M2 streaming  | 3.48s      | 13.80s   | **4.0x**    | 1 GB     | 8 GB    |
-| `length`    | OwnedValue    | 480ms      | 6.04s    | **12.6x**   | 529 MB   | 5 GB    |
+**Note on `length`**: The `length` builtin uses efficient cursor iteration to count elements (O(n) traversal without value materialization). However, it produces a computed `OwnedValue::Int` result rather than a cursor to a document subtree, so it cannot use M2 streaming for output.
+
+### Benchmark Results (Apple M1 Max, navigation pattern)
+
+**10MB file:**
+
+| Query       | Path          | succinctly | yq       | Speedup      | succ Mem | yq Mem   | Mem Ratio |
+|-------------|---------------|------------|----------|--------------|----------|----------|-----------|
+| `.`         | P9 streaming  | 119ms      | 1.18s    | **9.9x**     | 67 MB    | 706 MB   | **0.09x** |
+| `.[0]`      | M2 streaming  | 53ms       | 610ms    | **11.5x**    | 65 MB    | 488 MB   | **0.13x** |
+| `.[]`       | M2 streaming  | 197ms      | 1.37s    | **6.9x**     | 69 MB    | 841 MB   | **0.08x** |
+| `length`    | OwnedValue    | 53ms       | 612ms    | **11.5x**    | 67 MB    | 489 MB   | **0.14x** |
+
+**100MB file:**
+
+| Query       | Path          | succinctly | yq       | Speedup      | succ Mem | yq Mem   | Mem Ratio |
+|-------------|---------------|------------|----------|--------------|----------|----------|-----------|
+| `.`         | P9 streaming  | 1.12s      | 11.82s   | **10.5x**    | 529 MB   | 7 GB     | **0.07x** |
+| `.[0]`      | M2 streaming  | 468ms      | 5.97s    | **12.8x**    | 534 MB   | 5 GB     | **0.11x** |
+| `.[]`       | M2 streaming  | 1.91s      | 13.67s   | **7.2x**     | 554 MB   | 8 GB     | **0.07x** |
+| `length`    | OwnedValue    | 480ms      | 5.99s    | **12.5x**    | 529 MB   | 5 GB     | **0.11x** |
 
 **Key insights**:
-- **M2 streaming (`.[0]`) is 2.5x faster than identity (`.`)** on the same file
-- **succinctly uses 10-15x less memory** than yq across all query types
+- **M2 streaming (`.[0]`) is 2.4x faster than identity (`.`)** on the same file - navigates to first element without streaming entire document
+- **succinctly uses 7-14% of yq's memory** across all query types
+- **All paths use similar base memory** because the YAML index dominates (~5x input size)
 - Navigation queries benefit from M2's lazy evaluation - only accessed elements are materialized
 - `length` and `.[0]` show similar performance because both only need to count/access the first level
 
@@ -588,6 +605,8 @@ The M2 streaming optimization enables fast navigation queries without building a
 
 # Available query types: identity, first_element, iteration, length
 ```
+
+Note: The benchmark tool uses JSON output (`-o json`) for hash comparison. M2 YAML streaming uses the same code path with YAML serialization instead of JSON.
 
 ### When M2 Streaming Helps
 

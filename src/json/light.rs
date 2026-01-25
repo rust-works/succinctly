@@ -1521,6 +1521,34 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     fn cursor_at_position(&self, line: usize, col: usize) -> Option<Self> {
         JsonCursor::cursor_at_position(self, line, col)
     }
+
+    #[inline]
+    fn stream_json<Out: core::fmt::Write>(&self, out: &mut Out) -> core::fmt::Result {
+        // For JSON, we can directly output the raw bytes - they're already valid JSON
+        if let Some(bytes) = self.raw_bytes() {
+            // SAFETY: JSON input is valid UTF-8 (checked during indexing)
+            let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
+            out.write_str(s)
+        } else {
+            Err(core::fmt::Error)
+        }
+    }
+
+    #[inline]
+    fn stream_yaml<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        indent_spaces: usize,
+    ) -> core::fmt::Result {
+        // For JSON->YAML conversion, we need to format as YAML
+        stream_json_as_yaml(out, self.value(), 0, indent_spaces)
+    }
+
+    #[inline]
+    fn is_falsy(&self) -> bool {
+        // A value is falsy if it's null or false
+        matches!(self.value(), StandardJson::Null | StandardJson::Bool(false))
+    }
 }
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
@@ -1643,6 +1671,330 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for JsonElements<'a, W> {
     fn is_empty(&self) -> bool {
         JsonElements::is_empty(self)
     }
+}
+
+// ============================================================================
+// JSON to YAML Streaming Helpers
+// ============================================================================
+
+/// Stream a JSON value as YAML.
+fn stream_json_as_yaml<'a, W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
+    out: &mut Out,
+    value: StandardJson<'a, W>,
+    current_indent: usize,
+    indent_spaces: usize,
+) -> core::fmt::Result {
+    match value {
+        StandardJson::Null => out.write_str("null"),
+        StandardJson::Bool(b) => out.write_str(if b { "true" } else { "false" }),
+        StandardJson::Number(n) => {
+            // Try integer first, then float
+            if let Ok(i) = n.as_i64() {
+                write!(out, "{}", i)
+            } else if let Ok(f) = n.as_f64() {
+                if f.is_nan() {
+                    out.write_str(".nan")
+                } else if f.is_infinite() {
+                    if f > 0.0 {
+                        out.write_str(".inf")
+                    } else {
+                        out.write_str("-.inf")
+                    }
+                } else {
+                    write!(out, "{}", f)
+                }
+            } else {
+                out.write_str("null")
+            }
+        }
+        StandardJson::String(s) => {
+            // SAFETY: JSON strings are valid UTF-8
+            let str_val = core::str::from_utf8(s.raw_bytes()).map_err(|_| core::fmt::Error)?;
+            stream_json_string_as_yaml(out, str_val)
+        }
+        StandardJson::Array(elements) => {
+            if elements.is_empty() {
+                return out.write_str("[]");
+            }
+            if indent_spaces == 0 {
+                // Flow style
+                out.write_char('[')?;
+                let mut first = true;
+                for elem in elements {
+                    if !first {
+                        out.write_str(", ")?;
+                    }
+                    first = false;
+                    stream_json_as_yaml(out, elem, 0, 0)?;
+                }
+                out.write_char(']')
+            } else {
+                // Block style
+                let mut first = true;
+                for elem in elements {
+                    if !first {
+                        out.write_char('\n')?;
+                        write_json_yaml_indent(out, current_indent)?;
+                    }
+                    first = false;
+                    out.write_str("- ")?;
+                    if is_json_container(&elem) {
+                        out.write_char('\n')?;
+                        write_json_yaml_indent(out, current_indent + indent_spaces)?;
+                        stream_json_as_yaml(
+                            out,
+                            elem,
+                            current_indent + indent_spaces,
+                            indent_spaces,
+                        )?;
+                    } else {
+                        stream_json_as_yaml(
+                            out,
+                            elem,
+                            current_indent + indent_spaces,
+                            indent_spaces,
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+        }
+        StandardJson::Object(fields) => {
+            if fields.is_empty() {
+                return out.write_str("{}");
+            }
+            if indent_spaces == 0 {
+                // Flow style
+                out.write_char('{')?;
+                let mut first = true;
+                for field in fields {
+                    if !first {
+                        out.write_str(", ")?;
+                    }
+                    first = false;
+                    // Key
+                    if let StandardJson::String(k) = field.key() {
+                        let key_str =
+                            core::str::from_utf8(k.raw_bytes()).map_err(|_| core::fmt::Error)?;
+                        stream_json_string_as_yaml(out, key_str)?;
+                    } else {
+                        out.write_str("\"\"")?;
+                    }
+                    out.write_str(": ")?;
+                    stream_json_as_yaml(out, field.value(), 0, 0)?;
+                }
+                out.write_char('}')
+            } else {
+                // Block style
+                let mut first = true;
+                for field in fields {
+                    if !first {
+                        out.write_char('\n')?;
+                        write_json_yaml_indent(out, current_indent)?;
+                    }
+                    first = false;
+                    // Key
+                    if let StandardJson::String(k) = field.key() {
+                        let key_str =
+                            core::str::from_utf8(k.raw_bytes()).map_err(|_| core::fmt::Error)?;
+                        stream_json_string_as_yaml(out, key_str)?;
+                    } else {
+                        out.write_str("\"\"")?;
+                    }
+                    out.write_char(':')?;
+                    let val = field.value();
+                    if is_json_container(&val) {
+                        out.write_char('\n')?;
+                        write_json_yaml_indent(out, current_indent + indent_spaces)?;
+                        stream_json_as_yaml(
+                            out,
+                            val,
+                            current_indent + indent_spaces,
+                            indent_spaces,
+                        )?;
+                    } else {
+                        out.write_char(' ')?;
+                        stream_json_as_yaml(
+                            out,
+                            val,
+                            current_indent + indent_spaces,
+                            indent_spaces,
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+        }
+        StandardJson::Error(_) => out.write_str("null"),
+    }
+}
+
+/// Check if a JSON value is a non-empty container.
+fn is_json_container<W: AsRef<[u64]> + Clone>(value: &StandardJson<'_, W>) -> bool {
+    match value {
+        StandardJson::Array(elements) => !elements.is_empty(),
+        StandardJson::Object(fields) => !fields.is_empty(),
+        _ => false,
+    }
+}
+
+/// Write indentation spaces.
+fn write_json_yaml_indent<Out: core::fmt::Write>(
+    out: &mut Out,
+    spaces: usize,
+) -> core::fmt::Result {
+    for _ in 0..spaces {
+        out.write_char(' ')?;
+    }
+    Ok(())
+}
+
+/// Stream a JSON string value as YAML with smart quoting.
+fn stream_json_string_as_yaml<Out: core::fmt::Write>(out: &mut Out, s: &str) -> core::fmt::Result {
+    if s.is_empty() {
+        return out.write_str("''");
+    }
+
+    // Check if we need quoting
+    if needs_json_yaml_quoting(s) {
+        stream_json_yaml_double_quoted(out, s)
+    } else {
+        out.write_str(s)
+    }
+}
+
+/// Check if a JSON string needs quoting when output as YAML.
+fn needs_json_yaml_quoting(s: &str) -> bool {
+    if s.is_empty() {
+        return true;
+    }
+
+    let bytes = s.as_bytes();
+
+    // Check first character
+    let first = bytes[0];
+    if matches!(
+        first,
+        b'-' | b'?'
+            | b':'
+            | b','
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+            | b'#'
+            | b'&'
+            | b'*'
+            | b'!'
+            | b'|'
+            | b'>'
+            | b'\''
+            | b'"'
+            | b'%'
+            | b'@'
+            | b'`'
+    ) {
+        return true;
+    }
+
+    // Check for leading/trailing whitespace
+    if bytes[0] == b' ' || bytes[bytes.len() - 1] == b' ' {
+        return true;
+    }
+
+    // Check for special values
+    let lower = s.to_lowercase();
+    if matches!(
+        lower.as_str(),
+        "null" | "~" | "true" | "false" | "yes" | "no" | "on" | "off" | ".inf" | "-.inf" | ".nan"
+    ) {
+        return true;
+    }
+
+    // Check if it looks like a number
+    if looks_like_json_yaml_number(s) {
+        return true;
+    }
+
+    // Check for special characters
+    for b in bytes {
+        if *b < 0x20 || *b == b':' || *b == b'#' {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Check if a string looks like a number.
+fn looks_like_json_yaml_number(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    // Optional sign
+    if bytes[i] == b'-' || bytes[i] == b'+' {
+        i += 1;
+        if i >= bytes.len() {
+            return false;
+        }
+    }
+
+    // Must have at least one digit
+    if !bytes[i].is_ascii_digit() {
+        return false;
+    }
+
+    // Check remaining
+    let mut has_dot = false;
+    let mut has_exp = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'0'..=b'9' => {}
+            b'.' if !has_dot && !has_exp => has_dot = true,
+            b'e' | b'E' if !has_exp => {
+                has_exp = true;
+                if i + 1 < bytes.len() && (bytes[i + 1] == b'-' || bytes[i + 1] == b'+') {
+                    i += 1;
+                }
+            }
+            _ => return false,
+        }
+        i += 1;
+    }
+
+    true
+}
+
+/// Stream a double-quoted YAML string.
+fn stream_json_yaml_double_quoted<Out: core::fmt::Write>(
+    out: &mut Out,
+    s: &str,
+) -> core::fmt::Result {
+    out.write_char('"')?;
+
+    for ch in s.chars() {
+        match ch {
+            '"' => out.write_str("\\\"")?,
+            '\\' => out.write_str("\\\\")?,
+            '\n' => out.write_str("\\n")?,
+            '\r' => out.write_str("\\r")?,
+            '\t' => out.write_str("\\t")?,
+            c if (c as u32) < 0x20 => {
+                let b = c as u8;
+                out.write_str("\\x")?;
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                out.write_char(HEX[(b >> 4) as usize] as char)?;
+                out.write_char(HEX[(b & 0xf) as usize] as char)?;
+            }
+            c => out.write_char(c)?,
+        }
+    }
+
+    out.write_char('"')
 }
 
 #[cfg(test)]

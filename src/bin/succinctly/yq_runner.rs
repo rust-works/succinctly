@@ -4,6 +4,7 @@
 //! YAML semi-indexing and jq expression evaluator.
 
 use anyhow::{Context, Result};
+use core::fmt::Write as FmtWrite;
 use indexmap::IndexMap;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
@@ -1111,6 +1112,45 @@ fn parse_variables(args: &YqCommand) -> Result<EvalContext> {
     Ok(context)
 }
 
+/// Check if an expression can use M2 streaming path.
+///
+/// M2 streaming is used for simple navigation expressions that produce
+/// cursor results without requiring OwnedValue construction:
+/// - Identity: `.`
+/// - Field access: `.field`
+/// - Index access: `.[0]`, `.[-1]`
+/// - Iteration: `.[]`
+/// - Chained navigation: `.field[0].name`
+/// - Optional variants: `.field?`, `.[0]?`, `.[]?`
+///
+/// Expressions that require OwnedValue construction cannot use M2:
+/// - Builtins like `length`, `keys`, `map`
+/// - Array/object construction: `[...]`, `{...}`
+/// - Arithmetic, comparison, and logic operators
+/// - String interpolation
+/// - Variables and function calls
+fn can_use_m2_streaming(expr: &Expr) -> bool {
+    match expr {
+        // Core M2 expressions
+        Expr::Identity => true,
+        Expr::Field(_) => true,
+        Expr::Index(_) => true,
+        Expr::Iterate => true,
+
+        // Chained navigation
+        Expr::Pipe(exprs) => exprs.iter().all(can_use_m2_streaming),
+
+        // Optional variants
+        Expr::Optional(inner) => can_use_m2_streaming(inner),
+
+        // Parentheses don't affect streamability
+        Expr::Paren(inner) => can_use_m2_streaming(inner),
+
+        // Everything else requires OwnedValue
+        _ => false,
+    }
+}
+
 /// Check if an expression contains the split_doc builtin.
 /// This is used to determine if output should use per-result document separators.
 fn contains_split_doc(expr: &Expr) -> bool {
@@ -1351,10 +1391,18 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // Check if expression contains split_doc - if so, each result is a separate document
     let has_split_doc = contains_split_doc(&program.expr);
 
-    // Fast path: identity filter with JSON compact output - stream directly from YAML cursor
-    // This avoids building OwnedValue DOM and JSON round-trip
+    // M2 streaming fast path: navigation queries with compact output
+    // This avoids building OwnedValue DOM for:
+    // - Identity: `.`
+    // - Field access: `.field`
+    // - Index access: `.[0]`
+    // - Iteration: `.[]`
+    // - Chained navigation: `.field[0].name`
+    //
+    // Supports both JSON and YAML output formats.
     let is_identity = matches!(program.expr, Expr::Identity);
-    let can_fast_path = is_identity
+    let is_m2_streamable = can_use_m2_streaming(&program.expr);
+    let can_json_fast_path = is_m2_streamable
         && output_config.compact
         && output_config.output_format == OutputFormat::Json
         && !args.null_input
@@ -1362,11 +1410,67 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && !args.slurp
         && !args.inplace
         && context.named.is_empty();
+    let can_yaml_fast_path = is_m2_streamable
+        && output_config.compact
+        && output_config.output_format == OutputFormat::Yaml
+        && !args.null_input
+        && !args.raw_input
+        && !args.slurp
+        && !args.inplace
+        && context.named.is_empty();
+    let can_fast_path = can_json_fast_path || can_yaml_fast_path;
 
     if can_fast_path {
-        // Direct YAML → JSON streaming
+        // M2 streaming fast path: evaluate expression and stream results directly
         // Track global document index across all files for --doc filtering
         let mut global_doc_index: usize = 0;
+
+        // Helper macro to stream cursor results (avoiding closure borrow issues)
+        macro_rules! stream_cursor {
+            ($cursor:expr, $writer:expr) => {{
+                if can_yaml_fast_path {
+                    // M2 YAML path: YAML output streaming
+                    if is_identity {
+                        // P9 path: stream directly without evaluation
+                        $cursor
+                            .stream_yaml(&mut FmtWriter($writer), 2)
+                            .map_err(|_| anyhow::anyhow!("Write error"))?;
+                        writeln!($writer)?;
+                        had_output = true;
+                    } else {
+                        // M2 YAML path: evaluate and stream YAML results
+                        let result = eval_with_cursor(&program.expr, $cursor);
+                        let stats = result
+                            .stream_yaml(&mut FmtWriter($writer), 2, |w| w.write_str("\n"))
+                            .map_err(|_| anyhow::anyhow!("Write error"))?;
+                        if stats.count > 0 {
+                            had_output = true;
+                            last_was_falsy = stats.last_was_falsy;
+                        }
+                    }
+                } else {
+                    // M2 path: JSON output streaming
+                    if is_identity {
+                        // P9 path: stream directly without evaluation
+                        $cursor
+                            .stream_json(&mut FmtWriter($writer))
+                            .map_err(|_| anyhow::anyhow!("Write error"))?;
+                        writeln!($writer)?;
+                        had_output = true;
+                    } else {
+                        // M2 path: evaluate and stream results
+                        let result = eval_with_cursor(&program.expr, $cursor);
+                        let stats = result
+                            .stream_json(&mut FmtWriter($writer), |w| w.write_str("\n"))
+                            .map_err(|_| anyhow::anyhow!("Write error"))?;
+                        if stats.count > 0 {
+                            had_output = true;
+                            last_was_falsy = stats.last_was_falsy;
+                        }
+                    }
+                }
+            }};
+        }
 
         if args.files.is_empty() {
             let yaml_bytes = read_stdin()?;
@@ -1374,25 +1478,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 .map_err(|e| anyhow::anyhow!("YAML parse error: {}", e))?;
             let root = index.root(&yaml_bytes);
 
-            // Output each document directly using cursor iteration with streaming
+            // Output each document using M2 streaming
             match root.value() {
                 YamlValue::Sequence(mut docs) => {
                     while let Some((cursor, rest)) = docs.uncons_cursor() {
                         // Apply --doc filter if specified
-                        if let Some(target_doc) = args.document {
-                            if global_doc_index == target_doc {
-                                had_output = true;
-                                cursor
-                                    .stream_json(&mut FmtWriter(&mut writer))
-                                    .map_err(|_| anyhow::anyhow!("Write error"))?;
-                                writeln!(writer)?;
-                            }
-                        } else {
-                            had_output = true;
-                            cursor
-                                .stream_json(&mut FmtWriter(&mut writer))
-                                .map_err(|_| anyhow::anyhow!("Write error"))?;
-                            writeln!(writer)?;
+                        let should_process = args
+                            .document
+                            .map_or(true, |target| global_doc_index == target);
+                        if should_process {
+                            stream_cursor!(cursor, &mut writer);
                         }
                         global_doc_index += 1;
                         docs = rest;
@@ -1401,10 +1496,23 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 _ => {
                     // Single document case
                     if args.document.is_none() || args.document == Some(0) {
-                        had_output = true;
-                        root.stream_json_document(&mut FmtWriter(&mut writer))
-                            .map_err(|_| anyhow::anyhow!("Write error"))?;
-                        writeln!(writer)?;
+                        if is_identity {
+                            // P9 path for identity on single doc
+                            if can_yaml_fast_path {
+                                root.stream_yaml_document(&mut FmtWriter(&mut writer), 2)
+                                    .map_err(|_| anyhow::anyhow!("Write error"))?;
+                            } else {
+                                root.stream_json_document(&mut FmtWriter(&mut writer))
+                                    .map_err(|_| anyhow::anyhow!("Write error"))?;
+                            }
+                            writeln!(writer)?;
+                            had_output = true;
+                        } else {
+                            // M2 path: need to get the actual document cursor
+                            if let Some(doc_cursor) = root.first_child() {
+                                stream_cursor!(doc_cursor, &mut writer);
+                            }
+                        }
                     }
                 }
             }
@@ -1419,20 +1527,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     YamlValue::Sequence(mut docs) => {
                         while let Some((cursor, rest)) = docs.uncons_cursor() {
                             // Apply --doc filter if specified
-                            if let Some(target_doc) = args.document {
-                                if global_doc_index == target_doc {
-                                    had_output = true;
-                                    cursor
-                                        .stream_json(&mut FmtWriter(&mut writer))
-                                        .map_err(|_| anyhow::anyhow!("Write error"))?;
-                                    writeln!(writer)?;
-                                }
-                            } else {
-                                had_output = true;
-                                cursor
-                                    .stream_json(&mut FmtWriter(&mut writer))
-                                    .map_err(|_| anyhow::anyhow!("Write error"))?;
-                                writeln!(writer)?;
+                            let should_process = args
+                                .document
+                                .map_or(true, |target| global_doc_index == target);
+                            if should_process {
+                                stream_cursor!(cursor, &mut writer);
                             }
                             global_doc_index += 1;
                             docs = rest;
@@ -1440,11 +1539,27 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     }
                     _ => {
                         // Single document case
-                        if args.document.is_none() || args.document == Some(global_doc_index) {
-                            had_output = true;
-                            root.stream_json_document(&mut FmtWriter(&mut writer))
-                                .map_err(|_| anyhow::anyhow!("Write error"))?;
-                            writeln!(writer)?;
+                        let should_process = args
+                            .document
+                            .map_or(true, |target| global_doc_index == target);
+                        if should_process {
+                            if is_identity {
+                                // P9 path for identity on single doc
+                                if can_yaml_fast_path {
+                                    root.stream_yaml_document(&mut FmtWriter(&mut writer), 2)
+                                        .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                } else {
+                                    root.stream_json_document(&mut FmtWriter(&mut writer))
+                                        .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                }
+                                writeln!(writer)?;
+                                had_output = true;
+                            } else {
+                                // M2 path: need to get the actual document cursor
+                                if let Some(doc_cursor) = root.first_child() {
+                                    stream_cursor!(doc_cursor, &mut writer);
+                                }
+                            }
                         }
                         global_doc_index += 1;
                     }

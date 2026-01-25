@@ -1110,6 +1110,177 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         self.stream_json_value(out)
     }
 
+    /// Stream this cursor's value as YAML.
+    ///
+    /// - `indent_spaces`: Spaces per indentation level (0 for flow style)
+    ///
+    /// This enables M2.5 streaming optimization for YAML output format,
+    /// allowing navigation query results to be written directly without
+    /// materializing OwnedValue.
+    pub fn stream_yaml<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        indent_spaces: usize,
+    ) -> core::fmt::Result {
+        self.stream_yaml_value(out, 0, indent_spaces)
+    }
+
+    /// Stream YAML, unwrapping single documents (matches yq behavior).
+    ///
+    /// If the root is a single-document array `[doc]`, outputs just `doc` as YAML.
+    pub fn stream_yaml_document<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        indent_spaces: usize,
+    ) -> core::fmt::Result {
+        // Check if this is the root document array with a single document
+        if self.bp_pos == 0 {
+            if let YamlValue::Sequence(elements) = self.value() {
+                if let Some((cursor, rest)) = elements.uncons_cursor() {
+                    if rest.is_empty() {
+                        // Single document - output it directly without array wrapper
+                        return cursor.stream_yaml_value(out, 0, indent_spaces);
+                    }
+                }
+            }
+        }
+
+        // Multiple documents or not at root - output as-is
+        self.stream_yaml_value(out, 0, indent_spaces)
+    }
+
+    /// Internal: stream this cursor's value as YAML.
+    fn stream_yaml_value<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        current_indent: usize,
+        indent_spaces: usize,
+    ) -> core::fmt::Result {
+        match self.value() {
+            YamlValue::Null => out.write_str("null"),
+            YamlValue::String(s) => stream_yaml_string_value(out, &s),
+            YamlValue::Mapping(fields) => {
+                if fields.is_empty() {
+                    return out.write_str("{}");
+                }
+                if indent_spaces == 0 {
+                    // Flow style
+                    out.write_char('{')?;
+                    let mut first = true;
+                    for field in fields {
+                        if !first {
+                            out.write_str(", ")?;
+                        }
+                        first = false;
+                        // Write key
+                        if let YamlValue::String(s) = field.key() {
+                            stream_yaml_string_value(out, &s)?;
+                        } else {
+                            out.write_str("\"\"")?;
+                        }
+                        out.write_str(": ")?;
+                        field.value_cursor().stream_yaml_value(out, 0, 0)?;
+                    }
+                    out.write_char('}')
+                } else {
+                    // Block style
+                    let mut first = true;
+                    for field in fields {
+                        if !first {
+                            out.write_char('\n')?;
+                            write_yaml_indent(out, current_indent)?;
+                        }
+                        first = false;
+                        // Write key
+                        if let YamlValue::String(s) = field.key() {
+                            stream_yaml_string_value(out, &s)?;
+                        } else {
+                            out.write_str("\"\"")?;
+                        }
+                        out.write_char(':')?;
+                        // Check if value needs newline
+                        let value = field.value_cursor();
+                        if is_yaml_cursor_container(&value) {
+                            out.write_char('\n')?;
+                            write_yaml_indent(out, current_indent + indent_spaces)?;
+                            value.stream_yaml_value(
+                                out,
+                                current_indent + indent_spaces,
+                                indent_spaces,
+                            )?;
+                        } else {
+                            out.write_char(' ')?;
+                            value.stream_yaml_value(
+                                out,
+                                current_indent + indent_spaces,
+                                indent_spaces,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            YamlValue::Sequence(elements) => {
+                if elements.is_empty() {
+                    return out.write_str("[]");
+                }
+                if indent_spaces == 0 {
+                    // Flow style
+                    out.write_char('[')?;
+                    let mut first = true;
+                    let mut elems = elements;
+                    while let Some((cursor, rest)) = elems.uncons_cursor() {
+                        if !first {
+                            out.write_str(", ")?;
+                        }
+                        first = false;
+                        cursor.stream_yaml_value(out, 0, 0)?;
+                        elems = rest;
+                    }
+                    out.write_char(']')
+                } else {
+                    // Block style
+                    let mut first = true;
+                    let mut elems = elements;
+                    while let Some((cursor, rest)) = elems.uncons_cursor() {
+                        if !first {
+                            out.write_char('\n')?;
+                            write_yaml_indent(out, current_indent)?;
+                        }
+                        first = false;
+                        out.write_str("- ")?;
+                        // Check if value needs newline
+                        if is_yaml_cursor_container(&cursor) {
+                            out.write_char('\n')?;
+                            write_yaml_indent(out, current_indent + indent_spaces)?;
+                            cursor.stream_yaml_value(
+                                out,
+                                current_indent + indent_spaces,
+                                indent_spaces,
+                            )?;
+                        } else {
+                            cursor.stream_yaml_value(
+                                out,
+                                current_indent + indent_spaces,
+                                indent_spaces,
+                            )?;
+                        }
+                        elems = rest;
+                    }
+                    Ok(())
+                }
+            }
+            YamlValue::Alias { target, .. } => {
+                if let Some(target_cursor) = target {
+                    target_cursor.stream_yaml_value(out, current_indent, indent_spaces)
+                } else {
+                    out.write_str("null")
+                }
+            }
+            YamlValue::Error(_) => out.write_str("null"),
+        }
+    }
+
     /// Internal: stream this cursor's value as JSON.
     fn stream_json_value<Out: core::fmt::Write>(&self, out: &mut Out) -> core::fmt::Result {
         match self.value() {
@@ -4447,6 +4618,39 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     fn cursor_at_position(&self, line: usize, col: usize) -> Option<Self> {
         YamlCursor::cursor_at_position(self, line, col)
     }
+
+    #[inline]
+    fn stream_json<Out: core::fmt::Write>(&self, out: &mut Out) -> core::fmt::Result {
+        YamlCursor::stream_json(self, out)
+    }
+
+    #[inline]
+    fn stream_yaml<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        indent_spaces: usize,
+    ) -> core::fmt::Result {
+        YamlCursor::stream_yaml(self, out, indent_spaces)
+    }
+
+    #[inline]
+    fn is_falsy(&self) -> bool {
+        // A value is falsy if it's null or false
+        match self.value() {
+            YamlValue::Null => true,
+            YamlValue::String(s) if s.is_unquoted() => {
+                if let Ok(str_val) = s.as_str() {
+                    matches!(
+                        str_val.as_ref(),
+                        "null" | "~" | "" | "false" | "False" | "FALSE"
+                    )
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
 }
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
@@ -4639,6 +4843,202 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for YamlElements<'a, W> {
     fn is_empty(&self) -> bool {
         YamlElements::is_empty(self)
     }
+}
+
+// ============================================================================
+// YAML Streaming Helpers
+// ============================================================================
+
+/// Check if a cursor points to a non-empty container.
+fn is_yaml_cursor_container<W: AsRef<[u64]>>(cursor: &YamlCursor<'_, W>) -> bool {
+    match cursor.value() {
+        YamlValue::Mapping(fields) => !fields.is_empty(),
+        YamlValue::Sequence(elements) => !elements.is_empty(),
+        _ => false,
+    }
+}
+
+/// Write indentation spaces.
+fn write_yaml_indent<Out: core::fmt::Write>(out: &mut Out, spaces: usize) -> core::fmt::Result {
+    for _ in 0..spaces {
+        out.write_char(' ')?;
+    }
+    Ok(())
+}
+
+/// Stream a YAML string value with smart quoting.
+fn stream_yaml_string_value<Out: core::fmt::Write>(
+    out: &mut Out,
+    s: &YamlString<'_>,
+) -> core::fmt::Result {
+    // Try to get the string value
+    let str_val = match s.as_str() {
+        Ok(v) => v,
+        Err(_) => return out.write_str("\"\""),
+    };
+
+    // For quoted strings, preserve the quoting style
+    match s {
+        YamlString::DoubleQuoted { .. } => stream_yaml_double_quoted(out, &str_val),
+        YamlString::SingleQuoted { .. } => stream_yaml_single_quoted(out, &str_val),
+        _ => {
+            // Unquoted or block - use smart quoting based on content
+            if needs_yaml_quoting(&str_val) {
+                stream_yaml_double_quoted(out, &str_val)
+            } else {
+                out.write_str(&str_val)
+            }
+        }
+    }
+}
+
+/// Check if a string needs quoting in YAML.
+fn needs_yaml_quoting(s: &str) -> bool {
+    if s.is_empty() {
+        return true;
+    }
+
+    let bytes = s.as_bytes();
+
+    // Check first character - indicators that require quoting
+    let first = bytes[0];
+    if matches!(
+        first,
+        b'-' | b'?'
+            | b':'
+            | b','
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+            | b'#'
+            | b'&'
+            | b'*'
+            | b'!'
+            | b'|'
+            | b'>'
+            | b'\''
+            | b'"'
+            | b'%'
+            | b'@'
+            | b'`'
+    ) {
+        return true;
+    }
+
+    // Check for leading/trailing whitespace
+    if bytes[0] == b' ' || bytes[bytes.len() - 1] == b' ' {
+        return true;
+    }
+
+    // Check for special values that look like YAML keywords
+    let lower = s.to_lowercase();
+    if matches!(
+        lower.as_str(),
+        "null" | "~" | "true" | "false" | "yes" | "no" | "on" | "off" | ".inf" | "-.inf" | ".nan"
+    ) {
+        return true;
+    }
+
+    // Check if it looks like a number
+    if looks_like_yaml_number(s) {
+        return true;
+    }
+
+    // Check for characters that need escaping
+    for b in bytes {
+        if *b < 0x20 || *b == b':' || *b == b'#' {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Check if a string looks like a number.
+fn looks_like_yaml_number(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    // Optional sign
+    if bytes[i] == b'-' || bytes[i] == b'+' {
+        i += 1;
+        if i >= bytes.len() {
+            return false;
+        }
+    }
+
+    // Must have at least one digit
+    if !bytes[i].is_ascii_digit() {
+        return false;
+    }
+
+    // Check remaining characters
+    let mut has_dot = false;
+    let mut has_exp = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'0'..=b'9' => {}
+            b'.' if !has_dot && !has_exp => has_dot = true,
+            b'e' | b'E' if !has_exp => {
+                has_exp = true;
+                // Optional sign after exponent
+                if i + 1 < bytes.len() && (bytes[i + 1] == b'-' || bytes[i + 1] == b'+') {
+                    i += 1;
+                }
+            }
+            _ => return false,
+        }
+        i += 1;
+    }
+
+    true
+}
+
+/// Stream a double-quoted YAML string with proper escaping.
+fn stream_yaml_double_quoted<Out: core::fmt::Write>(out: &mut Out, s: &str) -> core::fmt::Result {
+    out.write_char('"')?;
+
+    for ch in s.chars() {
+        match ch {
+            '"' => out.write_str("\\\"")?,
+            '\\' => out.write_str("\\\\")?,
+            '\n' => out.write_str("\\n")?,
+            '\r' => out.write_str("\\r")?,
+            '\t' => out.write_str("\\t")?,
+            c if (c as u32) < 0x20 => {
+                // Control characters as \xNN
+                let b = c as u8;
+                out.write_str("\\x")?;
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                out.write_char(HEX[(b >> 4) as usize] as char)?;
+                out.write_char(HEX[(b & 0xf) as usize] as char)?;
+            }
+            c => out.write_char(c)?,
+        }
+    }
+
+    out.write_char('"')
+}
+
+/// Stream a single-quoted YAML string with proper escaping.
+fn stream_yaml_single_quoted<Out: core::fmt::Write>(out: &mut Out, s: &str) -> core::fmt::Result {
+    out.write_char('\'')?;
+
+    for ch in s.chars() {
+        if ch == '\'' {
+            // Single quotes are escaped by doubling
+            out.write_str("''")?;
+        } else {
+            out.write_char(ch)?;
+        }
+    }
+
+    out.write_char('\'')
 }
 
 #[cfg(test)]

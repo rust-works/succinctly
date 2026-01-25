@@ -23,7 +23,7 @@ pub enum QueryType {
     FirstElement,
     /// Iteration (`.[]`) - uses M2 streaming
     Iteration,
-    /// Length builtin (`length`) - uses OwnedValue path
+    /// Length builtin (`length`) - produces computed OwnedValue (not cursor-streamable)
     Length,
 }
 

@@ -74,6 +74,7 @@ pub mod eval_generic;
 mod expr;
 mod lazy;
 mod parser;
+pub mod stream;
 mod value;
 
 pub use eval::{eval, eval_lenient, substitute_vars, EvalError, QueryResult};
@@ -85,4 +86,5 @@ pub use lazy::JqValue;
 pub use parser::{
     parse, parse_program, parse_program_with_mode, parse_with_mode, ParseError, ParserMode,
 };
+pub use stream::{StreamStats, StreamableValue};
 pub use value::OwnedValue;

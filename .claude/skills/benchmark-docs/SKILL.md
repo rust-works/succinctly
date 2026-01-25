@@ -151,12 +151,12 @@ cd bench-compare && cargo bench --bench json_parsers
 
 The yq benchmark supports multiple query types to exercise different execution paths:
 
-| Query Type     | Example    | Execution Path | Description                      |
-|----------------|------------|----------------|----------------------------------|
-| `identity`     | `.`        | P9 streaming   | Full document streaming output   |
-| `first_element`| `.[0]`     | M2 streaming   | Navigate to first array element  |
-| `iteration`    | `.[]`      | M2 streaming   | Iterate over array elements      |
-| `length`       | `length`   | OwnedValue     | Requires full DOM construction   |
+| Query Type     | Example    | Execution Path | Description                                     |
+|----------------|------------|----------------|-------------------------------------------------|
+| `identity`     | `.`        | P9 streaming   | Full document streaming output                  |
+| `first_element`| `.[0]`     | M2 streaming   | Navigate to first array element                 |
+| `iteration`    | `.[]`      | M2 streaming   | Iterate over array elements                     |
+| `length`       | `length`   | OwnedValue     | Produces computed value (not cursor-streamable) |
 
 ### Running yq Benchmarks
 

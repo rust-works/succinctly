@@ -76,6 +76,38 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     fn cursor_at_position(&self, _line: usize, _col: usize) -> Option<Self> {
         None
     }
+
+    /// Stream this cursor's value as compact JSON to the output.
+    ///
+    /// This enables M2 streaming optimization where navigation query results
+    /// can be written directly to output without materializing OwnedValue.
+    ///
+    /// Default implementation returns an error indicating streaming is not supported.
+    fn stream_json<W: core::fmt::Write>(&self, _out: &mut W) -> core::fmt::Result {
+        Err(core::fmt::Error)
+    }
+
+    /// Stream this cursor's value as YAML to the output.
+    ///
+    /// This enables M2.5 streaming optimization for YAML output format.
+    /// - `indent_spaces`: Spaces per indentation level (0 for flow style)
+    ///
+    /// Default implementation returns an error indicating streaming is not supported.
+    fn stream_yaml<W: core::fmt::Write>(
+        &self,
+        _out: &mut W,
+        _indent_spaces: usize,
+    ) -> core::fmt::Result {
+        Err(core::fmt::Error)
+    }
+
+    /// Check if the value at this cursor is falsy (null or false).
+    ///
+    /// Used for `--exit-status` flag handling without requiring full materialization.
+    /// Default implementation returns false (conservative assumption).
+    fn is_falsy(&self) -> bool {
+        false
+    }
 }
 
 /// A value from a document (JSON value or YAML value).

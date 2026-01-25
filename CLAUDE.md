@@ -328,12 +328,12 @@ To regenerate: `succinctly dev bench yq` (includes memory) or `cargo bench --ben
 
 | Query       | Path          | succinctly | yq       | Speedup     | succ Mem | yq Mem  |
 |-------------|---------------|------------|----------|-------------|----------|---------|
-| `.`         | P9 streaming  | 1.18s      | 12.06s   | **10.2x**   | 532 MB   | 7 GB    |
-| `.[0]`      | M2 streaming  | 479ms      | 6.05s    | **12.6x**   | 532 MB   | 5 GB    |
-| `.[]`       | M2 streaming  | 3.48s      | 13.80s   | **4.0x**    | 1 GB     | 8 GB    |
-| `length`    | OwnedValue    | 480ms      | 6.04s    | **12.6x**   | 529 MB   | 5 GB    |
+| `.`         | P9 streaming  | 1.12s      | 11.82s   | **10.5x**   | 529 MB   | 7 GB    |
+| `.[0]`      | M2 streaming  | 468ms      | 5.97s    | **12.8x**   | 534 MB   | 5 GB    |
+| `.[]`       | M2 streaming  | 1.91s      | 13.67s   | **7.2x**    | 554 MB   | 8 GB    |
+| `length`    | OwnedValue    | 480ms      | 5.99s    | **12.5x**   | 529 MB   | 5 GB    |
 
-M2 streaming (`.[0]`) is **2.5x faster** than identity (`.`), with **10-15x less memory** than yq.
+M2 streaming (`.[0]`) is **2.4x faster** than identity (`.`), with **7-14% of yq's memory**.
 
 To benchmark: `succinctly dev bench yq --queries all --memory`
 
