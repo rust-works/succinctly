@@ -5,36 +5,19 @@
 
 use anyhow::Result;
 use std::process::Command;
-use std::time::Duration;
-
-/// Maximum retries for cargo run commands that fail with exit code 101.
-/// This handles flaky failures from cargo lock contention when tests run in parallel.
-const MAX_CARGO_RETRIES: u32 = 3;
 
 /// Helper to run a CLI command and capture its output
 fn run_cli(args: &[&str]) -> Result<String> {
-    for attempt in 0..MAX_CARGO_RETRIES {
-        let output = Command::new("cargo")
-            .args(["run", "--features", "cli", "--bin", "succinctly", "--"])
-            .args(args)
-            .output()?;
+    let output = Command::new(assert_cmd::cargo_bin!("succinctly"))
+        .args(args)
+        .output()?;
 
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        // Exit code 101 often indicates cargo lock contention; retry
-        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
-            std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
-            continue;
-        }
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("Command failed: {}", stderr);
-        }
-
-        return Ok(String::from_utf8(output.stdout)?);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Command failed: {}", stderr);
     }
-    unreachable!()
+
+    Ok(String::from_utf8(output.stdout)?)
 }
 
 #[test]

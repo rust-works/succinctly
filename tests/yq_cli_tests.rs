@@ -7,83 +7,45 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use anyhow::Result;
 use tempfile::NamedTempFile;
 
-/// Maximum retries for flaky cargo run commands (lock contention in CI)
-const MAX_CARGO_RETRIES: usize = 3;
-
 /// Helper to run yq command with input from stdin
 fn run_yq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(String, i32)> {
-    for attempt in 0..MAX_CARGO_RETRIES {
-        let mut cmd = Command::new("cargo")
-            .args([
-                "run",
-                "--features",
-                "cli",
-                "--bin",
-                "succinctly",
-                "--",
-                "yq",
-            ])
-            .args(extra_args)
-            .arg(filter)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("succinctly"))
+        .arg("yq")
+        .args(extra_args)
+        .arg(filter)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
 
-        if let Some(mut stdin) = cmd.stdin.take() {
-            stdin.write_all(input.as_bytes())?;
-        }
-
-        let output = cmd.wait_with_output()?;
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        // Exit code 101 often indicates cargo lock contention; retry
-        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
-            std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
-            continue;
-        }
-
-        let stdout = String::from_utf8(output.stdout)?;
-        return Ok((stdout, exit_code));
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(input.as_bytes())?;
     }
-    unreachable!()
+
+    let output = cmd.wait_with_output()?;
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8(output.stdout)?;
+
+    Ok((stdout, exit_code))
 }
 
 /// Helper to run yq command with file input
 fn run_yq_file(filter: &str, file_path: &str, extra_args: &[&str]) -> Result<(String, i32)> {
-    for attempt in 0..MAX_CARGO_RETRIES {
-        let output = Command::new("cargo")
-            .args([
-                "run",
-                "--features",
-                "cli",
-                "--bin",
-                "succinctly",
-                "--",
-                "yq",
-            ])
-            .args(extra_args)
-            .arg(filter)
-            .arg(file_path)
-            .output()?;
+    let output = Command::new(assert_cmd::cargo_bin!("succinctly"))
+        .arg("yq")
+        .args(extra_args)
+        .arg(filter)
+        .arg(file_path)
+        .output()?;
 
-        let exit_code = output.status.code().unwrap_or(-1);
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8(output.stdout)?;
 
-        // Exit code 101 often indicates cargo lock contention; retry
-        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
-            std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
-            continue;
-        }
-
-        let stdout = String::from_utf8(output.stdout)?;
-        return Ok((stdout, exit_code));
-    }
-    unreachable!()
+    Ok((stdout, exit_code))
 }
 
 /// Helper to run system yq command with input from stdin

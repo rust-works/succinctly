@@ -80,6 +80,7 @@ md5 = { version = "0.7", optional = true }
 ctrlc = { version = "3.4", optional = true }
 
 [dev-dependencies]
+assert_cmd = "2.0"
 criterion = "0.5"
 proptest = "1.0"
 rand = "0.8"
