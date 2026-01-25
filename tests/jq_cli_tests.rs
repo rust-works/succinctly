@@ -1375,31 +1375,40 @@ fn test_import_with_namespace() -> Result<()> {
 
 /// Helper to run jq command with binary input (for testing --seq with RS characters)
 fn run_jq_binary_stdin(filter: &str, input: &[u8], extra_args: &[&str]) -> Result<(Vec<u8>, i32)> {
-    let mut cmd = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "cli",
-            "--bin",
-            "succinctly",
-            "--",
-            "jq",
-        ])
-        .args(extra_args)
-        .arg(filter)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    for attempt in 0..MAX_CARGO_RETRIES {
+        let mut cmd = Command::new("cargo")
+            .args([
+                "run",
+                "--features",
+                "cli",
+                "--bin",
+                "succinctly",
+                "--",
+                "jq",
+            ])
+            .args(extra_args)
+            .arg(filter)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
 
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(input)?;
+        if let Some(mut stdin) = cmd.stdin.take() {
+            stdin.write_all(input)?;
+        }
+
+        let output = cmd.wait_with_output()?;
+        let exit_code = output.status.code().unwrap_or(-1);
+
+        // Exit code 101 often indicates cargo lock contention; retry
+        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
+            std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
+            continue;
+        }
+
+        return Ok((output.stdout, exit_code));
     }
-
-    let output = cmd.wait_with_output()?;
-    let exit_code = output.status.code().unwrap_or(-1);
-
-    Ok((output.stdout, exit_code))
+    unreachable!()
 }
 
 #[test]
