@@ -168,6 +168,13 @@ impl<'a> Parser<'a> {
         let seq_item_words = vec![0u64; input.len().div_ceil(32).max(1)]; // Same size as BP
         let container_words = vec![0u64; input.len().div_ceil(32).max(1)]; // Same size as BP
 
+        // Estimate BP opens: ~1 structural element per 8 bytes of input
+        let estimated_opens = input.len().div_ceil(8).max(1);
+
+        // Pre-allocate indent/type stacks for typical nesting depths
+        let mut indent_stack = Vec::with_capacity(32);
+        indent_stack.push(0); // Start at indent 0
+
         Self {
             input,
             pos: 0,
@@ -178,10 +185,10 @@ impl<'a> Parser<'a> {
             container_words,
             bp_pos: 0,
             ty_pos: 0,
-            bp_to_text: Vec::new(),
-            bp_to_text_end: Vec::new(),
-            indent_stack: vec![0], // Start at indent 0
-            type_stack: Vec::new(),
+            bp_to_text: Vec::with_capacity(estimated_opens),
+            bp_to_text_end: Vec::with_capacity(estimated_opens),
+            indent_stack,
+            type_stack: Vec::with_capacity(32),
             current_type: None,
             anchors: BTreeMap::new(),
             aliases: BTreeMap::new(),
