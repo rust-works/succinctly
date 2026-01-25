@@ -17,13 +17,13 @@ The benchmarks below compare succinctly against DOM-based tools (jq, yq, serde_j
 
 ## Benchmark Results
 
-| Benchmark                        | Description                          | Key Finding                                      |
-|----------------------------------|--------------------------------------|--------------------------------------------------|
-| [jq](jq.md)                      | succinctly jq vs system jq           | 1.5-2.7x faster across platforms                 |
-| [yq](yq.md)                      | succinctly yq vs system yq           | 4.5-11x faster (Graviton 4), 16-40x (x86_64)     |
-| [Rust Parsers](rust-parsers.md)  | vs serde_json, sonic-rs, simd-json   | Competitive with specialized parsers             |
-| [Cross-Language](cross-language.md) | Multi-language parser comparison  | Best-in-class for semi-indexing                  |
-| [DSV](dsv.md)                    | CSV/TSV parsing performance          | 85-1676 MiB/s (API)                              |
+| Benchmark                           | Description                          | Key Finding                                      |
+|-------------------------------------|--------------------------------------|--------------------------------------------------|
+| [jq](jq.md)                         | succinctly jq vs system jq           | 1.5-2.7x faster across platforms                 |
+| [yq](yq.md)                         | succinctly yq vs system yq           | 4.5-11x faster (Graviton 4), 16-40x (x86_64)     |
+| [Rust Parsers](rust-parsers.md)     | vs serde_json, sonic-rs, simd-json   | Competitive with specialized parsers             |
+| [Cross-Language](cross-language.md) | Multi-language parser comparison     | Best-in-class for semi-indexing                  |
+| [DSV](dsv.md)                       | CSV/TSV parsing performance          | 85-1676 MiB/s (API)                              |
 
 ## Methodology
 
@@ -35,24 +35,25 @@ All benchmarks use:
 
 ## Available Benchmark Suites
 
-| Benchmark               | Description                               | Data Required    |
-|-------------------------|-------------------------------------------|------------------|
-| `pfsm_vs_simd`          | PFSM (table-based) vs SIMD (AVX2/NEON)    | JSON test data   |
-| `pfsm_vs_scalar`        | PFSM vs true scalar implementation        | JSON test data   |
-| `json_simd`             | All SIMD implementations comparison       | JSON test data   |
-| `json_pipeline`         | Full pipeline: index + navigate + print   | JSON test data   |
-| `jq_comparison`         | succinctly jq vs system jq                | CLI + JSON data  |
-| `yq_comparison`         | succinctly yq vs system yq                | CLI + YAML data  |
-| `yq_select`             | Partial selection queries                 | CLI + YAML data  |
-| `yaml_bench`            | YAML parsing throughput                   | Generated inline |
-| `yaml_type_stack_micro` | YAML type stack operations                | Generated inline |
-| `yaml_anchor_micro`     | YAML anchor parsing                       | Generated inline |
-| `yaml_transcode_micro`  | YAML→JSON transcoding                     | Generated inline |
-| `dsv_bench`             | DSV/CSV parsing and access                | DSV test data    |
-| `rank_select`           | BitVec rank/select operations             | Generated inline |
-| `balanced_parens`       | Tree navigation operations                | Generated inline |
-| `neon_movemask`         | NEON movemask implementations             | N/A (ARM only)   |
-| `popcount_strategies`   | Popcount implementations                  | Generated inline |
+| Benchmark               | Description                                | Data Required    |
+|-------------------------|--------------------------------------------|------------------|
+| `pfsm_vs_simd`          | PFSM (table-based) vs SIMD (AVX2/NEON)     | JSON test data   |
+| `pfsm_vs_scalar`        | PFSM vs true scalar implementation         | JSON test data   |
+| `json_simd`             | All SIMD implementations comparison        | JSON test data   |
+| `json_pipeline`         | Full pipeline: index + navigate + print    | JSON test data   |
+| `jq_comparison`         | succinctly jq vs system jq                 | CLI + JSON data  |
+| `yq_comparison`         | succinctly yq vs system yq                 | CLI + YAML data  |
+| `yq_select`             | Partial selection queries                  | CLI + YAML data  |
+| `yaml_bench`            | YAML parsing throughput                    | Generated inline |
+| `yaml_type_stack_micro` | YAML type stack operations                 | Generated inline |
+| `yaml_anchor_micro`     | YAML anchor parsing                        | Generated inline |
+| `yaml_transcode_micro`  | YAML→JSON transcoding                      | Generated inline |
+| `dsv_bench`             | DSV/CSV parsing and access                 | DSV test data    |
+| `rank_select`           | BitVec rank/select operations              | Generated inline |
+| `balanced_parens`       | Tree navigation operations                 | Generated inline |
+| `elias_fano`            | Elias-Fano encoding for monotone sequences | Generated inline |
+| `neon_movemask`         | NEON movemask implementations              | N/A (ARM only)   |
+| `popcount_strategies`   | Popcount implementations                   | Generated inline |
 
 ## Running Benchmarks
 

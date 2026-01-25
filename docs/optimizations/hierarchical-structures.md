@@ -186,6 +186,95 @@ fn select1(&self, k: u64) -> u64 {
 
 ---
 
+## Elias-Fano Encoding
+
+**Problem**: Store monotonically increasing integers (like `bp_to_text` positions) compactly.
+
+**Naive**: Store as `Vec<u32>` - 4 bytes per element.
+
+### Elias-Fano Structure
+
+Split each integer into high and low bits:
+
+```
+For sequence with n elements, max value m:
+- low_width = floor(log2(m/n))
+- Low bits: dense array, n × low_width bits
+- High bits: unary encoded bitvector with n set bits
+```
+
+**Example** (n=4, values=[3, 7, 12, 15], low_width=2):
+```
+Values:   3=0b0011  7=0b0111  12=0b1100  15=0b1111
+Low bits:     11        11        00        11  → packed array
+High bits: position encodes value >> low_width
+           0 1 2 3    (high values: 0, 1, 3, 3)
+           ↓ ↓   ↓↓
+           1 1 0 1 1  (unary: one 1-bit per element at high_value + rank)
+```
+
+### Cursor-Based Access
+
+For forward-only patterns (like tree navigation), maintain cursor state:
+
+```rust
+pub struct EliasFanoCursor<'a> {
+    ef: &'a EliasFano,
+    idx: usize,           // Current element index
+    high_pos: usize,      // Position in high_bits bitvector
+    word_idx: usize,      // Current word in high_bits
+    remaining_bits: u64,  // Masked bits for scanning
+}
+
+fn advance_one(&mut self) -> Option<u32> {
+    // Clear current bit, find next 1-bit - O(1) amortized
+    self.remaining_bits &= self.remaining_bits - 1;
+    if self.remaining_bits != 0 {
+        self.high_pos = self.word_idx * 64 + self.remaining_bits.trailing_zeros();
+    } else {
+        // Scan to next non-zero word
+        self.word_idx += 1;
+        while self.ef.high_bits[self.word_idx] == 0 { self.word_idx += 1; }
+        self.remaining_bits = self.ef.high_bits[self.word_idx];
+        self.high_pos = self.word_idx * 64 + self.remaining_bits.trailing_zeros();
+    }
+    self.current()
+}
+```
+
+### Benchmark Results (Apple M1 Max)
+
+For bp_to_text-like data (positions with 10-100 byte gaps):
+
+| Metric               | EliasFano          | Vec\<u32\>   | Comparison        |
+|----------------------|--------------------|--------------|-------------------|
+| **Compression**      | 88 KB (100K elems) | 390 KB       | **4.42×** smaller |
+| Sequential iter      | 1.76 ns/elem       | 0.05 ns/elem | 36× slower        |
+| cursor_from + 5 iter | 26.2 ns            | 1.70 ns      | 15× slower        |
+| Random access        | 14.6 ns            | 0.4 ns       | 36× slower        |
+
+**Key insight**: Cursor iteration amortizes setup cost. The 36× penalty for random
+access drops to 15× when iterating 5 elements after positioning.
+
+### SIMD Optimization Opportunity
+
+The `select_in_word` operation (find k-th set bit) is the bottleneck:
+
+| Platform | Technique            | Expected Speedup                |
+|----------|----------------------|---------------------------------|
+| x86 BMI2 | `PDEP` + `TZCNT`     | 3-4× (O(1) vs O(popcount) loop) |
+| ARM NEON | Broadword with `CNT` | 1.5-2×                          |
+| ARM SVE2 | `BDEP` + `CTZ`       | 3-4× (if available)             |
+
+### Prior Art
+
+- **Elias (1974)**: Original Elias gamma/delta codes
+- **Fano (1971)**: Information-theoretic coding
+- **Vigna (2013)**: "Quasi-Succinct Indices" (modern Elias-Fano with select)
+- **Ottaviano & Venturini (2014)**: "Partitioned Elias-Fano Indexes" (SIGIR)
+
+---
+
 ## RangeMin Structure (Balanced Parentheses)
 
 **Problem**: Navigate tree encoded as balanced parentheses.
@@ -419,10 +508,13 @@ Fewer levels / larger blocks:
 |---------------------|-----------------------|----------------------------|----------|
 | 3-level RankDir     | `bits/rank.rs`        | O(1) rank queries          | ~3%      |
 | SelectIndex         | `bits/select.rs`      | Accelerated select         | ~3%      |
+| EliasFano           | `bits/elias_fano.rs`  | Compressed monotone ints   | ~23%*    |
 | CumulativeIndex     | `json/light.rs`       | Fast IB select             | ~4%      |
 | RangeMinIndex       | `trees/bp.rs`         | O(1) find_close            | ~6%      |
 | RangeMaxRevIndex    | `trees/bp.rs`         | O(1) find_open (16-492x)   | ~1.5%    |
 | LightweightIndex    | `dsv/index_*.rs`      | DSV iteration              | ~0.8%    |
+
+*EliasFano overhead is relative to the data being encoded, not to a bitvector. It provides 4.4× compression vs Vec<u32> for bp_to_text-like data.
 
 ---
 

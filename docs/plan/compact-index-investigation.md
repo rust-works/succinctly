@@ -6,10 +6,10 @@ This document outlines the investigation plan for reducing `YamlIndex` memory ov
 
 The `bp_to_text` and `bp_to_text_end` arrays use **4 bytes (u32) per node**, contributing ~0.8× input size overhead:
 
-| Component | Current Size | Formula |
-|-----------|--------------|---------|
-| `bp_to_text` | 4 bytes × M | Start position per BP open |
-| `bp_to_text_end` | 4 bytes × M | End position per BP open (0 for containers) |
+| Component        | Current Size | Formula                                     |
+|------------------|--------------|---------------------------------------------|
+| `bp_to_text`     | 4 bytes × M  | Start position per BP open                  |
+| `bp_to_text_end` | 4 bytes × M  | End position per BP open (0 for containers) |
 
 Where M = number of nodes ≈ input_size / 10 for typical YAML.
 
@@ -70,12 +70,12 @@ Store differences between consecutive positions:
 
 The positions have different properties for scalars vs containers:
 
-| Property | Scalars | Containers |
-|----------|---------|------------|
-| `bp_to_text_end` | Non-zero (actual end) | Zero (sentinel) |
-| Positions | Strictly monotonic | May share positions |
-| Interleaved [start, end] | Monotonically increasing | Not applicable |
-| Count | ~70-80% of nodes | ~20-30% of nodes |
+| Property                 | Scalars                  | Containers          |
+|--------------------------|--------------------------|---------------------|
+| `bp_to_text_end`         | Non-zero (actual end)    | Zero (sentinel)     |
+| Positions                | Strictly monotonic       | May share positions |
+| Interleaved [start, end] | Monotonically increasing | Not applicable      |
+| Count                    | ~70-80% of nodes         | ~20-30% of nodes    |
 
 **Proposed structure**:
 ```rust
@@ -196,11 +196,11 @@ pub trait PositionLookup {
 
 | File Size | Pattern | Current Memory | Compact Memory | Build Time Δ | Query Time Δ |
 |-----------|---------|----------------|----------------|--------------|--------------|
-| 10KB | users | ? | ? | ? | ? |
-| 100KB | users | ? | ? | ? | ? |
-| 1MB | users | ? | ? | ? | ? |
-| 10MB | users | ? | ? | ? | ? |
-| 100MB | users | ? | ? | ? | ? |
+| 10KB      | users   | ?              | ?              | ?            | ?            |
+| 100KB     | users   | ?              | ?              | ?            | ?            |
+| 1MB       | users   | ?              | ?              | ?            | ?            |
+| 10MB      | users   | ?              | ?              | ?            | ?            |
+| 100MB     | users   | ?              | ?              | ?            | ?            |
 
 ### Phase 5: Trade-off Analysis
 
@@ -222,11 +222,11 @@ pub trait PositionLookup {
 
 ### Optimistic Case
 
-| Component | Current | Compact | Reduction |
-|-----------|---------|---------|-----------|
-| Scalar positions | 64 MB | 5 MB | 12× |
-| Container positions | 16 MB | 16 MB | 1× |
-| **Total** | **80 MB** | **21 MB** | **4×** |
+| Component           | Current   | Compact   | Reduction |
+|---------------------|-----------|-----------|-----------|
+| Scalar positions    | 64 MB     | 5 MB      | 12×       |
+| Container positions | 16 MB     | 16 MB     | 1×        |
+| **Total**           | **80 MB** | **21 MB** | **4×**    |
 
 Total index overhead: ~5× → ~3.5× input size
 
@@ -234,9 +234,9 @@ Total index overhead: ~5× → ~3.5× input size
 
 Elias-Fano access latency too high for hot path (`bp_to_text_pos` called frequently during navigation). Fall back to bit-compressed vectors:
 
-| Component | Current | Bit-compressed | Reduction |
-|-----------|---------|----------------|-----------|
-| All positions | 80 MB | 68 MB (27-bit) | 1.2× |
+| Component     | Current | Bit-compressed | Reduction |
+|---------------|---------|----------------|-----------|
+| All positions | 80 MB   | 68 MB (27-bit) | 1.2×      |
 
 Minimal improvement, likely reject optimization.
 
@@ -257,8 +257,92 @@ Minimal improvement, likely reject optimization.
 7. [ef_rs Rust crate](https://crates.io/crates/ef_rs)
 8. [succinct Rust crate](https://github.com/miiohio/succinct)
 
+## Implementation Status
+
+### Phase 2 Complete: Portable Elias-Fano Implementation
+
+**Location**: `src/bits/elias_fano.rs`
+
+A portable Elias-Fano implementation with cursor-based access has been completed:
+
+```rust
+pub struct EliasFano {
+    low_bits: Vec<u64>,      // Dense packed low bits
+    low_width: usize,        // Bits per low value
+    high_bits: Vec<u64>,     // Unary encoded high bits
+    len: usize,              // Element count
+    universe: u64,           // Max value + 1
+    select_samples: Vec<u32>, // Sampled positions (every 256 elements)
+}
+
+pub struct EliasFanoCursor<'a> { /* cursor state for O(1) amortized iteration */ }
+```
+
+**Operations implemented**:
+- `build(values)` - Construction from sorted `Vec<u32>`
+- `get(i)` - O(1) random access via select samples
+- `cursor()` / `cursor_from(idx)` - Create cursor at position
+- `advance_one()` - O(1) amortized forward iteration
+- `advance_by(k)` - Skip k elements forward
+- `seek(idx)` - Jump to arbitrary index
+
+### Benchmark Results (Apple M1 Max)
+
+**Compression** (bp_to_text-like data with 10-100 byte gaps):
+
+| Elements | Vec\<u32\> | EliasFano | Compression |
+|----------|------------|-----------|-------------|
+| 10K      | 39 KB      | 8 KB      | **4.42×**   |
+| 100K     | 390 KB     | 88 KB     | **4.42×**   |
+| 1M       | 3.9 MB     | 883 KB    | **4.42×**   |
+
+**Access latency** (1000 queries):
+
+| Operation                | EliasFano    | Vec\<u32\>   | Ratio |
+|--------------------------|--------------|--------------|-------|
+| Sequential (advance_one) | 1.76 ns/elem | 0.05 ns/elem | 36×   |
+| Random access (get)      | 14.6 ns      | 0.4 ns       | 36×   |
+| cursor_from              | 13.4 ns      | 0.43 ns      | 31×   |
+| cursor_from + 5 iter     | 26.2 ns      | 1.70 ns      | 15×   |
+| Skip-by-2-8 (advance_by) | 8.5× slower  | —            | 8.5×  |
+
+**Key findings**:
+1. **Compression achieved**: 4.42× (exceeds 4× target)
+2. **Random access**: 36× slower than Vec (exceeds 2× target, needs SIMD optimization)
+3. **Cursor iteration amortizes well**: Ratio drops from 31× to 15× with iteration
+4. **Forward-only patterns**: The cursor-based approach works well for jq navigation patterns
+
+### Next Steps
+
+**Phase 3: SIMD Acceleration (x86)**
+- BMI2 PDEP+TZCNT for O(1) select-in-word (currently O(popcount) loop)
+- Expected: 3-4× speedup on random access
+
+**Phase 4: SIMD Acceleration (ARM)**
+- NEON popcount for broadword select
+- SVE2 BDEP if available
+
+**Phase 5: Integration**
+- Replace `bp_to_text: Vec<u32>` with `EliasFano` in YamlIndex
+- Evaluate end-to-end yq benchmark impact
+
+**Phase 6: bp_to_text_end**
+- Delta encoding from bp_to_text (scalar end = start + length)
+- Container end = 0 (sentinel, don't encode)
+
+### Decision Status
+
+**Current assessment**: PROMISING but needs SIMD optimization before integration.
+
+- ✅ Compression: 4.42× (target: 4×)
+- ❌ Random access latency: 36× (target: ≤2×)
+- ⚠️ Cursor iteration: 15× with amortization (acceptable for forward-only patterns)
+
+The portable implementation provides the foundation. SIMD-accelerated `select_in_word` should bring random access latency within acceptable bounds.
+
 ## Changelog
 
-| Date | Change |
-|------|--------|
-| 2026-01-25 | Initial investigation plan based on literature research |
+| Date       | Change                                                        |
+|------------|---------------------------------------------------------------|
+| 2026-01-25 | Initial investigation plan based on literature research       |
+| 2026-01-25 | Phase 2 complete: Portable EliasFano with cursor-based access |

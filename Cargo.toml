@@ -165,3 +165,7 @@ harness = false
 [[bench]]
 name = "bp_select_micro"
 harness = false
+
+[[bench]]
+name = "elias_fano"
+harness = false
