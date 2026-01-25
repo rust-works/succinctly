@@ -52,7 +52,18 @@ impl CacheAlignedL1L2 {
         }
     }
 
+    /// Create a builder for in-place construction.
+    ///
+    /// This avoids the intermediate Vec allocation and copy that `from_vec` requires.
+    fn builder(capacity: usize) -> CacheAlignedL1L2Builder {
+        CacheAlignedL1L2Builder::with_capacity(capacity)
+    }
+
     /// Create from a vector, allocating with cache-line alignment.
+    ///
+    /// Note: Prefer using `builder()` for new code to avoid the intermediate
+    /// Vec allocation and copy.
+    #[allow(dead_code)]
     fn from_vec(data: Vec<u128>) -> Self {
         if data.is_empty() {
             return Self::empty();
@@ -155,6 +166,145 @@ impl Default for CacheAlignedL1L2 {
 unsafe impl Send for CacheAlignedL1L2 {}
 unsafe impl Sync for CacheAlignedL1L2 {}
 
+/// Builder for in-place construction of CacheAlignedL1L2.
+///
+/// This avoids the double allocation pattern of building a Vec first
+/// and then copying to aligned memory. Instead, it allocates the
+/// aligned memory upfront and writes directly to it.
+struct CacheAlignedL1L2Builder {
+    /// Pointer to the cache-aligned allocation.
+    ptr: NonNull<u128>,
+    /// Current number of entries written.
+    len: usize,
+    /// Total capacity of the allocation.
+    capacity: usize,
+}
+
+impl CacheAlignedL1L2Builder {
+    /// Create a builder with the given capacity.
+    ///
+    /// Allocates cache-aligned memory immediately.
+    fn with_capacity(capacity: usize) -> Self {
+        if capacity == 0 {
+            return Self {
+                ptr: NonNull::dangling(),
+                len: 0,
+                capacity: 0,
+            };
+        }
+
+        let layout = Layout::from_size_align(capacity * 16, CACHE_LINE_SIZE).expect("layout error");
+
+        // Safety: layout is valid (non-zero size, power-of-two alignment)
+        let ptr = unsafe { alloc::alloc::alloc(layout) as *mut u128 };
+        if ptr.is_null() {
+            alloc::alloc::handle_alloc_error(layout);
+        }
+
+        Self {
+            ptr: NonNull::new(ptr).unwrap(),
+            len: 0,
+            capacity,
+        }
+    }
+
+    /// Push a value directly into the aligned storage.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the builder is at capacity.
+    #[inline]
+    fn push(&mut self, value: u128) {
+        debug_assert!(
+            self.len < self.capacity,
+            "CacheAlignedL1L2Builder overflow: len={}, capacity={}",
+            self.len,
+            self.capacity
+        );
+
+        // Safety: len < capacity, so ptr.add(len) is within bounds
+        unsafe {
+            self.ptr.as_ptr().add(self.len).write(value);
+        }
+        self.len += 1;
+    }
+
+    /// Consume the builder and return the finished CacheAlignedL1L2.
+    ///
+    /// If fewer elements were pushed than the capacity, the remaining
+    /// space is reclaimed.
+    fn build(self) -> CacheAlignedL1L2 {
+        if self.len == 0 {
+            // Nothing was pushed, deallocate if we allocated
+            if self.capacity > 0 {
+                let layout =
+                    Layout::from_size_align(self.capacity * 16, CACHE_LINE_SIZE).expect("layout");
+                // Safety: ptr was allocated with this layout
+                unsafe {
+                    alloc::alloc::dealloc(self.ptr.as_ptr() as *mut u8, layout);
+                }
+            }
+            return CacheAlignedL1L2::empty();
+        }
+
+        if self.len == self.capacity {
+            // Exact fit, no reallocation needed
+            // Prevent Drop from running (we're transferring ownership)
+            let result = CacheAlignedL1L2 {
+                ptr: self.ptr,
+                len: self.len,
+            };
+            core::mem::forget(self);
+            return result;
+        }
+
+        // len < capacity: reallocate to exact size
+        let new_layout =
+            Layout::from_size_align(self.len * 16, CACHE_LINE_SIZE).expect("layout error");
+
+        // Safety: new_layout is valid
+        let new_ptr = unsafe { alloc::alloc::alloc(new_layout) as *mut u128 };
+        if new_ptr.is_null() {
+            alloc::alloc::handle_alloc_error(new_layout);
+        }
+
+        // Copy to new allocation
+        // Safety: both pointers are valid, len elements
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr, self.len);
+        }
+
+        // Deallocate old (oversized) allocation
+        let old_layout =
+            Layout::from_size_align(self.capacity * 16, CACHE_LINE_SIZE).expect("layout");
+        unsafe {
+            alloc::alloc::dealloc(self.ptr.as_ptr() as *mut u8, old_layout);
+        }
+
+        // Prevent Drop from running
+        let result = CacheAlignedL1L2 {
+            ptr: NonNull::new(new_ptr).unwrap(),
+            len: self.len,
+        };
+        core::mem::forget(self);
+        result
+    }
+}
+
+impl Drop for CacheAlignedL1L2Builder {
+    fn drop(&mut self) {
+        // Only deallocate if we actually allocated
+        if self.capacity > 0 {
+            let layout =
+                Layout::from_size_align(self.capacity * 16, CACHE_LINE_SIZE).expect("layout error");
+            // Safety: ptr was allocated with this layout
+            unsafe {
+                alloc::alloc::dealloc(self.ptr.as_ptr() as *mut u8, layout);
+            }
+        }
+    }
+}
+
 #[cfg(feature = "serde")]
 impl Serialize for CacheAlignedL1L2 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -229,7 +379,7 @@ impl RankDirectory {
 
         let num_blocks = words.len().div_ceil(WORDS_PER_BLOCK);
         let mut l0 = Vec::new();
-        let mut l1_l2_vec = Vec::with_capacity(num_blocks);
+        let mut l1_l2_builder = CacheAlignedL1L2::builder(num_blocks);
 
         let mut cumulative_rank: u64 = 0;
         let mut l0_base: u64 = 0;
@@ -264,13 +414,13 @@ impl RankDirectory {
                 entry |= (offset as u128) << (32 + i * 9);
             }
 
-            l1_l2_vec.push(entry);
+            l1_l2_builder.push(entry);
             cumulative_rank += block_cumulative as u64;
         }
 
         Self {
             l0,
-            l1_l2: CacheAlignedL1L2::from_vec(l1_l2_vec),
+            l1_l2: l1_l2_builder.build(),
         }
     }
 
@@ -407,5 +557,107 @@ mod tests {
         let dir = RankDirectory::build(&words);
 
         assert_eq!(dir.rank_at_word(7), 64 * 7); // 448
+    }
+
+    // Tests for CacheAlignedL1L2Builder
+    mod builder_tests {
+        use super::*;
+
+        #[test]
+        fn test_builder_empty() {
+            let builder = CacheAlignedL1L2::builder(0);
+            let result = builder.build();
+            assert!(result.is_empty());
+            assert_eq!(result.len(), 0);
+        }
+
+        #[test]
+        fn test_builder_single_element() {
+            let mut builder = CacheAlignedL1L2::builder(1);
+            builder.push(42);
+            let result = builder.build();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result.as_slice(), &[42]);
+        }
+
+        #[test]
+        fn test_builder_multiple_elements() {
+            let mut builder = CacheAlignedL1L2::builder(4);
+            builder.push(1);
+            builder.push(2);
+            builder.push(3);
+            builder.push(4);
+            let result = builder.build();
+            assert_eq!(result.len(), 4);
+            assert_eq!(result.as_slice(), &[1, 2, 3, 4]);
+        }
+
+        #[test]
+        fn test_builder_partial_capacity() {
+            // Builder with capacity 10, only push 3 elements
+            let mut builder = CacheAlignedL1L2::builder(10);
+            builder.push(100);
+            builder.push(200);
+            builder.push(300);
+            let result = builder.build();
+            assert_eq!(result.len(), 3);
+            assert_eq!(result.as_slice(), &[100, 200, 300]);
+        }
+
+        #[test]
+        fn test_builder_matches_from_vec() {
+            // Verify builder produces same result as from_vec
+            let values: Vec<u128> = (0..16).map(|i| i * 1000).collect();
+
+            let from_vec_result = CacheAlignedL1L2::from_vec(values.clone());
+
+            let mut builder = CacheAlignedL1L2::builder(values.len());
+            for &v in &values {
+                builder.push(v);
+            }
+            let builder_result = builder.build();
+
+            assert_eq!(from_vec_result.len(), builder_result.len());
+            assert_eq!(from_vec_result.as_slice(), builder_result.as_slice());
+        }
+
+        #[test]
+        fn test_builder_alignment() {
+            // Verify the resulting pointer is cache-aligned (64 bytes)
+            let mut builder = CacheAlignedL1L2::builder(8);
+            for i in 0..8 {
+                builder.push(i as u128);
+            }
+            let result = builder.build();
+
+            // Check that the pointer is 64-byte aligned
+            let ptr_addr = result.ptr.as_ptr() as usize;
+            assert_eq!(
+                ptr_addr % CACHE_LINE_SIZE,
+                0,
+                "Pointer should be cache-line aligned"
+            );
+        }
+
+        #[test]
+        fn test_builder_large_values() {
+            // Test with large u128 values
+            let mut builder = CacheAlignedL1L2::builder(3);
+            builder.push(u128::MAX);
+            builder.push(u128::MAX / 2);
+            builder.push(1);
+            let result = builder.build();
+            assert_eq!(result.as_slice(), &[u128::MAX, u128::MAX / 2, 1]);
+        }
+
+        #[test]
+        fn test_builder_drop_without_build() {
+            // Ensure builder can be dropped without calling build (no memory leak)
+            let mut builder = CacheAlignedL1L2::builder(100);
+            builder.push(1);
+            builder.push(2);
+            // Drop without calling build() - should not leak
+            drop(builder);
+        }
     }
 }
