@@ -11,14 +11,15 @@ These plans are kept for:
 
 ## Active Plans
 
-| Plan                                                   | Status      | Module                            | Description                   |
-|--------------------------------------------------------|-------------|-----------------------------------|-------------------------------|
-| [jq.md](jq.md)                                         | Implemented | `src/jq/`                         | jq query language for JSON    |
-| [dsv.md](dsv.md)                                       | Implemented | `src/dsv/`                        | DSV (CSV/TSV) semi-indexing   |
-| [yq.md](yq.md)                                         | Implemented | `src/yaml/`, `yq_runner.rs`       | yq command for YAML           |
-| [yq-memory-optimization.md](yq-memory-optimization.md) | Partial     | `yq_runner.rs`, `eval_generic.rs` | yq memory reduction plan      |
-| [m2-benchmark-improvements.md](m2-benchmark-improvements.md) | Proposed | `yq_bench.rs`                   | Benchmark M2 streaming path   |
-| [simd-features.md](simd-features.md)                   | Current     | `src/yaml/simd/`                  | YAML SIMD feature flag matrix |
+| Plan                                                             | Status      | Module                            | Description                    |
+|------------------------------------------------------------------|-------------|-----------------------------------|--------------------------------|
+| [jq.md](jq.md)                                                   | Implemented | `src/jq/`                         | jq query language for JSON     |
+| [dsv.md](dsv.md)                                                 | Implemented | `src/dsv/`                        | DSV (CSV/TSV) semi-indexing    |
+| [yq.md](yq.md)                                                   | Implemented | `src/yaml/`, `yq_runner.rs`       | yq command for YAML            |
+| [yq-memory-optimization.md](yq-memory-optimization.md)           | Partial     | `yq_runner.rs`, `eval_generic.rs` | yq memory reduction plan       |
+| [compact-index-investigation.md](compact-index-investigation.md) | Proposed    | `src/yaml/index.rs`               | Elias-Fano for position arrays |
+| [m2-benchmark-improvements.md](m2-benchmark-improvements.md)     | Proposed    | `yq_bench.rs`                     | Benchmark M2 streaming path    |
+| [simd-features.md](simd-features.md)                             | Current     | `src/yaml/simd/`                  | YAML SIMD feature flag matrix  |
 
 ## Plan Status Legend
 
