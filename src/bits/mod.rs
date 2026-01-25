@@ -8,7 +8,7 @@
 //! - [`BitVec`] - Main bitvector with integrated rank/select indices
 //! - [`RankDirectory`] - 3-level Poppy-style rank index (~3% overhead)
 //! - [`SelectIndex`] - Sampled select index (~1-3% overhead)
-//! - [`EliasFano`] - Elias-Fano encoding for monotone integer sequences
+//! - [`EliasFano`](crate::bits::EliasFano) - Elias-Fano encoding for monotone integer sequences
 //!
 //! # Example
 //!

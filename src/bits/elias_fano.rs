@@ -39,6 +39,8 @@
 //! ```
 
 #[cfg(not(test))]
+use alloc::vec;
+#[cfg(not(test))]
 use alloc::vec::Vec;
 
 /// Select sample rate - one sample per this many elements.
