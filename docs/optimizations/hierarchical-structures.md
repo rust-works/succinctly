@@ -244,27 +244,34 @@ fn advance_one(&mut self) -> Option<u32> {
 
 ### Benchmark Results (Apple M1 Max)
 
-For bp_to_text-like data (positions with 10-100 byte gaps):
+For bp_to_text-like data (positions with 10-100 byte gaps, 100K elements):
 
-| Metric               | EliasFano          | Vec\<u32\>   | Comparison        |
-|----------------------|--------------------|--------------|-------------------|
-| **Compression**      | 88 KB (100K elems) | 390 KB       | **4.42×** smaller |
-| Sequential iter      | 1.76 ns/elem       | 0.05 ns/elem | 36× slower        |
-| cursor_from + 5 iter | 26.2 ns            | 1.70 ns      | 15× slower        |
-| Random access        | 14.6 ns            | 0.4 ns       | 36× slower        |
+| Metric               | EliasFano          | Vec\<u32\>    | Comparison        |
+|----------------------|--------------------|---------------|-------------------|
+| **Compression**      | 88 KB (100K elems) | 390 KB        | **4.42×** smaller |
+| Sequential iter      | 1.77 ns/elem       | 0.048 ns/elem | 37× slower        |
+| cursor_from + 5 iter | 32.6 ns            | 1.69 ns       | 19× slower        |
+| Random access        | 30.7 ns            | 0.67 ns       | 46× slower        |
+| Skip-by-2-8          | 128 µs total       | 20.8 µs total | 6.2× slower       |
 
-**Key insight**: Cursor iteration amortizes setup cost. The 36× penalty for random
-access drops to 15× when iterating 5 elements after positioning.
+**Key insight**: Cursor iteration amortizes setup cost. The 44× penalty for
+cursor_from drops to 19× when iterating 5 elements after positioning.
+Skip-by-small patterns (typical for next_sibling) are only 6.2× slower.
 
 ### SIMD Optimization Opportunity
 
 The `select_in_word` operation (find k-th set bit) is the bottleneck:
 
-| Platform | Technique            | Expected Speedup                |
-|----------|----------------------|---------------------------------|
-| x86 BMI2 | `PDEP` + `TZCNT`     | 3-4× (O(1) vs O(popcount) loop) |
-| ARM NEON | Broadword with `CNT` | 1.5-2×                          |
-| ARM SVE2 | `BDEP` + `CTZ`       | 3-4× (if available)             |
+| Platform   | Technique            | Expected Speedup                |
+|------------|----------------------|---------------------------------|
+| x86 BMI2   | `PDEP` + `TZCNT`     | 3-4× (O(1) vs O(popcount) loop) |
+| ARM SVE2   | `BDEP` + `CTZ`       | 3-4× (Graviton 4+)              |
+| ARM M1-M3  | Broadword SWAR       | **3-4×** (vs CTZ loop)          |
+
+**M1/M2/M3 discovery**: Broadword SWAR beats CTZ loop for k≥4:
+- CTZ is O(k), Broadword is O(1) after byte-search
+- k=31 (typical): 12.4 ns (CTZ) vs 3.6 ns (Broadword) = **3.4× faster**
+- k=63 (worst): 28.1 ns (CTZ) vs 4.6 ns (Broadword) = **6.1× faster**
 
 ### Prior Art
 

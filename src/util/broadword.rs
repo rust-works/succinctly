@@ -85,8 +85,15 @@ fn select_in_word_ctz(x: u64, k: u32) -> u32 {
 /// It computes byte popcounts and prefix sums in parallel, then uses a lookup
 /// table for the final byte.
 ///
-/// Note: The CTZ loop (`select_in_word`) is often faster on modern CPUs due
-/// to the efficient `tzcnt` instruction.
+/// # Performance (Apple M1 Max)
+///
+/// Broadword is faster than CTZ loop for k≥4:
+/// - k=0-1: CTZ wins (0.7-1.0 ns vs 1.5-1.8 ns)
+/// - k=4+: Broadword wins, gap widens with k
+/// - k=31: 12.4 ns (CTZ) vs 3.6 ns (Broadword) = 3.4× faster
+/// - k=63: 28.1 ns (CTZ) vs 4.6 ns (Broadword) = 6.1× faster
+///
+/// For Elias-Fano `select1` where k averages ~32, broadword is ~3× faster.
 #[inline]
 #[allow(dead_code)]
 pub fn select_in_word_broadword(x: u64, k: u32) -> u32 {

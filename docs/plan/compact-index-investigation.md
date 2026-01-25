@@ -296,21 +296,31 @@ pub struct EliasFanoCursor<'a> { /* cursor state for O(1) amortized iteration */
 | 100K     | 390 KB     | 88 KB     | **4.42×**   |
 | 1M       | 3.9 MB     | 883 KB    | **4.42×**   |
 
-**Access latency** (1000 queries):
+**Construction throughput**:
 
-| Operation                | EliasFano    | Vec\<u32\>   | Ratio |
-|--------------------------|--------------|--------------|-------|
-| Sequential (advance_one) | 1.76 ns/elem | 0.05 ns/elem | 36×   |
-| Random access (get)      | 14.6 ns      | 0.4 ns       | 36×   |
-| cursor_from              | 13.4 ns      | 0.43 ns      | 31×   |
-| cursor_from + 5 iter     | 26.2 ns      | 1.70 ns      | 15×   |
-| Skip-by-2-8 (advance_by) | 8.5× slower  | —            | 8.5×  |
+| Elements | Time      | Throughput   |
+|----------|-----------|--------------|
+| 10K      | 22.7 µs   | 441 Melem/s  |
+| 100K     | 231 µs    | 432 Melem/s  |
+| 1M       | 2.33 ms   | 430 Melem/s  |
+
+**Access latency** (criterion benchmarks, 100K elements):
+
+| Operation                | EliasFano     | Vec\<u32\>    | Ratio   |
+|--------------------------|---------------|---------------|---------|
+| Sequential (advance_one) | 1.77 ns/elem  | 0.048 ns/elem | **37×** |
+| Random access (get)      | 30.7 ns       | 0.67 ns       | **46×** |
+| cursor_from              | 19.0 ns       | 0.43 ns       | **44×** |
+| cursor_from + 5 iter     | 32.6 ns       | 1.69 ns       | **19×** |
+| Skip-by-2-8 (advance_by) | 128 µs total  | 20.8 µs total | **6.2×** |
+| seek (random jump)       | 17.1 ns       | 0.42 ns       | **41×** |
 
 **Key findings**:
 1. **Compression achieved**: 4.42× (exceeds 4× target)
-2. **Random access**: 36× slower than Vec (exceeds 2× target, needs SIMD optimization)
-3. **Cursor iteration amortizes well**: Ratio drops from 31× to 15× with iteration
-4. **Forward-only patterns**: The cursor-based approach works well for jq navigation patterns
+2. **Random access**: 46× slower than Vec (exceeds 2× target)
+3. **Cursor iteration amortizes well**: Ratio drops from 44× to 19× with 5 iterations
+4. **Skip-by-small is efficient**: Only 6.2× slower for advance_by(2-8) patterns
+5. **Forward-only patterns**: Cursor-based approach works well for jq navigation patterns
 
 ### Next Steps
 
@@ -332,13 +342,35 @@ pub struct EliasFanoCursor<'a> { /* cursor state for O(1) amortized iteration */
 
 ### Decision Status
 
-**Current assessment**: PROMISING but needs SIMD optimization before integration.
+**Current assessment**: PROMISING - broadword optimization available for M1.
 
 - ✅ Compression: 4.42× (target: 4×)
-- ❌ Random access latency: 36× (target: ≤2×)
-- ⚠️ Cursor iteration: 15× with amortization (acceptable for forward-only patterns)
+- ❌ Random access latency: 46× with CTZ (target: ≤2×)
+- ⚠️ Cursor iteration: 19× with amortization (acceptable for forward-only patterns)
+- ✅ Skip-by-small: 6.2× (good for next_sibling patterns)
 
-The portable implementation provides the foundation. SIMD-accelerated `select_in_word` should bring random access latency within acceptable bounds.
+**M1 Optimization Discovery** (select_in_word benchmark):
+
+| k  | CTZ (ns) | Broadword (ns) | Winner    | Speedup |
+|----|----------|----------------|-----------|---------|
+| 0  | 0.65     | 1.47           | CTZ       | 0.4×    |
+| 1  | 0.96     | 1.78           | CTZ       | 0.5×    |
+| 4  | 2.57     | 2.43           | Broadword | 1.1×    |
+| 8  | 3.85     | 1.52           | Broadword | 2.5×    |
+| 16 | 6.44     | 1.98           | Broadword | 3.3×    |
+| 31 | 12.37    | 3.59           | Broadword | 3.4×    |
+| 48 | 20.82    | 3.22           | Broadword | 6.5×    |
+| 63 | 28.14    | 4.62           | Broadword | 6.1×    |
+
+**Key insight**: CTZ is O(k), Broadword is O(1). For k≥4, broadword wins.
+In Elias-Fano `select1`, k averages ~32 within a word → **~3-4× speedup expected**.
+
+**Platform-specific expectations**:
+- x86 with BMI2: PDEP+TZCNT should achieve 3-4× speedup
+- ARM with SVE2 (Graviton 4): BDEP should achieve 3-4× speedup
+- M1/M2/M3 with broadword: **~3× speedup** (46× → ~15× vs Vec)
+
+**Next optimization**: Switch `select_in_word` to use broadword for k≥4 on M1.
 
 ## Changelog
 
@@ -346,3 +378,5 @@ The portable implementation provides the foundation. SIMD-accelerated `select_in
 |------------|---------------------------------------------------------------|
 | 2026-01-25 | Initial investigation plan based on literature research       |
 | 2026-01-25 | Phase 2 complete: Portable EliasFano with cursor-based access |
+| 2026-01-25 | Updated benchmarks with criterion results; M1 optimization analysis complete |
+| 2026-01-25 | Discovery: Broadword 3-6× faster than CTZ for k≥4 on M1       |

@@ -43,6 +43,8 @@ use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
+use crate::util::broadword::select_in_word;
+
 /// Select sample rate - one sample per this many elements.
 /// Trade-off: lower = faster seek, more memory.
 const SELECT_SAMPLE_RATE: usize = 256;
@@ -183,7 +185,7 @@ impl EliasFano {
             while sample_target < ones_seen + word_ones {
                 // The sample_target-th 1-bit is in this word
                 let local_rank = sample_target - ones_seen;
-                let bit_pos = select_in_word(word, local_rank);
+                let bit_pos = select_in_word(word, local_rank as u32) as usize;
                 let global_pos = word_idx * 64 + bit_pos;
                 select_samples.push(global_pos as u32);
 
@@ -347,7 +349,7 @@ impl EliasFano {
 
             let ones = word.count_ones() as usize;
             if ones > remaining {
-                let bit_pos = select_in_word(word, remaining);
+                let bit_pos = select_in_word(word, remaining as u32) as usize;
                 return word_idx * 64 + bit_pos;
             }
             remaining -= ones;
@@ -544,34 +546,6 @@ impl<'a> EliasFanoCursor<'a> {
         self.remaining_bits = self.ef.high_bits[word_idx] & !((1u64 << bit_offset) - 1);
 
         self.current()
-    }
-}
-
-/// Broadword select: find position of k-th set bit in a 64-bit word (0-indexed).
-///
-/// Uses a simple loop which is efficient for small k and portable.
-/// For architecture-specific optimizations (PDEP+TZCNT on x86), see the simd module.
-#[inline]
-fn select_in_word(word: u64, k: usize) -> usize {
-    if word == 0 {
-        return 64;
-    }
-
-    // Simple loop implementation - efficient for small k (typical case)
-    // and fully portable across all architectures
-    let mut remaining = k;
-    let mut w = word;
-
-    loop {
-        if remaining == 0 {
-            return w.trailing_zeros() as usize;
-        }
-        // Clear lowest set bit
-        w &= w.wrapping_sub(1);
-        if w == 0 {
-            return 64; // Not enough bits
-        }
-        remaining -= 1;
     }
 }
 
@@ -880,20 +854,6 @@ mod tests {
 
         let collected: Vec<u32> = ef.into_iter().collect();
         assert_eq!(collected, values);
-    }
-
-    #[test]
-    fn test_select_in_word() {
-        assert_eq!(select_in_word(0b1010_1010, 0), 1);
-        assert_eq!(select_in_word(0b1010_1010, 1), 3);
-        assert_eq!(select_in_word(0b1010_1010, 2), 5);
-        assert_eq!(select_in_word(0b1010_1010, 3), 7);
-
-        assert_eq!(select_in_word(0b1, 0), 0);
-        assert_eq!(select_in_word(0b1000_0000, 0), 7);
-
-        assert_eq!(select_in_word(u64::MAX, 0), 0);
-        assert_eq!(select_in_word(u64::MAX, 63), 63);
     }
 
     #[test]
