@@ -13,6 +13,7 @@ use alloc::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeMap;
 
+use crate::bits::CompactRank;
 use crate::trees::{BalancedParens, WithSelect};
 use crate::util::broadword::select_in_word;
 
@@ -36,8 +37,8 @@ pub struct YamlIndex<W = Vec<u64>> {
     ib: W,
     /// Number of valid bits in IB
     ib_len: usize,
-    /// Cumulative popcount per word (for fast rank/select on IB)
-    ib_rank: Vec<u32>,
+    /// Two-level rank directory for IB (~3.5% overhead vs 50% for `Vec<u32>`).
+    ib_rank: CompactRank,
     /// Balanced parentheses - encodes the YAML structure as a tree.
     /// Uses WithSelect for O(1) select1 queries needed by find_bp_at_text_pos.
     bp: BalancedParens<W, WithSelect>,
@@ -57,8 +58,8 @@ pub struct YamlIndex<W = Vec<u64>> {
     seq_items: W,
     /// Container markers - 1 if BP position has a TY entry (is a mapping or sequence)
     containers: W,
-    /// Cumulative popcount per word for containers (for fast rank on containers)
-    containers_rank: Vec<u32>,
+    /// Two-level rank directory for containers (~3.5% overhead).
+    containers_rank: CompactRank,
     /// Anchor definitions: anchor name → BP position of the anchored value
     anchors: BTreeMap<String, usize>,
     /// Reverse anchor mapping: BP position → anchor name (for metadata access)
@@ -70,31 +71,16 @@ pub struct YamlIndex<W = Vec<u64>> {
     newlines: crate::bits::BitVec,
 }
 
-/// Build cumulative popcount index for a bitvector.
-/// Returns a vector where entry i = total 1-bits in words [0, i).
-fn build_cumulative_rank(words: &[u64]) -> Vec<u32> {
-    let mut rank = Vec::with_capacity(words.len() + 1);
-    let mut cumulative: u32 = 0;
-    rank.push(0);
-    for &word in words {
-        cumulative += word.count_ones();
-        rank.push(cumulative);
-    }
-    rank
+/// Build compact rank directory for IB.
+#[inline]
+fn build_ib_rank(words: &[u64]) -> CompactRank {
+    CompactRank::build(words)
 }
 
-/// Build cumulative popcount index for IB.
-/// Returns a vector where entry i = total 1-bits in words [0, i).
+/// Build compact rank directory for containers.
 #[inline]
-fn build_ib_rank(words: &[u64]) -> Vec<u32> {
-    build_cumulative_rank(words)
-}
-
-/// Build cumulative popcount index for containers.
-/// Returns a vector where entry i = total 1-bits in words [0, i).
-#[inline]
-fn build_containers_rank(words: &[u64]) -> Vec<u32> {
-    build_cumulative_rank(words)
+fn build_containers_rank(words: &[u64]) -> CompactRank {
+    CompactRank::build(words)
 }
 
 /// Build newline index from text.
@@ -412,8 +398,10 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         let word_idx = bp_pos / 64;
         let bit_idx = bp_pos % 64;
 
-        // Use cumulative index for full words (O(1) lookup)
-        let mut count = self.containers_rank[word_idx.min(container_words.len())] as usize;
+        // Use compact rank for full words
+        let mut count = self
+            .containers_rank
+            .rank_at_word(container_words, word_idx.min(container_words.len()));
 
         // Add partial word bits
         if word_idx < container_words.len() && bit_idx > 0 {
@@ -577,7 +565,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         let hint = hint.min(n.saturating_sub(1));
 
         // Check if hint is already past k
-        let hint_rank = self.ib_rank[hint + 1];
+        let hint_rank = self.ib_rank.rank_at_word(words, hint + 1) as u32;
         let lo;
         let hi;
 
@@ -588,7 +576,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
 
             loop {
                 let next = (hint + bound).min(n);
-                if next >= n || self.ib_rank[next + 1] > k32 {
+                if next >= n || self.ib_rank.rank_at_word(words, next + 1) as u32 > k32 {
                     lo = prev;
                     hi = next;
                     break;
@@ -603,7 +591,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
 
             loop {
                 let next = hint.saturating_sub(bound);
-                if next == 0 || self.ib_rank[next + 1] <= k32 {
+                if next == 0 || self.ib_rank.rank_at_word(words, next + 1) as u32 <= k32 {
                     lo = next;
                     hi = prev;
                     break;
@@ -618,7 +606,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         let mut hi = hi;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.ib_rank[mid + 1] <= k32 {
+            if self.ib_rank.rank_at_word(words, mid + 1) as u32 <= k32 {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -629,8 +617,8 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             return None;
         }
 
-        // Now lo is the word index, and ib_rank[lo] is count before this word
-        let remaining = k - self.ib_rank[lo] as usize;
+        // Now lo is the word index, and rank_at_word(lo) is count before this word
+        let remaining = k - self.ib_rank.rank_at_word(words, lo);
         let word = words[lo];
         let bit_pos = select_in_word(word, remaining as u32) as usize;
         let result = lo * 64 + bit_pos;
@@ -658,7 +646,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         let mut hi = n;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.ib_rank[mid + 1] <= k32 {
+            if self.ib_rank.rank_at_word(words, mid + 1) as u32 <= k32 {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -669,7 +657,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             return None;
         }
 
-        let remaining = k - self.ib_rank[lo] as usize;
+        let remaining = k - self.ib_rank.rank_at_word(words, lo);
         let word = words[lo];
         let bit_pos = select_in_word(word, remaining as u32) as usize;
         let result = lo * 64 + bit_pos;
@@ -691,8 +679,8 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         let word_idx = pos / 64;
         let bit_idx = pos % 64;
 
-        // Use cumulative index for full words
-        let mut count = self.ib_rank[word_idx.min(words.len())] as usize;
+        // Use compact rank for full words
+        let mut count = self.ib_rank.rank_at_word(words, word_idx.min(words.len()));
 
         // Add partial word
         if word_idx < words.len() && bit_idx > 0 {
