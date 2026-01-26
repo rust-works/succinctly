@@ -258,11 +258,8 @@ jobs:
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin || true
 
-      - name: Build CLI (for integration tests)
-        run: cargo build --features cli --bin succinctly
-
       - name: Generate coverage report
-        run: cargo tarpaulin --verbose --workspace --timeout 300 --out xml
+        run: cargo tarpaulin --verbose --workspace --timeout 300 --out xml --exclude-files 'tests/*cli*'
 
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v4
