@@ -22,12 +22,14 @@
 //! ```
 
 mod bitvec;
+mod compact_rank;
 mod elias_fano;
 pub(crate) mod popcount;
 mod rank;
 mod select;
 
 pub use bitvec::BitVec;
+pub use compact_rank::CompactRank;
 pub use elias_fano::{EliasFano, EliasFanoCursor, EliasFanoIter};
 pub use popcount::{popcount_word, popcount_words};
 pub use rank::RankDirectory;
