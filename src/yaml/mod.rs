@@ -48,6 +48,7 @@
 //! (bracket-based like JSON), anchors, aliases, and block scalars uniformly.
 
 mod advance_positions;
+mod end_positions;
 mod error;
 mod index;
 mod light;

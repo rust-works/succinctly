@@ -18,6 +18,7 @@ use crate::trees::{BalancedParens, WithSelect};
 use crate::util::broadword::select_in_word;
 
 use super::advance_positions::OpenPositions;
+use super::end_positions::EndPositions;
 use super::error::YamlError;
 use super::light::YamlCursor;
 use super::parser::build_semi_index;
@@ -51,9 +52,10 @@ pub struct YamlIndex<W = Vec<u64>> {
     /// Uses Advance Index encoding for ~1.5× compression when positions are monotonic,
     /// otherwise falls back to `Vec<u32>` for non-monotonic cases (explicit keys, etc.).
     open_positions: OpenPositions,
-    /// End positions for scalars. For each BP open, stores the end byte offset.
-    /// For containers, stores 0 (containers don't have a text end position).
-    bp_to_text_end: Vec<u32>,
+    /// End positions for scalars using memory-efficient encoding.
+    /// Uses Advance Index encoding for ~5× compression when end positions are monotonic,
+    /// otherwise falls back to `Vec<u32>`.
+    bp_to_text_end: EndPositions,
     /// Sequence item markers - 1 if BP position is a sequence item wrapper
     seq_items: W,
     /// Container markers - 1 if BP position has a TY entry (is a mapping or sequence)
@@ -159,7 +161,7 @@ impl YamlIndex<Vec<u64>> {
             ty: semi.ty,
             ty_len: semi.ty_len,
             open_positions,
-            bp_to_text_end: semi.bp_to_text_end,
+            bp_to_text_end: EndPositions::build(&semi.bp_to_text_end, ib_len),
             seq_items: semi.seq_items,
             containers: semi.containers,
             containers_rank,
@@ -210,7 +212,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             ty,
             ty_len,
             open_positions,
-            bp_to_text_end,
+            bp_to_text_end: EndPositions::build(&bp_to_text_end, ib_len),
             seq_items,
             containers,
             containers_rank,
@@ -260,7 +262,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             ty,
             ty_len,
             open_positions,
-            bp_to_text_end,
+            bp_to_text_end: EndPositions::build(&bp_to_text_end, ib_len),
             seq_items,
             containers,
             containers_rank,
@@ -289,14 +291,10 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// Get the text end byte offset for a BP position.
     ///
     /// For scalars, returns the end position. For containers and null values, returns `None`.
-    /// The value 0 is used as a sentinel meaning "no end position" (null/empty values).
     #[inline]
     pub fn bp_to_text_end_pos(&self, bp_pos: usize) -> Option<usize> {
         let open_idx = self.bp.rank1(bp_pos);
-        self.bp_to_text_end
-            .get(open_idx)
-            .map(|&pos| pos as usize)
-            .filter(|&pos| pos > 0) // 0 is sentinel for "no end position"
+        self.bp_to_text_end.get(open_idx)
     }
 
     /// Get a reference to the interest bits words.

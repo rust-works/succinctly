@@ -43,7 +43,7 @@ use crate::util::broadword::select_in_word;
 
 /// Select sample rate - one sample per this many 1-bits.
 /// Trade-off: lower = faster random access, more memory.
-const SELECT_SAMPLE_RATE: usize = 256;
+pub(super) const SELECT_SAMPLE_RATE: usize = 256;
 
 /// Open position storage with automatic optimization.
 ///
@@ -640,7 +640,7 @@ impl<'a> AdvancePositionsCursor<'a> {
 }
 
 /// Build select samples for a bitvector.
-fn build_select_samples(words: &[u64], total_ones: usize) -> Vec<u32> {
+pub(super) fn build_select_samples(words: &[u64], total_ones: usize) -> Vec<u32> {
     if total_ones == 0 {
         return Vec::new();
     }
