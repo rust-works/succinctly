@@ -3279,14 +3279,42 @@ impl<'a> Parser<'a> {
         self.pop_type();
         self.write_bp_close();
 
+        // Truncate over-allocated bitvectors to actual used length.
+        // Parser pre-allocates worst-case (e.g., bp_words at input.len()/32 words)
+        // but actual usage is typically much smaller (e.g., 1-2% for sparse YAML).
+        let bp_word_count = self.bp_pos.div_ceil(64).max(1);
+        let ty_word_count = self.ty_pos.div_ceil(64).max(1);
+
+        let mut bp = core::mem::take(&mut self.bp_words);
+        bp.truncate(bp_word_count);
+        bp.shrink_to_fit();
+
+        let mut ty = core::mem::take(&mut self.ty_words);
+        ty.truncate(ty_word_count);
+        ty.shrink_to_fit();
+
+        let mut seq_items = core::mem::take(&mut self.seq_item_words);
+        seq_items.truncate(bp_word_count);
+        seq_items.shrink_to_fit();
+
+        let mut containers = core::mem::take(&mut self.container_words);
+        containers.truncate(bp_word_count);
+        containers.shrink_to_fit();
+
+        let mut bp_to_text = core::mem::take(&mut self.bp_to_text);
+        bp_to_text.shrink_to_fit();
+
+        let mut bp_to_text_end = core::mem::take(&mut self.bp_to_text_end);
+        bp_to_text_end.shrink_to_fit();
+
         Ok(SemiIndex {
             ib: core::mem::take(&mut self.ib_words),
-            bp: core::mem::take(&mut self.bp_words),
-            ty: core::mem::take(&mut self.ty_words),
-            bp_to_text: core::mem::take(&mut self.bp_to_text),
-            bp_to_text_end: core::mem::take(&mut self.bp_to_text_end),
-            seq_items: core::mem::take(&mut self.seq_item_words),
-            containers: core::mem::take(&mut self.container_words),
+            bp,
+            ty,
+            bp_to_text,
+            bp_to_text_end,
+            seq_items,
+            containers,
             ib_len: self.input.len(),
             bp_len: self.bp_pos,
             ty_len: self.ty_pos,

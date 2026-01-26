@@ -38,6 +38,7 @@ use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
+use crate::bits::CompactRank;
 use crate::util::broadword::select_in_word;
 
 /// Select sample rate - one sample per this many 1-bits.
@@ -152,9 +153,8 @@ pub struct AdvancePositions {
     ib_words: Vec<u64>,
     /// Number of valid bits in IB (= text length).
     ib_len: usize,
-    /// Cumulative popcount per word for IB (for rank queries).
-    /// Entry i = total 1-bits in words [0, i).
-    ib_rank: Vec<u32>,
+    /// Two-level rank directory for IB (~3.5% overhead vs 50% for Vec<u32>).
+    ib_rank: CompactRank,
     /// Sampled select index for IB: entry i = position of (i * SAMPLE_RATE)-th 1-bit.
     ib_select_samples: Vec<u32>,
     /// Total number of unique positions (1-bits in IB).
@@ -164,8 +164,8 @@ pub struct AdvancePositions {
     advance_words: Vec<u64>,
     /// Number of BP opens.
     num_opens: usize,
-    /// Cumulative popcount per word for advance (for rank queries).
-    advance_rank: Vec<u32>,
+    /// Two-level rank directory for advance (~3.5% overhead).
+    advance_rank: CompactRank,
 }
 
 /// Cursor for efficient sequential iteration through positions.
@@ -212,12 +212,12 @@ impl AdvancePositions {
             return Self {
                 ib_words: Vec::new(),
                 ib_len: text_len,
-                ib_rank: vec![0],
+                ib_rank: CompactRank::empty(),
                 ib_select_samples: Vec::new(),
                 ib_ones: 0,
                 advance_words: Vec::new(),
                 num_opens: 0,
-                advance_rank: vec![0],
+                advance_rank: CompactRank::empty(),
             };
         }
 
@@ -258,11 +258,11 @@ impl AdvancePositions {
             prev_pos = Some(pos);
         }
 
-        // Build cumulative rank for IB
-        let ib_rank = build_cumulative_rank(&ib_words);
+        // Build compact rank for IB
+        let ib_rank = CompactRank::build(&ib_words);
 
-        // Build cumulative rank for advance
-        let advance_rank = build_cumulative_rank(&advance_words);
+        // Build compact rank for advance
+        let advance_rank = CompactRank::build(&advance_words);
 
         // Build select samples for IB
         let ib_select_samples = build_select_samples(&ib_words, ib_ones);
@@ -403,8 +403,10 @@ impl AdvancePositions {
         let word_idx = pos / 64;
         let bit_idx = pos % 64;
 
-        // Use cumulative index for full words
-        let mut count = self.advance_rank[word_idx.min(self.advance_words.len())] as usize;
+        // Use compact rank for full words
+        let mut count = self
+            .advance_rank
+            .rank_at_word(&self.advance_words, word_idx.min(self.advance_words.len()));
 
         // Add partial word
         if word_idx < self.advance_words.len() && bit_idx > 0 {
@@ -468,10 +470,10 @@ impl AdvancePositions {
     /// Returns the heap memory usage in bytes.
     pub fn heap_size(&self) -> usize {
         self.ib_words.len() * 8
-            + self.ib_rank.len() * 4
+            + self.ib_rank.heap_size()
             + self.ib_select_samples.len() * 4
             + self.advance_words.len() * 8
-            + self.advance_rank.len() * 4
+            + self.advance_rank.heap_size()
     }
 
     /// Find the last (deepest) open index that starts at the given text position.
@@ -521,8 +523,10 @@ impl AdvancePositions {
         let word_idx = pos / 64;
         let bit_idx = pos % 64;
 
-        // Use cumulative index for full words
-        let mut count = self.ib_rank[word_idx.min(self.ib_words.len())] as usize;
+        // Use compact rank for full words
+        let mut count = self
+            .ib_rank
+            .rank_at_word(&self.ib_words, word_idx.min(self.ib_words.len()));
 
         // Add partial word
         if word_idx < self.ib_words.len() && bit_idx > 0 {
@@ -536,7 +540,9 @@ impl AdvancePositions {
     /// Select the k-th 1-bit in advance bitmap (0-indexed).
     #[inline]
     fn advance_select1(&self, k: usize) -> Option<usize> {
-        let total_advances = *self.advance_rank.last().unwrap_or(&0) as usize;
+        let total_advances = self
+            .advance_rank
+            .rank_at_word(&self.advance_words, self.advance_words.len());
         if k >= total_advances {
             return None;
         }
@@ -631,19 +637,6 @@ impl<'a> AdvancePositionsCursor<'a> {
             }
         }
     }
-}
-
-/// Build cumulative popcount index for a bitvector.
-/// Returns a vector where entry i = total 1-bits in words [0, i).
-fn build_cumulative_rank(words: &[u64]) -> Vec<u32> {
-    let mut rank = Vec::with_capacity(words.len() + 1);
-    let mut cumulative: u32 = 0;
-    rank.push(0);
-    for &word in words {
-        cumulative += word.count_ones();
-        rank.push(cumulative);
-    }
-    rank
 }
 
 /// Build select samples for a bitvector.
