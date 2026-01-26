@@ -298,11 +298,11 @@ To regenerate: `cargo bench --bench jq_comparison`
 
 | Size       | succinctly             | yq                     | Speedup     | Mem Ratio  |
 |------------|------------------------|------------------------|-------------|------------|
-| **10KB**   |   6.0 ms  (1.6 MiB/s)  |   9.6 ms  (1.0 MiB/s)  | **1.6x**    | **0.50x**  |
-| **100KB**  |   7.6 ms (12.9 MiB/s)  |  20.6 ms  (4.7 MiB/s)  | **2.7x**    | **0.34x**  |
-| **1MB**    |  21.5 ms (46.5 MiB/s)  | 117.9 ms  (8.5 MiB/s)  | **5.5x**    | **0.13x**  |
-| **10MB**   | 153.1 ms (65.3 MiB/s)  |   1.04 s  (9.7 MiB/s)  | **6.8x**    | **0.06x**  |
-| **100MB**  |   1.42 s (70.2 MiB/s)  |   9.77 s (10.2 MiB/s)  | **6.9x**    | **0.05x**  |
+| **10KB**   |   6.4 ms  (1.5 MiB/s)  |   9.2 ms  (1.1 MiB/s)  | **1.4x**    | **0.51x**  |
+| **100KB**  |   7.1 ms (13.0 MiB/s)  |  20.9 ms  (4.4 MiB/s)  | **2.9x**    | **0.33x**  |
+| **1MB**    |  22.8 ms (40.4 MiB/s)  | 115.3 ms  (8.0 MiB/s)  | **5.1x**    | **0.12x**  |
+| **10MB**   | 165.3 ms (56.5 MiB/s)  |   1.03 s  (9.1 MiB/s)  | **6.2x**    | **0.04x**  |
+| **100MB**  |   1.52 s (61.1 MiB/s)  |   9.84 s  (9.4 MiB/s)  | **6.5x**    | **0.03x**  |
 
 ### yq Query Performance (ARM Neoverse-V2)
 
@@ -336,12 +336,12 @@ To regenerate: `succinctly dev bench yq` (includes memory) or `cargo bench --ben
 
 | Query       | Path          | succinctly | yq       | Speedup     | succ Mem | yq Mem  |
 |-------------|---------------|------------|----------|-------------|----------|---------|
-| `.`         | P9 streaming  | 1.12s      | 11.82s   | **10.5x**   | 529 MB   | 7 GB    |
-| `.[0]`      | M2 streaming  | 468ms      | 5.97s    | **12.8x**   | 534 MB   | 5 GB    |
-| `.[]`       | M2 streaming  | 1.91s      | 13.67s   | **7.2x**    | 554 MB   | 8 GB    |
-| `length`    | OwnedValue    | 480ms      | 5.99s    | **12.5x**   | 529 MB   | 5 GB    |
+| `.`         | P9 streaming  | 1.78s      | 11.54s   | **6.5x**    | 254 MB   | 7 GB    |
+| `.[0]`      | M2 streaming  | 444ms      | 5.84s    | **13.2x**   | 254 MB   | 5 GB    |
+| `.[]`       | M2 streaming  | 2.53s      | 13.30s   | **5.3x**    | 269 MB   | 8 GB    |
+| `length`    | OwnedValue    | 445ms      | 5.84s    | **13.1x**   | 254 MB   | 5 GB    |
 
-M2 streaming (`.[0]`) is **2.4x faster** than identity (`.`), with **7-14% of yq's memory**.
+M2 streaming (`.[0]`) is **4.0x faster** than identity (`.`), with **3-5% of yq's memory**.
 
 To benchmark: `succinctly dev bench yq --queries all --memory`
 
