@@ -17,19 +17,48 @@ pub const H8: u64 = 0x8080_8080_8080_8080;
 ///
 /// Returns the bit position (0-63), or 64 if there are fewer than k+1 set bits.
 ///
-/// On ARM64 with SVE2-BITPERM support (Graviton 4, Azure Cobalt 100), this uses
-/// the BDEP instruction for O(1) performance. Otherwise falls back to the CTZ loop.
+/// Uses hardware acceleration when available:
+/// - x86_64 with fast BMI2: PDEP instruction for O(1) performance
+/// - ARM64 with SVE2-BITPERM: BDEP instruction for O(1) performance
+/// - Otherwise: CTZ loop (O(k) but efficient for small k)
 ///
-/// # Performance (Graviton 4)
+/// # Performance
 ///
-/// | Method | k=0 | k=31 | k=63 |
-/// |--------|-----|------|------|
-/// | CTZ loop | 0.9 ns | 10 ns | 31 ns |
-/// | BDEP | 1.8 ns | 1.8 ns | 1.8 ns |
+/// | Platform | Method | k=0 | k=31 | k=63 |
+/// |----------|--------|-----|------|------|
+/// | x86_64 (Zen 3+) | PDEP | ~2 ns | ~2 ns | ~2 ns |
+/// | ARM64 (Graviton 4) | BDEP | 1.8 ns | 1.8 ns | 1.8 ns |
+/// | Any | CTZ loop | ~1 ns | ~12 ns | ~28 ns |
 ///
-/// BDEP is 5-17x faster for k > 0.
+/// Hardware select is 5-17x faster for k > 0.
 #[inline]
 pub fn select_in_word(x: u64, k: u32) -> u32 {
+    // x86_64 with fast BMI2 (Intel Haswell+, AMD Zen 3+)
+    #[cfg(all(target_arch = "x86_64", any(feature = "std", test)))]
+    {
+        use core::sync::atomic::{AtomicU8, Ordering};
+
+        // Cache the feature detection result
+        // 0 = unknown, 1 = fast BMI2 available, 2 = not available
+        static HAS_FAST_BMI2: AtomicU8 = AtomicU8::new(0);
+
+        let has_fast_bmi2 = match HAS_FAST_BMI2.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let detected = crate::util::simd::x86::has_fast_bmi2();
+                HAS_FAST_BMI2.store(if detected { 1 } else { 2 }, Ordering::Relaxed);
+                detected
+            }
+        };
+
+        if has_fast_bmi2 {
+            // SAFETY: has_fast_bmi2() verified BMI2 is available
+            return unsafe { crate::util::simd::x86::select_in_word_pdep(x, k) };
+        }
+    }
+
+    // ARM64 with SVE2-BITPERM (Graviton 4, Azure Cobalt 100)
     #[cfg(all(target_arch = "aarch64", feature = "std"))]
     {
         use core::sync::atomic::{AtomicU8, Ordering};
