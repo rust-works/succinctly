@@ -26,10 +26,9 @@ use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
-use crate::bits::CompactRank;
 use crate::util::broadword::select_in_word;
 
-use super::advance_positions::{build_select_samples, SELECT_SAMPLE_RATE};
+use super::advance_positions::{build_cumulative_rank, build_select_samples, SELECT_SAMPLE_RATE};
 
 /// End position storage with automatic optimization.
 ///
@@ -52,8 +51,8 @@ pub enum EndPositions {
 pub struct CompactEndPositions {
     /// 1 if this BP open has a non-zero end position (is a scalar with end).
     has_end: Vec<u64>,
-    /// Rank directory for has_end.
-    has_end_rank: CompactRank,
+    /// Cumulative popcount for has_end. O(1) rank via single array lookup.
+    has_end_rank: Vec<u32>,
     /// Total number of BP opens.
     num_opens: usize,
 
@@ -62,9 +61,6 @@ pub struct CompactEndPositions {
     /// Number of valid bits in IB (= text length).
     #[allow(dead_code)]
     ib_len: usize,
-    /// Rank directory for IB (unused currently; kept for potential rank queries).
-    #[allow(dead_code)]
-    ib_rank: CompactRank,
     /// Sampled select index for IB.
     ib_select_samples: Vec<u32>,
     /// Total number of unique end positions (1-bits in IB).
@@ -75,8 +71,8 @@ pub struct CompactEndPositions {
     /// Number of scalars (nodes with non-zero end positions).
     #[allow(dead_code)]
     num_scalars: usize,
-    /// Rank directory for advance.
-    advance_rank: CompactRank,
+    /// Cumulative popcount for advance. O(1) rank via single array lookup.
+    advance_rank: Vec<u32>,
 }
 
 impl EndPositions {
@@ -113,9 +109,7 @@ impl EndPositions {
         }
 
         EndPositions::Compact(Box::new(CompactEndPositions::build(
-            positions,
-            &non_zero,
-            text_len,
+            positions, &non_zero, text_len,
         )))
     }
 
@@ -155,16 +149,15 @@ impl CompactEndPositions {
     fn empty(text_len: usize) -> Self {
         Self {
             has_end: Vec::new(),
-            has_end_rank: CompactRank::empty(),
+            has_end_rank: vec![0],
             num_opens: 0,
             ib_words: Vec::new(),
             ib_len: text_len,
-            ib_rank: CompactRank::empty(),
             ib_select_samples: Vec::new(),
             ib_ones: 0,
             advance_words: Vec::new(),
             num_scalars: 0,
-            advance_rank: CompactRank::empty(),
+            advance_rank: vec![0],
         }
     }
 
@@ -186,7 +179,7 @@ impl CompactEndPositions {
                 has_end[i / 64] |= 1u64 << (i % 64);
             }
         }
-        let has_end_rank = CompactRank::build(&has_end);
+        let has_end_rank = build_cumulative_rank(&has_end);
 
         if non_zero_positions.is_empty() {
             return Self {
@@ -195,12 +188,11 @@ impl CompactEndPositions {
                 num_opens,
                 ib_words: Vec::new(),
                 ib_len: text_len,
-                ib_rank: CompactRank::empty(),
                 ib_select_samples: Vec::new(),
                 ib_ones: 0,
                 advance_words: Vec::new(),
                 num_scalars: 0,
-                advance_rank: CompactRank::empty(),
+                advance_rank: vec![0],
             };
         }
 
@@ -224,9 +216,7 @@ impl CompactEndPositions {
                 // Set IB bit at this text position
                 let word_idx = pos as usize / 64;
                 let bit_idx = pos as usize % 64;
-                if word_idx < ib_words.len()
-                    && (ib_words[word_idx] >> bit_idx) & 1 == 0
-                {
+                if word_idx < ib_words.len() && (ib_words[word_idx] >> bit_idx) & 1 == 0 {
                     ib_words[word_idx] |= 1u64 << bit_idx;
                     ib_ones += 1;
                 }
@@ -238,8 +228,7 @@ impl CompactEndPositions {
             prev_pos = Some(pos);
         }
 
-        let ib_rank = CompactRank::build(&ib_words);
-        let advance_rank = CompactRank::build(&advance_words);
+        let advance_rank = build_cumulative_rank(&advance_words);
         let ib_select_samples = build_select_samples(&ib_words, ib_ones);
 
         Self {
@@ -248,7 +237,6 @@ impl CompactEndPositions {
             num_opens,
             ib_words,
             ib_len: text_len,
-            ib_rank,
             ib_select_samples,
             ib_ones,
             advance_words,
@@ -296,9 +284,8 @@ impl CompactEndPositions {
         let word_idx = pos / 64;
         let bit_idx = pos % 64;
 
-        let mut count = self
-            .has_end_rank
-            .rank_at_word(&self.has_end, word_idx.min(self.has_end.len()));
+        // Use cumulative rank for full words (single array lookup)
+        let mut count = self.has_end_rank[word_idx.min(self.has_end.len())] as usize;
 
         if word_idx < self.has_end.len() && bit_idx > 0 {
             let mask = (1u64 << bit_idx) - 1;
@@ -318,9 +305,8 @@ impl CompactEndPositions {
         let word_idx = pos / 64;
         let bit_idx = pos % 64;
 
-        let mut count = self
-            .advance_rank
-            .rank_at_word(&self.advance_words, word_idx.min(self.advance_words.len()));
+        // Use cumulative rank for full words (single array lookup)
+        let mut count = self.advance_rank[word_idx.min(self.advance_words.len())] as usize;
 
         if word_idx < self.advance_words.len() && bit_idx > 0 {
             let mask = (1u64 << bit_idx) - 1;
@@ -372,12 +358,11 @@ impl CompactEndPositions {
     #[cfg(test)]
     pub fn heap_size(&self) -> usize {
         self.has_end.len() * 8
-            + self.has_end_rank.heap_size()
+            + self.has_end_rank.len() * 4
             + self.ib_words.len() * 8
-            + self.ib_rank.heap_size()
             + self.ib_select_samples.len() * 4
             + self.advance_words.len() * 8
-            + self.advance_rank.heap_size()
+            + self.advance_rank.len() * 4
     }
 }
 
@@ -455,12 +440,7 @@ mod tests {
         assert!(ep.is_compact());
 
         for (i, &expected) in positions.iter().enumerate() {
-            assert_eq!(
-                ep.get(i),
-                Some(expected as usize),
-                "get({}) failed",
-                i
-            );
+            assert_eq!(ep.get(i), Some(expected as usize), "get({}) failed", i);
         }
     }
 
@@ -583,12 +563,7 @@ mod tests {
             if expected == 0 {
                 assert_eq!(got, None, "get({}) should be None", i);
             } else {
-                assert_eq!(
-                    got,
-                    Some(expected as usize),
-                    "get({}) failed",
-                    i
-                );
+                assert_eq!(got, Some(expected as usize), "get({}) failed", i);
             }
         }
     }
