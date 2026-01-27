@@ -16,6 +16,7 @@ This directory documents optimization techniques used in the succinctly library,
 | **Allocation** | [zero-copy.md](zero-copy.md) | Type punning, memory mapping, streaming |
 | **Parallelism** | [parallel-prefix.md](parallel-prefix.md) | Prefix XOR, cumulative index, carry propagation |
 | **Parsing** | [state-machines.md](state-machines.md) | PFSM, fast-path bypass, two-stage pipeline |
+| **Compact encoding** | [end-positions.md](end-positions.md) | Bitmap encoding, advance index, sequential cursor |
 
 ---
 
@@ -140,6 +141,7 @@ For newcomers to performance optimization:
 8. **[zero-copy.md](zero-copy.md)** - Avoiding unnecessary work
 9. **[parallel-prefix.md](parallel-prefix.md)** - Cumulative operations
 10. **[state-machines.md](state-machines.md)** - Optimising parsers
+11. **[end-positions.md](end-positions.md)** - Bitmap encoding for position data (case study)
 
 ---
 
@@ -188,4 +190,5 @@ When adding new optimization documentation:
 ## See Also
 
 - [history.md](history.md) - Complete record of all optimizations attempted (successes and failures with exact measurements)
+- [end-positions.md](end-positions.md) - Detailed case study of three EndPositions designs (Vec, 3-bitmap, 2-bitmap)
 - [../../.claude/skills/](../../.claude/skills/) - Claude Code skill files for specific topics
