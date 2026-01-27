@@ -57,8 +57,9 @@ For detailed architectural documentation, see [Semi-Indexing Architecture](../ar
 
 **CPU**: AMD Ryzen 9 7950X (Zen 4)
 **OS**: Linux 6.6.87.2-microsoft-standard-WSL2 (WSL2)
+**yq version**: v4.49.2 (https://github.com/mikefarah/yq/)
 **succinctly**: Built with `--release --features cli` and `-C target-cpu=native`
-**SIMD**: SSE2/AVX2 (16/32 bytes/iteration for string scanning)
+**SIMD**: SSE2/AVX2 (16/32 bytes/iteration for string scanning), BMI2 (PDEP for select_in_word)
 **Optimizations**: P0+ SIMD optimizations (multi-character classification + hybrid scalar/SIMD integration)
 
 ## Methodology
@@ -130,20 +131,25 @@ Note: System `yq` was not installed for comparison. Results show succinctly perf
 - ✅ Memory efficiency improves dramatically at scale
 - ✅ **Streaming JSON output** eliminates intermediate String allocations
 
-### x86_64 (AMD Ryzen 9 7950X) - yq Identity Comparison
+### x86_64 (AMD Ryzen 9 7950X) - yq Identity Comparison (comprehensive pattern)
 
-| Size      | succinctly             | yq                     | Speedup    |
-|-----------|------------------------|------------------------|------------|
-| **10KB**  | 2.9 ms (3.4 MiB/s)     | 68.9 ms (145 KiB/s)    | **24x**    |
-| **100KB** | 4.4 ms (21.4 MiB/s)    | 85.2 ms (1.1 MiB/s)    | **19x**    |
-| **1MB**   | 20.6 ms (45.9 MiB/s)   | 216.5 ms (4.4 MiB/s)   | **11x**    |
+| Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
+|------------|--------------|--------------|---------------|----------|---------|-----------|
+| **1KB**    |    2.6 ms    |   61.4 ms    | **23x**       |    5 MB  |   22 MB | **0.21x** |
+| **10KB**   |    2.6 ms    |   63.0 ms    | **24x**       |    5 MB  |   22 MB | **0.21x** |
+| **100KB**  |    4.1 ms    |  100.9 ms    | **25x**       |    5 MB  |   22 MB | **0.21x** |
+| **1MB**    |   17.9 ms    |  207.8 ms    | **12x**       |    7 MB  |   82 MB | **0.09x** |
+| **10MB**   |  151.4 ms    |    1.34 s    | **9x**        |   30 MB  |  627 MB | **0.05x** |
+| **100MB**  |    1.42 s    |   13.30 s    | **9x**        |  258 MB  |    6 GB | **0.04x** |
 
 ### x86_64 (AMD Ryzen 9 7950X) - Key Achievements
 
 **Key Achievements:**
 - ✅ **Full yq CLI compatibility** - quoted strings preserved as strings
-- ✅ **24x faster than yq** on 10KB files (end-to-end CLI comparison)
-- ✅ **11x faster than yq** on 1MB files
+- ✅ **25x faster than yq** on 100KB files (end-to-end CLI comparison)
+- ✅ **12x faster than yq** on 1MB files
+- ✅ **25x less memory** on 100MB files (258 MB vs 6 GB)
+- ✅ **BMI2 PDEP** for O(1) select_in_word (7.6-16x faster select1)
 - ✅ **Comprehensive test suite** - 32 tests including 8 direct byte-for-byte comparisons
 
 **See also:** [docs/parsing/yaml.md](../parsing/yaml.md) for optimization details.
@@ -271,6 +277,127 @@ Mixed mappings and sequences.
 
 ---
 
+## Detailed Results by Pattern (x86_64 - AMD Ryzen 9 7950X)
+
+### Pattern: comprehensive
+
+Mixed YAML content with various features.
+
+| Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
+|------------|--------------|--------------|---------------|----------|---------|-----------|
+| **1KB**    |    2.6 ms    |   61.4 ms    | **23x**       |    5 MB  |   22 MB | **0.21x** |
+| **10KB**   |    2.6 ms    |   63.0 ms    | **24x**       |    5 MB  |   22 MB | **0.21x** |
+| **100KB**  |    4.1 ms    |  100.9 ms    | **25x**       |    5 MB  |   22 MB | **0.21x** |
+| **1MB**    |   17.9 ms    |  207.8 ms    | **12x**       |    7 MB  |   82 MB | **0.09x** |
+| **10MB**   |  151.4 ms    |    1.34 s    | **9x**        |   30 MB  |  627 MB | **0.05x** |
+| **100MB**  |    1.42 s    |   13.30 s    | **9x**        |  258 MB  |    6 GB | **0.04x** |
+
+### Pattern: nested
+
+Deeply nested mapping structures. **Best speedup pattern** due to efficient BP tree navigation.
+
+| Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
+|------------|--------------|--------------|---------------|----------|---------|-----------|
+| **1KB**    |    2.5 ms    |   64.2 ms    | **25x**       |    4 MB  |   22 MB | **0.20x** |
+| **10KB**   |    2.6 ms    |   64.2 ms    | **24x**       |    4 MB  |   22 MB | **0.20x** |
+| **100KB**  |    3.2 ms    |   73.6 ms    | **23x**       |    5 MB  |   23 MB | **0.21x** |
+| **1MB**    |   11.2 ms    |  168.8 ms    | **15x**       |    6 MB  |   55 MB | **0.11x** |
+| **10MB**   |   87.1 ms    |  992.9 ms    | **11x**       |   20 MB  |  430 MB | **0.05x** |
+| **100MB**  |  689.1 ms    |    7.87 s    | **11x**       |  136 MB  |    4 GB | **0.04x** |
+
+### Pattern: pathological
+
+Worst-case structural density. Tests parser robustness.
+
+| Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
+|------------|--------------|--------------|---------------|----------|---------|-----------|
+| **1KB**    |    2.7 ms    |   63.2 ms    | **24x**       |    4 MB  |   22 MB | **0.20x** |
+| **10KB**   |    2.8 ms    |   64.6 ms    | **23x**       |    4 MB  |   22 MB | **0.20x** |
+| **100KB**  |    4.4 ms    |   83.5 ms    | **19x**       |    5 MB  |   22 MB | **0.22x** |
+| **1MB**    |   19.0 ms    |  246.6 ms    | **13x**       |    7 MB  |   94 MB | **0.08x** |
+| **10MB**   |  153.8 ms    |    1.65 s    | **11x**       |   31 MB  |  739 MB | **0.04x** |
+| **100MB**  |    1.39 s    |   16.16 s    | **12x**       |  265 MB  |    7 GB | **0.03x** |
+
+### Pattern: users
+
+Realistic user record arrays (common in config files).
+
+| Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
+|------------|--------------|--------------|---------------|----------|---------|-----------|
+| **1KB**    |    2.6 ms    |   63.4 ms    | **25x**       |    4 MB  |   22 MB | **0.20x** |
+| **10KB**   |    2.6 ms    |   65.1 ms    | **25x**       |    5 MB  |   22 MB | **0.21x** |
+| **100KB**  |    4.3 ms    |   83.2 ms    | **19x**       |    5 MB  |   23 MB | **0.21x** |
+| **1MB**    |   21.1 ms    |  241.3 ms    | **11x**       |    8 MB  |   92 MB | **0.08x** |
+| **10MB**   |  181.5 ms    |    1.70 s    | **9x**        |   34 MB  |  835 MB | **0.04x** |
+| **100MB**  |    1.76 s    |   17.38 s    | **10x**       |  305 MB  |    8 GB | **0.04x** |
+
+### Pattern: sequences
+
+Sequence-heavy YAML content.
+
+| Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
+|------------|--------------|--------------|---------------|----------|---------|-----------|
+| **1KB**    |    2.4 ms    |   63.1 ms    | **26x**       |    4 MB  |   22 MB | **0.20x** |
+| **10KB**   |    2.6 ms    |   65.1 ms    | **25x**       |    5 MB  |   23 MB | **0.21x** |
+| **100KB**  |    4.5 ms    |   82.3 ms    | **18x**       |    5 MB  |   22 MB | **0.23x** |
+| **1MB**    |   20.0 ms    |  228.2 ms    | **11x**       |    8 MB  |   89 MB | **0.09x** |
+| **10MB**   |  168.0 ms    |    1.66 s    | **10x**       |   36 MB  |  942 MB | **0.04x** |
+| **100MB**  |    1.59 s    |   15.98 s    | **10x**       |  312 MB  |    8 GB | **0.04x** |
+
+### Pattern: strings
+
+String-heavy YAML with quoted variants.
+
+| Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
+|------------|--------------|--------------|---------------|----------|---------|-----------|
+| **1KB**    |    2.5 ms    |   63.1 ms    | **25x**       |    4 MB  |   23 MB | **0.20x** |
+| **10KB**   |    2.6 ms    |   66.3 ms    | **25x**       |    4 MB  |   22 MB | **0.20x** |
+| **100KB**  |    3.8 ms    |   74.2 ms    | **20x**       |    5 MB  |   22 MB | **0.21x** |
+| **1MB**    |   14.6 ms    |  156.2 ms    | **11x**       |    7 MB  |   54 MB | **0.12x** |
+| **10MB**   |  119.1 ms    |  905.0 ms    | **8x**        |   26 MB  |  452 MB | **0.06x** |
+| **100MB**  |    1.13 s    |    8.48 s    | **8x**        |  223 MB  |    4 GB | **0.05x** |
+
+### Pattern: numbers
+
+Numeric-heavy YAML content.
+
+| Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
+|------------|--------------|--------------|---------------|----------|---------|-----------|
+| **1KB**    |    2.5 ms    |   62.6 ms    | **25x**       |    4 MB  |   22 MB | **0.20x** |
+| **10KB**   |    2.7 ms    |   64.7 ms    | **24x**       |    4 MB  |   22 MB | **0.20x** |
+| **100KB**  |    4.4 ms    |   77.9 ms    | **18x**       |    5 MB  |   23 MB | **0.21x** |
+| **1MB**    |   18.9 ms    |  207.1 ms    | **11x**       |    7 MB  |   67 MB | **0.10x** |
+| **10MB**   |  157.2 ms    |    1.31 s    | **8x**        |   30 MB  |  562 MB | **0.05x** |
+| **100MB**  |    1.46 s    |   11.95 s    | **8x**        |  248 MB  |    5 GB | **0.05x** |
+
+### Pattern: unicode
+
+Unicode-heavy strings in various scripts.
+
+| Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
+|------------|--------------|--------------|---------------|----------|---------|-----------|
+| **1KB**    |    2.4 ms    |   62.1 ms    | **26x**       |    4 MB  |   22 MB | **0.20x** |
+| **10KB**   |    2.5 ms    |   63.8 ms    | **26x**       |    4 MB  |   22 MB | **0.21x** |
+| **100KB**  |    3.7 ms    |   73.4 ms    | **20x**       |    5 MB  |   22 MB | **0.21x** |
+| **1MB**    |   13.5 ms    |  151.7 ms    | **11x**       |    7 MB  |   52 MB | **0.13x** |
+| **10MB**   |  105.6 ms    |  885.9 ms    | **8x**        |   26 MB  |  465 MB | **0.06x** |
+| **100MB**  |    1.03 s    |    8.12 s    | **8x**        |  223 MB  |    4 GB | **0.05x** |
+
+### Pattern: mixed
+
+Mixed mappings and sequences.
+
+| Size       | succinctly   | yq           | Speedup       | succ Mem | yq Mem  | Mem Ratio |
+|------------|--------------|--------------|---------------|----------|---------|-----------|
+| **1KB**    |    2.5 ms    |   63.4 ms    | **25x**       |    4 MB  |   22 MB | **0.20x** |
+| **10KB**   |    2.6 ms    |   65.0 ms    | **25x**       |    4 MB  |   22 MB | **0.20x** |
+| **100KB**  |    4.1 ms    |   79.9 ms    | **19x**       |    5 MB  |   22 MB | **0.22x** |
+| **1MB**    |   16.9 ms    |  212.7 ms    | **13x**       |    7 MB  |   88 MB | **0.08x** |
+| **10MB**   |  140.6 ms    |    1.31 s    | **9x**        |   30 MB  |  624 MB | **0.05x** |
+| **100MB**  |    1.31 s    |   12.29 s    | **9x**        |  245 MB  |    6 GB | **0.04x** |
+
+---
+
 ## Pattern Descriptions
 
 | Pattern           | Description                                     | Best For               |
@@ -291,14 +418,23 @@ Mixed mappings and sequences.
 
 ### Speed
 
+**Apple M1 Max (ARM):**
 - **1.4-9.4x faster** across all patterns and sizes
 - **Best performance on nested structures**: 9.4x speedup on 100MB deeply nested files
 - **Pathological patterns**: 8.9x speedup on worst-case structural density
 - **Larger files benefit more**: Speedup increases with file size (amortizes index construction)
 - **100MB files**: 5.6-9.4x faster depending on pattern
 
+**AMD Ryzen 9 7950X (x86_64):**
+- **8-25x faster** across all patterns and sizes (1MB+)
+- **Best performance on nested structures**: 15x speedup on 1MB, 11x on 100MB
+- **Small files dominate by startup**: 23-26x faster on 1-10KB (yq startup ~62ms)
+- **100MB files**: 8-12x faster depending on pattern
+- **BMI2 PDEP**: O(1) select_in_word gives 7.6-16x faster BP select1 queries
+
 ### Memory
 
+**Apple M1 Max:**
 - **20-35x less memory** on large files (100MB) with streaming output
 - **Consistent ~7 MB baseline** for small files regardless of pattern
 - **Linear scaling**: Memory grows proportionally with file size
@@ -312,6 +448,20 @@ Mixed mappings and sequences.
 | **1MB**    | 9-11 MB       | 59-106 MB   | ~0.12x       |
 | **10MB**   | 21-46 MB      | 418-888 MB  | ~0.05x       |
 | **100MB**  | 122-384 MB    | 3-9 GB      | ~0.04x       |
+
+**AMD Ryzen 9 7950X:**
+- **20-25x less memory** on 100MB files (136-312 MB vs 4-8 GB)
+- **Consistent ~4-5 MB baseline** for small files
+- Lower baseline than ARM due to smaller yq Go runtime on x86_64
+
+| Size       | succinctly    | yq          | Ratio        |
+|------------|---------------|-------------|--------------|
+| **1KB**    | 4-5 MB        | 22-23 MB    | ~0.20x       |
+| **10KB**   | 4-5 MB        | 22-23 MB    | ~0.20x       |
+| **100KB**  | 5 MB          | 22-23 MB    | ~0.21x       |
+| **1MB**    | 6-8 MB        | 52-94 MB    | ~0.10x       |
+| **10MB**   | 20-36 MB      | 430-942 MB  | ~0.05x       |
+| **100MB**  | 136-312 MB    | 4-8 GB      | ~0.04x       |
 
 ### Why succinctly is faster
 
@@ -329,7 +479,9 @@ The YAML parser uses platform-specific SIMD for hot paths:
 | Platform | Instruction Set | Width            | Operations                                               | Status |
 |----------|-----------------|------------------|----------------------------------------------------------|--------|
 | ARM64    | NEON            | 16 bytes/iter    | String scanning, indentation count                       | ✓      |
+| ARM64    | SVE2 BDEP       | O(1)/word        | select_in_word (bit deposit for k-th set bit)            | ✓      |
 | x86_64   | SSE2/AVX2       | 16-32 bytes/iter | String scanning, indentation, multi-char classification  | ✓ P0   |
+| x86_64   | BMI2 PDEP       | O(1)/word        | select_in_word (parallel bit deposit for k-th set bit)   | ✓ new  |
 
 #### ARM64 (NEON) Results
 
@@ -369,6 +521,7 @@ The YAML parser uses platform-specific SIMD for hot paths:
 - **P9**: Direct YAML-to-JSON streaming - eliminated intermediate DOM for identity queries (8-22% improvement, 2.3x on yq benchmarks)
 - **P11**: BP Select1 for yq-locate - zero-cost generic select support for O(1) offset-to-BP lookups (2.5-5.9x faster select1, fixes issue #26)
 - **P12**: Advance Index for bp_to_text - memory-efficient bitmap encoding (~1.5× measured, 20-25% faster yq identity queries on 1MB files)
+- **BMI2 PDEP select_in_word**: O(1) select_in_word on x86_64 using BMI2 PDEP instruction (7.6-16x faster BP select1 queries, with AMD Zen 1/2 slow-path detection)
 - **M2**: Navigation streaming - cursor-based streaming for navigation queries, supports both JSON and YAML output
 
 **Rejected Optimizations:**
@@ -493,9 +646,9 @@ $ echo 'id: "001"' | succinctly yq -o json '.'
 - **5.1x faster** on 1MB files
 
 **Speed (AMD Ryzen 9 7950X):**
-- **24x faster** on 10KB files
-- **19x faster** on 100KB files
-- **11x faster** on 1MB files
+- **25x faster** on 100KB files
+- **12x faster** on 1MB files
+- **9x faster** on 100MB files
 
 **Memory (Apple M1 Max, 100MB files):**
 - **20-35x less memory** (122-384 MB vs 3-9 GB)
@@ -530,12 +683,22 @@ The `bp_select_micro` benchmark measures the performance of select1 queries on b
 | 100K opens | 156 µs        | 1.42 ms                   | **9.1x**  |
 | 1M opens   | 173 µs        | 1.73 ms                   | **10.0x** |
 
+### Results (AMD Ryzen 9 7950X with BMI2 PDEP, 10K queries each)
+
+| BP Size    | select1 (new) | binary_search_rank1 (old) | Speedup   |
+|------------|---------------|---------------------------|-----------|
+| 1K opens   | 49 µs         | 371 µs                    | **7.6x**  |
+| 10K opens  | 47 µs         | 538 µs                    | **11.4x** |
+| 100K opens | 47 µs         | 687 µs                    | **14.5x** |
+| 1M opens   | 56 µs         | 890 µs                    | **16.0x** |
+
 ### Key Observations
 
-- **select1 stays nearly constant**: ~210-356 µs regardless of BP size (O(1) amortized)
-- **binary_search scales with log(n)**: 548-820 µs → 1.2-2.1 ms as BP grows from 1K to 1M
-- **Larger documents benefit more**: 5.1-5.9x speedup at 1M opens vs 2.5-2.6x at 1K
-- **Ryzen 9 faster overall**: ~35% faster than M1 Max due to higher clock speed
+- **select1 stays nearly constant**: ~47-56 µs regardless of BP size (O(1) amortized via PDEP)
+- **binary_search scales with log(n)**: 371-890 µs as BP grows from 1K to 1M
+- **Larger documents benefit more**: 16x speedup at 1M opens vs 7.6x at 1K
+- **BMI2 PDEP dominates on x86_64**: 7.6-16x speedup vs 2.5-5.9x on M1 Max and 4.2-10x on Neoverse-V2
+- **AMD Zen 4 has fast BMI2**: PDEP runs in 3 cycles (vs 18 cycles on AMD Zen 1/2, which is auto-detected and avoided)
 
 ### Why It Matters
 

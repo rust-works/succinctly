@@ -52,16 +52,16 @@ Full jq pipeline including DSV parsing, iteration, and JSON output.
 
 | Pattern      | Time   | Throughput  |
 |--------------|--------|-------------|
-| strings      |  97ms  | 102.8 MiB/s |
-| quoted       | 184ms  |  54.4 MiB/s |
-| pathological | 220ms  |  45.4 MiB/s |
-| wide         | 241ms  |  41.5 MiB/s |
-| multiline    | 306ms  |  32.6 MiB/s |
-| users        | 544ms  |  18.4 MiB/s |
-| numeric      | 568ms  |  17.6 MiB/s |
-| mixed        | 606ms  |  16.5 MiB/s |
-| tabular      | 607ms  |  16.5 MiB/s |
-| long         | 1.03s  |   9.7 MiB/s |
+| strings      |  97ms  | 102.6 MiB/s |
+| quoted       | 178ms  |  56.1 MiB/s |
+| pathological | 214ms  |  46.8 MiB/s |
+| wide         | 232ms  |  43.0 MiB/s |
+| multiline    | 307ms  |  32.6 MiB/s |
+| users        | 524ms  |  19.1 MiB/s |
+| numeric      | 539ms  |  18.6 MiB/s |
+| tabular      | 574ms  |  17.4 MiB/s |
+| mixed        | 585ms  |  17.1 MiB/s |
+| long         | 1.01s  |   9.9 MiB/s |
 
 ### ARM Neoverse-V2 (Graviton 4) - 10MB Files
 
