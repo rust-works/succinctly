@@ -282,9 +282,9 @@ To regenerate: `cargo bench --bench jq_comparison`
 
 | Size      | succinctly            | jq                    | Speedup    |
 |-----------|-----------------------|-----------------------|------------|
-| **10KB**  |  2.2 ms (4.3 MiB/s)   |  2.7 ms  (3.5 MiB/s)  | **1.2x**   |
-| **100KB** |  4.7 ms (17.1 MiB/s)  |  6.8 ms (12.5 MiB/s)  | **1.5x**   |
-| **1MB**   | 28.4 ms (28.4 MiB/s)  | 47.3 ms (17.1 MiB/s)  | **1.7x**   |
+| **10KB**  |  1.9 ms (4.9 MiB/s)   |  2.6 ms  (3.6 MiB/s)  | **1.4x**   |
+| **100KB** |  4.4 ms (19.4 MiB/s)  |  6.7 ms (12.7 MiB/s)  | **1.5x**   |
+| **1MB**   | 28.2 ms (28.7 MiB/s)  | 47.7 ms (16.9 MiB/s)  | **1.7x**   |
 
 ### jq Query Performance (ARM Neoverse-V1)
 
@@ -308,9 +308,9 @@ To regenerate: `cargo bench --bench jq_comparison`
 
 | Size      | succinctly              | yq                    | Speedup    |
 |-----------|-------------------------|-----------------------|------------|
-| **10KB**  | 2.0 ms  (4.9 MiB/s)     | 5.5 ms (1.8 MiB/s)    | **2.7x**   |
-| **100KB** | 3.7 ms (24.9 MiB/s)     | 21.6 ms (4.3 MiB/s)   | **5.8x**   |
-| **1MB**   | 19.5 ms (47.3 MiB/s)    | 154.6 ms (6.0 MiB/s)  | **7.9x**   |
+| **10KB**  | 2.1 ms  (4.7 MiB/s)     | 5.8 ms (1.7 MiB/s)    | **2.8x**   |
+| **100KB** | 4.3 ms (21.4 MiB/s)     | 21.3 ms (4.3 MiB/s)   | **5.0x**   |
+| **1MB**   | 24.3 ms (37.9 MiB/s)    | 156.1 ms (5.9 MiB/s)  | **6.4x**   |
 
 ### yq Query Performance (ARM Neoverse-V1)
 
