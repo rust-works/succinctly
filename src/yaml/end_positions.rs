@@ -166,18 +166,7 @@ impl EndPositions {
             return EndPositions::Dense(positions.to_vec());
         }
 
-        // Fill zeros with previous non-zero value to make sequence monotonic.
-        // Leading zeros (before any scalar) stay as 0.
-        let mut filled = Vec::with_capacity(positions.len());
-        let mut prev = 0u32;
-        for &pos in positions {
-            if pos > 0 {
-                prev = pos;
-            }
-            filled.push(prev);
-        }
-
-        EndPositions::Compact(Box::new(CompactEndPositions::build(&filled, text_len)))
+        EndPositions::Compact(Box::new(CompactEndPositions::build(positions, text_len)))
     }
 
     /// Get the end position for the `open_idx`-th BP open.
@@ -233,15 +222,18 @@ impl CompactEndPositions {
         }
     }
 
-    /// Build compact end positions from zero-filled positions.
+    /// Build compact end positions from raw positions with inline zero-filling.
     ///
-    /// `filled_positions` must be monotonically non-decreasing (zeros replaced
-    /// with the previous non-zero value). All entries have a value; containers
-    /// inherit the previous scalar's end position (or 0 for leading containers).
-    fn build(filled_positions: &[u32], text_len: usize) -> Self {
-        let num_opens = filled_positions.len();
+    /// `positions` contains one entry per BP open. Zero entries are containers
+    /// (no end position); non-zero entries are scalar end positions. Non-zero
+    /// entries must be monotonically non-decreasing (caller checks this).
+    ///
+    /// Zero entries are filled with the previous non-zero value inline during
+    /// bitmap construction, avoiding a temporary `Vec<u32>` allocation.
+    fn build(positions: &[u32], text_len: usize) -> Self {
+        let num_opens = positions.len();
 
-        if filled_positions.is_empty() || filled_positions.iter().all(|&p| p == 0) {
+        if positions.is_empty() || positions.iter().all(|&p| p == 0) {
             return Self::empty(text_len);
         }
 
@@ -255,23 +247,32 @@ impl CompactEndPositions {
         let advance_num_words = num_opens.div_ceil(64);
         let mut advance_words = vec![0u64; advance_num_words];
 
-        let mut prev_pos: Option<u32> = None;
+        let mut prev_effective: Option<u32> = None;
+        let mut prev_nonzero = 0u32;
         let mut ib_ones = 0usize;
 
-        for (i, &pos) in filled_positions.iter().enumerate() {
-            if pos == 0 {
-                // Leading container (zero-filled): no advance, no IB bit.
-                // Set prev_pos so next non-zero entry detects the transition.
-                prev_pos = Some(0);
+        for (i, &pos) in positions.iter().enumerate() {
+            // Inline zero-fill: containers (pos == 0) inherit previous non-zero value.
+            // Leading containers (before any scalar) have prev_nonzero == 0.
+            let effective = if pos > 0 {
+                prev_nonzero = pos;
+                pos
+            } else {
+                prev_nonzero
+            };
+
+            if effective == 0 {
+                // Leading container (before any scalar): no advance, no IB bit.
+                prev_effective = Some(0);
                 continue;
             }
 
-            let is_new_position = prev_pos != Some(pos);
+            let is_new_position = prev_effective != Some(effective);
 
             if is_new_position {
                 // Set IB bit at this text position
-                let word_idx = pos as usize / 64;
-                let bit_idx = pos as usize % 64;
+                let word_idx = effective as usize / 64;
+                let bit_idx = effective as usize % 64;
                 if word_idx < ib_words.len() && (ib_words[word_idx] >> bit_idx) & 1 == 0 {
                     ib_words[word_idx] |= 1u64 << bit_idx;
                     ib_ones += 1;
@@ -281,7 +282,7 @@ impl CompactEndPositions {
                 advance_words[i / 64] |= 1u64 << (i % 64);
             }
 
-            prev_pos = Some(pos);
+            prev_effective = Some(effective);
         }
 
         let advance_rank = build_cumulative_rank(&advance_words);

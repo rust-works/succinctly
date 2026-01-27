@@ -13,6 +13,8 @@ use alloc::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeMap;
 
+use core::cell::OnceCell;
+
 use crate::trees::{BalancedParens, WithSelect};
 use crate::util::broadword::select_in_word;
 
@@ -67,9 +69,10 @@ pub struct YamlIndex<W = Vec<u64>> {
     bp_to_anchor: BTreeMap<usize, String>,
     /// Alias references: BP position of alias → target BP position (resolved at parse time)
     aliases: BTreeMap<usize, usize>,
-    /// Newline positions for fast line/column lookup.
+    /// Newline positions for fast line/column lookup (built lazily on first use).
     /// Bit i is set if position i is the start of a new line (immediately after a line terminator).
-    newlines: crate::bits::BitVec,
+    /// Only needed by `to_line_column()` and `to_offset()` (used by `yq-locate` CLI).
+    newlines: OnceCell<crate::bits::BitVec>,
 }
 
 /// Build cumulative popcount index for IB.
@@ -130,17 +133,16 @@ impl YamlIndex<Vec<u64>> {
     /// Build a YAML index from YAML text.
     ///
     /// This parses the YAML to build the interest bits (IB), balanced
-    /// parentheses (BP), and type bits (TY) index structures, plus
-    /// newline positions for fast line/column lookup.
+    /// parentheses (BP), and type bits (TY) index structures.
+    ///
+    /// The newline index for line/column lookup is built lazily on first
+    /// call to `to_line_column()` or `to_offset()`.
     pub fn build(yaml: &[u8]) -> Result<Self, YamlError> {
         let semi = build_semi_index(yaml)?;
 
         let ib_len = yaml.len();
         let ib_rank = build_ib_rank(&semi.ib);
         let containers_rank = build_containers_rank(&semi.containers);
-
-        // Build newline index for fast line/column lookup
-        let newlines = build_newline_index(yaml);
 
         // Build reverse anchor mapping (bp_pos → anchor_name)
         let bp_to_anchor: BTreeMap<usize, String> = semi
@@ -167,7 +169,7 @@ impl YamlIndex<Vec<u64>> {
             anchors: semi.anchors,
             bp_to_anchor,
             aliases: semi.aliases,
-            newlines,
+            newlines: OnceCell::new(),
         })
     }
 }
@@ -218,7 +220,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             anchors,
             bp_to_anchor,
             aliases,
-            newlines: crate::bits::BitVec::new(),
+            newlines: OnceCell::new(),
         }
     }
 
@@ -268,7 +270,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             anchors,
             bp_to_anchor,
             aliases,
-            newlines,
+            newlines: OnceCell::from(newlines),
         }
     }
 
@@ -711,7 +713,9 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// Convert a byte offset to (line, column) using the newline index.
     ///
     /// Lines and columns are 1-based to match common editor conventions.
-    /// Returns (1, offset+1) if newline index is empty.
+    /// Returns (1, offset+1) if the text has no newlines.
+    ///
+    /// The newline index is built lazily on first call from `text`.
     ///
     /// # Example
     ///
@@ -722,16 +726,18 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// let index = YamlIndex::build(yaml).unwrap();
     ///
     /// // Position 0 is line 1, column 1
-    /// assert_eq!(index.to_line_column(0), (1, 1));
+    /// assert_eq!(index.to_line_column(0, yaml), (1, 1));
     ///
     /// // Position 12 is line 2, column 1 (right after the newline)
-    /// assert_eq!(index.to_line_column(12), (2, 1));
+    /// assert_eq!(index.to_line_column(12, yaml), (2, 1));
     /// ```
     #[inline]
-    pub fn to_line_column(&self, offset: usize) -> (usize, usize) {
+    pub fn to_line_column(&self, offset: usize, text: &[u8]) -> (usize, usize) {
         use crate::RankSelect;
 
-        if self.newlines.is_empty() {
+        let newlines = self.ensure_newlines(text);
+
+        if newlines.is_empty() {
             return (1, offset + 1);
         }
 
@@ -739,7 +745,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         // rank1(offset + 1) gives the count of line-start markers in [0, offset],
         // which equals the number of lines before the current line.
         // So line number = 1 + rank1(offset + 1).
-        let markers_before_or_at = self.newlines.rank1(offset + 1);
+        let markers_before_or_at = newlines.rank1(offset + 1);
         let line = 1 + markers_before_or_at;
 
         // Column = offset - start of this line + 1
@@ -748,7 +754,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         } else {
             // The start of line N is at the (N-2)th marker (0-indexed select)
             // because line 1 has no marker, line 2 has marker 0, line 3 has marker 1, etc.
-            self.newlines.select1(line - 2).unwrap_or(0)
+            newlines.select1(line - 2).unwrap_or(0)
         };
 
         let column = offset - line_start + 1;
@@ -758,7 +764,9 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// Convert (line, column) to a byte offset using the newline index.
     ///
     /// Lines and columns are 1-based to match common editor conventions.
-    /// Returns None if the line/column is out of bounds or the newline index is empty.
+    /// Returns None if the line/column is out of bounds.
+    ///
+    /// The newline index is built lazily on first call from `text`.
     ///
     /// # Example
     ///
@@ -769,20 +777,22 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// let index = YamlIndex::build(yaml).unwrap();
     ///
     /// // Line 1, column 1 is offset 0
-    /// assert_eq!(index.to_offset(1, 1), Some(0));
+    /// assert_eq!(index.to_offset(1, 1, yaml), Some(0));
     ///
     /// // Line 2, column 1 is offset 12 (first char after newline)
-    /// assert_eq!(index.to_offset(2, 1), Some(12));
+    /// assert_eq!(index.to_offset(2, 1, yaml), Some(12));
     /// ```
     #[inline]
-    pub fn to_offset(&self, line: usize, column: usize) -> Option<usize> {
+    pub fn to_offset(&self, line: usize, column: usize, text: &[u8]) -> Option<usize> {
         use crate::RankSelect;
 
         if line == 0 || column == 0 {
             return None;
         }
 
-        if self.newlines.is_empty() {
+        let newlines = self.ensure_newlines(text);
+
+        if newlines.is_empty() {
             // No newline markers means single-line document
             if line == 1 {
                 return Some(column - 1);
@@ -796,16 +806,22 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         let line_start = if line == 1 {
             0
         } else {
-            self.newlines.select1(line - 2)?
+            newlines.select1(line - 2)?
         };
 
         Some(line_start + column - 1)
     }
 
-    /// Get a reference to the newline bitvector.
+    /// Get a reference to the newline bitvector, building it lazily if needed.
     #[inline]
-    pub fn newlines(&self) -> &crate::bits::BitVec {
-        &self.newlines
+    pub fn newlines(&self, text: &[u8]) -> &crate::bits::BitVec {
+        self.ensure_newlines(text)
+    }
+
+    /// Lazily build and cache the newline index from the source text.
+    #[inline]
+    fn ensure_newlines(&self, text: &[u8]) -> &crate::bits::BitVec {
+        self.newlines.get_or_init(|| build_newline_index(text))
     }
 }
 
@@ -845,14 +861,14 @@ mod tests {
         let index = YamlIndex::build(yaml).unwrap();
 
         // All positions on line 1
-        assert_eq!(index.to_line_column(0), (1, 1)); // 'n'
-        assert_eq!(index.to_line_column(5), (1, 6)); // ' '
-        assert_eq!(index.to_line_column(10), (1, 11)); // 'e'
+        assert_eq!(index.to_line_column(0, yaml), (1, 1)); // 'n'
+        assert_eq!(index.to_line_column(5, yaml), (1, 6)); // ' '
+        assert_eq!(index.to_line_column(10, yaml), (1, 11)); // 'e'
 
         // Reverse lookup
-        assert_eq!(index.to_offset(1, 1), Some(0));
-        assert_eq!(index.to_offset(1, 6), Some(5));
-        assert_eq!(index.to_offset(2, 1), None); // No line 2
+        assert_eq!(index.to_offset(1, 1, yaml), Some(0));
+        assert_eq!(index.to_offset(1, 6, yaml), Some(5));
+        assert_eq!(index.to_offset(2, 1, yaml), None); // No line 2
     }
 
     #[test]
@@ -861,19 +877,19 @@ mod tests {
         let index = YamlIndex::build(yaml).unwrap();
 
         // Line 1: positions 0-10 (name: Alice)
-        assert_eq!(index.to_line_column(0), (1, 1)); // 'n'
-        assert_eq!(index.to_line_column(10), (1, 11)); // 'e'
-        assert_eq!(index.to_line_column(11), (1, 12)); // '\n'
+        assert_eq!(index.to_line_column(0, yaml), (1, 1)); // 'n'
+        assert_eq!(index.to_line_column(10, yaml), (1, 11)); // 'e'
+        assert_eq!(index.to_line_column(11, yaml), (1, 12)); // '\n'
 
         // Line 2: positions 12-18 (age: 30)
-        assert_eq!(index.to_line_column(12), (2, 1)); // 'a'
-        assert_eq!(index.to_line_column(17), (2, 6)); // '3'
-        assert_eq!(index.to_line_column(18), (2, 7)); // '0'
+        assert_eq!(index.to_line_column(12, yaml), (2, 1)); // 'a'
+        assert_eq!(index.to_line_column(17, yaml), (2, 6)); // '3'
+        assert_eq!(index.to_line_column(18, yaml), (2, 7)); // '0'
 
         // Reverse lookup
-        assert_eq!(index.to_offset(1, 1), Some(0));
-        assert_eq!(index.to_offset(2, 1), Some(12));
-        assert_eq!(index.to_offset(2, 6), Some(17));
+        assert_eq!(index.to_offset(1, 1, yaml), Some(0));
+        assert_eq!(index.to_offset(2, 1, yaml), Some(12));
+        assert_eq!(index.to_offset(2, 6, yaml), Some(17));
     }
 
     #[test]
@@ -882,19 +898,19 @@ mod tests {
         let index = YamlIndex::build(yaml).unwrap();
 
         // Line 1: positions 0-6 (- item1)
-        assert_eq!(index.to_line_column(0), (1, 1));
-        assert_eq!(index.to_line_column(7), (1, 8)); // '\n'
+        assert_eq!(index.to_line_column(0, yaml), (1, 1));
+        assert_eq!(index.to_line_column(7, yaml), (1, 8)); // '\n'
 
         // Line 2: positions 8-14 (- item2)
-        assert_eq!(index.to_line_column(8), (2, 1));
+        assert_eq!(index.to_line_column(8, yaml), (2, 1));
 
         // Line 3: positions 16-22 (- item3)
-        assert_eq!(index.to_line_column(16), (3, 1));
+        assert_eq!(index.to_line_column(16, yaml), (3, 1));
 
         // Reverse lookup
-        assert_eq!(index.to_offset(1, 1), Some(0));
-        assert_eq!(index.to_offset(2, 1), Some(8));
-        assert_eq!(index.to_offset(3, 1), Some(16));
+        assert_eq!(index.to_offset(1, 1, yaml), Some(0));
+        assert_eq!(index.to_offset(2, 1, yaml), Some(8));
+        assert_eq!(index.to_offset(3, 1, yaml), Some(16));
     }
 
     #[test]
@@ -903,12 +919,12 @@ mod tests {
         let index = YamlIndex::build(yaml).unwrap();
 
         // Line 1: positions 0-10 (name: Alice)
-        assert_eq!(index.to_line_column(0), (1, 1));
-        assert_eq!(index.to_line_column(10), (1, 11));
+        assert_eq!(index.to_line_column(0, yaml), (1, 1));
+        assert_eq!(index.to_line_column(10, yaml), (1, 11));
 
         // Line 2: positions 13-19 (age: 30) - after \r\n
-        assert_eq!(index.to_line_column(13), (2, 1));
-        assert_eq!(index.to_offset(2, 1), Some(13));
+        assert_eq!(index.to_line_column(13, yaml), (2, 1));
+        assert_eq!(index.to_offset(2, 1, yaml), Some(13));
     }
 
     #[test]
@@ -917,8 +933,8 @@ mod tests {
         let index = YamlIndex::build(yaml).unwrap();
 
         // Line 2: position 12 (age: 30) - after \r
-        assert_eq!(index.to_line_column(12), (2, 1));
-        assert_eq!(index.to_offset(2, 1), Some(12));
+        assert_eq!(index.to_line_column(12, yaml), (2, 1));
+        assert_eq!(index.to_offset(2, 1, yaml), Some(12));
     }
 
     #[test]
@@ -926,8 +942,8 @@ mod tests {
         let yaml = b"name: Alice\nage: 30";
         let index = YamlIndex::build(yaml).unwrap();
 
-        assert_eq!(index.to_offset(0, 1), None); // line 0 invalid
-        assert_eq!(index.to_offset(1, 0), None); // column 0 invalid
+        assert_eq!(index.to_offset(0, 1, yaml), None); // line 0 invalid
+        assert_eq!(index.to_offset(1, 0, yaml), None); // column 0 invalid
     }
 
     #[test]
@@ -937,8 +953,8 @@ mod tests {
 
         // Test round-trip: offset -> line/column -> offset
         for offset in 0..yaml.len() {
-            let (line, col) = index.to_line_column(offset);
-            let result = index.to_offset(line, col);
+            let (line, col) = index.to_line_column(offset, yaml);
+            let result = index.to_offset(line, col, yaml);
             assert_eq!(
                 result,
                 Some(offset),
