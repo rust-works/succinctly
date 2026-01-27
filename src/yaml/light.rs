@@ -142,7 +142,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             return YamlValue::Null;
         }
 
-        let Some(text_pos) = self.text_position() else {
+        // Compute open_idx once — reused for both text_pos and text_end_pos
+        // to avoid a redundant rank1 in the unquoted scalar path.
+        let open_idx = self.index.bp_to_open_idx(self.bp_pos);
+        let Some(text_pos) = self.index.text_pos_by_open_idx(open_idx) else {
             return YamlValue::Error("invalid cursor position");
         };
 
@@ -277,9 +280,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             }
             _ => {
                 // Unquoted (plain) scalar - may span multiple lines
-                // Use pre-computed end position for O(1) lookup
+                // Use pre-computed end position for O(1) lookup.
+                // Reuses open_idx computed above to skip redundant rank1.
                 let end = self
-                    .text_end_position()
+                    .index
+                    .text_end_pos_by_open_idx(open_idx)
                     .filter(|&e| e >= effective_text_pos)
                     .unwrap_or(effective_text_pos);
 
