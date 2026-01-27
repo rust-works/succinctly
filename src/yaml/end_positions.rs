@@ -34,6 +34,8 @@
 //! lookup.
 
 #[cfg(not(test))]
+use alloc::boxed::Box;
+#[cfg(not(test))]
 use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
