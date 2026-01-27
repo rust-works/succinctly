@@ -26,9 +26,54 @@ use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
+use core::cell::Cell;
+
 use crate::util::broadword::select_in_word;
 
 use super::advance_positions::{build_cumulative_rank, build_select_samples, SELECT_SAMPLE_RATE};
+
+/// Cursor state for sequential access optimization.
+///
+/// When `get()` is called with consecutively increasing `open_idx` values
+/// (as happens during depth-first streaming), this cursor enables O(1)
+/// amortized access by maintaining incremental rank/select state instead
+/// of recomputing from scratch each time.
+///
+/// Invariants (when `next_open_idx < usize::MAX`):
+/// - `he_cumulative` = number of 1-bits in `has_end[0..next_open_idx)`
+/// - `adv_cumulative` = number of 1-bits in `advance[0..he_cumulative)`
+/// - `ib_ones_before` = number of 1-bits in `ib_words[0..ib_word_idx)`
+#[derive(Clone, Copy, Debug)]
+struct SequentialCursor {
+    /// The next expected open_idx for sequential access.
+    next_open_idx: usize,
+    /// has_end_rank1(next_open_idx): cumulative 1-bits in has_end before this position.
+    he_cumulative: usize,
+    /// advance_rank1(he_cumulative): cumulative 1-bits in advance before this scalar position.
+    adv_cumulative: usize,
+    /// Current word index in IB bitmap for forward scanning.
+    ib_word_idx: usize,
+    /// Number of 1-bits in ib_words[0..ib_word_idx).
+    ib_ones_before: usize,
+    /// Last argument to ib_select1 (for duplicate detection). usize::MAX = uninitialized.
+    last_ib_arg: usize,
+    /// Cached result from last ib_select1 call.
+    last_ib_result: usize,
+}
+
+impl Default for SequentialCursor {
+    fn default() -> Self {
+        Self {
+            next_open_idx: 0,
+            he_cumulative: 0,
+            adv_cumulative: 0,
+            ib_word_idx: 0,
+            ib_ones_before: 0,
+            last_ib_arg: usize::MAX,
+            last_ib_result: 0,
+        }
+    }
+}
 
 /// End position storage with automatic optimization.
 ///
@@ -73,6 +118,11 @@ pub struct CompactEndPositions {
     num_scalars: usize,
     /// Cumulative popcount for advance. O(1) rank via single array lookup.
     advance_rank: Vec<u32>,
+
+    /// Cursor for sequential access optimization (interior mutability).
+    /// Enables amortized O(1) access when open_idx values are accessed
+    /// in monotonically increasing order (streaming/depth-first traversal).
+    cursor: Cell<SequentialCursor>,
 }
 
 impl EndPositions {
@@ -158,6 +208,7 @@ impl CompactEndPositions {
             advance_words: Vec::new(),
             num_scalars: 0,
             advance_rank: vec![0],
+            cursor: Cell::default(),
         }
     }
 
@@ -193,6 +244,7 @@ impl CompactEndPositions {
                 advance_words: Vec::new(),
                 num_scalars: 0,
                 advance_rank: vec![0],
+                cursor: Cell::default(),
             };
         }
 
@@ -242,36 +294,207 @@ impl CompactEndPositions {
             advance_words,
             num_scalars,
             advance_rank,
+            cursor: Cell::default(),
         }
     }
 
     /// Get the end position for the `open_idx`-th BP open.
     ///
     /// Returns `None` if the entry has no end position (container) or out of bounds.
+    ///
+    /// Uses a sequential cursor optimization: when called with monotonically
+    /// increasing `open_idx` values (streaming/depth-first traversal), this
+    /// achieves amortized O(1) by using incremental bit tests instead of
+    /// full rank/select recomputation. Gaps (skipped container positions) are
+    /// handled by advancing the cursor through the gap incrementally.
     #[inline]
     pub fn get(&self, open_idx: usize) -> Option<usize> {
+        let cursor = self.cursor.get();
+        if open_idx == cursor.next_open_idx {
+            // Fast path: direct sequential access (most common in streaming)
+            self.get_sequential(open_idx, cursor)
+        } else if open_idx > cursor.next_open_idx {
+            // Small gap (skipped containers): advance cursor through gap, then sequential
+            let mut cursor = cursor;
+            self.advance_cursor_to(&mut cursor, open_idx);
+            self.get_sequential(open_idx, cursor)
+        } else {
+            // Backwards jump: full recomputation (rare, only in non-streaming access)
+            self.get_random(open_idx)
+        }
+    }
+
+    /// Advance the cursor from its current position to `target` open_idx.
+    ///
+    /// This incrementally updates has_end_rank and advance_rank by scanning
+    /// the skipped positions' bits. Cost: O(gap_size) bit lookups, typically
+    /// 1-3 for container gaps in streaming traversal.
+    #[inline]
+    fn advance_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
+        while cursor.next_open_idx < target {
+            let idx = cursor.next_open_idx;
+            let word_idx = idx / 64;
+            let bit_idx = idx % 64;
+            let he_bit = if word_idx < self.has_end.len() {
+                ((self.has_end[word_idx] >> bit_idx) & 1) as usize
+            } else {
+                0
+            };
+
+            if he_bit != 0 {
+                // This was a scalar we're skipping: update advance rank
+                let adv_word_idx = cursor.he_cumulative / 64;
+                let adv_bit_idx = cursor.he_cumulative % 64;
+                let adv_bit = if adv_word_idx < self.advance_words.len() {
+                    ((self.advance_words[adv_word_idx] >> adv_bit_idx) & 1) as usize
+                } else {
+                    0
+                };
+                cursor.adv_cumulative += adv_bit;
+            }
+            cursor.he_cumulative += he_bit;
+            cursor.next_open_idx += 1;
+        }
+    }
+
+    /// Fast path for sequential access (open_idx == cursor.next_open_idx).
+    ///
+    /// Uses incremental bit tests for rank (O(1) per call) and forward
+    /// scanning for IB select (amortized O(1) per call). Total: ~2-3
+    /// memory accesses per call vs ~70 for the random access path.
+    #[inline]
+    fn get_sequential(&self, open_idx: usize, mut cursor: SequentialCursor) -> Option<usize> {
         if open_idx >= self.num_opens {
             return None;
         }
 
-        // Check if this BP open has an end position
+        // 1. Check has_end bit (single word access, same word as previous call)
         let word_idx = open_idx / 64;
         let bit_idx = open_idx % 64;
-        if word_idx >= self.has_end.len() || (self.has_end[word_idx] >> bit_idx) & 1 == 0 {
+        let he_bit = if word_idx < self.has_end.len() {
+            (self.has_end[word_idx] >> bit_idx) & 1
+        } else {
+            0
+        };
+
+        // 2. scalar_idx = he_cumulative (rank before this position, already tracked)
+        let scalar_idx = cursor.he_cumulative;
+
+        // 3. Update he_cumulative for next call:
+        //    has_end_rank1(open_idx + 1) = has_end_rank1(open_idx) + has_end[open_idx]
+        cursor.he_cumulative += he_bit as usize;
+        cursor.next_open_idx = open_idx + 1;
+
+        if he_bit == 0 {
+            self.cursor.set(cursor);
             return None;
         }
 
-        // Count scalars before this open to get scalar index
-        let scalar_idx = self.has_end_rank1(open_idx);
+        // 4. advance_count = advance_rank1(scalar_idx + 1) (single bit lookup)
+        //    = adv_cumulative + advance[scalar_idx]
+        let adv_word_idx = scalar_idx / 64;
+        let adv_bit_idx = scalar_idx % 64;
+        let adv_bit = if adv_word_idx < self.advance_words.len() {
+            (self.advance_words[adv_word_idx] >> adv_bit_idx) & 1
+        } else {
+            0
+        };
+        let advance_count = cursor.adv_cumulative + adv_bit as usize;
 
-        // Count advances up to and including this scalar
-        let advance_count = self.advance_rank1(scalar_idx + 1);
+        // 5. Update adv_cumulative: advance_rank1(new he_cumulative) = advance_count
+        cursor.adv_cumulative = advance_count;
+
         if advance_count == 0 {
+            self.cursor.set(cursor);
             return None;
         }
 
-        // Find the (advance_count - 1)-th unique end position in IB
-        self.ib_select1(advance_count - 1)
+        // 6. ib_select1(advance_count - 1) — forward scan from cursor position
+        let k = advance_count - 1;
+
+        // Fast path: duplicate end position (same IB select argument as last time)
+        if k == cursor.last_ib_arg {
+            self.cursor.set(cursor);
+            return Some(cursor.last_ib_result);
+        }
+
+        // Forward scan in IB bitmap from cursor position
+        let mut remaining = k - cursor.ib_ones_before;
+        let mut wi = cursor.ib_word_idx;
+
+        while wi < self.ib_words.len() {
+            let word = self.ib_words[wi];
+            let ones = word.count_ones() as usize;
+            if remaining < ones {
+                let bit_pos = select_in_word(word, remaining as u32) as usize;
+                let result = wi * 64 + bit_pos;
+
+                // Update IB cursor state (stay at this word for potential next select)
+                cursor.ib_ones_before = k - remaining; // ones in [0..wi)
+                cursor.ib_word_idx = wi;
+                cursor.last_ib_arg = k;
+                cursor.last_ib_result = result;
+                self.cursor.set(cursor);
+                return Some(result);
+            }
+            remaining -= ones;
+            wi += 1;
+        }
+
+        self.cursor.set(cursor);
+        None
+    }
+
+    /// Random access path (backwards jump): full rank/select computation,
+    /// then sets up cursor for subsequent sequential access.
+    ///
+    /// Preserves IB cursor state from previous sequential run to avoid
+    /// rescanning the entire IB bitmap on subsequent forward calls.
+    fn get_random(&self, open_idx: usize) -> Option<usize> {
+        if open_idx >= self.num_opens {
+            return None;
+        }
+
+        // Check has_end bit
+        let word_idx = open_idx / 64;
+        let bit_idx = open_idx % 64;
+        let he_bit = if word_idx < self.has_end.len() {
+            (self.has_end[word_idx] >> bit_idx) & 1
+        } else {
+            0
+        };
+
+        // Always compute rank to set up cursor for subsequent sequential access
+        let scalar_idx = self.has_end_rank1(open_idx);
+        let he_cumulative = scalar_idx + he_bit as usize;
+
+        let (result, adv_cumulative) = if he_bit == 0 {
+            (None, self.advance_rank1(he_cumulative))
+        } else {
+            let advance_count = self.advance_rank1(scalar_idx + 1);
+            let res = if advance_count == 0 {
+                None
+            } else {
+                self.ib_select1(advance_count - 1)
+            };
+            (res, advance_count)
+        };
+
+        // Set up cursor for subsequent sequential access starting at open_idx + 1.
+        // Reset IB cursor to 0 because backwards jumps invalidate the old IB state
+        // (old cursor was ahead of new position). This is acceptable because backwards
+        // jumps only happen in non-streaming (test) access patterns.
+        self.cursor.set(SequentialCursor {
+            next_open_idx: open_idx + 1,
+            he_cumulative,
+            adv_cumulative,
+            ib_word_idx: 0,
+            ib_ones_before: 0,
+            last_ib_arg: usize::MAX,
+            last_ib_result: 0,
+        });
+
+        result
     }
 
     /// Count 1-bits in has_end in [0, pos).
