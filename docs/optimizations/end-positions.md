@@ -159,11 +159,11 @@ Example: N = 7  →  28 bytes
 
 ### Strengths and weaknesses
 
-| Aspect | Rating | Notes |
-|--------|--------|-------|
-| Memory | Poor | 4 bytes per node, even for zero-valued containers |
-| Query speed | Excellent | Single array index — one cache-line access |
-| Code simplicity | Excellent | A one-liner |
+| Aspect          | Rating    | Notes                                             |
+|-----------------|-----------|---------------------------------------------------|
+| Memory          | Poor      | 4 bytes per node, even for zero-valued containers |
+| Query speed     | Excellent | Single array index — one cache-line access        |
+| Code simplicity | Excellent | A one-liner                                       |
 
 The direct array is the gold standard for speed. Every query is a single
 memory load. But for a 1 MB YAML file with ~130K nodes, it consumes ~520 KB
@@ -401,10 +401,10 @@ Step 4: Forward-scan IB from cursor.ib_word_idx      ← 0–1 memory accesses
 
 ### Strengths and weaknesses
 
-| Aspect | Rating | Notes |
-|--------|--------|-------|
-| Memory | Good | ~3–5× smaller than `Vec<u32>` |
-| Query speed | Moderate | 2–3 bitmap accesses on hot path |
+| Aspect          | Rating   | Notes                                                    |
+|-----------------|----------|----------------------------------------------------------|
+| Memory          | Good     | ~3–5× smaller than `Vec<u32>`                            |
+| Query speed     | Moderate | 2–3 bitmap accesses on hot path                          |
 | Code complexity | Moderate | Three bitmaps, two rank structures, cursor with 7 fields |
 
 The 2–3 bitmap accesses per call introduce a measurable overhead compared to
@@ -466,14 +466,14 @@ of scalar_idx — no `has_end` rank needed.
 
 ### What changes
 
-| Aspect | 3-Bitmap | 2-Bitmap |
-|--------|----------|----------|
-| Bitmaps | has_end + IB + advance | IB + advance |
-| Advance indexed by | scalar_idx (S entries) | open_idx (N entries) |
-| Advance size | ⌈S/64⌉ words | ⌈N/64⌉ words |
-| Container result | `None` | `Some(prev_scalar_end)` or `None` for leading |
-| Cursor fields | 7 (56 bytes) | 6 (48 bytes) |
-| Memory accesses (sequential) | 2–3 | 1–2 |
+| Aspect                       | 3-Bitmap               | 2-Bitmap                                      |
+|------------------------------|------------------------|-----------------------------------------------|
+| Bitmaps                      | has_end + IB + advance | IB + advance                                  |
+| Advance indexed by           | scalar_idx (S entries) | open_idx (N entries)                          |
+| Advance size                 | ⌈S/64⌉ words           | ⌈N/64⌉ words                                  |
+| Container result             | `None`                 | `Some(prev_scalar_end)` or `None` for leading |
+| Cursor fields                | 7 (56 bytes)           | 6 (48 bytes)                                  |
+| Memory accesses (sequential) | 2–3                    | 1–2                                           |
 
 ### How zero-filling works
 
@@ -726,19 +726,19 @@ All benchmarks on ARM Neoverse V2 (AWS Graviton 3, 64 KB L1D, ~224-entry ROB).
 
 This measures the isolated effect of eliminating `has_end`:
 
-| Benchmark | 3-Bitmap | 2-Bitmap | Change |
-|-----------|----------|----------|--------|
-| simple_kv/10 | 1.86 µs | 1.64 µs | **-11.7%** |
-| simple_kv/100 | 9.04 µs | 8.45 µs | **-6.5%** |
-| simple_kv/1000 | 76.8 µs | 73.5 µs | **-4.3%** |
-| sequences/10 | 2.26 µs | 2.04 µs | **-9.8%** |
-| sequences/100 | 7.37 µs | 7.01 µs | **-4.9%** |
-| quoted/double/10 | 2.80 µs | 2.43 µs | **-13.3%** |
-| quoted/single/10 | 2.77 µs | 2.37 µs | **-14.3%** |
-| large/1kb | 6.75 µs | 6.28 µs | **-7.0%** |
-| large/1mb | 4.39 ms | 3.88 ms | **-11.5%** |
-| anchors/10 | 4.11 µs | 3.73 µs | **-9.1%** |
-| anchors/k8s_10 | 9.06 µs | 8.50 µs | **-6.2%** |
+| Benchmark        | 3-Bitmap | 2-Bitmap | Change     |
+|------------------|----------|----------|------------|
+| simple_kv/10     | 1.86 µs  | 1.64 µs  | **-11.7%** |
+| simple_kv/100    | 9.04 µs  | 8.45 µs  | **-6.5%**  |
+| simple_kv/1000   | 76.8 µs  | 73.5 µs  | **-4.3%**  |
+| sequences/10     | 2.26 µs  | 2.04 µs  | **-9.8%**  |
+| sequences/100    | 7.37 µs  | 7.01 µs  | **-4.9%**  |
+| quoted/double/10 | 2.80 µs  | 2.43 µs  | **-13.3%** |
+| quoted/single/10 | 2.77 µs  | 2.37 µs  | **-14.3%** |
+| large/1kb        | 6.75 µs  | 6.28 µs  | **-7.0%**  |
+| large/1mb        | 4.39 ms  | 3.88 ms  | **-11.5%** |
+| anchors/10       | 4.11 µs  | 3.73 µs  | **-9.1%**  |
+| anchors/k8s_10   | 9.06 µs  | 8.50 µs  | **-6.2%**  |
 
 The improvement is largest for small documents with many nodes (high
 lookup-to-parse ratio), reaching **14.3%** for quoted/single/10.
@@ -748,18 +748,18 @@ lookup-to-parse ratio), reaching **14.3%** for quoted/single/10.
 This shows the total cost of compact encoding (both OpenPositions and
 EndPositions bitmaps) compared to the original `Vec<u32>` arrays:
 
-| Benchmark | main | 2-Bitmap branch | Change | Notes |
-|-----------|------|-----------------|--------|-------|
-| simple_kv/10 | 1.41 µs | 1.65 µs | +17% | Many short scalars |
-| simple_kv/1000 | 70.3 µs | 73.5 µs | +4.6% | |
-| sequences/10 | 1.67 µs | 2.04 µs | +22% | Highest node density |
-| quoted/double/10 | 1.96 µs | 2.43 µs | +24% | |
-| large/1kb | 5.41 µs | 6.27 µs | +16% | |
-| large/1mb | 3.79 ms | 4.22 ms | +11% | |
-| long_strings/1024b | 113 µs | 85.2 µs | **-25%** | Few lookups, long values |
-| long_strings/4096b | 469 µs | 308 µs | **-34%** | |
-| block_scalars/100x100 | 632 µs | 530 µs | **-16%** | |
-| block_scalars/10x1000 | 667 µs | 534 µs | **-20%** | |
+| Benchmark             | main     | 2-Bitmap branch | Change   | Notes                    |
+|-----------------------|----------|-----------------|----------|--------------------------|
+| simple_kv/10          | 1.41 µs  | 1.65 µs         | +17%     | Many short scalars       |
+| simple_kv/1000        | 70.3 µs  | 73.5 µs         | +4.6%    | -                        |
+| sequences/10          | 1.67 µs  | 2.04 µs         | +22%     | Highest node density     |
+| quoted/double/10      | 1.96 µs  | 2.43 µs         | +24%     | -                        |
+| large/1kb             | 5.41 µs  | 6.27 µs         | +16%     | -                        |
+| large/1mb             | 3.79 ms  | 4.22 ms         | +11%     | -                        |
+| long_strings/1024b    | 113 µs   | 85.2 µs         | **-25%** | Few lookups, long values |
+| long_strings/4096b    | 469 µs   | 308 µs          | **-34%** | -                        |
+| block_scalars/100x100 | 632 µs   | 530 µs          | **-16%** | -                        |
+| block_scalars/10x1000 | 667 µs   | 534 µs          | **-20%** | -                        |
 
 The branch is slower for workloads with many short scalars (high lookup
 frequency), but faster for workloads with fewer, longer values (where
@@ -767,17 +767,17 @@ other optimizations on the branch dominate).
 
 ### Memory usage
 
-| YAML size | Design | End pos storage | Ratio |
-|-----------|--------|-----------------|-------|
-| 1 KB (N≈130) | Vec<u32> | 520 B | 1.0× |
-| | 3-Bitmap | ~155 B | 3.4× smaller |
-| | 2-Bitmap | ~145 B | 3.6× smaller |
-| 10 KB (N≈1.3K) | Vec<u32> | 5.2 KB | 1.0× |
-| | 3-Bitmap | ~1.5 KB | 3.5× smaller |
-| | 2-Bitmap | ~1.4 KB | 3.7× smaller |
-| 1 MB (N≈130K) | Vec<u32> | 520 KB | 1.0× |
-| | 3-Bitmap | ~159 KB | 3.3× smaller |
-| | 2-Bitmap | ~148 KB | 3.5× smaller |
+| YAML size       | Design   | End pos storage | Ratio        |
+|-----------------|----------|-----------------|--------------|
+| 1 KB (N≈130)    | Vec<u32> | 520 B           | 1.0×         |
+| -               | 3-Bitmap | ~155 B          | 3.4× smaller |
+| -               | 2-Bitmap | ~145 B          | 3.6× smaller |
+| 10 KB (N≈1.3K)  | Vec<u32> | 5.2 KB          | 1.0×         |
+| -               | 3-Bitmap | ~1.5 KB         | 3.5× smaller |
+| -               | 2-Bitmap | ~1.4 KB         | 3.7× smaller |
+| 1 MB (N≈130K)   | Vec<u32> | 520 KB          | 1.0×         |
+| -               | 3-Bitmap | ~159 KB         | 3.3× smaller |
+| -               | 2-Bitmap | ~148 KB         | 3.5× smaller |
 
 The 2-bitmap design saves an additional ~7% memory over 3-bitmap by
 eliminating the `has_end` bitmap and its rank array.

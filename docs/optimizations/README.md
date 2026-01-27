@@ -4,19 +4,19 @@ This directory documents optimization techniques used in the succinctly library,
 
 ## Quick Reference
 
-| Category | Document | Key Techniques |
-|----------|----------|----------------|
-| **Bit-level** | [bit-manipulation.md](bit-manipulation.md) | Popcount, CTZ/CLZ, broadword select, PDEP/PEXT |
-| **Lookup tables** | [lookup-tables.md](lookup-tables.md) | Byte tables, nibble tables, state machine tables |
-| **SIMD** | [simd.md](simd.md) | AVX2, AVX-512, SSE4.2, NEON |
-| **Memory** | [cache-memory.md](cache-memory.md) | Alignment, layout, prefetching, bandwidth |
-| **Data structures** | [hierarchical-structures.md](hierarchical-structures.md) | Rank directory, select index, RangeMin |
-| **Control flow** | [branchless.md](branchless.md) | CMOV, arithmetic selection, SIMD masking |
-| **Access patterns** | [access-patterns.md](access-patterns.md) | Sequential, strided, random, search algorithms |
-| **Allocation** | [zero-copy.md](zero-copy.md) | Type punning, memory mapping, streaming |
-| **Parallelism** | [parallel-prefix.md](parallel-prefix.md) | Prefix XOR, cumulative index, carry propagation |
-| **Parsing** | [state-machines.md](state-machines.md) | PFSM, fast-path bypass, two-stage pipeline |
-| **Compact encoding** | [end-positions.md](end-positions.md) | Bitmap encoding, advance index, sequential cursor |
+| Category             | Document                                                 | Key Techniques                                  |
+|----------------------|----------------------------------------------------------|-------------------------------------------------|
+| **Bit-level**        | [bit-manipulation.md](bit-manipulation.md)               | Popcount, CTZ/CLZ, broadword select, PDEP/PEXT  |
+| **Lookup tables**    | [lookup-tables.md](lookup-tables.md)                     | Byte tables, nibble tables, state machine tables |
+| **SIMD**             | [simd.md](simd.md)                                      | AVX2, AVX-512, SSE4.2, NEON                     |
+| **Memory**           | [cache-memory.md](cache-memory.md)                       | Alignment, layout, prefetching, bandwidth        |
+| **Data structures**  | [hierarchical-structures.md](hierarchical-structures.md) | Rank directory, select index, RangeMin           |
+| **Control flow**     | [branchless.md](branchless.md)                           | CMOV, arithmetic selection, SIMD masking         |
+| **Access patterns**  | [access-patterns.md](access-patterns.md)                 | Sequential, strided, random, search algorithms   |
+| **Allocation**       | [zero-copy.md](zero-copy.md)                             | Type punning, memory mapping, streaming          |
+| **Parallelism**      | [parallel-prefix.md](parallel-prefix.md)                 | Prefix XOR, cumulative index, carry propagation  |
+| **Parsing**          | [state-machines.md](state-machines.md)                   | PFSM, fast-path bypass, two-stage pipeline       |
+| **Compact encoding** | [end-positions.md](end-positions.md)                     | Bitmap encoding, advance index, sequential cursor|
 
 ---
 
@@ -24,35 +24,35 @@ This directory documents optimization techniques used in the succinctly library,
 
 ### Highest Impact Techniques
 
-| Technique | Speedup | Category | Document |
-|-----------|---------|----------|----------|
-| Cumulative Index | **627x** | Hierarchical | [hierarchical-structures.md](hierarchical-structures.md) |
-| RangeMin Index | **40x** | Hierarchical | [hierarchical-structures.md](hierarchical-structures.md) |
-| Byte Lookup Tables | **11x** | Lookup | [lookup-tables.md](lookup-tables.md) |
-| BMI2 PDEP Toggle | **10x** | Bit manipulation | [bit-manipulation.md](bit-manipulation.md) |
-| Lightweight DSV Index | **5-9x** | Cache/Memory | [cache-memory.md](cache-memory.md) |
-| AVX-512 VPOPCNTDQ | **5.2x** | SIMD | [simd.md](simd.md) |
-| Exponential Search | **3.1x** | Access patterns | [access-patterns.md](access-patterns.md) |
-| NEON VMINV L1 Building | **2.8x** | SIMD | [simd.md](simd.md) |
-| SSE4.1 PHMINPOSUW L1/L2 | **1-3%** (10M+) | SIMD | [simd.md](simd.md) |
-| AVX2 JSON Parser | **1.78x** | SIMD | [simd.md](simd.md) |
-| PFSM Tables | **1.77x** | State machines | [state-machines.md](state-machines.md) |
-| NEON DSV Index | **1.8x** | SIMD | [simd.md](simd.md) |
-| NEON 256B Popcount | **1.15x** | SIMD | [simd.md](simd.md) |
-| SIMD Unquoted Structural Skip | **3-8%** | SIMD | [simd.md](simd.md) |
-| Lazy line + direct indexing | **2-6%** | State machines | [state-machines.md](state-machines.md) |
+| Technique                      | Speedup            | Category         | Document                                                 |
+|--------------------------------|--------------------|------------------|----------------------------------------------------------|
+| Cumulative Index               | **627x**           | Hierarchical     | [hierarchical-structures.md](hierarchical-structures.md) |
+| RangeMin Index                 | **40x**            | Hierarchical     | [hierarchical-structures.md](hierarchical-structures.md) |
+| Byte Lookup Tables             | **11x**            | Lookup           | [lookup-tables.md](lookup-tables.md)                     |
+| BMI2 PDEP Toggle               | **10x**            | Bit manipulation | [bit-manipulation.md](bit-manipulation.md)               |
+| Lightweight DSV Index          | **5-9x**           | Cache/Memory     | [cache-memory.md](cache-memory.md)                       |
+| AVX-512 VPOPCNTDQ              | **5.2x**           | SIMD             | [simd.md](simd.md)                                      |
+| Exponential Search             | **3.1x**           | Access patterns  | [access-patterns.md](access-patterns.md)                 |
+| NEON VMINV L1 Building         | **2.8x**           | SIMD             | [simd.md](simd.md)                                      |
+| SSE4.1 PHMINPOSUW L1/L2       | **1-3%** (10M+)    | SIMD             | [simd.md](simd.md)                                      |
+| AVX2 JSON Parser               | **1.78x**          | SIMD             | [simd.md](simd.md)                                      |
+| PFSM Tables                    | **1.77x**          | State machines   | [state-machines.md](state-machines.md)                   |
+| NEON DSV Index                 | **1.8x**           | SIMD             | [simd.md](simd.md)                                      |
+| NEON 256B Popcount             | **1.15x**          | SIMD             | [simd.md](simd.md)                                      |
+| SIMD Unquoted Structural Skip  | **3-8%**           | SIMD             | [simd.md](simd.md)                                      |
+| Lazy line + direct indexing    | **2-6%**           | State machines   | [state-machines.md](state-machines.md)                   |
 
 ### Notable Failures (Instructive)
 
-| Technique | Penalty | Reason | Document |
-|-----------|---------|--------|----------|
-| BMI2 PDEP BitWriter | **-71%** | Wrong use case (consecutive bits) | [bit-manipulation.md](bit-manipulation.md) |
-| NEON PFSM Shuffle | **-47%** | Serial dependency overhead | [state-machines.md](state-machines.md) |
-| BMI1 Mask Iteration | **-26%** | Optimised <1% of runtime | [simd.md](simd.md) |
-| NEON Batched Popcount | **-25%** | Prefix sum inherently sequential | [parallel-prefix.md](parallel-prefix.md) |
-| AVX-512 JSON Parser | **-10%** | Memory-bound, not compute-bound | [simd.md](simd.md) |
-| AVX-512 YAML Parser | **-7%** | Memory bandwidth bottleneck + benchmark flaw | [simd.md](simd.md) |
-| SIMD Lookahead Quote Skip | **-2 to -6%** | Short strings, SIMD overhead dominates | [state-machines.md](state-machines.md) |
+| Technique                   | Penalty        | Reason                                       | Document                                       |
+|-----------------------------|----------------|----------------------------------------------|-------------------------------------------------|
+| BMI2 PDEP BitWriter         | **-71%**       | Wrong use case (consecutive bits)            | [bit-manipulation.md](bit-manipulation.md)     |
+| NEON PFSM Shuffle           | **-47%**       | Serial dependency overhead                   | [state-machines.md](state-machines.md)         |
+| BMI1 Mask Iteration         | **-26%**       | Optimised <1% of runtime                     | [simd.md](simd.md)                            |
+| NEON Batched Popcount       | **-25%**       | Prefix sum inherently sequential             | [parallel-prefix.md](parallel-prefix.md)       |
+| AVX-512 JSON Parser         | **-10%**       | Memory-bound, not compute-bound              | [simd.md](simd.md)                            |
+| AVX-512 YAML Parser         | **-7%**        | Memory bandwidth bottleneck + benchmark flaw | [simd.md](simd.md)                            |
+| SIMD Lookahead Quote Skip   | **-2 to -6%** | Short strings, SIMD overhead dominates       | [state-machines.md](state-machines.md)         |
 
 ---
 
