@@ -6,20 +6,32 @@
 //!
 //! # Structure
 //!
-//! For monotonically non-decreasing non-zero positions, uses three bitmaps:
+//! For monotonically non-decreasing non-zero positions, uses two bitmaps:
 //!
-//! - **has_end**: One bit per BP open, set if the node has a non-zero end position
 //! - **IB (Interest Bits)**: One bit per text byte, set at each unique end position
-//! - **Advance bitmap**: One bit per scalar (node with end pos), set when end position advances
+//! - **Advance bitmap**: One bit per BP open, set when end position advances
+//!
+//! Container zeros are filled with the previous non-zero value before encoding,
+//! making the sequence monotonic. This eliminates the need for a separate `has_end`
+//! bitmap, reducing the hot path from 3 bitmap accesses to 2.
 //!
 //! For non-monotonic positions, falls back to `Vec<u32>`.
 //!
 //! # Memory
 //!
-//! With typical YAML density (N opens, S scalars ≈ 60-70% of N, L text bytes):
+//! With typical YAML density (N opens, L text bytes):
 //! - Dense `Vec<u32>`: 4N bytes
-//! - Compact: N/8 (has_end) + L/8 (IB) + S/8 (advance) + rank/select overhead ≈ 0.8N bytes
-//! - **~5x smaller** (when monotonic)
+//! - Compact: L/8 (IB) + N/8 (advance) + rank/select overhead
+//! - **~4-5x smaller** (when monotonic)
+//!
+//! # API Note
+//!
+//! The Compact variant may return `Some(value)` for container entries (which
+//! get the previous scalar's end position due to zero-filling). The Dense
+//! variant returns `None` for zero entries. This inconsistency is acceptable
+//! because the only production caller (`value()` in `light.rs`) only calls
+//! `get()` for scalar nodes — containers exit before reaching the end position
+//! lookup.
 
 #[cfg(not(test))]
 use alloc::vec;
@@ -40,16 +52,13 @@ use super::advance_positions::{build_cumulative_rank, build_select_samples, SELE
 /// of recomputing from scratch each time.
 ///
 /// Invariants (when `next_open_idx < usize::MAX`):
-/// - `he_cumulative` = number of 1-bits in `has_end[0..next_open_idx)`
-/// - `adv_cumulative` = number of 1-bits in `advance[0..he_cumulative)`
+/// - `adv_cumulative` = number of 1-bits in `advance[0..next_open_idx)`
 /// - `ib_ones_before` = number of 1-bits in `ib_words[0..ib_word_idx)`
 #[derive(Clone, Copy, Debug)]
 struct SequentialCursor {
     /// The next expected open_idx for sequential access.
     next_open_idx: usize,
-    /// has_end_rank1(next_open_idx): cumulative 1-bits in has_end before this position.
-    he_cumulative: usize,
-    /// advance_rank1(he_cumulative): cumulative 1-bits in advance before this scalar position.
+    /// advance_rank1(next_open_idx): cumulative 1-bits in advance before this position.
     adv_cumulative: usize,
     /// Current word index in IB bitmap for forward scanning.
     ib_word_idx: usize,
@@ -65,7 +74,6 @@ impl Default for SequentialCursor {
     fn default() -> Self {
         Self {
             next_open_idx: 0,
-            he_cumulative: 0,
             adv_cumulative: 0,
             ib_word_idx: 0,
             ib_ones_before: 0,
@@ -87,20 +95,17 @@ pub enum EndPositions {
     Dense(Vec<u32>),
 }
 
-/// Compact encoding for scalar end positions using three bitmaps.
+/// Compact encoding for scalar end positions using two bitmaps.
 ///
-/// Only non-zero entries (scalars with end positions) are stored in the
-/// IB + advance bitmaps. A `has_end` bitmap identifies which BP opens
-/// have non-zero end positions.
+/// Container zeros are filled with the previous non-zero value, making the
+/// entire sequence monotonically non-decreasing. The advance bitmap is indexed
+/// by BP open index (one bit per open), not by scalar index.
+///
+/// This eliminates the `has_end` bitmap from the previous 3-bitmap design,
+/// reducing the hot path from 3 bitmap accesses to 2 and shrinking the
+/// sequential cursor from 56 to 48 bytes.
 #[derive(Clone, Debug)]
 pub struct CompactEndPositions {
-    /// 1 if this BP open has a non-zero end position (is a scalar with end).
-    has_end: Vec<u64>,
-    /// Cumulative popcount for has_end. O(1) rank via single array lookup.
-    has_end_rank: Vec<u32>,
-    /// Total number of BP opens.
-    num_opens: usize,
-
     /// Interest bits: one bit per text byte, set at each unique end position.
     ib_words: Vec<u64>,
     /// Number of valid bits in IB (= text length).
@@ -111,11 +116,11 @@ pub struct CompactEndPositions {
     /// Total number of unique end positions (1-bits in IB).
     ib_ones: usize,
 
-    /// Advance bitmap: one bit per scalar, set when end position advances.
+    /// Advance bitmap: one bit per BP open, set when end position advances.
+    /// Indexed by open_idx (includes containers), not by scalar index.
     advance_words: Vec<u64>,
-    /// Number of scalars (nodes with non-zero end positions).
-    #[allow(dead_code)]
-    num_scalars: usize,
+    /// Total number of BP opens.
+    num_opens: usize,
     /// Cumulative popcount for advance. O(1) rank via single array lookup.
     advance_rank: Vec<u32>,
 
@@ -129,6 +134,9 @@ impl EndPositions {
     /// Build from a slice of end positions (one per BP open).
     ///
     /// Zero entries are treated as sentinels (containers with no end position).
+    /// For compact encoding, zeros are filled with the previous non-zero value
+    /// to create a monotonic sequence suitable for 2-bitmap encoding.
+    ///
     /// Automatically chooses compact or dense storage based on monotonicity
     /// of the non-zero entries.
     pub fn build(positions: &[u32], text_len: usize) -> Self {
@@ -136,21 +144,19 @@ impl EndPositions {
             return EndPositions::Compact(Box::new(CompactEndPositions::empty(text_len)));
         }
 
-        // Extract non-zero positions and check monotonicity
-        let mut non_zero: Vec<u32> = Vec::new();
+        // Check if non-zero positions are monotonically non-decreasing
         let mut is_monotonic = true;
-        let mut prev: Option<u32> = None;
+        let mut prev_nonzero: Option<u32> = None;
 
         for &pos in positions {
             if pos > 0 {
-                if let Some(p) = prev {
+                if let Some(p) = prev_nonzero {
                     if pos < p {
                         is_monotonic = false;
                         break;
                     }
                 }
-                prev = Some(pos);
-                non_zero.push(pos);
+                prev_nonzero = Some(pos);
             }
         }
 
@@ -158,14 +164,30 @@ impl EndPositions {
             return EndPositions::Dense(positions.to_vec());
         }
 
-        EndPositions::Compact(Box::new(CompactEndPositions::build(
-            positions, &non_zero, text_len,
-        )))
+        // Fill zeros with previous non-zero value to make sequence monotonic.
+        // Leading zeros (before any scalar) stay as 0.
+        let mut filled = Vec::with_capacity(positions.len());
+        let mut prev = 0u32;
+        for &pos in positions {
+            if pos > 0 {
+                prev = pos;
+            }
+            filled.push(prev);
+        }
+
+        EndPositions::Compact(Box::new(CompactEndPositions::build(&filled, text_len)))
     }
 
     /// Get the end position for the `open_idx`-th BP open.
     ///
-    /// Returns `None` if the entry is 0 (container/no end position) or out of bounds.
+    /// For the Dense variant, returns `None` if the entry is 0 (container).
+    /// For the Compact variant, may return `Some(value)` for containers
+    /// (they inherit the previous scalar's end position due to zero-filling).
+    /// Returns `None` only for leading containers (before any scalar) or
+    /// out of bounds.
+    ///
+    /// In production, this is only called for scalar nodes from `value()`,
+    /// so the container behavior is irrelevant.
     #[inline]
     pub fn get(&self, open_idx: usize) -> Option<usize> {
         match self {
@@ -198,54 +220,27 @@ impl CompactEndPositions {
     /// Create an empty instance.
     fn empty(text_len: usize) -> Self {
         Self {
-            has_end: Vec::new(),
-            has_end_rank: vec![0],
-            num_opens: 0,
             ib_words: Vec::new(),
             ib_len: text_len,
             ib_select_samples: Vec::new(),
             ib_ones: 0,
             advance_words: Vec::new(),
-            num_scalars: 0,
+            num_opens: 0,
             advance_rank: vec![0],
             cursor: Cell::default(),
         }
     }
 
-    /// Build compact end positions from all positions and the pre-extracted non-zero positions.
+    /// Build compact end positions from zero-filled positions.
     ///
-    /// `all_positions` contains one entry per BP open (including zeros for containers).
-    /// `non_zero_positions` contains only the non-zero entries, in order, and must be
-    /// monotonically non-decreasing.
-    fn build(all_positions: &[u32], non_zero_positions: &[u32], text_len: usize) -> Self {
-        let num_opens = all_positions.len();
-        let num_scalars = non_zero_positions.len();
+    /// `filled_positions` must be monotonically non-decreasing (zeros replaced
+    /// with the previous non-zero value). All entries have a value; containers
+    /// inherit the previous scalar's end position (or 0 for leading containers).
+    fn build(filled_positions: &[u32], text_len: usize) -> Self {
+        let num_opens = filled_positions.len();
 
-        // Build has_end bitmap: 1 if BP open has non-zero end position
-        let has_end_num_words = num_opens.div_ceil(64);
-        let mut has_end = vec![0u64; has_end_num_words];
-
-        for (i, &pos) in all_positions.iter().enumerate() {
-            if pos > 0 {
-                has_end[i / 64] |= 1u64 << (i % 64);
-            }
-        }
-        let has_end_rank = build_cumulative_rank(&has_end);
-
-        if non_zero_positions.is_empty() {
-            return Self {
-                has_end,
-                has_end_rank,
-                num_opens,
-                ib_words: Vec::new(),
-                ib_len: text_len,
-                ib_select_samples: Vec::new(),
-                ib_ones: 0,
-                advance_words: Vec::new(),
-                num_scalars: 0,
-                advance_rank: vec![0],
-                cursor: Cell::default(),
-            };
+        if filled_positions.is_empty() || filled_positions.iter().all(|&p| p == 0) {
+            return Self::empty(text_len);
         }
 
         // Build IB: set bit at each unique end position.
@@ -254,14 +249,21 @@ impl CompactEndPositions {
         let ib_num_words = (text_len + 1).div_ceil(64);
         let mut ib_words = vec![0u64; ib_num_words];
 
-        // Build advance bitmap: set bit when end position changes
-        let advance_num_words = num_scalars.div_ceil(64);
+        // Build advance bitmap: one bit per BP open, set when position changes
+        let advance_num_words = num_opens.div_ceil(64);
         let mut advance_words = vec![0u64; advance_num_words];
 
         let mut prev_pos: Option<u32> = None;
         let mut ib_ones = 0usize;
 
-        for (i, &pos) in non_zero_positions.iter().enumerate() {
+        for (i, &pos) in filled_positions.iter().enumerate() {
+            if pos == 0 {
+                // Leading container (zero-filled): no advance, no IB bit.
+                // Set prev_pos so next non-zero entry detects the transition.
+                prev_pos = Some(0);
+                continue;
+            }
+
             let is_new_position = prev_pos != Some(pos);
 
             if is_new_position {
@@ -284,15 +286,12 @@ impl CompactEndPositions {
         let ib_select_samples = build_select_samples(&ib_words, ib_ones);
 
         Self {
-            has_end,
-            has_end_rank,
-            num_opens,
             ib_words,
             ib_len: text_len,
             ib_select_samples,
             ib_ones,
             advance_words,
-            num_scalars,
+            num_opens,
             advance_rank,
             cursor: Cell::default(),
         }
@@ -300,14 +299,15 @@ impl CompactEndPositions {
 
     /// Get the end position for the `open_idx`-th BP open.
     ///
-    /// Returns `None` if the entry has no end position (container) or out of bounds.
+    /// Returns the position for any valid open_idx. For containers that were
+    /// zero-filled, returns the previous scalar's end position. Returns `None`
+    /// only for leading containers (advance_count == 0) or out of bounds.
     ///
     /// Uses a sequential cursor optimization: when called with monotonically
     /// increasing `open_idx` values (streaming/depth-first traversal), this
     /// achieves amortized O(1) by using incremental bit tests instead of
-    /// full rank/select recomputation. Gaps (skipped container positions) are
-    /// handled by advancing the cursor through the gap incrementally.
-    #[inline]
+    /// full rank/select recomputation.
+    #[inline(always)]
     pub fn get(&self, open_idx: usize) -> Option<usize> {
         let cursor = self.cursor.get();
         if open_idx == cursor.next_open_idx {
@@ -326,41 +326,28 @@ impl CompactEndPositions {
 
     /// Advance the cursor from its current position to `target` open_idx.
     ///
-    /// This incrementally updates has_end_rank and advance_rank by scanning
-    /// the skipped positions' bits. Cost: O(gap_size) bit lookups, typically
-    /// 1-3 for container gaps in streaming traversal.
+    /// Incrementally updates advance_rank by scanning the skipped positions' bits.
+    /// Cost: O(gap_size) bit lookups, typically 1-3 for container gaps.
     #[inline]
     fn advance_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
         while cursor.next_open_idx < target {
             let idx = cursor.next_open_idx;
             let word_idx = idx / 64;
             let bit_idx = idx % 64;
-            let he_bit = if word_idx < self.has_end.len() {
-                ((self.has_end[word_idx] >> bit_idx) & 1) as usize
+            let adv_bit = if word_idx < self.advance_words.len() {
+                ((self.advance_words[word_idx] >> bit_idx) & 1) as usize
             } else {
                 0
             };
-
-            if he_bit != 0 {
-                // This was a scalar we're skipping: update advance rank
-                let adv_word_idx = cursor.he_cumulative / 64;
-                let adv_bit_idx = cursor.he_cumulative % 64;
-                let adv_bit = if adv_word_idx < self.advance_words.len() {
-                    ((self.advance_words[adv_word_idx] >> adv_bit_idx) & 1) as usize
-                } else {
-                    0
-                };
-                cursor.adv_cumulative += adv_bit;
-            }
-            cursor.he_cumulative += he_bit;
+            cursor.adv_cumulative += adv_bit;
             cursor.next_open_idx += 1;
         }
     }
 
     /// Fast path for sequential access (open_idx == cursor.next_open_idx).
     ///
-    /// Uses incremental bit tests for rank (O(1) per call) and forward
-    /// scanning for IB select (amortized O(1) per call). Total: ~2-3
+    /// Uses incremental bit test for advance rank (O(1) per call) and forward
+    /// scanning for IB select (amortized O(1) per call). Total: ~1-2
     /// memory accesses per call vs ~70 for the random access path.
     #[inline]
     fn get_sequential(&self, open_idx: usize, mut cursor: SequentialCursor) -> Option<usize> {
@@ -368,48 +355,29 @@ impl CompactEndPositions {
             return None;
         }
 
-        // 1. Check has_end bit (single word access, same word as previous call)
+        // 1. Check advance bit (single word access)
         let word_idx = open_idx / 64;
         let bit_idx = open_idx % 64;
-        let he_bit = if word_idx < self.has_end.len() {
-            (self.has_end[word_idx] >> bit_idx) & 1
+        let adv_bit = if word_idx < self.advance_words.len() {
+            (self.advance_words[word_idx] >> bit_idx) & 1
         } else {
             0
         };
 
-        // 2. scalar_idx = he_cumulative (rank before this position, already tracked)
-        let scalar_idx = cursor.he_cumulative;
-
-        // 3. Update he_cumulative for next call:
-        //    has_end_rank1(open_idx + 1) = has_end_rank1(open_idx) + has_end[open_idx]
-        cursor.he_cumulative += he_bit as usize;
-        cursor.next_open_idx = open_idx + 1;
-
-        if he_bit == 0 {
-            self.cursor.set(cursor);
-            return None;
-        }
-
-        // 4. advance_count = advance_rank1(scalar_idx + 1) (single bit lookup)
-        //    = adv_cumulative + advance[scalar_idx]
-        let adv_word_idx = scalar_idx / 64;
-        let adv_bit_idx = scalar_idx % 64;
-        let adv_bit = if adv_word_idx < self.advance_words.len() {
-            (self.advance_words[adv_word_idx] >> adv_bit_idx) & 1
-        } else {
-            0
-        };
+        // 2. advance_count = adv_cumulative + advance[open_idx]
         let advance_count = cursor.adv_cumulative + adv_bit as usize;
 
-        // 5. Update adv_cumulative: advance_rank1(new he_cumulative) = advance_count
+        // 3. Update cursor for next call
         cursor.adv_cumulative = advance_count;
+        cursor.next_open_idx = open_idx + 1;
 
         if advance_count == 0 {
+            // Before any real position (leading containers with filled value 0)
             self.cursor.set(cursor);
             return None;
         }
 
-        // 6. ib_select1(advance_count - 1) — forward scan from cursor position
+        // 4. ib_select1(advance_count - 1) — forward scan from cursor position
         let k = advance_count - 1;
 
         // Fast path: duplicate end position (same IB select argument as last time)
@@ -447,47 +415,24 @@ impl CompactEndPositions {
 
     /// Random access path (backwards jump): full rank/select computation,
     /// then sets up cursor for subsequent sequential access.
-    ///
-    /// Preserves IB cursor state from previous sequential run to avoid
-    /// rescanning the entire IB bitmap on subsequent forward calls.
     fn get_random(&self, open_idx: usize) -> Option<usize> {
         if open_idx >= self.num_opens {
             return None;
         }
 
-        // Check has_end bit
-        let word_idx = open_idx / 64;
-        let bit_idx = open_idx % 64;
-        let he_bit = if word_idx < self.has_end.len() {
-            (self.has_end[word_idx] >> bit_idx) & 1
-        } else {
-            0
-        };
+        let advance_count = self.advance_rank1(open_idx + 1);
 
-        // Always compute rank to set up cursor for subsequent sequential access
-        let scalar_idx = self.has_end_rank1(open_idx);
-        let he_cumulative = scalar_idx + he_bit as usize;
-
-        let (result, adv_cumulative) = if he_bit == 0 {
-            (None, self.advance_rank1(he_cumulative))
+        let result = if advance_count == 0 {
+            None
         } else {
-            let advance_count = self.advance_rank1(scalar_idx + 1);
-            let res = if advance_count == 0 {
-                None
-            } else {
-                self.ib_select1(advance_count - 1)
-            };
-            (res, advance_count)
+            self.ib_select1(advance_count - 1)
         };
 
         // Set up cursor for subsequent sequential access starting at open_idx + 1.
-        // Reset IB cursor to 0 because backwards jumps invalidate the old IB state
-        // (old cursor was ahead of new position). This is acceptable because backwards
-        // jumps only happen in non-streaming (test) access patterns.
+        // Reset IB cursor to 0 because backwards jumps invalidate the old IB state.
         self.cursor.set(SequentialCursor {
             next_open_idx: open_idx + 1,
-            he_cumulative,
-            adv_cumulative,
+            adv_cumulative: advance_count,
             ib_word_idx: 0,
             ib_ones_before: 0,
             last_ib_arg: usize::MAX,
@@ -495,27 +440,6 @@ impl CompactEndPositions {
         });
 
         result
-    }
-
-    /// Count 1-bits in has_end in [0, pos).
-    #[inline]
-    fn has_end_rank1(&self, pos: usize) -> usize {
-        if pos == 0 {
-            return 0;
-        }
-
-        let word_idx = pos / 64;
-        let bit_idx = pos % 64;
-
-        // Use cumulative rank for full words (single array lookup)
-        let mut count = self.has_end_rank[word_idx.min(self.has_end.len())] as usize;
-
-        if word_idx < self.has_end.len() && bit_idx > 0 {
-            let mask = (1u64 << bit_idx) - 1;
-            count += (self.has_end[word_idx] & mask).count_ones() as usize;
-        }
-
-        count
     }
 
     /// Count 1-bits in advance bitmap in [0, pos).
@@ -580,9 +504,7 @@ impl CompactEndPositions {
     /// Returns the heap memory usage in bytes.
     #[cfg(test)]
     pub fn heap_size(&self) -> usize {
-        self.has_end.len() * 8
-            + self.has_end_rank.len() * 4
-            + self.ib_words.len() * 8
+        self.ib_words.len() * 8
             + self.ib_select_samples.len() * 4
             + self.advance_words.len() * 8
             + self.advance_rank.len() * 4
@@ -602,7 +524,7 @@ mod tests {
 
     #[test]
     fn test_all_zeros() {
-        // All containers, no scalars
+        // All containers, no scalars — all return None (no advances)
         let positions = vec![0, 0, 0, 0, 0];
         let ep = EndPositions::build(&positions, 100);
         assert!(ep.is_compact());
@@ -614,14 +536,16 @@ mod tests {
     #[test]
     fn test_simple_scalars() {
         // BP opens: container(0), scalar(10), scalar(20), container(0), scalar(30)
+        // After filling: [0, 10, 20, 20, 30]
         let positions = vec![0, 10, 20, 0, 30];
         let ep = EndPositions::build(&positions, 100);
         assert!(ep.is_compact());
 
-        assert_eq!(ep.get(0), None); // container
+        assert_eq!(ep.get(0), None); // leading container (advance_count == 0)
         assert_eq!(ep.get(1), Some(10)); // scalar
         assert_eq!(ep.get(2), Some(20)); // scalar
-        assert_eq!(ep.get(3), None); // container
+                                         // Container between scalars: returns previous scalar's end (20)
+        assert_eq!(ep.get(3), Some(20));
         assert_eq!(ep.get(4), Some(30)); // scalar
         assert_eq!(ep.get(5), None); // out of bounds
     }
@@ -630,10 +554,11 @@ mod tests {
     fn test_duplicate_end_positions() {
         // Multiple scalars ending at the same position (unlikely but possible)
         let positions = vec![0, 10, 10, 20, 20, 20];
+        // After filling: [0, 10, 10, 20, 20, 20]
         let ep = EndPositions::build(&positions, 100);
         assert!(ep.is_compact());
 
-        assert_eq!(ep.get(0), None);
+        assert_eq!(ep.get(0), None); // leading container
         assert_eq!(ep.get(1), Some(10));
         assert_eq!(ep.get(2), Some(10));
         assert_eq!(ep.get(3), Some(20));
@@ -670,12 +595,14 @@ mod tests {
     #[test]
     fn test_single_scalar() {
         let positions = vec![0, 42, 0];
+        // After filling: [0, 42, 42]
         let ep = EndPositions::build(&positions, 100);
         assert!(ep.is_compact());
 
-        assert_eq!(ep.get(0), None);
-        assert_eq!(ep.get(1), Some(42));
-        assert_eq!(ep.get(2), None);
+        assert_eq!(ep.get(0), None); // leading container
+        assert_eq!(ep.get(1), Some(42)); // scalar
+                                         // Container after scalar: returns previous value (42)
+        assert_eq!(ep.get(2), Some(42));
     }
 
     #[test]
@@ -716,12 +643,10 @@ mod tests {
             vec_size
         );
 
-        // Verify all values are correct
+        // Verify scalar values are correct
         for (i, &expected) in positions.iter().enumerate() {
             let got = ep.get(i);
-            if expected == 0 {
-                assert_eq!(got, None, "get({}) should be None for container", i);
-            } else {
+            if expected > 0 {
                 assert_eq!(
                     got,
                     Some(expected as usize),
@@ -731,17 +656,19 @@ mod tests {
                     got
                 );
             }
+            // Containers may return Some(prev_value) or None — don't check
         }
     }
 
     #[test]
     fn test_realistic_yaml_pattern() {
         // Simulate: mapping(0), key_scalar(5), value_scalar(11), key_scalar(15), value_scalar(22)
+        // After filling: [0, 5, 11, 15, 22]
         let positions = vec![0, 5, 11, 15, 22];
         let ep = EndPositions::build(&positions, 30);
         assert!(ep.is_compact());
 
-        assert_eq!(ep.get(0), None); // mapping container
+        assert_eq!(ep.get(0), None); // leading container
         assert_eq!(ep.get(1), Some(5));
         assert_eq!(ep.get(2), Some(11));
         assert_eq!(ep.get(3), Some(15));
@@ -751,14 +678,16 @@ mod tests {
     #[test]
     fn test_large_positions() {
         // Test with positions near u32 range
+        // After filling: [0, 100000, 200000, 200000, 300000]
         let positions = vec![0, 100_000, 200_000, 0, 300_000];
         let ep = EndPositions::build(&positions, 400_000);
         assert!(ep.is_compact());
 
-        assert_eq!(ep.get(0), None);
+        assert_eq!(ep.get(0), None); // leading container
         assert_eq!(ep.get(1), Some(100_000));
         assert_eq!(ep.get(2), Some(200_000));
-        assert_eq!(ep.get(3), None);
+        // Container between scalars: returns previous value (200000)
+        assert_eq!(ep.get(3), Some(200_000));
         assert_eq!(ep.get(4), Some(300_000));
     }
 
@@ -780,14 +709,13 @@ mod tests {
         let ep = EndPositions::build(&positions, text_len);
         assert!(ep.is_compact());
 
-        // Verify all values
+        // Verify scalar values are correct
         for (i, &expected) in positions.iter().enumerate() {
             let got = ep.get(i);
-            if expected == 0 {
-                assert_eq!(got, None, "get({}) should be None", i);
-            } else {
+            if expected > 0 {
                 assert_eq!(got, Some(expected as usize), "get({}) failed", i);
             }
+            // Containers may return Some(prev_value) or None
         }
     }
 
@@ -825,14 +753,13 @@ mod tests {
         assert!(ep.is_compact(), "Real YAML should use compact encoding");
         assert!(compact_size < dense_size, "Compact should be smaller");
 
-        // Verify correctness: all values match
+        // Verify correctness: scalar values must match
         for (i, &expected) in semi.bp_to_text_end.iter().enumerate() {
             let got = ep.get(i);
-            if expected == 0 {
-                assert_eq!(got, None, "open {} should be None", i);
-            } else {
+            if expected > 0 {
                 assert_eq!(got, Some(expected as usize), "open {} mismatch", i);
             }
+            // Containers (expected == 0) may return Some(prev_value) or None
         }
     }
 
@@ -840,11 +767,12 @@ mod tests {
     fn test_end_position_at_text_len() {
         // Edge case: end position equals text_len (scalar ending at EOF).
         // This can happen when the last scalar has no trailing newline.
+        // After filling: [0, 64]
         let positions = vec![0, 64];
         let ep = EndPositions::build(&positions, 64);
         assert!(ep.is_compact());
 
-        assert_eq!(ep.get(0), None);
+        assert_eq!(ep.get(0), None); // leading container
         assert_eq!(ep.get(1), Some(64));
     }
 
@@ -852,14 +780,54 @@ mod tests {
     fn test_end_position_at_text_len_multiple_of_64() {
         // Regression test: text_len is a multiple of 64, and the last scalar
         // ends exactly at text_len. The IB bitmap must accommodate this extra bit.
+        // After filling: [0, 50, 100, 100, 192]
         let positions = vec![0, 50, 100, 0, 192];
         let ep = EndPositions::build(&positions, 192);
         assert!(ep.is_compact());
 
-        assert_eq!(ep.get(0), None);
+        assert_eq!(ep.get(0), None); // leading container
         assert_eq!(ep.get(1), Some(50));
         assert_eq!(ep.get(2), Some(100));
-        assert_eq!(ep.get(3), None);
+        // Container between scalars: returns previous value (100)
+        assert_eq!(ep.get(3), Some(100));
         assert_eq!(ep.get(4), Some(192));
+    }
+
+    #[test]
+    fn test_containers_between_scalars_return_previous() {
+        // Explicit test for the 2-bitmap behavior: containers between scalars
+        // return the previous scalar's end position.
+        let positions = vec![0, 10, 0, 0, 20, 0, 30];
+        // After filling: [0, 10, 10, 10, 20, 20, 30]
+        let ep = EndPositions::build(&positions, 100);
+        assert!(ep.is_compact());
+
+        assert_eq!(ep.get(0), None); // leading container
+        assert_eq!(ep.get(1), Some(10)); // scalar
+        assert_eq!(ep.get(2), Some(10)); // container → prev scalar (10)
+        assert_eq!(ep.get(3), Some(10)); // container → prev scalar (10)
+        assert_eq!(ep.get(4), Some(20)); // scalar
+        assert_eq!(ep.get(5), Some(20)); // container → prev scalar (20)
+        assert_eq!(ep.get(6), Some(30)); // scalar
+    }
+
+    #[test]
+    fn test_random_access_after_sequential() {
+        // Test backwards jump resets cursor correctly
+        let positions = vec![5, 10, 15, 20, 25];
+        let ep = EndPositions::build(&positions, 100);
+
+        // Sequential access
+        assert_eq!(ep.get(0), Some(5));
+        assert_eq!(ep.get(1), Some(10));
+        assert_eq!(ep.get(2), Some(15));
+
+        // Backwards jump
+        assert_eq!(ep.get(0), Some(5));
+        assert_eq!(ep.get(1), Some(10));
+
+        // Forward again
+        assert_eq!(ep.get(3), Some(20));
+        assert_eq!(ep.get(4), Some(25));
     }
 }

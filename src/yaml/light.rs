@@ -278,7 +278,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             _ => {
                 // Unquoted (plain) scalar - may span multiple lines
                 // Use pre-computed end position for O(1) lookup
-                let end = self.text_end_position().unwrap_or(effective_text_pos);
+                let end = self
+                    .text_end_position()
+                    .filter(|&e| e >= effective_text_pos)
+                    .unwrap_or(effective_text_pos);
 
                 // Compute base_indent only if needed for multi-line scalar decoding
                 // For single-line scalars (no newlines), base_indent doesn't matter
