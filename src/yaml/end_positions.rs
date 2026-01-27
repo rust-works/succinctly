@@ -594,6 +594,51 @@ mod tests {
     }
 
     #[test]
+    fn test_real_yaml_compression() {
+        // Generate a realistic YAML structure and measure EndPositions savings
+        let mut yaml = String::new();
+        for i in 0..500 {
+            yaml.push_str(&format!("key_{}: value_{}\n", i, i));
+        }
+        yaml.push_str("nested:\n");
+        for i in 0..200 {
+            yaml.push_str(&format!("  sub_{}: sub_val_{}\n", i, i));
+        }
+        yaml.push_str("list:\n");
+        for i in 0..300 {
+            yaml.push_str(&format!("  - item_{}\n", i));
+        }
+
+        let semi = super::super::parser::build_semi_index(yaml.as_bytes()).unwrap();
+        let text_len = yaml.len();
+        let dense_size = semi.bp_to_text_end.len() * 4;
+        let ep = EndPositions::build(&semi.bp_to_text_end, text_len);
+        let compact_size = ep.heap_size();
+
+        let num_opens = semi.bp_to_text_end.len();
+        let num_nonzero = semi.bp_to_text_end.iter().filter(|&&v| v > 0).count();
+
+        eprintln!(
+            "Real YAML ({} bytes, {} opens, {} scalars): Vec<u32>={} bytes, EndPositions={} bytes ({:.2}x compression)",
+            text_len, num_opens, num_nonzero, dense_size, compact_size,
+            dense_size as f64 / compact_size as f64
+        );
+
+        assert!(ep.is_compact(), "Real YAML should use compact encoding");
+        assert!(compact_size < dense_size, "Compact should be smaller");
+
+        // Verify correctness: all values match
+        for (i, &expected) in semi.bp_to_text_end.iter().enumerate() {
+            let got = ep.get(i);
+            if expected == 0 {
+                assert_eq!(got, None, "open {} should be None", i);
+            } else {
+                assert_eq!(got, Some(expected as usize), "open {} mismatch", i);
+            }
+        }
+    }
+
+    #[test]
     fn test_end_position_at_text_len() {
         // Edge case: end position equals text_len (scalar ending at EOF).
         // This can happen when the last scalar has no trailing newline.
