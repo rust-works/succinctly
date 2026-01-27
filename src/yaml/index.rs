@@ -296,6 +296,28 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         self.bp_to_text_end.get(open_idx)
     }
 
+    /// Compute the open index for a BP position (rank1).
+    ///
+    /// This is the index into the open_positions and end_positions arrays.
+    /// Use with `text_pos_by_open_idx` and `text_end_pos_by_open_idx` to
+    /// avoid redundant rank1 computation when both positions are needed.
+    #[inline]
+    pub fn bp_to_open_idx(&self, bp_pos: usize) -> usize {
+        self.bp.rank1(bp_pos)
+    }
+
+    /// Get the text byte offset given a precomputed open index.
+    #[inline]
+    pub fn text_pos_by_open_idx(&self, open_idx: usize) -> Option<usize> {
+        self.open_positions.get(open_idx).map(|pos| pos as usize)
+    }
+
+    /// Get the text end byte offset given a precomputed open index.
+    #[inline]
+    pub fn text_end_pos_by_open_idx(&self, open_idx: usize) -> Option<usize> {
+        self.bp_to_text_end.get(open_idx)
+    }
+
     /// Get a reference to the interest bits words.
     #[inline]
     pub fn ib(&self) -> &[u64] {
