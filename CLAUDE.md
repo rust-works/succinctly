@@ -272,9 +272,9 @@ cargo test
 
 | Size      | succinctly            | jq                    | Speedup    |
 |-----------|-----------------------|-----------------------|------------|
-| **10KB**  |  4.1 ms  (2.3 MiB/s)  |  4.8 ms  (2.0 MiB/s)  | **1.2x**   |
-| **100KB** |  6.6 ms (12.9 MiB/s)  |  9.0 ms  (9.4 MiB/s)  | **1.4x**   |
-| **1MB**   | 29.6 ms (27.3 MiB/s)  | 45.3 ms (17.8 MiB/s)  | **1.5x**   |
+| **10KB**  |  4.2 ms  (2.2 MiB/s)  |  4.3 ms  (2.1 MiB/s)  | **1.0x**   |
+| **100KB** |  6.5 ms (13.2 MiB/s)  |  8.2 ms (10.4 MiB/s)  | **1.3x**   |
+| **1MB**   | 28.0 ms (28.8 MiB/s)  | 43.8 ms (18.5 MiB/s)  | **1.6x**   |
 
 To regenerate: `cargo bench --bench jq_comparison`
 
@@ -298,19 +298,19 @@ To regenerate: `cargo bench --bench jq_comparison`
 
 | Size       | succinctly             | yq                     | Speedup     | Mem Ratio  |
 |------------|------------------------|------------------------|-------------|------------|
-| **10KB**   |   6.4 ms  (1.5 MiB/s)  |   9.2 ms  (1.1 MiB/s)  | **1.4x**    | **0.51x**  |
-| **100KB**  |   7.1 ms (13.0 MiB/s)  |  20.9 ms  (4.4 MiB/s)  | **2.9x**    | **0.33x**  |
-| **1MB**    |  22.8 ms (40.4 MiB/s)  | 115.3 ms  (8.0 MiB/s)  | **5.1x**    | **0.12x**  |
-| **10MB**   | 165.3 ms (56.5 MiB/s)  |   1.03 s  (9.1 MiB/s)  | **6.2x**    | **0.04x**  |
-| **100MB**  |   1.52 s (61.1 MiB/s)  |   9.84 s  (9.4 MiB/s)  | **6.5x**    | **0.03x**  |
+| **10KB**   |   5.8 ms  (1.7 MiB/s)  |   9.0 ms  (1.1 MiB/s)  | **1.6x**    | **0.50x**  |
+| **100KB**  |   7.3 ms (12.6 MiB/s)  |  19.5 ms  (4.7 MiB/s)  | **2.7x**    | **0.35x**  |
+| **1MB**    |  20.5 ms (45.0 MiB/s)  | 111.2 ms  (8.3 MiB/s)  | **5.4x**    | **0.12x**  |
+| **10MB**   | 161.6 ms (57.8 MiB/s)  |   1.01 s  (9.2 MiB/s)  | **6.3x**    | **0.05x**  |
+| **100MB**  |   1.50 s (61.9 MiB/s)  |   9.68 s  (9.6 MiB/s)  | **6.4x**    | **0.05x**  |
 
 ### yq Query Performance (ARM Neoverse-V2)
 
 | Size      | succinctly              | yq                    | Speedup    |
 |-----------|-------------------------|-----------------------|------------|
-| **10KB**  | 2.1 ms  (4.7 MiB/s)     | 5.8 ms (1.7 MiB/s)    | **2.8x**   |
-| **100KB** | 4.3 ms (21.4 MiB/s)     | 21.3 ms (4.3 MiB/s)   | **5.0x**   |
-| **1MB**   | 24.3 ms (37.9 MiB/s)    | 156.1 ms (5.9 MiB/s)  | **6.4x**   |
+| **10KB**  | 2.0 ms  (5.0 MiB/s)     | 5.7 ms (1.7 MiB/s)    | **2.9x**   |
+| **100KB** | 3.7 ms (25.1 MiB/s)     | 21.4 ms (4.3 MiB/s)   | **5.8x**   |
+| **1MB**   | 19.7 ms (46.7 MiB/s)    | 156.4 ms (5.9 MiB/s)  | **7.9x**   |
 
 ### yq Query Performance (ARM Neoverse-V1)
 
@@ -326,9 +326,9 @@ Note: System `yq` not installed; showing succinctly-only performance.
 
 | Size      | succinctly              | yq                    | Speedup    |
 |-----------|-------------------------|-----------------------|------------|
-| **10KB**  | 2.7 ms   (3.4 MiB/s)    | 64.7 ms (140 KiB/s)   | **24x**    |
-| **100KB** | 4.4 ms  (20.5 MiB/s)    | 77.9 ms (1.2 MiB/s)   | **18x**    |
-| **1MB**   | 18.9 ms (49.0 MiB/s)    |207.1 ms (4.5 MiB/s)   | **11x**    |
+| **10KB**  | 2.6 ms   (3.8 MiB/s)    | 59.9 ms (164 KiB/s)   | **23x**    |
+| **100KB** | 4.0 ms  (23.0 MiB/s)    | 74.6 ms (1.2 MiB/s)   | **19x**    |
+| **1MB**   | 17.3 ms (53.3 MiB/s)    |195.3 ms (4.7 MiB/s)   | **11x**    |
 
 To regenerate: `succinctly dev bench yq` (includes memory) or `cargo bench --bench yq_comparison` (time only)
 
