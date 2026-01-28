@@ -41,6 +41,7 @@ This directory documents optimization techniques used in the succinctly library,
 | NEON 256B Popcount             | **1.15x**          | SIMD             | [simd.md](simd.md)                                      |
 | SIMD Unquoted Structural Skip  | **3-8%**           | SIMD             | [simd.md](simd.md)                                      |
 | Lazy line + direct indexing    | **2-6%**           | State machines   | [state-machines.md](state-machines.md)                   |
+| P12-A Build Mitigation         | **11-85%** (build) | Compact encoding | [end-positions.md](end-positions.md)                     |
 
 ### Notable Failures (Instructive)
 
