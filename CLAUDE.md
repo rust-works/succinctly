@@ -515,3 +515,13 @@ For detailed documentation on optimization techniques used in this project, see 
   - **Neutral on strings/ and nested/** — unique positions reduce duplicate-cache hit rate
   - Best for: small-medium YAML with container-heavy structure (Kubernetes manifests, CI/CD configs)
   - See [docs/parsing/yaml.md#o1-sequential-cursor-for-advancepositions---accepted-](docs/parsing/yaml.md#o1-sequential-cursor-for-advancepositions---accepted-) for full analysis
+- ✅ O2 (Gap-Skipping via advance_rank1): **2-6% faster** yq queries on nested/users at small-medium sizes, issue #74
+  - Replaced O(G) linear loop in `advance_cursor_to()` with O(1) `advance_rank1(target)` call
+  - Applied to both `CompactEndPositions` and `AdvancePositions` cursor forward-gap paths
+  - Reuses existing cumulative rank array — zero additional memory overhead
+  - **End-to-end yq benchmarks** (against O1 baseline):
+    - nested/1kb: **-6.1%**, users/10kb: **-6.0%**, strings/100kb: **-5.5%**
+    - Most workloads show noisy but directionally positive results
+  - **yaml_bench**: No regression (query-path only optimization)
+  - Results are noisy because the forward-gap path is infrequently hit during typical streaming
+  - See [docs/parsing/yaml.md#o2-gap-skipping-via-advance_rank1---accepted-](docs/parsing/yaml.md#o2-gap-skipping-via-advance_rank1---accepted-) for full analysis

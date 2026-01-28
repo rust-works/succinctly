@@ -29,8 +29,9 @@ This document records all optimization attempts in the succinctly library, showi
 | Dual Select Methods       | **3.1x** (seq), **1.39x** (rand)           | All      | Deployed |
 | P12-A Build Mitigation    | **11-85%** (yaml_bench build)               | All      | Deployed |
 | O1 Sequential Cursor      | **3-13%** (yq identity queries, 1-100KB)    | All      | Deployed |
+| O2 Gap-Skip rank1         | **2-6%** (yq identity queries, nested/users) | All      | Deployed |
 
-**Total Successful**: 17 optimizations
+**Total Successful**: 18 optimizations
 **Best Result**: Cumulative index (627x)
 
 ### Failed Optimizations
@@ -537,7 +538,7 @@ AVX-512 execution (though memory bandwidth may still limit gains for this worklo
 **Technique**: Added `Cell<SequentialCursor>` with three-path dispatch (mirroring the existing pattern in `CompactEndPositions`):
 
 1. **Sequential path** (open_idx == cursor.next_open_idx): Single bit test for advance rank + forward IB scan from cursor position. O(1) amortized.
-2. **Forward-gap path** (open_idx > cursor): Linear advance through skipped positions (typically 1-3 for container gaps), then sequential.
+2. **Forward-gap path** (open_idx > cursor): O(1) advance via `advance_rank1(target)` (upgraded from linear scan by O2), then sequential.
 3. **Random path** (backwards jump): Full rank/select recomputation, then sets up cursor for subsequent sequential access.
 
 A duplicate-detection cache (`last_ib_arg`) provides an additional fast path when consecutive open indices share the same text position (containers sharing position with first child).
@@ -563,6 +564,54 @@ A duplicate-detection cache (`last_ib_arg`) provides an additional fast path whe
 **Key insight**: The sequential cursor pattern (proven in `CompactEndPositions`) generalises to `AdvancePositions` with consistent benefits for workloads with duplicate positions. The optimization is most visible at small-medium sizes (1KB-100KB) where `get()` is a larger fraction of total query time.
 
 **Files**: [src/yaml/advance_positions.rs](../../src/yaml/advance_positions.rs)
+
+### ✅ O2 Gap-Skipping via advance_rank1 (January 2026)
+
+**Status**: Implemented and deployed — [issue #74](https://github.com/rust-works/succinctly/issues/74)
+
+**Problem**: The forward-gap path in `advance_cursor_to()` (used by both `CompactEndPositions` and `AdvancePositions`) advanced the cursor by looping bit-by-bit through the advance bitmap. For gaps of size G, this was O(G) — scanning each skipped position individually to accumulate the advance rank.
+
+**Technique**: Replaced the linear loop with a single `advance_rank1(target)` call, which uses the precomputed cumulative rank array for O(1) lookup:
+
+```rust
+// Before (O(G) linear scan):
+fn advance_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
+    while cursor.next_open_idx < target {
+        let idx = cursor.next_open_idx;
+        let word_idx = idx / 64;
+        let bit_idx = idx % 64;
+        let adv_bit = ((self.advance_words[word_idx] >> bit_idx) & 1) as usize;
+        cursor.adv_cumulative += adv_bit;
+        cursor.next_open_idx += 1;
+    }
+}
+
+// After (O(1) rank lookup):
+fn advance_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
+    cursor.adv_cumulative = self.advance_rank1(target);
+    cursor.next_open_idx = target;
+}
+```
+
+The IB cursor state (`ib_word_idx`, `ib_ones_before`) remains valid after the rank jump because we only move forward — the subsequent `get_sequential()` forward scan still works correctly. The duplicate-detection cache (`last_ib_arg`/`last_ib_result`) also remains valid across gap-skips.
+
+**Benchmark Results** (Apple M1 Max, clean A/B comparison against O1 baseline, `succinctly_yq_identity`):
+
+| Workload       | 1KB           | 10KB         | 100KB        | 1MB          |
+|----------------|---------------|--------------|--------------|--------------|
+| users          | **-3.4%**     | **-6.0%**    | +1.3%        | -1.5%        |
+| nested         | **-6.1%**     | +2.2%        | **-2.7%**    | -0.5%        |
+| sequences      | neutral       | -0.7%        | neutral      | -1.7%        |
+| strings        | +2.7%         | **-3.5%**    | **-5.5%**    | -0.2%        |
+| comprehensive  | neutral       | -0.6%        | neutral      | +1.1%        |
+
+**Parsing (yaml_bench)**: No regression — `advance_cursor_to()` is only called during queries, not during index construction.
+
+**Why results are noisy**: The forward-gap path is infrequently hit during typical streaming (most accesses are sequential). The optimization eliminates O(G) work in the gap path, but gaps are typically small (1-3 positions). The strongest signals appear on nested and users workloads at small-medium sizes where gaps occur more frequently.
+
+**Key insight**: Even small algorithmic improvements (O(G) → O(1)) compound when applied to hot paths. The rank array already existed for random-access `get()` — reusing it for gap-skipping cost zero additional memory.
+
+**Files**: [src/yaml/end_positions.rs](../../src/yaml/end_positions.rs), [src/yaml/advance_positions.rs](../../src/yaml/advance_positions.rs)
 
 ---
 

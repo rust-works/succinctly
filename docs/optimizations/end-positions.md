@@ -896,9 +896,14 @@ doesn't hold for random-access workloads.
 
 This same cursor pattern was subsequently applied to `AdvancePositions`
 (open-to-text position mapping) in [issue #74](https://github.com/rust-works/succinctly/issues/74),
-yielding 3–13% improvement on yq identity queries at 1–100KB. The duplicate-detection
+yielding 3–13% improvement on yq identity queries at 1–100KB (O1). The duplicate-detection
 cache (`last_ib_arg`) is particularly effective for YAML, where containers share
 text positions with their first children.
+
+A further refinement (O2) replaced the linear bit-by-bit loop in `advance_cursor_to()`
+with a single `advance_rank1(target)` call, upgrading the forward-gap path from O(G)
+to O(1). This reuses the precomputed cumulative rank array that already existed for
+random-access queries, adding zero memory overhead.
 
 ### 5. Zero-filling is a valid encoding trick when the API allows it
 

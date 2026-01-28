@@ -696,6 +696,7 @@ The YAML parser uses platform-specific SIMD for hot paths:
 - **P12**: Advance Index for bp_to_text - memory-efficient bitmap encoding (~1.5× measured, 20-25% faster yq identity queries on 1MB files)
 - **P12-A**: Build regression mitigation (A1: inline zero-fill, A2: combined monotonicity check, A4: lazy newline index) - 11-85% faster `yaml_bench` build times ([issue #72](https://github.com/rust-works/succinctly/issues/72))
 - **O1**: Sequential cursor for AdvancePositions - `Cell<SequentialCursor>` with three-path dispatch for amortized O(1) sequential access (3-13% faster yq identity queries at 1-100KB, [issue #74](https://github.com/rust-works/succinctly/issues/74))
+- **O2**: Gap-skipping via advance_rank1 - replaced O(G) linear loop in `advance_cursor_to()` with O(1) rank lookup (2-6% faster on nested/users at small-medium sizes, [issue #74](https://github.com/rust-works/succinctly/issues/74))
 - **BMI2 PDEP select_in_word**: O(1) select_in_word on x86_64 using BMI2 PDEP instruction (7.6-16x faster BP select1 queries, with AMD Zen 1/2 slow-path detection)
 - **M2**: Navigation streaming - cursor-based streaming for navigation queries, supports both JSON and YAML output
 
