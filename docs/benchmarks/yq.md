@@ -694,7 +694,7 @@ The YAML parser uses platform-specific SIMD for hot paths:
 - **P9**: Direct YAML-to-JSON streaming - eliminated intermediate DOM for identity queries (8-22% improvement, 2.3x on yq benchmarks)
 - **P11**: BP Select1 for yq-locate - zero-cost generic select support for O(1) offset-to-BP lookups (2.5-5.9x faster select1, fixes issue #26)
 - **P12**: Advance Index for bp_to_text - memory-efficient bitmap encoding (~1.5× measured, 20-25% faster yq identity queries on 1MB files)
-- **P12-A**: Build regression mitigation (A1: inline zero-fill, A4: lazy newline index) - 11-85% faster `yaml_bench` build times ([issue #72](https://github.com/rust-works/succinctly/issues/72))
+- **P12-A**: Build regression mitigation (A1: inline zero-fill, A2: combined monotonicity check, A4: lazy newline index) - 11-85% faster `yaml_bench` build times ([issue #72](https://github.com/rust-works/succinctly/issues/72))
 - **BMI2 PDEP select_in_word**: O(1) select_in_word on x86_64 using BMI2 PDEP instruction (7.6-16x faster BP select1 queries, with AMD Zen 1/2 slow-path detection)
 - **M2**: Navigation streaming - cursor-based streaming for navigation queries, supports both JSON and YAML output
 

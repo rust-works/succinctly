@@ -502,11 +502,13 @@ AVX-512 execution (though memory bandwidth may still limit gains for this worklo
 
 **Problem**: P12 compact bitmap encoding introduced 11-24% `yaml_bench` regression from bitmap construction overhead.
 
-**Technique**: Two build-path optimisations to reduce allocation and scanning costs:
+**Technique**: Three build-path optimisations to reduce allocation and scanning costs:
 
 1. **A1 — Inline zero-filling**: Eliminated temporary `Vec<u32>` allocation in `EndPositions::build()`. Zero-filling now happens inline during bitmap construction, saving one O(N) alloc+copy+dealloc per build.
 
-2. **A4 — Lazy newline index**: Changed `YamlIndex.newlines` from eager `BitVec` to `OnceCell<BitVec>`. The newline index is only used by `yq-locate` CLI, not by parsing or queries. Removes a full O(N) text scan from every `build()` call.
+2. **A2 — Combined monotonicity check**: Merged the separate O(N) monotonicity scan into the bitmap construction loop. `CompactEndPositions::try_build()` now checks monotonicity inline and returns `None` on violation, eliminating one full pass over the positions array.
+
+3. **A4 — Lazy newline index**: Changed `YamlIndex.newlines` from eager `BitVec` to `OnceCell<BitVec>`. The newline index is only used by `yq-locate` CLI, not by parsing or queries. Removes a full O(N) text scan from every `build()` call.
 
 **Benchmark Results** (Apple M1 Max, `yaml_bench`):
 

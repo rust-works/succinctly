@@ -477,12 +477,12 @@ of scalar_idx — no `has_end` rank needed.
 
 ### How zero-filling works
 
-Zero-filling is performed **inline** during bitmap construction, avoiding a
-temporary `Vec<u32>` allocation. The `CompactEndPositions::build()` function
-tracks `prev_nonzero` as it iterates over positions:
+Zero-filling, monotonicity checking, and bitmap construction are performed
+in a **single pass** by `CompactEndPositions::try_build()`. This avoids both
+a temporary `Vec<u32>` allocation (A1) and a separate monotonicity scan (A2):
 
 ```rust
-fn build(positions: &[u32], text_len: usize) -> Self {
+fn try_build(positions: &[u32], text_len: usize) -> Option<Self> {
     // ... bitmap setup ...
 
     let mut prev_effective: Option<u32> = None;
@@ -491,6 +491,10 @@ fn build(positions: &[u32], text_len: usize) -> Self {
     for (i, &pos) in positions.iter().enumerate() {
         // Inline zero-fill: containers (pos == 0) inherit previous non-zero value
         let effective = if pos > 0 {
+            // Monotonicity check: non-zero positions must be non-decreasing
+            if prev_nonzero > 0 && pos < prev_nonzero {
+                return None; // fall back to Dense
+            }
             prev_nonzero = pos;
             pos
         } else {
@@ -518,9 +522,9 @@ fn build(positions: &[u32], text_len: usize) -> Self {
 }
 ```
 
-This eliminates the O(N) temporary allocation and copy that was previously
-needed to pre-fill zeros before bitmap construction (see [A1 optimisation,
-issue #72](https://github.com/rust-works/succinctly/issues/72)).
+This eliminates the O(N) temporary allocation (A1) and the separate O(N)
+monotonicity scan (A2) that were previously needed before bitmap construction
+(see [issue #72](https://github.com/rust-works/succinctly/issues/72)).
 
 During the bitmap build, leading zeros (value 0, before any scalar) are
 skipped — they get no advance bit. This ensures `get()` returns `None` for
@@ -813,17 +817,23 @@ other optimizations on the branch dominate).
 The 2-bitmap design saves an additional ~7% memory over 3-bitmap by
 eliminating the `has_end` bitmap and its rank array.
 
-### Build regression mitigation (A1 + A4, issue #72)
+### Build regression mitigation (A1 + A2 + A4, issue #72)
 
 The compact 2-bitmap encoding introduced an 11-24% `yaml_bench` regression
 compared to the `Vec<u32>` baseline, because bitmap construction is more
-expensive than simple array allocation. Two optimisations (A1 and A4) reduced
-this regression significantly:
+expensive than simple array allocation. Three optimisations (A1, A2, and A4)
+reduced this regression significantly:
 
 **A1: Inline zero-filling** — Eliminated the temporary `Vec<u32>` that was
 allocated, filled, and immediately discarded during `EndPositions::build()`.
 Zero-filling now happens inline during bitmap construction (see code above).
 Saves one O(N) alloc+copy+dealloc per build (~520KB for 1MB YAML).
+
+**A2: Combined monotonicity check** — Merged the monotonicity check into the
+bitmap construction loop. Previously, `EndPositions::build()` made a separate
+O(N) pass to verify non-zero positions were non-decreasing before calling
+`CompactEndPositions::build()` for a second pass. Now `try_build()` checks
+monotonicity inline and returns `None` on violation, triggering Dense fallback.
 
 **A4: Lazy newline index** — Changed the `newlines` bitvector in `YamlIndex`
 from eager construction to lazy initialisation via `core::cell::OnceCell`.

@@ -4298,19 +4298,25 @@ The parser processes the value before backtracking to handle the key, producing 
 
 ---
 
-## P12-A: Build Regression Mitigation (A1 + A4) - ACCEPTED ✅
+## P12-A: Build Regression Mitigation (A1 + A2 + A4) - ACCEPTED ✅
 
 ### Problem Statement
 
 GitHub issue [#72](https://github.com/rust-works/succinctly/issues/72) identified that the P12 compact bitmap encoding introduced an 11-24% `yaml_bench` regression compared to the `Vec<u32>` baseline. While the bitmap encoding provides ~3.5× memory reduction and 20-25% faster yq identity queries, the build-time cost of constructing bitmaps and rank/select indices is inherently higher than simple array allocation.
 
-Four actionable optimisations (A1-A4) were proposed. A1 and A4 were implemented.
+Four actionable optimisations (A1-A4) were proposed. A1, A2, and A4 were implemented.
 
 ### Solution: A1 — Inline Zero-Filling in EndPositions::build()
 
 Previously, `EndPositions::build()` allocated a temporary `Vec<u32>`, copied all positions into it with zeros replaced by the previous non-zero value, then passed this filled vector to `CompactEndPositions::build()`. This required one O(N) allocation + copy + deallocation per build.
 
-The A1 optimisation folds zero-filling directly into `CompactEndPositions::build()`, tracking `prev_nonzero` and `prev_effective` during bitmap construction. This eliminates the temporary Vec (~520KB for 1MB YAML).
+The A1 optimisation folds zero-filling directly into `CompactEndPositions::try_build()`, tracking `prev_nonzero` and `prev_effective` during bitmap construction. This eliminates the temporary Vec (~520KB for 1MB YAML).
+
+### Solution: A2 — Combined Monotonicity Check
+
+Previously, `EndPositions::build()` made a separate O(N) loop over positions to check whether non-zero entries were monotonically non-decreasing, then called `CompactEndPositions::build()` which iterated the same positions again for bitmap construction.
+
+The A2 optimisation merges the monotonicity check into the bitmap construction loop. `CompactEndPositions::try_build()` returns `Option<Self>` — if a non-monotonic non-zero position is detected mid-loop, it returns `None` and the caller falls back to Dense storage. This eliminates one full O(N) pass.
 
 ### Solution: A4 — Lazy Newline Index
 
@@ -4349,6 +4355,7 @@ End-to-end yq comparison benchmarks showed ~3-8% apparent regression for both `s
 **Benefits:**
 - ✅ **11-85% faster** `YamlIndex::build()` across all workload types
 - ✅ **Zero allocations removed** from build hot path (A1: temp Vec, A4: newline BitVec)
+- ✅ **One fewer O(N) pass** over positions array (A2: monotonicity check merged into bitmap build)
 - ✅ No memory impact on steady-state query performance
 - ✅ No API changes visible to external callers (A4 adds `text` param to internal methods only)
 
@@ -4358,13 +4365,12 @@ End-to-end yq comparison benchmarks showed ~3-8% apparent regression for both `s
 
 ### Remaining Opportunities
 
-- **A2**: Combine monotonicity check with zero-filling into a single pass in `EndPositions::build()`
 - **A3**: Reuse IB bitmap allocation between `OpenPositions::build()` and `EndPositions::build()`
 
 ### Files Modified
 
 - `src/yaml/index.rs` — Changed `newlines` field to `OnceCell<BitVec>`, updated constructors, added `ensure_newlines()`, updated `to_line_column()`/`to_offset()`/`newlines()` signatures
-- `src/yaml/end_positions.rs` — Inline zero-filling in `CompactEndPositions::build()`, removed temp Vec from `EndPositions::build()`
+- `src/yaml/end_positions.rs` — Single-pass `CompactEndPositions::try_build()` with inline zero-filling, monotonicity check, and bitmap construction; removed temp Vec and separate monotonicity loop from `EndPositions::build()`
 - `src/yaml/light.rs` — Updated call sites to pass `self.text` to `to_line_column()`/`to_offset()`
 
 ---
