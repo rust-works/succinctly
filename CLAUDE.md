@@ -503,3 +503,15 @@ For detailed documentation on optimization techniques used in this project, see 
   - Broad improvements across all categories (simple_kv: -11% to -22%, nested: -15% to -24%)
   - A3 from issue #72 remains as future opportunity
   - See [docs/parsing/yaml.md#p12-a-build-regression-mitigation-a1--a2--a4---accepted-](docs/parsing/yaml.md#p12-a-build-regression-mitigation-a1--a2--a4---accepted-) for full analysis
+- ✅ O1 (Sequential Cursor for AdvancePositions): **3-13% faster** yq queries on small-medium files, issue #74
+  - Applied `Cell<SequentialCursor>` pattern from `CompactEndPositions` to `AdvancePositions`
+  - Three-path dispatch: sequential (amortized O(1)), forward-gap (linear advance), random (full recomputation)
+  - Duplicate-detection cache: `last_ib_arg`/`last_ib_result` for O(1) return on shared positions (~33% of nodes)
+  - **End-to-end yq benchmarks** (users/ workload):
+    - 1KB: **-9 to -13%** time (strongest improvement)
+    - 10KB: **-8%** time
+    - 100KB: **-3%** time
+    - 1MB: neutral (get() is smaller fraction of total streaming time)
+  - **Neutral on strings/ and nested/** — unique positions reduce duplicate-cache hit rate
+  - Best for: small-medium YAML with container-heavy structure (Kubernetes manifests, CI/CD configs)
+  - See [docs/parsing/yaml.md#o1-sequential-cursor-for-advancepositions---accepted-](docs/parsing/yaml.md#o1-sequential-cursor-for-advancepositions---accepted-) for full analysis

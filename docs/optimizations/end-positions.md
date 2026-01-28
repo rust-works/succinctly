@@ -894,6 +894,12 @@ cursor, the compact encoding would be impractically slow. The cursor relies on
 the natural depth-first traversal order of YAML streaming — a property that
 doesn't hold for random-access workloads.
 
+This same cursor pattern was subsequently applied to `AdvancePositions`
+(open-to-text position mapping) in [issue #74](https://github.com/rust-works/succinctly/issues/74),
+yielding 3–13% improvement on yq identity queries at 1–100KB. The duplicate-detection
+cache (`last_ib_arg`) is particularly effective for YAML, where containers share
+text positions with their first children.
+
 ### 5. Zero-filling is a valid encoding trick when the API allows it
 
 By filling container zeros with the previous scalar's end position, we made the

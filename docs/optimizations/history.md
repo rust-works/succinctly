@@ -28,8 +28,9 @@ This document records all optimization attempts in the succinctly library, showi
 | Cumulative Index          | **627x**                                   | All      | Deployed |
 | Dual Select Methods       | **3.1x** (seq), **1.39x** (rand)           | All      | Deployed |
 | P12-A Build Mitigation    | **11-85%** (yaml_bench build)               | All      | Deployed |
+| O1 Sequential Cursor      | **3-13%** (yq identity queries, 1-100KB)    | All      | Deployed |
 
-**Total Successful**: 16 optimizations
+**Total Successful**: 17 optimizations
 **Best Result**: Cumulative index (627x)
 
 ### Failed Optimizations
@@ -526,6 +527,42 @@ AVX-512 execution (though memory bandwidth may still limit gains for this worklo
 **Key insight**: Build-path allocations and eager scans that aren't needed by the hot path (queries, yq evaluation) should be deferred or eliminated. The lazy newline index has the largest impact on newline-heavy content because it removes an entire O(N) pass.
 
 **Files**: [src/yaml/index.rs](../../src/yaml/index.rs), [src/yaml/end_positions.rs](../../src/yaml/end_positions.rs)
+
+### ✅ O1 Sequential Cursor for AdvancePositions (January 2026)
+
+**Status**: Implemented and deployed — [issue #74](https://github.com/rust-works/succinctly/issues/74)
+
+**Problem**: `AdvancePositions::get()` performed full `advance_rank1()` + `ib_select1()` on every call, even during sequential streaming traversals where open_idx increases monotonically.
+
+**Technique**: Added `Cell<SequentialCursor>` with three-path dispatch (mirroring the existing pattern in `CompactEndPositions`):
+
+1. **Sequential path** (open_idx == cursor.next_open_idx): Single bit test for advance rank + forward IB scan from cursor position. O(1) amortized.
+2. **Forward-gap path** (open_idx > cursor): Linear advance through skipped positions (typically 1-3 for container gaps), then sequential.
+3. **Random path** (backwards jump): Full rank/select recomputation, then sets up cursor for subsequent sequential access.
+
+A duplicate-detection cache (`last_ib_arg`) provides an additional fast path when consecutive open indices share the same text position (containers sharing position with first child).
+
+**Benchmark Results** (Apple M1 Max, `succinctly_yq_identity`, clean A/B comparison):
+
+| Workload       | 1KB           | 10KB         | 100KB        | 1MB          |
+|----------------|---------------|--------------|--------------|--------------|
+| users          | **-9 to -13%**| **-8%**      | **-3%**      | neutral      |
+| comprehensive  | **-3 to -10%**| **-10 to -12%** | **-7 to -10%** | **-2.6%** |
+| sequences      | neutral       | **-5%**      | noisy        | neutral      |
+| nested         | noisy         | neutral      | neutral      | -1.1%        |
+| strings        | neutral       | neutral      | neutral      | neutral      |
+
+**Parsing (yaml_bench)**: No regression — cursor field adds zero cost to index construction.
+
+**Why users/ benefits most**: User YAML generates key-value pairs where containers share text positions with first children, creating many duplicate positions. The cursor's `last_ib_arg` cache hits on every duplicate, bypassing the full IB select scan.
+
+**Why neutral at 1MB**: At larger sizes, `get()` is a smaller fraction of total time (memory bandwidth and JSON output dominate).
+
+**Why neutral on strings/**: String-heavy files have few duplicate positions, so the duplicate-detection fast path fires less often.
+
+**Key insight**: The sequential cursor pattern (proven in `CompactEndPositions`) generalises to `AdvancePositions` with consistent benefits for workloads with duplicate positions. The optimization is most visible at small-medium sizes (1KB-100KB) where `get()` is a larger fraction of total query time.
+
+**Files**: [src/yaml/advance_positions.rs](../../src/yaml/advance_positions.rs)
 
 ---
 

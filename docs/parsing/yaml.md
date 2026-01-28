@@ -4375,6 +4375,73 @@ End-to-end yq comparison benchmarks showed ~3-8% apparent regression for both `s
 
 ---
 
+## O1: Sequential Cursor for AdvancePositions — Accepted ✅
+
+**Issue**: [#74](https://github.com/rust-works/succinctly/issues/74)
+
+### Problem
+
+`AdvancePositions::get()` performed full `advance_rank1()` + `ib_select1()` on every call, even during sequential streaming traversals where `open_idx` increases monotonically. During depth-first streaming (the common case for `yq '.'` identity queries), `value()` calls `text_pos_by_open_idx()` → `open_positions.get()` for every node. Each call paid the full rank/select cost even though successive calls typically access consecutive or nearby open indices.
+
+The identical pattern had already been optimised in `CompactEndPositions` (P12), where a `Cell<SequentialCursor>` with three-path dispatch reduced end-position lookups from ~5-8 memory accesses to ~1-2.
+
+### Design
+
+Added `Cell<SequentialCursor>` to `AdvancePositions` with three-path `get()` dispatch:
+
+```rust
+#[inline(always)]
+pub fn get(&self, open_idx: usize) -> Option<u32> {
+    let cursor = self.cursor.get();
+    if open_idx == cursor.next_open_idx {
+        self.get_sequential(open_idx, cursor)     // O(1) amortized
+    } else if open_idx > cursor.next_open_idx {
+        self.advance_cursor_to(&mut cursor, open_idx);
+        self.get_sequential(open_idx, cursor)     // O(gap) + O(1)
+    } else {
+        self.get_random(open_idx)                  // Full rank/select
+    }
+}
+```
+
+The `SequentialCursor` (48 bytes, 6 `usize` fields) tracks:
+- `next_open_idx`: expected next sequential access
+- `adv_cumulative`: advance rank up to cursor position
+- `ib_word_idx` / `ib_ones_before`: forward scan state in IB bitmap
+- `last_ib_arg` / `last_ib_result`: duplicate-detection cache
+
+The duplicate-detection cache is the key optimisation for YAML: when a container shares the same text position as its first child (common in YAML), consecutive `get()` calls produce the same IB select argument. The cache returns instantly without any bitmap scan.
+
+### Benchmark Results
+
+**Parsing (yaml_bench)**: No regression — cursor field is initialised to zeros during construction and adds zero cost to the parsing hot path.
+
+**yq identity queries** (Apple M1 Max, clean A/B comparison, `succinctly_yq_identity`):
+
+| Workload       | 1KB           | 10KB            | 100KB           | 1MB          |
+|----------------|---------------|-----------------|-----------------|--------------|
+| users          | **-9 to -13%**| **-8%**         | **-3%**         | neutral      |
+| comprehensive  | **-3 to -10%**| **-10 to -12%** | **-7 to -10%**  | **-2.6%**    |
+| sequences      | neutral       | **-5%**         | noisy           | neutral      |
+| nested         | noisy         | neutral         | neutral         | -1.1%        |
+| strings        | neutral       | neutral         | neutral         | neutral      |
+
+### Analysis
+
+**Why users/ benefits most**: User-generated YAML has many key-value pairs where each mapping container shares the text position of its first key. This produces ~33% duplicate positions in the advance bitmap. The `last_ib_arg` cache hits on every duplicate, saving the full IB select scan.
+
+**Why improvement diminishes at 1MB**: At larger file sizes, `get()` is a smaller fraction of total streaming time. Memory bandwidth (reading IB/advance bitmaps), JSON string escaping, and output writing dominate. The cursor saves ~5-10ns per call × ~130K nodes = ~650µs-1.3ms, which is 3-6% of the ~20ms total at 1MB — within noise.
+
+**Why strings/ is neutral**: String-heavy files have many distinct text positions (each string starts at a unique byte offset), so few consecutive calls share the same IB select argument. The duplicate-detection fast path fires infrequently.
+
+**Comparison with EndPositions cursor**: The same pattern yields 20-25% improvement for EndPositions (P12) because EndPositions has higher duplicate rates (all container entries are zero-filled to the previous scalar's end position). For AdvancePositions, the duplicate rate depends on YAML structure (~33% for typical files vs ~50%+ for EndPositions).
+
+### Files Modified
+
+- `src/yaml/advance_positions.rs` — Added `SequentialCursor` struct, `Cell<SequentialCursor>` field, three-path `get()` dispatch with `get_sequential()`, `advance_cursor_to()`, `get_random()` methods
+
+---
+
 ## References
 
 ### YAML Specification
