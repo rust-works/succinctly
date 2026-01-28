@@ -4442,6 +4442,73 @@ The duplicate-detection cache is the key optimisation for YAML: when a container
 
 ---
 
+## O2: Gap-Skipping via advance_rank1 — Accepted ✅
+
+**Issue**: [#74](https://github.com/rust-works/succinctly/issues/74)
+
+### Problem
+
+The forward-gap path in `advance_cursor_to()` (introduced by O1 for both `CompactEndPositions` and `AdvancePositions`) advanced the cursor bit-by-bit through the advance bitmap when `open_idx > cursor.next_open_idx`. For a gap of size G, this required G iterations — each reading one bit from the advance bitmap and accumulating the rank.
+
+While gaps are typically small (1-3 positions for container nesting), the linear scan was unnecessary: the cumulative rank array already exists for random-access queries and provides O(1) lookup.
+
+### Design
+
+Replaced the linear loop with a single `advance_rank1(target)` call in both `CompactEndPositions` and `AdvancePositions`:
+
+```rust
+// Before (O(G) linear scan):
+fn advance_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
+    while cursor.next_open_idx < target {
+        let idx = cursor.next_open_idx;
+        let word_idx = idx / 64;
+        let bit_idx = idx % 64;
+        let adv_bit = ((self.advance_words[word_idx] >> bit_idx) & 1) as usize;
+        cursor.adv_cumulative += adv_bit;
+        cursor.next_open_idx += 1;
+    }
+}
+
+// After (O(1) rank lookup):
+fn advance_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
+    cursor.adv_cumulative = self.advance_rank1(target);
+    cursor.next_open_idx = target;
+}
+```
+
+**Correctness**: The IB cursor state (`ib_word_idx`, `ib_ones_before`) remains valid after the rank jump because we only move forward — the subsequent `get_sequential()` forward scan still works correctly. The duplicate-detection cache (`last_ib_arg`/`last_ib_result`) also remains valid across gap-skips.
+
+### Benchmark Results
+
+**Parsing (yaml_bench)**: No regression — `advance_cursor_to()` is only called during queries (`get()`), not during index construction.
+
+**yq identity queries** (Apple M1 Max, clean A/B comparison against O1 baseline, `succinctly_yq_identity`):
+
+| Workload       | 1KB           | 10KB         | 100KB        | 1MB          |
+|----------------|---------------|--------------|--------------|--------------|
+| users          | **-3.4%**     | **-6.0%**    | +1.3%        | -1.5%        |
+| nested         | **-6.1%**     | +2.2%        | **-2.7%**    | -0.5%        |
+| sequences      | neutral       | -0.7%        | neutral      | -1.7%        |
+| strings        | +2.7%         | **-3.5%**    | **-5.5%**    | -0.2%        |
+| comprehensive  | neutral       | -0.6%        | neutral      | +1.1%        |
+
+### Analysis
+
+**Why results are noisy**: The forward-gap path is infrequently hit during typical streaming. Most accesses are sequential (hit the O(1) fast path), and backward jumps are rare (random path). The gap path fires when depth-first traversal skips container open indices that don't correspond to child nodes — typically 1-3 positions per nesting level.
+
+**Strongest signals**: nested/1kb (-6.1%) and users/10kb (-6.0%) — these workloads have the most container nesting, producing more gap-path invocations.
+
+**Why strings benefit at larger sizes**: String-heavy files at 10-100KB have enough positions that occasional gaps accumulate measurable savings (strings/100kb: -5.5%).
+
+**Key insight**: The rank array already existed for random-access `get()` — reusing it for gap-skipping added zero memory overhead. Even small algorithmic improvements (O(G) → O(1)) compound when applied to hot paths.
+
+### Files Modified
+
+- `src/yaml/end_positions.rs` — Replaced linear loop in `advance_cursor_to()` with `advance_rank1(target)`
+- `src/yaml/advance_positions.rs` — Same change
+
+---
+
 ## References
 
 ### YAML Specification

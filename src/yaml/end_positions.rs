@@ -322,22 +322,13 @@ impl CompactEndPositions {
 
     /// Advance the cursor from its current position to `target` open_idx.
     ///
-    /// Incrementally updates advance_rank by scanning the skipped positions' bits.
-    /// Cost: O(gap_size) bit lookups, typically 1-3 for container gaps.
+    /// Uses O(1) advance_rank1 lookup instead of linear bit scanning.
+    /// IB cursor state (ib_word_idx, ib_ones_before) remains valid for
+    /// forward scanning since target > cursor.next_open_idx.
     #[inline]
     fn advance_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
-        while cursor.next_open_idx < target {
-            let idx = cursor.next_open_idx;
-            let word_idx = idx / 64;
-            let bit_idx = idx % 64;
-            let adv_bit = if word_idx < self.advance_words.len() {
-                ((self.advance_words[word_idx] >> bit_idx) & 1) as usize
-            } else {
-                0
-            };
-            cursor.adv_cumulative += adv_bit;
-            cursor.next_open_idx += 1;
-        }
+        cursor.adv_cumulative = self.advance_rank1(target);
+        cursor.next_open_idx = target;
     }
 
     /// Fast path for sequential access (open_idx == cursor.next_open_idx).
