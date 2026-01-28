@@ -4298,6 +4298,77 @@ The parser processes the value before backtracking to handle the key, producing 
 
 ---
 
+## P12-A: Build Regression Mitigation (A1 + A4) - ACCEPTED ✅
+
+### Problem Statement
+
+GitHub issue [#72](https://github.com/rust-works/succinctly/issues/72) identified that the P12 compact bitmap encoding introduced an 11-24% `yaml_bench` regression compared to the `Vec<u32>` baseline. While the bitmap encoding provides ~3.5× memory reduction and 20-25% faster yq identity queries, the build-time cost of constructing bitmaps and rank/select indices is inherently higher than simple array allocation.
+
+Four actionable optimisations (A1-A4) were proposed. A1 and A4 were implemented.
+
+### Solution: A1 — Inline Zero-Filling in EndPositions::build()
+
+Previously, `EndPositions::build()` allocated a temporary `Vec<u32>`, copied all positions into it with zeros replaced by the previous non-zero value, then passed this filled vector to `CompactEndPositions::build()`. This required one O(N) allocation + copy + deallocation per build.
+
+The A1 optimisation folds zero-filling directly into `CompactEndPositions::build()`, tracking `prev_nonzero` and `prev_effective` during bitmap construction. This eliminates the temporary Vec (~520KB for 1MB YAML).
+
+### Solution: A4 — Lazy Newline Index
+
+Previously, `YamlIndex::build()` eagerly called `build_newline_index(yaml)`, performing a full O(N) scan of the text to build a bitvector marking line boundaries. This newline index is only used by:
+
+- `to_line_column()` — used by `yq-locate` CLI
+- `to_offset()` — used by `yq-locate` CLI
+
+It is never used during normal parsing, jq/yq query evaluation, or benchmarks.
+
+The A4 optimisation changes the `newlines` field from `crate::bits::BitVec` to `OnceCell<crate::bits::BitVec>`, building it lazily on first access. The `to_line_column()` and `to_offset()` methods now take an additional `text: &[u8]` parameter to enable lazy construction.
+
+### Benchmark Results
+
+#### yaml_bench (Apple M1 Max)
+
+| Category        | Improvement Range | Notes                              |
+|-----------------|-------------------|------------------------------------|
+| simple_kv       | **-11% to -22%** | Core key-value parsing             |
+| nested          | **-15% to -24%** | Deeply nested structures           |
+| sequences       | **-9% to -15%**  | Array-like YAML                    |
+| quoted strings  | **-20% to -37%** | Double/single quoted values        |
+| long strings    | **-44% to -85%** | Largest gains (newline scan removed)|
+| large files     | **-18% to -21%** | 100KB-1MB files                    |
+| block scalars   | **-42% to -57%** | Literal/folded blocks              |
+| anchors         | **-12% to -16%** | Anchor/alias workloads             |
+
+The long string and block scalar categories show the largest improvements because they contain the most newlines, so removing the eager newline scan (A4) has the biggest impact. The A1 optimisation contributes broadly across all categories by eliminating the temporary Vec allocation.
+
+#### yq_comparison (Apple M1 Max)
+
+End-to-end yq comparison benchmarks showed ~3-8% apparent regression for both `succinctly` and `system_yq`. Since the system yq binary was unchanged, this is environmental noise (thermal throttling, system load) rather than a code regression.
+
+### Trade-offs
+
+**Benefits:**
+- ✅ **11-85% faster** `YamlIndex::build()` across all workload types
+- ✅ **Zero allocations removed** from build hot path (A1: temp Vec, A4: newline BitVec)
+- ✅ No memory impact on steady-state query performance
+- ✅ No API changes visible to external callers (A4 adds `text` param to internal methods only)
+
+**Costs:**
+- ⚠️ `to_line_column()` and `to_offset()` now require `text: &[u8]` parameter
+- ⚠️ First call to `to_line_column()`/`to_offset()` pays the full newline index build cost
+
+### Remaining Opportunities
+
+- **A2**: Combine monotonicity check with zero-filling into a single pass in `EndPositions::build()`
+- **A3**: Reuse IB bitmap allocation between `OpenPositions::build()` and `EndPositions::build()`
+
+### Files Modified
+
+- `src/yaml/index.rs` — Changed `newlines` field to `OnceCell<BitVec>`, updated constructors, added `ensure_newlines()`, updated `to_line_column()`/`to_offset()`/`newlines()` signatures
+- `src/yaml/end_positions.rs` — Inline zero-filling in `CompactEndPositions::build()`, removed temp Vec from `EndPositions::build()`
+- `src/yaml/light.rs` — Updated call sites to pass `self.text` to `to_line_column()`/`to_offset()`
+
+---
+
 ## References
 
 ### YAML Specification

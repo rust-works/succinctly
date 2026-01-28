@@ -61,6 +61,8 @@ extra bits at positions 11 and 15 are where containers/seq-items open at the `-`
 character, but no `set_ib()` is called there -- the scalar follows after `- `.
 
 `newlines` marks the first byte of each line after a line terminator.
+Built lazily via `OnceCell` on first call to `to_line_column()` or `to_offset()`
+(used by `yq-locate` CLI). Not constructed during normal parsing or query evaluation.
 
 ## bp_to_text (text positions, duplicates stacked)
 
@@ -176,7 +178,7 @@ bitmap) to support O(1) select queries, needed by the `get()` random access path
 
       seq_items            (no index)
       bp_to_text_end       (no index)
-      newlines             (has internal rank)
+      newlines             (lazy OnceCell, has internal rank)
       anchors <-- inverse --> bp_to_anchor
       aliases
 ```

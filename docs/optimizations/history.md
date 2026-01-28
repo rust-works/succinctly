@@ -27,8 +27,9 @@ This document records all optimization attempts in the succinctly library, showi
 | Hierarchical RangeMin     | **40x**                                    | All      | Deployed |
 | Cumulative Index          | **627x**                                   | All      | Deployed |
 | Dual Select Methods       | **3.1x** (seq), **1.39x** (rand)           | All      | Deployed |
+| P12-A Build Mitigation    | **11-85%** (yaml_bench build)               | All      | Deployed |
 
-**Total Successful**: 15 optimizations
+**Total Successful**: 16 optimizations
 **Best Result**: Cumulative index (627x)
 
 ### Failed Optimizations
@@ -366,7 +367,7 @@ Before implementing an optimization, ask:
 
 ## Conclusion
 
-**Success Rate**: 11/19 attempted optimizations (58%)
+**Success Rate**: 12/19 attempted optimizations (63%)
 
 **Key Insight**: The most successful optimizations were algorithmic (cumulative index: 627x, RangeMin: 40x) rather than micro-optimizations. SIMD acceleration works best when:
 1. Targeting actual bottlenecks
@@ -495,6 +496,35 @@ at typical data sizes. Only at 10M+ nodes is the improvement measurable.
 values directly and processes 32 lanes. This could provide better results on CPUs with efficient
 AVX-512 execution (though memory bandwidth may still limit gains for this workload).
 
+### ✅ P12-A Build Regression Mitigation (January 2026)
+
+**Status**: Implemented and deployed — [issue #72](https://github.com/rust-works/succinctly/issues/72)
+
+**Problem**: P12 compact bitmap encoding introduced 11-24% `yaml_bench` regression from bitmap construction overhead.
+
+**Technique**: Two build-path optimisations to reduce allocation and scanning costs:
+
+1. **A1 — Inline zero-filling**: Eliminated temporary `Vec<u32>` allocation in `EndPositions::build()`. Zero-filling now happens inline during bitmap construction, saving one O(N) alloc+copy+dealloc per build.
+
+2. **A4 — Lazy newline index**: Changed `YamlIndex.newlines` from eager `BitVec` to `OnceCell<BitVec>`. The newline index is only used by `yq-locate` CLI, not by parsing or queries. Removes a full O(N) text scan from every `build()` call.
+
+**Benchmark Results** (Apple M1 Max, `yaml_bench`):
+
+| Category        | Improvement     | Notes                              |
+|-----------------|-----------------|-------------------------------------|
+| simple_kv       | -11% to -22%   | Core key-value parsing              |
+| nested          | -15% to -24%   | Deeply nested structures            |
+| sequences       | -9% to -15%    | Array-like YAML                     |
+| quoted strings  | -20% to -37%   | Double/single quoted values         |
+| long strings    | -44% to -85%   | Largest gains (newline scan removed) |
+| large files     | -18% to -21%   | 100KB-1MB files                     |
+| block scalars   | -42% to -57%   | Literal/folded blocks               |
+| anchors         | -12% to -16%   | Anchor/alias workloads              |
+
+**Key insight**: Build-path allocations and eager scans that aren't needed by the hot path (queries, yq evaluation) should be deferred or eliminated. The lazy newline index has the largest impact on newline-heavy content because it removes an entire O(N) pass.
+
+**Files**: [src/yaml/index.rs](../../src/yaml/index.rs), [src/yaml/end_positions.rs](../../src/yaml/end_positions.rs)
+
 ---
 
 ## Future Optimization Opportunities
@@ -535,4 +565,4 @@ See [docs/plan/sve2-optimizations.md](../plan/sve2-optimizations.md#future-neon-
 
 ---
 
-*Last Updated: 2026-01-23*
+*Last Updated: 2026-01-28*

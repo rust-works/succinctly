@@ -477,19 +477,50 @@ of scalar_idx — no `has_end` rank needed.
 
 ### How zero-filling works
 
+Zero-filling is performed **inline** during bitmap construction, avoiding a
+temporary `Vec<u32>` allocation. The `CompactEndPositions::build()` function
+tracks `prev_nonzero` as it iterates over positions:
+
 ```rust
 fn build(positions: &[u32], text_len: usize) -> Self {
-    // Fill zeros with previous non-zero value
-    let mut filled = Vec::with_capacity(positions.len());
-    let mut prev = 0u32;
-    for &pos in positions {
-        if pos > 0 { prev = pos; }
-        filled.push(prev);
+    // ... bitmap setup ...
+
+    let mut prev_effective: Option<u32> = None;
+    let mut prev_nonzero = 0u32;
+
+    for (i, &pos) in positions.iter().enumerate() {
+        // Inline zero-fill: containers (pos == 0) inherit previous non-zero value
+        let effective = if pos > 0 {
+            prev_nonzero = pos;
+            pos
+        } else {
+            prev_nonzero
+        };
+
+        if effective == 0 {
+            // Leading container (before any scalar): no advance, no IB bit
+            prev_effective = Some(0);
+            continue;
+        }
+
+        let is_new_position = prev_effective != Some(effective);
+
+        if is_new_position {
+            // Set IB bit at this text position
+            ib_words[effective as usize / 64] |= 1u64 << (effective as usize % 64);
+            // Set advance bit
+            advance_words[i / 64] |= 1u64 << (i % 64);
+        }
+
+        prev_effective = Some(effective);
     }
-    // Now build 2-bitmap encoding from the filled sequence
-    CompactEndPositions::build(&filled, text_len)
+    // ... build rank/select indices ...
 }
 ```
+
+This eliminates the O(N) temporary allocation and copy that was previously
+needed to pre-fill zeros before bitmap construction (see [A1 optimisation,
+issue #72](https://github.com/rust-works/succinctly/issues/72)).
 
 During the bitmap build, leading zeros (value 0, before any scalar) are
 skipped — they get no advance bit. This ensures `get()` returns `None` for
@@ -781,6 +812,41 @@ other optimizations on the branch dominate).
 
 The 2-bitmap design saves an additional ~7% memory over 3-bitmap by
 eliminating the `has_end` bitmap and its rank array.
+
+### Build regression mitigation (A1 + A4, issue #72)
+
+The compact 2-bitmap encoding introduced an 11-24% `yaml_bench` regression
+compared to the `Vec<u32>` baseline, because bitmap construction is more
+expensive than simple array allocation. Two optimisations (A1 and A4) reduced
+this regression significantly:
+
+**A1: Inline zero-filling** — Eliminated the temporary `Vec<u32>` that was
+allocated, filled, and immediately discarded during `EndPositions::build()`.
+Zero-filling now happens inline during bitmap construction (see code above).
+Saves one O(N) alloc+copy+dealloc per build (~520KB for 1MB YAML).
+
+**A4: Lazy newline index** — Changed the `newlines` bitvector in `YamlIndex`
+from eager construction to lazy initialisation via `core::cell::OnceCell`.
+The newline index is only needed by `to_line_column()` and `to_offset()`
+(used by `yq-locate` CLI), not by parsing or query evaluation. This removes
+a full O(N) text scan from every `YamlIndex::build()` call.
+
+**yaml_bench results after A1 + A4** (Apple M1 Max):
+
+| Benchmark             | Change          | Notes                           |
+|-----------------------|-----------------|---------------------------------|
+| simple_kv             | **-11% to -22%**| Core key-value parsing          |
+| nested                | **-15% to -24%**| Deeply nested structures        |
+| sequences             | **-9% to -15%** | Array-like YAML                 |
+| quoted strings        | **-20% to -37%**| Double/single quoted values     |
+| long strings          | **-44% to -85%**| Largest gains (newline removed) |
+| large files           | **-18% to -21%**| 100KB-1MB files                 |
+| block scalars         | **-42% to -57%**| Literal/folded blocks           |
+| anchors               | **-12% to -16%**| Anchor/alias workloads          |
+
+The long string and block scalar categories show the largest improvements
+because they contain the most newlines, so removing the eager newline scan
+has the biggest impact.
 
 ---
 

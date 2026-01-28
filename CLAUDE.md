@@ -495,3 +495,10 @@ For detailed documentation on optimization techniques used in this project, see 
   - **Minor regression**: ~1.5-2% on tiny (10-element) quoted string benchmarks
   - Better cache locality from compact bitmap representation
   - See [docs/parsing/yaml.md#p12-advance-index-for-memory-efficient-bp_to_text---accepted-](docs/parsing/yaml.md#p12-advance-index-for-memory-efficient-bp_to_text---accepted-) for full analysis
+- ✅ P12-A (Build Regression Mitigation): **11-85% faster** `yaml_bench` build times, fixes issue #72
+  - A1: Inline zero-filling in `EndPositions::build()` — eliminates temp `Vec<u32>` allocation
+  - A4: Lazy newline index via `OnceCell` — removes O(N) text scan from `build()`
+  - Largest gains on newline-heavy content (long strings: -44% to -85%, block scalars: -42% to -57%)
+  - Broad improvements across all categories (simple_kv: -11% to -22%, nested: -15% to -24%)
+  - A2 and A3 from issue #72 remain as future opportunities
+  - See [docs/parsing/yaml.md#p12-a-build-regression-mitigation-a1--a4---accepted-](docs/parsing/yaml.md#p12-a-build-regression-mitigation-a1--a4---accepted-) for full analysis
