@@ -146,27 +146,12 @@ impl EndPositions {
             return EndPositions::Compact(Box::new(CompactEndPositions::empty(text_len)));
         }
 
-        // Check if non-zero positions are monotonically non-decreasing
-        let mut is_monotonic = true;
-        let mut prev_nonzero: Option<u32> = None;
-
-        for &pos in positions {
-            if pos > 0 {
-                if let Some(p) = prev_nonzero {
-                    if pos < p {
-                        is_monotonic = false;
-                        break;
-                    }
-                }
-                prev_nonzero = Some(pos);
-            }
+        // Single-pass build with inline monotonicity check and zero-filling.
+        // Returns None if non-zero positions are not monotonically non-decreasing.
+        match CompactEndPositions::try_build(positions, text_len) {
+            Some(compact) => EndPositions::Compact(Box::new(compact)),
+            None => EndPositions::Dense(positions.to_vec()),
         }
-
-        if !is_monotonic {
-            return EndPositions::Dense(positions.to_vec());
-        }
-
-        EndPositions::Compact(Box::new(CompactEndPositions::build(positions, text_len)))
     }
 
     /// Get the end position for the `open_idx`-th BP open.
@@ -222,20 +207,19 @@ impl CompactEndPositions {
         }
     }
 
-    /// Build compact end positions from raw positions with inline zero-filling.
+    /// Build compact end positions from raw positions with inline zero-filling
+    /// and monotonicity checking in a single pass.
     ///
     /// `positions` contains one entry per BP open. Zero entries are containers
-    /// (no end position); non-zero entries are scalar end positions. Non-zero
-    /// entries must be monotonically non-decreasing (caller checks this).
+    /// (no end position); non-zero entries are scalar end positions.
+    ///
+    /// Returns `None` if non-zero positions are not monotonically non-decreasing
+    /// (caller should fall back to Dense storage).
     ///
     /// Zero entries are filled with the previous non-zero value inline during
     /// bitmap construction, avoiding a temporary `Vec<u32>` allocation.
-    fn build(positions: &[u32], text_len: usize) -> Self {
+    fn try_build(positions: &[u32], text_len: usize) -> Option<Self> {
         let num_opens = positions.len();
-
-        if positions.is_empty() || positions.iter().all(|&p| p == 0) {
-            return Self::empty(text_len);
-        }
 
         // Build IB: set bit at each unique end position.
         // End positions can be at text_len (one past last byte for scalars ending at EOF),
@@ -255,6 +239,10 @@ impl CompactEndPositions {
             // Inline zero-fill: containers (pos == 0) inherit previous non-zero value.
             // Leading containers (before any scalar) have prev_nonzero == 0.
             let effective = if pos > 0 {
+                // Monotonicity check: non-zero positions must be non-decreasing.
+                if prev_nonzero > 0 && pos < prev_nonzero {
+                    return None;
+                }
                 prev_nonzero = pos;
                 pos
             } else {
@@ -285,10 +273,15 @@ impl CompactEndPositions {
             prev_effective = Some(effective);
         }
 
+        if ib_ones == 0 {
+            // All positions were zero (containers only, no scalars).
+            return Some(Self::empty(text_len));
+        }
+
         let advance_rank = build_cumulative_rank(&advance_words);
         let ib_select_samples = build_select_samples(&ib_words, ib_ones);
 
-        Self {
+        Some(Self {
             ib_words,
             ib_len: text_len,
             ib_select_samples,
@@ -297,7 +290,7 @@ impl CompactEndPositions {
             num_opens,
             advance_rank,
             cursor: Cell::default(),
-        }
+        })
     }
 
     /// Get the end position for the `open_idx`-th BP open.
