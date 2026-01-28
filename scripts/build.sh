@@ -23,6 +23,10 @@ echo "=== Building succinctly (with CLI) ==="
 cargo build --release --features cli
 
 echo ""
+echo "=== Building succinctly (with bench-runner) ==="
+cargo build --release --features bench-runner
+
+echo ""
 echo "=== Checking bench-compare ==="
 cd "$ROOT_DIR/bench-compare"
 cargo check --all-targets

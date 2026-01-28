@@ -158,7 +158,40 @@ GitHub Actions runs `rank_select` benchmarks on every PR/push for smoke testing:
 
 ## How to Run Benchmarks
 
-### Quick Start
+### Unified Benchmark Runner (Recommended)
+
+The project includes a unified benchmark runner that provides discovery, listing, and running all benchmarks with automatic metadata tracking.
+
+```bash
+# Build with bench-runner feature
+cargo build --release --features bench-runner
+
+# List all available benchmarks
+./target/release/succinctly bench list
+
+# List by category
+./target/release/succinctly bench list --category core
+./target/release/succinctly bench list --category json
+
+# Run specific benchmarks
+./target/release/succinctly bench run rank_select yaml_bench
+
+# Run all benchmarks in a category
+./target/release/succinctly bench run --category core
+
+# Run all benchmarks
+./target/release/succinctly bench run --all
+
+# Dry run (see what would execute)
+./target/release/succinctly bench run --dry-run --all
+```
+
+**Output Location**: Results are saved to `data/bench/results/<timestamp>_<commit>/` with:
+- `metadata.json` - Git, system, and toolchain information
+- `summary.json` - Run summary with pass/fail status
+- `stdout/` - Raw output from each benchmark
+
+### Quick Start (Traditional)
 
 ```bash
 # 1. Build release binary

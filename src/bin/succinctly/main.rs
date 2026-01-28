@@ -33,6 +33,9 @@ enum Command {
     Dev(DevCommand),
     /// Install short alias symlinks (sjq, syq, sjq-locate, syq-locate)
     InstallAliases(InstallAliasesArgs),
+    /// Unified benchmark runner (list and run all benchmarks)
+    #[cfg(feature = "bench-runner")]
+    Bench(BenchRunnerCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -94,6 +97,24 @@ struct InstallAliasesArgs {
     /// Directory to create symlinks in (default: same directory as the binary)
     #[arg(long, value_name = "DIR")]
     dir: Option<PathBuf>,
+}
+
+/// Unified benchmark runner command.
+#[cfg(feature = "bench-runner")]
+#[derive(Debug, Parser)]
+struct BenchRunnerCommand {
+    #[command(subcommand)]
+    command: BenchRunnerSubcommand,
+}
+
+/// Unified benchmark runner subcommands.
+#[cfg(feature = "bench-runner")]
+#[derive(Debug, Subcommand)]
+enum BenchRunnerSubcommand {
+    /// List all available benchmarks
+    List(bench_runner::ListArgs),
+    /// Run one or more benchmarks
+    Run(bench_runner::RunArgs),
 }
 
 /// Default alias names installed by `install-aliases`.
@@ -1039,6 +1060,11 @@ fn main() -> Result<()> {
             },
         },
         Command::InstallAliases(args) => install_aliases(args),
+        #[cfg(feature = "bench-runner")]
+        Command::Bench(bench_cmd) => match bench_cmd.command {
+            BenchRunnerSubcommand::List(args) => bench_runner::run_list(args),
+            BenchRunnerSubcommand::Run(args) => bench_runner::run_benchmarks(args),
+        },
     }
 }
 
@@ -1639,6 +1665,8 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
+#[cfg(feature = "bench-runner")]
+mod bench_runner;
 mod dsv_bench;
 mod dsv_generators;
 mod generators;

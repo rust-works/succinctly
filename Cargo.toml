@@ -60,6 +60,9 @@ broadword-yaml = []
 # Useful for benchmarking baseline scalar performance.
 scalar-yaml = []
 
+# Unified benchmark runner (succinctly bench list/run)
+bench-runner = ["cli", "dep:chrono"]
+
 [dependencies]
 bytemuck = { version = "1.14", features = ["derive"] }
 indexmap = "2.2"
@@ -78,6 +81,7 @@ serde_json = { version = "1.0", features = ["preserve_order"], optional = true }
 atty = { version = "0.2", optional = true }
 md5 = { version = "0.7", optional = true }
 ctrlc = { version = "3.4", optional = true }
+chrono = { version = "0.4", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
