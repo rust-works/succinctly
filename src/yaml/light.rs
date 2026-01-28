@@ -142,7 +142,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             return YamlValue::Null;
         }
 
-        let Some(text_pos) = self.text_position() else {
+        // Compute open_idx once — reused for both text_pos and text_end_pos
+        // to avoid a redundant rank1 in the unquoted scalar path.
+        let open_idx = self.index.bp_to_open_idx(self.bp_pos);
+        let Some(text_pos) = self.index.text_pos_by_open_idx(open_idx) else {
             return YamlValue::Error("invalid cursor position");
         };
 
@@ -277,8 +280,13 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             }
             _ => {
                 // Unquoted (plain) scalar - may span multiple lines
-                // Use pre-computed end position for O(1) lookup
-                let end = self.text_end_position().unwrap_or(effective_text_pos);
+                // Use pre-computed end position for O(1) lookup.
+                // Reuses open_idx computed above to skip redundant rank1.
+                let end = self
+                    .index
+                    .text_end_pos_by_open_idx(open_idx)
+                    .filter(|&e| e >= effective_text_pos)
+                    .unwrap_or(effective_text_pos);
 
                 // Compute base_indent only if needed for multi-line scalar decoding
                 // For single-line scalars (no newlines), base_indent doesn't matter
@@ -1497,7 +1505,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     #[inline]
     pub fn line(&self) -> usize {
         let offset = self.text_position().unwrap_or(0);
-        let (line, _column) = self.index.to_line_column(offset);
+        let (line, _column) = self.index.to_line_column(offset, self.text);
         line
     }
 
@@ -1521,7 +1529,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     #[inline]
     pub fn column(&self) -> usize {
         let offset = self.text_position().unwrap_or(0);
-        let (_line, column) = self.index.to_line_column(offset);
+        let (_line, column) = self.index.to_line_column(offset, self.text);
         column
     }
 
@@ -1799,7 +1807,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// This enables position-based navigation in jq queries via `at_position(line; col)`.
     pub fn cursor_at_position(&self, line: usize, col: usize) -> Option<YamlCursor<'a, W>> {
         // Convert line/column to byte offset
-        let offset = self.index.to_offset(line, col)?;
+        let offset = self.index.to_offset(line, col, self.text)?;
 
         // Use cursor_at_offset to find the node
         self.cursor_at_offset(offset)

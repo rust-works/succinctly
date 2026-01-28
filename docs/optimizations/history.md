@@ -27,8 +27,11 @@ This document records all optimization attempts in the succinctly library, showi
 | Hierarchical RangeMin     | **40x**                                    | All      | Deployed |
 | Cumulative Index          | **627x**                                   | All      | Deployed |
 | Dual Select Methods       | **3.1x** (seq), **1.39x** (rand)           | All      | Deployed |
+| P12-A Build Mitigation    | **11-85%** (yaml_bench build)               | All      | Deployed |
+| O1 Sequential Cursor      | **3-13%** (yq identity queries, 1-100KB)    | All      | Deployed |
+| O2 Gap-Skip rank1         | **2-6%** (yq identity queries, nested/users) | All      | Deployed |
 
-**Total Successful**: 15 optimizations
+**Total Successful**: 18 optimizations
 **Best Result**: Cumulative index (627x)
 
 ### Failed Optimizations
@@ -366,7 +369,7 @@ Before implementing an optimization, ask:
 
 ## Conclusion
 
-**Success Rate**: 11/19 attempted optimizations (58%)
+**Success Rate**: 12/19 attempted optimizations (63%)
 
 **Key Insight**: The most successful optimizations were algorithmic (cumulative index: 627x, RangeMin: 40x) rather than micro-optimizations. SIMD acceleration works best when:
 1. Targeting actual bottlenecks
@@ -495,6 +498,121 @@ at typical data sizes. Only at 10M+ nodes is the improvement measurable.
 values directly and processes 32 lanes. This could provide better results on CPUs with efficient
 AVX-512 execution (though memory bandwidth may still limit gains for this workload).
 
+### ✅ P12-A Build Regression Mitigation (January 2026)
+
+**Status**: Implemented and deployed — [issue #72](https://github.com/rust-works/succinctly/issues/72)
+
+**Problem**: P12 compact bitmap encoding introduced 11-24% `yaml_bench` regression from bitmap construction overhead.
+
+**Technique**: Three build-path optimisations to reduce allocation and scanning costs:
+
+1. **A1 — Inline zero-filling**: Eliminated temporary `Vec<u32>` allocation in `EndPositions::build()`. Zero-filling now happens inline during bitmap construction, saving one O(N) alloc+copy+dealloc per build.
+
+2. **A2 — Combined monotonicity check**: Merged the separate O(N) monotonicity scan into the bitmap construction loop. `CompactEndPositions::try_build()` now checks monotonicity inline and returns `None` on violation, eliminating one full pass over the positions array.
+
+3. **A4 — Lazy newline index**: Changed `YamlIndex.newlines` from eager `BitVec` to `OnceCell<BitVec>`. The newline index is only used by `yq-locate` CLI, not by parsing or queries. Removes a full O(N) text scan from every `build()` call.
+
+**Benchmark Results** (Apple M1 Max, `yaml_bench`):
+
+| Category        | Improvement     | Notes                              |
+|-----------------|-----------------|-------------------------------------|
+| simple_kv       | -11% to -22%   | Core key-value parsing              |
+| nested          | -15% to -24%   | Deeply nested structures            |
+| sequences       | -9% to -15%    | Array-like YAML                     |
+| quoted strings  | -20% to -37%   | Double/single quoted values         |
+| long strings    | -44% to -85%   | Largest gains (newline scan removed) |
+| large files     | -18% to -21%   | 100KB-1MB files                     |
+| block scalars   | -42% to -57%   | Literal/folded blocks               |
+| anchors         | -12% to -16%   | Anchor/alias workloads              |
+
+**Key insight**: Build-path allocations and eager scans that aren't needed by the hot path (queries, yq evaluation) should be deferred or eliminated. The lazy newline index has the largest impact on newline-heavy content because it removes an entire O(N) pass.
+
+**Files**: [src/yaml/index.rs](../../src/yaml/index.rs), [src/yaml/end_positions.rs](../../src/yaml/end_positions.rs)
+
+### ✅ O1 Sequential Cursor for AdvancePositions (January 2026)
+
+**Status**: Implemented and deployed — [issue #74](https://github.com/rust-works/succinctly/issues/74)
+
+**Problem**: `AdvancePositions::get()` performed full `advance_rank1()` + `ib_select1()` on every call, even during sequential streaming traversals where open_idx increases monotonically.
+
+**Technique**: Added `Cell<SequentialCursor>` with three-path dispatch (mirroring the existing pattern in `CompactEndPositions`):
+
+1. **Sequential path** (open_idx == cursor.next_open_idx): Single bit test for advance rank + forward IB scan from cursor position. O(1) amortized.
+2. **Forward-gap path** (open_idx > cursor): O(1) advance via `advance_rank1(target)` (upgraded from linear scan by O2), then sequential.
+3. **Random path** (backwards jump): Full rank/select recomputation, then sets up cursor for subsequent sequential access.
+
+A duplicate-detection cache (`last_ib_arg`) provides an additional fast path when consecutive open indices share the same text position (containers sharing position with first child).
+
+**Benchmark Results** (Apple M1 Max, `succinctly_yq_identity`, clean A/B comparison):
+
+| Workload       | 1KB           | 10KB         | 100KB        | 1MB          |
+|----------------|---------------|--------------|--------------|--------------|
+| users          | **-9 to -13%**| **-8%**      | **-3%**      | neutral      |
+| comprehensive  | **-3 to -10%**| **-10 to -12%** | **-7 to -10%** | **-2.6%** |
+| sequences      | neutral       | **-5%**      | noisy        | neutral      |
+| nested         | noisy         | neutral      | neutral      | -1.1%        |
+| strings        | neutral       | neutral      | neutral      | neutral      |
+
+**Parsing (yaml_bench)**: No regression — cursor field adds zero cost to index construction.
+
+**Why users/ benefits most**: User YAML generates key-value pairs where containers share text positions with first children, creating many duplicate positions. The cursor's `last_ib_arg` cache hits on every duplicate, bypassing the full IB select scan.
+
+**Why neutral at 1MB**: At larger sizes, `get()` is a smaller fraction of total time (memory bandwidth and JSON output dominate).
+
+**Why neutral on strings/**: String-heavy files have few duplicate positions, so the duplicate-detection fast path fires less often.
+
+**Key insight**: The sequential cursor pattern (proven in `CompactEndPositions`) generalises to `AdvancePositions` with consistent benefits for workloads with duplicate positions. The optimization is most visible at small-medium sizes (1KB-100KB) where `get()` is a larger fraction of total query time.
+
+**Files**: [src/yaml/advance_positions.rs](../../src/yaml/advance_positions.rs)
+
+### ✅ O2 Gap-Skipping via advance_rank1 (January 2026)
+
+**Status**: Implemented and deployed — [issue #74](https://github.com/rust-works/succinctly/issues/74)
+
+**Problem**: The forward-gap path in `advance_cursor_to()` (used by both `CompactEndPositions` and `AdvancePositions`) advanced the cursor by looping bit-by-bit through the advance bitmap. For gaps of size G, this was O(G) — scanning each skipped position individually to accumulate the advance rank.
+
+**Technique**: Replaced the linear loop with a single `advance_rank1(target)` call, which uses the precomputed cumulative rank array for O(1) lookup:
+
+```rust
+// Before (O(G) linear scan):
+fn advance_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
+    while cursor.next_open_idx < target {
+        let idx = cursor.next_open_idx;
+        let word_idx = idx / 64;
+        let bit_idx = idx % 64;
+        let adv_bit = ((self.advance_words[word_idx] >> bit_idx) & 1) as usize;
+        cursor.adv_cumulative += adv_bit;
+        cursor.next_open_idx += 1;
+    }
+}
+
+// After (O(1) rank lookup):
+fn advance_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
+    cursor.adv_cumulative = self.advance_rank1(target);
+    cursor.next_open_idx = target;
+}
+```
+
+The IB cursor state (`ib_word_idx`, `ib_ones_before`) remains valid after the rank jump because we only move forward — the subsequent `get_sequential()` forward scan still works correctly. The duplicate-detection cache (`last_ib_arg`/`last_ib_result`) also remains valid across gap-skips.
+
+**Benchmark Results** (Apple M1 Max, clean A/B comparison against O1 baseline, `succinctly_yq_identity`):
+
+| Workload       | 1KB           | 10KB         | 100KB        | 1MB          |
+|----------------|---------------|--------------|--------------|--------------|
+| users          | **-3.4%**     | **-6.0%**    | +1.3%        | -1.5%        |
+| nested         | **-6.1%**     | +2.2%        | **-2.7%**    | -0.5%        |
+| sequences      | neutral       | -0.7%        | neutral      | -1.7%        |
+| strings        | +2.7%         | **-3.5%**    | **-5.5%**    | -0.2%        |
+| comprehensive  | neutral       | -0.6%        | neutral      | +1.1%        |
+
+**Parsing (yaml_bench)**: No regression — `advance_cursor_to()` is only called during queries, not during index construction.
+
+**Why results are noisy**: The forward-gap path is infrequently hit during typical streaming (most accesses are sequential). The optimization eliminates O(G) work in the gap path, but gaps are typically small (1-3 positions). The strongest signals appear on nested and users workloads at small-medium sizes where gaps occur more frequently.
+
+**Key insight**: Even small algorithmic improvements (O(G) → O(1)) compound when applied to hot paths. The rank array already existed for random-access `get()` — reusing it for gap-skipping cost zero additional memory.
+
+**Files**: [src/yaml/end_positions.rs](../../src/yaml/end_positions.rs), [src/yaml/advance_positions.rs](../../src/yaml/advance_positions.rs)
+
 ---
 
 ## Future Optimization Opportunities
@@ -535,4 +653,4 @@ See [docs/plan/sve2-optimizations.md](../plan/sve2-optimizations.md#future-neon-
 
 ---
 
-*Last Updated: 2026-01-23*
+*Last Updated: 2026-01-28*

@@ -272,9 +272,9 @@ cargo test
 
 | Size      | succinctly            | jq                    | Speedup    |
 |-----------|-----------------------|-----------------------|------------|
-| **10KB**  |  4.1 ms  (2.3 MiB/s)  |  4.8 ms  (2.0 MiB/s)  | **1.2x**   |
-| **100KB** |  6.6 ms (12.9 MiB/s)  |  9.0 ms  (9.4 MiB/s)  | **1.4x**   |
-| **1MB**   | 29.6 ms (27.3 MiB/s)  | 45.3 ms (17.8 MiB/s)  | **1.5x**   |
+| **10KB**  |  4.2 ms  (2.2 MiB/s)  |  4.3 ms  (2.1 MiB/s)  | **1.0x**   |
+| **100KB** |  6.5 ms (13.2 MiB/s)  |  8.2 ms (10.4 MiB/s)  | **1.3x**   |
+| **1MB**   | 28.0 ms (28.8 MiB/s)  | 43.8 ms (18.5 MiB/s)  | **1.6x**   |
 
 To regenerate: `cargo bench --bench jq_comparison`
 
@@ -282,9 +282,9 @@ To regenerate: `cargo bench --bench jq_comparison`
 
 | Size      | succinctly            | jq                    | Speedup    |
 |-----------|-----------------------|-----------------------|------------|
-| **10KB**  |  2.2 ms (4.3 MiB/s)   |  2.7 ms  (3.5 MiB/s)  | **1.2x**   |
-| **100KB** |  4.7 ms (17.1 MiB/s)  |  6.8 ms (12.5 MiB/s)  | **1.5x**   |
-| **1MB**   | 28.4 ms (28.4 MiB/s)  | 47.3 ms (17.1 MiB/s)  | **1.7x**   |
+| **10KB**  |  1.9 ms (4.9 MiB/s)   |  2.6 ms  (3.6 MiB/s)  | **1.4x**   |
+| **100KB** |  4.4 ms (19.4 MiB/s)  |  6.7 ms (12.7 MiB/s)  | **1.5x**   |
+| **1MB**   | 28.2 ms (28.7 MiB/s)  | 47.7 ms (16.9 MiB/s)  | **1.7x**   |
 
 ### jq Query Performance (ARM Neoverse-V1)
 
@@ -298,19 +298,19 @@ To regenerate: `cargo bench --bench jq_comparison`
 
 | Size       | succinctly             | yq                     | Speedup     | Mem Ratio  |
 |------------|------------------------|------------------------|-------------|------------|
-| **10KB**   |   6.0 ms  (1.6 MiB/s)  |   9.6 ms  (1.0 MiB/s)  | **1.6x**    | **0.50x**  |
-| **100KB**  |   7.6 ms (12.9 MiB/s)  |  20.6 ms  (4.7 MiB/s)  | **2.7x**    | **0.34x**  |
-| **1MB**    |  21.5 ms (46.5 MiB/s)  | 117.9 ms  (8.5 MiB/s)  | **5.5x**    | **0.13x**  |
-| **10MB**   | 153.1 ms (65.3 MiB/s)  |   1.04 s  (9.7 MiB/s)  | **6.8x**    | **0.06x**  |
-| **100MB**  |   1.42 s (70.2 MiB/s)  |   9.77 s (10.2 MiB/s)  | **6.9x**    | **0.05x**  |
+| **10KB**   |   5.8 ms  (1.7 MiB/s)  |   9.0 ms  (1.1 MiB/s)  | **1.6x**    | **0.50x**  |
+| **100KB**  |   7.3 ms (12.6 MiB/s)  |  19.5 ms  (4.7 MiB/s)  | **2.7x**    | **0.35x**  |
+| **1MB**    |  20.5 ms (45.0 MiB/s)  | 111.2 ms  (8.3 MiB/s)  | **5.4x**    | **0.12x**  |
+| **10MB**   | 161.6 ms (57.8 MiB/s)  |   1.01 s  (9.2 MiB/s)  | **6.3x**    | **0.05x**  |
+| **100MB**  |   1.50 s (61.9 MiB/s)  |   9.68 s  (9.6 MiB/s)  | **6.4x**    | **0.05x**  |
 
 ### yq Query Performance (ARM Neoverse-V2)
 
 | Size      | succinctly              | yq                    | Speedup    |
 |-----------|-------------------------|-----------------------|------------|
-| **10KB**  | 2.0 ms  (4.9 MiB/s)     | 5.5 ms (1.8 MiB/s)    | **2.7x**   |
-| **100KB** | 3.7 ms (24.9 MiB/s)     | 21.6 ms (4.3 MiB/s)   | **5.8x**   |
-| **1MB**   | 19.5 ms (47.3 MiB/s)    | 154.6 ms (6.0 MiB/s)  | **7.9x**   |
+| **10KB**  | 2.0 ms  (5.0 MiB/s)     | 5.7 ms (1.7 MiB/s)    | **2.9x**   |
+| **100KB** | 3.7 ms (25.1 MiB/s)     | 21.4 ms (4.3 MiB/s)   | **5.8x**   |
+| **1MB**   | 19.7 ms (46.7 MiB/s)    | 156.4 ms (5.9 MiB/s)  | **7.9x**   |
 
 ### yq Query Performance (ARM Neoverse-V1)
 
@@ -326,9 +326,9 @@ Note: System `yq` not installed; showing succinctly-only performance.
 
 | Size      | succinctly              | yq                    | Speedup    |
 |-----------|-------------------------|-----------------------|------------|
-| **10KB**  | 2.9 ms   (3.4 MiB/s)    | 68.9 ms (145 KiB/s)   | **24x**    |
-| **100KB** | 4.4 ms  (21.4 MiB/s)    | 85.2 ms (1.1 MiB/s)   | **19x**    |
-| **1MB**   | 20.6 ms (45.9 MiB/s)    |216.5 ms (4.4 MiB/s)   | **11x**    |
+| **10KB**  | 2.6 ms   (3.8 MiB/s)    | 59.9 ms (164 KiB/s)   | **23x**    |
+| **100KB** | 4.0 ms  (23.0 MiB/s)    | 74.6 ms (1.2 MiB/s)   | **19x**    |
+| **1MB**   | 17.3 ms (53.3 MiB/s)    |195.3 ms (4.7 MiB/s)   | **11x**    |
 
 To regenerate: `succinctly dev bench yq` (includes memory) or `cargo bench --bench yq_comparison` (time only)
 
@@ -336,12 +336,12 @@ To regenerate: `succinctly dev bench yq` (includes memory) or `cargo bench --ben
 
 | Query       | Path          | succinctly | yq       | Speedup     | succ Mem | yq Mem  |
 |-------------|---------------|------------|----------|-------------|----------|---------|
-| `.`         | P9 streaming  | 1.12s      | 11.82s   | **10.5x**   | 529 MB   | 7 GB    |
-| `.[0]`      | M2 streaming  | 468ms      | 5.97s    | **12.8x**   | 534 MB   | 5 GB    |
-| `.[]`       | M2 streaming  | 1.91s      | 13.67s   | **7.2x**    | 554 MB   | 8 GB    |
-| `length`    | OwnedValue    | 480ms      | 5.99s    | **12.5x**   | 529 MB   | 5 GB    |
+| `.`         | P9 streaming  | 1.78s      | 11.54s   | **6.5x**    | 254 MB   | 7 GB    |
+| `.[0]`      | M2 streaming  | 444ms      | 5.84s    | **13.2x**   | 254 MB   | 5 GB    |
+| `.[]`       | M2 streaming  | 2.53s      | 13.30s   | **5.3x**    | 269 MB   | 8 GB    |
+| `length`    | OwnedValue    | 445ms      | 5.84s    | **13.1x**   | 254 MB   | 5 GB    |
 
-M2 streaming (`.[0]`) is **2.4x faster** than identity (`.`), with **7-14% of yq's memory**.
+M2 streaming (`.[0]`) is **4.0x faster** than identity (`.`), with **3-5% of yq's memory**.
 
 To benchmark: `succinctly dev bench yq --queries all --memory`
 
@@ -495,3 +495,33 @@ For detailed documentation on optimization techniques used in this project, see 
   - **Minor regression**: ~1.5-2% on tiny (10-element) quoted string benchmarks
   - Better cache locality from compact bitmap representation
   - See [docs/parsing/yaml.md#p12-advance-index-for-memory-efficient-bp_to_text---accepted-](docs/parsing/yaml.md#p12-advance-index-for-memory-efficient-bp_to_text---accepted-) for full analysis
+- ✅ P12-A (Build Regression Mitigation): **11-85% faster** `yaml_bench` build times, fixes issue #72
+  - A1: Inline zero-filling in `EndPositions::build()` — eliminates temp `Vec<u32>` allocation
+  - A2: Combined monotonicity check — merged into `try_build()`, eliminates separate O(N) scan
+  - A4: Lazy newline index via `OnceCell` — removes O(N) text scan from `build()`
+  - Largest gains on newline-heavy content (long strings: -44% to -85%, block scalars: -42% to -57%)
+  - Broad improvements across all categories (simple_kv: -11% to -22%, nested: -15% to -24%)
+  - A3 from issue #72 remains as future opportunity
+  - See [docs/parsing/yaml.md#p12-a-build-regression-mitigation-a1--a2--a4---accepted-](docs/parsing/yaml.md#p12-a-build-regression-mitigation-a1--a2--a4---accepted-) for full analysis
+- ✅ O1 (Sequential Cursor for AdvancePositions): **3-13% faster** yq queries on small-medium files, issue #74
+  - Applied `Cell<SequentialCursor>` pattern from `CompactEndPositions` to `AdvancePositions`
+  - Three-path dispatch: sequential (amortized O(1)), forward-gap (linear advance), random (full recomputation)
+  - Duplicate-detection cache: `last_ib_arg`/`last_ib_result` for O(1) return on shared positions (~33% of nodes)
+  - **End-to-end yq benchmarks** (users/ workload):
+    - 1KB: **-9 to -13%** time (strongest improvement)
+    - 10KB: **-8%** time
+    - 100KB: **-3%** time
+    - 1MB: neutral (get() is smaller fraction of total streaming time)
+  - **Neutral on strings/ and nested/** — unique positions reduce duplicate-cache hit rate
+  - Best for: small-medium YAML with container-heavy structure (Kubernetes manifests, CI/CD configs)
+  - See [docs/parsing/yaml.md#o1-sequential-cursor-for-advancepositions---accepted-](docs/parsing/yaml.md#o1-sequential-cursor-for-advancepositions---accepted-) for full analysis
+- ✅ O2 (Gap-Skipping via advance_rank1): **2-6% faster** yq queries on nested/users at small-medium sizes, issue #74
+  - Replaced O(G) linear loop in `advance_cursor_to()` with O(1) `advance_rank1(target)` call
+  - Applied to both `CompactEndPositions` and `AdvancePositions` cursor forward-gap paths
+  - Reuses existing cumulative rank array — zero additional memory overhead
+  - **End-to-end yq benchmarks** (against O1 baseline):
+    - nested/1kb: **-6.1%**, users/10kb: **-6.0%**, strings/100kb: **-5.5%**
+    - Most workloads show noisy but directionally positive results
+  - **yaml_bench**: No regression (query-path only optimization)
+  - Results are noisy because the forward-gap path is infrequently hit during typical streaming
+  - See [docs/parsing/yaml.md#o2-gap-skipping-via-advance_rank1---accepted-](docs/parsing/yaml.md#o2-gap-skipping-via-advance_rank1---accepted-) for full analysis

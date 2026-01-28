@@ -38,11 +38,13 @@ use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
+use core::cell::Cell;
+
 use crate::util::broadword::select_in_word;
 
 /// Select sample rate - one sample per this many 1-bits.
 /// Trade-off: lower = faster random access, more memory.
-const SELECT_SAMPLE_RATE: usize = 256;
+pub(super) const SELECT_SAMPLE_RATE: usize = 256;
 
 /// Open position storage with automatic optimization.
 ///
@@ -142,6 +144,40 @@ impl OpenPositions {
     }
 }
 
+/// Cursor state for sequential access optimization in `AdvancePositions`.
+///
+/// Invariants (when `next_open_idx < usize::MAX`):
+/// - `adv_cumulative` = number of 1-bits in `advance[0..next_open_idx)`
+/// - `ib_ones_before` = number of 1-bits in `ib_words[0..ib_word_idx)`
+#[derive(Clone, Copy, Debug)]
+struct SequentialCursor {
+    /// The next expected open_idx for sequential access.
+    next_open_idx: usize,
+    /// advance_rank1(next_open_idx): cumulative 1-bits in advance before this position.
+    adv_cumulative: usize,
+    /// Current word index in IB bitmap for forward scanning.
+    ib_word_idx: usize,
+    /// Number of 1-bits in ib_words[0..ib_word_idx).
+    ib_ones_before: usize,
+    /// Last argument to ib_select1 (for duplicate detection). usize::MAX = uninitialized.
+    last_ib_arg: usize,
+    /// Cached result from last ib_select1 call.
+    last_ib_result: usize,
+}
+
+impl Default for SequentialCursor {
+    fn default() -> Self {
+        Self {
+            next_open_idx: 0,
+            adv_cumulative: 0,
+            ib_word_idx: 0,
+            ib_ones_before: 0,
+            last_ib_arg: usize::MAX,
+            last_ib_result: 0,
+        }
+    }
+}
+
 /// Advance Index for memory-efficient BP-to-text position mapping.
 ///
 /// Stores positions using two bitmaps instead of a dense `Vec<u32>`,
@@ -152,8 +188,7 @@ pub struct AdvancePositions {
     ib_words: Vec<u64>,
     /// Number of valid bits in IB (= text length).
     ib_len: usize,
-    /// Cumulative popcount per word for IB (for rank queries).
-    /// Entry i = total 1-bits in words [0, i).
+    /// Cumulative popcount for IB. O(1) rank via single array lookup.
     ib_rank: Vec<u32>,
     /// Sampled select index for IB: entry i = position of (i * SAMPLE_RATE)-th 1-bit.
     ib_select_samples: Vec<u32>,
@@ -164,8 +199,13 @@ pub struct AdvancePositions {
     advance_words: Vec<u64>,
     /// Number of BP opens.
     num_opens: usize,
-    /// Cumulative popcount per word for advance (for rank queries).
+    /// Cumulative popcount for advance bitmap. O(1) rank via single array lookup.
     advance_rank: Vec<u32>,
+
+    /// Cursor for sequential access optimization (interior mutability).
+    /// Enables amortized O(1) access when open_idx values are accessed
+    /// in monotonically increasing order (streaming/depth-first traversal).
+    cursor: Cell<SequentialCursor>,
 }
 
 /// Cursor for efficient sequential iteration through positions.
@@ -218,6 +258,7 @@ impl AdvancePositions {
                 advance_words: Vec::new(),
                 num_opens: 0,
                 advance_rank: vec![0],
+                cursor: Cell::default(),
             };
         }
 
@@ -261,7 +302,7 @@ impl AdvancePositions {
         // Build cumulative rank for IB
         let ib_rank = build_cumulative_rank(&ib_words);
 
-        // Build cumulative rank for advance
+        // Build cumulative rank for advance (small bitmap: one bit per BP open)
         let advance_rank = build_cumulative_rank(&advance_words);
 
         // Build select samples for IB
@@ -276,6 +317,7 @@ impl AdvancePositions {
             advance_words,
             num_opens,
             advance_rank,
+            cursor: Cell::default(),
         }
     }
 
@@ -294,22 +336,131 @@ impl AdvancePositions {
     /// Get the text position for the `open_idx`-th BP open.
     ///
     /// Returns `None` if `open_idx >= len()`.
-    #[inline]
+    ///
+    /// Uses a sequential cursor optimization: when called with monotonically
+    /// increasing `open_idx` values (streaming/depth-first traversal), this
+    /// achieves amortized O(1) by using incremental bit tests instead of
+    /// full rank/select recomputation.
+    #[inline(always)]
     pub fn get(&self, open_idx: usize) -> Option<u32> {
+        let cursor = self.cursor.get();
+        if open_idx == cursor.next_open_idx {
+            // Fast path: direct sequential access (most common in streaming)
+            self.get_sequential(open_idx, cursor)
+        } else if open_idx > cursor.next_open_idx {
+            // Small gap (skipped containers): advance cursor through gap, then sequential
+            let mut cursor = cursor;
+            self.advance_cursor_to(&mut cursor, open_idx);
+            self.get_sequential(open_idx, cursor)
+        } else {
+            // Backwards jump: full recomputation (rare, only in non-streaming access)
+            self.get_random(open_idx)
+        }
+    }
+
+    /// Fast path for sequential access (open_idx == cursor.next_open_idx).
+    ///
+    /// Uses incremental bit test for advance rank (O(1) per call) and forward
+    /// scanning for IB select (amortized O(1) per call).
+    #[inline]
+    fn get_sequential(&self, open_idx: usize, mut cursor: SequentialCursor) -> Option<u32> {
         if open_idx >= self.num_opens {
             return None;
         }
 
-        // Count advances up to and including this position
-        let advance_count = self.advance_rank1(open_idx + 1);
+        // 1. Check advance bit (single word access)
+        let word_idx = open_idx / 64;
+        let bit_idx = open_idx % 64;
+        let adv_bit = if word_idx < self.advance_words.len() {
+            (self.advance_words[word_idx] >> bit_idx) & 1
+        } else {
+            0
+        };
+
+        // 2. advance_count = adv_cumulative + advance[open_idx]
+        let advance_count = cursor.adv_cumulative + adv_bit as usize;
+
+        // 3. Update cursor for next call
+        cursor.adv_cumulative = advance_count;
+        cursor.next_open_idx = open_idx + 1;
 
         if advance_count == 0 {
-            return None; // Shouldn't happen with valid data
+            self.cursor.set(cursor);
+            return None;
         }
 
-        // Find the (advance_count - 1)-th unique position in IB
-        let ib_pos = self.ib_select1(advance_count - 1)?;
-        Some(ib_pos as u32)
+        // 4. ib_select1(advance_count - 1) — forward scan from cursor position
+        let k = advance_count - 1;
+
+        // Fast path: duplicate position (same IB select argument as last time)
+        if k == cursor.last_ib_arg {
+            self.cursor.set(cursor);
+            return Some(cursor.last_ib_result as u32);
+        }
+
+        // Forward scan in IB bitmap from cursor position
+        let mut remaining = k - cursor.ib_ones_before;
+        let mut wi = cursor.ib_word_idx;
+
+        while wi < self.ib_words.len() {
+            let word = self.ib_words[wi];
+            let ones = word.count_ones() as usize;
+            if remaining < ones {
+                let bit_pos = select_in_word(word, remaining as u32) as usize;
+                let result = wi * 64 + bit_pos;
+
+                cursor.ib_ones_before = k - remaining;
+                cursor.ib_word_idx = wi;
+                cursor.last_ib_arg = k;
+                cursor.last_ib_result = result;
+                self.cursor.set(cursor);
+                return Some(result as u32);
+            }
+            remaining -= ones;
+            wi += 1;
+        }
+
+        self.cursor.set(cursor);
+        None
+    }
+
+    /// Advance the cursor from its current position to `target` open_idx.
+    ///
+    /// Uses O(1) advance_rank1 lookup instead of linear bit scanning.
+    /// IB cursor state (ib_word_idx, ib_ones_before) remains valid for
+    /// forward scanning since target > cursor.next_open_idx.
+    #[inline]
+    fn advance_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
+        cursor.adv_cumulative = self.advance_rank1(target);
+        cursor.next_open_idx = target;
+    }
+
+    /// Random access path (backwards jump): full rank/select computation,
+    /// then sets up cursor for subsequent sequential access.
+    fn get_random(&self, open_idx: usize) -> Option<u32> {
+        if open_idx >= self.num_opens {
+            return None;
+        }
+
+        let advance_count = self.advance_rank1(open_idx + 1);
+
+        let result = if advance_count == 0 {
+            None
+        } else {
+            self.ib_select1(advance_count - 1).map(|pos| pos as u32)
+        };
+
+        // Set up cursor for subsequent sequential access starting at open_idx + 1
+        self.cursor.set(SequentialCursor {
+            next_open_idx: open_idx + 1,
+            adv_cumulative: advance_count,
+            ib_word_idx: 0,
+            ib_ones_before: 0,
+            last_ib_arg: usize::MAX,
+            last_ib_result: 0,
+        });
+
+        result
     }
 
     /// Create a cursor starting at open index 0.
@@ -403,7 +554,7 @@ impl AdvancePositions {
         let word_idx = pos / 64;
         let bit_idx = pos % 64;
 
-        // Use cumulative index for full words
+        // Use cumulative rank for full words (single array lookup)
         let mut count = self.advance_rank[word_idx.min(self.advance_words.len())] as usize;
 
         // Add partial word
@@ -521,7 +672,7 @@ impl AdvancePositions {
         let word_idx = pos / 64;
         let bit_idx = pos % 64;
 
-        // Use cumulative index for full words
+        // Use cumulative rank for full words (single array lookup)
         let mut count = self.ib_rank[word_idx.min(self.ib_words.len())] as usize;
 
         // Add partial word
@@ -635,7 +786,8 @@ impl<'a> AdvancePositionsCursor<'a> {
 
 /// Build cumulative popcount index for a bitvector.
 /// Returns a vector where entry i = total 1-bits in words [0, i).
-fn build_cumulative_rank(words: &[u64]) -> Vec<u32> {
+/// This gives O(1) rank queries via a single array lookup.
+pub(super) fn build_cumulative_rank(words: &[u64]) -> Vec<u32> {
     let mut rank = Vec::with_capacity(words.len() + 1);
     let mut cumulative: u32 = 0;
     rank.push(0);
@@ -647,7 +799,7 @@ fn build_cumulative_rank(words: &[u64]) -> Vec<u32> {
 }
 
 /// Build select samples for a bitvector.
-fn build_select_samples(words: &[u64], total_ones: usize) -> Vec<u32> {
+pub(super) fn build_select_samples(words: &[u64], total_ones: usize) -> Vec<u32> {
     if total_ones == 0 {
         return Vec::new();
     }
