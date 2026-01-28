@@ -12,6 +12,24 @@ cargo build --release --features cli
 
 The binary will be located at `target/release/succinctly`.
 
+### Short Aliases
+
+Install short alias symlinks for interactive use:
+
+```bash
+succinctly install-aliases              # creates symlinks next to the binary
+succinctly install-aliases --dir ~/bin  # or specify a directory on your PATH
+```
+
+This creates `sjq`, `syq`, `sjq-locate`, and `syq-locate` symlinks. With aliases installed, you can use `sjq` instead of `succinctly jq`:
+
+```bash
+sjq '.users[].name' input.json        # instead of: succinctly jq '.users[].name' input.json
+syq '.spec.containers[]' k8s.yaml     # instead of: succinctly yq '.spec.containers[]' k8s.yaml
+```
+
+The binary also recognizes `jq` and `yq` as alias names if you create those symlinks manually, but `install-aliases` does not create them to avoid shadowing system tools.
+
 ## Commands
 
 ### JSON Generation

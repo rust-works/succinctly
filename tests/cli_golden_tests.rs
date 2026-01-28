@@ -59,6 +59,13 @@ fn test_help_json_generate() -> Result<()> {
 }
 
 #[test]
+fn test_help_install_aliases() -> Result<()> {
+    let output = run_cli(&["install-aliases", "--help"])?;
+    insta::assert_snapshot!("help_install_aliases", output);
+    Ok(())
+}
+
+#[test]
 fn test_version() -> Result<()> {
     let output = run_cli(&["--version"])?;
     insta::assert_snapshot!("version", output);

@@ -56,31 +56,56 @@ cargo bench                              # Run benchmarks
 ```bash
 cargo build --release --features cli
 
-# JSON operations
-./target/release/succinctly json generate 10mb -o benchmark.json
-./target/release/succinctly jq '.users[].name' input.json
-./target/release/succinctly jq -r '.users[] | [.name, .age] | @csv' input.json
-./target/release/succinctly jq -r '.users[] | [.name, .age] | @dsv("|")' input.json
-./target/release/succinctly jq-locate input.json --offset 42
-./target/release/succinctly jq-locate input.json --line 5 --column 10
+# Install short aliases (sjq, syq, sjq-locate, syq-locate)
+./target/release/succinctly install-aliases          # symlinks next to binary
+./target/release/succinctly install-aliases --dir ~/bin  # or specify directory
 
-# YAML operations
-./target/release/succinctly yq '.users[].name' config.yaml
-./target/release/succinctly yq -o json '.' config.yaml         # Output as JSON
-./target/release/succinctly yq '.spec.containers[]' k8s.yaml
-./target/release/succinctly yq --doc 0 '.' multi-doc.yaml      # First document only
-./target/release/succinctly yq-locate config.yaml --offset 42
-./target/release/succinctly yq-locate config.yaml --line 5 --column 10
+# JSON operations (sjq is an alias for succinctly jq)
+sjq '.users[].name' input.json
+sjq -r '.users[] | [.name, .age] | @csv' input.json
+sjq -r '.users[] | [.name, .age] | @dsv("|")' input.json
+sjq-locate input.json --offset 42
+sjq-locate input.json --line 5 --column 10
+
+# YAML operations (syq is an alias for succinctly yq)
+syq '.users[].name' config.yaml
+syq -o json '.' config.yaml         # Output as JSON
+syq '.spec.containers[]' k8s.yaml
+syq --doc 0 '.' multi-doc.yaml      # First document only
+syq-locate config.yaml --offset 42
+syq-locate config.yaml --line 5 --column 10
 
 # DSV/CSV operations
-./target/release/succinctly jq --input-dsv ',' '.[] | select(.[0] == "Alice")' data.csv
+sjq --input-dsv ',' '.[] | select(.[0] == "Alice")' data.csv
 ./target/release/succinctly dsv generate users 1000 -o users.csv
+
+# Data generation
+./target/release/succinctly json generate 10mb -o benchmark.json
 
 # Benchmarks
 ./target/release/succinctly dev bench jq
 ./target/release/succinctly dev bench yq
 ./target/release/succinctly dev bench yq --queries all --memory  # M2 streaming comparison
 ./target/release/succinctly dev bench dsv
+```
+
+### Multi-call Aliases
+
+The binary supports multi-call invocation via symlinks. When invoked as `sjq`, `syq`, etc., it dispatches directly to the corresponding subcommand:
+
+| Alias         | Equivalent              | Installed by default |
+|---------------|-------------------------|----------------------|
+| `sjq`         | `succinctly jq`         | Yes                  |
+| `syq`         | `succinctly yq`         | Yes                  |
+| `sjq-locate`  | `succinctly jq-locate`  | Yes                  |
+| `syq-locate`  | `succinctly yq-locate`  | Yes                  |
+| `jq`          | `succinctly jq`         | No (recognized only) |
+| `yq`          | `succinctly yq`         | No (recognized only) |
+
+Run `succinctly install-aliases` to create symlinks, or create them manually:
+
+```bash
+ln -s $(which succinctly) ~/bin/sjq
 ```
 
 ## Code Architecture

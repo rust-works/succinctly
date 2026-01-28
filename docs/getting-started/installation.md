@@ -52,6 +52,15 @@ Or install globally:
 cargo install succinctly --features cli
 ```
 
+After installing, create short aliases for interactive use:
+
+```bash
+succinctly install-aliases              # symlinks next to the binary
+succinctly install-aliases --dir ~/bin  # or specify a directory
+```
+
+This creates `sjq`, `syq`, `sjq-locate`, and `syq-locate` symlinks so you can use `sjq` instead of `succinctly jq`.
+
 ## Platform-Specific Notes
 
 ### macOS (Apple Silicon)
@@ -96,13 +105,15 @@ fn main() {
 
 ```bash
 # Check version
-./target/release/succinctly --version
+succinctly --version
 
-# Test jq
-echo '{"name": "test"}' | ./target/release/succinctly jq '.name'
+# Test jq (using short alias or full command)
+echo '{"name": "test"}' | sjq '.name'
+echo '{"name": "test"}' | succinctly jq '.name'
 
 # Test yq
-echo 'name: test' | ./target/release/succinctly yq '.name'
+echo 'name: test' | syq '.name'
+echo 'name: test' | succinctly yq '.name'
 ```
 
 ## Troubleshooting

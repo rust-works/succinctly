@@ -1,5 +1,6 @@
 ---
 source: tests/cli_golden_tests.rs
+assertion_line: 43
 expression: output
 ---
 Succinct data structures toolkit
@@ -7,15 +8,16 @@ Succinct data structures toolkit
 Usage: succinctly <COMMAND>
 
 Commands:
-  json       JSON operations (generate, parse, benchmark)
-  dsv        DSV (CSV/TSV) operations (generate, parse)
-  yaml       YAML operations (generate, parse)
-  jq         Command-line JSON processor (jq-compatible)
-  yq         Command-line YAML processor (jq-compatible syntax)
-  jq-locate  Find jq expression for a position in a JSON file
-  yq-locate  Find yq expression for a position in a YAML file
-  dev        Developer tools (benchmarking, profiling)
-  help       Print this message or the help of the given subcommand(s)
+  json             JSON operations (generate, parse, benchmark)
+  dsv              DSV (CSV/TSV) operations (generate, parse)
+  yaml             YAML operations (generate, parse)
+  jq               Command-line JSON processor (jq-compatible)
+  yq               Command-line YAML processor (jq-compatible syntax)
+  jq-locate        Find jq expression for a position in a JSON file
+  yq-locate        Find yq expression for a position in a YAML file
+  dev              Developer tools (benchmarking, profiling)
+  install-aliases  Install short alias symlinks (sjq, syq, sjq-locate, syq-locate)
+  help             Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help     Print help

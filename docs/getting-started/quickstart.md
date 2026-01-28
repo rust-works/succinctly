@@ -69,37 +69,45 @@ fn main() {
 
 ## Using the CLI
 
+Install short aliases for interactive use (optional but recommended):
+
+```bash
+succinctly install-aliases    # creates sjq, syq, sjq-locate, syq-locate
+```
+
 ### Query JSON with jq
 
 ```bash
 # Pretty print
-succinctly jq '.' data.json
+sjq '.' data.json
 
 # Extract field
-succinctly jq '.name' data.json
+sjq '.name' data.json
 
 # Filter array
-succinctly jq '.users[] | select(.age > 30)' data.json
+sjq '.users[] | select(.age > 30)' data.json
 
 # Compact output
-succinctly jq -c '.' data.json
+sjq -c '.' data.json
 ```
 
 ### Query YAML with yq
 
 ```bash
 # Pretty print
-succinctly yq '.' config.yaml
+syq '.' config.yaml
 
 # Convert to JSON
-succinctly yq -o json '.' config.yaml
+syq -o json '.' config.yaml
 
 # Extract field
-succinctly yq '.metadata.name' deployment.yaml
+syq '.metadata.name' deployment.yaml
 
 # Compact JSON output
-succinctly yq -o json -I 0 '.' config.yaml
+syq -o json -I 0 '.' config.yaml
 ```
+
+> **Note:** All commands also work with the full syntax: `succinctly jq`, `succinctly yq`, etc.
 
 ### Generate Test Data
 

@@ -1,0 +1,12 @@
+---
+source: tests/cli_golden_tests.rs
+assertion_line: 64
+expression: output
+---
+Install short alias symlinks (sjq, syq, sjq-locate, syq-locate)
+
+Usage: succinctly install-aliases [OPTIONS]
+
+Options:
+      --dir <DIR>  Directory to create symlinks in (default: same directory as the binary)
+  -h, --help       Print help

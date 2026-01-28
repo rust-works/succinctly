@@ -257,35 +257,40 @@ The library includes CLI tools for JSON, YAML, and DSV operations:
 # Build the CLI
 cargo build --release --features cli
 
-# Generate synthetic JSON/YAML for benchmarking
-./target/release/succinctly json generate 10mb -o benchmark.json
-./target/release/succinctly yaml generate 10kb -o benchmark.yaml
+# Install short aliases (sjq, syq, sjq-locate, syq-locate)
+succinctly install-aliases
 
 # Query JSON files (jq-compatible)
-./target/release/succinctly jq '.users[].name' input.json
-./target/release/succinctly jq -r '.users[0]' input.json
+sjq '.users[].name' input.json
+sjq -r '.users[0]' input.json
 
 # Query YAML files (yq-compatible)
-./target/release/succinctly yq '.users[].name' config.yaml
-./target/release/succinctly yq -o json '.' config.yaml          # Output as JSON
-./target/release/succinctly yq '.spec.containers[]' k8s.yaml
-./target/release/succinctly yq --doc 0 '.' multi-doc.yaml       # First document only
+syq '.users[].name' config.yaml
+syq -o json '.' config.yaml          # Output as JSON
+syq '.spec.containers[]' k8s.yaml
+syq --doc 0 '.' multi-doc.yaml       # First document only
 
 # Query CSV/TSV files (converted to JSON on-the-fly)
-./target/release/succinctly jq --input-dsv ',' '.[] | .[0]' users.csv
-./target/release/succinctly jq --input-dsv '\t' '.[0]' data.tsv
+sjq --input-dsv ',' '.[] | .[0]' users.csv
+sjq --input-dsv '\t' '.[0]' data.tsv
 
 # Output as CSV/TSV/DSV
-./target/release/succinctly jq -r '.users[] | [.name, .age] | @csv' data.json
-./target/release/succinctly jq -r '.users[] | [.name, .age] | @dsv("|")' data.json
-./target/release/succinctly yq -r '.users[] | [.name, .age] | @csv' data.yaml
+sjq -r '.users[] | [.name, .age] | @csv' data.json
+sjq -r '.users[] | [.name, .age] | @dsv("|")' data.json
+syq -r '.users[] | [.name, .age] | @csv' data.yaml
 
 # Find jq/yq expression for a position (useful for editor integration)
-./target/release/succinctly jq-locate input.json --offset 42
-./target/release/succinctly jq-locate input.json --line 5 --column 10
-./target/release/succinctly yq-locate config.yaml --offset 42
-./target/release/succinctly yq-locate config.yaml --line 5 --column 10
+sjq-locate input.json --offset 42
+sjq-locate input.json --line 5 --column 10
+syq-locate config.yaml --offset 42
+syq-locate config.yaml --line 5 --column 10
+
+# Generate synthetic JSON/YAML for benchmarking
+succinctly json generate 10mb -o benchmark.json
+succinctly yaml generate 10kb -o benchmark.yaml
 ```
+
+The `sjq`/`syq` aliases are symlinks created by `succinctly install-aliases`. All commands also work via the full `succinctly jq`/`succinctly yq` syntax.
 
 ## Architecture
 

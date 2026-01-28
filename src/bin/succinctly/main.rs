@@ -31,6 +31,8 @@ enum Command {
     YqLocate(yq_locate::YqLocateArgs),
     /// Developer tools (benchmarking, profiling)
     Dev(DevCommand),
+    /// Install short alias symlinks (sjq, syq, sjq-locate, syq-locate)
+    InstallAliases(InstallAliasesArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -86,6 +88,16 @@ enum DevSubcommand {
     /// Run benchmarks
     Bench(BenchCommand),
 }
+
+#[derive(Debug, Parser)]
+struct InstallAliasesArgs {
+    /// Directory to create symlinks in (default: same directory as the binary)
+    #[arg(long, value_name = "DIR")]
+    dir: Option<PathBuf>,
+}
+
+/// Default alias names installed by `install-aliases`.
+const MULTICALL_ALIASES: &[&str] = &["sjq", "syq", "sjq-locate", "syq-locate"];
 
 #[derive(Debug, Parser)]
 struct BenchCommand {
@@ -851,7 +863,62 @@ fn parse_size(s: &str) -> Result<usize, String> {
         .map_err(|_| format!("Invalid number in size: '{}'", s))
 }
 
+/// Multi-call binary support: detect if invoked via a known alias name.
+///
+/// When the binary is symlinked as `sjq`, `syq`, etc., this function
+/// detects the alias from argv[0] and dispatches directly to the
+/// appropriate subcommand, bypassing the top-level Cli parser.
+///
+/// Returns `Some(exit_code)` if a multi-call alias was detected,
+/// or `None` to fall through to normal `Cli::parse()`.
+fn try_multicall() -> Result<Option<i32>> {
+    let binary_name = std::env::args()
+        .next()
+        .as_deref()
+        .and_then(|s| std::path::Path::new(s).file_name())
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string());
+
+    let name = match binary_name {
+        Some(ref n) => n.as_str(),
+        None => return Ok(None),
+    };
+
+    match name {
+        "sjq" | "jq" => {
+            let cmd = JqCommand::parse_from(
+                std::iter::once(name.to_string()).chain(std::env::args().skip(1)),
+            );
+            Ok(Some(jq_runner::run_jq(cmd)?))
+        }
+        "syq" | "yq" => {
+            let cmd = YqCommand::parse_from(
+                std::iter::once(name.to_string()).chain(std::env::args().skip(1)),
+            );
+            Ok(Some(yq_runner::run_yq(cmd)?))
+        }
+        "sjq-locate" | "jq-locate" => {
+            let cmd = jq_locate::JqLocateArgs::parse_from(
+                std::iter::once(name.to_string()).chain(std::env::args().skip(1)),
+            );
+            Ok(Some(jq_locate::run_jq_locate(cmd)?))
+        }
+        "syq-locate" | "yq-locate" => {
+            let cmd = yq_locate::YqLocateArgs::parse_from(
+                std::iter::once(name.to_string()).chain(std::env::args().skip(1)),
+            );
+            Ok(Some(yq_locate::run_yq_locate(cmd)?))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn main() -> Result<()> {
+    // Multi-call binary: check if invoked via a known alias name (e.g., sjq, syq)
+    if let Some(exit_code) = try_multicall()? {
+        std::process::exit(exit_code);
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -971,7 +1038,64 @@ fn main() -> Result<()> {
                 BenchSubcommand::Dsv(args) => run_dsv_benchmark(args),
             },
         },
+        Command::InstallAliases(args) => install_aliases(args),
     }
+}
+
+/// Install short alias symlinks for the multi-call binary.
+fn install_aliases(args: InstallAliasesArgs) -> Result<()> {
+    let binary = std::env::current_exe().context("Cannot determine binary path")?;
+    let binary = std::fs::canonicalize(&binary).context("Cannot resolve binary path")?;
+
+    let dir = match args.dir {
+        Some(d) => d,
+        None => binary
+            .parent()
+            .map(|p| p.to_path_buf())
+            .context("Cannot determine binary directory")?,
+    };
+
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("Cannot create directory: {}", dir.display()))?;
+    }
+
+    for alias in MULTICALL_ALIASES {
+        let target = dir.join(alias);
+
+        // Skip if symlink already points to the right binary
+        if target.is_symlink() {
+            if let Ok(existing) = std::fs::read_link(&target) {
+                if existing == binary {
+                    eprintln!("  skip {} (already exists)", alias);
+                    continue;
+                }
+            }
+            // Remove stale symlink
+            std::fs::remove_file(&target)
+                .with_context(|| format!("Cannot remove existing symlink: {}", target.display()))?;
+        } else if target.exists() {
+            eprintln!("  skip {} (non-symlink file exists)", alias);
+            continue;
+        }
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&binary, &target)
+            .with_context(|| format!("Cannot create symlink: {}", target.display()))?;
+
+        #[cfg(not(unix))]
+        std::fs::hard_link(&binary, &target)
+            .with_context(|| format!("Cannot create hard link: {}", target.display()))?;
+
+        eprintln!("  created {} -> {}", alias, binary.display());
+    }
+
+    eprintln!(
+        "\nInstalled {} aliases in {}",
+        MULTICALL_ALIASES.len(),
+        dir.display()
+    );
+    Ok(())
 }
 
 /// Run jq benchmark
