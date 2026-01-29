@@ -47,8 +47,41 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 #[cfg(test)]
 use std::borrow::Cow;
 
+use core::cell::Cell;
+
 use crate::trees::BalancedParens;
 use crate::util::broadword::select_in_word;
+
+// ============================================================================
+// SequentialCursor: O(1) amortized access for streaming traversals
+// ============================================================================
+
+/// Cursor state for sequential access optimization on IB select.
+///
+/// When `ib_select1_from()` is called with consecutively increasing k values
+/// (as happens during depth-first streaming like `.[]` iteration), this cursor
+/// enables O(1) amortized access by maintaining incremental scan state instead
+/// of performing exponential search each time.
+///
+/// # Design (ported from YAML O1 optimization)
+///
+/// Three-path dispatch:
+/// - **Sequential** (k == next_k): Forward scan from cursor position, O(1) amortized
+/// - **Forward gap** (k > next_k): Jump to expected word, then forward scan
+/// - **Backwards** (k < next_k): Full recomputation (rare in streaming)
+///
+/// # Invariants (when `next_k < usize::MAX`)
+///
+/// - `ib_ones_before` = number of 1-bits in `ib_words[0..ib_word_idx)`
+#[derive(Clone, Copy, Debug, Default)]
+struct SequentialCursor {
+    /// The next expected k value (IB rank) for sequential access.
+    next_k: usize,
+    /// Current word index in IB bitmap for forward scanning.
+    ib_word_idx: usize,
+    /// Number of 1-bits in ib_words[0..ib_word_idx).
+    ib_ones_before: usize,
+}
 
 // ============================================================================
 // JsonIndex: Holds the IB and BP index structures
@@ -62,7 +95,7 @@ use crate::util::broadword::select_in_word;
 ///
 /// Use [`JsonIndex::build`] to create an owned index from JSON text,
 /// or [`JsonIndex::from_parts`] to create from pre-existing index data.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct JsonIndex<W = Vec<u64>> {
     /// Interest bits - marks positions of structural characters and value starts
     ib: W,
@@ -75,6 +108,24 @@ pub struct JsonIndex<W = Vec<u64>> {
     /// Newline positions for fast line/column lookup.
     /// Bit i is set if position i is the start of a new line (immediately after a line terminator).
     newlines: crate::bits::BitVec,
+    /// Cursor for sequential access optimization (interior mutability).
+    /// Enables amortized O(1) access when k values are accessed in monotonically
+    /// increasing order (streaming/depth-first traversal like `.[]` iteration).
+    ib_cursor: Cell<SequentialCursor>,
+}
+
+// Manual Clone impl since Cell<SequentialCursor> needs special handling
+impl<W: Clone> Clone for JsonIndex<W> {
+    fn clone(&self) -> Self {
+        Self {
+            ib: self.ib.clone(),
+            ib_len: self.ib_len,
+            ib_rank: self.ib_rank.clone(),
+            bp: self.bp.clone(),
+            newlines: self.newlines.clone(),
+            ib_cursor: Cell::new(self.ib_cursor.get()),
+        }
+    }
 }
 
 /// Build cumulative popcount index for IB.
@@ -165,6 +216,7 @@ impl JsonIndex<Vec<u64>> {
             ib_rank,
             bp: BalancedParens::new(semi.bp, bp_bit_count),
             newlines,
+            ib_cursor: Cell::default(),
         }
     }
 }
@@ -192,6 +244,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
             ib_rank,
             bp: BalancedParens::from_words(bp, bp_len),
             newlines: crate::bits::BitVec::new(),
+            ib_cursor: Cell::default(),
         }
     }
 
@@ -219,6 +272,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
             ib_rank,
             bp: BalancedParens::from_words(bp, bp_len),
             newlines,
+            ib_cursor: Cell::default(),
         }
     }
 
@@ -318,21 +372,134 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
         }
     }
 
-    /// Perform select1 with a hint for the starting word index.
+    /// Perform select1 with sequential cursor optimization.
     ///
-    /// Uses exponential search (galloping) from the hint, which is optimal for
-    /// sequential access patterns. When iterating through elements, the next
-    /// select is typically near the previous one, so starting from the hint
-    /// gives O(log d) where d is the distance, instead of O(log n).
+    /// Uses a sequential cursor to achieve O(1) amortized access for sequential
+    /// patterns (like `.[]` iteration). Falls back to O(log d) exponential search
+    /// for forward gaps and O(log n) for backwards jumps.
     ///
-    /// # Performance
+    /// # Performance (O1 optimization from YAML)
     ///
-    /// - **Sequential access**: O(log d) where d = distance from hint (~3.3x faster)
-    /// - **Random access**: O(log n) with ~37% overhead vs pure binary search
+    /// - **Sequential access** (k == next_k): O(1) amortized via forward scan
+    /// - **Forward gap** (k > next_k): O(1) rank lookup + O(d) forward scan
+    /// - **Backwards** (k < next_k): O(log n) binary search (rare in streaming)
     ///
-    /// For random access patterns (e.g., `.[42]`), prefer [`Self::ib_select1`].
+    /// The `hint` parameter is kept for API compatibility but is no longer used
+    /// when the sequential cursor is active (sequential/forward-gap paths).
+    ///
+    /// For pure random access patterns (e.g., `.[42]`), prefer [`Self::ib_select1`].
     #[inline]
     pub fn ib_select1_from(&self, k: usize, hint: usize) -> Option<usize> {
+        let cursor = self.ib_cursor.get();
+
+        if k == cursor.next_k {
+            // Fast path: direct sequential access (most common in streaming)
+            self.ib_select1_sequential(k, cursor)
+        } else if k > cursor.next_k {
+            // Forward gap: advance cursor using rank, then forward scan
+            let mut cursor = cursor;
+            self.advance_ib_cursor_to(&mut cursor, k);
+            self.ib_select1_sequential(k, cursor)
+        } else {
+            // Backwards jump: use exponential search from hint, then reset cursor
+            self.ib_select1_with_hint(k, hint)
+        }
+    }
+
+    /// Fast path for sequential access (k == cursor.next_k).
+    ///
+    /// Forward scans from the cursor position in IB, achieving O(1) amortized
+    /// when called with consecutively increasing k values.
+    #[inline]
+    fn ib_select1_sequential(&self, k: usize, mut cursor: SequentialCursor) -> Option<usize> {
+        let words = self.ib.as_ref();
+        if words.is_empty() {
+            return None;
+        }
+
+        // Forward scan in IB bitmap from cursor position
+        let mut remaining = k - cursor.ib_ones_before;
+        let mut wi = cursor.ib_word_idx;
+
+        while wi < words.len() {
+            let word = words[wi];
+            let ones = word.count_ones() as usize;
+            if remaining < ones {
+                let bit_pos = select_in_word(word, remaining as u32) as usize;
+                let result = wi * 64 + bit_pos;
+
+                if result >= self.ib_len {
+                    return None;
+                }
+
+                // Update cursor for next call
+                cursor.ib_ones_before = k - remaining;
+                cursor.ib_word_idx = wi;
+                cursor.next_k = k + 1;
+                self.ib_cursor.set(cursor);
+                return Some(result);
+            }
+            remaining -= ones;
+            wi += 1;
+        }
+
+        // k is out of range
+        None
+    }
+
+    /// Advance the cursor from its current position to `target` k value.
+    ///
+    /// Uses cumulative rank to find the correct word. For small gaps, does linear
+    /// scan from cursor position. For large gaps (>8 words), uses binary search.
+    #[inline]
+    fn advance_ib_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
+        let words = self.ib.as_ref();
+        if words.is_empty() {
+            return;
+        }
+
+        let k32 = target as u32;
+        let n = words.len();
+
+        // Estimate how far we need to go
+        // Use binary search for large gaps to avoid O(N) scan
+        let gap = target.saturating_sub(cursor.ib_ones_before);
+        let estimated_words = gap / 8; // ~8 ones per word is typical for JSON
+
+        let wi = if estimated_words > 8 {
+            // Large gap: use binary search over rank array
+            let mut lo = cursor.ib_word_idx;
+            let mut hi = n;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if self.ib_rank[mid + 1] <= k32 {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo.min(n.saturating_sub(1))
+        } else {
+            // Small gap: linear scan from cursor (better cache locality)
+            let mut wi = cursor.ib_word_idx;
+            while wi < n && self.ib_rank[wi + 1] <= k32 {
+                wi += 1;
+            }
+            wi.min(n.saturating_sub(1))
+        };
+
+        // Update cursor state
+        cursor.ib_word_idx = wi;
+        cursor.ib_ones_before = self.ib_rank[wi] as usize;
+        cursor.next_k = target;
+    }
+
+    /// Exponential search fallback for backwards jumps.
+    ///
+    /// Used when k < cursor.next_k, which is rare during streaming access.
+    /// Does NOT reset the cursor - backwards jumps indicate random access
+    /// patterns where cursor reset would just cause more backwards jumps.
+    fn ib_select1_with_hint(&self, k: usize, hint: usize) -> Option<usize> {
         let words = self.ib.as_ref();
         if words.is_empty() {
             return None;
@@ -358,7 +525,6 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
             loop {
                 let next = (hint + bound).min(n);
                 if next >= n || self.ib_rank[next + 1] > k32 {
-                    // Found the range: [prev, next]
                     lo = prev;
                     hi = next;
                     break;
@@ -375,7 +541,6 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
             loop {
                 let next = hint.saturating_sub(bound);
                 if next == 0 || self.ib_rank[next + 1] <= k32 {
-                    // Found the range: [next, prev]
                     lo = next;
                     hi = prev;
                     break;
@@ -407,11 +572,16 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
         let bit_pos = select_in_word(word, remaining as u32) as usize;
         let result = lo * 64 + bit_pos;
 
-        if result < self.ib_len {
-            Some(result)
-        } else {
-            None
+        if result >= self.ib_len {
+            return None;
         }
+
+        // NOTE: Do NOT reset cursor here. Backwards jumps indicate random access
+        // patterns where cursor reset would be wasted (next access is likely
+        // also random, causing another backwards jump). The cursor is only
+        // useful for sequential streaming patterns.
+
+        Some(result)
     }
 
     /// Perform select1 on the IB using pure binary search.
@@ -3050,5 +3220,177 @@ mod tests {
                 offset
             );
         }
+    }
+
+    // ========================================================================
+    // Sequential Cursor Tests (O1 optimization)
+    // ========================================================================
+
+    #[test]
+    fn test_sequential_cursor_basic() {
+        // Test that sequential ib_select1_from calls work correctly
+        let json = br#"[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]"#;
+        let index = JsonIndex::build(json);
+
+        // Sequential access: k = 0, 1, 2, ...
+        let mut prev_pos = 0;
+        for k in 0..11 {
+            // 11 IB bits: '[', 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+            let pos = index.ib_select1_from(k, prev_pos / 64);
+            assert!(pos.is_some(), "ib_select1_from({}) should succeed", k);
+            if k > 0 {
+                assert!(
+                    pos.unwrap() > prev_pos,
+                    "positions should increase: {} > {}",
+                    pos.unwrap(),
+                    prev_pos
+                );
+            }
+            prev_pos = pos.unwrap();
+        }
+    }
+
+    #[test]
+    fn test_sequential_cursor_forward_gap() {
+        // Test forward gap: access k=0, then k=5 (skip 1,2,3,4)
+        let json = br#"[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]"#;
+        let index = JsonIndex::build(json);
+
+        // First access at k=0
+        let pos0 = index.ib_select1_from(0, 0);
+        assert!(pos0.is_some());
+
+        // Skip ahead to k=5 (forward gap)
+        let pos5 = index.ib_select1_from(5, 0);
+        assert!(pos5.is_some());
+        assert!(pos5.unwrap() > pos0.unwrap());
+
+        // Continue sequentially from k=5
+        let pos6 = index.ib_select1_from(6, pos5.unwrap() / 64);
+        assert!(pos6.is_some());
+        assert!(pos6.unwrap() > pos5.unwrap());
+    }
+
+    #[test]
+    fn test_sequential_cursor_backwards_jump() {
+        // Test backwards jump: access k=5, then k=2
+        let json = br#"[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]"#;
+        let index = JsonIndex::build(json);
+
+        // First access at k=5
+        let pos5 = index.ib_select1_from(5, 0);
+        assert!(pos5.is_some());
+
+        // Jump backwards to k=2
+        let pos2 = index.ib_select1_from(2, 0);
+        assert!(pos2.is_some());
+        assert!(pos2.unwrap() < pos5.unwrap());
+
+        // Verify we can continue from k=2 sequentially
+        let pos3 = index.ib_select1_from(3, pos2.unwrap() / 64);
+        assert!(pos3.is_some());
+        assert!(pos3.unwrap() > pos2.unwrap());
+    }
+
+    #[test]
+    fn test_sequential_cursor_mixed_patterns() {
+        // Test mixed access patterns
+        let json = br#"{"a": [1, 2, 3], "b": [4, 5, 6], "c": [7, 8, 9]}"#;
+        let index = JsonIndex::build(json);
+
+        // Collect all positions using both methods
+        let mut sequential_positions = Vec::new();
+        let mut random_positions = Vec::new();
+
+        // Sequential access
+        for k in 0..20 {
+            if let Some(pos) = index.ib_select1_from(k, 0) {
+                sequential_positions.push(pos);
+            }
+        }
+
+        // Random access (using ib_select1)
+        for k in 0..20 {
+            if let Some(pos) = index.ib_select1(k) {
+                random_positions.push(pos);
+            }
+        }
+
+        // Both methods should return the same positions
+        assert_eq!(
+            sequential_positions, random_positions,
+            "Sequential and random access should return same positions"
+        );
+    }
+
+    #[test]
+    fn test_sequential_cursor_large_json() {
+        // Test with larger JSON to exercise cursor across word boundaries
+        let mut json = String::from("[");
+        for i in 0..1000 {
+            if i > 0 {
+                json.push_str(", ");
+            }
+            json.push_str(&i.to_string());
+        }
+        json.push(']');
+        let json = json.into_bytes();
+
+        let index = JsonIndex::build(&json);
+
+        // Sequential iteration through all elements
+        let mut prev_pos = 0;
+        for k in 0..1001 {
+            // '[' + 1000 numbers
+            let pos = index.ib_select1_from(k, prev_pos / 64);
+            assert!(pos.is_some(), "k={} should succeed", k);
+            if k > 0 {
+                assert!(
+                    pos.unwrap() > prev_pos,
+                    "k={}: {} > {}",
+                    k,
+                    pos.unwrap(),
+                    prev_pos
+                );
+            }
+            prev_pos = pos.unwrap();
+        }
+
+        // Verify against random access
+        for k in [0, 100, 500, 999, 1000] {
+            let seq_pos = index.ib_select1_from(k, 0);
+            let rand_pos = index.ib_select1(k);
+            assert_eq!(
+                seq_pos, rand_pos,
+                "k={}: sequential and random should match",
+                k
+            );
+        }
+    }
+
+    #[test]
+    fn test_sequential_cursor_consistency() {
+        // Verify cursor state doesn't corrupt results
+        let json = br#"{"users": [{"name": "Alice"}, {"name": "Bob"}]}"#;
+        let index = JsonIndex::build(json);
+
+        // Access pattern: 0, 1, 2, back to 0, 3, 4, 5
+        let p0a = index.ib_select1_from(0, 0);
+        let p1 = index.ib_select1_from(1, 0);
+        let p2 = index.ib_select1_from(2, 0);
+        let p0b = index.ib_select1_from(0, 0); // backwards
+        let p3 = index.ib_select1_from(3, 0);
+        let p4 = index.ib_select1_from(4, 0);
+        let p5 = index.ib_select1_from(5, 0);
+
+        // Both accesses to k=0 should return the same position
+        assert_eq!(p0a, p0b, "k=0 should return same position");
+
+        // Verify ordering
+        assert!(p0a.unwrap() < p1.unwrap());
+        assert!(p1.unwrap() < p2.unwrap());
+        assert!(p2.unwrap() < p3.unwrap());
+        assert!(p3.unwrap() < p4.unwrap());
+        assert!(p4.unwrap() < p5.unwrap());
     }
 }

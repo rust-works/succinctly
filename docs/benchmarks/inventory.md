@@ -15,6 +15,7 @@ The project contains **7 main benchmark documentation files** with approximately
 | [rust-parsers.md](rust-parsers.md) | Rust JSON parser comparison | ~12 |
 | [rust-yaml-parsers.md](rust-yaml-parsers.md) | Rust YAML parser comparison | ~10 |
 | [../parsing/yaml.md](../parsing/yaml.md) | YAML optimization phases | ~15 |
+| [../parsing/json.md](../parsing/json.md) | JSON optimization phases | ~2 |
 
 ---
 
@@ -337,6 +338,21 @@ Benchmark comparison of succinctly against serde_yaml, the standard Rust YAML pa
 - YAML to JSON Conversion (2.8-3.9x faster)
 - Memory Efficiency (10-39x less memory)
 - Use Case Recommendations
+
+---
+
+## [../parsing/json.md](../parsing/json.md) - JSON Optimization Phases
+
+JSON parsing implementation and optimization benchmark results.
+
+### Benchmark Sections
+
+#### O1: Sequential Cursor for IB Select - ACCEPTED ✅
+- Micro-benchmark Results (select_patterns, 10K queries)
+- End-to-end jq queries (criterion, 10KB-1MB)
+- CLI benchmark results (`succinctly dev bench jq`)
+- Key Design Decisions
+- Comparison with YAML O1
 
 ---
 

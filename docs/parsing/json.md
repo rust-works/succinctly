@@ -363,6 +363,87 @@ succinctly jq-locate file.json --offset 42 --format json
 | Branchless masking   | [branchless.md](../optimizations/branchless.md)                | SIMD result extraction  |
 | Lazy evaluation      | [zero-copy.md](../optimizations/zero-copy.md)                  | Defer value decoding    |
 | Exponential search   | [access-patterns.md](../optimizations/access-patterns.md)      | Sequential select hints |
+| Sequential cursor    | [access-patterns.md](../optimizations/access-patterns.md)      | O(1) amortized IB select |
+
+---
+
+## Optimization History
+
+### O1: Sequential Cursor for IB Select - ACCEPTED ✅
+
+**Date**: 2026-01-29
+**Source**: Ported from YAML O1 optimization
+
+#### Problem
+
+`ib_select1_from()` used exponential search (galloping) for every call, even during
+sequential streaming traversals where k values increase monotonically. While the
+hint parameter provided O(log d) performance where d is distance from hint, there
+was still overhead from the exponential search setup.
+
+#### Solution
+
+Added `Cell<SequentialCursor>` to `JsonIndex` with three-path dispatch:
+
+1. **Sequential** (k == cursor.next_k): Forward scan from cursor position, O(1) amortized
+2. **Forward gap** (k > cursor.next_k): Binary search for large gaps, linear for small
+3. **Backwards** (k < cursor.next_k): Original exponential search (no cursor reset)
+
+```rust
+struct SequentialCursor {
+    next_k: usize,        // Next expected IB rank
+    ib_word_idx: usize,   // Current word in IB bitmap
+    ib_ones_before: usize // Cumulative 1-bits before current word
+}
+```
+
+#### Benchmark Results (Apple M1 Max)
+
+**Micro-benchmark (10K queries, select_patterns):**
+
+| Pattern | Time | Note |
+|---------|------|------|
+| Sequential (exponential) | 104 µs | 3.3x faster than binary search |
+| Random (exponential) | 1.06 ms | No regression |
+
+**End-to-end jq queries (criterion):**
+
+| Size | Time Change | Throughput Change |
+|------|-------------|-------------------|
+| 10KB | within noise | within noise |
+| **100KB** | **-4.5%** | **+4.7%** |
+| 1MB | within noise | within noise |
+
+**CLI benchmark (`succinctly dev bench jq`):**
+
+| Pattern | Size | Speedup vs jq |
+|---------|------|---------------|
+| comprehensive | 1MB | 1.82x |
+| nested | 1MB | 3.40x |
+| strings | 1MB | 2.78x |
+| users | 1MB | 2.07x |
+
+Results are consistent with pre-optimization documented values.
+
+#### Key Design Decisions
+
+1. **No cursor reset on backwards jumps**: Prevents cascading overhead for random access
+2. **Binary search for large forward gaps**: Avoids O(N) linear scan when jumping far ahead
+3. **Interior mutability via Cell**: Enables cursor updates through shared reference
+
+#### Files Changed
+
+- `src/json/light.rs`: Added `SequentialCursor`, modified `ib_select1_from()`
+
+#### Why Less Impactful Than YAML
+
+Unlike YAML's O1 optimization (3-13% improvement), JSON sees modest gains because:
+
+1. **No duplicate positions**: JSON has no shared positions like YAML containers (~33% cache hit rate in YAML)
+2. **Hint-based search already efficient**: Original exponential search with good hints was already O(log 1) for sequential access
+3. **Different access patterns**: JSON's `ib_select1_from` uses caller-provided hints that are often accurate
+
+The optimization provides measurable benefit at medium file sizes (100KB) without any regression on random access patterns.
 
 ---
 
