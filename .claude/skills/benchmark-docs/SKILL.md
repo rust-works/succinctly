@@ -38,12 +38,13 @@ For complete documentation update workflow, see [docs/guides/benchmarking.md](..
 
 ### Quick Workflow
 
-1. Run benchmarks: `./target/release/succinctly dev bench jq`
-2. Review output: `data/bench/results/jq-bench.md`
-3. Update documentation:
+1. Build the benchmark runner: `cargo build --release --features bench-runner`
+2. Run benchmarks: `./target/release/succinctly bench run jq_bench`
+3. Review output: `data/bench/results/<timestamp>/jq-bench.md`
+4. Update documentation:
    - `docs/benchmarks/jq.md` - Full results with all patterns/sizes
    - `README.md` - Summary highlights only
-4. Follow platform parity rules (see below)
+5. Follow platform parity rules (see below)
 
 ## README Table Requirements
 
@@ -91,21 +92,57 @@ See the markdown-tables skill for complete table formatting rules.
 
 ## Before Running Benchmarks
 
+**CRITICAL: Always compile before benchmarking:**
+```bash
+cargo build --release --features bench-runner
+```
+
 See [docs/guides/benchmarking.md](../../../docs/guides/benchmarking.md#troubleshooting) for environment setup and troubleshooting.
 
-Quick check: Ensure CPU load is low (`uptime`) to avoid skewed results.
+Quick checks:
+- Build is up to date: `cargo build --release --features bench-runner`
+- CPU load is low: `uptime`
+- Test data exists: `ls data/bench/generated/`
 
 ## Benchmark Commands Reference
 
 For complete command reference, see [docs/guides/benchmarking.md](../../../docs/guides/benchmarking.md#how-to-run-benchmarks).
 
-Quick commands:
+**IMPORTANT: Always use the unified benchmark runner (`succinctly bench`), not `dev bench`.**
+
+### Running Benchmarks
+
+**Always build first, then run benchmarks:**
+
 ```bash
-# Generate data and run benchmarks
-cargo run --release --features cli -- json generate-suite
-cargo run --release --features cli -- yaml generate-suite
-./target/release/succinctly dev bench jq
-./target/release/succinctly dev bench yq
+# Step 1: Build the benchmark runner (required before running benchmarks)
+cargo build --release --features bench-runner
+
+# Step 2: Generate test data (if not already present)
+./target/release/succinctly json generate-suite
+./target/release/succinctly yaml generate-suite
+
+# Step 3: Run benchmarks using the unified runner
+./target/release/succinctly bench run jq_bench      # JSON vs jq
+./target/release/succinctly bench run yq_bench      # YAML vs yq
+./target/release/succinctly bench run jq_comparison # Criterion JSON benchmarks
+./target/release/succinctly bench run yq_comparison # Criterion YAML benchmarks
+```
+
+### Listing Available Benchmarks
+
+```bash
+./target/release/succinctly bench list
+```
+
+### Running Multiple Benchmarks
+
+```bash
+# Run all JSON benchmarks
+./target/release/succinctly bench run jq_bench jq_comparison
+
+# Run all YAML benchmarks
+./target/release/succinctly bench run yq_bench yq_comparison yaml_bench
 ```
 
 ## yq Benchmark Query Types
@@ -121,26 +158,22 @@ The yq benchmark supports multiple query types to exercise different execution p
 
 ### Running yq Benchmarks
 
-```bash
-# Run all query types (default) - exercises P9, M2, and OwnedValue paths
-./target/release/succinctly dev bench yq
+**Always build first:** `cargo build --release --features bench-runner`
 
+```bash
+# Run yq CLI benchmark (recommended - includes memory tracking)
+./target/release/succinctly bench run yq_bench
+
+# For advanced options, use dev bench yq (after running unified runner)
 # Run specific query types
 ./target/release/succinctly dev bench yq --queries identity
 ./target/release/succinctly dev bench yq --queries identity,first_element
-./target/release/succinctly dev bench yq --queries first_element,iteration,length
-
-# Use "all" to explicitly run all query types
-./target/release/succinctly dev bench yq --queries all
 
 # Focus on M2 streaming with the navigation pattern
 ./target/release/succinctly dev bench yq --patterns navigation --sizes 10mb,100mb
 
 # Memory-focused comparison
 ./target/release/succinctly dev bench yq --memory
-
-# Combine options
-./target/release/succinctly dev bench yq --patterns navigation --queries all --memory --sizes 100mb
 ```
 
 ### Query Type Aliases
