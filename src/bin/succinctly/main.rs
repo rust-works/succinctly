@@ -170,6 +170,10 @@ struct BenchJqArgs {
     /// Path to succinctly binary
     #[arg(long, default_value = "./target/release/succinctly")]
     binary: PathBuf,
+
+    /// Skip memory measurement (memory is collected by default)
+    #[arg(long)]
+    no_memory: bool,
 }
 
 /// Arguments for yq benchmark
@@ -200,9 +204,9 @@ struct BenchYqArgs {
     #[arg(short, long, default_value = "identity")]
     queries: String,
 
-    /// Memory-focused benchmark mode (emphasizes memory comparison)
+    /// Skip memory measurement (memory is collected by default)
     #[arg(long)]
-    memory: bool,
+    no_memory: bool,
 
     /// Number of warmup runs before benchmarking
     #[arg(long, default_value = "1")]
@@ -259,6 +263,10 @@ struct BenchDsvArgs {
     /// Query to run (default: "." for full output, or ".[0]" for first column)
     #[arg(long, default_value = ".")]
     query: String,
+
+    /// Skip memory measurement (memory is collected by default)
+    #[arg(long)]
+    no_memory: bool,
 }
 
 /// Generate synthetic JSON files for benchmarking and testing
@@ -1165,6 +1173,7 @@ fn run_jq_benchmark(args: BenchJqArgs) -> Result<()> {
         succinctly_binary: args.binary,
         warmup_runs: args.warmup,
         benchmark_runs: args.runs,
+        memory_mode: !args.no_memory,
     };
 
     // Use default output paths if not specified
@@ -1248,7 +1257,7 @@ fn run_yq_benchmark(args: BenchYqArgs) -> Result<()> {
         succinctly_binary: args.binary,
         warmup_runs: args.warmup,
         benchmark_runs: args.runs,
-        memory_mode: args.memory,
+        memory_mode: !args.no_memory,
     };
 
     // Use default output paths if not specified
@@ -1316,6 +1325,7 @@ fn run_dsv_benchmark(args: BenchDsvArgs) -> Result<()> {
         benchmark_runs: args.runs,
         delimiter: args.delimiter,
         query: args.query,
+        memory_mode: !args.no_memory,
     };
 
     // Use default output paths if not specified

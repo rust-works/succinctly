@@ -85,7 +85,7 @@ sjq --input-dsv ',' '.[] | select(.[0] == "Alice")' data.csv
 # Benchmarks (requires: cargo build --release --features bench-runner)
 ./target/release/succinctly bench run jq_bench
 ./target/release/succinctly bench run yq_bench
-./target/release/succinctly bench run yq_bench --queries all --memory  # M2 streaming comparison
+./target/release/succinctly bench run yq_bench --queries all  # M2 streaming comparison (memory collected by default)
 ./target/release/succinctly bench run dsv_bench
 ```
 
@@ -368,7 +368,7 @@ To regenerate: `succinctly bench run yq_bench` (includes memory) or `cargo bench
 
 M2 streaming (`.[0]`) is **2.9x faster** than identity (`.`), with **3-4% of yq's memory**.
 
-To benchmark: `succinctly bench run yq_bench --queries all --memory`
+To benchmark: `succinctly bench run yq_bench --queries all` (memory collected by default)
 
 ### Optimization Techniques
 

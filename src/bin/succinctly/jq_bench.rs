@@ -41,6 +41,8 @@ pub struct BenchConfig {
     pub succinctly_binary: PathBuf,
     pub warmup_runs: usize,
     pub benchmark_runs: usize,
+    /// Include memory comparison in output (default: true)
+    pub memory_mode: bool,
 }
 
 impl Default for BenchConfig {
@@ -70,6 +72,7 @@ impl Default for BenchConfig {
             succinctly_binary: PathBuf::from("./target/release/succinctly"),
             warmup_runs: 1,
             benchmark_runs: 3,
+            memory_mode: true,
         }
     }
 }
@@ -174,7 +177,7 @@ pub fn run_benchmark(
 
     // Generate markdown output (even if interrupted)
     if let Some(md_path) = output_md {
-        let markdown = generate_markdown(&results);
+        let markdown = generate_markdown(&results, config.memory_mode);
         std::fs::write(md_path, markdown)?;
     }
 
@@ -482,7 +485,7 @@ fn get_cpu_info() -> String {
 }
 
 /// Generate markdown tables from results
-pub fn generate_markdown(results: &[BenchmarkResult]) -> String {
+pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> String {
     let mut md = String::new();
 
     md.push_str("# jq vs succinctly Benchmark Results\n\n");
@@ -525,8 +528,13 @@ pub fn generate_markdown(results: &[BenchmarkResult]) -> String {
         // jq Mem: 7 chars (e.g., "  25 MB")
         // succ Mem: 8 chars (e.g., "   29 MB")
         // Mem Ratio: 10 chars (e.g., "     1.16x")
-        md.push_str("| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |\n");
-        md.push_str("|-----------|----------|--------------|---------------|---------|----------|------------|\n");
+        if memory_mode {
+            md.push_str("| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |\n");
+            md.push_str("|-----------|----------|--------------|---------------|---------|----------|------------|\n");
+        } else {
+            md.push_str("| Size      | jq       | succinctly   | Speedup       |\n");
+            md.push_str("|-----------|----------|--------------|---------------|\n");
+        }
 
         // Sort by size (largest first)
         let mut sorted = pattern_results.clone();
@@ -538,13 +546,10 @@ pub fn generate_markdown(results: &[BenchmarkResult]) -> String {
 
         for r in sorted {
             let speedup = r.jq.wall_time_ms / r.succinctly.wall_time_ms;
-            let mem_ratio = r.succinctly.peak_memory_bytes as f64 / r.jq.peak_memory_bytes as f64;
 
             // Format values - format_time_fixed returns 8 chars, format_memory_fixed returns 7 chars
             let jq_time = format_time_fixed(r.jq.wall_time_ms);
             let succ_time = format_time_fixed(r.succinctly.wall_time_ms);
-            let jq_mem = format_memory_fixed(r.jq.peak_memory_bytes);
-            let succ_mem = format_memory_fixed(r.succinctly.peak_memory_bytes);
 
             // Size column: **name** with trailing padding (9 chars total)
             let size_bold = format!("**{}**", r.size);
@@ -577,15 +582,33 @@ pub fn generate_markdown(results: &[BenchmarkResult]) -> String {
                 format!("{:>13}", speedup_str) // Same visual width without bold
             };
 
-            // Memory columns: right-aligned, format_memory_fixed returns 7 chars
-            let jq_mem_col = jq_mem;
-            let succ_mem_col = format!("{:>8}", succ_mem); // 8 chars for succ Mem column
-            let mem_ratio_col = format!("{:>9.2}x", mem_ratio);
+            if memory_mode {
+                let mem_ratio =
+                    r.succinctly.peak_memory_bytes as f64 / r.jq.peak_memory_bytes as f64;
+                let jq_mem = format_memory_fixed(r.jq.peak_memory_bytes);
+                let succ_mem = format_memory_fixed(r.succinctly.peak_memory_bytes);
 
-            md.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} |\n",
-                size_col, jq_col, succ_col, speedup_col, jq_mem_col, succ_mem_col, mem_ratio_col
-            ));
+                // Memory columns: right-aligned, format_memory_fixed returns 7 chars
+                let jq_mem_col = jq_mem;
+                let succ_mem_col = format!("{:>8}", succ_mem); // 8 chars for succ Mem column
+                let mem_ratio_col = format!("{:>9.2}x", mem_ratio);
+
+                md.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} | {} |\n",
+                    size_col,
+                    jq_col,
+                    succ_col,
+                    speedup_col,
+                    jq_mem_col,
+                    succ_mem_col,
+                    mem_ratio_col
+                ));
+            } else {
+                md.push_str(&format!(
+                    "| {} | {} | {} | {} |\n",
+                    size_col, jq_col, succ_col, speedup_col
+                ));
+            }
         }
 
         md.push('\n');

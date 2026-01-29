@@ -74,16 +74,20 @@ config:
 
 ### Phase 3: Memory-Focused Benchmark Mode
 
-Add a `--memory` flag to run benchmarks focused on memory comparison:
+**IMPLEMENTED**: Memory is now collected by default. Use `--no-memory` to skip:
 
 ```bash
-succinctly bench run yq_bench --memory
+# Memory collected by default
+succinctly bench run yq_bench
+
+# Skip memory collection (faster)
+succinctly bench run yq_bench --no-memory
 ```
 
-This would:
-1. Run each query type on the same file
-2. Compare memory usage between streaming and non-streaming paths
-3. Output a memory comparison table
+This:
+1. Runs each query type on the same file
+2. Compares memory usage between streaming and non-streaming paths
+3. Outputs a memory comparison table (markdown includes memory columns by default)
 
 ### Phase 4: Document M2 Impact
 

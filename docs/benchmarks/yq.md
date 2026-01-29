@@ -1170,8 +1170,8 @@ cargo build --release --features bench-runner
 # Compare identity vs navigation queries
 ./target/release/succinctly bench run yq_bench --queries identity,first_element --sizes 10mb,100mb
 
-# Memory-focused comparison
-./target/release/succinctly bench run yq_bench --memory --queries all --sizes 100mb
+# Memory is collected by default; use --no-memory to skip
+./target/release/succinctly bench run yq_bench --queries all --sizes 100mb
 
 # Available query types: identity, first_element, iteration, length
 ```
@@ -1214,8 +1214,8 @@ cargo build --release --features bench-runner
 # Run navigation-focused benchmarks (M2 streaming)
 ./target/release/succinctly bench run yq_bench --patterns navigation --queries all --sizes 10mb,100mb
 
-# Run memory-focused comparison
-./target/release/succinctly bench run yq_bench --memory --queries identity,first_element,length
+# Skip memory collection for faster runs
+./target/release/succinctly bench run yq_bench --no-memory --queries identity,first_element,length
 
 # Run Criterion benchmarks (wall time only)
 cargo bench --bench yq_comparison
