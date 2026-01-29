@@ -410,6 +410,66 @@ pub fn parse_anchor_name(input: &[u8], start: usize) -> usize {
     }
 }
 
+// ============================================================================
+// Issue #87: JSON Escape Scanning for Streaming Output
+// ============================================================================
+
+/// Find the next JSON escapable character in the input.
+///
+/// Searches for characters that need escaping in JSON strings:
+/// - Double quote (`"`)
+/// - Backslash (`\`)
+/// - Control characters (bytes < 0x20)
+///
+/// Returns the index of the first escapable character, or `bytes.len()`
+/// if no escapable character is found.
+///
+/// This is the main optimization for `write_json_string` in the YAML→JSON
+/// streaming path. Uses SIMD to process 16-32 bytes at a time.
+#[inline(always)]
+pub fn find_json_escape(bytes: &[u8], start: usize) -> usize {
+    if start >= bytes.len() {
+        return bytes.len();
+    }
+
+    // ARM64 with NEON (default)
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(feature = "broadword-yaml"),
+        not(feature = "scalar-yaml")
+    ))]
+    {
+        neon::find_json_escape_neon(bytes, start)
+    }
+
+    // x86_64 - use scalar for now, can add AVX2 later
+    #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
+    {
+        find_json_escape_scalar(bytes, start)
+    }
+
+    // Scalar fallback for other platforms
+    #[cfg(any(
+        feature = "scalar-yaml",
+        not(any(target_arch = "aarch64", target_arch = "x86_64"))
+    ))]
+    {
+        find_json_escape_scalar(bytes, start)
+    }
+}
+
+/// Scalar implementation of find_json_escape.
+#[inline(always)]
+#[allow(dead_code)]
+fn find_json_escape_scalar(bytes: &[u8], start: usize) -> usize {
+    for (i, &b) in bytes[start..].iter().enumerate() {
+        if b == b'"' || b == b'\\' || b < 0x20 {
+            return start + i;
+        }
+    }
+    bytes.len()
+}
+
 /// Scalar fallback for parse_anchor_name
 #[allow(dead_code)]
 fn parse_anchor_name_scalar(input: &[u8], start: usize) -> usize {
@@ -511,68 +571,6 @@ fn count_leading_spaces_scalar(input: &[u8], start: usize) -> usize {
     input[start..].iter().take_while(|&&b| b == b' ').count()
 }
 
-// ============================================================================
-// JSON Escape Scanning (Issue #87 Optimization)
-// ============================================================================
-
-/// Find the next byte that needs JSON escaping.
-///
-/// Searches for: `"`, `\`, or control characters (0x00-0x1F).
-/// Returns offset from `start` to the found character, or `None` if not found.
-///
-/// This is the main optimization for the `write_json_string` streaming path.
-/// Uses SIMD on supported platforms for 16-32x faster scanning.
-#[inline]
-pub fn find_json_escape(input: &[u8], start: usize) -> Option<usize> {
-    if start >= input.len() {
-        return None;
-    }
-
-    // Scalar fallback: when scalar-yaml feature is enabled
-    #[cfg(feature = "scalar-yaml")]
-    {
-        find_json_escape_scalar(input, start)
-    }
-
-    // x86_64 uses native SIMD (when not scalar)
-    #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
-    {
-        x86::find_json_escape_x86(input, start)
-    }
-
-    // ARM64 with NEON - use scalar for now (can add NEON later)
-    #[cfg(all(
-        target_arch = "aarch64",
-        not(feature = "broadword-yaml"),
-        not(feature = "scalar-yaml")
-    ))]
-    {
-        find_json_escape_scalar(input, start)
-    }
-
-    // Broadword/other platforms - use scalar
-    #[cfg(all(
-        not(feature = "scalar-yaml"),
-        not(target_arch = "x86_64"),
-        not(all(target_arch = "aarch64", not(feature = "broadword-yaml")))
-    ))]
-    {
-        find_json_escape_scalar(input, start)
-    }
-}
-
-/// Scalar implementation of find_json_escape.
-#[allow(dead_code)]
-fn find_json_escape_scalar(input: &[u8], start: usize) -> Option<usize> {
-    let data = &input[start..];
-    for (i, &b) in data.iter().enumerate() {
-        if b == b'"' || b == b'\\' || b < 0x20 {
-            return Some(i);
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,32 +649,33 @@ mod tests {
     #[test]
     fn test_find_json_escape_basic() {
         let input = b"hello\"world";
-        assert_eq!(find_json_escape(input, 0), Some(5));
+        assert_eq!(find_json_escape(input, 0), 5);
     }
 
     #[test]
     fn test_find_json_escape_backslash() {
         let input = b"hello\\world";
-        assert_eq!(find_json_escape(input, 0), Some(5));
+        assert_eq!(find_json_escape(input, 0), 5);
     }
 
     #[test]
     fn test_find_json_escape_control() {
         let input = b"hello\nworld";
-        assert_eq!(find_json_escape(input, 0), Some(5));
+        assert_eq!(find_json_escape(input, 0), 5);
     }
 
     #[test]
     fn test_find_json_escape_none() {
         let input = b"hello world";
-        assert_eq!(find_json_escape(input, 0), None);
+        // Returns input.len() when no escape character found
+        assert_eq!(find_json_escape(input, 0), input.len());
     }
 
     #[test]
     fn test_find_json_escape_long() {
         let mut input = vec![b'a'; 100];
         input[50] = b'"';
-        assert_eq!(find_json_escape(&input, 0), Some(50));
+        assert_eq!(find_json_escape(&input, 0), 50);
     }
 
     #[test]

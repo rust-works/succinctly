@@ -4,8 +4,12 @@
 //! This benchmarks the optimized single-pass transcoding that converts YAML
 //! escape sequences directly to JSON escape sequences without intermediate
 //! string allocation.
+//!
+//! Issue #87: Also includes micro-benchmarks for the SIMD escape scanning
+//! optimization that accelerates `write_json_string`.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use succinctly::yaml::simd::find_json_escape;
 use succinctly::yaml::YamlIndex;
 
 /// Helper to generate double-quoted YAML string with escapes
@@ -274,6 +278,163 @@ fn bench_large_document(c: &mut Criterion) {
     group.finish();
 }
 
+// ============================================================================
+// Issue #87: SIMD Escape Scanning Micro-benchmarks
+// ============================================================================
+
+/// Scalar reference implementation for comparison
+fn find_json_escape_scalar(bytes: &[u8], start: usize) -> usize {
+    for (i, &b) in bytes[start..].iter().enumerate() {
+        if b == b'"' || b == b'\\' || b < 0x20 {
+            return start + i;
+        }
+    }
+    bytes.len()
+}
+
+/// Benchmark escape scanning with no escape characters (worst case for SIMD - scans entire string)
+fn bench_escape_scan_no_escapes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("escape_scan/no_escapes");
+
+    for &size in &[16, 32, 64, 128, 256, 512, 1024] {
+        // String with no characters needing escape
+        let data = vec![b'x'; size];
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("simd", size), &data, |b, data| {
+            b.iter(|| find_json_escape(black_box(data), 0))
+        });
+
+        group.bench_with_input(BenchmarkId::new("scalar", size), &data, |b, data| {
+            b.iter(|| find_json_escape_scalar(black_box(data), 0))
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark escape scanning with early escape (best case - quick exit)
+fn bench_escape_scan_early_escape(c: &mut Criterion) {
+    let mut group = c.benchmark_group("escape_scan/early_escape");
+
+    for &size in &[16, 32, 64, 128, 256, 512, 1024] {
+        // Escape at position 8 (within first SIMD chunk)
+        let mut data = vec![b'x'; size];
+        data[8] = b'"';
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("simd", size), &data, |b, data| {
+            b.iter(|| find_json_escape(black_box(data), 0))
+        });
+
+        group.bench_with_input(BenchmarkId::new("scalar", size), &data, |b, data| {
+            b.iter(|| find_json_escape_scalar(black_box(data), 0))
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark escape scanning with escape at middle
+fn bench_escape_scan_mid_escape(c: &mut Criterion) {
+    let mut group = c.benchmark_group("escape_scan/mid_escape");
+
+    for &size in &[32, 64, 128, 256, 512, 1024] {
+        // Escape at middle of string
+        let mut data = vec![b'x'; size];
+        data[size / 2] = b'\\';
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("simd", size), &data, |b, data| {
+            b.iter(|| find_json_escape(black_box(data), 0))
+        });
+
+        group.bench_with_input(BenchmarkId::new("scalar", size), &data, |b, data| {
+            b.iter(|| find_json_escape_scalar(black_box(data), 0))
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark escape scanning with control characters
+fn bench_escape_scan_control_chars(c: &mut Criterion) {
+    let mut group = c.benchmark_group("escape_scan/control_chars");
+
+    for &size in &[32, 64, 128, 256, 512, 1024] {
+        // Control char (tab) at position 50
+        let mut data = vec![b'x'; size];
+        let escape_pos = (size / 2).min(50);
+        data[escape_pos] = b'\t';
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("simd", size), &data, |b, data| {
+            b.iter(|| find_json_escape(black_box(data), 0))
+        });
+
+        group.bench_with_input(BenchmarkId::new("scalar", size), &data, |b, data| {
+            b.iter(|| find_json_escape_scalar(black_box(data), 0))
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark with realistic JSON string content (mixed alphanumeric with occasional escapes)
+fn bench_escape_scan_realistic(c: &mut Criterion) {
+    let mut group = c.benchmark_group("escape_scan/realistic");
+
+    // Simulate typical JSON string: mostly safe chars with occasional escapes
+    // Pattern: 20 safe chars, then an escape, repeated
+    fn make_realistic_string(len: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(len);
+        let pattern: &[u8] = b"hello world 12345!?";
+        for i in 0..len {
+            if i > 0 && i % 20 == 0 {
+                data.push(b'"'); // Escape every 20 chars
+            } else {
+                data.push(pattern[i % pattern.len()]);
+            }
+        }
+        data
+    }
+
+    for &size in &[64, 128, 256, 512, 1024, 2048] {
+        let data = make_realistic_string(size);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        group.bench_with_input(BenchmarkId::new("simd", size), &data, |b, data| {
+            b.iter(|| {
+                let mut pos = 0;
+                while pos < data.len() {
+                    let escape_pos = find_json_escape(black_box(data), pos);
+                    if escape_pos < data.len() {
+                        pos = escape_pos + 1;
+                    } else {
+                        break;
+                    }
+                }
+            })
+        });
+
+        group.bench_with_input(BenchmarkId::new("scalar", size), &data, |b, data| {
+            b.iter(|| {
+                let mut pos = 0;
+                while pos < data.len() {
+                    let escape_pos = find_json_escape_scalar(black_box(data), pos);
+                    if escape_pos < data.len() {
+                        pos = escape_pos + 1;
+                    } else {
+                        break;
+                    }
+                }
+            })
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_double_quoted,
@@ -283,4 +444,14 @@ criterion_group!(
     bench_realistic_document,
     bench_large_document,
 );
-criterion_main!(benches);
+
+criterion_group!(
+    escape_scan_benches,
+    bench_escape_scan_no_escapes,
+    bench_escape_scan_early_escape,
+    bench_escape_scan_mid_escape,
+    bench_escape_scan_control_chars,
+    bench_escape_scan_realistic,
+);
+
+criterion_main!(benches, escape_scan_benches);

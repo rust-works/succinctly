@@ -4509,80 +4509,117 @@ fn advance_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
 
 ---
 
-## O3: SIMD JSON Escape Scanning — Accepted ✅
+## O3: SIMD Escape Scanning for JSON Output — Accepted ✅
 
 **Issue**: [#87](https://github.com/rust-works/succinctly/issues/87)
 
 ### Problem
 
-Profile analysis showed **70% of yq streaming time** was spent in the output path, with `write_json_string` being a key hot function. The escape character scanning loop processed **1 byte per iteration**:
+When streaming YAML to JSON via `to_json_document()`, the `write_json_string()` function scans strings for characters that need JSON escaping (`"`, `\`, and control chars `< 0x20`). The original scalar implementation checked each byte sequentially, which became a bottleneck for long strings.
+
+### Design
+
+Use platform-specific SIMD to scan 16 bytes at a time (ARM NEON):
+
+1. Load 16 bytes into a SIMD vector
+2. Compare against `"`, `\`, and control character threshold (`< 0x20`)
+3. OR the three comparison masks together
+4. Extract bitmask using `neon_movemask`
+5. If any bit is set, return position of first escape character
+6. Otherwise, advance 16 bytes and repeat
+
+**Implementation** ([`src/yaml/simd/neon.rs`](../../src/yaml/simd/neon.rs)):
 
 ```rust
-// Before: Byte-by-byte scan
-while i < bytes.len() {
-    let b = bytes[i];
-    if b == b'"' || b == b'\\' || b < 0x20 {
-        break;
+#[inline(always)]
+pub fn find_json_escape_neon(bytes: &[u8], start: usize) -> usize {
+    if start >= bytes.len() { return bytes.len(); }
+
+    // Threshold: only use SIMD for 16+ remaining bytes
+    if bytes.len() - start >= 16 {
+        unsafe { find_json_escape_neon_impl(bytes, start) }
+    } else {
+        find_json_escape_scalar(bytes, start)
     }
-    i += 1;
 }
 ```
 
-### Solution
+Key optimizations:
+- **`#[inline(always)]`**: Critical for eliminating function call overhead; without it, 3-5% end-to-end regression
+- **16-byte threshold**: SIMD setup overhead exceeds scalar for short strings
+- **Early exit**: Returns immediately when escape found (no full scan)
+- **Reuses `neon_movemask`**: Existing helper for SIMD→bitmask conversion
+- **`#[inline(always)]` critical**: Without forced inlining, function call overhead caused 3-5% end-to-end regression
 
-Implemented AVX2-accelerated escape scanning that processes **32 bytes per iteration**:
+### Benchmark Results
 
-```rust
-// AVX2: 32-byte parallel scan
-let chunk = _mm256_loadu_si256(ptr);
-let is_quote = _mm256_cmpeq_epi8(chunk, quote_vec);
-let is_backslash = _mm256_cmpeq_epi8(chunk, backslash_vec);
-let is_control = _mm256_cmpgt_epi8(control_threshold, chunk);  // < 0x20
-let escape_mask = _mm256_or_si256(...);  // combine all conditions
-```
+**Micro-benchmarks** (Apple M1 Max, `yaml_transcode_micro`):
 
-**Threshold optimization**: SIMD overhead isn't amortized for short strings. Added a 32-byte threshold:
-- **< 32 bytes remaining**: Use inline scalar loop (avoids function call overhead)
-- **≥ 32 bytes remaining**: Use SIMD for 32-byte chunks
+#### No escapes (worst case for SIMD — must scan entire string)
 
-### Results
+| Size   | SIMD      | Scalar     | Speedup   | SIMD Throughput |
+|--------|-----------|------------|-----------|-----------------|
+| 16B    | 2.5 ns    | 10.4 ns    | **4.1x**  | 5.9 GiB/s       |
+| 32B    | 3.8 ns    | 20.6 ns    | **5.4x**  | 7.9 GiB/s       |
+| 64B    | 6.4 ns    | 40.8 ns    | **6.3x**  | 9.3 GiB/s       |
+| 128B   | 8.9 ns    | 87.3 ns    | **9.8x**  | 13.4 GiB/s      |
+| 256B   | 14.2 ns   | 168.4 ns   | **11.8x** | 16.7 GiB/s      |
+| 512B   | 27.0 ns   | 330.8 ns   | **12.3x** | 17.7 GiB/s      |
+| 1024B  | 54.5 ns   | 652.9 ns   | **12.0x** | 17.5 GiB/s      |
 
-**Micro-benchmark speedups** (raw SIMD vs scalar):
+#### Mid-escape (escape at string midpoint)
 
-| Size | SIMD | Scalar | Speedup |
-|------|------|--------|---------|
-| 1KB | 13.5ns (70 GiB/s) | 382ns (2.5 GiB/s) | **28x** |
-| 4KB | 50ns (75 GiB/s) | 1.5µs (2.5 GiB/s) | **30x** |
+| Size   | SIMD      | Scalar     | Speedup   |
+|--------|-----------|------------|-----------|
+| 32B    | 2.9 ns    | 10.7 ns    | **3.6x**  |
+| 64B    | 4.1 ns    | 20.9 ns    | **5.1x**  |
+| 128B   | 5.4 ns    | 41.3 ns    | **7.7x**  |
+| 256B   | 8.5 ns    | 88.0 ns    | **10.4x** |
+| 512B   | 14.8 ns   | 168.6 ns   | **11.4x** |
+| 1024B  | 27.5 ns   | 330.7 ns   | **12.0x** |
 
-**End-to-end transcode benchmarks** (yaml_transcode_micro):
+#### Realistic (escape every ~20 chars, simulates typical JSON strings)
 
-| Benchmark | Change | Throughput |
-|-----------|--------|------------|
-| unicode_8digit/100 | **-11%** | 432 MiB/s |
-| realistic/config | **-4%** | 234 MiB/s |
-| escape_heavy | **-3%** | 233 MiB/s |
-| large/500_items | **-5%** | 227 MiB/s |
+| Size   | SIMD      | Scalar     | Speedup   |
+|--------|-----------|------------|-----------|
+| 64B    | 17.0 ns   | 42.8 ns    | **2.5x**  |
+| 128B   | 53.4 ns   | 87.4 ns    | **1.6x**  |
+| 256B   | 125.3 ns  | 169.3 ns   | **1.4x**  |
+| 512B   | 246.2 ns  | 332.0 ns   | **1.3x**  |
+| 1024B  | 512.5 ns  | 652.2 ns   | **1.3x**  |
+| 2048B  | 1.02 µs   | 1.30 µs    | **1.3x**  |
 
-### Key Learnings
+**End-to-end transcode benchmarks** (YAML→JSON streaming):
 
-1. **Threshold is critical**: Initial implementation without threshold caused 2-7% regression on short strings due to function call overhead
+| Benchmark                        | Throughput    |
+|----------------------------------|---------------|
+| transcode/realistic/config       | 188 MiB/s     |
+| transcode/realistic/escape_heavy | 180 MiB/s     |
+| transcode/large/500_items        | 184 MiB/s     |
+| transcode/double_quoted/500      | 363 MiB/s     |
+| transcode/single_quoted/500      | 421 MiB/s     |
 
-2. **SIMD for control chars**: Used signed comparison trick for `byte < 0x20`:
-   ```rust
-   // Works for ASCII bytes 0x00-0x7F
-   _mm256_cmpgt_epi8(_mm256_set1_epi8(0x20), chunk)
-   ```
+### Analysis
 
-3. **Hybrid approach wins**: Combining SIMD for long spans with inline scalar for short spans provides the best of both worlds
+**Why micro-benchmarks show large wins**: Pure escape scanning (no parsing, no output) isolates the SIMD benefit. At 1024 bytes with no escapes, SIMD is **12x faster** because it processes 16 bytes per iteration vs 1 byte.
 
-4. **Pattern from CLAUDE.md confirmed**: "Wider SIMD != automatically faster" — threshold tuning prevents overhead regression
+**Why realistic patterns show smaller wins**: Real strings have escapes every ~20 characters, so SIMD scans 1-2 chunks before finding an escape, then scalar handles the escape and restarts SIMD. The repeated SIMD setup partially offsets the per-chunk gain.
+
+**Why end-to-end impact is modest**: `write_json_string()` is only one component of the streaming path. For typical YAML (short keys, moderate values), strings are <100 bytes on average. The 16-byte threshold means many calls use scalar anyway. The optimization helps most when streaming YAML with long string values.
+
+**Threshold tuning**: Initial implementation had no threshold and caused **6-9% end-to-end regression** due to SIMD setup overhead on short strings. Adding the 16-byte threshold reduced but didn't eliminate the regression.
+
+**Inlining fix**: Even with the threshold, `#[inline]` caused **3-5% end-to-end regression** due to function call overhead at each `write_json_string()` invocation. Switching to `#[inline(always)]` on both `find_json_escape()` and `find_json_escape_neon()` eliminated the regression entirely, achieving neutral-to-slightly-positive end-to-end impact while preserving the 4-12x micro-benchmark wins.
+
+**Inlining requirement**: Initial implementation with `#[inline]` caused **3-5% end-to-end regression** due to function call overhead not being eliminated by the compiler. Changing to `#[inline(always)]` on both `find_json_escape` and `find_json_escape_neon` eliminated the regression.
 
 ### Files Modified
 
-- `src/yaml/simd/x86.rs` — Added `find_json_escape_avx2`, `find_json_escape_sse2`, `find_json_escape_x86`
-- `src/yaml/simd/mod.rs` — Added public `find_json_escape` dispatcher
-- `src/yaml/light.rs` — Updated `write_json_string` with threshold-based SIMD/scalar hybrid
-- `benches/json_escape_micro.rs` — New micro-benchmark for escape scanning
+- `src/yaml/simd/neon.rs` — Added `find_json_escape_neon()` and `find_json_escape_neon_impl()` with 12 unit tests
+- `src/yaml/simd/mod.rs` — Added public `find_json_escape()` API with platform dispatch
+- `src/yaml/light.rs` — Integrated `find_json_escape()` into `write_json_string()`
+- `src/yaml/mod.rs` — Made `simd` module public for benchmark access
+- `benches/yaml_transcode_micro.rs` — Added 5 escape scanning benchmark groups
 
 ---
 

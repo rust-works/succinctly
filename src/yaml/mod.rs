@@ -54,7 +54,6 @@ mod index;
 mod light;
 mod locate;
 mod parser;
-/// SIMD-accelerated string scanning for YAML parsing.
 pub mod simd;
 
 pub use error::YamlError;

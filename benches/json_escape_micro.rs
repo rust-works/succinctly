@@ -4,22 +4,16 @@
 //! that need JSON escaping (", \, or control characters 0x00-0x1F).
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-
-// Import the SIMD function - this is internal but we can benchmark via the public path
-#[cfg(target_arch = "x86_64")]
-fn find_json_escape(input: &[u8], start: usize) -> Option<usize> {
-    succinctly::yaml::simd::find_json_escape(input, start)
-}
+use succinctly::yaml::simd::find_json_escape;
 
 /// Scalar implementation for comparison
-fn find_json_escape_scalar(input: &[u8], start: usize) -> Option<usize> {
-    let data = &input[start..];
-    for (i, &b) in data.iter().enumerate() {
+fn find_json_escape_scalar(input: &[u8], start: usize) -> usize {
+    for (i, &b) in input[start..].iter().enumerate() {
         if b == b'"' || b == b'\\' || b < 0x20 {
-            return Some(i);
+            return start + i;
         }
     }
-    None
+    input.len()
 }
 
 /// Generate a string with no escape characters (best case for SIMD)

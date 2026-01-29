@@ -418,6 +418,18 @@ YAML parsing implementation and optimization benchmark results.
 - End-to-end yq benchmarks (nested/1kb, users/10kb, strings/100kb)
 - Impact analysis
 
+##### O3: SIMD Escape Scanning for JSON Output - ACCEPTED ✅
+- Issue #87: NEON SIMD optimization for ARM64
+- Micro-benchmark results (4-12x speedup on no-escape strings, 1.3-2.5x on realistic patterns)
+- End-to-end transcode benchmarks (180-420 MiB/s)
+- Threshold tuning (16-byte minimum for SIMD benefit)
+- Escape scan benchmark groups:
+  - escape_scan/no_escapes (SIMD vs scalar, 16B-1024B)
+  - escape_scan/early_escape (escape at position 8)
+  - escape_scan/mid_escape (escape at midpoint)
+  - escape_scan/control_chars (tab character detection)
+  - escape_scan/realistic (escape every ~20 chars, 64B-2048B)
+
 #### Optimization Phases (Rejected)
 
 ##### P1: YFSM (YAML Finite State Machine) - REJECTED ❌
@@ -501,8 +513,9 @@ YAML parsing implementation and optimization benchmark results.
 ### By Feature
 - **Lazy Evaluation**: [yq.md](yq.md) - Selection Benchmarks
 - **Streaming Navigation**: [yq.md](yq.md) - M2 Streaming Navigation Benchmarks
-- **SIMD Optimizations**: [yaml.md](../parsing/yaml.md) - P0+, P2.7, P4
+- **SIMD Optimizations**: [yaml.md](../parsing/yaml.md) - P0+, P2.7, P4, O3
 - **BP Select1**: [yq.md](yq.md) - BP Select1 Micro-benchmark
+- **Escape Scanning**: [yaml.md](../parsing/yaml.md) - O3 SIMD Escape Scanning
 
 ---
 

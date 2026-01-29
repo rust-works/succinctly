@@ -526,6 +526,97 @@ fn parse_anchor_name_scalar(input: &[u8], start: usize) -> usize {
 }
 
 // ============================================================================
+// Issue #87: JSON Escape Scanning for Streaming Output
+// ============================================================================
+
+/// Find the next JSON escapable character using NEON.
+///
+/// Searches for characters that need escaping in JSON strings:
+/// - Double quote (`"`)
+/// - Backslash (`\`)
+/// - Control characters (bytes < 0x20)
+///
+/// Returns the offset from `start` to the found character, or the length
+/// of the slice if no escapable character is found.
+///
+/// This is used for fast-path scanning in `write_json_string` during
+/// YAML→JSON streaming output.
+#[inline(always)]
+pub fn find_json_escape_neon(bytes: &[u8], start: usize) -> usize {
+    if start >= bytes.len() {
+        return bytes.len();
+    }
+
+    // Use NEON for 16+ bytes, otherwise scalar is faster
+    if bytes.len() - start >= 16 {
+        // SAFETY: NEON is mandatory on aarch64
+        unsafe { find_json_escape_neon_impl(bytes, start) }
+    } else {
+        find_json_escape_scalar(bytes, start)
+    }
+}
+
+/// Scalar implementation for short strings
+#[inline(always)]
+fn find_json_escape_scalar(bytes: &[u8], start: usize) -> usize {
+    for (i, &b) in bytes[start..].iter().enumerate() {
+        if b == b'"' || b == b'\\' || b < 0x20 {
+            return start + i;
+        }
+    }
+    bytes.len()
+}
+
+#[target_feature(enable = "neon")]
+unsafe fn find_json_escape_neon_impl(bytes: &[u8], start: usize) -> usize {
+    let len = bytes.len();
+    let data = &bytes[start..];
+    let data_len = data.len();
+    let mut offset = 0;
+
+    // Create comparison vectors
+    let quote_vec = vdupq_n_u8(b'"');
+    let backslash_vec = vdupq_n_u8(b'\\');
+    let control_threshold = vdupq_n_u8(0x20);
+
+    // Process 16-byte chunks
+    while offset + 16 <= data_len {
+        let chunk = vld1q_u8(data.as_ptr().add(offset));
+
+        // Check for quote and backslash
+        let quotes = vceqq_u8(chunk, quote_vec);
+        let backslashes = vceqq_u8(chunk, backslash_vec);
+
+        // Check for control characters (bytes < 0x20)
+        let controls = vcltq_u8(chunk, control_threshold);
+
+        // Combine all matches
+        let matches = vorrq_u8(vorrq_u8(quotes, backslashes), controls);
+
+        // Extract bitmask
+        let mask = neon_movemask(matches);
+
+        if mask != 0 {
+            // Found a match - return absolute position
+            return start + offset + mask.trailing_zeros() as usize;
+        }
+
+        offset += 16;
+    }
+
+    // Handle remaining bytes with scalar fallback
+    for i in offset..data_len {
+        let b = data[i];
+        if b == b'"' || b == b'\\' || b < 0x20 {
+            return start + i;
+        }
+    }
+
+    // No escapable character found
+    len
+}
+
+// ============================================================================
 // P2.7 Optimization: Block Scalar SIMD Parsing
 // ============================================================================
 
@@ -942,6 +1033,157 @@ mod tests {
                 "Mismatch for input {:?} with min_indent={}",
                 String::from_utf8_lossy(input),
                 min_indent
+            );
+        }
+    }
+
+    // ========================================================================
+    // Issue #87: JSON Escape Scanning NEON tests
+    // ========================================================================
+
+    #[test]
+    fn test_find_json_escape_quote() {
+        let input = b"hello\"world";
+        assert_eq!(find_json_escape_neon(input, 0), 5);
+    }
+
+    #[test]
+    fn test_find_json_escape_backslash() {
+        let input = b"hello\\world";
+        assert_eq!(find_json_escape_neon(input, 0), 5);
+    }
+
+    #[test]
+    fn test_find_json_escape_control_char() {
+        // Tab is 0x09 (< 0x20)
+        let input = b"hello\tworld";
+        assert_eq!(find_json_escape_neon(input, 0), 5);
+
+        // Newline is 0x0A
+        let input2 = b"hello\nworld";
+        assert_eq!(find_json_escape_neon(input2, 0), 5);
+
+        // Null byte
+        let input3 = b"hello\x00world";
+        assert_eq!(find_json_escape_neon(input3, 0), 5);
+    }
+
+    #[test]
+    fn test_find_json_escape_no_escape() {
+        let input = b"hello world";
+        assert_eq!(find_json_escape_neon(input, 0), input.len());
+    }
+
+    #[test]
+    fn test_find_json_escape_long_string() {
+        // Test with > 16 bytes to exercise SIMD path
+        let mut input = vec![b'a'; 100];
+        input[50] = b'"';
+        assert_eq!(find_json_escape_neon(&input, 0), 50);
+    }
+
+    #[test]
+    fn test_find_json_escape_at_chunk_boundary() {
+        // Escape at exactly byte 16 (second chunk)
+        let mut input = vec![b'a'; 32];
+        input[16] = b'"';
+        assert_eq!(find_json_escape_neon(&input, 0), 16);
+    }
+
+    #[test]
+    fn test_find_json_escape_in_remainder() {
+        // Escape in the remainder bytes (< 16)
+        let mut input = vec![b'a'; 20];
+        input[18] = b'\\';
+        assert_eq!(find_json_escape_neon(&input, 0), 18);
+    }
+
+    #[test]
+    fn test_find_json_escape_with_offset() {
+        let input = b"abc\"def\"ghi";
+        assert_eq!(find_json_escape_neon(input, 0), 3);
+        assert_eq!(find_json_escape_neon(input, 4), 7);
+    }
+
+    #[test]
+    fn test_find_json_escape_control_chars_throughout() {
+        // Test various control chars at different positions
+        for ctrl in 0u8..0x20 {
+            let mut input = vec![b'x'; 50];
+            input[25] = ctrl;
+            assert_eq!(
+                find_json_escape_neon(&input, 0),
+                25,
+                "Failed for control char 0x{:02x}",
+                ctrl
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_json_escape_empty() {
+        assert_eq!(find_json_escape_neon(b"", 0), 0);
+    }
+
+    #[test]
+    fn test_find_json_escape_start_past_end() {
+        let input = b"hello";
+        assert_eq!(find_json_escape_neon(input, 10), input.len());
+    }
+
+    /// Scalar reference implementation for comparison testing
+    fn find_json_escape_scalar(bytes: &[u8], start: usize) -> usize {
+        for (i, &b) in bytes[start..].iter().enumerate() {
+            if b == b'"' || b == b'\\' || b < 0x20 {
+                return start + i;
+            }
+        }
+        bytes.len()
+    }
+
+    #[test]
+    fn test_find_json_escape_matches_scalar() {
+        let test_cases: &[&[u8]] = &[
+            b"",
+            b"\"",
+            b"\\",
+            b"\t",
+            b"\n",
+            b"\r",
+            b"\x00",
+            b"no escape chars here",
+            b"escape at end\"",
+            b"\"escape at start",
+            b"has\\backslash",
+            b"has\ttab",
+            b"has\nnewline",
+            b"multiple \"escapes\" here\\",
+            // Long strings
+            &[b'x'; 100],
+        ];
+
+        for &input in test_cases {
+            let scalar = find_json_escape_scalar(input, 0);
+            let neon = find_json_escape_neon(input, 0);
+            assert_eq!(
+                scalar,
+                neon,
+                "Mismatch for {:?}: scalar={}, neon={}",
+                String::from_utf8_lossy(input),
+                scalar,
+                neon
+            );
+        }
+
+        // Test with various offsets
+        let input = b"abc\"def\\ghi\tjkl";
+        for start in 0..input.len() {
+            let scalar = find_json_escape_scalar(input, start);
+            let neon = find_json_escape_neon(input, start);
+            assert_eq!(
+                scalar, neon,
+                "Mismatch at offset {}: scalar={}, neon={}",
+                start, scalar, neon
             );
         }
     }
