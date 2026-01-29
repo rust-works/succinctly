@@ -630,8 +630,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout.lock());
 
-    // Track last output for exit status
-    let mut last_output: Option<OwnedValue> = None;
+    // Track last output for exit status (only need to know if last was null/false)
+    let mut last_was_falsy = false;
     let mut had_output = false;
 
     // Validate DSV delimiter if provided
@@ -681,7 +681,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     for result in results {
                         had_output = true;
                         if args.exit_status {
-                            last_output = Some(result.clone());
+                            last_was_falsy =
+                                matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
                         }
                         write_output(&mut out, &result, &output_config)?;
                     }
@@ -696,10 +697,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 if !had_output {
                     return Ok(exit_codes::NO_OUTPUT);
                 }
-                if let Some(last) = last_output {
-                    if matches!(last, OwnedValue::Null | OwnedValue::Bool(false)) {
-                        return Ok(exit_codes::FALSE_OR_NULL);
-                    }
+                if last_was_falsy {
+                    return Ok(exit_codes::FALSE_OR_NULL);
                 }
             }
 
@@ -748,12 +747,10 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // This avoids building the index and materializing JqValue, saving significant memory.
                 if use_identity_fast_path {
                     had_output = true;
-                    // For exit_status, identity on valid JSON is not null/false
+                    // For exit_status, identity on valid JSON is truthy (not null or false)
+                    // We reset last_was_falsy to false since valid JSON identity is truthy
                     if args.exit_status {
-                        // Parse minimally just to check the type for exit_status
-                        // For now, assume it's a truthy value (not null or false)
-                        // A more thorough check would parse the first token
-                        last_output = Some(OwnedValue::Bool(true));
+                        last_was_falsy = false;
                     }
                     out.write_all(json_bytes)?;
                     out.write_all(b"\n")?;
@@ -767,9 +764,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // Consume results to free memory after each value is written
                 for result in results {
                     had_output = true;
-                    // For exit_status tracking, we need to check the last value
+                    // For exit_status tracking, check if value is falsy (null/false) without materializing
                     if args.exit_status {
-                        last_output = Some(result.materialize());
+                        last_was_falsy = !result.is_truthy();
                     }
                     write_output_jq_value(&mut out, &result, &output_config)?;
                     // result is dropped here, freeing its memory immediately
@@ -785,7 +782,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 
             for result in results {
                 had_output = true;
-                last_output = Some(result.clone());
+                // Check if value is falsy without cloning
+                last_was_falsy = matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
                 write_output(&mut out, &result, &output_config)?;
             }
         }
@@ -798,10 +796,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         if !had_output {
             return Ok(exit_codes::NO_OUTPUT);
         }
-        if let Some(last) = last_output {
-            if matches!(last, OwnedValue::Null | OwnedValue::Bool(false)) {
-                return Ok(exit_codes::FALSE_OR_NULL);
-            }
+        if last_was_falsy {
+            return Ok(exit_codes::FALSE_OR_NULL);
         }
     }
 
