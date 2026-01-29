@@ -85,6 +85,27 @@ Test at SIMD chunk boundaries (multiples of 16/32):
 | **100KB** |  4.6 ms (18.4 MiB/s)  |  8.2 ms (10.5 MiB/s)  | **1.76x**  |
 | **1MB**   | 24.7 ms (32.7 MiB/s)  | 43.9 ms (18.4 MiB/s)  | **1.78x**  |
 
+## Sequential Cursor Optimization (O1/O2)
+
+JSON uses a `Cell<SequentialCursor>` for O(1) amortized IB select during streaming access.
+
+**Key implementation**: `src/json/light.rs` - `ib_select1_from()` with three-path dispatch:
+1. **Sequential** (k == cursor.next_k): Forward scan, O(1) amortized
+2. **Forward gap** (k > cursor.next_k): Binary search from cursor position
+3. **Backwards** (k < cursor.next_k): Exponential search from hint (don't reset cursor!)
+
+### Why JSON Differs from YAML
+
+| Factor                | JSON                   | YAML                     | Impact                                    |
+|-----------------------|------------------------|--------------------------|-------------------------------------------|
+| Duplicate positions   | None                   | ~33% (container sharing) | YAML benefits more from position caching  |
+| Hint accuracy         | High (caller provides) | Lower                    | JSON exponential search already efficient |
+| Forward-gap frequency | Rare                   | More common              | JSON O2 has neutral impact                |
+
+**Lesson**: Porting optimizations between JSON/YAML doesn't yield identical results due to architectural differences.
+
+See [docs/parsing/json.md#optimization-history](../../../docs/parsing/json.md#optimization-history) for full benchmark results.
+
 ## See Also
 
 - [docs/parsing/json.md](../../../docs/parsing/json.md) - Full JSON parsing documentation

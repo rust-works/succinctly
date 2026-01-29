@@ -94,6 +94,58 @@ fn select1(&self, k: usize) -> Option<usize> {
 
 **Result**: 627x speedup (2.76s to 4.4ms) when select is called per result.
 
+## Sequential Cursor Pattern (O1/O2 from JSON/YAML)
+
+**When to use**: Streaming traversals where select queries access monotonically increasing positions.
+
+### Pattern: Cell<SequentialCursor> with Three-Path Dispatch
+
+```rust
+#[derive(Clone, Copy, Default)]
+struct SequentialCursor {
+    next_k: usize,        // Next expected rank
+    word_idx: usize,      // Current word in bitmap
+    ones_before: usize,   // Cumulative 1-bits before current word
+}
+
+impl Index {
+    fn select1_from(&self, k: usize, hint: usize) -> Option<usize> {
+        let cursor = self.cursor.get();  // Cell<SequentialCursor>
+
+        if k == cursor.next_k {
+            // Path 1: Sequential - O(1) amortized forward scan
+            self.select1_sequential(k, cursor)
+        } else if k > cursor.next_k {
+            // Path 2: Forward gap - binary search from cursor position
+            let mut cursor = cursor;
+            self.advance_cursor_to(&mut cursor, k);
+            self.select1_sequential(k, cursor)
+        } else {
+            // Path 3: Backwards jump - exponential search from hint
+            // IMPORTANT: Do NOT reset cursor here
+            self.select1_with_hint(k, hint)
+        }
+    }
+}
+```
+
+### Critical Lesson: Don't Reset Cursor on Backwards Jumps
+
+**Problem**: Initial implementation reset cursor after backwards jumps, causing 6600% regression on random access.
+
+**Why**: Random access patterns repeatedly jump backwards. If each backwards jump resets the cursor to position 0, subsequent forward queries must scan from the beginning, creating O(N) behavior.
+
+**Solution**: Leave cursor unchanged on backwards jumps. Random access uses the hint-based exponential search which doesn't need cursor state.
+
+### JSON vs YAML Optimization Impact
+
+| Optimization         | YAML Impact  | JSON Impact    | Why Different                                         |
+|----------------------|--------------|----------------|-------------------------------------------------------|
+| O1 Sequential Cursor | 3-13% faster | ~4.5% at 100KB | YAML has ~33% duplicate positions (container sharing) |
+| O2 Gap-Skipping      | 2-6% faster  | Neutral        | JSON forward-gap path rarely hit                      |
+
+**Key insight**: YAML containers share positions (a mapping's key and value both reference the same BP open), creating ~33% cache hits on duplicate position lookups. JSON has no such sharing, so the optimization benefit is smaller.
+
 ## Exponential Search for Sequential Select
 
 **When to use**: Select queries during iteration (`.users[]`) access sequential positions.

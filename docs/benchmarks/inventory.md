@@ -6,16 +6,16 @@ This document provides a comprehensive index of all benchmark reports in the pro
 
 The project contains **7 main benchmark documentation files** with approximately **120+ distinct benchmark report sections**.
 
-| File | Description | Sections |
-|------|-------------|----------|
-| [jq.md](jq.md) | JSON query performance vs system jq | ~40 |
-| [yq.md](yq.md) | YAML query performance vs system yq | ~35 |
-| [dsv.md](dsv.md) | CSV/TSV parsing performance | ~8 |
-| [cross-language.md](cross-language.md) | Multi-parser JSON comparison | ~15 |
-| [rust-parsers.md](rust-parsers.md) | Rust JSON parser comparison | ~12 |
-| [rust-yaml-parsers.md](rust-yaml-parsers.md) | Rust YAML parser comparison | ~10 |
-| [../parsing/yaml.md](../parsing/yaml.md) | YAML optimization phases | ~15 |
-| [../parsing/json.md](../parsing/json.md) | JSON optimization phases | ~2 |
+| File                                               | Description                         | Sections |
+|----------------------------------------------------|-------------------------------------|----------|
+| [jq.md](jq.md)                                     | JSON query performance vs system jq | ~40      |
+| [yq.md](yq.md)                                     | YAML query performance vs system yq | ~35      |
+| [dsv.md](dsv.md)                                   | CSV/TSV parsing performance         | ~8       |
+| [cross-language.md](cross-language.md)             | Multi-parser JSON comparison        | ~15      |
+| [rust-parsers.md](rust-parsers.md)                 | Rust JSON parser comparison         | ~12      |
+| [rust-yaml-parsers.md](rust-yaml-parsers.md)       | Rust YAML parser comparison         | ~10      |
+| [../parsing/yaml.md](../parsing/yaml.md)           | YAML optimization phases            | ~15      |
+| [../parsing/json.md](../parsing/json.md)           | JSON optimization phases            | ~2       |
 
 ---
 
@@ -350,13 +350,13 @@ JSON parsing implementation and optimization benchmark results.
 #### O1: Sequential Cursor for IB Select - ACCEPTED ✅
 - Micro-benchmark Results (select_patterns, 10K queries)
 - End-to-end jq queries (criterion, 10KB-1MB)
-- CLI benchmark results (`succinctly dev bench jq`)
+- CLI benchmark results (`succinctly bench run jq_bench`)
 - Key Design Decisions
 - Comparison with YAML O1
 
 #### O2: Gap-Skipping via Binary Search - ACCEPTED ✅
 - Micro-benchmark Results (select_patterns, 10K queries)
-- CLI benchmark results (`succinctly dev bench jq`)
+- CLI benchmark results (`succinctly bench run jq_bench`)
 - Key Design Decisions
 - Why neutral impact (forward-gap path rarely hit)
 
@@ -567,9 +567,34 @@ cargo run --release --features cli -- yaml generate-suite
 cargo run --release --features cli -- dsv generate-suite
 ```
 
+### Unified Benchmark Framework
+
+The unified benchmark framework (`succinctly bench`) provides orchestration, metadata collection,
+and organized output for all benchmarks. It requires the `bench-runner` feature:
+
+```bash
+cargo build --release --features cli,bench-runner
+```
+
+**Commands:**
+- `succinctly bench list` - List all available benchmarks
+- `succinctly bench run <name>` - Run specific benchmark(s)
+- `succinctly bench run --all` - Run all benchmarks
+- `succinctly bench run --category json` - Run benchmarks by category
+
+**Architecture:** The unified framework calls `succinctly dev bench` internally for CLI benchmarks.
+Both interfaces are valid:
+- `succinctly bench run jq_bench` - Unified wrapper with metadata collection
+- `succinctly dev bench jq` - Direct benchmark execution
+
 ### Run Benchmarks
 ```bash
-# CLI benchmarks
+# Via unified framework (recommended)
+./target/release/succinctly bench run jq_bench
+./target/release/succinctly bench run yq_bench
+./target/release/succinctly bench run dsv_cli
+
+# Direct CLI benchmarks
 ./target/release/succinctly dev bench jq
 ./target/release/succinctly dev bench yq
 ./target/release/succinctly dev bench dsv
