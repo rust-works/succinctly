@@ -6,11 +6,11 @@ Performance benchmarks for DSV parsing via `succinctly jq --input-dsv`.
 
 ## Summary
 
-| Metric             | ARM (M1 Max) | x86_64 (Ryzen 9)  | ARM (Graviton 4) |
-|--------------------|--------------|-------------------|------------------|
-| **CLI Throughput** | 6-29 MiB/s   | 10-103 MiB/s      | 7-89 MiB/s       |
-| **API Iteration**  | -            | 85-1676 MiB/s     | ~1000 MiB/s      |
-| **Parse Speed**    | ~0.8 GB/s    | 1.3-3.7 GB/s      | ~3.8 GB/s        |
+| Metric             | ARM (M1 Max) | x86_64 (Ryzen 9)  | ARM (Graviton 4) | ARM (Graviton 3) |
+|--------------------|--------------|-------------------|------------------|------------------|
+| **CLI Throughput** | 6-29 MiB/s   | 10-103 MiB/s      | 7-89 MiB/s       | 7-90 MiB/s       |
+| **API Iteration**  | -            | 85-1676 MiB/s     | ~1000 MiB/s      | ~1000 MiB/s      |
+| **Parse Speed**    | ~0.8 GB/s    | 1.3-3.7 GB/s      | ~3.8 GB/s        | ~3.8 GB/s        |
 
 ## Platforms
 
@@ -28,6 +28,12 @@ Performance benchmarks for DSV parsing via `succinctly jq --input-dsv`.
 - **CPU**: ARM Neoverse-V2 (AWS Graviton 4)
 - **SIMD**: NEON (16 bytes/iter), SVE2 with SVEBITPERM
 - **Build**: `cargo build --release --features cli`
+
+### Platform 4: ARM Neoverse-V1 (AWS Graviton 3)
+- **CPU**: ARM Neoverse-V1 (8 cores)
+- **SIMD**: NEON (16 bytes/iter), SVE (256-bit vectors)
+- **Build**: `cargo build --release --features cli`
+- **Date**: 2026-01-29
 
 ## CLI Throughput (End-to-End)
 
@@ -77,6 +83,133 @@ Full jq pipeline including DSV parsing, iteration, and JSON output.
 | tabular      | 756ms | 13.2 MiB/s |
 | mixed        | 751ms | 13.3 MiB/s |
 | long         | 1.35s | 7.4 MiB/s  |
+
+### ARM Neoverse-V1 (Graviton 3) - 10MB Files
+
+| Pattern      | Time  | Throughput |
+|--------------|-------|------------|
+| strings      | 112ms | 89.3 MiB/s |
+| quoted       | 222ms | 45.0 MiB/s |
+| pathological | 264ms | 37.9 MiB/s |
+| wide         | 320ms | 31.3 MiB/s |
+| multiline    | 407ms | 24.6 MiB/s |
+| users        | 691ms | 14.5 MiB/s |
+| numeric      | 722ms | 13.8 MiB/s |
+| tabular      | 751ms | 13.3 MiB/s |
+| mixed        | 746ms | 13.4 MiB/s |
+| long         | 1.32s | 7.6 MiB/s  |
+
+### ARM Neoverse-V1 (Graviton 3) - Full Results by Pattern
+
+**Pattern: tabular**
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    7.32s |   13.7 MiB/s |  142 MB |
+| **10mb**  |  751.3ms |   13.3 MiB/s |   18 MB |
+| **1mb**   |   77.5ms |   12.9 MiB/s |    5 MB |
+| **100kb** |    9.3ms |   10.5 MiB/s |    4 MB |
+| **10kb**  |    2.5ms |    3.9 MiB/s |    4 MB |
+| **1kb**   |    1.8ms |    0.5 MiB/s |    4 MB |
+
+**Pattern: users**
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    6.90s |   14.5 MiB/s |  142 MB |
+| **10mb**  |  691.2ms |   14.5 MiB/s |   18 MB |
+| **1mb**   |   70.8ms |   14.1 MiB/s |    5 MB |
+| **100kb** |    8.5ms |   11.5 MiB/s |    4 MB |
+| **10kb**  |    2.4ms |    4.1 MiB/s |    4 MB |
+| **1kb**   |    1.8ms |    0.5 MiB/s |    4 MB |
+
+**Pattern: numeric**
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    7.24s |   13.8 MiB/s |  142 MB |
+| **10mb**  |  722.1ms |   13.8 MiB/s |   18 MB |
+| **1mb**   |   73.1ms |   13.7 MiB/s |    5 MB |
+| **100kb** |    8.6ms |   11.4 MiB/s |    4 MB |
+| **10kb**  |    2.3ms |    4.2 MiB/s |    4 MB |
+| **1kb**   |    1.8ms |    0.5 MiB/s |    4 MB |
+
+**Pattern: strings (fastest)**
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    1.11s |   90.5 MiB/s |  142 MB |
+| **10mb**  |  112.0ms |   89.3 MiB/s |   18 MB |
+| **1mb**   |   12.5ms |   79.7 MiB/s |    5 MB |
+| **100kb** |    2.7ms |   35.9 MiB/s |    4 MB |
+| **10kb**  |    1.7ms |    5.7 MiB/s |    4 MB |
+| **1kb**   |    1.7ms |    0.6 MiB/s |    4 MB |
+
+**Pattern: quoted**
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    2.08s |   48.1 MiB/s |  142 MB |
+| **10mb**  |  222.2ms |   45.0 MiB/s |   18 MB |
+| **1mb**   |   23.5ms |   42.6 MiB/s |    5 MB |
+| **100kb** |    3.9ms |   25.2 MiB/s |    4 MB |
+| **10kb**  |    1.9ms |    5.2 MiB/s |    4 MB |
+| **1kb**   |    1.8ms |    0.6 MiB/s |    4 MB |
+
+**Pattern: multiline**
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    3.42s |   29.3 MiB/s |  142 MB |
+| **10mb**  |  406.5ms |   24.6 MiB/s |   18 MB |
+| **1mb**   |   40.9ms |   24.5 MiB/s |    5 MB |
+| **100kb** |    5.8ms |   17.0 MiB/s |    4 MB |
+| **10kb**  |    2.0ms |    4.8 MiB/s |    4 MB |
+| **1kb**   |    1.7ms |    0.6 MiB/s |    4 MB |
+
+**Pattern: wide**
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    3.28s |   30.5 MiB/s |  142 MB |
+| **10mb**  |  319.9ms |   31.3 MiB/s |   18 MB |
+| **1mb**   |   33.1ms |   30.3 MiB/s |    5 MB |
+| **100kb** |    4.6ms |   21.3 MiB/s |    4 MB |
+| **10kb**  |    2.0ms |    5.0 MiB/s |    4 MB |
+| **1kb**   |    1.8ms |    0.6 MiB/s |    4 MB |
+
+**Pattern: long (slowest)**
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |   13.19s |    7.6 MiB/s |  142 MB |
+| **10mb**  |    1.32s |    7.6 MiB/s |   18 MB |
+| **1mb**   |  140.2ms |    7.1 MiB/s |    5 MB |
+| **100kb** |   15.9ms |    6.2 MiB/s |    4 MB |
+| **10kb**  |    3.1ms |    3.1 MiB/s |    4 MB |
+| **1kb**   |    1.9ms |    0.5 MiB/s |    4 MB |
+
+**Pattern: mixed**
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    7.51s |   13.3 MiB/s |  142 MB |
+| **10mb**  |  746.1ms |   13.4 MiB/s |   18 MB |
+| **1mb**   |   76.0ms |   13.2 MiB/s |    5 MB |
+| **100kb** |    9.0ms |   10.8 MiB/s |    4 MB |
+| **10kb**  |    2.5ms |    3.9 MiB/s |    4 MB |
+| **1kb**   |    2.0ms |    0.5 MiB/s |    4 MB |
+
+**Pattern: pathological**
+
+| Size      | Time     | Throughput   | Memory   |
+|-----------|----------|--------------|----------|
+| **100mb** |    2.47s |   40.5 MiB/s |  142 MB |
+| **10mb**  |  263.9ms |   37.9 MiB/s |   18 MB |
+| **1mb**   |   28.1ms |   35.6 MiB/s |    5 MB |
+| **100kb** |    4.5ms |   21.8 MiB/s |    4 MB |
+| **10kb**  |    2.0ms |    4.8 MiB/s |    4 MB |
+| **1kb**   |    1.8ms |    0.5 MiB/s |    4 MB |
 
 ## Query Comparison
 

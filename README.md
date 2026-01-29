@@ -196,19 +196,19 @@ Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
 
 | Pattern           | jq       | succinctly    | Speedup  | jq Mem  | succ Mem | Mem Ratio  |
 |-------------------|----------|---------------|----------|---------|----------|------------|
-| **nested**        |  347.2ms |  **54.8ms**   | **6.3x** |   25 MB |    29 MB |      1.17x |
-| **strings**       |  331.0ms |  **75.2ms**   | **4.4x** |   16 MB |    17 MB |      1.07x |
-| **pathological**  |    1.35s | **677.0ms**   | **2.0x** |  526 MB |    20 MB |      0.04x |
-| **unicode**       |  334.8ms | **157.1ms**   | **2.1x** |   41 MB |    19 MB |      0.46x |
-| **users**         |  413.7ms | **196.8ms**   | **2.1x** |   70 MB |    15 MB |      0.21x |
-| **comprehensive** |  692.4ms | **364.7ms**   | **1.9x** |  135 MB |    17 MB |      0.13x |
-| **numbers**       |  370.7ms | **213.8ms**   | **1.7x** |   97 MB |    18 MB |      0.19x |
-| **arrays**        |    1.07s | **700.8ms**   | **1.5x** |  368 MB |    20 MB |      0.05x |
-| **literals**      |  510.9ms | **397.1ms**   | **1.3x** |  103 MB |    19 MB |      0.19x |
+| **nested**        |  330.7ms |  **63.7ms**   | **5.2x** |   25 MB |    31 MB |      1.26x |
+| **strings**       |  307.7ms |  **78.7ms**   | **3.9x** |   16 MB |    19 MB |      1.23x |
+| **pathological**  |    1.33s | **631.3ms**   | **2.1x** |  525 MB |    38 MB |      0.07x |
+| **unicode**       |  319.6ms | **156.5ms**   | **2.0x** |   41 MB |    21 MB |      0.52x |
+| **users**         |  386.6ms | **189.6ms**   | **2.0x** |   71 MB |    17 MB |      0.24x |
+| **comprehensive** |  641.6ms | **342.9ms**   | **1.9x** |  134 MB |    19 MB |      0.14x |
+| **numbers**       |  349.6ms | **209.3ms**   | **1.7x** |   96 MB |    20 MB |      0.21x |
+| **arrays**        |    1.02s | **677.8ms**   | **1.5x** |  367 MB |    57 MB |      0.16x |
+| **literals**      |  484.3ms | **397.9ms**   | **1.2x** |  103 MB |    22 MB |      0.21x |
 
 **Key findings**:
-- **1.2-6.3x faster** across all patterns
-- **5-25x less memory** on most patterns due to streaming lazy evaluation
+- **1.2-5.2x faster** across all patterns
+- **4-14x less memory** on most patterns due to streaming lazy evaluation
 - Best speedup on nested/string-heavy data
 
 ### Platform-Specific Optimizations

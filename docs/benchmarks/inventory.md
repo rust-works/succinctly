@@ -4,15 +4,16 @@ This document provides a comprehensive index of all benchmark reports in the pro
 
 ## Overview
 
-The project contains **6 main benchmark documentation files** with approximately **110+ distinct benchmark report sections**.
+The project contains **7 main benchmark documentation files** with approximately **120+ distinct benchmark report sections**.
 
 | File | Description | Sections |
 |------|-------------|----------|
 | [jq.md](jq.md) | JSON query performance vs system jq | ~40 |
 | [yq.md](yq.md) | YAML query performance vs system yq | ~35 |
 | [dsv.md](dsv.md) | CSV/TSV parsing performance | ~8 |
-| [cross-language.md](cross-language.md) | Multi-parser comparison | ~15 |
+| [cross-language.md](cross-language.md) | Multi-parser JSON comparison | ~15 |
 | [rust-parsers.md](rust-parsers.md) | Rust JSON parser comparison | ~12 |
+| [rust-yaml-parsers.md](rust-yaml-parsers.md) | Rust YAML parser comparison | ~10 |
 | [../parsing/yaml.md](../parsing/yaml.md) | YAML optimization phases | ~15 |
 
 ---
@@ -51,12 +52,17 @@ Comprehensive benchmarks comparing `succinctly jq .` vs `jq .` for JSON formatti
 - Key Findings
 
 #### ARM Neoverse-V1 (AWS Graviton 3)
-- Summary - Comprehensive Pattern
-- Pattern: comprehensive
-- Pattern: users
-- Pattern: nested
+- Summary - Comprehensive Pattern (all sizes 1KB-100MB)
 - Pattern: arrays
+- Pattern: comprehensive
+- Pattern: literals
+- Pattern: mixed
+- Pattern: nested
+- Pattern: numbers
+- Pattern: pathological
 - Pattern: strings
+- Pattern: unicode
+- Pattern: users
 - Key Findings
 
 #### Apple M1 Max (ARM)
@@ -102,6 +108,19 @@ Benchmarks comparing `succinctly yq .` vs `yq .` (Mike Farah's yq) for YAML form
 - Pattern: numbers
 - Pattern: unicode
 - Pattern: mixed
+
+#### Detailed Results by Pattern (ARM - Neoverse-V1 / Graviton 3)
+- Pattern: comprehensive
+- Pattern: config
+- Pattern: mixed
+- Pattern: navigation
+- Pattern: nested
+- Pattern: numbers
+- Pattern: pathological
+- Pattern: sequences
+- Pattern: strings
+- Pattern: unicode
+- Pattern: users
 
 #### Detailed Results by Pattern (ARM - Apple M1 Max)
 - Pattern: comprehensive
@@ -158,6 +177,7 @@ Performance benchmarks for DSV parsing via `succinctly jq --input-dsv`.
 - Apple M1 Max (ARM)
 - AMD Ryzen 9 7950X (x86_64)
 - ARM Neoverse-V2 (AWS Graviton 4)
+- ARM Neoverse-V1 (AWS Graviton 3)
 
 ### Benchmark Sections
 
@@ -168,6 +188,7 @@ Performance benchmarks for DSV parsing via `succinctly jq --input-dsv`.
 - ARM (M1 Max) - 10MB Files (10 patterns)
 - x86_64 (Ryzen 9) - 10MB Files (10 patterns)
 - ARM Neoverse-V2 (Graviton 4) - 10MB Files (10 patterns)
+- ARM Neoverse-V1 (Graviton 3) - 10MB Files (10 patterns) with full results by pattern
 
 #### Query Comparison
 - Single column selection (.[0]) vs full output (.) - x86_64
@@ -272,6 +293,49 @@ Benchmark comparison of succinctly against other popular Rust JSON parsers.
 #### Key Findings
 - Parse Performance
 - Memory Efficiency
+- Use Case Recommendations
+
+---
+
+## [rust-yaml-parsers.md](rust-yaml-parsers.md) - Rust YAML Parser Comparison
+
+Benchmark comparison of succinctly against serde_yaml, the standard Rust YAML parser.
+
+### Libraries Compared
+- serde_yaml (Standard YAML parser, based on yaml-rust2)
+- succinctly (Semi-index, streaming)
+
+### Platform
+- x86_64 (AMD Ryzen 9 7950X, Zen 4)
+
+### Benchmark Sections
+
+#### Parse-Only Performance
+- Summary Table (1MB file)
+- Detailed Results by File Size:
+  - 1KB Files
+  - 10KB Files
+  - 100KB Files
+  - 1MB Files
+  - 10MB Files
+
+#### Parse + Traverse Performance
+- Summary Table (1MB file)
+- Detailed Results by File Size (1KB to 10MB)
+
+#### YAML to JSON Conversion
+- Summary Table (1MB file)
+- Detailed Results by File Size (1KB to 10MB)
+
+#### Peak Memory Usage
+- Summary Table (all sizes)
+- Memory Efficiency (vs YAML size)
+
+#### Key Findings
+- Parse Performance (8-14x faster)
+- Parse + Traverse Performance (4-6x faster)
+- YAML to JSON Conversion (2.8-3.9x faster)
+- Memory Efficiency (10-39x less memory)
 - Use Case Recommendations
 
 ---
@@ -420,19 +484,19 @@ YAML parsing implementation and optimization benchmark results.
 ### By Platform
 - **AMD Ryzen 9 7950X (x86_64)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [cross-language.md](cross-language.md), [rust-parsers.md](rust-parsers.md), [yaml.md](../parsing/yaml.md)
 - **ARM Neoverse-V2 (Graviton 4)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md)
-- **ARM Neoverse-V1 (Graviton 3)**: [jq.md](jq.md), [yq.md](yq.md)
+- **ARM Neoverse-V1 (Graviton 3)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md)
 - **Apple M1 Max**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [cross-language.md](cross-language.md), [yaml.md](../parsing/yaml.md)
 
 ### By Format
 - **JSON**: [jq.md](jq.md), [cross-language.md](cross-language.md), [rust-parsers.md](rust-parsers.md)
-- **YAML**: [yq.md](yq.md), [yaml.md](../parsing/yaml.md)
+- **YAML**: [yq.md](yq.md), [rust-yaml-parsers.md](rust-yaml-parsers.md), [yaml.md](../parsing/yaml.md)
 - **DSV/CSV/TSV**: [dsv.md](dsv.md)
 
 ### By Comparison Type
 - **vs External Tools**: [jq.md](jq.md) (vs jq), [yq.md](yq.md) (vs yq)
-- **vs Rust Parsers**: [cross-language.md](cross-language.md), [rust-parsers.md](rust-parsers.md)
+- **vs Rust Parsers**: [cross-language.md](cross-language.md), [rust-parsers.md](rust-parsers.md), [rust-yaml-parsers.md](rust-yaml-parsers.md)
 - **Optimization Phases**: [yaml.md](../parsing/yaml.md)
-- **Memory Benchmarks**: [cross-language.md](cross-language.md), [rust-parsers.md](rust-parsers.md), [yq.md](yq.md)
+- **Memory Benchmarks**: [cross-language.md](cross-language.md), [rust-parsers.md](rust-parsers.md), [rust-yaml-parsers.md](rust-yaml-parsers.md), [yq.md](yq.md)
 
 ### By Feature
 - **Lazy Evaluation**: [yq.md](yq.md) - Selection Benchmarks
