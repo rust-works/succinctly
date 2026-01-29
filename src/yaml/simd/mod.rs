@@ -442,10 +442,15 @@ pub fn find_json_escape(bytes: &[u8], start: usize) -> usize {
         neon::find_json_escape_neon(bytes, start)
     }
 
-    // x86_64 - use AVX2/SSE2 SIMD
+    // x86_64 with SIMD (AVX2 with SSE2 fallback)
     #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
     {
-        x86::find_json_escape_x86(bytes, start).map_or(bytes.len(), |offset| start + offset)
+        // 16-byte threshold to avoid regression on short strings
+        if bytes.len() - start >= 16 {
+            x86::find_json_escape_x86(bytes, start).map_or(bytes.len(), |offset| start + offset)
+        } else {
+            find_json_escape_scalar(bytes, start)
+        }
     }
 
     // Scalar fallback for other platforms

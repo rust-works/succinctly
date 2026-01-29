@@ -14,6 +14,7 @@ use alloc::vec::Vec;
 use indexmap::IndexMap;
 
 use super::expr::Literal;
+use crate::yaml::simd::find_json_escape;
 
 /// An owned JSON value.
 ///
@@ -221,19 +222,38 @@ impl OwnedValue {
 }
 
 /// Escape a string for JSON output.
+///
+/// Uses SIMD-accelerated scanning to find characters that need escaping.
 fn escape_json_string(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            c if c.is_control() => {
-                result.push_str(&format!("\\u{:04x}", c as u32));
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Use SIMD to find the next byte that needs escaping
+        let escape_pos = find_json_escape(bytes, i);
+
+        // Copy safe segment
+        if i < escape_pos {
+            result.push_str(&s[i..escape_pos]);
+        }
+        i = escape_pos;
+
+        // Handle escape if needed
+        if i < bytes.len() {
+            let b = bytes[i];
+            match b {
+                b'"' => result.push_str("\\\""),
+                b'\\' => result.push_str("\\\\"),
+                b'\n' => result.push_str("\\n"),
+                b'\r' => result.push_str("\\r"),
+                b'\t' => result.push_str("\\t"),
+                b if b < 0x20 => {
+                    result.push_str(&format!("\\u{:04x}", b));
+                }
+                _ => result.push(b as char),
             }
-            c => result.push(c),
+            i += 1;
         }
     }
     result

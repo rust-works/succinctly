@@ -21,6 +21,7 @@
 //! | `length`, complex | OwnedValue | 5-8x input |
 
 use super::value::OwnedValue;
+use crate::yaml::simd::find_json_escape;
 
 /// A value that can be streamed directly to output without intermediate allocation.
 ///
@@ -130,20 +131,14 @@ fn stream_json_string<W: core::fmt::Write>(out: &mut W, s: &str) -> core::fmt::R
     let mut i = 0;
 
     while i < bytes.len() {
-        // Find the next byte that needs escaping
-        let start = i;
-        while i < bytes.len() {
-            let b = bytes[i];
-            if b == b'"' || b == b'\\' || b < 0x20 {
-                break;
-            }
-            i += 1;
-        }
+        // Use SIMD to find the next byte that needs escaping
+        let escape_pos = find_json_escape(bytes, i);
 
         // Write unescaped segment
-        if start < i {
-            out.write_str(&s[start..i])?;
+        if i < escape_pos {
+            out.write_str(&s[i..escape_pos])?;
         }
+        i = escape_pos;
 
         // Handle escape sequence if needed
         if i < bytes.len() {
