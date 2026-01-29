@@ -51,12 +51,17 @@ Comprehensive benchmarks comparing `succinctly jq .` vs `jq .` for JSON formatti
 - Key Findings
 
 #### ARM Neoverse-V1 (AWS Graviton 3)
-- Summary - Comprehensive Pattern
-- Pattern: comprehensive
-- Pattern: users
-- Pattern: nested
+- Summary - Comprehensive Pattern (all sizes 1KB-100MB)
 - Pattern: arrays
+- Pattern: comprehensive
+- Pattern: literals
+- Pattern: mixed
+- Pattern: nested
+- Pattern: numbers
+- Pattern: pathological
 - Pattern: strings
+- Pattern: unicode
+- Pattern: users
 - Key Findings
 
 #### Apple M1 Max (ARM)
@@ -102,6 +107,19 @@ Benchmarks comparing `succinctly yq .` vs `yq .` (Mike Farah's yq) for YAML form
 - Pattern: numbers
 - Pattern: unicode
 - Pattern: mixed
+
+#### Detailed Results by Pattern (ARM - Neoverse-V1 / Graviton 3)
+- Pattern: comprehensive
+- Pattern: config
+- Pattern: mixed
+- Pattern: navigation
+- Pattern: nested
+- Pattern: numbers
+- Pattern: pathological
+- Pattern: sequences
+- Pattern: strings
+- Pattern: unicode
+- Pattern: users
 
 #### Detailed Results by Pattern (ARM - Apple M1 Max)
 - Pattern: comprehensive
@@ -158,6 +176,7 @@ Performance benchmarks for DSV parsing via `succinctly jq --input-dsv`.
 - Apple M1 Max (ARM)
 - AMD Ryzen 9 7950X (x86_64)
 - ARM Neoverse-V2 (AWS Graviton 4)
+- ARM Neoverse-V1 (AWS Graviton 3)
 
 ### Benchmark Sections
 
@@ -168,6 +187,7 @@ Performance benchmarks for DSV parsing via `succinctly jq --input-dsv`.
 - ARM (M1 Max) - 10MB Files (10 patterns)
 - x86_64 (Ryzen 9) - 10MB Files (10 patterns)
 - ARM Neoverse-V2 (Graviton 4) - 10MB Files (10 patterns)
+- ARM Neoverse-V1 (Graviton 3) - 10MB Files (10 patterns) with full results by pattern
 
 #### Query Comparison
 - Single column selection (.[0]) vs full output (.) - x86_64
@@ -420,7 +440,7 @@ YAML parsing implementation and optimization benchmark results.
 ### By Platform
 - **AMD Ryzen 9 7950X (x86_64)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [cross-language.md](cross-language.md), [rust-parsers.md](rust-parsers.md), [yaml.md](../parsing/yaml.md)
 - **ARM Neoverse-V2 (Graviton 4)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md)
-- **ARM Neoverse-V1 (Graviton 3)**: [jq.md](jq.md), [yq.md](yq.md)
+- **ARM Neoverse-V1 (Graviton 3)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md)
 - **Apple M1 Max**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [cross-language.md](cross-language.md), [yaml.md](../parsing/yaml.md)
 
 ### By Format
