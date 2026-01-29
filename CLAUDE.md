@@ -307,9 +307,9 @@ To regenerate: `cargo bench --bench jq_comparison`
 
 | Size      | succinctly            | jq                    | Speedup    |
 |-----------|-----------------------|-----------------------|------------|
-| **10KB**  |  1.9 ms (4.9 MiB/s)   |  2.6 ms  (3.6 MiB/s)  | **1.4x**   |
-| **100KB** |  4.4 ms (19.4 MiB/s)  |  6.7 ms (12.7 MiB/s)  | **1.5x**   |
-| **1MB**   | 28.2 ms (28.7 MiB/s)  | 47.7 ms (16.9 MiB/s)  | **1.7x**   |
+| **10KB**  |  1.8 ms (5.3 MiB/s)   |  2.6 ms  (3.6 MiB/s)  | **1.4x**   |
+| **100KB** |  4.3 ms (21.1 MiB/s)  |  6.3 ms (14.4 MiB/s)  | **1.5x**   |
+| **1MB**   | 28.0 ms (28.9 MiB/s)  | 46.1 ms (17.5 MiB/s)  | **1.6x**   |
 
 ### jq Query Performance (ARM Neoverse-V1)
 
