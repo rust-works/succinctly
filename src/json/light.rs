@@ -449,8 +449,14 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
 
     /// Advance the cursor from its current position to `target` k value.
     ///
-    /// Uses cumulative rank to find the correct word. For small gaps, does linear
-    /// scan from cursor position. For large gaps (>8 words), uses binary search.
+    /// Uses O(log N) binary search over the cumulative rank array to find
+    /// the word containing the target-th 1-bit. Search is bounded by the
+    /// cursor's current position for forward gaps.
+    ///
+    /// O2 optimization: Always uses binary search instead of heuristic-based
+    /// linear scan. This provides consistent O(log N) performance regardless
+    /// of gap size, simplifying the code while maintaining efficiency since
+    /// the forward-gap path is rarely hit during streaming access.
     #[inline]
     fn advance_ib_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
         let words = self.ib.as_ref();
@@ -461,32 +467,19 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
         let k32 = target as u32;
         let n = words.len();
 
-        // Estimate how far we need to go
-        // Use binary search for large gaps to avoid O(N) scan
-        let gap = target.saturating_sub(cursor.ib_ones_before);
-        let estimated_words = gap / 8; // ~8 ones per word is typical for JSON
-
-        let wi = if estimated_words > 8 {
-            // Large gap: use binary search over rank array
-            let mut lo = cursor.ib_word_idx;
-            let mut hi = n;
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                if self.ib_rank[mid + 1] <= k32 {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
+        // Binary search over rank array to find word containing target-th 1-bit
+        // Start from cursor position since we know target > cursor.next_k
+        let mut lo = cursor.ib_word_idx;
+        let mut hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.ib_rank[mid + 1] <= k32 {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
-            lo.min(n.saturating_sub(1))
-        } else {
-            // Small gap: linear scan from cursor (better cache locality)
-            let mut wi = cursor.ib_word_idx;
-            while wi < n && self.ib_rank[wi + 1] <= k32 {
-                wi += 1;
-            }
-            wi.min(n.saturating_sub(1))
-        };
+        }
+        let wi = lo.min(n.saturating_sub(1));
 
         // Update cursor state
         cursor.ib_word_idx = wi;

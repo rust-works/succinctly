@@ -354,6 +354,12 @@ JSON parsing implementation and optimization benchmark results.
 - Key Design Decisions
 - Comparison with YAML O1
 
+#### O2: Gap-Skipping via Binary Search - ACCEPTED ✅
+- Micro-benchmark Results (select_patterns, 10K queries)
+- CLI benchmark results (`succinctly dev bench jq`)
+- Key Design Decisions
+- Why neutral impact (forward-gap path rarely hit)
+
 ---
 
 ## [../parsing/yaml.md](../parsing/yaml.md) - YAML Optimization Phases

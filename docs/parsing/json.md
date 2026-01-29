@@ -414,7 +414,7 @@ struct SequentialCursor {
 | **100KB** | **-4.5%** | **+4.7%** |
 | 1MB | within noise | within noise |
 
-**CLI benchmark (`succinctly dev bench jq`):**
+**CLI benchmark (`succinctly bench run jq_bench`):**
 
 | Pattern | Size | Speedup vs jq |
 |---------|------|---------------|
@@ -444,6 +444,81 @@ Unlike YAML's O1 optimization (3-13% improvement), JSON sees modest gains becaus
 3. **Different access patterns**: JSON's `ib_select1_from` uses caller-provided hints that are often accurate
 
 The optimization provides measurable benefit at medium file sizes (100KB) without any regression on random access patterns.
+
+---
+
+### O2: Gap-Skipping via Binary Search - ACCEPTED ✅
+
+**Date**: 2026-01-29
+**Source**: Simplified from O1's heuristic-based approach
+
+#### Problem
+
+O1's `advance_ib_cursor_to()` used a heuristic to choose between linear scan (for small gaps)
+and binary search (for large gaps). The threshold (`estimated_words > 8`) added complexity
+without clear benefit, since the forward-gap path is rarely hit during streaming access.
+
+#### Solution
+
+Simplified to always use binary search over the cumulative rank array:
+
+```rust
+fn advance_ib_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
+    // Binary search over rank array to find word containing target-th 1-bit
+    // Start from cursor position since we know target > cursor.next_k
+    let mut lo = cursor.ib_word_idx;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if self.ib_rank[mid + 1] <= k32 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    // Update cursor state...
+}
+```
+
+#### Benchmark Results (Apple M1 Max)
+
+**Micro-benchmark (10K queries, select_patterns):**
+
+| Pattern | Time | Note |
+|---------|------|------|
+| Sequential (exponential) | 104 µs | Unchanged from O1 |
+| Random (exponential) | 1.06 ms | No regression |
+
+**CLI benchmark (`succinctly bench run jq_bench`):**
+
+| Pattern | Size | Speedup vs jq |
+|---------|------|---------------|
+| nested | 1MB | 3.33x |
+| strings | 1MB | 3.02x |
+| users | 1MB | 2.26x |
+
+Results are consistent with O1 baseline - no measurable change because the forward-gap
+path is rarely hit during typical streaming access.
+
+#### Key Design Decisions
+
+1. **Always binary search**: Removes heuristic complexity for consistent O(log N) behavior
+2. **Bounded search**: Starts from `cursor.ib_word_idx` for forward gaps
+3. **Simpler code**: Easier to understand and maintain
+
+#### Files Changed
+
+- `src/json/light.rs`: Simplified `advance_ib_cursor_to()` to remove heuristic
+
+#### Why Neutral Impact
+
+Unlike YAML's O2 optimization (2-6% improvement), JSON sees no measurable change because:
+
+1. **Forward-gap path rarely hit**: Sequential access (k == cursor.next_k) is the common case
+2. **Binary search already fast**: O(log N) for forward gaps is efficient regardless of gap size
+3. **Heuristic overhead minimal**: The removed linear scan path was only used for small gaps
+
+The simplification is worthwhile for code clarity without sacrificing performance.
 
 ---
 
