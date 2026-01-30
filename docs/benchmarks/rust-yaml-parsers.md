@@ -158,18 +158,85 @@ Convert YAML to JSON output.
 | **succinctly** | 78.59 ms | 119 MiB/s  | **3.9x faster**  |
 | serde_yaml     | 308.1 ms | 30.3 MiB/s | baseline         |
 
+---
+
+# ARM Neoverse-V2 (AWS Graviton 4)
+
+**Platform**: ARM Neoverse-V2 (AWS Graviton 4)
+**Date**: 2026-01-30
+**SIMD**: NEON (128-bit), SVE2 (128-bit vectors), SVEBITPERM (BDEP/BEXT)
+
+## Parse-Only Performance (ARM)
+
+### Summary Table (1MB file)
+
+| Library        | Time     | Throughput | vs serde_yaml    |
+|----------------|----------|------------|------------------|
+| **succinctly** | 3.30 ms  | 279 MiB/s  | **12.2x faster** |
+| serde_yaml     | 40.2 ms  | 23.0 MiB/s | baseline         |
+
+### Detailed Results by File Size (ARM)
+
+| Size   | serde_yaml | succinctly  | Speedup          |
+|--------|-----------|-------------|------------------|
+| 1KB    | 57.3 µs   | 6.36 µs     | **9.0x faster**  |
+| 10KB   | 478.4 µs  | 38.8 µs     | **12.3x faster** |
+| 100KB  | 4.14 ms   | 340.5 µs    | **12.2x faster** |
+| 1MB    | 40.2 ms   | 3.30 ms     | **12.2x faster** |
+| 10MB   | 430 ms    | 32.6 ms     | **13.2x faster** |
+
+## Parse + Traverse Performance (ARM)
+
+### Summary Table (1MB file)
+
+| Library        | Time     | Throughput | vs serde_yaml    |
+|----------------|----------|------------|------------------|
+| **succinctly** | 7.46 ms  | 124 MiB/s  | **5.4x faster**  |
+| serde_yaml     | 40.6 ms  | 22.7 MiB/s | baseline         |
+
+### Detailed Results by File Size (ARM)
+
+| Size   | serde_yaml | succinctly  | Speedup          |
+|--------|-----------|-------------|------------------|
+| 1KB    | 63.9 µs   | 12.0 µs     | **5.3x faster**  |
+| 10KB   | 483.7 µs  | 84.2 µs     | **5.7x faster**  |
+| 100KB  | 4.16 ms   | 780.8 µs    | **5.3x faster**  |
+| 1MB    | 40.6 ms   | 7.46 ms     | **5.4x faster**  |
+| 10MB   | 431.4 ms  | 72.0 ms     | **6.0x faster**  |
+
+## YAML to JSON Conversion (ARM)
+
+### Summary Table (1MB file)
+
+| Library        | Time     | Throughput | vs serde_yaml    |
+|----------------|----------|------------|------------------|
+| **succinctly** | 10.98 ms | 84.0 MiB/s | **3.8x faster**  |
+| serde_yaml     | 41.3 ms  | 22.3 MiB/s | baseline         |
+
+### Detailed Results by File Size (ARM)
+
+| Size   | serde_yaml | succinctly  | Speedup          |
+|--------|-----------|-------------|------------------|
+| 1KB    | 65.5 µs   | 16.4 µs     | **4.0x faster**  |
+| 10KB   | 495.7 µs  | 119.7 µs    | **4.1x faster**  |
+| 100KB  | 4.25 ms   | 1.15 ms     | **3.7x faster**  |
+| 1MB    | 41.3 ms   | 10.98 ms    | **3.8x faster**  |
+| 10MB   | 447.7 ms  | 105.0 ms    | **4.3x faster**  |
+
+---
+
 ## Peak Memory Usage
 
-Memory overhead during parsing/indexing.
+Memory overhead during parsing/indexing (consistent across platforms).
 
 ### Summary Table
 
 | Size   | serde_yaml | **succinctly** | YAML Size | Ratio     |
 |--------|-----------|----------------|-----------|-----------|
-| 1KB    | 106.7 KB  | **2.77 KB**    | 1.23 KB   | **38.6x** |
-| 10KB   | 369.1 KB  | **20.4 KB**    | 10.0 KB   | **18.1x** |
+| 1KB    | 106.6 KB  | **2.77 KB**    | 1.23 KB   | **38.5x** |
+| 10KB   | 369.0 KB  | **20.4 KB**    | 10.0 KB   | **18.1x** |
 | 100KB  | 2.63 MB   | **188.8 KB**   | 94.2 KB   | **14.3x** |
-| 1MB    | 22.22 MB  | **1.84 MB**    | 944 KB    | **12.0x** |
+| 1MB    | 22.21 MB  | **1.84 MB**    | 944 KB    | **12.0x** |
 | 10MB   | 194.1 MB  | **18.7 MB**    | 9.34 MB   | **10.4x** |
 
 **Key Findings:**

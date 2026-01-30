@@ -145,6 +145,49 @@ cargo build --release --features bench-runner
 ./target/release/succinctly bench run yq_bench yq_comparison yaml_bench
 ```
 
+## Memory Collection
+
+**Memory is collected by default** for CLI benchmarks. Use `--no-memory` to skip.
+
+### Benchmark Types and Memory Support
+
+| Type | Memory Collected | How | Examples |
+|------|------------------|-----|----------|
+| **CLI** | Yes (default) | `/usr/bin/time` peak RSS | `jq_bench`, `yq_bench`, `dsv_cli` |
+| **Criterion** | No | In-process timing only | `jq_comparison`, `yaml_bench` |
+| **CrossParser** | No | In-process timing only | `json_parsers`, `yaml_parsers` |
+
+### Memory Flag Usage
+
+```bash
+# Memory collected by default
+./target/release/succinctly bench run yq_bench
+
+# Skip memory collection (faster)
+./target/release/succinctly bench run yq_bench --no-memory
+
+# All CLI benchmarks support --no-memory
+./target/release/succinctly bench run jq_bench --no-memory
+./target/release/succinctly bench run dsv_cli --no-memory
+```
+
+### Unified Runner Output
+
+When running via `succinctly bench run`, CLI benchmark results are saved to the output directory:
+
+```
+data/bench/results/<timestamp>/
+  metadata.json      # System info
+  summary.json       # Run summary
+  jq_bench.jsonl     # Raw results with peak_memory_bytes
+  jq_bench.md        # Markdown with memory columns
+  yq_bench.jsonl
+  yq_bench.md
+  stdout/
+    jq_bench.txt     # Console output
+    yq_bench.txt
+```
+
 ## yq Benchmark Query Types
 
 The yq benchmark supports multiple query types to exercise different execution paths:
@@ -161,7 +204,7 @@ The yq benchmark supports multiple query types to exercise different execution p
 **Always build first:** `cargo build --release --features bench-runner`
 
 ```bash
-# Run yq CLI benchmark (recommended - includes memory tracking)
+# Run yq CLI benchmark (memory is collected by default)
 ./target/release/succinctly bench run yq_bench
 
 # Run specific query types
@@ -171,8 +214,8 @@ The yq benchmark supports multiple query types to exercise different execution p
 # Focus on M2 streaming with the navigation pattern
 ./target/release/succinctly bench run yq_bench --patterns navigation --sizes 10mb,100mb
 
-# Memory-focused comparison
-./target/release/succinctly bench run yq_bench --memory
+# Skip memory collection (faster, but no memory comparison)
+./target/release/succinctly bench run yq_bench --no-memory
 ```
 
 ### Query Type Aliases

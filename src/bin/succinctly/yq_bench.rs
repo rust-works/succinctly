@@ -115,7 +115,7 @@ pub struct BenchConfig {
     pub succinctly_binary: PathBuf,
     pub warmup_runs: usize,
     pub benchmark_runs: usize,
-    /// Memory-focused mode: shows detailed memory comparison
+    /// Include memory comparison in output (default: true)
     pub memory_mode: bool,
 }
 
@@ -148,7 +148,7 @@ impl Default for BenchConfig {
             succinctly_binary: PathBuf::from("./target/release/succinctly"),
             warmup_runs: 1,
             benchmark_runs: 3,
-            memory_mode: false,
+            memory_mode: true,
         }
     }
 }

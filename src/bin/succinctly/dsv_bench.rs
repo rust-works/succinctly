@@ -42,6 +42,8 @@ pub struct BenchConfig {
     pub benchmark_runs: usize,
     pub delimiter: char,
     pub query: String,
+    /// Include memory measurement in output (default: true)
+    pub memory_mode: bool,
 }
 
 impl Default for BenchConfig {
@@ -73,6 +75,7 @@ impl Default for BenchConfig {
             benchmark_runs: 3,
             delimiter: ',',
             query: ".".into(),
+            memory_mode: true,
         }
     }
 }
@@ -169,7 +172,7 @@ pub fn run_benchmark(
 
     // Generate markdown output (even if interrupted)
     if let Some(md_path) = output_md {
-        let markdown = generate_markdown(&results);
+        let markdown = generate_markdown(&results, config.memory_mode);
         std::fs::write(md_path, markdown)?;
     }
 
@@ -452,7 +455,7 @@ fn get_cpu_info() -> String {
 }
 
 /// Generate markdown tables from results
-pub fn generate_markdown(results: &[BenchmarkResult]) -> String {
+pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> String {
     let mut md = String::new();
 
     md.push_str("# DSV Input Benchmark Results\n\n");
@@ -496,8 +499,14 @@ pub fn generate_markdown(results: &[BenchmarkResult]) -> String {
         }
 
         md.push_str(&format!("## Pattern: {}\n\n", pattern));
-        md.push_str("| Size      | Time     | Throughput   | Memory   |\n");
-        md.push_str("|-----------|----------|--------------|----------|\n");
+        if memory_mode {
+            md.push_str("| Size      | Time     | Throughput   | Memory   |\n");
+            md.push_str("|-----------|----------|--------------|----------|\n");
+        } else {
+            md.push_str("| Size      | Time     | Throughput   |\n");
+            md.push_str("|-----------|----------|--------------|");
+            md.push('\n');
+        }
 
         // Sort by size (largest first)
         let mut sorted = pattern_results.clone();
@@ -514,16 +523,23 @@ pub fn generate_markdown(results: &[BenchmarkResult]) -> String {
             // Format values
             let time = format_time_fixed(r.succinctly.wall_time_ms);
             let throughput_str = format!("{:.1} MiB/s", throughput);
-            let mem = format_memory_fixed(r.succinctly.peak_memory_bytes);
 
             // Size column: **name** with trailing padding (9 chars total)
             let size_bold = format!("**{}**", r.size);
             let size_col = format!("{:<9}", size_bold);
 
-            md.push_str(&format!(
-                "| {} | {} | {:>12} | {} |\n",
-                size_col, time, throughput_str, mem
-            ));
+            if memory_mode {
+                let mem = format_memory_fixed(r.succinctly.peak_memory_bytes);
+                md.push_str(&format!(
+                    "| {} | {} | {:>12} | {} |\n",
+                    size_col, time, throughput_str, mem
+                ));
+            } else {
+                md.push_str(&format!(
+                    "| {} | {} | {:>12} |\n",
+                    size_col, time, throughput_str
+                ));
+            }
         }
 
         md.push('\n');

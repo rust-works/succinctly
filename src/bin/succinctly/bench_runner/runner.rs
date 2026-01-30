@@ -418,8 +418,25 @@ fn run_cli_benchmark(
         );
     }
 
+    // Get the output directory (parent of stdout_dir)
+    let output_dir = stdout_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("stdout_dir has no parent"))?;
+
+    // Set output paths for JSONL and markdown files in the unified output directory
+    let jsonl_path = output_dir.join(format!("{}.jsonl", benchmark.name));
+    let md_path = output_dir.join(format!("{}.md", benchmark.name));
+
     let output = Command::new(&binary)
-        .args(["dev", "bench", subcommand])
+        .args([
+            "dev",
+            "bench",
+            subcommand,
+            "-o",
+            jsonl_path.to_str().unwrap_or(""),
+            "-m",
+            md_path.to_str().unwrap_or(""),
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
