@@ -351,9 +351,9 @@ Note: System `yq` not installed; showing succinctly-only performance.
 
 | Size      | succinctly              | yq                    | Speedup    |
 |-----------|-------------------------|-----------------------|------------|
-| **10KB**  | 2.6 ms   (3.8 MiB/s)    | 59.9 ms (164 KiB/s)   | **23x**    |
-| **100KB** | 4.0 ms  (23.0 MiB/s)    | 74.6 ms (1.2 MiB/s)   | **19x**    |
-| **1MB**   | 17.3 ms (53.3 MiB/s)    |195.3 ms (4.7 MiB/s)   | **11x**    |
+| **10KB**  | 2.7 ms   (3.6 MiB/s)    | 62.9 ms (156 KiB/s)   | **23x**    |
+| **100KB** | 3.7 ms  (26.3 MiB/s)    | 78.2 ms (1.2 MiB/s)   | **21x**    |
+| **1MB**   | 13.8 ms (72.5 MiB/s)    |203.3 ms (4.9 MiB/s)   | **15x**    |
 
 To regenerate: `succinctly bench run yq_bench` (includes memory) or `cargo bench --bench yq_comparison` (time only)
 
