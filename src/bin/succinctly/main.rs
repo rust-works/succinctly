@@ -1565,7 +1565,7 @@ fn generate_dsv_suite(args: GenerateDsvSuite) -> Result<()> {
     Ok(())
 }
 
-/// YAML Suite configuration: patterns and sizes to generate
+/// YAML Suite configuration: patterns that scale to various sizes
 const YAML_SUITE_PATTERNS: &[(&str, yaml_generators::YamlPattern)] = &[
     ("comprehensive", yaml_generators::YamlPattern::Comprehensive),
     ("users", yaml_generators::YamlPattern::Users),
@@ -1574,11 +1574,14 @@ const YAML_SUITE_PATTERNS: &[(&str, yaml_generators::YamlPattern)] = &[
     ("mixed", yaml_generators::YamlPattern::Mixed),
     ("strings", yaml_generators::YamlPattern::Strings),
     ("numbers", yaml_generators::YamlPattern::Numbers),
-    ("config", yaml_generators::YamlPattern::Config),
     ("unicode", yaml_generators::YamlPattern::Unicode),
     ("pathological", yaml_generators::YamlPattern::Pathological),
     ("navigation", yaml_generators::YamlPattern::Navigation),
 ];
+
+/// YAML patterns that are fixed-size (realistic templates, not scaled)
+const YAML_FIXED_PATTERNS: &[(&str, yaml_generators::YamlPattern)] =
+    &[("config", yaml_generators::YamlPattern::Config)];
 
 fn generate_yaml_suite(args: GenerateYamlSuite) -> Result<()> {
     let output_dir = &args.output_dir;
@@ -1605,6 +1608,7 @@ fn generate_yaml_suite(args: GenerateYamlSuite) -> Result<()> {
         format_bytes(args.max_size)
     );
 
+    // Generate scalable patterns at various sizes
     for (pattern_name, pattern) in YAML_SUITE_PATTERNS {
         // Create pattern subdirectory
         let pattern_dir = output_dir.join(pattern_name);
@@ -1643,6 +1647,41 @@ fn generate_yaml_suite(args: GenerateYamlSuite) -> Result<()> {
                 seed
             );
         }
+    }
+
+    // Generate fixed-size patterns (realistic templates, single file each)
+    for (pattern_name, pattern) in YAML_FIXED_PATTERNS {
+        // Create pattern subdirectory
+        let pattern_dir = output_dir.join(pattern_name);
+        std::fs::create_dir_all(&pattern_dir)?;
+
+        let filename = format!("{}.yaml", pattern_name);
+        let path = pattern_dir.join(&filename);
+
+        // Deterministic seed: base_seed + file_index
+        let seed = args.seed.wrapping_add(file_index);
+        file_index += 1;
+
+        // Fixed patterns use their natural size (generators stop when template is complete)
+        // Use a large target to let the generator run to completion
+        let yaml = yaml_generators::generate_yaml(1024 * 1024, *pattern, Some(seed));
+
+        if args.verify {
+            if let Err(e) = succinctly::yaml::YamlIndex::build(yaml.as_bytes()) {
+                anyhow::bail!("Generated invalid YAML for {}: {}", path.display(), e);
+            }
+        }
+
+        std::fs::write(&path, &yaml)?;
+        total_bytes += yaml.len();
+        file_count += 1;
+
+        eprintln!(
+            "  {} ({}, seed={}) [fixed-size]",
+            path.display(),
+            format_bytes(yaml.len()),
+            seed
+        );
     }
 
     eprintln!();

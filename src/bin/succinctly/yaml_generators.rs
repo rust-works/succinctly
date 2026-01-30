@@ -546,12 +546,21 @@ fn add_nested_mapping(
     let ind = indent(indent_level);
     let mut count = 0;
 
-    while yaml.len().saturating_sub(start_len) < target_size && count < 50 {
+    while yaml.len().saturating_sub(start_len) < target_size {
         let used = yaml.len().saturating_sub(start_len);
-        if max_depth > 0 && used < target_size / 2 {
+        let remaining = target_size.saturating_sub(used);
+
+        // Nest if we have depth budget and enough remaining space for it to be worthwhile
+        if max_depth > 0 && remaining > 100 {
             yaml.push_str(&format!("{}level_{}:\n", ind, count));
-            let remaining = target_size.saturating_sub(yaml.len().saturating_sub(start_len));
-            add_nested_mapping(yaml, remaining / 2, rng, indent_level + 2, max_depth - 1);
+            // Give 90% of remaining to nested content to ensure proper scaling
+            add_nested_mapping(
+                yaml,
+                remaining * 9 / 10,
+                rng,
+                indent_level + 2,
+                max_depth - 1,
+            );
         } else {
             let value = rng.as_mut().map(|r| r.gen_range(0..100)).unwrap_or(count);
             yaml.push_str(&format!("{}leaf_{}: {}\n", ind, count, value));
@@ -571,14 +580,16 @@ fn add_mixed_nested(
     let ind = indent(indent_level);
     let mut count = 0;
 
-    while yaml.len().saturating_sub(start_len) < target_size && count < 30 {
+    while yaml.len().saturating_sub(start_len) < target_size {
         let use_sequence = rng
             .as_mut()
             .map(|r| r.r#gen::<bool>())
             .unwrap_or(count % 2 == 0);
         let used = yaml.len().saturating_sub(start_len);
+        let remaining = target_size.saturating_sub(used);
 
-        if max_depth > 0 && used < target_size / 2 {
+        // Nest if we have depth budget and enough remaining space
+        if max_depth > 0 && remaining > 100 {
             if use_sequence {
                 yaml.push_str(&format!("{}list_{}:\n", ind, count));
                 let items = rng.as_mut().map(|r| r.gen_range(2..5)).unwrap_or(3);
@@ -587,8 +598,14 @@ fn add_mixed_nested(
                 }
             } else {
                 yaml.push_str(&format!("{}map_{}:\n", ind, count));
-                let remaining = target_size.saturating_sub(yaml.len().saturating_sub(start_len));
-                add_mixed_nested(yaml, remaining / 3, rng, indent_level + 2, max_depth - 1);
+                // Give 90% of remaining to nested content to ensure proper scaling
+                add_mixed_nested(
+                    yaml,
+                    remaining * 9 / 10,
+                    rng,
+                    indent_level + 2,
+                    max_depth - 1,
+                );
             }
         } else {
             yaml.push_str(&format!("{}value_{}: {}\n", ind, count, count));
