@@ -4,7 +4,7 @@ This document provides a comprehensive index of all benchmark reports in the pro
 
 ## Overview
 
-The project contains **7 main benchmark documentation files** with approximately **120+ distinct benchmark report sections**.
+The project contains **7 main benchmark documentation files** with approximately **150+ distinct benchmark report sections**, plus **6 core/internal benchmark suites**.
 
 | File | Description | Sections |
 |------|-------------|----------|
@@ -12,8 +12,8 @@ The project contains **7 main benchmark documentation files** with approximately
 | [yq.md](yq.md) | YAML query performance vs system yq | ~35 |
 | [dsv.md](dsv.md) | CSV/TSV parsing performance | ~8 |
 | [cross-language.md](cross-language.md) | Multi-parser JSON comparison | ~15 |
-| [rust-parsers.md](rust-parsers.md) | Rust JSON parser comparison | ~12 |
-| [rust-yaml-parsers.md](rust-yaml-parsers.md) | Rust YAML parser comparison | ~10 |
+| [rust-parsers.md](rust-parsers.md) | Rust JSON parser comparison (x86_64 + ARM) | ~20 |
+| [rust-yaml-parsers.md](rust-yaml-parsers.md) | Rust YAML parser comparison (x86_64 + ARM) | ~16 |
 | [../parsing/yaml.md](../parsing/yaml.md) | YAML optimization phases | ~15 |
 
 ---
@@ -491,11 +491,62 @@ YAML parsing implementation and optimization benchmark results.
 
 ---
 
+## Core/Internal Benchmarks
+
+Internal micro-benchmarks for succinct data structures. Not documented in separate files but run via Criterion.
+
+### Succinct Data Structures
+- **rank_select**: O(1) rank and O(log n) select operations on BitVec
+  - rank1 at various densities (1%, 10%, 50%, 90%) for 1M and 10M bitvectors
+  - select1 at various densities for 1M and 10M bitvectors
+  - Construction time for 1M and 10M bitvectors
+  - select_in_word micro-benchmark (sparse/dense patterns)
+
+- **balanced_parens**: BP tree navigation operations
+  - findclose, findopen, enclose, excess
+  - Various tree sizes and shapes
+
+- **bp_select_micro**: BP select1 performance (for P11 optimization validation)
+  - 10K queries across various BP sizes (1K-1M opens)
+  - Compares binary search vs sampled select
+
+- **elias_fano**: Elias-Fano compressed sequence operations
+  - Construction, iteration, random access
+  - Various sequence lengths and densities
+
+### SIMD/Popcount Benchmarks
+- **popcount_strategies**: Hardware vs software popcount
+  - Native POPCNT (x86_64), NEON (ARM)
+  - Lookup table fallback
+  - Cumulative popcount for block indexing
+
+- **neon_movemask**: ARM NEON movemask emulation
+  - Various approaches to extract comparison results
+  - Comparison with x86 PMOVMSKB equivalent
+
+### Running Core Benchmarks
+```bash
+# All core benchmarks
+cargo bench --bench rank_select
+cargo bench --bench balanced_parens
+cargo bench --bench bp_select_micro
+cargo bench --bench elias_fano
+cargo bench --bench popcount_strategies
+cargo bench --bench neon_movemask
+
+# Via unified runner
+./target/release/succinctly bench run rank_select
+./target/release/succinctly bench run balanced_parens
+./target/release/succinctly bench run --all  # Runs all 23 benchmarks
+```
+
+---
+
 ## Finding Specific Benchmarks
 
 ### By Platform
-- **AMD Ryzen 9 7950X (x86_64)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [cross-language.md](cross-language.md), [rust-parsers.md](rust-parsers.md), [yaml.md](../parsing/yaml.md)
-- **ARM Neoverse-V2 (Graviton 4)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md)
+- **AMD Ryzen 9 7950X (x86_64)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [cross-language.md](cross-language.md), [rust-parsers.md](rust-parsers.md), [rust-yaml-parsers.md](rust-yaml-parsers.md), [yaml.md](../parsing/yaml.md)
+- **ARM Neoverse-V2 (Graviton 4)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [rust-parsers.md](rust-parsers.md), [rust-yaml-parsers.md](rust-yaml-parsers.md)
 - **ARM Neoverse-V1 (Graviton 3)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md)
 - **Apple M1 Max**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [cross-language.md](cross-language.md), [yaml.md](../parsing/yaml.md)
 
