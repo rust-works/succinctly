@@ -8,38 +8,62 @@ Creates releases for the succinctly crate. Triggered by terms like "release", "p
 
 ### Steps
 
-1. **Update CHANGELOG.md**
-   - Move `[Unreleased]` items to new version section
-   - Add date in format `YYYY-MM-DD`
-   - Update comparison links at bottom of file
+1. **Gather ALL changes since last release**
+   ```bash
+   git describe --tags --abbrev=0  # Get last tag (e.g., v0.4.0)
+   git log v0.4.0..HEAD --oneline --no-merges  # ALL commits, not just recent
+   ```
+   - Review the FULL list - there may be 50+ commits
+   - Categorize by: CLI, Performance, Memory, SIMD, Compatibility, Fixes
 
-2. **Bump version in Cargo.toml**
+2. **Run quality checks FIRST**
+   ```bash
+   ./scripts/build.sh
+   cargo test --all-features
+   ```
+
+3. **Bump version in Cargo.toml**
    - Follow semver: MAJOR.MINOR.PATCH
    - MAJOR: Breaking API changes
    - MINOR: New features (backward compatible)
    - PATCH: Bug fixes (backward compatible)
 
-3. **Update version snapshot** (if test fails)
+4. **Update version snapshot** (ALWAYS required)
    ```bash
-   cargo insta accept
+   grep -r "0\.4\.0" tests/snapshots/  # Find version in snapshots
    ```
+   - Update `tests/snapshots/cli_golden_tests__version.snap`
+   - This test WILL fail if you skip this step
 
-4. **Run tests**
-   ```bash
-   cargo test
-   cargo clippy --all-targets --all-features -- -D warnings
-   ```
+5. **Update CHANGELOG.md**
+   - Create new version section with date `YYYY-MM-DD`
+   - Group changes by user impact (not by commit type):
+     - **CLI Enhancements** - user-facing CLI features
+     - **Performance** - speed/memory improvements with metrics
+     - **SIMD Optimizations** - architecture-specific speedups
+     - **Memory Optimizations** - space efficiency improvements
+     - **Fixed** - bug fixes
+   - Update comparison links at bottom of file
 
-5. **Commit the release**
+6. **Commit the release**
    ```bash
    git add Cargo.toml Cargo.lock CHANGELOG.md tests/snapshots/
    git commit -m "chore(release): prepare vX.Y.Z"
    ```
 
-6. **Create and push tag**
+7. **Push via PR** (branch protection may block direct push)
    ```bash
-   git tag -a vX.Y.Z -m "Release vX.Y.Z - brief description"
-   git push origin main
+   git checkout -b release/vX.Y.Z
+   git push -u origin release/vX.Y.Z
+   gh pr create --title "chore(release): prepare vX.Y.Z" --body "..."
+   ```
+   - If direct push to main is allowed, use that instead
+   - Wait for PR to be merged before tagging
+
+8. **Create and push tag** (after merge)
+   ```bash
+   git checkout main && git pull origin main
+   git tag -a vX.Y.Z -m "Release vX.Y.Z"
    git push origin vX.Y.Z
    ```
 
@@ -58,6 +82,9 @@ Creates releases for the succinctly crate. Triggered by terms like "release", "p
 - **Never run `cargo publish` manually** - CI handles this
 - **Never push a tag before the commit is pushed** - tag must reference pushed commit
 - **Never skip updating CHANGELOG.md** - it's part of the release
+- **Never look at only recent commits** - always check ALL commits since last tag
+- **Never forget version snapshots** - grep for old version across codebase
+- **Never push directly to main without checking** - branch protection may require PR
 
 ## Troubleshooting
 
