@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-01-31
+
+### Added
+
+- **CLI Enhancements**
+  - Multi-call binary support: `sjq`, `syq`, `sjq-locate`, `syq-locate` symlinks
+  - `succinctly install-aliases` command to create symlinks
+  - Unified benchmark runner (`succinctly bench run`) with comprehensive metadata tracking
+  - Default memory collection for CLI benchmarks
+
+- **YAML Streaming (M2.5)**
+  - Direct YAML→JSON streaming for navigation queries (`.[0]`, `.[]`)
+  - Eliminates intermediate `OwnedValue` DOM for 2-3x faster identity queries
+  - 3-4% of yq's memory usage on large files
+
+- **Memory Optimizations**
+  - Advance Index: memory-efficient `bp_to_text` mapping with ~1.5x compression
+  - EndPositions: 2-bitmap encoding for scalar end positions
+  - Sequential cursor optimization for amortized O(1) position lookups
+  - Elias-Fano encoding for monotone integer sequences
+  - CompactRank two-level directory for O(1) rank queries
+  - In-place builder for cache-aligned L1L2 storage
+
+- **SIMD Optimizations**
+  - AVX2-accelerated JSON escape scanning for YAML→JSON output on x86_64
+  - ARM64 NEON escape scanning for JSON output (4-12x faster on long strings)
+  - BMI2 PDEP support for O(1) select-in-word on x86_64
+
+- **yq Compatibility**
+  - Key ordering in yq mode: object keys output in document order (matching `jq -yy`)
+
+### Changed
+
+- Build regression mitigation: inline zero-filling and lazy newline index (P12-A)
+
+### Fixed
+
+- `keys` function ordering now compatible with yq mode (returns keys in document order)
+- `no_std` compatibility: added missing `alloc::boxed::Box` import
+- Elias-Fano: fixed `no_std` and rustdoc compatibility
+- Flaky CI: implemented cargo retry logic for test stability
+
+### Performance
+
+- yq identity queries: 20-25% faster on 1MB files (P12 Advance Index)
+- yq small-medium files: 3-13% faster (O1 sequential cursor)
+- YAML parsing: 11-85% faster build times (P12-A mitigations)
+- Escape scanning: 4-12x faster with SIMD (O3)
+
 ## [0.4.0] - 2026-01-24
 
 ### Added
@@ -217,7 +266,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Select queries: ~50 ns (O(log n))
 - Popcount: 96.8 GiB/s (AVX-512), 18.5 GiB/s (scalar)
 
-[Unreleased]: https://github.com/rust-works/succinctly/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/rust-works/succinctly/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/rust-works/succinctly/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/rust-works/succinctly/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rust-works/succinctly/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rust-works/succinctly/compare/v0.1.0...v0.2.0
