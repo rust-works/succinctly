@@ -740,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "succinctly"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytemuck",
  "indexmap",
