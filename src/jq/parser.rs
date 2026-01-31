@@ -4734,6 +4734,29 @@ mod tests {
     }
 
     #[test]
+    fn test_yq_mode_keys_returns_document_order() {
+        // In yq mode, `keys` returns document order (like yq), not sorted (like jq)
+        // This matches yq's behavior where key order is preserved
+        assert_eq!(
+            parse_with_mode("keys", ParserMode::Yq).unwrap(),
+            Expr::Builtin(Builtin::KeysUnsorted)
+        );
+
+        // In jq mode (default), `keys` returns sorted order
+        assert_eq!(parse("keys").unwrap(), Expr::Builtin(Builtin::Keys));
+
+        // keys_unsorted is available in both modes for explicit document order
+        assert_eq!(
+            parse_with_mode("keys_unsorted", ParserMode::Yq).unwrap(),
+            Expr::Builtin(Builtin::KeysUnsorted)
+        );
+        assert_eq!(
+            parse("keys_unsorted").unwrap(),
+            Expr::Builtin(Builtin::KeysUnsorted)
+        );
+    }
+
+    #[test]
     fn test_jq_mode_kebab_case_is_subtraction() {
         // In Jq mode (default), .foo-bar is parsed as .foo minus bar
         let expr = parse(".foo-bar").unwrap();
