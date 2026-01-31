@@ -27,6 +27,7 @@ Creates releases for the succinctly crate. Triggered by terms like "release", "p
    - MAJOR: Breaking API changes
    - MINOR: New features (backward compatible)
    - PATCH: Bug fixes (backward compatible)
+   - Run `cargo check` or `cargo build` to update `Cargo.lock` with the new version
 
 4. **Update version snapshot** (ALWAYS required)
    ```bash
