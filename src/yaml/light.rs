@@ -160,20 +160,18 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // Check for sequence item wrapper (non-container node starting with "- ").
         // Sequence items delegate to their first child's value.
         // This inline check uses the already-computed text_pos to avoid redundant lookups.
-        if self.text[text_pos] == b'-' {
-            let is_seq_item = if text_pos + 1 >= self.text.len() {
-                true
-            } else {
-                let next = self.text[text_pos + 1];
-                next == b' ' || next == b'\t' || next == b'\n' || next == b'\r'
-            };
-            if is_seq_item {
-                if let Some(child) = self.first_child() {
-                    return child.value();
-                }
-                // Empty sequence item (null)
-                return YamlValue::Null;
+        // Optimized: single branch using .get() with space as default (valid seq terminator).
+        if self.text[text_pos] == b'-'
+            && matches!(
+                self.text.get(text_pos + 1).copied().unwrap_or(b' '),
+                b' ' | b'\t' | b'\n' | b'\r'
+            )
+        {
+            if let Some(child) = self.first_child() {
+                return child.value();
             }
+            // Empty sequence item (null)
+            return YamlValue::Null;
         }
 
         // Check for alias (only for non-container nodes)
