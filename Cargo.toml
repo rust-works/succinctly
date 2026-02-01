@@ -98,7 +98,15 @@ name = "rank_select"
 harness = false
 
 [[bench]]
-name = "json_simd"
+name = "json_simd_indexing"
+harness = false
+
+[[bench]]
+name = "json_simd_cursor"
+harness = false
+
+[[bench]]
+name = "json_simd_full"
 harness = false
 
 [[bench]]
