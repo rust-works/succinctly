@@ -135,7 +135,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // A sequence item is a thin wrapper around the actual content:
         //   - [item1, item2]  <- sequence item wrappers contain the actual values
         // The item wrapper's first_child IS the value (could be scalar, mapping, etc.)
-        if self.index.is_seq_item(self.bp_pos) {
+        if self.index.is_seq_item(self.text, self.bp_pos) {
             if let Some(child) = self.first_child() {
                 return child.value();
             }
