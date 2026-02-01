@@ -452,34 +452,6 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             false
         }
     }
-
-    /// Count sequence items at BP positions 0..bp_pos.
-    ///
-    /// This is used to adjust TY index calculations since sequence items
-    /// have BP opens but no TY entries.
-    #[inline]
-    pub fn count_seq_items_before(&self, bp_pos: usize) -> usize {
-        let seq_item_words = self.seq_items.as_ref();
-        if seq_item_words.is_empty() {
-            return 0;
-        }
-
-        let word_idx = bp_pos / 64;
-        let bit_idx = bp_pos % 64;
-
-        let mut count = 0usize;
-        for word in seq_item_words.iter().take(word_idx) {
-            count += word.count_ones() as usize;
-        }
-
-        if word_idx < seq_item_words.len() && bit_idx > 0 {
-            let mask = (1u64 << bit_idx) - 1;
-            count += (seq_item_words[word_idx] & mask).count_ones() as usize;
-        }
-
-        count
-    }
-
     /// Debug helper to get open position for a given open index.
     #[cfg(test)]
     pub fn debug_open_position_at(&self, open_idx: usize) -> Option<u32> {
