@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-02-02
+
+### Fixed
+
+- `jq`: Return `null` for missing fields on objects instead of error (issue #61)
+
+### Changed
+
+- Refactored `json_simd` benchmark into focused components for better maintainability
+- Removed unused `count_seq_items_before` method from YAML parser
+
+### Documentation
+
+- Added Apple M4 Pro benchmark results
+- Updated ARM Neoverse-V2 benchmark results
+
 ## [0.5.0] - 2026-01-31
 
 ### Added
@@ -266,7 +282,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Select queries: ~50 ns (O(log n))
 - Popcount: 96.8 GiB/s (AVX-512), 18.5 GiB/s (scalar)
 
-[Unreleased]: https://github.com/rust-works/succinctly/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/rust-works/succinctly/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/rust-works/succinctly/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/rust-works/succinctly/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/rust-works/succinctly/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rust-works/succinctly/compare/v0.2.0...v0.3.0
