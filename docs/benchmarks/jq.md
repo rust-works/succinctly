@@ -561,6 +561,126 @@ cargo build --release --features bench-runner
 
 ---
 
+# Apple M4 Pro (ARM, aarch64)
+
+**CPU**: Apple M4 Pro (12 cores)
+**OS**: macOS 15.6.1
+**jq version**: System jq
+**succinctly**: Built with `--release --features cli`
+**Date**: 2026-02-01
+
+## Pattern: arrays
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    7.08s |    **5.24s** |      **1.4x** |    3 GB |   522 MB |      0.15x |
+| **10mb**  |  900.3ms |  **435.0ms** |      **2.1x** |  347 MB |    71 MB |      0.20x |
+| **1mb**   |   72.9ms |   **42.8ms** |      **1.7x** |   36 MB |     9 MB |      0.25x |
+| **100kb** |    9.9ms |    **6.8ms** |      **1.5x** |    6 MB |     5 MB |      0.87x |
+| **10kb**  |    3.6ms |    **3.6ms** |      **1.0x** |    3 MB |     4 MB |      1.75x |
+| **1kb**   |    3.0ms |      3.3ms   |          0.9x |    2 MB |     4 MB |      1.96x |
+
+## Pattern: comprehensive
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    4.66s |    **2.52s** |      **1.8x** |    1 GB |   118 MB |      0.09x |
+| **10mb**  |  513.5ms |  **227.3ms** |      **2.3x** |  127 MB |    16 MB |      0.12x |
+| **1mb**   |   54.4ms |   **24.5ms** |      **2.2x** |   15 MB |     6 MB |      0.37x |
+| **100kb** |    8.5ms |    **5.3ms** |      **1.6x** |    4 MB |     5 MB |      1.28x |
+| **10kb**  |    3.4ms |    **3.4ms** |      **1.0x** |    2 MB |     4 MB |      1.90x |
+| **1kb**   |    2.8ms |      3.2ms   |          0.9x |    2 MB |     4 MB |      1.99x |
+
+## Pattern: literals
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    3.40s |    **3.16s** |      **1.1x** |  915 MB |   147 MB |      0.16x |
+| **10mb**  |  402.3ms |  **266.7ms** |      **1.5x** |  104 MB |    19 MB |      0.18x |
+| **1mb**   |   34.9ms |   **27.1ms** |      **1.3x** |   12 MB |     6 MB |      0.49x |
+| **100kb** |    6.3ms |    **5.2ms** |      **1.2x** |    3 MB |     4 MB |      1.34x |
+| **10kb**  |    3.1ms |      3.2ms   |          0.9x |    2 MB |     4 MB |      1.90x |
+| **1kb**   |    2.9ms |      3.1ms   |          0.9x |    2 MB |     4 MB |      1.98x |
+
+## Pattern: mixed
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |  815.3ms |  **307.5ms** |      **2.7x** |  233 MB |    22 MB |      0.10x |
+| **10mb**  |   67.0ms |   **31.4ms** |      **2.1x** |   26 MB |     6 MB |      0.23x |
+| **1mb**   |   12.3ms |    **6.0ms** |      **2.0x** |    5 MB |     4 MB |      0.99x |
+| **100kb** |    3.4ms |    **3.4ms** |      **1.0x** |    2 MB |     4 MB |      1.81x |
+| **10kb**  |    2.8ms |      3.2ms   |          0.9x |    2 MB |     4 MB |      1.96x |
+| **1kb**   |    2.8ms |      3.2ms   |          0.9x |    2 MB |     4 MB |      1.96x |
+
+## Pattern: nested
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    2.60s |  **293.0ms** |      **8.9x** |  210 MB |   239 MB |      1.14x |
+| **10mb**  |  272.8ms |   **35.2ms** |      **7.8x** |   30 MB |    28 MB |      0.92x |
+| **1mb**   |   46.2ms |    **6.2ms** |      **7.5x** |    4 MB |     7 MB |      1.58x |
+| **100kb** |    5.3ms |    **3.4ms** |      **1.6x** |    2 MB |     5 MB |      1.87x |
+| **10kb**  |    3.0ms |      3.1ms   |          1.0x |    2 MB |     4 MB |      1.95x |
+| **1kb**   |    2.8ms |      3.1ms   |          0.9x |    2 MB |     4 MB |      1.97x |
+
+## Pattern: numbers
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    2.38s |    **1.51s** |      **1.6x** |  982 MB |   132 MB |      0.13x |
+| **10mb**  |  259.9ms |  **141.0ms** |      **1.8x** |   98 MB |    17 MB |      0.18x |
+| **1mb**   |   29.2ms |   **16.6ms** |      **1.8x** |   12 MB |     6 MB |      0.46x |
+| **100kb** |    5.1ms |    **4.4ms** |      **1.2x** |    3 MB |     5 MB |      1.41x |
+| **10kb**  |    3.0ms |      3.1ms   |          0.9x |    2 MB |     4 MB |      1.92x |
+| **1kb**   |    2.9ms |      3.1ms   |          0.9x |    2 MB |     4 MB |      1.99x |
+
+## Pattern: pathological
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    9.84s |    **5.22s** |      **1.9x** |    5 GB |   365 MB |      0.08x |
+| **10mb**  |    1.30s |  **425.9ms** |      **3.0x** |  470 MB |    38 MB |      0.08x |
+| **1mb**   |  107.9ms |   **40.8ms** |      **2.6x** |   49 MB |     7 MB |      0.15x |
+| **100kb** |   14.6ms |    **6.6ms** |      **2.2x** |    7 MB |     5 MB |      0.69x |
+| **10kb**  |    4.1ms |    **3.4ms** |      **1.2x** |    3 MB |     4 MB |      1.64x |
+| **1kb**   |    2.9ms |      3.2ms   |          0.9x |    2 MB |     4 MB |      1.94x |
+
+## Pattern: strings
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    2.20s |  **446.5ms** |      **4.9x** |  150 MB |   123 MB |      0.82x |
+| **10mb**  |  361.0ms |   **44.9ms** |      **8.0x** |   17 MB |    16 MB |      0.98x |
+| **1mb**   |   41.9ms |    **7.4ms** |      **5.7x** |    4 MB |     6 MB |      1.55x |
+| **100kb** |    5.3ms |    **3.4ms** |      **1.5x** |    2 MB |     4 MB |      1.91x |
+| **10kb**  |    2.9ms |      3.2ms   |          0.9x |    2 MB |     4 MB |      1.95x |
+| **1kb**   |    2.7ms |      3.2ms   |          0.9x |    2 MB |     4 MB |      1.95x |
+
+## Pattern: unicode
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    2.39s |    **1.12s** |      **2.1x** |  423 MB |   141 MB |      0.33x |
+| **10mb**  |  254.2ms |  **100.0ms** |      **2.5x** |   42 MB |    18 MB |      0.43x |
+| **1mb**   |   28.0ms |   **12.6ms** |      **2.2x** |    7 MB |     6 MB |      0.88x |
+| **100kb** |    5.2ms |    **4.1ms** |      **1.3x** |    3 MB |     5 MB |      1.72x |
+| **10kb**  |    3.2ms |      3.3ms   |          1.0x |    2 MB |     4 MB |      1.92x |
+| **1kb**   |    2.9ms |      3.1ms   |          0.9x |    2 MB |     4 MB |      1.93x |
+
+## Pattern: users
+
+| Size      | jq       | succinctly   | Speedup       | jq Mem  | succ Mem | Mem Ratio  |
+|-----------|----------|--------------|---------------|---------|----------|------------|
+| **100mb** |    3.66s |    **1.27s** |      **2.9x** |  647 MB |    99 MB |      0.15x |
+| **10mb**  |  287.7ms |  **126.7ms** |      **2.3x** |   67 MB |    14 MB |      0.20x |
+| **1mb**   |   31.7ms |   **14.4ms** |      **2.2x** |    9 MB |     5 MB |      0.61x |
+| **100kb** |    5.4ms |    **4.1ms** |      **1.3x** |    3 MB |     4 MB |      1.58x |
+| **10kb**  |    2.9ms |      3.2ms   |          0.9x |    2 MB |     4 MB |      1.94x |
+| **1kb**   |    2.8ms |      3.1ms   |          0.9x |    2 MB |     4 MB |      1.96x |
+
+---
+
 ## Pattern Descriptions
 
 | Pattern           | Description                                     |
@@ -592,6 +712,13 @@ cargo build --release --features bench-runner
 - **Best performance on nested data**: 5.8x speedup on deeply nested structures (100MB)
 - **String-heavy data**: 4.1x speedup due to efficient escape handling
 - **Generally faster than x86_64**: ARM NEON SIMD provides better acceleration for JSON parsing
+
+**Apple M4 Pro (ARM)**:
+- **1.0-8.9x faster** across all patterns and sizes
+- **Best performance on nested data**: 8.9x speedup on deeply nested structures (100MB)
+- **String-heavy data**: 8.0x speedup on 10MB strings, 4.9x on 100MB
+- **Pathological data**: 3.0x speedup on worst-case patterns (10MB)
+- **Fastest ARM platform tested**: M4 Pro shows significant improvements over M1 Max
 
 ### Memory
 

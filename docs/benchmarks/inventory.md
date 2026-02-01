@@ -27,6 +27,7 @@ Comprehensive benchmarks comparing `succinctly jq .` vs `jq .` for JSON formatti
 - ARM Neoverse-V2 (AWS Graviton 4)
 - ARM Neoverse-V1 (AWS Graviton 3)
 - Apple M1 Max (ARM)
+- Apple M4 Pro (ARM)
 
 ### Benchmark Sections
 
@@ -77,6 +78,18 @@ Comprehensive benchmarks comparing `succinctly jq .` vs `jq .` for JSON formatti
 - Pattern: unicode
 - Pattern: users
 
+#### Apple M4 Pro (ARM)
+- Pattern: arrays
+- Pattern: comprehensive
+- Pattern: literals
+- Pattern: mixed
+- Pattern: nested
+- Pattern: numbers
+- Pattern: pathological
+- Pattern: strings
+- Pattern: unicode
+- Pattern: users
+
 ---
 
 ## [yq.md](yq.md) - YAML Query Benchmarks
@@ -87,6 +100,7 @@ Benchmarks comparing `succinctly yq .` vs `yq .` (Mike Farah's yq) for YAML form
 - ARM Neoverse-V2 (AWS Graviton 4)
 - ARM Neoverse-V1 (AWS Graviton 3)
 - Apple M1 Max
+- Apple M4 Pro
 - AMD Ryzen 9 7950X (Zen 4)
 
 ### Benchmark Sections
@@ -132,6 +146,18 @@ Benchmarks comparing `succinctly yq .` vs `yq .` (Mike Farah's yq) for YAML form
 - Pattern: numbers
 - Pattern: unicode
 - Pattern: mixed
+
+#### Detailed Results by Pattern (ARM - Apple M4 Pro)
+- Pattern: comprehensive
+- Pattern: mixed
+- Pattern: navigation
+- Pattern: nested
+- Pattern: numbers
+- Pattern: pathological
+- Pattern: sequences
+- Pattern: strings
+- Pattern: unicode
+- Pattern: users
 
 #### Detailed Results by Pattern (x86_64 - AMD Ryzen 9 7950X)
 - Pattern: comprehensive
@@ -549,6 +575,7 @@ cargo bench --bench neon_movemask
 - **ARM Neoverse-V2 (Graviton 4)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [rust-parsers.md](rust-parsers.md), [rust-yaml-parsers.md](rust-yaml-parsers.md)
 - **ARM Neoverse-V1 (Graviton 3)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md)
 - **Apple M1 Max**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [cross-language.md](cross-language.md), [yaml.md](../parsing/yaml.md)
+- **Apple M4 Pro**: [jq.md](jq.md), [yq.md](yq.md)
 
 ### By Format
 - **JSON**: [jq.md](jq.md), [cross-language.md](cross-language.md), [rust-parsers.md](rust-parsers.md)

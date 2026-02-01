@@ -297,11 +297,19 @@ cargo test
 
 | Size      | succinctly            | jq                    | Speedup    |
 |-----------|-----------------------|-----------------------|------------|
-| **10KB**  |  4.2 ms  (2.2 MiB/s)  |  4.3 ms  (2.1 MiB/s)  | **1.0x**   |
-| **100KB** |  6.5 ms (13.2 MiB/s)  |  8.2 ms (10.4 MiB/s)  | **1.3x**   |
-| **1MB**   | 28.0 ms (28.8 MiB/s)  | 43.8 ms (18.5 MiB/s)  | **1.6x**   |
+| **10KB**  |  5.7 ms  (1.7 MiB/s)  |  6.0 ms  (1.6 MiB/s)  | **1.0x**   |
+| **100KB** |  8.2 ms (11.9 MiB/s)  | 12.0 ms  (8.1 MiB/s)  | **1.5x**   |
+| **1MB**   | 38.9 ms (25.7 MiB/s)  | 70.9 ms (14.1 MiB/s)  | **1.8x**   |
 
-To regenerate: `cargo bench --bench jq_comparison`
+### jq Query Performance (Apple M4 Pro)
+
+| Size      | succinctly            | jq                    | Speedup    |
+|-----------|-----------------------|-----------------------|------------|
+| **10KB**  |  3.4 ms  (2.9 MiB/s)  |  3.4 ms  (2.9 MiB/s)  | **1.0x**   |
+| **100KB** |  5.3 ms (18.4 MiB/s)  |  8.5 ms (11.5 MiB/s)  | **1.6x**   |
+| **1MB**   | 24.5 ms (40.8 MiB/s)  | 54.4 ms (18.4 MiB/s)  | **2.2x**   |
+
+To regenerate: `succinctly bench run jq_bench`
 
 ### jq Query Performance (ARM Neoverse-V2)
 
@@ -323,11 +331,21 @@ To regenerate: `cargo bench --bench jq_comparison`
 
 | Size       | succinctly             | yq                     | Speedup     | Mem Ratio  |
 |------------|------------------------|------------------------|-------------|------------|
-| **10KB**   |   5.9 ms  (1.7 MiB/s)  |  10.2 ms  (1.0 MiB/s)  | **1.7x**    | **0.51x**  |
-| **100KB**  |   7.1 ms (13.0 MiB/s)  |  20.2 ms  (4.6 MiB/s)  | **2.8x**    | **0.33x**  |
-| **1MB**    |  18.3 ms (50.3 MiB/s)  | 114.8 ms  (8.0 MiB/s)  | **6.3x**    | **0.13x**  |
-| **10MB**   | 123.6 ms (74.5 MiB/s)  |   1.04 s  (8.9 MiB/s)  | **8.4x**    | **0.04x**  |
-| **100MB**  |   1.12 s (82.4 MiB/s)  |   9.74 s  (9.5 MiB/s)  | **8.7x**    | **0.04x**  |
+| **10KB**   |   5.5 ms  (1.8 MiB/s)  |   9.1 ms  (1.1 MiB/s)  | **1.7x**    | **0.51x**  |
+| **100KB**  |   6.1 ms (16.0 MiB/s)  |  19.5 ms  (5.0 MiB/s)  | **3.2x**    | **0.33x**  |
+| **1MB**    |  18.6 ms (53.8 MiB/s)  | 113.7 ms  (8.8 MiB/s)  | **6.1x**    | **0.12x**  |
+| **10MB**   | 119.8 ms (83.5 MiB/s)  |   1.02 s  (9.8 MiB/s)  | **8.5x**    | **0.05x**  |
+| **100MB**  |   1.09 s (91.7 MiB/s)  |   9.74 s (10.3 MiB/s)  | **8.9x**    | **0.04x**  |
+
+### yq Query Performance (Apple M4 Pro)
+
+| Size       | succinctly             | yq                     | Speedup     | Mem Ratio  |
+|------------|------------------------|------------------------|-------------|------------|
+| **10KB**   |   3.1 ms  (3.2 MiB/s)  |   5.8 ms  (1.7 MiB/s)  | **1.9x**    | **0.33x**  |
+| **100KB**  |   4.0 ms (24.4 MiB/s)  |  13.6 ms  (7.2 MiB/s)  | **3.4x**    | **0.22x**  |
+| **1MB**    |  12.0 ms (83.3 MiB/s)  |  78.0 ms (12.8 MiB/s)  | **6.5x**    | **0.09x**  |
+| **10MB**   |  87.0 ms (114.9 MiB/s) | 694.7 ms (14.4 MiB/s)  | **8.0x**    | **0.05x**  |
+| **100MB**  | 815.3 ms (122.7 MiB/s) |   6.77 s (14.8 MiB/s)  | **8.3x**    | **0.04x**  |
 
 ### yq Query Performance (ARM Neoverse-V2)
 
@@ -361,12 +379,12 @@ To regenerate: `succinctly bench run yq_bench` (includes memory) or `cargo bench
 
 | Query       | Path          | succinctly | yq       | Speedup     | succ Mem | yq Mem  |
 |-------------|---------------|------------|----------|-------------|----------|---------|
-| `.`         | P9 streaming  | 1.27s      | 11.40s   | **9.0x**    | 275 MB   | 7 GB    |
+| `.`         | P9 streaming  | 1.21s      | 11.31s   | **9.4x**    | 275 MB   | 7 GB    |
 | `.[0]`      | M2 streaming  | 444ms      | 5.84s    | **13.2x**   | 254 MB   | 5 GB    |
 | `.[]`       | M2 streaming  | 2.53s      | 13.30s   | **5.3x**    | 269 MB   | 8 GB    |
 | `length`    | OwnedValue    | 445ms      | 5.84s    | **13.1x**   | 254 MB   | 5 GB    |
 
-M2 streaming (`.[0]`) is **2.9x faster** than identity (`.`), with **3-4% of yq's memory**.
+M2 streaming (`.[0]`) is **2.7x faster** than identity (`.`), with **3-4% of yq's memory**.
 
 To benchmark: `succinctly bench run yq_bench --queries all` (memory collected by default)
 
