@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-02-03
+
+### Added
+
+- **jq Compatibility Enhancements**
+  - Comprehensive null handling: array indexing, object operations, and built-in functions return null instead of errors
+  - String slicing with character-based indexing, negative indices, and Unicode support
+  - Overflow handling that converts to float on integer overflow
+  - Division and modulo by zero error handling with proper error messages
+  - `has()` and `in()` functions properly reject negative array indices
+  - `split()` handles empty delimiter by splitting into individual characters
+  - `@uri`, `@html`, `@sh` format functions accept and convert non-string types
+  - `first`, `last`, `nth` return null for empty/null inputs
+  - `reverse()` returns empty array for null input
+  - `getpath()` traverses null values gracefully
+
+- **yq Compatibility Enhancements**
+  - yq-compatible evaluation mode with different arithmetic semantics (wrapping overflow, infinity for division by zero)
+  - Compile-time evaluation semantics system via `EvalSemantics` trait
+  - `JqSemantics` and `YqSemantics` marker types for zero-cost abstraction
+  - Negative array indexing support for `has()` and `in()` in yq mode
+
+### Changed
+
+- **Breaking**: `eval()` and `eval_lenient()` now require a semantics type parameter (`JqSemantics` or `YqSemantics`)
+- **Breaking**: Removed `set_eval_mode()` and `get_eval_mode()` functions (replaced by compile-time generics)
+- Replaced runtime evaluation mode switching with compile-time generic semantics for zero-overhead mode selection
+
+### Performance
+
+- Eliminated runtime mode checking branches in arithmetic operations through monomorphization
+
 ## [0.5.1] - 2026-02-02
 
 ### Fixed
@@ -282,7 +314,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Select queries: ~50 ns (O(log n))
 - Popcount: 96.8 GiB/s (AVX-512), 18.5 GiB/s (scalar)
 
-[Unreleased]: https://github.com/rust-works/succinctly/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/rust-works/succinctly/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/rust-works/succinctly/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/rust-works/succinctly/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/rust-works/succinctly/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/rust-works/succinctly/compare/v0.3.0...v0.4.0

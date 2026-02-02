@@ -2,4 +2,4 @@
 source: tests/cli_golden_tests.rs
 expression: output
 ---
-succinctly 0.5.1
+succinctly 0.6.0
