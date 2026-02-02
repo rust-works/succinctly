@@ -1,6 +1,6 @@
 //! Integration tests for jq query functionality.
 
-use succinctly::jq::{eval, eval_lenient, parse, QueryResult};
+use succinctly::jq::{eval, eval_lenient, parse, OwnedValue, QueryResult};
 use succinctly::json::light::StandardJson;
 use succinctly::json::JsonIndex;
 
@@ -182,20 +182,34 @@ fn test_index_negative() {
 }
 
 #[test]
-fn test_index_out_of_bounds() {
+fn test_index_out_of_bounds_returns_null() {
+    // jq returns null for out-of-bounds array access (not an error)
     query!(br#"[1, 2, 3]"#, ".[10]",
-        QueryResult::Error(e) => {
-            assert!(e.message.contains("out of bounds"));
-        }
+        QueryResult::One(StandardJson::Null) => {}
     );
 }
 
 #[test]
-fn test_index_negative_out_of_bounds() {
+fn test_index_negative_out_of_bounds_returns_null() {
+    // jq returns null for negative out-of-bounds array access (not an error)
     query!(br#"[1, 2, 3]"#, ".[-10]",
-        QueryResult::Error(e) => {
-            assert!(e.message.contains("out of bounds"));
-        }
+        QueryResult::One(StandardJson::Null) => {}
+    );
+}
+
+#[test]
+fn test_index_on_null_returns_null() {
+    // jq returns null when indexing null
+    query!(b"null", ".[0]",
+        QueryResult::One(StandardJson::Null) => {}
+    );
+}
+
+#[test]
+fn test_index_on_null_negative_returns_null() {
+    // jq returns null when indexing null with negative index
+    query!(b"null", ".[-1]",
+        QueryResult::One(StandardJson::Null) => {}
     );
 }
 
@@ -310,6 +324,42 @@ fn test_slice_empty_result() {
     );
 }
 
+#[test]
+fn test_slice_on_null_returns_null() {
+    // jq returns null when slicing null
+    query!(b"null", ".[0:2]",
+        QueryResult::One(StandardJson::Null) => {}
+    );
+}
+
+#[test]
+fn test_slice_on_string() {
+    // jq supports string slicing
+    query!(br#""hello""#, ".[1:3]",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "el");
+        }
+    );
+}
+
+#[test]
+fn test_slice_on_string_from_start() {
+    query!(br#""hello""#, ".[:2]",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "he");
+        }
+    );
+}
+
+#[test]
+fn test_slice_on_string_to_end() {
+    query!(br#""hello""#, ".[3:]",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "lo");
+        }
+    );
+}
+
 // =============================================================================
 // Optional tests
 // =============================================================================
@@ -332,9 +382,18 @@ fn test_optional_field_present() {
 }
 
 #[test]
-fn test_optional_index_out_of_bounds() {
+fn test_optional_index_out_of_bounds_returns_null() {
+    // jq returns null for optional out-of-bounds (not empty)
     query!(br#"[1, 2, 3]"#, ".[10]?",
-        QueryResult::None => {}
+        QueryResult::One(StandardJson::Null) => {}
+    );
+}
+
+#[test]
+fn test_optional_index_on_null_returns_null() {
+    // jq returns null for optional index on null
+    query!(b"null", ".[0]?",
+        QueryResult::One(StandardJson::Null) => {}
     );
 }
 
@@ -633,6 +692,215 @@ fn test_now_ignores_input() {
         QueryResult::Owned(succinctly::jq::OwnedValue::Float(ts)) => {
             let jan_2024 = 1704067200.0;
             assert!(ts > jan_2024, "timestamp {} should be after 2024-01-01", ts);
+        }
+    );
+}
+
+// =============================================================================
+// jq-compatibility: null handling tests
+// These tests verify jq-compatible behavior where null is returned instead of
+// errors for various edge cases. See issue #61 and related PRs.
+// =============================================================================
+
+#[test]
+fn test_has_on_null_returns_false() {
+    // jq: null | has("foo") => false
+    query!(b"null", r#"has("foo")"#,
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b);
+        }
+    );
+}
+
+#[test]
+fn test_has_on_object() {
+    query!(br#"{"a": 1}"#, r#"has("a")"#,
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        }
+    );
+}
+
+#[test]
+fn test_has_on_object_missing() {
+    query!(br#"{"a": 1}"#, r#"has("b")"#,
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b);
+        }
+    );
+}
+
+#[test]
+fn test_has_on_array() {
+    query!(br#"[1, 2, 3]"#, "has(1)",
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        }
+    );
+}
+
+#[test]
+fn test_has_on_array_out_of_bounds() {
+    query!(br#"[1, 2, 3]"#, "has(10)",
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b);
+        }
+    );
+}
+
+#[test]
+fn test_in_on_object() {
+    // jq: "a" | in({"a": 1}) => true
+    query!(br#""a""#, r#"in({"a": 1})"#,
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        }
+    );
+}
+
+#[test]
+fn test_in_on_object_missing() {
+    query!(br#""b""#, r#"in({"a": 1})"#,
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b);
+        }
+    );
+}
+
+#[test]
+fn test_in_on_array() {
+    // jq: 1 | in([10, 20, 30]) => true (index 1 exists)
+    query!(b"1", "in([10, 20, 30])",
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        }
+    );
+}
+
+#[test]
+fn test_first_on_null_returns_null() {
+    // jq: null | first => null
+    query!(b"null", "first",
+        QueryResult::Owned(OwnedValue::Null) => {}
+    );
+}
+
+#[test]
+fn test_first_on_empty_returns_null() {
+    // jq: [] | first => null
+    query!(b"[]", "first",
+        QueryResult::Owned(OwnedValue::Null) => {}
+    );
+}
+
+#[test]
+fn test_last_on_null_returns_null() {
+    // jq: null | last => null
+    query!(b"null", "last",
+        QueryResult::Owned(OwnedValue::Null) => {}
+    );
+}
+
+#[test]
+fn test_last_on_empty_returns_null() {
+    // jq: [] | last => null
+    query!(b"[]", "last",
+        QueryResult::Owned(OwnedValue::Null) => {}
+    );
+}
+
+#[test]
+fn test_nth_on_null_returns_null() {
+    // jq: null | nth(0) => null
+    query!(b"null", "nth(0)",
+        QueryResult::Owned(OwnedValue::Null) => {}
+    );
+}
+
+#[test]
+fn test_reverse_on_null_returns_empty_array() {
+    // jq: null | reverse => []
+    query!(b"null", "reverse",
+        QueryResult::Owned(OwnedValue::Array(arr)) => {
+            assert!(arr.is_empty());
+        }
+    );
+}
+
+#[test]
+fn test_values_on_null_returns_empty() {
+    // jq: null | values => (no output)
+    query!(b"null", "values",
+        QueryResult::None => {}
+    );
+}
+
+#[test]
+fn test_getpath_on_null_returns_null() {
+    // jq: null | getpath(["a"]) => null
+    query!(b"null", r#"getpath(["a"])"#,
+        QueryResult::Owned(OwnedValue::Null) => {}
+    );
+}
+
+#[test]
+fn test_getpath_on_null_nested() {
+    // jq: null | getpath(["a", "b", "c"]) => null
+    query!(b"null", r#"getpath(["a", "b", "c"])"#,
+        QueryResult::Owned(OwnedValue::Null) => {}
+    );
+}
+
+// =============================================================================
+// jq-compatibility: format function tests
+// =============================================================================
+
+#[test]
+fn test_uri_on_number() {
+    // jq: 42 | @uri => "42" (converts to string first)
+    query!(b"42", "@uri",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "42");
+        }
+    );
+}
+
+#[test]
+fn test_uri_on_bool() {
+    // jq: true | @uri => "true"
+    query!(b"true", "@uri",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "true");
+        }
+    );
+}
+
+#[test]
+fn test_html_on_number() {
+    // jq: 42 | @html => "42"
+    query!(b"42", "@html",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "42");
+        }
+    );
+}
+
+#[test]
+fn test_sh_on_array() {
+    // jq: [1, 2, 3] | @sh => "1 2 3"
+    query!(b"[1, 2, 3]", "@sh",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "1 2 3");
+        }
+    );
+}
+
+#[test]
+fn test_sh_on_array_with_strings() {
+    // jq: ["a", "b c", "d"] | @sh => "'a' 'b c' 'd'"
+    query!(br#"["a", "b c", "d"]"#, "@sh",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "'a' 'b c' 'd'");
         }
     );
 }
