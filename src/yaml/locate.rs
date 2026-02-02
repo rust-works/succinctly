@@ -200,7 +200,7 @@ pub fn path_to_bp<W: AsRef<[u64]>>(
     while let Some(parent_bp) = index.bp().parent(current_bp) {
         // Skip sequence item wrappers - they don't contribute to the path
         // Sequence items are transparent; the path goes directly to the sequence
-        if index.is_seq_item(parent_bp) {
+        if index.is_seq_item(text, parent_bp) {
             current_bp = parent_bp;
             continue;
         }

@@ -57,8 +57,6 @@ pub struct YamlIndex<W = Vec<u64>> {
     /// Uses Advance Index encoding for ~5× compression when end positions are monotonic,
     /// otherwise falls back to `Vec<u32>`.
     bp_to_text_end: EndPositions,
-    /// Sequence item markers - 1 if BP position is a sequence item wrapper
-    seq_items: W,
     /// Container markers - 1 if BP position has a TY entry (is a mapping or sequence)
     containers: W,
     /// Cumulative popcount for containers. O(1) rank via single array lookup.
@@ -163,7 +161,6 @@ impl YamlIndex<Vec<u64>> {
             ty_len: semi.ty_len,
             open_positions,
             bp_to_text_end: EndPositions::build(&semi.bp_to_text_end, ib_len),
-            seq_items: semi.seq_items,
             containers: semi.containers,
             containers_rank,
             anchors: semi.anchors,
@@ -188,7 +185,6 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         ty_len: usize,
         bp_to_text: Vec<u32>,
         bp_to_text_end: Vec<u32>,
-        seq_items: W,
         containers: W,
         anchors: BTreeMap<String, usize>,
         aliases: BTreeMap<usize, usize>,
@@ -214,7 +210,6 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             ty_len,
             open_positions,
             bp_to_text_end: EndPositions::build(&bp_to_text_end, ib_len),
-            seq_items,
             containers,
             containers_rank,
             anchors,
@@ -237,7 +232,6 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         ty_len: usize,
         bp_to_text: Vec<u32>,
         bp_to_text_end: Vec<u32>,
-        seq_items: W,
         containers: W,
         anchors: BTreeMap<String, usize>,
         aliases: BTreeMap<usize, usize>,
@@ -264,7 +258,6 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             ty_len,
             open_positions,
             bp_to_text_end: EndPositions::build(&bp_to_text_end, ib_len),
-            seq_items,
             containers,
             containers_rank,
             anchors,
@@ -441,16 +434,26 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     ///
     /// Sequence items have BP open/close but no TY entry.
     /// They are wrapper nodes around the item's content.
+    /// Derives this from text (starts with `- `) rather than storing a bitvector.
     #[inline]
-    pub fn is_seq_item(&self, bp_pos: usize) -> bool {
-        let word_idx = bp_pos / 64;
-        let bit_idx = bp_pos % 64;
-        let seq_item_words = self.seq_items.as_ref();
-        if word_idx < seq_item_words.len() {
-            (seq_item_words[word_idx] >> bit_idx) & 1 == 1
-        } else {
-            false
+    pub fn is_seq_item(&self, text: &[u8], bp_pos: usize) -> bool {
+        // Fast path: containers (mappings/sequences) are never seq_items
+        if self.is_container(bp_pos) {
+            return false;
         }
+
+        // Get text position for this BP node
+        let Some(text_pos) = self.bp_to_text_pos(bp_pos) else {
+            return false;
+        };
+
+        // Check for block sequence indicator `-` followed by whitespace.
+        // Optimized: single branch using .get() with space as default (valid seq terminator).
+        text.get(text_pos) == Some(&b'-')
+            && matches!(
+                text.get(text_pos + 1).copied().unwrap_or(b' '),
+                b' ' | b'\t' | b'\n' | b'\r'
+            )
     }
     /// Debug helper to get open position for a given open index.
     #[cfg(test)]
