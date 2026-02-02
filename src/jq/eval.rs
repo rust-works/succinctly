@@ -210,13 +210,11 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
         Expr::Index(idx) => match value {
             StandardJson::Array(elements) => match get_element_at_index(elements, *idx) {
                 Some(v) => QueryResult::One(v),
-                None if optional => QueryResult::None,
-                None => {
-                    // Count elements to give accurate error
-                    let len = count_elements(elements);
-                    QueryResult::Error(EvalError::index_out_of_bounds(*idx, len))
-                }
+                // jq returns null for out-of-bounds array access (not an error)
+                None => QueryResult::One(StandardJson::Null),
             },
+            // jq returns null for index on null
+            StandardJson::Null => QueryResult::One(StandardJson::Null),
             _ if optional => QueryResult::None,
             _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
         },
@@ -225,6 +223,41 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
             StandardJson::Array(elements) => {
                 let results = slice_elements(elements, *start, *end);
                 QueryResult::Many(results)
+            }
+            // jq returns null for slice on null
+            StandardJson::Null => QueryResult::One(StandardJson::Null),
+            // jq supports string slicing
+            StandardJson::String(s) => {
+                let s_str = match s.as_str() {
+                    Ok(s) => s,
+                    Err(_) => return QueryResult::Error(EvalError::new("invalid UTF-8 in string")),
+                };
+                let len = s_str.chars().count();
+                // Resolve indices like jq does
+                let resolve_idx = |idx: i64| -> usize {
+                    if idx >= 0 {
+                        (idx as usize).min(len)
+                    } else {
+                        let pos = len as i64 + idx;
+                        if pos < 0 {
+                            0
+                        } else {
+                            pos as usize
+                        }
+                    }
+                };
+                let start_idx = start.map(resolve_idx).unwrap_or(0);
+                let end_idx = end.map(resolve_idx).unwrap_or(len);
+                if start_idx >= end_idx || start_idx >= len {
+                    QueryResult::Owned(OwnedValue::String(String::new()))
+                } else {
+                    let sliced: String = s_str
+                        .chars()
+                        .skip(start_idx)
+                        .take(end_idx - start_idx)
+                        .collect();
+                    QueryResult::Owned(OwnedValue::String(sliced))
+                }
             }
             _ if optional => QueryResult::None,
             _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
@@ -1573,6 +1606,8 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>>(
     };
 
     match (&value, &key_owned) {
+        // jq: null | has("key") => false
+        (StandardJson::Null, _) => QueryResult::Owned(OwnedValue::Bool(false)),
         // Object has string key
         (StandardJson::Object(fields), OwnedValue::String(key)) => {
             let found = (*fields).clone().any(|f| {
@@ -1612,12 +1647,12 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>>(
     let key_owned = to_owned(&value);
     let obj_result = eval_single(obj_expr, value.clone(), optional);
 
-    // Get the object to check against
-    let obj = match obj_result {
-        QueryResult::One(o) => o,
+    // Get the object/array to check against (need to handle Owned case for object literals)
+    let obj_owned = match obj_result {
+        QueryResult::One(o) => to_owned(&o),
         QueryResult::Many(os) => {
             if let Some(o) = os.into_iter().next() {
-                o
+                to_owned(&o)
             } else if optional {
                 return QueryResult::None;
             } else {
@@ -1626,6 +1661,7 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>>(
                 ));
             }
         }
+        QueryResult::Owned(o) => o,
         QueryResult::Error(e) => return QueryResult::Error(e),
         _ if optional => return QueryResult::None,
         _ => {
@@ -1633,20 +1669,13 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>>(
         }
     };
 
-    match (&key_owned, &obj) {
-        (OwnedValue::String(key), StandardJson::Object(fields)) => {
-            let found = (*fields).clone().any(|f| {
-                if let StandardJson::String(k) = f.key() {
-                    if let Ok(cow) = k.as_str() {
-                        return cow.as_ref() == key;
-                    }
-                }
-                false
-            });
+    match (&key_owned, &obj_owned) {
+        (OwnedValue::String(key), OwnedValue::Object(fields)) => {
+            let found = fields.keys().any(|k| k == key);
             QueryResult::Owned(OwnedValue::Bool(found))
         }
-        (OwnedValue::Int(idx), StandardJson::Array(elements)) => {
-            let len = (*elements).count() as i64;
+        (OwnedValue::Int(idx), OwnedValue::Array(elements)) => {
+            let len = elements.len() as i64;
             let in_bounds = if *idx >= 0 {
                 *idx < len
             } else {
@@ -2268,15 +2297,16 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>>(
 /// Builtin: first - first element (.[0])
 fn builtin_first<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
-    optional: bool,
+    _optional: bool,
 ) -> QueryResult<'a, W> {
     match value {
         StandardJson::Array(elements) => match elements.get(0) {
             Some(v) => QueryResult::One(v),
-            None if optional => QueryResult::None,
-            None => QueryResult::Error(EvalError::new("array is empty")),
+            // jq: [] | first => null
+            None => QueryResult::Owned(OwnedValue::Null),
         },
-        _ if optional => QueryResult::None,
+        // jq: null | first => null
+        StandardJson::Null => QueryResult::Owned(OwnedValue::Null),
         _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
     }
 }
@@ -2284,22 +2314,20 @@ fn builtin_first<'a, W: Clone + AsRef<[u64]>>(
 /// Builtin: last - last element (.[-1])
 fn builtin_last<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
-    optional: bool,
+    _optional: bool,
 ) -> QueryResult<'a, W> {
     match value {
         StandardJson::Array(elements) => {
             let items: Vec<_> = elements.collect();
             if items.is_empty() {
-                if optional {
-                    QueryResult::None
-                } else {
-                    QueryResult::Error(EvalError::new("array is empty"))
-                }
+                // jq: [] | last => null
+                QueryResult::Owned(OwnedValue::Null)
             } else {
                 QueryResult::Owned(to_owned(&items[items.len() - 1]))
             }
         }
-        _ if optional => QueryResult::None,
+        // jq: null | last => null
+        StandardJson::Null => QueryResult::Owned(OwnedValue::Null),
         _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
     }
 }
@@ -2310,6 +2338,11 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // jq: null | nth(0) => null
+    if matches!(value, StandardJson::Null) {
+        return QueryResult::Owned(OwnedValue::Null);
+    }
+
     // Get the index
     let n_result = eval_single(n_expr, value.clone(), optional);
     let n = match result_to_owned(n_result) {
@@ -2321,8 +2354,8 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>>(
     match value {
         StandardJson::Array(elements) => match get_element_at_index(elements, n) {
             Some(v) => QueryResult::One(v),
-            None if optional => QueryResult::None,
-            None => QueryResult::Error(EvalError::new(format!("index {} out of bounds", n))),
+            // jq: [1,2] | nth(10) => null
+            None => QueryResult::Owned(OwnedValue::Null),
         },
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
@@ -2332,7 +2365,7 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>>(
 /// Builtin: reverse - reverse array
 fn builtin_reverse<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
-    optional: bool,
+    _optional: bool,
 ) -> QueryResult<'a, W> {
     match value {
         StandardJson::Array(elements) => {
@@ -2349,7 +2382,8 @@ fn builtin_reverse<'a, W: Clone + AsRef<[u64]>>(
                 QueryResult::Owned(OwnedValue::String(String::new()))
             }
         }
-        _ if optional => QueryResult::None,
+        // jq: null | reverse => []
+        StandardJson::Null => QueryResult::Owned(OwnedValue::Array(Vec::new())),
         _ => QueryResult::Error(EvalError::type_error("array or string", type_name(&value))),
     }
 }
@@ -2833,24 +2867,34 @@ fn format_json(value: &OwnedValue) -> Result<String, EvalError> {
 }
 
 /// @uri - URI/percent encode
-fn format_uri(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
-    match value {
-        OwnedValue::String(s) => {
-            let mut result = String::new();
-            for c in s.chars() {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
-                    result.push(c);
-                } else {
-                    for b in c.to_string().as_bytes() {
-                        result.push_str(&format!("%{:02X}", b));
-                    }
-                }
+fn format_uri(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
+    // jq converts non-strings to strings first (e.g., 42 | @uri => "42")
+    let s = match value {
+        OwnedValue::String(s) => s.clone(),
+        OwnedValue::Int(n) => n.to_string(),
+        OwnedValue::Float(f) => f.to_string(),
+        OwnedValue::Bool(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
             }
-            Ok(result)
         }
-        _ if optional => Ok(String::new()),
-        _ => Err(EvalError::type_error("string", value.type_name())),
+        OwnedValue::Null => "null".to_string(),
+        _ => return Err(EvalError::type_error("string", value.type_name())),
+    };
+
+    let mut result = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+            result.push(c);
+        } else {
+            for b in c.to_string().as_bytes() {
+                result.push_str(&format!("%{:02X}", b));
+            }
+        }
     }
+    Ok(result)
 }
 
 /// @urid - URI/percent decode
@@ -3050,29 +3094,66 @@ fn format_base64d(value: &OwnedValue, optional: bool) -> Result<String, EvalErro
 }
 
 /// @html - HTML entity escape
-fn format_html(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
-    match value {
-        OwnedValue::String(s) => {
-            let mut result = String::new();
-            for c in s.chars() {
-                match c {
-                    '<' => result.push_str("&lt;"),
-                    '>' => result.push_str("&gt;"),
-                    '&' => result.push_str("&amp;"),
-                    '"' => result.push_str("&quot;"),
-                    '\'' => result.push_str("&#39;"),
-                    _ => result.push(c),
-                }
+fn format_html(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
+    // jq converts non-strings to strings first (e.g., 42 | @html => "42")
+    let s = match value {
+        OwnedValue::String(s) => s.clone(),
+        OwnedValue::Int(n) => n.to_string(),
+        OwnedValue::Float(f) => f.to_string(),
+        OwnedValue::Bool(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
             }
-            Ok(result)
         }
-        _ if optional => Ok(String::new()),
-        _ => Err(EvalError::type_error("string", value.type_name())),
+        OwnedValue::Null => "null".to_string(),
+        _ => return Err(EvalError::type_error("string", value.type_name())),
+    };
+
+    let mut result = String::new();
+    for c in s.chars() {
+        match c {
+            '<' => result.push_str("&lt;"),
+            '>' => result.push_str("&gt;"),
+            '&' => result.push_str("&amp;"),
+            '"' => result.push_str("&quot;"),
+            '\'' => result.push_str("&#39;"),
+            _ => result.push(c),
+        }
+    }
+    Ok(result)
+}
+
+/// Shell-quote a single value for @sh
+fn shell_quote_value(value: &OwnedValue) -> String {
+    match value {
+        // jq always quotes strings in @sh array output
+        OwnedValue::String(s) => {
+            if s.contains('\'') {
+                let escaped = s.replace('\'', "'\\''");
+                format!("'{}'", escaped)
+            } else {
+                format!("'{}'", s)
+            }
+        }
+        // Numbers, bools, null are NOT quoted in jq
+        OwnedValue::Int(n) => n.to_string(),
+        OwnedValue::Float(f) => f.to_string(),
+        OwnedValue::Bool(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        OwnedValue::Null => "null".to_string(),
+        _ => String::new(),
     }
 }
 
 /// @sh - Shell quote
-fn format_sh(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
+fn format_sh(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
     match value {
         OwnedValue::String(s) => {
             // Use single quotes and escape single quotes
@@ -3083,7 +3164,20 @@ fn format_sh(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
                 Ok(format!("'{}'", s))
             }
         }
-        _ if optional => Ok(String::new()),
+        // jq: [1, 2, 3] | @sh => "1 2 3"
+        OwnedValue::Array(arr) => {
+            let parts: Vec<String> = arr.iter().map(shell_quote_value).collect();
+            Ok(parts.join(" "))
+        }
+        // Numbers, bools, null are converted to strings
+        OwnedValue::Int(n) => Ok(n.to_string()),
+        OwnedValue::Float(f) => Ok(f.to_string()),
+        OwnedValue::Bool(b) => Ok(if *b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }),
+        OwnedValue::Null => Ok("null".to_string()),
         _ => Err(EvalError::type_error("string", value.type_name())),
     }
 }
@@ -4144,6 +4238,10 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>>(
 
     for segment in path {
         match (&current, &segment) {
+            // jq: null | getpath(["a"]) => null
+            (OwnedValue::Null, _) => {
+                return QueryResult::Owned(OwnedValue::Null);
+            }
             (OwnedValue::Object(obj), OwnedValue::String(key)) => {
                 current = obj.get(key).cloned().unwrap_or(OwnedValue::Null);
             }
