@@ -904,3 +904,338 @@ fn test_sh_on_array_with_strings() {
         }
     );
 }
+
+// =============================================================================
+// Compatibility tests - Arithmetic edge cases
+// =============================================================================
+
+#[test]
+fn test_float_division_by_zero_returns_error() {
+    // jq: 1.5 / 0 => error "cannot be divided because the divisor is zero"
+    query!(b"null", "1.5 / 0",
+        QueryResult::Error(_) => {}
+    );
+}
+
+#[test]
+fn test_float_modulo_by_zero_returns_error() {
+    // jq: 1.5 % 0 => error "cannot be divided (remainder) because the divisor is zero"
+    query!(b"null", "1.5 % 0",
+        QueryResult::Error(_) => {}
+    );
+}
+
+#[test]
+fn test_integer_division_by_zero_returns_error() {
+    // jq: 1 / 0 => error (integer division by zero)
+    query!(b"null", "1 / 0",
+        QueryResult::Error(_) => {}
+    );
+}
+
+#[test]
+fn test_integer_modulo_by_zero_returns_error() {
+    // jq: 1 % 0 => error (integer modulo by zero)
+    query!(b"null", "1 % 0",
+        QueryResult::Error(_) => {}
+    );
+}
+
+#[test]
+fn test_integer_addition_overflow_converts_to_float() {
+    // jq: 9223372036854775807 + 1 => 9223372036854776000 (float)
+    query!(b"null", "9223372036854775807 + 1",
+        QueryResult::Owned(OwnedValue::Float(f)) => {
+            // jq converts to float, so result is approximately 9.22e18
+            assert!(f > 9e18, "expected large positive float, got {}", f);
+        }
+    );
+}
+
+#[test]
+fn test_integer_multiplication_overflow_converts_to_float() {
+    // jq: 9223372036854775807 * 2 => 18446744073709552000 (float)
+    query!(b"null", "9223372036854775807 * 2",
+        QueryResult::Owned(OwnedValue::Float(f)) => {
+            // jq converts to float, so result is approximately 1.84e19
+            assert!(f > 1e19, "expected large positive float, got {}", f);
+        }
+    );
+}
+
+#[test]
+fn test_integer_subtraction_overflow_converts_to_float() {
+    // jq: -9223372036854775808 - 1 => -9223372036854776000 (float)
+    query!(b"null", "-9223372036854775808 - 1",
+        QueryResult::Owned(OwnedValue::Float(f)) => {
+            assert!(f < -9e18, "expected large negative float, got {}", f);
+        }
+    );
+}
+
+// =============================================================================
+// Compatibility tests - has()/in() with negative indices
+// =============================================================================
+
+#[test]
+fn test_has_negative_index_returns_false() {
+    // jq: [1,2,3] | has(-1) => false
+    query!(b"[1, 2, 3]", "has(-1)",
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b, "has(-1) should return false for arrays");
+        }
+    );
+}
+
+#[test]
+fn test_has_negative_two_returns_false() {
+    // jq: [1,2,3] | has(-2) => false
+    query!(b"[1, 2, 3]", "has(-2)",
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b, "has(-2) should return false for arrays");
+        }
+    );
+}
+
+#[test]
+fn test_has_valid_positive_index_returns_true() {
+    // jq: [1,2,3] | has(0) => true
+    query!(b"[1, 2, 3]", "has(0)",
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b, "has(0) should return true");
+        }
+    );
+}
+
+#[test]
+fn test_has_out_of_bounds_positive_index_returns_false() {
+    // jq: [1,2,3] | has(5) => false
+    query!(b"[1, 2, 3]", "has(5)",
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b, "has(5) should return false for 3-element array");
+        }
+    );
+}
+
+#[test]
+fn test_in_negative_index_returns_false() {
+    // jq: -1 | in([1,2,3]) => false
+    query!(b"null", "-1 | in([1, 2, 3])",
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b, "in() with -1 should return false for arrays");
+        }
+    );
+}
+
+#[test]
+fn test_in_valid_positive_index_returns_true() {
+    // jq: 0 | in([1,2,3]) => true
+    query!(b"null", "0 | in([1, 2, 3])",
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b, "in() with 0 should return true");
+        }
+    );
+}
+
+#[test]
+fn test_in_out_of_bounds_positive_index_returns_false() {
+    // jq: 5 | in([1,2,3]) => false
+    query!(b"null", "5 | in([1, 2, 3])",
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b, "in() with 5 should return false for 3-element array");
+        }
+    );
+}
+
+// =============================================================================
+// Compatibility tests - split("") edge cases
+// =============================================================================
+
+#[test]
+fn test_split_empty_delimiter() {
+    // jq: "hello" | split("") => ["h","e","l","l","o"]
+    query!(br#""hello""#, r#"split("")"#,
+        QueryResult::Owned(OwnedValue::Array(arr)) => {
+            assert_eq!(arr.len(), 5, "split(\"\") should produce 5 elements, got {}", arr.len());
+            let expected = ["h", "e", "l", "l", "o"];
+            for (i, (actual, exp)) in arr.iter().zip(expected.iter()).enumerate() {
+                match actual {
+                    OwnedValue::String(s) => assert_eq!(s, *exp, "element {} mismatch", i),
+                    _ => panic!("expected string at index {}", i),
+                }
+            }
+        }
+    );
+}
+
+#[test]
+fn test_split_empty_delimiter_on_empty_string() {
+    // jq: "" | split("") => []
+    query!(br#""""#, r#"split("")"#,
+        QueryResult::Owned(OwnedValue::Array(arr)) => {
+            assert!(arr.is_empty(), "split(\"\") on empty string should return [], got {:?}", arr);
+        }
+    );
+}
+
+#[test]
+fn test_split_normal_delimiter() {
+    // jq: "a,b,c" | split(",") => ["a","b","c"]
+    query!(br#""a,b,c""#, r#"split(",")"#,
+        QueryResult::Owned(OwnedValue::Array(arr)) => {
+            assert_eq!(arr.len(), 3);
+        }
+    );
+}
+
+#[test]
+fn test_split_consecutive_delimiters() {
+    // jq: "a,,b" | split(",") => ["a","","b"]
+    query!(br#""a,,b""#, r#"split(",")"#,
+        QueryResult::Owned(OwnedValue::Array(arr)) => {
+            assert_eq!(arr.len(), 3);
+            match &arr[1] {
+                OwnedValue::String(s) => assert_eq!(s, ""),
+                _ => panic!("expected empty string at index 1"),
+            }
+        }
+    );
+}
+
+// =============================================================================
+// Compatibility tests - @csv quoting behavior
+// =============================================================================
+
+#[test]
+fn test_csv_quotes_fields_with_comma() {
+    // jq: ["a","b,c"] | @csv => "\"a\",\"b,c\""
+    query!(br#"["a", "b,c"]"#, "@csv",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            // Must contain quoted "b,c"
+            assert!(s.contains("\"b,c\""), "comma in field should be quoted: {}", s);
+        }
+    );
+}
+
+#[test]
+fn test_csv_escapes_quotes() {
+    // jq: ["a\"b"] | @csv => "\"a\"\"b\""
+    query!(br#"["a\"b"]"#, "@csv",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            // Quote in field should be doubled
+            assert!(s.contains("\"\""), "quote in field should be doubled: {}", s);
+        }
+    );
+}
+
+#[test]
+fn test_csv_numbers_not_quoted() {
+    // jq: [1,2,3] | @csv => "1,2,3"
+    query!(b"[1, 2, 3]", "@csv",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "1,2,3");
+        }
+    );
+}
+
+// =============================================================================
+// Compatibility tests - @base64d edge cases
+// =============================================================================
+
+#[test]
+fn test_base64_roundtrip() {
+    // jq: "hello" | @base64 | @base64d => "hello"
+    query!(br#""hello""#, "@base64 | @base64d",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "hello");
+        }
+    );
+}
+
+#[test]
+fn test_base64_encode() {
+    // jq: "hello" | @base64 => "aGVsbG8="
+    query!(br#""hello""#, "@base64",
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "aGVsbG8=");
+        }
+    );
+}
+
+// =============================================================================
+// Compatibility tests - Comparison edge cases
+// =============================================================================
+
+#[test]
+fn test_null_not_equal_false() {
+    // jq: null == false => false
+    query!(b"null", "null == false",
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b, "null should not equal false");
+        }
+    );
+}
+
+#[test]
+fn test_null_not_equal_zero() {
+    // jq: null == 0 => false
+    query!(b"null", "null == 0",
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b, "null should not equal 0");
+        }
+    );
+}
+
+#[test]
+fn test_null_not_equal_empty_string() {
+    // jq: null == "" => false
+    query!(b"null", r#"null == """#,
+        QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b, "null should not equal empty string");
+        }
+    );
+}
+
+// =============================================================================
+// Compatibility tests - Alternative operator edge cases
+// =============================================================================
+
+#[test]
+fn test_alternative_with_null() {
+    // jq: null // "default" => "default"
+    query!(b"null", r#"null // "default""#,
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "default");
+        }
+    );
+}
+
+#[test]
+fn test_alternative_with_false() {
+    // jq: false // "default" => "default"
+    query!(b"null", r#"false // "default""#,
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "default");
+        }
+    );
+}
+
+#[test]
+fn test_alternative_with_zero() {
+    // jq: 0 // "default" => 0 (0 is truthy in jq)
+    query!(b"null", r#"0 // "default""#,
+        QueryResult::Owned(OwnedValue::Int(n)) => {
+            assert_eq!(n, 0);
+        }
+    );
+}
+
+#[test]
+fn test_alternative_with_empty_string() {
+    // jq: "" // "default" => "" (empty string is truthy in jq)
+    query!(b"null", r#""" // "default""#,
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "");
+        }
+    );
+}

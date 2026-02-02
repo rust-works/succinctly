@@ -657,8 +657,11 @@ fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>>(
 /// Add two values (numbers, strings, arrays, objects).
 fn arith_add(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalError> {
     match (left, right) {
-        // Number addition
-        (OwnedValue::Int(a), OwnedValue::Int(b)) => Ok(OwnedValue::Int(a.wrapping_add(b))),
+        // Number addition - convert to float on overflow (jq behavior)
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => match a.checked_add(b) {
+            Some(result) => Ok(OwnedValue::Int(result)),
+            None => Ok(OwnedValue::Float(a as f64 + b as f64)),
+        },
         (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 + b)),
         (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a + b as f64)),
         (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a + b)),
@@ -690,7 +693,11 @@ fn arith_add(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalErro
 /// Subtract two values.
 fn arith_sub(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalError> {
     match (left, right) {
-        (OwnedValue::Int(a), OwnedValue::Int(b)) => Ok(OwnedValue::Int(a.wrapping_sub(b))),
+        // Convert to float on overflow (jq behavior)
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => match a.checked_sub(b) {
+            Some(result) => Ok(OwnedValue::Int(result)),
+            None => Ok(OwnedValue::Float(a as f64 - b as f64)),
+        },
         (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 - b)),
         (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a - b as f64)),
         (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a - b)),
@@ -710,7 +717,11 @@ fn arith_sub(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalErro
 /// Multiply two values.
 fn arith_mul(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalError> {
     match (left, right) {
-        (OwnedValue::Int(a), OwnedValue::Int(b)) => Ok(OwnedValue::Int(a.wrapping_mul(b))),
+        // Convert to float on overflow (jq behavior)
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => match a.checked_mul(b) {
+            Some(result) => Ok(OwnedValue::Int(result)),
+            None => Ok(OwnedValue::Float(a as f64 * b as f64)),
+        },
         (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 * b)),
         (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a * b as f64)),
         (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a * b)),
@@ -765,9 +776,27 @@ fn arith_div(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalErro
                 Ok(OwnedValue::Float(a as f64 / b as f64))
             }
         }
-        (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 / b)),
-        (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a / b as f64)),
-        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a / b)),
+        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
+            if b == 0.0 {
+                Err(EvalError::new("division by zero"))
+            } else {
+                Ok(OwnedValue::Float(a as f64 / b))
+            }
+        }
+        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
+            if b == 0 {
+                Err(EvalError::new("division by zero"))
+            } else {
+                Ok(OwnedValue::Float(a / b as f64))
+            }
+        }
+        (OwnedValue::Float(a), OwnedValue::Float(b)) => {
+            if b == 0.0 {
+                Err(EvalError::new("division by zero"))
+            } else {
+                Ok(OwnedValue::Float(a / b))
+            }
+        }
         // String split: "a,b,c" / "," = ["a", "b", "c"]
         (OwnedValue::String(s), OwnedValue::String(sep)) => {
             let parts: Vec<OwnedValue> = s
@@ -794,9 +823,27 @@ fn arith_mod(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalErro
                 Ok(OwnedValue::Int(a % b))
             }
         }
-        (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a % b)),
-        (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 % b)),
-        (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a % b as f64)),
+        (OwnedValue::Float(a), OwnedValue::Float(b)) => {
+            if b == 0.0 {
+                Err(EvalError::new("modulo by zero"))
+            } else {
+                Ok(OwnedValue::Float(a % b))
+            }
+        }
+        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
+            if b == 0.0 {
+                Err(EvalError::new("modulo by zero"))
+            } else {
+                Ok(OwnedValue::Float(a as f64 % b))
+            }
+        }
+        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
+            if b == 0 {
+                Err(EvalError::new("modulo by zero"))
+            } else {
+                Ok(OwnedValue::Float(a % b as f64))
+            }
+        }
         (a, b) => Err(EvalError::new(format!(
             "cannot compute modulo of {} and {}",
             a.type_name(),
@@ -1620,14 +1667,11 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>>(
             });
             QueryResult::Owned(OwnedValue::Bool(found))
         }
-        // Array has index
+        // Array has index - jq's has() only accepts non-negative indices
         (StandardJson::Array(elements), OwnedValue::Int(idx)) => {
             let len = (*elements).count() as i64;
-            let in_bounds = if *idx >= 0 {
-                *idx < len
-            } else {
-                idx.abs() <= len
-            };
+            // jq: has() returns false for negative indices
+            let in_bounds = *idx >= 0 && *idx < len;
             QueryResult::Owned(OwnedValue::Bool(in_bounds))
         }
         _ if optional => QueryResult::None,
@@ -1674,13 +1718,11 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>>(
             let found = fields.keys().any(|k| k == key);
             QueryResult::Owned(OwnedValue::Bool(found))
         }
+        // jq's in() only accepts non-negative indices for arrays
         (OwnedValue::Int(idx), OwnedValue::Array(elements)) => {
             let len = elements.len() as i64;
-            let in_bounds = if *idx >= 0 {
-                *idx < len
-            } else {
-                idx.abs() <= len
-            };
+            // jq: in() returns false for negative indices
+            let in_bounds = *idx >= 0 && *idx < len;
             QueryResult::Owned(OwnedValue::Bool(in_bounds))
         }
         _ if optional => QueryResult::None,
@@ -2181,10 +2223,17 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>>(
     match &value {
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
-                let parts: Vec<OwnedValue> = cow
-                    .split(&sep)
-                    .map(|p| OwnedValue::String(p.to_string()))
-                    .collect();
+                // jq: split("") returns each character as a separate element
+                // Rust's split("") includes empty strings at boundaries, so special-case it
+                let parts: Vec<OwnedValue> = if sep.is_empty() {
+                    cow.chars()
+                        .map(|c| OwnedValue::String(c.to_string()))
+                        .collect()
+                } else {
+                    cow.split(&sep)
+                        .map(|p| OwnedValue::String(p.to_string()))
+                        .collect()
+                };
                 QueryResult::Owned(OwnedValue::Array(parts))
             } else {
                 QueryResult::Owned(OwnedValue::Array(vec![]))

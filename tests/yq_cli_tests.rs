@@ -928,3 +928,190 @@ fn test_split_doc_identity_passthrough() -> Result<()> {
     assert_eq!(output, "42\n");
     Ok(())
 }
+
+// =============================================================================
+// Compatibility tests - YAML merge keys (<<)
+// =============================================================================
+
+#[test]
+#[ignore] // TODO: Fix - merge keys should be expanded
+fn test_yaml_merge_key_expansion() -> Result<()> {
+    // yq: merge key << should be expanded
+    let input = "default: &default\n  a: 1\nitem:\n  <<: *default\n  b: 2";
+    let (output, exit_code) = run_yq_stdin(".item", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    // Should have both 'a' from merge and 'b' from item
+    assert!(
+        output.contains("\"a\"") && output.contains("\"b\""),
+        "merge key should expand anchor: got {}",
+        output
+    );
+    // Should NOT have literal << key
+    assert!(
+        !output.contains("\"<<\""),
+        "merge key << should be expanded, not literal: {}",
+        output
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore] // TODO: Fix - merge keys should be expanded
+fn test_yaml_merge_key_override() -> Result<()> {
+    // When item has same key as anchor, item's value takes precedence
+    let input = "default: &default\n  a: 1\n  b: original\nitem:\n  <<: *default\n  b: override";
+    let (output, exit_code) = run_yq_stdin(".item.b", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    assert!(
+        output.contains("override"),
+        "item's value should override anchor: got {}",
+        output
+    );
+    Ok(())
+}
+
+#[test]
+fn test_yaml_anchor_alias_without_merge() -> Result<()> {
+    // Regular anchors/aliases (not merge keys) should work
+    let input = "anchor: &anchor\n  x: 1\nref: *anchor";
+    let (output, exit_code) = run_yq_stdin(".ref.x", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "1");
+    Ok(())
+}
+
+// =============================================================================
+// Compatibility tests - Block scalar edge cases
+// =============================================================================
+
+#[test]
+fn test_block_scalar_literal_with_clip() -> Result<()> {
+    // Literal style with clip chomping (default): single trailing newline
+    let input = "text: |\n  line1\n  line2\n";
+    let (output, exit_code) = run_yq_stdin(".text", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "\"line1\\nline2\\n\"");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_literal_with_strip() -> Result<()> {
+    // Literal style with strip chomping (|-): no trailing newline
+    let input = "text: |-\n  line1\n  line2\n";
+    let (output, exit_code) = run_yq_stdin(".text", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "\"line1\\nline2\"");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_literal_with_keep() -> Result<()> {
+    // Literal style with keep chomping (|+): preserve trailing newlines
+    let input = "text: |+\n  line1\n  line2\n\n";
+    let (output, exit_code) = run_yq_stdin(".text", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "\"line1\\nline2\\n\\n\"");
+    Ok(())
+}
+
+#[test]
+fn test_block_scalar_folded() -> Result<()> {
+    // Folded style (>): newlines become spaces
+    let input = "text: >\n  line1\n  line2\n";
+    let (output, exit_code) = run_yq_stdin(".text", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    // Folded converts newlines to spaces (with trailing newline from clip)
+    assert_eq!(output.trim(), "\"line1 line2\\n\"");
+    Ok(())
+}
+
+// =============================================================================
+// Compatibility tests - Multi-document handling
+// =============================================================================
+
+#[test]
+fn test_multi_doc_select_first() -> Result<()> {
+    let input = "---\na: 1\n---\nb: 2";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "0"])?;
+    assert_eq!(exit_code, 0);
+    assert!(
+        output.contains("a:"),
+        "should output first document: {}",
+        output
+    );
+    assert!(
+        !output.contains("b:"),
+        "should not include second document: {}",
+        output
+    );
+    Ok(())
+}
+
+#[test]
+fn test_multi_doc_select_second() -> Result<()> {
+    let input = "---\na: 1\n---\nb: 2";
+    let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "1"])?;
+    assert_eq!(exit_code, 0);
+    assert!(
+        output.contains("b:"),
+        "should output second document: {}",
+        output
+    );
+    assert!(
+        !output.contains("a:"),
+        "should not include first document: {}",
+        output
+    );
+    Ok(())
+}
+
+// =============================================================================
+// Compatibility tests - Type preservation
+// =============================================================================
+
+#[test]
+fn test_quoted_number_stays_string() -> Result<()> {
+    // Quoted "1.0" should stay as string, not become number 1
+    let input = "version: \"1.0\"";
+    let (output, exit_code) = run_yq_stdin(".version", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    // Should be "1.0" (string), not 1 or 1.0 (number)
+    assert_eq!(output.trim(), "\"1.0\"");
+    Ok(())
+}
+
+#[test]
+fn test_unquoted_number_becomes_number() -> Result<()> {
+    // Unquoted 1.0 should be a number
+    let input = "version: 1.0";
+    let (output, exit_code) = run_yq_stdin(".version", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    // Should be 1 (integer, as 1.0 parses to 1 in jq-style)
+    let trimmed = output.trim();
+    assert!(
+        trimmed == "1" || trimmed == "1.0",
+        "unquoted number should be numeric: {}",
+        trimmed
+    );
+    Ok(())
+}
+
+#[test]
+fn test_quoted_bool_stays_string() -> Result<()> {
+    // Quoted "true" should stay as string
+    let input = "flag: \"true\"";
+    let (output, exit_code) = run_yq_stdin(".flag", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "\"true\"");
+    Ok(())
+}
+
+#[test]
+fn test_unquoted_bool_becomes_bool() -> Result<()> {
+    // Unquoted true should be boolean
+    let input = "flag: true";
+    let (output, exit_code) = run_yq_stdin(".flag", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "true");
+    Ok(())
+}
