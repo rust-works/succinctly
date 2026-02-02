@@ -738,7 +738,7 @@ fn bench_jq_queries(c: &mut Criterion) {
     group.bench_function("identity", |b| {
         b.iter(|| {
             let cursor = index.root(black_box(&bytes));
-            let result = jq::eval(&identity_expr, cursor);
+            let result = jq::eval::<Vec<u64>, jq::JqSemantics>(&identity_expr, cursor);
             black_box(result)
         })
     });
@@ -750,7 +750,7 @@ fn bench_jq_queries(c: &mut Criterion) {
     group.bench_function("root_array_index", |b| {
         b.iter(|| {
             let cursor = index.root(black_box(&bytes));
-            let result = jq::eval(&expr, cursor);
+            let result = jq::eval::<Vec<u64>, jq::JqSemantics>(&expr, cursor);
             black_box(result)
         })
     });
@@ -760,7 +760,7 @@ fn bench_jq_queries(c: &mut Criterion) {
         group.bench_function("field_array_index", |b| {
             b.iter(|| {
                 let cursor = index.root(black_box(&bytes));
-                let result = jq::eval(&field_expr, cursor);
+                let result = jq::eval::<Vec<u64>, jq::JqSemantics>(&field_expr, cursor);
                 black_box(result)
             })
         });
@@ -772,7 +772,7 @@ fn bench_jq_queries(c: &mut Criterion) {
     group.bench_function("iterate_to_50", |b| {
         b.iter(|| {
             let cursor = index.root(black_box(&bytes));
-            let result = jq::eval_lenient(&iter_expr, cursor);
+            let result = jq::eval_lenient::<Vec<u64>, jq::JqSemantics>(&iter_expr, cursor);
             // Only look at first 51 elements
             let first_51: Vec<_> = result.into_iter().take(51).collect();
             black_box(first_51)

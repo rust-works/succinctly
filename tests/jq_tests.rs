@@ -1,6 +1,6 @@
 //! Integration tests for jq query functionality.
 
-use succinctly::jq::{eval, eval_lenient, parse, OwnedValue, QueryResult};
+use succinctly::jq::{eval, eval_lenient, parse, JqSemantics, OwnedValue, QueryResult};
 use succinctly::json::light::StandardJson;
 use succinctly::json::JsonIndex;
 
@@ -12,7 +12,7 @@ macro_rules! query {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let expr = parse($expr).expect("parse failed");
-        match eval(&expr, cursor) {
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
             $pattern $(if $guard)? => $body,
             other => panic!("unexpected result: {:?}", other),
         }
@@ -26,7 +26,7 @@ macro_rules! query_lenient {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let expr = parse($expr).expect("parse failed");
-        let results = eval_lenient(&expr, cursor);
+        let results = eval_lenient::<Vec<u64>, JqSemantics>(&expr, cursor);
         assert_eq!(
             results.len(),
             $expected,
@@ -40,7 +40,7 @@ macro_rules! query_lenient {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let expr = parse($expr).expect("parse failed");
-        let results = eval_lenient(&expr, cursor);
+        let results = eval_lenient::<Vec<u64>, JqSemantics>(&expr, cursor);
         assert!(
             results.is_empty(),
             "expected empty results, got {}",

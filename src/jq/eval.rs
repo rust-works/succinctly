@@ -15,6 +15,48 @@ use alloc::vec::Vec;
 
 use indexmap::IndexMap;
 
+/// Trait for evaluation semantics - determines behavior for edge cases.
+///
+/// jq and yq (mikefarah/yq) have different behaviors for some operations.
+/// This trait is implemented by zero-sized marker types, allowing the compiler
+/// to monomorphize and optimize away all branches at compile time.
+pub trait EvalSemantics: Copy + Default {
+    /// If true, integer overflow wraps (yq). If false, converts to float (jq).
+    const OVERFLOW_WRAPS: bool;
+    /// If true, division by zero returns infinity (yq). If false, returns error (jq).
+    const DIV_BY_ZERO_IS_INFINITY: bool;
+    /// If true, has(-1) on arrays checks if abs(idx) <= len (yq). If false, only non-negative (jq).
+    const NEGATIVE_INDEX_IN_HAS: bool;
+}
+
+/// jq-compatible evaluation semantics (default).
+///
+/// - Integer overflow converts to float
+/// - Division by zero returns error
+/// - has(-1) on arrays returns false
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JqSemantics;
+
+impl EvalSemantics for JqSemantics {
+    const OVERFLOW_WRAPS: bool = false;
+    const DIV_BY_ZERO_IS_INFINITY: bool = false;
+    const NEGATIVE_INDEX_IN_HAS: bool = false;
+}
+
+/// yq-compatible evaluation semantics.
+///
+/// - Integer overflow wraps
+/// - Division by zero returns infinity
+/// - has(-1) on arrays returns true (if abs(idx) <= len)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct YqSemantics;
+
+impl EvalSemantics for YqSemantics {
+    const OVERFLOW_WRAPS: bool = true;
+    const DIV_BY_ZERO_IS_INFINITY: bool = true;
+    const NEGATIVE_INDEX_IN_HAS: bool = true;
+}
+
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
@@ -187,7 +229,7 @@ fn needs_path_context(expr: &Expr) -> bool {
 }
 
 /// Evaluate a single expression against a JSON value.
-fn eval_single<'a, W: Clone + AsRef<[u64]>>(
+fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -196,7 +238,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
         Expr::Identity => QueryResult::One(value),
 
         Expr::Field(name) => match value {
-            StandardJson::Object(fields) => match find_field(fields, name) {
+            StandardJson::Object(fields) => match find_field::<W>(fields, name) {
                 Some(v) => QueryResult::One(v),
                 // jq returns null for missing fields on objects (not an error)
                 None => QueryResult::One(StandardJson::Null),
@@ -208,7 +250,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
         },
 
         Expr::Index(idx) => match value {
-            StandardJson::Array(elements) => match get_element_at_index(elements, *idx) {
+            StandardJson::Array(elements) => match get_element_at_index::<W>(elements, *idx) {
                 Some(v) => QueryResult::One(v),
                 // jq returns null for out-of-bounds array access (not an error)
                 None => QueryResult::One(StandardJson::Null),
@@ -221,7 +263,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
 
         Expr::Slice { start, end } => match value {
             StandardJson::Array(elements) => {
-                let results = slice_elements(elements, *start, *end);
+                let results = slice_elements::<W>(elements, *start, *end);
                 QueryResult::Many(results)
             }
             // jq returns null for slice on null
@@ -276,52 +318,58 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
             _ => QueryResult::Error(EvalError::type_error("array or object", type_name(&value))),
         },
 
-        Expr::Optional(inner) => eval_single(inner, value, true),
+        Expr::Optional(inner) => eval_single::<W, S>(inner, value, true),
 
-        Expr::Pipe(exprs) => eval_pipe(exprs, value, optional),
+        Expr::Pipe(exprs) => eval_pipe::<W, S>(exprs, value, optional),
 
-        Expr::Comma(exprs) => eval_comma(exprs, value, optional),
+        Expr::Comma(exprs) => eval_comma::<W, S>(exprs, value, optional),
 
-        Expr::Array(inner) => eval_array_construction(inner, value, optional),
+        Expr::Array(inner) => eval_array_construction::<W, S>(inner, value, optional),
 
-        Expr::Object(entries) => eval_object_construction(entries, value, optional),
+        Expr::Object(entries) => eval_object_construction::<W, S>(entries, value, optional),
 
         Expr::Literal(lit) => QueryResult::Owned(literal_to_owned(lit)),
 
-        Expr::RecursiveDescent => eval_recursive_descent(value),
+        Expr::RecursiveDescent => eval_recursive_descent::<W, S>(value),
 
-        Expr::Paren(inner) => eval_single(inner, value, optional),
+        Expr::Paren(inner) => eval_single::<W, S>(inner, value, optional),
 
-        Expr::Arithmetic { op, left, right } => eval_arithmetic(*op, left, right, value, optional),
+        Expr::Arithmetic { op, left, right } => {
+            eval_arithmetic::<W, S>(*op, left, right, value, optional)
+        }
 
-        Expr::Compare { op, left, right } => eval_compare(*op, left, right, value, optional),
+        Expr::Compare { op, left, right } => {
+            eval_compare::<W, S>(*op, left, right, value, optional)
+        }
 
-        Expr::And(left, right) => eval_and(left, right, value, optional),
+        Expr::And(left, right) => eval_and::<W, S>(left, right, value, optional),
 
-        Expr::Or(left, right) => eval_or(left, right, value, optional),
+        Expr::Or(left, right) => eval_or::<W, S>(left, right, value, optional),
 
-        Expr::Not => eval_not(value),
+        Expr::Not => eval_not::<W>(value),
 
-        Expr::Alternative(left, right) => eval_alternative(left, right, value, optional),
+        Expr::Alternative(left, right) => eval_alternative::<W, S>(left, right, value, optional),
 
         Expr::If {
             cond,
             then_branch,
             else_branch,
-        } => eval_if(cond, then_branch, else_branch, value, optional),
+        } => eval_if::<W, S>(cond, then_branch, else_branch, value, optional),
 
-        Expr::Try { expr, catch } => eval_try(expr, catch.as_deref(), value, optional),
+        Expr::Try { expr, catch } => eval_try::<W, S>(expr, catch.as_deref(), value, optional),
 
-        Expr::Error(msg) => eval_error(msg.as_deref(), value, optional),
+        Expr::Error(msg) => eval_error::<W, S>(msg.as_deref(), value, optional),
 
-        Expr::Builtin(builtin) => eval_builtin(builtin, value, optional),
+        Expr::Builtin(builtin) => eval_builtin::<W, S>(builtin, value, optional),
 
-        Expr::StringInterpolation(parts) => eval_string_interpolation(parts, value, optional),
+        Expr::StringInterpolation(parts) => {
+            eval_string_interpolation::<W, S>(parts, value, optional)
+        }
 
-        Expr::Format(format_type) => eval_format(format_type.clone(), value, optional),
+        Expr::Format(format_type) => eval_format::<W>(format_type.clone(), value, optional),
 
         // Phase 8: Variables and Advanced Control Flow
-        Expr::As { expr, var, body } => eval_as(expr, var, body, value, optional),
+        Expr::As { expr, var, body } => eval_as::<W, S>(expr, var, body, value, optional),
         Expr::Var(name) => {
             // Variable references without context should error
             // In practice, variables are resolved by eval_as which substitutes them
@@ -337,21 +385,21 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
         }
         Expr::Env => {
             // $ENV returns an object containing all environment variables
-            eval_env(optional)
+            eval_env::<W>(optional)
         }
         Expr::Reduce {
             input,
             var,
             init,
             update,
-        } => eval_reduce(input, var, init, update, value, optional),
+        } => eval_reduce::<W, S>(input, var, init, update, value, optional),
         Expr::Foreach {
             input,
             var,
             init,
             update,
             extract,
-        } => eval_foreach(
+        } => eval_foreach::<W, S>(
             input,
             var,
             init,
@@ -360,15 +408,15 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
             value,
             optional,
         ),
-        Expr::Limit { n, expr } => eval_limit(n, expr, value, optional),
-        Expr::FirstExpr(expr) => eval_first_expr(expr, value, optional),
-        Expr::LastExpr(expr) => eval_last_expr(expr, value, optional),
-        Expr::NthExpr { n, expr } => eval_nth_expr(n, expr, value, optional),
-        Expr::Until { cond, update } => eval_until(cond, update, value, optional),
-        Expr::While { cond, update } => eval_while(cond, update, value, optional),
-        Expr::Repeat(expr) => eval_repeat(expr, value, optional),
+        Expr::Limit { n, expr } => eval_limit::<W, S>(n, expr, value, optional),
+        Expr::FirstExpr(expr) => eval_first_expr::<W, S>(expr, value, optional),
+        Expr::LastExpr(expr) => eval_last_expr::<W, S>(expr, value, optional),
+        Expr::NthExpr { n, expr } => eval_nth_expr::<W, S>(n, expr, value, optional),
+        Expr::Until { cond, update } => eval_until::<W, S>(cond, update, value, optional),
+        Expr::While { cond, update } => eval_while::<W, S>(cond, update, value, optional),
+        Expr::Repeat(expr) => eval_repeat::<W, S>(expr, value, optional),
         Expr::Range { from, to, step } => {
-            eval_range(from, to.as_deref(), step.as_deref(), value, optional)
+            eval_range::<W, S>(from, to.as_deref(), step.as_deref(), value, optional)
         }
 
         // Phase 9: Variables & Definitions
@@ -376,14 +424,14 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
             expr,
             pattern,
             body,
-        } => eval_as_pattern(expr, pattern, body, value, optional),
+        } => eval_as_pattern::<W, S>(expr, pattern, body, value, optional),
         Expr::FuncDef {
             name,
             params,
             body,
             then,
-        } => eval_func_def(name, params, body, then, value, optional),
-        Expr::FuncCall { name, args } => eval_func_call(name, args, value, optional),
+        } => eval_func_def::<W, S>(name, params, body, then, value, optional),
+        Expr::FuncCall { name, args } => eval_func_call::<W>(name, args, value, optional),
         Expr::NamespacedCall {
             namespace,
             name,
@@ -398,19 +446,19 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>>(
         }
 
         // Assignment operators
-        Expr::Assign { path, value: val } => eval_assign(path, val, value, optional),
-        Expr::Update { path, filter } => eval_update(path, filter, value, optional),
+        Expr::Assign { path, value: val } => eval_assign::<W, S>(path, val, value, optional),
+        Expr::Update { path, filter } => eval_update::<W, S>(path, filter, value, optional),
         Expr::CompoundAssign {
             op,
             path,
             value: val,
-        } => eval_compound_assign(*op, path, val, value, optional),
+        } => eval_compound_assign::<W, S>(*op, path, val, value, optional),
         Expr::AlternativeAssign { path, value: val } => {
-            eval_alternative_assign(path, val, value, optional)
+            eval_alternative_assign::<W, S>(path, val, value, optional)
         }
 
         // Label-break for non-local control flow
-        Expr::Label { name, body } => eval_label(name, body, value, optional),
+        Expr::Label { name, body } => eval_label::<W, S>(name, body, value, optional),
         Expr::Break(name) => QueryResult::Break(name.clone()),
     }
 }
@@ -427,7 +475,7 @@ fn literal_to_owned(lit: &Literal) -> OwnedValue {
 }
 
 /// Evaluate a comma expression (multiple outputs).
-fn eval_comma<'a, W: Clone + AsRef<[u64]>>(
+fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
     value: StandardJson<'a, W>,
     optional: bool,
@@ -441,7 +489,7 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>>(
     let mut has_owned = false;
 
     for expr in exprs {
-        match eval_single(expr, value.clone(), optional).materialize_cursor() {
+        match eval_single::<W, S>(expr, value.clone(), optional).materialize_cursor() {
             QueryResult::One(v) => all_results.push(v),
             QueryResult::OneCursor(_) => {
                 unreachable!("materialize_cursor should have converted this")
@@ -478,13 +526,13 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate array construction.
-fn eval_array_construction<'a, W: Clone + AsRef<[u64]>>(
+fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     inner: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Collect all outputs from the inner expression into an array
-    let result = eval_single(inner, value, optional);
+    let result = eval_single::<W, S>(inner, value, optional);
 
     let items: Vec<OwnedValue> = match result.materialize_cursor() {
         QueryResult::One(v) => vec![to_owned(&v)],
@@ -501,7 +549,7 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate object construction.
-fn eval_object_construction<'a, W: Clone + AsRef<[u64]>>(
+fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     entries: &[super::expr::ObjectEntry],
     value: StandardJson<'a, W>,
     optional: bool,
@@ -513,7 +561,7 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>>(
         let key_str = match &entry.key {
             ObjectKey::Literal(s) => s.clone(),
             ObjectKey::Expr(key_expr) => {
-                let key_result = eval_single(key_expr, value.clone(), optional);
+                let key_result = eval_single::<W, S>(key_expr, value.clone(), optional);
                 match key_result {
                     QueryResult::One(StandardJson::String(s)) => {
                         if let Ok(cow) = s.as_str() {
@@ -533,7 +581,7 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>>(
         };
 
         // Evaluate the value
-        let val_result = eval_single(&entry.value, value.clone(), optional);
+        let val_result = eval_single::<W, S>(&entry.value, value.clone(), optional);
         let owned_val = match val_result.materialize_cursor() {
             QueryResult::One(v) => to_owned(&v),
             QueryResult::OneCursor(_) => unreachable!(),
@@ -565,16 +613,16 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate recursive descent.
-fn eval_recursive_descent<'a, W: Clone + AsRef<[u64]>>(
+fn eval_recursive_descent<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
 ) -> QueryResult<'a, W> {
     let mut results = Vec::new();
-    collect_recursive(&value, &mut results);
+    collect_recursive::<W, S>(&value, &mut results);
     QueryResult::Many(results)
 }
 
 /// Collect all values recursively.
-fn collect_recursive<'a, W: Clone + AsRef<[u64]>>(
+fn collect_recursive<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: &StandardJson<'a, W>,
     results: &mut Vec<StandardJson<'a, W>>,
 ) {
@@ -583,12 +631,12 @@ fn collect_recursive<'a, W: Clone + AsRef<[u64]>>(
     match value {
         StandardJson::Array(elements) => {
             for elem in *elements {
-                collect_recursive(&elem, results);
+                collect_recursive::<W, S>(&elem, results);
             }
         }
         StandardJson::Object(fields) => {
             for field in *fields {
-                collect_recursive(&field.value(), results);
+                collect_recursive::<W, S>(&field.value(), results);
             }
         }
         _ => {}
@@ -624,28 +672,28 @@ fn result_to_owned<W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate arithmetic operations.
-fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>>(
+fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     op: ArithOp,
     left: &Expr,
     right: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let left_val = match result_to_owned(eval_single(left, value.clone(), optional)) {
+    let left_val = match result_to_owned(eval_single::<W, S>(left, value.clone(), optional)) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
-    let right_val = match result_to_owned(eval_single(right, value, optional)) {
+    let right_val = match result_to_owned(eval_single::<W, S>(right, value, optional)) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
 
     let result = match op {
-        ArithOp::Add => arith_add(left_val, right_val),
-        ArithOp::Sub => arith_sub(left_val, right_val),
-        ArithOp::Mul => arith_mul(left_val, right_val),
-        ArithOp::Div => arith_div(left_val, right_val),
-        ArithOp::Mod => arith_mod(left_val, right_val),
+        ArithOp::Add => arith_add::<S>(left_val, right_val),
+        ArithOp::Sub => arith_sub::<S>(left_val, right_val),
+        ArithOp::Mul => arith_mul::<S>(left_val, right_val),
+        ArithOp::Div => arith_div::<S>(left_val, right_val),
+        ArithOp::Mod => arith_mod::<S>(left_val, right_val),
     };
 
     match result {
@@ -655,13 +703,24 @@ fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Add two values (numbers, strings, arrays, objects).
-fn arith_add(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalError> {
+fn arith_add<S: EvalSemantics>(
+    left: OwnedValue,
+    right: OwnedValue,
+) -> Result<OwnedValue, EvalError> {
     match (left, right) {
-        // Number addition - convert to float on overflow (jq behavior)
-        (OwnedValue::Int(a), OwnedValue::Int(b)) => match a.checked_add(b) {
-            Some(result) => Ok(OwnedValue::Int(result)),
-            None => Ok(OwnedValue::Float(a as f64 + b as f64)),
-        },
+        // Number addition - jq converts to float on overflow, yq wraps
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => {
+            if S::OVERFLOW_WRAPS {
+                // yq behavior: wrapping add
+                Ok(OwnedValue::Int(a.wrapping_add(b)))
+            } else {
+                // jq behavior: convert to float on overflow
+                match a.checked_add(b) {
+                    Some(result) => Ok(OwnedValue::Int(result)),
+                    None => Ok(OwnedValue::Float(a as f64 + b as f64)),
+                }
+            }
+        }
         (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 + b)),
         (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a + b as f64)),
         (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a + b)),
@@ -691,13 +750,24 @@ fn arith_add(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalErro
 }
 
 /// Subtract two values.
-fn arith_sub(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalError> {
+fn arith_sub<S: EvalSemantics>(
+    left: OwnedValue,
+    right: OwnedValue,
+) -> Result<OwnedValue, EvalError> {
     match (left, right) {
-        // Convert to float on overflow (jq behavior)
-        (OwnedValue::Int(a), OwnedValue::Int(b)) => match a.checked_sub(b) {
-            Some(result) => Ok(OwnedValue::Int(result)),
-            None => Ok(OwnedValue::Float(a as f64 - b as f64)),
-        },
+        // jq converts to float on overflow, yq wraps
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => {
+            if S::OVERFLOW_WRAPS {
+                // yq behavior: wrapping sub
+                Ok(OwnedValue::Int(a.wrapping_sub(b)))
+            } else {
+                // jq behavior: convert to float on overflow
+                match a.checked_sub(b) {
+                    Some(result) => Ok(OwnedValue::Int(result)),
+                    None => Ok(OwnedValue::Float(a as f64 - b as f64)),
+                }
+            }
+        }
         (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 - b)),
         (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a - b as f64)),
         (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a - b)),
@@ -715,13 +785,24 @@ fn arith_sub(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalErro
 }
 
 /// Multiply two values.
-fn arith_mul(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalError> {
+fn arith_mul<S: EvalSemantics>(
+    left: OwnedValue,
+    right: OwnedValue,
+) -> Result<OwnedValue, EvalError> {
     match (left, right) {
-        // Convert to float on overflow (jq behavior)
-        (OwnedValue::Int(a), OwnedValue::Int(b)) => match a.checked_mul(b) {
-            Some(result) => Ok(OwnedValue::Int(result)),
-            None => Ok(OwnedValue::Float(a as f64 * b as f64)),
-        },
+        // jq converts to float on overflow, yq wraps
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => {
+            if S::OVERFLOW_WRAPS {
+                // yq behavior: wrapping mul
+                Ok(OwnedValue::Int(a.wrapping_mul(b)))
+            } else {
+                // jq behavior: convert to float on overflow
+                match a.checked_mul(b) {
+                    Some(result) => Ok(OwnedValue::Int(result)),
+                    None => Ok(OwnedValue::Float(a as f64 * b as f64)),
+                }
+            }
+        }
         (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 * b)),
         (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a * b as f64)),
         (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a * b)),
@@ -767,31 +848,40 @@ fn merge_objects(
 }
 
 /// Divide two values.
-fn arith_div(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalError> {
+fn arith_div<S: EvalSemantics>(
+    left: OwnedValue,
+    right: OwnedValue,
+) -> Result<OwnedValue, EvalError> {
     match (left, right) {
         (OwnedValue::Int(a), OwnedValue::Int(b)) => {
             if b == 0 {
-                Err(EvalError::new("division by zero"))
+                if S::DIV_BY_ZERO_IS_INFINITY {
+                    // yq behavior: return infinity
+                    Ok(OwnedValue::Float(a as f64 / b as f64))
+                } else {
+                    // jq behavior: error
+                    Err(EvalError::new("division by zero"))
+                }
             } else {
                 Ok(OwnedValue::Float(a as f64 / b as f64))
             }
         }
         (OwnedValue::Int(a), OwnedValue::Float(b)) => {
-            if b == 0.0 {
+            if b == 0.0 && !S::DIV_BY_ZERO_IS_INFINITY {
                 Err(EvalError::new("division by zero"))
             } else {
                 Ok(OwnedValue::Float(a as f64 / b))
             }
         }
         (OwnedValue::Float(a), OwnedValue::Int(b)) => {
-            if b == 0 {
+            if b == 0 && !S::DIV_BY_ZERO_IS_INFINITY {
                 Err(EvalError::new("division by zero"))
             } else {
                 Ok(OwnedValue::Float(a / b as f64))
             }
         }
         (OwnedValue::Float(a), OwnedValue::Float(b)) => {
-            if b == 0.0 {
+            if b == 0.0 && !S::DIV_BY_ZERO_IS_INFINITY {
                 Err(EvalError::new("division by zero"))
             } else {
                 Ok(OwnedValue::Float(a / b))
@@ -814,31 +904,40 @@ fn arith_div(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalErro
 }
 
 /// Modulo two values.
-fn arith_mod(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalError> {
+fn arith_mod<S: EvalSemantics>(
+    left: OwnedValue,
+    right: OwnedValue,
+) -> Result<OwnedValue, EvalError> {
     match (left, right) {
         (OwnedValue::Int(a), OwnedValue::Int(b)) => {
             if b == 0 {
-                Err(EvalError::new("modulo by zero"))
+                if S::DIV_BY_ZERO_IS_INFINITY {
+                    // yq behavior: return NaN (will be serialized as null)
+                    Ok(OwnedValue::Float(f64::NAN))
+                } else {
+                    // jq behavior: error
+                    Err(EvalError::new("modulo by zero"))
+                }
             } else {
                 Ok(OwnedValue::Int(a % b))
             }
         }
         (OwnedValue::Float(a), OwnedValue::Float(b)) => {
-            if b == 0.0 {
+            if b == 0.0 && !S::DIV_BY_ZERO_IS_INFINITY {
                 Err(EvalError::new("modulo by zero"))
             } else {
                 Ok(OwnedValue::Float(a % b))
             }
         }
         (OwnedValue::Int(a), OwnedValue::Float(b)) => {
-            if b == 0.0 {
+            if b == 0.0 && !S::DIV_BY_ZERO_IS_INFINITY {
                 Err(EvalError::new("modulo by zero"))
             } else {
                 Ok(OwnedValue::Float(a as f64 % b))
             }
         }
         (OwnedValue::Float(a), OwnedValue::Int(b)) => {
-            if b == 0 {
+            if b == 0 && !S::DIV_BY_ZERO_IS_INFINITY {
                 Err(EvalError::new("modulo by zero"))
             } else {
                 Ok(OwnedValue::Float(a % b as f64))
@@ -853,18 +952,18 @@ fn arith_mod(left: OwnedValue, right: OwnedValue) -> Result<OwnedValue, EvalErro
 }
 
 /// Evaluate comparison operations.
-fn eval_compare<'a, W: Clone + AsRef<[u64]>>(
+fn eval_compare<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     op: CompareOp,
     left: &Expr,
     right: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let left_val = match result_to_owned(eval_single(left, value.clone(), optional)) {
+    let left_val = match result_to_owned(eval_single::<W, S>(left, value.clone(), optional)) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
-    let right_val = match result_to_owned(eval_single(right, value, optional)) {
+    let right_val = match result_to_owned(eval_single::<W, S>(right, value, optional)) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -947,14 +1046,14 @@ fn compare_values(left: &OwnedValue, right: &OwnedValue) -> core::cmp::Ordering 
 }
 
 /// Evaluate boolean AND (short-circuiting).
-fn eval_and<'a, W: Clone + AsRef<[u64]>>(
+fn eval_and<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     left: &Expr,
     right: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate left first
-    let left_val = match result_to_owned(eval_single(left, value.clone(), optional)) {
+    let left_val = match result_to_owned(eval_single::<W, S>(left, value.clone(), optional)) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -965,7 +1064,7 @@ fn eval_and<'a, W: Clone + AsRef<[u64]>>(
     }
 
     // Evaluate right
-    let right_val = match result_to_owned(eval_single(right, value, optional)) {
+    let right_val = match result_to_owned(eval_single::<W, S>(right, value, optional)) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -974,14 +1073,14 @@ fn eval_and<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate boolean OR (short-circuiting).
-fn eval_or<'a, W: Clone + AsRef<[u64]>>(
+fn eval_or<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     left: &Expr,
     right: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate left first
-    let left_val = match result_to_owned(eval_single(left, value.clone(), optional)) {
+    let left_val = match result_to_owned(eval_single::<W, S>(left, value.clone(), optional)) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -992,7 +1091,7 @@ fn eval_or<'a, W: Clone + AsRef<[u64]>>(
     }
 
     // Evaluate right
-    let right_val = match result_to_owned(eval_single(right, value, optional)) {
+    let right_val = match result_to_owned(eval_single::<W, S>(right, value, optional)) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -1007,14 +1106,14 @@ fn eval_not<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryRes
 }
 
 /// Evaluate alternative operator (//): returns left if truthy, otherwise right.
-fn eval_alternative<'a, W: Clone + AsRef<[u64]>>(
+fn eval_alternative<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     left: &Expr,
     right: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate left
-    let left_result = eval_single(left, value.clone(), optional);
+    let left_result = eval_single::<W, S>(left, value.clone(), optional);
 
     // Check if left produced a truthy result
     let is_truthy = match &left_result {
@@ -1031,12 +1130,12 @@ fn eval_alternative<'a, W: Clone + AsRef<[u64]>>(
     if is_truthy {
         left_result
     } else {
-        eval_single(right, value, optional)
+        eval_single::<W, S>(right, value, optional)
     }
 }
 
 /// Evaluate if-then-else expression.
-fn eval_if<'a, W: Clone + AsRef<[u64]>>(
+fn eval_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cond: &Expr,
     then_branch: &Expr,
     else_branch: &Expr,
@@ -1044,7 +1143,7 @@ fn eval_if<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate condition
-    let cond_result = eval_single(cond, value.clone(), optional);
+    let cond_result = eval_single::<W, S>(cond, value.clone(), optional);
 
     // Check if condition is truthy
     let is_truthy = match &cond_result {
@@ -1059,26 +1158,26 @@ fn eval_if<'a, W: Clone + AsRef<[u64]>>(
     };
 
     if is_truthy {
-        eval_single(then_branch, value, optional)
+        eval_single::<W, S>(then_branch, value, optional)
     } else {
-        eval_single(else_branch, value, optional)
+        eval_single::<W, S>(else_branch, value, optional)
     }
 }
 
 /// Evaluate try-catch expression.
-fn eval_try<'a, W: Clone + AsRef<[u64]>>(
+fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     catch: Option<&Expr>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the expression
-    let result = eval_single(expr, value.clone(), optional);
+    let result = eval_single::<W, S>(expr, value.clone(), optional);
 
     match result {
         // If error, use catch handler or return nothing
         QueryResult::Error(_) => match catch {
-            Some(catch_expr) => eval_single(catch_expr, value, optional),
+            Some(catch_expr) => eval_single::<W, S>(catch_expr, value, optional),
             None => QueryResult::None,
         },
         // Non-error results pass through
@@ -1088,13 +1187,13 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>>(
 
 /// Evaluate label expression.
 /// `label $name | expr` establishes a scope that can be exited with `break $name`.
-fn eval_label<'a, W: Clone + AsRef<[u64]>>(
+fn eval_label<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     name: &str,
     body: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let result = eval_single(body, value, optional);
+    let result = eval_single::<W, S>(body, value, optional);
     match result {
         // If we get a Break with matching label, convert to empty output
         QueryResult::Break(label) if label == name => QueryResult::None,
@@ -1104,14 +1203,14 @@ fn eval_label<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate error expression.
-fn eval_error<'a, W: Clone + AsRef<[u64]>>(
+fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     msg: Option<&Expr>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     let message = match msg {
         Some(msg_expr) => {
-            let msg_result = eval_single(msg_expr, value, optional);
+            let msg_result = eval_single::<W, S>(msg_expr, value, optional);
             match result_to_owned(msg_result) {
                 Ok(OwnedValue::String(s)) => s,
                 Ok(v) => v.to_json(),
@@ -1125,7 +1224,7 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate a builtin function.
-fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
+fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     builtin: &Builtin,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -1245,110 +1344,112 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         }
 
         // Length & Keys
-        Builtin::Length => builtin_length(value, optional),
+        Builtin::Length => builtin_length::<W>(value, optional),
         Builtin::Utf8ByteLength => builtin_utf8bytelength(value, optional),
-        Builtin::Keys => builtin_keys(value, optional, true),
-        Builtin::KeysUnsorted => builtin_keys(value, optional, false),
-        Builtin::Has(key_expr) => builtin_has(key_expr, value, optional),
-        Builtin::In(obj_expr) => builtin_in(obj_expr, value, optional),
+        Builtin::Keys => builtin_keys::<W>(value, optional, true),
+        Builtin::KeysUnsorted => builtin_keys::<W>(value, optional, false),
+        Builtin::Has(key_expr) => builtin_has::<W, S>(key_expr, value, optional),
+        Builtin::In(obj_expr) => builtin_in::<W, S>(obj_expr, value, optional),
 
         // Selection & Filtering
-        Builtin::Select(cond) => builtin_select(cond, value, optional),
+        Builtin::Select(cond) => builtin_select::<W, S>(cond, value, optional),
         Builtin::Empty => QueryResult::None,
 
         // Map & Iteration
-        Builtin::Map(f) => builtin_map(f, value, optional),
-        Builtin::MapValues(f) => builtin_map_values(f, value, optional),
+        Builtin::Map(f) => builtin_map::<W, S>(f, value, optional),
+        Builtin::MapValues(f) => builtin_map_values::<W, S>(f, value, optional),
 
         // Reduction
-        Builtin::Add => builtin_add(value, optional),
-        Builtin::Any => builtin_any(value, optional),
-        Builtin::All => builtin_all(value, optional),
-        Builtin::Min => builtin_min(value, optional),
-        Builtin::Max => builtin_max(value, optional),
-        Builtin::MinBy(f) => builtin_min_by(f, value, optional),
-        Builtin::MaxBy(f) => builtin_max_by(f, value, optional),
+        Builtin::Add => builtin_add::<W, S>(value, optional),
+        Builtin::Any => builtin_any::<W>(value, optional),
+        Builtin::All => builtin_all::<W>(value, optional),
+        Builtin::Min => builtin_min::<W>(value, optional),
+        Builtin::Max => builtin_max::<W>(value, optional),
+        Builtin::MinBy(f) => builtin_min_by::<W, S>(f, value, optional),
+        Builtin::MaxBy(f) => builtin_max_by::<W, S>(f, value, optional),
 
         // Phase 5: String Functions
-        Builtin::AsciiDowncase => builtin_ascii_downcase(value, optional),
-        Builtin::AsciiUpcase => builtin_ascii_upcase(value, optional),
-        Builtin::Ltrimstr(s) => builtin_ltrimstr(s, value, optional),
-        Builtin::Rtrimstr(s) => builtin_rtrimstr(s, value, optional),
-        Builtin::Startswith(s) => builtin_startswith(s, value, optional),
-        Builtin::Endswith(s) => builtin_endswith(s, value, optional),
-        Builtin::Split(sep) => builtin_split(sep, value, optional),
-        Builtin::Join(sep) => builtin_join(sep, value, optional),
-        Builtin::Contains(b) => builtin_contains(b, value, optional),
-        Builtin::Inside(b) => builtin_inside(b, value, optional),
+        Builtin::AsciiDowncase => builtin_ascii_downcase::<W>(value, optional),
+        Builtin::AsciiUpcase => builtin_ascii_upcase::<W>(value, optional),
+        Builtin::Ltrimstr(s) => builtin_ltrimstr::<W, S>(s, value, optional),
+        Builtin::Rtrimstr(s) => builtin_rtrimstr::<W, S>(s, value, optional),
+        Builtin::Startswith(s) => builtin_startswith::<W, S>(s, value, optional),
+        Builtin::Endswith(s) => builtin_endswith::<W, S>(s, value, optional),
+        Builtin::Split(sep) => builtin_split::<W, S>(sep, value, optional),
+        Builtin::Join(sep) => builtin_join::<W, S>(sep, value, optional),
+        Builtin::Contains(b) => builtin_contains::<W, S>(b, value, optional),
+        Builtin::Inside(b) => builtin_inside::<W, S>(b, value, optional),
 
         // Phase 5: Array Functions
-        Builtin::First => builtin_first(value, optional),
-        Builtin::Last => builtin_last(value, optional),
-        Builtin::Nth(n) => builtin_nth(n, value, optional),
-        Builtin::Reverse => builtin_reverse(value, optional),
-        Builtin::Flatten => builtin_flatten(value, optional, 1),
-        Builtin::FlattenDepth(depth) => builtin_flatten_depth(depth, value, optional),
-        Builtin::GroupBy(f) => builtin_group_by(f, value, optional),
-        Builtin::Unique => builtin_unique(value, optional),
-        Builtin::UniqueBy(f) => builtin_unique_by(f, value, optional),
-        Builtin::Sort => builtin_sort(value, optional),
-        Builtin::SortBy(f) => builtin_sort_by(f, value, optional),
+        Builtin::First => builtin_first::<W>(value, optional),
+        Builtin::Last => builtin_last::<W>(value, optional),
+        Builtin::Nth(n) => builtin_nth::<W, S>(n, value, optional),
+        Builtin::Reverse => builtin_reverse::<W>(value, optional),
+        Builtin::Flatten => builtin_flatten::<W>(value, optional, 1),
+        Builtin::FlattenDepth(depth) => builtin_flatten_depth::<W, S>(depth, value, optional),
+        Builtin::GroupBy(f) => builtin_group_by::<W, S>(f, value, optional),
+        Builtin::Unique => builtin_unique::<W>(value, optional),
+        Builtin::UniqueBy(f) => builtin_unique_by::<W, S>(f, value, optional),
+        Builtin::Sort => builtin_sort::<W>(value, optional),
+        Builtin::SortBy(f) => builtin_sort_by::<W, S>(f, value, optional),
 
         // Phase 5: Object Functions
-        Builtin::ToEntries => builtin_to_entries(value, optional),
-        Builtin::FromEntries => builtin_from_entries(value, optional),
-        Builtin::WithEntries(f) => builtin_with_entries(f, value, optional),
+        Builtin::ToEntries => builtin_to_entries::<W>(value, optional),
+        Builtin::FromEntries => builtin_from_entries::<W>(value, optional),
+        Builtin::WithEntries(f) => builtin_with_entries::<W, S>(f, value, optional),
 
         // Phase 6: Type Conversions
-        Builtin::ToString => builtin_tostring(value, optional),
-        Builtin::ToNumber => builtin_tonumber(value, optional),
-        Builtin::ToJson => builtin_tojson(value, optional),
-        Builtin::FromJson => builtin_fromjson(value, optional),
+        Builtin::ToString => builtin_tostring::<W>(value, optional),
+        Builtin::ToNumber => builtin_tonumber::<W>(value, optional),
+        Builtin::ToJson => builtin_tojson::<W>(value, optional),
+        Builtin::FromJson => builtin_fromjson::<W>(value, optional),
 
         // Phase 6: Additional String Functions
-        Builtin::Explode => builtin_explode(value, optional),
-        Builtin::Implode => builtin_implode(value, optional),
-        Builtin::Test(re) => builtin_test(re, value, optional),
-        Builtin::Indices(s) => builtin_indices(s, value, optional),
-        Builtin::Index(s) => builtin_index(s, value, optional),
-        Builtin::Rindex(s) => builtin_rindex(s, value, optional),
-        Builtin::ToJsonStream => builtin_tojsonstream(value, optional),
-        Builtin::FromJsonStream => builtin_fromjsonstream(value, optional),
-        Builtin::GetPath(path) => builtin_getpath(path, value, optional),
+        Builtin::Explode => builtin_explode::<W>(value, optional),
+        Builtin::Implode => builtin_implode::<W>(value, optional),
+        Builtin::Test(re) => builtin_test::<W, S>(re, value, optional),
+        Builtin::Indices(s) => builtin_indices::<W, S>(s, value, optional),
+        Builtin::Index(s) => builtin_index::<W, S>(s, value, optional),
+        Builtin::Rindex(s) => builtin_rindex::<W, S>(s, value, optional),
+        Builtin::ToJsonStream => builtin_tojsonstream::<W>(value, optional),
+        Builtin::FromJsonStream => builtin_fromjsonstream::<W>(value, optional),
+        Builtin::GetPath(path) => builtin_getpath::<W, S>(path, value, optional),
 
         // Phase 16: Regex Functions
         #[cfg(feature = "regex")]
-        Builtin::TestFlags(re, flags) => builtin_test_flags(re, flags, value, optional),
+        Builtin::TestFlags(re, flags) => builtin_test_flags::<W, S>(re, flags, value, optional),
         #[cfg(feature = "regex")]
-        Builtin::Match(re) => builtin_match(re, None, value, optional),
+        Builtin::Match(re) => builtin_match::<W, S>(re, None, value, optional),
         #[cfg(feature = "regex")]
-        Builtin::MatchFlags(re, flags) => builtin_match_flags(re, flags, value, optional),
+        Builtin::MatchFlags(re, flags) => builtin_match_flags::<W, S>(re, flags, value, optional),
         #[cfg(feature = "regex")]
-        Builtin::Capture(re) => builtin_capture(re, value, optional),
+        Builtin::Capture(re) => builtin_capture::<W, S>(re, value, optional),
         #[cfg(feature = "regex")]
-        Builtin::CaptureFlags(re, flags) => builtin_capture_flags(re, flags, value, optional),
+        Builtin::CaptureFlags(re, flags) => {
+            builtin_capture_flags::<W, S>(re, flags, value, optional)
+        }
         #[cfg(feature = "regex")]
-        Builtin::Sub(re, replacement) => builtin_sub(re, replacement, value, optional),
+        Builtin::Sub(re, replacement) => builtin_sub::<W, S>(re, replacement, value, optional),
         #[cfg(feature = "regex")]
         Builtin::SubFlags(re, replacement, flags) => {
-            builtin_sub_flags(re, replacement, flags, value, optional)
+            builtin_sub_flags::<W, S>(re, replacement, flags, value, optional)
         }
         #[cfg(feature = "regex")]
-        Builtin::Gsub(re, replacement) => builtin_gsub(re, replacement, value, optional),
+        Builtin::Gsub(re, replacement) => builtin_gsub::<W, S>(re, replacement, value, optional),
         #[cfg(feature = "regex")]
         Builtin::GsubFlags(re, replacement, flags) => {
-            builtin_gsub_flags(re, replacement, flags, value, optional)
+            builtin_gsub_flags::<W, S>(re, replacement, flags, value, optional)
         }
         #[cfg(feature = "regex")]
-        Builtin::Scan(re) => builtin_scan(re, value, optional),
+        Builtin::Scan(re) => builtin_scan::<W, S>(re, value, optional),
         #[cfg(feature = "regex")]
-        Builtin::ScanFlags(re, flags) => builtin_scan_flags(re, flags, value, optional),
+        Builtin::ScanFlags(re, flags) => builtin_scan_flags::<W, S>(re, flags, value, optional),
         #[cfg(feature = "regex")]
-        Builtin::SplitRegex(re, flags) => builtin_split_regex(re, flags, value, optional),
+        Builtin::SplitRegex(re, flags) => builtin_split_regex::<W, S>(re, flags, value, optional),
         #[cfg(feature = "regex")]
-        Builtin::Splits(re) => builtin_splits(re, value, optional),
+        Builtin::Splits(re) => builtin_splits::<W, S>(re, value, optional),
         #[cfg(feature = "regex")]
-        Builtin::SplitsFlags(re, flags) => builtin_splits_flags(re, flags, value, optional),
+        Builtin::SplitsFlags(re, flags) => builtin_splits_flags::<W, S>(re, flags, value, optional),
         // Non-regex fallbacks for when regex feature is not enabled
         #[cfg(not(feature = "regex"))]
         Builtin::TestFlags(_, _)
@@ -1369,14 +1470,14 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         }
 
         // Phase 8: Advanced Control Flow Builtins
-        Builtin::Recurse => builtin_recurse(value, optional),
-        Builtin::RecurseF(f) => builtin_recurse_f(f, value, optional),
-        Builtin::RecurseCond(f, cond) => builtin_recurse_cond(f, cond, value, optional),
-        Builtin::Walk(f) => builtin_walk(f, value, optional),
-        Builtin::IsValid(expr) => builtin_isvalid(expr, value, optional),
+        Builtin::Recurse => builtin_recurse::<W, S>(value, optional),
+        Builtin::RecurseF(f) => builtin_recurse_f::<W, S>(f, value, optional),
+        Builtin::RecurseCond(f, cond) => builtin_recurse_cond::<W, S>(f, cond, value, optional),
+        Builtin::Walk(f) => builtin_walk::<W, S>(f, value, optional),
+        Builtin::IsValid(expr) => builtin_isvalid::<W, S>(expr, value, optional),
 
         // Phase 10: Path Expressions
-        Builtin::Path(expr) => builtin_path(expr, value, optional),
+        Builtin::Path(expr) => builtin_path::<W>(expr, value, optional),
         Builtin::PathNoArg => {
             // PathNoArg requires path context which is handled in eval_pipe_with_context
             // When called without context, return empty path (root position)
@@ -1393,84 +1494,84 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
             let _ = n_expr; // Unused here, but evaluated in context version
             QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
         }
-        Builtin::Paths => builtin_paths(value, optional),
-        Builtin::PathsFilter(filter) => builtin_paths_filter(filter, value, optional),
-        Builtin::LeafPaths => builtin_leaf_paths(value, optional),
-        Builtin::SetPath(path, val) => builtin_setpath(path, val, value, optional),
-        Builtin::DelPaths(paths) => builtin_delpaths(paths, value, optional),
+        Builtin::Paths => builtin_paths::<W>(value, optional),
+        Builtin::PathsFilter(filter) => builtin_paths_filter::<W, S>(filter, value, optional),
+        Builtin::LeafPaths => builtin_leaf_paths::<W>(value, optional),
+        Builtin::SetPath(path, val) => builtin_setpath::<W, S>(path, val, value, optional),
+        Builtin::DelPaths(paths) => builtin_delpaths::<W, S>(paths, value, optional),
 
         // Phase 10: Math Functions
-        Builtin::Floor => builtin_floor(value, optional),
-        Builtin::Ceil => builtin_ceil(value, optional),
-        Builtin::Round => builtin_round(value, optional),
-        Builtin::Sqrt => builtin_sqrt(value, optional),
-        Builtin::Fabs => builtin_fabs(value, optional),
-        Builtin::Log => builtin_log(value, optional),
-        Builtin::Log10 => builtin_log10(value, optional),
-        Builtin::Log2 => builtin_log2(value, optional),
-        Builtin::Exp => builtin_exp(value, optional),
-        Builtin::Exp10 => builtin_exp10(value, optional),
-        Builtin::Exp2 => builtin_exp2(value, optional),
-        Builtin::Pow(base, exp) => builtin_pow(base, exp, value, optional),
-        Builtin::Sin => builtin_sin(value, optional),
-        Builtin::Cos => builtin_cos(value, optional),
-        Builtin::Tan => builtin_tan(value, optional),
-        Builtin::Asin => builtin_asin(value, optional),
-        Builtin::Acos => builtin_acos(value, optional),
-        Builtin::Atan => builtin_atan(value, optional),
-        Builtin::Atan2(y, x) => builtin_atan2(y, x, value, optional),
-        Builtin::Sinh => builtin_sinh(value, optional),
-        Builtin::Cosh => builtin_cosh(value, optional),
-        Builtin::Tanh => builtin_tanh(value, optional),
-        Builtin::Asinh => builtin_asinh(value, optional),
-        Builtin::Acosh => builtin_acosh(value, optional),
-        Builtin::Atanh => builtin_atanh(value, optional),
+        Builtin::Floor => builtin_floor::<W>(value, optional),
+        Builtin::Ceil => builtin_ceil::<W>(value, optional),
+        Builtin::Round => builtin_round::<W>(value, optional),
+        Builtin::Sqrt => builtin_sqrt::<W>(value, optional),
+        Builtin::Fabs => builtin_fabs::<W>(value, optional),
+        Builtin::Log => builtin_log::<W>(value, optional),
+        Builtin::Log10 => builtin_log10::<W>(value, optional),
+        Builtin::Log2 => builtin_log2::<W>(value, optional),
+        Builtin::Exp => builtin_exp::<W>(value, optional),
+        Builtin::Exp10 => builtin_exp10::<W>(value, optional),
+        Builtin::Exp2 => builtin_exp2::<W>(value, optional),
+        Builtin::Pow(base, exp) => builtin_pow::<W, S>(base, exp, value, optional),
+        Builtin::Sin => builtin_sin::<W>(value, optional),
+        Builtin::Cos => builtin_cos::<W>(value, optional),
+        Builtin::Tan => builtin_tan::<W>(value, optional),
+        Builtin::Asin => builtin_asin::<W>(value, optional),
+        Builtin::Acos => builtin_acos::<W>(value, optional),
+        Builtin::Atan => builtin_atan::<W>(value, optional),
+        Builtin::Atan2(y, x) => builtin_atan2::<W, S>(y, x, value, optional),
+        Builtin::Sinh => builtin_sinh::<W>(value, optional),
+        Builtin::Cosh => builtin_cosh::<W>(value, optional),
+        Builtin::Tanh => builtin_tanh::<W>(value, optional),
+        Builtin::Asinh => builtin_asinh::<W>(value, optional),
+        Builtin::Acosh => builtin_acosh::<W>(value, optional),
+        Builtin::Atanh => builtin_atanh::<W>(value, optional),
 
         // Phase 10: Number Classification & Constants
         Builtin::Infinite => QueryResult::Owned(OwnedValue::Float(f64::INFINITY)),
         Builtin::Nan => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
-        Builtin::IsInfinite => builtin_isinfinite(value, optional),
-        Builtin::IsNan => builtin_isnan(value, optional),
-        Builtin::IsNormal => builtin_isnormal(value, optional),
-        Builtin::IsFinite => builtin_isfinite(value, optional),
+        Builtin::IsInfinite => builtin_isinfinite::<W>(value, optional),
+        Builtin::IsNan => builtin_isnan::<W>(value, optional),
+        Builtin::IsNormal => builtin_isnormal::<W>(value, optional),
+        Builtin::IsFinite => builtin_isfinite::<W>(value, optional),
 
         // Phase 10: Debug
-        Builtin::Debug => builtin_debug(value, optional),
-        Builtin::DebugMsg(msg) => builtin_debug_msg(msg, value, optional),
+        Builtin::Debug => builtin_debug::<W>(value, optional),
+        Builtin::DebugMsg(msg) => builtin_debug_msg::<W>(msg, value, optional),
 
         // Phase 10: Environment
-        Builtin::Env => builtin_env(value, optional),
-        Builtin::EnvVar(var) => builtin_envvar(var, value, optional),
-        Builtin::EnvObject(name) => builtin_env_object(name, optional),
-        Builtin::StrEnv(name) => builtin_strenv(name, optional),
+        Builtin::Env => builtin_env::<W>(value, optional),
+        Builtin::EnvVar(var) => builtin_envvar::<W, S>(var, value, optional),
+        Builtin::EnvObject(name) => builtin_env_object::<W>(name, optional),
+        Builtin::StrEnv(name) => builtin_strenv::<W>(name, optional),
 
         // Phase 10: Null handling
         Builtin::NullLit => QueryResult::Owned(OwnedValue::Null),
 
         // Phase 10: String functions
-        Builtin::Trim => builtin_trim(value, optional),
-        Builtin::Ltrim => builtin_ltrim(value, optional),
-        Builtin::Rtrim => builtin_rtrim(value, optional),
+        Builtin::Trim => builtin_trim::<W>(value, optional),
+        Builtin::Ltrim => builtin_ltrim::<W>(value, optional),
+        Builtin::Rtrim => builtin_rtrim::<W>(value, optional),
 
         // Phase 10: Array functions
-        Builtin::Transpose => builtin_transpose(value, optional),
-        Builtin::BSearch(x) => builtin_bsearch(x, value, optional),
+        Builtin::Transpose => builtin_transpose::<W>(value, optional),
+        Builtin::BSearch(x) => builtin_bsearch::<W, S>(x, value, optional),
 
         // Phase 10: Object functions
-        Builtin::ModuleMeta(name) => builtin_modulemeta(name, value, optional),
-        Builtin::Pick(keys) => builtin_pick(keys, value, optional),
-        Builtin::Omit(keys) => builtin_omit(keys, value, optional),
+        Builtin::ModuleMeta(name) => builtin_modulemeta::<W>(name, value, optional),
+        Builtin::Pick(keys) => builtin_pick::<W, S>(keys, value, optional),
+        Builtin::Omit(keys) => builtin_omit::<W, S>(keys, value, optional),
 
         // YAML metadata functions (yq)
-        Builtin::Tag => builtin_tag(value),
-        Builtin::Anchor => builtin_anchor(),
-        Builtin::Style => builtin_style(value),
-        Builtin::Kind => builtin_kind(value),
-        Builtin::Line => builtin_line(),
-        Builtin::Column => builtin_column(),
-        Builtin::DocumentIndex => builtin_document_index(),
-        Builtin::Shuffle => builtin_shuffle(value, optional),
-        Builtin::Pivot => builtin_pivot(value, optional),
+        Builtin::Tag => builtin_tag::<W>(value),
+        Builtin::Anchor => builtin_anchor::<W>(),
+        Builtin::Style => builtin_style::<W>(value),
+        Builtin::Kind => builtin_kind::<W>(value),
+        Builtin::Line => builtin_line::<W>(),
+        Builtin::Column => builtin_column::<W>(),
+        Builtin::DocumentIndex => builtin_document_index::<W>(),
+        Builtin::Shuffle => builtin_shuffle::<W>(value, optional),
+        Builtin::Pivot => builtin_pivot::<W>(value, optional),
         Builtin::SplitDoc => {
             // split_doc is identity - the output formatting (--- separators)
             // is handled by the yq runner, not here
@@ -1483,61 +1584,63 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>>(
         }
 
         // Phase 11: Path manipulation
-        Builtin::Del(path) => builtin_del(path, value, optional),
+        Builtin::Del(path) => builtin_del::<W>(path, value, optional),
 
         // Phase 12: Additional builtins
-        Builtin::Now => builtin_now(),
-        Builtin::Abs => builtin_fabs(value, optional), // abs is an alias for fabs
-        Builtin::Builtins => builtin_builtins(),
-        Builtin::Normals => builtin_normals(value),
-        Builtin::Finites => builtin_finites(value),
+        Builtin::Now => builtin_now::<W>(),
+        Builtin::Abs => builtin_fabs::<W>(value, optional), // abs is an alias for fabs
+        Builtin::Builtins => builtin_builtins::<W>(),
+        Builtin::Normals => builtin_normals::<W>(value),
+        Builtin::Finites => builtin_finites::<W>(value),
 
         // Phase 13: Iteration control
-        Builtin::Limit(n_expr, expr) => builtin_limit(n_expr, expr, value, optional),
-        Builtin::FirstStream(expr) => builtin_first_stream(expr, value, optional),
-        Builtin::LastStream(expr) => builtin_last_stream(expr, value, optional),
-        Builtin::NthStream(n_expr, expr) => builtin_nth_stream(n_expr, expr, value, optional),
-        Builtin::Range(n) => builtin_range(n, value, optional),
-        Builtin::RangeFromTo(from, to) => builtin_range_from_to(from, to, value, optional),
-        Builtin::RangeFromToBy(from, to, by) => {
-            builtin_range_from_to_by(from, to, by, value, optional)
+        Builtin::Limit(n_expr, expr) => builtin_limit::<W, S>(n_expr, expr, value, optional),
+        Builtin::FirstStream(expr) => builtin_first_stream::<W, S>(expr, value, optional),
+        Builtin::LastStream(expr) => builtin_last_stream::<W, S>(expr, value, optional),
+        Builtin::NthStream(n_expr, expr) => {
+            builtin_nth_stream::<W, S>(n_expr, expr, value, optional)
         }
-        Builtin::IsEmpty(expr) => builtin_isempty(expr, value, optional),
+        Builtin::Range(n) => builtin_range::<W, S>(n, value, optional),
+        Builtin::RangeFromTo(from, to) => builtin_range_from_to::<W, S>(from, to, value, optional),
+        Builtin::RangeFromToBy(from, to, by) => {
+            builtin_range_from_to_by::<W, S>(from, to, by, value, optional)
+        }
+        Builtin::IsEmpty(expr) => builtin_isempty::<W, S>(expr, value, optional),
 
         // Phase 14: Recursive traversal (extends Phase 8)
-        Builtin::RecurseDown => builtin_recurse(value, optional), // alias for recurse
+        Builtin::RecurseDown => builtin_recurse::<W, S>(value, optional), // alias for recurse
 
         // Phase 15: Date/Time functions
-        Builtin::Gmtime => builtin_gmtime(value, optional),
-        Builtin::Localtime => builtin_localtime(value, optional),
-        Builtin::Mktime => builtin_mktime(value, optional),
-        Builtin::Strftime(fmt) => builtin_strftime(fmt, value, optional),
-        Builtin::Strptime(fmt) => builtin_strptime(fmt, value, optional),
-        Builtin::Todate => builtin_todate(value, optional),
-        Builtin::Fromdate => builtin_fromdate(value, optional),
-        Builtin::Todateiso8601 => builtin_todate(value, optional), // alias for todate
-        Builtin::Fromdateiso8601 => builtin_fromdate(value, optional), // alias for fromdate
+        Builtin::Gmtime => builtin_gmtime::<W>(value, optional),
+        Builtin::Localtime => builtin_localtime::<W>(value, optional),
+        Builtin::Mktime => builtin_mktime::<W>(value, optional),
+        Builtin::Strftime(fmt) => builtin_strftime::<W, S>(fmt, value, optional),
+        Builtin::Strptime(fmt) => builtin_strptime::<W, S>(fmt, value, optional),
+        Builtin::Todate => builtin_todate::<W>(value, optional),
+        Builtin::Fromdate => builtin_fromdate::<W>(value, optional),
+        Builtin::Todateiso8601 => builtin_todate::<W>(value, optional), // alias for todate
+        Builtin::Fromdateiso8601 => builtin_fromdate::<W>(value, optional), // alias for fromdate
 
         // Phase 17: Combinations
-        Builtin::Combinations => builtin_combinations(value, optional),
-        Builtin::CombinationsN(n) => builtin_combinations_n(n, value, optional),
+        Builtin::Combinations => builtin_combinations::<W>(value, optional),
+        Builtin::CombinationsN(n) => builtin_combinations_n::<W, S>(n, value, optional),
 
         // Phase 18: Additional math functions
-        Builtin::Trunc => builtin_trunc(value, optional),
+        Builtin::Trunc => builtin_trunc::<W>(value, optional),
 
         // Phase 19: Type conversion
-        Builtin::ToBoolean => builtin_toboolean(value, optional),
+        Builtin::ToBoolean => builtin_toboolean::<W>(value, optional),
 
         // Phase 20: Iteration control extension
-        Builtin::Skip(n_expr, expr) => builtin_skip(n_expr, expr, value, optional),
+        Builtin::Skip(n_expr, expr) => builtin_skip::<W, S>(n_expr, expr, value, optional),
 
         // Phase 21: Extended Date/Time functions (yq)
-        Builtin::FromUnix => builtin_from_unix(value, optional),
-        Builtin::ToUnix => builtin_to_unix(value, optional),
-        Builtin::Tz(zone) => builtin_tz(zone, value, optional),
+        Builtin::FromUnix => builtin_from_unix::<W>(value, optional),
+        Builtin::ToUnix => builtin_to_unix::<W>(value, optional),
+        Builtin::Tz(zone) => builtin_tz::<W, S>(zone, value, optional),
 
         // Phase 22: File operations (yq)
-        Builtin::Load(file_expr) => builtin_load(file_expr, value, optional),
+        Builtin::Load(file_expr) => builtin_load::<W, S>(file_expr, value, optional),
 
         // Phase 23: Position-based navigation (succinctly extension)
         // These require cursor context - handled in eval_generic.rs
@@ -1640,13 +1743,13 @@ fn builtin_keys<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: has(key)
-fn builtin_has<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     key_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the key expression
-    let key_result = eval_single(key_expr, value.clone(), optional);
+    let key_result = eval_single::<W, S>(key_expr, value.clone(), optional);
     let key_owned = match result_to_owned(key_result) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
@@ -1667,11 +1770,20 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>>(
             });
             QueryResult::Owned(OwnedValue::Bool(found))
         }
-        // Array has index - jq's has() only accepts non-negative indices
+        // Array has index - jq returns false for negative, yq returns true if in range
         (StandardJson::Array(elements), OwnedValue::Int(idx)) => {
             let len = (*elements).count() as i64;
-            // jq: has() returns false for negative indices
-            let in_bounds = *idx >= 0 && *idx < len;
+            let in_bounds = if S::NEGATIVE_INDEX_IN_HAS {
+                // yq behavior: negative indices are valid if abs(idx) <= len
+                if *idx >= 0 {
+                    *idx < len
+                } else {
+                    idx.abs() <= len
+                }
+            } else {
+                // jq behavior: only non-negative indices
+                *idx >= 0 && *idx < len
+            };
             QueryResult::Owned(OwnedValue::Bool(in_bounds))
         }
         _ if optional => QueryResult::None,
@@ -1682,14 +1794,14 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: in(obj)
-fn builtin_in<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     obj_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // The input should be a key (string or number), and we check if it exists in obj
     let key_owned = to_owned(&value);
-    let obj_result = eval_single(obj_expr, value.clone(), optional);
+    let obj_result = eval_single::<W, S>(obj_expr, value.clone(), optional);
 
     // Get the object/array to check against (need to handle Owned case for object literals)
     let obj_owned = match obj_result {
@@ -1718,11 +1830,20 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>>(
             let found = fields.keys().any(|k| k == key);
             QueryResult::Owned(OwnedValue::Bool(found))
         }
-        // jq's in() only accepts non-negative indices for arrays
+        // jq returns false for negative indices, yq returns true if in range
         (OwnedValue::Int(idx), OwnedValue::Array(elements)) => {
             let len = elements.len() as i64;
-            // jq: in() returns false for negative indices
-            let in_bounds = *idx >= 0 && *idx < len;
+            let in_bounds = if S::NEGATIVE_INDEX_IN_HAS {
+                // yq behavior: negative indices are valid if abs(idx) <= len
+                if *idx >= 0 {
+                    *idx < len
+                } else {
+                    idx.abs() <= len
+                }
+            } else {
+                // jq behavior: only non-negative indices
+                *idx >= 0 && *idx < len
+            };
             QueryResult::Owned(OwnedValue::Bool(in_bounds))
         }
         _ if optional => QueryResult::None,
@@ -1733,13 +1854,13 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: select(condition)
-fn builtin_select<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cond: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate condition
-    let cond_result = eval_single(cond, value.clone(), optional);
+    let cond_result = eval_single::<W, S>(cond, value.clone(), optional);
 
     // Check if condition is truthy
     let is_truthy = match &cond_result {
@@ -1761,7 +1882,7 @@ fn builtin_select<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: map(f)
-fn builtin_map<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -1771,7 +1892,7 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>>(
         StandardJson::Array(elements) => {
             let mut results = Vec::new();
             for elem in elements {
-                match eval_single(f, elem, optional).materialize_cursor() {
+                match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
                     QueryResult::One(v) => results.push(to_owned(&v)),
                     QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Owned(v) => results.push(v),
@@ -1790,7 +1911,7 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: map_values(f)
-fn builtin_map_values<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -1812,7 +1933,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>>(
 
                 // Apply f to the value
                 let field_val = field.value();
-                match eval_single(f, field_val, optional).materialize_cursor() {
+                match eval_single::<W, S>(f, field_val, optional).materialize_cursor() {
                     QueryResult::One(v) => {
                         result_map.insert(key, to_owned(&v));
                     }
@@ -1841,7 +1962,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>>(
             // map_values on array applies to each element
             let mut results = Vec::new();
             for elem in elements {
-                match eval_single(f, elem, optional).materialize_cursor() {
+                match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
                     QueryResult::One(v) => results.push(to_owned(&v)),
                     QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Owned(v) => results.push(v),
@@ -1868,7 +1989,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: add
-fn builtin_add<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_add<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -1882,7 +2003,7 @@ fn builtin_add<'a, W: Clone + AsRef<[u64]>>(
             // Fold the items using addition
             let mut acc = items.into_iter();
             let first = acc.next().unwrap();
-            let result = acc.try_fold(first, arith_add);
+            let result = acc.try_fold(first, arith_add::<S>);
 
             match result {
                 Ok(v) => QueryResult::Owned(v),
@@ -1975,7 +2096,7 @@ fn builtin_max<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: min_by(f)
-fn builtin_min_by<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -1990,7 +2111,7 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>>(
             // Compute keys for each item
             let mut keyed: Vec<(OwnedValue, StandardJson<'a, W>)> = Vec::new();
             for item in items {
-                match eval_single(f, item.clone(), optional) {
+                match eval_single::<W, S>(f, item.clone(), optional) {
                     QueryResult::One(v) => keyed.push((to_owned(&v), item)),
                     QueryResult::Owned(v) => keyed.push((v, item)),
                     QueryResult::Error(e) => return QueryResult::Error(e),
@@ -2011,7 +2132,7 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: max_by(f)
-fn builtin_max_by<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -2026,7 +2147,7 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>>(
             // Compute keys for each item
             let mut keyed: Vec<(OwnedValue, StandardJson<'a, W>)> = Vec::new();
             for item in items {
-                match eval_single(f, item.clone(), optional) {
+                match eval_single::<W, S>(f, item.clone(), optional) {
                     QueryResult::One(v) => keyed.push((to_owned(&v), item)),
                     QueryResult::Owned(v) => keyed.push((v, item)),
                     QueryResult::Error(e) => return QueryResult::Error(e),
@@ -2089,13 +2210,13 @@ fn builtin_ascii_upcase<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: ltrimstr(s) - remove prefix s
-fn builtin_ltrimstr<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_ltrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     prefix_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the prefix string
-    let prefix_result = eval_single(prefix_expr, value.clone(), optional);
+    let prefix_result = eval_single::<W, S>(prefix_expr, value.clone(), optional);
     let prefix = match result_to_owned(prefix_result) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
@@ -2121,13 +2242,13 @@ fn builtin_ltrimstr<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: rtrimstr(s) - remove suffix s
-fn builtin_rtrimstr<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_rtrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     suffix_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the suffix string
-    let suffix_result = eval_single(suffix_expr, value.clone(), optional);
+    let suffix_result = eval_single::<W, S>(suffix_expr, value.clone(), optional);
     let suffix = match result_to_owned(suffix_result) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
@@ -2153,13 +2274,13 @@ fn builtin_rtrimstr<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: startswith(s) - check if string starts with s
-fn builtin_startswith<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_startswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     prefix_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the prefix string
-    let prefix_result = eval_single(prefix_expr, value.clone(), optional);
+    let prefix_result = eval_single::<W, S>(prefix_expr, value.clone(), optional);
     let prefix = match result_to_owned(prefix_result) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
@@ -2180,13 +2301,13 @@ fn builtin_startswith<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: endswith(s) - check if string ends with s
-fn builtin_endswith<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_endswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     suffix_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the suffix string
-    let suffix_result = eval_single(suffix_expr, value.clone(), optional);
+    let suffix_result = eval_single::<W, S>(suffix_expr, value.clone(), optional);
     let suffix = match result_to_owned(suffix_result) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
@@ -2207,13 +2328,13 @@ fn builtin_endswith<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: split(s) - split string by separator
-fn builtin_split<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sep_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the separator string
-    let sep_result = eval_single(sep_expr, value.clone(), optional);
+    let sep_result = eval_single::<W, S>(sep_expr, value.clone(), optional);
     let sep = match result_to_owned(sep_result) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
@@ -2245,13 +2366,13 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: join(s) - join array elements with separator
-fn builtin_join<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sep_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the separator string
-    let sep_result = eval_single(sep_expr, value.clone(), optional);
+    let sep_result = eval_single::<W, S>(sep_expr, value.clone(), optional);
     let sep = match result_to_owned(sep_result) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
@@ -2285,13 +2406,13 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: contains(b) - check if input contains b
-fn builtin_contains<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     b_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the value to check
-    let b_result = eval_single(b_expr, value.clone(), optional);
+    let b_result = eval_single::<W, S>(b_expr, value.clone(), optional);
     let b = match result_to_owned(b_result) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
@@ -2322,13 +2443,13 @@ fn owned_contains(a: &OwnedValue, b: &OwnedValue) -> bool {
 }
 
 /// Builtin: inside(b) - check if input is inside b
-fn builtin_inside<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     b_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the container value
-    let b_result = eval_single(b_expr, value.clone(), optional);
+    let b_result = eval_single::<W, S>(b_expr, value.clone(), optional);
     let b = match result_to_owned(b_result) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
@@ -2382,7 +2503,7 @@ fn builtin_last<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: nth(n) - nth element
-fn builtin_nth<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     n_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -2393,7 +2514,7 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>>(
     }
 
     // Get the index
-    let n_result = eval_single(n_expr, value.clone(), optional);
+    let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match result_to_owned(n_result) {
         Ok(OwnedValue::Int(i)) => i,
         Ok(_) => return QueryResult::Error(EvalError::type_error("number", "non-number")),
@@ -2401,7 +2522,7 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>>(
     };
 
     match value {
-        StandardJson::Array(elements) => match get_element_at_index(elements, n) {
+        StandardJson::Array(elements) => match get_element_at_index::<W>(elements, n) {
             Some(v) => QueryResult::One(v),
             // jq: [1,2] | nth(10) => null
             None => QueryResult::Owned(OwnedValue::Null),
@@ -2473,13 +2594,13 @@ fn flatten_owned(items: Vec<OwnedValue>, depth: usize) -> Vec<OwnedValue> {
 }
 
 /// Builtin: flatten(depth) - flatten to specific depth
-fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     depth_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the depth
-    let depth_result = eval_single(depth_expr, value.clone(), optional);
+    let depth_result = eval_single::<W, S>(depth_expr, value.clone(), optional);
     let depth = match result_to_owned(depth_result) {
         Ok(OwnedValue::Int(d)) if d >= 0 => d as usize,
         Ok(OwnedValue::Int(_)) => {
@@ -2489,11 +2610,11 @@ fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>>(
         Err(e) => return QueryResult::Error(e),
     };
 
-    builtin_flatten(value, optional, depth)
+    builtin_flatten::<W>(value, optional, depth)
 }
 
 /// Builtin: group_by(f) - group by key function
-fn builtin_group_by<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -2505,7 +2626,7 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>>(
             // Compute keys for each item
             let mut keyed: Vec<(OwnedValue, OwnedValue)> = Vec::new();
             for item in items {
-                let key = match eval_single(f, item.clone(), optional) {
+                let key = match eval_single::<W, S>(f, item.clone(), optional) {
                     QueryResult::One(v) => to_owned(&v),
                     QueryResult::Owned(v) => v,
                     QueryResult::Error(e) => return QueryResult::Error(e),
@@ -2570,7 +2691,7 @@ fn builtin_unique<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: unique_by(f) - remove duplicates by key
-fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -2582,7 +2703,7 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>>(
             // Compute keys for each item
             let mut keyed: Vec<(OwnedValue, OwnedValue)> = Vec::new();
             for item in items {
-                let key = match eval_single(f, item.clone(), optional) {
+                let key = match eval_single::<W, S>(f, item.clone(), optional) {
                     QueryResult::One(v) => to_owned(&v),
                     QueryResult::Owned(v) => v,
                     QueryResult::Error(e) => return QueryResult::Error(e),
@@ -2622,7 +2743,7 @@ fn builtin_sort<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: sort_by(f) - sort by key function
-fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -2634,7 +2755,7 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>>(
             // Compute keys for each item
             let mut keyed: Vec<(OwnedValue, OwnedValue)> = Vec::new();
             for item in items {
-                let key = match eval_single(f, item.clone(), optional) {
+                let key = match eval_single::<W, S>(f, item.clone(), optional) {
                     QueryResult::One(v) => to_owned(&v),
                     QueryResult::Owned(v) => v,
                     QueryResult::Error(e) => return QueryResult::Error(e),
@@ -2732,7 +2853,7 @@ fn builtin_from_entries<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: with_entries(f) - to_entries | map(f) | from_entries
-fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -2766,7 +2887,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>>(
                 let index = crate::json::JsonIndex::build(&entry_json);
                 let cursor = index.root(&entry_json);
 
-                match eval_single(f, cursor.value(), optional).materialize_cursor() {
+                match eval_single::<Vec<u64>, S>(f, cursor.value(), optional).materialize_cursor() {
                     QueryResult::One(v) => transformed.push(to_owned(&v)),
                     QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Owned(v) => transformed.push(v),
@@ -2820,7 +2941,7 @@ fn owned_to_json_bytes(value: &OwnedValue) -> Vec<u8> {
 // =============================================================================
 
 /// Evaluate string interpolation: `"Hello \(.name)"`
-fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>>(
+fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     parts: &[StringPart],
     value: StandardJson<'a, W>,
     optional: bool,
@@ -2831,7 +2952,7 @@ fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>>(
         match part {
             StringPart::Literal(s) => result.push_str(s),
             StringPart::Expr(expr) => {
-                let val = eval_single(expr, value.clone(), optional).materialize_cursor();
+                let val = eval_single::<W, S>(expr, value.clone(), optional).materialize_cursor();
                 let s = match val {
                     QueryResult::One(v) => owned_to_string(&to_owned(&v)),
                     QueryResult::OneCursor(_) => unreachable!(),
@@ -3511,14 +3632,14 @@ fn builtin_toboolean<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: skip(n; expr) - skip first n outputs from expr
-fn builtin_skip<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     n_expr: &Expr,
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate n
-    let n_result = eval_single(n_expr, value.clone(), optional);
+    let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match n_result {
         QueryResult::One(v) => {
             if let StandardJson::Number(num) = v {
@@ -3534,7 +3655,7 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Evaluate expr and skip first n results
-    let result = eval_single(expr, value, optional);
+    let result = eval_single::<W, S>(expr, value, optional);
     match result {
         QueryResult::One(v) => {
             if n == 0 {
@@ -4043,13 +4164,13 @@ fn builtin_implode<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: test(re) - test if string matches (basic substring matching)
-fn builtin_test<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_test<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the pattern
-    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
@@ -4073,13 +4194,13 @@ fn builtin_test<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: indices(s) - find all indices of substring/element s
-fn builtin_indices<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_indices<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     s_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the pattern (can be any type for arrays, must be string for strings)
-    let pattern = match result_to_owned(eval_single(s_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(s_expr, value.clone(), optional)) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -4125,13 +4246,13 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: index(s) - first index of substring/element s, or null
-fn builtin_index<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     s_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the pattern (can be any type for arrays, must be string for strings)
-    let pattern = match result_to_owned(eval_single(s_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(s_expr, value.clone(), optional)) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -4171,13 +4292,13 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: rindex(s) - last index of substring/element s, or null
-fn builtin_rindex<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_rindex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     s_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the pattern (can be any type for arrays, must be string for strings)
-    let pattern = match result_to_owned(eval_single(s_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(s_expr, value.clone(), optional)) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -4270,13 +4391,13 @@ fn builtin_fromjsonstream<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: getpath(path) - get value at path
-fn builtin_getpath<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the path expression
-    let path = match result_to_owned(eval_single(path_expr, value.clone(), optional)) {
+    let path = match result_to_owned(eval_single::<W, S>(path_expr, value.clone(), optional)) {
         Ok(OwnedValue::Array(arr)) => arr,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("array", "path")),
@@ -4350,14 +4471,14 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<regex::Regex, EvalE
 
 /// Builtin: match(re) or match(re; flags) - return match object
 #[cfg(feature = "regex")]
-fn builtin_match<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     flags: Option<&str>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the pattern
-    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
@@ -4452,13 +4573,13 @@ fn build_match_object(re: &regex::Regex, matched: &str, offset: usize, input: &s
 
 /// Builtin: capture(re) - return named captures as object
 #[cfg(feature = "regex")]
-fn builtin_capture<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_capture<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the pattern
-    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
@@ -4500,13 +4621,13 @@ fn builtin_capture<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: scan(re) - find all matches
 #[cfg(feature = "regex")]
-fn builtin_scan<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_scan<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the pattern
-    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
@@ -4542,13 +4663,13 @@ fn builtin_scan<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: splits(re) - split by regex
 #[cfg(feature = "regex")]
-fn builtin_splits<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_splits<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the pattern
-    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
@@ -4584,14 +4705,14 @@ fn builtin_splits<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: sub(re; replacement) - replace first match
 #[cfg(feature = "regex")]
-fn builtin_sub<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_sub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     replacement_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the pattern
-    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
@@ -4599,8 +4720,11 @@ fn builtin_sub<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Get the replacement
-    let replacement = match result_to_owned(eval_single(replacement_expr, value.clone(), optional))
-    {
+    let replacement = match result_to_owned(eval_single::<W, S>(
+        replacement_expr,
+        value.clone(),
+        optional,
+    )) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
@@ -4632,14 +4756,14 @@ fn builtin_sub<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: gsub(re; replacement) - replace all matches
 #[cfg(feature = "regex")]
-fn builtin_gsub<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_gsub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     replacement_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the pattern
-    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
@@ -4647,8 +4771,11 @@ fn builtin_gsub<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Get the replacement
-    let replacement = match result_to_owned(eval_single(replacement_expr, value.clone(), optional))
-    {
+    let replacement = match result_to_owned(eval_single::<W, S>(
+        replacement_expr,
+        value.clone(),
+        optional,
+    )) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
@@ -4680,14 +4807,14 @@ fn builtin_gsub<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: test(re; flags) - test with flags expression
 #[cfg(feature = "regex")]
-fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     flags_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the flags expression
-    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+    let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
@@ -4695,7 +4822,7 @@ fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Get the pattern
-    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
@@ -4726,52 +4853,52 @@ fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: match(re; flags) - match with flags expression
 #[cfg(feature = "regex")]
-fn builtin_match_flags<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_match_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     flags_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the flags expression
-    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+    let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
         Err(e) => return QueryResult::Error(e),
     };
 
-    builtin_match(re_expr, Some(&flags), value, optional)
+    builtin_match::<W, S>(re_expr, Some(&flags), value, optional)
 }
 
 /// Builtin: capture(re; flags) - capture with flags expression
 #[cfg(feature = "regex")]
-fn builtin_capture_flags<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_capture_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     flags_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the flags expression
-    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+    let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
         Err(e) => return QueryResult::Error(e),
     };
 
-    builtin_capture_with_flags(re_expr, Some(&flags), value, optional)
+    builtin_capture_with_flags::<W, S>(re_expr, Some(&flags), value, optional)
 }
 
 /// Builtin: capture(re) or capture(re; flags) - capture named groups
 #[cfg(feature = "regex")]
-fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     flags: Option<&str>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the pattern
-    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
@@ -4815,7 +4942,7 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: sub(re; replacement; flags) - replace first match with flags
 #[cfg(feature = "regex")]
-fn builtin_sub_flags<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_sub_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     replacement_expr: &Expr,
     flags_expr: &Expr,
@@ -4823,19 +4950,19 @@ fn builtin_sub_flags<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the flags expression
-    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+    let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
         Err(e) => return QueryResult::Error(e),
     };
 
-    builtin_sub_with_flags(re_expr, replacement_expr, Some(&flags), value, optional)
+    builtin_sub_with_flags::<W, S>(re_expr, replacement_expr, Some(&flags), value, optional)
 }
 
 /// Builtin: sub(re; replacement) or sub(re; replacement; flags) - replace first match
 #[cfg(feature = "regex")]
-fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     replacement_expr: &Expr,
     flags: Option<&str>,
@@ -4843,7 +4970,7 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the pattern
-    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
@@ -4851,8 +4978,11 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Get the replacement
-    let replacement = match result_to_owned(eval_single(replacement_expr, value.clone(), optional))
-    {
+    let replacement = match result_to_owned(eval_single::<W, S>(
+        replacement_expr,
+        value.clone(),
+        optional,
+    )) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
@@ -4887,7 +5017,7 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: gsub(re; replacement; flags) - replace all matches with flags
 #[cfg(feature = "regex")]
-fn builtin_gsub_flags<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_gsub_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     replacement_expr: &Expr,
     flags_expr: &Expr,
@@ -4895,19 +5025,19 @@ fn builtin_gsub_flags<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the flags expression
-    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+    let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
         Err(e) => return QueryResult::Error(e),
     };
 
-    builtin_gsub_with_flags(re_expr, replacement_expr, Some(&flags), value, optional)
+    builtin_gsub_with_flags::<W, S>(re_expr, replacement_expr, Some(&flags), value, optional)
 }
 
 /// Builtin: gsub(re; replacement) or gsub(re; replacement; flags) - replace all matches
 #[cfg(feature = "regex")]
-fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     replacement_expr: &Expr,
     flags: Option<&str>,
@@ -4915,7 +5045,7 @@ fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the pattern
-    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
@@ -4923,8 +5053,11 @@ fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Get the replacement
-    let replacement = match result_to_owned(eval_single(replacement_expr, value.clone(), optional))
-    {
+    let replacement = match result_to_owned(eval_single::<W, S>(
+        replacement_expr,
+        value.clone(),
+        optional,
+    )) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "replacement")),
@@ -4959,33 +5092,33 @@ fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: scan(re; flags) - find all matches with flags
 #[cfg(feature = "regex")]
-fn builtin_scan_flags<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_scan_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     flags_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the flags expression
-    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+    let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
         Err(e) => return QueryResult::Error(e),
     };
 
-    builtin_scan_with_flags(re_expr, Some(&flags), value, optional)
+    builtin_scan_with_flags::<W, S>(re_expr, Some(&flags), value, optional)
 }
 
 /// Builtin: scan(re) or scan(re; flags) - find all matches
 #[cfg(feature = "regex")]
-fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     flags: Option<&str>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the pattern
-    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
@@ -5041,14 +5174,14 @@ fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: split(re; flags) - split by regex with flags
 #[cfg(feature = "regex")]
-fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     flags_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the flags expression
-    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+    let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
@@ -5056,7 +5189,7 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Get the pattern
-    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
@@ -5092,33 +5225,33 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: splits(re; flags) - split by regex with flags as stream
 #[cfg(feature = "regex")]
-fn builtin_splits_flags<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_splits_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     flags_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the flags expression
-    let flags = match result_to_owned(eval_single(flags_expr, value.clone(), optional)) {
+    let flags = match result_to_owned(eval_single::<W, S>(flags_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "flags")),
         Err(e) => return QueryResult::Error(e),
     };
 
-    builtin_splits_with_flags(re_expr, Some(&flags), value, optional)
+    builtin_splits_with_flags::<W, S>(re_expr, Some(&flags), value, optional)
 }
 
 /// Builtin: splits(re) or splits(re; flags) - split by regex as stream
 #[cfg(feature = "regex")]
-fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     flags: Option<&str>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the pattern
-    let pattern = match result_to_owned(eval_single(re_expr, value.clone(), optional)) {
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
@@ -5201,7 +5334,7 @@ fn convert_jq_replacement(replacement: &str) -> String {
 }
 
 /// Evaluate a pipe (chain) of expressions.
-fn eval_pipe<'a, W: Clone + AsRef<[u64]>>(
+fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
     value: StandardJson<'a, W>,
     optional: bool,
@@ -5209,7 +5342,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>>(
     // Check if any expression in the pipe needs path context (PathNoArg, Parent)
     if exprs.iter().any(needs_path_context) {
         let owned = to_owned(&value);
-        return eval_pipe_with_path_context::<W>(exprs, &owned, &[], optional);
+        return eval_pipe_with_path_context::<W, S>(exprs, &owned, &[], optional);
     }
 
     if exprs.is_empty() {
@@ -5219,7 +5352,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>>(
     let (first, rest) = exprs.split_first().unwrap();
 
     // Evaluate first expression
-    let result = eval_single(first, value, optional);
+    let result = eval_single::<W, S>(first, value, optional);
 
     if rest.is_empty() {
         return result;
@@ -5227,12 +5360,12 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>>(
 
     // Apply remaining expressions to the result
     match result.materialize_cursor() {
-        QueryResult::One(v) => eval_pipe(rest, v, optional),
+        QueryResult::One(v) => eval_pipe::<W, S>(rest, v, optional),
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(values) => {
             let mut all_results = Vec::new();
             for v in values {
-                match eval_pipe(rest, v, optional).materialize_cursor() {
+                match eval_pipe::<W, S>(rest, v, optional).materialize_cursor() {
                     QueryResult::One(r) => all_results.push(r),
                     QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Many(rs) => all_results.extend(rs),
@@ -5252,13 +5385,21 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::Break(label) => QueryResult::Break(label),
         QueryResult::Owned(v) => {
             // Continue piping with owned value using eval_owned_pipe
-            eval_owned_pipe::<W>(rest, v, optional)
+            // Convert the result type since eval_owned_pipe uses Vec<u64> internally
+            match eval_owned_pipe::<Vec<u64>, S>(rest, v, optional) {
+                QueryResult::Owned(o) => QueryResult::Owned(o),
+                QueryResult::Error(e) => QueryResult::Error(e),
+                QueryResult::None => QueryResult::None,
+                QueryResult::ManyOwned(vs) => QueryResult::ManyOwned(vs),
+                QueryResult::Break(label) => QueryResult::Break(label),
+                _ => unreachable!("eval_owned_pipe only returns Owned variants"),
+            }
         }
         QueryResult::ManyOwned(vs) => {
             // Pipe each owned value through the rest
             let mut all_results: Vec<OwnedValue> = Vec::new();
             for v in vs {
-                match eval_owned_pipe::<W>(rest, v, optional).materialize_cursor() {
+                match eval_owned_pipe::<Vec<u64>, S>(rest, v, optional).materialize_cursor() {
                     QueryResult::Owned(r) => all_results.push(r),
                     QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::ManyOwned(rs) => all_results.extend(rs),
@@ -5281,7 +5422,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate a pipe with an OwnedValue as input.
-fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>>(
+fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
     value: OwnedValue,
     optional: bool,
@@ -5298,7 +5439,7 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>>(
         Expr::Pipe(exprs.to_vec())
     };
 
-    match eval_owned_expr(&rest_expr, &value, optional) {
+    match eval_owned_expr::<S>(&rest_expr, &value, optional) {
         Ok(v) => QueryResult::Owned(v),
         Err(e) => QueryResult::Error(e),
     }
@@ -5388,9 +5529,9 @@ fn slice_elements<'a, W: Clone + AsRef<[u64]>>(
 /// let cursor = index.root(json);
 ///
 /// let expr = parse(".name").unwrap();
-/// let result = eval(&expr, cursor);
+/// let result = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
 /// ```
-pub fn eval<'a, W: Clone + AsRef<[u64]>>(
+pub fn eval<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     cursor: JsonCursor<'a, W>,
 ) -> QueryResult<'a, W> {
@@ -5399,16 +5540,16 @@ pub fn eval<'a, W: Clone + AsRef<[u64]>>(
     if matches!(expr, Expr::Identity) {
         return QueryResult::OneCursor(cursor);
     }
-    eval_single(expr, cursor.value(), false)
+    eval_single::<W, S>(expr, cursor.value(), false)
 }
 
 /// Evaluate a jq expression, returning only successfully matched values.
 /// Errors and None results are filtered out.
-pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>>(
+pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     cursor: JsonCursor<'a, W>,
 ) -> Vec<StandardJson<'a, W>> {
-    match eval(expr, cursor) {
+    match eval::<W, S>(expr, cursor) {
         QueryResult::One(v) => vec![v],
         QueryResult::OneCursor(c) => vec![c.value()],
         QueryResult::Many(vs) => vs,
@@ -5426,14 +5567,16 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>>(
 
 /// Evaluate simple assignment: `.path = value`
 /// Sets the value at path and returns the modified input.
-fn eval_assign<'a, W: Clone + AsRef<[u64]>>(
+fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     value_expr: &Expr,
     input: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // First evaluate the value expression
-    let new_value = match eval_single(value_expr, input.clone(), optional).materialize_cursor() {
+    let new_value = match eval_single::<W, S>(value_expr, input.clone(), optional)
+        .materialize_cursor()
+    {
         QueryResult::One(v) => to_owned(&v),
         QueryResult::Owned(v) => v,
         QueryResult::None => OwnedValue::Null,
@@ -5470,7 +5613,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>>(
 
 /// Evaluate update assignment: `.path |= filter`
 /// Applies filter to the value at path and updates it.
-fn eval_update<'a, W: Clone + AsRef<[u64]>>(
+fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     filter_expr: &Expr,
     input: StandardJson<'a, W>,
@@ -5480,7 +5623,7 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>>(
     let mut result = to_owned(&input);
 
     // Get current value at path, apply filter, and set back
-    if let Err(e) = update_path(&mut result, path_expr, filter_expr, optional) {
+    if let Err(e) = update_path::<S>(&mut result, path_expr, filter_expr, optional) {
         return QueryResult::Error(e);
     }
 
@@ -5488,7 +5631,7 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate compound assignment: `.path += value`, `.path -= value`, etc.
-fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>>(
+fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     op: AssignOp,
     path_expr: &Expr,
     value_expr: &Expr,
@@ -5510,12 +5653,12 @@ fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>>(
         right: value_expr.clone().into(),
     };
 
-    eval_update(path_expr, &filter, input, optional)
+    eval_update::<W, S>(path_expr, &filter, input, optional)
 }
 
 /// Evaluate alternative assignment: `.path //= value`
 /// Sets path to value only if current value is null or false.
-fn eval_alternative_assign<'a, W: Clone + AsRef<[u64]>>(
+fn eval_alternative_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     value_expr: &Expr,
     input: StandardJson<'a, W>,
@@ -5524,7 +5667,7 @@ fn eval_alternative_assign<'a, W: Clone + AsRef<[u64]>>(
     // Convert to update: .path //= value  becomes  .path |= . // value
     let filter = Expr::Alternative(Box::new(Expr::Identity), Box::new(value_expr.clone()));
 
-    eval_update(path_expr, &filter, input, optional)
+    eval_update::<W, S>(path_expr, &filter, input, optional)
 }
 
 /// Set a value at a path in an owned value.
@@ -5624,7 +5767,7 @@ fn get_path_mut<'a>(
 }
 
 /// Update a value at a path by applying a filter.
-fn update_path(
+fn update_path<S: EvalSemantics>(
     root: &mut OwnedValue,
     path_expr: &Expr,
     filter_expr: &Expr,
@@ -5633,7 +5776,7 @@ fn update_path(
     match path_expr {
         Expr::Identity => {
             // Apply filter to root itself using eval_owned_expr
-            match eval_owned_expr(filter_expr, root, optional) {
+            match eval_owned_expr::<S>(filter_expr, root, optional) {
                 Ok(v) => {
                     *root = v;
                     Ok(())
@@ -5645,7 +5788,7 @@ fn update_path(
         Expr::Field(name) => {
             if let OwnedValue::Object(map) = root {
                 let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
-                update_path(current, &Expr::Identity, filter_expr, optional)
+                update_path::<S>(current, &Expr::Identity, filter_expr, optional)
             } else if optional {
                 Ok(())
             } else {
@@ -5657,7 +5800,7 @@ fn update_path(
                 let len = arr.len() as i64;
                 let actual_idx = if *idx < 0 { len + idx } else { *idx };
                 if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
-                    update_path(
+                    update_path::<S>(
                         &mut arr[actual_idx as usize],
                         &Expr::Identity,
                         filter_expr,
@@ -5679,13 +5822,13 @@ fn update_path(
             match root {
                 OwnedValue::Array(arr) => {
                     for elem in arr.iter_mut() {
-                        update_path(elem, &Expr::Identity, filter_expr, optional)?;
+                        update_path::<S>(elem, &Expr::Identity, filter_expr, optional)?;
                     }
                     Ok(())
                 }
                 OwnedValue::Object(map) => {
                     for value in map.values_mut() {
-                        update_path(value, &Expr::Identity, filter_expr, optional)?;
+                        update_path::<S>(value, &Expr::Identity, filter_expr, optional)?;
                     }
                     Ok(())
                 }
@@ -5699,7 +5842,7 @@ fn update_path(
         Expr::Pipe(exprs) if !exprs.is_empty() => {
             // Chain: navigate and update
             if exprs.len() == 1 {
-                update_path(root, &exprs[0], filter_expr, optional)
+                update_path::<S>(root, &exprs[0], filter_expr, optional)
             } else {
                 // Navigate to the penultimate path, then update the last
                 let first = &exprs[0];
@@ -5709,7 +5852,7 @@ fn update_path(
                     Expr::Field(name) => {
                         if let OwnedValue::Object(map) = root {
                             let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
-                            update_path(current, &rest, filter_expr, optional)
+                            update_path::<S>(current, &rest, filter_expr, optional)
                         } else if optional {
                             Ok(())
                         } else {
@@ -5721,7 +5864,7 @@ fn update_path(
                             let len = arr.len() as i64;
                             let actual_idx = if *idx < 0 { len + idx } else { *idx };
                             if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
-                                update_path(
+                                update_path::<S>(
                                     &mut arr[actual_idx as usize],
                                     &rest,
                                     filter_expr,
@@ -5741,13 +5884,13 @@ fn update_path(
                     Expr::Iterate => match root {
                         OwnedValue::Array(arr) => {
                             for elem in arr.iter_mut() {
-                                update_path(elem, &rest, filter_expr, optional)?;
+                                update_path::<S>(elem, &rest, filter_expr, optional)?;
                             }
                             Ok(())
                         }
                         OwnedValue::Object(map) => {
                             for value in map.values_mut() {
-                                update_path(value, &rest, filter_expr, optional)?;
+                                update_path::<S>(value, &rest, filter_expr, optional)?;
                             }
                             Ok(())
                         }
@@ -5757,11 +5900,11 @@ fn update_path(
                             owned_type_name(root),
                         )),
                     },
-                    _ => update_path(root, first, filter_expr, optional),
+                    _ => update_path::<S>(root, first, filter_expr, optional),
                 }
             }
         }
-        Expr::Optional(inner) => update_path(root, inner, filter_expr, true),
+        Expr::Optional(inner) => update_path::<S>(root, inner, filter_expr, true),
         _ => Err(EvalError::new("cannot use expression as update target")),
     }
 }
@@ -6469,7 +6612,7 @@ fn owned_to_expr(value: &OwnedValue) -> Expr {
 }
 
 /// Evaluate `as` binding: `expr as $var | body`.
-fn eval_as<'a, W: Clone + AsRef<[u64]>>(
+fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     var: &str,
     body: &Expr,
@@ -6477,7 +6620,7 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the expression to get the value to bind
-    let bound_result = eval_single(expr, value.clone(), optional);
+    let bound_result = eval_single::<W, S>(expr, value.clone(), optional);
 
     // Get all values from the expression
     let bound_values: Vec<OwnedValue> = match bound_result.materialize_cursor() {
@@ -6496,7 +6639,7 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>>(
 
     for bound_val in bound_values {
         let substituted_body = substitute_var(body, var, &bound_val);
-        match eval_single(&substituted_body, value.clone(), optional).materialize_cursor() {
+        match eval_single::<W, S>(&substituted_body, value.clone(), optional).materialize_cursor() {
             QueryResult::One(v) => all_results.push(to_owned(&v)),
             QueryResult::OneCursor(_) => unreachable!(),
             QueryResult::Many(vs) => all_results.extend(vs.iter().map(to_owned)),
@@ -6518,7 +6661,7 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate `reduce`: `reduce EXPR as $var (INIT; UPDATE)`.
-fn eval_reduce<'a, W: Clone + AsRef<[u64]>>(
+fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &Expr,
     var: &str,
     init: &Expr,
@@ -6527,7 +6670,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate input to get the stream of values
-    let input_result = eval_single(input, value.clone(), optional);
+    let input_result = eval_single::<W, S>(input, value.clone(), optional);
     let input_values: Vec<OwnedValue> = match input_result.materialize_cursor() {
         QueryResult::One(v) => vec![to_owned(&v)],
         QueryResult::OneCursor(_) => unreachable!(),
@@ -6540,7 +6683,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Evaluate initial accumulator
-    let init_result = eval_single(init, value.clone(), optional);
+    let init_result = eval_single::<W, S>(init, value.clone(), optional);
     let mut acc = match result_to_owned(init_result) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
@@ -6551,7 +6694,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>>(
         // Substitute $var in update, then evaluate with acc as input
         let substituted = substitute_var(update, var, &input_val);
         // We need to evaluate with acc as the input
-        let acc_result = eval_owned_expr(&substituted, &acc, optional);
+        let acc_result = eval_owned_expr::<S>(&substituted, &acc, optional);
         match acc_result {
             Ok(new_acc) => acc = new_acc,
             Err(e) => return QueryResult::Error(e),
@@ -6562,7 +6705,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate an expression with an OwnedValue as input.
-fn eval_owned_expr(
+fn eval_owned_expr<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     optional: bool,
@@ -6578,7 +6721,7 @@ fn eval_owned_expr(
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
 
-    match eval_single(expr, cursor.value(), optional).materialize_cursor() {
+    match eval_single::<Vec<u64>, S>(expr, cursor.value(), optional).materialize_cursor() {
         QueryResult::One(v) => Ok(to_owned(&v)),
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Owned(v) => Ok(v),
@@ -6664,7 +6807,7 @@ fn owned_value_to_json_string(value: &OwnedValue) -> String {
 }
 
 /// Evaluate `foreach`: `foreach EXPR as $var (INIT; UPDATE)` or `foreach EXPR as $var (INIT; UPDATE; EXTRACT)`.
-fn eval_foreach<'a, W: Clone + AsRef<[u64]>>(
+fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &Expr,
     var: &str,
     init: &Expr,
@@ -6674,7 +6817,7 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate input to get the stream
-    let input_result = eval_single(input, value.clone(), optional);
+    let input_result = eval_single::<W, S>(input, value.clone(), optional);
     let input_values: Vec<OwnedValue> = match input_result.materialize_cursor() {
         QueryResult::One(v) => vec![to_owned(&v)],
         QueryResult::OneCursor(_) => unreachable!(),
@@ -6687,7 +6830,7 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Evaluate initial state
-    let init_result = eval_single(init, value.clone(), optional);
+    let init_result = eval_single::<W, S>(init, value.clone(), optional);
     let mut state = match result_to_owned(init_result) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
@@ -6698,13 +6841,13 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>>(
     for input_val in input_values {
         // Substitute $var and evaluate update with state as input
         let substituted_update = substitute_var(update, var, &input_val);
-        match eval_owned_expr(&substituted_update, &state, optional) {
+        match eval_owned_expr::<S>(&substituted_update, &state, optional) {
             Ok(new_state) => {
                 state = new_state;
                 // If there's an extract expression, evaluate it
                 if let Some(ext) = extract {
                     let substituted_extract = substitute_var(ext, var, &input_val);
-                    match eval_owned_expr(&substituted_extract, &state, optional) {
+                    match eval_owned_expr::<S>(&substituted_extract, &state, optional) {
                         Ok(output) => outputs.push(output),
                         Err(e) => return QueryResult::Error(e),
                     }
@@ -6727,14 +6870,14 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate `limit(n; expr)` - take first n outputs.
-fn eval_limit<'a, W: Clone + AsRef<[u64]>>(
+fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     n_expr: &Expr,
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate n
-    let n_result = eval_single(n_expr, value.clone(), optional);
+    let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match result_to_owned(n_result) {
         Ok(OwnedValue::Int(i)) if i >= 0 => i as usize,
         Ok(_) => {
@@ -6748,7 +6891,7 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>>(
     }
 
     // Evaluate expr and take first n
-    let result = eval_single(expr, value, optional);
+    let result = eval_single::<W, S>(expr, value, optional);
     match result {
         QueryResult::One(v) if n >= 1 => QueryResult::One(v),
         QueryResult::Many(vs) => {
@@ -6779,12 +6922,12 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate `first(expr)` - take first output.
-fn eval_first_expr<'a, W: Clone + AsRef<[u64]>>(
+fn eval_first_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let result = eval_single(expr, value, optional);
+    let result = eval_single::<W, S>(expr, value, optional);
     match result.materialize_cursor() {
         QueryResult::One(v) => QueryResult::One(v),
         QueryResult::OneCursor(_) => unreachable!(),
@@ -6810,12 +6953,12 @@ fn eval_first_expr<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate `last(expr)` - take last output.
-fn eval_last_expr<'a, W: Clone + AsRef<[u64]>>(
+fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let result = eval_single(expr, value, optional);
+    let result = eval_single::<W, S>(expr, value, optional);
     match result.materialize_cursor() {
         QueryResult::One(v) => QueryResult::One(v),
         QueryResult::OneCursor(_) => unreachable!(),
@@ -6841,14 +6984,14 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate `nth(n; expr)` - take nth output.
-fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>>(
+fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     n_expr: &Expr,
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate n
-    let n_result = eval_single(n_expr, value.clone(), optional);
+    let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match result_to_owned(n_result) {
         Ok(OwnedValue::Int(i)) if i >= 0 => i as usize,
         Ok(_) => {
@@ -6857,7 +7000,7 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>>(
         Err(e) => return QueryResult::Error(e),
     };
 
-    let result = eval_single(expr, value, optional);
+    let result = eval_single::<W, S>(expr, value, optional);
     match result.materialize_cursor() {
         QueryResult::One(v) if n == 0 => QueryResult::One(v),
         QueryResult::OneCursor(_) => unreachable!(),
@@ -6885,7 +7028,7 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate `until(cond; update)` - apply update until cond is true.
-fn eval_until<'a, W: Clone + AsRef<[u64]>>(
+fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cond: &Expr,
     update: &Expr,
     value: StandardJson<'a, W>,
@@ -6896,7 +7039,7 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>>(
 
     for _ in 0..MAX_ITERATIONS {
         // Check condition
-        match eval_owned_expr(cond, &current, optional) {
+        match eval_owned_expr::<S>(cond, &current, optional) {
             Ok(cond_val) => {
                 if cond_val.is_truthy() {
                     return QueryResult::Owned(current);
@@ -6906,7 +7049,7 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>>(
         }
 
         // Apply update
-        match eval_owned_expr(update, &current, optional) {
+        match eval_owned_expr::<S>(update, &current, optional) {
             Ok(new_val) => current = new_val,
             Err(e) => return QueryResult::Error(e),
         }
@@ -6916,7 +7059,7 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate `while(cond; update)` - output values while cond is true.
-fn eval_while<'a, W: Clone + AsRef<[u64]>>(
+fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cond: &Expr,
     update: &Expr,
     value: StandardJson<'a, W>,
@@ -6928,7 +7071,7 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>>(
 
     for _ in 0..MAX_ITERATIONS {
         // Check condition
-        match eval_owned_expr(cond, &current, optional) {
+        match eval_owned_expr::<S>(cond, &current, optional) {
             Ok(cond_val) => {
                 if !cond_val.is_truthy() {
                     break;
@@ -6941,7 +7084,7 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>>(
         outputs.push(current.clone());
 
         // Apply update
-        match eval_owned_expr(update, &current, optional) {
+        match eval_owned_expr::<S>(update, &current, optional) {
             Ok(new_val) => current = new_val,
             Err(e) => return QueryResult::Error(e),
         }
@@ -6961,7 +7104,7 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>>(
 /// producing an infinite stream of outputs. This is different from feeding
 /// the output back as input.
 /// Note: This produces an infinite stream, so it should be used with `limit`.
-fn eval_repeat<'a, W: Clone + AsRef<[u64]>>(
+fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -6972,7 +7115,7 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>>(
 
     for _ in 0..MAX_ITERATIONS {
         // Evaluate expr with the original input each time
-        match eval_owned_expr(expr, &owned, optional) {
+        match eval_owned_expr::<S>(expr, &owned, optional) {
             Ok(new_val) => outputs.push(new_val),
             Err(_) => break, // Stop on error
         }
@@ -6988,14 +7131,14 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Evaluate `range(n)`, `range(a;b)`, or `range(a;b;step)`.
-fn eval_range<'a, W: Clone + AsRef<[u64]>>(
+fn eval_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     from: &Expr,
     to: Option<&Expr>,
     step: Option<&Expr>,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let from_val = match eval_single(from, value.clone(), optional) {
+    let from_val = match eval_single::<W, S>(from, value.clone(), optional) {
         QueryResult::Owned(OwnedValue::Int(i)) => i,
         QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
         QueryResult::One(v) => match to_owned(&v) {
@@ -7008,7 +7151,7 @@ fn eval_range<'a, W: Clone + AsRef<[u64]>>(
     };
 
     let to_val = if let Some(to_expr) = to {
-        match eval_single(to_expr, value.clone(), optional) {
+        match eval_single::<W, S>(to_expr, value.clone(), optional) {
             QueryResult::Owned(OwnedValue::Int(i)) => i,
             QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
             QueryResult::One(v) => match to_owned(&v) {
@@ -7022,11 +7165,11 @@ fn eval_range<'a, W: Clone + AsRef<[u64]>>(
     } else {
         // range(n) means range(0; n)
         let to = from_val;
-        return eval_range_values(0, to, 1);
+        return eval_range_values::<W>(0, to, 1);
     };
 
     let step_val = if let Some(step_expr) = step {
-        match eval_single(step_expr, value, optional) {
+        match eval_single::<W, S>(step_expr, value, optional) {
             QueryResult::Owned(OwnedValue::Int(i)) if i != 0 => i,
             QueryResult::Owned(OwnedValue::Float(f)) if f != 0.0 => f as i64,
             QueryResult::One(v) => match to_owned(&v) {
@@ -7041,7 +7184,7 @@ fn eval_range<'a, W: Clone + AsRef<[u64]>>(
         1
     };
 
-    eval_range_values(from_val, to_val, step_val)
+    eval_range_values::<W>(from_val, to_val, step_val)
 }
 
 /// Helper to generate range values.
@@ -7077,17 +7220,17 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: recurse (recurse(.[]))
-fn builtin_recurse<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_recurse<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Default recurse is equivalent to recurse(.[]?)
     let f = Expr::Optional(Box::new(Expr::Iterate));
-    builtin_recurse_f(&f, value, optional)
+    builtin_recurse_f::<W, S>(&f, value, optional)
 }
 
 /// Builtin: recurse(f)
-fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
     _optional: bool,
@@ -7101,7 +7244,7 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>>(
         outputs.push(current.clone());
 
         // Apply f to get children
-        match eval_owned_expr(f, &current, true) {
+        match eval_owned_expr::<S>(f, &current, true) {
             Ok(OwnedValue::Array(arr)) => {
                 queue.extend(arr);
             }
@@ -7122,7 +7265,7 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: recurse(f; cond)
-fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     cond: &Expr,
     value: StandardJson<'a, W>,
@@ -7136,7 +7279,7 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>>(
         let current = queue.remove(0);
 
         // Check condition
-        let should_continue = match eval_owned_expr(cond, &current, optional) {
+        let should_continue = match eval_owned_expr::<S>(cond, &current, optional) {
             Ok(v) => v.is_truthy(),
             Err(_) => false,
         };
@@ -7148,7 +7291,7 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>>(
         outputs.push(current.clone());
 
         // Apply f to get children
-        match eval_owned_expr(f, &current, true) {
+        match eval_owned_expr::<S>(f, &current, true) {
             Ok(OwnedValue::Array(arr)) => {
                 queue.extend(arr);
             }
@@ -7169,31 +7312,37 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: walk(f) - recursively transform all values.
-fn builtin_walk<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_walk<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     let owned = to_owned(&value);
-    match walk_impl(f, owned, optional) {
+    match walk_impl::<S>(f, owned, optional) {
         Ok(result) => QueryResult::Owned(result),
         Err(e) => QueryResult::Error(e),
     }
 }
 
 /// Implementation of walk - processes children first, then applies f.
-fn walk_impl(f: &Expr, value: OwnedValue, optional: bool) -> Result<OwnedValue, EvalError> {
+fn walk_impl<S: EvalSemantics>(
+    f: &Expr,
+    value: OwnedValue,
+    optional: bool,
+) -> Result<OwnedValue, EvalError> {
     // First, recursively process children
     let processed = match value {
         OwnedValue::Array(arr) => {
-            let new_arr: Result<Vec<_>, _> =
-                arr.into_iter().map(|v| walk_impl(f, v, optional)).collect();
+            let new_arr: Result<Vec<_>, _> = arr
+                .into_iter()
+                .map(|v| walk_impl::<S>(f, v, optional))
+                .collect();
             OwnedValue::Array(new_arr?)
         }
         OwnedValue::Object(obj) => {
             let new_obj: Result<IndexMap<_, _>, _> = obj
                 .into_iter()
-                .map(|(k, v)| walk_impl(f, v, optional).map(|nv| (k, nv)))
+                .map(|(k, v)| walk_impl::<S>(f, v, optional).map(|nv| (k, nv)))
                 .collect();
             OwnedValue::Object(new_obj?)
         }
@@ -7201,16 +7350,16 @@ fn walk_impl(f: &Expr, value: OwnedValue, optional: bool) -> Result<OwnedValue, 
     };
 
     // Then apply f to the processed value
-    eval_owned_expr(f, &processed, optional)
+    eval_owned_expr::<S>(f, &processed, optional)
 }
 
 /// Builtin: isvalid(expr) - check if expr succeeds without errors.
-fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    match eval_single(expr, value, true) {
+    match eval_single::<W, S>(expr, value, true) {
         QueryResult::Error(_) => QueryResult::Owned(OwnedValue::Bool(false)),
         QueryResult::None => QueryResult::Owned(OwnedValue::Bool(false)),
         _ => QueryResult::Owned(OwnedValue::Bool(true)),
@@ -7223,18 +7372,18 @@ fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>>(
 
 /// Evaluate a pipe while tracking the traversal path.
 /// This enables PathNoArg and Parent to access the path context.
-fn eval_pipe_with_path_context<'a, W: Clone + AsRef<[u64]>>(
+fn eval_pipe_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
     value: &OwnedValue,
     current_path: &[OwnedValue],
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Call the internal version with root value
-    eval_pipe_with_path_context_internal::<W>(exprs, value, value, current_path, optional)
+    eval_pipe_with_path_context_internal::<W, S>(exprs, value, value, current_path, optional)
 }
 
 /// Internal helper that also tracks the root value for parent navigation.
-fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
+fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
     value: &OwnedValue,
     root: &OwnedValue,
@@ -7255,7 +7404,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
         }
         // Continue with remaining expressions
         if let QueryResult::Owned(v) = path_result {
-            return eval_pipe_with_path_context_internal::<W>(
+            return eval_pipe_with_path_context_internal::<W, S>(
                 rest,
                 &v,
                 root,
@@ -7279,7 +7428,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
         }
         // Continue with remaining expressions
         if let QueryResult::Owned(v) = key_result {
-            return eval_pipe_with_path_context_internal::<W>(
+            return eval_pipe_with_path_context_internal::<W, S>(
                 rest,
                 &v,
                 root,
@@ -7313,7 +7462,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
             } else {
                 current_path[..current_path.len() - 1].to_vec()
             };
-            return eval_pipe_with_path_context_internal::<W>(
+            return eval_pipe_with_path_context_internal::<W, S>(
                 rest,
                 &v,
                 root,
@@ -7326,7 +7475,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
     // Handle ParentN - return the nth parent value
     if let Expr::Builtin(Builtin::ParentN(n_expr)) = first {
         // Evaluate n
-        let n = match eval_owned_expr(n_expr, value, optional) {
+        let n = match eval_owned_expr::<S>(n_expr, value, optional) {
             Ok(OwnedValue::Int(i)) => i as usize,
             Ok(OwnedValue::Float(f)) => f as usize,
             Ok(_) if optional => return QueryResult::None,
@@ -7356,7 +7505,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
             return parent_result;
         }
         if let QueryResult::Owned(v) = parent_result {
-            return eval_pipe_with_path_context_internal::<W>(
+            return eval_pipe_with_path_context_internal::<W, S>(
                 rest,
                 &v,
                 root,
@@ -7370,7 +7519,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
     match first {
         Expr::Identity => {
             // Identity doesn't change the path
-            eval_pipe_with_path_context_internal::<W>(rest, value, root, current_path, optional)
+            eval_pipe_with_path_context_internal::<W, S>(rest, value, root, current_path, optional)
         }
         Expr::Field(name) => {
             // Extend path with field name
@@ -7383,7 +7532,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
                     if rest.is_empty() {
                         return QueryResult::Owned(v.clone());
                     }
-                    return eval_pipe_with_path_context_internal::<W>(
+                    return eval_pipe_with_path_context_internal::<W, S>(
                         rest, v, root, &new_path, optional,
                     );
                 }
@@ -7415,7 +7564,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
                     if rest.is_empty() {
                         return QueryResult::Owned(v.clone());
                     }
-                    return eval_pipe_with_path_context_internal::<W>(
+                    return eval_pipe_with_path_context_internal::<W, S>(
                         rest, v, root, &new_path, optional,
                     );
                 }
@@ -7444,7 +7593,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
                         if rest.is_empty() {
                             results.push(v.clone());
                         } else {
-                            match eval_pipe_with_path_context_internal::<W>(
+                            match eval_pipe_with_path_context_internal::<W, S>(
                                 rest, v, root, &new_path, optional,
                             ) {
                                 QueryResult::Owned(r) => results.push(r),
@@ -7463,7 +7612,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
                         if rest.is_empty() {
                             results.push(v.clone());
                         } else {
-                            match eval_pipe_with_path_context_internal::<W>(
+                            match eval_pipe_with_path_context_internal::<W, S>(
                                 rest, v, root, &new_path, optional,
                             ) {
                                 QueryResult::Owned(r) => results.push(r),
@@ -7494,7 +7643,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
         Expr::Paren(inner) => {
             // Parentheses don't change path, just evaluate inner
             if rest.is_empty() {
-                eval_pipe_with_path_context_internal::<W>(
+                eval_pipe_with_path_context_internal::<W, S>(
                     &[(**inner).clone()],
                     value,
                     root,
@@ -7504,7 +7653,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
             } else {
                 let mut combined = vec![(**inner).clone()];
                 combined.extend(rest.iter().cloned());
-                eval_pipe_with_path_context_internal::<W>(
+                eval_pipe_with_path_context_internal::<W, S>(
                     &combined,
                     value,
                     root,
@@ -7516,7 +7665,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
         Expr::Optional(inner) => {
             // Optional - evaluate with optional=true
             if rest.is_empty() {
-                eval_pipe_with_path_context_internal::<W>(
+                eval_pipe_with_path_context_internal::<W, S>(
                     &[(**inner).clone()],
                     value,
                     root,
@@ -7526,7 +7675,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
             } else {
                 let mut combined = vec![(**inner).clone()];
                 combined.extend(rest.iter().cloned());
-                eval_pipe_with_path_context_internal::<W>(
+                eval_pipe_with_path_context_internal::<W, S>(
                     &combined,
                     value,
                     root,
@@ -7539,7 +7688,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
             // Flatten nested pipe - combine inner pipe with rest
             let mut combined = inner_exprs.clone();
             combined.extend(rest.iter().cloned());
-            eval_pipe_with_path_context_internal::<W>(
+            eval_pipe_with_path_context_internal::<W, S>(
                 &combined,
                 value,
                 root,
@@ -7549,12 +7698,12 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
         }
         Expr::Builtin(builtin) => {
             // Handle other builtins that don't need special path handling
-            match eval_builtin_owned(builtin, value, optional) {
+            match eval_builtin_owned::<S>(builtin, value, optional) {
                 Ok(result) => {
                     if rest.is_empty() {
                         QueryResult::Owned(result)
                     } else {
-                        eval_pipe_with_path_context_internal::<W>(
+                        eval_pipe_with_path_context_internal::<W, S>(
                             rest,
                             &result,
                             root,
@@ -7570,13 +7719,13 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
         Expr::Object(_) | Expr::Array(_) | Expr::Literal(_) => {
             // Value-constructing expressions reset the path context
             // because we're now at the "root" of a newly constructed value
-            match eval_owned_expr(first, value, optional) {
+            match eval_owned_expr::<S>(first, value, optional) {
                 Ok(result) => {
                     if rest.is_empty() {
                         QueryResult::Owned(result)
                     } else {
                         // Reset path and root to the new value
-                        eval_pipe_with_path_context_internal::<W>(
+                        eval_pipe_with_path_context_internal::<W, S>(
                             rest,
                             &result,
                             &result,
@@ -7592,12 +7741,12 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
         _ => {
             // For other expressions, evaluate normally and continue
             // Note: This loses path context for complex expressions
-            match eval_owned_expr(first, value, optional) {
+            match eval_owned_expr::<S>(first, value, optional) {
                 Ok(result) => {
                     if rest.is_empty() {
                         QueryResult::Owned(result)
                     } else {
-                        eval_pipe_with_path_context_internal::<W>(
+                        eval_pipe_with_path_context_internal::<W, S>(
                             rest,
                             &result,
                             root,
@@ -7614,13 +7763,13 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Helper to evaluate a builtin with an OwnedValue
-fn eval_builtin_owned(
+fn eval_builtin_owned<S: EvalSemantics>(
     builtin: &Builtin,
     value: &OwnedValue,
     optional: bool,
 ) -> Result<OwnedValue, EvalError> {
     // For most builtins, we can just delegate to eval_owned_expr
-    eval_owned_expr(&Expr::Builtin(builtin.clone()), value, optional)
+    eval_owned_expr::<S>(&Expr::Builtin(builtin.clone()), value, optional)
 }
 
 /// Builtin: path(expr) - return the path to values selected by expr
@@ -7920,7 +8069,7 @@ fn builtin_paths<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: paths(filter) - paths to values matching filter
 /// Returns each path as a separate output (streaming), matching jq behavior
-fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     filter: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -7935,7 +8084,8 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>>(
             // Get the value at this path
             if let Some(val_at_path) = get_value_at_path(&owned, path_arr) {
                 // Check if filter matches
-                if let Ok(OwnedValue::Bool(true)) = eval_owned_expr(filter, &val_at_path, optional)
+                if let Ok(OwnedValue::Bool(true)) =
+                    eval_owned_expr::<S>(filter, &val_at_path, optional)
                 {
                     filtered_paths.push(path);
                 }
@@ -8096,14 +8246,14 @@ fn set_value_at_path(value: OwnedValue, path: &[OwnedValue], new_val: OwnedValue
 }
 
 /// Builtin: setpath(path; value) - set value at path
-fn builtin_setpath<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     val_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate path expression
-    let path_result = eval_single(path_expr, value.clone(), optional);
+    let path_result = eval_single::<W, S>(path_expr, value.clone(), optional);
     let path_owned = match path_result {
         QueryResult::One(v) => to_owned(&v),
         QueryResult::Owned(v) => v,
@@ -8117,7 +8267,7 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Evaluate value expression
-    let new_val = match eval_single(val_expr, value.clone(), optional) {
+    let new_val = match eval_single::<W, S>(val_expr, value.clone(), optional) {
         QueryResult::One(v) => to_owned(&v),
         QueryResult::Owned(v) => v,
         QueryResult::Error(e) => return QueryResult::Error(e),
@@ -8358,7 +8508,7 @@ fn builtin_gmtime<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let timestamp = match get_float_value(&value, optional) {
+    let timestamp = match get_float_value::<W>(&value, optional) {
         Ok(f) => f,
         Err(r) => return r,
     };
@@ -8425,7 +8575,7 @@ fn builtin_localtime<'a, W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'a, W> {
     #[cfg(feature = "std")]
     {
-        let timestamp = match get_float_value(&value, optional) {
+        let timestamp = match get_float_value::<W>(&value, optional) {
             Ok(f) => f,
             Err(r) => return r,
         };
@@ -8516,7 +8666,7 @@ fn builtin_localtime<'a, W: Clone + AsRef<[u64]>>(
     #[cfg(not(feature = "std"))]
     {
         // In no_std, fall back to gmtime (UTC)
-        builtin_gmtime(value, optional)
+        builtin_gmtime::<W>(value, optional)
     }
 }
 
@@ -8649,13 +8799,13 @@ fn builtin_mktime<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: strftime(fmt) - format broken-down time as string
-fn builtin_strftime<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     fmt_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // First get the format string
-    let fmt = match result_to_owned(eval_single(fmt_expr, value.clone(), optional)) {
+    let fmt = match result_to_owned(eval_single::<W, S>(fmt_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "strftime format")),
@@ -8810,13 +8960,13 @@ fn format_strftime(
 }
 
 /// Builtin: strptime(fmt) - parse string to broken-down time
-fn builtin_strptime<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_strptime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     fmt_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // First get the format string
-    let fmt = match result_to_owned(eval_single(fmt_expr, value.clone(), optional)) {
+    let fmt = match result_to_owned(eval_single::<W, S>(fmt_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "strptime format")),
@@ -9174,7 +9324,7 @@ fn builtin_todate<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let timestamp = match get_float_value(&value, optional) {
+    let timestamp = match get_float_value::<W>(&value, optional) {
         Ok(f) => f,
         Err(r) => return r,
     };
@@ -9355,7 +9505,7 @@ fn builtin_from_unix<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // from_unix is the same as todate - converts Unix timestamp to ISO 8601 string
-    builtin_todate(value, optional)
+    builtin_todate::<W>(value, optional)
 }
 
 /// Builtin: to_unix - convert ISO 8601 date string to Unix epoch
@@ -9365,7 +9515,7 @@ fn builtin_to_unix<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // to_unix is the same as fromdate - parses ISO 8601 string to Unix timestamp
-    builtin_fromdate(value, optional)
+    builtin_fromdate::<W>(value, optional)
 }
 
 /// Format Unix timestamp to ISO 8601 string with timezone offset
@@ -9667,19 +9817,19 @@ fn is_dst_australia(timestamp: f64) -> bool {
 }
 
 /// Builtin: tz(zone) - convert Unix timestamp to datetime in specified timezone
-fn builtin_tz<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     zone_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the timestamp from input
-    let timestamp = match get_float_value(&value, optional) {
+    let timestamp = match get_float_value::<W>(&value, optional) {
         Ok(f) => f,
         Err(r) => return r,
     };
 
     // Evaluate the timezone expression to get the zone name
-    let zone_str = match result_to_owned(eval_single(zone_expr, value.clone(), optional)) {
+    let zone_str = match result_to_owned(eval_single::<W, S>(zone_expr, value.clone(), optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "tz zone argument")),
@@ -9703,7 +9853,7 @@ fn builtin_tz<'a, W: Clone + AsRef<[u64]>>(
 /// Builtin: load(file) - load external YAML/JSON file and return its parsed content
 /// This function is only available with the "std" feature enabled.
 #[cfg(feature = "std")]
-fn builtin_load<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     file_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -9711,7 +9861,7 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>>(
     use std::path::Path;
 
     // Evaluate the file expression to get the filename
-    let filename = match result_to_owned(eval_single(file_expr, value, optional)) {
+    let filename = match result_to_owned(eval_single::<W, S>(file_expr, value, optional)) {
         Ok(OwnedValue::String(s)) => s,
         Ok(_) if optional => return QueryResult::None,
         Ok(_) => return QueryResult::Error(EvalError::type_error("string", "load filename")),
@@ -9864,7 +10014,7 @@ fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
 
 /// Builtin: load(file) - stub for no_std builds (returns error)
 #[cfg(not(feature = "std"))]
-fn builtin_load<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     _file_expr: &Expr,
     _value: StandardJson<'a, W>,
     optional: bool,
@@ -9925,13 +10075,13 @@ fn builtin_combinations<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: combinations(n) - generate n-way combinations (Cartesian product with itself n times)
 /// Input with n=2: [1,2] -> outputs [1,1], [1,2], [2,1], [2,2]
-fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     n_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get n
-    let n = match result_to_owned(eval_single(n_expr, value.clone(), optional)) {
+    let n = match result_to_owned(eval_single::<W, S>(n_expr, value.clone(), optional)) {
         Ok(OwnedValue::Int(i)) if i >= 0 => i as usize,
         Ok(OwnedValue::Int(_)) if optional => return QueryResult::None,
         Ok(OwnedValue::Int(_)) => {
@@ -10239,14 +10389,14 @@ fn builtin_finites<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> Q
 // Phase 13: Iteration control
 
 /// Builtin: limit(n; expr) - output at most n values from expr
-fn builtin_limit<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     n_expr: &Expr,
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate n
-    let n_result = eval_single(n_expr, value.clone(), optional);
+    let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match n_result {
         QueryResult::One(v) => {
             if let StandardJson::Number(num) = v {
@@ -10266,7 +10416,7 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>>(
     }
 
     // Evaluate expr and take at most n results
-    let result = eval_single(expr, value, optional);
+    let result = eval_single::<W, S>(expr, value, optional);
     match result {
         QueryResult::One(v) => QueryResult::Owned(to_owned(&v)),
         QueryResult::OneCursor(c) => QueryResult::Owned(to_owned(&c.value())),
@@ -10299,12 +10449,12 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: first(expr) - output only the first value from expr (stream version)
-fn builtin_first_stream<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_first_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let result = eval_single(expr, value, optional);
+    let result = eval_single::<W, S>(expr, value, optional);
     match result {
         QueryResult::One(v) => QueryResult::Owned(to_owned(&v)),
         QueryResult::OneCursor(c) => QueryResult::Owned(to_owned(&c.value())),
@@ -10330,12 +10480,12 @@ fn builtin_first_stream<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: last(expr) - output only the last value from expr (stream version)
-fn builtin_last_stream<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_last_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let result = eval_single(expr, value, optional);
+    let result = eval_single::<W, S>(expr, value, optional);
     match result {
         QueryResult::One(v) => QueryResult::Owned(to_owned(&v)),
         QueryResult::OneCursor(c) => QueryResult::Owned(to_owned(&c.value())),
@@ -10361,14 +10511,14 @@ fn builtin_last_stream<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: nth(n; expr) - output only the nth value from expr (0-indexed, stream version)
-fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     n_expr: &Expr,
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate n
-    let n_result = eval_single(n_expr, value.clone(), optional);
+    let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match n_result {
         QueryResult::One(v) => {
             if let StandardJson::Number(num) = v {
@@ -10384,7 +10534,7 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Evaluate expr and get the nth result
-    let result = eval_single(expr, value, optional);
+    let result = eval_single::<W, S>(expr, value, optional);
     match result {
         QueryResult::One(v) if n == 0 => QueryResult::Owned(to_owned(&v)),
         QueryResult::OneCursor(c) if n == 0 => QueryResult::Owned(to_owned(&c.value())),
@@ -10408,13 +10558,13 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: range(n) - generate integers from 0 to n-1
-fn builtin_range<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     n_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate n
-    let n_result = eval_single(n_expr, value, optional);
+    let n_result = eval_single::<W, S>(n_expr, value, optional);
     let n = match n_result {
         QueryResult::One(v) => {
             if let StandardJson::Number(num) = v {
@@ -10442,14 +10592,14 @@ fn builtin_range<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: range(from; upto) - generate integers from `from` to `upto-1`
-fn builtin_range_from_to<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_range_from_to<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     from_expr: &Expr,
     to_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate from
-    let from_result = eval_single(from_expr, value.clone(), optional);
+    let from_result = eval_single::<W, S>(from_expr, value.clone(), optional);
     let from = match from_result {
         QueryResult::One(v) => {
             if let StandardJson::Number(num) = v {
@@ -10465,7 +10615,7 @@ fn builtin_range_from_to<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Evaluate to
-    let to_result = eval_single(to_expr, value, optional);
+    let to_result = eval_single::<W, S>(to_expr, value, optional);
     let to = match to_result {
         QueryResult::One(v) => {
             if let StandardJson::Number(num) = v {
@@ -10493,7 +10643,7 @@ fn builtin_range_from_to<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: range(from; upto; by) - generate integers from `from` to `upto-1` stepping by `by`
-fn builtin_range_from_to_by<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_range_from_to_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     from_expr: &Expr,
     to_expr: &Expr,
     by_expr: &Expr,
@@ -10501,7 +10651,7 @@ fn builtin_range_from_to_by<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate from
-    let from_result = eval_single(from_expr, value.clone(), optional);
+    let from_result = eval_single::<W, S>(from_expr, value.clone(), optional);
     let from = match from_result {
         QueryResult::One(v) => {
             if let StandardJson::Number(num) = v {
@@ -10517,7 +10667,7 @@ fn builtin_range_from_to_by<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Evaluate to
-    let to_result = eval_single(to_expr, value.clone(), optional);
+    let to_result = eval_single::<W, S>(to_expr, value.clone(), optional);
     let to = match to_result {
         QueryResult::One(v) => {
             if let StandardJson::Number(num) = v {
@@ -10533,7 +10683,7 @@ fn builtin_range_from_to_by<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Evaluate by
-    let by_result = eval_single(by_expr, value, optional);
+    let by_result = eval_single::<W, S>(by_expr, value, optional);
     let by = match by_result {
         QueryResult::One(v) => {
             if let StandardJson::Number(num) = v {
@@ -10576,12 +10726,12 @@ fn builtin_range_from_to_by<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: isempty(expr) - returns true if expr produces no outputs
-fn builtin_isempty<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let result = eval_single(expr, value, optional);
+    let result = eval_single::<W, S>(expr, value, optional);
     let is_empty = match result {
         QueryResult::None => true,
         QueryResult::Many(ref v) if v.is_empty() => true,
@@ -10593,13 +10743,13 @@ fn builtin_isempty<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: delpaths(paths) - delete multiple paths
-fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     paths_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate paths expression
-    let paths_result = eval_single(paths_expr, value.clone(), optional);
+    let paths_result = eval_single::<W, S>(paths_expr, value.clone(), optional);
     let paths_owned = match paths_result {
         QueryResult::One(v) => to_owned(&v),
         QueryResult::Owned(v) => v,
@@ -10706,7 +10856,7 @@ fn builtin_floor<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Int(floor_f64(n) as i64)),
         Err(r) => r,
     }
@@ -10717,7 +10867,7 @@ fn builtin_ceil<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Int(ceil_f64(n) as i64)),
         Err(r) => r,
     }
@@ -10728,7 +10878,7 @@ fn builtin_round<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Int(round_f64(n) as i64)),
         Err(r) => r,
     }
@@ -10739,7 +10889,7 @@ fn builtin_trunc<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Int(libm::trunc(n) as i64)),
         Err(r) => r,
     }
@@ -10750,7 +10900,7 @@ fn builtin_sqrt<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(sqrt_f64(n))),
         Err(r) => r,
     }
@@ -10761,7 +10911,7 @@ fn builtin_fabs<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::fabs(n))),
         Err(r) => r,
     }
@@ -10772,7 +10922,7 @@ fn builtin_log<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::log(n))),
         Err(r) => r,
     }
@@ -10783,7 +10933,7 @@ fn builtin_log10<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::log10(n))),
         Err(r) => r,
     }
@@ -10794,7 +10944,7 @@ fn builtin_log2<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::log2(n))),
         Err(r) => r,
     }
@@ -10805,7 +10955,7 @@ fn builtin_exp<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::exp(n))),
         Err(r) => r,
     }
@@ -10816,7 +10966,7 @@ fn builtin_exp10<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::pow(10.0, n))),
         Err(r) => r,
     }
@@ -10827,7 +10977,7 @@ fn builtin_exp2<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::exp2(n))),
         Err(r) => r,
     }
@@ -10857,20 +11007,23 @@ fn get_number_from_result<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: pow(base; exp) - power function
-fn builtin_pow<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_pow<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     base_expr: &Expr,
     exp_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let base =
-        match get_number_from_result(eval_single(base_expr, value.clone(), optional), optional) {
-            Ok(n) => n,
-            Err(NumberError::None) => return QueryResult::None,
-            Err(NumberError::Error(e)) => return QueryResult::Error(e),
-        };
+    let base = match get_number_from_result(
+        eval_single::<W, S>(base_expr, value.clone(), optional),
+        optional,
+    ) {
+        Ok(n) => n,
+        Err(NumberError::None) => return QueryResult::None,
+        Err(NumberError::Error(e)) => return QueryResult::Error(e),
+    };
 
-    let exp = match get_number_from_result(eval_single(exp_expr, value, optional), optional) {
+    let exp = match get_number_from_result(eval_single::<W, S>(exp_expr, value, optional), optional)
+    {
         Ok(n) => n,
         Err(NumberError::None) => return QueryResult::None,
         Err(NumberError::Error(e)) => return QueryResult::Error(e),
@@ -10886,7 +11039,7 @@ fn builtin_sin<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::sin(n))),
         Err(r) => r,
     }
@@ -10897,7 +11050,7 @@ fn builtin_cos<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::cos(n))),
         Err(r) => r,
     }
@@ -10908,7 +11061,7 @@ fn builtin_tan<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::tan(n))),
         Err(r) => r,
     }
@@ -10919,7 +11072,7 @@ fn builtin_asin<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::asin(n))),
         Err(r) => r,
     }
@@ -10930,7 +11083,7 @@ fn builtin_acos<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::acos(n))),
         Err(r) => r,
     }
@@ -10941,26 +11094,29 @@ fn builtin_atan<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::atan(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: atan2(y; x)
-fn builtin_atan2<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_atan2<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     y_expr: &Expr,
     x_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let y = match get_number_from_result(eval_single(y_expr, value.clone(), optional), optional) {
+    let y = match get_number_from_result(
+        eval_single::<W, S>(y_expr, value.clone(), optional),
+        optional,
+    ) {
         Ok(n) => n,
         Err(NumberError::None) => return QueryResult::None,
         Err(NumberError::Error(e)) => return QueryResult::Error(e),
     };
 
-    let x = match get_number_from_result(eval_single(x_expr, value, optional), optional) {
+    let x = match get_number_from_result(eval_single::<W, S>(x_expr, value, optional), optional) {
         Ok(n) => n,
         Err(NumberError::None) => return QueryResult::None,
         Err(NumberError::Error(e)) => return QueryResult::Error(e),
@@ -10976,7 +11132,7 @@ fn builtin_sinh<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::sinh(n))),
         Err(r) => r,
     }
@@ -10987,7 +11143,7 @@ fn builtin_cosh<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::cosh(n))),
         Err(r) => r,
     }
@@ -10998,7 +11154,7 @@ fn builtin_tanh<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::tanh(n))),
         Err(r) => r,
     }
@@ -11009,7 +11165,7 @@ fn builtin_asinh<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::asinh(n))),
         Err(r) => r,
     }
@@ -11020,7 +11176,7 @@ fn builtin_acosh<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::acosh(n))),
         Err(r) => r,
     }
@@ -11031,7 +11187,7 @@ fn builtin_atanh<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::atanh(n))),
         Err(r) => r,
     }
@@ -11096,7 +11252,7 @@ fn builtin_isfinite<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match get_float_value(&value, optional) {
+    match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Bool(n.is_finite())),
         Err(_) => QueryResult::Owned(OwnedValue::Bool(false)),
     }
@@ -11167,14 +11323,14 @@ fn builtin_env<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: env.VAR or $ENV.VAR - get environment variable (expression-based)
 #[cfg(feature = "std")]
-fn builtin_envvar<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_envvar<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     var: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the expression to get the variable name
     let owned_value = to_owned(&value);
-    let var_result = eval_owned_expr(var, &owned_value, optional);
+    let var_result = eval_owned_expr::<S>(var, &owned_value, optional);
     let var_name = match var_result {
         Ok(OwnedValue::String(s)) => s,
         _ if optional => return QueryResult::None,
@@ -11189,7 +11345,7 @@ fn builtin_envvar<'a, W: Clone + AsRef<[u64]>>(
 }
 
 #[cfg(not(feature = "std"))]
-fn builtin_envvar<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_envvar<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     _var: &Expr,
     _value: StandardJson<'a, W>,
     _optional: bool,
@@ -11391,7 +11547,7 @@ fn compare_owned_values(a: &OwnedValue, b: &OwnedValue) -> core::cmp::Ordering {
 }
 
 /// Builtin: bsearch(x) - binary search for x in sorted array
-fn builtin_bsearch<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_bsearch<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     x_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -11403,7 +11559,7 @@ fn builtin_bsearch<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // Evaluate search value
-    let x = match eval_single(x_expr, value, optional) {
+    let x = match eval_single::<W, S>(x_expr, value, optional) {
         QueryResult::One(v) => to_owned(&v),
         QueryResult::Owned(v) => v,
         QueryResult::Error(e) => return QueryResult::Error(e),
@@ -11438,13 +11594,13 @@ fn builtin_modulemeta<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: pick(keys) - select only specified keys from object/array (yq)
-fn builtin_pick<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     keys_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the keys expression to get the array of keys
-    let keys_owned = match eval_single(keys_expr, value.clone(), optional) {
+    let keys_owned = match eval_single::<W, S>(keys_expr, value.clone(), optional) {
         QueryResult::One(v) => to_owned(&v),
         QueryResult::OneCursor(c) => to_owned(&c.value()),
         QueryResult::Owned(v) => v,
@@ -11523,13 +11679,13 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: omit(keys) - remove specified keys from object/indices from array
 /// Inverse of `pick`: keeps all keys/indices except those specified.
-fn builtin_omit<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     keys_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the keys expression to get the array of keys to omit
-    let keys_owned = match eval_single(keys_expr, value.clone(), optional) {
+    let keys_owned = match eval_single::<W, S>(keys_expr, value.clone(), optional) {
         QueryResult::One(v) => to_owned(&v),
         QueryResult::OneCursor(c) => to_owned(&c.value()),
         QueryResult::Owned(v) => v,
@@ -11779,10 +11935,10 @@ fn builtin_pivot<'a, W: Clone + AsRef<[u64]>>(
 
             if all_arrays {
                 // Transpose array of arrays
-                pivot_arrays(&items)
+                pivot_arrays::<W>(&items)
             } else if all_objects {
                 // Transpose array of objects
-                pivot_objects(&items)
+                pivot_objects::<W>(&items)
             } else {
                 // Mixed or unsupported types
                 if optional {
@@ -11872,7 +12028,7 @@ fn pivot_objects<'a, W: Clone + AsRef<[u64]>>(items: &[OwnedValue]) -> QueryResu
 // ============================================================================
 
 /// Evaluate destructuring pattern binding: `expr as {key: $var, ...} | body`.
-fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>>(
+fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     pattern: &Pattern,
     body: &Expr,
@@ -11880,7 +12036,7 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the expression to get the value to destructure
-    let bound_result = eval_single(expr, value.clone(), optional);
+    let bound_result = eval_single::<W, S>(expr, value.clone(), optional);
 
     let bound_values: Vec<OwnedValue> = match bound_result.materialize_cursor() {
         QueryResult::One(v) => vec![to_owned(&v)],
@@ -11908,7 +12064,7 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>>(
             substituted_body = substitute_var(&substituted_body, var_name, var_value);
         }
 
-        match eval_single(&substituted_body, value.clone(), optional).materialize_cursor() {
+        match eval_single::<W, S>(&substituted_body, value.clone(), optional).materialize_cursor() {
             QueryResult::One(v) => all_results.push(to_owned(&v)),
             QueryResult::OneCursor(_) => unreachable!(),
             QueryResult::Many(vs) => all_results.extend(vs.iter().map(to_owned)),
@@ -11969,7 +12125,7 @@ fn extract_pattern_bindings(
 ///
 /// In jq, function definitions are scoped - the function is available in `then`.
 /// We implement this by substituting function calls with the body (with args substituted).
-fn eval_func_def<'a, W: Clone + AsRef<[u64]>>(
+fn eval_func_def<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     name: &str,
     params: &[String],
     body: &Expr,
@@ -11979,7 +12135,7 @@ fn eval_func_def<'a, W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'a, W> {
     // Substitute all calls to this function in `then` with the body
     let expanded_then = expand_func_calls(then, name, params, body);
-    eval_single(&expanded_then, value, optional)
+    eval_single::<W, S>(&expanded_then, value, optional)
 }
 
 /// Expand function calls to a defined function by inlining the body.
@@ -13223,7 +13379,7 @@ mod tests {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
             let expr = parse($expr).unwrap();
-            match eval(&expr, cursor) {
+            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 $pattern $(if $guard)? => $body,
                 other => panic!("unexpected result: {:?}", other),
             }
@@ -16968,7 +17124,7 @@ mod tests {
         let index = crate::json::JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = crate::jq::parse(filter).unwrap();
-        match eval(&expr, cursor) {
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 2, "expected line 2 for $__loc__ on second line");
             }
@@ -16985,7 +17141,7 @@ mod tests {
         let index = crate::json::JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = crate::jq::parse(filter).unwrap();
-        match eval(&expr, cursor) {
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 3, "expected line 3 for $__loc__ on third line");
             }
@@ -17001,7 +17157,7 @@ mod tests {
         let index = crate::json::JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = crate::jq::parse(filter).unwrap();
-        match eval(&expr, cursor) {
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 1, "expected line 1 for $__loc__ in function on line 1");
             }
@@ -17814,7 +17970,7 @@ mod tests {
                     let cursor = index.root(json_bytes);
                     let query = format!(r#"load("{}")"#, path);
                     let expr = parse(&query).unwrap();
-                    match eval(&expr, cursor) {
+                    match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                         QueryResult::Owned(OwnedValue::Object(obj)) => {
                             assert_eq!(
                                 obj.get("name"),
@@ -17836,7 +17992,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#"load("{}")"#, path);
                 let expr = parse(&query).unwrap();
-                match eval(&expr, cursor) {
+                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         assert_eq!(
                             obj.get("name"),
@@ -17857,7 +18013,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#"load("{}")"#, path);
                 let expr = parse(&query).unwrap();
-                match eval(&expr, cursor) {
+                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         let items = obj.get("items").unwrap();
                         match items {
@@ -17880,7 +18036,7 @@ mod tests {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
             let expr = parse(r#"load("/tmp/nonexistent_file_12345.yaml")"#).unwrap();
-            match eval(&expr, cursor) {
+            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Error(err) => {
                     assert!(
                         err.message.contains("Failed to read file")
@@ -17898,7 +18054,7 @@ mod tests {
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
             let expr = parse(r#"try load("/tmp/nonexistent_file_12345.yaml") catch null"#).unwrap();
-            match eval(&expr, cursor) {
+            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Owned(OwnedValue::Null) => {}
                 other => panic!("expected null, got: {:?}", other),
             }
@@ -17911,7 +18067,7 @@ mod tests {
             let cursor = index.root(json_bytes);
             let expr =
                 parse(r#"try load("/tmp/nonexistent_file_12345.yaml") catch "not found""#).unwrap();
-            match eval(&expr, cursor) {
+            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Owned(OwnedValue::String(s)) => {
                     assert_eq!(s, "not found");
                 }
@@ -17927,7 +18083,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#". + {{config: load("{}")}}"#, path);
                 let expr = parse(&query).unwrap();
-                match eval(&expr, cursor) {
+                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         assert_eq!(
                             obj.get("name"),
@@ -17957,7 +18113,7 @@ mod tests {
                 let cursor = index.root(json_bytes);
                 let query = format!(r#"load("{}")"#, path);
                 let expr = parse(&query).unwrap();
-                match eval(&expr, cursor) {
+                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Array(arr)) => {
                         assert_eq!(arr.len(), 2);
                         match &arr[0] {
@@ -17993,7 +18149,7 @@ mod tests {
                 let index = JsonIndex::build(json_bytes);
                 let cursor = index.root(json_bytes);
                 let expr = parse(r#"load(.path)"#).unwrap();
-                match eval(&expr, cursor) {
+                match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         assert_eq!(obj.get("loaded"), Some(&OwnedValue::Bool(true)));
                     }

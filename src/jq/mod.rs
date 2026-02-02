@@ -42,7 +42,7 @@
 //! # Example
 //!
 //! ```
-//! use succinctly::jq::{parse, eval, QueryResult};
+//! use succinctly::jq::{parse, eval, JqSemantics, QueryResult};
 //! use succinctly::json::{JsonIndex, StandardJson};
 //!
 //! let json = br#"{"users": [{"name": "Alice"}, {"name": "Bob"}]}"#;
@@ -51,7 +51,7 @@
 //!
 //! // Get first user's name
 //! let expr = parse(".users[0].name").unwrap();
-//! match eval(&expr, cursor) {
+//! match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
 //!     QueryResult::One(StandardJson::String(s)) => {
 //!         assert_eq!(s.as_str().unwrap().as_ref(), "Alice");
 //!     }
@@ -60,7 +60,7 @@
 //!
 //! // Get all user names
 //! let expr = parse(".users[].name").unwrap();
-//! match eval(&expr, cursor) {
+//! match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
 //!     QueryResult::Many(names) => {
 //!         assert_eq!(names.len(), 2);
 //!     }
@@ -77,7 +77,10 @@ mod parser;
 pub mod stream;
 mod value;
 
-pub use eval::{eval, eval_lenient, substitute_vars, EvalError, QueryResult};
+pub use eval::{
+    eval, eval_lenient, substitute_vars, EvalError, EvalSemantics, JqSemantics, QueryResult,
+    YqSemantics,
+};
 pub use expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal, MetaValue,
     ModuleMeta, ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,

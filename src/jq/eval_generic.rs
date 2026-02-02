@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use indexmap::IndexMap;
 
 use super::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
-use super::eval::{eval as full_eval, EvalError, QueryResult};
+use super::eval::{eval as full_eval, EvalError, JqSemantics, QueryResult};
 use super::expr::{Builtin, CompareOp, Expr, Literal};
 use super::value::OwnedValue;
 use crate::json::JsonIndex;
@@ -159,7 +159,7 @@ fn eval_on_owned<V: DocumentValue>(expr: &Expr, owned: OwnedValue) -> GenericRes
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
 
-    match full_eval(expr, cursor) {
+    match full_eval::<Vec<u64>, JqSemantics>(expr, cursor) {
         QueryResult::One(v) => GenericResult::Owned(standard_json_to_owned(&v)),
         QueryResult::OneCursor(c) => GenericResult::Owned(standard_json_to_owned(&c.value())),
         QueryResult::Many(vs) => {
@@ -679,7 +679,7 @@ fn eval_single<V: DocumentValue>(
             let cursor = index.root(json_bytes);
 
             // Evaluate using the full evaluator
-            match full_eval(expr, cursor) {
+            match full_eval::<Vec<u64>, JqSemantics>(expr, cursor) {
                 QueryResult::One(v) => {
                     // Convert StandardJson back to OwnedValue
                     GenericResult::Owned(standard_json_to_owned(&v))

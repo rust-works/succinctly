@@ -10,7 +10,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
 use succinctly::jq::eval_generic::{eval_with_cursor, to_owned, GenericResult};
-use succinctly::jq::{self, Builtin, Expr, OwnedValue, QueryResult};
+use succinctly::jq::{self, Builtin, Expr, OwnedValue, QueryResult, YqSemantics};
 use succinctly::json::light::StandardJson;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{YamlCursor, YamlIndex, YamlValue};
@@ -429,7 +429,7 @@ fn evaluate_input(
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
 
-    let result = jq::eval(expr, cursor);
+    let result = jq::eval::<Vec<u64>, YqSemantics>(expr, cursor);
 
     // Convert result to Vec<OwnedValue>
     match result {
