@@ -305,9 +305,9 @@ cargo test
 
 | Size      | succinctly            | jq                    | Speedup    |
 |-----------|-----------------------|-----------------------|------------|
-| **10KB**  |  3.4 ms  (2.9 MiB/s)  |  6.2 ms  (1.6 MiB/s)  | **1.8x**   |
-| **100KB** |  5.3 ms (18.4 MiB/s)  | 14.3 ms  (6.8 MiB/s)  | **2.7x**   |
-| **1MB**   | 24.5 ms (40.8 MiB/s)  | 86.7 ms (11.5 MiB/s)  | **3.5x**   |
+| **10KB**  |  3.3 ms  (3.0 MiB/s)  |  6.2 ms  (1.6 MiB/s)  | **1.9x**   |
+| **100KB** |  5.4 ms (18.1 MiB/s)  | 14.3 ms  (6.8 MiB/s)  | **2.6x**   |
+| **1MB**   | 24.6 ms (40.7 MiB/s)  | 85.7 ms (11.7 MiB/s)  | **3.5x**   |
 
 To regenerate: `succinctly bench run jq_bench`
 
@@ -341,11 +341,11 @@ To regenerate: `succinctly bench run jq_bench`
 
 | Size       | succinctly             | yq                     | Speedup     | Mem Ratio  |
 |------------|------------------------|------------------------|-------------|------------|
-| **10KB**   |   4.3 ms  (2.3 MiB/s)  |   7.6 ms  (1.3 MiB/s)  | **1.7x**    | **0.35x**  |
-| **100KB**  |   4.9 ms (19.9 MiB/s)  |  15.2 ms  (6.4 MiB/s)  | **3.1x**    | **0.21x**  |
-| **1MB**    |  13.5 ms (74.1 MiB/s)  |  88.0 ms (11.4 MiB/s)  | **6.5x**    | **0.09x**  |
-| **10MB**   |  94.3 ms (106.0 MiB/s) | 758.9 ms (13.2 MiB/s)  | **8.1x**    | **0.04x**  |
-| **100MB**  | 853.3 ms (117.2 MiB/s) |   7.81 s (12.8 MiB/s)  | **9.2x**    | **0.04x**  |
+| **10KB**   |   4.3 ms  (2.3 MiB/s)  |   7.6 ms  (1.3 MiB/s)  | **1.7x**    | **0.33x**  |
+| **100KB**  |   4.4 ms (22.2 MiB/s)  |  14.8 ms  (6.6 MiB/s)  | **3.3x**    | **0.21x**  |
+| **1MB**    |  13.1 ms (76.3 MiB/s)  |  85.7 ms (11.7 MiB/s)  | **6.6x**    | **0.08x**  |
+| **10MB**   |  94.0 ms (106.4 MiB/s) | 742.6 ms (13.5 MiB/s)  | **7.9x**    | **0.04x**  |
+| **100MB**  | 868.2 ms (115.2 MiB/s) |   7.36 s (13.6 MiB/s)  | **8.5x**    | **0.04x**  |
 
 ### yq Query Performance (ARM Neoverse-V2)
 

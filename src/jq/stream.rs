@@ -21,6 +21,7 @@
 //! | `length`, complex | OwnedValue | 5-8x input |
 
 use super::value::OwnedValue;
+use crate::yaml::simd::find_json_escape;
 
 /// A value that can be streamed directly to output without intermediate allocation.
 ///
@@ -123,30 +124,31 @@ fn stream_owned_value_json<W: core::fmt::Write>(
 }
 
 /// Stream a string as JSON with proper escaping.
+///
+/// Uses SIMD-accelerated escape detection (O3 optimization from issue #81) to
+/// find characters that need escaping in 16-32 byte chunks, then copies safe
+/// spans directly to output.
 fn stream_json_string<W: core::fmt::Write>(out: &mut W, s: &str) -> core::fmt::Result {
     out.write_char('"')?;
 
     let bytes = s.as_bytes();
+    let len = bytes.len();
     let mut i = 0;
 
-    while i < bytes.len() {
-        // Find the next byte that needs escaping
-        let start = i;
-        while i < bytes.len() {
-            let b = bytes[i];
-            if b == b'"' || b == b'\\' || b < 0x20 {
-                break;
-            }
-            i += 1;
+    while i < len {
+        // SIMD-accelerated scan for next escapable character (", \, or < 0x20)
+        // Returns index of first match, or len if no escapes needed
+        let escape_pos = find_json_escape(bytes, i);
+
+        // Copy the safe span directly (no escaping needed)
+        if i < escape_pos {
+            out.write_str(&s[i..escape_pos])?;
         }
 
-        // Write unescaped segment
-        if start < i {
-            out.write_str(&s[start..i])?;
-        }
+        i = escape_pos;
 
         // Handle escape sequence if needed
-        if i < bytes.len() {
+        if i < len {
             let b = bytes[i];
             match b {
                 b'"' => out.write_str("\\\"")?,
