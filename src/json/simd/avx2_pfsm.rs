@@ -18,6 +18,14 @@
 //!
 //! Using `vpshufb`: `_mm_shuffle_epi8(T1, T0)` computes `T1[T0[i]]` for each byte.
 //!
+//! # Phi Enumeration
+//!
+//! Instead of computing phi sequentially after determining actual states, we enumerate
+//! phi outputs for ALL 4 possible starting states in parallel. At chunk boundaries,
+//! we select the correct accumulated output based on the actual starting state.
+//!
+//! This implements the full Mytkowicz approach for output-producing FSMs.
+//!
 //! # Binary Tree Reduction
 //!
 //! Instead of 16 sequential compositions, use binary tree:
@@ -68,6 +76,45 @@ impl TransitionPack {
     #[inline]
     fn apply(self, state: u8) -> u8 {
         ((self.0 >> (state * 8)) & 0xFF) as u8
+    }
+}
+
+/// Accumulated phi outputs for a single starting state.
+///
+/// Uses fixed-width accumulation: store BP decisions (not bits) during enumeration,
+/// then compact to actual bitstream after path selection.
+#[derive(Clone, Copy, Debug, Default)]
+struct PhiAccum {
+    /// IB bits: 1 bit per position (bit i = IB for byte i)
+    ib: u16,
+    /// BP open decisions: bit i = 1 if byte i emitted bp_open
+    bp_open: u16,
+    /// BP close decisions: bit i = 1 if byte i emitted bp_close
+    bp_close: u16,
+}
+
+impl PhiAccum {
+    /// Compact bp_open/bp_close masks into actual BP bitstream.
+    ///
+    /// Returns (bp_bits, bp_len) where bp_bits contains the compacted bits
+    /// and bp_len is the number of valid bits.
+    #[inline]
+    fn compact_bp(self, count: usize) -> (u32, u8) {
+        let mut bp_bits: u32 = 0;
+        let mut bp_len: u8 = 0;
+
+        for i in 0..count {
+            if (self.bp_open >> i) & 1 != 0 {
+                bp_bits |= 1 << bp_len;
+                bp_len += 1;
+            }
+            if (self.bp_close >> i) & 1 != 0 {
+                // close is 0, just advance length
+                bp_len += 1;
+            }
+        }
+
+        (bp_bits, bp_len)
     }
 }
 
@@ -134,10 +181,97 @@ unsafe fn compose_16(bytes: &[u8; 16]) -> TransitionPack {
     compose(l3_0, l3_1)
 }
 
+/// Enumerate phi outputs for all 4 possible starting states.
+///
+/// This implements the Mytkowicz phi enumeration: instead of computing phi
+/// sequentially after determining actual states, we compute phi for ALL
+/// possible starting states in parallel, then select the correct one.
+///
+/// Returns:
+/// - `accum`: Accumulated phi outputs for each of the 4 starting states
+/// - `final_trans`: Composed transition function for the chunk
+#[target_feature(enable = "avx2")]
+unsafe fn enumerate_phi_16(bytes: &[u8; 16]) -> ([PhiAccum; 4], TransitionPack) {
+    // S[i] = current state if we started from state i
+    // Initialize to identity: S[i] = i
+    let mut s: [u8; 4] = [0, 1, 2, 3];
+
+    // Accumulated phi for each starting state
+    let mut accum: [PhiAccum; 4] = [PhiAccum::default(); 4];
+
+    for (pos, &byte) in bytes.iter().enumerate() {
+        let t = TRANSITION_TABLE[byte as usize];
+        let p = PHI_TABLE[byte as usize];
+
+        // Enumerate phi for all 4 starting states
+        for start in 0..4 {
+            let state = s[start];
+            let phi = ((p >> (state * 8)) & 0xFF) as u8;
+
+            // Extract bits: bit0=bp_close, bit1=bp_open, bit2=ib
+            let ib_bit = (phi >> 2) & 1;
+            let bp_open = (phi >> 1) & 1;
+            let bp_close = phi & 1;
+
+            // Accumulate into fixed-width masks
+            accum[start].ib |= (ib_bit as u16) << pos;
+            accum[start].bp_open |= (bp_open as u16) << pos;
+            accum[start].bp_close |= (bp_close as u16) << pos;
+        }
+
+        // Update S: S[i] = T[S[i]]
+        for state in &mut s {
+            *state = ((t >> (*state * 8)) & 0xFF) as u8;
+        }
+    }
+
+    // Compute composed transition for final state calculation
+    // S now contains: S[i] = final state if started from state i
+    let final_trans = TransitionPack(
+        (s[0] as u32) | ((s[1] as u32) << 8) | ((s[2] as u32) << 16) | ((s[3] as u32) << 24),
+    );
+
+    (accum, final_trans)
+}
+
+/// Process a 16-byte chunk using phi enumeration.
+///
+/// This is the optimized version that enumerates phi for all starting states,
+/// then selects the correct accumulated output based on the actual starting state.
+#[target_feature(enable = "avx2")]
+unsafe fn process_chunk_16_enum(
+    bytes: &[u8; 16],
+    initial_state: u8,
+    ib: &mut BitWriter,
+    bp: &mut BitWriter,
+) -> u8 {
+    // Enumerate phi for all starting states
+    let (accum, final_trans) = enumerate_phi_16(bytes);
+
+    // Select the correct accumulated output based on actual starting state
+    let selected = accum[initial_state as usize];
+
+    // Write IB bits (16 bits, one per byte)
+    ib.write_bits(selected.ib as u64, 16);
+
+    // Compact and write BP bits
+    let (bp_bits, bp_len) = selected.compact_bp(16);
+    if bp_len > 0 {
+        bp.write_bits(bp_bits as u64, bp_len as usize);
+    }
+
+    // Return final state
+    final_trans.apply(initial_state)
+}
+
 /// Compute the state after each byte position using prefix composition.
 ///
 /// Returns `states[i]` = state BEFORE processing byte `i` (for phi extraction).
+///
+/// Note: This is the old sequential approach, kept for reference.
+/// The new enumerate_phi_16 replaces this with full phi enumeration.
 #[target_feature(enable = "avx2")]
+#[allow(dead_code)]
 unsafe fn prefix_states_16(bytes: &[u8; 16], initial_state: u8) -> [u8; 16] {
     // For phi extraction, we need the state BEFORE each byte.
     // This requires a prefix scan, which we compute using parallel prefix.
@@ -188,10 +322,14 @@ unsafe fn prefix_states_16(bytes: &[u8; 16], initial_state: u8) -> [u8; 16] {
     states
 }
 
-/// Process a 16-byte chunk using PFSM shuffle composition.
+/// Process a 16-byte chunk using PFSM shuffle composition (old approach).
 ///
 /// Returns the final state after processing all 16 bytes.
+///
+/// Note: This is the old sequential phi extraction approach.
+/// Use process_chunk_16_enum for the optimized phi enumeration version.
 #[target_feature(enable = "avx2")]
+#[allow(dead_code)]
 unsafe fn process_chunk_16(
     bytes: &[u8; 16],
     initial_state: u8,
@@ -231,6 +369,7 @@ unsafe fn process_chunk_16(
 
 /// Process a 32-byte chunk by processing two 16-byte halves.
 #[target_feature(enable = "avx2")]
+#[allow(dead_code)]
 unsafe fn process_chunk_32(
     bytes: &[u8],
     initial_state: u8,
@@ -246,6 +385,25 @@ unsafe fn process_chunk_32(
     // Process second half
     let second_half: &[u8; 16] = bytes[16..32].try_into().unwrap();
     process_chunk_16(second_half, mid_state, ib, bp)
+}
+
+/// Process a 32-byte chunk using phi enumeration (two 16-byte halves).
+#[target_feature(enable = "avx2")]
+unsafe fn process_chunk_32_enum(
+    bytes: &[u8],
+    initial_state: u8,
+    ib: &mut BitWriter,
+    bp: &mut BitWriter,
+) -> u8 {
+    debug_assert!(bytes.len() == 32);
+
+    // Process first half with enumeration
+    let first_half: &[u8; 16] = bytes[0..16].try_into().unwrap();
+    let mid_state = process_chunk_16_enum(first_half, initial_state, ib, bp);
+
+    // Process second half with enumeration
+    let second_half: &[u8; 16] = bytes[16..32].try_into().unwrap();
+    process_chunk_16_enum(second_half, mid_state, ib, bp)
 }
 
 /// Build JSON semi-index using AVX2 PFSM shuffle composition.
@@ -265,16 +423,16 @@ unsafe fn build_semi_index_standard_avx2_pfsm(json: &[u8]) -> SemiIndex {
     let mut state: u8 = 0; // InJson
     let mut offset = 0;
 
-    // Process 32-byte chunks
+    // Process 32-byte chunks using phi enumeration
     while offset + 32 <= json.len() {
-        state = process_chunk_32(&json[offset..offset + 32], state, &mut ib, &mut bp);
+        state = process_chunk_32_enum(&json[offset..offset + 32], state, &mut ib, &mut bp);
         offset += 32;
     }
 
-    // Process remaining bytes in 16-byte chunk if possible
+    // Process remaining bytes in 16-byte chunk if possible using phi enumeration
     if offset + 16 <= json.len() {
         let chunk: &[u8; 16] = json[offset..offset + 16].try_into().unwrap();
-        state = process_chunk_16(chunk, state, &mut ib, &mut bp);
+        state = process_chunk_16_enum(chunk, state, &mut ib, &mut bp);
         offset += 16;
     }
 
@@ -467,5 +625,118 @@ mod tests {
         assert_eq!(scalar.state, avx2.state);
         assert_eq!(scalar.ib, avx2.ib);
         assert_eq!(scalar.bp, avx2.bp);
+    }
+
+    #[test]
+    fn test_phi_accum_compact_bp() {
+        // Test BP compaction: bp_open at pos 0, 2; bp_close at pos 1, 3
+        // Expected: 1 (open), 0 (close), 1 (open), 0 (close) = 0b0101 = 5
+        let accum = PhiAccum {
+            ib: 0,
+            bp_open: 0b0101,  // positions 0 and 2
+            bp_close: 0b1010, // positions 1 and 3
+        };
+        let (bp_bits, bp_len) = accum.compact_bp(4);
+        assert_eq!(bp_len, 4);
+        assert_eq!(bp_bits, 0b0101); // open=1, close=0
+    }
+
+    #[test]
+    fn test_phi_accum_compact_bp_variable_length() {
+        // Test variable length: only bp_open at pos 0 and 3
+        // Expected: 1 (pos 0), 1 (pos 3) = 0b11 = 3, length 2
+        let accum = PhiAccum {
+            ib: 0,
+            bp_open: 0b1001, // positions 0 and 3
+            bp_close: 0,
+        };
+        let (bp_bits, bp_len) = accum.compact_bp(4);
+        assert_eq!(bp_len, 2);
+        assert_eq!(bp_bits, 0b11);
+    }
+
+    #[test]
+    fn test_enumerate_phi_16() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        unsafe {
+            // Test: {"a":1}  padded to 16 bytes
+            let mut bytes = [b' '; 16];
+            bytes[0] = b'{';
+            bytes[1] = b'"';
+            bytes[2] = b'a';
+            bytes[3] = b'"';
+            bytes[4] = b':';
+            bytes[5] = b'1';
+            bytes[6] = b'}';
+
+            let (accum, final_trans) = enumerate_phi_16(&bytes);
+
+            // Starting from InJson (0):
+            // - { : IB=1, bp_open=1
+            // - " : IB=1 (entering string)
+            // - a : IB=0 (in string)
+            // - " : IB=1 (exiting string)
+            // - : : IB=0 (colon, not IB in standard cursor... let's check)
+            // - 1 : IB=1 (value start)
+            // - } : IB=1, bp_close=1
+
+            // Check final state for starting state 0
+            assert_eq!(final_trans.apply(0), 0); // Back to InJson
+
+            // The accum[0] should have the phi outputs for starting from InJson
+            // IB should have bits set for structural chars
+            let selected = accum[0];
+
+            // { is at position 0, should have bp_open
+            assert_ne!(selected.bp_open & 1, 0);
+            // } is at position 6, should have bp_close
+            assert_ne!(selected.bp_close & (1 << 6), 0);
+        }
+    }
+
+    #[test]
+    fn test_enumerate_phi_matches_prefix_states() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        unsafe {
+            // Compare enumerate_phi_16 output with prefix_states_16 + manual phi extraction
+            let mut bytes = [b' '; 16];
+            bytes[0] = b'"';
+            bytes[1] = b'a';
+            bytes[2] = b'"';
+            bytes[3] = b'{';
+            bytes[4] = b'}';
+
+            let initial_state: u8 = 0;
+
+            // Old approach: prefix states then extract phi
+            let states = prefix_states_16(&bytes, initial_state);
+            let mut expected_ib: u16 = 0;
+            let mut expected_bp_open: u16 = 0;
+            let mut expected_bp_close: u16 = 0;
+
+            for i in 0..16 {
+                let phi_entry = PHI_TABLE[bytes[i] as usize];
+                let state = states[i];
+                let phi = ((phi_entry >> (state * 8)) & 0xFF) as u8;
+                let ib_bit = (phi >> 2) & 1;
+                let bp_open = (phi >> 1) & 1;
+                let bp_close = phi & 1;
+                expected_ib |= (ib_bit as u16) << i;
+                expected_bp_open |= (bp_open as u16) << i;
+                expected_bp_close |= (bp_close as u16) << i;
+            }
+
+            // New approach: enumerate phi
+            let (accum, _) = enumerate_phi_16(&bytes);
+            let selected = accum[initial_state as usize];
+
+            assert_eq!(selected.ib, expected_ib, "IB mismatch");
+            assert_eq!(selected.bp_open, expected_bp_open, "bp_open mismatch");
+            assert_eq!(selected.bp_close, expected_bp_close, "bp_close mismatch");
+        }
     }
 }

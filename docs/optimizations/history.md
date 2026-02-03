@@ -280,19 +280,19 @@ Implements Mytkowicz et al. "Data-Parallel Finite-State Machines" using AVX2 `vp
 
 **Micro-benchmark results** (BP construction only):
 
-| Size | Before | After | Improvement |
-|------|--------|-------|-------------|
-| 10K  | 2.65 µs | 2.02 µs | **+24%** |
-| 100K | 25.5 µs | 19.5 µs | **+23%** |
-| 1M   | 294.8 µs | 193.7 µs | **+34%** |
+| Size | Before   | After    | Improvement |
+|------|----------|----------|-------------|
+| 10K  | 2.65 µs  | 2.02 µs  | **+24%**    |
+| 100K | 25.5 µs  | 19.5 µs  | **+23%**    |
+| 1M   | 294.8 µs | 193.7 µs | **+34%**    |
 
 **End-to-end results** (JSON semi-indexing):
 
-| Size | Before | After | Regression |
-|------|--------|-------|------------|
-| 1KB  | 883 MiB/s | 714 MiB/s | **-19%** |
-| 10KB | 872 MiB/s | 647 MiB/s | **-26%** |
-| 100KB| 677 MiB/s | 580 MiB/s | **-14%** |
+| Size | Before    | After     | Regression |
+|------|-----------|-----------|------------|
+| 1KB  | 883 MiB/s | 714 MiB/s | **-19%**   |
+| 10KB | 872 MiB/s | 647 MiB/s | **-26%**   |
+| 100KB| 677 MiB/s | 580 MiB/s | **-14%**   |
 
 **Why it failed**:
 1. **Instruction cache pollution**: Unrolled code is larger, evicts other hot code
@@ -426,11 +426,11 @@ Before implementing an optimization, ask:
 
 **Benchmark Results** (Apple M1 Max):
 
-| Size | Before | After | Improvement |
-|------|--------|-------|-------------|
-| 10K nodes | 2.41 µs | 2.00 µs | **17%** |
-| 100K nodes | 20.70 µs | 17.07 µs | **18%** |
-| 1M nodes | 207.21 µs | 171.96 µs | **17%** |
+| Size       | Before    | After     | Improvement |
+|------------|-----------|-----------|-------------|
+| 10K nodes  | 2.41 µs   | 2.00 µs   | **17%**     |
+| 100K nodes | 20.70 µs  | 17.07 µs  | **18%**     |
+| 1M nodes   | 207.21 µs | 171.96 µs | **17%**     |
 
 **Key insight**: Loop unrolling and batched lookups provide better instruction scheduling and cache locality, without needing SIMD intrinsics.
 
@@ -442,12 +442,12 @@ Before implementing an optimization, ask:
 
 **Benchmark Results** (AWS Graviton 4 / Neoverse-V2):
 
-| Metric | Before (64B) | After (256B) | Improvement |
-|--------|--------------|--------------|-------------|
-| 10M bits raw popcount | baseline | -15.5% time | **15.5% faster** |
-| 1M bits raw popcount | baseline | -10.8% time | **10.8% faster** |
-| 1M bits construction | baseline | -4.0% time | **4.0% faster** |
-| 10M bits construction | baseline | -2.3% time | **2.3% faster** |
+| Metric                | Before (64B) | After (256B) | Improvement      |
+|-----------------------|--------------|--------------|------------------|
+| 10M bits raw popcount | baseline     | -15.5% time  | **15.5% faster** |
+| 1M bits raw popcount  | baseline     | -10.8% time  | **10.8% faster** |
+| 1M bits construction  | baseline     | -4.0% time   | **4.0% faster**  |
+| 10M bits construction | baseline     | -2.3% time   | **2.3% faster**  |
 
 **Key insight**: The 4 independent 64-byte operations can execute in parallel on superscalar CPUs before their results are summed. This amortizes horizontal reduction overhead and improves instruction scheduling.
 
@@ -463,11 +463,11 @@ Before implementing an optimization, ask:
 
 **Benchmark Results** (AWS Graviton 4 / Neoverse-V2):
 
-| Size | Before | After | Improvement |
-|------|--------|-------|-------------|
-| 10K nodes | 5.4 µs | 2.07 µs | **2.6x faster (-62%)** |
+| Size       | Before  | After   | Improvement            |
+|------------|---------|---------|------------------------|
+| 10K nodes  | 5.4 µs  | 2.07 µs | **2.6x faster (-62%)** |
 | 100K nodes | 52.7 µs | 19.1 µs | **2.8x faster (-64%)** |
-| 1M nodes | 527 µs | 185 µs | **2.8x faster (-65%)** |
+| 1M nodes   | 527 µs  | 185 µs  | **2.8x faster (-65%)** |
 
 **Key insight**: The VMINV instruction finds the minimum across a vector in a single operation, eliminating the scalar min-finding loop. Combined with SIMD prefix sums, this dramatically accelerates the L1 index construction which aggregates per-word statistics into per-block statistics.
 
@@ -480,11 +480,11 @@ Added for code consistency and benefit at large data sizes.
 
 **Benchmark Results** (AWS Graviton 4 / Neoverse-V2):
 
-| Size | Nodes | L2 Entries | Scalar | SIMD | Improvement |
-|------|-------|------------|--------|------|-------------|
-| ~2.5MB | 10M | ~10K | 1.91ms | 1.91ms | ~0% (noise) |
-| ~25MB | 100M | ~100K | 19.70ms | 19.44ms | **1.3%** |
-| ~125MB | 500M | ~488K | 153.78ms | 148.73ms | **3.4%** |
+| Size   | Nodes | L2 Entries | Scalar   | SIMD     | Improvement |
+|--------|-------|------------|----------|----------|-------------|
+| ~2.5MB | 10M   | ~10K       | 1.91ms   | 1.91ms   | ~0% (noise) |
+| ~25MB  | 100M  | ~100K      | 19.70ms  | 19.44ms  | **1.3%**    |
+| ~125MB | 500M  | ~488K      | 153.78ms | 148.73ms | **3.4%**    |
 
 **Key insight**: L2 SIMD benefit scales with data size. At 500M nodes, L2 has ~488K entries
 (comparable to L1 at ~1M nodes), making SIMD worthwhile. No regression at smaller sizes,
@@ -509,22 +509,22 @@ let result = biased_min.wrapping_add(i16::MIN);  // Unbias
 
 **Benchmark Results** (AMD Ryzen 9 7950X, Zen 4):
 
-| Size | Scalar | SSE4.1 | Improvement |
-|------|--------|--------|-------------|
-| 10K nodes | 1.97 µs | 1.98 µs | ~0% (neutral) |
-| 100K nodes | 18.96 µs | 18.97 µs | ~0% (neutral) |
-| 1M nodes | 188.0 µs | 197.2 µs | **-5% (regression)** |
-| 10M nodes | 3.15 ms | 3.05 ms | **+3%** |
-| 100M nodes | 31.98 ms | 31.36 ms | **+2%** |
-| 500M nodes | 253.8 ms | 250.6 ms | **+1%** |
+| Size       | Scalar   | SSE4.1   | Improvement          |
+|------------|----------|----------|----------------------|
+| 10K nodes  | 1.97 µs  | 1.98 µs  | ~0% (neutral)        |
+| 100K nodes | 18.96 µs | 18.97 µs | ~0% (neutral)        |
+| 1M nodes   | 188.0 µs | 197.2 µs | **-5% (regression)** |
+| 10M nodes  | 3.15 ms  | 3.05 ms  | **+3%**              |
+| 100M nodes | 31.98 ms | 31.36 ms | **+2%**              |
+| 500M nodes | 253.8 ms | 250.6 ms | **+1%**              |
 
 **Why SSE4.1 shows much less improvement than NEON (2.8x)**:
 
-| Factor | ARM NEON | x86 SSE4.1 |
-|--------|----------|------------|
-| Horizontal min | `vminvq_s16` (signed direct) | `_mm_minpos_epu16` (unsigned only) |
-| Horizontal sum | `vaddvq_s16` (single instruction) | Multiple shifts + adds |
-| Bias overhead | None needed | +2 ops per block |
+| Factor         | ARM NEON                          | x86 SSE4.1                         |
+|----------------|-----------------------------------|------------------------------------|
+| Horizontal min | `vminvq_s16` (signed direct)      | `_mm_minpos_epu16` (unsigned only) |
+| Horizontal sum | `vaddvq_s16` (single instruction) | Multiple shifts + adds             |
+| Bias overhead  | None needed                       | +2 ops per block                   |
 
 **Key insight**: ARM's `vminvq_s16` handles signed values directly. SSE4.1's unsigned-only
 PHMINPOSUW requires bias/unbias operations that add significant overhead, negating most benefit
@@ -550,16 +550,16 @@ AVX-512 execution (though memory bandwidth may still limit gains for this worklo
 
 **Benchmark Results** (Apple M1 Max, `yaml_bench`):
 
-| Category        | Improvement     | Notes                              |
-|-----------------|-----------------|-------------------------------------|
-| simple_kv       | -11% to -22%   | Core key-value parsing              |
-| nested          | -15% to -24%   | Deeply nested structures            |
-| sequences       | -9% to -15%    | Array-like YAML                     |
-| quoted strings  | -20% to -37%   | Double/single quoted values         |
+| Category        | Improvement    | Notes                                |
+|-----------------|----------------|--------------------------------------|
+| simple_kv       | -11% to -22%   | Core key-value parsing               |
+| nested          | -15% to -24%   | Deeply nested structures             |
+| sequences       |  -9% to -15%   | Array-like YAML                      |
+| quoted strings  | -20% to -37%   | Double/single quoted values          |
 | long strings    | -44% to -85%   | Largest gains (newline scan removed) |
-| large files     | -18% to -21%   | 100KB-1MB files                     |
-| block scalars   | -42% to -57%   | Literal/folded blocks               |
-| anchors         | -12% to -16%   | Anchor/alias workloads              |
+| large files     | -18% to -21%   | 100KB-1MB files                      |
+| block scalars   | -42% to -57%   | Literal/folded blocks                |
+| anchors         | -12% to -16%   | Anchor/alias workloads               |
 
 **Key insight**: Build-path allocations and eager scans that aren't needed by the hot path (queries, yq evaluation) should be deferred or eliminated. The lazy newline index has the largest impact on newline-heavy content because it removes an entire O(N) pass.
 
