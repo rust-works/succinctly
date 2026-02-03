@@ -221,21 +221,85 @@ impl OwnedValue {
 }
 
 /// Escape a string for JSON output.
+///
+/// Uses SIMD-accelerated scanning (AVX2/SSE2 on x86_64, NEON on ARM64) to
+/// quickly skip over runs of non-escapable characters.
 fn escape_json_string(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            c if c.is_control() => {
-                result.push_str(&format!("\\u{:04x}", c as u32));
+    use crate::yaml::simd::find_json_escape;
+
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+
+    // Fast path: if string is short or no escapes needed, avoid allocation overhead
+    if len == 0 {
+        return String::new();
+    }
+
+    // Use SIMD to check if any escape is needed
+    let first_escape = find_json_escape(bytes, 0);
+    if first_escape == len {
+        // No escapes needed - return copy of original string
+        return s.to_string();
+    }
+
+    // Need escaping - pre-allocate with some extra space for escape sequences
+    let mut result = String::with_capacity(len + len / 8);
+    let mut pos = 0;
+
+    // Copy prefix before first escape
+    if first_escape > 0 {
+        // SAFETY: find_json_escape only finds positions at ASCII characters (", \, or < 0x20),
+        // so bytes[0..first_escape] contains only valid UTF-8 continuation bytes or complete
+        // multi-byte sequences
+        result.push_str(unsafe { core::str::from_utf8_unchecked(&bytes[0..first_escape]) });
+        pos = first_escape;
+    }
+
+    // Process remaining characters
+    while pos < len {
+        let b = bytes[pos];
+
+        // Handle the escapable character
+        match b {
+            b'"' => {
+                result.push_str("\\\"");
+                pos += 1;
             }
-            c => result.push(c),
+            b'\\' => {
+                result.push_str("\\\\");
+                pos += 1;
+            }
+            b'\n' => {
+                result.push_str("\\n");
+                pos += 1;
+            }
+            b'\r' => {
+                result.push_str("\\r");
+                pos += 1;
+            }
+            b'\t' => {
+                result.push_str("\\t");
+                pos += 1;
+            }
+            b if b < 0x20 => {
+                // Other control characters use \uXXXX
+                result.push_str(&format!("\\u{:04x}", b));
+                pos += 1;
+            }
+            _ => {
+                // Not an escapable byte - use SIMD to find the next one
+                let next_escape = find_json_escape(bytes, pos);
+
+                // Copy the run of non-escapable bytes
+                // SAFETY: find_json_escape only stops at ASCII bytes, so the slice
+                // from pos to next_escape is valid UTF-8
+                result
+                    .push_str(unsafe { core::str::from_utf8_unchecked(&bytes[pos..next_escape]) });
+                pos = next_escape;
+            }
         }
     }
+
     result
 }
 
@@ -371,5 +435,141 @@ mod tests {
             OwnedValue::from(Literal::String("hello".into())),
             OwnedValue::String("hello".into())
         );
+    }
+
+    // ========================================================================
+    // Tests for SIMD-accelerated escape_json_string (Issue #91)
+    // ========================================================================
+
+    #[test]
+    fn test_escape_json_string_empty() {
+        assert_eq!(escape_json_string(""), "");
+    }
+
+    #[test]
+    fn test_escape_json_string_no_escapes() {
+        // Fast path: no escapes needed
+        assert_eq!(escape_json_string("hello world"), "hello world");
+        assert_eq!(escape_json_string("simple text"), "simple text");
+    }
+
+    #[test]
+    fn test_escape_json_string_quotes() {
+        assert_eq!(escape_json_string("hello\"world"), "hello\\\"world");
+        assert_eq!(escape_json_string("\"quoted\""), "\\\"quoted\\\"");
+    }
+
+    #[test]
+    fn test_escape_json_string_backslash() {
+        assert_eq!(escape_json_string("hello\\world"), "hello\\\\world");
+        assert_eq!(escape_json_string("path\\to\\file"), "path\\\\to\\\\file");
+    }
+
+    #[test]
+    fn test_escape_json_string_control_chars() {
+        assert_eq!(escape_json_string("hello\nworld"), "hello\\nworld");
+        assert_eq!(escape_json_string("hello\rworld"), "hello\\rworld");
+        assert_eq!(escape_json_string("hello\tworld"), "hello\\tworld");
+        // Other control chars use \uXXXX
+        assert_eq!(escape_json_string("hello\x01world"), "hello\\u0001world");
+        assert_eq!(escape_json_string("hello\x00world"), "hello\\u0000world");
+    }
+
+    #[test]
+    fn test_escape_json_string_unicode() {
+        // Unicode should pass through unchanged
+        assert_eq!(escape_json_string("héllo wörld"), "héllo wörld");
+        assert_eq!(escape_json_string("こんにちは"), "こんにちは");
+        assert_eq!(escape_json_string("emoji: 🦀"), "emoji: 🦀");
+    }
+
+    #[test]
+    fn test_escape_json_string_mixed() {
+        assert_eq!(
+            escape_json_string("hello \"world\"\nline2"),
+            "hello \\\"world\\\"\\nline2"
+        );
+        assert_eq!(
+            escape_json_string("path: C:\\Users\\name"),
+            "path: C:\\\\Users\\\\name"
+        );
+    }
+
+    #[test]
+    fn test_escape_json_string_long() {
+        // Test with > 32 bytes to exercise SIMD path
+        let long_no_escape = "a".repeat(100);
+        assert_eq!(escape_json_string(&long_no_escape), long_no_escape);
+
+        // Long string with escape in the middle
+        let mut long_with_escape = "a".repeat(50);
+        long_with_escape.push('"');
+        long_with_escape.push_str(&"b".repeat(50));
+        let expected_correct = "a".repeat(50) + "\\\"" + &"b".repeat(50);
+        assert_eq!(escape_json_string(&long_with_escape), expected_correct);
+    }
+
+    #[test]
+    fn test_escape_json_string_at_boundaries() {
+        // Escape at 16-byte boundary (SSE2 chunk size)
+        let mut input = "a".repeat(16);
+        input.push('"');
+        let expected = format!("{}\\\"", "a".repeat(16));
+        assert_eq!(escape_json_string(&input), expected);
+
+        // Escape at 32-byte boundary (AVX2 chunk size)
+        let mut input32 = "a".repeat(32);
+        input32.push('"');
+        let expected32 = format!("{}\\\"", "a".repeat(32));
+        assert_eq!(escape_json_string(&input32), expected32);
+    }
+
+    #[test]
+    fn test_escape_json_string_simd_correctness() {
+        // Reference scalar implementation for comparison
+        fn escape_json_string_scalar(s: &str) -> String {
+            let mut result = String::with_capacity(s.len());
+            for c in s.chars() {
+                match c {
+                    '"' => result.push_str("\\\""),
+                    '\\' => result.push_str("\\\\"),
+                    '\n' => result.push_str("\\n"),
+                    '\r' => result.push_str("\\r"),
+                    '\t' => result.push_str("\\t"),
+                    c if c.is_control() => {
+                        result.push_str(&format!("\\u{:04x}", c as u32));
+                    }
+                    c => result.push(c),
+                }
+            }
+            result
+        }
+
+        // Test various inputs
+        let test_cases = [
+            "",
+            "simple",
+            "hello world",
+            "with\"quote",
+            "with\\backslash",
+            "newline\nhere",
+            "tab\there",
+            "carriage\rreturn",
+            "control\x01char",
+            "multiple \"quotes\" and \\backslashes\\ here",
+            "unicode: héllo 世界 🦀",
+            &"a".repeat(100),
+            &format!("{}\"{}\"", "a".repeat(50), "b".repeat(50)),
+        ];
+
+        for input in test_cases {
+            let simd_result = escape_json_string(input);
+            let scalar_result = escape_json_string_scalar(input);
+            assert_eq!(
+                simd_result, scalar_result,
+                "Mismatch for input: {:?}",
+                input
+            );
+        }
     }
 }
