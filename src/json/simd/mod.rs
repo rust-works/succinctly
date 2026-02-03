@@ -97,18 +97,8 @@ pub use neon::build_semi_index_standard;
 
 // Runtime dispatch when std is available (test mode or std feature)
 // Priority: AVX2 > SSE4.2 > SSE2
-// Optional: AVX2 PFSM shuffle composition (experimental, enable with SUCCINCTLY_AVX2_PFSM=1)
 #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
 pub fn build_semi_index_standard(json: &[u8]) -> crate::json::standard::SemiIndex {
-    // AVX2 PFSM shuffle composition - experimental, not enabled by default
-    // Enable with SUCCINCTLY_AVX2_PFSM=1 environment variable
-    #[cfg(feature = "std")]
-    if std::env::var("SUCCINCTLY_AVX2_PFSM").is_ok_and(|v| v == "1")
-        && is_x86_feature_detected!("avx2")
-    {
-        return avx2_pfsm::build_semi_index_standard(json);
-    }
-
     if is_x86_feature_detected!("avx2") {
         avx2::build_semi_index_standard(json)
     } else if is_x86_feature_detected!("sse4.2") {

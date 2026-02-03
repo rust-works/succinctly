@@ -53,8 +53,9 @@ This document records all optimization attempts in the succinctly library, showi
 | NEON Movemask Batching | **0%** (no effect)       | ARM      | Rejected       |
 | NEON Prefetching       | **0%** (no effect)       | ARM      | Rejected       |
 | BP L0 Index Unrolling  | **-19%** (e2e)           | All      | Rejected       |
+| AVX2 Phi Enumeration   | **-72%** (3.5x slower)   | x86_64   | Rejected       |
 
-**Total Failed**: 9 attempts
+**Total Failed**: 10 attempts
 **Worst Failure**: BMI2 PDEP (-71%, 3.4x slower)
 
 ---
@@ -301,6 +302,64 @@ Implements Mytkowicz et al. "Data-Parallel Finite-State Machines" using AVX2 `vp
 4. **Compiler already optimal**: Loop-based version allowed better compiler optimizations
 
 **Lesson**: Micro-benchmark wins ≠ end-to-end improvements. Always benchmark the complete pipeline. This is the fourth optimization (after P2.6, P2.8, P3 in YAML) where micro-benchmarks showed gains but end-to-end showed regressions.
+
+### 7. AVX2 Phi Enumeration - REJECTED
+
+**File**: [src/json/simd/avx2_pfsm.rs](../../src/json/simd/avx2_pfsm.rs)
+
+**Paper**: Mytkowicz et al. "Data-Parallel Finite-State Machines" (ASPLOS 2014)
+
+**Hypothesis**: Enumerate phi (output function) for all 4 possible starting states, then select the correct accumulated output at chunk boundaries. This would allow parallel output accumulation instead of sequential phi extraction.
+
+**Technique**: The `PhiAccum` structure uses fixed-width accumulation to handle variable-length BP output:
+
+```rust
+struct PhiAccum {
+    ib: u16,       // Interest Bits: 1 bit per input byte (fixed-width)
+    bp_open: u16,  // Records which positions emitted '(' (open paren)
+    bp_close: u16, // Records which positions emitted ')' (close paren)
+}
+```
+
+For each byte, we record *decisions* (bp_open/bp_close) at fixed positions rather than accumulating variable-length bits directly. The `compact_bp()` method then converts these masks to actual BP bits by iterating positions and emitting `1` for opens, `0` for closes.
+
+**Benchmark Results** (AMD Ryzen 9 7950X):
+
+| Workload             | Scalar PFSM | Phi Enum  | Regression           |
+|----------------------|-------------|-----------|----------------------|
+| comprehensive/10kb   | 700 MiB/s   | 195 MiB/s | **-72% (3.6x slower)** |
+| users/10kb           | 732 MiB/s   | 180 MiB/s | **-75% (4.1x slower)** |
+
+**Why it failed**:
+
+1. **Enumeration overhead dominates**: Processing 4 parallel paths requires 4x the phi computation (4 accumulations per byte instead of 1), plus 4x the transition tracking
+2. **Compaction cost**: The `compact_bp()` method iterates through all positions to convert bp_open/bp_close masks to actual BP bits — additional O(n) pass
+3. **No parallelism gained**: Despite computing all 4 paths, selection at chunk boundaries is still sequential
+4. **Paper targets different FSMs**: Mytkowicz et al. focused on FSMs where phi produces fixed-width outputs (e.g., token classification). JSON semi-indexing produces variable-width BP output (0-2 bits per byte)
+5. **Scalar PFSM already efficient**: Modern x86 CPUs execute the simple scalar loop extremely efficiently with out-of-order execution and branch prediction
+
+**Comparison with NEON PFSM Shuffle (also failed)**:
+
+| Approach         | Technique                | Result  | Root Cause                    |
+|------------------|--------------------------|---------|-------------------------------|
+| NEON Shuffle     | vpshufb transition comp  | -47%    | Sequential phi extraction     |
+| AVX2 Phi Enum    | Enumerate all 4 outputs  | -72%    | 4x computation + compaction   |
+
+Both approaches attempt to parallelize FSM execution but fail because:
+- Transition composition can be parallelized (shuffle works)
+- But phi extraction/accumulation remains fundamentally sequential for output-producing FSMs
+- The "select correct path at boundary" step cannot eliminate the sequential dependency
+
+**Lesson**: The Mytkowicz paper's techniques work well for FSMs that:
+1. Produce fixed-width outputs (or no outputs)
+2. Only need final state (not accumulated outputs)
+3. Process very long chunks where setup is amortized
+
+JSON semi-indexing violates all three: variable-width BP output, accumulated IB/BP bits needed, and 16-32 byte chunks are too short for amortization.
+
+**Status**: Code remains in [avx2_pfsm.rs](../../src/json/simd/avx2_pfsm.rs) as reference but is not used. Scalar PFSM remains the production implementation.
+
+**GitHub Issue**: [#116](https://github.com/rust-works/succinctly/issues/116)
 
 ---
 
@@ -581,13 +640,13 @@ A duplicate-detection cache (`last_ib_arg`) provides an additional fast path whe
 
 **Benchmark Results** (Apple M1 Max, `succinctly_yq_identity`, clean A/B comparison):
 
-| Workload       | 1KB           | 10KB         | 100KB        | 1MB          |
-|----------------|---------------|--------------|--------------|--------------|
-| users          | **-9 to -13%**| **-8%**      | **-3%**      | neutral      |
+| Workload       | 1KB           | 10KB            | 100KB          | 1MB       |
+|----------------|---------------|-----------------|----------------|-----------|
+| users          | **-9 to -13%**| **-8%**         | **-3%**        | neutral   |
 | comprehensive  | **-3 to -10%**| **-10 to -12%** | **-7 to -10%** | **-2.6%** |
-| sequences      | neutral       | **-5%**      | noisy        | neutral      |
-| nested         | noisy         | neutral      | neutral      | -1.1%        |
-| strings        | neutral       | neutral      | neutral      | neutral      |
+| sequences      | neutral       | **-5%**         | noisy          | neutral   |
+| nested         | noisy         | neutral         | neutral        | -1.1%     |
+| strings        | neutral       | neutral         | neutral        | neutral   |
 
 **Parsing (yaml_bench)**: No regression — cursor field adds zero cost to index construction.
 
@@ -673,20 +732,20 @@ Based on analysis of ARM NEON instructions for indexing and data structures (Jan
 
 ### Reference: Applicable NEON Instructions
 
-| Instruction | Use Case | Status in Codebase |
-|-------------|----------|-------------------|
-| CNT (`vcntq_u8`) | Popcount | ✅ Deployed |
-| CMEQ (`vceqq_*`) | Char classification | ✅ Deployed (JSON/YAML/DSV) |
-| TBL (`vqtbl1q_u8`) | Nibble lookup | ✅ Deployed (JSON only) |
-| PMULL (`vmull_p64`) | Prefix XOR | ✅ Deployed (DSV, +25%) |
-| ADDV (`vaddvq_*`) | Horizontal sum | ✅ Deployed |
-| **Unrolled lookup** | BP min excess | ✅ **Deployed (BP, +17%)** |
-| **256B loop unroll** | Popcount ILP | ✅ **Deployed (popcount, +10-15%)** |
-| **MINV** (`vminvq_s16`) | L1/L2 block minimum | ✅ **Deployed (BP L1: +2.8x, L2: +1-3% at scale)** |
-| **Vector CLZ** | First match position | ❌ Not yet used (BP opportunity) |
+| Instruction             | Use Case             | Status in Codebase                                 |
+|-------------------------|----------------------|----------------------------------------------------|
+| CNT (`vcntq_u8`)        | Popcount             | ✅ Deployed                                         |
+| CMEQ (`vceqq_*`)        | Char classification  | ✅ Deployed (JSON/YAML/DSV)                         |
+| TBL (`vqtbl1q_u8`)      | Nibble lookup        | ✅ Deployed (JSON only)                             |
+| PMULL (`vmull_p64`)     | Prefix XOR           | ✅ Deployed (DSV, +25%)                             |
+| ADDV (`vaddvq_*`)       | Horizontal sum       | ✅ Deployed                                         |
+| **Unrolled lookup**     | BP min excess        | ✅ **Deployed (BP, +17%)**                          |
+| **256B loop unroll**    | Popcount ILP         | ✅ **Deployed (popcount, +10-15%)**                 |
+| **MINV** (`vminvq_s16`) | L1/L2 block minimum  | ✅ **Deployed (BP L1: +2.8x, L2: +1-3% at scale)**  |
+| **Vector CLZ**          | First match position | ❌ Not yet used (BP opportunity)                    |
 
 See [docs/plan/sve2-optimizations.md](../plan/sve2-optimizations.md#future-neon-optimization-opportunities) for detailed analysis.
 
 ---
 
-*Last Updated: 2026-01-28*
+*Last Updated: 2026-02-04*
