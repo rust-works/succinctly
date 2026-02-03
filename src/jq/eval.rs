@@ -274,7 +274,22 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Ok(s) => s,
                     Err(_) => return QueryResult::Error(EvalError::new("invalid UTF-8 in string")),
                 };
+
+                // Fast path: identity slice [:] returns original string without character counting
+                if start.is_none() && end.is_none() {
+                    return QueryResult::One(value);
+                }
+
+                // Fast path: [0:] on non-empty string returns original
+                if let Some(0) = start {
+                    if end.is_none() && !s_str.is_empty() {
+                        return QueryResult::One(value);
+                    }
+                }
+
+                // Only count characters when actually slicing
                 let len = s_str.chars().count();
+
                 // Resolve indices like jq does
                 let resolve_idx = |idx: i64| -> usize {
                     if idx >= 0 {
@@ -288,18 +303,27 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         }
                     }
                 };
+
                 let start_idx = start.map(resolve_idx).unwrap_or(0);
                 let end_idx = end.map(resolve_idx).unwrap_or(len);
+
+                // Check for empty slice
                 if start_idx >= end_idx || start_idx >= len {
-                    QueryResult::Owned(OwnedValue::String(String::new()))
-                } else {
-                    let sliced: String = s_str
-                        .chars()
-                        .skip(start_idx)
-                        .take(end_idx - start_idx)
-                        .collect();
-                    QueryResult::Owned(OwnedValue::String(sliced))
+                    return QueryResult::Owned(OwnedValue::String(String::new()));
                 }
+
+                // Fast path: if resolved slice is full string, return original
+                if start_idx == 0 && end_idx == len {
+                    return QueryResult::One(value);
+                }
+
+                // Actually slice the string (requires character iteration)
+                let sliced: String = s_str
+                    .chars()
+                    .skip(start_idx)
+                    .take(end_idx - start_idx)
+                    .collect();
+                QueryResult::Owned(OwnedValue::String(sliced))
             }
             _ if optional => QueryResult::None,
             _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
