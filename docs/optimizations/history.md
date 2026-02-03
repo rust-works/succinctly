@@ -34,19 +34,25 @@ This document records all optimization attempts in the succinctly library, showi
 **Total Successful**: 18 optimizations
 **Best Result**: Cumulative index (627x)
 
+### Partial Success / Mixed Results
+
+| Optimization           | vs Baseline        | vs Alternative     | Platform | Status             |
+|------------------------|--------------------|--------------------|----------|--------------------|
+| AVX2 PFSM Shuffle      | **-10%** (vs PFSM) | **+10%** (vs AVX2) | x86_64   | Optional (env var) |
+
 ### Failed Optimizations
 
 | Optimization           | Penalty                  | Platform | Action         |
 |------------------------|--------------------------|----------|----------------|
-| AVX-512 JSON Parser    | **-10%** (avg)           | x86_64   | Removed      |
-| BMI1 Mask Iteration    | **-26%** (avg)           | x86_64   | Reverted     |
-| BMI2 PDEP BitWriter    | **-71%** (3.4x slower!)  | x86_64   | Reverted     |
-| PFSM Batched           | **-25%** (vs production) | All      | Not deployed |
-| NEON PFSM Shuffle      | **-47%**                 | ARM      | Reverted     |
-| NEON Batched Popcount  | **-25%**                 | ARM      | Rejected     |
-| NEON Movemask Batching | **0%** (no effect)       | ARM      | Rejected     |
-| NEON Prefetching       | **0%** (no effect)       | ARM      | Rejected     |
-| BP L0 Index Unrolling  | **-19%** (e2e)           | All      | Rejected     |
+| AVX-512 JSON Parser    | **-10%** (avg)           | x86_64   | Removed        |
+| BMI1 Mask Iteration    | **-26%** (avg)           | x86_64   | Reverted       |
+| BMI2 PDEP BitWriter    | **-71%** (3.4x slower!)  | x86_64   | Reverted       |
+| PFSM Batched           | **-25%** (vs production) | All      | Not deployed   |
+| NEON PFSM Shuffle      | **-47%**                 | ARM      | Reverted       |
+| NEON Batched Popcount  | **-25%**                 | ARM      | Rejected       |
+| NEON Movemask Batching | **0%** (no effect)       | ARM      | Rejected       |
+| NEON Prefetching       | **0%** (no effect)       | ARM      | Rejected       |
+| BP L0 Index Unrolling  | **-19%** (e2e)           | All      | Rejected       |
 
 **Total Failed**: 9 attempts
 **Worst Failure**: BMI2 PDEP (-71%, 3.4x slower)
@@ -237,6 +243,36 @@ Table-driven state machine with BMI2/AVX2 batch bit extraction (ported from hask
 **Why it failed**: Sequential phi extraction negates parallel gains. Each state depends on the previous state - SIMD cannot break this dependency chain.
 
 **Lesson**: Parallel computation is useless if results must be consumed sequentially.
+
+### 5b. AVX2 PFSM Shuffle Composition - PARTIAL SUCCESS
+
+**File**: [src/json/simd/avx2_pfsm.rs](../../src/json/simd/avx2_pfsm.rs)
+
+Implements Mytkowicz et al. "Data-Parallel Finite-State Machines" using AVX2 `vpshufb` to compose transitions in parallel. Binary tree reduction composes 16 transitions in 4 sequential steps (O(log n)).
+
+| Workload           | Scalar PFSM | AVX2 Class | AVX2-PFSM | vs PFSM  | vs AVX2  |
+|--------------------|-------------|------------|-----------|----------|----------|
+| comprehensive/10kb | 727 MiB/s   | 555 MiB/s  | 637 MiB/s | **-12%** | **+15%** |
+| comprehensive/100kb| 668 MiB/s   | 536 MiB/s  | 611 MiB/s | **-9%**  | **+14%** |
+| comprehensive/1mb  | 627 MiB/s   | 507 MiB/s  | 537 MiB/s | **-14%** | **+6%**  |
+| users/10kb         | 732 MiB/s   | 646 MiB/s  | 677 MiB/s | **-8%**  | **+5%**  |
+| nested/10kb        | 804 MiB/s   | 857 MiB/s  | 709 MiB/s | **-12%** | **-17%** |
+| arrays/10kb        | 716 MiB/s   | 570 MiB/s  | 646 MiB/s | **-10%** | **+13%** |
+
+**Results**:
+- **Beats AVX2 classification** by 5-15% on most workloads (not nested)
+- **Slower than scalar PFSM** by 8-14% on all workloads
+- Exception: nested/10kb where AVX2 classification wins (structure-heavy, many short tokens)
+
+**Why partial success**:
+1. `vpshufb` composition is efficient (1 cycle/op on modern CPUs)
+2. Binary tree reduces 16 sequential compositions to 4 dependency levels
+3. But phi extraction remains sequential (same problem as NEON)
+4. Scalar PFSM benefits from CPU out-of-order execution and branch prediction
+
+**Status**: Available behind `SUCCINCTLY_AVX2_PFSM=1` environment variable. Not enabled by default since scalar PFSM is faster.
+
+**Lesson**: The x86 paper results don't translate directly because modern CPUs execute simple scalar loops very efficiently. The composition overhead (~15 vpshufb + 16 table lookups) exceeds the benefit of reduced sequential dependency depth.
 
 ### 6. BP L0 Index Unrolling - REJECTED
 

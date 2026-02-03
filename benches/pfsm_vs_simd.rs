@@ -81,6 +81,16 @@ fn bench_pfsm_vs_simd(c: &mut Criterion) {
             });
         }
 
+        // Benchmark AVX2 PFSM shuffle composition (experimental)
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") {
+            group.bench_with_input(BenchmarkId::new("AVX2-PFSM", &name), json, |b, json| {
+                b.iter(|| {
+                    succinctly::json::simd::avx2_pfsm::build_semi_index_standard(black_box(json))
+                });
+            });
+        }
+
         // Benchmark NEON SIMD on ARM
         #[cfg(target_arch = "aarch64")]
         group.bench_with_input(BenchmarkId::new("NEON", &name), json, |b, json| {
