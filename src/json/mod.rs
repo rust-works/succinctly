@@ -21,6 +21,7 @@ pub mod pfsm_tables;
 pub mod simple;
 pub mod simple_light;
 pub mod standard;
+pub mod validate;
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub mod simd;

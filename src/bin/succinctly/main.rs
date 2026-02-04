@@ -50,6 +50,8 @@ enum JsonSubcommand {
     Generate(GenerateJson),
     /// Generate a suite of JSON files with various sizes and patterns
     GenerateSuite(GenerateSuite),
+    /// Validate JSON files strictly according to RFC 8259
+    Validate(json_validate::ValidateArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -1003,6 +1005,10 @@ fn main() -> Result<()> {
                 Ok(())
             }
             JsonSubcommand::GenerateSuite(args) => generate_json_suite(args),
+            JsonSubcommand::Validate(args) => {
+                let exit_code = json_validate::run(args)?;
+                std::process::exit(exit_code);
+            }
         },
         Command::Dsv(dsv_cmd) => match dsv_cmd.command {
             DsvSubcommand::Generate(args) => {
@@ -1722,6 +1728,7 @@ mod generators;
 mod jq_bench;
 mod jq_locate;
 mod jq_runner;
+mod json_validate;
 mod yaml_generators;
 mod yq_bench;
 mod yq_locate;
