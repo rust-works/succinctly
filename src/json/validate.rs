@@ -1,8 +1,9 @@
 //! Strict JSON validator according to RFC 8259.
 //!
-//! This module provides a fast, scalar JSON validator that performs strict
-//! validation according to RFC 8259. Unlike the semi-indexing parser, this
-//! validator checks all aspects of JSON validity including:
+//! This module provides a fast JSON validator that performs strict
+//! validation according to RFC 8259. On x86_64, SIMD acceleration (AVX2/SSE2)
+//! is used to scan strings for escape characters. Unlike the semi-indexing
+//! parser, this validator checks all aspects of JSON validity including:
 //!
 //! - Structural syntax (braces, brackets, colons, commas)
 //! - String escape sequences (including surrogate pairs)
@@ -28,6 +29,11 @@
 use alloc::string::String;
 
 use core::fmt;
+
+// SIMD-accelerated string scanning for x86_64
+#[cfg(target_arch = "x86_64")]
+#[path = "validate_simd.rs"]
+mod simd;
 
 /// Position information for error reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +153,8 @@ impl std::error::Error for ValidationError {}
 /// A strict JSON validator with position tracking.
 ///
 /// Uses recursive descent parsing to validate JSON according to RFC 8259.
+/// On x86_64, SIMD acceleration is used for chunked string validation
+/// (combined UTF-8 + terminator scanning with AVX2/SSE2).
 pub struct Validator<'a> {
     input: &'a [u8],
     offset: usize,
@@ -322,10 +330,45 @@ impl<'a> Validator<'a> {
     }
 
     /// Validate a JSON string.
+    ///
+    /// Uses chunked SIMD validation (32 bytes at a time) for combined UTF-8
+    /// validation and terminator scanning. Falls back to scalar for short strings
+    /// or when handling terminators.
     fn validate_string(&mut self) -> Result<(), ValidationError> {
         self.advance(); // consume opening quote
 
+        // Initialize UTF-8 state for tracking multi-byte sequences across chunks
+        let mut utf8_state = simd::Utf8State::new();
+
         loop {
+            // SIMD fast path: process 32-byte chunks with combined UTF-8 + terminator validation
+            #[cfg(target_arch = "x86_64")]
+            while self.input.len() - self.offset >= 32 {
+                let result = simd::validate_string_chunk(self.input, self.offset, &mut utf8_state);
+
+                if !result.utf8_valid {
+                    return Err(self.error(ValidationErrorKind::InvalidUtf8));
+                }
+
+                if result.terminator_offset > 0 {
+                    // Skip past valid UTF-8 content before the terminator
+                    self.offset += result.terminator_offset;
+                    self.column += result.terminator_offset;
+                }
+
+                if result.terminator_offset < 32 {
+                    // Found a terminator, break to handle it
+                    break;
+                }
+                // No terminator in this chunk, continue to next chunk
+            }
+
+            // Check for pending continuation bytes from last chunk
+            if utf8_state.pending_continuations > 0 {
+                return Err(self.error(ValidationErrorKind::InvalidUtf8));
+            }
+
+            // Handle current byte (terminator or remaining bytes)
             match self.peek() {
                 Some(b'"') => {
                     self.advance();
@@ -333,12 +376,12 @@ impl<'a> Validator<'a> {
                 }
                 Some(b'\\') => {
                     self.validate_escape()?;
+                    utf8_state = simd::Utf8State::new(); // Reset after escape
                 }
                 Some(b) if b < 0x20 => {
                     return Err(self.error(ValidationErrorKind::ControlCharacter { byte: b }));
                 }
                 Some(_) => {
-                    // Validate UTF-8 sequence
                     self.validate_utf8_char()?;
                 }
                 None => {
@@ -348,7 +391,20 @@ impl<'a> Validator<'a> {
         }
     }
 
+    /// Find the exact UTF-8 error position within a span (called on error path only).
+    fn find_utf8_error_in_span(&mut self, span_len: usize) -> Result<(), ValidationError> {
+        let end = self.offset + span_len;
+        while self.offset < end {
+            if let Err(e) = self.validate_utf8_char() {
+                return Err(e);
+            }
+        }
+        // Shouldn't reach here, but if we do, continue normally
+        Ok(())
+    }
+
     /// Validate a single UTF-8 character (may be multi-byte).
+    /// Used for scalar fallback when SIMD isn't available or for short strings.
     fn validate_utf8_char(&mut self) -> Result<(), ValidationError> {
         let b = self.peek().unwrap();
 
@@ -358,7 +414,7 @@ impl<'a> Validator<'a> {
             return Ok(());
         }
 
-        // Determine expected length and validate leading byte
+        // Multi-byte UTF-8 validation
         let (len, min_cp, max_cp) = if b & 0xE0 == 0xC0 {
             (2, 0x80u32, 0x7FFu32)
         } else if b & 0xF0 == 0xE0 {
