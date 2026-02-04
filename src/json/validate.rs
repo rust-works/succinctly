@@ -178,6 +178,10 @@ impl<'a> Validator<'a> {
     /// Returns `Ok(())` if the input is valid JSON, or an error with position
     /// information if validation fails.
     pub fn validate(&mut self) -> Result<(), ValidationError> {
+        // Create SIMD constants once at document start
+        #[cfg(target_arch = "x86_64")]
+        let simd_constants = unsafe { simd::SimdConstants::new() };
+
         self.skip_whitespace();
 
         if self.is_eof() {
@@ -186,7 +190,11 @@ impl<'a> Validator<'a> {
             }));
         }
 
+        #[cfg(target_arch = "x86_64")]
+        self.validate_value(&simd_constants)?;
+        #[cfg(not(target_arch = "x86_64"))]
         self.validate_value()?;
+
         self.skip_whitespace();
 
         if !self.is_eof() {
@@ -197,6 +205,27 @@ impl<'a> Validator<'a> {
     }
 
     /// Validate a JSON value (object, array, string, number, or keyword).
+    #[cfg(target_arch = "x86_64")]
+    fn validate_value(&mut self, simd_constants: &simd::SimdConstants) -> Result<(), ValidationError> {
+        match self.peek() {
+            Some(b'{') => self.validate_object(simd_constants),
+            Some(b'[') => self.validate_array(simd_constants),
+            Some(b'"') => self.validate_string(simd_constants),
+            Some(b'-') | Some(b'0'..=b'9') => self.validate_number(),
+            Some(b't') | Some(b'f') | Some(b'n') => self.validate_keyword(),
+            Some(b'+') => Err(self.error(ValidationErrorKind::LeadingPlus)),
+            Some(c) => Err(self.error(ValidationErrorKind::UnexpectedCharacter {
+                expected: "JSON value",
+                found: c as char,
+            })),
+            None => Err(self.error(ValidationErrorKind::UnexpectedEof {
+                expected: "JSON value",
+            })),
+        }
+    }
+
+    /// Validate a JSON value (object, array, string, number, or keyword).
+    #[cfg(not(target_arch = "x86_64"))]
     fn validate_value(&mut self) -> Result<(), ValidationError> {
         match self.peek() {
             Some(b'{') => self.validate_object(),
@@ -216,6 +245,76 @@ impl<'a> Validator<'a> {
     }
 
     /// Validate a JSON object.
+    #[cfg(target_arch = "x86_64")]
+    fn validate_object(&mut self, simd_constants: &simd::SimdConstants) -> Result<(), ValidationError> {
+        self.advance(); // consume '{'
+        self.skip_whitespace();
+
+        // Empty object
+        if self.peek() == Some(b'}') {
+            self.advance();
+            return Ok(());
+        }
+
+        loop {
+            // Expect string key
+            if self.peek() != Some(b'"') {
+                return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
+                    expected: "string key",
+                    found: self.peek().map(|b| b as char).unwrap_or('\0'),
+                }));
+            }
+            self.validate_string(simd_constants)?;
+            self.skip_whitespace();
+
+            // Expect colon
+            if self.peek() != Some(b':') {
+                return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
+                    expected: "':'",
+                    found: self.peek().map(|b| b as char).unwrap_or('\0'),
+                }));
+            }
+            self.advance();
+            self.skip_whitespace();
+
+            // Expect value
+            self.validate_value(simd_constants)?;
+            self.skip_whitespace();
+
+            // Expect comma or closing brace
+            match self.peek() {
+                Some(b',') => {
+                    self.advance();
+                    self.skip_whitespace();
+                    // Check for trailing comma
+                    if self.peek() == Some(b'}') {
+                        return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
+                            expected: "string key",
+                            found: '}',
+                        }));
+                    }
+                }
+                Some(b'}') => {
+                    self.advance();
+                    return Ok(());
+                }
+                Some(c) => {
+                    return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
+                        expected: "',' or '}'",
+                        found: c as char,
+                    }));
+                }
+                None => {
+                    return Err(self.error(ValidationErrorKind::UnexpectedEof {
+                        expected: "',' or '}'",
+                    }));
+                }
+            }
+        }
+    }
+
+    /// Validate a JSON object.
+    #[cfg(not(target_arch = "x86_64"))]
     fn validate_object(&mut self) -> Result<(), ValidationError> {
         self.advance(); // consume '{'
         self.skip_whitespace();
@@ -284,6 +383,54 @@ impl<'a> Validator<'a> {
     }
 
     /// Validate a JSON array.
+    #[cfg(target_arch = "x86_64")]
+    fn validate_array(&mut self, simd_constants: &simd::SimdConstants) -> Result<(), ValidationError> {
+        self.advance(); // consume '['
+        self.skip_whitespace();
+
+        // Empty array
+        if self.peek() == Some(b']') {
+            self.advance();
+            return Ok(());
+        }
+
+        loop {
+            self.validate_value(simd_constants)?;
+            self.skip_whitespace();
+
+            match self.peek() {
+                Some(b',') => {
+                    self.advance();
+                    self.skip_whitespace();
+                    // Check for trailing comma
+                    if self.peek() == Some(b']') {
+                        return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
+                            expected: "JSON value",
+                            found: ']',
+                        }));
+                    }
+                }
+                Some(b']') => {
+                    self.advance();
+                    return Ok(());
+                }
+                Some(c) => {
+                    return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
+                        expected: "',' or ']'",
+                        found: c as char,
+                    }));
+                }
+                None => {
+                    return Err(self.error(ValidationErrorKind::UnexpectedEof {
+                        expected: "',' or ']'",
+                    }));
+                }
+            }
+        }
+    }
+
+    /// Validate a JSON array.
+    #[cfg(not(target_arch = "x86_64"))]
     fn validate_array(&mut self) -> Result<(), ValidationError> {
         self.advance(); // consume '['
         self.skip_whitespace();
@@ -331,20 +478,20 @@ impl<'a> Validator<'a> {
 
     /// Validate a JSON string.
     ///
-    /// Uses chunked SIMD validation (32 bytes at a time) for combined UTF-8
+    /// Uses chunked SIMD validation (64 bytes at a time) for combined UTF-8
     /// validation and terminator scanning. Falls back to scalar for short strings
     /// or when handling terminators.
-    fn validate_string(&mut self) -> Result<(), ValidationError> {
+    #[cfg(target_arch = "x86_64")]
+    fn validate_string(&mut self, simd_constants: &simd::SimdConstants) -> Result<(), ValidationError> {
         self.advance(); // consume opening quote
 
-        // Initialize UTF-8 state for tracking multi-byte sequences across chunks
-        let mut utf8_state = simd::Utf8State::new();
+        // Initialize UTF-8 carry state for tracking multi-byte sequences across chunks
+        let mut utf8_carry = unsafe { simd::Utf8Carry::new() };
 
         loop {
-            // SIMD fast path: process 32-byte chunks with combined UTF-8 + terminator validation
-            #[cfg(target_arch = "x86_64")]
-            while self.input.len() - self.offset >= 32 {
-                let result = simd::validate_string_chunk(self.input, self.offset, &mut utf8_state);
+            // SIMD fast path: process 64-byte chunks with combined UTF-8 + terminator validation
+            while self.input.len() - self.offset >= 64 {
+                let result = simd::validate_string_chunk(self.input, self.offset, &mut utf8_carry, simd_constants);
 
                 if !result.utf8_valid {
                     return Err(self.error(ValidationErrorKind::InvalidUtf8));
@@ -356,7 +503,7 @@ impl<'a> Validator<'a> {
                     self.column += result.terminator_offset;
                 }
 
-                if result.terminator_offset < 32 {
+                if result.terminator_offset < 64 {
                     // Found a terminator, break to handle it
                     break;
                 }
@@ -364,7 +511,7 @@ impl<'a> Validator<'a> {
             }
 
             // Check for pending continuation bytes from last chunk
-            if utf8_state.pending_continuations > 0 {
+            if utf8_carry.has_pending() {
                 return Err(self.error(ValidationErrorKind::InvalidUtf8));
             }
 
@@ -376,7 +523,35 @@ impl<'a> Validator<'a> {
                 }
                 Some(b'\\') => {
                     self.validate_escape()?;
-                    utf8_state = simd::Utf8State::new(); // Reset after escape
+                    // Reset carry state after escape
+                    utf8_carry = unsafe { simd::Utf8Carry::new() };
+                }
+                Some(b) if b < 0x20 => {
+                    return Err(self.error(ValidationErrorKind::ControlCharacter { byte: b }));
+                }
+                Some(_) => {
+                    self.validate_utf8_char()?;
+                }
+                None => {
+                    return Err(self.error(ValidationErrorKind::UnclosedString));
+                }
+            }
+        }
+    }
+
+    /// Validate a JSON string (non-x86_64 version).
+    #[cfg(not(target_arch = "x86_64"))]
+    fn validate_string(&mut self) -> Result<(), ValidationError> {
+        self.advance(); // consume opening quote
+
+        loop {
+            match self.peek() {
+                Some(b'"') => {
+                    self.advance();
+                    return Ok(());
+                }
+                Some(b'\\') => {
+                    self.validate_escape()?;
                 }
                 Some(b) if b < 0x20 => {
                     return Err(self.error(ValidationErrorKind::ControlCharacter { byte: b }));
