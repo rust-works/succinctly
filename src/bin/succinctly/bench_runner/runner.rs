@@ -64,6 +64,10 @@ pub struct RunArgs {
     /// Verbose output
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Extra arguments to pass to criterion benchmarks (after --)
+    #[arg(last = true)]
+    pub extra_args: Vec<String>,
 }
 
 /// Result from a single benchmark execution.
@@ -144,13 +148,19 @@ pub fn run_benchmarks(args: RunArgs) -> Result<()> {
     if args.dry_run {
         println!("Dry run - would execute {} benchmarks:", benchmarks.len());
         println!();
+        let extra_args_str = if args.extra_args.is_empty() {
+            String::new()
+        } else {
+            format!(" -- {}", args.extra_args.join(" "))
+        };
         for b in &benchmarks {
             println!("  {} ({}, {})", b.name, b.category, b.bench_type);
             match b.bench_type {
                 BenchmarkType::Criterion => {
                     println!(
-                        "    Command: cargo bench --bench {}",
-                        b.criterion_name.unwrap_or(b.name)
+                        "    Command: cargo bench --bench {}{}",
+                        b.criterion_name.unwrap_or(b.name),
+                        extra_args_str
                     );
                 }
                 BenchmarkType::CliBench => {
@@ -161,8 +171,9 @@ pub fn run_benchmarks(args: RunArgs) -> Result<()> {
                 }
                 BenchmarkType::CrossParser => {
                     println!(
-                        "    Command: cd bench-compare && cargo bench --bench {}",
-                        b.criterion_name.unwrap_or(b.name)
+                        "    Command: cd bench-compare && cargo bench --bench {}{}",
+                        b.criterion_name.unwrap_or(b.name),
+                        extra_args_str
                     );
                 }
             }
@@ -219,7 +230,7 @@ pub fn run_benchmarks(args: RunArgs) -> Result<()> {
         );
         std::io::stderr().flush().ok();
 
-        let result = run_single_benchmark(benchmark, &stdout_dir, args.verbose);
+        let result = run_single_benchmark(benchmark, &stdout_dir, args.verbose, &args.extra_args);
 
         match &result {
             Ok(r) if r.success => {
@@ -345,11 +356,14 @@ fn run_single_benchmark(
     benchmark: &BenchmarkInfo,
     stdout_dir: &Path,
     verbose: bool,
+    extra_args: &[String],
 ) -> Result<BenchmarkResult> {
     let start = Instant::now();
 
     let (exit_code, error_msg) = match benchmark.bench_type {
-        BenchmarkType::Criterion => run_criterion_benchmark(benchmark, stdout_dir, verbose)?,
+        BenchmarkType::Criterion => {
+            run_criterion_benchmark(benchmark, stdout_dir, verbose, extra_args)?
+        }
         BenchmarkType::CliBench => run_cli_benchmark(benchmark, stdout_dir, verbose)?,
         BenchmarkType::CrossParser => run_cross_parser_benchmark(benchmark, stdout_dir, verbose)?,
     };
@@ -373,11 +387,20 @@ fn run_criterion_benchmark(
     benchmark: &BenchmarkInfo,
     stdout_dir: &Path,
     _verbose: bool,
+    extra_args: &[String],
 ) -> Result<(Option<i32>, Option<String>)> {
     let bench_name = benchmark.criterion_name.unwrap_or(benchmark.name);
 
-    let output = Command::new("cargo")
-        .args(["bench", "--bench", bench_name])
+    let mut cmd = Command::new("cargo");
+    cmd.args(["bench", "--bench", bench_name]);
+
+    // Pass extra args to criterion (e.g., filter patterns)
+    if !extra_args.is_empty() {
+        cmd.arg("--");
+        cmd.args(extra_args);
+    }
+
+    let output = cmd
         .current_dir(benchmark.working_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -520,6 +543,7 @@ mod tests {
             continue_on_error: false,
             dry_run: false,
             verbose: false,
+            extra_args: vec![],
         };
         let benchmarks = select_benchmarks(&args).unwrap();
         assert_eq!(benchmarks.len(), BENCHMARKS.len());
@@ -536,6 +560,7 @@ mod tests {
             continue_on_error: false,
             dry_run: false,
             verbose: false,
+            extra_args: vec![],
         };
         let benchmarks = select_benchmarks(&args).unwrap();
         assert!(benchmarks
@@ -554,6 +579,7 @@ mod tests {
             continue_on_error: false,
             dry_run: false,
             verbose: false,
+            extra_args: vec![],
         };
         let benchmarks = select_benchmarks(&args).unwrap();
         assert_eq!(benchmarks.len(), 2);
