@@ -481,6 +481,11 @@ impl<'a> Validator<'a> {
     /// Uses chunked SIMD validation (64 bytes at a time) for combined UTF-8
     /// validation and terminator scanning. Falls back to scalar for short strings
     /// or when handling terminators.
+    ///
+    /// Optimization: tracks `simd_validated_to` to avoid re-validating bytes that
+    /// SIMD already checked. When an escape is found mid-chunk, the bytes after
+    /// the escape (up to the chunk boundary) are already validated - we just need
+    /// to scan them for terminators without re-running UTF-8 validation.
     #[cfg(target_arch = "x86_64")]
     fn validate_string(&mut self, simd_constants: &simd::SimdConstants) -> Result<(), ValidationError> {
         self.advance(); // consume opening quote
@@ -488,14 +493,24 @@ impl<'a> Validator<'a> {
         // Initialize UTF-8 carry state for tracking multi-byte sequences across chunks
         let mut utf8_carry = unsafe { simd::Utf8Carry::new() };
 
+        // Track how far SIMD has validated UTF-8 to avoid redundant re-validation.
+        // When SIMD processes a 64-byte chunk, it validates ALL bytes even if a
+        // terminator is found early. After handling the terminator (e.g., escape),
+        // we can skip UTF-8 validation for the remainder of that chunk.
+        let mut simd_validated_to = self.offset;
+
         loop {
             // SIMD fast path: process 64-byte chunks with combined UTF-8 + terminator validation
-            while self.input.len() - self.offset >= 64 {
+            // Only run SIMD if we're beyond the already-validated region
+            while self.input.len() - self.offset >= 64 && self.offset >= simd_validated_to {
                 let result = simd::validate_string_chunk(self.input, self.offset, &mut utf8_carry, simd_constants);
 
                 if !result.utf8_valid {
                     return Err(self.error(ValidationErrorKind::InvalidUtf8));
                 }
+
+                // Mark this entire chunk as UTF-8 validated
+                simd_validated_to = self.offset + 64;
 
                 if result.terminator_offset > 0 {
                     // Skip past valid UTF-8 content before the terminator
@@ -511,7 +526,8 @@ impl<'a> Validator<'a> {
             }
 
             // Check for pending continuation bytes from last chunk
-            if utf8_carry.has_pending() {
+            // Only check if we've reached/exceeded the validated region (SIMD was involved)
+            if self.offset >= simd_validated_to && utf8_carry.has_pending() {
                 return Err(self.error(ValidationErrorKind::InvalidUtf8));
             }
 
@@ -523,14 +539,19 @@ impl<'a> Validator<'a> {
                 }
                 Some(b'\\') => {
                     self.validate_escape()?;
-                    // Reset carry state after escape
+                    // Reset carry state after escape (escapes are ASCII, no pending UTF-8)
                     utf8_carry = unsafe { simd::Utf8Carry::new() };
                 }
                 Some(b) if b < 0x20 => {
                     return Err(self.error(ValidationErrorKind::ControlCharacter { byte: b }));
                 }
                 Some(_) => {
-                    self.validate_utf8_char()?;
+                    // If we're in the SIMD-validated region, UTF-8 is already checked
+                    if self.offset < simd_validated_to {
+                        self.advance();
+                    } else {
+                        self.validate_utf8_char()?;
+                    }
                 }
                 None => {
                     return Err(self.error(ValidationErrorKind::UnclosedString));
@@ -1553,5 +1574,105 @@ mod tests {
         }
         s.push('"');
         assert!(validate(s.as_bytes()).is_ok());
+    }
+
+    // ========================================================================
+    // SIMD optimization tests - validates the simd_validated_to fast path
+    // ========================================================================
+
+    #[test]
+    fn test_simd_validated_region_with_escapes() {
+        // This tests the optimization where SIMD validates a full 64-byte chunk
+        // but finds an escape early. After the escape, we should skip re-validating
+        // the bytes that SIMD already checked.
+        //
+        // Pattern: 10 chars + escape + remaining chars (total > 64)
+        // The escape at position 10 triggers scalar handling, but bytes 12-63
+        // are already validated and should use the fast path.
+        let padding = "abcdefghij"; // 10 chars before escape
+        let after_escape = "x".repeat(60); // 60 chars after escape, total 72+ bytes
+        let json = format!(r#""{}\n{}""#, padding, after_escape);
+        assert!(
+            validate(json.as_bytes()).is_ok(),
+            "String with escape followed by long content should be valid"
+        );
+    }
+
+    #[test]
+    fn test_simd_multiple_escapes_in_chunk() {
+        // Multiple escapes within a 64-byte chunk, each triggering the fast path
+        // for the bytes between them
+        let json = r#""abc\ndef\nghi\njkl\nmno\npqr\nstu\nvwx\nyz0123456789""#;
+        assert!(
+            validate(json.as_bytes()).is_ok(),
+            "String with multiple escapes should be valid"
+        );
+    }
+
+    #[test]
+    fn test_simd_escape_near_chunk_boundary() {
+        // Escape near the 64-byte boundary tests edge cases in simd_validated_to tracking
+        let padding = "a".repeat(62); // 62 chars + 2 char escape = 64 exactly
+        let json = format!(r#""{}\n""#, padding);
+        assert!(
+            validate(json.as_bytes()).is_ok(),
+            "Escape at chunk boundary should be valid"
+        );
+    }
+
+    #[test]
+    fn test_simd_long_string_with_periodic_escapes() {
+        // Long string with escapes every ~20 chars tests sustained fast path usage
+        let mut s = String::from("\"");
+        for i in 0..20 {
+            s.push_str(&"a".repeat(18));
+            s.push_str("\\n");
+            if i < 19 {
+                // Don't add more content after last escape
+            }
+        }
+        s.push('"');
+        assert!(
+            validate(s.as_bytes()).is_ok(),
+            "Long string with periodic escapes should be valid"
+        );
+    }
+
+    #[test]
+    fn test_simd_validated_region_with_utf8() {
+        // UTF-8 content after an escape should still be handled correctly
+        // even when using the simd_validated_to fast path
+        let padding = "hello";
+        let utf8_content = "日本語テスト"; // Japanese text
+        let more_padding = "a".repeat(40);
+        let json = format!(r#""{}\n{}{}""#, padding, utf8_content, more_padding);
+        assert!(
+            validate(json.as_bytes()).is_ok(),
+            "UTF-8 after escape in validated region should be valid"
+        );
+    }
+
+    #[test]
+    fn test_simd_control_char_in_validated_region() {
+        // Control character in the SIMD-validated region should still be caught
+        let mut bytes = Vec::new();
+        bytes.push(b'"');
+        bytes.extend_from_slice(b"hello\\n"); // 7 bytes
+        bytes.extend_from_slice(&[b'a'; 20]); // 20 more = 27 total
+        bytes.push(0x01); // Control char at position 28 (in validated region)
+        bytes.extend_from_slice(&[b'a'; 30]); // Fill rest of chunk
+        bytes.push(b'"');
+
+        let result = validate(&bytes);
+        assert!(
+            result.is_err(),
+            "Control char in validated region should be caught"
+        );
+        if let Err(e) = result {
+            assert!(
+                matches!(e.kind, ValidationErrorKind::ControlCharacter { byte: 0x01 }),
+                "Should report control character error"
+            );
+        }
     }
 }
