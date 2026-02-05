@@ -370,19 +370,24 @@ unsafe fn validate_utf8_block(
     );
 
     // === Calculate incomplete state for next block ===
-    // Check last 3 bytes for sequences that continue into next block
-    let mut first_len_bytes = [0u8; 32];
-    _mm256_storeu_si256(first_len_bytes.as_mut_ptr() as *mut __m256i, first_len);
+    // Check last 3 bytes for sequences that continue into next block.
+    // Extract only the high 128 bits (bytes 16-31) to avoid full 32-byte store.
+    let high128 = _mm256_extracti128_si256::<1>(first_len);
 
-    let mut incomplete_count = 0u8;
-    // Check if last byte starts a multi-byte sequence
-    if first_len_bytes[31] >= 1 {
-        incomplete_count = first_len_bytes[31];
-    } else if first_len_bytes[30] >= 2 {
-        incomplete_count = first_len_bytes[30] - 1;
-    } else if first_len_bytes[29] >= 3 {
-        incomplete_count = first_len_bytes[29] - 2;
-    }
+    // Bytes 29, 30, 31 are at positions 13, 14, 15 in the high 128-bit lane
+    let byte29 = _mm_extract_epi8::<13>(high128) as u8;
+    let byte30 = _mm_extract_epi8::<14>(high128) as u8;
+    let byte31 = _mm_extract_epi8::<15>(high128) as u8;
+
+    let incomplete_count = if byte31 >= 1 {
+        byte31
+    } else if byte30 >= 2 {
+        byte30 - 1
+    } else if byte29 >= 3 {
+        byte29 - 2
+    } else {
+        0
+    };
 
     let next_incomplete = if incomplete_count > 0 {
         _mm256_set1_epi8(incomplete_count as i8)
