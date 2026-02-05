@@ -110,17 +110,13 @@ impl SimdConstants {
             // Nibble E: 3-byte sequences (2 continuations)
             // Nibble F: 4-byte sequences (3 continuations)
             first_len_tbl: _mm256_setr_epi8(
-                0, 0, 0, 0, 0, 0, 0, 0,  // 0x0-0x7: ASCII
-                0, 0, 0, 0,              // 0x8-0xB: continuations
-                1, 1,                     // 0xC-0xD: 2-byte
-                2,                        // 0xE: 3-byte
-                3,                        // 0xF: 4-byte
+                0, 0, 0, 0, 0, 0, 0, 0, // 0x0-0x7: ASCII
+                0, 0, 0, 0, // 0x8-0xB: continuations
+                1, 1, // 0xC-0xD: 2-byte
+                2, // 0xE: 3-byte
+                3, // 0xF: 4-byte
                 // Repeat for high lane
-                0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0,
-                1, 1,
-                2,
-                3,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 3,
             ),
 
             nibble_mask: _mm256_set1_epi8(0x0F),
@@ -185,19 +181,10 @@ unsafe fn validate_chunk_64_avx2(
 
     // === UTF-8 VALIDATION (Keiser-Lemire) ===
     // Validate the full 64-byte chunk
-    let (error0, incomplete0, first_len0) = validate_utf8_block(
-        chunk0,
-        carry.prev_incomplete,
-        carry.prev_first_len,
-        c,
-    );
+    let (error0, incomplete0, first_len0) =
+        validate_utf8_block(chunk0, carry.prev_incomplete, carry.prev_first_len, c);
 
-    let (error1, incomplete1, first_len1) = validate_utf8_block(
-        chunk1,
-        incomplete0,
-        first_len0,
-        c,
-    );
+    let (error1, incomplete1, first_len1) = validate_utf8_block(chunk1, incomplete0, first_len0, c);
 
     // Accumulate errors
     let total_error = _mm256_or_si256(_mm256_or_si256(carry.error, error0), error1);
@@ -216,11 +203,8 @@ unsafe fn validate_chunk_64_avx2(
     let ctrl1 = _mm256_movemask_epi8(is_control1) as u32;
     let control_mask: u64 = (ctrl0 as u64) | ((ctrl1 as u64) << 32);
 
-    let first_control_char = if control_mask != 0 {
-        control_mask.trailing_zeros() as usize
-    } else {
-        64
-    };
+    // Branchless: trailing_zeros() returns 64 for u64 when all bits are zero
+    let first_control_char = control_mask.trailing_zeros() as usize;
 
     // === TERMINATOR DETECTION (NOT ERRORS) ===
     // Quote and backslash are valid terminators that need handling
@@ -229,15 +213,16 @@ unsafe fn validate_chunk_64_avx2(
     let is_quote1 = _mm256_cmpeq_epi8(chunk1, c.quote);
     let is_backslash1 = _mm256_cmpeq_epi8(chunk1, c.backslash);
 
-    let qb0 = _mm256_movemask_epi8(_mm256_or_si256(is_quote0, is_backslash0)) as u32;
-    let qb1 = _mm256_movemask_epi8(_mm256_or_si256(is_quote1, is_backslash1)) as u32;
-    let quote_backslash_mask: u64 = (qb0 as u64) | ((qb1 as u64) << 32);
+    // Combine quote and backslash before movemask to minimize expensive operations
+    let terminator0 = _mm256_or_si256(is_quote0, is_backslash0);
+    let terminator1 = _mm256_or_si256(is_quote1, is_backslash1);
 
-    let first_quote_or_backslash = if quote_backslash_mask != 0 {
-        quote_backslash_mask.trailing_zeros() as usize
-    } else {
-        64
-    };
+    let t0 = _mm256_movemask_epi8(terminator0) as u32;
+    let t1 = _mm256_movemask_epi8(terminator1) as u32;
+    let terminator_mask: u64 = (t0 as u64) | ((t1 as u64) << 32);
+
+    // Branchless: trailing_zeros() returns 64 for u64 when all bits are zero
+    let first_quote_or_backslash = terminator_mask.trailing_zeros() as usize;
 
     // Update carry state for next chunk
     carry.error = total_error;
@@ -267,9 +252,7 @@ unsafe fn shift_right_1(input: __m256i, prev: __m256i) -> __m256i {
     // Step 2: alignr within this rearranged vector
     // For low lane: need prev_high[15] (=prev[31]) at pos 0, input_low[0..14] at pos 1..15
     // For high lane: need input_low[15] at pos 16, input_high[0..14] (=input[16..30]) at 17..31
-    let shifted = _mm256_alignr_epi8(input, prev_high_input_low, 15);
-
-    shifted
+    _mm256_alignr_epi8(input, prev_high_input_low, 15)
 }
 
 /// Shift a 256-bit register right by 2 bytes.
@@ -312,7 +295,11 @@ unsafe fn validate_utf8_block(
 
     if any_high == 0 && !has_prev_incomplete {
         // All ASCII, no pending - trivially valid
-        return (_mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256());
+        return (
+            _mm256_setzero_si256(),
+            _mm256_setzero_si256(),
+            _mm256_setzero_si256(),
+        );
     }
 
     // Get high nibbles for classification
@@ -337,7 +324,7 @@ unsafe fn validate_utf8_block(
     // Use unsigned comparison by XORing with 0x80 to flip sign bit
     let sign_flip = _mm256_set1_epi8(0x80u8 as i8);
     let input_unsigned = _mm256_xor_si256(input, sign_flip);
-    let f4_unsigned = _mm256_set1_epi8((0xF4u8 ^ 0x80u8) as i8);  // 0x74
+    let f4_unsigned = _mm256_set1_epi8((0xF4u8 ^ 0x80u8) as i8); // 0x74
     let byte_gt_f4 = _mm256_cmpgt_epi8(input_unsigned, f4_unsigned);
 
     // === Check continuation byte placement ===
@@ -354,20 +341,14 @@ unsafe fn validate_utf8_block(
     let expect_cont_3 = _mm256_cmpgt_epi8(first_len_shifted_3, _mm256_set1_epi8(2));
 
     // Combine: we expect a continuation byte if any of the above
-    let expect_cont = _mm256_or_si256(
-        expect_cont_1,
-        _mm256_or_si256(expect_cont_2, expect_cont_3),
-    );
+    let expect_cont = _mm256_or_si256(expect_cont_1, _mm256_or_si256(expect_cont_2, expect_cont_3));
 
     // Error: is_continuation XOR expect_cont
     // (unexpected continuation OR missing continuation)
     let cont_error = _mm256_xor_si256(is_continuation, expect_cont);
 
     // === Combine all errors ===
-    let error = _mm256_or_si256(
-        _mm256_or_si256(invalid_c0c1, byte_gt_f4),
-        cont_error,
-    );
+    let error = _mm256_or_si256(_mm256_or_si256(invalid_c0c1, byte_gt_f4), cont_error);
 
     // === Calculate incomplete state for next block ===
     // Check last 3 bytes for sequences that continue into next block.
@@ -399,13 +380,8 @@ unsafe fn validate_utf8_block(
 }
 
 /// Scalar fallback for chunks smaller than 64 bytes.
-/// Scalar fallback for string chunk validation.
 /// Scans the full chunk and returns separate positions for control chars and quote/backslash.
-fn validate_string_chunk_scalar(
-    input: &[u8],
-    start: usize,
-    carry: &mut Utf8Carry,
-) -> ChunkResult {
+fn validate_string_chunk_scalar(input: &[u8], start: usize, carry: &mut Utf8Carry) -> ChunkResult {
     let data = &input[start..];
     let chunk_len = data.len().min(64);
 
@@ -484,7 +460,9 @@ pub fn find_string_terminator(input: &[u8], start: usize) -> Option<usize> {
 
     // Return earliest terminator (control char or quote/backslash)
     let chunk_len = (input.len() - start).min(64);
-    let terminator_offset = result.first_control_char.min(result.first_quote_or_backslash);
+    let terminator_offset = result
+        .first_control_char
+        .min(result.first_quote_or_backslash);
 
     if terminator_offset < chunk_len {
         Some(terminator_offset)
@@ -639,7 +617,8 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         let constants = unsafe { test_constants() };
         // Mixed UTF-8 longer than 64 bytes
-        let input = "Hello 世界 Привет мир مرحبا العالم 🌍🌎🌏 end of test string here\"".as_bytes();
+        let input =
+            "Hello 世界 Привет мир مرحبا العالم 🌍🌎🌏 end of test string here\"".as_bytes();
         #[cfg(target_arch = "x86_64")]
         let result = validate_string_chunk(input, 0, &mut carry, &constants);
         #[cfg(not(target_arch = "x86_64"))]
