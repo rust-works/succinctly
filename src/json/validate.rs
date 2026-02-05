@@ -1033,4 +1033,294 @@ mod tests {
         let err = validate(input).unwrap_err();
         assert_eq!(err.position.line, 3);
     }
+
+    // ========================================================================
+    // RFC 8259 comprehensive coverage tests
+    // ========================================================================
+
+    /// RFC 8259 Section 7: All control characters (U+0000 through U+001F) must be escaped.
+    #[test]
+    fn test_all_control_characters_rejected() {
+        for byte in 0x00u8..=0x1F {
+            let input = format!("\"hello{}world\"", byte as char);
+            let err = validate(input.as_bytes()).unwrap_err();
+            assert!(
+                matches!(err.kind, ValidationErrorKind::ControlCharacter { byte: b } if b == byte),
+                "Control char 0x{:02X} should be rejected",
+                byte
+            );
+        }
+    }
+
+    /// RFC 8259 Section 6: -0 is a valid number.
+    #[test]
+    fn test_negative_zero() {
+        assert!(validate(b"-0").is_ok());
+        assert!(validate(b"[-0]").is_ok());
+        assert!(validate(br#"{"value": -0}"#).is_ok());
+    }
+
+    /// RFC 8259 Section 6: Zero with exponent is valid.
+    #[test]
+    fn test_zero_with_exponent() {
+        assert!(validate(b"0e0").is_ok());
+        assert!(validate(b"0E0").is_ok());
+        assert!(validate(b"0e+0").is_ok());
+        assert!(validate(b"0e-0").is_ok());
+        assert!(validate(b"0.0e0").is_ok());
+    }
+
+    /// RFC 8259 Section 4: Empty string keys are valid.
+    #[test]
+    fn test_empty_string_key() {
+        assert!(validate(br#"{"": 1}"#).is_ok());
+        assert!(validate(br#"{"": ""}"#).is_ok());
+        assert!(validate(br#"{"": null, "a": 1}"#).is_ok());
+    }
+
+    /// RFC 8259: High surrogate followed by non-\u escape should error.
+    #[test]
+    fn test_high_surrogate_followed_by_regular_escape() {
+        // \uD83D followed by \n (not another \uXXXX)
+        let err = validate(br#""\uD83D\n""#).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::UnpairedSurrogate { .. }
+        ));
+
+        // \uD83D followed by \t
+        let err = validate(br#""\uD83D\t""#).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::UnpairedSurrogate { .. }
+        ));
+    }
+
+    /// RFC 8259: High surrogate at end of string should error.
+    #[test]
+    fn test_high_surrogate_at_string_end() {
+        let err = validate(br#""\uD83D""#).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::UnpairedSurrogate { .. }
+        ));
+    }
+
+    /// UTF-8: Standalone continuation bytes (0x80-0xBF) are invalid.
+    #[test]
+    fn test_invalid_utf8_standalone_continuation() {
+        let err = validate(b"\"hello\x80world\"").unwrap_err();
+        assert!(matches!(err.kind, ValidationErrorKind::InvalidUtf8));
+
+        let err = validate(b"\"hello\xBFworld\"").unwrap_err();
+        assert!(matches!(err.kind, ValidationErrorKind::InvalidUtf8));
+    }
+
+    /// UTF-8: Overlong encodings are invalid (C0, C1 lead bytes).
+    #[test]
+    fn test_invalid_utf8_overlong_2byte() {
+        // C0 80 is overlong encoding of NUL
+        let err = validate(b"\"hello\xC0\x80world\"").unwrap_err();
+        assert!(matches!(err.kind, ValidationErrorKind::InvalidUtf8));
+
+        // C1 BF is overlong encoding of U+007F
+        let err = validate(b"\"hello\xC1\xBFworld\"").unwrap_err();
+        assert!(matches!(err.kind, ValidationErrorKind::InvalidUtf8));
+    }
+
+    /// UTF-8: Invalid lead bytes F5-FF are rejected.
+    #[test]
+    fn test_invalid_utf8_f5_and_above() {
+        for lead in 0xF5u8..=0xFF {
+            let input = [b'"', b'x', lead, 0x80, 0x80, 0x80, b'"'];
+            let err = validate(&input).unwrap_err();
+            assert!(
+                matches!(err.kind, ValidationErrorKind::InvalidUtf8),
+                "Lead byte 0x{:02X} should be rejected",
+                lead
+            );
+        }
+    }
+
+    /// UTF-8: Truncated multi-byte sequences are invalid.
+    #[test]
+    fn test_invalid_utf8_truncated() {
+        // 2-byte sequence truncated (missing continuation)
+        let err = validate(b"\"hello\xC2\"").unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::UnclosedString | ValidationErrorKind::InvalidUtf8
+        ));
+
+        // 3-byte sequence truncated (missing 1 continuation)
+        let err = validate(b"\"hello\xE0\xA0\"").unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::UnclosedString | ValidationErrorKind::InvalidUtf8
+        ));
+
+        // 4-byte sequence truncated (missing 2 continuations)
+        let err = validate(b"\"hello\xF0\x90\"").unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::UnclosedString | ValidationErrorKind::InvalidUtf8
+        ));
+    }
+
+    /// UTF-8: Surrogate codepoints encoded directly in UTF-8 (ED A0 80 - ED BF BF) are invalid.
+    #[test]
+    fn test_invalid_utf8_surrogate_codepoints() {
+        // U+D800 encoded as UTF-8: ED A0 80
+        let err = validate(b"\"hello\xED\xA0\x80world\"").unwrap_err();
+        assert!(matches!(err.kind, ValidationErrorKind::InvalidUtf8));
+
+        // U+DFFF encoded as UTF-8: ED BF BF
+        let err = validate(b"\"hello\xED\xBF\xBFworld\"").unwrap_err();
+        assert!(matches!(err.kind, ValidationErrorKind::InvalidUtf8));
+    }
+
+    /// UTF-8: Codepoints above U+10FFFF are invalid.
+    #[test]
+    fn test_invalid_utf8_above_max_codepoint() {
+        // F4 90 80 80 would encode U+110000 (above max)
+        let err = validate(b"\"hello\xF4\x90\x80\x80world\"").unwrap_err();
+        assert!(matches!(err.kind, ValidationErrorKind::InvalidUtf8));
+    }
+
+    /// RFC 8259 Section 7: All valid escape sequences.
+    #[test]
+    fn test_all_valid_escapes() {
+        assert!(validate(br#""\"""#).is_ok()); // quotation mark
+        assert!(validate(br#""\\""#).is_ok()); // reverse solidus
+        assert!(validate(br#""\/""#).is_ok()); // solidus
+        assert!(validate(br#""\b""#).is_ok()); // backspace
+        assert!(validate(br#""\f""#).is_ok()); // form feed
+        assert!(validate(br#""\n""#).is_ok()); // line feed
+        assert!(validate(br#""\r""#).is_ok()); // carriage return
+        assert!(validate(br#""\t""#).is_ok()); // tab
+        assert!(validate(br#""\u0000""#).is_ok()); // unicode escape
+    }
+
+    /// RFC 8259: Invalid escape sequences.
+    #[test]
+    fn test_invalid_escapes() {
+        // Common mistakes
+        let err = validate(br#""\a""#).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::InvalidEscape { sequence: 'a' }
+        ));
+
+        let err = validate(br#""\v""#).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::InvalidEscape { sequence: 'v' }
+        ));
+
+        let err = validate(br#""\x00""#).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::InvalidEscape { sequence: 'x' }
+        ));
+
+        let err = validate(br#""\0""#).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::InvalidEscape { sequence: '0' }
+        ));
+    }
+
+    /// RFC 8259 Section 6: Number edge cases.
+    #[test]
+    fn test_number_edge_cases() {
+        // Valid edge cases
+        assert!(validate(b"0").is_ok());
+        assert!(validate(b"-0").is_ok());
+        assert!(validate(b"0.0").is_ok());
+        assert!(validate(b"-0.0").is_ok());
+        assert!(validate(b"1e1").is_ok());
+        assert!(validate(b"1E1").is_ok());
+        assert!(validate(b"1e+1").is_ok());
+        assert!(validate(b"1e-1").is_ok());
+        assert!(validate(b"0.1e1").is_ok());
+        assert!(validate(b"123456789012345678901234567890").is_ok()); // large integer
+
+        // Invalid: multiple leading zeros
+        let err = validate(b"00").unwrap_err();
+        assert!(matches!(err.kind, ValidationErrorKind::LeadingZero));
+
+        // Invalid: leading zero before digit
+        let err = validate(b"01").unwrap_err();
+        assert!(matches!(err.kind, ValidationErrorKind::LeadingZero));
+
+        // Invalid: negative with leading zero
+        let err = validate(b"-01").unwrap_err();
+        assert!(matches!(err.kind, ValidationErrorKind::LeadingZero));
+    }
+
+    /// RFC 8259: Structural edge cases.
+    #[test]
+    fn test_structural_edge_cases() {
+        // Deeply nested (but valid)
+        let deep_array = "[".repeat(100) + &"]".repeat(100);
+        assert!(validate(deep_array.as_bytes()).is_ok());
+
+        let deep_object = r#"{"a":"#.repeat(50) + "1" + &"}".repeat(50);
+        assert!(validate(deep_object.as_bytes()).is_ok());
+
+        // Empty containers
+        assert!(validate(b"{}").is_ok());
+        assert!(validate(b"[]").is_ok());
+        assert!(validate(b"[[]]").is_ok());
+        assert!(validate(b"{{}}").is_err()); // invalid - key required
+        assert!(validate(br#"{"a":{}}"#).is_ok());
+    }
+
+    /// RFC 8259 Section 2: Whitespace handling.
+    #[test]
+    fn test_whitespace_edge_cases() {
+        // All valid whitespace characters
+        assert!(validate(b" null").is_ok());
+        assert!(validate(b"\tnull").is_ok());
+        assert!(validate(b"\nnull").is_ok());
+        assert!(validate(b"\rnull").is_ok());
+        assert!(validate(b" \t\n\r null \t\n\r ").is_ok());
+
+        // Whitespace in structures
+        assert!(validate(b"{ }").is_ok());
+        assert!(validate(b"[ ]").is_ok());
+        assert!(validate(br#"{ "a" : 1 }"#).is_ok());
+        assert!(validate(b"[ 1 , 2 , 3 ]").is_ok());
+    }
+
+    /// RFC 8259: Unicode escape edge cases.
+    #[test]
+    fn test_unicode_escape_edge_cases() {
+        // Lowercase hex
+        assert!(validate(br#""\u00ff""#).is_ok());
+        // Uppercase hex
+        assert!(validate(br#""\u00FF""#).is_ok());
+        // Mixed case
+        assert!(validate(br#""\u00Ff""#).is_ok());
+
+        // Valid surrogate pair (U+1F600 GRINNING FACE)
+        assert!(validate(br#""\uD83D\uDE00""#).is_ok());
+
+        // Multiple surrogate pairs
+        assert!(validate(br#""\uD83D\uDE00\uD83D\uDE01""#).is_ok());
+    }
+
+    /// RFC 8259: String with all printable ASCII.
+    #[test]
+    fn test_printable_ascii_in_string() {
+        // All printable ASCII (0x20-0x7E) except quote and backslash
+        let mut s = String::from("\"");
+        for c in 0x20u8..=0x7E {
+            if c != b'"' && c != b'\\' {
+                s.push(c as char);
+            }
+        }
+        s.push('"');
+        assert!(validate(s.as_bytes()).is_ok());
+    }
 }
