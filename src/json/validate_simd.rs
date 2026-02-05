@@ -35,6 +35,8 @@ pub struct Utf8Carry {
     pub prev_incomplete: __m256i,
     /// Previous first_len info.
     pub prev_first_len: __m256i,
+    /// Previous input (last 32 bytes) for multi-byte sequence validation.
+    pub prev_input: __m256i,
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -51,6 +53,7 @@ impl Utf8Carry {
             error: _mm256_setzero_si256(),
             prev_incomplete: _mm256_setzero_si256(),
             prev_first_len: _mm256_setzero_si256(),
+            prev_input: _mm256_setzero_si256(),
         }
     }
 
@@ -155,6 +158,7 @@ unsafe fn validate_utf8_document_avx2(input: &[u8], c: &SimdConstants) -> Result
     let mut offset = 0;
     let mut prev_incomplete = _mm256_setzero_si256();
     let mut prev_first_len = _mm256_setzero_si256();
+    let mut prev_input = _mm256_setzero_si256();
 
     // Process 64 bytes at a time (two 32-byte AVX2 registers)
     while offset + 64 <= input.len() {
@@ -163,10 +167,10 @@ unsafe fn validate_utf8_document_avx2(input: &[u8], c: &SimdConstants) -> Result
         let chunk1 = _mm256_loadu_si256(ptr.add(1));
 
         let (error0, incomplete0, first_len0) =
-            validate_utf8_block(chunk0, prev_incomplete, prev_first_len, c);
+            validate_utf8_block(chunk0, prev_incomplete, prev_first_len, prev_input, c);
 
         let (error1, incomplete1, first_len1) =
-            validate_utf8_block(chunk1, incomplete0, first_len0, c);
+            validate_utf8_block(chunk1, incomplete0, first_len0, chunk0, c);
 
         // Check for errors
         let total_error = _mm256_or_si256(error0, error1);
@@ -183,6 +187,7 @@ unsafe fn validate_utf8_document_avx2(input: &[u8], c: &SimdConstants) -> Result
 
         prev_incomplete = incomplete1;
         prev_first_len = first_len1;
+        prev_input = chunk1;
         offset += 64;
     }
 
@@ -192,7 +197,7 @@ unsafe fn validate_utf8_document_avx2(input: &[u8], c: &SimdConstants) -> Result
         let chunk = _mm256_loadu_si256(ptr);
 
         let (error, incomplete, _first_len) =
-            validate_utf8_block(chunk, prev_incomplete, prev_first_len, c);
+            validate_utf8_block(chunk, prev_incomplete, prev_first_len, prev_input, c);
 
         if _mm256_testz_si256(error, error) == 0 {
             let err_mask = _mm256_movemask_epi8(error) as u32;
@@ -200,7 +205,7 @@ unsafe fn validate_utf8_document_avx2(input: &[u8], c: &SimdConstants) -> Result
         }
 
         prev_incomplete = incomplete;
-        // prev_first_len not needed after this point (no more chunks to process)
+        // prev_first_len and prev_input not needed after this point (no more chunks to process)
         offset += 32;
     }
 
@@ -518,10 +523,16 @@ unsafe fn validate_chunk_64_avx2(
 
     // === UTF-8 VALIDATION (Keiser-Lemire) ===
     // Validate the full 64-byte chunk
-    let (error0, incomplete0, first_len0) =
-        validate_utf8_block(chunk0, carry.prev_incomplete, carry.prev_first_len, c);
+    let (error0, incomplete0, first_len0) = validate_utf8_block(
+        chunk0,
+        carry.prev_incomplete,
+        carry.prev_first_len,
+        carry.prev_input,
+        c,
+    );
 
-    let (error1, incomplete1, first_len1) = validate_utf8_block(chunk1, incomplete0, first_len0, c);
+    let (error1, incomplete1, first_len1) =
+        validate_utf8_block(chunk1, incomplete0, first_len0, chunk0, c);
 
     // Accumulate errors
     let total_error = _mm256_or_si256(_mm256_or_si256(carry.error, error0), error1);
@@ -562,6 +573,7 @@ unsafe fn validate_chunk_64_avx2(
     carry.error = total_error;
     carry.prev_incomplete = incomplete1;
     carry.prev_first_len = first_len1;
+    carry.prev_input = chunk1;
 
     ChunkResult {
         utf8_valid: !has_error,
@@ -612,12 +624,23 @@ unsafe fn shift_right_3(input: __m256i, prev: __m256i) -> __m256i {
 
 /// Keiser-Lemire UTF-8 validation for one 32-byte block.
 /// Returns (error, prev_incomplete for next block, prev_first_len for next block).
+///
+/// Validates:
+/// - Continuation byte placement (10xxxxxx after lead bytes)
+/// - No standalone continuation bytes
+/// - No overlong 2-byte (C0, C1)
+/// - No invalid lead bytes (F5-FF)
+/// - No overlong 3-byte (E0 followed by 80-9F)
+/// - No surrogates (ED followed by A0-BF, i.e., U+D800-U+DFFF)
+/// - No overlong 4-byte (F0 followed by 80-8F)
+/// - No out-of-range 4-byte (F4 followed by 90-BF, i.e., > U+10FFFF)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn validate_utf8_block(
     input: __m256i,
     prev_incomplete: __m256i,
     prev_first_len: __m256i,
+    prev_input: __m256i,
     c: &SimdConstants,
 ) -> (__m256i, __m256i, __m256i) {
     // Check if entire block is ASCII (all bytes < 0x80)
@@ -670,6 +693,9 @@ unsafe fn validate_utf8_block(
     let first_len_shifted_2 = shift_right_2(first_len, prev_first_len);
     let first_len_shifted_3 = shift_right_3(first_len, prev_first_len);
 
+    // Get shifted input for byte-pair validation (previous byte at each position)
+    let input_shifted_1 = shift_right_1(input, prev_input);
+
     // Expected continuation at position i if first_len[i-1] >= 1
     let expect_cont_1 = _mm256_cmpgt_epi8(first_len_shifted_1, _mm256_setzero_si256());
     // Expected second continuation if first_len[i-2] >= 2
@@ -684,8 +710,62 @@ unsafe fn validate_utf8_block(
     // (unexpected continuation OR missing continuation)
     let cont_error = _mm256_xor_si256(is_continuation, expect_cont);
 
+    // === Check for overlong/surrogate/out-of-range in multi-byte sequences ===
+    // These checks validate the second byte of 3-byte and 4-byte sequences.
+    //
+    // For 3-byte sequences starting with E0-EF:
+    // - E0: second byte must be A0-BF (not 80-9F, that's overlong encoding of < U+0800)
+    // - ED: second byte must be 80-9F (not A0-BF, that's surrogate U+D800-U+DFFF)
+    // - E1-EC, EE-EF: second byte must be 80-BF (standard continuation)
+    //
+    // For 4-byte sequences starting with F0-F4:
+    // - F0: second byte must be 90-BF (not 80-8F, that's overlong encoding of < U+10000)
+    // - F4: second byte must be 80-8F (not 90-BF, that's > U+10FFFF)
+    // - F1-F3: second byte must be 80-BF (standard continuation)
+
+    // Check E0 followed by invalid second byte (80-9F = overlong)
+    let prev_is_e0 = _mm256_cmpeq_epi8(input_shifted_1, _mm256_set1_epi8(0xE0u8 as i8));
+    // Second byte in range 80-9F means: (byte & 0xE0) == 0x80
+    let byte_and_e0 = _mm256_and_si256(input, _mm256_set1_epi8(0xE0u8 as i8));
+    let is_80_9f = _mm256_cmpeq_epi8(byte_and_e0, _mm256_set1_epi8(0x80u8 as i8));
+    let e0_overlong_error = _mm256_and_si256(prev_is_e0, is_80_9f);
+
+    // Check ED followed by invalid second byte (A0-BF = surrogate)
+    let prev_is_ed = _mm256_cmpeq_epi8(input_shifted_1, _mm256_set1_epi8(0xEDu8 as i8));
+    // Second byte in range A0-BF means: (byte & 0xE0) == 0xA0
+    let is_a0_bf = _mm256_cmpeq_epi8(byte_and_e0, _mm256_set1_epi8(0xA0u8 as i8));
+    let ed_surrogate_error = _mm256_and_si256(prev_is_ed, is_a0_bf);
+
+    // Check F0 followed by invalid second byte (80-8F = overlong)
+    let prev_is_f0 = _mm256_cmpeq_epi8(input_shifted_1, _mm256_set1_epi8(0xF0u8 as i8));
+    // Second byte in range 80-8F means: (byte & 0xF0) == 0x80
+    let byte_and_f0 = _mm256_and_si256(input, _mm256_set1_epi8(0xF0u8 as i8));
+    let is_80_8f = _mm256_cmpeq_epi8(byte_and_f0, _mm256_set1_epi8(0x80u8 as i8));
+    let f0_overlong_error = _mm256_and_si256(prev_is_f0, is_80_8f);
+
+    // Check F4 followed by invalid second byte (90-BF = out of range > U+10FFFF)
+    let prev_is_f4 = _mm256_cmpeq_epi8(input_shifted_1, _mm256_set1_epi8(0xF4u8 as i8));
+    // Second byte >= 0x90: use unsigned comparison
+    let input_unsigned_for_f4 = _mm256_xor_si256(input, c.sign_flip);
+    let bound_8f_unsigned = _mm256_set1_epi8((0x8Fu8 ^ 0x80) as i8);
+    let is_ge_90 = _mm256_cmpgt_epi8(input_unsigned_for_f4, bound_8f_unsigned);
+    // Also must be a continuation byte (< 0xC0)
+    let c0_unsigned = _mm256_set1_epi8((0xC0u8 ^ 0x80) as i8);
+    let is_lt_c0 = _mm256_cmpgt_epi8(c0_unsigned, input_unsigned_for_f4);
+    let is_90_bf = _mm256_and_si256(is_ge_90, is_lt_c0);
+    let f4_range_error = _mm256_and_si256(prev_is_f4, is_90_bf);
+
+    // Combine multi-byte sequence errors
+    let multibyte_error = _mm256_or_si256(
+        _mm256_or_si256(e0_overlong_error, ed_surrogate_error),
+        _mm256_or_si256(f0_overlong_error, f4_range_error),
+    );
+
     // === Combine all errors ===
-    let error = _mm256_or_si256(_mm256_or_si256(invalid_c0c1, byte_gt_f4), cont_error);
+    let error = _mm256_or_si256(
+        _mm256_or_si256(_mm256_or_si256(invalid_c0c1, byte_gt_f4), cont_error),
+        multibyte_error,
+    );
 
     // === Calculate incomplete state for next block ===
     // Check last 3 bytes for sequences that continue into next block.
@@ -1163,5 +1243,178 @@ mod tests {
         assert_eq!(result.quote_mask.trailing_zeros() as usize, 3); // Quote at position 3
         assert_eq!(result.first_control_char, 7); // Control at position 7
         assert!(result.utf8_valid);
+    }
+
+    // === Tests for whole-document UTF-8 validation edge cases ===
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_utf8_surrogate_rejected() {
+        // Surrogate codepoint U+D800 encoded as ED A0 80 (invalid UTF-8)
+        let constants = unsafe { test_constants() };
+        let input = b"hello\xED\xA0\x80world";
+        let result = validate_utf8_document(input, &constants);
+        assert!(result.is_err(), "Surrogate U+D800 should be rejected");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_utf8_surrogate_high_rejected() {
+        // Surrogate codepoint U+DFFF encoded as ED BF BF (invalid UTF-8)
+        let constants = unsafe { test_constants() };
+        let input = b"hello\xED\xBF\xBFworld";
+        let result = validate_utf8_document(input, &constants);
+        assert!(result.is_err(), "Surrogate U+DFFF should be rejected");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_utf8_valid_near_surrogate() {
+        // Valid codepoint U+D7FF (just below surrogates) encoded as ED 9F BF
+        let constants = unsafe { test_constants() };
+        let input = b"hello\xED\x9F\xBFworld";
+        let result = validate_utf8_document(input, &constants);
+        assert!(result.is_ok(), "U+D7FF should be valid");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_utf8_valid_above_surrogate() {
+        // Valid codepoint U+E000 (just above surrogates) encoded as EE 80 80
+        let constants = unsafe { test_constants() };
+        let input = b"hello\xEE\x80\x80world";
+        let result = validate_utf8_document(input, &constants);
+        assert!(result.is_ok(), "U+E000 should be valid");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_utf8_overlong_3byte_rejected() {
+        // Overlong encoding of U+007F using 3 bytes: E0 81 BF (invalid)
+        // Valid 3-byte after E0 must have second byte >= A0
+        let constants = unsafe { test_constants() };
+        let input = b"hello\xE0\x81\xBFworld";
+        let result = validate_utf8_document(input, &constants);
+        assert!(
+            result.is_err(),
+            "Overlong 3-byte encoding should be rejected"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_utf8_overlong_3byte_boundary() {
+        // E0 9F BF is overlong (encodes U+07FF, should use 2-byte)
+        let constants = unsafe { test_constants() };
+        let input = b"hello\xE0\x9F\xBFworld";
+        let result = validate_utf8_document(input, &constants);
+        assert!(result.is_err(), "E0 9F BF (overlong) should be rejected");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_utf8_valid_3byte_after_e0() {
+        // E0 A0 80 is the smallest valid 3-byte sequence (U+0800)
+        let constants = unsafe { test_constants() };
+        let input = b"hello\xE0\xA0\x80world";
+        let result = validate_utf8_document(input, &constants);
+        assert!(result.is_ok(), "E0 A0 80 (U+0800) should be valid");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_utf8_overlong_4byte_rejected() {
+        // Overlong encoding using 4 bytes: F0 80 80 80 (invalid)
+        // Valid 4-byte after F0 must have second byte >= 90
+        let constants = unsafe { test_constants() };
+        let input = b"hello\xF0\x80\x80\x80world";
+        let result = validate_utf8_document(input, &constants);
+        assert!(
+            result.is_err(),
+            "Overlong 4-byte encoding should be rejected"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_utf8_overlong_4byte_boundary() {
+        // F0 8F BF BF is overlong (encodes U+FFFF, should use 3-byte)
+        let constants = unsafe { test_constants() };
+        let input = b"hello\xF0\x8F\xBF\xBFworld";
+        let result = validate_utf8_document(input, &constants);
+        assert!(result.is_err(), "F0 8F BF BF (overlong) should be rejected");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_utf8_valid_4byte_after_f0() {
+        // F0 90 80 80 is the smallest valid 4-byte sequence (U+10000)
+        let constants = unsafe { test_constants() };
+        let input = b"hello\xF0\x90\x80\x80world";
+        let result = validate_utf8_document(input, &constants);
+        assert!(result.is_ok(), "F0 90 80 80 (U+10000) should be valid");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_utf8_out_of_range_rejected() {
+        // F4 90 80 80 encodes U+110000 which is > U+10FFFF (invalid)
+        let constants = unsafe { test_constants() };
+        let input = b"hello\xF4\x90\x80\x80world";
+        let result = validate_utf8_document(input, &constants);
+        assert!(result.is_err(), "Codepoint > U+10FFFF should be rejected");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_utf8_valid_max_codepoint() {
+        // F4 8F BF BF is the largest valid 4-byte sequence (U+10FFFF)
+        let constants = unsafe { test_constants() };
+        let input = b"hello\xF4\x8F\xBF\xBFworld";
+        let result = validate_utf8_document(input, &constants);
+        assert!(result.is_ok(), "F4 8F BF BF (U+10FFFF) should be valid");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_utf8_f4_boundary() {
+        // F4 8F xx is valid (U+10Fxxx), F4 90 xx is invalid (> U+10FFFF)
+        let constants = unsafe { test_constants() };
+        // F4 8F BF BD is valid (U+10FFFD)
+        let valid = b"\xF4\x8F\xBF\xBD";
+        assert!(validate_utf8_document(valid, &constants).is_ok());
+        // F4 90 80 80 is invalid (U+110000)
+        let invalid = b"\xF4\x90\x80\x80";
+        assert!(validate_utf8_document(invalid, &constants).is_err());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_utf8_long_string_with_surrogate() {
+        // Test that SIMD path catches surrogate in a long string (> 64 bytes)
+        let constants = unsafe { test_constants() };
+        let mut input = vec![b'x'; 100];
+        // Insert surrogate at position 50 (well into SIMD territory)
+        input[50] = 0xED;
+        input[51] = 0xA0;
+        input[52] = 0x80;
+        let result = validate_utf8_document(&input, &constants);
+        assert!(result.is_err(), "Surrogate in long string should be caught");
+        assert_eq!(result.unwrap_err(), 51, "Error should point to second byte");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_utf8_cross_chunk_surrogate() {
+        // Test surrogate that crosses 32-byte chunk boundary
+        let constants = unsafe { test_constants() };
+        let mut input = vec![b'x'; 64];
+        // Place ED at position 31 (last byte of first 32-byte chunk)
+        // A0 80 at positions 32-33 (start of second chunk)
+        input[31] = 0xED;
+        input[32] = 0xA0;
+        input[33] = 0x80;
+        let result = validate_utf8_document(&input, &constants);
+        assert!(result.is_err(), "Cross-chunk surrogate should be caught");
     }
 }
