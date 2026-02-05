@@ -488,13 +488,15 @@ impl<'a> Validator<'a> {
     /// Validate a JSON string.
     ///
     /// Uses chunked SIMD validation (64 bytes at a time) for combined UTF-8
-    /// validation and terminator scanning. Both SIMD and scalar validation run
-    /// to completion on each chunk without interaction.
+    /// validation and terminator detection. SIMD processes the full chunk and
+    /// returns a backslash bitmap, allowing all escapes to be validated in
+    /// batch before moving to the next chunk.
     ///
-    /// After each chunk completes:
-    /// 1. Check for errors (UTF-8 invalid or control character)
-    /// 2. If both error types exist, return the earliest by position
-    /// 3. If no errors, handle the first terminator (quote ends string, backslash starts escape)
+    /// Flow per chunk:
+    /// 1. SIMD validates UTF-8 and detects control chars, quote, and all backslashes
+    /// 2. Check for errors (UTF-8 invalid or control character before quote)
+    /// 3. Process all escapes in chunk up to quote position
+    /// 4. If quote found, string ends; otherwise advance to next chunk
     #[cfg(target_arch = "x86_64")]
     fn validate_string(
         &mut self,
@@ -508,7 +510,9 @@ impl<'a> Validator<'a> {
         loop {
             // Check for enough bytes for SIMD processing
             if self.input.len() - self.offset >= 64 {
-                // SIMD path: process 64-byte chunk
+                let chunk_start = self.offset;
+
+                // SIMD path: process full 64-byte chunk
                 let result = simd::validate_string_chunk(
                     self.input,
                     self.offset,
@@ -516,69 +520,81 @@ impl<'a> Validator<'a> {
                     simd_constants,
                 );
 
-                // === Step 1: Check for ERRORS ===
-                // Both UTF-8 errors and control chars are errors that must be reported.
-                // If both exist, return the earliest by position.
-                let utf8_error_pos = if !result.utf8_valid {
-                    Some(0usize)
-                } else {
-                    None
-                };
-                let control_error_pos = if result.first_control_char < 64 {
-                    Some(result.first_control_char)
-                } else {
-                    None
-                };
+                // === Step 1: Check for UTF-8 ERRORS ===
+                if !result.utf8_valid {
+                    return Err(self.error(ValidationErrorKind::InvalidUtf8));
+                }
 
-                match (utf8_error_pos, control_error_pos) {
-                    (Some(utf8_pos), Some(ctrl_pos)) => {
-                        // Both errors - return the earliest
-                        if utf8_pos <= ctrl_pos {
-                            return Err(self.error(ValidationErrorKind::InvalidUtf8));
-                        } else {
-                            self.offset += ctrl_pos;
-                            self.column += ctrl_pos;
-                            let byte = self.input[self.offset];
-                            return Err(self.error(ValidationErrorKind::ControlCharacter { byte }));
-                        }
-                    }
-                    (Some(_), None) => {
-                        return Err(self.error(ValidationErrorKind::InvalidUtf8));
-                    }
-                    (None, Some(ctrl_pos)) => {
-                        self.offset += ctrl_pos;
-                        self.column += ctrl_pos;
+                // === Step 2: Find first unescaped quote using bitmask operations ===
+                //
+                // Fast path: no backslashes in chunk at all
+                if result.backslash_mask == 0 {
+                    let first_quote = result.quote_mask.trailing_zeros() as usize;
+                    // Check control char before quote
+                    if result.first_control_char < first_quote {
+                        self.offset += result.first_control_char;
+                        self.column += result.first_control_char;
                         let byte = self.input[self.offset];
                         return Err(self.error(ValidationErrorKind::ControlCharacter { byte }));
                     }
-                    (None, None) => {
-                        // No errors - continue to terminator handling
+                    if first_quote < 64 {
+                        // Quote is the terminator
+                        self.offset += first_quote + 1;
+                        self.column += first_quote + 1;
+                        return Ok(());
+                    } else {
+                        // No terminator - advance whole chunk
+                        self.offset += 64;
+                        self.column += 64;
+                        continue;
                     }
                 }
 
-                // === Step 2: Handle VALID TERMINATORS ===
-                if result.first_quote_or_backslash < 64 {
-                    // Advance to the terminator position
-                    self.offset += result.first_quote_or_backslash;
-                    self.column += result.first_quote_or_backslash;
-
-                    // Handle the terminator
-                    match self.peek() {
-                        Some(b'"') => {
-                            self.advance();
-                            return Ok(());
-                        }
-                        Some(b'\\') => {
-                            self.validate_escape()?;
-                            // Reset carry state after escape (escapes are ASCII, no pending UTF-8)
-                            utf8_carry = unsafe { simd::Utf8Carry::new() };
-                        }
-                        _ => unreachable!("SIMD reported quote/backslash but byte doesn't match"),
+                // Backslash path: process terminators (quotes/backslashes) in order
+                // Single-pass algorithm using bitmasks to find next terminator efficiently
+                loop {
+                    let current_pos = self.offset - chunk_start;
+                    if current_pos >= 64 {
+                        break;
                     }
-                } else {
-                    // No terminator in this chunk - advance past entire chunk
-                    self.offset += 64;
-                    self.column += 64;
+
+                    // Find next quote and backslash from current position
+                    let pos_mask = !((1u64 << current_pos) - 1);
+                    let next_quote = (result.quote_mask & pos_mask).trailing_zeros() as usize;
+                    let next_bs = (result.backslash_mask & pos_mask).trailing_zeros() as usize;
+                    let next_terminator = next_quote.min(next_bs);
+
+                    // Check for control char before next terminator
+                    if result.first_control_char >= current_pos
+                        && result.first_control_char < next_terminator
+                    {
+                        self.offset += result.first_control_char - current_pos;
+                        self.column += result.first_control_char - current_pos;
+                        let byte = self.input[self.offset];
+                        return Err(self.error(ValidationErrorKind::ControlCharacter { byte }));
+                    }
+
+                    if next_terminator >= 64 {
+                        // No more terminators - advance to end of chunk
+                        let advance = 64 - current_pos;
+                        self.offset += advance;
+                        self.column += advance;
+                        break;
+                    }
+
+                    // Advance to terminator
+                    let advance = next_terminator - current_pos;
+                    self.offset += advance;
+                    self.column += advance;
+
+                    if next_quote <= next_bs {
+                        // Quote comes first (or at same position, impossible) - string ends
+                        self.advance();
+                        return Ok(());
+                    } else {
+                        // Backslash comes first - validate the escape sequence
+                        self.validate_escape()?;
+                    }
                 }
             } else {
                 // Scalar path for remaining bytes (< 64)
