@@ -165,6 +165,64 @@ cargo bench --bench popcount_strategies --features simd
 cargo bench --bench json_simd
 ```
 
+## JSON String Scanner Learnings (2026-02)
+
+Learnings from optimizing `validate_string_chunk_avx2` in `src/json/validate_simd.rs`.
+
+### Movemask is the bottleneck
+
+`_mm256_movemask_epi8` (SIMD→GPR transition) costs ~3 cycles + pipeline stall. Every attempt to reduce movemask calls by adding branches made things worse:
+
+| Attempt | Result | Reason |
+|---------|--------|--------|
+| Lazy control char detection (testz) | +1-7% regression | testz + branch overhead |
+| Combined masks with early-exit | +5-7% regression | Branch overhead |
+| Separate quote/backslash tracking | +6-10% regression | Extra movemask ops |
+
+**Lesson**: Accept the 4 movemasks per 64-byte chunk. Trying to skip them costs more than doing them.
+
+### Branchless beats branchy for hot paths
+
+Only micro-optimization that worked:
+```rust
+// Before (branchy)
+let pos = if mask != 0 { mask.trailing_zeros() } else { 64 };
+
+// After (branchless) - 0.2-1.7% faster
+let pos = mask.trailing_zeros() as usize;  // Returns 64 for u64 when zero
+```
+
+### Inline constants beat struct-loaded constants
+
+```rust
+// Fast: vpbroadcastb (1 cycle)
+let sign_flip = _mm256_set1_epi8(0x80u8 as i8);
+
+// Slow: memory load (3-4 cycles)
+let sign_flip = constants.sign_flip;  // From struct field
+```
+
+Adding `sign_flip` and `control_bound` to `SimdConstants` caused +3% regression on string-heavy patterns.
+
+### 32-byte chunks caused regression
+
+| Benchmark | 64-byte | 32-byte | Change |
+|-----------|---------|---------|--------|
+| nested | 791 ns | 976 ns | **+23%** |
+| unicode | 4.86 µs | 4.05 µs | -17% |
+
+32-byte chunks help patterns with long strings (unicode, literals) but hurt patterns with many short strings (nested JSON with small keys). The loop overhead dominates for short strings.
+
+**Lesson**: 64-byte chunks are the right tradeoff for general JSON.
+
+### Optimize the common case
+
+All failed optimizations tried to speed up rare paths:
+- Control chars present (~0.1% of chunks)
+- Terminators found early (~5% of chunks in long strings)
+
+The common path (64 bytes of clean ASCII) is already fast. Don't add overhead to check if you can skip work.
+
 ## Key Takeaways
 
 1. **Profile first, optimize second** - Don't assume wider is better
@@ -173,6 +231,9 @@ cargo bench --bench json_simd
 4. **Consider architecture** - Zen 4 splits AVX-512, future Zen 5 may not
 5. **Amdahl's Law always wins** - Optimize what matters (the slow 80%)
 6. **Remove failed optimizations** - Slower code creates technical debt
+7. **Movemask is expensive** - Accept the cost, don't add branches to avoid it
+8. **Branchless for hot paths** - Even well-predicted branches have overhead
+9. **Inline SIMD constants** - Struct loads are slower than `vpbroadcastb`
 
 ## See Also
 
