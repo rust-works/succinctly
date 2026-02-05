@@ -23,6 +23,44 @@ perf stat -e branch-misses,branches ./binary
 cargo bench --bench <name>
 ```
 
+### 1a. CRITICAL: Always Capture Full Benchmark Output
+
+**NEVER filter benchmark output directly.** Always capture to a file first, then analyze.
+
+```bash
+# WRONG - loses data if interrupted or filtered incorrectly
+cargo bench --bench json_validate_bench 2>&1 | grep "time:"
+
+# CORRECT - capture everything, then analyze
+cargo bench --bench json_validate_bench 2>&1 | tee /tmp/bench_$(date +%Y%m%d_%H%M%S).txt
+# Then analyze from file:
+grep -E "(time:|thrpt:|change:)" /tmp/bench_*.txt
+```
+
+**Why this matters:**
+- Benchmarks take minutes to run - losing results wastes time
+- Criterion outputs multi-line results that grep can miss
+- You need full context to understand regressions
+- Comparison requires both before/after data preserved
+
+**Workflow for A/B comparison:**
+```bash
+# 1. Benchmark current state
+cargo bench --bench <name> 2>&1 | tee /tmp/bench_after.txt
+
+# 2. Stash/checkout baseline
+git stash  # or git checkout <baseline>
+
+# 3. Benchmark baseline
+cargo bench --bench <name> 2>&1 | tee /tmp/bench_before.txt
+
+# 4. Restore working state
+git stash pop  # or git checkout -
+
+# 5. Compare results from files
+diff /tmp/bench_before.txt /tmp/bench_after.txt
+```
+
 ### 2. Algorithm > Micro-Optimization
 
 **Evidence from this codebase:**

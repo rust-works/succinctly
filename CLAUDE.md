@@ -16,6 +16,7 @@ Detailed guidance is organized into skills in `.claude/skills/`. Claude will aut
 | **yaml-semi-indexing** | "YAML index", "YAML parser", "sequence item"| YAML parsing and debugging patterns        |
 | **testing**            | "test", "assert", "coverage", "regression"  | Test quality patterns and anti-patterns    |
 | **commit-msg**         | "commit message", "amend commit"            | Conventional commits format                |
+| **skill-writing**      | "create skill", "SKILL.md", "write skill"   | Best practices for writing Claude skills   |
 
 ## AI Scratch Directory
 
