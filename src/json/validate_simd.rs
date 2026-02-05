@@ -1,26 +1,20 @@
-//! SIMD-accelerated string validation for JSON validator.
+//! SIMD-accelerated validation for JSON validator.
 //!
-//! This module provides integrated 64-byte chunked validation that combines:
-//! - UTF-8 validation using the Keiser-Lemire algorithm (< 1 instruction/byte)
-//! - String terminator detection (`"`, `\`, control chars < 0x20)
+//! This module provides:
+//! - Whole-document UTF-8 validation using the Keiser-Lemire algorithm
+//! - String terminator scanning (`"`, `\`, control chars < 0x20)
 //!
-//! Both operations run on the same loaded data, avoiding redundant memory access.
-//! The SIMD implementation processes 64 bytes at a time with AVX2.
+//! Architecture: UTF-8 is validated once for the entire document upfront,
+//! then string scanning only needs to find terminators without re-validating UTF-8.
+//! This is more efficient than per-string UTF-8 validation.
 
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
-/// Result of validating a string chunk.
-///
-/// Separates validation results into:
-/// - UTF-8 validation errors (invalid byte sequences)
-/// - Control character errors (bytes < 0x20, illegal in JSON strings)
-/// - Quote bitmap (all quote positions for efficient terminator finding)
-/// - Backslash bitmap (all escape positions for batch processing)
-///
-/// SIMD validates the full 64-byte chunk. The caller uses bitmask operations
-/// to efficiently find the first unescaped quote without byte-by-byte scanning.
+/// Result of validating a string chunk (legacy - kept for reference).
+/// Now replaced by ScanResult since UTF-8 is validated for the entire document upfront.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct ChunkResult {
     /// True if UTF-8 is valid for the entire chunk.
     pub utf8_valid: bool,
@@ -134,6 +128,327 @@ impl SimdConstants {
             sign_flip: _mm256_set1_epi8(0x80u8 as i8),
             control_bound: _mm256_set1_epi8((0x20u8 ^ 0x80u8) as i8), // 0xA0
         }
+    }
+}
+
+/// Validate entire document as UTF-8 using SIMD.
+/// Call once at the start of validation, before parsing.
+/// Returns Ok(()) if valid, Err(offset) with byte offset of first invalid byte.
+#[cfg(target_arch = "x86_64")]
+pub fn validate_utf8_document(input: &[u8], constants: &SimdConstants) -> Result<(), usize> {
+    if is_x86_feature_detected!("avx2") {
+        unsafe { validate_utf8_document_avx2(input, constants) }
+    } else {
+        validate_utf8_document_scalar(input)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn validate_utf8_document(input: &[u8]) -> Result<(), usize> {
+    validate_utf8_document_scalar(input)
+}
+
+/// AVX2 implementation of whole-document UTF-8 validation.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn validate_utf8_document_avx2(input: &[u8], c: &SimdConstants) -> Result<(), usize> {
+    let mut offset = 0;
+    let mut prev_incomplete = _mm256_setzero_si256();
+    let mut prev_first_len = _mm256_setzero_si256();
+
+    // Process 64 bytes at a time (two 32-byte AVX2 registers)
+    while offset + 64 <= input.len() {
+        let ptr = input.as_ptr().add(offset) as *const __m256i;
+        let chunk0 = _mm256_loadu_si256(ptr);
+        let chunk1 = _mm256_loadu_si256(ptr.add(1));
+
+        let (error0, incomplete0, first_len0) =
+            validate_utf8_block(chunk0, prev_incomplete, prev_first_len, c);
+
+        let (error1, incomplete1, first_len1) =
+            validate_utf8_block(chunk1, incomplete0, first_len0, c);
+
+        // Check for errors
+        let total_error = _mm256_or_si256(error0, error1);
+        if _mm256_testz_si256(total_error, total_error) == 0 {
+            // Find the first error position
+            let err0_mask = _mm256_movemask_epi8(error0) as u32;
+            let err1_mask = _mm256_movemask_epi8(error1) as u32;
+            if err0_mask != 0 {
+                return Err(offset + err0_mask.trailing_zeros() as usize);
+            } else {
+                return Err(offset + 32 + err1_mask.trailing_zeros() as usize);
+            }
+        }
+
+        prev_incomplete = incomplete1;
+        prev_first_len = first_len1;
+        offset += 64;
+    }
+
+    // Process remaining 32-byte chunk if available
+    if offset + 32 <= input.len() {
+        let ptr = input.as_ptr().add(offset) as *const __m256i;
+        let chunk = _mm256_loadu_si256(ptr);
+
+        let (error, incomplete, _first_len) =
+            validate_utf8_block(chunk, prev_incomplete, prev_first_len, c);
+
+        if _mm256_testz_si256(error, error) == 0 {
+            let err_mask = _mm256_movemask_epi8(error) as u32;
+            return Err(offset + err_mask.trailing_zeros() as usize);
+        }
+
+        prev_incomplete = incomplete;
+        // prev_first_len not needed after this point (no more chunks to process)
+        offset += 32;
+    }
+
+    // Check for incomplete sequence at end
+    if _mm256_testz_si256(prev_incomplete, prev_incomplete) == 0 {
+        return Err(input.len());
+    }
+
+    // Validate remaining bytes with scalar
+    validate_utf8_tail(&input[offset..]).map_err(|e| offset + e)
+}
+
+/// Scalar UTF-8 validation for tail bytes or non-x86_64 platforms.
+fn validate_utf8_document_scalar(input: &[u8]) -> Result<(), usize> {
+    let mut i = 0;
+    while i < input.len() {
+        let b = input[i];
+        if b < 0x80 {
+            i += 1;
+        } else if b < 0xC2 {
+            // Invalid: 0x80-0xBF are continuations, 0xC0-0xC1 are overlong
+            return Err(i);
+        } else if b < 0xE0 {
+            // 2-byte sequence
+            if i + 1 >= input.len() || (input[i + 1] & 0xC0) != 0x80 {
+                return Err(i);
+            }
+            i += 2;
+        } else if b < 0xF0 {
+            // 3-byte sequence
+            if i + 2 >= input.len() {
+                return Err(i);
+            }
+            let b1 = input[i + 1];
+            let b2 = input[i + 2];
+            if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 {
+                return Err(i);
+            }
+            // Check for overlong and surrogate
+            let cp = ((b as u32 & 0x0F) << 12) | ((b1 as u32 & 0x3F) << 6) | (b2 as u32 & 0x3F);
+            if cp < 0x800 || (0xD800..=0xDFFF).contains(&cp) {
+                return Err(i);
+            }
+            i += 3;
+        } else if b <= 0xF4 {
+            // 4-byte sequence
+            if i + 3 >= input.len() {
+                return Err(i);
+            }
+            let b1 = input[i + 1];
+            let b2 = input[i + 2];
+            let b3 = input[i + 3];
+            if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80 {
+                return Err(i);
+            }
+            // Check for overlong and out-of-range
+            let cp = ((b as u32 & 0x07) << 18)
+                | ((b1 as u32 & 0x3F) << 12)
+                | ((b2 as u32 & 0x3F) << 6)
+                | (b3 as u32 & 0x3F);
+            if !(0x10000..=0x10FFFF).contains(&cp) {
+                return Err(i);
+            }
+            i += 4;
+        } else {
+            // 0xF5-0xFF are invalid
+            return Err(i);
+        }
+    }
+    Ok(())
+}
+
+/// Validate tail bytes (< 32) after SIMD processing.
+fn validate_utf8_tail(input: &[u8]) -> Result<(), usize> {
+    validate_utf8_document_scalar(input)
+}
+
+/// Result of scanning a string chunk (no UTF-8 validation).
+#[derive(Debug, Clone, Copy)]
+pub struct ScanResult {
+    /// Offset to first control character (< 0x20), or 64 if none found.
+    pub first_control_char: usize,
+    /// Bitmap of all quote positions in the chunk.
+    pub quote_mask: u64,
+    /// Bitmap of all backslash positions in the chunk.
+    pub backslash_mask: u64,
+}
+
+/// Scan a string chunk for terminators only (UTF-8 already validated).
+/// This is faster than validate_string_chunk because it skips UTF-8 validation.
+#[inline]
+pub fn scan_string_chunk(
+    input: &[u8],
+    start: usize,
+    #[cfg(target_arch = "x86_64")] constants: &SimdConstants,
+) -> ScanResult {
+    if start >= input.len() {
+        return ScanResult {
+            first_control_char: 0,
+            quote_mask: 0,
+            backslash_mask: 0,
+        };
+    }
+
+    let remaining = input.len() - start;
+
+    #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
+    if remaining >= 64 && is_x86_feature_detected!("avx2") {
+        return unsafe { scan_chunk_64_avx2(input, start, constants) };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if remaining >= 16 {
+        return unsafe { scan_chunk_16_sse2(input, start) };
+    }
+
+    scan_chunk_scalar(input, start)
+}
+
+/// AVX2 string scanning - terminators only, no UTF-8.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scan_chunk_64_avx2(input: &[u8], start: usize, c: &SimdConstants) -> ScanResult {
+    let data = &input[start..];
+    let ptr = data.as_ptr() as *const __m256i;
+
+    let chunk0 = _mm256_loadu_si256(ptr);
+    let chunk1 = _mm256_loadu_si256(ptr.add(1));
+
+    // Control character detection
+    let chunk0_unsigned = _mm256_xor_si256(chunk0, c.sign_flip);
+    let chunk1_unsigned = _mm256_xor_si256(chunk1, c.sign_flip);
+    let is_control0 = _mm256_cmpgt_epi8(c.control_bound, chunk0_unsigned);
+    let is_control1 = _mm256_cmpgt_epi8(c.control_bound, chunk1_unsigned);
+
+    let ctrl0 = _mm256_movemask_epi8(is_control0) as u32;
+    let ctrl1 = _mm256_movemask_epi8(is_control1) as u32;
+    let control_mask: u64 = (ctrl0 as u64) | ((ctrl1 as u64) << 32);
+    let first_control_char = control_mask.trailing_zeros() as usize;
+
+    // Quote and backslash detection
+    let is_quote0 = _mm256_cmpeq_epi8(chunk0, c.quote);
+    let is_backslash0 = _mm256_cmpeq_epi8(chunk0, c.backslash);
+    let is_quote1 = _mm256_cmpeq_epi8(chunk1, c.quote);
+    let is_backslash1 = _mm256_cmpeq_epi8(chunk1, c.backslash);
+
+    let q0 = _mm256_movemask_epi8(is_quote0) as u32;
+    let q1 = _mm256_movemask_epi8(is_quote1) as u32;
+    let quote_mask: u64 = (q0 as u64) | ((q1 as u64) << 32);
+
+    let b0 = _mm256_movemask_epi8(is_backslash0) as u32;
+    let b1 = _mm256_movemask_epi8(is_backslash1) as u32;
+    let backslash_mask: u64 = (b0 as u64) | ((b1 as u64) << 32);
+
+    ScanResult {
+        first_control_char,
+        quote_mask,
+        backslash_mask,
+    }
+}
+
+/// SSE2 string scanning for 16-63 bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn scan_chunk_16_sse2(input: &[u8], start: usize) -> ScanResult {
+    use core::arch::x86_64::*;
+
+    let data = &input[start..];
+    let remaining = data.len().min(64);
+
+    let quote_vec = _mm_set1_epi8(b'"' as i8);
+    let backslash_vec = _mm_set1_epi8(b'\\' as i8);
+    let sign_flip = _mm_set1_epi8(0x80u8 as i8);
+    let control_bound = _mm_set1_epi8((0x20u8 ^ 0x80) as i8);
+
+    let mut quote_mask: u64 = 0;
+    let mut backslash_mask: u64 = 0;
+    let mut first_control_char = remaining;
+    let mut offset = 0;
+
+    while offset + 16 <= remaining {
+        let ptr = data.as_ptr().add(offset) as *const __m128i;
+        let chunk = _mm_loadu_si128(ptr);
+
+        let is_quote = _mm_cmpeq_epi8(chunk, quote_vec);
+        let is_backslash = _mm_cmpeq_epi8(chunk, backslash_vec);
+        let q = _mm_movemask_epi8(is_quote) as u16;
+        let b = _mm_movemask_epi8(is_backslash) as u16;
+
+        quote_mask |= (q as u64) << offset;
+        backslash_mask |= (b as u64) << offset;
+
+        let chunk_unsigned = _mm_xor_si128(chunk, sign_flip);
+        let is_control = _mm_cmpgt_epi8(control_bound, chunk_unsigned);
+        let ctrl = _mm_movemask_epi8(is_control) as u16;
+
+        if ctrl != 0 && first_control_char == remaining {
+            first_control_char = offset + ctrl.trailing_zeros() as usize;
+        }
+
+        offset += 16;
+    }
+
+    // Handle remaining bytes
+    for (i, &b) in data.iter().enumerate().take(remaining).skip(offset) {
+        if b == b'"' {
+            quote_mask |= 1u64 << i;
+        }
+        if b == b'\\' {
+            backslash_mask |= 1u64 << i;
+        }
+        if b < 0x20 && first_control_char == remaining {
+            first_control_char = i;
+        }
+    }
+
+    ScanResult {
+        first_control_char,
+        quote_mask,
+        backslash_mask,
+    }
+}
+
+/// Scalar string scanning fallback.
+fn scan_chunk_scalar(input: &[u8], start: usize) -> ScanResult {
+    let data = &input[start..];
+    let chunk_len = data.len().min(64);
+
+    let mut first_control_char = chunk_len;
+    let mut quote_mask: u64 = 0;
+    let mut backslash_mask: u64 = 0;
+
+    for (i, &b) in data.iter().take(chunk_len).enumerate() {
+        if b < 0x20 && first_control_char == chunk_len {
+            first_control_char = i;
+        }
+        if b == b'"' {
+            quote_mask |= 1u64 << i;
+        }
+        if b == b'\\' {
+            backslash_mask |= 1u64 << i;
+        }
+    }
+
+    ScanResult {
+        first_control_char,
+        quote_mask,
+        backslash_mask,
     }
 }
 

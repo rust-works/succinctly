@@ -182,6 +182,34 @@ impl<'a> Validator<'a> {
         #[cfg(target_arch = "x86_64")]
         let simd_constants = unsafe { simd::SimdConstants::new() };
 
+        // Validate entire document as UTF-8 upfront (more efficient than per-string)
+        #[cfg(target_arch = "x86_64")]
+        if let Err(offset) = simd::validate_utf8_document(self.input, &simd_constants) {
+            // Find line/column for the error offset
+            let (line, column) = self.offset_to_position(offset);
+            return Err(ValidationError {
+                kind: ValidationErrorKind::InvalidUtf8,
+                position: Position {
+                    offset,
+                    line,
+                    column,
+                },
+            });
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        if let Err(offset) = simd::validate_utf8_document(self.input) {
+            let (line, column) = self.offset_to_position(offset);
+            return Err(ValidationError {
+                kind: ValidationErrorKind::InvalidUtf8,
+                position: Position {
+                    offset,
+                    line,
+                    column,
+                },
+            });
+        }
+
         self.skip_whitespace();
 
         if self.is_eof() {
@@ -202,6 +230,30 @@ impl<'a> Validator<'a> {
         }
 
         Ok(())
+    }
+
+    /// Convert byte offset to line/column position.
+    fn offset_to_position(&self, target_offset: usize) -> (usize, usize) {
+        let mut line = 1;
+        let mut column = 1;
+        for (i, &b) in self.input.iter().enumerate() {
+            if i >= target_offset {
+                break;
+            }
+            if b == b'\n' {
+                line += 1;
+                column = 1;
+            } else if b == b'\r' {
+                // Handle CRLF
+                if self.input.get(i + 1) != Some(&b'\n') {
+                    line += 1;
+                    column = 1;
+                }
+            } else {
+                column += 1;
+            }
+        }
+        (line, column)
     }
 
     /// Validate a JSON value (object, array, string, number, or keyword).
@@ -487,15 +539,13 @@ impl<'a> Validator<'a> {
 
     /// Validate a JSON string.
     ///
-    /// Uses chunked SIMD validation (64 bytes at a time) for combined UTF-8
-    /// validation and terminator detection. SIMD processes the full chunk and
-    /// returns a backslash bitmap, allowing all escapes to be validated in
-    /// batch before moving to the next chunk.
+    /// UTF-8 is validated for the entire document upfront, so string validation
+    /// only needs to scan for terminators (quote, backslash, control chars).
     ///
     /// Flow per chunk:
-    /// 1. SIMD validates UTF-8 and detects control chars, quote, and all backslashes
-    /// 2. Check for errors (UTF-8 invalid or control character before quote)
-    /// 3. Process all escapes in chunk up to quote position
+    /// 1. SIMD scans for control chars, quotes, and backslashes
+    /// 2. Check for control character errors
+    /// 3. Process escapes up to quote position
     /// 4. If quote found, string ends; otherwise advance to next chunk
     #[cfg(target_arch = "x86_64")]
     fn validate_string(
@@ -504,29 +554,14 @@ impl<'a> Validator<'a> {
     ) -> Result<(), ValidationError> {
         self.advance(); // consume opening quote
 
-        // Initialize UTF-8 carry state for tracking multi-byte sequences across chunks
-        let mut utf8_carry = unsafe { simd::Utf8Carry::new() };
-
         loop {
             // Check for enough bytes for SIMD processing
             if self.input.len() - self.offset >= 64 {
                 let chunk_start = self.offset;
 
-                // SIMD path: process full 64-byte chunk
-                let result = simd::validate_string_chunk(
-                    self.input,
-                    self.offset,
-                    &mut utf8_carry,
-                    simd_constants,
-                );
+                // SIMD path: scan for terminators only (UTF-8 already validated)
+                let result = simd::scan_string_chunk(self.input, self.offset, simd_constants);
 
-                // === Step 1: Check for UTF-8 ERRORS ===
-                if !result.utf8_valid {
-                    return Err(self.error(ValidationErrorKind::InvalidUtf8));
-                }
-
-                // === Step 2: Find first unescaped quote using bitmask operations ===
-                //
                 // Fast path: no backslashes in chunk at all
                 if result.backslash_mask == 0 {
                     let first_quote = result.quote_mask.trailing_zeros() as usize;
@@ -551,7 +586,6 @@ impl<'a> Validator<'a> {
                 }
 
                 // Backslash path: process terminators (quotes/backslashes) in order
-                // Single-pass algorithm using bitmasks to find next terminator efficiently
                 loop {
                     let current_pos = self.offset - chunk_start;
                     if current_pos >= 64 {
@@ -588,7 +622,7 @@ impl<'a> Validator<'a> {
                     self.column += advance;
 
                     if next_quote <= next_bs {
-                        // Quote comes first (or at same position, impossible) - string ends
+                        // Quote comes first - string ends
                         self.advance();
                         return Ok(());
                     } else {
@@ -598,11 +632,7 @@ impl<'a> Validator<'a> {
                 }
             } else {
                 // Scalar path for remaining bytes (< 64)
-                // Check for pending continuation bytes from SIMD chunks
-                if utf8_carry.has_pending() {
-                    return Err(self.error(ValidationErrorKind::InvalidUtf8));
-                }
-
+                // UTF-8 already validated, just scan for terminators
                 match self.peek() {
                     Some(b'"') => {
                         self.advance();
@@ -615,7 +645,8 @@ impl<'a> Validator<'a> {
                         return Err(self.error(ValidationErrorKind::ControlCharacter { byte: b }));
                     }
                     Some(_) => {
-                        self.validate_utf8_char()?;
+                        // UTF-8 already validated, just advance
+                        self.advance();
                     }
                     None => {
                         return Err(self.error(ValidationErrorKind::UnclosedString));
@@ -626,6 +657,7 @@ impl<'a> Validator<'a> {
     }
 
     /// Validate a JSON string (non-x86_64 version).
+    /// UTF-8 is validated for the entire document upfront.
     #[cfg(not(target_arch = "x86_64"))]
     fn validate_string(&mut self) -> Result<(), ValidationError> {
         self.advance(); // consume opening quote
@@ -643,7 +675,8 @@ impl<'a> Validator<'a> {
                     return Err(self.error(ValidationErrorKind::ControlCharacter { byte: b }));
                 }
                 Some(_) => {
-                    self.validate_utf8_char()?;
+                    // UTF-8 already validated, just advance
+                    self.advance();
                 }
                 None => {
                     return Err(self.error(ValidationErrorKind::UnclosedString));
@@ -653,7 +686,9 @@ impl<'a> Validator<'a> {
     }
 
     /// Validate a single UTF-8 character (may be multi-byte).
-    /// Used for scalar fallback when SIMD isn't available or for short strings.
+    /// Note: No longer used since UTF-8 is validated for the entire document upfront.
+    /// Kept for reference and potential future use.
+    #[allow(dead_code)]
     fn validate_utf8_char(&mut self) -> Result<(), ValidationError> {
         let b = self.peek().unwrap();
 
