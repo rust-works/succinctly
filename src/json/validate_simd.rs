@@ -11,26 +11,23 @@
 use core::arch::x86_64::*;
 
 /// Result of validating a string chunk.
+///
+/// Separates three categories:
+/// - UTF-8 validation errors (invalid byte sequences)
+/// - Control character errors (bytes < 0x20, illegal in JSON strings)
+/// - Valid terminators (quote or backslash, need handling but aren't errors)
+///
+/// Both validations run to completion on the full chunk. After SIMD completes,
+/// the caller checks for errors first (returning the earliest), then handles
+/// valid terminators.
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkResult {
-    /// Offset to first terminator (relative to chunk start), or chunk size if none found.
-    pub terminator_offset: usize,
-    /// True if UTF-8 is valid up to the terminator (or entire chunk if no terminator).
+    /// True if UTF-8 is valid for the entire chunk.
     pub utf8_valid: bool,
-    /// Error state from UTF-8 validation (non-zero means error detected).
-    pub error: u32,
-    /// Previous block state for cross-chunk validation.
-    pub prev_incomplete: __m256i,
-    /// Previous block state (high bytes).
-    pub prev_first_len: __m256i,
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[derive(Debug, Clone, Copy)]
-pub struct ChunkResult {
-    pub terminator_offset: usize,
-    pub utf8_valid: bool,
-    pub error: u32,
+    /// Offset to first control character (< 0x20), or 64 if none found.
+    pub first_control_char: usize,
+    /// Offset to first quote or backslash, or 64 if none found.
+    pub first_quote_or_backslash: usize,
 }
 
 /// Carry state for UTF-8 validation across chunk boundaries.
@@ -61,10 +58,6 @@ impl Utf8Carry {
         }
     }
 
-    pub fn has_error(&self) -> bool {
-        unsafe { _mm256_testz_si256(self.error, self.error) == 0 }
-    }
-
     pub fn has_pending(&self) -> bool {
         unsafe { _mm256_testz_si256(self.prev_incomplete, self.prev_incomplete) == 0 }
     }
@@ -83,33 +76,20 @@ impl Utf8Carry {
     }
 }
 
-// Compatibility alias
-pub type Utf8State = Utf8Carry;
-
-/// SIMD constant vectors for Keiser-Lemire algorithm.
+/// SIMD constant vectors for JSON string validation.
 /// Create once at document start and reuse for all chunks.
 #[cfg(target_arch = "x86_64")]
 pub struct SimdConstants {
     // Terminator detection
     pub quote: __m256i,
     pub backslash: __m256i,
-    pub control_bound: __m256i,
 
     // Keiser-Lemire UTF-8 lookup tables
     /// For each high nibble, how many continuation bytes follow (0, 1, 2, or 3).
     pub first_len_tbl: __m256i,
-    /// For each high nibble, the "range" index for validating the second byte.
-    pub first_range_tbl: __m256i,
-    /// For adjusting the range based on low nibble of first byte.
-    pub range_adjust_tbl: __m256i,
-    /// Minimum valid values for second byte (indexed by range).
-    pub range_min_tbl: __m256i,
-    /// Maximum valid values for second byte (indexed by range, as signed comparison).
-    pub range_max_tbl: __m256i,
 
     // Useful constants
     pub nibble_mask: __m256i,
-    pub continuation_mask: __m256i,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -121,7 +101,6 @@ impl SimdConstants {
             // Terminator detection vectors
             quote: _mm256_set1_epi8(b'"' as i8),
             backslash: _mm256_set1_epi8(b'\\' as i8),
-            control_bound: _mm256_set1_epi8(0x20),
 
             // Keiser-Lemire: first_len_tbl
             // Maps high nibble (0-F) to number of continuation bytes expected.
@@ -144,72 +123,18 @@ impl SimdConstants {
                 3,
             ),
 
-            // first_range_tbl: Maps high nibble to range index (0-7).
-            // Used to look up valid second byte range.
-            first_range_tbl: _mm256_setr_epi8(
-                0, 0, 0, 0, 0, 0, 0, 0,  // ASCII: range 0
-                0, 0, 0, 0,              // Continuations: range 0
-                0, 0,                     // 2-byte (C0-DF): range 0 (adjusted for C0-C1)
-                0,                        // 3-byte (E0-EF): range 0 (adjusted for E0, ED)
-                0,                        // 4-byte (F0-FF): range 0 (adjusted for F0, F4)
-                // Repeat
-                0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0,
-                0, 0,
-                0,
-                0,
-            ),
-
-            // range_adjust_tbl: Adjusts range based on low nibble of first byte.
-            // This handles special cases: E0->3, ED->3, F0->3, F4->4
-            range_adjust_tbl: _mm256_setr_epi8(
-                // For 3-byte (E0-EF), indexed by low nibble:
-                // E0: need range 3 (second byte A0-BF to avoid overlong)
-                // E1-EC: need range 0 (second byte 80-BF)
-                // ED: need range 4 (second byte 80-9F to avoid surrogates)
-                // EE-EF: need range 0 (second byte 80-BF)
-                3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0,
-                // For 4-byte (F0-F7), indexed by low nibble:
-                // F0: need range 3 (second byte 90-BF to avoid overlong)
-                // F1-F3: need range 0 (second byte 80-BF)
-                // F4: need range 4 (second byte 80-8F to avoid > U+10FFFF)
-                3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            ),
-
-            // range_min_tbl: Minimum valid second byte for each range (unsigned).
-            // Range 0: 0x80 (normal continuation)
-            // Range 3: 0x90 (after E0) or 0xA0 (after F0) to avoid overlong
-            // Range 4: 0x80 (after ED) or 0x80 (after F4)
-            range_min_tbl: _mm256_setr_epi8(
-                0x80u8 as i8, 0x80u8 as i8, 0x80u8 as i8, 0xA0u8 as i8,
-                0x80u8 as i8, 0x80u8 as i8, 0x80u8 as i8, 0x80u8 as i8,
-                0, 0, 0, 0, 0, 0, 0, 0,
-                // Repeat
-                0x80u8 as i8, 0x80u8 as i8, 0x80u8 as i8, 0xA0u8 as i8,
-                0x80u8 as i8, 0x80u8 as i8, 0x80u8 as i8, 0x80u8 as i8,
-                0, 0, 0, 0, 0, 0, 0, 0,
-            ),
-
-            // range_max_tbl: Maximum valid second byte for each range.
-            // Stored as signed for use with _mm256_cmpgt_epi8.
-            range_max_tbl: _mm256_setr_epi8(
-                0xBFu8 as i8, 0xBFu8 as i8, 0xBFu8 as i8, 0xBFu8 as i8,
-                0x9Fu8 as i8, 0xBFu8 as i8, 0xBFu8 as i8, 0x8Fu8 as i8,
-                0, 0, 0, 0, 0, 0, 0, 0,
-                // Repeat
-                0xBFu8 as i8, 0xBFu8 as i8, 0xBFu8 as i8, 0xBFu8 as i8,
-                0x9Fu8 as i8, 0xBFu8 as i8, 0xBFu8 as i8, 0x8Fu8 as i8,
-                0, 0, 0, 0, 0, 0, 0, 0,
-            ),
-
             nibble_mask: _mm256_set1_epi8(0x0F),
-            continuation_mask: _mm256_set1_epi8(0xC0u8 as i8),
         }
     }
 }
 
 /// Validate a string chunk: find terminators and validate UTF-8 in one pass.
 /// Pass pre-created SimdConstants from the caller to avoid per-chunk allocation.
+///
+/// Returns a `ChunkResult` with separate positions for:
+/// - `first_control_char`: ERRORS that must be reported
+/// - `first_quote_or_backslash`: Valid terminators that need handling
+/// - `utf8_valid`: Whether UTF-8 is valid for the chunk
 #[inline]
 pub fn validate_string_chunk(
     input: &[u8],
@@ -219,16 +144,9 @@ pub fn validate_string_chunk(
 ) -> ChunkResult {
     if start >= input.len() {
         return ChunkResult {
-            terminator_offset: 0,
             utf8_valid: true,
-            #[cfg(target_arch = "x86_64")]
-            error: 0,
-            #[cfg(target_arch = "x86_64")]
-            prev_incomplete: unsafe { _mm256_setzero_si256() },
-            #[cfg(target_arch = "x86_64")]
-            prev_first_len: unsafe { _mm256_setzero_si256() },
-            #[cfg(not(target_arch = "x86_64"))]
-            error: 0,
+            first_control_char: 0,
+            first_quote_or_backslash: 0,
         };
     }
 
@@ -245,8 +163,11 @@ pub fn validate_string_chunk(
 }
 
 /// AVX2 implementation - processes 64 bytes with full Keiser-Lemire UTF-8 validation.
-/// Terminators (", \, control chars) are valid ASCII, so we validate the full chunk
-/// and return terminator position separately.
+///
+/// Both UTF-8 validation and terminator detection run to completion on the full chunk.
+/// Returns separate positions for:
+/// - Control characters (errors)
+/// - Quote/backslash (valid terminators that need handling)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn validate_chunk_64_avx2(
@@ -263,7 +184,7 @@ unsafe fn validate_chunk_64_avx2(
     let chunk1 = _mm256_loadu_si256(ptr.add(1));
 
     // === UTF-8 VALIDATION (Keiser-Lemire) ===
-    // Always validate the full 64-byte chunk - terminators are valid ASCII
+    // Validate the full 64-byte chunk
     let (error0, incomplete0, first_len0) = validate_utf8_block(
         chunk0,
         carry.prev_incomplete,
@@ -283,45 +204,78 @@ unsafe fn validate_chunk_64_avx2(
     let has_error = _mm256_testz_si256(total_error, total_error) == 0;
 
     // === TERMINATOR DETECTION ===
-    let term0 = find_terminators_avx2(chunk0, c);
-    let term1 = find_terminators_avx2(chunk1, c);
-    let term_mask: u64 = (term0 as u64) | ((term1 as u64) << 32);
+    // Compute all comparison results in SIMD registers (no movemask yet)
 
-    let terminator_offset = if term_mask != 0 {
-        term_mask.trailing_zeros() as usize
-    } else {
-        64
-    };
+    // Control chars (< 0x20)
+    let sign_flip = _mm256_set1_epi8(0x80u8 as i8);
+    let bound_unsigned = _mm256_set1_epi8((0x20u8 ^ 0x80u8) as i8);
+    let chunk0_unsigned = _mm256_xor_si256(chunk0, sign_flip);
+    let chunk1_unsigned = _mm256_xor_si256(chunk1, sign_flip);
+    let is_control0 = _mm256_cmpgt_epi8(bound_unsigned, chunk0_unsigned);
+    let is_control1 = _mm256_cmpgt_epi8(bound_unsigned, chunk1_unsigned);
+
+    // Quote and backslash
+    let is_quote0 = _mm256_cmpeq_epi8(chunk0, c.quote);
+    let is_backslash0 = _mm256_cmpeq_epi8(chunk0, c.backslash);
+    let is_quote1 = _mm256_cmpeq_epi8(chunk1, c.quote);
+    let is_backslash1 = _mm256_cmpeq_epi8(chunk1, c.backslash);
+
+    // Combine ALL terminators in SIMD registers (still no movemask)
+    let all_terminators0 = _mm256_or_si256(
+        is_control0,
+        _mm256_or_si256(is_quote0, is_backslash0)
+    );
+    let all_terminators1 = _mm256_or_si256(
+        is_control1,
+        _mm256_or_si256(is_quote1, is_backslash1)
+    );
+
+    // FAST PATH: Single combined movemask to check if ANY terminator exists
+    let combined0 = _mm256_movemask_epi8(all_terminators0) as u32;
+    let combined1 = _mm256_movemask_epi8(all_terminators1) as u32;
+    let combined_mask: u64 = (combined0 as u64) | ((combined1 as u64) << 32);
 
     // Update carry state for next chunk
     carry.error = total_error;
     carry.prev_incomplete = incomplete1;
     carry.prev_first_len = first_len1;
 
-    ChunkResult {
-        terminator_offset,
-        utf8_valid: !has_error,
-        error: if has_error { 1 } else { 0 },
-        prev_incomplete: incomplete1,
-        prev_first_len: first_len1,
-    }
-}
+    if combined_mask == 0 {
+        // FAST PATH: No terminators at all - most common case for long strings
+        ChunkResult {
+            utf8_valid: !has_error,
+            first_control_char: 64,
+            first_quote_or_backslash: 64,
+        }
+    } else {
+        // SLOW PATH: Found something - now separate the masks
+        // Only pay the cost of extra movemasks when we actually need them
+        let ctrl0 = _mm256_movemask_epi8(is_control0) as u32;
+        let ctrl1 = _mm256_movemask_epi8(is_control1) as u32;
+        let control_mask: u64 = (ctrl0 as u64) | ((ctrl1 as u64) << 32);
 
-/// Find terminators (", \, control chars) in a 256-bit chunk.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn find_terminators_avx2(chunk: __m256i, c: &SimdConstants) -> u32 {
-    let is_quote = _mm256_cmpeq_epi8(chunk, c.quote);
-    let is_backslash = _mm256_cmpeq_epi8(chunk, c.backslash);
-    // Control char detection needs unsigned comparison (bytes < 0x20)
-    // Use XOR with 0x80 to convert to unsigned-like comparison
-    let sign_flip = _mm256_set1_epi8(0x80u8 as i8);
-    let chunk_unsigned = _mm256_xor_si256(chunk, sign_flip);
-    let bound_unsigned = _mm256_set1_epi8((0x20u8 ^ 0x80u8) as i8);  // 0xA0
-    let is_control = _mm256_cmpgt_epi8(bound_unsigned, chunk_unsigned);
-    let terminators = _mm256_or_si256(_mm256_or_si256(is_quote, is_backslash), is_control);
-    _mm256_movemask_epi8(terminators) as u32
+        let qb0 = _mm256_movemask_epi8(_mm256_or_si256(is_quote0, is_backslash0)) as u32;
+        let qb1 = _mm256_movemask_epi8(_mm256_or_si256(is_quote1, is_backslash1)) as u32;
+        let quote_backslash_mask: u64 = (qb0 as u64) | ((qb1 as u64) << 32);
+
+        let first_control_char = if control_mask != 0 {
+            control_mask.trailing_zeros() as usize
+        } else {
+            64
+        };
+
+        let first_quote_or_backslash = if quote_backslash_mask != 0 {
+            quote_backslash_mask.trailing_zeros() as usize
+        } else {
+            64
+        };
+
+        ChunkResult {
+            utf8_valid: !has_error,
+            first_control_char,
+            first_quote_or_backslash,
+        }
+    }
 }
 
 /// Shift a 256-bit register right by 1 byte, bringing prev[31] to position 0.
@@ -466,48 +420,16 @@ unsafe fn validate_utf8_block(
     (error, next_incomplete, first_len)
 }
 
-/// Scalar UTF-8 state for fallback.
-struct ScalarUtf8State {
-    pending: u8,
-}
-
-/// Scalar UTF-8 validation for partial chunks.
-fn validate_utf8_scalar_slice(data: &[u8], state: &mut ScalarUtf8State) -> bool {
-    let mut pending = state.pending;
-
-    for &b in data {
-        if pending > 0 {
-            if (b & 0xC0) == 0x80 {
-                pending -= 1;
-            } else {
-                return false;
-            }
-        } else if b >= 0x80 {
-            if b < 0xC2 {
-                return false; // Unexpected continuation or overlong
-            } else if b < 0xE0 {
-                pending = 1;
-            } else if b < 0xF0 {
-                pending = 2;
-            } else if b <= 0xF4 {
-                pending = 3;
-            } else {
-                return false; // Invalid byte
-            }
-        }
-    }
-
-    state.pending = pending;
-    true
-}
-
 /// Scalar fallback for chunks smaller than 64 bytes.
+/// Scalar fallback for string chunk validation.
+/// Scans the full chunk and returns separate positions for control chars and quote/backslash.
 fn validate_string_chunk_scalar(
     input: &[u8],
     start: usize,
     carry: &mut Utf8Carry,
 ) -> ChunkResult {
     let data = &input[start..];
+    let chunk_len = data.len().min(64);
 
     #[cfg(target_arch = "x86_64")]
     let mut pending = if carry.has_pending() { 1u8 } else { 0u8 };
@@ -515,30 +437,21 @@ fn validate_string_chunk_scalar(
     let mut pending = carry.pending;
 
     let mut utf8_valid = true;
+    let mut first_control_char = chunk_len;
+    let mut first_quote_or_backslash = chunk_len;
 
-    for (i, &b) in data.iter().enumerate() {
-        if b == b'"' || b == b'\\' || b < 0x20 {
-            #[cfg(target_arch = "x86_64")]
-            {
-                return ChunkResult {
-                    terminator_offset: i,
-                    utf8_valid,
-                    error: if utf8_valid { 0 } else { 1 },
-                    prev_incomplete: unsafe { _mm256_setzero_si256() },
-                    prev_first_len: unsafe { _mm256_setzero_si256() },
-                };
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                carry.pending = pending;
-                return ChunkResult {
-                    terminator_offset: i,
-                    utf8_valid,
-                    error: if utf8_valid { 0 } else { 1 },
-                };
-            }
+    for (i, &b) in data.iter().take(chunk_len).enumerate() {
+        // Track control chars (errors)
+        if b < 0x20 && first_control_char == chunk_len {
+            first_control_char = i;
         }
 
+        // Track quote/backslash (valid terminators)
+        if (b == b'"' || b == b'\\') && first_quote_or_backslash == chunk_len {
+            first_quote_or_backslash = i;
+        }
+
+        // UTF-8 validation
         if pending > 0 {
             if (b & 0xC0) == 0x80 {
                 pending -= 1;
@@ -561,28 +474,21 @@ fn validate_string_chunk_scalar(
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        ChunkResult {
-            terminator_offset: data.len(),
-            utf8_valid,
-            error: if utf8_valid { 0 } else { 1 },
-            prev_incomplete: unsafe { _mm256_setzero_si256() },
-            prev_first_len: unsafe { _mm256_setzero_si256() },
-        }
-    }
     #[cfg(not(target_arch = "x86_64"))]
     {
         carry.pending = pending;
-        ChunkResult {
-            terminator_offset: data.len(),
-            utf8_valid,
-            error: if utf8_valid { 0 } else { 1 },
-        }
+    }
+
+    ChunkResult {
+        utf8_valid,
+        first_control_char,
+        first_quote_or_backslash,
     }
 }
 
-// Compatibility wrapper
+// Compatibility wrapper - returns first terminator (control char, quote, or backslash)
+// This function is provided for external callers and tests.
+#[allow(dead_code)]
 #[inline]
 pub fn find_string_terminator(input: &[u8], start: usize) -> Option<usize> {
     #[cfg(target_arch = "x86_64")]
@@ -598,8 +504,12 @@ pub fn find_string_terminator(input: &[u8], start: usize) -> Option<usize> {
     #[cfg(not(target_arch = "x86_64"))]
     let result = validate_string_chunk(input, start, &mut carry);
 
-    if result.terminator_offset < input.len() - start {
-        Some(result.terminator_offset)
+    // Return earliest terminator (control char or quote/backslash)
+    let chunk_len = (input.len() - start).min(64);
+    let terminator_offset = result.first_control_char.min(result.first_quote_or_backslash);
+
+    if terminator_offset < chunk_len {
+        Some(terminator_offset)
     } else {
         None
     }
@@ -625,7 +535,8 @@ mod tests {
         let result = validate_string_chunk(input, 0, &mut carry, &constants);
         #[cfg(not(target_arch = "x86_64"))]
         let result = validate_string_chunk(input, 0, &mut carry);
-        assert_eq!(result.terminator_offset, 5);
+        assert_eq!(result.first_quote_or_backslash, 5);
+        assert_eq!(result.first_control_char, 11); // No control char
         assert!(result.utf8_valid);
     }
 
@@ -639,7 +550,7 @@ mod tests {
         let result = validate_string_chunk(input, 0, &mut carry, &constants);
         #[cfg(not(target_arch = "x86_64"))]
         let result = validate_string_chunk(input, 0, &mut carry);
-        assert_eq!(result.terminator_offset, 31);
+        assert_eq!(result.first_quote_or_backslash, 31);
         assert!(result.utf8_valid);
     }
 
@@ -654,7 +565,7 @@ mod tests {
         #[cfg(not(target_arch = "x86_64"))]
         let result = validate_string_chunk(input, 0, &mut carry);
         assert!(result.utf8_valid);
-        assert_eq!(input[result.terminator_offset], b'"');
+        assert_eq!(input[result.first_quote_or_backslash], b'"');
     }
 
     #[test]
@@ -668,7 +579,7 @@ mod tests {
         #[cfg(not(target_arch = "x86_64"))]
         let result = validate_string_chunk(input, 0, &mut carry);
         assert!(result.utf8_valid);
-        assert_eq!(input[result.terminator_offset], b'"');
+        assert_eq!(input[result.first_quote_or_backslash], b'"');
     }
 
     #[test]
@@ -682,7 +593,7 @@ mod tests {
         #[cfg(not(target_arch = "x86_64"))]
         let result = validate_string_chunk(input, 0, &mut carry);
         assert!(result.utf8_valid);
-        assert_eq!(input[result.terminator_offset], b'"');
+        assert_eq!(input[result.first_quote_or_backslash], b'"');
     }
 
     #[test]
@@ -695,7 +606,10 @@ mod tests {
         let result = validate_string_chunk(input, 0, &mut carry, &constants);
         #[cfg(not(target_arch = "x86_64"))]
         let result = validate_string_chunk(input, 0, &mut carry);
-        assert_eq!(result.terminator_offset, 5);
+        // Control char at position 5 is an ERROR
+        assert_eq!(result.first_control_char, 5);
+        // No quote or backslash in this input
+        assert_eq!(result.first_quote_or_backslash, 11);
     }
 
     #[test]
@@ -708,7 +622,10 @@ mod tests {
         let result = validate_string_chunk(input, 0, &mut carry, &constants);
         #[cfg(not(target_arch = "x86_64"))]
         let result = validate_string_chunk(input, 0, &mut carry);
-        assert_eq!(result.terminator_offset, 5);
+        // Backslash at position 5 is a valid terminator
+        assert_eq!(result.first_quote_or_backslash, 5);
+        // No control char in this input
+        assert_eq!(result.first_control_char, 12);
     }
 
     #[test]
@@ -725,7 +642,8 @@ mod tests {
         #[cfg(not(target_arch = "x86_64"))]
         let result = validate_string_chunk(input, 0, &mut carry);
         assert!(result.utf8_valid);
-        assert_eq!(result.terminator_offset, 64);
+        assert_eq!(result.first_quote_or_backslash, 64); // No quote in first 64 bytes
+        assert_eq!(result.first_control_char, 64); // No control char
 
         // Second chunk (starting at 64) should find the quote
         #[cfg(target_arch = "x86_64")]
@@ -733,8 +651,8 @@ mod tests {
         #[cfg(not(target_arch = "x86_64"))]
         let result2 = validate_string_chunk(input, 64, &mut carry);
         assert!(result2.utf8_valid);
-        assert_eq!(result2.terminator_offset, 27);
-        assert_eq!(input[64 + result2.terminator_offset], b'"');
+        assert_eq!(result2.first_quote_or_backslash, 27);
+        assert_eq!(input[64 + result2.first_quote_or_backslash], b'"');
     }
 
     #[test]
@@ -797,5 +715,37 @@ mod tests {
 
         let input = b"hello world";
         assert_eq!(find_string_terminator(input, 0), None);
+    }
+
+    #[test]
+    fn test_control_char_before_quote() {
+        // Control char should be detected as an error even if quote comes later
+        let mut carry = unsafe { Utf8Carry::new() };
+        #[cfg(target_arch = "x86_64")]
+        let constants = unsafe { test_constants() };
+        let input = b"abc\x01def\"ghi";
+        #[cfg(target_arch = "x86_64")]
+        let result = validate_string_chunk(input, 0, &mut carry, &constants);
+        #[cfg(not(target_arch = "x86_64"))]
+        let result = validate_string_chunk(input, 0, &mut carry);
+        assert_eq!(result.first_control_char, 3); // Control at position 3
+        assert_eq!(result.first_quote_or_backslash, 7); // Quote at position 7
+        assert!(result.utf8_valid);
+    }
+
+    #[test]
+    fn test_quote_before_control_char() {
+        // Quote before control char - both should be reported separately
+        let mut carry = unsafe { Utf8Carry::new() };
+        #[cfg(target_arch = "x86_64")]
+        let constants = unsafe { test_constants() };
+        let input = b"abc\"def\x01ghi";
+        #[cfg(target_arch = "x86_64")]
+        let result = validate_string_chunk(input, 0, &mut carry, &constants);
+        #[cfg(not(target_arch = "x86_64"))]
+        let result = validate_string_chunk(input, 0, &mut carry);
+        assert_eq!(result.first_quote_or_backslash, 3); // Quote at position 3
+        assert_eq!(result.first_control_char, 7); // Control at position 7
+        assert!(result.utf8_valid);
     }
 }
