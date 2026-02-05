@@ -203,10 +203,8 @@ unsafe fn validate_chunk_64_avx2(
     let total_error = _mm256_or_si256(_mm256_or_si256(carry.error, error0), error1);
     let has_error = _mm256_testz_si256(total_error, total_error) == 0;
 
-    // === TERMINATOR DETECTION ===
-    // Compute all comparison results in SIMD registers (no movemask yet)
-
-    // Control chars (< 0x20)
+    // === CONTROL CHARACTER DETECTION (ERRORS) ===
+    // Control chars (< 0x20) are validation errors
     let sign_flip = _mm256_set1_epi8(0x80u8 as i8);
     let bound_unsigned = _mm256_set1_epi8((0x20u8 ^ 0x80u8) as i8);
     let chunk0_unsigned = _mm256_xor_si256(chunk0, sign_flip);
@@ -214,67 +212,42 @@ unsafe fn validate_chunk_64_avx2(
     let is_control0 = _mm256_cmpgt_epi8(bound_unsigned, chunk0_unsigned);
     let is_control1 = _mm256_cmpgt_epi8(bound_unsigned, chunk1_unsigned);
 
-    // Quote and backslash
+    let ctrl0 = _mm256_movemask_epi8(is_control0) as u32;
+    let ctrl1 = _mm256_movemask_epi8(is_control1) as u32;
+    let control_mask: u64 = (ctrl0 as u64) | ((ctrl1 as u64) << 32);
+
+    let first_control_char = if control_mask != 0 {
+        control_mask.trailing_zeros() as usize
+    } else {
+        64
+    };
+
+    // === TERMINATOR DETECTION (NOT ERRORS) ===
+    // Quote and backslash are valid terminators that need handling
     let is_quote0 = _mm256_cmpeq_epi8(chunk0, c.quote);
     let is_backslash0 = _mm256_cmpeq_epi8(chunk0, c.backslash);
     let is_quote1 = _mm256_cmpeq_epi8(chunk1, c.quote);
     let is_backslash1 = _mm256_cmpeq_epi8(chunk1, c.backslash);
 
-    // Combine ALL terminators in SIMD registers (still no movemask)
-    let all_terminators0 = _mm256_or_si256(
-        is_control0,
-        _mm256_or_si256(is_quote0, is_backslash0)
-    );
-    let all_terminators1 = _mm256_or_si256(
-        is_control1,
-        _mm256_or_si256(is_quote1, is_backslash1)
-    );
+    let qb0 = _mm256_movemask_epi8(_mm256_or_si256(is_quote0, is_backslash0)) as u32;
+    let qb1 = _mm256_movemask_epi8(_mm256_or_si256(is_quote1, is_backslash1)) as u32;
+    let quote_backslash_mask: u64 = (qb0 as u64) | ((qb1 as u64) << 32);
 
-    // FAST PATH: Single combined movemask to check if ANY terminator exists
-    let combined0 = _mm256_movemask_epi8(all_terminators0) as u32;
-    let combined1 = _mm256_movemask_epi8(all_terminators1) as u32;
-    let combined_mask: u64 = (combined0 as u64) | ((combined1 as u64) << 32);
+    let first_quote_or_backslash = if quote_backslash_mask != 0 {
+        quote_backslash_mask.trailing_zeros() as usize
+    } else {
+        64
+    };
 
     // Update carry state for next chunk
     carry.error = total_error;
     carry.prev_incomplete = incomplete1;
     carry.prev_first_len = first_len1;
 
-    if combined_mask == 0 {
-        // FAST PATH: No terminators at all - most common case for long strings
-        ChunkResult {
-            utf8_valid: !has_error,
-            first_control_char: 64,
-            first_quote_or_backslash: 64,
-        }
-    } else {
-        // SLOW PATH: Found something - now separate the masks
-        // Only pay the cost of extra movemasks when we actually need them
-        let ctrl0 = _mm256_movemask_epi8(is_control0) as u32;
-        let ctrl1 = _mm256_movemask_epi8(is_control1) as u32;
-        let control_mask: u64 = (ctrl0 as u64) | ((ctrl1 as u64) << 32);
-
-        let qb0 = _mm256_movemask_epi8(_mm256_or_si256(is_quote0, is_backslash0)) as u32;
-        let qb1 = _mm256_movemask_epi8(_mm256_or_si256(is_quote1, is_backslash1)) as u32;
-        let quote_backslash_mask: u64 = (qb0 as u64) | ((qb1 as u64) << 32);
-
-        let first_control_char = if control_mask != 0 {
-            control_mask.trailing_zeros() as usize
-        } else {
-            64
-        };
-
-        let first_quote_or_backslash = if quote_backslash_mask != 0 {
-            quote_backslash_mask.trailing_zeros() as usize
-        } else {
-            64
-        };
-
-        ChunkResult {
-            utf8_valid: !has_error,
-            first_control_char,
-            first_quote_or_backslash,
-        }
+    ChunkResult {
+        utf8_valid: !has_error,
+        first_control_char,
+        first_quote_or_backslash,
     }
 }
 
