@@ -130,9 +130,20 @@ Benchmarks for `succinctly json validate` - strict RFC 8259 JSON validation thro
 Benchmarks for `succinctly text validate utf8` - scalar UTF-8 validation throughput. Serves as baseline for future SIMD implementations.
 
 ### Platforms Covered
+- Apple M4 Pro (ARM)
 - AMD Ryzen 9 7950X (x86_64)
 
 ### Benchmark Sections
+
+#### Apple M4 Pro (ARM)
+- Performance by Pattern Type (5 patterns at 1MB)
+- Detailed Results (5 sizes: 1KB-10MB):
+  - ASCII (Pure 7-bit)
+  - Mixed (Realistic content)
+  - CJK (3-byte sequences)
+  - Emoji (4-byte sequences)
+  - Latin Extended (2-byte sequences)
+- Sequence Type Comparison (1MB)
 
 #### AMD Ryzen 9 7950X (x86_64)
 - Summary Table (all patterns at 100MB)
@@ -144,7 +155,7 @@ Benchmarks for `succinctly text validate utf8` - scalar UTF-8 validation through
   - Mixed (Realistic content)
   - Latin Extended (2-byte sequences)
   - All Lengths (Uniform 1-4 byte mix)
-- Key Findings (throughput by character type, scaling)
+- Key Findings (throughput by character type, scaling, cross-platform comparison)
 
 ---
 
@@ -631,7 +642,7 @@ cargo bench --bench neon_movemask
 - **ARM Neoverse-V2 (Graviton 4)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [rust-parsers.md](rust-parsers.md), [rust-yaml-parsers.md](rust-yaml-parsers.md)
 - **ARM Neoverse-V1 (Graviton 3)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md)
 - **Apple M1 Max**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [cross-language.md](cross-language.md), [yaml.md](../parsing/yaml.md)
-- **Apple M4 Pro**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [json-validate.md](json-validate.md)
+- **Apple M4 Pro**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [json-validate.md](json-validate.md), [utf8-validate.md](utf8-validate.md)
 
 ### By Format
 - **JSON**: [jq.md](jq.md), [json-validate.md](json-validate.md), [cross-language.md](cross-language.md), [rust-parsers.md](rust-parsers.md)

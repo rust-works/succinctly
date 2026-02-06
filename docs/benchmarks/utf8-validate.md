@@ -6,9 +6,96 @@ This serves as the baseline for future SIMD implementations.
 
 ## Summary
 
-| Platform                      | ASCII (MiB/s) | CJK (MiB/s) | Emoji (MiB/s) | Mixed (MiB/s) |
+| Platform                      | ASCII (GiB/s) | CJK (GiB/s) | Emoji (GiB/s) | Mixed (GiB/s) |
 |-------------------------------|---------------|-------------|---------------|---------------|
-| AMD Ryzen 9 7950X (x86_64)    | 2,261         | 1,359       | 1,036         | 1,819         |
+| Apple M4 Pro (ARM)            | 2.0           | 2.5         | 2.9           | 2.1           |
+| AMD Ryzen 9 7950X (x86_64)    | 2.2           | 1.3         | 1.0           | 1.8           |
+
+**Key Finding**: Apple M4 Pro is **2-3x faster** than AMD Ryzen 9 7950X on multi-byte sequences (CJK, emoji) while maintaining comparable ASCII throughput.
+
+## Apple M4 Pro (ARM)
+
+**Date**: 2026-02-06
+**Commit**: b58037f (utf8-validation-scalar branch)
+**CPU**: Apple M4 Pro (12 cores)
+**OS**: macOS 15.6.1
+**Rust**: 1.93.0
+
+### Performance by Pattern Type (1MB)
+
+| Pattern       | Time (µs) | Throughput (GiB/s) |
+|---------------|-----------|-------------------|
+| ASCII         | 487.6     | 2.00              |
+| Mixed         | 461.0     | 2.12              |
+| CJK (3-byte)  | 396.5     | 2.46              |
+| Emoji (4-byte)| 340.6     | 2.87              |
+| 2-byte Latin  | 431.4     | 2.26              |
+
+### Detailed Results by Pattern
+
+#### ASCII (Pure 7-bit)
+
+| Size  | Time       | Throughput (GiB/s) |
+|-------|------------|-------------------|
+| 1KB   | 449.5 ns   | 2.12              |
+| 10KB  | 4.47 µs    | 2.13              |
+| 100KB | 45.3 µs    | 2.10              |
+| 1MB   | 487.6 µs   | 2.00              |
+| 10MB  | 4.73 ms    | 2.07              |
+
+#### Mixed (Realistic content)
+
+| Size  | Time       | Throughput (GiB/s) |
+|-------|------------|-------------------|
+| 1KB   | 463.3 ns   | 2.06              |
+| 10KB  | 4.47 µs    | 2.14              |
+| 100KB | 45.1 µs    | 2.12              |
+| 1MB   | 461.0 µs   | 2.12              |
+| 10MB  | 4.64 ms    | 2.11              |
+
+#### CJK (3-byte sequences)
+
+| Size  | Time       | Throughput (GiB/s) |
+|-------|------------|-------------------|
+| 1KB   | 382.1 ns   | 2.50              |
+| 10KB  | 3.82 µs    | 2.49              |
+| 100KB | 38.7 µs    | 2.46              |
+| 1MB   | 396.5 µs   | 2.46              |
+| 10MB  | 3.94 ms    | 2.48              |
+
+#### Emoji (4-byte sequences)
+
+| Size  | Time       | Throughput (GiB/s) |
+|-------|------------|-------------------|
+| 1KB   | 355.3 ns   | 2.68              |
+| 10KB  | 3.31 µs    | 2.88              |
+| 100KB | 33.4 µs    | 2.85              |
+| 1MB   | 340.6 µs   | 2.87              |
+| 10MB  | 3.44 ms    | 2.84              |
+
+#### Latin Extended (2-byte sequences)
+
+| Size  | Time       | Throughput (GiB/s) |
+|-------|------------|-------------------|
+| 1KB   | 458.0 ns   | 2.08              |
+| 10KB  | 3.99 µs    | 2.39              |
+| 100KB | 40.6 µs    | 2.35              |
+| 1MB   | 431.4 µs   | 2.26              |
+| 10MB  | 4.31 ms    | 2.27              |
+
+### Sequence Type Comparison (1MB)
+
+Direct comparison of byte sequence lengths at 1MB:
+
+| Sequence Type      | Time (µs) | Throughput (GiB/s) |
+|--------------------|-----------|-------------------|
+| ASCII (1-byte)     | 505.0     | 1.93              |
+| Extended (2-byte)  | 403.9     | 2.42              |
+| CJK (3-byte)       | 394.4     | 2.48              |
+| Emoji (4-byte)     | 350.7     | 2.79              |
+| Mixed              | 469.8     | 2.08              |
+
+**Observation**: Longer UTF-8 sequences validate *faster* on M4 Pro due to fewer continuation byte validations per MB of data.
 
 ## AMD Ryzen 9 7950X (x86_64)
 
@@ -104,19 +191,36 @@ This serves as the baseline for future SIMD implementations.
 
 ## Key Findings
 
-### Throughput by Character Type
+### Cross-Platform Comparison (1MB)
+
+| Pattern       | M4 Pro (GiB/s) | Ryzen 9 (GiB/s) | M4 Pro Advantage |
+|---------------|----------------|-----------------|------------------|
+| ASCII         | 2.0            | 2.2             | 0.9x (Ryzen wins)|
+| Mixed         | 2.1            | 1.8             | **1.2x**         |
+| CJK (3-byte)  | 2.5            | 1.3             | **1.9x**         |
+| Emoji (4-byte)| 2.9            | 1.0             | **2.9x**         |
+| 2-byte Latin  | 2.3            | 0.8             | **2.9x**         |
+
+### Throughput by Character Type (AMD Ryzen 9 7950X)
 
 1. **ASCII-dominant content** (~2.2-2.3 GiB/s): Pure ASCII, log files, source code, pathological
 2. **Mixed content** (~1.8-1.9 GiB/s): JSON-like, mixed prose
 3. **Multi-byte content** (~1.0-1.4 GiB/s): CJK (3-byte), emoji (4-byte), Greek/Cyrillic (2-byte)
 4. **Uniform multi-byte** (~0.5 GiB/s): All-lengths pattern with maximum byte diversity
 
+### Throughput by Character Type (Apple M4 Pro)
+
+1. **Emoji (4-byte)** (~2.8-2.9 GiB/s): Fastest due to fewest characters per MB
+2. **CJK (3-byte)** (~2.4-2.5 GiB/s): Excellent performance on ideographic content
+3. **2-byte Latin** (~2.3-2.4 GiB/s): Extended Latin, Greek, Cyrillic
+4. **ASCII/Mixed** (~2.0-2.1 GiB/s): Comparable performance across content types
+
 ### Performance Characteristics
 
-- **ASCII is fastest**: Single-byte validation requires no continuation byte checks
-- **3-byte (CJK) faster than 4-byte (emoji)**: Fewer continuation bytes to validate per character
-- **Latin (2-byte) slower than CJK (3-byte)**: Higher character density means more state machine transitions
-- **All-lengths is slowest**: Maximum branch prediction misses from alternating sequence lengths
+- **M4 Pro inverts the pattern**: Multi-byte sequences are *faster* than ASCII (fewer characters to validate per MB)
+- **Ryzen 9 follows expected pattern**: ASCII is fastest, multi-byte is slower
+- **Branch prediction**: M4 Pro's branch predictor handles UTF-8 state machine better
+- **Memory bandwidth**: Both platforms are memory-bound at large sizes
 
 ### Scaling
 
