@@ -132,6 +132,7 @@ Benchmarks for `succinctly text validate utf8` - scalar UTF-8 validation through
 ### Platforms Covered
 - Apple M4 Pro (ARM)
 - AMD Ryzen 9 7950X (x86_64)
+- Apple M1 Max (ARM)
 
 ### Benchmark Sections
 
@@ -156,6 +157,17 @@ Benchmarks for `succinctly text validate utf8` - scalar UTF-8 validation through
   - Latin Extended (2-byte sequences)
   - All Lengths (Uniform 1-4 byte mix)
 - Key Findings (throughput by character type, scaling, cross-platform comparison)
+
+#### Apple M1 Max (ARM)
+- Performance by Pattern Type (5 patterns x 5 sizes)
+- Detailed Results:
+  - ASCII (Pure 7-bit)
+  - Mixed (Realistic content)
+  - CJK (3-byte sequences)
+  - Emoji (4-byte sequences)
+  - 2-byte (Latin Extended)
+- Sequence Types Comparison (1MB)
+- Key Observations
 
 ---
 
@@ -641,7 +653,7 @@ cargo bench --bench neon_movemask
 - **AMD Ryzen 9 7950X (x86_64)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [json-validate.md](json-validate.md), [utf8-validate.md](utf8-validate.md), [cross-language.md](cross-language.md), [rust-parsers.md](rust-parsers.md), [rust-yaml-parsers.md](rust-yaml-parsers.md), [yaml.md](../parsing/yaml.md)
 - **ARM Neoverse-V2 (Graviton 4)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [rust-parsers.md](rust-parsers.md), [rust-yaml-parsers.md](rust-yaml-parsers.md)
 - **ARM Neoverse-V1 (Graviton 3)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md)
-- **Apple M1 Max**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [cross-language.md](cross-language.md), [yaml.md](../parsing/yaml.md)
+- **Apple M1 Max**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [cross-language.md](cross-language.md), [yaml.md](../parsing/yaml.md), [utf8-validate.md](utf8-validate.md)
 - **Apple M4 Pro**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [json-validate.md](json-validate.md), [utf8-validate.md](utf8-validate.md)
 
 ### By Format
