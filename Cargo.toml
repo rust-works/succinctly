@@ -189,3 +189,7 @@ harness = false
 [[bench]]
 name = "json_validate_bench"
 harness = false
+
+[[bench]]
+name = "utf8_validate_bench"
+harness = false

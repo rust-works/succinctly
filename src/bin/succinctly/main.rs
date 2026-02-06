@@ -36,6 +36,32 @@ enum Command {
     /// Unified benchmark runner (list and run all benchmarks)
     #[cfg(feature = "bench-runner")]
     Bench(BenchRunnerCommand),
+    /// Text processing operations (UTF-8 validation, etc.)
+    Text(TextCommand),
+}
+
+#[derive(Debug, Parser)]
+struct TextCommand {
+    #[command(subcommand)]
+    command: TextSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TextSubcommand {
+    /// Text validation operations
+    Validate(TextValidateCommand),
+}
+
+#[derive(Debug, Parser)]
+struct TextValidateCommand {
+    #[command(subcommand)]
+    command: TextValidateSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TextValidateSubcommand {
+    /// Validate UTF-8 encoding
+    Utf8(text_validate::ValidateUtf8Args),
 }
 
 #[derive(Debug, Parser)]
@@ -1084,6 +1110,14 @@ fn main() -> Result<()> {
             BenchRunnerSubcommand::List(args) => bench_runner::run_list(args),
             BenchRunnerSubcommand::Run(args) => bench_runner::run_benchmarks(args),
         },
+        Command::Text(text_cmd) => match text_cmd.command {
+            TextSubcommand::Validate(validate_cmd) => match validate_cmd.command {
+                TextValidateSubcommand::Utf8(args) => {
+                    let exit_code = text_validate::run(args)?;
+                    std::process::exit(exit_code);
+                }
+            },
+        },
     }
 }
 
@@ -1734,6 +1768,7 @@ mod jq_bench;
 mod jq_locate;
 mod jq_runner;
 mod json_validate;
+mod text_validate;
 mod yaml_generators;
 mod yq_bench;
 mod yq_locate;
