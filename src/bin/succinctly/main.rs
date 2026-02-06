@@ -50,6 +50,10 @@ struct TextCommand {
 enum TextSubcommand {
     /// Text validation operations
     Validate(TextValidateCommand),
+    /// Generate UTF-8 text files for benchmarking and testing
+    Generate(GenerateUtf8),
+    /// Generate a suite of UTF-8 files with various sizes and patterns
+    GenerateSuite(GenerateUtf8Suite),
 }
 
 #[derive(Debug, Parser)]
@@ -62,6 +66,98 @@ struct TextValidateCommand {
 enum TextValidateSubcommand {
     /// Validate UTF-8 encoding
     Utf8(text_validate::ValidateUtf8Args),
+}
+
+#[derive(Debug, Parser)]
+struct GenerateUtf8 {
+    /// Size of text to generate (supports b, kb, mb, gb - case insensitive)
+    /// Examples: 1024, 1kb, 512MB, 2Gb
+    #[arg(value_parser = parse_size)]
+    size: usize,
+
+    /// Output file path (defaults to stdout)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// UTF-8 pattern to generate
+    #[arg(short, long, default_value = "mixed")]
+    pattern: Utf8PatternArg,
+
+    /// Random seed for reproducible generation
+    #[arg(short, long)]
+    seed: Option<u64>,
+
+    /// Verify generated content is valid UTF-8
+    #[arg(long)]
+    verify: bool,
+}
+
+#[derive(Debug, Parser)]
+struct GenerateUtf8Suite {
+    /// Output directory (defaults to data/bench/generated/utf8)
+    #[arg(short, long, default_value = "data/bench/generated/utf8")]
+    output_dir: PathBuf,
+
+    /// Base seed for deterministic generation (each file uses seed + file_index)
+    #[arg(short, long, default_value = "42")]
+    seed: u64,
+
+    /// Clean output directory before generating
+    #[arg(long)]
+    clean: bool,
+
+    /// Verify all generated files are valid UTF-8
+    #[arg(long)]
+    verify: bool,
+
+    /// Maximum file size to generate (files larger than this are skipped)
+    /// Supports units: b, kb, mb, gb (e.g., "100mb", "1gb")
+    #[arg(short, long, value_parser = parse_size, default_value = "1gb")]
+    max_size: usize,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum Utf8PatternArg {
+    /// Pure ASCII (7-bit, single-byte sequences)
+    Ascii,
+    /// Latin Extended characters (2-byte sequences: accents, diacritics)
+    Latin,
+    /// Greek and Cyrillic (2-byte sequences)
+    GreekCyrillic,
+    /// Chinese/Japanese/Korean (3-byte sequences)
+    Cjk,
+    /// Emoji and symbols (4-byte sequences)
+    Emoji,
+    /// Mixed realistic content (prose with occasional non-ASCII)
+    Mixed,
+    /// Uniform mix of all sequence lengths (1-4 bytes)
+    AllLengths,
+    /// Log file style (mostly ASCII with timestamps)
+    LogFile,
+    /// Source code style (ASCII with unicode in strings/comments)
+    SourceCode,
+    /// JSON-like structure with unicode strings
+    JsonLike,
+    /// Pathological: maximum multi-byte density
+    Pathological,
+}
+
+impl From<Utf8PatternArg> for text_generators::Utf8Pattern {
+    fn from(arg: Utf8PatternArg) -> Self {
+        match arg {
+            Utf8PatternArg::Ascii => text_generators::Utf8Pattern::Ascii,
+            Utf8PatternArg::Latin => text_generators::Utf8Pattern::Latin,
+            Utf8PatternArg::GreekCyrillic => text_generators::Utf8Pattern::GreekCyrillic,
+            Utf8PatternArg::Cjk => text_generators::Utf8Pattern::Cjk,
+            Utf8PatternArg::Emoji => text_generators::Utf8Pattern::Emoji,
+            Utf8PatternArg::Mixed => text_generators::Utf8Pattern::Mixed,
+            Utf8PatternArg::AllLengths => text_generators::Utf8Pattern::AllLengths,
+            Utf8PatternArg::LogFile => text_generators::Utf8Pattern::LogFile,
+            Utf8PatternArg::SourceCode => text_generators::Utf8Pattern::SourceCode,
+            Utf8PatternArg::JsonLike => text_generators::Utf8Pattern::JsonLike,
+            Utf8PatternArg::Pathological => text_generators::Utf8Pattern::Pathological,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -162,6 +258,8 @@ enum BenchSubcommand {
     Yq(BenchYqArgs),
     /// Benchmark succinctly jq with DSV input
     Dsv(BenchDsvArgs),
+    /// Benchmark succinctly UTF-8 validation vs std::str::from_utf8
+    Utf8(BenchUtf8Args),
 }
 
 /// Arguments for jq benchmark
@@ -295,6 +393,38 @@ struct BenchDsvArgs {
     /// Skip memory measurement (memory is collected by default)
     #[arg(long)]
     no_memory: bool,
+}
+
+/// Arguments for UTF-8 validation benchmark
+#[derive(Debug, Parser)]
+struct BenchUtf8Args {
+    /// Directory containing generated UTF-8 files
+    #[arg(short, long, default_value = "data/bench/generated/utf8")]
+    data_dir: PathBuf,
+
+    /// Output JSONL file for raw results
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Output markdown file for formatted tables
+    #[arg(short, long)]
+    markdown: Option<PathBuf>,
+
+    /// Patterns to benchmark (comma-separated, or "all")
+    #[arg(short, long, default_value = "all")]
+    patterns: String,
+
+    /// Sizes to benchmark (comma-separated, or "all")
+    #[arg(short, long, default_value = "all")]
+    sizes: String,
+
+    /// Number of warmup runs before benchmarking
+    #[arg(long, default_value = "1")]
+    warmup: usize,
+
+    /// Number of benchmark runs (median is taken)
+    #[arg(long, default_value = "3")]
+    runs: usize,
 }
 
 /// Generate synthetic JSON files for benchmarking and testing
@@ -1102,6 +1232,7 @@ fn main() -> Result<()> {
                 BenchSubcommand::Jq(args) => run_jq_benchmark(args),
                 BenchSubcommand::Yq(args) => run_yq_benchmark(args),
                 BenchSubcommand::Dsv(args) => run_dsv_benchmark(args),
+                BenchSubcommand::Utf8(args) => run_utf8_benchmark(args),
             },
         },
         Command::InstallAliases(args) => install_aliases(args),
@@ -1117,6 +1248,30 @@ fn main() -> Result<()> {
                     std::process::exit(exit_code);
                 }
             },
+            TextSubcommand::Generate(args) => {
+                let data =
+                    text_generators::generate_utf8(args.size, args.pattern.into(), args.seed);
+
+                if args.verify {
+                    succinctly::text::utf8::validate_utf8(&data)
+                        .map_err(|e| anyhow::anyhow!("Generated invalid UTF-8: {}", e))?;
+                    eprintln!("✓ UTF-8 validated successfully");
+                }
+
+                match args.output {
+                    Some(path) => {
+                        std::fs::write(&path, &data)?;
+                        eprintln!("✓ Wrote {} bytes to {}", data.len(), path.display());
+                    }
+                    None => {
+                        use std::io::Write;
+                        std::io::stdout().write_all(&data)?;
+                    }
+                }
+
+                Ok(())
+            }
+            TextSubcommand::GenerateSuite(args) => generate_utf8_suite(args),
         },
     }
 }
@@ -1387,6 +1542,70 @@ fn run_dsv_benchmark(args: BenchDsvArgs) -> Result<()> {
     }
 
     let _results = dsv_bench::run_benchmark(
+        &config,
+        Some(output_jsonl.as_path()),
+        Some(output_md.as_path()),
+    )?;
+
+    Ok(())
+}
+
+fn run_utf8_benchmark(args: BenchUtf8Args) -> Result<()> {
+    let all_patterns = vec![
+        "ascii",
+        "latin",
+        "greek_cyrillic",
+        "cjk",
+        "emoji",
+        "mixed",
+        "all_lengths",
+        "log_file",
+        "source_code",
+        "json_like",
+        "pathological",
+    ];
+    let all_sizes = vec!["1kb", "10kb", "100kb", "1mb", "10mb", "100mb"];
+
+    let patterns = if args.patterns == "all" {
+        all_patterns.into_iter().map(String::from).collect()
+    } else {
+        args.patterns
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    };
+
+    let sizes = if args.sizes == "all" {
+        all_sizes.into_iter().map(String::from).collect()
+    } else {
+        args.sizes
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    };
+
+    let config = utf8_bench::BenchConfig {
+        data_dir: args.data_dir,
+        patterns,
+        sizes,
+        warmup_runs: args.warmup,
+        benchmark_runs: args.runs,
+    };
+
+    // Use default output paths if not specified
+    let results_dir = PathBuf::from("data/bench/results");
+    let default_jsonl = results_dir.join("utf8-bench.jsonl");
+    let default_md = results_dir.join("utf8-bench.md");
+
+    let output_jsonl = args.output.unwrap_or(default_jsonl);
+    let output_md = args.markdown.unwrap_or(default_md);
+
+    // Ensure results directory exists
+    if let Some(parent) = output_jsonl.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let _results = utf8_bench::run_benchmark(
         &config,
         Some(output_jsonl.as_path()),
         Some(output_md.as_path()),
@@ -1747,6 +1966,110 @@ fn generate_yaml_suite(args: GenerateYamlSuite) -> Result<()> {
     Ok(())
 }
 
+/// UTF-8 patterns for suite generation
+const UTF8_SUITE_PATTERNS: &[(&str, text_generators::Utf8Pattern)] = &[
+    ("ascii", text_generators::Utf8Pattern::Ascii),
+    ("latin", text_generators::Utf8Pattern::Latin),
+    (
+        "greek_cyrillic",
+        text_generators::Utf8Pattern::GreekCyrillic,
+    ),
+    ("cjk", text_generators::Utf8Pattern::Cjk),
+    ("emoji", text_generators::Utf8Pattern::Emoji),
+    ("mixed", text_generators::Utf8Pattern::Mixed),
+    ("all_lengths", text_generators::Utf8Pattern::AllLengths),
+    ("log_file", text_generators::Utf8Pattern::LogFile),
+    ("source_code", text_generators::Utf8Pattern::SourceCode),
+    ("json_like", text_generators::Utf8Pattern::JsonLike),
+    ("pathological", text_generators::Utf8Pattern::Pathological),
+];
+
+fn generate_utf8_suite(args: GenerateUtf8Suite) -> Result<()> {
+    let output_dir = &args.output_dir;
+
+    // Clean directory if requested
+    if args.clean && output_dir.exists() {
+        std::fs::remove_dir_all(output_dir)
+            .with_context(|| format!("Failed to clean directory: {}", output_dir.display()))?;
+        eprintln!("Cleaned {}", output_dir.display());
+    }
+
+    // Create output directory
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("Failed to create directory: {}", output_dir.display()))?;
+
+    let mut file_index: u64 = 0;
+    let mut total_bytes: usize = 0;
+    let mut file_count: usize = 0;
+    let mut skipped_count: usize = 0;
+
+    eprintln!(
+        "Generating UTF-8 suite in {} (max size: {})...",
+        output_dir.display(),
+        format_bytes(args.max_size)
+    );
+
+    // Generate patterns at various sizes
+    for (pattern_name, pattern) in UTF8_SUITE_PATTERNS {
+        // Create pattern subdirectory
+        let pattern_dir = output_dir.join(pattern_name);
+        std::fs::create_dir_all(&pattern_dir)?;
+
+        for (size_name, size) in SUITE_SIZES {
+            // Skip files that exceed max_size
+            if *size > args.max_size {
+                skipped_count += 1;
+                continue;
+            }
+
+            let filename = format!("{}.txt", size_name);
+            let path = pattern_dir.join(&filename);
+
+            // Deterministic seed: base_seed + file_index
+            let seed = args.seed.wrapping_add(file_index);
+            file_index += 1;
+
+            let data = text_generators::generate_utf8(*size, *pattern, Some(seed));
+
+            if args.verify {
+                if let Err(e) = succinctly::text::utf8::validate_utf8(&data) {
+                    anyhow::bail!("Generated invalid UTF-8 for {}: {}", path.display(), e);
+                }
+            }
+
+            std::fs::write(&path, &data)?;
+            total_bytes += data.len();
+            file_count += 1;
+
+            eprintln!(
+                "  {} ({}, seed={})",
+                path.display(),
+                format_bytes(data.len()),
+                seed
+            );
+        }
+    }
+
+    eprintln!(
+        "\n✓ Generated {} files ({} total)",
+        file_count,
+        format_bytes(total_bytes)
+    );
+    if skipped_count > 0 {
+        eprintln!(
+            "  (skipped {} files exceeding max size {})",
+            skipped_count,
+            format_bytes(args.max_size)
+        );
+    }
+
+    if args.verify {
+        eprintln!("All files validated successfully");
+    }
+
+    Ok(())
+}
+
 fn format_bytes(bytes: usize) -> String {
     if bytes >= 1024 * 1024 * 1024 {
         format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
@@ -1768,7 +2091,9 @@ mod jq_bench;
 mod jq_locate;
 mod jq_runner;
 mod json_validate;
+mod text_generators;
 mod text_validate;
+mod utf8_bench;
 mod yaml_generators;
 mod yq_bench;
 mod yq_locate;

@@ -263,54 +263,6 @@ fn bench_sequence_types(c: &mut Criterion) {
     group.finish();
 }
 
-/// Compare with std::str::from_utf8
-fn bench_vs_std(c: &mut Criterion) {
-    let mut group = c.benchmark_group("utf8_vs_std");
-    let size = 1024 * 1024; // 1MB
-
-    // ASCII comparison
-    let ascii = generate_ascii(size);
-    group.throughput(Throughput::Bytes(size as u64));
-    group.bench_with_input(
-        BenchmarkId::new("succinctly_ascii", "1mb"),
-        &ascii,
-        |b, data| {
-            b.iter(|| validate_utf8(black_box(data)));
-        },
-    );
-    group.bench_with_input(BenchmarkId::new("std_ascii", "1mb"), &ascii, |b, data| {
-        b.iter(|| std::str::from_utf8(black_box(data)));
-    });
-
-    // Mixed comparison
-    let mixed = generate_mixed(size);
-    group.bench_with_input(
-        BenchmarkId::new("succinctly_mixed", "1mb"),
-        &mixed,
-        |b, data| {
-            b.iter(|| validate_utf8(black_box(data)));
-        },
-    );
-    group.bench_with_input(BenchmarkId::new("std_mixed", "1mb"), &mixed, |b, data| {
-        b.iter(|| std::str::from_utf8(black_box(data)));
-    });
-
-    // CJK comparison
-    let cjk = generate_cjk(size);
-    group.bench_with_input(
-        BenchmarkId::new("succinctly_cjk", "1mb"),
-        &cjk,
-        |b, data| {
-            b.iter(|| validate_utf8(black_box(data)));
-        },
-    );
-    group.bench_with_input(BenchmarkId::new("std_cjk", "1mb"), &cjk, |b, data| {
-        b.iter(|| std::str::from_utf8(black_box(data)));
-    });
-
-    group.finish();
-}
-
 fn format_size(bytes: usize) -> String {
     if bytes >= 1024 * 1024 {
         format!("{}mb", bytes / (1024 * 1024))
@@ -330,7 +282,6 @@ criterion_group!(
     bench_2byte,
     bench_error_at_end,
     bench_sequence_types,
-    bench_vs_std,
 );
 
 criterion_main!(benches);
