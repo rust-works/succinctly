@@ -159,6 +159,49 @@ Cache behavior > theoretical complexity:
 
 **Lesson:** Only trust end-to-end benchmarks on real workloads.
 
+### 8. Precomputed Constants: Measure the Trade-off
+
+Precomputing SIMD constants avoids repeated `_mm256_set1_epi8` calls, but larger structs cause cache pressure.
+
+**Evidence (JSON validator):**
+- 13 fields (416 bytes, 7 cache lines): **6-7% regression** on large unicode files
+- 6 fields (192 bytes, 3 cache lines): **2.5-3.6% improvement**
+
+**Decision tree:**
+```
+Is the constant used on EVERY chunk?
+├── Yes → Precompute (quote, backslash, control char detection)
+└── No → Create inline (UTF-8 validation, only for non-ASCII content)
+```
+
+**Key insight:** UTF-8 validation constants are only needed for non-ASCII content. Creating them inline is cheaper than the cache pressure of storing them.
+
+### 9. SSE2 Fallback for Short Chunks
+
+AVX2 processes 64 bytes, but tails and short strings need fallback. SSE2 beats scalar for 16-63 byte ASCII chunks.
+
+**Evidence (JSON validator):**
+| Pattern | Improvement |
+|---------|-------------|
+| literals | -17.2% |
+| arrays | -12.2% |
+| numbers | -9.7% |
+| nested | -7.4% |
+| strings | -0.9% (already AVX2) |
+
+**Implementation pattern:**
+```rust
+if remaining >= 64 && is_x86_feature_detected!("avx2") {
+    return avx2_path(...);
+}
+if remaining >= 16 && !has_pending_utf8 {
+    return sse2_path(...);  // ASCII-only fast path
+}
+return scalar_path(...);
+```
+
+**Key insight:** Fall back to scalar if non-ASCII detected (for proper UTF-8 validation). The SSE2 path is specifically for ASCII-only content which is common in JSON.
+
 ## Optimization Workflow
 
 ### 1. Identify Regression
