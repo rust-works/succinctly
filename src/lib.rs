@@ -13,6 +13,7 @@
 //! - [`jq`] - jq-style query language for JSON navigation
 //! - [`dsv`] - High-performance CSV/TSV parsing with succinct indexing
 //! - [`yaml`] - YAML semi-indexing (Phase 1: block style)
+//! - [`text`] - Text processing utilities (UTF-8 validation)
 //!
 //! ## Quick Start
 //!
@@ -85,6 +86,9 @@ pub mod dsv;
 
 /// YAML semi-indexing (Phase 1: YAML-lite).
 pub mod yaml;
+
+/// Text processing utilities (UTF-8 validation, etc.).
+pub mod text;
 
 // =============================================================================
 // Public re-exports (convenience + backward compatibility)

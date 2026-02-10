@@ -4,13 +4,14 @@ This document provides a comprehensive index of all benchmark reports in the pro
 
 ## Overview
 
-The project contains **8 main benchmark documentation files** with approximately **160+ distinct benchmark report sections**, plus **6 core/internal benchmark suites**.
+The project contains **9 main benchmark documentation files** with approximately **175+ distinct benchmark report sections**, plus **6 core/internal benchmark suites**.
 
 | File                                         | Description                                | Sections |
 |----------------------------------------------|--------------------------------------------|----------|
 | [jq.md](jq.md)                               | JSON query performance vs system jq        | ~40      |
 | [yq.md](yq.md)                               | YAML query performance vs system yq        | ~35      |
 | [json-validate.md](json-validate.md)         | JSON validation (RFC 8259) throughput      | ~12      |
+| [utf8-validate.md](utf8-validate.md)         | UTF-8 validation throughput (scalar)       | ~15      |
 | [dsv.md](dsv.md)                             | CSV/TSV parsing performance                | ~8       |
 | [cross-language.md](cross-language.md)       | Multi-parser JSON comparison               | ~15      |
 | [rust-parsers.md](rust-parsers.md)           | Rust JSON parser comparison (x86_64 + ARM) | ~20      |
@@ -121,6 +122,52 @@ Benchmarks for `succinctly json validate` - strict RFC 8259 JSON validation thro
 
 #### Analysis
 - Key Findings (cross-platform comparison)
+
+---
+
+## [utf8-validate.md](utf8-validate.md) - UTF-8 Validation Benchmarks
+
+Benchmarks for `succinctly text validate utf8` - scalar UTF-8 validation throughput. Serves as baseline for future SIMD implementations.
+
+### Platforms Covered
+- Apple M4 Pro (ARM)
+- AMD Ryzen 9 7950X (x86_64)
+- Apple M1 Max (ARM)
+
+### Benchmark Sections
+
+#### Apple M4 Pro (ARM)
+- Performance by Pattern Type (5 patterns at 1MB)
+- Detailed Results (5 sizes: 1KB-10MB):
+  - ASCII (Pure 7-bit)
+  - Mixed (Realistic content)
+  - CJK (3-byte sequences)
+  - Emoji (4-byte sequences)
+  - Latin Extended (2-byte sequences)
+- Sequence Type Comparison (1MB)
+
+#### AMD Ryzen 9 7950X (x86_64)
+- Summary Table (all patterns at 100MB)
+- Performance by Pattern Type (11 patterns x 6 sizes)
+- Detailed Results:
+  - ASCII (Pure 7-bit)
+  - CJK (3-byte sequences)
+  - Emoji (4-byte sequences)
+  - Mixed (Realistic content)
+  - Latin Extended (2-byte sequences)
+  - All Lengths (Uniform 1-4 byte mix)
+- Key Findings (throughput by character type, scaling, cross-platform comparison)
+
+#### Apple M1 Max (ARM)
+- Performance by Pattern Type (5 patterns x 5 sizes)
+- Detailed Results:
+  - ASCII (Pure 7-bit)
+  - Mixed (Realistic content)
+  - CJK (3-byte sequences)
+  - Emoji (4-byte sequences)
+  - 2-byte (Latin Extended)
+- Sequence Types Comparison (1MB)
+- Key Observations
 
 ---
 
@@ -603,16 +650,17 @@ cargo bench --bench neon_movemask
 ## Finding Specific Benchmarks
 
 ### By Platform
-- **AMD Ryzen 9 7950X (x86_64)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [json-validate.md](json-validate.md), [cross-language.md](cross-language.md), [rust-parsers.md](rust-parsers.md), [rust-yaml-parsers.md](rust-yaml-parsers.md), [yaml.md](../parsing/yaml.md)
+- **AMD Ryzen 9 7950X (x86_64)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [json-validate.md](json-validate.md), [utf8-validate.md](utf8-validate.md), [cross-language.md](cross-language.md), [rust-parsers.md](rust-parsers.md), [rust-yaml-parsers.md](rust-yaml-parsers.md), [yaml.md](../parsing/yaml.md)
 - **ARM Neoverse-V2 (Graviton 4)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [rust-parsers.md](rust-parsers.md), [rust-yaml-parsers.md](rust-yaml-parsers.md)
 - **ARM Neoverse-V1 (Graviton 3)**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md)
-- **Apple M1 Max**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [cross-language.md](cross-language.md), [yaml.md](../parsing/yaml.md)
-- **Apple M4 Pro**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [json-validate.md](json-validate.md)
+- **Apple M1 Max**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [cross-language.md](cross-language.md), [yaml.md](../parsing/yaml.md), [utf8-validate.md](utf8-validate.md)
+- **Apple M4 Pro**: [jq.md](jq.md), [yq.md](yq.md), [dsv.md](dsv.md), [json-validate.md](json-validate.md), [utf8-validate.md](utf8-validate.md)
 
 ### By Format
 - **JSON**: [jq.md](jq.md), [json-validate.md](json-validate.md), [cross-language.md](cross-language.md), [rust-parsers.md](rust-parsers.md)
 - **YAML**: [yq.md](yq.md), [rust-yaml-parsers.md](rust-yaml-parsers.md), [yaml.md](../parsing/yaml.md)
 - **DSV/CSV/TSV**: [dsv.md](dsv.md)
+- **UTF-8 Text**: [utf8-validate.md](utf8-validate.md)
 
 ### By Comparison Type
 - **vs External Tools**: [jq.md](jq.md) (vs jq), [yq.md](yq.md) (vs yq)
@@ -666,6 +714,9 @@ cargo run --release --features cli -- yaml generate-suite
 
 # DSV
 cargo run --release --features cli -- dsv generate-suite
+
+# UTF-8
+cargo run --release --features cli -- text generate-suite
 ```
 
 ### Run Benchmarks
@@ -677,6 +728,7 @@ cargo build --release --features bench-runner
 ./target/release/succinctly bench run jq_bench
 ./target/release/succinctly bench run yq_bench
 ./target/release/succinctly bench run dsv_bench
+./target/release/succinctly bench run utf8_bench
 
 # Criterion benchmarks
 cargo bench --bench jq_comparison
@@ -684,6 +736,7 @@ cargo bench --bench yq_comparison
 cargo bench --bench yq_select
 cargo bench --bench yaml_bench
 cargo bench --bench json_parsers
+cargo bench --bench utf8_validate_bench
 
 # Cross-parser comparison
 cd bench-compare
