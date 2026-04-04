@@ -234,8 +234,15 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   coverage:
-    name: Coverage
-    runs-on: ubuntu-latest
+    name: Coverage (${{ matrix.name }})
+    strategy:
+      matrix:
+        include:
+          - name: x86_64
+            runner: ubuntu-latest
+          - name: ARM64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -253,17 +260,25 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.name }}-coverage-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin || true
 
-      - name: Generate coverage report
-        run: cargo tarpaulin --verbose --workspace --timeout 300 --out xml
+      - name: Generate coverage report (default)
+        run: cargo tarpaulin --verbose --workspace --timeout 300 --out xml --output-dir target/coverage/default
+
+      - name: Generate coverage report (simd)
+        run: cargo tarpaulin --verbose --workspace --timeout 300 --features simd --out xml --output-dir target/coverage/simd
+
+      - name: Generate coverage report (portable-popcount)
+        run: cargo tarpaulin --verbose --workspace --timeout 300 --features portable-popcount --out xml --output-dir target/coverage/portable
 
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v4
         with:
+          files: target/coverage/default/cobertura.xml,target/coverage/simd/cobertura.xml,target/coverage/portable/cobertura.xml
+          flags: ${{ matrix.name }}
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

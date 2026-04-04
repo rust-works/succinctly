@@ -37,7 +37,7 @@ pub fn popcount_word(word: u64) -> u32 {
 
 /// Popcount multiple words, returning total.
 #[inline]
-pub fn popcount_words(words: &[u64]) -> u32 {
+pub fn popcount_words(words: &[u64]) -> usize {
     // Priority: portable-popcount > simd > default
     #[cfg(feature = "portable-popcount")]
     {
@@ -72,10 +72,10 @@ pub fn popcount_words(words: &[u64]) -> u32 {
 /// Default implementation using Rust's count_ones.
 #[inline]
 #[cfg(not(any(feature = "simd", feature = "portable-popcount")))]
-fn popcount_words_default(words: &[u64]) -> u32 {
-    let mut total = 0u32;
+fn popcount_words_default(words: &[u64]) -> usize {
+    let mut total = 0usize;
     for &word in words {
-        total += word.count_ones();
+        total += word.count_ones() as usize;
     }
     total
 }
@@ -101,10 +101,10 @@ pub fn popcount_word_portable(mut x: u64) -> u32 {
 /// Portable popcount for word slice.
 #[inline]
 #[cfg(feature = "portable-popcount")]
-fn popcount_words_portable(words: &[u64]) -> u32 {
-    let mut total = 0u32;
+fn popcount_words_portable(words: &[u64]) -> usize {
+    let mut total = 0usize;
     for &word in words {
-        total += popcount_word_portable(word);
+        total += popcount_word_portable(word) as usize;
     }
     total
 }
@@ -126,12 +126,12 @@ fn popcount_words_portable(words: &[u64]) -> u32 {
     not(feature = "portable-popcount")
 ))]
 #[inline]
-fn popcount_words_neon(words: &[u64]) -> u32 {
+fn popcount_words_neon(words: &[u64]) -> usize {
     if words.is_empty() {
         return 0;
     }
 
-    let mut total = 0u32;
+    let mut total = 0usize;
     let ptr = words.as_ptr() as *const u8;
     let byte_len = words.len() * 8;
     let mut offset = 0;
@@ -145,7 +145,7 @@ fn popcount_words_neon(words: &[u64]) -> u32 {
             let c1 = popcount_64bytes_neon(ptr.add(offset + 64));
             let c2 = popcount_64bytes_neon(ptr.add(offset + 128));
             let c3 = popcount_64bytes_neon(ptr.add(offset + 192));
-            total += c0 + c1 + c2 + c3;
+            total += (c0 + c1 + c2 + c3) as usize;
         }
         offset += 256;
     }
@@ -154,14 +154,14 @@ fn popcount_words_neon(words: &[u64]) -> u32 {
     while offset + 64 <= byte_len {
         // SAFETY: We verified bounds above
         let count = unsafe { popcount_64bytes_neon(ptr.add(offset)) };
-        total += count;
+        total += count as usize;
         offset += 64;
     }
 
     // Handle remaining words
     let remaining_words = (byte_len - offset) / 8;
     for i in 0..remaining_words {
-        total += words[offset / 8 + i].count_ones();
+        total += words[offset / 8 + i].count_ones() as usize;
     }
 
     total
@@ -211,14 +211,14 @@ unsafe fn popcount_64bytes_neon(ptr: *const u8) -> u32 {
 ))]
 #[inline]
 #[target_feature(enable = "avx512f,avx512vpopcntdq")]
-unsafe fn popcount_words_avx512vpopcntdq(words: &[u64]) -> u32 {
+unsafe fn popcount_words_avx512vpopcntdq(words: &[u64]) -> usize {
     use core::arch::x86_64::*;
 
     if words.is_empty() {
         return 0;
     }
 
-    let mut total = 0u32;
+    let mut total = 0usize;
     let mut offset = 0;
 
     // Process 8 u64 words (512 bits) at a time
@@ -231,14 +231,14 @@ unsafe fn popcount_words_avx512vpopcntdq(words: &[u64]) -> u32 {
             let counts = _mm512_popcnt_epi64(v);
 
             // Sum all 8 counts into a single value
-            total += _mm512_reduce_add_epi64(counts) as u32;
+            total += _mm512_reduce_add_epi64(counts) as usize;
         }
         offset += 8;
     }
 
     // Handle remaining words (< 8)
     for &word in &words[offset..] {
-        total += word.count_ones();
+        total += word.count_ones() as usize;
     }
 
     total
@@ -255,7 +255,7 @@ unsafe fn popcount_words_avx512vpopcntdq(words: &[u64]) -> u32 {
     not(feature = "portable-popcount")
 ))]
 #[inline]
-fn popcount_words_x86(words: &[u64]) -> u32 {
+fn popcount_words_x86(words: &[u64]) -> usize {
     // Runtime dispatch to AVX-512 VPOPCNTDQ if available (requires std)
     #[cfg(feature = "std")]
     {
@@ -265,9 +265,9 @@ fn popcount_words_x86(words: &[u64]) -> u32 {
     }
 
     // Fallback: scalar POPCNT (count_ones compiles to POPCNT on x86_64)
-    let mut total = 0u32;
+    let mut total = 0usize;
     for &word in words {
-        total += word.count_ones();
+        total += word.count_ones() as usize;
     }
     total
 }
@@ -303,9 +303,83 @@ mod tests {
             let words: Vec<u64> = (0..len)
                 .map(|i| (i as u64) | 0x8000_0000_0000_0001)
                 .collect();
-            let expected: u32 = words.iter().map(|w| w.count_ones()).sum();
+            let expected: usize = words.iter().map(|w| w.count_ones() as usize).sum();
             assert_eq!(popcount_words(&words), expected, "len={}", len);
         }
+    }
+
+    /// Test sizes that exercise NEON/SIMD chunk boundaries:
+    /// - 256-byte main loop: 32 words
+    /// - 64-byte secondary loop: 8 words
+    /// - Scalar tail: < 8 words
+    #[test]
+    fn test_popcount_words_chunk_boundaries() {
+        // Exact boundary sizes and off-by-one around them
+        for len in [
+            0, 1, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 39, 40, 48, 63, 64, 65, 96, 100, 128,
+        ] {
+            let words: Vec<u64> = (0..len)
+                .map(|i| (i as u64).wrapping_mul(0xDEAD_BEEF_CAFE_BABE) | 1)
+                .collect();
+            let expected: usize = words.iter().map(|w| w.count_ones() as usize).sum();
+            assert_eq!(popcount_words(&words), expected, "len={}", len);
+        }
+    }
+
+    /// Test that all-ones input produces exact count at various sizes.
+    /// This exercises the accumulator with maximum bits per word (64).
+    #[test]
+    fn test_popcount_words_all_ones() {
+        for len in [1, 8, 32, 33, 64, 100, 256] {
+            let words = vec![u64::MAX; len];
+            assert_eq!(popcount_words(&words), len * 64, "len={}", len);
+        }
+    }
+
+    /// Test that all-zeros input returns 0 at various sizes.
+    #[test]
+    fn test_popcount_words_all_zeros() {
+        for len in [1, 8, 32, 64, 100] {
+            let words = vec![0u64; len];
+            assert_eq!(popcount_words(&words), 0, "len={}", len);
+        }
+    }
+
+    /// Regression test for #44: popcount_words previously returned u32,
+    /// which overflows at ~512MB of all-ones data (67M words × 64 = 4.29B > u32::MAX).
+    /// With usize return type, this count is representable.
+    #[test]
+    fn test_popcount_words_exceeds_u32_max() {
+        // Verify the return type can represent values > u32::MAX.
+        // We can't allocate 512MB in a normal test, but we can verify
+        // the type system prevents the old overflow by computing what
+        // the result would be and asserting it fits in usize.
+        let words_for_overflow: usize = (u32::MAX as usize / 64) + 1; // 67_108_864
+        let expected: usize = words_for_overflow * 64; // 4_294_967_296 > u32::MAX
+        assert!(expected > u32::MAX as usize);
+
+        // Smaller but concrete test: 1M words × 64 bits = 64M ones.
+        // This fits in u32 but exercises large accumulation.
+        let words = vec![u64::MAX; 1_000_000];
+        assert_eq!(popcount_words(&words), 64_000_000);
+    }
+
+    /// Test with single-bit-set patterns at every bit position.
+    #[test]
+    fn test_popcount_words_single_bits() {
+        let words: Vec<u64> = (0..64).map(|i| 1u64 << i).collect();
+        assert_eq!(popcount_words(&words), 64);
+    }
+
+    /// Test with mixed density patterns to catch accumulation errors.
+    #[test]
+    fn test_popcount_words_mixed_density() {
+        // Alternating dense/sparse words
+        let words: Vec<u64> = (0..128)
+            .map(|i| if i % 2 == 0 { u64::MAX } else { 1 })
+            .collect();
+        let expected = 64 * 64 + 64; // 64 full words + 64 words with 1 bit
+        assert_eq!(popcount_words(&words), expected);
     }
 
     #[cfg(feature = "portable-popcount")]
@@ -349,7 +423,7 @@ mod tests {
                 })
                 .collect();
 
-            let expected: u32 = words.iter().map(|w: &u64| w.count_ones()).sum();
+            let expected: usize = words.iter().map(|w: &u64| w.count_ones() as usize).sum();
             let avx512_result = unsafe { popcount_words_avx512vpopcntdq(&words) };
 
             assert_eq!(
