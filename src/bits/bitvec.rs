@@ -87,7 +87,7 @@ impl BitVec {
         }
 
         // Count total ones using the selected popcount implementation
-        let ones_count: usize = popcount_words(&words) as usize;
+        let ones_count: usize = popcount_words(&words);
 
         // Build rank directory
         let rank_dir = RankDirectory::build(&words);
