@@ -258,12 +258,19 @@ jobs:
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin || true
 
-      - name: Generate coverage report
-        run: cargo tarpaulin --verbose --workspace --timeout 300 --out xml
+      - name: Generate coverage report (default)
+        run: cargo tarpaulin --verbose --workspace --timeout 300 --out xml --output-dir target/coverage/default
+
+      - name: Generate coverage report (simd)
+        run: cargo tarpaulin --verbose --workspace --timeout 300 --features simd --out xml --output-dir target/coverage/simd
+
+      - name: Generate coverage report (portable-popcount)
+        run: cargo tarpaulin --verbose --workspace --timeout 300 --features portable-popcount --out xml --output-dir target/coverage/portable
 
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v4
         with:
+          files: target/coverage/default/cobertura.xml,target/coverage/simd/cobertura.xml,target/coverage/portable/cobertura.xml
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
