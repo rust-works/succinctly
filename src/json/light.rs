@@ -698,17 +698,44 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
         }
 
         let end = match self.text[start] {
-            // Containers: use BP to find closing bracket position
+            // Containers: scan text for matching close bracket.
+            // Closing brackets have IB=0, so we cannot use ib_select1_from to
+            // find their text position. Instead, scan forward tracking depth.
             b'{' | b'[' => {
-                // Find the close paren in BP
-                let close_bp = self.index.bp().find_close(self.bp_pos)?;
-                // Map close BP position to text position
-                // The close bracket is at the BP close position's corresponding IB bit
-                let close_rank = self.index.bp().rank1(close_bp);
-                // For containers, there's a close bracket at this position
-                // We need to find the text position and then include the bracket
-                let close_text = self.index.ib_select1_from(close_rank, close_rank / 8)?;
-                close_text + 1 // Include the closing bracket
+                let close_char = if self.text[start] == b'{' { b'}' } else { b']' };
+                let mut depth = 1u32;
+                let mut i = start + 1;
+                while i < self.text.len() {
+                    match self.text[i] {
+                        b'"' => {
+                            // Skip string contents
+                            i += 1;
+                            while i < self.text.len() {
+                                match self.text[i] {
+                                    b'"' => {
+                                        i += 1;
+                                        break;
+                                    }
+                                    b'\\' => i += 2,
+                                    _ => i += 1,
+                                }
+                            }
+                        }
+                        c if c == self.text[start] => {
+                            depth += 1;
+                            i += 1;
+                        }
+                        c if c == close_char => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Some((start, i + 1));
+                            }
+                            i += 1;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                return None;
             }
             // String: scan for closing quote
             b'"' => {
@@ -3050,5 +3077,110 @@ mod tests {
                 offset
             );
         }
+    }
+
+    // === text_range tests for containers (issue #137) ===
+
+    #[test]
+    fn test_text_range_nested_object_value() {
+        let json = br#"{"key": {"key2": "value"}}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        let fields = root.value().as_object().unwrap();
+        let (value, _) = fields.uncons().unwrap();
+        let range = value.value_cursor().text_range().unwrap();
+        assert_eq!(range, (8, 25));
+    }
+
+    #[test]
+    fn test_text_range_empty_object_value() {
+        let json = br#"{"key": {}}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let fields = root.value().as_object().unwrap();
+        let (field, _) = fields.uncons().unwrap();
+        let range = field.value_cursor().text_range().unwrap();
+        assert_eq!(range, (8, 10));
+        assert_eq!(&json[range.0..range.1], b"{}");
+    }
+
+    #[test]
+    fn test_text_range_empty_array_value() {
+        let json = br#"{"list": []}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let fields = root.value().as_object().unwrap();
+        let (field, _) = fields.uncons().unwrap();
+        let range = field.value_cursor().text_range().unwrap();
+        assert_eq!(range, (9, 11));
+        assert_eq!(&json[range.0..range.1], b"[]");
+    }
+
+    #[test]
+    fn test_text_range_array_value() {
+        let json = br#"{"items": [1, 2, 3]}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let fields = root.value().as_object().unwrap();
+        let (field, _) = fields.uncons().unwrap();
+        let range = field.value_cursor().text_range().unwrap();
+        assert_eq!(range, (10, 19));
+        assert_eq!(&json[range.0..range.1], b"[1, 2, 3]");
+    }
+
+    #[test]
+    fn test_text_range_second_field() {
+        let json = br#"{"a": 1, "b": "hello"}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let fields = root.value().as_object().unwrap();
+        let (_, rest) = fields.uncons().unwrap();
+        let (field_b, _) = rest.uncons().unwrap();
+        let range = field_b.value_cursor().text_range().unwrap();
+        assert_eq!(range, (14, 21));
+        assert_eq!(&json[range.0..range.1], br#""hello""#);
+    }
+
+    #[test]
+    fn test_text_range_deeply_nested() {
+        let json = br#"{"a": {"b": {"c": 1}}}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        let fields = root.value().as_object().unwrap();
+        let (field_a, _) = fields.uncons().unwrap();
+        assert_eq!(field_a.value_cursor().text_range().unwrap(), (6, 21));
+        assert_eq!(&json[6..21], br#"{"b": {"c": 1}}"#);
+
+        let fields_b = field_a.value().as_object().unwrap();
+        let (field_b, _) = fields_b.uncons().unwrap();
+        assert_eq!(field_b.value_cursor().text_range().unwrap(), (12, 20));
+        assert_eq!(&json[12..20], br#"{"c": 1}"#);
+
+        let fields_c = field_b.value().as_object().unwrap();
+        let (field_c, _) = fields_c.uncons().unwrap();
+        assert_eq!(field_c.value_cursor().text_range().unwrap(), (18, 19));
+        assert_eq!(&json[18..19], b"1");
+    }
+
+    #[test]
+    fn test_text_range_root_object() {
+        let json = br#"{"a": 1}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let range = root.text_range().unwrap();
+        assert_eq!(range, (0, 8));
+        assert_eq!(&json[range.0..range.1], br#"{"a": 1}"#);
+    }
+
+    #[test]
+    fn test_text_range_root_array() {
+        let json = b"[1, 2, 3]";
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let range = root.text_range().unwrap();
+        assert_eq!(range, (0, 9));
+        assert_eq!(&json[range.0..range.1], b"[1, 2, 3]");
     }
 }
