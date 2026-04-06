@@ -1,6 +1,6 @@
 # End Position Encoding: From Array to Bitmaps
 
-[Home](/) > [Docs](../) > [Optimizations](./) > End Positions
+[Home](../../) > [Docs](../) > [Optimizations](./) > End Positions
 
 This document traces the evolution of the YAML end-position lookup through three
 designs, each reducing memory while keeping query speed competitive. The designs

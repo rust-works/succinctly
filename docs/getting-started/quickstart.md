@@ -1,6 +1,6 @@
 # Quickstart Tutorial
 
-[Home](/) > [Docs](../) > [Getting Started](./) > Quickstart
+[Home](../../) > [Docs](../) > [Getting Started](./) > Quickstart
 
 Get started with succinctly in 5 minutes.
 

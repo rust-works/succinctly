@@ -1,6 +1,6 @@
 # yq Query Language Reference
 
-[Home](/) > [Docs](../) > [Reference](./) > yq Language
+[Home](../../) > [Docs](../) > [Reference](./) > yq Language
 
 ## Overview
 

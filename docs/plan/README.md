@@ -1,6 +1,6 @@
 # Implementation Plans
 
-[Home](/) > [Docs](../) > Plan
+[Home](../../) > [Docs](../) > Plan
 
 This directory contains planning documents for major features that have been **implemented**.
 

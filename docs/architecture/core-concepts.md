@@ -1,6 +1,6 @@
 # Core Concepts
 
-[Home](/) > [Docs](../) > [Architecture](./) > Core Concepts
+[Home](../../) > [Docs](../) > [Architecture](./) > Core Concepts
 
 Introduction to succinct data structures and why they matter.
 

@@ -1,6 +1,6 @@
 # Architecture
 
-[Home](/) > [Docs](../) > Architecture
+[Home](../../) > [Docs](../) > Architecture
 
 Design documentation for succinctly's core data structures and algorithms.
 

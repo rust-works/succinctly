@@ -1,6 +1,6 @@
 # Optimization History
 
-[Home](/) > [Docs](../) > [Optimizations](./) > History
+[Home](../../) > [Docs](../) > [Optimizations](./) > History
 
 This document records all optimization attempts in the succinctly library, showing what worked, what failed, and exact performance measurements.
 

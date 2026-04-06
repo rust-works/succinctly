@@ -1,6 +1,6 @@
 # Prior Art and References
 
-[Home](/) > [Docs](../) > [Architecture](./) > Prior Art
+[Home](../../) > [Docs](../) > [Architecture](./) > Prior Art
 
 This document records the academic papers, prior implementations, and key references that informed succinctly's design.
 

@@ -1,6 +1,6 @@
 # Installation
 
-[Home](/) > [Docs](../) > [Getting Started](./) > Installation
+[Home](../../) > [Docs](../) > [Getting Started](./) > Installation
 
 ## Library Installation
 

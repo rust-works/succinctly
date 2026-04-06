@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-05
+
+### Added
+
+- **JSON Validation**
+  - Strict RFC 8259 JSON validator with CLI command (`succinctly json validate`)
+  - `--validate` flag for `jq` command to enforce strict validation before processing
+  - Comprehensive RFC 8259 compliance test suite
+
+- **Benchmark Infrastructure**
+  - JSON validation benchmark suite with criterion
+  - Criterion extra args support in benchmark runner
+
+### Performance
+
+- **Zero-copy JSON string output**: eliminates allocation for unescaped strings
+- **SIMD-accelerated string escaping**: faster JSON output with vectorized escape detection
+- **Lazy string slicing**: defers string slice operations for reduced allocation
+
+### Fixed
+
+- `popcount_words` return type changed from `u32` to `usize` to prevent overflow on large bitvectors (#139)
+- JSON container range lookup replaced BP-based method with correct linear scan (#138)
+
+### CI
+
+- ARM64 runner added to coverage matrix
+- Separate coverage reports for default, simd, and portable-popcount feature flags
+
 ## [0.6.0] - 2026-02-03
 
 ### Added
@@ -314,7 +343,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Select queries: ~50 ns (O(log n))
 - Popcount: 96.8 GiB/s (AVX-512), 18.5 GiB/s (scalar)
 
-[Unreleased]: https://github.com/rust-works/succinctly/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/rust-works/succinctly/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/rust-works/succinctly/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/rust-works/succinctly/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/rust-works/succinctly/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/rust-works/succinctly/compare/v0.4.0...v0.5.0

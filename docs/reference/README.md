@@ -1,6 +1,6 @@
 # Reference
 
-[Home](/) > [Docs](../) > Reference
+[Home](../../) > [Docs](../) > Reference
 
 Language and feature reference documentation for succinctly.
 

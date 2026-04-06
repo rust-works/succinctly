@@ -1,6 +1,6 @@
 # Guides
 
-[Home](/) > [Docs](../) > Guides
+[Home](../../) > [Docs](../) > Guides
 
 Practical how-to documentation for using and developing succinctly.
 

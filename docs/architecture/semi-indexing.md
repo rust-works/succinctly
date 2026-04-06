@@ -1,6 +1,6 @@
 # Semi-Indexing
 
-[Home](/) > [Docs](../) > [Architecture](./) > Semi-Indexing
+[Home](../../) > [Docs](../) > [Architecture](./) > Semi-Indexing
 
 The semi-indexing approach for JSON, YAML, and DSV parsing.
 

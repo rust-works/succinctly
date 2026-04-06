@@ -1,6 +1,6 @@
 # JSON Validation Benchmarks
 
-[Home](/) > [Docs](../) > [Benchmarks](./) > JSON Validation
+[Home](../../) > [Docs](../) > [Benchmarks](./) > JSON Validation
 
 Performance benchmarks for `succinctly json validate` - strict RFC 8259 JSON validation.
 
