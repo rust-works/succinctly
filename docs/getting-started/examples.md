@@ -1,6 +1,6 @@
 # Examples
 
-[Home](/) > [Docs](../) > [Getting Started](./) > Examples
+[Home](../../) > [Docs](../) > [Getting Started](./) > Examples
 
 Common usage patterns and real-world examples.
 

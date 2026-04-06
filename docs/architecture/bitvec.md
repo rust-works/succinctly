@@ -1,6 +1,6 @@
 # BitVec Design
 
-[Home](/) > [Docs](../) > [Architecture](./) > BitVec
+[Home](../../) > [Docs](../) > [Architecture](./) > BitVec
 
 Design and implementation of the bit vector with rank/select support.
 

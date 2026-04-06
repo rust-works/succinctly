@@ -1,6 +1,6 @@
 # Balanced Parentheses
 
-[Home](/) > [Docs](../) > [Architecture](./) > Balanced Parentheses
+[Home](../../) > [Docs](../) > [Architecture](./) > Balanced Parentheses
 
 Succinct tree representation using balanced parentheses.
 

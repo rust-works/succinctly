@@ -1,6 +1,6 @@
 # jq Query Language Reference
 
-[Home](/) > [Docs](../) > [Reference](./) > jq Language
+[Home](../../) > [Docs](../) > [Reference](./) > jq Language
 
 ## Overview
 

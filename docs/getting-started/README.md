@@ -1,6 +1,6 @@
 # Getting Started with Succinctly
 
-[Home](/) > [Docs](../) > Getting Started
+[Home](../../) > [Docs](../) > Getting Started
 
 Welcome! This guide will get you up and running with succinctly.
 

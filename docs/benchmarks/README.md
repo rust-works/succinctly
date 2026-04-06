@@ -1,6 +1,6 @@
 # Benchmarks
 
-[Home](/) > [Docs](../) > Benchmarks
+[Home](../../) > [Docs](../) > Benchmarks
 
 Performance comparisons between succinctly and other tools.
 

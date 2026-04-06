@@ -1,6 +1,6 @@
 # DSV (CSV/TSV) Benchmarks
 
-[Home](/) > [Docs](../) > [Benchmarks](./) > DSV
+[Home](../../) > [Docs](../) > [Benchmarks](./) > DSV
 
 Performance benchmarks for DSV parsing via `succinctly jq --input-dsv`.
 
