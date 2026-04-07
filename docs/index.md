@@ -17,15 +17,15 @@ graph TD
     DI --> JQ
 ```
 
-| Concept                    | Wiki Page                                | Implementation                            | Architecture Doc                                                   |
-|----------------------------|------------------------------------------|-------------------------------------------|--------------------------------------------------------------------|
-| Bitvector with rank/select | [BitVec](architecture/bitvec.md)                      | [src/bits/](../src/bits/)                 | [architecture/bitvec.md](architecture/bitvec.md)                   |
-| Succinct tree encoding     | [BalancedParens](architecture/balanced-parens.md)     | [src/trees/bp.rs](../src/trees/bp.rs)     | [architecture/balanced-parens.md](architecture/balanced-parens.md) |
-| JSON structural index      | [JsonIndex](parsing/json-index.md)               | [src/json/](../src/json/)                 | [parsing/json.md](parsing/json.md)                                 |
-| YAML structural index      | [YamlIndex](parsing/yaml-index.md)               | [src/yaml/](../src/yaml/)                 | [parsing/yaml.md](parsing/yaml.md)                                 |
-| DSV/CSV structural index   | [DsvIndex](parsing/dsv-index.md)                 | [src/dsv/](../src/dsv/)                   | [parsing/dsv.md](parsing/dsv.md)                                   |
-| Query language             | [jq Evaluator](reference/jq-evaluator.md)          | [src/jq/](../src/jq/)                     | [CLAUDE.md](../CLAUDE.md#jq-format-functions)                      |
-| SIMD acceleration          | [SIMD Strategy](optimizations/simd-strategy.md)        | per-module `simd/` dirs                   | [optimizations/simd.md](optimizations/simd.md)                     |
+| Concept                    | Wiki Page                                             | Implementation                        | Architecture Doc                                                   |
+|----------------------------|-------------------------------------------------------|---------------------------------------|--------------------------------------------------------------------|
+| Bitvector with rank/select | [BitVec](architecture/bitvec.md)                      | [src/bits/](../src/bits/)             | [architecture/bitvec.md](architecture/bitvec.md)                   |
+| Succinct tree encoding     | [BalancedParens](architecture/balanced-parens.md)     | [src/trees/bp.rs](../src/trees/bp.rs) | [architecture/balanced-parens.md](architecture/balanced-parens.md) |
+| JSON structural index      | [JsonIndex](parsing/json-index.md)                    | [src/json/](../src/json/)             | [parsing/json.md](parsing/json.md)                                 |
+| YAML structural index      | [YamlIndex](parsing/yaml-index.md)                    | [src/yaml/](../src/yaml/)             | [parsing/yaml.md](parsing/yaml.md)                                 |
+| DSV/CSV structural index   | [DsvIndex](parsing/dsv-index.md)                      | [src/dsv/](../src/dsv/)               | [parsing/dsv.md](parsing/dsv.md)                                   |
+| Query language             | [jq Evaluator](reference/jq-evaluator.md)             | [src/jq/](../src/jq/)                 | [CLAUDE.md](../CLAUDE.md#jq-format-functions)                      |
+| SIMD acceleration          | [SIMD Strategy](optimizations/simd-strategy.md)       | per-module `simd/` dirs               | [optimizations/simd.md](optimizations/simd.md)                     |
 
 ## How Semi-Indexing Works
 
@@ -42,16 +42,16 @@ This yields 3-6% memory overhead vs 100%+ for DOM parsers. See [architecture/sem
 
 Each core data structure traces back to specific research papers:
 
-| Paper                                                                                                     | Authors                  | Year | Used By                                                    |
-|-----------------------------------------------------------------------------------------------------------|--------------------------|------|------------------------------------------------------------|
-| [Broadword Implementation of Rank/Select Queries](https://vigna.di.unimi.it/ftp/papers/Broadword.pdf)     | Vigna                    | 2008 | [BitVec](architecture/bitvec.md) — broadword algorithms                 |
-| [Space-Efficient, High-Performance Rank & Select](https://www.cs.cmu.edu/~dga/papers/zhou-sea2013.pdf)    | Zhou, Andersen, Kaminsky | 2013 | [BitVec](architecture/bitvec.md) — Poppy 3-level directory              |
-| [Fully-Functional Succinct Trees](https://doi.org/10.1137/1.9781611973075.18)                             | Sadakane & Navarro       | 2010 | [BalancedParens](architecture/balanced-parens.md) — RangeMin navigation |
-| Optimal Succinctness for Parentheses                                                                      | Navarro & Sadakane       | 2014 | [BalancedParens](architecture/balanced-parens.md) — space-optimal BP    |
-| [Parsing Gigabytes of JSON per Second](https://arxiv.org/abs/1902.08318)                                  | Langdale & Lemire        | 2019 | [JsonIndex](parsing/json-index.md) — SIMD structural scanning      |
-| [Data-Parallel Finite-State Machines](https://doi.org/10.1145/2597917.2597946)                            | Mytkowicz et al.         | 2014 | [JsonIndex](parsing/json-index.md) — PFSM parser                   |
-| [Faster Population Counts Using AVX2](https://arxiv.org/abs/1611.07612)                                   | Mula, Kurz, Lemire       | 2016 | [BitVec](architecture/bitvec.md) — Harley-Seal popcount                 |
-| [Semi-Indexing Semi-Structured Data in Tiny Space](https://arxiv.org/abs/1104.4892)                       | Ottaviano et al.         | 2011 | Overall architecture                                       |
+| Paper                                                                                                     | Authors                  | Year | Used By                                                                  |
+|-----------------------------------------------------------------------------------------------------------|--------------------------|------|--------------------------------------------------------------------------|
+| [Broadword Implementation of Rank/Select Queries](https://vigna.di.unimi.it/ftp/papers/Broadword.pdf)     | Vigna                    | 2008 | [BitVec](architecture/bitvec.md) — broadword algorithms                  |
+| [Space-Efficient, High-Performance Rank & Select](https://www.cs.cmu.edu/~dga/papers/zhou-sea2013.pdf)    | Zhou, Andersen, Kaminsky | 2013 | [BitVec](architecture/bitvec.md) — Poppy 3-level directory               |
+| [Fully-Functional Succinct Trees](https://doi.org/10.1137/1.9781611973075.18)                             | Sadakane & Navarro       | 2010 | [BalancedParens](architecture/balanced-parens.md) — RangeMin navigation  |
+| Optimal Succinctness for Parentheses                                                                      | Navarro & Sadakane       | 2014 | [BalancedParens](architecture/balanced-parens.md) — space-optimal BP     |
+| [Parsing Gigabytes of JSON per Second](https://arxiv.org/abs/1902.08318)                                  | Langdale & Lemire        | 2019 | [JsonIndex](parsing/json-index.md) — SIMD structural scanning           |
+| [Data-Parallel Finite-State Machines](https://doi.org/10.1145/2597917.2597946)                            | Mytkowicz et al.         | 2014 | [JsonIndex](parsing/json-index.md) — PFSM parser                        |
+| [Faster Population Counts Using AVX2](https://arxiv.org/abs/1611.07612)                                   | Mula, Kurz, Lemire       | 2016 | [BitVec](architecture/bitvec.md) — Harley-Seal popcount                  |
+| [Semi-Indexing Semi-Structured Data in Tiny Space](https://arxiv.org/abs/1104.4892)                       | Ottaviano et al.         | 2011 | Overall architecture                                                     |
 
 See [architecture/prior-art.md](architecture/prior-art.md) for the complete reference list, including the Haskell-Works heritage, general references (Knuth, Warren, Drepper), and related projects (simdjson, simd-json, sonic-rs).
 

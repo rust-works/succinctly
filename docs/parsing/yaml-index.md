@@ -74,7 +74,7 @@ YAML parsing has an extensive documented optimization history (P0-P12, O1-O3):
 | O1    | +3-13%          | Sequential cursor for AdvancePositions       |
 | O3    | 4-12x micro     | SIMD escape scanning (NEON)                  |
 
-**Rejected** (with documented reasons): P2.6 (prefetching), P2.8 (threshold tuning), P3 (branchless), P5-P8 (various), all documented in [parsing/yaml.md](parsing/yaml.md).
+**Rejected** (with documented reasons): P2.6 (prefetching), P2.8 (threshold tuning), P3 (branchless), P5-P8 (various), all documented in [yaml.md](yaml.md).
 
 Key lesson: micro-benchmark wins frequently don't translate to end-to-end gains. Three consecutive optimizations (P2.6, P2.8, P3) showed micro gains but caused real regressions.
 

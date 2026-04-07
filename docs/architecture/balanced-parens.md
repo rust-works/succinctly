@@ -103,10 +103,10 @@ BP:   ( ( ( ) ( ) ) )
 
 The RangeMin index construction uses SIMD acceleration on supported platforms:
 
-| Platform | Instruction | Speedup | Notes |
-|----------|-------------|---------|-------|
-| ARM64 | NEON VMINV | **2.8x** | Direct signed horizontal minimum |
-| x86_64 | SSE4.1 PHMINPOSUW | **1-3%** (large data) | Requires bias trick for signed values |
+| Platform | Instruction       | Speedup               | Notes                                 |
+|----------|-------------------|-----------------------|---------------------------------------|
+| ARM64    | NEON VMINV        | **2.8x**              | Direct signed horizontal minimum      |
+| x86_64   | SSE4.1 PHMINPOSUW | **1-3%** (large data) | Requires bias trick for signed values |
 
 ARM NEON provides `vminvq_s16` which directly computes the minimum across 8 signed 16-bit values. SSE4.1's `PHMINPOSUW` only handles unsigned values, requiring a bias/unbias workaround that adds overhead.
 
