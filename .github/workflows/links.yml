@@ -42,6 +42,7 @@ jobs:
             --exclude '^https://www\.agner\.org/'
             --exclude '^https://github\.com/rust-works/succinctly/compare/v'
             --exclude '^https://www\.cs\.cmu\.edu/'
+            --exclude '^https://doi\.org/'
             '**/*.md'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
