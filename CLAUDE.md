@@ -18,6 +18,10 @@ Detailed guidance is organized into skills in `.claude/skills/`. Claude will aut
 | **commit-msg**         | "commit message", "amend commit"            | Conventional commits format                |
 | **skill-writing**      | "create skill", "SKILL.md", "write skill"   | Best practices for writing Claude skills   |
 
+## Knowledge Wiki
+
+A structured knowledge base for this codebase lives in `docs/`. Start at [docs/index.md](docs/index.md) for a concept-oriented map of how the data structures, algorithms, SIMD implementations, and benchmarks relate to each other. The wiki pages cross-link to existing architecture docs, parsing docs, source files, and academic papers.
+
 ## AI Scratch Directory
 
 Use `.ai/scratch/` for temporary files (git-ignored):
