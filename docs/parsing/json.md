@@ -368,6 +368,10 @@ succinctly jq-locate file.json --offset 42 --format json
 
 ---
 
+## See Also
+
+- [JsonIndex wiki page](../json-index.md) — concept overview, dependencies, and academic references
+
 ## References
 
 - Langdale, G. & Lemire, D. "Parsing Gigabytes of JSON per Second" (2019)

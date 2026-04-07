@@ -411,6 +411,10 @@ for chunk in data.chunks(64) {
 
 ---
 
+## See Also
+
+- [DsvIndex wiki page](../dsv-index.md) — concept overview, dependencies, and academic references
+
 ## References
 
 - RFC 4180: Common Format and MIME Type for CSV Files
