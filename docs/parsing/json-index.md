@@ -1,6 +1,6 @@
 # JsonIndex
 
-[Knowledge Map](index.md) > JsonIndex
+[Home](../../) > [Docs](../) > [Parsing](./) > JsonIndex
 
 Semi-index for JSON documents. Builds a lightweight structural index (~3-4% overhead) enabling O(1) navigation without constructing a DOM tree.
 
@@ -82,12 +82,12 @@ let name: &str = cursor.as_str();
 
 ## Depends On
 
-- [BitVec](architecture/bitvec.md) — IB and BP are stored as bitvectors with rank/select indices
-- [BalancedParens](architecture/balanced-parens.md) — BP encoding with `find_close` for subtree skipping
+- [BitVec](../architecture/bitvec.md) — IB and BP are stored as bitvectors with rank/select indices
+- [BalancedParens](../architecture/balanced-parens.md) — BP encoding with `find_close` for subtree skipping
 
 ## Used By
 
-- [jq Evaluator](jq-evaluator.md) — evaluates jq expressions against the cursor API
+- [jq Evaluator](../reference/jq-evaluator.md) — evaluates jq expressions against the cursor API
 
 ## Academic Papers
 
@@ -97,7 +97,7 @@ let name: &str = cursor.as_str();
 
 ## Source & Docs
 
-- Implementation: [src/json/](../src/json/) (mod.rs, pfsm_optimized.rs, bit_writer.rs, validate.rs)
-- SIMD variants: [src/json/simd/](../src/json/simd/) (avx2.rs, sse42.rs, neon.rs, bmi2.rs, sve2.rs)
-- Parsing doc: [parsing/json.md](parsing/json.md)
-- Benchmark: [benchmarks/jq.md](benchmarks/jq.md), [benchmarks/rust-parsers.md](benchmarks/rust-parsers.md)
+- Implementation: [src/json/](../../src/json/) (mod.rs, pfsm_optimized.rs, bit_writer.rs, validate.rs)
+- SIMD variants: [src/json/simd/](../../src/json/simd/) (avx2.rs, sse42.rs, neon.rs, bmi2.rs, sve2.rs)
+- Parsing doc: [json.md](json.md)
+- Benchmark: [benchmarks/jq.md](../benchmarks/jq.md), [benchmarks/rust-parsers.md](../benchmarks/rust-parsers.md)

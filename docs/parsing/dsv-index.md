@@ -1,6 +1,6 @@
 # DsvIndex
 
-[Knowledge Map](index.md) > DsvIndex
+[Home](../../) > [Docs](../) > [Parsing](./) > DsvIndex
 
 Semi-index for delimiter-separated value (CSV/TSV) files. Marks field and row boundaries without materializing data, enabling O(1) field lookup with ~3-4% overhead.
 
@@ -50,16 +50,16 @@ DSV indexing throughput (API-level, not end-to-end CLI):
 
 ## Depends On
 
-- [BitVec](architecture/bitvec.md) — marker and newline bitvectors with rank/select
+- [BitVec](../architecture/bitvec.md) — marker and newline bitvectors with rank/select
 
 ## Used By
 
-- [jq Evaluator](jq-evaluator.md) — DSV input via `--input-dsv` flag
+- [jq Evaluator](../reference/jq-evaluator.md) — DSV input via `--input-dsv` flag
 - CLI: `succinctly dsv generate` for test data generation
 
 ## Source & Docs
 
-- Implementation: [src/dsv/](../src/dsv/) (parser.rs, index.rs, index_lightweight.rs, cursor.rs)
-- SIMD: [src/dsv/simd/](../src/dsv/simd/) (avx2.rs, bmi2.rs, sse2.rs, neon.rs, sve2.rs)
-- Parsing doc: [parsing/dsv.md](parsing/dsv.md)
-- Benchmark: [benchmarks/dsv.md](benchmarks/dsv.md)
+- Implementation: [src/dsv/](../../src/dsv/) (parser.rs, index.rs, index_lightweight.rs, cursor.rs)
+- SIMD: [src/dsv/simd/](../../src/dsv/simd/) (avx2.rs, bmi2.rs, sse2.rs, neon.rs, sve2.rs)
+- Parsing doc: [dsv.md](dsv.md)
+- Benchmark: [benchmarks/dsv.md](../benchmarks/dsv.md)

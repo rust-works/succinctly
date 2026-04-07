@@ -94,9 +94,9 @@ Popcount uses platform-specific SIMD:
 ## Used By
 
 - [BalancedParens](balanced-parens.md) — stores its parenthesis sequence as a `BitVec`, uses rank1/select1 for tree navigation
-- [JsonIndex](../json-index.md) — interest bits and BP encoding are both bitvectors
-- [YamlIndex](../yaml-index.md) — same pattern, plus type bits
-- [DsvIndex](../dsv-index.md) — marker and newline bitvectors
+- [JsonIndex](../parsing/json-index.md) — interest bits and BP encoding are both bitvectors
+- [YamlIndex](../parsing/yaml-index.md) — same pattern, plus type bits
+- [DsvIndex](../parsing/dsv-index.md) — marker and newline bitvectors
 
 ## Academic Papers
 

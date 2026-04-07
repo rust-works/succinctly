@@ -4,7 +4,7 @@
 
 Benchmarks comparing `succinctly yq .` (identity filter) vs `yq .` (Mike Farah's yq v4.48.1) for YAML formatting/printing.
 
-**See also**: [YamlIndex wiki page](../yaml-index.md) for architecture overview and academic references | [YAML 1.2 Compliance](../compliance/yaml/1.2.md) for type handling details (Norway problem, booleans, etc.)
+**See also**: [YamlIndex wiki page](../parsing/yaml-index.md) for architecture overview and academic references | [YAML 1.2 Compliance](../compliance/yaml/1.2.md) for type handling details (Norway problem, booleans, etc.)
 
 ## Architectural Differences
 

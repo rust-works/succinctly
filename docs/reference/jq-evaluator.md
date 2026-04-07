@@ -1,6 +1,6 @@
 # jq Evaluator
 
-[Knowledge Map](index.md) > jq Evaluator
+[Home](../../) > [Docs](../) > [Reference](./) > jq Evaluator
 
 A jq-compatible query language implementation that works with succinctly's semi-indexed documents, supporting both JSON and YAML inputs.
 
@@ -64,12 +64,12 @@ The implementation covers a substantial subset of jq:
 
 ## Depends On
 
-- [JsonIndex](json-index.md) — cursor API for JSON documents
-- [YamlIndex](yaml-index.md) — cursor API for YAML documents
-- [DsvIndex](dsv-index.md) — via `--input-dsv` flag
+- [JsonIndex](../parsing/json-index.md) — cursor API for JSON documents
+- [YamlIndex](../parsing/yaml-index.md) — cursor API for YAML documents
+- [DsvIndex](../parsing/dsv-index.md) — via `--input-dsv` flag
 
 ## Source & Docs
 
-- Implementation: [src/jq/](../src/jq/) (parser.rs, expr.rs, eval.rs, eval_generic.rs, value.rs, stream.rs, lazy.rs, document.rs)
-- CLI integration: [src/bin/succinctly/jq_runner.rs](../src/bin/succinctly/jq_runner.rs), [src/bin/succinctly/yq_runner.rs](../src/bin/succinctly/yq_runner.rs)
-- CLI guide: [guides/cli.md](guides/cli.md)
+- Implementation: [src/jq/](../../src/jq/) (parser.rs, expr.rs, eval.rs, eval_generic.rs, value.rs, stream.rs, lazy.rs, document.rs)
+- CLI integration: [src/bin/succinctly/jq_runner.rs](../../src/bin/succinctly/jq_runner.rs), [src/bin/succinctly/yq_runner.rs](../../src/bin/succinctly/yq_runner.rs)
+- CLI guide: [guides/cli.md](../guides/cli.md)

@@ -749,7 +749,7 @@ isolation but cause regression when integrated due to real-world data characteri
 
 ## See Also
 
-- [SIMD Strategy wiki page](../simd-strategy.md) — per-module SIMD usage, platform support, and lessons learned
+- [SIMD Strategy wiki page](simd-strategy.md) — per-module SIMD usage, platform support, and lessons learned
 
 ## References
 

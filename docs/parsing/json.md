@@ -370,7 +370,7 @@ succinctly jq-locate file.json --offset 42 --format json
 
 ## See Also
 
-- [JsonIndex wiki page](../json-index.md) — concept overview, dependencies, and academic references
+- [JsonIndex wiki page](json-index.md) — concept overview, dependencies, and academic references
 
 ## References
 

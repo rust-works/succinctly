@@ -10,6 +10,7 @@ Language and feature reference documentation for succinctly.
 |-----------------------------------|------------------------------------------|
 | [jq Language](jq-language.md)     | jq query language features for JSON      |
 | [yq Language](yq-language.md)     | yq query language features for YAML      |
+| [jq Evaluator](jq-evaluator.md)  | jq evaluator architecture and syntax     |
 
 ## See Also
 

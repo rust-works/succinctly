@@ -14,6 +14,14 @@ Traditional parsers materialize data into memory structures (DOM trees, row arra
 | CSV/TSV | [dsv.md](dsv.md)      | Marker bits + quote state tracking    |
 | YAML    | [yaml.md](yaml.md)    | Feasibility analysis (not implemented)|
 
+### Concept Overviews (Wiki Pages)
+
+| Format  | Document                          | Description                              |
+|---------|-----------------------------------|------------------------------------------|
+| JSON    | [json-index.md](json-index.md)    | JsonIndex concept overview and references |
+| YAML    | [yaml-index.md](yaml-index.md)    | YamlIndex concept overview and references |
+| CSV/TSV | [dsv-index.md](dsv-index.md)      | DsvIndex concept overview and references  |
+
 ---
 
 ## Semi-Indexing Approach

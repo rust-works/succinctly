@@ -20,6 +20,7 @@ This directory documents optimization techniques used in the succinctly library,
 | **Parsing**          | [state-machines.md](state-machines.md)                   | PFSM, fast-path bypass, two-stage pipeline       |
 | **Compact encoding** | [end-positions.md](end-positions.md)                     | Bitmap encoding, advance index, sequential cursor|
 | **Targets**          | [targets.md](targets.md)                                 | CPU target configurations, architecture flags    |
+| **SIMD Strategy**    | [simd-strategy.md](simd-strategy.md)                     | Per-module SIMD usage, platform support, lessons |
 
 ---
 

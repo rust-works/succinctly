@@ -120,9 +120,9 @@ See [SIMD Optimizations](../optimizations/simd.md#x86-sse41-horizontal-minimum-p
 
 ## Used By
 
-- [JsonIndex](../json-index.md) — encodes JSON nesting structure (objects, arrays, values)
-- [YamlIndex](../yaml-index.md) — encodes virtual brackets from indentation
-- [DsvIndex](../dsv-index.md) — encodes row/field structure
+- [JsonIndex](../parsing/json-index.md) — encodes JSON nesting structure (objects, arrays, values)
+- [YamlIndex](../parsing/yaml-index.md) — encodes virtual brackets from indentation
+- [DsvIndex](../parsing/dsv-index.md) — encodes row/field structure
 
 ## Depends On
 

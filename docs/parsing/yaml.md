@@ -4627,7 +4627,7 @@ Key optimizations:
 
 ## See Also
 
-- [YamlIndex wiki page](../yaml-index.md) — concept overview, dependencies, and academic references
+- [YamlIndex wiki page](yaml-index.md) — concept overview, dependencies, and academic references
 
 ## References
 
