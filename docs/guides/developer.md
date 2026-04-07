@@ -1,5 +1,7 @@
 # Developer Guide
 
+[Home](../../) > [Docs](../) > [Guides](./) > Developer Guide
+
 This guide provides detailed information for developers working on succinctly.
 
 ## Architecture Overview

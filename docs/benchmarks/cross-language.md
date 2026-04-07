@@ -1,5 +1,7 @@
 # Cross-Parser JSON Benchmark Results
 
+[Home](../../) > [Docs](../) > [Benchmarks](./) > Cross-Language
+
 Comprehensive benchmarks comparing **succinctly** against other Rust JSON parsers across different input patterns and sizes.
 
 ## Architectural Context

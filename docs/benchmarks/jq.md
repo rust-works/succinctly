@@ -1,5 +1,7 @@
 # jq vs succinctly Comparison Benchmarks
 
+[Home](../../) > [Docs](../) > [Benchmarks](./) > jq
+
 Comprehensive benchmarks comparing `succinctly jq .` vs `jq .` for JSON formatting/printing.
 
 Results are provided for both ARM (Apple M1 Max) and x86_64 (AMD Zen 4) platforms.

@@ -1,5 +1,7 @@
 # Branchless Programming
 
+[Home](../../) > [Docs](../) > [Optimizations](./) > Branchless
+
 Modern CPUs use branch prediction to speculatively execute code before knowing which path will be taken. Mispredicted branches cause pipeline flushes costing 10-20 cycles. Branchless code eliminates this penalty for unpredictable branches.
 
 ## Overview

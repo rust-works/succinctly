@@ -1,5 +1,7 @@
 # YAML Succinct Parsing: Buffer Layout
 
+[Home](../../) > [Docs](../) > [Parsing](./) > YAML Succinct
+
 This document traces through a small YAML example to show what each buffer
 in `YamlIndex` and `AdvancePositions` contains and why it exists.
 

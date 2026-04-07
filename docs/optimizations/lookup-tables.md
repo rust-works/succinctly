@@ -1,5 +1,7 @@
 # Lookup Table Techniques
 
+[Home](../../) > [Docs](../) > [Optimizations](./) > Lookup Tables
+
 Lookup tables trade memory for computation, replacing complex calculations with simple array indexing. This technique is particularly effective when the input domain is small and bounded.
 
 ## Overview

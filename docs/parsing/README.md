@@ -1,5 +1,7 @@
 # Parsing Documentation
 
+[Home](../../) > [Docs](../) > Parsing
+
 This directory documents how the succinctly library parses structured data formats using semi-indexing techniques.
 
 ## Overview
@@ -81,6 +83,7 @@ Both parsers share optimization techniques:
 - [JSON Parsing](json.md) - Semi-index structure, PFSM, SIMD classification
 - [DSV Parsing](dsv.md) - Quote handling, PDEP carry propagation, lightweight index
 - [YAML Analysis](yaml.md) - Feasibility study, ambiguity analysis, oracle model
+- [YAML Succinct Buffer Layout](yaml-succinct.md) - Buffer layout walkthrough for YamlIndex
 
 ### Optimisation Techniques
 

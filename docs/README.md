@@ -49,6 +49,7 @@ Learn the basics:
 **Understanding internals**:
 - [Architecture](architecture/) - Design decisions and core concepts
 - [Parsing Implementation](parsing/) - JSON/YAML/DSV parser internals
+- [Reference](reference/) - jq and yq language documentation
 - [Implementation Plans](plan/) - Feature planning documents
 
 ### AI-Assisted Development

@@ -1,5 +1,7 @@
 # YAML Parsing: Feasibility Analysis
 
+[Home](../../) > [Docs](../) > [Parsing](./) > YAML
+
 This document investigates whether succinctly's semi-indexing techniques can be applied to YAML parsing.
 
 **Related**: [YAML 1.2 Compliance](../compliance/yaml/1.2.md) - type handling, Norway problem, boolean recognition

@@ -1,5 +1,7 @@
 # Hierarchical Data Structures
 
+[Home](../../) > [Docs](../) > [Optimizations](./) > Hierarchical Structures
+
 Hierarchical structures enable O(1) or O(log n) queries by organizing auxiliary data at multiple granularity levels. This technique trades space for query time.
 
 ## Overview

@@ -1,5 +1,7 @@
 # User Guide
 
+[Home](../../) > [Docs](../) > [Guides](./) > API
+
 This guide covers how to use succinctly in your Rust projects.
 
 ## Installation

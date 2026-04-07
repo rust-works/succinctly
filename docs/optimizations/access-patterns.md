@@ -1,5 +1,7 @@
 # Access Pattern Optimisation
 
+[Home](../../) > [Docs](../) > [Optimizations](./) > Access Patterns
+
 The pattern of memory access significantly impacts performance. Sequential access can achieve 50+ GB/s while random access may only achieve 1-2 GB/s due to cache misses.
 
 ## Overview

@@ -1,5 +1,7 @@
 # JSON Parsing
 
+[Home](../../) > [Docs](../) > [Parsing](./) > JSON
+
 This document describes how the succinctly library parses and indexes JSON documents using semi-indexing techniques.
 
 ## Overview

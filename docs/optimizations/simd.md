@@ -1,5 +1,7 @@
 # SIMD (Single Instruction, Multiple Data)
 
+[Home](../../) > [Docs](../) > [Optimizations](./) > SIMD
+
 SIMD enables parallel processing of multiple data elements with a single instruction. Modern CPUs provide various SIMD extensions with different vector widths and capabilities.
 
 ## Overview
