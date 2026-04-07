@@ -14,8 +14,8 @@ Tracks updates to the knowledge wiki pages in `docs/`.
 
 **Pages created:**
 - [index.md](index.md) — Knowledge map entry point with concept graph, paper references, cross-links
-- [bitvec.md](bitvec.md) — BitVec rank/select, Poppy structure, SIMD popcount
-- [balanced-parens.md](balanced-parens.md) — BP tree encoding, RangeMin, generic SelectSupport
+- [bitvec.md](architecture/bitvec.md) — BitVec rank/select, Poppy structure, SIMD popcount
+- [balanced-parens.md](architecture/balanced-parens.md) — BP tree encoding, RangeMin, generic SelectSupport
 - [json-index.md](json-index.md) — JSON semi-indexing, PFSM, SIMD classification pipeline
 - [yaml-index.md](yaml-index.md) — YAML oracle parser, virtual brackets, P0-P12/O1-O3 optimization history
 - [dsv-index.md](dsv-index.md) — DSV quote handling, prefix XOR, BMI2 toggle

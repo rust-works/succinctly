@@ -9,7 +9,7 @@ Semi-index for YAML documents. Converts indentation-based structure into balance
 YAML's context-sensitive grammar (indentation, multiple scalar styles, anchors/aliases) makes it significantly harder to semi-index than JSON. Succinctly uses a two-phase approach:
 
 1. **Oracle phase** — a sequential parser that tracks indentation and resolves character ambiguity, emitting virtual brackets
-2. **Index phase** — the virtual brackets become a [BalancedParens](balanced-parens.md) encoding, just like JSON
+2. **Index phase** — the virtual brackets become a [BalancedParens](architecture/balanced-parens.md) encoding, just like JSON
 
 After building, the same cursor API provides O(1) navigation.
 
@@ -86,8 +86,8 @@ Key lesson: micro-benchmark wins frequently don't translate to end-to-end gains.
 
 ## Depends On
 
-- [BitVec](bitvec.md) — all bit vectors use rank/select
-- [BalancedParens](balanced-parens.md) — with `WithSelect` generic parameter
+- [BitVec](architecture/bitvec.md) — all bit vectors use rank/select
+- [BalancedParens](architecture/balanced-parens.md) — with `WithSelect` generic parameter
 
 ## Used By
 

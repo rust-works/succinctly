@@ -112,6 +112,32 @@ ARM NEON provides `vminvq_s16` which directly computes the minimum across 8 sign
 
 See [SIMD Optimizations](../optimizations/simd.md#x86-sse41-horizontal-minimum-phminposuw) for implementation details.
 
+### Generic Select Support
+
+`BalancedParens<W, S>` is generic over select support:
+- `NoSelect` (ZST) — used by JSON, zero overhead
+- `WithSelect` — used by YAML for `at_offset`/`yq-locate`, enables O(1) sampled select1
+
+## Used By
+
+- [JsonIndex](../json-index.md) — encodes JSON nesting structure (objects, arrays, values)
+- [YamlIndex](../yaml-index.md) — encodes virtual brackets from indentation
+- [DsvIndex](../dsv-index.md) — encodes row/field structure
+
+## Depends On
+
+- [BitVec](bitvec.md) — the parenthesis sequence and RangeMin index are stored as bitvectors
+
+## Academic Papers
+
+- Sadakane & Navarro 2010 — fully-functional succinct trees, RangeMin for O(1) navigation
+- Navarro & Sadakane 2014 — space-optimal BP representation
+
+## Source & Docs
+
+- Implementation: [src/trees/bp.rs](../../src/trees/bp.rs)
+- Optimization: [optimizations/hierarchical-structures.md](../optimizations/hierarchical-structures.md)
+
 ## See Also
 
 - [Core Concepts](core-concepts.md) - Theory background

@@ -50,7 +50,7 @@ DSV indexing throughput (API-level, not end-to-end CLI):
 
 ## Depends On
 
-- [BitVec](bitvec.md) — marker and newline bitvectors with rank/select
+- [BitVec](architecture/bitvec.md) — marker and newline bitvectors with rank/select
 
 ## Used By
 

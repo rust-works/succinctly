@@ -82,8 +82,8 @@ let name: &str = cursor.as_str();
 
 ## Depends On
 
-- [BitVec](bitvec.md) — IB and BP are stored as bitvectors with rank/select indices
-- [BalancedParens](balanced-parens.md) — BP encoding with `find_close` for subtree skipping
+- [BitVec](architecture/bitvec.md) — IB and BP are stored as bitvectors with rank/select indices
+- [BalancedParens](architecture/balanced-parens.md) — BP encoding with `find_close` for subtree skipping
 
 ## Used By
 

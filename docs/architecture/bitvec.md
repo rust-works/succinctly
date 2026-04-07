@@ -91,6 +91,24 @@ Popcount uses platform-specific SIMD:
 - ARM64: NEON `vcnt` + horizontal add
 - Fallback: Lookup table
 
+## Used By
+
+- [BalancedParens](balanced-parens.md) — stores its parenthesis sequence as a `BitVec`, uses rank1/select1 for tree navigation
+- [JsonIndex](../json-index.md) — interest bits and BP encoding are both bitvectors
+- [YamlIndex](../yaml-index.md) — same pattern, plus type bits
+- [DsvIndex](../dsv-index.md) — marker and newline bitvectors
+
+## Academic Papers
+
+- [Vigna 2008](https://vigna.di.unimi.it/ftp/papers/Broadword.pdf) — broadword rank/select algorithms
+- [Zhou, Andersen, Kaminsky 2013](https://www.cs.cmu.edu/~dga/papers/zhou-sea2013.pdf) — Poppy structure (3-level directory)
+- [Mula, Kurz, Lemire 2016](https://arxiv.org/abs/1611.07612) — Harley-Seal popcount with AVX2
+
+## Source & Docs
+
+- Implementation: [src/bits/](../../src/bits/) (bitvec.rs, rank.rs, select.rs, popcount.rs)
+- Optimization techniques: [optimizations/bit-manipulation.md](../optimizations/bit-manipulation.md)
+
 ## See Also
 
 - [Core Concepts](core-concepts.md) - Rank/select theory
