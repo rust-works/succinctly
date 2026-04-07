@@ -95,6 +95,15 @@ The project documents both successes and failures in optimization:
 
 Key lesson: Micro-benchmark wins often don't translate to end-to-end improvements. Three consecutive YAML optimizations (P2.6, P2.8, P3) showed micro-benchmark gains but caused real-world regressions.
 
+## Maintaining the Knowledge Map
+
+Maintenance procedures are codified in the `knowledge-map` skill (`.claude/skills/knowledge-map/SKILL.md`), which Claude auto-invokes when updating wiki pages. The key rules:
+
+- Every concept page follows a consistent structure: breadcrumb, What It Does, How It Works, Depends On, Used By, Academic Papers, Source & Docs
+- Depends On / Used By links must be bidirectional
+- Tables use fixed-width columns
+- Changes are logged in [log.md](log.md)
+
 ## Ingestion Log
 
 See [log.md](log.md) for a record of wiki updates.
