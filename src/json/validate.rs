@@ -1,8 +1,9 @@
 //! Strict JSON validator according to RFC 8259.
 //!
-//! This module provides a fast, scalar JSON validator that performs strict
-//! validation according to RFC 8259. Unlike the semi-indexing parser, this
-//! validator checks all aspects of JSON validity including:
+//! This module provides a fast JSON validator that performs strict
+//! validation according to RFC 8259. On x86_64, SIMD acceleration (AVX2/SSE2)
+//! is used to scan strings for escape characters. Unlike the semi-indexing
+//! parser, this validator checks all aspects of JSON validity including:
 //!
 //! - Structural syntax (braces, brackets, colons, commas)
 //! - String escape sequences (including surrogate pairs)
@@ -28,6 +29,11 @@
 use alloc::string::String;
 
 use core::fmt;
+
+// SIMD-accelerated string scanning for x86_64
+#[cfg(target_arch = "x86_64")]
+#[path = "validate_simd.rs"]
+mod simd;
 
 /// Position information for error reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +153,8 @@ impl std::error::Error for ValidationError {}
 /// A strict JSON validator with position tracking.
 ///
 /// Uses recursive descent parsing to validate JSON according to RFC 8259.
+/// On x86_64, SIMD acceleration is used for chunked string validation
+/// (combined UTF-8 + terminator scanning with AVX2/SSE2).
 pub struct Validator<'a> {
     input: &'a [u8],
     offset: usize,
@@ -170,6 +178,38 @@ impl<'a> Validator<'a> {
     /// Returns `Ok(())` if the input is valid JSON, or an error with position
     /// information if validation fails.
     pub fn validate(&mut self) -> Result<(), ValidationError> {
+        // Create SIMD constants once at document start
+        #[cfg(target_arch = "x86_64")]
+        let simd_constants = unsafe { simd::SimdConstants::new() };
+
+        // Validate entire document as UTF-8 upfront (more efficient than per-string)
+        #[cfg(target_arch = "x86_64")]
+        if let Err(offset) = simd::validate_utf8_document(self.input, &simd_constants) {
+            // Find line/column for the error offset
+            let (line, column) = self.offset_to_position(offset);
+            return Err(ValidationError {
+                kind: ValidationErrorKind::InvalidUtf8,
+                position: Position {
+                    offset,
+                    line,
+                    column,
+                },
+            });
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        if let Err(offset) = simd::validate_utf8_document(self.input) {
+            let (line, column) = self.offset_to_position(offset);
+            return Err(ValidationError {
+                kind: ValidationErrorKind::InvalidUtf8,
+                position: Position {
+                    offset,
+                    line,
+                    column,
+                },
+            });
+        }
+
         self.skip_whitespace();
 
         if self.is_eof() {
@@ -178,7 +218,11 @@ impl<'a> Validator<'a> {
             }));
         }
 
+        #[cfg(target_arch = "x86_64")]
+        self.validate_value(&simd_constants)?;
+        #[cfg(not(target_arch = "x86_64"))]
         self.validate_value()?;
+
         self.skip_whitespace();
 
         if !self.is_eof() {
@@ -188,7 +232,55 @@ impl<'a> Validator<'a> {
         Ok(())
     }
 
+    /// Convert byte offset to line/column position.
+    fn offset_to_position(&self, target_offset: usize) -> (usize, usize) {
+        let mut line = 1;
+        let mut column = 1;
+        for (i, &b) in self.input.iter().enumerate() {
+            if i >= target_offset {
+                break;
+            }
+            if b == b'\n' {
+                line += 1;
+                column = 1;
+            } else if b == b'\r' {
+                // Handle CRLF
+                if self.input.get(i + 1) != Some(&b'\n') {
+                    line += 1;
+                    column = 1;
+                }
+            } else {
+                column += 1;
+            }
+        }
+        (line, column)
+    }
+
     /// Validate a JSON value (object, array, string, number, or keyword).
+    #[cfg(target_arch = "x86_64")]
+    fn validate_value(
+        &mut self,
+        simd_constants: &simd::SimdConstants,
+    ) -> Result<(), ValidationError> {
+        match self.peek() {
+            Some(b'{') => self.validate_object(simd_constants),
+            Some(b'[') => self.validate_array(simd_constants),
+            Some(b'"') => self.validate_string(simd_constants),
+            Some(b'-') | Some(b'0'..=b'9') => self.validate_number(),
+            Some(b't') | Some(b'f') | Some(b'n') => self.validate_keyword(),
+            Some(b'+') => Err(self.error(ValidationErrorKind::LeadingPlus)),
+            Some(c) => Err(self.error(ValidationErrorKind::UnexpectedCharacter {
+                expected: "JSON value",
+                found: c as char,
+            })),
+            None => Err(self.error(ValidationErrorKind::UnexpectedEof {
+                expected: "JSON value",
+            })),
+        }
+    }
+
+    /// Validate a JSON value (object, array, string, number, or keyword).
+    #[cfg(not(target_arch = "x86_64"))]
     fn validate_value(&mut self) -> Result<(), ValidationError> {
         match self.peek() {
             Some(b'{') => self.validate_object(),
@@ -208,6 +300,79 @@ impl<'a> Validator<'a> {
     }
 
     /// Validate a JSON object.
+    #[cfg(target_arch = "x86_64")]
+    fn validate_object(
+        &mut self,
+        simd_constants: &simd::SimdConstants,
+    ) -> Result<(), ValidationError> {
+        self.advance(); // consume '{'
+        self.skip_whitespace();
+
+        // Empty object
+        if self.peek() == Some(b'}') {
+            self.advance();
+            return Ok(());
+        }
+
+        loop {
+            // Expect string key
+            if self.peek() != Some(b'"') {
+                return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
+                    expected: "string key",
+                    found: self.peek().map(|b| b as char).unwrap_or('\0'),
+                }));
+            }
+            self.validate_string(simd_constants)?;
+            self.skip_whitespace();
+
+            // Expect colon
+            if self.peek() != Some(b':') {
+                return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
+                    expected: "':'",
+                    found: self.peek().map(|b| b as char).unwrap_or('\0'),
+                }));
+            }
+            self.advance();
+            self.skip_whitespace();
+
+            // Expect value
+            self.validate_value(simd_constants)?;
+            self.skip_whitespace();
+
+            // Expect comma or closing brace
+            match self.peek() {
+                Some(b',') => {
+                    self.advance();
+                    self.skip_whitespace();
+                    // Check for trailing comma
+                    if self.peek() == Some(b'}') {
+                        return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
+                            expected: "string key",
+                            found: '}',
+                        }));
+                    }
+                }
+                Some(b'}') => {
+                    self.advance();
+                    return Ok(());
+                }
+                Some(c) => {
+                    return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
+                        expected: "',' or '}'",
+                        found: c as char,
+                    }));
+                }
+                None => {
+                    return Err(self.error(ValidationErrorKind::UnexpectedEof {
+                        expected: "',' or '}'",
+                    }));
+                }
+            }
+        }
+    }
+
+    /// Validate a JSON object.
+    #[cfg(not(target_arch = "x86_64"))]
     fn validate_object(&mut self) -> Result<(), ValidationError> {
         self.advance(); // consume '{'
         self.skip_whitespace();
@@ -276,6 +441,57 @@ impl<'a> Validator<'a> {
     }
 
     /// Validate a JSON array.
+    #[cfg(target_arch = "x86_64")]
+    fn validate_array(
+        &mut self,
+        simd_constants: &simd::SimdConstants,
+    ) -> Result<(), ValidationError> {
+        self.advance(); // consume '['
+        self.skip_whitespace();
+
+        // Empty array
+        if self.peek() == Some(b']') {
+            self.advance();
+            return Ok(());
+        }
+
+        loop {
+            self.validate_value(simd_constants)?;
+            self.skip_whitespace();
+
+            match self.peek() {
+                Some(b',') => {
+                    self.advance();
+                    self.skip_whitespace();
+                    // Check for trailing comma
+                    if self.peek() == Some(b']') {
+                        return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
+                            expected: "JSON value",
+                            found: ']',
+                        }));
+                    }
+                }
+                Some(b']') => {
+                    self.advance();
+                    return Ok(());
+                }
+                Some(c) => {
+                    return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
+                        expected: "',' or ']'",
+                        found: c as char,
+                    }));
+                }
+                None => {
+                    return Err(self.error(ValidationErrorKind::UnexpectedEof {
+                        expected: "',' or ']'",
+                    }));
+                }
+            }
+        }
+    }
+
+    /// Validate a JSON array.
+    #[cfg(not(target_arch = "x86_64"))]
     fn validate_array(&mut self) -> Result<(), ValidationError> {
         self.advance(); // consume '['
         self.skip_whitespace();
@@ -322,6 +538,127 @@ impl<'a> Validator<'a> {
     }
 
     /// Validate a JSON string.
+    ///
+    /// UTF-8 is validated for the entire document upfront, so string validation
+    /// only needs to scan for terminators (quote, backslash, control chars).
+    ///
+    /// Flow per chunk:
+    /// 1. SIMD scans for control chars, quotes, and backslashes
+    /// 2. Check for control character errors
+    /// 3. Process escapes up to quote position
+    /// 4. If quote found, string ends; otherwise advance to next chunk
+    #[cfg(target_arch = "x86_64")]
+    fn validate_string(
+        &mut self,
+        simd_constants: &simd::SimdConstants,
+    ) -> Result<(), ValidationError> {
+        self.advance(); // consume opening quote
+
+        loop {
+            // Check for enough bytes for SIMD processing
+            if self.input.len() - self.offset >= 64 {
+                let chunk_start = self.offset;
+
+                // SIMD path: scan for terminators only (UTF-8 already validated)
+                let result = simd::scan_string_chunk(self.input, self.offset, simd_constants);
+
+                // Fast path: no backslashes in chunk at all
+                if result.backslash_mask == 0 {
+                    let first_quote = result.quote_mask.trailing_zeros() as usize;
+                    // Check control char before quote
+                    if result.first_control_char < first_quote {
+                        self.offset += result.first_control_char;
+                        self.column += result.first_control_char;
+                        let byte = self.input[self.offset];
+                        return Err(self.error(ValidationErrorKind::ControlCharacter { byte }));
+                    }
+                    if first_quote < 64 {
+                        // Quote is the terminator
+                        self.offset += first_quote + 1;
+                        self.column += first_quote + 1;
+                        return Ok(());
+                    } else {
+                        // No terminator - advance whole chunk
+                        self.offset += 64;
+                        self.column += 64;
+                        continue;
+                    }
+                }
+
+                // Backslash path: process terminators (quotes/backslashes) in order
+                loop {
+                    let current_pos = self.offset - chunk_start;
+                    if current_pos >= 64 {
+                        break;
+                    }
+
+                    // Find next quote and backslash from current position
+                    let pos_mask = !((1u64 << current_pos) - 1);
+                    let next_quote = (result.quote_mask & pos_mask).trailing_zeros() as usize;
+                    let next_bs = (result.backslash_mask & pos_mask).trailing_zeros() as usize;
+                    let next_terminator = next_quote.min(next_bs);
+
+                    // Check for control char before next terminator
+                    if result.first_control_char >= current_pos
+                        && result.first_control_char < next_terminator
+                    {
+                        self.offset += result.first_control_char - current_pos;
+                        self.column += result.first_control_char - current_pos;
+                        let byte = self.input[self.offset];
+                        return Err(self.error(ValidationErrorKind::ControlCharacter { byte }));
+                    }
+
+                    if next_terminator >= 64 {
+                        // No more terminators - advance to end of chunk
+                        let advance = 64 - current_pos;
+                        self.offset += advance;
+                        self.column += advance;
+                        break;
+                    }
+
+                    // Advance to terminator
+                    let advance = next_terminator - current_pos;
+                    self.offset += advance;
+                    self.column += advance;
+
+                    if next_quote <= next_bs {
+                        // Quote comes first - string ends
+                        self.advance();
+                        return Ok(());
+                    } else {
+                        // Backslash comes first - validate the escape sequence
+                        self.validate_escape()?;
+                    }
+                }
+            } else {
+                // Scalar path for remaining bytes (< 64)
+                // UTF-8 already validated, just scan for terminators
+                match self.peek() {
+                    Some(b'"') => {
+                        self.advance();
+                        return Ok(());
+                    }
+                    Some(b'\\') => {
+                        self.validate_escape()?;
+                    }
+                    Some(b) if b < 0x20 => {
+                        return Err(self.error(ValidationErrorKind::ControlCharacter { byte: b }));
+                    }
+                    Some(_) => {
+                        // UTF-8 already validated, just advance
+                        self.advance();
+                    }
+                    None => {
+                        return Err(self.error(ValidationErrorKind::UnclosedString));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Validate a JSON string (non-x86_64 version).
+    /// UTF-8 is validated for the entire document upfront.
+    #[cfg(not(target_arch = "x86_64"))]
     fn validate_string(&mut self) -> Result<(), ValidationError> {
         self.advance(); // consume opening quote
 
@@ -338,83 +675,14 @@ impl<'a> Validator<'a> {
                     return Err(self.error(ValidationErrorKind::ControlCharacter { byte: b }));
                 }
                 Some(_) => {
-                    // Validate UTF-8 sequence
-                    self.validate_utf8_char()?;
+                    // UTF-8 already validated, just advance
+                    self.advance();
                 }
                 None => {
                     return Err(self.error(ValidationErrorKind::UnclosedString));
                 }
             }
         }
-    }
-
-    /// Validate a single UTF-8 character (may be multi-byte).
-    fn validate_utf8_char(&mut self) -> Result<(), ValidationError> {
-        let b = self.peek().unwrap();
-
-        // Single byte ASCII (0x00-0x7F)
-        if b < 0x80 {
-            self.advance();
-            return Ok(());
-        }
-
-        // Determine expected length and validate leading byte
-        let (len, min_cp, max_cp) = if b & 0xE0 == 0xC0 {
-            (2, 0x80u32, 0x7FFu32)
-        } else if b & 0xF0 == 0xE0 {
-            (3, 0x800u32, 0xFFFFu32)
-        } else if b & 0xF8 == 0xF0 {
-            (4, 0x10000u32, 0x10FFFFu32)
-        } else {
-            return Err(self.error(ValidationErrorKind::InvalidUtf8));
-        };
-
-        // Check we have enough bytes
-        if self.offset + len > self.input.len() {
-            return Err(self.error(ValidationErrorKind::InvalidUtf8));
-        }
-
-        // Validate continuation bytes
-        for i in 1..len {
-            let cont = self.input[self.offset + i];
-            if cont & 0xC0 != 0x80 {
-                return Err(self.error(ValidationErrorKind::InvalidUtf8));
-            }
-        }
-
-        // Decode and validate codepoint
-        let cp = match len {
-            2 => ((b as u32 & 0x1F) << 6) | (self.input[self.offset + 1] as u32 & 0x3F),
-            3 => {
-                ((b as u32 & 0x0F) << 12)
-                    | ((self.input[self.offset + 1] as u32 & 0x3F) << 6)
-                    | (self.input[self.offset + 2] as u32 & 0x3F)
-            }
-            4 => {
-                ((b as u32 & 0x07) << 18)
-                    | ((self.input[self.offset + 1] as u32 & 0x3F) << 12)
-                    | ((self.input[self.offset + 2] as u32 & 0x3F) << 6)
-                    | (self.input[self.offset + 3] as u32 & 0x3F)
-            }
-            _ => unreachable!(),
-        };
-
-        // Check for overlong encoding
-        if cp < min_cp || cp > max_cp {
-            return Err(self.error(ValidationErrorKind::InvalidUtf8));
-        }
-
-        // Check for surrogate codepoints (invalid in UTF-8)
-        if (0xD800..=0xDFFF).contains(&cp) {
-            return Err(self.error(ValidationErrorKind::InvalidUtf8));
-        }
-
-        // Advance past all bytes
-        for _ in 0..len {
-            self.advance();
-        }
-
-        Ok(())
     }
 
     /// Validate an escape sequence.
@@ -1322,5 +1590,105 @@ mod tests {
         }
         s.push('"');
         assert!(validate(s.as_bytes()).is_ok());
+    }
+
+    // ========================================================================
+    // SIMD optimization tests - validates the simd_validated_to fast path
+    // ========================================================================
+
+    #[test]
+    fn test_simd_validated_region_with_escapes() {
+        // This tests the optimization where SIMD validates a full 64-byte chunk
+        // but finds an escape early. After the escape, we should skip re-validating
+        // the bytes that SIMD already checked.
+        //
+        // Pattern: 10 chars + escape + remaining chars (total > 64)
+        // The escape at position 10 triggers scalar handling, but bytes 12-63
+        // are already validated and should use the fast path.
+        let padding = "abcdefghij"; // 10 chars before escape
+        let after_escape = "x".repeat(60); // 60 chars after escape, total 72+ bytes
+        let json = format!(r#""{}\n{}""#, padding, after_escape);
+        assert!(
+            validate(json.as_bytes()).is_ok(),
+            "String with escape followed by long content should be valid"
+        );
+    }
+
+    #[test]
+    fn test_simd_multiple_escapes_in_chunk() {
+        // Multiple escapes within a 64-byte chunk, each triggering the fast path
+        // for the bytes between them
+        let json = r#""abc\ndef\nghi\njkl\nmno\npqr\nstu\nvwx\nyz0123456789""#;
+        assert!(
+            validate(json.as_bytes()).is_ok(),
+            "String with multiple escapes should be valid"
+        );
+    }
+
+    #[test]
+    fn test_simd_escape_near_chunk_boundary() {
+        // Escape near the 64-byte boundary tests edge cases in simd_validated_to tracking
+        let padding = "a".repeat(62); // 62 chars + 2 char escape = 64 exactly
+        let json = format!(r#""{}\n""#, padding);
+        assert!(
+            validate(json.as_bytes()).is_ok(),
+            "Escape at chunk boundary should be valid"
+        );
+    }
+
+    #[test]
+    fn test_simd_long_string_with_periodic_escapes() {
+        // Long string with escapes every ~20 chars tests sustained fast path usage
+        let mut s = String::from("\"");
+        for i in 0..20 {
+            s.push_str(&"a".repeat(18));
+            s.push_str("\\n");
+            if i < 19 {
+                // Don't add more content after last escape
+            }
+        }
+        s.push('"');
+        assert!(
+            validate(s.as_bytes()).is_ok(),
+            "Long string with periodic escapes should be valid"
+        );
+    }
+
+    #[test]
+    fn test_simd_validated_region_with_utf8() {
+        // UTF-8 content after an escape should still be handled correctly
+        // even when using the simd_validated_to fast path
+        let padding = "hello";
+        let utf8_content = "日本語テスト"; // Japanese text
+        let more_padding = "a".repeat(40);
+        let json = format!(r#""{}\n{}{}""#, padding, utf8_content, more_padding);
+        assert!(
+            validate(json.as_bytes()).is_ok(),
+            "UTF-8 after escape in validated region should be valid"
+        );
+    }
+
+    #[test]
+    fn test_simd_control_char_in_validated_region() {
+        // Control character in the SIMD-validated region should still be caught
+        let mut bytes = Vec::new();
+        bytes.push(b'"');
+        bytes.extend_from_slice(b"hello\\n"); // 7 bytes
+        bytes.extend_from_slice(&[b'a'; 20]); // 20 more = 27 total
+        bytes.push(0x01); // Control char at position 28 (in validated region)
+        bytes.extend_from_slice(&[b'a'; 30]); // Fill rest of chunk
+        bytes.push(b'"');
+
+        let result = validate(&bytes);
+        assert!(
+            result.is_err(),
+            "Control char in validated region should be caught"
+        );
+        if let Err(e) = result {
+            assert!(
+                matches!(e.kind, ValidationErrorKind::ControlCharacter { byte: 0x01 }),
+                "Should report control character error"
+            );
+        }
     }
 }
