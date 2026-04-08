@@ -896,10 +896,9 @@ unsafe fn find_json_escape_avx2(input: &[u8], start: usize) -> Option<usize> {
     }
 
     // Handle remaining bytes (< 16) with scalar
-    for i in offset..data_len {
-        let b = data[i];
+    for (i, &b) in data[offset..].iter().enumerate() {
         if b == b'"' || b == b'\\' || b < 0x20 {
-            return Some(i);
+            return Some(offset + i);
         }
     }
 
@@ -941,10 +940,9 @@ unsafe fn find_json_escape_sse2(input: &[u8], start: usize) -> Option<usize> {
     }
 
     // Handle remaining bytes with scalar
-    for i in offset..data_len {
-        let b = data[i];
+    for (i, &b) in data[offset..].iter().enumerate() {
         if b == b'"' || b == b'\\' || b < 0x20 {
-            return Some(i);
+            return Some(offset + i);
         }
     }
 
