@@ -13,6 +13,7 @@ pub enum BenchmarkCategory {
     Json,
     Yaml,
     Dsv,
+    Text,
     CrossParser,
 }
 
@@ -23,6 +24,7 @@ impl fmt::Display for BenchmarkCategory {
             Self::Json => write!(f, "json"),
             Self::Yaml => write!(f, "yaml"),
             Self::Dsv => write!(f, "dsv"),
+            Self::Text => write!(f, "text"),
             Self::CrossParser => write!(f, "cross-parser"),
         }
     }
@@ -37,9 +39,10 @@ impl std::str::FromStr for BenchmarkCategory {
             "json" => Ok(Self::Json),
             "yaml" => Ok(Self::Yaml),
             "dsv" => Ok(Self::Dsv),
+            "text" => Ok(Self::Text),
             "cross-parser" | "crossparser" | "cross_parser" => Ok(Self::CrossParser),
             _ => Err(format!(
-                "unknown category '{}', expected: core, json, yaml, dsv, cross-parser",
+                "unknown category '{}', expected: core, json, yaml, dsv, text, cross-parser",
                 s
             )),
         }
@@ -309,6 +312,25 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         cli_subcommand: Some("dsv"),
         working_dir: ".",
     },
+    // ========== TEXT ==========
+    BenchmarkInfo {
+        name: "utf8_validate_bench",
+        description: "UTF-8 validation throughput (Criterion)",
+        category: BenchmarkCategory::Text,
+        bench_type: BenchmarkType::Criterion,
+        criterion_name: Some("utf8_validate_bench"),
+        cli_subcommand: None,
+        working_dir: ".",
+    },
+    BenchmarkInfo {
+        name: "utf8_bench",
+        description: "CLI: UTF-8 scalar validation baseline",
+        category: BenchmarkCategory::Text,
+        bench_type: BenchmarkType::CliBench,
+        criterion_name: None,
+        cli_subcommand: Some("utf8"),
+        working_dir: ".",
+    },
     // ========== CROSS-PARSER ==========
     BenchmarkInfo {
         name: "json_parsers",
@@ -367,6 +389,7 @@ mod tests {
         assert!(!filter_by_category(BenchmarkCategory::Json).is_empty());
         assert!(!filter_by_category(BenchmarkCategory::Yaml).is_empty());
         assert!(!filter_by_category(BenchmarkCategory::Dsv).is_empty());
+        assert!(!filter_by_category(BenchmarkCategory::Text).is_empty());
         assert!(!filter_by_category(BenchmarkCategory::CrossParser).is_empty());
     }
 
