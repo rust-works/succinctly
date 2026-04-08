@@ -1,5 +1,7 @@
 # Bit Manipulation Techniques
 
+[Home](../../) > [Docs](../) > [Optimizations](./) > Bit Manipulation
+
 Bit manipulation optimizations operate on individual bits or groups of bits within machine words, exploiting the parallel nature of bitwise operations to achieve constant-time or sub-linear complexity.
 
 ## Overview

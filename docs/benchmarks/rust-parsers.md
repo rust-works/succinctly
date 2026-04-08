@@ -1,5 +1,7 @@
 # Rust JSON Parser Comparison
 
+[Home](../../) > [Docs](../) > [Benchmarks](./) > Rust JSON Parsers
+
 Benchmark comparison of succinctly against other popular Rust JSON parsers.
 
 **Platform**: x86_64 (AMD Ryzen 9 7950X, Zen 4)

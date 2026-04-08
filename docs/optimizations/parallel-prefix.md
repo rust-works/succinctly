@@ -1,5 +1,7 @@
 # Parallel Prefix Operations
 
+[Home](../../) > [Docs](../) > [Optimizations](./) > Parallel Prefix
+
 Parallel prefix (scan) operations compute cumulative results across a sequence. While inherently sequential in nature, clever algorithms can parallelize portions of the computation.
 
 ## Overview

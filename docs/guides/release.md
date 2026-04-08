@@ -1,5 +1,7 @@
 # Release Checklist
 
+[Home](../../) > [Docs](../) > [Guides](./) > Release
+
 This document describes the release process for succinctly.
 
 ## Overview

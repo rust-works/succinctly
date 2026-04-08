@@ -1,5 +1,7 @@
 # Benchmarking Guide
 
+[Home](../../) > [Docs](../) > [Guides](./) > Benchmarking
+
 This guide provides complete information for running, interpreting, and documenting benchmarks in the succinctly project.
 
 ## Table of Contents

@@ -1,5 +1,7 @@
 # Optimisation Techniques
 
+[Home](../../) > [Docs](../) > Optimizations
+
 This directory documents optimization techniques used in the succinctly library, organized by category. Each document covers the theory, implementation patterns, prior art, and practical lessons learned.
 
 ## Quick Reference
@@ -17,6 +19,8 @@ This directory documents optimization techniques used in the succinctly library,
 | **Parallelism**      | [parallel-prefix.md](parallel-prefix.md)                 | Prefix XOR, cumulative index, carry propagation  |
 | **Parsing**          | [state-machines.md](state-machines.md)                   | PFSM, fast-path bypass, two-stage pipeline       |
 | **Compact encoding** | [end-positions.md](end-positions.md)                     | Bitmap encoding, advance index, sequential cursor|
+| **Targets**          | [targets.md](targets.md)                                 | CPU target configurations, architecture flags    |
+| **SIMD Strategy**    | [simd-strategy.md](simd-strategy.md)                     | Per-module SIMD usage, platform support, lessons |
 
 ---
 

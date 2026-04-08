@@ -1,6 +1,6 @@
 # YamlIndex
 
-[Knowledge Map](index.md) > YamlIndex
+[Home](../../) > [Docs](../) > [Parsing](./) > YamlIndex
 
 Semi-index for YAML documents. Converts indentation-based structure into balanced parentheses via an "oracle parser", enabling O(1) navigation with lazy value extraction.
 
@@ -9,7 +9,7 @@ Semi-index for YAML documents. Converts indentation-based structure into balance
 YAML's context-sensitive grammar (indentation, multiple scalar styles, anchors/aliases) makes it significantly harder to semi-index than JSON. Succinctly uses a two-phase approach:
 
 1. **Oracle phase** — a sequential parser that tracks indentation and resolves character ambiguity, emitting virtual brackets
-2. **Index phase** — the virtual brackets become a [BalancedParens](balanced-parens.md) encoding, just like JSON
+2. **Index phase** — the virtual brackets become a [BalancedParens](../architecture/balanced-parens.md) encoding, just like JSON
 
 After building, the same cursor API provides O(1) navigation.
 
@@ -74,7 +74,7 @@ YAML parsing has an extensive documented optimization history (P0-P12, O1-O3):
 | O1    | +3-13%          | Sequential cursor for AdvancePositions       |
 | O3    | 4-12x micro     | SIMD escape scanning (NEON)                  |
 
-**Rejected** (with documented reasons): P2.6 (prefetching), P2.8 (threshold tuning), P3 (branchless), P5-P8 (various), all documented in [parsing/yaml.md](parsing/yaml.md).
+**Rejected** (with documented reasons): P2.6 (prefetching), P2.8 (threshold tuning), P3 (branchless), P5-P8 (various), all documented in [yaml.md](yaml.md).
 
 Key lesson: micro-benchmark wins frequently don't translate to end-to-end gains. Three consecutive optimizations (P2.6, P2.8, P3) showed micro gains but caused real regressions.
 
@@ -86,17 +86,17 @@ Key lesson: micro-benchmark wins frequently don't translate to end-to-end gains.
 
 ## Depends On
 
-- [BitVec](bitvec.md) — all bit vectors use rank/select
-- [BalancedParens](balanced-parens.md) — with `WithSelect` generic parameter
+- [BitVec](../architecture/bitvec.md) — all bit vectors use rank/select
+- [BalancedParens](../architecture/balanced-parens.md) — with `WithSelect` generic parameter
 
 ## Used By
 
-- [jq Evaluator](jq-evaluator.md) — via `YqSemantics` evaluation mode
+- [jq Evaluator](../reference/jq-evaluator.md) — via `YqSemantics` evaluation mode
 
 ## Source & Docs
 
-- Implementation: [src/yaml/](../src/yaml/) (parser.rs, index.rs, advance_positions.rs, end_positions.rs)
-- SIMD: [src/yaml/simd/](../src/yaml/simd/) (neon.rs, x86.rs, broadword.rs)
-- Parsing doc: [parsing/yaml.md](parsing/yaml.md) (very detailed, includes all optimization history)
-- YAML 1.2 compliance: [compliance/yaml/1.2.md](compliance/yaml/1.2.md)
-- Benchmark: [benchmarks/yq.md](benchmarks/yq.md)
+- Implementation: [src/yaml/](../../src/yaml/) (parser.rs, index.rs, advance_positions.rs, end_positions.rs)
+- SIMD: [src/yaml/simd/](../../src/yaml/simd/) (neon.rs, x86.rs, broadword.rs)
+- Parsing doc: [yaml.md](yaml.md) (very detailed, includes all optimization history)
+- YAML 1.2 compliance: [compliance/yaml/1.2.md](../compliance/yaml/1.2.md)
+- Benchmark: [benchmarks/yq.md](../benchmarks/yq.md)

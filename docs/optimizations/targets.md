@@ -1,5 +1,7 @@
 # CPU Target Optimizations
 
+[Home](../../) > [Docs](../) > [Optimizations](./) > Targets
+
 This document describes CPU-specific optimization configurations for building high-performance code on various architectures.
 
 ## ARM Graviton (Neoverse-V2)

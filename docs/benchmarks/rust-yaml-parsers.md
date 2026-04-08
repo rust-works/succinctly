@@ -1,5 +1,7 @@
 # Rust YAML Parser Comparison
 
+[Home](../../) > [Docs](../) > [Benchmarks](./) > Rust YAML Parsers
+
 Benchmark comparison of succinctly against serde_yaml, the standard Rust YAML parser.
 
 **Platform**: x86_64 (AMD Ryzen 9 7950X, Zen 4)

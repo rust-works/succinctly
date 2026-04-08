@@ -1,5 +1,7 @@
 # SIMD (Single Instruction, Multiple Data)
 
+[Home](../../) > [Docs](../) > [Optimizations](./) > SIMD
+
 SIMD enables parallel processing of multiple data elements with a single instruction. Modern CPUs provide various SIMD extensions with different vector widths and capabilities.
 
 ## Overview
@@ -744,6 +746,10 @@ isolation but cause regression when integrated due to real-world data characteri
 9. **Specialized instructions win**: SVE2 inline assembly for general ops is 50% slower than NEON, but BDEP (SVE2-BITPERM) provides 5-17x speedup for select_in_word
 
 ---
+
+## See Also
+
+- [SIMD Strategy wiki page](simd-strategy.md) — per-module SIMD usage, platform support, and lessons learned
 
 ## References
 

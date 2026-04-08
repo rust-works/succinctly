@@ -1,5 +1,7 @@
 # Cache and Memory Optimisation
 
+[Home](../../) > [Docs](../) > [Optimizations](./) > Cache & Memory
+
 Modern CPUs can process data far faster than memory can deliver it. Understanding the memory hierarchy is essential for high-performance code.
 
 ## Overview

@@ -1,5 +1,7 @@
 # JSON Parsing
 
+[Home](../../) > [Docs](../) > [Parsing](./) > JSON
+
 This document describes how the succinctly library parses and indexes JSON documents using semi-indexing techniques.
 
 ## Overview
@@ -365,6 +367,10 @@ succinctly jq-locate file.json --offset 42 --format json
 | Exponential search   | [access-patterns.md](../optimizations/access-patterns.md)      | Sequential select hints |
 
 ---
+
+## See Also
+
+- [JsonIndex wiki page](json-index.md) — concept overview, dependencies, and academic references
 
 ## References
 

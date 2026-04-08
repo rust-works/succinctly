@@ -1,5 +1,7 @@
 # DSV (CSV/TSV) Parsing
 
+[Home](../../) > [Docs](../) > [Parsing](./) > DSV
+
 This document describes how the succinctly library parses and indexes delimiter-separated value (DSV) files, including CSV and TSV formats.
 
 ## Overview
@@ -408,6 +410,10 @@ for chunk in data.chunks(64) {
 ```
 
 ---
+
+## See Also
+
+- [DsvIndex wiki page](dsv-index.md) — concept overview, dependencies, and academic references
 
 ## References
 

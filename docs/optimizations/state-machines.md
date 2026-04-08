@@ -1,5 +1,7 @@
 # State Machine Optimisation
 
+[Home](../../) > [Docs](../) > [Optimizations](./) > State Machines
+
 Finite state machines (FSMs) are fundamental to parsing and pattern matching. Optimising state machine execution can yield significant performance improvements for text processing.
 
 ## Overview

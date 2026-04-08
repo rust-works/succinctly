@@ -1,6 +1,6 @@
 # SIMD Strategy
 
-[Knowledge Map](index.md) > SIMD Strategy
+[Home](../../) > [Docs](../) > [Optimizations](./) > SIMD Strategy
 
 Succinctly uses SIMD acceleration across all parsing modules, with platform-specific implementations selected at compile time and runtime.
 
@@ -18,24 +18,24 @@ Succinctly uses SIMD acceleration across all parsing modules, with platform-spec
 
 ## Per-Module SIMD Usage
 
-### JSON ([src/json/simd/](../src/json/simd/))
+### JSON ([src/json/simd/](../../src/json/simd/))
 - **Character classification**: AVX2 processes 32 bytes/iteration identifying structural characters (`{}[]:,"`)
 - **SSE4.2**: `PCMPISTRI` for string matching (38% faster than SSE2)
 - **Result**: ~880 MiB/s indexing throughput
 
-### DSV ([src/dsv/simd/](../src/dsv/simd/))
+### DSV ([src/dsv/simd/](../../src/dsv/simd/))
 - **Quote state tracking**: BMI2 `PDEP` + carry propagation computes running XOR in one chain (10x vs scalar)
 - **Prefix XOR**: AVX2/NEON parallel prefix for quote parity
 - **PMULL**: ARM carryless multiply for prefix XOR
 - **Result**: 85-1676 MiB/s throughput
 
-### YAML ([src/yaml/simd/](../src/yaml/simd/))
+### YAML ([src/yaml/simd/](../../src/yaml/simd/))
 - **Block scalar scanning** (P2.7): AVX2 scans 32-byte chunks for newlines, checks indentation
 - **Anchor name scanning** (P4): AVX2 scans for anchor terminators in 32-byte chunks
 - **Escape scanning** (O3): NEON scans for JSON escape characters (`"`, `\`, `< 0x20`)
 - **Result**: ~250-400 MiB/s indexing, up to 110 MiB/s yq queries
 
-### BalancedParens ([src/trees/bp.rs](../src/trees/bp.rs))
+### BalancedParens ([src/trees/bp.rs](../../src/trees/bp.rs))
 - **RangeMin**: ARM NEON `vminvq_s16` for 2.8x faster horizontal minimum
 - **x86**: SSE4.1 `PHMINPOSUW` (modest 1-3% gain due to unsigned-only limitation)
 
@@ -48,7 +48,7 @@ AVX-512 for JSON parsing was **7-17% slower** than AVX2 and was removed from the
 - Zen 4 splits 512-bit ops into two 256-bit paths
 - AVX2 already saturates memory bandwidth for sequential parsing
 
-See [parsing/yaml.md](parsing/yaml.md#p8-avx-512-variants---rejected-) for the YAML AVX-512 analysis.
+See [parsing/yaml.md](../parsing/yaml.md#p8-avx-512-variants---rejected-) for the YAML AVX-512 analysis.
 
 ### SIMD Thresholds Matter
 
@@ -75,6 +75,6 @@ SIMD paths are selected via `#[cfg(target_arch)]` and Rust's `is_x86_feature_det
 
 ## Source & Docs
 
-- Optimization guide: [optimizations/simd.md](optimizations/simd.md)
-- Optimization history: [optimizations/history.md](optimizations/history.md)
+- Optimization guide: [simd.md](simd.md)
+- Optimization history: [history.md](history.md)
 - Per-module SIMD directories: `src/json/simd/`, `src/yaml/simd/`, `src/dsv/simd/`, `src/util/simd/`

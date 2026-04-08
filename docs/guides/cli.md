@@ -1,5 +1,7 @@
 # Succinctly CLI Tool
 
+[Home](../../) > [Docs](../) > [Guides](./) > CLI
+
 Command-line utility for working with succinct data structures.
 
 ## Installation

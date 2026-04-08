@@ -1,5 +1,7 @@
 # Zero-Copy and Allocation Optimisation
 
+[Home](../../) > [Docs](../) > [Optimizations](./) > Zero-Copy
+
 Memory allocation is expensive. Each allocation involves system calls, lock contention, and fragmentation management. Zero-copy techniques eliminate unnecessary data movement and allocation.
 
 ## Overview

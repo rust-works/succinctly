@@ -12,7 +12,7 @@ The knowledge wiki lives in `docs/` with `docs/index.md` as the entry point. Eac
 
 Every concept page follows this structure:
 
-1. **Breadcrumb**: `[Knowledge Map](index.md) > PageName`
+1. **Breadcrumb**: `[Home](../../) > [Docs](../) > [Category](./) > PageName`
 2. **What It Does** — one-paragraph summary
 3. **How It Works** — key algorithms and data structures
 4. **Depends On** — links to wiki pages this concept uses
@@ -24,15 +24,15 @@ Every concept page follows this structure:
 
 ### New data structure or module
 
-1. Create a new `docs/<name>.md` following the page structure above
+1. Create the page in the appropriate subdirectory (e.g. `docs/parsing/`, `docs/optimizations/`, `docs/reference/`) following the page structure above
 2. Add a row to the Core Data Structures table in `docs/index.md`
 3. Update Depends On / Used By sections on related pages (keep these bidirectional)
-4. If the module has SIMD variants, add to `docs/simd-strategy.md`
+4. If the module has SIMD variants, add to `docs/optimizations/simd-strategy.md`
 
 ### New optimization
 
-1. Add a row to the relevant concept page's optimization table (e.g. the Optimization Journey table in `docs/yaml-index.md`)
-2. If it involves a new SIMD technique, update `docs/simd-strategy.md`
+1. Add a row to the relevant concept page's optimization table (e.g. the Optimization Journey table in `docs/parsing/yaml-index.md`)
+2. If it involves a new SIMD technique, update `docs/optimizations/simd-strategy.md`
 
 ### New academic paper reference
 
@@ -42,8 +42,8 @@ Every concept page follows this structure:
 
 ### New SIMD path
 
-1. Update the Platform Support table in `docs/simd-strategy.md`
-2. Update the Per-Module SIMD Usage section in `docs/simd-strategy.md`
+1. Update the Platform Support table in `docs/optimizations/simd-strategy.md`
+2. Update the Per-Module SIMD Usage section in `docs/optimizations/simd-strategy.md`
 3. Update the SIMD Platform Support table in `docs/index.md` if a new platform is added
 
 ## Formatting Rules

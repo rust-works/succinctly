@@ -1,5 +1,7 @@
 # Benchmark Inventory
 
+[Home](../../) > [Docs](../) > [Benchmarks](./) > Inventory
+
 This document provides a comprehensive index of all benchmark reports in the project.
 
 ## Overview

@@ -103,14 +103,40 @@ BP:   ( ( ( ) ( ) ) )
 
 The RangeMin index construction uses SIMD acceleration on supported platforms:
 
-| Platform | Instruction | Speedup | Notes |
-|----------|-------------|---------|-------|
-| ARM64 | NEON VMINV | **2.8x** | Direct signed horizontal minimum |
-| x86_64 | SSE4.1 PHMINPOSUW | **1-3%** (large data) | Requires bias trick for signed values |
+| Platform | Instruction       | Speedup               | Notes                                 |
+|----------|-------------------|-----------------------|---------------------------------------|
+| ARM64    | NEON VMINV        | **2.8x**              | Direct signed horizontal minimum      |
+| x86_64   | SSE4.1 PHMINPOSUW | **1-3%** (large data) | Requires bias trick for signed values |
 
 ARM NEON provides `vminvq_s16` which directly computes the minimum across 8 signed 16-bit values. SSE4.1's `PHMINPOSUW` only handles unsigned values, requiring a bias/unbias workaround that adds overhead.
 
 See [SIMD Optimizations](../optimizations/simd.md#x86-sse41-horizontal-minimum-phminposuw) for implementation details.
+
+### Generic Select Support
+
+`BalancedParens<W, S>` is generic over select support:
+- `NoSelect` (ZST) — used by JSON, zero overhead
+- `WithSelect` — used by YAML for `at_offset`/`yq-locate`, enables O(1) sampled select1
+
+## Used By
+
+- [JsonIndex](../parsing/json-index.md) — encodes JSON nesting structure (objects, arrays, values)
+- [YamlIndex](../parsing/yaml-index.md) — encodes virtual brackets from indentation
+- [DsvIndex](../parsing/dsv-index.md) — encodes row/field structure
+
+## Depends On
+
+- [BitVec](bitvec.md) — the parenthesis sequence and RangeMin index are stored as bitvectors
+
+## Academic Papers
+
+- Sadakane & Navarro 2010 — fully-functional succinct trees, RangeMin for O(1) navigation
+- Navarro & Sadakane 2014 — space-optimal BP representation
+
+## Source & Docs
+
+- Implementation: [src/trees/bp.rs](../../src/trees/bp.rs)
+- Optimization: [optimizations/hierarchical-structures.md](../optimizations/hierarchical-structures.md)
 
 ## See Also
 
