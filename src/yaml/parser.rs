@@ -97,9 +97,6 @@ pub struct SemiIndex {
     /// End positions for scalars. For each BP open, stores the end byte offset.
     /// For containers, stores 0 (containers don't have a text end position).
     pub bp_to_text_end: Vec<u32>,
-    /// Sequence item marker bits: 1 if this BP position is a sequence item wrapper.
-    /// Sequence items have BP open/close but no TY entry.
-    pub seq_items: Vec<u64>,
     /// Container marker bits: 1 if this BP position has a TY entry (is a mapping or sequence).
     /// Used to compute correct TY index from BP position.
     pub containers: Vec<u64>,
@@ -126,7 +123,6 @@ struct Parser<'a> {
     ib_words: Vec<u64>,
     bp_words: Vec<u64>,
     ty_words: Vec<u64>,
-    seq_item_words: Vec<u64>,
     /// Container marker bits - marks BP positions that have TY entries (mappings/sequences)
     container_words: Vec<u64>,
     bp_pos: usize,
@@ -165,7 +161,6 @@ impl<'a> Parser<'a> {
         let ib_words = vec![0u64; input.len().div_ceil(64).max(1)];
         let bp_words = vec![0u64; input.len().div_ceil(32).max(1)]; // ~2x IB for BP
         let ty_words = vec![0u64; input.len().div_ceil(64).max(1)];
-        let seq_item_words = vec![0u64; input.len().div_ceil(32).max(1)]; // Same size as BP
         let container_words = vec![0u64; input.len().div_ceil(32).max(1)]; // Same size as BP
 
         // Estimate BP opens: ~1 structural element per 8 bytes of input
@@ -181,7 +176,6 @@ impl<'a> Parser<'a> {
             ib_words,
             bp_words,
             ty_words,
-            seq_item_words,
             container_words,
             bp_pos: 0,
             ty_pos: 0,
@@ -275,19 +269,6 @@ impl<'a> Parser<'a> {
         }
         // Close is 0, which is default, so just increment position
         self.bp_pos += 1;
-    }
-
-    /// Mark the current BP position as a sequence item.
-    /// Call this BEFORE write_bp_open for sequence items.
-    #[inline]
-    fn mark_seq_item(&mut self) {
-        let bp_pos = self.bp_pos;
-        let word_idx = bp_pos / 64;
-        let bit_idx = bp_pos % 64;
-        while word_idx >= self.seq_item_words.len() {
-            self.seq_item_words.push(0);
-        }
-        self.seq_item_words[word_idx] |= 1u64 << bit_idx;
     }
 
     /// Close a pending explicit key by adding a null value node.
@@ -1221,7 +1202,6 @@ impl<'a> Parser<'a> {
         }
 
         // Open the sequence item node
-        self.mark_seq_item();
         self.write_bp_open();
 
         // Skip `- `
@@ -3293,10 +3273,6 @@ impl<'a> Parser<'a> {
         ty.truncate(ty_word_count);
         ty.shrink_to_fit();
 
-        let mut seq_items = core::mem::take(&mut self.seq_item_words);
-        seq_items.truncate(bp_word_count);
-        seq_items.shrink_to_fit();
-
         let mut containers = core::mem::take(&mut self.container_words);
         containers.truncate(bp_word_count);
         containers.shrink_to_fit();
@@ -3313,7 +3289,6 @@ impl<'a> Parser<'a> {
             ty,
             bp_to_text,
             bp_to_text_end,
-            seq_items,
             containers,
             ib_len: self.input.len(),
             bp_len: self.bp_pos,
