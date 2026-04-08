@@ -538,6 +538,11 @@ Fewer levels / larger blocks:
 
 ---
 
+## See Also
+
+- [End Positions](end-positions.md) — memory-efficient position tracking for YAML
+- [Cache & Memory](cache-memory.md) — why compact structures outperform complex ones
+
 ## References
 
 - Jacobson, G. "Space-efficient Static Trees and Graphs" (1989)

@@ -219,6 +219,11 @@ Typical speedups with proper vectorization:
 - [Performance Tuning](../performance.md) - Optimization techniques
 - [Benchmarking Guide](../benchmarking.md) - How to measure performance
 
+## See Also
+
+- [SIMD](simd.md) — SIMD instruction reference per platform
+- [SIMD Strategy](simd-strategy.md) — how succinctly selects SIMD paths at runtime
+
 ---
 
 **Last Updated**: 2026-01-21

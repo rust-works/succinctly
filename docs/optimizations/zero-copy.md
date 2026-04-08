@@ -413,6 +413,11 @@ impl<'a> JsonCursor<'a> {
 
 ---
 
+## See Also
+
+- [Access Patterns](access-patterns.md) — memory access performance characteristics
+- [Cache & Memory](cache-memory.md) — alignment and cache line utilisation
+
 ## References
 
 - Rust Performance Book - Memory allocation chapter

@@ -320,6 +320,11 @@ fn main() {
 
 ---
 
+## See Also
+
+- [State Machines](state-machines.md) — PFSM tables for JSON parsing
+- [Bit Manipulation](bit-manipulation.md) — bitwise alternatives to table lookups
+
 ## References
 
 - Knuth, D. E. "The Art of Computer Programming, Volume 3: Sorting and Searching"

@@ -467,6 +467,11 @@ fn process_byte(byte: u8, state: u8) -> (u8, u8) {
 
 ---
 
+## See Also
+
+- [Lookup Tables](lookup-tables.md) — precomputed PFSM transition tables
+- [Branchless Algorithms](branchless.md) — eliminating branches in hot loops
+
 ## References
 
 - Aho, A., Lam, M., Sethi, R., Ullman, J. "Compilers: Principles, Techniques, and Tools"

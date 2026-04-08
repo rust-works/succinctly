@@ -380,6 +380,11 @@ for chunk in data.chunks_exact(8) {
 
 ---
 
+## See Also
+
+- [Cache & Memory](cache-memory.md) — cache line behaviour, alignment, prefetching
+- [Zero-Copy Techniques](zero-copy.md) — avoiding unnecessary memory copies
+
 ## References
 
 - Drepper, U. "What Every Programmer Should Know About Memory" (2007)

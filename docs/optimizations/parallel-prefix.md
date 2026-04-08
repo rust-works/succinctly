@@ -275,6 +275,11 @@ fn pfsm_transition(byte: u8) -> [u8; 4] {
 
 ---
 
+## See Also
+
+- [Bit Manipulation](bit-manipulation.md) — PDEP/PEXT for DSV quote masking
+- [SIMD](simd.md) — vectorised prefix XOR on AVX2/NEON
+
 ## References
 
 - Blelloch, G. "Prefix Sums and Their Applications" (1990)

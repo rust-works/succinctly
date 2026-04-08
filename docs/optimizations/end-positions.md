@@ -950,3 +950,8 @@ is narrower than its interface suggests, the implementation can exploit that.
 - Design 1: `bp_to_text_end: Vec<u32>` in [src/yaml/index.rs](../../src/yaml/index.rs)
 - Designs 2 & 3: [src/yaml/end_positions.rs](../../src/yaml/end_positions.rs)
 - Query site: `value()` in [src/yaml/light.rs](../../src/yaml/light.rs)
+
+## See Also
+
+- [Bit Manipulation](bit-manipulation.md) — rank/select operations used by bitmap designs
+- [Hierarchical Structures](hierarchical-structures.md) — rank directory design that end positions build on
