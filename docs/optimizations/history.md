@@ -653,4 +653,11 @@ See [docs/plan/sve2-optimizations.md](../plan/sve2-optimizations.md#future-neon-
 
 ---
 
+## See Also
+
+- [README](README.md) — quick reference table of all optimisation techniques
+- [SIMD Strategy](simd-strategy.md) — per-module SIMD usage and lessons learned
+
+---
+
 *Last Updated: 2026-01-28*

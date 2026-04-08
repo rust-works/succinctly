@@ -73,6 +73,11 @@ BMI2 quote indexing works for DSV (context-free `""` escaping) but not YAML (bac
 
 SIMD paths are selected via `#[cfg(target_arch)]` and Rust's `is_x86_feature_detected!()` / `is_aarch64_feature_detected!()` macros. The `simd` feature flag enables explicit intrinsics; without it, Rust's auto-vectorization handles basic cases.
 
+## See Also
+
+- [SIMD](simd.md) — detailed technique reference for each SIMD extension
+- [Targets](targets.md) — CPU-specific build configurations
+
 ## Source & Docs
 
 - Optimization guide: [simd.md](simd.md)

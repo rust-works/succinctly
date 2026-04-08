@@ -274,6 +274,12 @@ fn rotate_left(x: u64, n: u32) -> u64 {
 
 ---
 
+## See Also
+
+- [Lookup Tables](lookup-tables.md) — precomputed tables for bit operations
+- [Parallel Prefix](parallel-prefix.md) — prefix XOR for quote state tracking
+- [SIMD](simd.md) — vectorised bit operations (POPCNT, PDEP/PEXT)
+
 ## References
 
 - Knuth, D. E. "The Art of Computer Programming, Volume 4A: Combinatorial Algorithms"

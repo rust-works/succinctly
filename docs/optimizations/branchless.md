@@ -391,6 +391,11 @@ let result = if condition {
 
 ---
 
+## See Also
+
+- [State Machines](state-machines.md) — PFSM and branchless state transitions
+- [Lookup Tables](lookup-tables.md) — replacing branches with table lookups
+
 ## References
 
 - Fog, A. "Optimizing Software in C++" - Branch prediction chapter

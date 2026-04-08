@@ -400,6 +400,11 @@ struct Counters {
 
 ---
 
+## See Also
+
+- [Access Patterns](access-patterns.md) — sequential vs random access performance
+- [Zero-Copy Techniques](zero-copy.md) — reducing allocations and copies
+
 ## References
 
 - Drepper, U. "What Every Programmer Should Know About Memory" (2007)
