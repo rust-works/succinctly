@@ -2566,6 +2566,60 @@ mod tests {
         assert_eq!(bp.excess(3), 0); // after second close (balanced)
     }
 
+    /// Build `depth` opens followed by `depth` closes: `(((...)))`.
+    /// The excess peaks at `depth` in the middle.
+    fn deeply_nested(depth: usize) -> (Vec<u64>, usize) {
+        let total = 2 * depth;
+        let mut words = vec![0u64; total.div_ceil(64)];
+        for i in 0..depth {
+            words[i / 64] |= 1u64 << (i % 64);
+        }
+        (words, total)
+    }
+
+    #[test]
+    #[ignore = "blocked on #188: L1/L2 excess counters are i16 and overflow \
+                past 32767-deep nesting (build panics in debug at bp.rs ~1639, \
+                silently wraps in release). Un-ignore once #188 widens the \
+                counters (including the SIMD build path)."]
+    fn test_bp_nesting_beyond_i16_excess() {
+        // Overflow ceiling for #188 — CONFIRMED failing today. The L1/L2
+        // hierarchical excess is stored in i16 (`l1_block_excess` /
+        // `l2_block_excess` / `running_excess`), so nesting deeper than
+        // i16::MAX (32767) overflows a too-narrow counter and corrupts
+        // navigation. Build a single chain 40_000 deep (~80_000 bits, ~10 KiB)
+        // and require excess/find_close/find_open/enclose to stay correct at
+        // and past the boundary — this is the proof that the widened type
+        // behaves, to land with the #188 fix.
+        let depth = 40_000usize;
+        assert!(depth > i16::MAX as usize);
+        let (words, len) = deeply_nested(depth);
+        let bp = BalancedParens::new(words, len);
+
+        // Excess climbs to `depth` at the innermost open, then returns to 0.
+        assert_eq!(bp.excess(depth - 1), depth as i32, "peak excess");
+        assert_eq!(bp.excess(len - 1), 0, "balanced at end");
+        // Just past the i16 boundary the running excess must still be exact.
+        assert_eq!(bp.excess(32767), 32768, "excess at i16::MAX+1 open");
+        assert_eq!(bp.excess(32768), 32769, "excess just past i16 boundary");
+
+        // Matching: open k pairs with close (len-1-k) for every level.
+        assert_eq!(bp.find_close(0), Some(len - 1), "outermost close");
+        assert_eq!(bp.find_close(depth - 1), Some(depth), "innermost close");
+        assert_eq!(
+            bp.find_close(32767),
+            Some(len - 1 - 32767),
+            "close across i16 boundary"
+        );
+        assert_eq!(bp.find_open(len - 1), Some(0), "outermost open");
+        assert_eq!(bp.find_open(depth), Some(depth - 1), "innermost open");
+
+        // Nesting: each open (except the root) is enclosed by the previous one.
+        assert_eq!(bp.enclose(depth - 1), Some(depth - 2), "deep enclose");
+        assert_eq!(bp.enclose(33000), Some(32999), "enclose past i16 boundary");
+        assert_eq!(bp.enclose(0), None, "root has no parent");
+    }
+
     #[test]
     fn test_word_min_excess() {
         // "()" = 0b01 - open at 0, close at 1
