@@ -1187,4 +1187,32 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_find_json_escape_all_bytes_match_scalar() {
+        // Exhaustive over-match guard (#186). Only `"`, `\`, and bytes < 0x20
+        // must be flagged; a mis-specified SIMD classifier tends to over-match
+        // the boundary bytes near those (`@ \ ^ _ | ~`, DEL, `* <`) or, via a
+        // signed compare, the high bytes 0x80..=0xFF (multibyte UTF-8). Place
+        // every possible byte value at positions covering the 16-byte NEON path,
+        // the chunk boundary, and the <16-byte scalar remainder, and require
+        // NEON to agree with the scalar reference exactly.
+        //
+        // 'A' (0x41) is the filler and is never an escape byte.
+        for b in 0u8..=255 {
+            for &pos in &[0usize, 1, 7, 15, 16, 17, 31, 32, 33, 47] {
+                let mut input = vec![b'A'; 48];
+                input[pos] = b;
+                for &start in &[0usize, 3, 16] {
+                    let scalar = find_json_escape_scalar(&input, start);
+                    let neon = find_json_escape_neon(&input, start);
+                    assert_eq!(
+                        scalar, neon,
+                        "classifier mismatch for byte 0x{b:02x} at pos {pos}, \
+                         start {start}: scalar={scalar}, neon={neon}"
+                    );
+                }
+            }
+        }
+    }
 }

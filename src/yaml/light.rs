@@ -5246,6 +5246,31 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_double_quoted_hex_escape_non_ascii() {
+        // \xNN with value > 0x7F takes the char::from_u32(val) path.
+        let s = YamlString::DoubleQuoted {
+            text: b"\"caf\\xe9\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "café");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_unicode_escape() {
+        // \uNNNN 4-digit escape -> char::from_u32(codepoint).
+        let s = YamlString::DoubleQuoted {
+            text: b"\"caf\\u00e9\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "café");
+        let s2 = YamlString::DoubleQuoted {
+            text: b"\"\\u1234\"",
+            start: 0,
+        };
+        assert_eq!(&*s2.as_str().unwrap(), "\u{1234}");
+    }
+
+    #[test]
     fn test_decode_double_quoted_space_escape() {
         let s = YamlString::DoubleQuoted {
             text: b"\"spaced\\ word\"",
