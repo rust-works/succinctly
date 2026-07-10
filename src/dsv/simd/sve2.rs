@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn test_simple_csv() {
         if !has_sve2() {
-            eprintln!("Skipping SVE2 test: CPU doesn't support sve2-bitperm");
+            crate::util::simd::note_simd_skip("sve2-bitperm");
             return;
         }
 
