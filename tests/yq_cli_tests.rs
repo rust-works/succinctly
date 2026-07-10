@@ -273,6 +273,74 @@ fn test_indent_space_syntax() -> Result<()> {
 }
 
 // ============================================================================
+// -I 0 (compact identity) scalar type preservation — #168/#169/#170/#175
+//
+// Cases surfaced by code review. Correct cases are asserted directly; where
+// succinctly currently diverges from yq the assertion pins the CURRENT output
+// and the comment records yq's correct answer plus the tracking issue, so the
+// fix is forced to update the assertion (and no silent regression slips in).
+// ============================================================================
+
+#[test]
+fn test_i0_block_literal_stays_string() -> Result<()> {
+    // `|-` (block literal, strip chomp) is always a string.
+    let (out, code) = run_yq_stdin(".", "s: |-\n  hello\n  world\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"s":"hello\nworld"}"#);
+    Ok(())
+}
+
+#[test]
+fn test_i0_block_folded_stays_string() -> Result<()> {
+    // `>-` (block folded, strip chomp) is always a string.
+    let (out, code) = run_yq_stdin(".", "s: >-\n  hello\n  world\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"s":"hello world"}"#);
+    Ok(())
+}
+
+#[test]
+fn test_i0_float_one_point_zero() -> Result<()> {
+    // yq preserves `1.0` as a float -> {"x":1.0}. succinctly currently collapses
+    // it to the integer {"x":1} -- bug #168/#170.
+    let (out, code) = run_yq_stdin(".", "x: 1.0\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"x":1}"#);
+    Ok(())
+}
+
+#[test]
+fn test_i0_leading_dot_float_is_number() -> Result<()> {
+    // yq treats `.5` as the number 0.5 -> {"x":0.5}. succinctly currently keeps
+    // it as the string {"x":".5"} -- bug #169.
+    let (out, code) = run_yq_stdin(".", "x: .5\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"x":".5"}"#);
+    Ok(())
+}
+
+#[test]
+fn test_i0_multidoc_json_stream() -> Result<()> {
+    // Multi-document input streams one compact JSON value per document. This
+    // already matches yq.
+    let (out, code) = run_yq_stdin(".", "a: 1\n---\nb: 2\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "{\"a\":1}\n{\"b\":2}");
+    Ok(())
+}
+
+#[test]
+fn test_i0_multidoc_yaml_separator() -> Result<()> {
+    // yq emits a `---` separator between YAML documents and preserves numeric
+    // types: expected `a: 1\n---\nb: 2`. succinctly currently omits the
+    // separator AND stringifies the numbers -- bug #175 (+ type preservation).
+    let (out, code) = run_yq_stdin(".", "a: 1\n---\nb: 2\n", &["-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "a: \"1\"\nb: \"2\"");
+    Ok(())
+}
+
+// ============================================================================
 // File Input Tests
 // ============================================================================
 
