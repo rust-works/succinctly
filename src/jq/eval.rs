@@ -108,6 +108,33 @@ impl<'a, W: Clone + AsRef<[u64]>> QueryResult<'a, W> {
             other => other,
         }
     }
+
+    /// Returns true if this result is an evaluation error.
+    ///
+    /// Mirrors [`crate::jq::eval_generic::GenericResult::is_error`] so the two
+    /// evaluators can be compared directly in tests.
+    pub fn is_error(&self) -> bool {
+        matches!(self, QueryResult::Error(_))
+    }
+
+    /// Collect all output values into a `Vec<OwnedValue>`.
+    ///
+    /// Mirrors [`crate::jq::eval_generic::GenericResult::collect_owned`]: `None`,
+    /// `Error`, and `Break` collect to an empty `Vec`. This gives the full
+    /// evaluator the same materialization surface as the generic (CLI) path,
+    /// which is what evaluator-parity tests rely on.
+    pub fn collect_owned(self) -> Vec<OwnedValue> {
+        match self {
+            QueryResult::One(v) => vec![to_owned(&v)],
+            QueryResult::OneCursor(c) => vec![to_owned(&c.value())],
+            QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
+            QueryResult::None => Vec::new(),
+            QueryResult::Error(_) => Vec::new(),
+            QueryResult::Owned(o) => vec![o],
+            QueryResult::ManyOwned(os) => os,
+            QueryResult::Break(_) => Vec::new(),
+        }
+    }
 }
 
 /// Error that occurs during evaluation.
@@ -16244,9 +16271,44 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_query_result_collect_owned_and_is_error() {
+        // Covers the None / Error / Break / Owned / ManyOwned arms and is_error,
+        // which the integration parity tests do not exercise.
+        let none: QueryResult<Vec<u64>> = QueryResult::None;
+        assert!(none.collect_owned().is_empty());
+        assert!(!QueryResult::<Vec<u64>>::None.is_error());
+
+        let err: QueryResult<Vec<u64>> = QueryResult::Error(EvalError::new("boom"));
+        assert!(err.is_error());
+        assert!(err.collect_owned().is_empty());
+
+        let brk: QueryResult<Vec<u64>> = QueryResult::Break("lbl".into());
+        assert!(brk.collect_owned().is_empty());
+
+        let owned: QueryResult<Vec<u64>> = QueryResult::Owned(OwnedValue::Int(7));
+        assert_eq!(owned.collect_owned(), vec![OwnedValue::Int(7)]);
+
+        let many: QueryResult<Vec<u64>> =
+            QueryResult::ManyOwned(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        assert_eq!(many.collect_owned().len(), 2);
+    }
+
     // =============================================
     // Date/Time function tests (Phase 15)
     // =============================================
+
+    #[test]
+    fn test_localtime_structure() {
+        // localtime is timezone-dependent, so assert only the 8-field structure.
+        // This still exercises the hour/minute/second/weekday computation
+        // regardless of the host's $TZ.
+        query!(b"0", r#"localtime"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 8);
+            }
+        );
+    }
 
     #[test]
     fn test_gmtime() {
