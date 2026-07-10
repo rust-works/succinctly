@@ -576,6 +576,22 @@ impl OutputConfig {
     }
 }
 
+/// Trim leading and trailing ASCII whitespace from a byte slice.
+///
+/// Equivalent to `<[u8]>::trim_ascii` but usable on our MSRV (1.73), which
+/// predates that method's stabilization (1.80).
+fn trim_ascii_ws(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |p| p + 1);
+    &bytes[start..end]
+}
+
 /// Validate JSON bytes and print a formatted error message if invalid.
 /// Returns Ok(()) if valid, Err with exit code if invalid.
 fn validate_json_input(input: &[u8], filename: Option<&str>) -> Result<(), i32> {
@@ -851,12 +867,16 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // This avoids building the index and materializing JqValue, saving significant memory.
                 if use_identity_fast_path {
                     had_output = true;
-                    // For exit_status, identity on valid JSON is not null/false
+                    // For exit_status, inspect the raw JSON token so that `null`
+                    // and `false` inputs still produce the falsy exit code (jq: 1)
+                    // on the identity fast path. Only these two literals are falsy;
+                    // a quoted "false"/"null" string or any number stays truthy.
                     if args.exit_status {
-                        // Parse minimally just to check the type for exit_status
-                        // For now, assume it's a truthy value (not null or false)
-                        // A more thorough check would parse the first token
-                        last_output = Some(OwnedValue::Bool(true));
+                        last_output = Some(match trim_ascii_ws(json_bytes) {
+                            b"null" => OwnedValue::Null,
+                            b"false" => OwnedValue::Bool(false),
+                            _ => OwnedValue::Bool(true),
+                        });
                     }
                     out.write_all(json_bytes)?;
                     out.write_all(b"\n")?;
