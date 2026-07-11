@@ -8547,9 +8547,9 @@ fn builtin_gmtime<'a, W: Clone + AsRef<[u64]>>(
         (secs - 86399) / 86400
     };
     let time_of_day = ((secs % 86400) + 86400) % 86400;
-    let hour = (time_of_day / 3600) as i64;
-    let minute = ((time_of_day % 3600) / 60) as i64;
-    let second = (time_of_day % 60) as i64;
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
 
     // Calculate year, month, day from days since epoch
     // Using algorithm from Howard Hinnant's date library
@@ -8566,7 +8566,7 @@ fn builtin_gmtime<'a, W: Clone + AsRef<[u64]>>(
 
     // Calculate weekday (0 = Sunday, 6 = Saturday)
     // Jan 1, 1970 was a Thursday (4)
-    let weekday = ((days % 7 + 4 + 7) % 7) as i64;
+    let weekday = (days % 7 + 4 + 7) % 7;
 
     // Calculate day of year (0-365, 0 = Jan 1)
     let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
@@ -8648,9 +8648,9 @@ fn builtin_localtime<'a, W: Clone + AsRef<[u64]>>(
             (local_secs - 86399) / 86400
         };
         let time_of_day = ((local_secs % 86400) + 86400) % 86400;
-        let hour = (time_of_day / 3600) as i64;
-        let minute = ((time_of_day % 3600) / 60) as i64;
-        let second = (time_of_day % 60) as i64;
+        let hour = time_of_day / 3600;
+        let minute = (time_of_day % 3600) / 60;
+        let second = time_of_day % 60;
 
         // Calculate year, month, day from days since epoch
         let z = days + 719468;
@@ -8664,7 +8664,7 @@ fn builtin_localtime<'a, W: Clone + AsRef<[u64]>>(
         let month = if mp < 10 { mp + 3 } else { mp - 9 };
         let year = y + if month <= 2 { 1 } else { 0 };
 
-        let weekday = ((days % 7 + 4 + 7) % 7) as i64;
+        let weekday = (days % 7 + 4 + 7) % 7;
 
         let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
         let month_days: [i64; 12] = if is_leap {

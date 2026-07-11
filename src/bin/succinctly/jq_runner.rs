@@ -1193,12 +1193,9 @@ fn find_matching_close(bytes: &[u8], pos: usize) -> Option<usize> {
         match bytes[i] {
             b'"' => {
                 // Skip string
-                if let Some(end) = find_string_end(bytes, i) {
-                    i = end;
-                    continue;
-                } else {
-                    return None;
-                }
+                let end = find_string_end(bytes, i)?;
+                i = end;
+                continue;
             }
             c if c == open => depth += 1,
             c if c == close => depth -= 1,

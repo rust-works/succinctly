@@ -57,6 +57,21 @@ cargo test --features large-tests        # 1GB bitvector tests
 cargo bench                              # Run benchmarks
 ```
 
+### Coverage
+
+CI runs coverage via the [`action-works/omni-dev-coverage-check`](https://github.com/action-works/omni-dev-coverage-check)
+action (x86_64 + ARM64 matrix), which wraps `cargo-llvm-cov` + `omni-dev coverage diff` and
+posts PR patch coverage as a sticky comment. To reproduce the CI line-coverage number locally,
+use the same feature set CI uses:
+
+```bash
+# TOTAL line % (matches the CI `test-args`; the fail-under-lines gate is set just below this)
+cargo llvm-cov --features cli,simd,regex,serde --workspace --summary-only --fail-under-lines 0
+
+# PR diff / patch coverage (added lines covered + uncovered file:line list), like the CI comment
+omni-dev coverage diff
+```
+
 ### CLI Tool
 
 ```bash

@@ -2068,17 +2068,11 @@ fn transcode_double_quoted_to_json(
                         let val = parse_hex(hex)?;
                         if val < 0x20 || val == 0x22 || val == 0x5C {
                             // Control char, quote, or backslash - escape it
-                            write_json_escape(
-                                output,
-                                char::from_u32(val as u32).unwrap_or('\u{FFFD}'),
-                            );
+                            write_json_escape(output, char::from_u32(val).unwrap_or('\u{FFFD}'));
                         } else if val <= 0x7F {
                             output.push(val as u8 as char);
                         } else {
-                            write_json_escape(
-                                output,
-                                char::from_u32(val as u32).unwrap_or('\u{FFFD}'),
-                            );
+                            write_json_escape(output, char::from_u32(val).unwrap_or('\u{FFFD}'));
                         }
                         i += 2;
                     }
@@ -2088,7 +2082,7 @@ fn transcode_double_quoted_to_json(
                             return Err(YamlStringError::InvalidEscape);
                         }
                         let hex = &bytes[i + 1..i + 5];
-                        let codepoint = parse_hex(hex)? as u32;
+                        let codepoint = parse_hex(hex)?;
                         let ch = char::from_u32(codepoint).ok_or(YamlStringError::InvalidEscape)?;
                         write_json_escape(output, ch);
                         i += 4;
@@ -2463,17 +2457,15 @@ fn write_yaml_scalar_as_json(output: &mut String, str_val: &str) {
             }
         }
         // Could be +number or +.inf
-        b'+' => {
-            if bytes.len() > 1 && bytes[1].is_ascii_digit() {
-                if let Ok(n) = str_val.parse::<i64>() {
-                    write_i64(output, n);
+        b'+' if bytes.len() > 1 && bytes[1].is_ascii_digit() => {
+            if let Ok(n) = str_val.parse::<i64>() {
+                write_i64(output, n);
+                return;
+            }
+            if let Ok(f) = str_val.parse::<f64>() {
+                if !f.is_nan() && !f.is_infinite() {
+                    write_f64(output, f);
                     return;
-                }
-                if let Ok(f) = str_val.parse::<f64>() {
-                    if !f.is_nan() && !f.is_infinite() {
-                        write_f64(output, f);
-                        return;
-                    }
                 }
             }
         }
@@ -2747,7 +2739,7 @@ fn stream_transcode_double_quoted_to_json<Out: core::fmt::Write>(
                         }
                         let hex = &bytes[i + 1..i + 3];
                         let val = parse_hex(hex)?;
-                        let ch = char::from_u32(val as u32).unwrap_or('\u{FFFD}');
+                        let ch = char::from_u32(val).unwrap_or('\u{FFFD}');
                         if val < 0x20 || val == 0x22 || val == 0x5C {
                             stream_json_escape(out, ch)
                                 .map_err(|_| YamlStringError::InvalidUtf8)?;
@@ -2765,7 +2757,7 @@ fn stream_transcode_double_quoted_to_json<Out: core::fmt::Write>(
                             return Err(YamlStringError::InvalidEscape);
                         }
                         let hex = &bytes[i + 1..i + 5];
-                        let codepoint = parse_hex(hex)? as u32;
+                        let codepoint = parse_hex(hex)?;
                         let ch = char::from_u32(codepoint).ok_or(YamlStringError::InvalidEscape)?;
                         stream_json_escape(out, ch).map_err(|_| YamlStringError::InvalidUtf8)?;
                         i += 4;
@@ -3029,15 +3021,13 @@ fn stream_yaml_scalar_as_json<Out: core::fmt::Write>(
                 }
             }
         }
-        b'+' => {
-            if bytes.len() > 1 && bytes[1].is_ascii_digit() {
-                if let Ok(n) = str_val.parse::<i64>() {
-                    return write!(out, "{}", n);
-                }
-                if let Ok(f) = str_val.parse::<f64>() {
-                    if !f.is_nan() && !f.is_infinite() {
-                        return write!(out, "{}", f);
-                    }
+        b'+' if bytes.len() > 1 && bytes[1].is_ascii_digit() => {
+            if let Ok(n) = str_val.parse::<i64>() {
+                return write!(out, "{}", n);
+            }
+            if let Ok(f) = str_val.parse::<f64>() {
+                if !f.is_nan() && !f.is_infinite() {
+                    return write!(out, "{}", f);
                 }
             }
         }
@@ -3938,9 +3928,7 @@ fn decode_double_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
                         if val <= 0x7F {
                             result.push(val as u8 as char);
                         } else {
-                            result.push(
-                                char::from_u32(val as u32).ok_or(YamlStringError::InvalidEscape)?,
-                            );
+                            result.push(char::from_u32(val).ok_or(YamlStringError::InvalidEscape)?);
                         }
                         i += 2;
                     }
@@ -3950,7 +3938,7 @@ fn decode_double_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
                             return Err(YamlStringError::InvalidEscape);
                         }
                         let hex = &bytes[i + 1..i + 5];
-                        let codepoint = parse_hex(hex)? as u32;
+                        let codepoint = parse_hex(hex)?;
                         result
                             .push(char::from_u32(codepoint).ok_or(YamlStringError::InvalidEscape)?);
                         i += 4;
