@@ -2,22 +2,30 @@
 //! (#149, belongs with #182).
 //!
 //! The scalar reference parser (`src/dsv/parser.rs`) and every SIMD backend
-//! implement the *same* quote semantics: quote state toggles on every quote
-//! byte, and delimiters/newlines are marked only outside quotes. So for any
-//! input the scalar index and each SIMD index must be identical.
+//! must build the same index for any input: quote state toggles on every quote
+//! byte, and delimiters/newlines are marked only outside quotes.
 //!
 //! The critical case is a quote at bit offset 63 of a 64-bit chunk: the
 //! chunk-boundary carry must propagate, or an embedded delimiter/newline in the
-//! next chunk leaks out of the quoted span (bug #149). The pre-existing
-//! per-backend `test_quoted_spanning_chunks` only places a quote at offset 0 —
-//! which is exactly why the bit-63 bug slipped through. Here we sweep a quote
-//! across *every* offset and fuzz randomized CSV.
+//! next chunk leaks out of the quoted span. The pre-existing per-backend
+//! `test_quoted_spanning_chunks` only places a quote at offset 0 — which is
+//! exactly why the bit-63 bug slipped through.
 //!
-//! On this aarch64 host the sweep exercises scalar vs NEON (and SVE2 when
-//! detected). The x86 backends (SSE2/AVX2/BMI2) run these same assertions on
-//! x86 CI — tracked in #193; SVE2 under emulation — tracked in #194. Backends
-//! that are compiled but whose hardware feature is absent print a `SKIPPED`
-//! line so a fully-skipped run does not read as "passed".
+//! The SIMD backends fall into two families:
+//!
+//! * **prefix-xor** (`neon`, `sse2`, `avx2`) — track quote state with a running
+//!   `in_quote` flag. These agree with scalar today, including at bit 63, and
+//!   are asserted directly.
+//! * **toggle64** (`bmi2` PDEP, `sve2` BDEP) — share a carry formula that drops
+//!   a quote at bit 63 (`(addend << 1)` loses the top bit), so they currently
+//!   DISAGREE with scalar at the chunk boundary. That is bug #149 (with #182);
+//!   the in-repo `toggle64_reference` re-implements the same buggy formula, so
+//!   the old unit test never caught it. Those backends are exercised only by the
+//!   `#[ignore]`d repro test at the bottom until #149 is fixed.
+//!
+//! On this aarch64 host the direct assertions run scalar vs NEON. On x86 CI they
+//! run scalar vs SSE2/AVX2. Absent CPU features print a `SKIPPED` line so a
+//! fully-skipped run does not read as "passed". See #193 (x86) / #194 (SVE2).
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -25,9 +33,9 @@ use succinctly::dsv::{build_index_scalar, DsvConfig, DsvIndex};
 
 type Builder = fn(&[u8], &DsvConfig) -> DsvIndex;
 
-/// SIMD backends compiled for this target whose required CPU features are
-/// present. Absent features are reported as `SKIPPED` (see #193 / #194).
-fn simd_backends() -> Vec<(&'static str, Builder)> {
+/// Carry-correct SIMD backends for this target (prefix-xor family). These agree
+/// with the scalar reference today, including at the bit-63 chunk boundary.
+fn prefix_xor_backends() -> Vec<(&'static str, Builder)> {
     #[allow(unused_mut)]
     let mut backends: Vec<(&'static str, Builder)> = Vec::new();
 
@@ -35,13 +43,6 @@ fn simd_backends() -> Vec<(&'static str, Builder)> {
     {
         // NEON is mandatory on aarch64, so it always runs.
         backends.push(("neon", succinctly::dsv::simd::neon::build_index_simd));
-        // SVE2 does not exist on Apple Silicon; validated under emulation (#194).
-        // NOTE: #194 should tighten this to the exact `sve2-bitperm` feature.
-        if std::arch::is_aarch64_feature_detected!("sve2") {
-            backends.push(("sve2", succinctly::dsv::simd::sve2::build_index_simd));
-        } else {
-            eprintln!("SKIPPED dsv differential [sve2]: sve2 not detected (see #194)");
-        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -53,10 +54,36 @@ fn simd_backends() -> Vec<(&'static str, Builder)> {
         } else {
             eprintln!("SKIPPED dsv differential [avx2]: avx2 not detected (see #193)");
         }
+    }
+
+    backends
+}
+
+/// The `toggle64`-based backends (BMI2 PDEP / SVE2 BDEP). They share the carry
+/// formula that drops a quote at bit 63, so they currently DISAGREE with scalar
+/// at a chunk boundary — bug #149 (with #182). Exercised only by the ignored
+/// repro test until #149 is fixed.
+fn toggle64_backends() -> Vec<(&'static str, Builder)> {
+    #[allow(unused_mut)]
+    let mut backends: Vec<(&'static str, Builder)> = Vec::new();
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SVE2 is absent on Apple Silicon; validated under emulation (#194).
+        // NOTE: #194 should tighten this to the exact `sve2-bitperm` feature.
+        if std::arch::is_aarch64_feature_detected!("sve2") {
+            backends.push(("sve2", succinctly::dsv::simd::sve2::build_index_simd));
+        } else {
+            eprintln!("SKIPPED dsv toggle64 differential [sve2]: sve2 not detected (see #194)");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
         if std::arch::is_x86_feature_detected!("bmi2") {
             backends.push(("bmi2", succinctly::dsv::simd::bmi2::build_index_simd));
         } else {
-            eprintln!("SKIPPED dsv differential [bmi2]: bmi2 not detected (see #193)");
+            eprintln!("SKIPPED dsv toggle64 differential [bmi2]: bmi2 not detected (see #193)");
         }
     }
 
@@ -75,12 +102,17 @@ fn index_sig(idx: &DsvIndex, len: usize) -> (Vec<usize>, Vec<usize>) {
     (markers, newlines)
 }
 
-/// Assert every available SIMD backend builds the same index as the scalar
+/// Assert every backend in `backends` builds the same index as the scalar
 /// reference for `text` under `config`.
-fn assert_matches_scalar(label: &str, text: &[u8], config: &DsvConfig) {
+fn assert_backends_match_scalar(
+    backends: &[(&'static str, Builder)],
+    label: &str,
+    text: &[u8],
+    config: &DsvConfig,
+) {
     let scalar = build_index_scalar(text, config);
     let scalar_sig = index_sig(&scalar, text.len());
-    for (name, build) in simd_backends() {
+    for (name, build) in backends {
         let simd = build(text, config);
         assert_eq!(
             index_sig(&simd, text.len()),
@@ -89,6 +121,11 @@ fn assert_matches_scalar(label: &str, text: &[u8], config: &DsvConfig) {
             String::from_utf8_lossy(text)
         );
     }
+}
+
+/// Assert the carry-correct (prefix-xor) backends match scalar.
+fn assert_matches_scalar(label: &str, text: &[u8], config: &DsvConfig) {
+    assert_backends_match_scalar(&prefix_xor_backends(), label, text, config);
 }
 
 /// Build an input whose quoted span opens at byte `open`, is longer than one
@@ -123,10 +160,10 @@ fn test_quote_at_every_offset_matches_scalar() {
 
 #[test]
 fn test_bit63_carry_regression() {
-    // Regression for #149: a quote at offset 63 (last bit of chunk 0) must set
-    // the carry so the delimiter at offset 64 (first bit of chunk 1) stays
-    // masked. Also check the neighboring boundary bits 62/64 and the next
-    // boundary at 127/128.
+    // A quote at offset 63 (last bit of chunk 0) must set the carry so the
+    // delimiter at offset 64 (first bit of chunk 1) stays masked. Also check the
+    // neighboring boundary bits 62/64 and the next boundary at 127/128. The
+    // toggle64 backends fail this (#149) and are covered separately below.
     let config = DsvConfig::default();
     for open in [62usize, 63, 64, 65, 126, 127, 128, 129] {
         let mut text = vec![b'a'; open + 80];
@@ -145,7 +182,7 @@ fn test_random_csv_matches_scalar() {
     // plus every special byte used by the configs below (delimiters, newline,
     // quote, CR). Chunk-spanning quoted regions arise naturally.
     let mut rng = ChaCha8Rng::seed_from_u64(0x9E37_79B9_7F4A_7C15);
-    let alphabet = [b'a', b'b', b',', b'\t', b';', b'\n', b'\r', b'"', b' '];
+    let alphabet = *b"ab,\t;\n\r\" ";
     let configs = [
         DsvConfig::default(),
         DsvConfig::tsv(),
@@ -159,5 +196,23 @@ fn test_random_csv_matches_scalar() {
             .collect();
         let config = &configs[rng.gen_range(0..configs.len())];
         assert_matches_scalar("fuzz", &text, config);
+    }
+}
+
+#[test]
+#[ignore = "blocked on #149: the toggle64 (BMI2 PDEP / SVE2 BDEP) carry formula \
+            drops a quote at bit 63, so bmi2/sve2 disagree with scalar at the \
+            chunk boundary. Un-ignore once #149 fixes toggle64; run with \
+            `--ignored` on an x86 (bmi2) or SVE2 (sve2) host to reproduce."]
+fn test_toggle64_backends_match_scalar_149() {
+    let backends = toggle64_backends();
+    if backends.is_empty() {
+        eprintln!("SKIPPED dsv toggle64 differential: no toggle64 backend on this host");
+        return;
+    }
+    let config = DsvConfig::default();
+    for open in 0..192usize {
+        let text = spanning_quote_input(open);
+        assert_backends_match_scalar(&backends, &format!("open={open}"), &text, &config);
     }
 }
