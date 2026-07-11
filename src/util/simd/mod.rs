@@ -59,7 +59,10 @@ pub fn popcount_512_scalar(data: &[u8; 64]) -> u32 {
 /// countable (grep the test output for `SKIPPED`), so a fully-skipped SIMD suite
 /// no longer looks green. See #191; applied to the x86 sites in #193 and the
 /// remaining SVE2 sites in #194.
+// Used today only by the aarch64 SVE2 test modules; the x86 BMI2/AVX2/SSE2
+// sites adopt it in #193, so it is dead on x86-only builds until then.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn note_simd_skip(feature: &str) {
     eprintln!("SKIPPED: SIMD test - CPU feature `{feature}` unavailable");
 }
