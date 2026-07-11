@@ -236,49 +236,31 @@ jobs:
   coverage:
     name: Coverage (${{ matrix.name }})
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: x86_64
             runner: ubuntu-latest
+            use-prebuilt: 'true'
           - name: ARM64
             runner: ubuntu-24.04-arm
+            use-prebuilt: 'false'   # no aarch64-linux prebuilt; build omni-dev from source
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      pull-requests: write          # required to post the sticky coverage comment
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
         with:
-          components: llvm-tools-preview
+          fetch-depth: 0            # full history for git merge-base (PR fork point)
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - uses: action-works/omni-dev-coverage-check@v1
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-${{ matrix.name }}-coverage-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin || true
-
-      - name: Generate coverage report (default)
-        run: cargo tarpaulin --verbose --workspace --timeout 300 --out xml --output-dir target/coverage/default
-
-      - name: Generate coverage report (simd)
-        run: cargo tarpaulin --verbose --workspace --timeout 300 --features simd --out xml --output-dir target/coverage/simd
-
-      - name: Generate coverage report (portable-popcount)
-        run: cargo tarpaulin --verbose --workspace --timeout 300 --features portable-popcount --out xml --output-dir target/coverage/portable
-
-      - name: Upload to codecov.io
-        uses: codecov/codecov-action@v4
-        with:
-          files: target/coverage/default/cobertura.xml,target/coverage/simd/cobertura.xml,target/coverage/portable/cobertura.xml
-          flags: ${{ matrix.name }}
-          fail_ci_if_error: false
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          version: 0.34.0                               # pin; we're a consumer
+          use-prebuilt-binary: ${{ matrix.use-prebuilt }}
+          test-args: --features cli,simd,regex,serde --workspace
+          fail-under-lines: 55   # floor a few pts below local llvm-cov (ARM: 59.58% lines)
+          # fail-under-patch left unset → report-only initially
+          baseline-artifact-name: coverage-baseline-${{ matrix.name }}
+          artifact-name: coverage-summary-${{ matrix.name }}
+          comment-header: coverage-${{ matrix.name }}
