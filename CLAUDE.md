@@ -183,6 +183,7 @@ The jq implementation supports format functions for converting values to strings
 | **@json**    | `@json`             | JSON format                                       | `{"a":1}`           |
 | **@text**    | `@text`             | Convert to string (same as tostring)              | `42`                |
 | **@uri**     | `@uri`              | URI percent encoding                              | `hello%20world`     |
+| **@urid**    | `@urid`             | URI percent decoding                              | `hello world`       |
 | **@base64**  | `@base64`           | Base64 encoding                                   | `aGVsbG8=`          |
 | **@base64d** | `@base64d`          | Base64 decoding                                   | `hello`             |
 | **@html**    | `@html`             | HTML entity escaping                              | `&lt;script&gt;`    |
@@ -279,13 +280,20 @@ echo '{"data": {"nested": {"value": 42}}}' | succinctly jq 'at_offset(9) | .nest
 
 ## Feature Flags
 
-| Feature             | Description                    |
-|---------------------|--------------------------------|
-| `simd`              | Explicit SIMD intrinsics       |
-| `portable-popcount` | Portable bitwise algorithm     |
-| `large-tests`       | 1GB bitvector tests            |
-| `huge-tests`        | 5GB bitvector tests            |
-| `cli`               | CLI tool                       |
+| Feature             | Description                               |
+|---------------------|-------------------------------------------|
+| `std`               | Standard library (default, CPU detection) |
+| `simd`              | Explicit SIMD intrinsics                  |
+| `portable-popcount` | Portable bitwise popcount                 |
+| `serde`             | Serde serialize/deserialize support       |
+| `regex`             | Regex builtins in jq (test, match, sub)   |
+| `cli`               | CLI tool (jq, yq, locate, generators)     |
+| `bench-runner`      | Unified benchmark runner (bench list/run) |
+| `large-tests`       | 1GB bitvector tests                       |
+| `huge-tests`        | 5GB bitvector tests                       |
+| `mmap-tests`        | Memory-mapped bitvector tests             |
+| `broadword-yaml`    | Portable broadword (SWAR) YAML on ARM64   |
+| `scalar-yaml`       | Pure scalar YAML parsing (no SIMD)        |
 
 ## Testing Strategy
 
