@@ -103,7 +103,7 @@ syq-locate config.yaml --line 5 --column 10
 
 # DSV/CSV operations
 sjq --input-dsv ',' '.[] | select(.[0] == "Alice")' data.csv
-./target/release/succinctly dsv generate users 1000 -o users.csv
+./target/release/succinctly dsv generate 1mb -p users -o users.csv
 
 # Data generation
 ./target/release/succinctly json generate 10mb -o benchmark.json
@@ -111,7 +111,7 @@ sjq --input-dsv ',' '.[] | select(.[0] == "Alice")' data.csv
 # Benchmarks (requires: cargo build --release --features bench-runner)
 ./target/release/succinctly bench run jq_bench
 ./target/release/succinctly bench run yq_bench
-./target/release/succinctly bench run yq_bench --queries all  # M2 streaming comparison (memory collected by default)
+./target/release/succinctly dev bench yq --queries all  # M2 streaming comparison (memory collected by default)
 ./target/release/succinctly bench run dsv_bench
 ```
 
@@ -413,7 +413,7 @@ To regenerate: `succinctly bench run yq_bench` (includes memory) or `cargo bench
 
 M2 streaming (`.[0]`) is **2.7x faster** than identity (`.`), with **3-4% of yq's memory**.
 
-To benchmark: `succinctly bench run yq_bench --queries all` (memory collected by default)
+To benchmark: `succinctly dev bench yq --queries all` (memory collected by default)
 
 ### Optimization Techniques
 
