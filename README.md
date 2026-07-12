@@ -67,11 +67,11 @@ assert_eq!(bv.select1(3), Some(7));  // Fourth 1-bit is at position 7
 ### Balanced Parentheses for Tree Navigation
 
 ```rust
-use succinctly::bp::BalancedParens;
+use succinctly::trees::BalancedParens;
 
 // Encode a tree as balanced parentheses: ((()())())
 // In bits: 1=open, 0=close -> 1110100100
-let bp = BalancedParens::new(&[0b0010010111], 10);
+let bp = BalancedParens::new(vec![0b0010010111], 10);
 
 // Find matching close parenthesis
 assert_eq!(bp.find_close(0), Some(9));  // Outermost pair
