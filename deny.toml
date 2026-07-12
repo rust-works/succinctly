@@ -1,0 +1,48 @@
+# deny.toml -- cargo-deny configuration for succinctly
+# Reference: https://embarkstudios.github.io/cargo-deny/
+#
+# Run locally with:  cargo deny check all
+
+[graph]
+targets = []
+all-features = true
+
+# ── Advisories ────────────────────────────────────────────────────────
+# RustSec advisory database (vulnerabilities, unmaintained, unsound).
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Flag unmaintained crates that are direct dependencies of this crate.
+unmaintained = "workspace"
+yanked = "warn"
+ignore = []
+
+# ── Licenses ──────────────────────────────────────────────────────────
+# Tuned to the licenses actually encountered in succinctly's dependency
+# tree (`cargo deny check licenses`). A new dependency introducing another
+# permissive license (e.g. ISC, BSD-3-Clause, MPL-2.0) will fail the gate
+# loudly; add it here after review.
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# ── Bans ──────────────────────────────────────────────────────────────
+# Warn (don't fail) on duplicate versions and wildcard requirements so
+# transitive-dependency skew is surfaced without blocking PRs.
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+# ── Sources ───────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
