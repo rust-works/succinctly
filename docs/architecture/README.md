@@ -2,7 +2,9 @@
 
 [Home](../../) > [Docs](../) > Architecture
 
-Design documentation for succinctly's core data structures and algorithms.
+Design documentation for succinctly's core data structures and algorithms. For the
+one-page top-level overview and orientation, start at the root
+[ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 ## Core Concepts
 

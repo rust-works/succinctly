@@ -193,7 +193,7 @@ pub trait DocumentValue: Sized + Clone {
 }
 
 /// Iterator-like access to object fields.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity)] // STYLE-0004: uncons returns the cons-list contract (field, rest); the nested tuple is intentional
 pub trait DocumentFields: Sized + Copy + Clone {
     /// The value type for keys and values.
     type Value: DocumentValue;
@@ -202,7 +202,7 @@ pub trait DocumentFields: Sized + Copy + Clone {
     type Cursor: DocumentCursor;
 
     /// Get the first field and remaining fields.
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity)] // STYLE-0004: uncons returns the cons-list contract (field, rest); the nested tuple is intentional
     fn uncons(&self) -> Option<(DocumentField<Self::Value, Self::Cursor>, Self)>;
 
     /// Find a field by name.

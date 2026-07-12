@@ -1,4 +1,4 @@
-#![allow(clippy::items_after_test_module)]
+#![allow(clippy::items_after_test_module)] // STYLE-0004: helper items intentionally follow `mod tests` in this file
 //! YamlCursor - Lazy YAML navigation using the semi-index.
 //!
 //! This module provides a cursor-based API for navigating YAML structures
@@ -431,7 +431,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// Compute base indent for plain scalar continuation checking.
     /// Returns (base_indent, is_document_root) where is_document_root is true
     /// if this scalar is the document root content (right after --- or at start).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: alternate parse-path helper; unused in current path
     fn compute_base_indent_and_root_flag(&self, value_pos: usize) -> (usize, bool) {
         // Find start of current line
         let mut line_start = value_pos;
@@ -593,7 +593,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
 
     /// Check if a position is inside a flow context (inside `[]` or `{}`).
     /// Returns true if there's an unmatched `[` or `{` before the position.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: alternate parse-path helper; unused in current path
     fn is_in_flow_context(&self, pos: usize) -> bool {
         // Find start of line containing pos
         let mut line_start = pos;
@@ -718,7 +718,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// A continuation line is more indented than base_indent (in block context),
     /// or any line that doesn't start with a flow delimiter (in flow context).
     /// For document root scalars (is_doc_root=true), continuation at indent 0 is allowed.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: alternate parse-path helper; unused in current path
     fn find_plain_scalar_end(&self, start: usize, base_indent: usize, is_doc_root: bool) -> usize {
         let in_flow = self.is_in_flow_context(start);
         let mut end = start;

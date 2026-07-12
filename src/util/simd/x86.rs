@@ -25,7 +25,7 @@ use core::arch::x86_64::*;
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "popcnt")]
 #[inline]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: platform-gated (x86_64 POPCNT)
 pub unsafe fn popcount_512_popcnt(ptr: *const u64) -> u32 {
     unsafe {
         let mut sum = 0i32;
@@ -50,7 +50,7 @@ pub unsafe fn popcount_512_popcnt(ptr: *const u64) -> u32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "popcnt")]
 #[inline]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: platform-gated (x86_64 POPCNT)
 pub unsafe fn popcount_words_popcnt(ptr: *const u64, word_count: usize) -> u32 {
     unsafe {
         let mut total = 0i32;

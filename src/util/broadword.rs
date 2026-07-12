@@ -6,11 +6,11 @@
 use crate::util::table::select_in_byte;
 
 /// Constant with 1 in each byte's LSB position.
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: broadword mask constant; unused under some feature combos
 pub const L8: u64 = 0x0101_0101_0101_0101;
 
 /// Constant with 1 in each byte's MSB position.
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: broadword mask constant; unused under some feature combos
 pub const H8: u64 = 0x8080_8080_8080_8080;
 
 /// Select the k-th set bit (0-indexed) in a 64-bit word.
@@ -124,7 +124,7 @@ fn select_in_word_ctz(x: u64, k: u32) -> u32 {
 ///
 /// For Elias-Fano `select1` where k averages ~32, broadword is ~3× faster.
 #[inline]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: broadword select fallback; unused when a SIMD select path is active
 pub fn select_in_word_broadword(x: u64, k: u32) -> u32 {
     if x == 0 {
         return 64;

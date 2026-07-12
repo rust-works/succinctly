@@ -319,6 +319,8 @@ cargo test
 
 | Document                                                          | Purpose                              |
 |-------------------------------------------------------------------|--------------------------------------|
+| [ARCHITECTURE.md](ARCHITECTURE.md)                                | Top-level architecture entry point   |
+| [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md)                        | Tagged, stable-ID coding conventions |
 | [docs/adrs/README.md](docs/adrs/README.md)                        | Architecture Decision Records (why)  |
 | [docs/guides/release.md](docs/guides/release.md)                  | Release process and checklist        |
 | [docs/optimizations/](docs/optimizations/)                        | Optimization techniques reference    |

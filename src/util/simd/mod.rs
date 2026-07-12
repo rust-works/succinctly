@@ -16,7 +16,7 @@ pub mod x86;
 ///
 /// Uses the best available implementation for the current platform.
 #[inline]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: reference popcount; unused on some targets
 pub fn popcount_512(data: &[u8; 64]) -> u32 {
     #[cfg(target_arch = "aarch64")]
     {
@@ -39,7 +39,7 @@ pub fn popcount_512(data: &[u8; 64]) -> u32 {
 
 /// Scalar fallback for 512-bit popcount.
 #[inline]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: scalar reference popcount
 pub fn popcount_512_scalar(data: &[u8; 64]) -> u32 {
     // Process byte-by-byte to avoid alignment issues
     let mut total = 0u32;
@@ -62,7 +62,7 @@ pub fn popcount_512_scalar(data: &[u8; 64]) -> u32 {
 // Used today only by the aarch64 SVE2 test modules; the x86 BMI2/AVX2/SSE2
 // sites adopt it in #193, so it is dead on x86-only builds until then.
 #[cfg(test)]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: test-only skip helper; dead on x86 builds until #193 wires it in
 pub(crate) fn note_simd_skip(feature: &str) {
     eprintln!("SKIPPED: SIMD test - CPU feature `{feature}` unavailable");
 }

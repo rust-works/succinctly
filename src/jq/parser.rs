@@ -82,7 +82,7 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    #[allow(dead_code)] // kept for tests and future use
+    #[allow(dead_code)] // STYLE-0005: kept for tests and future use
     fn new(input: &'a str) -> Self {
         Parser {
             input,

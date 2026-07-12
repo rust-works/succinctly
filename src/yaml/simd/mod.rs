@@ -249,7 +249,7 @@ pub fn classify_yaml_chars(input: &[u8], offset: usize) -> Option<YamlCharClass>
     not(feature = "scalar-yaml"),
     any(target_arch = "aarch64", not(target_arch = "x86_64"))
 ))]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: alternate classifier; unused in current path
 pub fn classify_yaml_chars_16(input: &[u8], offset: usize) -> Option<YamlCharClass16> {
     // ARM64 with NEON (default)
     #[cfg(all(target_arch = "aarch64", not(feature = "broadword-yaml")))]
@@ -280,7 +280,7 @@ pub fn classify_yaml_chars_16(input: &[u8], offset: usize) -> Option<YamlCharCla
         not(any(target_arch = "aarch64", target_arch = "x86_64"))
     )
 ))]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: alternate classifier; unused in current path
 pub fn classify_yaml_chars_8(input: &[u8], offset: usize) -> Option<YamlCharClassBroadword> {
     broadword::classify_yaml_chars_broadword(input, offset)
 }
@@ -290,7 +290,7 @@ pub fn classify_yaml_chars_8(input: &[u8], offset: usize) -> Option<YamlCharClas
 /// Returns offset from `start` to the newline, or `None` if not found.
 /// Uses SIMD/broadword for fast scanning on supported platforms.
 #[inline]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: SIMD helper; unused in current path
 pub fn find_newline(input: &[u8], start: usize) -> Option<usize> {
     if start >= input.len() {
         return None;
@@ -460,7 +460,7 @@ pub fn find_json_escape(bytes: &[u8], start: usize) -> usize {
 
 /// Scalar implementation of find_json_escape.
 #[inline(always)]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: scalar fallback (SIMD path used when detected)
 fn find_json_escape_scalar(bytes: &[u8], start: usize) -> usize {
     for (i, &b) in bytes[start..].iter().enumerate() {
         if b == b'"' || b == b'\\' || b < 0x20 {
@@ -471,7 +471,7 @@ fn find_json_escape_scalar(bytes: &[u8], start: usize) -> usize {
 }
 
 /// Scalar fallback for parse_anchor_name
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: scalar fallback (SIMD path used when detected)
 fn parse_anchor_name_scalar(input: &[u8], start: usize) -> usize {
     let mut pos = start;
     while pos < input.len() {
@@ -496,7 +496,7 @@ fn parse_anchor_name_scalar(input: &[u8], start: usize) -> usize {
 }
 
 /// Scalar fallback for find_block_scalar_end
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: scalar fallback (SIMD path used when detected)
 fn find_block_scalar_end_scalar(input: &[u8], start: usize, min_indent: usize) -> Option<usize> {
     let mut pos = start;
 
@@ -529,7 +529,7 @@ fn find_block_scalar_end_scalar(input: &[u8], start: usize, min_indent: usize) -
 }
 
 /// Scalar implementation of find_newline.
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: scalar fallback (SIMD path used when detected)
 fn find_newline_scalar(input: &[u8], start: usize) -> Option<usize> {
     for (i, &b) in input[start..].iter().enumerate() {
         if b == b'\n' {
@@ -544,7 +544,7 @@ fn find_newline_scalar(input: &[u8], start: usize) -> Option<usize> {
 // ============================================================================
 
 /// Scalar implementation of find_quote_or_escape.
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: scalar fallback (SIMD path used when detected)
 fn find_quote_or_escape_scalar(input: &[u8], start: usize, end: usize) -> Option<usize> {
     for (i, &b) in input[start..end].iter().enumerate() {
         if b == b'"' || b == b'\\' {
@@ -555,7 +555,7 @@ fn find_quote_or_escape_scalar(input: &[u8], start: usize, end: usize) -> Option
 }
 
 /// Scalar implementation of find_single_quote.
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: scalar fallback (SIMD path used when detected)
 fn find_single_quote_scalar(input: &[u8], start: usize, end: usize) -> Option<usize> {
     for (i, &b) in input[start..end].iter().enumerate() {
         if b == b'\'' {
@@ -566,7 +566,7 @@ fn find_single_quote_scalar(input: &[u8], start: usize, end: usize) -> Option<us
 }
 
 /// Scalar implementation of count_leading_spaces.
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: scalar fallback (SIMD path used when detected)
 fn count_leading_spaces_scalar(input: &[u8], start: usize) -> usize {
     input[start..].iter().take_while(|&&b| b == b' ').count()
 }

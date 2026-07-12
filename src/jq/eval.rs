@@ -7967,7 +7967,7 @@ fn eval_pipe_with_path_tracking(
 }
 
 /// Collect intermediate values along with their paths for continuing pipe evaluation
-#[allow(clippy::only_used_in_recursion)]
+#[allow(clippy::only_used_in_recursion)] // STYLE-0004: parameter used only in the recursive call; part of the recursion contract
 fn collect_intermediate_with_paths(
     expr: &Expr,
     value: &OwnedValue,
@@ -8903,7 +8903,7 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Format a time according to strftime format specifiers
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors strftime's broken-down-time field set
 fn format_strftime(
     fmt: &str,
     year: i64,
@@ -9067,7 +9067,7 @@ struct BrokenDownTime {
 }
 
 /// Parse a time string according to strptime format specifiers
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity)] // STYLE-0004: return mirrors strptime's broken-down-time field set
 fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
     let mut year: i64 = 1970;
     let mut month: i64 = 1;
@@ -9080,8 +9080,10 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
     // This matches jq's behavior where weekday/yearday in output are always
     // computed from the date, not taken from the parsed input.
     #[allow(unused_variables, unused_assignments)]
+    // STYLE-0004: weekday parsed from %w/%u then recomputed from the date (jq parity)
     let mut weekday: i64 = 4; // Thursday (Jan 1, 1970)
     #[allow(unused_variables, unused_assignments)]
+    // STYLE-0004: yearday parsed from %j then recomputed from the date (jq parity)
     let mut yearday: i64 = 0;
 
     let mut input_iter = input.chars().peekable();
@@ -9146,16 +9148,19 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
                     }
                 }
                 #[allow(unused_assignments)]
+                // STYLE-0004: assignment superseded once the date is recomputed (jq parity)
                 Some('j') => {
                     // Parse day-of-year, but we recalculate it from the date for consistency
                     yearday = parse_digits(&mut input_iter, 3)? - 1; // Convert to 0-indexed
                 }
                 #[allow(unused_assignments)]
+                // STYLE-0004: assignment superseded once the date is recomputed (jq parity)
                 Some('w') => {
                     // Parse weekday, but we recalculate it from the date for consistency
                     weekday = parse_digits(&mut input_iter, 1)?;
                 }
                 #[allow(unused_assignments)]
+                // STYLE-0004: assignment superseded once the date is recomputed (jq parity)
                 Some('u') => {
                     // Parse ISO weekday (1=Monday, 7=Sunday), convert to 0=Sunday
                     let w = parse_digits(&mut input_iter, 1)?;

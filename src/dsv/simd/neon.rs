@@ -245,7 +245,7 @@ unsafe fn prefix_xor_neon(x: u64) -> u64 {
 
 /// Scalar fallback for prefix XOR (used in tests for comparison).
 #[inline]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: scalar fallback (NEON path used when detected)
 fn prefix_xor_scalar(x: u64) -> u64 {
     // Parallel prefix XOR using doubling with left shifts
     // After step k, each bit i contains XOR of bits max(0, i-2^k+1)..=i

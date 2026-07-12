@@ -67,7 +67,7 @@ const fn extract_mask_u64(x: u64) -> u8 {
 /// YAML character classification result using broadword operations.
 /// Each field is a u8 bitmask for 8 bytes (one bit per byte position).
 #[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: broadword fallback classifier; unused when SIMD is active
 pub struct YamlCharClassBroadword {
     pub newlines: u8,
     pub colons: u8,
@@ -79,7 +79,7 @@ pub struct YamlCharClassBroadword {
     pub hash: u8,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: broadword fallback classifier; unused when SIMD is active
 impl YamlCharClassBroadword {
     /// Check if any structural character was found.
     #[inline(always)]
@@ -148,7 +148,7 @@ pub fn classify_yaml_chars_broadword(
 /// Returns combined u16 masks (low 8 bits from first chunk, high 8 from second).
 /// Returns `None` if fewer than 16 bytes remain.
 #[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: broadword fallback classifier; unused when SIMD is active
 pub struct YamlCharClass16 {
     pub newlines: u16,
     pub colons: u16,

@@ -47,7 +47,7 @@ pub struct YamlIndex<W = Vec<u64>> {
     /// Type bits - 0 = mapping, 1 = sequence at each container position
     ty: W,
     /// Number of valid bits in TY
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: index metadata field retained for parity with ib_len
     ty_len: usize,
     /// Memory-efficient BP open index to text position mapping.
     /// Uses Advance Index encoding for ~1.5× compression when positions are monotonic,
@@ -178,7 +178,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// Create a YAML index from pre-existing IB, BP, TY, and bp_to_text data.
     ///
     /// This is useful for loading serialized index data.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // STYLE-0004: constructor threads each index array; a builder would hide the 1:1 field mapping
     pub fn from_parts(
         ib: W,
         ib_len: usize,
@@ -227,7 +227,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// Create a YAML index from pre-existing data including newlines.
     ///
     /// This is useful for loading serialized index data with full line/column support.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // STYLE-0004: constructor threads each index array; a builder would hide the 1:1 field mapping
     pub fn from_parts_with_newlines(
         ib: W,
         ib_len: usize,

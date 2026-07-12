@@ -243,7 +243,7 @@ impl<'a> Iterator for DsvRows<'a> {
 /// Iterator over fields in a row.
 pub struct DsvFields<'a> {
     cursor: DsvCursor<'a>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: retained field (row start) for future use
     row_start: usize,
     started: bool,
     finished: bool,
@@ -309,7 +309,7 @@ impl<'a> Iterator for DsvFields<'a> {
 }
 
 /// Strip surrounding quotes from a field if present.
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: helper kept for future use
 pub fn strip_quotes(field: &[u8]) -> &[u8] {
     if field.len() >= 2 && field[0] == b'"' && field[field.len() - 1] == b'"' {
         &field[1..field.len() - 1]

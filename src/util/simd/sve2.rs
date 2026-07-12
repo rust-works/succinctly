@@ -94,7 +94,7 @@ pub unsafe fn bdep_u64(data: u64, mask: u64) -> u64 {
 /// Requires SVE2 with BITPERM extension. Caller must verify with
 /// `is_aarch64_feature_detected!("sve2-bitperm")`.
 #[inline]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: platform-gated (aarch64 SVE2-bitperm)
 #[target_feature(enable = "sve2-bitperm")]
 pub unsafe fn bext_u64(data: u64, mask: u64) -> u64 {
     let result: u64;
@@ -219,7 +219,7 @@ pub unsafe fn select_in_word_bdep(x: u64, k: u32) -> u32 {
 /// which is required for BDEP/BEXT instructions.
 #[cfg(feature = "std")]
 #[inline]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: platform-gated feature detection (aarch64 build)
 pub fn has_sve2_bitperm() -> bool {
     std::arch::is_aarch64_feature_detected!("sve2-bitperm")
 }
@@ -227,7 +227,7 @@ pub fn has_sve2_bitperm() -> bool {
 /// Check if SVE2-BITPERM is available (no_std version - always false).
 #[cfg(not(feature = "std"))]
 #[inline]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: const fallback for non-aarch64 builds
 pub const fn has_sve2_bitperm() -> bool {
     false
 }

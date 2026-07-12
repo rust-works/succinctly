@@ -188,6 +188,7 @@ impl fmt::Display for YamlError {
                 write!(f, "invalid UTF-8 sequence at offset {}", offset)
             }
             #[allow(deprecated)]
+            // STYLE-0004: Display arm for a deprecated error variant kept for back-compat
             YamlError::MultiDocumentNotSupported { offset } => {
                 write!(
                     f,
@@ -196,6 +197,7 @@ impl fmt::Display for YamlError {
                 )
             }
             #[allow(deprecated)]
+            // STYLE-0004: Display arm for a deprecated error variant kept for back-compat
             YamlError::FlowStyleNotSupported { offset, char } => {
                 write!(
                     f,
@@ -389,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
+    #[allow(deprecated)] // STYLE-0004: test intentionally exercises deprecated variants' Display arms
     fn test_deprecated_variant_display() {
         // Deprecated but still part of the enum and its Display arms.
         let err = YamlError::MultiDocumentNotSupported { offset: 0 };

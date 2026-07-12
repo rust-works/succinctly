@@ -753,7 +753,7 @@ fn build_l2_index_sse41(
 ///
 /// This is the reference implementation that SSE4.1 and NEON should match exactly.
 #[cfg(test)]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: scalar reference impl (SIMD path used in practice)
 fn build_l1_index_scalar(
     l0_min_excess: &[i8],
     l0_word_excess: &[i16],
@@ -787,7 +787,7 @@ fn build_l1_index_scalar(
 
 /// Scalar implementation of L2 index building for testing.
 #[cfg(test)]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: scalar reference impl (SIMD path used in practice)
 fn build_l2_index_scalar(
     l1_min_excess: &[i16],
     l1_block_excess: &[i16],
@@ -1476,7 +1476,7 @@ pub struct BalancedParens<W = Vec<u64>, S: SelectSupport = NoSelect> {
 /// Build the V2 index structures with absolute cumulative rank.
 /// Returns (l0_min_excess, l0_word_excess, l1_min_excess, l1_block_excess,
 ///          l2_min_excess, l2_block_excess, rank_l1, rank_l2, total_ones)
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity)] // STYLE-0004: build-time index tuple; a named struct adds indirection to a build-only path
 fn build_bp_index(
     words: &[u64],
     len: usize,
