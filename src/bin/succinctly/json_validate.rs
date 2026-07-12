@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use succinctly::json::validate::{ValidationError, ValidationErrorKind, Validator};
 
@@ -89,7 +89,7 @@ pub fn run(args: ValidateArgs) -> Result<i32> {
     } else if args.color {
         true
     } else {
-        atty::is(atty::Stream::Stderr)
+        io::stderr().is_terminal()
     };
 
     let scheme = ColorScheme::new(use_color);
