@@ -1,0 +1,30 @@
+name: Commit Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: commit-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  commit-check:
+    name: Commit Message Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: action-works/omni-dev-commit-check@v1
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          guidelines: .omni-dev/commit-guidelines.md
+          model: claude-haiku-4-5
+          verbose: true
+          github-token: ${{ github.token }}
