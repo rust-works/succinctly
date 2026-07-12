@@ -197,6 +197,60 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo test --verbose --features portable-popcount
 
+  # Upstream-toolchain leg (#203). Runs the x86_64 test suite on beta and nightly
+  # to catch upcoming-compiler breakage (lint changes, soundness fixes, stdlib
+  # deprecations) before it reaches a release. x86_64 only — the 3-arch fan-out
+  # above stays on `stable` so we don't triple CI minutes. `beta` gates CI;
+  # `nightly` is advisory (`continue-on-error`) because it is the flakiest. Not a
+  # required status context, so it skips wholesale on the docs-only fast path
+  # (job-level `if`, like bench/coverage) rather than run-and-skip-steps.
+  test-x86-upstream:
+    name: Test (x86_64) (${{ matrix.rust }})
+    needs: gate
+    if: needs.gate.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false                                   # beta breakage must not cancel nightly
+      matrix:
+        rust: [beta, nightly]
+    continue-on-error: ${{ matrix.rust == 'nightly' }}   # beta gates CI; nightly is advisory
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Build CLI (for integration tests)
+        run: cargo build --features cli --bin succinctly
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Run tests (simd feature)
+        run: cargo test --verbose --features simd
+
+      - name: Run tests (portable-popcount feature)
+        run: cargo test --verbose --features portable-popcount
+
+      - name: Check no_std compatibility
+        run: cargo check --no-default-features
+
   bench:
     name: Bench (${{ matrix.name }})
     needs: gate
