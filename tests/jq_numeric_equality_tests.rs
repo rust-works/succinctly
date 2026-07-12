@@ -24,7 +24,11 @@ fn full_outputs(json: &[u8], filter: &str) -> Vec<String> {
     let cursor = index.root(json);
     let expr = parse(filter).expect("parse failed");
     let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
-    result.collect_owned().iter().map(succinctly::jq::OwnedValue::to_json).collect()
+    result
+        .collect_owned()
+        .iter()
+        .map(succinctly::jq::OwnedValue::to_json)
+        .collect()
 }
 
 /// Convenience: assert the filter produces exactly one output and return it.

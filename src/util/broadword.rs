@@ -252,7 +252,7 @@ mod tests {
                 let bits_before = (word & ((1 << pos) - 1)).count_ones();
                 assert_eq!(bits_before, k, "word={word:#x}, k={k}, pos={pos}");
                 // Verify bit is set
-                assert!((word >> pos) & 1 == 1);
+                assert_eq!((word >> pos) & 1, 1);
             }
             // Beyond popcount should return 64
             assert_eq!(select_in_word(word, pop), 64);

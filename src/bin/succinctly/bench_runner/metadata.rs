@@ -130,8 +130,7 @@ pub fn collect_git_info() -> Result<GitInfo> {
 /// Collect system information.
 pub fn collect_system_info() -> SystemInfo {
     let cpu = get_cpu_info();
-    let cpu_cores = std::thread::available_parallelism()
-        .map_or(1, |p| p.get() as u32);
+    let cpu_cores = std::thread::available_parallelism().map_or(1, |p| p.get() as u32);
     let ram_gb = get_total_ram_gb();
     let os = std::env::consts::OS.to_string();
     let os_version = get_os_version();

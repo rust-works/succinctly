@@ -86,10 +86,7 @@ mod tests {
             for k in 0..pop {
                 let pos = SELECT_IN_BYTE_TABLE[(byte as usize) * 8 + k as usize];
                 // Verify the k-th bit is actually set at position pos
-                assert!(
-                    (byte >> pos) & 1 == 1,
-                    "byte={byte:08b}, k={k}, pos={pos}"
-                );
+                assert!((byte >> pos) & 1 == 1, "byte={byte:08b}, k={k}, pos={pos}");
             }
             // Verify positions beyond popcount return 8
             for k in pop..8 {

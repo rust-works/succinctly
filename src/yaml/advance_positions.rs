@@ -936,11 +936,7 @@ mod tests {
         for (i, &expected) in positions.iter().enumerate() {
             let cursor = ap.cursor_from(i);
             assert_eq!(cursor.index(), i);
-            assert_eq!(
-                cursor.current(),
-                Some(expected),
-                "cursor_from({i}) failed"
-            );
+            assert_eq!(cursor.current(), Some(expected), "cursor_from({i}) failed");
         }
 
         // cursor_from past end

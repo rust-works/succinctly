@@ -869,9 +869,7 @@ mod tests {
 
         // Print compression ratio for inspection
         let ratio = vec_size as f64 / ef_size as f64;
-        eprintln!(
-            "Compression: {vec_size} bytes -> {ef_size} bytes ({ratio:.2}x)"
-        );
+        eprintln!("Compression: {vec_size} bytes -> {ef_size} bytes ({ratio:.2}x)");
     }
 
     #[test]
@@ -964,9 +962,7 @@ mod tests {
         }
         let vec_seq_time = start.elapsed();
 
-        eprintln!(
-            "\nSequential iteration ({n} elements × {iterations} iterations):"
-        );
+        eprintln!("\nSequential iteration ({n} elements × {iterations} iterations):");
         eprintln!(
             "  Vec<u32>:    {:?} ({:.1} ns/elem)",
             vec_seq_time,
@@ -1054,9 +1050,7 @@ mod tests {
         }
         let vec_skip_time = start.elapsed();
 
-        eprintln!(
-            "\nSkip-by-small (advance_by 2-8 × {iterations} iterations):"
-        );
+        eprintln!("\nSkip-by-small (advance_by 2-8 × {iterations} iterations):");
         eprintln!("  Vec<u32>:    {vec_skip_time:?}");
         eprintln!("  EliasFano:   {ef_skip_time:?}");
         eprintln!(

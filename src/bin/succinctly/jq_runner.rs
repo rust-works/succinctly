@@ -992,8 +992,8 @@ fn build_context(args: &JqCommand) -> Result<EvalContext> {
 
     // Process --jsonargs: values become JSON positional args
     for arg in &args.jsonargs {
-        let json_value = parse_json_value(arg)
-            .with_context(|| format!("Invalid JSON for --jsonargs: {arg}"))?;
+        let json_value =
+            parse_json_value(arg).with_context(|| format!("Invalid JSON for --jsonargs: {arg}"))?;
         context.positional.push(json_value);
     }
 

@@ -273,8 +273,7 @@ fn detect_format_from_path(path: &Path) -> InputFormat {
 /// Get effective input format, resolving Auto to a specific format.
 fn resolve_input_format(format: InputFormat, path: Option<&Path>) -> InputFormat {
     match format {
-        InputFormat::Auto => path
-            .map_or(InputFormat::Yaml, detect_format_from_path),
+        InputFormat::Auto => path.map_or(InputFormat::Yaml, detect_format_from_path),
         other => other,
     }
 }
@@ -1683,7 +1682,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 let mut buf_writer = BufWriter::new(&mut output_buffer);
                 // Count matching docs for multi-doc separator logic
                 let matching_docs: usize = if let Some(target_doc) = args.document {
-                    usize::from((global_doc_index..global_doc_index + inputs.len()).contains(&target_doc))
+                    usize::from(
+                        (global_doc_index..global_doc_index + inputs.len()).contains(&target_doc),
+                    )
                 } else {
                     inputs.len()
                 };

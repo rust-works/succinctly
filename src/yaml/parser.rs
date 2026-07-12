@@ -1249,10 +1249,7 @@ impl<'a> Parser<'a> {
 
         // Check for nested sequence: `- - item` (sequence item containing a sequence)
         if self.peek() == Some(b'-')
-            && matches!(
-                self.peek_at(1),
-                Some(b' ' | b'\t' | b'\n' | b'\r') | None
-            )
+            && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
         {
             // Nested sequence - the item value is another sequence.
             // Use the actual column position of the nested `-` as the indent.
@@ -1349,10 +1346,7 @@ impl<'a> Parser<'a> {
                 let saved_pos = self.pos;
                 self.advance_by(next_indent);
                 let is_sequence_indicator = matches!(self.peek(), Some(b'-'))
-                    && matches!(
-                        self.peek_at(1),
-                        Some(b' ' | b'\t' | b'\n') | None
-                    );
+                    && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n') | None);
                 self.pos = saved_pos;
 
                 if next_indent < indent || (next_indent == indent && !is_sequence_indicator) {
@@ -1523,10 +1517,7 @@ impl<'a> Parser<'a> {
             self.advance_by(next_indent);
             let next_char = self.peek();
             let is_sequence_indicator = matches!(next_char, Some(b'-'))
-                && matches!(
-                    self.peek_at(1),
-                    Some(b' ' | b'\t' | b'\n') | None
-                );
+                && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n') | None);
             self.pos = saved_pos;
 
             if next_indent < indent {
@@ -1551,12 +1542,7 @@ impl<'a> Parser<'a> {
 
             // Check if this is a nested structure or a plain scalar value
             match self.peek() {
-                Some(b'-')
-                    if matches!(
-                        self.peek_at(1),
-                        Some(b' ' | b'\t' | b'\n') | None
-                    ) =>
-                {
+                Some(b'-') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n') | None) => {
                     // Sequence - will be handled by main loop
                     self.pos = saved_pos;
                     return Ok(());
@@ -1797,12 +1783,7 @@ impl<'a> Parser<'a> {
 
         // Parse the key value inline
         match self.peek() {
-            Some(b'-')
-                if matches!(
-                    self.peek_at(1),
-                    Some(b' ' | b'\n' | b'\r') | None
-                ) =>
-            {
+            Some(b'-') if matches!(self.peek_at(1), Some(b' ' | b'\n' | b'\r') | None) => {
                 // Sequence as key - open key node and let sequence parsing continue
                 // The key will be a sequence
                 self.write_bp_open();
@@ -1899,12 +1880,7 @@ impl<'a> Parser<'a> {
 
         // Parse the value
         match self.peek() {
-            Some(b'-')
-                if matches!(
-                    self.peek_at(1),
-                    Some(b' ' | b'\t' | b'\n' | b'\r') | None
-                ) =>
-            {
+            Some(b'-') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
                 // Sequence as value
                 self.write_bp_open();
                 self.write_ty(true); // sequence
@@ -2153,10 +2129,7 @@ impl<'a> Parser<'a> {
                         None
                     };
                     // In flow context, colon must be followed by space, or flow indicator
-                    return matches!(
-                        next,
-                        Some(b' ' | b'\t' | b',' | b']' | b'}') | None
-                    );
+                    return matches!(next, Some(b' ' | b'\t' | b',' | b']' | b'}') | None);
                 }
                 _ => i += 1,
             }
@@ -2167,10 +2140,7 @@ impl<'a> Parser<'a> {
     /// Check if we're looking at an explicit key indicator `?` in flow context
     fn looks_like_explicit_flow_key(&self) -> bool {
         self.peek() == Some(b'?')
-            && matches!(
-                self.peek_at(1),
-                Some(b' ' | b'\t' | b'\n' | b'\r') | None
-            )
+            && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
     }
 
     /// Parse an explicit mapping entry in flow context: `? key : value`
@@ -3446,29 +3416,14 @@ impl<'a> Parser<'a> {
 
         // Check what kind of content this is
         match self.peek() {
-            Some(b'-')
-                if matches!(
-                    self.peek_at(1),
-                    Some(b' ' | b'\t' | b'\n' | b'\r') | None
-                ) =>
-            {
+            Some(b'-') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
                 self.parse_sequence_item(indent)?;
             }
-            Some(b'?')
-                if matches!(
-                    self.peek_at(1),
-                    Some(b' ' | b'\n' | b'\r') | None
-                ) =>
-            {
+            Some(b'?') if matches!(self.peek_at(1), Some(b' ' | b'\n' | b'\r') | None) => {
                 // Explicit key indicator
                 self.parse_explicit_key(indent)?;
             }
-            Some(b':')
-                if matches!(
-                    self.peek_at(1),
-                    Some(b' ' | b'\n' | b'\r') | None
-                ) =>
-            {
+            Some(b':') if matches!(self.peek_at(1), Some(b' ' | b'\n' | b'\r') | None) => {
                 // Explicit value indicator (value for previous explicit key)
                 self.parse_explicit_value(indent)?;
             }
@@ -3541,10 +3496,7 @@ impl<'a> Parser<'a> {
                             // Anchor with value on next line - will be parsed in next iteration
                         }
                         Some(b'-')
-                            if matches!(
-                                self.peek_at(1),
-                                Some(b' ' | b'\t' | b'\n') | None
-                            ) =>
+                            if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n') | None) =>
                         {
                             // Anchor before block sequence on same line
                             self.parse_sequence_item(indent)?;
@@ -3733,10 +3685,7 @@ mod tests {
     fn test_flow_with_strings() {
         let yaml = b"items: [\"hello\", 'world', plain]";
         let result = build_semi_index(yaml);
-        assert!(
-            result.is_ok(),
-            "Flow with strings should parse: {result:?}"
-        );
+        assert!(result.is_ok(), "Flow with strings should parse: {result:?}");
     }
 
     #[test]
@@ -3839,10 +3788,7 @@ mod tests {
     fn test_block_folded_keep() {
         let yaml = b"text: >+\n  content\n\n";
         let result = build_semi_index(yaml);
-        assert!(
-            result.is_ok(),
-            "Block folded keep should parse: {result:?}"
-        );
+        assert!(result.is_ok(), "Block folded keep should parse: {result:?}");
     }
 
     #[test]

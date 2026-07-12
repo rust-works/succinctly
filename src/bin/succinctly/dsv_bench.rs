@@ -534,9 +534,7 @@ pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> Stri
                     "| {size_col} | {time} | {throughput_str:>12} | {mem} |\n"
                 ));
             } else {
-                md.push_str(&format!(
-                    "| {size_col} | {time} | {throughput_str:>12} |\n"
-                ));
+                md.push_str(&format!("| {size_col} | {time} | {throughput_str:>12} |\n"));
             }
         }
 

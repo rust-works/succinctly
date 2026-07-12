@@ -658,7 +658,8 @@ fn get_yq_version() -> String {
         .arg("--version")
         .output()
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok()).map_or_else(|| "Unknown".to_string(), |s| s.trim().to_string())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map_or_else(|| "Unknown".to_string(), |s| s.trim().to_string())
 }
 
 /// Generate markdown tables from results

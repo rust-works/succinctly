@@ -70,12 +70,8 @@ fn generate_tabular(
     let mut row_id = 1;
     while csv.len() < target_size {
         let age = rng.as_mut().map_or(25, |r| r.gen_range(18..80));
-        let score = rng
-            .as_mut()
-            .map_or(row_id * 10, |r| r.gen_range(0..10000));
-        let active = rng
-            .as_mut()
-            .map_or(row_id % 2 == 0, rand::Rng::gen::<bool>);
+        let score = rng.as_mut().map_or(row_id * 10, |r| r.gen_range(0..10000));
+        let active = rng.as_mut().map_or(row_id % 2 == 0, rand::Rng::gen::<bool>);
         let day = (row_id % 28) + 1;
         let month = (row_id % 12) + 1;
 
@@ -133,12 +129,8 @@ fn generate_users(
         let city = cities[row_id % cities.len()];
         let country = countries[row_id % countries.len()];
         let age = rng.as_mut().map_or(30, |r| r.gen_range(22..65));
-        let salary = rng
-            .as_mut()
-            .map_or(50000, |r| r.gen_range(30000..200000));
-        let phone_suffix = rng
-            .as_mut()
-            .map_or(1234, |r| r.gen_range(1000..9999));
+        let salary = rng.as_mut().map_or(50000, |r| r.gen_range(30000..200000));
+        let phone_suffix = rng.as_mut().map_or(1234, |r| r.gen_range(1000..9999));
 
         csv.push_str(&format!(
             "{}{}{}{}{}{}{}.{}@example.com{}+1-555-{:04}{}{}{}{}{}{}{}{}",
@@ -314,9 +306,7 @@ fn generate_quoted(
         let zip = 10000 + (row_id % 90000);
 
         // Address contains delimiter, must be quoted
-        let address = format!(
-            "{street_num} {street}{delimiter} {city}{delimiter} {zip}"
-        );
+        let address = format!("{street_num} {street}{delimiter} {city}{delimiter} {zip}");
 
         // Notes may contain delimiter
         let notes = if row_id % 3 == 0 {
@@ -395,9 +385,7 @@ fn generate_wide(
     while csv.len() < target_size {
         let values: Vec<String> = (0..num_columns)
             .map(|col| {
-                let val = rng
-                    .as_mut()
-                    .map_or(row_id * col, |r| r.gen_range(0..1000));
+                let val = rng.as_mut().map_or(row_id * col, |r| r.gen_range(0..1000));
                 val.to_string()
             })
             .collect();
@@ -427,9 +415,7 @@ fn generate_long(
 
     let mut row_id = 1;
     while csv.len() < target_size {
-        let value = rng
-            .as_mut()
-            .map_or(row_id, |r| r.gen_range(0..1000000));
+        let value = rng.as_mut().map_or(row_id, |r| r.gen_range(0..1000000));
         csv.push_str(&format!("{row_id}{delimiter}{value}\n"));
         row_id += 1;
     }
@@ -455,15 +441,11 @@ fn generate_mixed(
 
     let mut row_id = 1;
     while csv.len() < target_size {
-        let int_val = rng
-            .as_mut()
-            .map_or(row_id, |r| r.gen_range(-1000..1000));
+        let int_val = rng.as_mut().map_or(row_id, |r| r.gen_range(-1000..1000));
         let float_val: f64 = rng
             .as_mut()
             .map_or(row_id as f64 * 1.5, |r| r.r#gen::<f64>() * 1000.0 - 500.0);
-        let bool_val = rng
-            .as_mut()
-            .map_or(row_id % 2 == 0, rand::Rng::gen::<bool>);
+        let bool_val = rng.as_mut().map_or(row_id % 2 == 0, rand::Rng::gen::<bool>);
         let day = (row_id % 28) + 1;
         let month = (row_id % 12) + 1;
 

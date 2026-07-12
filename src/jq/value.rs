@@ -118,9 +118,7 @@ impl OwnedValue {
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Self::Int(n) => Some(*n),
-            Self::Float(f) if (*f - (*f as i64 as f64)).abs() < f64::EPSILON => {
-                Some(*f as i64)
-            }
+            Self::Float(f) if (*f - (*f as i64 as f64)).abs() < f64::EPSILON => Some(*f as i64),
             _ => None,
         }
     }

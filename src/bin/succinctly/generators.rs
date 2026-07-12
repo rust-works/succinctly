@@ -163,7 +163,9 @@ fn add_string_variations(
         // Mix escaped and normal strings based on density
         let use_escape = rng
             .as_mut()
-            .map_or(count % 10 < (escape_density * 10.0) as usize, |r| r.r#gen::<f64>() < escape_density);
+            .map_or(count % 10 < (escape_density * 10.0) as usize, |r| {
+                r.r#gen::<f64>() < escape_density
+            });
 
         if use_escape {
             let pattern = &escape_patterns[count % escape_patterns.len()];
@@ -190,9 +192,9 @@ fn add_number_variations(json: &mut String, target_size: usize, rng: &mut Option
 
         let num = match count % 8 {
             0 => count.to_string(),                              // Simple integer
-            1 => format!("-{count}"),                          // Negative integer
-            2 => format!("0.{count}"),                         // Decimal < 1
-            3 => format!("{count}.{count}"),                 // Decimal
+            1 => format!("-{count}"),                            // Negative integer
+            2 => format!("0.{count}"),                           // Decimal < 1
+            3 => format!("{count}.{count}"),                     // Decimal
             4 => format!("{}e{}", count, count % 10),            // Scientific notation
             5 => format!("-{}.{}e-{}", count, count, count % 5), // Negative scientific
             6 => "0".to_string(),                                // Zero
@@ -363,12 +365,8 @@ fn add_realistic_records(
         }
 
         let age = rng.as_mut().map_or(25, |r| r.gen_range(18..80));
-        let score = rng
-            .as_mut()
-            .map_or(count * 10, |r| r.gen_range(0..1000));
-        let active = rng
-            .as_mut()
-            .map_or(count % 2 == 0, rand::Rng::gen::<bool>);
+        let score = rng.as_mut().map_or(count * 10, |r| r.gen_range(0..1000));
+        let active = rng.as_mut().map_or(count % 2 == 0, rand::Rng::gen::<bool>);
         let salary = rng
             .as_mut()
             .map_or(50000.0, |r| r.r#gen::<f64>() * 200000.0);
@@ -609,9 +607,9 @@ pub fn generate_numbers_json(target_size: usize, seed: Option<u64>) -> String {
             json.push(',');
         }
 
-        let num = rng
-            .as_mut()
-            .map_or(i as f64 * std::f64::consts::PI, |r| r.r#gen::<f64>() * 1000000.0);
+        let num = rng.as_mut().map_or(i as f64 * std::f64::consts::PI, |r| {
+            r.r#gen::<f64>() * 1000000.0
+        });
 
         json.push_str(&format!("{num:.6}"));
 

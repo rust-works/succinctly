@@ -4601,7 +4601,9 @@ fn build_match_object(re: &regex::Regex, matched: &str, offset: usize, input: &s
             );
             cap_obj.insert(
                 "string".to_string(),
-                cap.map_or(OwnedValue::Null, |m| OwnedValue::String(m.as_str().to_string())),
+                cap.map_or(OwnedValue::Null, |m| {
+                    OwnedValue::String(m.as_str().to_string())
+                }),
             );
             cap_obj.insert(
                 "name".to_string(),
@@ -9254,10 +9256,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
                         if c == '+' || c == '-' {
                             input_iter.next();
                             for _ in 0..4 {
-                                if input_iter
-                                    .peek()
-                                    .is_some_and(char::is_ascii_digit)
-                                {
+                                if input_iter.peek().is_some_and(char::is_ascii_digit) {
                                     input_iter.next();
                                 }
                             }
@@ -9398,9 +9397,7 @@ fn builtin_todate<W: Clone + AsRef<[u64]>>(
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = y + i64::from(month <= 2);
 
-    let result = format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
-    );
+    let result = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
 
     QueryResult::Owned(OwnedValue::String(result))
 }
@@ -9590,9 +9587,7 @@ fn format_datetime_with_offset(timestamp: f64, offset_seconds: i64) -> String {
     let year = y + i64::from(month <= 2);
 
     if offset_seconds == 0 {
-        format!(
-            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
-        )
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
     } else {
         let offset_hours = offset_seconds.abs() / 3600;
         let offset_mins = (offset_seconds.abs() % 3600) / 60;
@@ -11537,7 +11532,11 @@ fn builtin_transpose<W: Clone + AsRef<[u64]>>(
     }
 
     // Find max length
-    let max_len = inner_arrays.iter().map(alloc::vec::Vec::len).max().unwrap_or(0);
+    let max_len = inner_arrays
+        .iter()
+        .map(alloc::vec::Vec::len)
+        .max()
+        .unwrap_or(0);
 
     // Build transposed result
     let mut result = Vec::with_capacity(max_len);

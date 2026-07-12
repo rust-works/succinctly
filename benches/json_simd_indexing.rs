@@ -48,7 +48,9 @@ fn bench_json_indexing(c: &mut Criterion) {
         // AVX2 (if available) - fastest on x86_64
         if is_x86_feature_detected!("avx2") {
             group.bench_with_input(BenchmarkId::new("AVX2", name), &bytes, |b, bytes| {
-                b.iter(|| succinctly::json::simd::avx2::build_semi_index_standard(black_box(bytes)));
+                b.iter(|| {
+                    succinctly::json::simd::avx2::build_semi_index_standard(black_box(bytes))
+                });
             });
         }
 

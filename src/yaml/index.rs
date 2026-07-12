@@ -500,7 +500,9 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     #[inline]
     pub fn get_alias_anchor_name(&self, bp_pos: usize) -> Option<&str> {
         let target_bp_pos = self.aliases.get(&bp_pos)?;
-        self.bp_to_anchor.get(target_bp_pos).map(alloc::string::String::as_str)
+        self.bp_to_anchor
+            .get(target_bp_pos)
+            .map(alloc::string::String::as_str)
     }
 
     /// Get the BP position of an anchor by name.
@@ -516,7 +518,9 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// Returns `None` if the position does not have an anchor.
     #[inline]
     pub fn get_anchor_name(&self, bp_pos: usize) -> Option<&str> {
-        self.bp_to_anchor.get(&bp_pos).map(alloc::string::String::as_str)
+        self.bp_to_anchor
+            .get(&bp_pos)
+            .map(alloc::string::String::as_str)
     }
 
     /// Resolve an alias at the given BP position to a cursor pointing to

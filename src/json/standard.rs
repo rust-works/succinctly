@@ -516,9 +516,9 @@ mod tests {
             let pfsm = build_semi_index(json);
             let scalar = build_semi_index_scalar(json);
             let label = core::str::from_utf8(json);
-            assert_eq!(scalar.ib, pfsm.ib, "IB mismatch for {:?}", label);
-            assert_eq!(scalar.bp, pfsm.bp, "BP mismatch for {:?}", label);
-            assert_eq!(scalar.state, pfsm.state, "state mismatch for {:?}", label);
+            assert_eq!(scalar.ib, pfsm.ib, "IB mismatch for {label:?}");
+            assert_eq!(scalar.bp, pfsm.bp, "BP mismatch for {label:?}");
+            assert_eq!(scalar.state, pfsm.state, "state mismatch for {label:?}");
         }
     }
 

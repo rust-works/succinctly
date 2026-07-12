@@ -3098,9 +3098,7 @@ impl<'a> Parser<'a> {
     fn is_expr_terminator(&self) -> bool {
         match self.peek() {
             // Structural terminators
-            Some(',' | ')' | ']' | '}' | '|' | ':' | ';') => {
-                true
-            }
+            Some(',' | ')' | ']' | '}' | '|' | ':' | ';') => true,
             // Arithmetic operators
             Some('+' | '-' | '*' | '/' | '%') => true,
             // Comparison operators

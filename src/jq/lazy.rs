@@ -366,7 +366,9 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                 OwnedValue::Float(0.0)
             }
             JqValue::String(s) => OwnedValue::String(s.clone()),
-            JqValue::Array(arr) => OwnedValue::Array(arr.iter().map(JqValue::materialize).collect()),
+            JqValue::Array(arr) => {
+                OwnedValue::Array(arr.iter().map(JqValue::materialize).collect())
+            }
             JqValue::Object(obj) => OwnedValue::Object(
                 obj.iter()
                     .map(|(k, v)| (k.clone(), v.materialize()))

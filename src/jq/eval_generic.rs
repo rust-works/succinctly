@@ -1081,9 +1081,7 @@ fn eval_builtin<V: DocumentValue>(
                 } else if let Ok(f) = s.parse::<f64>() {
                     GenericResult::Owned(OwnedValue::Float(f))
                 } else {
-                    GenericResult::Error(EvalError::new(format!(
-                        "cannot convert '{s}' to number"
-                    )))
+                    GenericResult::Error(EvalError::new(format!("cannot convert '{s}' to number")))
                 }
             } else {
                 GenericResult::Error(EvalError::new(format!(
@@ -1128,9 +1126,7 @@ fn eval_builtin<V: DocumentValue>(
                     if optional {
                         GenericResult::None
                     } else {
-                        GenericResult::Error(EvalError::new(format!(
-                            "no node at offset {offset}"
-                        )))
+                        GenericResult::Error(EvalError::new(format!("no node at offset {offset}")))
                     }
                 }
             }

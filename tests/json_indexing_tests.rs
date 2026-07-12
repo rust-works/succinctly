@@ -861,10 +861,8 @@ mod locate_exhaustive {
                 json.push(b',');
             }
             json.extend(
-                format!(
-                    r#"{{"id":{i},"name":"user{i}","tags":["a","b"],"meta":{{"x":{i}}}}}"#
-                )
-                .as_bytes(),
+                format!(r#"{{"id":{i},"name":"user{i}","tags":["a","b"],"meta":{{"x":{i}}}}}"#)
+                    .as_bytes(),
             );
         }
         json.extend(b"]}");

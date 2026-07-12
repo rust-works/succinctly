@@ -505,9 +505,7 @@ fn run_cross_parser_benchmark(
         .stderr(Stdio::piped())
         .output()
         .with_context(|| {
-            format!(
-                "Failed to run cargo bench --bench {bench_name} in bench-compare"
-            )
+            format!("Failed to run cargo bench --bench {bench_name} in bench-compare")
         })?;
 
     // Save stdout

@@ -360,9 +360,7 @@ fn generate_navigation(target_size: usize, seed: Option<u64>) -> String {
         let salary = rng
             .as_mut()
             .map_or(60000 + count * 1000, |r| r.gen_range(50000..200000));
-        let years = rng
-            .as_mut()
-            .map_or(1 + count % 15, |r| r.gen_range(1..20));
+        let years = rng.as_mut().map_or(1 + count % 15, |r| r.gen_range(1..20));
 
         // Top-level array item (block style)
         yaml.push_str("- \n");
@@ -489,9 +487,9 @@ fn add_number_values(
     while yaml.len().saturating_sub(start_len) < target_size {
         let num = match count % 6 {
             0 => count.to_string(),                             // Simple integer
-            1 => format!("-{count}"),                         // Negative integer
-            2 => format!("0.{count}"),                        // Decimal < 1
-            3 => format!("{count}.{count}"),                // Decimal
+            1 => format!("-{count}"),                           // Negative integer
+            2 => format!("0.{count}"),                          // Decimal < 1
+            3 => format!("{count}.{count}"),                    // Decimal
             4 => format!("{}.{}e{}", count, count, count % 10), // Scientific notation
             _ => {
                 let val = rng
@@ -576,9 +574,7 @@ fn add_mixed_nested(
     let mut count = 0;
 
     while yaml.len().saturating_sub(start_len) < target_size {
-        let use_sequence = rng
-            .as_mut()
-            .map_or(count % 2 == 0, rand::Rng::gen::<bool>);
+        let use_sequence = rng.as_mut().map_or(count % 2 == 0, rand::Rng::gen::<bool>);
         let used = yaml.len().saturating_sub(start_len);
         let remaining = target_size.saturating_sub(used);
 
@@ -641,9 +637,7 @@ fn add_user_records(
         let age = rng
             .as_mut()
             .map_or(25 + count % 50, |r| r.gen_range(18..80));
-        let score = rng
-            .as_mut()
-            .map_or(count * 10, |r| r.gen_range(0..1000));
+        let score = rng.as_mut().map_or(count * 10, |r| r.gen_range(0..1000));
 
         // Use block style for sequence items with mappings
         // Note: YAML-lite parser requires `- ` (dash-space) not just `-`
@@ -690,12 +684,8 @@ fn add_config_features(
     ];
 
     while yaml.len().saturating_sub(start_len) < target_size && count < feature_names.len() {
-        let enabled = rng
-            .as_mut()
-            .map_or(count % 2 == 0, rand::Rng::gen::<bool>);
-        let priority = rng
-            .as_mut()
-            .map_or(count + 1, |r| r.gen_range(1..10));
+        let enabled = rng.as_mut().map_or(count % 2 == 0, rand::Rng::gen::<bool>);
+        let priority = rng.as_mut().map_or(count + 1, |r| r.gen_range(1..10));
 
         yaml.push_str(&format!("{}{}:\n", ind, feature_names[count]));
         yaml.push_str(&format!("{inner_ind}enabled: {enabled}\n"));

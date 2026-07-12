@@ -118,9 +118,7 @@ fn generate_block_scalars(count: usize, lines_per_block: usize) -> Vec<u8> {
     for i in 0..count {
         yaml.extend_from_slice(format!("block{i}: |\n").as_bytes());
         for j in 0..lines_per_block {
-            yaml.extend_from_slice(
-                format!("  This is line {j} of block scalar {i}\n").as_bytes(),
-            );
+            yaml.extend_from_slice(format!("  This is line {j} of block scalar {i}\n").as_bytes());
         }
     }
     yaml
@@ -156,9 +154,7 @@ fn generate_anchor_heavy(pairs: usize) -> Vec<u8> {
             );
         } else if i % 3 == 1 {
             // Medium anchor names (16-24 chars)
-            yaml.extend_from_slice(
-                format!("setting_{i}: &anchor_medium_{i} val{i}\n").as_bytes(),
-            );
+            yaml.extend_from_slice(format!("setting_{i}: &anchor_medium_{i} val{i}\n").as_bytes());
         } else {
             // Reference previous anchors with aliases
             let ref_idx = i.saturating_sub(3);
@@ -167,9 +163,7 @@ fn generate_anchor_heavy(pairs: usize) -> Vec<u8> {
                     format!("ref_{i}: *config_anchor_very_long_name_{ref_idx}\n").as_bytes(),
                 );
             } else {
-                yaml.extend_from_slice(
-                    format!("ref_{i}: *anchor_medium_{ref_idx}\n").as_bytes(),
-                );
+                yaml.extend_from_slice(format!("ref_{i}: *anchor_medium_{ref_idx}\n").as_bytes());
             }
         }
     }

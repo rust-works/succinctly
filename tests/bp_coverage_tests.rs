@@ -367,10 +367,7 @@ mod find_close_in_word_tests {
             for p in 0..16u32 {
                 let result = find_close_in_word(word, p);
                 let naive = naive_find_close_in_word(word, p);
-                assert_eq!(
-                    result, naive,
-                    "find_close_in_word({word:#x}, {p}) mismatch"
-                );
+                assert_eq!(result, naive, "find_close_in_word({word:#x}, {p}) mismatch");
             }
         }
     }
@@ -484,10 +481,7 @@ mod cross_verification_tests {
             // excess
             let bp_excess = bp.excess(p);
             let naive_exc = naive_excess(&words, len, p);
-            assert_eq!(
-                bp_excess, naive_exc,
-                "excess({p}) mismatch at len={len}"
-            );
+            assert_eq!(bp_excess, naive_exc, "excess({p}) mismatch at len={len}");
         }
     }
 
@@ -653,11 +647,7 @@ mod inverse_tests {
         for p in 0..6 {
             if bp.is_open(p) {
                 if let (Some(size), Some(close)) = (bp.subtree_size(p), bp.find_close(p)) {
-                    assert_eq!(
-                        size,
-                        (close - p) / 2,
-                        "subtree_size formula failed at {p}"
-                    );
+                    assert_eq!(size, (close - p) / 2, "subtree_size formula failed at {p}");
                 }
             }
         }

@@ -688,9 +688,7 @@ fn bench_array_indexing(c: &mut Criterion) {
         unreachable!()
     };
 
-    println!(
-        "Using array with {array_len} elements for indexing benchmark"
-    );
+    println!("Using array with {array_len} elements for indexing benchmark");
 
     let mut group = c.benchmark_group("array_indexing");
     group.sample_size(100);

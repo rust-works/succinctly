@@ -2050,7 +2050,7 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
                 }
 
                 State::CheckL0 => {
-                    debug_assert!(pos % 64 == 0);
+                    debug_assert_eq!(pos % 64, 0);
 
                     let word_idx = pos / 64;
                     if word_idx >= self.l0_min_excess.len() {
@@ -2071,7 +2071,7 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
                 }
 
                 State::CheckL1 => {
-                    debug_assert!(pos % 64 == 0);
+                    debug_assert_eq!(pos % 64, 0);
 
                     let l1_idx = pos / (64 * FACTOR_L1);
                     if l1_idx >= self.l1_min_excess.len() {

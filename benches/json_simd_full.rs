@@ -76,7 +76,9 @@ fn bench_pattern_comparison(c: &mut Criterion) {
 
         if is_x86_feature_detected!("avx2") {
             group.bench_with_input(BenchmarkId::new("AVX2", pattern), &bytes, |b, bytes| {
-                b.iter(|| succinctly::json::simd::avx2::build_semi_index_standard(black_box(bytes)));
+                b.iter(|| {
+                    succinctly::json::simd::avx2::build_semi_index_standard(black_box(bytes))
+                });
             });
         }
 

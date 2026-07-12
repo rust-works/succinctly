@@ -18,7 +18,11 @@ fn full_outputs(json: &[u8], filter: &str) -> Vec<String> {
     let cursor = index.root(json);
     let expr = parse(filter).expect("parse failed");
     let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
-    result.collect_owned().iter().map(succinctly::jq::OwnedValue::to_json).collect()
+    result
+        .collect_owned()
+        .iter()
+        .map(succinctly::jq::OwnedValue::to_json)
+        .collect()
 }
 
 /// Outputs of the generic evaluator (`src/jq/eval_generic.rs`, the CLI path).
@@ -27,7 +31,11 @@ fn generic_outputs(json: &[u8], filter: &str) -> Vec<String> {
     let cursor = index.root(json);
     let expr = parse(filter).expect("parse failed");
     let result = eval_generic::eval_with_cursor(&expr, cursor);
-    result.collect_owned().iter().map(succinctly::jq::OwnedValue::to_json).collect()
+    result
+        .collect_owned()
+        .iter()
+        .map(succinctly::jq::OwnedValue::to_json)
+        .collect()
 }
 
 fn as_strs(v: &[String]) -> Vec<&str> {
