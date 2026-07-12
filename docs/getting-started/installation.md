@@ -8,7 +8,7 @@ Add succinctly to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-succinctly = "0.1"
+succinctly = "0.7"
 ```
 
 Or use cargo:
@@ -31,7 +31,7 @@ For maximum performance on supported platforms:
 
 ```toml
 [dependencies]
-succinctly = { version = "0.1", features = ["simd"] }
+succinctly = { version = "0.7", features = ["simd"] }
 ```
 
 This enables:
@@ -131,7 +131,7 @@ If you see performance warnings about SIMD:
 If cargo build fails:
 
 1. Update Rust: `rustup update`
-2. Ensure Rust 1.70 or later: `rustc --version`
+2. Ensure Rust 1.73 or later: `rustc --version`
 3. Clear cache: `cargo clean`
 
 ## See Also
