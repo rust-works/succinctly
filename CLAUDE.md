@@ -447,7 +447,7 @@ For detailed documentation on optimization techniques used in this project, see 
 
 **Recent YAML optimizations:**
 - ✅ P2.5 (Cached Type Checking): 1-17% improvement depending on nesting depth
-  - See [docs/parsing/yaml.md#p25-cached-type-checking](docs/parsing/yaml.md#p25-cached-type-checking) for details
+  - See [docs/parsing/yaml.md#p25-cached-type-checking---implemented-](docs/parsing/yaml.md#p25-cached-type-checking---implemented-) for details
   - Best for deeply nested YAML (Kubernetes configs, CI/CD files)
 - ❌ P2.6 (Software Prefetching): **REJECTED** - 30% regression on large files
   - Modern CPU hardware prefetchers are superior for sequential parsing
@@ -547,7 +547,7 @@ For detailed documentation on optimization techniques used in this project, see 
   - Current performance: 10KB: 1.63ms, 100KB: 2.78ms, 1MB: 13.2ms (with correct output)
   - Created comprehensive test suite: 32 tests including 8 direct byte-for-byte comparisons with system `yq`
   - **Key achievement**: `succinctly yq` is now a drop-in replacement for `yq` for supported arguments
-  - See [docs/parsing/yaml.md#p10-type-preservation---accepted-](docs/parsing/yaml.md#p10-type-preservation---accepted-) for full analysis
+  - See [docs/parsing/yaml.md#p10-type-preservation-for-yq-compatibility---accepted-](docs/parsing/yaml.md#p10-type-preservation-for-yq-compatibility---accepted-) for full analysis
 - ✅ P11 (BP Select1 for yq-locate): **2.5-5.9x faster** select1 queries, fixes issue #26
   - Added zero-cost generic `SelectSupport` trait to `BalancedParens<W, S>` (NoSelect for JSON, WithSelect for YAML)
   - `find_bp_at_text_pos()` now uses O(1) sampled select1 instead of O(log n) binary search on rank1
@@ -592,7 +592,7 @@ For detailed documentation on optimization techniques used in this project, see 
     - 1MB: neutral (get() is smaller fraction of total streaming time)
   - **Neutral on strings/ and nested/** — unique positions reduce duplicate-cache hit rate
   - Best for: small-medium YAML with container-heavy structure (Kubernetes manifests, CI/CD configs)
-  - See [docs/parsing/yaml.md#o1-sequential-cursor-for-advancepositions---accepted-](docs/parsing/yaml.md#o1-sequential-cursor-for-advancepositions---accepted-) for full analysis
+  - See [docs/parsing/yaml.md#o1-sequential-cursor-for-advancepositions--accepted-](docs/parsing/yaml.md#o1-sequential-cursor-for-advancepositions--accepted-) for full analysis
 - ✅ O2 (Gap-Skipping via advance_rank1): **2-6% faster** yq queries on nested/users at small-medium sizes, issue #74
   - Replaced O(G) linear loop in `advance_cursor_to()` with O(1) `advance_rank1(target)` call
   - Applied to both `CompactEndPositions` and `AdvancePositions` cursor forward-gap paths
@@ -602,7 +602,7 @@ For detailed documentation on optimization techniques used in this project, see 
     - Most workloads show noisy but directionally positive results
   - **yaml_bench**: No regression (query-path only optimization)
   - Results are noisy because the forward-gap path is infrequently hit during typical streaming
-  - See [docs/parsing/yaml.md#o2-gap-skipping-via-advance_rank1---accepted-](docs/parsing/yaml.md#o2-gap-skipping-via-advance_rank1---accepted-) for full analysis
+  - See [docs/parsing/yaml.md#o2-gap-skipping-via-advance_rank1--accepted-](docs/parsing/yaml.md#o2-gap-skipping-via-advance_rank1--accepted-) for full analysis
 - ✅ O3 (SIMD Escape Scanning): **4-12x faster** micro-benchmark escape scanning on ARM64 NEON, issue #87
   - Added `find_json_escape_neon()` using NEON SIMD to scan for JSON escape characters (`"`, `\`, `< 0x20`)
   - Processes 16 bytes per iteration vs 1 byte scalar
