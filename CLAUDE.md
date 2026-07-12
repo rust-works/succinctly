@@ -311,6 +311,7 @@ cargo test
 
 | Document                                                          | Purpose                              |
 |-------------------------------------------------------------------|--------------------------------------|
+| [docs/adrs/README.md](docs/adrs/README.md)                        | Architecture Decision Records (why)  |
 | [docs/guides/release.md](docs/guides/release.md)                  | Release process and checklist        |
 | [docs/optimizations/](docs/optimizations/)                        | Optimization techniques reference    |
 | [docs/benchmarks/jq.md](docs/benchmarks/jq.md)                    | JSON jq benchmark results            |

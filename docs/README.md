@@ -48,6 +48,7 @@ Learn the basics:
 ### Researchers & Deep Divers
 **Understanding internals**:
 - [Architecture](architecture/) - Design decisions and core concepts
+- [Architecture Decisions](adrs/) - ADRs: why key designs were chosen, and what was rejected
 - [Parsing Implementation](parsing/) - JSON/YAML/DSV parser internals
 - [Reference](reference/) - jq and yq language documentation
 - [Implementation Plans](plan/) - Feature planning documents
@@ -74,6 +75,12 @@ Design documentation:
 - Core concepts (BitVec, BalancedParens, semi-indexing)
 - Module structure
 - Implementation decisions
+
+### [adrs/](adrs/)
+Architecture Decision Records:
+- Core design choices (semi-indexing, PFSM JSON parser, YAML oracle)
+- Rejected optimizations (why P2.6/P2.8/P3/P5/P6/P7/P8 were not adopted)
+- Status-tracked, one decision per record
 
 ### [parsing/](parsing/)
 Parser implementation details:
