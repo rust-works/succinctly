@@ -1806,4 +1806,91 @@ mod tests {
         let result = eval_with_cursor(&expr, cursor);
         assert!(matches!(result, GenericResult::Error(_)));
     }
+
+    #[test]
+    fn test_generic_result_conversions_all_variants() {
+        // A real document-backed result fixes the generic `V` for the whole
+        // Vec, letting the owned / none / error / break variants sit alongside.
+        let doc = br#"{"a": 1, "b": [1, 2, 3]}"#;
+        let index = JsonIndex::build(doc);
+        let c0 = index.root(doc);
+        let c1 = index.root(doc);
+        let results = vec![
+            eval(&Expr::Field("a".to_string()), c0.value()), // single value
+            eval(
+                &Expr::pipe(vec![Expr::Field("b".to_string()), Expr::Iterate]),
+                c1.value(),
+            ), // Many
+            GenericResult::Owned(OwnedValue::Int(5)),
+            GenericResult::ManyOwned(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+            GenericResult::None,
+            GenericResult::Error(EvalError::new("boom")),
+            GenericResult::Break("lbl".to_string()),
+        ];
+
+        // is_error / error / is_single_cursor (borrow &self)
+        assert!(results[5].is_error());
+        assert!(results[5].error().is_some());
+        assert!(!results[2].is_error());
+        assert!(results[2].error().is_none());
+        assert!(!results[2].is_single_cursor());
+
+        // stream_json / stream_yaml exercise every variant's match arm.
+        for r in &results {
+            let mut j = String::new();
+            r.stream_json(&mut j, |_| Ok(())).unwrap();
+            let mut y = String::new();
+            r.stream_yaml(&mut y, 2, |_| Ok(())).unwrap();
+        }
+        // Spot-check the owned and error stream output.
+        let mut owned_json = String::new();
+        results[2].stream_json(&mut owned_json, |_| Ok(())).unwrap();
+        assert_eq!(owned_json, "5");
+        let mut err_json = String::new();
+        results[5].stream_json(&mut err_json, |_| Ok(())).unwrap();
+        assert!(err_json.contains("boom"));
+
+        // into_owned consumes; check the owned-family variants.
+        let owned: Vec<Option<OwnedValue>> =
+            results.into_iter().map(GenericResult::into_owned).collect();
+        assert_eq!(owned[2], Some(OwnedValue::Int(5))); // Owned
+        assert_eq!(
+            owned[3],
+            Some(OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2)
+            ]))
+        ); // ManyOwned
+        assert_eq!(owned[4], None); // None
+        assert_eq!(owned[5], None); // Error
+        assert_eq!(owned[6], None); // Break
+    }
+
+    #[test]
+    fn test_generic_result_collect_owned_all_variants() {
+        let doc = br#"{"b": [1, 2, 3]}"#;
+        let index = JsonIndex::build(doc);
+        let c = index.root(doc);
+        let results = vec![
+            eval(
+                &Expr::pipe(vec![Expr::Field("b".to_string()), Expr::Iterate]),
+                c.value(),
+            ), // Many
+            GenericResult::ManyOwned(vec![OwnedValue::Int(9)]),
+            GenericResult::None,
+            GenericResult::Error(EvalError::new("e")),
+            GenericResult::Break("l".to_string()),
+            GenericResult::Owned(OwnedValue::Bool(true)),
+        ];
+        let collected: Vec<Vec<OwnedValue>> = results
+            .into_iter()
+            .map(GenericResult::collect_owned)
+            .collect();
+        assert_eq!(collected[0].len(), 3); // Many -> 3 elements
+        assert_eq!(collected[1], vec![OwnedValue::Int(9)]); // ManyOwned
+        assert!(collected[2].is_empty()); // None
+        assert!(collected[3].is_empty()); // Error
+        assert!(collected[4].is_empty()); // Break
+        assert_eq!(collected[5], vec![OwnedValue::Bool(true)]); // Owned
+    }
 }

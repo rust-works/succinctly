@@ -1320,4 +1320,80 @@ mod tests {
         s.push('"');
         assert!(validate(s.as_bytes()).is_ok());
     }
+
+    #[test]
+    fn test_validation_error_kind_display() {
+        assert_eq!(
+            ValidationErrorKind::UnexpectedCharacter {
+                expected: "','",
+                found: '}'
+            }
+            .to_string(),
+            "expected ',', found '}'"
+        );
+        assert_eq!(
+            ValidationErrorKind::UnexpectedEof { expected: "value" }.to_string(),
+            "unexpected end of input, expected value"
+        );
+        assert_eq!(
+            ValidationErrorKind::TrailingContent.to_string(),
+            "trailing content after JSON value"
+        );
+        assert_eq!(
+            ValidationErrorKind::UnclosedString.to_string(),
+            "unclosed string"
+        );
+        assert_eq!(
+            ValidationErrorKind::InvalidEscape { sequence: 'x' }.to_string(),
+            "invalid escape sequence '\\x'"
+        );
+        assert_eq!(
+            ValidationErrorKind::InvalidUnicodeEscape { reason: "bad hex" }.to_string(),
+            "invalid unicode escape: bad hex"
+        );
+        assert_eq!(
+            ValidationErrorKind::UnpairedSurrogate { codepoint: 0xD800 }.to_string(),
+            "unpaired surrogate \\uD800"
+        );
+        assert_eq!(
+            ValidationErrorKind::ControlCharacter { byte: 0x01 }.to_string(),
+            "unescaped control character 0x01"
+        );
+        assert_eq!(
+            ValidationErrorKind::LeadingZero.to_string(),
+            "leading zeros not allowed in numbers"
+        );
+        assert_eq!(
+            ValidationErrorKind::LeadingPlus.to_string(),
+            "leading plus sign not allowed in numbers"
+        );
+        assert_eq!(
+            ValidationErrorKind::InvalidNumber {
+                reason: "no digits"
+            }
+            .to_string(),
+            "invalid number: no digits"
+        );
+        assert_eq!(
+            ValidationErrorKind::InvalidKeyword {
+                found: "nul".to_string()
+            }
+            .to_string(),
+            "invalid keyword 'nul' (expected null, true, or false)"
+        );
+        assert_eq!(
+            ValidationErrorKind::InvalidUtf8.to_string(),
+            "invalid UTF-8 sequence"
+        );
+    }
+
+    #[test]
+    fn test_missing_colon_in_object() {
+        // Triggers the object-key colon error path.
+        let err = validate(br#"{"a" 1}"#).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::UnexpectedCharacter { .. }
+        ));
+    }
 }

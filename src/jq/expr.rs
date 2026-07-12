@@ -1343,4 +1343,13 @@ mod tests {
         assert!(Expr::identity().is_identity());
         assert!(!Expr::field("x").is_identity());
     }
+
+    #[test]
+    fn test_program_from_expr() {
+        let prog = Program::from_expr(Expr::identity());
+        assert_eq!(prog.expr, Expr::Identity);
+        assert!(prog.module.is_none());
+        assert!(prog.imports.is_empty());
+        assert!(prog.includes.is_empty());
+    }
 }
