@@ -2614,6 +2614,67 @@ mod tests {
         assert_eq!(bp.enclose(33000), Some(32999));
     }
 
+    /// Build `(` + `pairs` copies of `()` + `)`: one outer pair wrapping a long
+    /// flat run of balanced pairs. Total length is `2 + 2 * pairs`, the nesting
+    /// depth never exceeds 2, and the running excess stays in `[1, 2]` across the
+    /// whole interior — it only returns to 0 at the final close. That keeps the
+    /// index counters far from the i16 ceiling (#188) while forcing `find_close`
+    /// from position 0 to traverse the entire sequence.
+    fn wrapped_flat_pairs(pairs: usize) -> (Vec<u64>, usize) {
+        let total = 2 + 2 * pairs;
+        let mut words = vec![0u64; total.div_ceil(64)];
+        // Outer open at position 0.
+        words[0] |= 1;
+        // Interior pair `i` opens at the odd position `1 + 2*i`; its close (an
+        // even position) is left as a 0 bit. The outer close at `total - 1` is
+        // likewise a 0 bit.
+        for i in 0..pairs {
+            let open = 1 + 2 * i;
+            words[open / 64] |= 1u64 << (open % 64);
+        }
+        (words, total)
+    }
+
+    #[test]
+    fn test_find_close_crosses_l2_block_boundary() {
+        // Coverage stabilizer for issue #220: deterministically exercise the L2
+        // hierarchical-navigation branches (`State::CheckL2` / `State::FromL2`)
+        // of `find_close_from`, instead of relying on proptest randomly drawing
+        // an input large enough to span a full L2 block (the source of the
+        // flaky covered/uncovered flip on unrelated PRs).
+        //
+        // One L2 block spans 64 * FACTOR_L1 * FACTOR_L2 parens. Build a sequence
+        // several L2 blocks long whose excess never drops to 0 until the very
+        // end, so `find_close(0)` must skip whole L2 blocks to reach the match —
+        // driving the scan through the L2 states on every run.
+        const L2_SPAN: usize = 64 * FACTOR_L1 * FACTOR_L2;
+        assert_eq!(L2_SPAN, 65_536);
+
+        let (words, len) = wrapped_flat_pairs(100_000);
+        assert!(
+            len > 3 * L2_SPAN,
+            "input must cross multiple L2 boundaries: len={len}, L2_SPAN={L2_SPAN}"
+        );
+
+        let bp = BalancedParens::new(words.clone(), len);
+
+        // The outer open matches the very last close, having skipped every
+        // interior L2 block along the way.
+        assert_eq!(bp.find_close(0), Some(len - 1));
+
+        // Accelerated result matches the linear-scan reference for opens sampled
+        // across multiple L2 blocks (the outer pair plus interior pairs whose
+        // close sits one position later).
+        for p in [0usize, 1, L2_SPAN + 1, 2 * L2_SPAN + 1, len - 3] {
+            assert!(bp.is_open(p), "sampled position {p} should be open");
+            assert_eq!(
+                bp.find_close(p),
+                find_close(&words, len, p),
+                "find_close({p}) mismatch: accelerated vs linear scan"
+            );
+        }
+    }
+
     #[test]
     fn test_word_min_excess() {
         // "()" = 0b01 - open at 0, close at 1
