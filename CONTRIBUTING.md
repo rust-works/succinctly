@@ -56,7 +56,10 @@ cargo test --features huge-tests
 
 ### Code Style
 
-We use standard Rust formatting and linting:
+We use standard Rust formatting and linting. The project's coding, documentation, and
+lint conventions are captured with stable rule IDs in
+[docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md) — consult it (and cite the relevant
+`STYLE-####` when suppressing a lint) before submitting changes.
 
 ```bash
 # Format code
