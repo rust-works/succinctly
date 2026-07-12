@@ -1,4 +1,4 @@
-#![allow(clippy::items_after_test_module)]
+#![allow(clippy::items_after_test_module)] // STYLE-0004: helper items intentionally follow `mod tests` in this file
 //! StandardJson - Lazy JSON navigation using the standard cursor.
 //!
 //! This module provides a cursor-based API for navigating JSON structures

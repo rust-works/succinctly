@@ -12,7 +12,7 @@ use core::arch::x86_64::*;
 /// Character classification results for a 32-byte chunk (AVX2).
 /// Some fields are not currently used but are part of the classification infrastructure.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: SIMD classifier type; used only on some paths
 pub struct YamlCharClass {
     /// Mask of bytes that are '\n'
     pub newlines: u32,

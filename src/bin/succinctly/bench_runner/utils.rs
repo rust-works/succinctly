@@ -3,7 +3,7 @@
 //! Consolidated from jq_bench.rs, yq_bench.rs, and dsv_bench.rs.
 //! Some functions are not currently used but are provided for future use.
 
-#![allow(dead_code)]
+#![allow(dead_code)] // STYLE-0005: bench-only helper module (see module doc above)
 
 use anyhow::{Context, Result};
 use std::process::{Command, Stdio};

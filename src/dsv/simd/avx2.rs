@@ -236,6 +236,7 @@ mod tests {
         let mut csv = Vec::new();
         csv.push(b'"');
         #[allow(clippy::same_item_push)]
+        // STYLE-0004: builds a test CSV fixture inline; explicit pushes read as the field being constructed
         for _ in 0..70 {
             csv.push(b'x');
         }

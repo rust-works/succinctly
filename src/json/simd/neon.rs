@@ -285,7 +285,7 @@ unsafe fn classify_chars(chunk: uint8x16_t) -> CharClass {
 ///
 /// This is the original serial implementation - kept for correctness reference.
 #[inline]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: serial reference impl kept for correctness
 fn process_chunk_standard_serial(
     class: CharClass,
     mut state: State,

@@ -18,7 +18,7 @@ use core::ptr::NonNull;
 const WORDS_PER_BLOCK: usize = 8;
 
 /// Number of bits per basic block.
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: derived layout constant; unused in some configs
 const BITS_PER_BLOCK: usize = WORDS_PER_BLOCK * 64;
 
 /// Number of blocks per superblock (for L0).
@@ -29,7 +29,7 @@ const BLOCKS_PER_SUPERBLOCK: usize = 1 << 23;
 const CACHE_LINE_SIZE: usize = 64;
 
 /// Number of u128 entries that fit in a cache line (64 / 16 = 4).
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: derived layout constant; unused in some configs
 const ENTRIES_PER_CACHE_LINE: usize = CACHE_LINE_SIZE / 16;
 
 /// Cache-aligned storage for L1+L2 entries.
@@ -65,7 +65,7 @@ impl CacheAlignedL1L2 {
     ///
     /// Note: Prefer using `builder()` for new code to avoid the intermediate
     /// Vec allocation and copy.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: test/utility constructor
     fn from_vec(data: Vec<u128>) -> Self {
         if data.is_empty() {
             return Self::empty();
@@ -94,14 +94,14 @@ impl CacheAlignedL1L2 {
 
     /// Get the number of entries.
     #[inline]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: utility accessor kept for symmetry
     fn len(&self) -> usize {
         self.len
     }
 
     /// Check if empty.
     #[inline]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: utility accessor kept for symmetry
     fn is_empty(&self) -> bool {
         self.len == 0
     }

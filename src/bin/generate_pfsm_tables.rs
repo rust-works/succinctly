@@ -20,7 +20,7 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-#[allow(clippy::enum_variant_names)]
+#[allow(clippy::enum_variant_names)] // STYLE-0004: PFSM state variants share the In* prefix by design (they mirror parser states)
 enum State {
     InJson = 0,
     InString = 1,

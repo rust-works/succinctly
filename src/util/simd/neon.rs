@@ -15,7 +15,7 @@ use core::arch::aarch64::*;
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: platform-gated (aarch64 NEON)
 pub unsafe fn popcount_512_neon(ptr: *const u8) -> u32 {
     unsafe {
         // Load 4 x 128-bit chunks
@@ -58,7 +58,7 @@ pub unsafe fn popcount_512_neon(ptr: *const u8) -> u32 {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: platform-gated (aarch64 NEON)
 pub unsafe fn popcount_neon(ptr: *const u8, len: usize) -> u32 {
     unsafe {
         let mut total = 0u32;

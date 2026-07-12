@@ -224,7 +224,7 @@ const fn extract_mask_u64(x: u64) -> u8 {
 ///
 /// NOTE: Currently unused - broadword integration is disabled. See P4 analysis.
 #[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: broadword classifier kept as reference/fallback
 pub struct YamlCharClassBroadword {
     pub newlines: u8,
     pub colons: u8,
@@ -236,7 +236,7 @@ pub struct YamlCharClassBroadword {
     pub hash: u8,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: broadword classifier kept as reference/fallback
 impl YamlCharClassBroadword {
     /// Check if any structural character was found.
     #[inline(always)]
@@ -269,7 +269,7 @@ impl YamlCharClassBroadword {
 ///
 /// NOTE: Currently unused - broadword integration is disabled. See P4 analysis.
 #[inline]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: broadword classifier kept as reference/fallback
 pub fn classify_yaml_chars_broadword(
     input: &[u8],
     offset: usize,
@@ -310,7 +310,7 @@ pub fn classify_yaml_chars_broadword(
 ///
 /// NOTE: Currently unused - broadword integration is disabled. See P4 analysis.
 #[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: broadword classifier kept as reference/fallback
 pub struct YamlCharClass16 {
     pub newlines: u16,
     pub colons: u16,
@@ -322,7 +322,7 @@ pub struct YamlCharClass16 {
     pub hash: u16,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: broadword classifier kept as reference/fallback
 impl YamlCharClass16 {
     /// Get mask of value terminators.
     #[inline(always)]

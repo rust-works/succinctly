@@ -347,7 +347,7 @@ pub fn filter_by_names(names: &[String]) -> Vec<&'static BenchmarkInfo> {
 }
 
 /// Get a benchmark by name.
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: bench-only lookup helper
 pub fn get_by_name(name: &str) -> Option<&'static BenchmarkInfo> {
     BENCHMARKS.iter().find(|b| b.name == name)
 }

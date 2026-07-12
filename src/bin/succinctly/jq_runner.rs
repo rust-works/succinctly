@@ -22,12 +22,12 @@ use super::JqCommand;
 pub mod exit_codes {
     pub const SUCCESS: i32 = 0;
     pub const FALSE_OR_NULL: i32 = 1; // With -e, last output was false or null
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: complete jq exit-code set; not all emitted yet
     pub const USAGE_ERROR: i32 = 2; // Usage problem or system error
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: complete jq exit-code set; not all emitted yet
     pub const COMPILE_ERROR: i32 = 3; // jq program compile error
     pub const NO_OUTPUT: i32 = 4; // With -e, no valid result produced
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: complete jq exit-code set; not all emitted yet
     pub const HALT_ERROR: i32 = 5; // halt_error without explicit code
 }
 

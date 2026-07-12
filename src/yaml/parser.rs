@@ -43,7 +43,7 @@ pub enum NodeType {
     /// Sequence (array-like): ordered list
     Sequence,
     /// Scalar value (string, number, etc.)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: parser style variant retained for completeness
     Scalar,
     /// Sequence item (tracks open items awaiting their value)
     SequenceItem,
@@ -73,7 +73,7 @@ pub enum ChompingIndicator {
 #[derive(Debug)]
 struct BlockScalarHeader {
     /// Literal or folded style (used for debugging/future extensions)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: retained field (block style) for future use
     style: BlockStyle,
     /// Chomping behavior
     chomping: ChompingIndicator,
@@ -104,12 +104,12 @@ pub struct SemiIndex {
     /// Used to compute correct TY index from BP position.
     pub containers: Vec<u64>,
     /// Number of valid bits in IB (= input length)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: index metadata field retained
     pub ib_len: usize,
     /// Number of valid bits in BP
     pub bp_len: usize,
     /// Number of valid bits in TY (= number of container opens)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: index metadata field retained
     pub ty_len: usize,
     /// Anchor definitions: anchor name → BP position of the anchored value
     pub anchors: BTreeMap<String, usize>,
@@ -224,7 +224,7 @@ impl<'a> Parser<'a> {
 
     /// Set an interest bit at a specific position.
     #[inline]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: helper for an experimental SIMD path
     fn set_ib_at(&mut self, pos: usize) {
         let word_idx = pos / 64;
         let bit_idx = pos % 64;
@@ -401,7 +401,7 @@ impl<'a> Parser<'a> {
     /// Find next newline using SIMD acceleration.
     /// Returns offset from current position, or None if not found.
     #[inline]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: helper for an experimental SIMD path
     fn find_next_newline_simd(&self) -> Option<usize> {
         super::simd::find_newline(self.input, self.pos)
     }
@@ -451,7 +451,7 @@ impl<'a> Parser<'a> {
     /// Kept for future investigation. See P4 analysis in docs/parsing/yaml.md.
     #[cfg(all(target_arch = "aarch64", not(feature = "scalar-yaml")))]
     #[inline]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: helper for an experimental SIMD path
     fn skip_unquoted_simd(&self, _value_start: usize) -> Option<usize> {
         // Use broadword classify to scan 16 bytes at once (two 8-byte chunks)
         if let Some(class) = super::simd::classify_yaml_chars_16(self.input, self.pos) {

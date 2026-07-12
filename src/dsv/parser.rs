@@ -72,7 +72,7 @@ pub fn build_index(text: &[u8], config: &DsvConfig) -> DsvIndex {
 ///
 /// This version processes 8 bytes at a time using broadword techniques,
 /// which is significantly faster for large files.
-#[allow(dead_code)]
+#[allow(dead_code)] // STYLE-0005: alternate/experimental index builder
 pub fn build_index_fast(text: &[u8], config: &DsvConfig) -> DsvIndex {
     if text.is_empty() {
         return DsvIndex::new_lightweight(DsvIndexLightweight::new(vec![], vec![], 0));

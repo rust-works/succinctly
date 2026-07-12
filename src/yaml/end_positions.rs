@@ -111,7 +111,7 @@ pub struct CompactEndPositions {
     /// Interest bits: one bit per text byte, set at each unique end position.
     ib_words: Vec<u64>,
     /// Number of valid bits in IB (= text length).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: index metadata field retained
     ib_len: usize,
     /// Sampled select index for IB.
     ib_select_samples: Vec<u32>,

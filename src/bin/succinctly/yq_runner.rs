@@ -31,9 +31,9 @@ impl<W: Write> core::fmt::Write for FmtWriter<W> {
 pub mod exit_codes {
     pub const SUCCESS: i32 = 0;
     pub const FALSE_OR_NULL: i32 = 1; // With -e, last output was false or null
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: complete jq exit-code set; not all emitted yet
     pub const USAGE_ERROR: i32 = 2; // Usage problem or system error
-    #[allow(dead_code)]
+    #[allow(dead_code)] // STYLE-0005: complete jq exit-code set; not all emitted yet
     pub const COMPILE_ERROR: i32 = 3; // jq program compile error
     pub const NO_OUTPUT: i32 = 4; // With -e, no valid result produced
 }
@@ -312,7 +312,7 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
 /// Parse and evaluate YAML bytes directly using the generic evaluator.
 ///
 /// This keeps the index alive during evaluation and preserves position metadata.
-#[allow(dead_code)] // Used in tests
+#[allow(dead_code)] // STYLE-0005: used in tests
 fn parse_and_evaluate_yaml(bytes: &[u8], expr: &Expr) -> Result<Vec<OwnedValue>> {
     let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {}", e))?;
     let root = index.root(bytes);
@@ -409,7 +409,7 @@ fn evaluate_yaml_direct_filtered(
 /// This processes YAML documents directly without intermediate OwnedValue conversion,
 /// preserving position metadata for `line` and `column` builtins. Returns results
 /// grouped by document for proper multi-doc handling (with `---` separators).
-#[allow(dead_code)] // Used by tests and may be used directly in future
+#[allow(dead_code)] // STYLE-0005: used by tests; may be called directly in future
 fn evaluate_yaml_direct(bytes: &[u8], expr: &Expr) -> Result<Vec<Vec<OwnedValue>>> {
     let (results, _) = evaluate_yaml_direct_filtered(bytes, expr, None)?;
     Ok(results)
@@ -453,7 +453,7 @@ fn evaluate_input(
 /// Evaluate a jq expression directly on a YAML cursor.
 ///
 /// This uses the generic evaluator to preserve position metadata (line/column).
-#[allow(dead_code)] // Used by parse_and_evaluate_yaml
+#[allow(dead_code)] // STYLE-0005: reachable only via the test-only helper above
 fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     cursor: YamlCursor<'_, W>,
     expr: &Expr,
