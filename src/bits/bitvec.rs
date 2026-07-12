@@ -23,7 +23,7 @@ use crate::{Config, RankSelect};
 /// # Memory Layout
 ///
 /// - **words**: Raw bit storage as `Vec<u64>`
-/// - **rank_dir**: Poppy-style 3-level rank directory (~3% overhead)
+/// - **rank_dir**: Poppy-style 3-level rank directory (~25% overhead, cache-aligned)
 /// - **select_idx**: Sampled select index (~1-3% overhead depending on sample rate)
 ///
 /// # Example

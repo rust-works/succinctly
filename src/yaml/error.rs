@@ -276,4 +276,140 @@ mod tests {
             "unclosed double quote starting at offset 10"
         );
     }
+
+    #[test]
+    fn test_unclosed_single_quote_display() {
+        // The non-double branch of UnclosedQuote reports "single".
+        let err = YamlError::UnclosedQuote {
+            start_offset: 7,
+            quote_type: '\'',
+        };
+        assert_eq!(
+            err.to_string(),
+            "unclosed single quote starting at offset 7"
+        );
+    }
+
+    #[test]
+    fn test_unexpected_character_display() {
+        let err = YamlError::UnexpectedCharacter {
+            offset: 12,
+            char: '@',
+            context: "in mapping value",
+        };
+        assert_eq!(
+            err.to_string(),
+            "unexpected character '@' at offset 12: in mapping value"
+        );
+    }
+
+    #[test]
+    fn test_invalid_escape_display() {
+        let err = YamlError::InvalidEscape {
+            offset: 4,
+            sequence: "\\q".to_string(),
+        };
+        assert_eq!(err.to_string(), "invalid escape sequence '\\q' at offset 4");
+    }
+
+    #[test]
+    fn test_invalid_utf8_display() {
+        let err = YamlError::InvalidUtf8 { offset: 9 };
+        assert_eq!(err.to_string(), "invalid UTF-8 sequence at offset 9");
+    }
+
+    #[test]
+    fn test_invalid_anchor_name_display() {
+        let err = YamlError::InvalidAnchorName {
+            offset: 2,
+            reason: "empty name",
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid anchor name at offset 2: empty name"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_anchor_display() {
+        let err = YamlError::DuplicateAnchor {
+            offset: 15,
+            name: "base".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "duplicate anchor 'base' at offset 15 (previously defined)"
+        );
+    }
+
+    #[test]
+    fn test_explicit_key_not_supported_display() {
+        let err = YamlError::ExplicitKeyNotSupported { offset: 6 };
+        assert_eq!(
+            err.to_string(),
+            "explicit keys (?) not supported at offset 6"
+        );
+    }
+
+    #[test]
+    fn test_tag_not_supported_display() {
+        let err = YamlError::TagNotSupported { offset: 8 };
+        assert_eq!(err.to_string(), "tags (!) not supported at offset 8");
+    }
+
+    #[test]
+    fn test_empty_input_display() {
+        assert_eq!(YamlError::EmptyInput.to_string(), "empty input");
+    }
+
+    #[test]
+    fn test_colon_without_space_display() {
+        let err = YamlError::ColonWithoutSpace { offset: 11 };
+        assert_eq!(
+            err.to_string(),
+            "colon at offset 11 must be followed by space or newline"
+        );
+    }
+
+    #[test]
+    fn test_key_without_value_display() {
+        let err = YamlError::KeyWithoutValue { offset: 5, line: 2 };
+        assert_eq!(err.to_string(), "key without value at line 2 (offset 5)");
+    }
+
+    #[test]
+    fn test_unexpected_eof_display() {
+        let err = YamlError::UnexpectedEof {
+            context: "while parsing flow sequence",
+        };
+        assert_eq!(
+            err.to_string(),
+            "unexpected end of input: while parsing flow sequence"
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_deprecated_variant_display() {
+        // Deprecated but still part of the enum and its Display arms.
+        let err = YamlError::MultiDocumentNotSupported { offset: 0 };
+        assert_eq!(
+            err.to_string(),
+            "multi-document YAML not supported (found `---` at offset 0)"
+        );
+
+        let err = YamlError::FlowStyleNotSupported {
+            offset: 3,
+            char: '[',
+        };
+        assert_eq!(err.to_string(), "flow style '[' not supported at offset 3");
+    }
+
+    #[test]
+    fn test_error_is_clone_and_eq() {
+        // Exercises the derived Clone/PartialEq used throughout the parser.
+        let err = YamlError::KeyWithoutValue { offset: 5, line: 2 };
+        assert_eq!(err.clone(), err);
+        assert_ne!(err, YamlError::EmptyInput);
+    }
 }

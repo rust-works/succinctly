@@ -215,9 +215,9 @@ Typical speedups with proper vectorization:
 
 ### Related Documentation
 
-- [Build Configuration](../build.md) - General build settings
-- [Performance Tuning](../performance.md) - Optimization techniques
-- [Benchmarking Guide](../benchmarking.md) - How to measure performance
+- [Developer Guide](../guides/developer.md) - Build configuration and development setup
+- [Optimisation Techniques](README.md) - Optimization techniques reference
+- [Benchmarking Guide](../guides/benchmarking.md) - How to measure performance
 
 ## See Also
 

@@ -39,7 +39,7 @@ Succinctly is a high-performance Rust library implementing succinct data structu
 
 Succinctly uses **semi-indexing** rather than traditional DOM parsing. Instead of building a complete in-memory tree, it creates a lightweight structural index (~3-6% overhead) and extracts values lazily. This enables:
 
-- **17-46x less memory** than DOM parsers
+- **18-46x less memory** than DOM parsers
 - **Fast queries** because only accessed values are materialized
 - **Streaming output** without intermediate allocations
 
@@ -103,7 +103,7 @@ syq-locate config.yaml --line 5 --column 10
 
 # DSV/CSV operations
 sjq --input-dsv ',' '.[] | select(.[0] == "Alice")' data.csv
-./target/release/succinctly dsv generate users 1000 -o users.csv
+./target/release/succinctly dsv generate 1mb -p users -o users.csv
 
 # Data generation
 ./target/release/succinctly json generate 10mb -o benchmark.json
@@ -111,7 +111,7 @@ sjq --input-dsv ',' '.[] | select(.[0] == "Alice")' data.csv
 # Benchmarks (requires: cargo build --release --features bench-runner)
 ./target/release/succinctly bench run jq_bench
 ./target/release/succinctly bench run yq_bench
-./target/release/succinctly bench run yq_bench --queries all  # M2 streaming comparison (memory collected by default)
+./target/release/succinctly dev bench yq --queries all  # M2 streaming comparison (memory collected by default)
 ./target/release/succinctly bench run dsv_bench
 ```
 
@@ -183,6 +183,7 @@ The jq implementation supports format functions for converting values to strings
 | **@json**    | `@json`             | JSON format                                       | `{"a":1}`           |
 | **@text**    | `@text`             | Convert to string (same as tostring)              | `42`                |
 | **@uri**     | `@uri`              | URI percent encoding                              | `hello%20world`     |
+| **@urid**    | `@urid`             | URI percent decoding                              | `hello world`       |
 | **@base64**  | `@base64`           | Base64 encoding                                   | `aGVsbG8=`          |
 | **@base64d** | `@base64d`          | Base64 decoding                                   | `hello`             |
 | **@html**    | `@html`             | HTML entity escaping                              | `&lt;script&gt;`    |
@@ -279,13 +280,20 @@ echo '{"data": {"nested": {"value": 42}}}' | succinctly jq 'at_offset(9) | .nest
 
 ## Feature Flags
 
-| Feature             | Description                    |
-|---------------------|--------------------------------|
-| `simd`              | Explicit SIMD intrinsics       |
-| `portable-popcount` | Portable bitwise algorithm     |
-| `large-tests`       | 1GB bitvector tests            |
-| `huge-tests`        | 5GB bitvector tests            |
-| `cli`               | CLI tool                       |
+| Feature             | Description                               |
+|---------------------|-------------------------------------------|
+| `std`               | Standard library (default, CPU detection) |
+| `simd`              | Explicit SIMD intrinsics                  |
+| `portable-popcount` | Portable bitwise popcount                 |
+| `serde`             | Serde serialize/deserialize support       |
+| `regex`             | Regex builtins in jq (test, match, sub)   |
+| `cli`               | CLI tool (jq, yq, locate, generators)     |
+| `bench-runner`      | Unified benchmark runner (bench list/run) |
+| `large-tests`       | 1GB bitvector tests                       |
+| `huge-tests`        | 5GB bitvector tests                       |
+| `mmap-tests`        | Memory-mapped bitvector tests             |
+| `broadword-yaml`    | Portable broadword (SWAR) YAML on ARM64   |
+| `scalar-yaml`       | Pure scalar YAML parsing (no SIMD)        |
 
 ## Testing Strategy
 
@@ -413,7 +421,7 @@ To regenerate: `succinctly bench run yq_bench` (includes memory) or `cargo bench
 
 M2 streaming (`.[0]`) is **2.7x faster** than identity (`.`), with **3-4% of yq's memory**.
 
-To benchmark: `succinctly bench run yq_bench --queries all` (memory collected by default)
+To benchmark: `succinctly dev bench yq --queries all` (memory collected by default)
 
 ### Optimization Techniques
 
@@ -439,7 +447,7 @@ For detailed documentation on optimization techniques used in this project, see 
 
 **Recent YAML optimizations:**
 - ✅ P2.5 (Cached Type Checking): 1-17% improvement depending on nesting depth
-  - See [docs/parsing/yaml.md#p25-cached-type-checking](docs/parsing/yaml.md#p25-cached-type-checking) for details
+  - See [docs/parsing/yaml.md#p25-cached-type-checking---implemented-](docs/parsing/yaml.md#p25-cached-type-checking---implemented-) for details
   - Best for deeply nested YAML (Kubernetes configs, CI/CD files)
 - ❌ P2.6 (Software Prefetching): **REJECTED** - 30% regression on large files
   - Modern CPU hardware prefetchers are superior for sequential parsing
@@ -539,7 +547,7 @@ For detailed documentation on optimization techniques used in this project, see 
   - Current performance: 10KB: 1.63ms, 100KB: 2.78ms, 1MB: 13.2ms (with correct output)
   - Created comprehensive test suite: 32 tests including 8 direct byte-for-byte comparisons with system `yq`
   - **Key achievement**: `succinctly yq` is now a drop-in replacement for `yq` for supported arguments
-  - See [docs/parsing/yaml.md#p10-type-preservation---accepted-](docs/parsing/yaml.md#p10-type-preservation---accepted-) for full analysis
+  - See [docs/parsing/yaml.md#p10-type-preservation-for-yq-compatibility---accepted-](docs/parsing/yaml.md#p10-type-preservation-for-yq-compatibility---accepted-) for full analysis
 - ✅ P11 (BP Select1 for yq-locate): **2.5-5.9x faster** select1 queries, fixes issue #26
   - Added zero-cost generic `SelectSupport` trait to `BalancedParens<W, S>` (NoSelect for JSON, WithSelect for YAML)
   - `find_bp_at_text_pos()` now uses O(1) sampled select1 instead of O(log n) binary search on rank1
@@ -584,7 +592,7 @@ For detailed documentation on optimization techniques used in this project, see 
     - 1MB: neutral (get() is smaller fraction of total streaming time)
   - **Neutral on strings/ and nested/** — unique positions reduce duplicate-cache hit rate
   - Best for: small-medium YAML with container-heavy structure (Kubernetes manifests, CI/CD configs)
-  - See [docs/parsing/yaml.md#o1-sequential-cursor-for-advancepositions---accepted-](docs/parsing/yaml.md#o1-sequential-cursor-for-advancepositions---accepted-) for full analysis
+  - See [docs/parsing/yaml.md#o1-sequential-cursor-for-advancepositions--accepted-](docs/parsing/yaml.md#o1-sequential-cursor-for-advancepositions--accepted-) for full analysis
 - ✅ O2 (Gap-Skipping via advance_rank1): **2-6% faster** yq queries on nested/users at small-medium sizes, issue #74
   - Replaced O(G) linear loop in `advance_cursor_to()` with O(1) `advance_rank1(target)` call
   - Applied to both `CompactEndPositions` and `AdvancePositions` cursor forward-gap paths
@@ -594,7 +602,7 @@ For detailed documentation on optimization techniques used in this project, see 
     - Most workloads show noisy but directionally positive results
   - **yaml_bench**: No regression (query-path only optimization)
   - Results are noisy because the forward-gap path is infrequently hit during typical streaming
-  - See [docs/parsing/yaml.md#o2-gap-skipping-via-advance_rank1---accepted-](docs/parsing/yaml.md#o2-gap-skipping-via-advance_rank1---accepted-) for full analysis
+  - See [docs/parsing/yaml.md#o2-gap-skipping-via-advance_rank1--accepted-](docs/parsing/yaml.md#o2-gap-skipping-via-advance_rank1--accepted-) for full analysis
 - ✅ O3 (SIMD Escape Scanning): **4-12x faster** micro-benchmark escape scanning on ARM64 NEON, issue #87
   - Added `find_json_escape_neon()` using NEON SIMD to scan for JSON escape characters (`"`, `\`, `< 0x20`)
   - Processes 16 bytes per iteration vs 1 byte scalar

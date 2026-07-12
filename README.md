@@ -24,7 +24,7 @@ Succinctly provides space-efficient data structures with fast rank and select op
 
 Unlike traditional parsers that build a complete in-memory representation (DOM) of documents, succinctly uses **semi-indexing**: it builds a lightweight structural index (~3-6% overhead) and extracts values lazily on demand. This approach offers:
 
-- **17-46x less memory** than DOM parsers (index is ~24% of input vs 600-800% for DOM)
+- **18-46x less memory** than DOM parsers (index is ~24% of input vs 600-800% for DOM)
 - **Faster queries** because only accessed values are materialized
 - **Streaming output** without intermediate allocations
 
@@ -36,7 +36,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-succinctly = "0.2"
+succinctly = "0.7"
 ```
 
 Or with cargo:
@@ -67,11 +67,11 @@ assert_eq!(bv.select1(3), Some(7));  // Fourth 1-bit is at position 7
 ### Balanced Parentheses for Tree Navigation
 
 ```rust
-use succinctly::bp::BalancedParens;
+use succinctly::trees::BalancedParens;
 
 // Encode a tree as balanced parentheses: ((()())())
 // In bits: 1=open, 0=close -> 1110100100
-let bp = BalancedParens::new(&[0b0010010111], 10);
+let bp = BalancedParens::new(vec![0b0010010111], 10);
 
 // Find matching close parenthesis
 assert_eq!(bp.find_close(0), Some(9));  // Outermost pair

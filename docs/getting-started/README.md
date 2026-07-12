@@ -20,7 +20,7 @@ See the [main README](../../README.md#performance) for detailed benchmarks.
 
 ## Prerequisites
 
-- Rust 1.70 or later
+- Rust 1.73 or later
 - Cargo (comes with Rust)
 
 ## Quick Install
@@ -29,7 +29,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-succinctly = "0.1"
+succinctly = "0.7"
 ```
 
 Or use cargo:
