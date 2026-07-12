@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use core::fmt::Write as FmtWrite;
 use indexmap::IndexMap;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
 use succinctly::jq::eval_generic::{eval_with_cursor, to_owned, GenericResult};
@@ -98,7 +98,7 @@ impl OutputConfig {
             true
         } else {
             // Default: color if stdout is a terminal
-            atty::is(atty::Stream::Stdout)
+            std::io::stdout().is_terminal()
         };
 
         // Compact output when indent is 0 (yq-compatible)

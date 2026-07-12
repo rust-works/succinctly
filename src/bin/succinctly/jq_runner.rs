@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use std::collections::BTreeMap;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
@@ -522,7 +522,7 @@ impl OutputConfig {
             false
         } else {
             // Default: color if stdout is a terminal
-            atty::is(atty::Stream::Stdout)
+            std::io::stdout().is_terminal()
         };
 
         // Get color scheme from JQ_COLORS env var (or defaults)
