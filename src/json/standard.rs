@@ -487,4 +487,50 @@ mod tests {
         // Just verify we have some BP output
         assert!(!semi.bp.is_empty());
     }
+
+    #[test]
+    fn test_scalar_matches_pfsm_semi_index() {
+        // The scalar reference implementation (state_machine + Phi + helpers)
+        // must produce byte-identical semi-indexes to the default PFSM path.
+        // This exercises the whole scalar code path, which the other tests skip.
+        let inputs: &[&[u8]] = &[
+            b"{}",
+            b"[]",
+            br#"{"a":"b"}"#,
+            b"[1,2,3]",
+            b"[true]",
+            b"[false]",
+            b"[null]",
+            b"[-123]",
+            b"[3.14]",
+            b"[1e+10]",
+            br#"{"a":{"b":1}}"#,
+            br#""a\"b""#,
+            b"{ \"a\" : 1 }",
+            br#"{"items":[1,2],"flag":true}"#,
+            b"[123",     // unterminated value -> ends InValue
+            br#"["abc"#, // unterminated string -> ends InString
+            br#"{"nested":{"deep":["x",{"y":false}]}}"#,
+        ];
+        for json in inputs {
+            let pfsm = build_semi_index(json);
+            let scalar = build_semi_index_scalar(json);
+            let label = core::str::from_utf8(json);
+            assert_eq!(scalar.ib, pfsm.ib, "IB mismatch for {:?}", label);
+            assert_eq!(scalar.bp, pfsm.bp, "BP mismatch for {:?}", label);
+            assert_eq!(scalar.state, pfsm.state, "state mismatch for {:?}", label);
+        }
+    }
+
+    #[test]
+    fn test_semi_index_byte_roundtrip() {
+        // ib_as_bytes/bp_as_bytes -> from_bytes must reconstruct identical words.
+        let json = br#"{"items":[1,2],"flag":true}"#;
+        let semi = build_semi_index(json);
+        let restored = SemiIndex::from_bytes(semi.ib_as_bytes(), semi.bp_as_bytes());
+        assert_eq!(restored.ib, semi.ib);
+        assert_eq!(restored.bp, semi.bp);
+        // from_bytes assumes a complete document, so state resets to InJson.
+        assert_eq!(restored.state, State::InJson);
+    }
 }
