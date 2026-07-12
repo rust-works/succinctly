@@ -81,11 +81,11 @@ fn run_git(args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
         .output()
-        .with_context(|| format!("Failed to run git {:?}", args))?;
+        .with_context(|| format!("Failed to run git {args:?}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git {:?} failed: {}", args, stderr);
+        anyhow::bail!("git {args:?} failed: {stderr}");
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -131,8 +131,7 @@ pub fn collect_git_info() -> Result<GitInfo> {
 pub fn collect_system_info() -> SystemInfo {
     let cpu = get_cpu_info();
     let cpu_cores = std::thread::available_parallelism()
-        .map(|p| p.get() as u32)
-        .unwrap_or(1);
+        .map_or(1, |p| p.get() as u32);
     let ram_gb = get_total_ram_gb();
     let os = std::env::consts::OS.to_string();
     let os_version = get_os_version();
@@ -192,9 +191,9 @@ pub fn collect_toolchain_info() -> Result<ToolchainInfo> {
             }
         }
         if !target_env.is_empty() {
-            format!("{}-unknown-{}-{}", target_arch, target_os, target_env)
+            format!("{target_arch}-unknown-{target_os}-{target_env}")
         } else {
-            format!("{}-{}", target_arch, target_os)
+            format!("{target_arch}-{target_os}")
         }
     } else {
         format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)

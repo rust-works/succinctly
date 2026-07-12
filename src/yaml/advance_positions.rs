@@ -70,9 +70,9 @@ impl OpenPositions {
         let is_monotonic = positions.windows(2).all(|w| w[0] <= w[1]);
 
         if is_monotonic {
-            OpenPositions::Compact(AdvancePositions::build_unchecked(positions, text_len))
+            Self::Compact(AdvancePositions::build_unchecked(positions, text_len))
         } else {
-            OpenPositions::Dense(positions.to_vec())
+            Self::Dense(positions.to_vec())
         }
     }
 
@@ -80,8 +80,8 @@ impl OpenPositions {
     #[inline]
     pub fn len(&self) -> usize {
         match self {
-            OpenPositions::Compact(ap) => ap.len(),
-            OpenPositions::Dense(v) => v.len(),
+            Self::Compact(ap) => ap.len(),
+            Self::Dense(v) => v.len(),
         }
     }
 
@@ -89,8 +89,8 @@ impl OpenPositions {
     #[inline]
     pub fn is_empty(&self) -> bool {
         match self {
-            OpenPositions::Compact(ap) => ap.is_empty(),
-            OpenPositions::Dense(v) => v.is_empty(),
+            Self::Compact(ap) => ap.is_empty(),
+            Self::Dense(v) => v.is_empty(),
         }
     }
 
@@ -98,8 +98,8 @@ impl OpenPositions {
     #[inline]
     pub fn get(&self, open_idx: usize) -> Option<u32> {
         match self {
-            OpenPositions::Compact(ap) => ap.get(open_idx),
-            OpenPositions::Dense(v) => v.get(open_idx).copied(),
+            Self::Compact(ap) => ap.get(open_idx),
+            Self::Dense(v) => v.get(open_idx).copied(),
         }
     }
 
@@ -108,8 +108,8 @@ impl OpenPositions {
     /// Returns `None` if no node starts at this position.
     pub fn find_last_open_at_text_pos(&self, text_pos: usize) -> Option<usize> {
         match self {
-            OpenPositions::Compact(ap) => ap.find_last_open_at_text_pos(text_pos),
-            OpenPositions::Dense(v) => {
+            Self::Compact(ap) => ap.find_last_open_at_text_pos(text_pos),
+            Self::Dense(v) => {
                 // Binary search for non-compact storage
                 let text_pos_u32 = text_pos as u32;
                 let search_result = v.binary_search(&text_pos_u32);
@@ -132,15 +132,15 @@ impl OpenPositions {
     /// Returns the heap memory usage in bytes.
     pub fn heap_size(&self) -> usize {
         match self {
-            OpenPositions::Compact(ap) => ap.heap_size(),
-            OpenPositions::Dense(v) => v.len() * 4,
+            Self::Compact(ap) => ap.heap_size(),
+            Self::Dense(v) => v.len() * 4,
         }
     }
 
     /// Returns true if using compact (Advance Index) storage.
     #[inline]
     pub fn is_compact(&self) -> bool {
-        matches!(self, OpenPositions::Compact(_))
+        matches!(self, Self::Compact(_))
     }
 }
 
@@ -707,7 +707,7 @@ impl AdvancePositions {
     }
 }
 
-impl<'a> AdvancePositionsCursor<'a> {
+impl AdvancePositionsCursor<'_> {
     /// Returns the current text position, or `None` if exhausted.
     #[inline]
     pub fn current(&self) -> Option<u32> {
@@ -873,7 +873,7 @@ mod tests {
 
         // Test random access
         for (i, &expected) in positions.iter().enumerate() {
-            assert_eq!(ap.get(i), Some(expected), "get({}) failed", i);
+            assert_eq!(ap.get(i), Some(expected), "get({i}) failed");
         }
 
         // Test cursor iteration
@@ -895,7 +895,7 @@ mod tests {
 
         // Test random access
         for (i, &expected) in positions.iter().enumerate() {
-            assert_eq!(ap.get(i), Some(expected), "get({}) failed", i);
+            assert_eq!(ap.get(i), Some(expected), "get({i}) failed");
         }
 
         // Test cursor iteration
@@ -939,8 +939,7 @@ mod tests {
             assert_eq!(
                 cursor.current(),
                 Some(expected),
-                "cursor_from({}) failed",
-                i
+                "cursor_from({i}) failed"
             );
         }
 
@@ -992,9 +991,7 @@ mod tests {
         // Should achieve meaningful compression
         assert!(
             ap_size < vec_size,
-            "AdvancePositions {} should be smaller than Vec<u32> {}",
-            ap_size,
-            vec_size
+            "AdvancePositions {ap_size} should be smaller than Vec<u32> {vec_size}"
         );
     }
 

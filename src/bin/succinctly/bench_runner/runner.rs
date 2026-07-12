@@ -138,7 +138,7 @@ pub fn run_benchmarks(args: RunArgs) -> Result<()> {
     if benchmarks.is_empty() {
         eprintln!("No benchmarks selected. Use --all, --category, or specify benchmark names.");
         eprintln!("\nAvailable benchmarks:");
-        for b in BENCHMARKS.iter() {
+        for b in BENCHMARKS {
             eprintln!("  {} ({})", b.name, b.category);
         }
         return Ok(());
@@ -188,7 +188,7 @@ pub fn run_benchmarks(args: RunArgs) -> Result<()> {
         match BenchmarkMetadata::collect() {
             Ok(m) => Some(m),
             Err(e) => {
-                eprintln!("Warning: Failed to collect metadata: {}", e);
+                eprintln!("Warning: Failed to collect metadata: {e}");
                 None
             }
         }
@@ -240,12 +240,12 @@ pub fn run_benchmarks(args: RunArgs) -> Result<()> {
                 eprintln!("FAILED (exit code: {:?})", r.exit_code);
                 if let Some(msg) = &r.error_message {
                     if args.verbose {
-                        eprintln!("    Error: {}", msg);
+                        eprintln!("    Error: {msg}");
                     }
                 }
             }
             Err(e) => {
-                eprintln!("ERROR: {}", e);
+                eprintln!("ERROR: {e}");
             }
         }
 
@@ -292,10 +292,10 @@ pub fn run_benchmarks(args: RunArgs) -> Result<()> {
     // Print summary
     eprintln!();
     eprintln!("Benchmark run complete:");
-    eprintln!("  Passed:   {}", passed);
-    eprintln!("  Failed:   {}", failed);
+    eprintln!("  Passed:   {passed}");
+    eprintln!("  Failed:   {failed}");
     if skipped > 0 {
-        eprintln!("  Skipped:  {}", skipped);
+        eprintln!("  Skipped:  {skipped}");
     }
     eprintln!("  Duration: {}", format_duration(total_duration));
     eprintln!("  Results:  {}", output_dir.display());
@@ -328,7 +328,7 @@ fn select_benchmarks(args: &RunArgs) -> Result<Vec<&'static BenchmarkInfo>> {
         // Check for unknown names
         for name in &args.names {
             if !benchmarks.iter().any(|b| b.name == name) {
-                eprintln!("Warning: Unknown benchmark '{}'", name);
+                eprintln!("Warning: Unknown benchmark '{name}'");
             }
         }
         return Ok(benchmarks);
@@ -405,7 +405,7 @@ fn run_criterion_benchmark(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .with_context(|| format!("Failed to run cargo bench --bench {}", bench_name))?;
+        .with_context(|| format!("Failed to run cargo bench --bench {bench_name}"))?;
 
     // Save stdout
     let stdout_path = stdout_dir.join(format!("{}.txt", benchmark.name));
@@ -463,7 +463,7 @@ fn run_cli_benchmark(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .with_context(|| format!("Failed to run succinctly dev bench {}", subcommand))?;
+        .with_context(|| format!("Failed to run succinctly dev bench {subcommand}"))?;
 
     // Save stdout
     let stdout_path = stdout_dir.join(format!("{}.txt", benchmark.name));
@@ -506,8 +506,7 @@ fn run_cross_parser_benchmark(
         .output()
         .with_context(|| {
             format!(
-                "Failed to run cargo bench --bench {} in bench-compare",
-                bench_name
+                "Failed to run cargo bench --bench {bench_name} in bench-compare"
             )
         })?;
 

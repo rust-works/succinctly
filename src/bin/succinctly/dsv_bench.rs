@@ -126,7 +126,7 @@ pub fn run_benchmark(
                 break 'outer;
             }
 
-            let file_path = config.data_dir.join(pattern).join(format!("{}.csv", size));
+            let file_path = config.data_dir.join(pattern).join(format!("{size}.csv"));
 
             if !file_path.exists() {
                 eprintln!("  Skipping {} (not found)", file_path.display());
@@ -162,7 +162,7 @@ pub fn run_benchmark(
                     results.push(result);
                 }
                 Err(e) => {
-                    eprintln!("ERROR: {}", e);
+                    eprintln!("ERROR: {e}");
                 }
             }
         }
@@ -288,7 +288,7 @@ fn run_command_with_timing(program: &str, args: &[&str]) -> Result<ToolResult> {
         let output = Command::new(program)
             .args(args)
             .output()
-            .with_context(|| format!("Failed to run {}", program))?;
+            .with_context(|| format!("Failed to run {program}"))?;
         (output.stdout, 0, 0.0, 0.0)
     };
 
@@ -463,7 +463,7 @@ pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> Stri
 
     // Add CPU info
     let cpu_info = get_cpu_info();
-    md.push_str(&format!("**CPU**: {}\n\n", cpu_info));
+    md.push_str(&format!("**CPU**: {cpu_info}\n\n"));
 
     if results.is_empty() {
         md.push_str("No results.\n");
@@ -471,8 +471,8 @@ pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> Stri
     }
 
     // Get delimiter from first result
-    let delimiter = results.first().map(|r| r.delimiter).unwrap_or(',');
-    md.push_str(&format!("**Delimiter**: '{}'\n\n", delimiter));
+    let delimiter = results.first().map_or(',', |r| r.delimiter);
+    md.push_str(&format!("**Delimiter**: '{delimiter}'\n\n"));
 
     // Group by pattern (alphabetical order)
     let patterns = [
@@ -498,7 +498,7 @@ pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> Stri
             continue;
         }
 
-        md.push_str(&format!("## Pattern: {}\n\n", pattern));
+        md.push_str(&format!("## Pattern: {pattern}\n\n"));
         if memory_mode {
             md.push_str("| Size      | Time     | Throughput   | Memory   |\n");
             md.push_str("|-----------|----------|--------------|----------|\n");
@@ -522,22 +522,20 @@ pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> Stri
 
             // Format values
             let time = format_time_fixed(r.succinctly.wall_time_ms);
-            let throughput_str = format!("{:.1} MiB/s", throughput);
+            let throughput_str = format!("{throughput:.1} MiB/s");
 
             // Size column: **name** with trailing padding (9 chars total)
             let size_bold = format!("**{}**", r.size);
-            let size_col = format!("{:<9}", size_bold);
+            let size_col = format!("{size_bold:<9}");
 
             if memory_mode {
                 let mem = format_memory_fixed(r.succinctly.peak_memory_bytes);
                 md.push_str(&format!(
-                    "| {} | {} | {:>12} | {} |\n",
-                    size_col, time, throughput_str, mem
+                    "| {size_col} | {time} | {throughput_str:>12} | {mem} |\n"
                 ));
             } else {
                 md.push_str(&format!(
-                    "| {} | {} | {:>12} |\n",
-                    size_col, time, throughput_str
+                    "| {size_col} | {time} | {throughput_str:>12} |\n"
                 ));
             }
         }
@@ -556,8 +554,8 @@ fn format_time_fixed(ms: f64) -> String {
         format!("{:>7.2}s", ms / 1000.0)
     } else {
         // Milliseconds: " 765.6ms" = 8 chars total (padding on left)
-        let ms_str = format!("{:.1}ms", ms);
-        format!("{:>8}", ms_str)
+        let ms_str = format!("{ms:.1}ms");
+        format!("{ms_str:>8}")
     }
 }
 
@@ -571,7 +569,7 @@ fn format_memory_fixed(bytes: u64) -> String {
     } else if bytes >= 1024 {
         format!("{:>4.0} KB", bytes as f64 / 1024.0)
     } else {
-        format!("{:>4} B ", bytes)
+        format!("{bytes:>4} B ")
     }
 }
 
@@ -584,6 +582,6 @@ fn format_bytes(bytes: usize) -> String {
     } else if bytes >= 1024 {
         format!("{:.2} KB", bytes as f64 / 1024.0)
     } else {
-        format!("{} bytes", bytes)
+        format!("{bytes} bytes")
     }
 }

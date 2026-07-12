@@ -32,9 +32,9 @@ impl PathComponent {
     /// Format as a jq path component.
     fn to_jq_string(&self) -> String {
         match self {
-            PathComponent::Index(i) => format!("[{}]", i),
-            PathComponent::DotKey(k) => format!(".{}", k),
-            PathComponent::BracketKey(k) => format!("[\"{}\"]", escape_jq_string(k)),
+            Self::Index(i) => format!("[{i}]"),
+            Self::DotKey(k) => format!(".{k}"),
+            Self::BracketKey(k) => format!("[\"{}\"]", escape_jq_string(k)),
         }
     }
 }
@@ -176,7 +176,7 @@ fn find_key_for_value<W: AsRef<[u64]>>(
 /// Extract the key string from a key cursor.
 fn extract_key_string<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Option<String> {
     match cursor.value() {
-        YamlValue::String(s) => s.as_str().ok().map(|cow| cow.into_owned()),
+        YamlValue::String(s) => s.as_str().ok().map(alloc::borrow::Cow::into_owned),
         _ => None,
     }
 }

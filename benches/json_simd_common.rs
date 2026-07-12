@@ -44,10 +44,10 @@ pub fn discover_json_files() -> Vec<(String, PathBuf, u64)> {
                             .and_then(|n| n.to_str())
                             .unwrap_or("unknown");
 
-                        let file_size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+                        let file_size = std::fs::metadata(&file_path).map_or(0, |m| m.len());
 
                         // Create display name: pattern/size (e.g., "comprehensive/10mb")
-                        let display_name = format!("{}/{}", pattern_name, size_name);
+                        let display_name = format!("{pattern_name}/{size_name}");
                         files.push((display_name, file_path, file_size));
                     }
                 }

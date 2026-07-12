@@ -70,13 +70,13 @@ pub enum JqValue<'a, W = Vec<u64>> {
     ///
     /// Created when constructing arrays with `[.a, .b + 1]` or collecting
     /// iteration results. Children can be `Cursor` (lazy) or materialized.
-    Array(Vec<JqValue<'a, W>>),
+    Array(Vec<Self>),
 
     /// JSON object with potentially mixed lazy/materialized values.
     ///
     /// Created when constructing objects with `{a: .x, b: .y + 1}`.
     /// Keys are always strings, values can be lazy or materialized.
-    Object(IndexMap<String, JqValue<'a, W>>),
+    Object(IndexMap<String, Self>),
 }
 
 impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
@@ -122,7 +122,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
 
     /// Create an array from values.
     #[inline]
-    pub fn array(values: Vec<JqValue<'a, W>>) -> Self {
+    pub fn array(values: Vec<Self>) -> Self {
         JqValue::Array(values)
     }
 
@@ -134,7 +134,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
 
     /// Create an object from key-value pairs.
     #[inline]
-    pub fn object(pairs: impl IntoIterator<Item = (String, JqValue<'a, W>)>) -> Self {
+    pub fn object(pairs: impl IntoIterator<Item = (String, Self)>) -> Self {
         JqValue::Object(pairs.into_iter().collect())
     }
 
@@ -366,7 +366,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                 OwnedValue::Float(0.0)
             }
             JqValue::String(s) => OwnedValue::String(s.clone()),
-            JqValue::Array(arr) => OwnedValue::Array(arr.iter().map(|v| v.materialize()).collect()),
+            JqValue::Array(arr) => OwnedValue::Array(arr.iter().map(JqValue::materialize).collect()),
             JqValue::Object(obj) => OwnedValue::Object(
                 obj.iter()
                     .map(|(k, v)| (k.clone(), v.materialize()))
@@ -399,7 +399,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             }
             JqValue::String(s) => OwnedValue::String(s),
             JqValue::Array(arr) => {
-                OwnedValue::Array(arr.into_iter().map(|v| v.into_owned()).collect())
+                OwnedValue::Array(arr.into_iter().map(JqValue::into_owned).collect())
             }
             JqValue::Object(obj) => {
                 OwnedValue::Object(obj.into_iter().map(|(k, v)| (k, v.into_owned())).collect())
@@ -446,12 +446,12 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::Null => out.write_str("null"),
             JqValue::Bool(true) => out.write_str("true"),
             JqValue::Bool(false) => out.write_str("false"),
-            JqValue::Int(n) => write!(out, "{}", n),
+            JqValue::Int(n) => write!(out, "{n}"),
             JqValue::Float(f) => {
                 if f.is_nan() || f.is_infinite() {
                     out.write_str("null")
                 } else {
-                    write!(out, "{}", f)
+                    write!(out, "{f}")
                 }
             }
             JqValue::RawNumber(bytes) => {
@@ -568,31 +568,31 @@ fn cursor_to_owned<W: Clone + AsRef<[u64]>>(cursor: &JsonCursor<'_, W>) -> Owned
 // From implementations
 // ============================================================================
 
-impl<'a, W> From<bool> for JqValue<'a, W> {
+impl<W> From<bool> for JqValue<'_, W> {
     fn from(b: bool) -> Self {
         JqValue::Bool(b)
     }
 }
 
-impl<'a, W> From<i64> for JqValue<'a, W> {
+impl<W> From<i64> for JqValue<'_, W> {
     fn from(n: i64) -> Self {
         JqValue::Int(n)
     }
 }
 
-impl<'a, W> From<f64> for JqValue<'a, W> {
+impl<W> From<f64> for JqValue<'_, W> {
     fn from(f: f64) -> Self {
         JqValue::Float(f)
     }
 }
 
-impl<'a, W> From<String> for JqValue<'a, W> {
+impl<W> From<String> for JqValue<'_, W> {
     fn from(s: String) -> Self {
         JqValue::String(s)
     }
 }
 
-impl<'a, W> From<&str> for JqValue<'a, W> {
+impl<W> From<&str> for JqValue<'_, W> {
     fn from(s: &str) -> Self {
         JqValue::String(s.to_string())
     }
@@ -618,7 +618,7 @@ mod tests {
 
         let s: JqValue<'_, Vec<u64>> = JqValue::string("hello");
         assert_eq!(
-            s.as_str().map(|c| c.into_owned()),
+            s.as_str().map(alloc::borrow::Cow::into_owned),
             Some("hello".to_string())
         );
     }
@@ -719,7 +719,7 @@ mod tests {
         let lit = Literal::String("hello".to_string());
         let val: JqValue<'_, Vec<u64>> = JqValue::from_literal(&lit);
         assert_eq!(
-            val.as_str().map(|c| c.into_owned()),
+            val.as_str().map(alloc::borrow::Cow::into_owned),
             Some("hello".to_string())
         );
     }
@@ -729,7 +729,7 @@ mod tests {
         use crate::json::JsonIndex;
 
         // Just a number
-        let json = br#"4e4"#;
+        let json = br"4e4";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
 
@@ -747,7 +747,7 @@ mod tests {
         use crate::json::JsonIndex;
 
         // JSON with exponential notation that would be reformatted if parsed
-        let json = br#"4e4"#;
+        let json = br"4e4";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
 
@@ -776,7 +776,7 @@ mod tests {
         use crate::json::JsonIndex;
 
         // Create a cursor value
-        let json = br#"4e4"#;
+        let json = br"4e4";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let cursor_val = JqValue::from_cursor(cursor);

@@ -188,3 +188,96 @@ harness = false
 [[bench]]
 name = "json_validate_bench"
 harness = false
+
+# =============================================================================
+# Lints
+#
+# succinctly opts the whole crate into clippy's strict groups (`all`,
+# `pedantic`, `nursery`) plus an explicit unsafe policy. CI runs
+# `cargo clippy --all-targets --all-features -- -D warnings`, so every lint
+# configured here is enforced as a hard error.
+#
+# The `allow` overrides below are deliberate and curated: each is a lint we
+# have chosen not to enforce (yet), with a rationale. They are meant to be
+# peeled back over time in focused follow-up PRs. `priority = -1` on the group
+# lines lets these individual `allow`s win over the group-level `warn`.
+# =============================================================================
+[lints.rust]
+# succinctly is an intrinsics-heavy crate, but `unsafe` is confined to a
+# handful of SIMD / popcount / balanced-parens / binary-serialization modules.
+# Each of those opts back in with a localized `#![allow(unsafe_code)]` carrying
+# a rationale; introducing `unsafe` anywhere else is a deliberate, reviewed
+# change rather than an accident.
+unsafe_code = "deny"
+
+[lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
+
+# --- Numeric casts -----------------------------------------------------------
+# Pervasive and intentional in bit-manipulation / SIMD / indexing code, where
+# narrowing and sign reinterpretation are the whole point. These are guarded by
+# tests and documented invariants rather than by the type system.
+cast_possible_truncation   = "allow"
+cast_possible_wrap         = "allow"
+cast_sign_loss             = "allow"
+cast_precision_loss        = "allow"
+cast_lossless              = "allow"
+cast_ptr_alignment         = "allow"  # SIMD (un)aligned loads are deliberate
+
+# --- API surface / documentation ---------------------------------------------
+must_use_candidate         = "allow"  # would annotate most of the public API; deferred
+return_self_not_must_use   = "allow"  # same policy as must_use_candidate
+missing_errors_doc         = "allow"  # error types are self-describing; pure doc churn
+missing_panics_doc         = "allow"  # ditto for documented panics
+doc_markdown               = "allow"  # domain acronyms (JSON/YAML/AVX2/POPCNT/NEON) trip false positives
+
+# --- Perf-crate idioms -------------------------------------------------------
+inline_always              = "allow"  # `#[inline(always)]` is a deliberate choice on hot paths
+too_many_lines             = "allow"  # parsers / state machines are legitimately long
+needless_pass_by_value     = "allow"  # by-value signatures are often chosen for the API shape
+trivially_copy_pass_by_ref = "allow"  # by-ref kept for signature consistency across a family of fns
+struct_excessive_bools     = "allow"  # config / option structs
+float_cmp                  = "allow"  # exact float comparisons are intentional (parsing / tests)
+unreadable_literal         = "allow"  # large hand-tuned hex / decimal lookup tables
+
+# --- Style / subjective ------------------------------------------------------
+items_after_statements     = "allow"
+match_same_arms            = "allow"  # separate arms often read better in state machines
+similar_names              = "allow"  # lo/hi, i/j, src/dst are clearer than contrived names
+if_not_else                = "allow"
+single_match_else          = "allow"
+unnecessary_wraps          = "allow"  # some wrappers exist for API / trait consistency
+no_effect_underscore_binding = "allow"
+manual_assert              = "allow"
+wildcard_imports           = "allow"  # `use super::*` in test modules
+naive_bytecount            = "allow"
+case_sensitive_file_extension_comparisons = "allow"
+match_wildcard_for_single_variants = "allow"
+ref_option                 = "allow"
+used_underscore_binding    = "allow"
+comparison_chain           = "allow"  # explicit ==/>/< documents fast-path-first branch order in benchmark-tuned cursor get()
+manual_let_else            = "allow"  # clippy declines to autofix these; explicit `match` reads clearer at error-mapping sites
+needless_continue          = "allow"  # explicit `continue` documents loop control in the jq parser / comparison loops
+needless_collect           = "allow"  # test-only: iterators materialised for readable assertions
+doc_link_with_quotes       = "allow"  # false positives on markdown citation links and jq code examples in doc comments
+ignore_without_reason      = "allow"  # test-only `#[ignore]`; reasons tracked in issues
+into_iter_without_iter     = "allow"  # would require adding matching Iterator impls; deferred
+unsafe_derive_deserialize  = "allow"  # types carry manual unsafe but Deserialize itself is safe
+
+# --- Nursery (unstable; higher false-positive rate) --------------------------
+# The nursery group is enabled for its occasional gems, but the noisiest and
+# most false-positive-prone lints are turned back off.
+missing_const_for_fn         = "allow"
+option_if_let_else           = "allow"
+format_push_string           = "allow"
+branches_sharing_code        = "allow"
+redundant_clone              = "allow"
+redundant_pub_crate          = "allow"
+copy_iterator                = "allow"
+unused_peekable              = "allow"
+suboptimal_flops             = "allow"
+derive_partial_eq_without_eq = "allow"
+equatable_if_let             = "allow"
+format_collect               = "allow"

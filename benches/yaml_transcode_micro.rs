@@ -63,7 +63,7 @@ fn make_multiline_double_quoted(lines: usize) -> Vec<u8> {
     let mut yaml = Vec::with_capacity(lines * 50);
     yaml.extend_from_slice(b"value: \"line one\n");
     for i in 1..lines {
-        yaml.extend_from_slice(format!("  line {} continues\n", i).as_bytes());
+        yaml.extend_from_slice(format!("  line {i} continues\n").as_bytes());
     }
     // Replace last newline with closing quote
     yaml.pop();
@@ -100,7 +100,7 @@ fn bench_double_quoted(c: &mut Criterion) {
                     let cursor = index.root(black_box(*yaml));
                     let result = cursor.to_json_document();
                     black_box(result)
-                })
+                });
             },
         );
     }
@@ -126,7 +126,7 @@ fn bench_single_quoted(c: &mut Criterion) {
                     let cursor = index.root(black_box(*yaml));
                     let result = cursor.to_json_document();
                     black_box(result)
-                })
+                });
             },
         );
     }
@@ -152,7 +152,7 @@ fn bench_multiline(c: &mut Criterion) {
                     let cursor = index.root(black_box(*yaml));
                     let result = cursor.to_json_document();
                     black_box(result)
-                })
+                });
             },
         );
     }
@@ -178,7 +178,7 @@ fn bench_unicode_8digit(c: &mut Criterion) {
                     let cursor = index.root(black_box(*yaml));
                     let result = cursor.to_json_document();
                     black_box(result)
-                })
+                });
             },
         );
     }
@@ -218,7 +218,7 @@ features:
             let cursor = index.root(black_box(config_yaml));
             let result = cursor.to_json_document();
             black_box(result)
-        })
+        });
     });
 
     // YAML with many escape sequences
@@ -241,7 +241,7 @@ features:
             let cursor = escape_index.root(black_box(escape_heavy));
             let result = cursor.to_json_document();
             black_box(result)
-        })
+        });
     });
 
     group.finish();
@@ -257,8 +257,7 @@ fn bench_large_document(c: &mut Criterion) {
     for i in 0..500 {
         large_yaml.extend_from_slice(
             format!(
-                "  - id: {}\n    name: \"Item {} with escape\\nand tab\\t\"\n    desc: 'Single ''quoted'' text'\n",
-                i, i
+                "  - id: {i}\n    name: \"Item {i} with escape\\nand tab\\t\"\n    desc: 'Single ''quoted'' text'\n"
             )
             .as_bytes(),
         );
@@ -272,7 +271,7 @@ fn bench_large_document(c: &mut Criterion) {
             let cursor = index.root(black_box(&large_yaml));
             let result = cursor.to_json_document();
             black_box(result)
-        })
+        });
     });
 
     group.finish();
@@ -302,11 +301,11 @@ fn bench_escape_scan_no_escapes(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
 
         group.bench_with_input(BenchmarkId::new("simd", size), &data, |b, data| {
-            b.iter(|| find_json_escape(black_box(data), 0))
+            b.iter(|| find_json_escape(black_box(data), 0));
         });
 
         group.bench_with_input(BenchmarkId::new("scalar", size), &data, |b, data| {
-            b.iter(|| find_json_escape_scalar(black_box(data), 0))
+            b.iter(|| find_json_escape_scalar(black_box(data), 0));
         });
     }
 
@@ -324,11 +323,11 @@ fn bench_escape_scan_early_escape(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
 
         group.bench_with_input(BenchmarkId::new("simd", size), &data, |b, data| {
-            b.iter(|| find_json_escape(black_box(data), 0))
+            b.iter(|| find_json_escape(black_box(data), 0));
         });
 
         group.bench_with_input(BenchmarkId::new("scalar", size), &data, |b, data| {
-            b.iter(|| find_json_escape_scalar(black_box(data), 0))
+            b.iter(|| find_json_escape_scalar(black_box(data), 0));
         });
     }
 
@@ -346,11 +345,11 @@ fn bench_escape_scan_mid_escape(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
 
         group.bench_with_input(BenchmarkId::new("simd", size), &data, |b, data| {
-            b.iter(|| find_json_escape(black_box(data), 0))
+            b.iter(|| find_json_escape(black_box(data), 0));
         });
 
         group.bench_with_input(BenchmarkId::new("scalar", size), &data, |b, data| {
-            b.iter(|| find_json_escape_scalar(black_box(data), 0))
+            b.iter(|| find_json_escape_scalar(black_box(data), 0));
         });
     }
 
@@ -369,11 +368,11 @@ fn bench_escape_scan_control_chars(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
 
         group.bench_with_input(BenchmarkId::new("simd", size), &data, |b, data| {
-            b.iter(|| find_json_escape(black_box(data), 0))
+            b.iter(|| find_json_escape(black_box(data), 0));
         });
 
         group.bench_with_input(BenchmarkId::new("scalar", size), &data, |b, data| {
-            b.iter(|| find_json_escape_scalar(black_box(data), 0))
+            b.iter(|| find_json_escape_scalar(black_box(data), 0));
         });
     }
 
@@ -414,7 +413,7 @@ fn bench_escape_scan_realistic(c: &mut Criterion) {
                         break;
                     }
                 }
-            })
+            });
         });
 
         group.bench_with_input(BenchmarkId::new("scalar", size), &data, |b, data| {
@@ -428,7 +427,7 @@ fn bench_escape_scan_realistic(c: &mut Criterion) {
                         break;
                     }
                 }
-            })
+            });
         });
     }
 

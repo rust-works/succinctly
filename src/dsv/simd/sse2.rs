@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // x86_64 SSE2 SIMD intrinsics
 //! SSE2-accelerated DSV indexing for x86_64.
 //!
 //! SSE2 is baseline for all x86_64 CPUs, providing universal availability.
@@ -100,10 +101,10 @@ unsafe fn process_chunk_64(
     in_quote: bool,
 ) -> (u64, u64, bool) {
     // Load 4 x 16-byte chunks
-    let chunk0 = _mm_loadu_si128(ptr as *const __m128i);
-    let chunk1 = _mm_loadu_si128(ptr.add(16) as *const __m128i);
-    let chunk2 = _mm_loadu_si128(ptr.add(32) as *const __m128i);
-    let chunk3 = _mm_loadu_si128(ptr.add(48) as *const __m128i);
+    let chunk0 = _mm_loadu_si128(ptr.cast::<__m128i>());
+    let chunk1 = _mm_loadu_si128(ptr.add(16).cast::<__m128i>());
+    let chunk2 = _mm_loadu_si128(ptr.add(32).cast::<__m128i>());
+    let chunk3 = _mm_loadu_si128(ptr.add(48).cast::<__m128i>());
 
     // Create comparison vectors
     let v_delimiter = _mm_set1_epi8(delimiter);

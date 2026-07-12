@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // x86_64 POPCNT/BMI2 intrinsics
 //! x86/x86_64 SIMD implementations.
 //!
 //! These implementations use POPCNT, BMI2, and other x86 instructions for
@@ -121,7 +122,7 @@ pub unsafe fn select_in_word_pdep(x: u64, k: u32) -> u32 {
     if scattered == 0 {
         return 64;
     }
-    63 - scattered.leading_zeros()
+    scattered.ilog2()
 }
 
 /// Check if the CPU has fast BMI2 support.
@@ -293,7 +294,7 @@ mod tests {
         unsafe {
             let word = u64::MAX;
             for k in 0..64 {
-                assert_eq!(select_in_word_pdep(word, k), k, "k={}", k);
+                assert_eq!(select_in_word_pdep(word, k), k, "k={k}");
             }
             assert_eq!(select_in_word_pdep(word, 64), 64);
         }
@@ -325,7 +326,7 @@ mod tests {
             // Dense: lower 32 bits set
             let word = 0xFFFF_FFFFu64;
             for k in 0..32 {
-                assert_eq!(select_in_word_pdep(word, k), k, "k={}", k);
+                assert_eq!(select_in_word_pdep(word, k), k, "k={k}");
             }
             assert_eq!(select_in_word_pdep(word, 32), 64);
         }
@@ -376,8 +377,7 @@ mod tests {
                     let ctz_result = select_ctz(word, k);
                     assert_eq!(
                         pdep_result, ctz_result,
-                        "Mismatch for word={:#x}, k={}",
-                        word, k
+                        "Mismatch for word={word:#x}, k={k}"
                     );
                 }
             }
@@ -416,8 +416,7 @@ mod tests {
                     let ctz_result = select_ctz(word, k);
                     assert_eq!(
                         pdep_result, ctz_result,
-                        "Mismatch for word={:#x}, k={}",
-                        word, k
+                        "Mismatch for word={word:#x}, k={k}"
                     );
                 }
             }
@@ -428,7 +427,7 @@ mod tests {
     fn test_has_fast_bmi2_detection() {
         // This test just ensures the function runs without panicking
         let result = has_fast_bmi2();
-        eprintln!("has_fast_bmi2() = {}", result);
+        eprintln!("has_fast_bmi2() = {result}");
 
         // If BMI2 is not supported, result must be false
         if !is_x86_feature_detected!("bmi2") {

@@ -41,18 +41,18 @@ fn bench_simple_cursor(c: &mut Criterion) {
         // AVX2 (if available)
         if is_x86_feature_detected!("avx2") {
             group.bench_with_input(BenchmarkId::new("AVX2", name), &bytes, |b, bytes| {
-                b.iter(|| succinctly::json::simd::avx2::build_semi_index_simple(black_box(bytes)))
+                b.iter(|| succinctly::json::simd::avx2::build_semi_index_simple(black_box(bytes)));
             });
         }
 
         // SSE2 (always available)
         group.bench_with_input(BenchmarkId::new("SSE2", name), &bytes, |b, bytes| {
-            b.iter(|| succinctly::json::simd::x86::build_semi_index_simple(black_box(bytes)))
+            b.iter(|| succinctly::json::simd::x86::build_semi_index_simple(black_box(bytes)));
         });
 
         // Scalar (byte-by-byte simple cursor)
         group.bench_with_input(BenchmarkId::new("Scalar", name), &bytes, |b, bytes| {
-            b.iter(|| succinctly::json::simple::build_semi_index(black_box(bytes)))
+            b.iter(|| succinctly::json::simple::build_semi_index(black_box(bytes)));
         });
     }
 
@@ -84,12 +84,12 @@ fn bench_simple_cursor(c: &mut Criterion) {
 
         // NEON simple cursor
         group.bench_with_input(BenchmarkId::new("NEON", name), &bytes, |b, bytes| {
-            b.iter(|| succinctly::json::simd::neon::build_semi_index_simple(black_box(bytes)))
+            b.iter(|| succinctly::json::simd::neon::build_semi_index_simple(black_box(bytes)));
         });
 
         // Scalar (byte-by-byte simple cursor)
         group.bench_with_input(BenchmarkId::new("Scalar", name), &bytes, |b, bytes| {
-            b.iter(|| succinctly::json::simple::build_semi_index(black_box(bytes)))
+            b.iter(|| succinctly::json::simple::build_semi_index(black_box(bytes)));
         });
     }
 

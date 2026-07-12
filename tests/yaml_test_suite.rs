@@ -12,7 +12,7 @@ use succinctly::yaml::{YamlIndex, YamlValue};
 
 /// Helper to convert YAML to JSON string for comparison.
 fn yaml_to_json(yaml: &[u8]) -> Result<String, String> {
-    let index = YamlIndex::build(yaml).map_err(|e| format!("{}", e))?;
+    let index = YamlIndex::build(yaml).map_err(|e| format!("{e}"))?;
     let root = index.root(yaml);
 
     // Get first document
@@ -30,7 +30,7 @@ fn yaml_to_json(yaml: &[u8]) -> Result<String, String> {
 
 /// Helper to convert multi-document YAML to JSON strings (one per doc).
 fn yaml_to_json_all(yaml: &[u8]) -> Result<String, String> {
-    let index = YamlIndex::build(yaml).map_err(|e| format!("{}", e))?;
+    let index = YamlIndex::build(yaml).map_err(|e| format!("{e}"))?;
     let root = index.root(yaml);
 
     // Get all documents
@@ -65,7 +65,7 @@ fn value_to_json<W: AsRef<[u64]>>(value: &YamlValue<'_, W>) -> String {
                         }
                         if let Ok(f) = s.parse::<f64>() {
                             if !f.is_nan() && !f.is_infinite() {
-                                return format!("{}", f);
+                                return format!("{f}");
                             }
                         }
                     }
@@ -123,7 +123,7 @@ fn value_to_json<W: AsRef<[u64]>>(value: &YamlValue<'_, W>) -> String {
                     .replace('\n', "\\n")
                     .replace('\r', "\\r")
                     .replace('\t', "\\t");
-                entries.push(format!("\"{}\": {}", escaped_key, val));
+                entries.push(format!("\"{escaped_key}\": {val}"));
             }
             format!("{{{}}}", entries.join(", "))
         }

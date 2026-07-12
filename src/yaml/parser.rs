@@ -531,11 +531,11 @@ impl<'a> Parser<'a> {
     fn looks_like_mapping_entry(&self) -> bool {
         // If we're at a flow structure, it's not a compact mapping
         match self.peek() {
-            Some(b'{') | Some(b'[') => return false,
+            Some(b'{' | b'[') => return false,
             // Empty key: `:` at start followed by whitespace/newline/EOF
             Some(b':') => {
                 let next = self.peek_at(1);
-                if matches!(next, Some(b' ') | Some(b'\t') | Some(b'\n') | None) {
+                if matches!(next, Some(b' ' | b'\t' | b'\n') | None) {
                     return true;
                 }
                 // Colon not followed by whitespace - continue checking
@@ -577,7 +577,7 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                return matches!(next, Some(b' ') | Some(b'\t') | Some(b'\n') | None);
+                return matches!(next, Some(b' ' | b'\t' | b'\n') | None);
             }
             return false;
         }
@@ -594,7 +594,7 @@ impl<'a> Parser<'a> {
                         None
                     };
                     match next {
-                        Some(b' ') | Some(b'\t') | Some(b'\n') | None => return true,
+                        Some(b' ' | b'\t' | b'\n') | None => return true,
                         _ => i += 1, // Colon not followed by whitespace, continue
                     }
                 }
@@ -632,11 +632,10 @@ impl<'a> Parser<'a> {
                         self.skip_to_eol();
                     }
                     continue;
-                } else {
-                    // Non-empty content - back up
-                    self.pos = start;
-                    break;
                 }
+                // Non-empty content - back up
+                self.pos = start;
+                break;
             } else {
                 break;
             }
@@ -714,8 +713,8 @@ impl<'a> Parser<'a> {
         let mut i = 0;
         loop {
             match self.peek_at(i) {
-                Some(b' ') | Some(b'\t') => i += 1,
-                Some(b'\n') | Some(b'\r') | Some(b'#') | None => return false,
+                Some(b' ' | b'\t') => i += 1,
+                Some(b'\n' | b'\r' | b'#') | None => return false,
                 _ => return true,
             }
         }
@@ -729,7 +728,7 @@ impl<'a> Parser<'a> {
         }
 
         match self.peek() {
-            Some(b'|') | Some(b'>') => {
+            Some(b'|' | b'>') => {
                 // Block scalar
                 self.parse_block_scalar(0)?;
             }
@@ -749,7 +748,7 @@ impl<'a> Parser<'a> {
                 self.set_bp_text_end(self.pos);
                 self.write_bp_close();
             }
-            Some(b'[') | Some(b'{') => {
+            Some(b'[' | b'{') => {
                 // Flow collection
                 self.parse_value(0)?;
             }
@@ -998,7 +997,7 @@ impl<'a> Parser<'a> {
                     // Empty line - skip it and continue
                     self.advance(); // Skip current \n
                                     // Skip to end of empty line
-                    while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+                    while matches!(self.peek(), Some(b' ' | b'\t')) {
                         self.advance();
                     }
                     continue;
@@ -1010,7 +1009,7 @@ impl<'a> Parser<'a> {
                     // Continue to next line - this is a valid continuation
                     self.advance(); // Skip \n
                                     // Skip leading whitespace (tabs are content, but we're at the scalar's level)
-                    while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+                    while matches!(self.peek(), Some(b' ' | b'\t')) {
                         self.advance();
                     }
                     continue;
@@ -1045,7 +1044,7 @@ impl<'a> Parser<'a> {
                 // Continue to next line
                 self.advance(); // Skip \n
                                 // Skip leading whitespace
-                while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+                while matches!(self.peek(), Some(b' ' | b'\t')) {
                     self.advance();
                 }
             } else {
@@ -1252,7 +1251,7 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(b'-')
             && matches!(
                 self.peek_at(1),
-                Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | None
+                Some(b' ' | b'\t' | b'\n' | b'\r') | None
             )
         {
             // Nested sequence - the item value is another sequence.
@@ -1322,7 +1321,7 @@ impl<'a> Parser<'a> {
         if self.peek() != Some(b':') {
             return Err(YamlError::UnexpectedCharacter {
                 offset: self.pos,
-                char: self.peek().map(|b| b as char).unwrap_or('\0'),
+                char: self.peek().map_or('\0', |b| b as char),
                 context: "expected ':' after key in compact mapping",
             });
         }
@@ -1352,7 +1351,7 @@ impl<'a> Parser<'a> {
                 let is_sequence_indicator = matches!(self.peek(), Some(b'-'))
                     && matches!(
                         self.peek_at(1),
-                        Some(b' ') | Some(b'\t') | Some(b'\n') | None
+                        Some(b' ' | b'\t' | b'\n') | None
                     );
                 self.pos = saved_pos;
 
@@ -1438,7 +1437,7 @@ impl<'a> Parser<'a> {
         let key_end = if self.peek() == Some(b':') {
             // Empty key - check that it's followed by proper terminator
             let next = self.peek_at(1);
-            if matches!(next, Some(b' ') | Some(b'\t') | Some(b'\n') | None) {
+            if matches!(next, Some(b' ' | b'\t' | b'\n') | None) {
                 // Empty key case - key length is 0, don't advance yet
                 self.pos
             } else {
@@ -1484,7 +1483,7 @@ impl<'a> Parser<'a> {
         if self.peek() != Some(b':') {
             return Err(YamlError::UnexpectedCharacter {
                 offset: self.pos,
-                char: self.peek().map(|b| b as char).unwrap_or('\0'),
+                char: self.peek().map_or('\0', |b| b as char),
                 context: "expected ':' after key",
             });
         }
@@ -1526,7 +1525,7 @@ impl<'a> Parser<'a> {
             let is_sequence_indicator = matches!(next_char, Some(b'-'))
                 && matches!(
                     self.peek_at(1),
-                    Some(b' ') | Some(b'\t') | Some(b'\n') | None
+                    Some(b' ' | b'\t' | b'\n') | None
                 );
             self.pos = saved_pos;
 
@@ -1555,19 +1554,19 @@ impl<'a> Parser<'a> {
                 Some(b'-')
                     if matches!(
                         self.peek_at(1),
-                        Some(b' ') | Some(b'\t') | Some(b'\n') | None
+                        Some(b' ' | b'\t' | b'\n') | None
                     ) =>
                 {
                     // Sequence - will be handled by main loop
                     self.pos = saved_pos;
                     return Ok(());
                 }
-                Some(b'?') if matches!(self.peek_at(1), Some(b' ') | Some(b'\n') | None) => {
+                Some(b'?') if matches!(self.peek_at(1), Some(b' ' | b'\n') | None) => {
                     // Explicit key - will be handled by main loop
                     self.pos = saved_pos;
                     return Ok(());
                 }
-                Some(b'{') | Some(b'[') | Some(b'|') | Some(b'>') => {
+                Some(b'{' | b'[' | b'|' | b'>') => {
                     // Flow/block structure - will be handled by main loop
                     self.pos = saved_pos;
                     return Ok(());
@@ -1577,7 +1576,7 @@ impl<'a> Parser<'a> {
                     self.pos = saved_pos;
                     return Ok(());
                 }
-                Some(b'&') | Some(b'*') => {
+                Some(b'&' | b'*') => {
                     // Anchor or alias on its own line - will be handled by main loop
                     self.pos = saved_pos;
                     return Ok(());
@@ -1639,7 +1638,7 @@ impl<'a> Parser<'a> {
                     // Skip past indent spaces to check what follows (SIMD accelerated)
                     self.skip_spaces_simd();
                     matches!(self.peek(), Some(b'-'))
-                        && matches!(self.peek_at(1), Some(b' ') | Some(b'\n') | None)
+                        && matches!(self.peek_at(1), Some(b' ' | b'\n') | None)
                 };
                 // Restore position after checking
                 self.pos = pos_before_check;
@@ -1673,7 +1672,7 @@ impl<'a> Parser<'a> {
                 Some(b'{') => {
                     self.parse_flow_mapping()?;
                 }
-                Some(b'|') | Some(b'>') => {
+                Some(b'|' | b'>') => {
                     // Block scalar - handles its own BP
                     self.parse_block_scalar(indent)?;
                 }
@@ -1762,7 +1761,7 @@ impl<'a> Parser<'a> {
                     && (next_indent == indent)
                     && matches!(
                         self.input.get(saved_pos + next_indent + 1).copied(),
-                        Some(b' ') | Some(b'\t') | Some(b'\n') | None
+                        Some(b' ' | b'\t' | b'\n') | None
                     )
                 {
                     // `: value` at same indent - empty key (null), value follows
@@ -1801,7 +1800,7 @@ impl<'a> Parser<'a> {
             Some(b'-')
                 if matches!(
                     self.peek_at(1),
-                    Some(b' ') | Some(b'\n') | Some(b'\r') | None
+                    Some(b' ' | b'\n' | b'\r') | None
                 ) =>
             {
                 // Sequence as key - open key node and let sequence parsing continue
@@ -1838,7 +1837,7 @@ impl<'a> Parser<'a> {
                 self.parse_flow_mapping()?;
                 self.write_bp_close();
             }
-            Some(b'|') | Some(b'>') => {
+            Some(b'|' | b'>') => {
                 // Block scalar as key
                 self.parse_block_scalar(indent)?;
             }
@@ -1903,7 +1902,7 @@ impl<'a> Parser<'a> {
             Some(b'-')
                 if matches!(
                     self.peek_at(1),
-                    Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | None
+                    Some(b' ' | b'\t' | b'\n' | b'\r') | None
                 ) =>
             {
                 // Sequence as value
@@ -1932,7 +1931,7 @@ impl<'a> Parser<'a> {
             Some(b'{') => {
                 self.parse_flow_mapping()?;
             }
-            Some(b'|') | Some(b'>') => {
+            Some(b'|' | b'>') => {
                 self.parse_block_scalar(indent)?;
             }
             Some(b'"') => {
@@ -2024,7 +2023,7 @@ impl<'a> Parser<'a> {
                 // Flow mapping
                 self.parse_flow_mapping()?;
             }
-            Some(b'|') | Some(b'>') => {
+            Some(b'|' | b'>') => {
                 // Block scalar - handles its own BP
                 self.parse_block_scalar(min_indent)?;
             }
@@ -2156,7 +2155,7 @@ impl<'a> Parser<'a> {
                     // In flow context, colon must be followed by space, or flow indicator
                     return matches!(
                         next,
-                        Some(b' ') | Some(b'\t') | Some(b',') | Some(b']') | Some(b'}') | None
+                        Some(b' ' | b'\t' | b',' | b']' | b'}') | None
                     );
                 }
                 _ => i += 1,
@@ -2170,7 +2169,7 @@ impl<'a> Parser<'a> {
         self.peek() == Some(b'?')
             && matches!(
                 self.peek_at(1),
-                Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | None
+                Some(b' ' | b'\t' | b'\n' | b'\r') | None
             )
     }
 
@@ -2203,7 +2202,7 @@ impl<'a> Parser<'a> {
                 // Don't consume anything, write empty node
                 self.pos
             }
-            Some(b',') | Some(b']') | Some(b'}') => {
+            Some(b',' | b']' | b'}') => {
                 // Empty key (null) - ? followed by terminator
                 self.pos
             }
@@ -2221,7 +2220,7 @@ impl<'a> Parser<'a> {
             self.skip_flow_whitespace();
 
             // Parse value (if present before , or ])
-            if !matches!(self.peek(), Some(b',') | Some(b']') | Some(b'}') | None) {
+            if !matches!(self.peek(), Some(b',' | b']' | b'}') | None) {
                 self.set_ib();
                 self.write_bp_open();
                 match self.peek() {
@@ -2291,7 +2290,7 @@ impl<'a> Parser<'a> {
         if self.peek() != Some(b':') {
             return Err(YamlError::UnexpectedCharacter {
                 offset: self.pos,
-                char: self.peek().map(|b| b as char).unwrap_or('\0'),
+                char: self.peek().map_or('\0', |b| b as char),
                 context: "expected ':' in implicit flow mapping entry",
             });
         }
@@ -2299,7 +2298,7 @@ impl<'a> Parser<'a> {
         self.skip_flow_whitespace();
 
         // Parse value (if present before , or ])
-        if !matches!(self.peek(), Some(b',') | Some(b']') | Some(b'}') | None) {
+        if !matches!(self.peek(), Some(b',' | b']' | b'}') | None) {
             self.set_ib();
             self.write_bp_open();
             let val_end = match self.peek() {
@@ -2356,7 +2355,7 @@ impl<'a> Parser<'a> {
                 if self.peek() != Some(b',') {
                     return Err(YamlError::UnexpectedCharacter {
                         offset: self.pos,
-                        char: self.peek().map(|b| b as char).unwrap_or('\0'),
+                        char: self.peek().map_or('\0', |b| b as char),
                         context: "expected ',' or ']' in flow sequence",
                     });
                 }
@@ -2450,7 +2449,7 @@ impl<'a> Parser<'a> {
                 if self.peek() != Some(b',') {
                     return Err(YamlError::UnexpectedCharacter {
                         offset: self.pos,
-                        char: self.peek().map(|b| b as char).unwrap_or('\0'),
+                        char: self.peek().map_or('\0', |b| b as char),
                         context: "expected ',' or '}' in flow mapping",
                     });
                 }
@@ -2508,7 +2507,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-            } else if matches!(self.peek(), Some(b',') | Some(b'}')) {
+            } else if matches!(self.peek(), Some(b',' | b'}')) {
                 // Key without colon/value - emit empty value (implicit null)
                 self.set_ib();
                 self.write_bp_open();
@@ -2517,7 +2516,7 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(YamlError::UnexpectedCharacter {
                     offset: self.pos,
-                    char: self.peek().map(|b| b as char).unwrap_or('\0'),
+                    char: self.peek().map_or('\0', |b| b as char),
                     context: "expected ':', ',' or '}' after key in flow mapping",
                 });
             }
@@ -2565,7 +2564,7 @@ impl<'a> Parser<'a> {
                 Some(b'{') => {
                     self.parse_flow_mapping()?;
                 }
-                Some(b':') | Some(b',') | Some(b'}') => {
+                Some(b':' | b',' | b'}') => {
                     // Empty key (null) - don't consume anything
                 }
                 _ => {
@@ -2639,7 +2638,7 @@ impl<'a> Parser<'a> {
                         self.advance();
                     }
                     // Skip leading whitespace
-                    while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+                    while matches!(self.peek(), Some(b' ' | b'\t')) {
                         self.advance();
                     }
                 }
@@ -2769,7 +2768,7 @@ impl<'a> Parser<'a> {
                         self.advance();
                     }
                     // Skip leading whitespace
-                    while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+                    while matches!(self.peek(), Some(b' ' | b'\t')) {
                         self.advance();
                     }
                 }
@@ -2817,14 +2816,7 @@ impl<'a> Parser<'a> {
                     let next = self.peek_at(1);
                     if matches!(
                         next,
-                        Some(b' ')
-                            | Some(b'\t')
-                            | Some(b'\n')
-                            | Some(b'\r')
-                            | Some(b',')
-                            | Some(b'}')
-                            | Some(b']')
-                            | None
+                        Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b'}' | b']') | None
                     ) {
                         break;
                     }
@@ -2876,7 +2868,7 @@ impl<'a> Parser<'a> {
                         self.advance();
                     }
                     // Skip leading whitespace
-                    while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+                    while matches!(self.peek(), Some(b' ' | b'\t')) {
                         self.advance();
                     }
                 }
@@ -2899,14 +2891,7 @@ impl<'a> Parser<'a> {
                                 };
                                 if matches!(
                                     after_colon,
-                                    Some(b' ')
-                                        | Some(b'\t')
-                                        | Some(b'\n')
-                                        | Some(b'\r')
-                                        | Some(b',')
-                                        | Some(b'}')
-                                        | Some(b']')
-                                        | None
+                                    Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b'}' | b']') | None
                                 ) {
                                     // Whitespace before `: ` - stop here
                                     break;
@@ -2958,7 +2943,7 @@ impl<'a> Parser<'a> {
             _ => {
                 return Err(YamlError::UnexpectedCharacter {
                     offset: self.pos,
-                    char: self.peek().map(|b| b as char).unwrap_or('\0'),
+                    char: self.peek().map_or('\0', |b| b as char),
                     context: "expected block scalar indicator (| or >)",
                 });
             }
@@ -3427,12 +3412,12 @@ impl<'a> Parser<'a> {
             Err(YamlError::TabIndentation { .. }) => {
                 // Tabs found - check if this leads to a flow structure
                 // Skip all leading whitespace (tabs and spaces)
-                while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+                while matches!(self.peek(), Some(b' ' | b'\t')) {
                     self.advance();
                 }
                 // If it's a flow structure, that's allowed
                 match self.peek() {
-                    Some(b'{') | Some(b'[') => {
+                    Some(b'{' | b'[') => {
                         self.close_deeper_indents(0);
                         self.parse_value(0)?;
                         // Move to next line if we haven't already
@@ -3464,7 +3449,7 @@ impl<'a> Parser<'a> {
             Some(b'-')
                 if matches!(
                     self.peek_at(1),
-                    Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | None
+                    Some(b' ' | b'\t' | b'\n' | b'\r') | None
                 ) =>
             {
                 self.parse_sequence_item(indent)?;
@@ -3472,7 +3457,7 @@ impl<'a> Parser<'a> {
             Some(b'?')
                 if matches!(
                     self.peek_at(1),
-                    Some(b' ') | Some(b'\n') | Some(b'\r') | None
+                    Some(b' ' | b'\n' | b'\r') | None
                 ) =>
             {
                 // Explicit key indicator
@@ -3481,7 +3466,7 @@ impl<'a> Parser<'a> {
             Some(b':')
                 if matches!(
                     self.peek_at(1),
-                    Some(b' ') | Some(b'\n') | Some(b'\r') | None
+                    Some(b' ' | b'\n' | b'\r') | None
                 ) =>
             {
                 // Explicit value indicator (value for previous explicit key)
@@ -3495,7 +3480,7 @@ impl<'a> Parser<'a> {
                 // Empty line
                 self.advance();
             }
-            Some(b'{') | Some(b'[') => {
+            Some(b'{' | b'[') => {
                 // Flow mapping or sequence at document root
                 self.close_deeper_indents(indent);
                 self.parse_value(indent)?;
@@ -3558,13 +3543,13 @@ impl<'a> Parser<'a> {
                         Some(b'-')
                             if matches!(
                                 self.peek_at(1),
-                                Some(b' ') | Some(b'\t') | Some(b'\n') | None
+                                Some(b' ' | b'\t' | b'\n') | None
                             ) =>
                         {
                             // Anchor before block sequence on same line
                             self.parse_sequence_item(indent)?;
                         }
-                        Some(b'{') | Some(b'[') => {
+                        Some(b'{' | b'[') => {
                             // Anchor before flow collection
                             self.parse_value(indent)?;
                         }
@@ -3727,21 +3712,21 @@ mod tests {
     fn test_flow_sequence() {
         let yaml = b"items: [1, 2, 3]";
         let result = build_semi_index(yaml);
-        assert!(result.is_ok(), "Flow sequence should parse: {:?}", result);
+        assert!(result.is_ok(), "Flow sequence should parse: {result:?}");
     }
 
     #[test]
     fn test_flow_mapping() {
         let yaml = b"person: {name: Alice, age: 30}";
         let result = build_semi_index(yaml);
-        assert!(result.is_ok(), "Flow mapping should parse: {:?}", result);
+        assert!(result.is_ok(), "Flow mapping should parse: {result:?}");
     }
 
     #[test]
     fn test_flow_nested() {
         let yaml = b"data: {users: [{name: Alice}, {name: Bob}]}";
         let result = build_semi_index(yaml);
-        assert!(result.is_ok(), "Nested flow should parse: {:?}", result);
+        assert!(result.is_ok(), "Nested flow should parse: {result:?}");
     }
 
     #[test]
@@ -3750,8 +3735,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "Flow with strings should parse: {:?}",
-            result
+            "Flow with strings should parse: {result:?}"
         );
     }
 
@@ -3761,8 +3745,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "Flow with trailing comma should parse: {:?}",
-            result
+            "Flow with trailing comma should parse: {result:?}"
         );
     }
 
@@ -3772,8 +3755,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "Empty flow sequence should parse: {:?}",
-            result
+            "Empty flow sequence should parse: {result:?}"
         );
     }
 
@@ -3783,8 +3765,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "Empty flow mapping should parse: {:?}",
-            result
+            "Empty flow mapping should parse: {result:?}"
         );
     }
 
@@ -3814,14 +3795,14 @@ mod tests {
     fn test_block_literal_basic() {
         let yaml = b"text: |\n  line1\n  line2\n";
         let result = build_semi_index(yaml);
-        assert!(result.is_ok(), "Block literal should parse: {:?}", result);
+        assert!(result.is_ok(), "Block literal should parse: {result:?}");
     }
 
     #[test]
     fn test_block_folded_basic() {
         let yaml = b"text: >\n  line1\n  line2\n";
         let result = build_semi_index(yaml);
-        assert!(result.is_ok(), "Block folded should parse: {:?}", result);
+        assert!(result.is_ok(), "Block folded should parse: {result:?}");
     }
 
     #[test]
@@ -3830,8 +3811,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "Block literal strip should parse: {:?}",
-            result
+            "Block literal strip should parse: {result:?}"
         );
     }
 
@@ -3841,8 +3821,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "Block literal keep should parse: {:?}",
-            result
+            "Block literal keep should parse: {result:?}"
         );
     }
 
@@ -3852,8 +3831,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "Block folded strip should parse: {:?}",
-            result
+            "Block folded strip should parse: {result:?}"
         );
     }
 
@@ -3863,8 +3841,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "Block folded keep should parse: {:?}",
-            result
+            "Block folded keep should parse: {result:?}"
         );
     }
 
@@ -3874,8 +3851,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "Block with explicit indent should parse: {:?}",
-            result
+            "Block with explicit indent should parse: {result:?}"
         );
     }
 
@@ -3885,8 +3861,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "Block with explicit indent and chomping should parse: {:?}",
-            result
+            "Block with explicit indent and chomping should parse: {result:?}"
         );
     }
 
@@ -3896,8 +3871,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "Empty block scalar should parse: {:?}",
-            result
+            "Empty block scalar should parse: {result:?}"
         );
     }
 
@@ -3907,8 +3881,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "Block scalar in sequence should parse: {:?}",
-            result
+            "Block scalar in sequence should parse: {result:?}"
         );
     }
 
@@ -3918,8 +3891,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "Block with nested indent should parse: {:?}",
-            result
+            "Block with nested indent should parse: {result:?}"
         );
     }
 
@@ -3929,8 +3901,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "Multiple block scalars should parse: {:?}",
-            result
+            "Multiple block scalars should parse: {result:?}"
         );
     }
 
@@ -3940,8 +3911,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "Block scalar with comment should parse: {:?}",
-            result
+            "Block scalar with comment should parse: {result:?}"
         );
     }
 
@@ -3967,8 +3937,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "explicit document start should parse: {:?}",
-            result
+            "explicit document start should parse: {result:?}"
         );
     }
 
@@ -3977,7 +3946,7 @@ mod tests {
         // Two documents separated by `---`
         let yaml = b"---\nname: Alice\n---\nname: Bob";
         let result = build_semi_index(yaml);
-        assert!(result.is_ok(), "two documents should parse: {:?}", result);
+        assert!(result.is_ok(), "two documents should parse: {result:?}");
     }
 
     #[test]
@@ -3987,8 +3956,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "document with end marker should parse: {:?}",
-            result
+            "document with end marker should parse: {result:?}"
         );
     }
 
@@ -3999,8 +3967,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "document end at EOF should parse: {:?}",
-            result
+            "document end at EOF should parse: {result:?}"
         );
     }
 
@@ -4011,8 +3978,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "mixed document types should parse: {:?}",
-            result
+            "mixed document types should parse: {result:?}"
         );
     }
 
@@ -4021,7 +3987,7 @@ mod tests {
         // Empty content between document markers
         let yaml = b"---\n---\nname: Alice";
         let result = build_semi_index(yaml);
-        assert!(result.is_ok(), "empty document should parse: {:?}", result);
+        assert!(result.is_ok(), "empty document should parse: {result:?}");
     }
 
     #[test]
@@ -4031,8 +3997,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "quoted document marker should parse: {:?}",
-            result
+            "quoted document marker should parse: {result:?}"
         );
     }
 
@@ -4040,7 +4005,7 @@ mod tests {
     fn test_three_documents() {
         let yaml = b"---\na: 1\n---\nb: 2\n---\nc: 3";
         let result = build_semi_index(yaml);
-        assert!(result.is_ok(), "three documents should parse: {:?}", result);
+        assert!(result.is_ok(), "three documents should parse: {result:?}");
     }
 
     #[test]
@@ -4050,8 +4015,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "question mark in value should parse: {:?}",
-            result
+            "question mark in value should parse: {result:?}"
         );
     }
 
@@ -4062,8 +4026,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "question mark in key should parse: {:?}",
-            result
+            "question mark in key should parse: {result:?}"
         );
     }
 
@@ -4074,8 +4037,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "question mark in flow key should parse: {:?}",
-            result
+            "question mark in flow key should parse: {result:?}"
         );
     }
 
@@ -4086,8 +4048,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "question mark in flow value should parse: {:?}",
-            result
+            "question mark in flow value should parse: {result:?}"
         );
     }
 
@@ -4098,8 +4059,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "question marks test should parse: {:?}",
-            result
+            "question marks test should parse: {result:?}"
         );
     }
 
@@ -4110,8 +4070,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "compact mapping in sequence should parse: {:?}",
-            result
+            "compact mapping in sequence should parse: {result:?}"
         );
     }
 
@@ -4122,8 +4081,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "flow mapping in sequence should parse: {:?}",
-            result
+            "flow mapping in sequence should parse: {result:?}"
         );
     }
 
@@ -4134,8 +4092,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "double colon plain scalar should parse: {:?}",
-            result
+            "double colon plain scalar should parse: {result:?}"
         );
     }
 
@@ -4146,8 +4103,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "quoted key mapping should parse: {:?}",
-            result
+            "quoted key mapping should parse: {result:?}"
         );
     }
 
@@ -4158,8 +4114,7 @@ mod tests {
         let result = build_semi_index(yaml);
         assert!(
             result.is_ok(),
-            "empty key in flow sequence should parse: {:?}",
-            result
+            "empty key in flow sequence should parse: {result:?}"
         );
     }
 
@@ -4197,19 +4152,18 @@ mod tests {
                     eprintln!("  key.is_null() = {:?}", key_val.is_null());
                     count += 1;
                 }
-                eprintln!("Field count: {}", count);
+                eprintln!("Field count: {count}");
                 assert!(
                     count > 0,
-                    "mapping should have at least one field, but has {}",
-                    count
+                    "mapping should have at least one field, but has {count}"
                 );
 
                 // Now test to_owned conversion
                 eprintln!("\n=== Testing to_owned conversion ===");
                 let owned = to_owned(&doc_cursor.value());
-                eprintln!("to_owned result: {:?}", owned);
+                eprintln!("to_owned result: {owned:?}");
             }
-            other => panic!("expected mapping, got {:?}", other),
+            other => panic!("expected mapping, got {other:?}"),
         }
     }
 }

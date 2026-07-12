@@ -33,83 +33,83 @@ pub enum OwnedValue {
     /// JSON string
     String(String),
     /// JSON array
-    Array(Vec<OwnedValue>),
+    Array(Vec<Self>),
     /// JSON object (IndexMap preserves insertion order like jq)
-    Object(IndexMap<String, OwnedValue>),
+    Object(IndexMap<String, Self>),
 }
 
 impl OwnedValue {
     /// Create a null value.
     pub fn null() -> Self {
-        OwnedValue::Null
+        Self::Null
     }
 
     /// Create a boolean value.
     pub fn bool(b: bool) -> Self {
-        OwnedValue::Bool(b)
+        Self::Bool(b)
     }
 
     /// Create an integer value.
     pub fn int(n: i64) -> Self {
-        OwnedValue::Int(n)
+        Self::Int(n)
     }
 
     /// Create a float value.
     pub fn float(f: f64) -> Self {
-        OwnedValue::Float(f)
+        Self::Float(f)
     }
 
     /// Create a string value.
     pub fn string(s: impl Into<String>) -> Self {
-        OwnedValue::String(s.into())
+        Self::String(s.into())
     }
 
     /// Create an empty array.
     pub fn array() -> Self {
-        OwnedValue::Array(Vec::new())
+        Self::Array(Vec::new())
     }
 
     /// Create an array from a vector of values.
-    pub fn array_from(values: Vec<OwnedValue>) -> Self {
-        OwnedValue::Array(values)
+    pub fn array_from(values: Vec<Self>) -> Self {
+        Self::Array(values)
     }
 
     /// Create an empty object.
     pub fn object() -> Self {
-        OwnedValue::Object(IndexMap::new())
+        Self::Object(IndexMap::new())
     }
 
     /// Create an object from key-value pairs.
-    pub fn object_from(pairs: impl IntoIterator<Item = (String, OwnedValue)>) -> Self {
-        OwnedValue::Object(pairs.into_iter().collect())
+    pub fn object_from(pairs: impl IntoIterator<Item = (String, Self)>) -> Self {
+        Self::Object(pairs.into_iter().collect())
     }
 
     /// Check if this value is null.
     pub fn is_null(&self) -> bool {
-        matches!(self, OwnedValue::Null)
+        matches!(self, Self::Null)
     }
 
     /// Check if this value is "truthy" (not null and not false).
     pub fn is_truthy(&self) -> bool {
-        !matches!(self, OwnedValue::Null | OwnedValue::Bool(false))
+        !matches!(self, Self::Null | Self::Bool(false))
     }
 
     /// Get the type name of this value.
     pub fn type_name(&self) -> &'static str {
         match self {
-            OwnedValue::Null => "null",
-            OwnedValue::Bool(_) => "boolean",
-            OwnedValue::Int(_) | OwnedValue::Float(_) => "number",
-            OwnedValue::String(_) => "string",
-            OwnedValue::Array(_) => "array",
-            OwnedValue::Object(_) => "object",
+            Self::Null => "null",
+            Self::Bool(_) => "boolean",
+            Self::Int(_) | Self::Float(_) => "number",
+            Self::String(_) => "string",
+            Self::Array(_) => "array",
+            Self::Object(_) => "object",
         }
     }
 
     /// Convert to a boolean, if possible.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
-            OwnedValue::Bool(b) => Some(*b),
+            Self::Bool(b) => Some(*b),
             _ => None,
         }
     }
@@ -117,8 +117,8 @@ impl OwnedValue {
     /// Convert to an i64, if possible.
     pub fn as_i64(&self) -> Option<i64> {
         match self {
-            OwnedValue::Int(n) => Some(*n),
-            OwnedValue::Float(f) if (*f - (*f as i64 as f64)).abs() < f64::EPSILON => {
+            Self::Int(n) => Some(*n),
+            Self::Float(f) if (*f - (*f as i64 as f64)).abs() < f64::EPSILON => {
                 Some(*f as i64)
             }
             _ => None,
@@ -128,8 +128,8 @@ impl OwnedValue {
     /// Convert to an f64, if possible.
     pub fn as_f64(&self) -> Option<f64> {
         match self {
-            OwnedValue::Int(n) => Some(*n as f64),
-            OwnedValue::Float(f) => Some(*f),
+            Self::Int(n) => Some(*n as f64),
+            Self::Float(f) => Some(*f),
             _ => None,
         }
     }
@@ -137,39 +137,39 @@ impl OwnedValue {
     /// Convert to a string reference, if possible.
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            OwnedValue::String(s) => Some(s),
+            Self::String(s) => Some(s),
             _ => None,
         }
     }
 
     /// Convert to an array reference, if possible.
-    pub fn as_array(&self) -> Option<&Vec<OwnedValue>> {
+    pub fn as_array(&self) -> Option<&Vec<Self>> {
         match self {
-            OwnedValue::Array(arr) => Some(arr),
+            Self::Array(arr) => Some(arr),
             _ => None,
         }
     }
 
     /// Convert to a mutable array reference, if possible.
-    pub fn as_array_mut(&mut self) -> Option<&mut Vec<OwnedValue>> {
+    pub fn as_array_mut(&mut self) -> Option<&mut Vec<Self>> {
         match self {
-            OwnedValue::Array(arr) => Some(arr),
+            Self::Array(arr) => Some(arr),
             _ => None,
         }
     }
 
     /// Convert to an object reference, if possible.
-    pub fn as_object(&self) -> Option<&IndexMap<String, OwnedValue>> {
+    pub fn as_object(&self) -> Option<&IndexMap<String, Self>> {
         match self {
-            OwnedValue::Object(obj) => Some(obj),
+            Self::Object(obj) => Some(obj),
             _ => None,
         }
     }
 
     /// Convert to a mutable object reference, if possible.
-    pub fn as_object_mut(&mut self) -> Option<&mut IndexMap<String, OwnedValue>> {
+    pub fn as_object_mut(&mut self) -> Option<&mut IndexMap<String, Self>> {
         match self {
-            OwnedValue::Object(obj) => Some(obj),
+            Self::Object(obj) => Some(obj),
             _ => None,
         }
     }
@@ -182,10 +182,10 @@ impl OwnedValue {
     /// - other: error (returns None)
     pub fn length(&self) -> Option<usize> {
         match self {
-            OwnedValue::Null => Some(0),
-            OwnedValue::String(s) => Some(s.chars().count()),
-            OwnedValue::Array(arr) => Some(arr.len()),
-            OwnedValue::Object(obj) => Some(obj.len()),
+            Self::Null => Some(0),
+            Self::String(s) => Some(s.chars().count()),
+            Self::Array(arr) => Some(arr.len()),
+            Self::Object(obj) => Some(obj.len()),
             _ => None,
         }
     }
@@ -193,23 +193,23 @@ impl OwnedValue {
     /// Format this value as JSON string.
     pub fn to_json(&self) -> String {
         match self {
-            OwnedValue::Null => "null".into(),
-            OwnedValue::Bool(true) => "true".into(),
-            OwnedValue::Bool(false) => "false".into(),
-            OwnedValue::Int(n) => format!("{}", n),
-            OwnedValue::Float(f) => {
+            Self::Null => "null".into(),
+            Self::Bool(true) => "true".into(),
+            Self::Bool(false) => "false".into(),
+            Self::Int(n) => format!("{n}"),
+            Self::Float(f) => {
                 if f.is_nan() || f.is_infinite() {
                     "null".into() // JSON doesn't support NaN or Infinity
                 } else {
-                    format!("{}", f)
+                    format!("{f}")
                 }
             }
-            OwnedValue::String(s) => format!("\"{}\"", escape_json_string(s)),
-            OwnedValue::Array(arr) => {
-                let elements: Vec<String> = arr.iter().map(|v| v.to_json()).collect();
+            Self::String(s) => format!("\"{}\"", escape_json_string(s)),
+            Self::Array(arr) => {
+                let elements: Vec<String> = arr.iter().map(Self::to_json).collect();
                 format!("[{}]", elements.join(","))
             }
-            OwnedValue::Object(obj) => {
+            Self::Object(obj) => {
                 let entries: Vec<String> = obj
                     .iter()
                     .map(|(k, v)| format!("\"{}\":{}", escape_json_string(k), v.to_json()))
@@ -242,48 +242,48 @@ fn escape_json_string(s: &str) -> String {
 impl From<Literal> for OwnedValue {
     fn from(lit: Literal) -> Self {
         match lit {
-            Literal::Null => OwnedValue::Null,
-            Literal::Bool(b) => OwnedValue::Bool(b),
-            Literal::Int(n) => OwnedValue::Int(n),
-            Literal::Float(f) => OwnedValue::Float(f),
-            Literal::String(s) => OwnedValue::String(s),
+            Literal::Null => Self::Null,
+            Literal::Bool(b) => Self::Bool(b),
+            Literal::Int(n) => Self::Int(n),
+            Literal::Float(f) => Self::Float(f),
+            Literal::String(s) => Self::String(s),
         }
     }
 }
 
 impl From<bool> for OwnedValue {
     fn from(b: bool) -> Self {
-        OwnedValue::Bool(b)
+        Self::Bool(b)
     }
 }
 
 impl From<i64> for OwnedValue {
     fn from(n: i64) -> Self {
-        OwnedValue::Int(n)
+        Self::Int(n)
     }
 }
 
 impl From<f64> for OwnedValue {
     fn from(f: f64) -> Self {
-        OwnedValue::Float(f)
+        Self::Float(f)
     }
 }
 
 impl From<String> for OwnedValue {
     fn from(s: String) -> Self {
-        OwnedValue::String(s)
+        Self::String(s)
     }
 }
 
 impl From<&str> for OwnedValue {
     fn from(s: &str) -> Self {
-        OwnedValue::String(s.to_string())
+        Self::String(s.to_string())
     }
 }
 
-impl<T: Into<OwnedValue>> From<Vec<T>> for OwnedValue {
+impl<T: Into<Self>> From<Vec<T>> for OwnedValue {
     fn from(arr: Vec<T>) -> Self {
-        OwnedValue::Array(arr.into_iter().map(Into::into).collect())
+        Self::Array(arr.into_iter().map(Into::into).collect())
     }
 }
 
@@ -309,7 +309,7 @@ mod tests {
         assert!(!OwnedValue::Bool(false).is_truthy());
         assert!(OwnedValue::Bool(true).is_truthy());
         assert!(OwnedValue::Int(0).is_truthy()); // 0 is truthy in jq!
-        assert!(OwnedValue::String("".into()).is_truthy()); // "" is truthy in jq!
+        assert!(OwnedValue::String(String::new()).is_truthy()); // "" is truthy in jq!
         assert!(OwnedValue::Array(vec![]).is_truthy()); // [] is truthy in jq!
     }
 
@@ -319,7 +319,7 @@ mod tests {
         assert_eq!(OwnedValue::Bool(true).type_name(), "boolean");
         assert_eq!(OwnedValue::Int(42).type_name(), "number");
         assert_eq!(OwnedValue::Float(2.5).type_name(), "number");
-        assert_eq!(OwnedValue::String("".into()).type_name(), "string");
+        assert_eq!(OwnedValue::String(String::new()).type_name(), "string");
         assert_eq!(OwnedValue::Array(vec![]).type_name(), "array");
         assert_eq!(OwnedValue::Object(IndexMap::new()).type_name(), "object");
     }

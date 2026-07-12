@@ -112,7 +112,7 @@ impl OutputConfig {
             " ".repeat(args.indent as usize)
         };
 
-        OutputConfig {
+        Self {
             output_format: args.output_format,
             compact,
             raw_output: args.raw_output || args.join_output || args.nul_output,
@@ -133,7 +133,7 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> Result<Owned
         YamlValue::String(s) => {
             let str_value = s
                 .as_str()
-                .map_err(|e| anyhow::anyhow!("invalid YAML string: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("invalid YAML string: {e}"))?;
 
             // Quoted strings should always be treated as strings (yq-compatible behavior)
             // Only unquoted scalars should undergo type detection
@@ -177,7 +177,7 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> Result<Owned
                 let key = match field.key() {
                     YamlValue::String(s) => s
                         .as_str()
-                        .map_err(|e| anyhow::anyhow!("invalid YAML key: {}", e))?
+                        .map_err(|e| anyhow::anyhow!("invalid YAML key: {e}"))?
                         .into_owned(),
                     other => {
                         // Non-string keys - convert to string representation
@@ -206,7 +206,7 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> Result<Owned
                 Ok(OwnedValue::Null)
             }
         }
-        YamlValue::Error(msg) => Err(anyhow::anyhow!("YAML error: {}", msg)),
+        YamlValue::Error(msg) => Err(anyhow::anyhow!("YAML error: {msg}")),
         YamlValue::Null => Ok(OwnedValue::Null),
     }
 }
@@ -265,7 +265,7 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
 fn detect_format_from_path(path: &Path) -> InputFormat {
     match path.extension().and_then(|e| e.to_str()) {
         Some("json") => InputFormat::Json,
-        Some("yaml") | Some("yml") => InputFormat::Yaml,
+        Some("yaml" | "yml") => InputFormat::Yaml,
         _ => InputFormat::Yaml, // Default to YAML
     }
 }
@@ -274,8 +274,7 @@ fn detect_format_from_path(path: &Path) -> InputFormat {
 fn resolve_input_format(format: InputFormat, path: Option<&Path>) -> InputFormat {
     match format {
         InputFormat::Auto => path
-            .map(detect_format_from_path)
-            .unwrap_or(InputFormat::Yaml),
+            .map_or(InputFormat::Yaml, detect_format_from_path),
         other => other,
     }
 }
@@ -292,7 +291,7 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
         InputFormat::Yaml | InputFormat::Auto => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
             let index =
-                YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {}", e))?;
+                YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
             let root = index.root(bytes);
 
             match root.value() {
@@ -314,7 +313,7 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
 /// This keeps the index alive during evaluation and preserves position metadata.
 #[allow(dead_code)] // STYLE-0005: used in tests
 fn parse_and_evaluate_yaml(bytes: &[u8], expr: &Expr) -> Result<Vec<OwnedValue>> {
-    let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {}", e))?;
+    let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
     let root = index.root(bytes);
 
     // YAML documents are wrapped in a sequence at the root
@@ -354,7 +353,7 @@ fn evaluate_yaml_direct_filtered(
     expr: &Expr,
     doc_filter: Option<(usize, usize)>,
 ) -> Result<(Vec<Vec<OwnedValue>>, usize)> {
-    let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {}", e))?;
+    let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
     let root = index.root(bytes);
 
     // YAML documents are wrapped in a sequence at the root
@@ -438,13 +437,13 @@ fn evaluate_input(
         QueryResult::Many(vs) => Ok(vs.iter().map(standard_json_to_owned).collect()),
         QueryResult::None => Ok(vec![]),
         QueryResult::Error(e) => {
-            eprintln!("yq: error: {}", e);
+            eprintln!("yq: error: {e}");
             Ok(vec![])
         }
         QueryResult::Owned(v) => Ok(vec![v]),
         QueryResult::ManyOwned(vs) => Ok(vs),
         QueryResult::Break(label) => {
-            eprintln!("yq: error: break ${} not in label", label);
+            eprintln!("yq: error: break ${label} not in label");
             Ok(vec![])
         }
     }
@@ -467,13 +466,13 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         GenericResult::Many(vs) => Ok(vs.iter().map(to_owned).collect()),
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
-            eprintln!("yq: error: {}", e);
+            eprintln!("yq: error: {e}");
             Ok(vec![])
         }
         GenericResult::Owned(v) => Ok(vec![v]),
         GenericResult::ManyOwned(vs) => Ok(vs),
         GenericResult::Break(label) => {
-            eprintln!("yq: error: break ${} not in label", label);
+            eprintln!("yq: error: break ${label} not in label");
             Ok(vec![])
         }
     }
@@ -555,7 +554,7 @@ fn output_value<W: Write>(writer: &mut W, value: &OwnedValue, config: &OutputCon
     // Handle raw output for scalars
     if config.raw_output {
         if let OwnedValue::String(s) = value {
-            write!(writer, "{}", s)?;
+            write!(writer, "{s}")?;
             write_terminator(writer, config)?;
             return Ok(());
         }
@@ -568,7 +567,7 @@ fn output_value<W: Write>(writer: &mut W, value: &OwnedValue, config: &OutputCon
         if config.use_color {
             write!(writer, "{}", colorize_yaml(&output))?;
         } else {
-            write!(writer, "{}", output)?;
+            write!(writer, "{output}")?;
         }
         write_terminator(writer, config)?;
         return Ok(());
@@ -585,7 +584,7 @@ fn output_value<W: Write>(writer: &mut W, value: &OwnedValue, config: &OutputCon
     if config.use_color {
         write!(writer, "{}", colorize_json(&json_str))?;
     } else {
-        write!(writer, "{}", json_str)?;
+        write!(writer, "{json_str}")?;
     }
 
     write_terminator(writer, config)?;
@@ -614,7 +613,7 @@ fn emit_yaml_value(
                     "-.inf".to_string()
                 }
             } else if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
-                format!("{:.1}", f)
+                format!("{f:.1}")
             } else {
                 f.to_string()
             }
@@ -643,9 +642,9 @@ fn emit_yaml_value(
                             && !item.starts_with('{')
                         {
                             // Multi-line value - emit nested content which handles its own indentation
-                            format!("{}-\n{}", indent, item)
+                            format!("{indent}-\n{item}")
                         } else {
-                            format!("{}- {}", indent, item)
+                            format!("{indent}- {item}")
                         }
                     })
                     .collect();
@@ -662,7 +661,7 @@ fn emit_yaml_value(
                     .map(|(k, v)| {
                         let key = yaml_quote_key(k);
                         let val = emit_yaml_value(v, config, depth, true);
-                        format!("{}: {}", key, val)
+                        format!("{key}: {val}")
                     })
                     .collect();
                 format!("{{{}}}", entries.join(", "))
@@ -687,10 +686,10 @@ fn emit_yaml_value(
                         {
                             // For nested containers, emit at depth+1 which handles its own indentation
                             let val = emit_yaml_value(v, config, depth + 1, false);
-                            format!("{}{}:\n{}", indent, key, val)
+                            format!("{indent}{key}:\n{val}")
                         } else {
                             let val = emit_yaml_value(v, config, depth + 1, false);
-                            format!("{}{}: {}", indent, key, val)
+                            format!("{indent}{key}: {val}")
                         }
                     })
                     .collect();
@@ -886,7 +885,7 @@ fn pretty_print_json_value(value: &OwnedValue, config: &OutputConfig, depth: usi
             if f.is_nan() || f.is_infinite() {
                 "null".to_string() // JSON doesn't support NaN or Infinity
             } else if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
-                format!("{:.1}", f) // Preserve decimal point for whole numbers
+                format!("{f:.1}") // Preserve decimal point for whole numbers
             } else {
                 f.to_string()
             }
@@ -1007,7 +1006,7 @@ fn escape_string_ascii(s: &str) -> String {
         } else {
             // Non-ASCII: escape as \uXXXX
             for unit in c.encode_utf16(&mut [0; 2]) {
-                result.push_str(&format!("\\u{:04x}", unit));
+                result.push_str(&format!("\\u{unit:04x}"));
             }
         }
     }
@@ -1104,7 +1103,7 @@ fn parse_variables(args: &YqCommand) -> Result<EvalContext> {
         if chunk.len() == 2 {
             let name = chunk[0].clone();
             let value = parse_json_value(&chunk[1])
-                .with_context(|| format!("invalid JSON for --argjson {}", name))?;
+                .with_context(|| format!("invalid JSON for --argjson {name}"))?;
             context.named.insert(name, value);
         }
     }
@@ -1372,7 +1371,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
     // Parse the jq program (use Yq mode for extended identifier syntax like kebab-case)
     let program = jq::parse_program_with_mode(&filter_str, jq::ParserMode::Yq)
-        .map_err(|e| anyhow::anyhow!("parse error: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
 
     // Parse variables
     let context = parse_variables(&args)?;
@@ -1475,7 +1474,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         if args.files.is_empty() {
             let yaml_bytes = read_stdin()?;
             let index = YamlIndex::build(&yaml_bytes)
-                .map_err(|e| anyhow::anyhow!("YAML parse error: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
             let root = index.root(&yaml_bytes);
 
             // Output each document using M2 streaming
@@ -1520,7 +1519,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             for file_path in &args.files {
                 let yaml_bytes = read_file(Path::new(file_path))?;
                 let index = YamlIndex::build(&yaml_bytes)
-                    .map_err(|e| anyhow::anyhow!("YAML parse error in {}: {}", file_path, e))?;
+                    .map_err(|e| anyhow::anyhow!("YAML parse error in {file_path}: {e}"))?;
                 let root = index.root(&yaml_bytes);
 
                 match root.value() {
@@ -1584,7 +1583,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             let mut content = String::new();
             for file_path in &args.files {
                 let file_content = std::fs::read_to_string(file_path)
-                    .with_context(|| format!("failed to read file: {}", file_path))?;
+                    .with_context(|| format!("failed to read file: {file_path}"))?;
                 content.push_str(&file_content);
             }
             content
@@ -1684,11 +1683,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 let mut buf_writer = BufWriter::new(&mut output_buffer);
                 // Count matching docs for multi-doc separator logic
                 let matching_docs: usize = if let Some(target_doc) = args.document {
-                    if (global_doc_index..global_doc_index + inputs.len()).contains(&target_doc) {
-                        1
-                    } else {
-                        0
-                    }
+                    usize::from((global_doc_index..global_doc_index + inputs.len()).contains(&target_doc))
                 } else {
                     inputs.len()
                 };
@@ -1792,7 +1787,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         }
 
         // Count total documents from collected results (after filtering)
-        let total_docs: usize = all_results.iter().map(|docs| docs.len()).sum();
+        let total_docs: usize = all_results.iter().map(std::vec::Vec::len).sum();
         let is_multi_doc = total_docs > 1;
 
         // Output all results with proper separators
@@ -2180,8 +2175,8 @@ mod tests {
         assert_eq!(inputs.len(), 1);
         if let OwnedValue::Object(map) = &inputs[0] {
             println!("map len: {}", map.len());
-            for (k, v) in map.iter() {
-                println!("  key={:?}, value={:?}", k, v);
+            for (k, v) in map {
+                println!("  key={k:?}, value={v:?}");
             }
             assert_eq!(map.len(), 1);
             // Empty key (null key in YAML becomes empty string in our representation)
@@ -2203,8 +2198,8 @@ mod tests {
         assert_eq!(results.len(), 1);
         if let OwnedValue::Object(map) = &results[0] {
             println!("direct eval map len: {}", map.len());
-            for (k, v) in map.iter() {
-                println!("  key={:?}, value={:?}", k, v);
+            for (k, v) in map {
+                println!("  key={k:?}, value={v:?}");
             }
             assert_eq!(map.len(), 1, "expected 1 key but got {} keys", map.len());
         } else {

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // ARM64 NEON SIMD intrinsics
 //! NEON-accelerated JSON semi-indexing for ARM64.
 //!
 //! Processes 16 bytes at a time using ARM NEON SIMD instructions.

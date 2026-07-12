@@ -114,8 +114,7 @@ fn has_system_yq() -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 /// Compare succinctly yq output with system yq output
@@ -152,7 +151,7 @@ fn test_quoted_leading_zero_preserved() -> Result<()> {
 
 #[test]
 fn test_unquoted_number_as_number() -> Result<()> {
-    let yaml = r#"count: 123"#;
+    let yaml = r"count: 123";
     let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
 
     assert_eq!(code, 0);
@@ -179,7 +178,7 @@ code: "007"
 
 #[test]
 fn test_single_quoted_string_preserved() -> Result<()> {
-    let yaml = r#"version: '2.0'"#;
+    let yaml = r"version: '2.0'";
     let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
 
     assert_eq!(code, 0);
@@ -232,7 +231,7 @@ codes:
 
 #[test]
 fn test_output_format_equals_syntax() -> Result<()> {
-    let yaml = r#"test: true"#;
+    let yaml = r"test: true";
     let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
 
     assert_eq!(code, 0);
@@ -242,19 +241,19 @@ fn test_output_format_equals_syntax() -> Result<()> {
 
 #[test]
 fn test_output_format_space_syntax() -> Result<()> {
-    let yaml = r#"test: true"#;
+    let yaml = r"test: true";
     let (output, code) = run_yq_stdin(".", yaml, &["-o", "json"])?;
 
     assert_eq!(code, 0);
     // Default format is pretty-printed, so check for field presence
     assert!(output.contains(r#""test""#));
-    assert!(output.contains(r#"true"#));
+    assert!(output.contains(r"true"));
     Ok(())
 }
 
 #[test]
 fn test_indent_equals_syntax() -> Result<()> {
-    let yaml = r#"a: 1"#;
+    let yaml = r"a: 1";
     let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
 
     assert_eq!(code, 0);
@@ -264,7 +263,7 @@ fn test_indent_equals_syntax() -> Result<()> {
 
 #[test]
 fn test_indent_space_syntax() -> Result<()> {
-    let yaml = r#"a: 1"#;
+    let yaml = r"a: 1";
     let (output, code) = run_yq_stdin(".", yaml, &["-o", "json", "-I", "0"])?;
 
     assert_eq!(code, 0);
@@ -349,7 +348,7 @@ fn test_file_input_type_preservation() -> Result<()> {
     let mut temp_file = NamedTempFile::new()?;
     writeln!(temp_file, r#"version: "1.0""#)?;
     writeln!(temp_file, r#"id: "001""#)?;
-    writeln!(temp_file, r#"count: 123"#)?;
+    writeln!(temp_file, r"count: 123")?;
 
     let path = temp_file.path().to_str().unwrap();
     let (output, code) = run_yq_file(".", path, &["-o=json", "-I=0"])?;
@@ -364,7 +363,7 @@ fn test_file_input_type_preservation() -> Result<()> {
 fn test_file_input_field_selection() -> Result<()> {
     let mut temp_file = NamedTempFile::new()?;
     writeln!(temp_file, r#"version: "2.5.1""#)?;
-    writeln!(temp_file, r#"build: 999"#)?;
+    writeln!(temp_file, r"build: 999")?;
 
     let path = temp_file.path().to_str().unwrap();
     let (output, code) = run_yq_file(".version", path, &["-o=json", "-I=0"])?;
@@ -511,16 +510,16 @@ fn test_yaml_output_format() -> Result<()> {
 
 #[test]
 fn test_compact_json_output() -> Result<()> {
-    let yaml = r#"
+    let yaml = r"
 a: 1
 b: 2
 c: 3
-"#;
+";
     let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
 
     assert_eq!(code, 0);
     // Compact output should not have newlines between fields
-    assert!(!output.trim().contains("\n"));
+    assert!(!output.trim().contains('\n'));
     Ok(())
 }
 
@@ -1011,14 +1010,12 @@ fn test_yaml_merge_key_expansion() -> Result<()> {
     // Should have both 'a' from merge and 'b' from item
     assert!(
         output.contains("\"a\"") && output.contains("\"b\""),
-        "merge key should expand anchor: got {}",
-        output
+        "merge key should expand anchor: got {output}"
     );
     // Should NOT have literal << key
     assert!(
         !output.contains("\"<<\""),
-        "merge key << should be expanded, not literal: {}",
-        output
+        "merge key << should be expanded, not literal: {output}"
     );
     Ok(())
 }
@@ -1032,8 +1029,7 @@ fn test_yaml_merge_key_override() -> Result<()> {
     assert_eq!(exit_code, 0);
     assert!(
         output.contains("override"),
-        "item's value should override anchor: got {}",
-        output
+        "item's value should override anchor: got {output}"
     );
     Ok(())
 }
@@ -1104,13 +1100,11 @@ fn test_multi_doc_select_first() -> Result<()> {
     assert_eq!(exit_code, 0);
     assert!(
         output.contains("a:"),
-        "should output first document: {}",
-        output
+        "should output first document: {output}"
     );
     assert!(
         !output.contains("b:"),
-        "should not include second document: {}",
-        output
+        "should not include second document: {output}"
     );
     Ok(())
 }
@@ -1122,13 +1116,11 @@ fn test_multi_doc_select_second() -> Result<()> {
     assert_eq!(exit_code, 0);
     assert!(
         output.contains("b:"),
-        "should output second document: {}",
-        output
+        "should output second document: {output}"
     );
     assert!(
         !output.contains("a:"),
-        "should not include first document: {}",
-        output
+        "should not include first document: {output}"
     );
     Ok(())
 }
@@ -1158,8 +1150,7 @@ fn test_unquoted_number_becomes_number() -> Result<()> {
     let trimmed = output.trim();
     assert!(
         trimmed == "1" || trimmed == "1.0",
-        "unquoted number should be numeric: {}",
-        trimmed
+        "unquoted number should be numeric: {trimmed}"
     );
     Ok(())
 }

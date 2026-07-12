@@ -143,14 +143,14 @@ impl EndPositions {
     /// of the non-zero entries.
     pub fn build(positions: &[u32], text_len: usize) -> Self {
         if positions.is_empty() {
-            return EndPositions::Compact(Box::new(CompactEndPositions::empty(text_len)));
+            return Self::Compact(Box::new(CompactEndPositions::empty(text_len)));
         }
 
         // Single-pass build with inline monotonicity check and zero-filling.
         // Returns None if non-zero positions are not monotonically non-decreasing.
         match CompactEndPositions::try_build(positions, text_len) {
-            Some(compact) => EndPositions::Compact(Box::new(compact)),
-            None => EndPositions::Dense(positions.to_vec()),
+            Some(compact) => Self::Compact(Box::new(compact)),
+            None => Self::Dense(positions.to_vec()),
         }
     }
 
@@ -167,8 +167,8 @@ impl EndPositions {
     #[inline]
     pub fn get(&self, open_idx: usize) -> Option<usize> {
         match self {
-            EndPositions::Compact(c) => c.get(open_idx),
-            EndPositions::Dense(v) => v
+            Self::Compact(c) => c.get(open_idx),
+            Self::Dense(v) => v
                 .get(open_idx)
                 .map(|&pos| pos as usize)
                 .filter(|&pos| pos > 0),
@@ -179,8 +179,8 @@ impl EndPositions {
     #[cfg(test)]
     pub fn heap_size(&self) -> usize {
         match self {
-            EndPositions::Compact(c) => c.heap_size(),
-            EndPositions::Dense(v) => v.len() * 4,
+            Self::Compact(c) => c.heap_size(),
+            Self::Dense(v) => v.len() * 4,
         }
     }
 
@@ -188,7 +188,7 @@ impl EndPositions {
     #[cfg(test)]
     #[inline]
     pub fn is_compact(&self) -> bool {
-        matches!(self, EndPositions::Compact(_))
+        matches!(self, Self::Compact(_))
     }
 }
 
@@ -516,7 +516,7 @@ mod tests {
         let ep = EndPositions::build(&positions, 100);
         assert!(ep.is_compact());
         for i in 0..5 {
-            assert_eq!(ep.get(i), None, "get({}) should be None", i);
+            assert_eq!(ep.get(i), None, "get({i}) should be None");
         }
     }
 
@@ -575,7 +575,7 @@ mod tests {
         assert!(ep.is_compact());
 
         for (i, &expected) in positions.iter().enumerate() {
-            assert_eq!(ep.get(i), Some(expected as usize), "get({}) failed", i);
+            assert_eq!(ep.get(i), Some(expected as usize), "get({i}) failed");
         }
     }
 
@@ -625,9 +625,7 @@ mod tests {
         // Should achieve meaningful compression
         assert!(
             ep_size < vec_size,
-            "EndPositions {} should be smaller than Vec<u32> {}",
-            ep_size,
-            vec_size
+            "EndPositions {ep_size} should be smaller than Vec<u32> {vec_size}"
         );
 
         // Verify scalar values are correct
@@ -637,10 +635,7 @@ mod tests {
                 assert_eq!(
                     got,
                     Some(expected as usize),
-                    "get({}) failed: expected {}, got {:?}",
-                    i,
-                    expected,
-                    got
+                    "get({i}) failed: expected {expected}, got {got:?}"
                 );
             }
             // Containers may return Some(prev_value) or None — don't check
@@ -700,7 +695,7 @@ mod tests {
         for (i, &expected) in positions.iter().enumerate() {
             let got = ep.get(i);
             if expected > 0 {
-                assert_eq!(got, Some(expected as usize), "get({}) failed", i);
+                assert_eq!(got, Some(expected as usize), "get({i}) failed");
             }
             // Containers may return Some(prev_value) or None
         }
@@ -711,15 +706,15 @@ mod tests {
         // Generate a realistic YAML structure and measure EndPositions savings
         let mut yaml = String::new();
         for i in 0..500 {
-            yaml.push_str(&format!("key_{}: value_{}\n", i, i));
+            yaml.push_str(&format!("key_{i}: value_{i}\n"));
         }
         yaml.push_str("nested:\n");
         for i in 0..200 {
-            yaml.push_str(&format!("  sub_{}: sub_val_{}\n", i, i));
+            yaml.push_str(&format!("  sub_{i}: sub_val_{i}\n"));
         }
         yaml.push_str("list:\n");
         for i in 0..300 {
-            yaml.push_str(&format!("  - item_{}\n", i));
+            yaml.push_str(&format!("  - item_{i}\n"));
         }
 
         let semi = super::super::parser::build_semi_index(yaml.as_bytes()).unwrap();
@@ -744,7 +739,7 @@ mod tests {
         for (i, &expected) in semi.bp_to_text_end.iter().enumerate() {
             let got = ep.get(i);
             if expected > 0 {
-                assert_eq!(got, Some(expected as usize), "open {} mismatch", i);
+                assert_eq!(got, Some(expected as usize), "open {i} mismatch");
             }
             // Containers (expected == 0) may return Some(prev_value) or None
         }

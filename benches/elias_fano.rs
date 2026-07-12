@@ -78,7 +78,7 @@ fn bench_sequential(c: &mut Criterion) {
                         cursor.advance_one();
                     }
                     black_box(sum)
-                })
+                });
             },
         );
 
@@ -93,7 +93,7 @@ fn bench_sequential(c: &mut Criterion) {
                         sum += v as u64;
                     }
                     black_box(sum)
-                })
+                });
             },
         );
     }
@@ -118,11 +118,11 @@ fn bench_random_access(c: &mut Criterion) {
             |b, (ef, queries)| {
                 b.iter(|| {
                     let mut sum = 0u64;
-                    for &i in queries.iter() {
+                    for &i in *queries {
                         sum += ef.get(black_box(i)).unwrap() as u64;
                     }
                     black_box(sum)
-                })
+                });
             },
         );
 
@@ -133,11 +133,11 @@ fn bench_random_access(c: &mut Criterion) {
             |b, (values, queries)| {
                 b.iter(|| {
                     let mut sum = 0u64;
-                    for &i in queries.iter() {
+                    for &i in *queries {
                         sum += values[black_box(i)] as u64;
                     }
                     black_box(sum)
-                })
+                });
             },
         );
     }
@@ -167,7 +167,7 @@ fn bench_skip_by_small(c: &mut Criterion) {
                         skip = (skip % 7) + 2; // Vary skip 2-8
                     }
                     black_box(sum)
-                })
+                });
             },
         );
 
@@ -186,7 +186,7 @@ fn bench_skip_by_small(c: &mut Criterion) {
                         skip = (skip % 7) + 2;
                     }
                     black_box(sum)
-                })
+                });
             },
         );
     }
@@ -212,14 +212,14 @@ fn bench_seek(c: &mut Criterion) {
             |b, (ef, targets)| {
                 b.iter(|| {
                     let mut sum = 0u64;
-                    for &target in targets.iter() {
+                    for &target in *targets {
                         let mut cursor = ef.cursor();
                         if let Some(v) = cursor.seek(black_box(target)) {
                             sum += v as u64;
                         }
                     }
                     black_box(sum)
-                })
+                });
             },
         );
 
@@ -230,11 +230,11 @@ fn bench_seek(c: &mut Criterion) {
             |b, (values, targets)| {
                 b.iter(|| {
                     let mut sum = 0u64;
-                    for &target in targets.iter() {
+                    for &target in *targets {
                         sum += values[black_box(target)] as u64;
                     }
                     black_box(sum)
-                })
+                });
             },
         );
     }
@@ -260,14 +260,14 @@ fn bench_cursor_from(c: &mut Criterion) {
             |b, (ef, positions)| {
                 b.iter(|| {
                     let mut sum = 0u64;
-                    for &pos in positions.iter() {
+                    for &pos in *positions {
                         let cursor = ef.cursor_from(black_box(pos));
                         if let Some(v) = cursor.current() {
                             sum += v as u64;
                         }
                     }
                     black_box(sum)
-                })
+                });
             },
         );
 
@@ -278,7 +278,7 @@ fn bench_cursor_from(c: &mut Criterion) {
             |b, (ef, positions)| {
                 b.iter(|| {
                     let mut sum = 0u64;
-                    for &pos in positions.iter() {
+                    for &pos in *positions {
                         let mut cursor = ef.cursor_from(black_box(pos));
                         // Iterate 5 elements (typical: small container children)
                         for _ in 0..5 {
@@ -291,7 +291,7 @@ fn bench_cursor_from(c: &mut Criterion) {
                         }
                     }
                     black_box(sum)
-                })
+                });
             },
         );
 
@@ -302,11 +302,11 @@ fn bench_cursor_from(c: &mut Criterion) {
             |b, (values, positions)| {
                 b.iter(|| {
                     let mut sum = 0u64;
-                    for &pos in positions.iter() {
+                    for &pos in *positions {
                         sum += values[black_box(pos)] as u64;
                     }
                     black_box(sum)
-                })
+                });
             },
         );
 
@@ -317,7 +317,7 @@ fn bench_cursor_from(c: &mut Criterion) {
             |b, (values, positions)| {
                 b.iter(|| {
                     let mut sum = 0u64;
-                    for &pos in positions.iter() {
+                    for &pos in *positions {
                         let start = black_box(pos);
                         for i in 0..5 {
                             if start + i < values.len() {
@@ -328,7 +328,7 @@ fn bench_cursor_from(c: &mut Criterion) {
                         }
                     }
                     black_box(sum)
-                })
+                });
             },
         );
     }

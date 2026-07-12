@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // x86_64 BMI2 (PDEP) SIMD intrinsics
 //! BMI2-accelerated DSV indexing for x86_64.
 //!
 //! Uses BMI2 PDEP instruction for quote state masking, providing ~10x speedup
@@ -107,8 +108,8 @@ unsafe fn process_chunk_64_bmi2(
     qq_carry: u64,
 ) -> (u64, u64, u64) {
     // Load 2 x 32-byte chunks using AVX2
-    let chunk0 = _mm256_loadu_si256(ptr as *const __m256i);
-    let chunk1 = _mm256_loadu_si256(ptr.add(32) as *const __m256i);
+    let chunk0 = _mm256_loadu_si256(ptr.cast::<__m256i>());
+    let chunk1 = _mm256_loadu_si256(ptr.add(32).cast::<__m256i>());
 
     // Create comparison vectors
     let v_delimiter = _mm256_set1_epi8(delimiter);
@@ -200,7 +201,7 @@ unsafe fn toggle64_bmi2(carry: u64, w: u64) -> (u64, u64) {
 
     // The new carry depends on whether addition overflowed
     // and the final state of the quote parity
-    let new_carry = if overflow { 1 } else { 0 };
+    let new_carry = u64::from(overflow);
 
     (result, new_carry)
 }

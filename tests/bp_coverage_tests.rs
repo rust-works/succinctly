@@ -183,9 +183,7 @@ mod excess_tests {
                 assert_eq!(
                     bp.excess(p),
                     expected,
-                    "excess({}) mismatch for words={:?}",
-                    p,
-                    words
+                    "excess({p}) mismatch for words={words:?}"
                 );
             }
         }
@@ -221,8 +219,7 @@ mod excess_tests {
                 assert_eq!(
                     bp.depth(p).unwrap() as i32,
                     bp.excess(p),
-                    "depth != excess at open position {}",
-                    p
+                    "depth != excess at open position {p}"
                 );
             }
         }
@@ -323,10 +320,7 @@ mod min_excess_tests {
             // min_excess should be <= total_excess (can't go below minimum)
             assert!(
                 min <= total,
-                "min_excess > total_excess for word={:#x}: min={}, total={}",
-                word,
-                min,
-                total
+                "min_excess > total_excess for word={word:#x}: min={min}, total={total}"
             );
 
             // min_excess should be <= 0 or the minimum running excess
@@ -361,8 +355,7 @@ mod find_close_in_word_tests {
             let naive = naive_find_close_in_word(word, p);
             assert_eq!(
                 result, naive,
-                "find_close_in_word({:#x}, {}) mismatch: got {:?}, expected {:?}",
-                word, p, result, naive
+                "find_close_in_word({word:#x}, {p}) mismatch: got {result:?}, expected {naive:?}"
             );
         }
     }
@@ -376,8 +369,7 @@ mod find_close_in_word_tests {
                 let naive = naive_find_close_in_word(word, p);
                 assert_eq!(
                     result, naive,
-                    "find_close_in_word({:#x}, {}) mismatch",
-                    word, p
+                    "find_close_in_word({word:#x}, {p}) mismatch"
                 );
             }
         }
@@ -439,8 +431,7 @@ mod find_close_in_word_tests {
             let naive = naive_find_unmatched_close_in_word(word);
             assert_eq!(
                 result, naive,
-                "find_unmatched_close_in_word({:#x}) mismatch: got {}, expected {}",
-                word, result, naive
+                "find_unmatched_close_in_word({word:#x}) mismatch: got {result}, expected {naive}"
             );
         }
     }
@@ -466,8 +457,7 @@ mod cross_verification_tests {
                 let linear_result = find_close(&words, len, p);
                 assert_eq!(
                     bp_result, linear_result,
-                    "find_close({}) mismatch at len={}",
-                    p, len
+                    "find_close({p}) mismatch at len={len}"
                 );
             }
 
@@ -477,8 +467,7 @@ mod cross_verification_tests {
                 let linear_result = find_open(&words, len, p);
                 assert_eq!(
                     bp_result, linear_result,
-                    "find_open({}) mismatch at len={}",
-                    p, len
+                    "find_open({p}) mismatch at len={len}"
                 );
             }
 
@@ -488,8 +477,7 @@ mod cross_verification_tests {
                 let linear_result = enclose(&words, len, p);
                 assert_eq!(
                     bp_result, linear_result,
-                    "enclose({}) mismatch at len={}",
-                    p, len
+                    "enclose({p}) mismatch at len={len}"
                 );
             }
 
@@ -498,8 +486,7 @@ mod cross_verification_tests {
             let naive_exc = naive_excess(&words, len, p);
             assert_eq!(
                 bp_excess, naive_exc,
-                "excess({}) mismatch at len={}",
-                p, len
+                "excess({p}) mismatch at len={len}"
             );
         }
     }
@@ -570,7 +557,7 @@ mod cross_verification_tests {
                 if bp.is_open(p) {
                     let bp_result = bp.find_close(p);
                     let linear_result = find_close(&words, len, p);
-                    assert_eq!(bp_result, linear_result, "find_close({}) mismatch", p);
+                    assert_eq!(bp_result, linear_result, "find_close({p}) mismatch");
                 }
             }
         }
@@ -596,8 +583,7 @@ mod cross_verification_tests {
                 let linear_result = find_close(&words, len, p);
                 assert_eq!(
                     bp_result, linear_result,
-                    "find_close({}) mismatch at large scale",
-                    p
+                    "find_close({p}) mismatch at large scale"
                 );
             }
         }
@@ -630,10 +616,7 @@ mod inverse_tests {
                         assert_eq!(
                             open,
                             Some(p),
-                            "find_open(find_close({})) != {} for close={}",
-                            p,
-                            p,
-                            close
+                            "find_open(find_close({p})) != {p} for close={close}"
                         );
                     }
                 }
@@ -673,8 +656,7 @@ mod inverse_tests {
                     assert_eq!(
                         size,
                         (close - p) / 2,
-                        "subtree_size formula failed at {}",
-                        p
+                        "subtree_size formula failed at {p}"
                     );
                 }
             }
@@ -748,9 +730,7 @@ mod depth_subtree_tests {
             assert_eq!(
                 bp.depth(i),
                 Some(expected),
-                "depth({}) should be {}",
-                i,
-                expected
+                "depth({i}) should be {expected}"
             );
         }
     }

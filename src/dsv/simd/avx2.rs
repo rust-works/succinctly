@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // x86_64 AVX2 SIMD intrinsics
 //! AVX2-accelerated DSV indexing for x86_64.
 //!
 //! Processes 64 bytes at a time using x86_64 AVX2 SIMD instructions to find
@@ -95,8 +96,8 @@ unsafe fn process_chunk_64(
     in_quote: bool,
 ) -> (u64, u64, bool) {
     // Load 2 x 32-byte chunks
-    let chunk0 = _mm256_loadu_si256(ptr as *const __m256i);
-    let chunk1 = _mm256_loadu_si256(ptr.add(32) as *const __m256i);
+    let chunk0 = _mm256_loadu_si256(ptr.cast::<__m256i>());
+    let chunk1 = _mm256_loadu_si256(ptr.add(32).cast::<__m256i>());
 
     // Create comparison vectors
     let v_delimiter = _mm256_set1_epi8(delimiter);

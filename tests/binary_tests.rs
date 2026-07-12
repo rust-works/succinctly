@@ -113,7 +113,7 @@ fn test_large_json_roundtrip() {
     let json = format!(
         r#"{{"items":[{}]}}"#,
         (0..1000)
-            .map(|i| format!(r#"{{"id":{},"name":"item{}"}}"#, i, i))
+            .map(|i| format!(r#"{{"id":{i},"name":"item{i}"}}"#))
             .collect::<Vec<_>>()
             .join(",")
     );
@@ -156,7 +156,7 @@ fn test_deeply_nested_json() {
     let depth = 50;
     let opens: String = "[".repeat(depth);
     let closes: String = "]".repeat(depth);
-    let json = format!("{}1{}", opens, closes);
+    let json = format!("{opens}1{closes}");
 
     let semi = standard::build_semi_index(json.as_bytes());
 

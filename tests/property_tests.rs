@@ -299,14 +299,14 @@ fn test_100k_bits_random_pattern() {
     // Sample some rank queries
     for i in (0..102400).step_by(1000) {
         let expected = naive_rank1(&words, 102400, i);
-        assert_eq!(bv.rank1(i), expected, "rank1({}) mismatch", i);
+        assert_eq!(bv.rank1(i), expected, "rank1({i}) mismatch");
     }
 
     // Sample some select queries
     let ones = bv.count_ones();
     for k in (0..ones).step_by(1000) {
         let expected = naive_select1(&words, 102400, k);
-        assert_eq!(bv.select1(k), expected, "select1({}) mismatch", k);
+        assert_eq!(bv.select1(k), expected, "select1({k}) mismatch");
     }
 }
 
@@ -358,7 +358,7 @@ fn test_many_blocks() {
     for block in 0..16 {
         let pos = block * 512;
         let expected = block * 8; // 8 ones per block
-        assert_eq!(bv.rank1(pos), expected, "rank1({}) at block {}", pos, block);
+        assert_eq!(bv.rank1(pos), expected, "rank1({pos}) at block {block}");
     }
 }
 
@@ -376,7 +376,7 @@ fn test_word_boundaries_rank() {
     for word_idx in 0..16 {
         let pos = word_idx * 64;
         let expected = word_idx * 8;
-        assert_eq!(bv.rank1(pos), expected, "rank1({}) at word boundary", pos);
+        assert_eq!(bv.rank1(pos), expected, "rank1({pos}) at word boundary");
     }
 }
 
@@ -391,8 +391,7 @@ fn test_word_boundaries_select() {
         assert_eq!(
             bv.select1(k),
             Some(expected),
-            "select1({}) at word boundary",
-            k
+            "select1({k}) at word boundary"
         );
     }
 }
@@ -889,7 +888,7 @@ proptest! {
         for l1_block in 0..(len / 2048) {
             let boundary = l1_block * 2048;
             // Test positions around boundary
-            for offset in [0, 1, 31, 32, 33, 63, 64, 65].iter() {
+            for offset in &[0, 1, 31, 32, 33, 63, 64, 65] {
                 let p = boundary.saturating_add(*offset);
                 if p < len && bp.is_open(p) {
                     let bp_result = bp.find_close(p);
@@ -913,7 +912,7 @@ proptest! {
         for l2_block in 0..(len / 65536).max(1) {
             let boundary = l2_block * 65536;
             // Test positions around boundary
-            for offset in [0, 1, 63, 64, 65, 2047, 2048, 2049].iter() {
+            for offset in &[0, 1, 63, 64, 65, 2047, 2048, 2049] {
                 let p = boundary.saturating_add(*offset);
                 if p < len && bp.is_open(p) {
                     let bp_result = bp.find_close(p);
@@ -957,9 +956,7 @@ fn test_large_deeply_nested() {
         assert_eq!(
             bp.find_close(i),
             Some(expected_close),
-            "find_close({}) should be {}",
-            i,
-            expected_close
+            "find_close({i}) should be {expected_close}"
         );
     }
 
@@ -996,9 +993,7 @@ fn test_large_flat_sequence() {
             assert_eq!(
                 bp.find_close(p),
                 Some(p + 1),
-                "find_close({}) at block {} boundary",
-                p,
-                block
+                "find_close({p}) at block {block} boundary"
             );
         }
     }
@@ -1059,8 +1054,7 @@ fn test_large_mixed_structure() {
             let linear_result = find_close(&words, len, p);
             assert_eq!(
                 bp_result, linear_result,
-                "find_close({}) mismatch in mixed structure",
-                p
+                "find_close({p}) mismatch in mixed structure"
             );
         }
     }
@@ -1073,8 +1067,7 @@ fn test_large_mixed_structure() {
             let linear_result = find_close(&words, len, boundary);
             assert_eq!(
                 bp_result, linear_result,
-                "find_close({}) mismatch at L1 boundary",
-                boundary
+                "find_close({boundary}) mismatch at L1 boundary"
             );
         }
     }
@@ -1100,8 +1093,7 @@ fn test_million_bit_random() {
         let linear_result = find_close(&words, len, p);
         assert_eq!(
             bp_result, linear_result,
-            "find_close({}) mismatch in 1M bit test",
-            p
+            "find_close({p}) mismatch in 1M bit test"
         );
     }
 }

@@ -238,8 +238,7 @@ mod tests {
             assert_eq!(
                 cr.rank_at_word(&words, i),
                 expected as usize,
-                "mismatch at word {}",
-                i
+                "mismatch at word {i}"
             );
         }
     }
@@ -267,10 +266,7 @@ mod tests {
 
         assert!(
             overhead_pct < 5.0,
-            "Overhead {:.1}% exceeds 5% target (bitmap={}, index={})",
-            overhead_pct,
-            bitmap_bytes,
-            index_bytes
+            "Overhead {overhead_pct:.1}% exceeds 5% target (bitmap={bitmap_bytes}, index={index_bytes})"
         );
     }
 }

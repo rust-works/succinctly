@@ -31,51 +31,51 @@ impl QueryType {
     /// Get the jq query string for this query type
     pub fn query(&self) -> &'static str {
         match self {
-            QueryType::Identity => ".",
-            QueryType::FirstElement => ".[0]",
-            QueryType::Iteration => ".[]",
-            QueryType::Length => "length",
+            Self::Identity => ".",
+            Self::FirstElement => ".[0]",
+            Self::Iteration => ".[]",
+            Self::Length => "length",
         }
     }
 
     /// Get a human-readable name for display
     pub fn name(&self) -> &'static str {
         match self {
-            QueryType::Identity => "identity",
-            QueryType::FirstElement => "first_element",
-            QueryType::Iteration => "iteration",
-            QueryType::Length => "length",
+            Self::Identity => "identity",
+            Self::FirstElement => "first_element",
+            Self::Iteration => "iteration",
+            Self::Length => "length",
         }
     }
 
     /// Get the execution path description
     pub fn path_description(&self) -> &'static str {
         match self {
-            QueryType::Identity => "P9 streaming",
-            QueryType::FirstElement => "M2 streaming",
-            QueryType::Iteration => "M2 streaming",
-            QueryType::Length => "OwnedValue",
+            Self::Identity => "P9 streaming",
+            Self::FirstElement => "M2 streaming",
+            Self::Iteration => "M2 streaming",
+            Self::Length => "OwnedValue",
         }
     }
 
     /// Parse query type from string
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
-            "identity" | "." => Some(QueryType::Identity),
-            "first_element" | "first" | ".[0]" => Some(QueryType::FirstElement),
-            "iteration" | "iter" | ".[]" => Some(QueryType::Iteration),
-            "length" => Some(QueryType::Length),
+            "identity" | "." => Some(Self::Identity),
+            "first_element" | "first" | ".[0]" => Some(Self::FirstElement),
+            "iteration" | "iter" | ".[]" => Some(Self::Iteration),
+            "length" => Some(Self::Length),
             _ => None,
         }
     }
 
     /// Get all available query types
-    pub fn all() -> &'static [QueryType] {
+    pub fn all() -> &'static [Self] {
         &[
-            QueryType::Identity,
-            QueryType::FirstElement,
-            QueryType::Iteration,
-            QueryType::Length,
+            Self::Identity,
+            Self::FirstElement,
+            Self::Iteration,
+            Self::Length,
         ]
     }
 }
@@ -229,7 +229,7 @@ pub fn run_benchmark(
                     break 'outer;
                 }
 
-                let file_path = config.data_dir.join(pattern).join(format!("{}.yaml", size));
+                let file_path = config.data_dir.join(pattern).join(format!("{size}.yaml"));
 
                 if !file_path.exists() {
                     eprintln!("  Skipping {} (not found)", file_path.display());
@@ -295,7 +295,7 @@ pub fn run_benchmark(
                         results.push(result);
                     }
                     Err(e) => {
-                        eprintln!("ERROR: {}", e);
+                        eprintln!("ERROR: {e}");
                     }
                 }
             }
@@ -476,7 +476,7 @@ fn run_command_with_timing(program: &str, args: &[&str]) -> Result<ToolResult> {
         let output = Command::new(program)
             .args(args)
             .output()
-            .with_context(|| format!("Failed to run {}", program))?;
+            .with_context(|| format!("Failed to run {program}"))?;
         (output.stdout, 0, 0.0, 0.0)
     };
 
@@ -619,8 +619,7 @@ fn check_yq_available() -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 /// Get CPU information for the current system
@@ -659,9 +658,7 @@ fn get_yq_version() -> String {
         .arg("--version")
         .output()
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "Unknown".to_string())
+        .and_then(|o| String::from_utf8(o.stdout).ok()).map_or_else(|| "Unknown".to_string(), |s| s.trim().to_string())
 }
 
 /// Generate markdown tables from results
@@ -673,11 +670,11 @@ pub fn generate_markdown(results: &[BenchmarkResult], has_yq: bool, memory_mode:
 
     // Add CPU info
     let cpu_info = get_cpu_info();
-    md.push_str(&format!("**CPU**: {}\n", cpu_info));
+    md.push_str(&format!("**CPU**: {cpu_info}\n"));
 
     if has_yq {
         let yq_version = get_yq_version();
-        md.push_str(&format!("**yq version**: {}\n", yq_version));
+        md.push_str(&format!("**yq version**: {yq_version}\n"));
     } else {
         md.push_str("**yq**: Not installed (succinctly-only benchmarks)\n");
     }
@@ -712,7 +709,7 @@ pub fn generate_markdown(results: &[BenchmarkResult], has_yq: bool, memory_mode:
     // If multiple queries, group by query first
     if queries.len() > 1 {
         for (query, query_path) in &queries {
-            md.push_str(&format!("## Query: `{}` ({})\n\n", query, query_path));
+            md.push_str(&format!("## Query: `{query}` ({query_path})\n\n"));
 
             let query_results: Vec<_> = results.iter().filter(|r| r.query == *query).collect();
             generate_pattern_tables(
@@ -727,7 +724,7 @@ pub fn generate_markdown(results: &[BenchmarkResult], has_yq: bool, memory_mode:
     } else {
         // Single query - just show pattern tables
         if let Some((query, query_path)) = queries.first() {
-            md.push_str(&format!("**Query**: `{}` ({})\n\n", query, query_path));
+            md.push_str(&format!("**Query**: `{query}` ({query_path})\n\n"));
         }
         let all_results: Vec<_> = results.iter().collect();
         generate_pattern_tables(
@@ -780,7 +777,7 @@ fn generate_memory_tables(
             continue;
         }
 
-        md.push_str(&format!("### Pattern: {}\n\n", pattern));
+        md.push_str(&format!("### Pattern: {pattern}\n\n"));
 
         if has_yq {
             md.push_str("| Size      | succ Mem | yq Mem  | Mem Ratio  | succ Time | yq Time  | Speedup    |\n");
@@ -802,7 +799,7 @@ fn generate_memory_tables(
             let succ_mem = format_memory_fixed(r.succinctly.peak_memory_bytes);
             let succ_time = format_time_fixed(r.succinctly.wall_time_ms);
             let size_bold = format!("**{}**", r.size);
-            let size_col = format!("{:<9}", size_bold);
+            let size_col = format!("{size_bold:<9}");
 
             if has_yq {
                 let yq_mem = format_memory_fixed(r.yq.peak_memory_bytes);
@@ -815,15 +812,13 @@ fn generate_memory_tables(
                 let speedup = r.yq.wall_time_ms / r.succinctly.wall_time_ms;
 
                 md.push_str(&format!(
-                    "| {} | {} | {} | **{:.2}x** | {} | {} | **{:.1}x** |\n",
-                    size_col, succ_mem, yq_mem, mem_ratio, succ_time, yq_time, speedup
+                    "| {size_col} | {succ_mem} | {yq_mem} | **{mem_ratio:.2}x** | {succ_time} | {yq_time} | **{speedup:.1}x** |\n"
                 ));
             } else {
                 let throughput =
                     r.filesize as f64 / (r.succinctly.wall_time_ms / 1000.0) / (1024.0 * 1024.0);
                 md.push_str(&format!(
-                    "| {} | {} | {} | {:>12.1} MiB/s |\n",
-                    size_col, succ_mem, succ_time, throughput
+                    "| {size_col} | {succ_mem} | {succ_time} | {throughput:>12.1} MiB/s |\n"
                 ));
             }
         }
@@ -850,7 +845,7 @@ fn generate_comparison_tables(
             continue;
         }
 
-        md.push_str(&format!("### Pattern: {}\n\n", pattern));
+        md.push_str(&format!("### Pattern: {pattern}\n\n"));
         md.push_str("| Size      | yq       | succinctly   | Speedup       | yq Mem  | succ Mem | Mem Ratio  |\n");
         md.push_str("|-----------|----------|--------------|---------------|---------|----------|------------|\n");
 
@@ -878,7 +873,7 @@ fn generate_comparison_tables(
 
             // Size column: **name** with trailing padding (9 chars total)
             let size_bold = format!("**{}**", r.size);
-            let size_col = format!("{:<9}", size_bold);
+            let size_col = format!("{size_bold:<9}");
 
             // yq time column
             let yq_col = yq_time;
@@ -889,28 +884,27 @@ fn generate_comparison_tables(
                 let padding = succ_time.len() - trimmed.len();
                 format!("{}**{}**", " ".repeat(padding), trimmed)
             } else {
-                format!("  {}  ", succ_time)
+                format!("  {succ_time}  ")
             };
 
             // Speedup column: bold if >= 1.0 (13 chars visual width)
-            let speedup_str = format!("{:.1}x", speedup);
+            let speedup_str = format!("{speedup:.1}x");
             let speedup_col = if speedup >= 1.0 {
-                let padded = format!("{:>9}", speedup_str);
+                let padded = format!("{speedup_str:>9}");
                 let trimmed = padded.trim_start();
                 let padding = padded.len() - trimmed.len();
                 format!("{}**{}**", " ".repeat(padding), trimmed)
             } else {
-                format!("{:>13}", speedup_str)
+                format!("{speedup_str:>13}")
             };
 
             // Memory columns
             let yq_mem_col = yq_mem;
-            let succ_mem_col = format!("{:>8}", succ_mem);
-            let mem_ratio_col = format!("{:>9.2}x", mem_ratio);
+            let succ_mem_col = format!("{succ_mem:>8}");
+            let mem_ratio_col = format!("{mem_ratio:>9.2}x");
 
             md.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} |\n",
-                size_col, yq_col, succ_col, speedup_col, yq_mem_col, succ_mem_col, mem_ratio_col
+                "| {size_col} | {yq_col} | {succ_col} | {speedup_col} | {yq_mem_col} | {succ_mem_col} | {mem_ratio_col} |\n"
             ));
         }
 
@@ -936,7 +930,7 @@ fn generate_succinctly_only_tables(
             continue;
         }
 
-        md.push_str(&format!("### Pattern: {}\n\n", pattern));
+        md.push_str(&format!("### Pattern: {pattern}\n\n"));
         md.push_str("| Size      | Time     | Throughput   | Memory   |\n");
         md.push_str("|-----------|----------|--------------|----------|\n");
 
@@ -954,16 +948,15 @@ fn generate_succinctly_only_tables(
 
             // Format values
             let time = format_time_fixed(r.succinctly.wall_time_ms);
-            let throughput_str = format!("{:.1} MiB/s", throughput);
+            let throughput_str = format!("{throughput:.1} MiB/s");
             let mem = format_memory_fixed(r.succinctly.peak_memory_bytes);
 
             // Size column
             let size_bold = format!("**{}**", r.size);
-            let size_col = format!("{:<9}", size_bold);
+            let size_col = format!("{size_bold:<9}");
 
             md.push_str(&format!(
-                "| {} | {} | {:>12} | {} |\n",
-                size_col, time, throughput_str, mem
+                "| {size_col} | {time} | {throughput_str:>12} | {mem} |\n"
             ));
         }
 
@@ -976,8 +969,8 @@ fn format_time_fixed(ms: f64) -> String {
     if ms >= 1000.0 {
         format!("{:>7.2}s", ms / 1000.0)
     } else {
-        let ms_str = format!("{:.1}ms", ms);
-        format!("{:>8}", ms_str)
+        let ms_str = format!("{ms:.1}ms");
+        format!("{ms_str:>8}")
     }
 }
 
@@ -990,7 +983,7 @@ fn format_memory_fixed(bytes: u64) -> String {
     } else if bytes >= 1024 {
         format!("{:>4.0} KB", bytes as f64 / 1024.0)
     } else {
-        format!("{:>4} B ", bytes)
+        format!("{bytes:>4} B ")
     }
 }
 
@@ -1003,7 +996,7 @@ fn format_bytes(bytes: usize) -> String {
     } else if bytes >= 1024 {
         format!("{:.2} KB", bytes as f64 / 1024.0)
     } else {
-        format!("{} bytes", bytes)
+        format!("{bytes} bytes")
     }
 }
 

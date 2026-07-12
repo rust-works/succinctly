@@ -67,13 +67,13 @@ fn bench_select1_with_select(c: &mut Criterion) {
             |b, (bp, queries)| {
                 b.iter(|| {
                     let mut sum = 0usize;
-                    for &q in queries.iter() {
+                    for &q in *queries {
                         if let Some(pos) = bp.select1(black_box(q)) {
                             sum += pos;
                         }
                     }
                     sum
-                })
+                });
             },
         );
 
@@ -84,7 +84,7 @@ fn bench_select1_with_select(c: &mut Criterion) {
             |b, (bp, queries)| {
                 b.iter(|| {
                     let mut sum = 0usize;
-                    for &q in queries.iter() {
+                    for &q in *queries {
                         let target_rank = black_box(q) + 1;
                         let bp_len = bp.len();
 
@@ -105,7 +105,7 @@ fn bench_select1_with_select(c: &mut Criterion) {
                         }
                     }
                     sum
-                })
+                });
             },
         );
     }

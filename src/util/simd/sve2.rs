@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // ARM64 SVE2 SIMD intrinsics
 //! SVE2-accelerated operations for ARM64.
 //!
 //! This module provides SVE2 implementations for performance-critical operations,
@@ -157,7 +158,7 @@ pub unsafe fn toggle64_sve2(carry: u64, quote_mask: u64) -> (u64, u64) {
     let (result, overflow) = shifted.overflowing_add(comp_w);
 
     // New carry depends on overflow
-    let new_carry = if overflow { 1 } else { 0 };
+    let new_carry = u64::from(overflow);
 
     (result, new_carry)
 }
@@ -210,7 +211,7 @@ pub unsafe fn select_in_word_bdep(x: u64, k: u32) -> u32 {
     if scattered == 0 {
         return 64;
     }
-    63 - scattered.leading_zeros()
+    scattered.ilog2()
 }
 
 /// Check if SVE2-BITPERM is available at runtime.
@@ -376,7 +377,7 @@ mod tests {
             let comp_w = !quote_mask;
             let shifted = (addend << 1) | c;
             let (result, overflow) = shifted.overflowing_add(comp_w);
-            let new_carry = if overflow { 1 } else { 0 };
+            let new_carry = u64::from(overflow);
 
             (result, new_carry)
         }
@@ -402,13 +403,11 @@ mod tests {
 
                     assert_eq!(
                         sve2_mask, ref_mask,
-                        "Mask mismatch for quote_mask={:#x}, carry={}",
-                        quote_mask, carry
+                        "Mask mismatch for quote_mask={quote_mask:#x}, carry={carry}"
                     );
                     assert_eq!(
                         sve2_carry, ref_carry,
-                        "Carry mismatch for quote_mask={:#x}, carry={}",
-                        quote_mask, carry
+                        "Carry mismatch for quote_mask={quote_mask:#x}, carry={carry}"
                     );
                 }
             }
@@ -450,7 +449,7 @@ mod tests {
         unsafe {
             let word = u64::MAX;
             for k in 0..64 {
-                assert_eq!(select_in_word_bdep(word, k), k, "k={}", k);
+                assert_eq!(select_in_word_bdep(word, k), k, "k={k}");
             }
             assert_eq!(select_in_word_bdep(word, 64), 64);
         }
@@ -499,8 +498,7 @@ mod tests {
                     let ctz_result = select_ctz(word, k);
                     assert_eq!(
                         bdep_result, ctz_result,
-                        "Mismatch for word={:#x}, k={}",
-                        word, k
+                        "Mismatch for word={word:#x}, k={k}"
                     );
                 }
             }

@@ -417,16 +417,16 @@ enum DsvPatternArg {
 impl From<DsvPatternArg> for dsv_generators::DsvPattern {
     fn from(arg: DsvPatternArg) -> Self {
         match arg {
-            DsvPatternArg::Tabular => dsv_generators::DsvPattern::Tabular,
-            DsvPatternArg::Users => dsv_generators::DsvPattern::Users,
-            DsvPatternArg::Numeric => dsv_generators::DsvPattern::Numeric,
-            DsvPatternArg::Strings => dsv_generators::DsvPattern::Strings,
-            DsvPatternArg::Quoted => dsv_generators::DsvPattern::Quoted,
-            DsvPatternArg::Multiline => dsv_generators::DsvPattern::Multiline,
-            DsvPatternArg::Wide => dsv_generators::DsvPattern::Wide,
-            DsvPatternArg::Long => dsv_generators::DsvPattern::Long,
-            DsvPatternArg::Mixed => dsv_generators::DsvPattern::Mixed,
-            DsvPatternArg::Pathological => dsv_generators::DsvPattern::Pathological,
+            DsvPatternArg::Tabular => Self::Tabular,
+            DsvPatternArg::Users => Self::Users,
+            DsvPatternArg::Numeric => Self::Numeric,
+            DsvPatternArg::Strings => Self::Strings,
+            DsvPatternArg::Quoted => Self::Quoted,
+            DsvPatternArg::Multiline => Self::Multiline,
+            DsvPatternArg::Wide => Self::Wide,
+            DsvPatternArg::Long => Self::Long,
+            DsvPatternArg::Mixed => Self::Mixed,
+            DsvPatternArg::Pathological => Self::Pathological,
         }
     }
 }
@@ -514,17 +514,17 @@ enum YamlPatternArg {
 impl From<YamlPatternArg> for yaml_generators::YamlPattern {
     fn from(arg: YamlPatternArg) -> Self {
         match arg {
-            YamlPatternArg::Comprehensive => yaml_generators::YamlPattern::Comprehensive,
-            YamlPatternArg::Users => yaml_generators::YamlPattern::Users,
-            YamlPatternArg::Nested => yaml_generators::YamlPattern::Nested,
-            YamlPatternArg::Sequences => yaml_generators::YamlPattern::Sequences,
-            YamlPatternArg::Mixed => yaml_generators::YamlPattern::Mixed,
-            YamlPatternArg::Strings => yaml_generators::YamlPattern::Strings,
-            YamlPatternArg::Numbers => yaml_generators::YamlPattern::Numbers,
-            YamlPatternArg::Config => yaml_generators::YamlPattern::Config,
-            YamlPatternArg::Unicode => yaml_generators::YamlPattern::Unicode,
-            YamlPatternArg::Pathological => yaml_generators::YamlPattern::Pathological,
-            YamlPatternArg::Navigation => yaml_generators::YamlPattern::Navigation,
+            YamlPatternArg::Comprehensive => Self::Comprehensive,
+            YamlPatternArg::Users => Self::Users,
+            YamlPatternArg::Nested => Self::Nested,
+            YamlPatternArg::Sequences => Self::Sequences,
+            YamlPatternArg::Mixed => Self::Mixed,
+            YamlPatternArg::Strings => Self::Strings,
+            YamlPatternArg::Numbers => Self::Numbers,
+            YamlPatternArg::Config => Self::Config,
+            YamlPatternArg::Unicode => Self::Unicode,
+            YamlPatternArg::Pathological => Self::Pathological,
+            YamlPatternArg::Navigation => Self::Navigation,
         }
     }
 }
@@ -853,16 +853,16 @@ pub struct YqCommand {
 impl From<PatternArg> for generators::Pattern {
     fn from(arg: PatternArg) -> Self {
         match arg {
-            PatternArg::Comprehensive => generators::Pattern::Comprehensive,
-            PatternArg::Users => generators::Pattern::Users,
-            PatternArg::Nested => generators::Pattern::Nested,
-            PatternArg::Arrays => generators::Pattern::Arrays,
-            PatternArg::Mixed => generators::Pattern::Mixed,
-            PatternArg::Strings => generators::Pattern::Strings,
-            PatternArg::Numbers => generators::Pattern::Numbers,
-            PatternArg::Literals => generators::Pattern::Literals,
-            PatternArg::Unicode => generators::Pattern::Unicode,
-            PatternArg::Pathological => generators::Pattern::Pathological,
+            PatternArg::Comprehensive => Self::Comprehensive,
+            PatternArg::Users => Self::Users,
+            PatternArg::Nested => Self::Nested,
+            PatternArg::Arrays => Self::Arrays,
+            PatternArg::Mixed => Self::Mixed,
+            PatternArg::Strings => Self::Strings,
+            PatternArg::Numbers => Self::Numbers,
+            PatternArg::Literals => Self::Literals,
+            PatternArg::Unicode => Self::Unicode,
+            PatternArg::Pathological => Self::Pathological,
         }
     }
 }
@@ -887,8 +887,7 @@ fn parse_size(s: &str) -> Result<usize, String> {
         (s.trim_end_matches('b'), 1)
     } else {
         return Err(format!(
-            "Invalid size format: '{}'. Use format like '1mb', '512KB', or '1024'",
-            s
+            "Invalid size format: '{s}'. Use format like '1mb', '512KB', or '1024'"
         ));
     };
 
@@ -896,7 +895,7 @@ fn parse_size(s: &str) -> Result<usize, String> {
         .trim()
         .parse::<usize>()
         .map(|n| n * unit)
-        .map_err(|_| format!("Invalid number in size: '{}'", s))
+        .map_err(|_| format!("Invalid number in size: '{s}'"))
 }
 
 /// Multi-call binary support: detect if invoked via a known alias name.
@@ -913,7 +912,7 @@ fn try_multicall() -> Result<Option<i32>> {
         .as_deref()
         .and_then(|s| std::path::Path::new(s).file_name())
         .and_then(|n| n.to_str())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
 
     let name = match binary_name {
         Some(ref n) => n.as_str(),
@@ -1003,7 +1002,7 @@ fn main() -> Result<()> {
                         eprintln!("✓ Wrote {} bytes to {}", output.len(), path.display());
                     }
                     None => {
-                        println!("{}", output);
+                        println!("{output}");
                     }
                 }
 
@@ -1038,7 +1037,7 @@ fn main() -> Result<()> {
                         eprintln!("✓ Wrote {} bytes to {}", dsv.len(), path.display());
                     }
                     None => {
-                        print!("{}", dsv);
+                        print!("{dsv}");
                     }
                 }
 
@@ -1053,7 +1052,7 @@ fn main() -> Result<()> {
 
                 if args.verify {
                     succinctly::yaml::YamlIndex::build(yaml.as_bytes())
-                        .map_err(|e| anyhow::anyhow!("Generated invalid YAML: {}", e))?;
+                        .map_err(|e| anyhow::anyhow!("Generated invalid YAML: {e}"))?;
                     eprintln!("✓ YAML validated successfully");
                 }
 
@@ -1063,7 +1062,7 @@ fn main() -> Result<()> {
                         eprintln!("✓ Wrote {} bytes to {}", yaml.len(), path.display());
                     }
                     None => {
-                        print!("{}", yaml);
+                        print!("{yaml}");
                     }
                 }
 
@@ -1096,7 +1095,7 @@ fn install_aliases(args: InstallAliasesArgs) -> Result<()> {
         Some(d) => d,
         None => binary
             .parent()
-            .map(|p| p.to_path_buf())
+            .map(std::path::Path::to_path_buf)
             .context("Cannot determine binary directory")?,
     };
 
@@ -1112,7 +1111,7 @@ fn install_aliases(args: InstallAliasesArgs) -> Result<()> {
         if target.is_symlink() {
             if let Ok(existing) = std::fs::read_link(&target) {
                 if existing == binary {
-                    eprintln!("  skip {} (already exists)", alias);
+                    eprintln!("  skip {alias} (already exists)");
                     continue;
                 }
             }
@@ -1120,7 +1119,7 @@ fn install_aliases(args: InstallAliasesArgs) -> Result<()> {
             std::fs::remove_file(&target)
                 .with_context(|| format!("Cannot remove existing symlink: {}", target.display()))?;
         } else if target.exists() {
-            eprintln!("  skip {} (non-symlink file exists)", alias);
+            eprintln!("  skip {alias} (non-symlink file exists)");
             continue;
         }
 
@@ -1423,7 +1422,7 @@ fn generate_json_suite(args: GenerateSuite) -> Result<()> {
                 continue;
             }
 
-            let filename = format!("{}.json", size_name);
+            let filename = format!("{size_name}.json");
             let path = pattern_dir.join(&filename);
 
             // Deterministic seed: base_seed + file_index
@@ -1458,7 +1457,7 @@ fn generate_json_suite(args: GenerateSuite) -> Result<()> {
     );
 
     if skipped_count > 0 {
-        eprintln!("Skipped {} files exceeding max size", skipped_count);
+        eprintln!("Skipped {skipped_count} files exceeding max size");
     }
 
     if args.verify {
@@ -1522,7 +1521,7 @@ fn generate_dsv_suite(args: GenerateDsvSuite) -> Result<()> {
                 continue;
             }
 
-            let filename = format!("{}.{}", size_name, extension);
+            let filename = format!("{size_name}.{extension}");
             let path = pattern_dir.join(&filename);
 
             // Deterministic seed: base_seed + file_index
@@ -1566,7 +1565,7 @@ fn generate_dsv_suite(args: GenerateDsvSuite) -> Result<()> {
     );
 
     if skipped_count > 0 {
-        eprintln!("Skipped {} files exceeding max size", skipped_count);
+        eprintln!("Skipped {skipped_count} files exceeding max size");
     }
 
     if args.verify {
@@ -1632,7 +1631,7 @@ fn generate_yaml_suite(args: GenerateYamlSuite) -> Result<()> {
                 continue;
             }
 
-            let filename = format!("{}.yaml", size_name);
+            let filename = format!("{size_name}.yaml");
             let path = pattern_dir.join(&filename);
 
             // Deterministic seed: base_seed + file_index
@@ -1666,7 +1665,7 @@ fn generate_yaml_suite(args: GenerateYamlSuite) -> Result<()> {
         let pattern_dir = output_dir.join(pattern_name);
         std::fs::create_dir_all(&pattern_dir)?;
 
-        let filename = format!("{}.yaml", pattern_name);
+        let filename = format!("{pattern_name}.yaml");
         let path = pattern_dir.join(&filename);
 
         // Deterministic seed: base_seed + file_index
@@ -1703,7 +1702,7 @@ fn generate_yaml_suite(args: GenerateYamlSuite) -> Result<()> {
     );
 
     if skipped_count > 0 {
-        eprintln!("Skipped {} files exceeding max size", skipped_count);
+        eprintln!("Skipped {skipped_count} files exceeding max size");
     }
 
     if args.verify {
@@ -1721,7 +1720,7 @@ fn format_bytes(bytes: usize) -> String {
     } else if bytes >= 1024 {
         format!("{:.2} KB", bytes as f64 / 1024.0)
     } else {
-        format!("{} bytes", bytes)
+        format!("{bytes} bytes")
     }
 }
 

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // dispatches to PDEP/BDEP intrinsics for select-in-word
 //! Broadword (SWAR) algorithms for bit manipulation.
 //!
 //! These algorithms operate on 64-bit words using SIMD-within-a-register techniques,
@@ -191,7 +192,7 @@ mod tests {
     fn test_select_in_word_all_ones() {
         let word = u64::MAX;
         for k in 0..64 {
-            assert_eq!(select_in_word(word, k), k, "k={}", k);
+            assert_eq!(select_in_word(word, k), k, "k={k}");
         }
         assert_eq!(select_in_word(word, 64), 64);
     }
@@ -233,9 +234,7 @@ mod tests {
                 assert_eq!(
                     select_in_word(word, k),
                     select_in_word_broadword(word, k),
-                    "word={:#x}, k={}",
-                    word,
-                    k
+                    "word={word:#x}, k={k}"
                 );
             }
         }
@@ -248,10 +247,10 @@ mod tests {
             let pop = word.count_ones();
             for k in 0..pop {
                 let pos = select_in_word(word, k);
-                assert!(pos < 64, "word={:#x}, k={}", word, k);
+                assert!(pos < 64, "word={word:#x}, k={k}");
                 // Verify this is actually the k-th bit
                 let bits_before = (word & ((1 << pos) - 1)).count_ones();
-                assert_eq!(bits_before, k, "word={:#x}, k={}, pos={}", word, k, pos);
+                assert_eq!(bits_before, k, "word={word:#x}, k={k}, pos={pos}");
                 // Verify bit is set
                 assert!((word >> pos) & 1 == 1);
             }

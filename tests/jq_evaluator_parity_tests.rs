@@ -18,7 +18,7 @@ fn full_outputs(json: &[u8], filter: &str) -> Vec<String> {
     let cursor = index.root(json);
     let expr = parse(filter).expect("parse failed");
     let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
-    result.collect_owned().iter().map(|v| v.to_json()).collect()
+    result.collect_owned().iter().map(succinctly::jq::OwnedValue::to_json).collect()
 }
 
 /// Outputs of the generic evaluator (`src/jq/eval_generic.rs`, the CLI path).
@@ -27,7 +27,7 @@ fn generic_outputs(json: &[u8], filter: &str) -> Vec<String> {
     let cursor = index.root(json);
     let expr = parse(filter).expect("parse failed");
     let result = eval_generic::eval_with_cursor(&expr, cursor);
-    result.collect_owned().iter().map(|v| v.to_json()).collect()
+    result.collect_owned().iter().map(succinctly::jq::OwnedValue::to_json).collect()
 }
 
 fn as_strs(v: &[String]) -> Vec<&str> {
@@ -71,22 +71,22 @@ fn assert_divergence(json: &[u8], filter: &str, full_expected: &[&str], generic_
 #[test]
 fn test_parity_values_builtin() {
     // `values` drops null inputs.
-    assert_parity(br#"[1,null,2,null,3]"#, "[.[] | values]");
+    assert_parity(br"[1,null,2,null,3]", "[.[] | values]");
     assert_parity(br#"{"a":1,"b":null,"c":3}"#, "[.[] | values]");
 }
 
 #[test]
 fn test_parity_first_last() {
-    assert_parity(br#"[10,20,30]"#, "first(.[])");
-    assert_parity(br#"[10,20,30]"#, "last(.[])");
-    assert_parity(br#"[10,20,30]"#, "first");
-    assert_parity(br#"[10,20,30]"#, "last");
+    assert_parity(br"[10,20,30]", "first(.[])");
+    assert_parity(br"[10,20,30]", "last(.[])");
+    assert_parity(br"[10,20,30]", "first");
+    assert_parity(br"[10,20,30]", "last");
 }
 
 #[test]
 fn test_parity_first_last_empty() {
-    assert_parity(br#"[]"#, "first(.[])");
-    assert_parity(br#"[]"#, "last(.[])");
+    assert_parity(br"[]", "first(.[])");
+    assert_parity(br"[]", "last(.[])");
 }
 
 #[test]
@@ -110,6 +110,6 @@ fn test_out_of_bounds_index_diverges_161_162() {
     // The FULL evaluator matches; the generic (CLI) path yields NO output --
     // bug #161/#162.
     for filter in [".[5]", ".[-5]", ".[100]"] {
-        assert_divergence(br#"[1,2,3]"#, filter, &["null"], &[]);
+        assert_divergence(br"[1,2,3]", filter, &["null"], &[]);
     }
 }

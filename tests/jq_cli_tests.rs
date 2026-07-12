@@ -148,7 +148,7 @@ fn test_nested_field_access() -> Result<()> {
 
 #[test]
 fn test_array_index() -> Result<()> {
-    let (output, code) = run_jq_stdin(".[1]", r#"[10,20,30]"#, &[])?;
+    let (output, code) = run_jq_stdin(".[1]", r"[10,20,30]", &[])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "20");
     Ok(())
@@ -156,7 +156,7 @@ fn test_array_index() -> Result<()> {
 
 #[test]
 fn test_array_iteration() -> Result<()> {
-    let (output, code) = run_jq_stdin(".[]", r#"[1,2,3]"#, &[])?;
+    let (output, code) = run_jq_stdin(".[]", r"[1,2,3]", &[])?;
     assert_eq!(code, 0);
     assert_eq!(output, "1\n2\n3\n");
     Ok(())
@@ -595,7 +595,7 @@ fn test_multiple_file_inputs() -> Result<()> {
 
 #[test]
 fn test_builtin_length() -> Result<()> {
-    let (output, code) = run_jq_stdin("length", r#"[1,2,3,4,5]"#, &[])?;
+    let (output, code) = run_jq_stdin("length", r"[1,2,3,4,5]", &[])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "5");
     Ok(())
@@ -611,7 +611,7 @@ fn test_builtin_keys() -> Result<()> {
 
 #[test]
 fn test_builtin_map() -> Result<()> {
-    let (output, code) = run_jq_stdin("map(. * 2)", r#"[1,2,3]"#, &["-c"])?;
+    let (output, code) = run_jq_stdin("map(. * 2)", r"[1,2,3]", &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "[2,4,6]");
     Ok(())
@@ -619,7 +619,7 @@ fn test_builtin_map() -> Result<()> {
 
 #[test]
 fn test_builtin_select() -> Result<()> {
-    let (output, code) = run_jq_stdin(".[] | select(. > 2)", r#"[1,2,3,4,5]"#, &[])?;
+    let (output, code) = run_jq_stdin(".[] | select(. > 2)", r"[1,2,3,4,5]", &[])?;
     assert_eq!(code, 0);
     assert_eq!(output, "3\n4\n5\n");
     Ok(())
@@ -640,7 +640,7 @@ fn test_builtin_type() -> Result<()> {
 #[test]
 fn test_object_construction() -> Result<()> {
     let (output, code) = run_jq_stdin(
-        r#"{name: .user, id: .id}"#,
+        r"{name: .user, id: .id}",
         r#"{"user":"Alice","id":42}"#,
         &["-c"],
     )?;
@@ -683,7 +683,7 @@ fn test_try_catch() -> Result<()> {
 
 #[test]
 fn test_reduce() -> Result<()> {
-    let (output, code) = run_jq_stdin("reduce .[] as $x (0; . + $x)", r#"[1,2,3,4,5]"#, &[])?;
+    let (output, code) = run_jq_stdin("reduce .[] as $x (0; . + $x)", r"[1,2,3,4,5]", &[])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "15");
     Ok(())
@@ -758,7 +758,7 @@ fn test_ascii_output() -> Result<()> {
     // Test that --ascii-output escapes non-ASCII characters
     let (output, _) = run_jq_stdin(".", r#"{"name":"世界"}"#, &["-c", "-a"])?;
     // Chinese characters should be escaped as \uXXXX
-    assert!(output.contains(r#"\u4e16\u754c"#));
+    assert!(output.contains(r"\u4e16\u754c"));
     assert!(!output.contains("世界"));
     Ok(())
 }
@@ -768,7 +768,7 @@ fn test_ascii_output_emoji() -> Result<()> {
     // Test that emoji (outside BMP) are escaped as surrogate pairs
     let (output, _) = run_jq_stdin(".", r#"{"emoji":"🌍"}"#, &["-c", "-a"])?;
     // Earth emoji U+1F30D should be encoded as surrogate pair
-    assert!(output.contains(r#"\ud83c\udf0d"#));
+    assert!(output.contains(r"\ud83c\udf0d"));
     assert!(!output.contains("🌍"));
     Ok(())
 }
@@ -859,7 +859,7 @@ fn test_number_formatting_field_access() -> Result<()> {
 #[test]
 fn test_number_formatting_array_iteration() -> Result<()> {
     // Test number formatting preserved through array iteration with --preserve-input
-    let (output, code) = run_jq_stdin(".[]", r#"[1e100, 2e-100]"#, &["-c", "--preserve-input"])?;
+    let (output, code) = run_jq_stdin(".[]", r"[1e100, 2e-100]", &["-c", "--preserve-input"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "1e100\n2e-100");
     Ok(())
@@ -1151,8 +1151,7 @@ fn test_include_directive() -> Result<()> {
 
     assert!(
         !stderr.contains("compile error"),
-        "Should parse include directive without error: {}",
-        stderr
+        "Should parse include directive without error: {stderr}"
     );
     assert_eq!(stdout.trim(), "42", "21 | double should equal 42");
     Ok(())
@@ -1189,8 +1188,7 @@ fn test_import_directive() -> Result<()> {
 
     assert!(
         !stderr.contains("compile error"),
-        "Should parse import directive without error: {}",
-        stderr
+        "Should parse import directive without error: {stderr}"
     );
     assert_eq!(stdout.trim(), "30", "10 | m::triple should equal 30");
     Ok(())
@@ -1251,8 +1249,7 @@ fn test_jq_library_path_env() -> Result<()> {
 
     assert!(
         !stderr.contains("compile error"),
-        "Should parse include directive without error: {}",
-        stderr
+        "Should parse include directive without error: {stderr}"
     );
     assert_eq!(stdout.trim(), "20", "5 | quadruple should equal 20");
     Ok(())
@@ -1282,8 +1279,7 @@ fn test_module_not_found_error() -> Result<()> {
     // Should produce a module error
     assert!(
         stderr.contains("module") && stderr.contains("not found"),
-        "Should report module not found error: {}",
-        stderr
+        "Should report module not found error: {stderr}"
     );
     Ok(())
 }
@@ -1313,8 +1309,7 @@ fn test_namespaced_call_parse() -> Result<()> {
     // Not a compile error, but an eval error
     assert!(
         !stderr.contains("compile error"),
-        "Should parse namespaced call without compile error: {}",
-        stderr
+        "Should parse namespaced call without compile error: {stderr}"
     );
     Ok(())
 }
@@ -1350,8 +1345,7 @@ fn test_home_jq_file_autoload() -> Result<()> {
     // Should successfully execute the function
     assert!(
         !stderr.contains("compile error"),
-        "Should not have compile error: {}",
-        stderr
+        "Should not have compile error: {stderr}"
     );
 
     // The function should multiply by 100
@@ -1394,8 +1388,7 @@ fn test_home_jq_dir_search_path() -> Result<()> {
 
     assert!(
         !stderr.contains("compile error") && !stderr.contains("module error"),
-        "Should find module in ~/.jq directory: {}",
-        stderr
+        "Should find module in ~/.jq directory: {stderr}"
     );
     assert_eq!(stdout.trim(), "1007", "7 | home_func should equal 1007");
     Ok(())
@@ -1433,8 +1426,7 @@ fn test_import_with_namespace() -> Result<()> {
     // Should not have errors
     assert!(
         !stderr.contains("compile error") && !stderr.contains("module error"),
-        "Should import module and use namespaced function: {}",
-        stderr
+        "Should import module and use namespaced function: {stderr}"
     );
 
     // Should output 10 (5 * 2)
@@ -1546,11 +1538,11 @@ fn test_seq_ignores_parse_errors() -> Result<()> {
     // Should only see outputs from valid JSON (1 and 2), not the invalid segment
     let output_str = String::from_utf8(output)?;
     assert!(
-        output_str.contains("1"),
+        output_str.contains('1'),
         "Should have output from first valid value"
     );
     assert!(
-        output_str.contains("2"),
+        output_str.contains('2'),
         "Should have output from second valid value"
     );
     Ok(())
@@ -1559,7 +1551,7 @@ fn test_seq_ignores_parse_errors() -> Result<()> {
 #[test]
 fn test_seq_multiple_outputs() -> Result<()> {
     // Each output from iterator should get RS prefix
-    let (output, code) = run_jq_binary_stdin(".[]", br#"[1,2,3]"#, &["--seq"])?;
+    let (output, code) = run_jq_binary_stdin(".[]", br"[1,2,3]", &["--seq"])?;
     assert_eq!(code, 0);
 
     // Count RS characters - should be 3 (one per output)

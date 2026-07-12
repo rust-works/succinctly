@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // SIMD anchor scan benchmarked directly
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 /// Scalar version: parse anchor name byte-by-byte
@@ -40,7 +41,7 @@ unsafe fn parse_anchor_name_simd(input: &[u8], start: usize) -> usize {
 
     // Process 32 bytes at a time with AVX2
     while pos + 32 <= end {
-        let chunk = _mm256_loadu_si256(input.as_ptr().add(pos) as *const __m256i);
+        let chunk = _mm256_loadu_si256(input.as_ptr().add(pos).cast::<__m256i>());
 
         // Check for whitespace characters
         let space = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b' ' as i8));
@@ -116,20 +117,20 @@ fn bench_anchor_name_parsing(c: &mut Criterion) {
     ];
 
     for (name, anchor) in sizes {
-        let input = format!("&{} value", anchor);
+        let input = format!("&{anchor} value");
         let bytes = input.as_bytes();
         let len = anchor.len();
 
         group.throughput(Throughput::Bytes(len as u64));
 
         group.bench_with_input(BenchmarkId::new("scalar", name), &bytes, |b, input| {
-            b.iter(|| parse_anchor_name_scalar(black_box(input), black_box(1)))
+            b.iter(|| parse_anchor_name_scalar(black_box(input), black_box(1)));
         });
 
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx2") {
             group.bench_with_input(BenchmarkId::new("simd", name), &bytes, |b, input| {
-                b.iter(|| unsafe { parse_anchor_name_simd(black_box(input), black_box(1)) })
+                b.iter(|| unsafe { parse_anchor_name_simd(black_box(input), black_box(1)) });
             });
         }
     }
@@ -152,11 +153,11 @@ fn bench_alias_scanning(c: &mut Criterion) {
         let mut doc = String::new();
         for i in 0..size / 20 {
             if i % 10 == 0 {
-                doc.push_str(&format!("key{}: &anchor{} value\n", i, i));
+                doc.push_str(&format!("key{i}: &anchor{i} value\n"));
             } else if i % 10 == 5 {
                 doc.push_str(&format!("ref{}: *anchor{}\n", i, i / 10));
             } else {
-                doc.push_str(&format!("key{}: value\n", i));
+                doc.push_str(&format!("key{i}: value\n"));
             }
         }
         let bytes = doc.as_bytes();
@@ -170,13 +171,13 @@ fn bench_alias_scanning(c: &mut Criterion) {
                 b.iter(|| {
                     let input = black_box(input);
                     let mut count = 0;
-                    for &byte in input.iter() {
+                    for &byte in *input {
                         if byte == b'&' || byte == b'*' {
                             count += 1;
                         }
                     }
                     count
-                })
+                });
             },
         );
 
@@ -194,7 +195,7 @@ fn bench_alias_scanning(c: &mut Criterion) {
 
                         while pos + 32 <= input.len() {
                             let chunk =
-                                _mm256_loadu_si256(input.as_ptr().add(pos) as *const __m256i);
+                                _mm256_loadu_si256(input.as_ptr().add(pos).cast::<__m256i>());
                             let anchor = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'&' as i8));
                             let alias = _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'*' as i8));
                             let matches = _mm256_or_si256(anchor, alias);
@@ -211,7 +212,7 @@ fn bench_alias_scanning(c: &mut Criterion) {
                         }
 
                         count
-                    })
+                    });
                 },
             );
         }

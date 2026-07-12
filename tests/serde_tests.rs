@@ -39,15 +39,14 @@ mod bitvec_serde {
 
         // Verify rank/select still work correctly
         for i in 0..bv.len() {
-            assert_eq!(restored.rank1(i), bv.rank1(i), "rank1 mismatch at {}", i);
+            assert_eq!(restored.rank1(i), bv.rank1(i), "rank1 mismatch at {i}");
         }
 
         for k in 0..bv.count_ones() {
             assert_eq!(
                 restored.select1(k),
                 bv.select1(k),
-                "select1 mismatch at {}",
-                k
+                "select1 mismatch at {k}"
             );
         }
     }
@@ -310,8 +309,7 @@ mod compact_serde {
                 assert_eq!(
                     restored.find_close(p),
                     bp.find_close(p),
-                    "find_close mismatch at {}",
-                    p
+                    "find_close mismatch at {p}"
                 );
             }
         }

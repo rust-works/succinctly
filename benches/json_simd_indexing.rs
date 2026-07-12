@@ -48,7 +48,7 @@ fn bench_json_indexing(c: &mut Criterion) {
         // AVX2 (if available) - fastest on x86_64
         if is_x86_feature_detected!("avx2") {
             group.bench_with_input(BenchmarkId::new("AVX2", name), &bytes, |b, bytes| {
-                b.iter(|| succinctly::json::simd::avx2::build_semi_index_standard(black_box(bytes)))
+                b.iter(|| succinctly::json::simd::avx2::build_semi_index_standard(black_box(bytes)));
             });
         }
 
@@ -57,18 +57,18 @@ fn bench_json_indexing(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::new("SSE4.2", name), &bytes, |b, bytes| {
                 b.iter(|| {
                     succinctly::json::simd::sse42::build_semi_index_standard(black_box(bytes))
-                })
+                });
             });
         }
 
         // SSE2 (always available on x86_64)
         group.bench_with_input(BenchmarkId::new("SSE2", name), &bytes, |b, bytes| {
-            b.iter(|| succinctly::json::simd::x86::build_semi_index_standard(black_box(bytes)))
+            b.iter(|| succinctly::json::simd::x86::build_semi_index_standard(black_box(bytes)));
         });
 
         // PFSM (table-based state machine) baseline
         group.bench_with_input(BenchmarkId::new("PFSM", name), &bytes, |b, bytes| {
-            b.iter(|| succinctly::json::standard::build_semi_index(black_box(bytes)))
+            b.iter(|| succinctly::json::standard::build_semi_index(black_box(bytes)));
         });
     }
 
@@ -102,17 +102,17 @@ fn bench_json_indexing(c: &mut Criterion) {
 
         // NEON (always available on aarch64)
         group.bench_with_input(BenchmarkId::new("NEON", name), &bytes, |b, bytes| {
-            b.iter(|| succinctly::json::simd::neon::build_semi_index_standard(black_box(bytes)))
+            b.iter(|| succinctly::json::simd::neon::build_semi_index_standard(black_box(bytes)));
         });
 
         // PFSM (table-based state machine) baseline
         group.bench_with_input(BenchmarkId::new("PFSM", name), &bytes, |b, bytes| {
-            b.iter(|| succinctly::json::standard::build_semi_index(black_box(bytes)))
+            b.iter(|| succinctly::json::standard::build_semi_index(black_box(bytes)));
         });
 
         // Full index
         group.bench_with_input(BenchmarkId::new("JsonIndex", name), &bytes, |b, bytes| {
-            b.iter(|| JsonIndex::build(black_box(bytes)))
+            b.iter(|| JsonIndex::build(black_box(bytes)));
         });
     }
 

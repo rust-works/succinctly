@@ -57,7 +57,7 @@ pub struct ParseError {
 
 impl ParseError {
     fn new(message: impl Into<String>, position: usize) -> Self {
-        ParseError {
+        Self {
             message: message.into(),
             position,
         }
@@ -162,11 +162,11 @@ impl<'a> Parser<'a> {
                 Ok(())
             }
             Some(c) => Err(ParseError::new(
-                format!("expected '{}', found '{}'", expected, c),
+                format!("expected '{expected}', found '{c}'"),
                 self.pos,
             )),
             None => Err(ParseError::new(
-                format!("expected '{}', found end of input", expected),
+                format!("expected '{expected}', found end of input"),
                 self.pos,
             )),
         }
@@ -218,7 +218,7 @@ impl<'a> Parser<'a> {
             }
             Some(c) => {
                 return Err(ParseError::new(
-                    format!("expected identifier, found '{}'", c),
+                    format!("expected identifier, found '{c}'"),
                     self.pos,
                 ));
             }
@@ -304,12 +304,12 @@ impl<'a> Parser<'a> {
         }
 
         // Check for exponent
-        if matches!(self.peek(), Some('e') | Some('E')) {
+        if matches!(self.peek(), Some('e' | 'E')) {
             self.next();
             is_float = true;
 
             // Optional sign
-            if matches!(self.peek(), Some('+') | Some('-')) {
+            if matches!(self.peek(), Some('+' | '-')) {
                 self.next();
             }
 
@@ -463,7 +463,7 @@ impl<'a> Parser<'a> {
                         }
                         Some(c) => {
                             return Err(ParseError::new(
-                                format!("invalid escape sequence '\\{}'", c),
+                                format!("invalid escape sequence '\\{c}'"),
                                 self.pos,
                             ));
                         }
@@ -568,7 +568,7 @@ impl<'a> Parser<'a> {
                         }
                         Some(c) => {
                             return Err(ParseError::new(
-                                format!("invalid escape sequence '\\{}'", c),
+                                format!("invalid escape sequence '\\{c}'"),
                                 self.pos,
                             ));
                         }
@@ -662,7 +662,7 @@ impl<'a> Parser<'a> {
                 }
             }
             Some(c) => Err(ParseError::new(
-                format!("expected ']' or ':', found '{}'", c),
+                format!("expected ']' or ':', found '{c}'"),
                 self.pos,
             )),
             None => Err(ParseError::new(
@@ -771,7 +771,7 @@ impl<'a> Parser<'a> {
                 }
                 Some(c) => {
                     return Err(ParseError::new(
-                        format!("expected ',' or '}}', found '{}'", c),
+                        format!("expected ',' or '}}', found '{c}'"),
                         self.pos,
                     ));
                 }
@@ -956,7 +956,7 @@ impl<'a> Parser<'a> {
             }
 
             Some(c) => Err(ParseError::new(
-                format!("unexpected character '{}', expected expression", c),
+                format!("unexpected character '{c}', expected expression"),
                 self.pos,
             )),
             None => Err(ParseError::new("unexpected end of input", self.pos)),
@@ -1533,7 +1533,7 @@ impl<'a> Parser<'a> {
                     self.skip_ws();
 
                     match self.peek() {
-                        Some(';') | Some(',') => {
+                        Some(';' | ',') => {
                             self.next();
                             self.skip_ws();
                         }
@@ -1683,7 +1683,7 @@ impl<'a> Parser<'a> {
             "props" => FormatType::Props,
             _ => {
                 return Err(ParseError::new(
-                    format!("unknown format '@{}'", format_name),
+                    format!("unknown format '@{format_name}'"),
                     format_start,
                 ));
             }
@@ -3098,13 +3098,13 @@ impl<'a> Parser<'a> {
     fn is_expr_terminator(&self) -> bool {
         match self.peek() {
             // Structural terminators
-            Some(',') | Some(')') | Some(']') | Some('}') | Some('|') | Some(':') | Some(';') => {
+            Some(',' | ')' | ']' | '}' | '|' | ':' | ';') => {
                 true
             }
             // Arithmetic operators
-            Some('+') | Some('-') | Some('*') | Some('/') | Some('%') => true,
+            Some('+' | '-' | '*' | '/' | '%') => true,
             // Comparison operators
-            Some('=') | Some('!') | Some('<') | Some('>') => true,
+            Some('=' | '!' | '<' | '>') => true,
             // Keywords that follow expressions
             Some('a') if self.matches_keyword("and") || self.matches_keyword("as") => true,
             Some('o') if self.matches_keyword("or") => true,
@@ -3491,7 +3491,7 @@ impl<'a> Parser<'a> {
                     body: Box::new(body),
                 })
             }
-            Some('{') | Some('[') => {
+            Some('{' | '[') => {
                 // Pattern destructuring: `{key: $var}` or `[$first, $second]`
                 let pattern = self.parse_pattern()?;
                 self.skip_ws();
@@ -3633,7 +3633,7 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
 
                 match self.peek() {
-                    Some(';') | Some(',') => {
+                    Some(';' | ',') => {
                         self.next();
                         self.skip_ws();
                     }
@@ -4605,7 +4605,7 @@ mod tests {
         );
 
         // Empty string key
-        assert_eq!(parse(".\"\"").unwrap(), Expr::Field("".into()));
+        assert_eq!(parse(".\"\"").unwrap(), Expr::Field(String::new()));
 
         // Quoted field in chained access
         assert_eq!(
@@ -4646,7 +4646,7 @@ mod tests {
         );
 
         // Empty string key
-        assert_eq!(parse(".[\"\"]").unwrap(), Expr::Field("".into()));
+        assert_eq!(parse(".[\"\"]").unwrap(), Expr::Field(String::new()));
 
         // Bracket string in chained access
         assert_eq!(
@@ -4772,10 +4772,10 @@ mod tests {
                     Expr::Var(name) => {
                         assert_eq!(name, "bar");
                     }
-                    other => panic!("expected FuncCall or Var, got {:?}", other),
+                    other => panic!("expected FuncCall or Var, got {other:?}"),
                 }
             }
-            _ => panic!("expected subtraction, got {:?}", expr),
+            _ => panic!("expected subtraction, got {expr:?}"),
         }
     }
 

@@ -19,7 +19,7 @@ const PATTERNS: &[&str] = &["comprehensive", "users", "nested", "arrays", "strin
 const SIZES: &[&str] = &["1kb", "10kb", "100kb", "1mb"];
 
 fn file_path(pattern: &str, size: &str) -> String {
-    format!("data/bench/generated/{}/{}.json", pattern, size)
+    format!("data/bench/generated/{pattern}/{size}.json")
 }
 
 fn get_succinctly_binary() -> Option<std::path::PathBuf> {
@@ -40,8 +40,7 @@ fn has_system_jq() -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 /// Benchmark succinctly jq with identity filter
@@ -62,7 +61,7 @@ fn bench_succinctly_identity(c: &mut Criterion) {
                 continue;
             }
 
-            let file_size = path_obj.metadata().map(|m| m.len()).unwrap_or(0);
+            let file_size = path_obj.metadata().map_or(0, |m| m.len());
             group.throughput(Throughput::Bytes(file_size));
 
             group.bench_with_input(
@@ -78,7 +77,7 @@ fn bench_succinctly_identity(c: &mut Criterion) {
                             .expect("Failed to execute succinctly");
                         assert!(output.status.success());
                         output.stdout
-                    })
+                    });
                 },
             );
         }
@@ -105,7 +104,7 @@ fn bench_system_jq_identity(c: &mut Criterion) {
                 continue;
             }
 
-            let file_size = path_obj.metadata().map(|m| m.len()).unwrap_or(0);
+            let file_size = path_obj.metadata().map_or(0, |m| m.len());
             group.throughput(Throughput::Bytes(file_size));
 
             group.bench_with_input(BenchmarkId::new(*pattern, *size), &path, |b, path| {
@@ -118,7 +117,7 @@ fn bench_system_jq_identity(c: &mut Criterion) {
                         .expect("Failed to execute jq");
                     assert!(output.status.success());
                     output.stdout
-                })
+                });
             });
         }
     }
@@ -149,7 +148,7 @@ fn bench_jq_comparison(c: &mut Criterion) {
             continue;
         }
 
-        let file_size = path_obj.metadata().map(|m| m.len()).unwrap_or(0);
+        let file_size = path_obj.metadata().map_or(0, |m| m.len());
         group.throughput(Throughput::Bytes(file_size));
 
         if let Some(ref binary) = succinctly_binary {
@@ -166,7 +165,7 @@ fn bench_jq_comparison(c: &mut Criterion) {
                             .expect("Failed to execute succinctly");
                         assert!(output.status.success());
                         output.stdout
-                    })
+                    });
                 },
             );
         }
@@ -182,7 +181,7 @@ fn bench_jq_comparison(c: &mut Criterion) {
                         .expect("Failed to execute jq");
                     assert!(output.status.success());
                     output.stdout
-                })
+                });
             });
         }
     }

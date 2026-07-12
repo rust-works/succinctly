@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // unchecked bit access + aligned allocation on hot rank/select paths
 //! Bitvector with rank/select support.
 //!
 //! This module provides `BitVec`, the main data structure for storing bits
@@ -408,7 +409,7 @@ mod tests {
             if bv.get(i) {
                 let rank = bv.rank1(i);
                 let select = bv.select1(rank);
-                assert_eq!(select, Some(i), "roundtrip failed at i={}", i);
+                assert_eq!(select, Some(i), "roundtrip failed at i={i}");
             }
         }
     }
@@ -484,19 +485,18 @@ mod tests {
             let words: Vec<u64> = vec![u64::MAX; num_words];
             let bv = BitVec::from_words(words, len);
 
-            assert_eq!(bv.len(), len, "len mismatch for {}", len);
-            assert_eq!(bv.count_ones(), len, "count_ones mismatch for len={}", len);
-            assert_eq!(bv.rank1(len), len, "rank1(len) mismatch for len={}", len);
+            assert_eq!(bv.len(), len, "len mismatch for {len}");
+            assert_eq!(bv.count_ones(), len, "count_ones mismatch for len={len}");
+            assert_eq!(bv.rank1(len), len, "rank1(len) mismatch for len={len}");
 
             if len > 0 {
                 assert_eq!(
                     bv.select1(len - 1),
                     Some(len - 1),
-                    "select1 last bit for len={}",
-                    len
+                    "select1 last bit for len={len}"
                 );
             }
-            assert_eq!(bv.select1(len), None, "select1 beyond for len={}", len);
+            assert_eq!(bv.select1(len), None, "select1 beyond for len={len}");
         }
     }
 
@@ -546,10 +546,10 @@ mod tests {
             words[num_words - 1] = 1u64 << bit_in_last_word;
             let bv = BitVec::from_words(words, len);
 
-            assert_eq!(bv.count_ones(), 1, "count_ones for len={}", len);
-            assert_eq!(bv.select1(0), Some(len - 1), "select1 for len={}", len);
-            assert_eq!(bv.rank1(len - 1), 0, "rank1(len-1) for len={}", len);
-            assert_eq!(bv.rank1(len), 1, "rank1(len) for len={}", len);
+            assert_eq!(bv.count_ones(), 1, "count_ones for len={len}");
+            assert_eq!(bv.select1(0), Some(len - 1), "select1 for len={len}");
+            assert_eq!(bv.rank1(len - 1), 0, "rank1(len-1) for len={len}");
+            assert_eq!(bv.rank1(len), 1, "rank1(len) for len={len}");
         }
     }
 
@@ -625,9 +625,7 @@ mod tests {
             assert_eq!(
                 bv.rank1(pos),
                 expected,
-                "rank1({}) at word {} boundary",
-                pos,
-                word_idx
+                "rank1({pos}) at word {word_idx} boundary"
             );
         }
     }
@@ -663,7 +661,7 @@ mod tests {
         assert_eq!(bv.count_ones(), 256);
         // With sample rate 1, every position should be directly indexed
         for k in 0..256 {
-            assert!(bv.select1(k).is_some(), "select1({}) should be Some", k);
+            assert!(bv.select1(k).is_some(), "select1({k}) should be Some");
         }
     }
 
@@ -678,7 +676,7 @@ mod tests {
 
         assert_eq!(bv.count_ones(), 8);
         for k in 0..8 {
-            assert_eq!(bv.select1(k), Some(k * 64), "select1({}) failed", k);
+            assert_eq!(bv.select1(k), Some(k * 64), "select1({k}) failed");
         }
     }
 
@@ -744,7 +742,7 @@ mod tests {
         // Verify rank(select(k)) = k for valid k
         for k in 0..bv.count_ones() {
             if let Some(pos) = bv.select1(k) {
-                assert_eq!(bv.rank1(pos), k, "rank1(select1({})) should be {}", k, k);
+                assert_eq!(bv.rank1(pos), k, "rank1(select1({k})) should be {k}");
             }
         }
     }

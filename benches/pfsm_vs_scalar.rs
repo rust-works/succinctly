@@ -18,12 +18,12 @@ fn benchmark_pfsm_vs_scalar(c: &mut Criterion) {
         let json = match fs::read(path) {
             Ok(data) => Box::leak(data.into_boxed_slice()),
             Err(_) => {
-                eprintln!("Warning: {} not found, skipping", path);
+                eprintln!("Warning: {path} not found, skipping");
                 continue;
             }
         };
 
-        let mut group = c.benchmark_group(format!("pfsm_vs_scalar/{}", name));
+        let mut group = c.benchmark_group(format!("pfsm_vs_scalar/{name}"));
         group.throughput(Throughput::Bytes(json.len() as u64));
 
         // PFSM: table-based state machine

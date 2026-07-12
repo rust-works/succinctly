@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // x86_64 SSE2 SIMD intrinsics
 //! SSE2-accelerated JSON semi-indexing for x86_64.
 //!
 //! Processes 16 bytes at a time using x86_64 SSE2 SIMD instructions.
@@ -247,7 +248,7 @@ unsafe fn build_semi_index_standard_sse2(json: &[u8]) -> SemiIndex {
 
         // Process 16-byte chunks
         while offset + 16 <= json.len() {
-            let chunk = _mm_loadu_si128(json.as_ptr().add(offset) as *const __m128i);
+            let chunk = _mm_loadu_si128(json.as_ptr().add(offset).cast::<__m128i>());
             let class = classify_chars(chunk);
             state =
                 process_chunk_standard(class, state, &mut ib, &mut bp, &json[offset..offset + 16]);
@@ -261,7 +262,7 @@ unsafe fn build_semi_index_standard_sse2(json: &[u8]) -> SemiIndex {
             let remaining = json.len() - offset;
             padded[..remaining].copy_from_slice(&json[offset..]);
 
-            let chunk = _mm_loadu_si128(padded.as_ptr() as *const __m128i);
+            let chunk = _mm_loadu_si128(padded.as_ptr().cast::<__m128i>());
             let class = classify_chars(chunk);
             state = process_chunk_standard(class, state, &mut ib, &mut bp, &json[offset..]);
         }
@@ -371,7 +372,7 @@ unsafe fn build_semi_index_simple_sse2(json: &[u8]) -> SimpleSemiIndex {
 
         // Process 16-byte chunks
         while offset + 16 <= json.len() {
-            let chunk = _mm_loadu_si128(json.as_ptr().add(offset) as *const __m128i);
+            let chunk = _mm_loadu_si128(json.as_ptr().add(offset).cast::<__m128i>());
             let class = classify_chars(chunk);
             state =
                 process_chunk_simple(class, state, &mut ib, &mut bp, &json[offset..offset + 16]);
@@ -385,7 +386,7 @@ unsafe fn build_semi_index_simple_sse2(json: &[u8]) -> SimpleSemiIndex {
             let remaining = json.len() - offset;
             padded[..remaining].copy_from_slice(&json[offset..]);
 
-            let chunk = _mm_loadu_si128(padded.as_ptr() as *const __m128i);
+            let chunk = _mm_loadu_si128(padded.as_ptr().cast::<__m128i>());
             let class = classify_chars(chunk);
             state = process_chunk_simple(class, state, &mut ib, &mut bp, &json[offset..]);
         }
@@ -424,7 +425,7 @@ mod tests {
     fn test_classify_chars() {
         unsafe {
             let input = br#"{"hello":123}   "#;
-            let chunk = _mm_loadu_si128(input.as_ptr() as *const __m128i);
+            let chunk = _mm_loadu_si128(input.as_ptr().cast::<__m128i>());
             let class = classify_chars(chunk);
 
             // Position 0 is '{', position 12 is '}'
@@ -449,7 +450,7 @@ mod tests {
     fn test_classify_chars_alphabetic() {
         unsafe {
             let input = b"abcdefghABCDEFGH";
-            let chunk = _mm_loadu_si128(input.as_ptr() as *const __m128i);
+            let chunk = _mm_loadu_si128(input.as_ptr().cast::<__m128i>());
             let class = classify_chars(chunk);
 
             // All positions should be value_chars (alphabetic)
@@ -461,7 +462,7 @@ mod tests {
     fn test_classify_chars_special() {
         unsafe {
             let input = b".-+truefalsennul";
-            let chunk = _mm_loadu_si128(input.as_ptr() as *const __m128i);
+            let chunk = _mm_loadu_si128(input.as_ptr().cast::<__m128i>());
             let class = classify_chars(chunk);
 
             // Position 0: '.', 1: '-', 2: '+'
@@ -474,8 +475,7 @@ mod tests {
                 assert_ne!(
                     class.value_chars & (1 << i),
                     0,
-                    "Alphabetic at position {}",
-                    i
+                    "Alphabetic at position {i}"
                 );
             }
         }

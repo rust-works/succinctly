@@ -401,8 +401,7 @@ mod edge_cases {
                     assert_eq!(
                         bp.find_open(close),
                         Some(p),
-                        "roundtrip failed at open position {}",
-                        p
+                        "roundtrip failed at open position {p}"
                     );
                 }
             }

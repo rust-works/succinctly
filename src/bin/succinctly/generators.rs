@@ -110,15 +110,15 @@ fn add_simple_values(json: &mut String, target_size: usize, rng: &mut Option<Cha
             json.push(',');
         }
 
-        let key = format!("field_{}", count);
-        let val = match rng.as_mut().map(|r| r.gen_range(0..4)).unwrap_or(count % 4) {
+        let key = format!("field_{count}");
+        let val = match rng.as_mut().map_or(count % 4, |r| r.gen_range(0..4)) {
             0 => "true".to_string(),
             1 => "false".to_string(),
             2 => "null".to_string(),
             _ => count.to_string(),
         };
 
-        json.push_str(&format!(r#""{}":"#, key));
+        json.push_str(&format!(r#""{key}":"#));
         json.push_str(&val);
         count += 1;
     }
@@ -136,11 +136,11 @@ fn add_string_variations(
 
     let escape_patterns = [
         r#"Line with \"quoted\" text"#,
-        r#"Path: C:\\Users\\test\\file.txt"#,
-        r#"Line with\nnewline"#,
-        r#"Tab\tseparated\tvalues"#,
+        r"Path: C:\\Users\\test\\file.txt",
+        r"Line with\nnewline",
+        r"Tab\tseparated\tvalues",
         r#"JSON: {\"key\":\"value\"}"#,
-        r#"Backspace:\b Formfeed:\f"#,
+        r"Backspace:\b Formfeed:\f",
         r#"Mixed: \"quotes\"\tand\nnewlines"#,
     ];
 
@@ -163,8 +163,7 @@ fn add_string_variations(
         // Mix escaped and normal strings based on density
         let use_escape = rng
             .as_mut()
-            .map(|r| r.r#gen::<f64>() < escape_density)
-            .unwrap_or(count % 10 < (escape_density * 10.0) as usize);
+            .map_or(count % 10 < (escape_density * 10.0) as usize, |r| r.r#gen::<f64>() < escape_density);
 
         if use_escape {
             let pattern = &escape_patterns[count % escape_patterns.len()];
@@ -191,18 +190,17 @@ fn add_number_variations(json: &mut String, target_size: usize, rng: &mut Option
 
         let num = match count % 8 {
             0 => count.to_string(),                              // Simple integer
-            1 => format!("-{}", count),                          // Negative integer
-            2 => format!("0.{}", count),                         // Decimal < 1
-            3 => format!("{}.{}", count, count),                 // Decimal
+            1 => format!("-{count}"),                          // Negative integer
+            2 => format!("0.{count}"),                         // Decimal < 1
+            3 => format!("{count}.{count}"),                 // Decimal
             4 => format!("{}e{}", count, count % 10),            // Scientific notation
             5 => format!("-{}.{}e-{}", count, count, count % 5), // Negative scientific
             6 => "0".to_string(),                                // Zero
             _ => {
                 let val = rng
                     .as_mut()
-                    .map(|r| r.r#gen::<f64>() * 1000000.0 - 500000.0)
-                    .unwrap_or(count as f64);
-                format!("{:.6}", val)
+                    .map_or(count as f64, |r| r.r#gen::<f64>() * 1000000.0 - 500000.0);
+                format!("{val:.6}")
             }
         };
 
@@ -236,9 +234,9 @@ fn add_array_variations(
         if i > 0 {
             json.push(',');
         }
-        json.push_str(&format!(r#""item_{}""#, i));
+        json.push_str(&format!(r#""item_{i}""#));
     }
-    json.push_str(r#"],"#);
+    json.push_str(r"],");
 
     // Nested arrays
     json.push_str(r#""nested":["#);
@@ -257,7 +255,7 @@ fn add_array_variations(
         json.push(']');
         level += 1;
     }
-    json.push_str(r#"],"#);
+    json.push_str(r"],");
 
     // Mixed type arrays
     json.push_str(r#""mixed":[1,"two",true,null,{"key":"value"},[1,2,3]],"#);
@@ -271,7 +269,7 @@ fn add_array_variations(
         }
         first = false;
         json.push('[');
-        let array_len = rng.as_mut().map(|r| r.gen_range(3..10)).unwrap_or(5);
+        let array_len = rng.as_mut().map_or(5, |r| r.gen_range(3..10));
         for i in 0..array_len {
             if i > 0 {
                 json.push(',');
@@ -299,7 +297,7 @@ fn add_nested_objects(
 
     json.push_str(r#""deep":"#);
     for level in 0..depth.min(20) {
-        json.push_str(&format!(r#"{{"level_{}":"#, level));
+        json.push_str(&format!(r#"{{"level_{level}":"#));
     }
     json.push_str(r#""bottom""#);
     for _ in 0..depth.min(20) {
@@ -331,13 +329,13 @@ fn add_tree_structure(
         return;
     }
 
-    let num_children = rng.as_mut().map(|r| r.gen_range(2..5)).unwrap_or(3);
+    let num_children = rng.as_mut().map_or(3, |r| r.gen_range(2..5));
 
     for i in 0..num_children {
         if i > 0 {
             json.push(',');
         }
-        json.push_str(&format!(r#""child_{}":{{"#, i));
+        json.push_str(&format!(r#""child_{i}":{{"#));
         add_tree_structure(
             json,
             remaining / num_children,
@@ -364,29 +362,25 @@ fn add_realistic_records(
             json.push(',');
         }
 
-        let age = rng.as_mut().map(|r| r.gen_range(18..80)).unwrap_or(25);
+        let age = rng.as_mut().map_or(25, |r| r.gen_range(18..80));
         let score = rng
             .as_mut()
-            .map(|r| r.gen_range(0..1000))
-            .unwrap_or(count * 10);
+            .map_or(count * 10, |r| r.gen_range(0..1000));
         let active = rng
             .as_mut()
-            .map(|r| r.r#gen::<bool>())
-            .unwrap_or(count % 2 == 0);
+            .map_or(count % 2 == 0, rand::Rng::gen::<bool>);
         let salary = rng
             .as_mut()
-            .map(|r| r.r#gen::<f64>() * 200000.0)
-            .unwrap_or(50000.0);
+            .map_or(50000.0, |r| r.r#gen::<f64>() * 200000.0);
 
         // Add escaped characters to some fields
         let name = if rng
             .as_mut()
-            .map(|r| r.r#gen::<f64>() < escape_density)
-            .unwrap_or(false)
+            .is_some_and(|r| r.r#gen::<f64>() < escape_density)
         {
-            format!(r#"User \"{}\" Smith"#, count)
+            format!(r#"User \"{count}\" Smith"#)
         } else {
-            format!("User{}", count)
+            format!("User{count}")
         };
 
         json.push_str(&format!(
@@ -463,12 +457,11 @@ pub fn generate_users_json(target_size: usize, seed: Option<u64>) -> String {
             json.push(',');
         }
 
-        let age = rng.as_mut().map(|r| r.gen_range(18..80)).unwrap_or(25);
-        let score = rng.as_mut().map(|r| r.gen_range(0..1000)).unwrap_or(i * 10);
+        let age = rng.as_mut().map_or(25, |r| r.gen_range(18..80));
+        let score = rng.as_mut().map_or(i * 10, |r| r.gen_range(0..1000));
 
         json.push_str(&format!(
-            r#"{{"id":{},"name":"User{}","email":"user{}@example.com","age":{},"active":true,"score":{}}}"#,
-            i, i, i, age, score
+            r#"{{"id":{i},"name":"User{i}","email":"user{i}@example.com","age":{age},"active":true,"score":{score}}}"#
         ));
 
         // Stop if we've exceeded target size
@@ -523,7 +516,7 @@ pub fn generate_arrays_json(target_size: usize, seed: Option<u64>) -> String {
             if j > 0 {
                 json.push(',');
             }
-            let val = rng.as_mut().map(|r| r.gen_range(0..1000)).unwrap_or(j);
+            let val = rng.as_mut().map_or(j, |r| r.gen_range(0..1000));
             json.push_str(&val.to_string());
         }
         json.push(']');
@@ -553,16 +546,15 @@ pub fn generate_mixed_json(target_size: usize, seed: Option<u64>) -> String {
 
         let pattern_idx = rng
             .as_mut()
-            .map(|r| r.gen_range(0..patterns.len()))
-            .unwrap_or(i % patterns.len());
+            .map_or(i % patterns.len(), |r| r.gen_range(0..patterns.len()));
 
         match patterns[pattern_idx] {
-            "string" => json.push_str(&format!(r#""value_{}""#, i)),
+            "string" => json.push_str(&format!(r#""value_{i}""#)),
             "number" => json.push_str(&i.to_string()),
             "bool" => json.push_str(if i % 2 == 0 { "true" } else { "false" }),
             "null" => json.push_str("null"),
             "array" => json.push_str(&format!("[{},{},{}]", i, i + 1, i + 2)),
-            "object" => json.push_str(&format!(r#"{{"key":"val_{}"}}"#, i)),
+            "object" => json.push_str(&format!(r#"{{"key":"val_{i}"}}"#)),
             _ => {}
         }
 
@@ -619,10 +611,9 @@ pub fn generate_numbers_json(target_size: usize, seed: Option<u64>) -> String {
 
         let num = rng
             .as_mut()
-            .map(|r| r.r#gen::<f64>() * 1000000.0)
-            .unwrap_or(i as f64 * std::f64::consts::PI);
+            .map_or(i as f64 * std::f64::consts::PI, |r| r.r#gen::<f64>() * 1000000.0);
 
-        json.push_str(&format!("{:.6}", num));
+        json.push_str(&format!("{num:.6}"));
 
         if json.len() >= target_size.saturating_sub(10) {
             break;
@@ -645,7 +636,7 @@ pub fn generate_literals_json(target_size: usize, seed: Option<u64>) -> String {
             json.push(',');
         }
 
-        let val = match rng.as_mut().map(|r| r.gen_range(0..3)).unwrap_or(count % 3) {
+        let val = match rng.as_mut().map_or(count % 3, |r| r.gen_range(0..3)) {
             0 => "true",
             1 => "false",
             _ => "null",
@@ -667,7 +658,7 @@ pub fn generate_unicode_json(target_size: usize, seed: Option<u64>) -> String {
         target_size,
         &mut seed.map(ChaCha8Rng::seed_from_u64),
     );
-    format!(r#"{{"unicode":[{}]}}"#, json)
+    format!(r#"{{"unicode":[{json}]}}"#)
 }
 
 /// Generate pathological JSON (worst-case for parsing)

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // hardware popcount intrinsics (NEON/POPCNT)
 //! Popcount implementations with compile-time switching.
 //!
 //! This module provides different popcount strategies that can be selected
@@ -132,7 +133,7 @@ fn popcount_words_neon(words: &[u64]) -> usize {
     }
 
     let mut total = 0usize;
-    let ptr = words.as_ptr() as *const u8;
+    let ptr = words.as_ptr().cast::<u8>();
     let byte_len = words.len() * 8;
     let mut offset = 0;
 
@@ -304,7 +305,7 @@ mod tests {
                 .map(|i| (i as u64) | 0x8000_0000_0000_0001)
                 .collect();
             let expected: usize = words.iter().map(|w| w.count_ones() as usize).sum();
-            assert_eq!(popcount_words(&words), expected, "len={}", len);
+            assert_eq!(popcount_words(&words), expected, "len={len}");
         }
     }
 
@@ -322,7 +323,7 @@ mod tests {
                 .map(|i| (i as u64).wrapping_mul(0xDEAD_BEEF_CAFE_BABE) | 1)
                 .collect();
             let expected: usize = words.iter().map(|w| w.count_ones() as usize).sum();
-            assert_eq!(popcount_words(&words), expected, "len={}", len);
+            assert_eq!(popcount_words(&words), expected, "len={len}");
         }
     }
 
@@ -332,7 +333,7 @@ mod tests {
     fn test_popcount_words_all_ones() {
         for len in [1, 8, 32, 33, 64, 100, 256] {
             let words = vec![u64::MAX; len];
-            assert_eq!(popcount_words(&words), len * 64, "len={}", len);
+            assert_eq!(popcount_words(&words), len * 64, "len={len}");
         }
     }
 
@@ -341,7 +342,7 @@ mod tests {
     fn test_popcount_words_all_zeros() {
         for len in [1, 8, 32, 64, 100] {
             let words = vec![0u64; len];
-            assert_eq!(popcount_words(&words), 0, "len={}", len);
+            assert_eq!(popcount_words(&words), 0, "len={len}");
         }
     }
 
@@ -390,8 +391,7 @@ mod tests {
             assert_eq!(
                 popcount_word_portable(word),
                 word.count_ones(),
-                "word={:#x}",
-                word
+                "word={word:#x}"
             );
         }
     }

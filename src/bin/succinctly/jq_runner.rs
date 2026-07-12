@@ -138,7 +138,7 @@ impl ModuleLoader {
             }
         }
 
-        ModuleLoader {
+        Self {
             search_path,
             loaded_modules: BTreeMap::new(),
             auto_loaded_defs,
@@ -151,7 +151,7 @@ impl ModuleLoader {
         let module_file = if module_path.ends_with(".jq") {
             module_path.to_string()
         } else {
-            format!("{}.jq", module_path)
+            format!("{module_path}.jq")
         };
 
         // Search in each path
@@ -175,7 +175,7 @@ impl ModuleLoader {
         // Resolve the module path
         let file_path = self
             .resolve_module(module_path)
-            .ok_or_else(|| anyhow::anyhow!("module '{}' not found in search path", module_path))?;
+            .ok_or_else(|| anyhow::anyhow!("module '{module_path}' not found in search path"))?;
 
         // Read and parse the module
         let contents = std::fs::read_to_string(&file_path)
@@ -231,7 +231,7 @@ impl ModuleLoader {
 
             // Add each function with a namespaced name (namespace::funcname)
             for (name, params, body) in defs.into_iter().rev() {
-                let namespaced_name = format!("{}::{}", namespace, name);
+                let namespaced_name = format!("{namespace}::{name}");
                 expr = Expr::FuncDef {
                     name: namespaced_name,
                     params,
@@ -258,7 +258,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             args,
         } => {
             // Convert to a regular function call with the namespaced name
-            let full_name = format!("{}::{}", namespace, name);
+            let full_name = format!("{namespace}::{name}");
             let rewritten_args: Vec<Expr> =
                 args.into_iter().map(rewrite_namespaced_calls).collect();
             Expr::FuncCall {
@@ -534,10 +534,9 @@ impl OutputConfig {
         // 3. Default: on (jq-compatible formatting)
         let jq_compat = !args.preserve_input
             && !std::env::var("SUCCINCTLY_PRESERVE_INPUT")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
-        OutputConfig {
+        Self {
             compact: args.compact_output,
             raw_output: args.raw_output || args.join_output || args.raw_output0,
             join_output: args.join_output,
@@ -626,14 +625,14 @@ fn print_validation_error(err: &ValidationError, input: &[u8], filename: Option<
         Some(f) => format!("{}:{}:{}", f, pos.line, pos.column),
         None => format!("<stdin>:{}:{}", pos.line, pos.column),
     };
-    eprintln!("  --> {}", location);
+    eprintln!("  --> {location}");
 
     // Print context snippet if possible
     if let Some((line_content, caret_offset)) = get_error_line(input, pos.line, pos.column) {
         let line_num_width = pos.line.to_string().len().max(3);
         let blank_padding = " ".repeat(line_num_width + 2);
 
-        eprintln!("{}|", blank_padding);
+        eprintln!("{blank_padding}|");
         eprintln!(
             " {:>width$} | {}",
             pos.line,
@@ -668,8 +667,7 @@ fn get_error_line(input: &[u8], line: usize, column: usize) -> Option<(String, u
 
     let line_end = text[line_start..]
         .find('\n')
-        .map(|i| line_start + i)
-        .unwrap_or(text.len());
+        .map_or(text.len(), |i| line_start + i);
 
     let line_content = &text[line_start..line_end];
 
@@ -679,13 +677,13 @@ fn get_error_line(input: &[u8], line: usize, column: usize) -> Option<(String, u
         let error_col = column.saturating_sub(1);
         if error_col < max_width / 2 {
             let truncated = &line_content[..max_width.min(line_content.len())];
-            (format!("{}...", truncated), error_col)
+            (format!("{truncated}..."), error_col)
         } else {
             let start = error_col.saturating_sub(max_width / 2);
             let end = (start + max_width).min(line_content.len());
             let truncated = &line_content[start..end];
             let pos_in_truncated = error_col.saturating_sub(start);
-            (format!("...{}...", truncated), pos_in_truncated + 3)
+            (format!("...{truncated}..."), pos_in_truncated + 3)
         }
     } else {
         (line_content.to_string(), column.saturating_sub(1))
@@ -720,14 +718,14 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 
     // Parse the filter as a full program (with module directives)
     let program = jq::parse_program(&filter_str).map_err(|e| {
-        eprintln!("jq: compile error: {}", e);
+        eprintln!("jq: compile error: {e}");
         anyhow::anyhow!("compile error")
     })?;
 
     // Create module loader and process imports/includes
     let mut module_loader = ModuleLoader::new(&args.library_path);
     let expr = module_loader.process_program(&program).map_err(|e| {
-        eprintln!("jq: module error: {}", e);
+        eprintln!("jq: module error: {e}");
         anyhow::anyhow!("module error")
     })?;
 
@@ -959,7 +957,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext> {
     for chunk in args.argjson.chunks(2) {
         if let [name, value] = chunk {
             let json_value = parse_json_value(value)
-                .with_context(|| format!("Invalid JSON for --argjson {}", name))?;
+                .with_context(|| format!("Invalid JSON for --argjson {name}"))?;
             context.named.insert(name.clone(), json_value);
         }
     }
@@ -968,7 +966,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext> {
     for chunk in args.slurpfile.chunks(2) {
         if let [name, file] = chunk {
             let contents = std::fs::read_to_string(file)
-                .with_context(|| format!("Failed to read file for --slurpfile {}", name))?;
+                .with_context(|| format!("Failed to read file for --slurpfile {name}"))?;
             let values = parse_json_stream(&contents)?;
             context
                 .named
@@ -980,7 +978,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext> {
     for chunk in args.rawfile.chunks(2) {
         if let [name, file] = chunk {
             let contents = std::fs::read_to_string(file)
-                .with_context(|| format!("Failed to read file for --rawfile {}", name))?;
+                .with_context(|| format!("Failed to read file for --rawfile {name}"))?;
             context
                 .named
                 .insert(name.clone(), OwnedValue::String(contents));
@@ -995,7 +993,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext> {
     // Process --jsonargs: values become JSON positional args
     for arg in &args.jsonargs {
         let json_value = parse_json_value(arg)
-            .with_context(|| format!("Invalid JSON for --jsonargs: {}", arg))?;
+            .with_context(|| format!("Invalid JSON for --jsonargs: {arg}"))?;
         context.positional.push(json_value);
     }
 
@@ -1290,7 +1288,7 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 
     // Use serde_json for parsing, then convert to OwnedValue
     let value: serde_json::Value =
-        serde_json::from_str(s).with_context(|| format!("Invalid JSON: {}", s))?;
+        serde_json::from_str(s).with_context(|| format!("Invalid JSON: {s}"))?;
 
     Ok(serde_to_owned(&value))
 }
@@ -1349,8 +1347,7 @@ fn validate_dsv_delimiter(delimiter: char) -> Result<()> {
             "Invalid delimiter: newline characters cannot be used as delimiter"
         )),
         c if !c.is_ascii() => Err(anyhow::anyhow!(
-            "Invalid delimiter '{}': only ASCII characters are supported",
-            c
+            "Invalid delimiter '{c}': only ASCII characters are supported"
         )),
         _ => Ok(()),
     }
@@ -1447,13 +1444,13 @@ fn evaluate_input(
         GenericResult::Many(vs) => Ok(vs.iter().map(generic_to_owned).collect()),
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
-            eprintln!("jq: error: {}", e);
+            eprintln!("jq: error: {e}");
             Ok(vec![])
         }
         GenericResult::Owned(v) => Ok(vec![v]),
         GenericResult::ManyOwned(vs) => Ok(vs),
         GenericResult::Break(label) => {
-            eprintln!("jq: error: break ${} not in label", label);
+            eprintln!("jq: error: break ${label} not in label");
             Ok(vec![])
         }
     }
@@ -1492,13 +1489,13 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             .collect(),
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
-            eprintln!("jq: error: {}", e);
+            eprintln!("jq: error: {e}");
             vec![]
         }
         GenericResult::Owned(v) => vec![JqValue::from_owned(v)],
         GenericResult::ManyOwned(vs) => vs.into_iter().map(JqValue::from_owned).collect(),
         GenericResult::Break(label) => {
-            eprintln!("jq: error: break ${} not in label", label);
+            eprintln!("jq: error: break ${label} not in label");
             vec![]
         }
     }
@@ -1548,9 +1545,9 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Write a single output JqValue (preserves number formatting when possible).
-fn write_output_jq_value<'a, Out: Write, Wrd: Clone + AsRef<[u64]>>(
+fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     out: &mut Out,
-    value: &JqValue<'a, Wrd>,
+    value: &JqValue<'_, Wrd>,
     config: &OutputConfig,
 ) -> Result<()> {
     // In seq mode, prepend RS (Record Separator) before each value
@@ -1671,12 +1668,12 @@ impl LiteralFormatter for JqCompatFormatter {
         if f.is_nan() || f.is_infinite() {
             "null".to_string()
         } else {
-            format!("{}", f)
+            format!("{f}")
         }
     }
 
     fn format_int(&self, i: i64) -> String {
-        format!("{}", i)
+        format!("{i}")
     }
 }
 
@@ -1697,12 +1694,12 @@ impl LiteralFormatter for PreserveFormatter {
         if f.is_nan() || f.is_infinite() {
             "null".to_string()
         } else {
-            format!("{}", f)
+            format!("{f}")
         }
     }
 
     fn format_int(&self, i: i64) -> String {
-        format!("{}", i)
+        format!("{i}")
     }
 }
 
@@ -1714,9 +1711,9 @@ impl LiteralFormatter for PreserveFormatter {
 ///
 /// This is the unified printer that handles JSON structure (arrays, objects,
 /// indentation) while delegating literal formatting to the formatter.
-fn print_json<'a, F, Out, Wrd>(
+fn print_json<F, Out, Wrd>(
     out: &mut Out,
-    value: &JqValue<'a, Wrd>,
+    value: &JqValue<'_, Wrd>,
     formatter: &F,
     config: &OutputConfig,
     level: usize,
@@ -2035,11 +2032,9 @@ fn format_number_jq_compat(raw: &[u8]) -> String {
         // Check if result is integer
         if value.fract() == 0.0 && value.abs() < 1e15 {
             return format!("{}", value as i64);
-        } else {
-            // Format as plain decimal
-            let formatted = format!("{}", value);
-            return formatted;
         }
+        // Format as plain decimal
+        return format!("{value}");
     }
 
     // For negative exponents >= -5, jq converts to decimal
@@ -2066,7 +2061,7 @@ fn format_number_jq_compat(raw: &[u8]) -> String {
 
     let sign = if value < 0.0 { "-" } else { "" };
     let exp_sign = if new_exp >= 0 { "+" } else { "" };
-    format!("{}{}E{}{}", sign, mantissa_str, exp_sign, new_exp)
+    format!("{sign}{mantissa_str}E{exp_sign}{new_exp}")
 }
 
 /// Format a mantissa value for jq-compatible output.
@@ -2079,25 +2074,24 @@ fn format_mantissa_jq(value: f64) -> String {
 
     // Try different precisions and pick the shortest that rounds back correctly
     for precision in 1..=15 {
-        let formatted = format!("{:.prec$}", value, prec = precision);
+        let formatted = format!("{value:.precision$}");
         if let Ok(parsed) = formatted.parse::<f64>() {
             if (parsed - value).abs() < 1e-14 {
                 // Trim trailing zeros
                 let trimmed = formatted.trim_end_matches('0');
                 if trimmed.ends_with('.') {
-                    return format!("{}0", trimmed);
-                } else {
-                    return trimmed.to_string();
+                    return format!("{trimmed}0");
                 }
+                return trimmed.to_string();
             }
         }
     }
 
     // Fallback: full precision
-    let formatted = format!("{:.15}", value);
+    let formatted = format!("{value:.15}");
     let trimmed = formatted.trim_end_matches('0');
     if trimmed.ends_with('.') {
-        format!("{}0", trimmed)
+        format!("{trimmed}0")
     } else {
         trimmed.to_string()
     }
@@ -2116,27 +2110,26 @@ fn format_decimal_jq(value: f64) -> String {
 
     // Try different precisions and pick the shortest that rounds back correctly
     for precision in 1..=15 {
-        let formatted = format!("{:.prec$}", abs_value, prec = precision);
+        let formatted = format!("{abs_value:.precision$}");
         if let Ok(parsed) = formatted.parse::<f64>() {
             if (parsed - abs_value).abs() < 1e-14 {
                 // Trim trailing zeros
                 let trimmed = formatted.trim_end_matches('0');
                 if trimmed.ends_with('.') {
-                    return format!("{}{}0", sign, trimmed);
-                } else {
-                    return format!("{}{}", sign, trimmed);
+                    return format!("{sign}{trimmed}0");
                 }
+                return format!("{sign}{trimmed}");
             }
         }
     }
 
     // Fallback: full precision
-    let formatted = format!("{:.15}", abs_value);
+    let formatted = format!("{abs_value:.15}");
     let trimmed = formatted.trim_end_matches('0');
     if trimmed.ends_with('.') {
-        format!("{}{}0", sign, trimmed)
+        format!("{sign}{trimmed}0")
     } else {
-        format!("{}{}", sign, trimmed)
+        format!("{sign}{trimmed}")
     }
 }
 
@@ -2233,7 +2226,7 @@ fn format_json_impl(value: &OwnedValue, indent: &str, level: usize, ascii: bool)
                 format!(
                     "[{}{}{separator}{}]",
                     separator,
-                    items.join(&format!(",{}", separator)),
+                    items.join(&format!(",{separator}")),
                     current_indent
                 )
             }
@@ -2278,12 +2271,12 @@ fn format_json_impl(value: &OwnedValue, indent: &str, level: usize, ascii: bool)
                 // Add indent before each key
                 let indented_items: Vec<String> = items
                     .iter()
-                    .map(|item| format!("{}{}", next_indent, item))
+                    .map(|item| format!("{next_indent}{item}"))
                     .collect();
                 format!(
                     "{{{}{}{separator}{}}}",
                     separator,
-                    indented_items.join(&format!(",{}", separator)),
+                    indented_items.join(&format!(",{separator}")),
                     current_indent
                 )
             }
@@ -2332,13 +2325,13 @@ fn escape_json_string_ascii(s: &str) -> String {
                 // For characters outside BMP, use surrogate pairs
                 let code = c as u32;
                 if code <= 0xFFFF {
-                    result.push_str(&format!("\\u{:04x}", code));
+                    result.push_str(&format!("\\u{code:04x}"));
                 } else {
                     // Surrogate pair for characters above U+FFFF
                     let adjusted = code - 0x10000;
                     let high = 0xD800 + (adjusted >> 10);
                     let low = 0xDC00 + (adjusted & 0x3FF);
-                    result.push_str(&format!("\\u{:04x}\\u{:04x}", high, low));
+                    result.push_str(&format!("\\u{high:04x}\\u{low:04x}"));
                 }
             }
             c => result.push(c),
@@ -2378,7 +2371,7 @@ struct ColorScheme {
 
 impl Default for ColorScheme {
     fn default() -> Self {
-        ColorScheme {
+        Self {
             reset: default_colors::RESET.to_string(),
             null: default_colors::NULL.to_string(),
             false_: default_colors::FALSE.to_string(),
@@ -2397,7 +2390,7 @@ impl ColorScheme {
     /// Format: "null:false:true:numbers:strings:arrays:objects:objectkeys"
     /// Each value is an SGR parameter like "1;30" for bold black.
     fn from_env() -> Self {
-        let mut scheme = ColorScheme::default();
+        let mut scheme = Self::default();
 
         if let Ok(colors) = std::env::var("JQ_COLORS") {
             let parts: Vec<&str> = colors.split(':').collect();
@@ -2405,42 +2398,42 @@ impl ColorScheme {
             // Parse each color in order
             if let Some(sgr) = parts.first() {
                 if !sgr.is_empty() {
-                    scheme.null = format!("\x1b[{}m", sgr);
+                    scheme.null = format!("\x1b[{sgr}m");
                 }
             }
             if let Some(sgr) = parts.get(1) {
                 if !sgr.is_empty() {
-                    scheme.false_ = format!("\x1b[{}m", sgr);
+                    scheme.false_ = format!("\x1b[{sgr}m");
                 }
             }
             if let Some(sgr) = parts.get(2) {
                 if !sgr.is_empty() {
-                    scheme.true_ = format!("\x1b[{}m", sgr);
+                    scheme.true_ = format!("\x1b[{sgr}m");
                 }
             }
             if let Some(sgr) = parts.get(3) {
                 if !sgr.is_empty() {
-                    scheme.number = format!("\x1b[{}m", sgr);
+                    scheme.number = format!("\x1b[{sgr}m");
                 }
             }
             if let Some(sgr) = parts.get(4) {
                 if !sgr.is_empty() {
-                    scheme.string = format!("\x1b[{}m", sgr);
+                    scheme.string = format!("\x1b[{sgr}m");
                 }
             }
             if let Some(sgr) = parts.get(5) {
                 if !sgr.is_empty() {
-                    scheme.array = format!("\x1b[{}m", sgr);
+                    scheme.array = format!("\x1b[{sgr}m");
                 }
             }
             if let Some(sgr) = parts.get(6) {
                 if !sgr.is_empty() {
-                    scheme.object = format!("\x1b[{}m", sgr);
+                    scheme.object = format!("\x1b[{sgr}m");
                 }
             }
             if let Some(sgr) = parts.get(7) {
                 if !sgr.is_empty() {
-                    scheme.key = format!("\x1b[{}m", sgr);
+                    scheme.key = format!("\x1b[{sgr}m");
                 }
             }
         }

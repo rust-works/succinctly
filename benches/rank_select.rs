@@ -48,11 +48,11 @@ fn bench_rank(c: &mut Criterion) {
                 |b, (bv, queries)| {
                     b.iter(|| {
                         let mut sum = 0usize;
-                        for &q in queries.iter() {
+                        for &q in *queries {
                             sum += bv.rank1(black_box(q));
                         }
                         sum
-                    })
+                    });
                 },
             );
         }
@@ -81,13 +81,13 @@ fn bench_select(c: &mut Criterion) {
                 |b, (bv, queries)| {
                     b.iter(|| {
                         let mut sum = 0usize;
-                        for &q in queries.iter() {
+                        for &q in *queries {
                             if let Some(pos) = bv.select1(black_box(q)) {
                                 sum += pos;
                             }
                         }
                         sum
-                    })
+                    });
                 },
             );
         }
@@ -133,7 +133,7 @@ fn bench_select_in_word(c: &mut Criterion) {
                     sum += select_in_word(black_box(word), k);
                 }
                 sum
-            })
+            });
         });
     }
     group.finish();
@@ -175,28 +175,28 @@ fn bench_popcount(c: &mut Criterion) {
                 sum += popcount_word(black_box(w));
             }
             sum
-        })
+        });
     });
 
     // Bulk popcount - 1M bits (~125KB of data)
     group.bench_function("1M_bits_raw", |b| {
-        b.iter(|| popcount_words(black_box(&words_1m)))
+        b.iter(|| popcount_words(black_box(&words_1m)));
     });
 
     // Bulk popcount - 10M bits (~1.25MB of data)
     group.bench_function("10M_bits_raw", |b| {
-        b.iter(|| popcount_words(black_box(&words_10m)))
+        b.iter(|| popcount_words(black_box(&words_10m)));
     });
 
     // ========== CONSTRUCTION BENCHMARKS ==========
     // These measure popcount in context of BitVec building
 
     group.bench_function("1M_bits_construction", |b| {
-        b.iter(|| BitVec::from_words(black_box(words_1m.clone()), words_1m.len() * 64))
+        b.iter(|| BitVec::from_words(black_box(words_1m.clone()), words_1m.len() * 64));
     });
 
     group.bench_function("10M_bits_construction", |b| {
-        b.iter(|| BitVec::from_words(black_box(words_10m.clone()), words_10m.len() * 64))
+        b.iter(|| BitVec::from_words(black_box(words_10m.clone()), words_10m.len() * 64));
     });
 
     // ========== RANK QUERY BENCHMARKS ==========
@@ -208,11 +208,11 @@ fn bench_popcount(c: &mut Criterion) {
     group.bench_function("1M_rank_queries", |b| {
         b.iter(|| {
             let mut sum = 0usize;
-            for &q in queries.iter() {
+            for &q in &queries {
                 sum += bv_1m.rank1(black_box(q));
             }
             sum
-        })
+        });
     });
 
     group.finish();

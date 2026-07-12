@@ -24,7 +24,7 @@ fn full_outputs(json: &[u8], filter: &str) -> Vec<String> {
     let cursor = index.root(json);
     let expr = parse(filter).expect("parse failed");
     let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
-    result.collect_owned().iter().map(|v| v.to_json()).collect()
+    result.collect_owned().iter().map(succinctly::jq::OwnedValue::to_json).collect()
 }
 
 /// Convenience: assert the filter produces exactly one output and return it.
@@ -59,7 +59,7 @@ fn test_eq_int_vs_float_diverges_156() {
 fn test_unique_dedups_int_and_float() {
     // `unique` sorts with the ordering-based comparison, which treats 1 and
     // 1.0 as equal -> a single element. This already matches jq.
-    assert_eq!(one(br#"[1,1.0]"#, "unique"), "[1]");
+    assert_eq!(one(br"[1,1.0]", "unique"), "[1]");
 }
 
 #[test]
@@ -68,17 +68,17 @@ fn test_difference_int_float_diverges_156() {
     // The FULL evaluator compares Int(1) != Float(1.0), so 1.0 is NOT removed.
     // This ALSO diverges from the generic/CLI path (which yields `[2,3]`) — see
     // the evaluator-parity tests, which pin that drift explicitly.
-    assert_eq!(one(br#"[1.0,2,3]"#, ". - [1]"), "[1,2,3]");
+    assert_eq!(one(br"[1.0,2,3]", ". - [1]"), "[1,2,3]");
 }
 
 #[test]
 fn test_contains_int_float_diverges_156() {
     // jq: `[1,2,3] | contains([1.0])` is `true`; succinctly currently `false`.
-    assert_eq!(one(br#"[1,2,3]"#, "contains([1.0])"), "false");
+    assert_eq!(one(br"[1,2,3]", "contains([1.0])"), "false");
 }
 
 #[test]
 fn test_index_int_float_diverges_156() {
     // jq: `[2,1,3] | index(1.0)` is `1`; succinctly currently `null`.
-    assert_eq!(one(br#"[2,1,3]"#, "index(1.0)"), "null");
+    assert_eq!(one(br"[2,1,3]", "index(1.0)"), "null");
 }

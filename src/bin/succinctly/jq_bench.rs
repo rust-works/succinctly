@@ -125,7 +125,7 @@ pub fn run_benchmark(
                 break 'outer;
             }
 
-            let file_path = config.data_dir.join(pattern).join(format!("{}.json", size));
+            let file_path = config.data_dir.join(pattern).join(format!("{size}.json"));
 
             if !file_path.exists() {
                 eprintln!("  Skipping {} (not found)", file_path.display());
@@ -167,7 +167,7 @@ pub fn run_benchmark(
                     results.push(result);
                 }
                 Err(e) => {
-                    eprintln!("ERROR: {}", e);
+                    eprintln!("ERROR: {e}");
                 }
             }
         }
@@ -310,7 +310,7 @@ fn run_command_with_timing(program: &str, args: &[&str]) -> Result<ToolResult> {
         let output = Command::new(program)
             .args(args)
             .output()
-            .with_context(|| format!("Failed to run {}", program))?;
+            .with_context(|| format!("Failed to run {program}"))?;
         (output.stdout, 0, 0.0, 0.0)
     };
 
@@ -493,7 +493,7 @@ pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> Stri
 
     // Add CPU info
     let cpu_info = get_cpu_info();
-    md.push_str(&format!("**CPU**: {}\n\n", cpu_info));
+    md.push_str(&format!("**CPU**: {cpu_info}\n\n"));
 
     // Group by pattern (alphabetical order)
     let patterns = [
@@ -519,7 +519,7 @@ pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> Stri
             continue;
         }
 
-        md.push_str(&format!("## Pattern: {}\n\n", pattern));
+        md.push_str(&format!("## Pattern: {pattern}\n\n"));
         // Column widths (content only, not including | separators):
         // Size: 9 chars (e.g., "**10mb** ")
         // jq: 8 chars (e.g., "  336.7ms")
@@ -553,7 +553,7 @@ pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> Stri
 
             // Size column: **name** with trailing padding (9 chars total)
             let size_bold = format!("**{}**", r.size);
-            let size_col = format!("{:<9}", size_bold);
+            let size_col = format!("{size_bold:<9}");
 
             // jq time column: already 8 chars from format_time_fixed
             let jq_col = jq_time;
@@ -566,20 +566,20 @@ pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> Stri
                 let padding = succ_time.len() - trimmed.len();
                 format!("{}**{}**", " ".repeat(padding), trimmed) // spaces before **, not after
             } else {
-                format!("  {}  ", succ_time) // 8 + 4 = 12 chars, same visual width
+                format!("  {succ_time}  ") // 8 + 4 = 12 chars, same visual width
             };
 
             // Speedup column: bold if >= 1.0 (13 chars visual width)
             // Move leading spaces outside ** so markdown renders correctly
-            let speedup_str = format!("{:.1}x", speedup);
+            let speedup_str = format!("{speedup:.1}x");
             let speedup_col = if speedup >= 1.0 {
                 // Right-align: total 9 chars visual, with ** markers = 13 chars
-                let padded = format!("{:>9}", speedup_str);
+                let padded = format!("{speedup_str:>9}");
                 let trimmed = padded.trim_start();
                 let padding = padded.len() - trimmed.len();
                 format!("{}**{}**", " ".repeat(padding), trimmed)
             } else {
-                format!("{:>13}", speedup_str) // Same visual width without bold
+                format!("{speedup_str:>13}") // Same visual width without bold
             };
 
             if memory_mode {
@@ -590,23 +590,15 @@ pub fn generate_markdown(results: &[BenchmarkResult], memory_mode: bool) -> Stri
 
                 // Memory columns: right-aligned, format_memory_fixed returns 7 chars
                 let jq_mem_col = jq_mem;
-                let succ_mem_col = format!("{:>8}", succ_mem); // 8 chars for succ Mem column
-                let mem_ratio_col = format!("{:>9.2}x", mem_ratio);
+                let succ_mem_col = format!("{succ_mem:>8}"); // 8 chars for succ Mem column
+                let mem_ratio_col = format!("{mem_ratio:>9.2}x");
 
                 md.push_str(&format!(
-                    "| {} | {} | {} | {} | {} | {} | {} |\n",
-                    size_col,
-                    jq_col,
-                    succ_col,
-                    speedup_col,
-                    jq_mem_col,
-                    succ_mem_col,
-                    mem_ratio_col
+                    "| {size_col} | {jq_col} | {succ_col} | {speedup_col} | {jq_mem_col} | {succ_mem_col} | {mem_ratio_col} |\n"
                 ));
             } else {
                 md.push_str(&format!(
-                    "| {} | {} | {} | {} |\n",
-                    size_col, jq_col, succ_col, speedup_col
+                    "| {size_col} | {jq_col} | {succ_col} | {speedup_col} |\n"
                 ));
             }
         }
@@ -625,8 +617,8 @@ fn format_time_fixed(ms: f64) -> String {
         format!("{:>7.2}s", ms / 1000.0)
     } else {
         // Milliseconds: " 765.6ms" = 8 chars total (padding on left)
-        let ms_str = format!("{:.1}ms", ms);
-        format!("{:>8}", ms_str)
+        let ms_str = format!("{ms:.1}ms");
+        format!("{ms_str:>8}")
     }
 }
 
@@ -640,7 +632,7 @@ fn format_memory_fixed(bytes: u64) -> String {
     } else if bytes >= 1024 {
         format!("{:>4.0} KB", bytes as f64 / 1024.0)
     } else {
-        format!("{:>4} B ", bytes)
+        format!("{bytes:>4} B ")
     }
 }
 
@@ -653,7 +645,7 @@ fn format_bytes(bytes: usize) -> String {
     } else if bytes >= 1024 {
         format!("{:.2} KB", bytes as f64 / 1024.0)
     } else {
-        format!("{} bytes", bytes)
+        format!("{bytes} bytes")
     }
 }
 
@@ -686,13 +678,11 @@ mod tests {
         // Spaces should be BEFORE **, not after
         assert!(
             succ_col.starts_with("  **"),
-            "Expected spaces before **, got: {}",
-            succ_col
+            "Expected spaces before **, got: {succ_col}"
         );
         assert!(
             !succ_col.contains("** "),
-            "Spaces should not be inside **: {}",
-            succ_col
+            "Spaces should not be inside **: {succ_col}"
         );
         assert_eq!(succ_col, "  **59.6ms**");
     }
@@ -701,8 +691,8 @@ mod tests {
     fn test_speedup_bold_formatting() {
         // Simulate speedup column formatting
         let speedup = 5.8;
-        let speedup_str = format!("{:.1}x", speedup);
-        let padded = format!("{:>9}", speedup_str);
+        let speedup_str = format!("{speedup:.1}x");
+        let padded = format!("{speedup_str:>9}");
         let trimmed = padded.trim_start();
         let padding = padded.len() - trimmed.len();
         let speedup_col = format!("{}**{}**", " ".repeat(padding), trimmed);
@@ -710,13 +700,11 @@ mod tests {
         // Spaces should be BEFORE **, not after
         assert!(
             speedup_col.contains("**5.8x**"),
-            "Expected **5.8x**, got: {}",
-            speedup_col
+            "Expected **5.8x**, got: {speedup_col}"
         );
         assert!(
             !speedup_col.contains("** "),
-            "Spaces should not be inside **: {}",
-            speedup_col
+            "Spaces should not be inside **: {speedup_col}"
         );
     }
 }

@@ -22,16 +22,16 @@ fn generate_deeply_nested_yaml(depth: usize) -> Vec<u8> {
         let indent = "  ".repeat(d);
         if d % 2 == 0 {
             // Mapping
-            yaml.extend_from_slice(format!("{}key{}:\n", indent, d).as_bytes());
+            yaml.extend_from_slice(format!("{indent}key{d}:\n").as_bytes());
         } else {
             // Sequence
-            yaml.extend_from_slice(format!("{}- item{}:\n", indent, d).as_bytes());
+            yaml.extend_from_slice(format!("{indent}- item{d}:\n").as_bytes());
         }
     }
 
     // Add leaf value
     let indent = "  ".repeat(depth);
-    yaml.extend_from_slice(format!("{}value: leaf\n", indent).as_bytes());
+    yaml.extend_from_slice(format!("{indent}value: leaf\n").as_bytes());
 
     yaml
 }
@@ -43,8 +43,8 @@ fn generate_wide_structure(width: usize) -> Vec<u8> {
 
     // Create many mapping entries at root level
     for i in 0..width / 2 {
-        yaml.extend_from_slice(format!("key{}:\n", i).as_bytes());
-        yaml.extend_from_slice(format!("  - item{}\n", i).as_bytes());
+        yaml.extend_from_slice(format!("key{i}:\n").as_bytes());
+        yaml.extend_from_slice(format!("  - item{i}\n").as_bytes());
     }
 
     yaml
@@ -58,14 +58,14 @@ fn generate_mixed_containers(pairs: usize) -> Vec<u8> {
     for i in 0..pairs {
         if i % 3 == 0 {
             // Mapping with sequence value
-            yaml.extend_from_slice(format!("key{}:\n", i).as_bytes());
+            yaml.extend_from_slice(format!("key{i}:\n").as_bytes());
             yaml.extend_from_slice(b"  - a\n  - b\n");
         } else if i % 3 == 1 {
             // Sequence item with nested mapping
             yaml.extend_from_slice(b"- nested:\n    val: x\n");
         } else {
             // Simple mapping
-            yaml.extend_from_slice(format!("key{}: value\n", i).as_bytes());
+            yaml.extend_from_slice(format!("key{i}: value\n").as_bytes());
         }
     }
 
@@ -82,7 +82,7 @@ fn bench_deeply_nested(c: &mut Criterion) {
             b.iter(|| {
                 let index = YamlIndex::build(black_box(yaml)).unwrap();
                 black_box(index)
-            })
+            });
         });
     }
 
@@ -99,7 +99,7 @@ fn bench_wide_structure(c: &mut Criterion) {
             b.iter(|| {
                 let index = YamlIndex::build(black_box(yaml)).unwrap();
                 black_box(index)
-            })
+            });
         });
     }
 
@@ -116,7 +116,7 @@ fn bench_mixed_containers(c: &mut Criterion) {
             b.iter(|| {
                 let index = YamlIndex::build(black_box(yaml)).unwrap();
                 black_box(index)
-            })
+            });
         });
     }
 

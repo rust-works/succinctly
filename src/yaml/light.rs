@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // from_utf8_unchecked on validated UTF-8 in the transcoder
 #![allow(clippy::items_after_test_module)] // STYLE-0004: helper items intentionally follow `mod tests` in this file
 //! YamlCursor - Lazy YAML navigation using the semi-index.
 //!
@@ -34,13 +35,13 @@ pub struct YamlCursor<'a, W = Vec<u64>> {
     bp_pos: usize,
 }
 
-impl<'a, W> Clone for YamlCursor<'a, W> {
+impl<W> Clone for YamlCursor<'_, W> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, W> Copy for YamlCursor<'a, W> {}
+impl<W> Copy for YamlCursor<'_, W> {}
 
 impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// Create a new cursor at the given BP position.
@@ -89,7 +90,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
 
     /// Navigate to the first child.
     #[inline]
-    pub fn first_child(&self) -> Option<YamlCursor<'a, W>> {
+    pub fn first_child(&self) -> Option<Self> {
         let new_pos = self.index.bp().first_child(self.bp_pos)?;
         Some(YamlCursor {
             text: self.text,
@@ -100,7 +101,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
 
     /// Navigate to the next sibling.
     #[inline]
-    pub fn next_sibling(&self) -> Option<YamlCursor<'a, W>> {
+    pub fn next_sibling(&self) -> Option<Self> {
         let new_pos = self.index.bp().next_sibling(self.bp_pos)?;
         Some(YamlCursor {
             text: self.text,
@@ -111,7 +112,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
 
     /// Navigate to the parent.
     #[inline]
-    pub fn parent(&self) -> Option<YamlCursor<'a, W>> {
+    pub fn parent(&self) -> Option<Self> {
         let new_pos = self.index.bp().parent(self.bp_pos)?;
         Some(YamlCursor {
             text: self.text,
@@ -163,9 +164,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             // Determine if mapping or sequence using the TY bits
             if self.index.is_sequence_at_bp(self.bp_pos) {
                 return YamlValue::Sequence(YamlElements::from_sequence_cursor(*self));
-            } else {
-                return YamlValue::Mapping(YamlFields::from_mapping_cursor(*self));
             }
+            return YamlValue::Mapping(YamlFields::from_mapping_cursor(*self));
         }
 
         // Check for alias (only for non-container nodes)
@@ -960,10 +960,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // Continuation line (in flow context, any non-delimiter continues)
                             end = empty_lines_end;
                             break;
-                        } else {
-                            // Not indented enough - scalar ends before this
-                            return line_end;
                         }
+                        // Not indented enough - scalar ends before this
+                        return line_end;
                     }
                 }
             }
@@ -1753,7 +1752,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// Note: For consistency with how yq evaluates expressions, if the offset
     /// lands on the document root sequence wrapper in a single-document file,
     /// this returns the document content instead of the wrapper.
-    pub fn cursor_at_offset(&self, offset: usize) -> Option<YamlCursor<'a, W>> {
+    pub fn cursor_at_offset(&self, offset: usize) -> Option<Self> {
         if offset >= self.text.len() {
             return None;
         }
@@ -1806,7 +1805,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// - The position doesn't correspond to a valid node
     ///
     /// This enables position-based navigation in jq queries via `at_position(line; col)`.
-    pub fn cursor_at_position(&self, line: usize, col: usize) -> Option<YamlCursor<'a, W>> {
+    pub fn cursor_at_position(&self, line: usize, col: usize) -> Option<Self> {
         // Convert line/column to byte offset
         let offset = self.index.to_offset(line, col, self.text)?;
 
@@ -2999,11 +2998,11 @@ fn stream_yaml_scalar_as_json<Out: core::fmt::Write>(
                     }
                     b'0'..=b'9' => {
                         if let Ok(n) = str_val.parse::<i64>() {
-                            return write!(out, "{}", n);
+                            return write!(out, "{n}");
                         }
                         if let Ok(f) = str_val.parse::<f64>() {
                             if !f.is_nan() && !f.is_infinite() {
-                                return write!(out, "{}", f);
+                                return write!(out, "{f}");
                             }
                         }
                     }
@@ -3013,21 +3012,21 @@ fn stream_yaml_scalar_as_json<Out: core::fmt::Write>(
         }
         b'0'..=b'9' => {
             if let Ok(n) = str_val.parse::<i64>() {
-                return write!(out, "{}", n);
+                return write!(out, "{n}");
             }
             if let Ok(f) = str_val.parse::<f64>() {
                 if !f.is_nan() && !f.is_infinite() {
-                    return write!(out, "{}", f);
+                    return write!(out, "{f}");
                 }
             }
         }
         b'+' if bytes.len() > 1 && bytes[1].is_ascii_digit() => {
             if let Ok(n) = str_val.parse::<i64>() {
-                return write!(out, "{}", n);
+                return write!(out, "{n}");
             }
             if let Ok(f) = str_val.parse::<f64>() {
                 if !f.is_nan() && !f.is_infinite() {
-                    return write!(out, "{}", f);
+                    return write!(out, "{f}");
                 }
             }
         }
@@ -3047,13 +3046,13 @@ pub struct YamlChildren<'a, W = Vec<u64>> {
     current: Option<YamlCursor<'a, W>>,
 }
 
-impl<'a, W> Clone for YamlChildren<'a, W> {
+impl<W> Clone for YamlChildren<'_, W> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, W> Copy for YamlChildren<'a, W> {}
+impl<W> Copy for YamlChildren<'_, W> {}
 
 impl<'a, W: AsRef<[u64]>> Iterator for YamlChildren<'a, W> {
     type Item = YamlCursor<'a, W>;
@@ -3103,13 +3102,13 @@ pub struct YamlFields<'a, W = Vec<u64>> {
     key_cursor: Option<YamlCursor<'a, W>>,
 }
 
-impl<'a, W> Clone for YamlFields<'a, W> {
+impl<W> Clone for YamlFields<'_, W> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, W> Copy for YamlFields<'a, W> {}
+impl<W> Copy for YamlFields<'_, W> {}
 
 impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
     /// Create a new YamlFields from a mapping cursor.
@@ -3126,7 +3125,7 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
     }
 
     /// Get the first field and the remaining fields.
-    pub fn uncons(&self) -> Option<(YamlField<'a, W>, YamlFields<'a, W>)> {
+    pub fn uncons(&self) -> Option<(YamlField<'a, W>, Self)> {
         let key_cursor = self.key_cursor?;
         let value_cursor = key_cursor.next_sibling()?;
 
@@ -3178,13 +3177,13 @@ pub struct YamlField<'a, W = Vec<u64>> {
     value_cursor: YamlCursor<'a, W>,
 }
 
-impl<'a, W> Clone for YamlField<'a, W> {
+impl<W> Clone for YamlField<'_, W> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, W> Copy for YamlField<'a, W> {}
+impl<W> Copy for YamlField<'_, W> {}
 
 impl<'a, W: AsRef<[u64]>> YamlField<'a, W> {
     /// Get the field key.
@@ -3217,13 +3216,13 @@ pub struct YamlElements<'a, W = Vec<u64>> {
     element_cursor: Option<YamlCursor<'a, W>>,
 }
 
-impl<'a, W> Clone for YamlElements<'a, W> {
+impl<W> Clone for YamlElements<'_, W> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, W> Copy for YamlElements<'a, W> {}
+impl<W> Copy for YamlElements<'_, W> {}
 
 impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
     /// Create a new YamlElements from a sequence cursor.
@@ -3243,7 +3242,7 @@ impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
     ///
     /// This returns the cursor directly, which is useful when you need to
     /// call cursor methods like `to_json()` without going through YamlValue.
-    pub fn uncons_cursor(&self) -> Option<(YamlCursor<'a, W>, YamlElements<'a, W>)> {
+    pub fn uncons_cursor(&self) -> Option<(YamlCursor<'a, W>, Self)> {
         let element_cursor = self.element_cursor?;
 
         let rest = YamlElements {
@@ -3276,7 +3275,7 @@ impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
     }
 
     /// Get the first element and the remaining elements.
-    pub fn uncons(&self) -> Option<(YamlValue<'a, W>, YamlElements<'a, W>)> {
+    pub fn uncons(&self) -> Option<(YamlValue<'a, W>, Self)> {
         let element_cursor = self.element_cursor?;
 
         let rest = YamlElements {
@@ -3631,9 +3630,8 @@ impl<'a> YamlString<'a> {
                             }
                         }
                         return (content_start, end);
-                    } else {
-                        return (content_start, content_start);
                     }
+                    return (content_start, content_start);
                 }
             }
         };
@@ -3765,9 +3763,8 @@ impl<'a> YamlString<'a> {
                     .is_some_and(|slice| slice.contains(&b':'));
                 if has_colon {
                     return line_indent + 2;
-                } else {
-                    return line_indent;
                 }
+                return line_indent;
             }
         }
 
@@ -3856,8 +3853,8 @@ pub enum YamlStringError {
 impl core::fmt::Display for YamlStringError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            YamlStringError::InvalidUtf8 => write!(f, "invalid UTF-8 in string"),
-            YamlStringError::InvalidEscape => write!(f, "invalid escape sequence"),
+            Self::InvalidUtf8 => write!(f, "invalid UTF-8 in string"),
+            Self::InvalidEscape => write!(f, "invalid escape sequence"),
         }
     }
 }
@@ -4208,11 +4205,10 @@ fn fold_plain_line_break(
             if line_indent > base_indent {
                 // Valid continuation - position is after the indentation
                 break;
-            } else {
-                // This shouldn't happen if find_plain_scalar_end worked correctly
-                // but handle it gracefully
-                break;
             }
+            // This shouldn't happen if find_plain_scalar_end worked correctly
+            // but handle it gracefully
+            break;
         }
     }
 
@@ -4248,12 +4244,12 @@ fn parse_hex(hex: &[u8]) -> Result<u32, YamlStringError> {
 }
 
 /// Decode a literal block scalar (preserves newlines).
-fn decode_block_literal<'a>(
-    text: &'a [u8],
+fn decode_block_literal(
+    text: &[u8],
     indicator_pos: usize,
     chomping: ChompingIndicator,
     explicit_indent: Option<u8>,
-) -> Result<Cow<'a, str>, YamlStringError> {
+) -> Result<Cow<'_, str>, YamlStringError> {
     let (content_start, content_end) =
         YamlString::find_block_content_range(text, indicator_pos, chomping, explicit_indent);
 
@@ -4351,12 +4347,12 @@ fn decode_block_literal<'a>(
 }
 
 /// Decode a folded block scalar (folds newlines to spaces).
-fn decode_block_folded<'a>(
-    text: &'a [u8],
+fn decode_block_folded(
+    text: &[u8],
     indicator_pos: usize,
     chomping: ChompingIndicator,
     explicit_indent: Option<u8>,
-) -> Result<Cow<'a, str>, YamlStringError> {
+) -> Result<Cow<'_, str>, YamlStringError> {
     let (content_start, content_end) =
         YamlString::find_block_content_range(text, indicator_pos, chomping, explicit_indent);
 
@@ -4543,8 +4539,8 @@ pub enum YamlNumberError {
 impl core::fmt::Display for YamlNumberError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            YamlNumberError::InvalidUtf8 => write!(f, "invalid UTF-8 in number"),
-            YamlNumberError::InvalidNumber => write!(f, "invalid number format"),
+            Self::InvalidUtf8 => write!(f, "invalid UTF-8 in number"),
+            Self::InvalidNumber => write!(f, "invalid number format"),
         }
     }
 }
@@ -4667,7 +4663,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
             }
             YamlValue::Alias { target, .. } => {
                 // Resolve alias and check target
-                target.map(|t| t.value().is_null()).unwrap_or(true) // Unresolved alias treated as null
+                target.map_or(true, |t| t.value().is_null()) // Unresolved alias treated as null
             }
             _ => false,
         }
@@ -4776,9 +4772,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
             }
             YamlValue::Mapping(_) => "object",
             YamlValue::Sequence(_) => "array",
-            YamlValue::Alias { target, .. } => {
-                target.map(|t| t.value().type_name()).unwrap_or("null")
-            }
+            YamlValue::Alias { target, .. } => target.map_or("null", |t| t.value().type_name()),
             YamlValue::Error(_) => "error",
         }
     }
@@ -5044,18 +5038,13 @@ mod tests {
 
     /// Helper to get the first document from the root document array.
     /// All YAML documents are wrapped in a virtual root sequence.
-    fn first_doc<'a, W: AsRef<[u64]> + core::fmt::Debug>(
-        root: YamlCursor<'a, W>,
-    ) -> YamlValue<'a, W> {
+    fn first_doc<W: AsRef<[u64]> + core::fmt::Debug>(root: YamlCursor<'_, W>) -> YamlValue<'_, W> {
         match root.value() {
             YamlValue::Sequence(elements) => elements
                 .into_iter()
                 .next()
                 .expect("expected at least one document"),
-            other => panic!(
-                "expected root to be document array (sequence), got {:?}",
-                other
-            ),
+            other => panic!("expected root to be document array (sequence), got {other:?}"),
         }
     }
 
@@ -5070,7 +5059,7 @@ mod tests {
             YamlValue::Mapping(fields) => {
                 assert!(!fields.is_empty());
             }
-            other => panic!("expected mapping, got {:?}", other),
+            other => panic!("expected mapping, got {other:?}"),
         }
     }
 
@@ -5578,8 +5567,7 @@ mod tests {
                 let decoded = s.as_str().unwrap();
                 assert!(
                     decoded.contains("Line 1") && decoded.contains("Line 2"),
-                    "block literal should contain both lines, got: {:?}",
-                    decoded
+                    "block literal should contain both lines, got: {decoded:?}"
                 );
             } else {
                 panic!("expected string for text");
@@ -5601,8 +5589,7 @@ mod tests {
                 let decoded = s.as_str().unwrap();
                 assert!(
                     decoded.contains("First part") && decoded.contains("second part"),
-                    "block folded should contain both parts, got: {:?}",
-                    decoded
+                    "block folded should contain both parts, got: {decoded:?}"
                 );
             } else {
                 panic!("expected string for text");
@@ -5639,15 +5626,14 @@ mod tests {
 
         if let YamlValue::Sequence(elements) = first_doc(root) {
             let items: Vec<_> = elements.collect();
-            assert_eq!(items.len(), 2, "expected 2 items, got items: {:?}", items);
+            assert_eq!(items.len(), 2, "expected 2 items, got items: {items:?}");
 
             // First item is block literal
             if let YamlValue::String(s) = &items[0] {
                 let decoded = s.as_str().unwrap();
                 assert!(
                     decoded.contains("item"),
-                    "first item should contain 'item', got: {:?}",
-                    decoded
+                    "first item should contain 'item', got: {decoded:?}"
                 );
             } else {
                 panic!("expected string for first item, got: {:?}", items[0]);
@@ -5843,9 +5829,8 @@ mod tests {
                                 assert_eq!(anchor_name, "n");
                                 assert!(target.is_some());
                                 return;
-                            } else {
-                                panic!("expected alias for greeting");
                             }
+                            panic!("expected alias for greeting");
                         }
                     }
                 }
@@ -5950,9 +5935,8 @@ mod tests {
                             // Target should be None because anchor doesn't exist
                             assert!(target.is_none(), "undefined alias should not resolve");
                             return;
-                        } else {
-                            panic!("expected alias for bad");
                         }
+                        panic!("expected alias for bad");
                     }
                 }
             }
@@ -5978,14 +5962,13 @@ mod tests {
                     if k.as_str().unwrap() == "items" {
                         if let YamlValue::Sequence(elements) = val {
                             let items: Vec<_> = elements.collect();
-                            assert_eq!(items.len(), 2, "expected 2 items, got: {:?}", items);
+                            assert_eq!(items.len(), 2, "expected 2 items, got: {items:?}");
                             if let YamlValue::String(s) = &items[0] {
                                 assert_eq!(&*s.as_str().unwrap(), "one");
                             }
                             return;
-                        } else {
-                            panic!("expected sequence for items, got: {:?}", val);
                         }
+                        panic!("expected sequence for items, got: {val:?}");
                     }
                 }
             }
@@ -6265,12 +6248,12 @@ mod tests {
             YamlValue::Mapping(fields) => {
                 // For mappings, extract all string values and compare
                 let mut pairs = Vec::new();
-                for field in fields.into_iter() {
+                for field in fields {
                     if let YamlValue::String(k) = field.key() {
                         if let YamlValue::String(v) = field.value() {
                             let key_str = k.as_str().unwrap();
                             let val_str = v.as_str().unwrap();
-                            pairs.push(format!("\"{}\":\"{}\"", key_str, val_str));
+                            pairs.push(format!("\"{key_str}\":\"{val_str}\""));
                         }
                     }
                 }
@@ -6285,8 +6268,7 @@ mod tests {
     fn json_string_to_rust_string(json: &str) -> String {
         assert!(
             json.starts_with('"') && json.ends_with('"'),
-            "not a JSON string: {}",
-            json
+            "not a JSON string: {json}"
         );
         let inner = &json[1..json.len() - 1];
         let mut result = String::new();
@@ -6317,7 +6299,7 @@ mod tests {
                             result.push(char::from_u32(codepoint).unwrap());
                         }
                     }
-                    Some(c) => panic!("unknown escape: \\{}", c),
+                    Some(c) => panic!("unknown escape: \\{c}"),
                     None => panic!("trailing backslash"),
                 }
             } else {
@@ -6334,8 +6316,7 @@ mod tests {
         let decoded_value = json_string_to_rust_string(decoded);
         assert_eq!(
             transcoded_value, decoded_value,
-            "{}: JSON strings decode to different values.\n  transcoded JSON: {}\n  decoded JSON: {}\n  transcoded value: {:?}\n  decoded value: {:?}",
-            context, transcoded, decoded, transcoded_value, decoded_value
+            "{context}: JSON strings decode to different values.\n  transcoded JSON: {transcoded}\n  decoded JSON: {decoded}\n  transcoded value: {transcoded_value:?}\n  decoded value: {decoded_value:?}"
         );
     }
 
@@ -6691,8 +6672,7 @@ mod tests {
         // Should contain "line one line two" (folded)
         assert!(
             transcoded.contains("line one line two"),
-            "got: {}",
-            transcoded
+            "got: {transcoded}"
         );
     }
 
@@ -6704,8 +6684,7 @@ mod tests {
         // Should contain "line one\nline two" (empty line becomes newline)
         assert!(
             transcoded.contains("line one\\nline two"),
-            "got: {}",
-            transcoded
+            "got: {transcoded}"
         );
     }
 
@@ -6717,8 +6696,7 @@ mod tests {
         // Should contain "line one line two" (folded)
         assert!(
             transcoded.contains("line one line two"),
-            "got: {}",
-            transcoded
+            "got: {transcoded}"
         );
     }
 
@@ -6728,7 +6706,7 @@ mod tests {
         let yaml = b"key: 'it''s\n  working'";
         let transcoded = get_json_via_transcode(yaml);
         // Should contain "it's working"
-        assert!(transcoded.contains("it's working"), "got: {}", transcoded);
+        assert!(transcoded.contains("it's working"), "got: {transcoded}");
     }
 
     // =========================================================================
