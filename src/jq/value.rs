@@ -370,4 +370,106 @@ mod tests {
             OwnedValue::String("hello".into())
         );
     }
+
+    #[test]
+    fn test_collection_constructors() {
+        assert_eq!(OwnedValue::array(), OwnedValue::Array(vec![]));
+        assert_eq!(
+            OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
+        );
+        assert_eq!(OwnedValue::object(), OwnedValue::Object(IndexMap::new()));
+        let obj = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        assert_eq!(obj.as_object().unwrap().get("a"), Some(&OwnedValue::Int(1)));
+    }
+
+    #[test]
+    fn test_is_null() {
+        assert!(OwnedValue::Null.is_null());
+        assert!(!OwnedValue::Bool(false).is_null());
+        assert!(!OwnedValue::Int(0).is_null());
+    }
+
+    #[test]
+    fn test_as_bool() {
+        assert_eq!(OwnedValue::Bool(true).as_bool(), Some(true));
+        assert_eq!(OwnedValue::Bool(false).as_bool(), Some(false));
+        assert_eq!(OwnedValue::Int(1).as_bool(), None);
+        assert_eq!(OwnedValue::Null.as_bool(), None);
+    }
+
+    #[test]
+    fn test_as_i64() {
+        assert_eq!(OwnedValue::Int(42).as_i64(), Some(42));
+        // A float with an integral value converts to i64...
+        assert_eq!(OwnedValue::Float(3.0).as_i64(), Some(3));
+        // ...but a fractional float does not.
+        assert_eq!(OwnedValue::Float(3.5).as_i64(), None);
+        assert_eq!(OwnedValue::String("3".into()).as_i64(), None);
+    }
+
+    #[test]
+    fn test_as_f64() {
+        assert_eq!(OwnedValue::Int(42).as_f64(), Some(42.0));
+        assert_eq!(OwnedValue::Float(2.5).as_f64(), Some(2.5));
+        assert_eq!(OwnedValue::Bool(true).as_f64(), None);
+    }
+
+    #[test]
+    fn test_as_str() {
+        assert_eq!(OwnedValue::String("hi".into()).as_str(), Some("hi"));
+        assert_eq!(OwnedValue::Int(1).as_str(), None);
+    }
+
+    #[test]
+    fn test_as_array_and_mut() {
+        let mut v = OwnedValue::Array(vec![OwnedValue::Int(1)]);
+        assert_eq!(v.as_array(), Some(&vec![OwnedValue::Int(1)]));
+        v.as_array_mut().unwrap().push(OwnedValue::Int(2));
+        assert_eq!(
+            v,
+            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
+        );
+        assert_eq!(OwnedValue::Null.as_array(), None);
+        assert_eq!(OwnedValue::Null.as_array_mut(), None);
+    }
+
+    #[test]
+    fn test_as_object_and_mut() {
+        let mut map = IndexMap::new();
+        map.insert("a".to_string(), OwnedValue::Int(1));
+        let mut v = OwnedValue::Object(map);
+        assert_eq!(v.as_object().unwrap().len(), 1);
+        v.as_object_mut()
+            .unwrap()
+            .insert("b".to_string(), OwnedValue::Int(2));
+        assert_eq!(v.as_object().unwrap().len(), 2);
+        assert_eq!(OwnedValue::Int(1).as_object(), None);
+        assert_eq!(OwnedValue::Int(1).as_object_mut(), None);
+    }
+
+    #[test]
+    fn test_from_primitives() {
+        assert_eq!(OwnedValue::from(true), OwnedValue::Bool(true));
+        assert_eq!(OwnedValue::from(7i64), OwnedValue::Int(7));
+        assert_eq!(OwnedValue::from(1.5f64), OwnedValue::Float(1.5));
+        assert_eq!(
+            OwnedValue::from(String::from("s")),
+            OwnedValue::String("s".into())
+        );
+        assert_eq!(OwnedValue::from("s"), OwnedValue::String("s".into()));
+    }
+
+    #[test]
+    fn test_from_vec() {
+        let v: OwnedValue = vec![1i64, 2, 3].into();
+        assert_eq!(
+            v,
+            OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Int(3)
+            ])
+        );
+    }
 }

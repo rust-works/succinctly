@@ -1263,4 +1263,84 @@ mod tests {
             Expr::Literal(Literal::String("hello".into()))
         );
     }
+
+    #[test]
+    fn test_literal_float() {
+        assert_eq!(Literal::float(2.5), Literal::Float(2.5));
+    }
+
+    #[test]
+    fn test_optional_and_paren() {
+        assert_eq!(
+            Expr::field("x").optional(),
+            Expr::Optional(Box::new(Expr::Field("x".into())))
+        );
+        assert_eq!(
+            Expr::paren(Expr::identity()),
+            Expr::Paren(Box::new(Expr::Identity))
+        );
+    }
+
+    #[test]
+    fn test_recursive_descent_and_not() {
+        assert_eq!(Expr::recursive_descent(), Expr::RecursiveDescent);
+        assert_eq!(Expr::not(), Expr::Not);
+    }
+
+    #[test]
+    fn test_arithmetic_and_compare() {
+        let one = || Expr::literal(Literal::int(1));
+        let two = || Expr::literal(Literal::int(2));
+        assert_eq!(
+            Expr::arithmetic(ArithOp::Add, one(), two()),
+            Expr::Arithmetic {
+                op: ArithOp::Add,
+                left: Box::new(Expr::Literal(Literal::Int(1))),
+                right: Box::new(Expr::Literal(Literal::Int(2))),
+            }
+        );
+        assert!(matches!(
+            Expr::compare(CompareOp::Lt, one(), two()),
+            Expr::Compare {
+                op: CompareOp::Lt,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_boolean_and_alternative() {
+        assert!(matches!(
+            Expr::and(Expr::identity(), Expr::identity()),
+            Expr::And(_, _)
+        ));
+        assert!(matches!(
+            Expr::or(Expr::identity(), Expr::identity()),
+            Expr::Or(_, _)
+        ));
+        assert!(matches!(
+            Expr::alternative(Expr::identity(), Expr::literal(Literal::int(0))),
+            Expr::Alternative(_, _)
+        ));
+    }
+
+    #[test]
+    fn test_if_try_error_builtin() {
+        assert!(matches!(
+            Expr::if_then_else(Expr::identity(), Expr::identity(), Expr::identity()),
+            Expr::If { .. }
+        ));
+        assert!(matches!(
+            Expr::try_expr(Expr::identity(), Some(Expr::identity())),
+            Expr::Try { .. }
+        ));
+        assert!(matches!(Expr::error(None), Expr::Error(None)));
+        assert_eq!(Expr::builtin(Builtin::Type), Expr::Builtin(Builtin::Type));
+    }
+
+    #[test]
+    fn test_is_identity() {
+        assert!(Expr::identity().is_identity());
+        assert!(!Expr::field("x").is_identity());
+    }
 }
