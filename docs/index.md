@@ -92,8 +92,19 @@ The project documents both successes and failures in optimization:
 - [optimizations/](optimizations/) — 11 technique guides (SIMD, cache, bit manipulation, etc.)
 - [parsing/yaml.md](parsing/yaml.md) — Detailed P0-P12 + O1-O3 optimization journey with benchmarks
 - [optimizations/history.md](optimizations/history.md) — Why AVX-512 was removed, and other lessons
+- [adrs/](adrs/) — Architecture Decision Records for the rejected optimizations (P2.6/P2.8/P3/P5/P6/P7/P8) and the core design choices
 
 Key lesson: Micro-benchmark wins often don't translate to end-to-end improvements. Three consecutive YAML optimizations (P2.6, P2.8, P3) showed micro-benchmark gains but caused real-world regressions.
+
+## Architecture Decisions (ADRs)
+
+Where this knowledge map explains *how* succinctly works today, the
+[Architecture Decision Records](adrs/README.md) record *why* it is shaped that way — and which
+approaches were considered and **rejected**. The corpus covers the core choices (semi-indexing
+over DOM parsing, the PFSM JSON parser, the YAML oracle) and the rejected optimizations
+(software prefetching, SIMD threshold tuning, branchless classification, flow-collection SIMD,
+BMI2 quote-indexing, parse-time newline index, AVX-512), each as a stable, citable record. See
+[adrs/README.md](adrs/README.md) for the inventory.
 
 ## Maintaining the Knowledge Map
 
