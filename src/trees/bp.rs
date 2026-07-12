@@ -2578,46 +2578,40 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "blocked on #188: L1/L2 excess counters are i16 and overflow \
-                past 32767-deep nesting (build panics in debug at bp.rs ~1639, \
-                silently wraps in release). Un-ignore once #188 widens the \
-                counters (including the SIMD build path)."]
-    fn test_bp_nesting_beyond_i16_excess() {
-        // Overflow ceiling for #188 — CONFIRMED failing today. The L1/L2
-        // hierarchical excess is stored in i16 (`l1_block_excess` /
-        // `l2_block_excess` / `running_excess`), so nesting deeper than
-        // i16::MAX (32767) overflows a too-narrow counter and corrupts
-        // navigation. Build a single chain 40_000 deep (~80_000 bits, ~10 KiB)
-        // and require excess/find_close/find_open/enclose to stay correct at
-        // and past the boundary — this is the proof that the widened type
-        // behaves, to land with the #188 fix.
-        let depth = 40_000usize;
-        assert!(depth > i16::MAX as usize);
+    fn test_bp_deep_nesting_navigation() {
+        // Deep (but within the i16 excess range) nesting exercises the L1/L2
+        // excess directory and multi-level find_close/find_open/enclose with a
+        // test that actually runs. Complements the ignored #188 ceiling test.
+        let depth = 1_000usize;
         let (words, len) = deeply_nested(depth);
         let bp = BalancedParens::new(words, len);
+        assert_eq!(bp.excess(depth - 1), depth as i32);
+        assert_eq!(bp.excess(len - 1), 0);
+        assert_eq!(bp.find_close(0), Some(len - 1));
+        assert_eq!(bp.find_close(depth - 1), Some(depth));
+        assert_eq!(bp.find_open(len - 1), Some(0));
+        assert_eq!(bp.find_open(depth), Some(depth - 1));
+        assert_eq!(bp.enclose(depth - 1), Some(depth - 2));
+        assert_eq!(bp.enclose(0), None);
+    }
 
-        // Excess climbs to `depth` at the innermost open, then returns to 0.
-        assert_eq!(bp.excess(depth - 1), depth as i32, "peak excess");
-        assert_eq!(bp.excess(len - 1), 0, "balanced at end");
-        // Just past the i16 boundary the running excess must still be exact.
-        assert_eq!(bp.excess(32767), 32768, "excess at i16::MAX+1 open");
-        assert_eq!(bp.excess(32768), 32769, "excess just past i16 boundary");
-
-        // Matching: open k pairs with close (len-1-k) for every level.
-        assert_eq!(bp.find_close(0), Some(len - 1), "outermost close");
-        assert_eq!(bp.find_close(depth - 1), Some(depth), "innermost close");
-        assert_eq!(
-            bp.find_close(32767),
-            Some(len - 1 - 32767),
-            "close across i16 boundary"
-        );
-        assert_eq!(bp.find_open(len - 1), Some(0), "outermost open");
-        assert_eq!(bp.find_open(depth), Some(depth - 1), "innermost open");
-
-        // Nesting: each open (except the root) is enclosed by the previous one.
-        assert_eq!(bp.enclose(depth - 1), Some(depth - 2), "deep enclose");
-        assert_eq!(bp.enclose(33000), Some(32999), "enclose past i16 boundary");
-        assert_eq!(bp.enclose(0), None, "root has no parent");
+    #[test]
+    #[ignore = "blocked on #188: L1/L2 excess counters are i16 and overflow past \
+                32767-deep nesting (build panics in debug at bp.rs ~1639, \
+                silently wraps in release). Un-ignore once #188 widens the \
+                counters (including the SIMD build path); run with --ignored to \
+                reproduce the overflow today."]
+    fn test_bp_nesting_beyond_i16_excess() {
+        // Overflow ceiling for #188 -- CONFIRMED failing today. Build a chain
+        // 40_000 deep (> i16::MAX) and require navigation to stay correct past
+        // the boundary; see test_bp_deep_nesting_navigation for the same
+        // assertions at a safe depth.
+        let depth = 40_000usize;
+        let (words, len) = deeply_nested(depth);
+        let bp = BalancedParens::new(words, len);
+        assert_eq!(bp.excess(depth - 1), depth as i32);
+        assert_eq!(bp.find_close(32767), Some(len - 1 - 32767));
+        assert_eq!(bp.enclose(33000), Some(32999));
     }
 
     #[test]

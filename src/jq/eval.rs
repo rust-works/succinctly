@@ -16294,6 +16294,23 @@ mod tests {
         assert_eq!(many.collect_owned().len(), 2);
     }
 
+    #[test]
+    fn test_query_result_collect_owned_cursor_arms() {
+        // Covers the One / OneCursor / Many arms via real evaluation.
+        fn owned(json: &[u8], filter: &str) -> Vec<OwnedValue> {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let expr = parse(filter).expect("parse failed");
+            eval::<Vec<u64>, JqSemantics>(&expr, cursor).collect_owned()
+        }
+        // OneCursor: identity passes a container through unchanged.
+        assert_eq!(owned(br#"{"a":1}"#, ".").len(), 1);
+        // Many: iterating an array yields several values.
+        assert_eq!(owned(br#"[1,2,3]"#, ".[]").len(), 3);
+        // One: field access returns a scalar reference.
+        assert_eq!(owned(br#"{"a":1}"#, ".a"), vec![OwnedValue::Int(1)]);
+    }
+
     // =============================================
     // Date/Time function tests (Phase 15)
     // =============================================
