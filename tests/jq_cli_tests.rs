@@ -482,6 +482,72 @@ fn test_exit_status_number() -> Result<()> {
     Ok(())
 }
 
+// -----------------------------------------------------------------------------
+// Exit status on the identity fast path (-c enables can_use_raw_identity()).
+//
+// The plain `-e` tests above never reach the identity fast path because
+// `can_use_raw_identity()` requires compact mode. With `-c -e` the fast path
+// emits raw bytes without materializing the value, so exit status must be
+// derived from the raw JSON token. Regression coverage for #175 / #178.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_exit_status_fast_path_false() -> Result<()> {
+    let (out, code) = run_jq_stdin(".", "false", &["-c", "-e"])?;
+    assert_eq!(out, "false\n");
+    assert_eq!(code, 1, "false on the identity fast path must exit 1");
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_fast_path_null() -> Result<()> {
+    let (out, code) = run_jq_stdin(".", "null", &["-c", "-e"])?;
+    assert_eq!(out, "null\n");
+    assert_eq!(code, 1, "null on the identity fast path must exit 1");
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_fast_path_true() -> Result<()> {
+    let (out, code) = run_jq_stdin(".", "true", &["-c", "-e"])?;
+    assert_eq!(out, "true\n");
+    assert_eq!(code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_fast_path_zero_is_truthy() -> Result<()> {
+    let (out, code) = run_jq_stdin(".", "0", &["-c", "-e"])?;
+    assert_eq!(out, "0\n");
+    // 0 is truthy in jq even though it is "falsy" in many other languages.
+    assert_eq!(code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_fast_path_false_string_is_truthy() -> Result<()> {
+    // A quoted "false" is a non-empty string, which is truthy.
+    let (out, code) = run_jq_stdin(".", "\"false\"", &["-c", "-e"])?;
+    assert_eq!(out, "\"false\"\n");
+    assert_eq!(code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_fast_path_last_value_wins() -> Result<()> {
+    // With multiple inputs, exit status reflects the LAST output value.
+    // Last value is `false` -> exit 1.
+    let (out, code) = run_jq_stdin(".", "true false", &["-c", "-e"])?;
+    assert_eq!(out, "true\nfalse\n");
+    assert_eq!(code, 1);
+
+    // Last value is `true` -> exit 0.
+    let (out, code) = run_jq_stdin(".", "false true", &["-c", "-e"])?;
+    assert_eq!(out, "false\ntrue\n");
+    assert_eq!(code, 0);
+    Ok(())
+}
+
 // =============================================================================
 // Multiple Input Tests
 // =============================================================================

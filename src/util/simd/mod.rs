@@ -49,6 +49,24 @@ pub fn popcount_512_scalar(data: &[u8; 64]) -> u32 {
     total
 }
 
+/// Emit a standardized `SKIPPED` line when a SIMD test bails out because the
+/// running CPU lacks the required feature.
+///
+/// Feature-gated SIMD tests self-skip with `if !detected { return; }`, which
+/// otherwise reports as a silent pass — so on an ARM host the x86 BMI2/AVX2/SSE2
+/// suites (and, absent emulation, SVE2) read as "passed" without asserting
+/// anything. Routing every skip through this helper makes the skips visible and
+/// countable (grep the test output for `SKIPPED`), so a fully-skipped SIMD suite
+/// no longer looks green. See #191; applied to the x86 sites in #193 and the
+/// remaining SVE2 sites in #194.
+// Used today only by the aarch64 SVE2 test modules; the x86 BMI2/AVX2/SSE2
+// sites adopt it in #193, so it is dead on x86-only builds until then.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn note_simd_skip(feature: &str) {
+    eprintln!("SKIPPED: SIMD test - CPU feature `{feature}` unavailable");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +75,13 @@ mod tests {
     fn test_popcount_512_all_zeros() {
         let data = [0u8; 64];
         assert_eq!(popcount_512(&data), 0);
+    }
+
+    #[test]
+    fn test_note_simd_skip_emits() {
+        // Exercise the shared skip-visibility helper directly so it is covered
+        // even on arches where no feature-gated SIMD test calls it (see #191).
+        note_simd_skip("test-feature");
     }
 
     #[test]

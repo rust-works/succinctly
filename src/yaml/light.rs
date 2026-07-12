@@ -5246,6 +5246,54 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_double_quoted_hex_escape_non_ascii() {
+        // \xNN with value > 0x7F takes the char::from_u32(val) path.
+        let s = YamlString::DoubleQuoted {
+            text: b"\"caf\\xe9\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "café");
+    }
+
+    #[test]
+    fn test_decode_double_quoted_unicode_escape() {
+        // \uNNNN 4-digit escape -> char::from_u32(codepoint).
+        let s = YamlString::DoubleQuoted {
+            text: b"\"caf\\u00e9\"",
+            start: 0,
+        };
+        assert_eq!(&*s.as_str().unwrap(), "café");
+        let s2 = YamlString::DoubleQuoted {
+            text: b"\"\\u1234\"",
+            start: 0,
+        };
+        assert_eq!(&*s2.as_str().unwrap(), "\u{1234}");
+    }
+
+    #[test]
+    fn test_to_json_double_quoted_non_ascii_and_leading_plus() {
+        // Exercises transcode_double_quoted_to_json (non-ASCII \x escape) and
+        // write_yaml_scalar_as_json (leading-'+' integer and float).
+        let yaml = b"s: \"caf\\xe9\"\ni: +123\nf: +1.5\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let json = index.root(yaml).to_json_document();
+        assert!(json.contains("\"i\":123"), "got {json}");
+        assert!(json.contains("\"f\":1.5"), "got {json}");
+    }
+
+    #[test]
+    fn test_stream_json_double_quoted_non_ascii_and_leading_plus() {
+        // Streaming counterpart of the test above: exercises
+        // stream_transcode_double_quoted_to_json and stream_yaml_scalar_as_json.
+        let yaml = b"s: \"caf\\xe9\"\ni: +123\nf: +1.5\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index.root(yaml).stream_json_document(&mut out).unwrap();
+        assert!(out.contains("\"i\":123"), "got {out}");
+        assert!(out.contains("\"f\":1.5"), "got {out}");
+    }
+
+    #[test]
     fn test_decode_double_quoted_space_escape() {
         let s = YamlString::DoubleQuoted {
             text: b"\"spaced\\ word\"",

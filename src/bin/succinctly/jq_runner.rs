@@ -576,6 +576,33 @@ impl OutputConfig {
     }
 }
 
+/// Trim leading and trailing ASCII whitespace from a byte slice.
+///
+/// Equivalent to `<[u8]>::trim_ascii` but usable on our MSRV (1.73), which
+/// predates that method's stabilization (1.80).
+fn trim_ascii_ws(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |p| p + 1);
+    &bytes[start..end]
+}
+
+/// Determine the `-e`/`--exit-status` value for a raw JSON token emitted on the
+/// identity fast path. Only the bare `null` and `false` literals are falsy; a
+/// quoted `"false"`/`"null"` string or any number stays truthy.
+fn identity_exit_status_value(json_bytes: &[u8]) -> OwnedValue {
+    match trim_ascii_ws(json_bytes) {
+        b"null" => OwnedValue::Null,
+        b"false" => OwnedValue::Bool(false),
+        _ => OwnedValue::Bool(true),
+    }
+}
+
 /// Validate JSON bytes and print a formatted error message if invalid.
 /// Returns Ok(()) if valid, Err with exit code if invalid.
 fn validate_json_input(input: &[u8], filename: Option<&str>) -> Result<(), i32> {
@@ -851,12 +878,12 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // This avoids building the index and materializing JqValue, saving significant memory.
                 if use_identity_fast_path {
                     had_output = true;
-                    // For exit_status, identity on valid JSON is not null/false
+                    // For exit_status, inspect the raw JSON token so that `null`
+                    // and `false` inputs still produce the falsy exit code (jq: 1)
+                    // on the identity fast path. Only these two literals are falsy;
+                    // a quoted "false"/"null" string or any number stays truthy.
                     if args.exit_status {
-                        // Parse minimally just to check the type for exit_status
-                        // For now, assume it's a truthy value (not null or false)
-                        // A more thorough check would parse the first token
-                        last_output = Some(OwnedValue::Bool(true));
+                        last_output = Some(identity_exit_status_value(json_bytes));
                     }
                     out.write_all(json_bytes)?;
                     out.write_all(b"\n")?;
@@ -2577,6 +2604,34 @@ fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_trim_ascii_ws() {
+        assert_eq!(trim_ascii_ws(b"  x  "), b"x");
+        assert_eq!(trim_ascii_ws(b"abc"), b"abc");
+        assert_eq!(trim_ascii_ws(b"\t\n false \r\n"), b"false");
+        assert_eq!(trim_ascii_ws(b"   "), b"");
+        assert_eq!(trim_ascii_ws(b""), b"");
+    }
+
+    #[test]
+    fn test_identity_exit_status_value() {
+        // Only the bare `null`/`false` literals (ignoring surrounding
+        // whitespace) are falsy on the identity fast path.
+        assert_eq!(identity_exit_status_value(b"null"), OwnedValue::Null);
+        assert_eq!(identity_exit_status_value(b"  null\n"), OwnedValue::Null);
+        assert_eq!(
+            identity_exit_status_value(b"false"),
+            OwnedValue::Bool(false)
+        );
+        assert_eq!(identity_exit_status_value(b"true"), OwnedValue::Bool(true));
+        assert_eq!(identity_exit_status_value(b"0"), OwnedValue::Bool(true));
+        // Quoted strings are truthy, not the falsy literals.
+        assert_eq!(
+            identity_exit_status_value(b"\"false\""),
+            OwnedValue::Bool(true)
+        );
+    }
 
     #[test]
     fn test_parse_json_value() {

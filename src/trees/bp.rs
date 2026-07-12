@@ -2566,6 +2566,54 @@ mod tests {
         assert_eq!(bp.excess(3), 0); // after second close (balanced)
     }
 
+    /// Build `depth` opens followed by `depth` closes: `(((...)))`.
+    /// The excess peaks at `depth` in the middle.
+    fn deeply_nested(depth: usize) -> (Vec<u64>, usize) {
+        let total = 2 * depth;
+        let mut words = vec![0u64; total.div_ceil(64)];
+        for i in 0..depth {
+            words[i / 64] |= 1u64 << (i % 64);
+        }
+        (words, total)
+    }
+
+    #[test]
+    fn test_bp_deep_nesting_navigation() {
+        // Deep (but within the i16 excess range) nesting exercises the L1/L2
+        // excess directory and multi-level find_close/find_open/enclose with a
+        // test that actually runs. Complements the ignored #188 ceiling test.
+        let depth = 1_000usize;
+        let (words, len) = deeply_nested(depth);
+        let bp = BalancedParens::new(words, len);
+        assert_eq!(bp.excess(depth - 1), depth as i32);
+        assert_eq!(bp.excess(len - 1), 0);
+        assert_eq!(bp.find_close(0), Some(len - 1));
+        assert_eq!(bp.find_close(depth - 1), Some(depth));
+        assert_eq!(bp.find_open(len - 1), Some(0));
+        assert_eq!(bp.find_open(depth), Some(depth - 1));
+        assert_eq!(bp.enclose(depth - 1), Some(depth - 2));
+        assert_eq!(bp.enclose(0), None);
+    }
+
+    #[test]
+    #[ignore = "blocked on #188: L1/L2 excess counters are i16 and overflow past \
+                32767-deep nesting (build panics in debug at bp.rs ~1639, \
+                silently wraps in release). Un-ignore once #188 widens the \
+                counters (including the SIMD build path); run with --ignored to \
+                reproduce the overflow today."]
+    fn test_bp_nesting_beyond_i16_excess() {
+        // Overflow ceiling for #188 -- CONFIRMED failing today. Build a chain
+        // 40_000 deep (> i16::MAX) and require navigation to stay correct past
+        // the boundary; see test_bp_deep_nesting_navigation for the same
+        // assertions at a safe depth.
+        let depth = 40_000usize;
+        let (words, len) = deeply_nested(depth);
+        let bp = BalancedParens::new(words, len);
+        assert_eq!(bp.excess(depth - 1), depth as i32);
+        assert_eq!(bp.find_close(32767), Some(len - 1 - 32767));
+        assert_eq!(bp.enclose(33000), Some(32999));
+    }
+
     #[test]
     fn test_word_min_excess() {
         // "()" = 0b01 - open at 0, close at 1
