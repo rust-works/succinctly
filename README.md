@@ -24,7 +24,7 @@ Succinctly provides space-efficient data structures with fast rank and select op
 
 Unlike traditional parsers that build a complete in-memory representation (DOM) of documents, succinctly uses **semi-indexing**: it builds a lightweight structural index (~3-6% overhead) and extracts values lazily on demand. This approach offers:
 
-- **17-46x less memory** than DOM parsers (index is ~24% of input vs 600-800% for DOM)
+- **18-46x less memory** than DOM parsers (index is ~24% of input vs 600-800% for DOM)
 - **Faster queries** because only accessed values are materialized
 - **Streaming output** without intermediate allocations
 

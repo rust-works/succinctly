@@ -140,7 +140,7 @@ Note: Numbers in parentheses show ratio to original JSON size. Succinctly uses ~
 1. **sonic-rs is fastest** for both parse-only and parse+traverse
 2. **succinctly is 2nd fastest** at 78-90% of sonic-rs parse speed
 3. **simd-json performs better on ARM** than x86 (relatively) - 200+ MiB/s vs baseline
-4. **succinctly uses 17-46x less memory** than other parsers
+4. **succinctly uses 18-46x less memory** than other parsers
 
 ### x86_64 Performance (AMD Zen 4)
 
@@ -466,7 +466,7 @@ cargo bench --bench json_parsers -- "100mb"
 | **Parse-Only (100MB)**     | **2nd** | 554 MiB/s  | 80% of sonic-rs, 3.5x faster than serde_json |
 | **Parse+Traverse (10MB)**  | **2nd** | 284 MiB/s  | 65% of sonic-rs, 1.9x faster than serde_json |
 | **Parse+Traverse (100MB)** | **2nd** | 290 MiB/s  | 66% of sonic-rs, 2.1x faster than serde_json |
-| **Memory Overhead**        | **1st** | 46%        | 17-46x less than DOM parsers                 |
+| **Memory Overhead**        | **1st** | 46%        | 18-46x less than DOM parsers                 |
 
 ### x86_64 (AMD Zen 4)
 

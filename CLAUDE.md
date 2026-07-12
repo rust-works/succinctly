@@ -39,7 +39,7 @@ Succinctly is a high-performance Rust library implementing succinct data structu
 
 Succinctly uses **semi-indexing** rather than traditional DOM parsing. Instead of building a complete in-memory tree, it creates a lightweight structural index (~3-6% overhead) and extracts values lazily. This enables:
 
-- **17-46x less memory** than DOM parsers
+- **18-46x less memory** than DOM parsers
 - **Fast queries** because only accessed values are materialized
 - **Streaming output** without intermediate allocations
 
