@@ -6,7 +6,7 @@
 //! # Data Structures
 //!
 //! - [`BitVec`] - Main bitvector with integrated rank/select indices
-//! - [`RankDirectory`] - 3-level Poppy-style rank index (~3% overhead)
+//! - [`RankDirectory`] - 3-level Poppy-style rank index (~25% overhead, cache-aligned)
 //! - [`SelectIndex`] - Sampled select index (~1-3% overhead)
 //! - [`EliasFano`](crate::bits::EliasFano) - Elias-Fano encoding for monotone integer sequences
 //!

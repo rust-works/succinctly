@@ -1,7 +1,9 @@
 //! Rank directory for O(1) rank queries.
 //!
 //! This module implements a Poppy-style 3-level rank directory that provides
-//! O(1) rank queries with ~3% space overhead.
+//! O(1) rank queries. It stores one cache-aligned 128-bit entry (L1 + packed
+//! L2 offsets) per 512-bit block, so the metadata overhead is ~25% of the
+//! bitvector size (16 bytes per 64-byte block).
 
 #[cfg(not(test))]
 use alloc::vec::Vec;
@@ -346,8 +348,9 @@ impl<'de> Deserialize<'de> for CacheAlignedL1L2 {
 /// to minimize cache line crossings during queries. Since each entry is 16 bytes,
 /// 4 entries fit per 64-byte cache line.
 ///
-/// Total overhead: 128 bits per 512 bits = 25% before optimization.
-/// With packing optimizations: ~3% for typical use cases.
+/// Total overhead: 128 bits of metadata per 512 bits of data = ~25%
+/// (16 bytes per 64-byte block). The cache-aligned layout trades space for
+/// query speed; it is not a compact (~3%) rank index.
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct RankDirectory {
