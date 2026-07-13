@@ -4818,4 +4818,35 @@ mod tests {
             Expr::Literal(Literal::String("hello # world".into()))
         );
     }
+
+    #[test]
+    fn test_parse_error_paths() {
+        // Unknown @format.
+        assert!(parse("@foobar")
+            .unwrap_err()
+            .message
+            .contains("unknown format"));
+        // Invalid escape inside a string literal.
+        assert!(parse(r#""\q""#)
+            .unwrap_err()
+            .message
+            .contains("invalid escape"));
+        // Unexpected character where an expression is expected.
+        assert!(parse("%").is_err());
+        // Array index/slice: expected ']' or ':'.
+        assert!(parse(".[1 2]").is_err());
+        // Object: expected ',' or '}'.
+        assert!(parse("{a: 1 c: 2}").is_err());
+        // Grouping: expected ')', found another char.
+        assert!(parse("(.foo]").is_err());
+        // Grouping: expected ')', found end of input.
+        assert!(parse("(.foo").is_err());
+    }
+
+    #[test]
+    fn test_parse_number_exponent_sign() {
+        // Exercises the optional +/- sign branch in exponent parsing.
+        assert!(parse("1e+5").is_ok());
+        assert!(parse("1e-5").is_ok());
+    }
 }

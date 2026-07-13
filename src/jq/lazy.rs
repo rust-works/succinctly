@@ -793,4 +793,25 @@ mod tests {
         // cursor_val should preserve "4e4", computed_val is "100"
         assert_eq!(output, "[4e4,100]");
     }
+
+    #[test]
+    fn test_jqvalue_object_constructor() {
+        let obj: JqValue<'_, Vec<u64>> = JqValue::object([("a".to_string(), JqValue::Int(1))]);
+        assert_eq!(obj.to_json_string(), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn test_jqvalue_array_into_owned() {
+        let arr: JqValue<'_, Vec<u64>> = JqValue::Array(vec![JqValue::Int(1), JqValue::Int(2)]);
+        assert_eq!(
+            arr.into_owned(),
+            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
+        );
+    }
+
+    #[test]
+    fn test_jqvalue_float_json() {
+        let f: JqValue<'_, Vec<u64>> = JqValue::Float(2.5);
+        assert_eq!(f.to_json_string(), "2.5");
+    }
 }

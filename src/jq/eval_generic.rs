@@ -1893,4 +1893,39 @@ mod tests {
         assert!(collected[4].is_empty()); // Break
         assert_eq!(collected[5], vec![OwnedValue::Bool(true)]); // Owned
     }
+
+    #[test]
+    fn test_generic_result_one_cursor_streaming() {
+        // at_offset lands on a node and yields a OneCursor result, exercising
+        // the OneCursor arms of collect_owned / stream_json / stream_yaml.
+        let json = br#"{"a": 1}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse("at_offset(6)").unwrap(); // offset 6 == the `1`
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(result.is_single_cursor());
+        let mut j = String::new();
+        result.stream_json(&mut j, |_| Ok(())).unwrap();
+        assert_eq!(j, "1");
+        let mut y = String::new();
+        result.stream_yaml(&mut y, 2, |_| Ok(())).unwrap();
+
+        let result2 = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result2.collect_owned(), vec![OwnedValue::Int(1)]);
+    }
+
+    #[test]
+    fn test_at_position_no_node_and_tonumber_error() {
+        // at_position with an out-of-range line yields the "no node" error.
+        let json = br#"{"a": "xyz"}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse("at_position(99; 1)").unwrap();
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(result.is_error());
+
+        // tonumber on a non-numeric string yields a conversion error.
+        let expr = crate::jq::parse(".a | tonumber").unwrap();
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(result.is_error());
+    }
 }
