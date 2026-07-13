@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // ARM64 NEON SIMD intrinsics
 //! NEON-accelerated DSV indexing for ARM64.
 //!
 //! Processes 64 bytes at a time using ARM NEON SIMD instructions to find
@@ -319,8 +320,7 @@ mod tests {
             let neon_result = unsafe { prefix_xor_neon(pattern) };
             assert_eq!(
                 neon_result, scalar_result,
-                "Mismatch for pattern {:#018x}: NEON={:#018x}, scalar={:#018x}",
-                pattern, neon_result, scalar_result
+                "Mismatch for pattern {pattern:#018x}: NEON={neon_result:#018x}, scalar={scalar_result:#018x}"
             );
         }
     }

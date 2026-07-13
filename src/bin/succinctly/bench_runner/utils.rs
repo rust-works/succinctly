@@ -116,7 +116,7 @@ pub fn format_bytes(bytes: u64) -> String {
     } else if bytes >= 1024 {
         format!("{:.2} KB", bytes as f64 / 1024.0)
     } else {
-        format!("{} bytes", bytes)
+        format!("{bytes} bytes")
     }
 }
 
@@ -129,7 +129,7 @@ pub fn format_memory_fixed(bytes: u64) -> String {
     } else if bytes >= 1024 {
         format!("{:>4.0} KB", bytes as f64 / 1024.0)
     } else {
-        format!("{:>4} B ", bytes)
+        format!("{bytes:>4} B ")
     }
 }
 
@@ -138,8 +138,8 @@ pub fn format_time_fixed(ms: f64) -> String {
     if ms >= 1000.0 {
         format!("{:>7.2}s", ms / 1000.0)
     } else {
-        let ms_str = format!("{:.1}ms", ms);
-        format!("{:>8}", ms_str)
+        let ms_str = format!("{ms:.1}ms");
+        format!("{ms_str:>8}")
     }
 }
 
@@ -148,13 +148,13 @@ pub fn format_duration(seconds: f64) -> String {
     if seconds >= 3600.0 {
         let hours = (seconds / 3600.0).floor();
         let mins = ((seconds % 3600.0) / 60.0).floor();
-        format!("{:.0}h {:.0}m", hours, mins)
+        format!("{hours:.0}h {mins:.0}m")
     } else if seconds >= 60.0 {
         let mins = (seconds / 60.0).floor();
         let secs = seconds % 60.0;
-        format!("{:.0}m {:.0}s", mins, secs)
+        format!("{mins:.0}m {secs:.0}s")
     } else {
-        format!("{:.1}s", seconds)
+        format!("{seconds:.1}s")
     }
 }
 
@@ -172,7 +172,7 @@ pub fn run_command_with_timing(program: &str, args: &[&str]) -> Result<TimingRes
         let output = Command::new(program)
             .args(args)
             .output()
-            .with_context(|| format!("Failed to run {}", program))?;
+            .with_context(|| format!("Failed to run {program}"))?;
         (output.stdout, 0, 0.0, 0.0)
     };
 

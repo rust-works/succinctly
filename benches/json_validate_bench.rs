@@ -35,7 +35,7 @@ const BASE_DIR: &str = "data/bench/generated";
 
 /// Load a test file, returning None if it doesn't exist
 fn load_file(pattern: &str, size: &str) -> Option<Vec<u8>> {
-    let path = format!("{}/{}/{}.json", BASE_DIR, pattern, size);
+    let path = format!("{BASE_DIR}/{pattern}/{size}.json");
     let path = Path::new(&path);
     if !path.exists() {
         return None;
@@ -47,7 +47,7 @@ fn load_file(pattern: &str, size: &str) -> Option<Vec<u8>> {
 fn bench_validate_by_size(c: &mut Criterion) {
     // Group benchmarks by size
     for size in SIZES {
-        let mut group = c.benchmark_group(format!("validate_{}", size));
+        let mut group = c.benchmark_group(format!("validate_{size}"));
 
         for pattern in PATTERNS {
             let Some(bytes) = load_file(pattern, size) else {
@@ -60,7 +60,7 @@ fn bench_validate_by_size(c: &mut Criterion) {
                 b.iter(|| {
                     let result = validate::validate(black_box(bytes));
                     black_box(result)
-                })
+                });
             });
         }
 
@@ -72,7 +72,7 @@ fn bench_validate_by_size(c: &mut Criterion) {
 fn bench_validate_by_pattern(c: &mut Criterion) {
     // Focus on comprehensive pattern as it tests all JSON features
     let pattern = "comprehensive";
-    let mut group = c.benchmark_group(format!("validate_{}", pattern));
+    let mut group = c.benchmark_group(format!("validate_{pattern}"));
 
     for size in SIZES {
         let Some(bytes) = load_file(pattern, size) else {
@@ -85,7 +85,7 @@ fn bench_validate_by_pattern(c: &mut Criterion) {
             b.iter(|| {
                 let result = validate::validate(black_box(bytes));
                 black_box(result)
-            })
+            });
         });
     }
 
@@ -108,7 +108,7 @@ fn bench_validate_large_files(c: &mut Criterion) {
             b.iter(|| {
                 let result = validate::validate(black_box(bytes));
                 black_box(result)
-            })
+            });
         });
     }
 
@@ -128,7 +128,7 @@ fn verify_all_files_valid(c: &mut Criterion) {
         for size in SIZES {
             if let Some(bytes) = load_file(pattern, size) {
                 total_bytes += bytes.len() as u64;
-                all_files.push((format!("{}/{}", pattern, size), bytes));
+                all_files.push((format!("{pattern}/{size}"), bytes));
             }
         }
     }
@@ -146,11 +146,11 @@ fn verify_all_files_valid(c: &mut Criterion) {
             for (name, bytes) in &all_files {
                 match validate::validate(black_box(bytes)) {
                     Ok(()) => valid_count += 1,
-                    Err(e) => panic!("Validation failed for {}: {:?}", name, e),
+                    Err(e) => panic!("Validation failed for {name}: {e:?}"),
                 }
             }
             valid_count
-        })
+        });
     });
 
     group.finish();

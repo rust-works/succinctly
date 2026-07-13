@@ -35,24 +35,24 @@ mod x86_simd_levels {
 
             // SSE2 (always available on x86_64)
             let sse2 = json::simd::x86::build_semi_index_standard(json);
-            assert_eq!(sse2.ib, scalar.ib, "{}: SSE2 IB mismatch", name);
-            assert_eq!(sse2.bp, scalar.bp, "{}: SSE2 BP mismatch", name);
-            assert_eq!(sse2.state, scalar.state, "{}: SSE2 state mismatch", name);
+            assert_eq!(sse2.ib, scalar.ib, "{name}: SSE2 IB mismatch");
+            assert_eq!(sse2.bp, scalar.bp, "{name}: SSE2 BP mismatch");
+            assert_eq!(sse2.state, scalar.state, "{name}: SSE2 state mismatch");
 
             // SSE4.2 (if supported)
             if is_x86_feature_detected!("sse4.2") {
                 let sse42 = json::simd::sse42::build_semi_index_standard(json);
-                assert_eq!(sse42.ib, scalar.ib, "{}: SSE4.2 IB mismatch", name);
-                assert_eq!(sse42.bp, scalar.bp, "{}: SSE4.2 BP mismatch", name);
-                assert_eq!(sse42.state, scalar.state, "{}: SSE4.2 state mismatch", name);
+                assert_eq!(sse42.ib, scalar.ib, "{name}: SSE4.2 IB mismatch");
+                assert_eq!(sse42.bp, scalar.bp, "{name}: SSE4.2 BP mismatch");
+                assert_eq!(sse42.state, scalar.state, "{name}: SSE4.2 state mismatch");
             }
 
             // AVX2 (if supported)
             if is_x86_feature_detected!("avx2") {
                 let avx2 = json::simd::avx2::build_semi_index_standard(json);
-                assert_eq!(avx2.ib, scalar.ib, "{}: AVX2 IB mismatch", name);
-                assert_eq!(avx2.bp, scalar.bp, "{}: AVX2 BP mismatch", name);
-                assert_eq!(avx2.state, scalar.state, "{}: AVX2 state mismatch", name);
+                assert_eq!(avx2.ib, scalar.ib, "{name}: AVX2 IB mismatch");
+                assert_eq!(avx2.bp, scalar.bp, "{name}: AVX2 BP mismatch");
+                assert_eq!(avx2.state, scalar.state, "{name}: AVX2 state mismatch");
             }
         }
     }
@@ -65,24 +65,24 @@ mod x86_simd_levels {
 
             // SSE2 (always available on x86_64)
             let sse2 = json::simd::x86::build_semi_index_simple(json);
-            assert_eq!(sse2.ib, scalar.ib, "{}: SSE2 IB mismatch", name);
-            assert_eq!(sse2.bp, scalar.bp, "{}: SSE2 BP mismatch", name);
-            assert_eq!(sse2.state, scalar.state, "{}: SSE2 state mismatch", name);
+            assert_eq!(sse2.ib, scalar.ib, "{name}: SSE2 IB mismatch");
+            assert_eq!(sse2.bp, scalar.bp, "{name}: SSE2 BP mismatch");
+            assert_eq!(sse2.state, scalar.state, "{name}: SSE2 state mismatch");
 
             // SSE4.2 (if supported)
             if is_x86_feature_detected!("sse4.2") {
                 let sse42 = json::simd::sse42::build_semi_index_simple(json);
-                assert_eq!(sse42.ib, scalar.ib, "{}: SSE4.2 IB mismatch", name);
-                assert_eq!(sse42.bp, scalar.bp, "{}: SSE4.2 BP mismatch", name);
-                assert_eq!(sse42.state, scalar.state, "{}: SSE4.2 state mismatch", name);
+                assert_eq!(sse42.ib, scalar.ib, "{name}: SSE4.2 IB mismatch");
+                assert_eq!(sse42.bp, scalar.bp, "{name}: SSE4.2 BP mismatch");
+                assert_eq!(sse42.state, scalar.state, "{name}: SSE4.2 state mismatch");
             }
 
             // AVX2 (if supported)
             if is_x86_feature_detected!("avx2") {
                 let avx2 = json::simd::avx2::build_semi_index_simple(json);
-                assert_eq!(avx2.ib, scalar.ib, "{}: AVX2 IB mismatch", name);
-                assert_eq!(avx2.bp, scalar.bp, "{}: AVX2 BP mismatch", name);
-                assert_eq!(avx2.state, scalar.state, "{}: AVX2 state mismatch", name);
+                assert_eq!(avx2.ib, scalar.ib, "{name}: AVX2 IB mismatch");
+                assert_eq!(avx2.bp, scalar.bp, "{name}: AVX2 BP mismatch");
+                assert_eq!(avx2.state, scalar.state, "{name}: AVX2 state mismatch");
             }
         }
     }
@@ -95,23 +95,21 @@ mod x86_simd_levels {
 
             if is_x86_feature_detected!("sse4.2") {
                 let sse42 = json::simd::sse42::build_semi_index_standard(json);
-                assert_eq!(sse42.ib, sse2.ib, "{}: SSE4.2 vs SSE2 IB mismatch", name);
-                assert_eq!(sse42.bp, sse2.bp, "{}: SSE4.2 vs SSE2 BP mismatch", name);
+                assert_eq!(sse42.ib, sse2.ib, "{name}: SSE4.2 vs SSE2 IB mismatch");
+                assert_eq!(sse42.bp, sse2.bp, "{name}: SSE4.2 vs SSE2 BP mismatch");
                 assert_eq!(
                     sse42.state, sse2.state,
-                    "{}: SSE4.2 vs SSE2 state mismatch",
-                    name
+                    "{name}: SSE4.2 vs SSE2 state mismatch"
                 );
             }
 
             if is_x86_feature_detected!("avx2") {
                 let avx2 = json::simd::avx2::build_semi_index_standard(json);
-                assert_eq!(avx2.ib, sse2.ib, "{}: AVX2 vs SSE2 IB mismatch", name);
-                assert_eq!(avx2.bp, sse2.bp, "{}: AVX2 vs SSE2 BP mismatch", name);
+                assert_eq!(avx2.ib, sse2.ib, "{name}: AVX2 vs SSE2 IB mismatch");
+                assert_eq!(avx2.bp, sse2.bp, "{name}: AVX2 vs SSE2 BP mismatch");
                 assert_eq!(
                     avx2.state, sse2.state,
-                    "{}: AVX2 vs SSE2 state mismatch",
-                    name
+                    "{name}: AVX2 vs SSE2 state mismatch"
                 );
             }
         }
@@ -124,23 +122,21 @@ mod x86_simd_levels {
 
             if is_x86_feature_detected!("sse4.2") {
                 let sse42 = json::simd::sse42::build_semi_index_simple(json);
-                assert_eq!(sse42.ib, sse2.ib, "{}: SSE4.2 vs SSE2 IB mismatch", name);
-                assert_eq!(sse42.bp, sse2.bp, "{}: SSE4.2 vs SSE2 BP mismatch", name);
+                assert_eq!(sse42.ib, sse2.ib, "{name}: SSE4.2 vs SSE2 IB mismatch");
+                assert_eq!(sse42.bp, sse2.bp, "{name}: SSE4.2 vs SSE2 BP mismatch");
                 assert_eq!(
                     sse42.state, sse2.state,
-                    "{}: SSE4.2 vs SSE2 state mismatch",
-                    name
+                    "{name}: SSE4.2 vs SSE2 state mismatch"
                 );
             }
 
             if is_x86_feature_detected!("avx2") {
                 let avx2 = json::simd::avx2::build_semi_index_simple(json);
-                assert_eq!(avx2.ib, sse2.ib, "{}: AVX2 vs SSE2 IB mismatch", name);
-                assert_eq!(avx2.bp, sse2.bp, "{}: AVX2 vs SSE2 BP mismatch", name);
+                assert_eq!(avx2.ib, sse2.ib, "{name}: AVX2 vs SSE2 IB mismatch");
+                assert_eq!(avx2.bp, sse2.bp, "{name}: AVX2 vs SSE2 BP mismatch");
                 assert_eq!(
                     avx2.state, sse2.state,
-                    "{}: AVX2 vs SSE2 state mismatch",
-                    name
+                    "{name}: AVX2 vs SSE2 state mismatch"
                 );
             }
         }
@@ -175,13 +171,13 @@ mod x86_simd_levels {
             let scalar = json::standard::build_semi_index(json);
             let sse2 = json::simd::x86::build_semi_index_standard(json);
 
-            assert_eq!(sse2.ib, scalar.ib, "{}: SSE2 IB mismatch", name);
-            assert_eq!(sse2.bp, scalar.bp, "{}: SSE2 BP mismatch", name);
+            assert_eq!(sse2.ib, scalar.ib, "{name}: SSE2 IB mismatch");
+            assert_eq!(sse2.bp, scalar.bp, "{name}: SSE2 BP mismatch");
 
             if is_x86_feature_detected!("avx2") {
                 let avx2 = json::simd::avx2::build_semi_index_standard(json);
-                assert_eq!(avx2.ib, scalar.ib, "{}: AVX2 IB mismatch", name);
-                assert_eq!(avx2.bp, scalar.bp, "{}: AVX2 BP mismatch", name);
+                assert_eq!(avx2.ib, scalar.ib, "{name}: AVX2 IB mismatch");
+                assert_eq!(avx2.bp, scalar.bp, "{name}: AVX2 BP mismatch");
             }
         }
     }

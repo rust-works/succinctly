@@ -197,12 +197,12 @@ fn generate_phi_table() -> [u32; 256] {
 
 fn format_table(table: &[u32; 256], name: &str) -> String {
     let mut output = String::new();
-    output.push_str(&format!("pub const {}: [u32; 256] = [\n", name));
+    output.push_str(&format!("pub const {name}: [u32; 256] = [\n"));
 
     for chunk in table.chunks(8) {
         output.push_str("    ");
         for (i, &entry) in chunk.iter().enumerate() {
-            output.push_str(&format!("0x{:08X}", entry));
+            output.push_str(&format!("0x{entry:08X}"));
             if i < chunk.len() - 1 {
                 output.push_str(", ");
             }
@@ -268,8 +268,7 @@ fn main() {
             let bp_open = (phi >> 1) & 1;
             let ib = (phi >> 2) & 1;
             eprintln!(
-                "  {:?} -> {:?}, phi=0b{:03b} (IB={}, BP_open={}, BP_close={})",
-                state, next, phi, ib, bp_open, bp_close
+                "  {state:?} -> {next:?}, phi=0b{phi:03b} (IB={ib}, BP_open={bp_open}, BP_close={bp_close})"
             );
         }
     }

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // runtime SIMD feature dispatch
 //! SIMD-accelerated JSON semi-indexing.
 //!
 //! This module provides vectorized implementations of JSON semi-indexing

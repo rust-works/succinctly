@@ -33,18 +33,18 @@ pub enum Expr {
     Iterate,
 
     /// Optional access: `.foo?` - returns null instead of error if missing
-    Optional(Box<Expr>),
+    Optional(Box<Self>),
 
     /// Chained expressions: `.foo.bar[0]`
     /// Each element is applied in sequence to the result of the previous.
-    Pipe(Vec<Expr>),
+    Pipe(Vec<Self>),
 
     /// Comma operator: `.foo, .bar` - outputs from both expressions
-    Comma(Vec<Expr>),
+    Comma(Vec<Self>),
 
     /// Array construction: `[.foo, .bar]` or `[.items[]]`
     /// Collects all outputs from the inner expression into an array.
-    Array(Box<Expr>),
+    Array(Box<Self>),
 
     /// Object construction: `{foo: .bar, baz: .qux}`
     /// Each entry is (key_expr, value_expr). Key can be literal or dynamic.
@@ -59,53 +59,53 @@ pub enum Expr {
 
     /// Parenthesized expression (for grouping)
     /// This is mostly handled by the parser, but we keep it for clarity.
-    Paren(Box<Expr>),
+    Paren(Box<Self>),
 
     /// Arithmetic operation: `.a + .b`, `.a - .b`, `.a * .b`, `.a / .b`, `.a % .b`
     Arithmetic {
         op: ArithOp,
-        left: Box<Expr>,
-        right: Box<Expr>,
+        left: Box<Self>,
+        right: Box<Self>,
     },
 
     /// Comparison operation: `.a == .b`, `.a != .b`, `.a < .b`, etc.
     Compare {
         op: CompareOp,
-        left: Box<Expr>,
-        right: Box<Expr>,
+        left: Box<Self>,
+        right: Box<Self>,
     },
 
     /// Boolean AND: `.a and .b`
-    And(Box<Expr>, Box<Expr>),
+    And(Box<Self>, Box<Self>),
 
     /// Boolean OR: `.a or .b`
-    Or(Box<Expr>, Box<Expr>),
+    Or(Box<Self>, Box<Self>),
 
     /// Boolean NOT: `not` (unary, applied via pipe)
     Not,
 
     /// Alternative operator: `.foo // "default"`
     /// Returns left if truthy, otherwise right.
-    Alternative(Box<Expr>, Box<Expr>),
+    Alternative(Box<Self>, Box<Self>),
 
     /// If-then-else conditional: `if .foo then .bar else .baz end`
     /// elif is desugared to nested If during parsing.
     If {
-        cond: Box<Expr>,
-        then_branch: Box<Expr>,
-        else_branch: Box<Expr>,
+        cond: Box<Self>,
+        then_branch: Box<Self>,
+        else_branch: Box<Self>,
     },
 
     /// Try-catch error handling: `try .foo catch "default"`
     /// If catch is None, errors are silently suppressed (outputs nothing).
     Try {
-        expr: Box<Expr>,
-        catch: Option<Box<Expr>>,
+        expr: Box<Self>,
+        catch: Option<Box<Self>>,
     },
 
     /// Error raising: `error` or `error("message")`
     /// Raises an error that can be caught by try-catch.
-    Error(Option<Box<Expr>>),
+    Error(Option<Box<Self>>),
 
     /// Builtin function call: `type`, `length`, `keys`, etc.
     Builtin(Builtin),
@@ -121,11 +121,11 @@ pub enum Expr {
     /// Variable binding: `.foo as $x | .bar + $x`
     As {
         /// Expression to evaluate and bind
-        expr: Box<Expr>,
+        expr: Box<Self>,
         /// Variable name (without the $)
         var: String,
         /// Body expression where the variable is in scope
-        body: Box<Expr>,
+        body: Box<Self>,
     },
 
     /// Variable reference: `$x`
@@ -146,60 +146,60 @@ pub enum Expr {
     /// Reduce: `reduce .[] as $x (0; . + $x)`
     Reduce {
         /// Input expression (what to iterate over)
-        input: Box<Expr>,
+        input: Box<Self>,
         /// Variable name for each element
         var: String,
         /// Initial accumulator value
-        init: Box<Expr>,
+        init: Box<Self>,
         /// Update expression (has access to accumulator via . and element via $var)
-        update: Box<Expr>,
+        update: Box<Self>,
     },
 
     /// Foreach: `foreach .[] as $x (0; . + 1)` or `foreach .[] as $x (0; . + 1; .)`
     Foreach {
         /// Input expression
-        input: Box<Expr>,
+        input: Box<Self>,
         /// Variable name for each element
         var: String,
         /// Initial accumulator value
-        init: Box<Expr>,
+        init: Box<Self>,
         /// Update expression
-        update: Box<Expr>,
+        update: Box<Self>,
         /// Extract expression (optional, defaults to identity)
-        extract: Option<Box<Expr>>,
+        extract: Option<Box<Self>>,
     },
 
     /// Limit: `limit(n; expr)` - take first n outputs
     Limit {
         /// Number of outputs to take
-        n: Box<Expr>,
+        n: Box<Self>,
         /// Expression to limit
-        expr: Box<Expr>,
+        expr: Box<Self>,
     },
 
     /// First with expression: `first(expr)` - first output of expr
-    FirstExpr(Box<Expr>),
+    FirstExpr(Box<Self>),
 
     /// Last with expression: `last(expr)` - last output of expr
-    LastExpr(Box<Expr>),
+    LastExpr(Box<Self>),
 
     /// Nth with expression: `nth(n; expr)` - nth output of expr
-    NthExpr { n: Box<Expr>, expr: Box<Expr> },
+    NthExpr { n: Box<Self>, expr: Box<Self> },
 
     /// Until: `until(cond; update)` - loop until condition is true
-    Until { cond: Box<Expr>, update: Box<Expr> },
+    Until { cond: Box<Self>, update: Box<Self> },
 
     /// While: `while(cond; update)` - loop while condition is true
-    While { cond: Box<Expr>, update: Box<Expr> },
+    While { cond: Box<Self>, update: Box<Self> },
 
     /// Repeat: `repeat(expr)` - infinite repetition
-    Repeat(Box<Expr>),
+    Repeat(Box<Self>),
 
     /// Range: `range(n)` or `range(a;b)` or `range(a;b;step)`
     Range {
-        from: Box<Expr>,
-        to: Option<Box<Expr>>,
-        step: Option<Box<Expr>>,
+        from: Box<Self>,
+        to: Option<Box<Self>>,
+        step: Option<Box<Self>>,
     },
 
     /// Label for non-local control flow: `label $name | expr`
@@ -208,7 +208,7 @@ pub enum Expr {
         /// Label name (without the $)
         name: String,
         /// Body expression
-        body: Box<Expr>,
+        body: Box<Self>,
     },
 
     /// Break from a labeled scope: `break $name`
@@ -220,11 +220,11 @@ pub enum Expr {
     /// or `. as [$first, $second] | ...`
     AsPattern {
         /// Expression to evaluate and destructure
-        expr: Box<Expr>,
+        expr: Box<Self>,
         /// Pattern to match against
         pattern: Pattern,
         /// Body expression where the variables are in scope
-        body: Box<Expr>,
+        body: Box<Self>,
     },
 
     /// Function definition: `def name: body;` or `def name(params): body;`
@@ -235,9 +235,9 @@ pub enum Expr {
         /// Parameter names (empty for no-arg functions)
         params: Vec<String>,
         /// Function body
-        body: Box<Expr>,
+        body: Box<Self>,
         /// Expression where this function is in scope
-        then: Box<Expr>,
+        then: Box<Self>,
     },
 
     /// Function call: `name` or `name(args)`
@@ -245,7 +245,7 @@ pub enum Expr {
         /// Function name
         name: String,
         /// Arguments (empty for no-arg calls)
-        args: Vec<Expr>,
+        args: Vec<Self>,
     },
 
     /// Namespaced function call: `module::func` or `module::func(args)`
@@ -255,7 +255,7 @@ pub enum Expr {
         /// Function name
         name: String,
         /// Arguments (empty for no-arg calls)
-        args: Vec<Expr>,
+        args: Vec<Self>,
     },
 
     // Assignment operators
@@ -263,18 +263,18 @@ pub enum Expr {
     /// Sets the path to the value and returns the modified input.
     Assign {
         /// Path expression (left side)
-        path: Box<Expr>,
+        path: Box<Self>,
         /// Value expression (right side)
-        value: Box<Expr>,
+        value: Box<Self>,
     },
 
     /// Update assignment: `.a |= f`
     /// Applies filter f to the value at path and updates it.
     Update {
         /// Path expression (left side)
-        path: Box<Expr>,
+        path: Box<Self>,
         /// Filter expression (right side)
-        filter: Box<Expr>,
+        filter: Box<Self>,
     },
 
     /// Compound assignment: `.a += value`, `.a -= value`, etc.
@@ -283,18 +283,18 @@ pub enum Expr {
         /// Assignment operator type
         op: AssignOp,
         /// Path expression (left side)
-        path: Box<Expr>,
+        path: Box<Self>,
         /// Value expression (right side)
-        value: Box<Expr>,
+        value: Box<Self>,
     },
 
     /// Alternative assignment: `.a //= value`
     /// Sets path to value only if current value is null or false.
     AlternativeAssign {
         /// Path expression (left side)
-        path: Box<Expr>,
+        path: Box<Self>,
         /// Default value expression (right side)
-        value: Box<Expr>,
+        value: Box<Self>,
     },
 }
 
@@ -313,7 +313,7 @@ pub struct Program {
 
 impl Default for Program {
     fn default() -> Self {
-        Program {
+        Self {
             module: None,
             imports: Vec::new(),
             includes: Vec::new(),
@@ -325,7 +325,7 @@ impl Default for Program {
 impl Program {
     /// Create a program from just an expression (no module directives).
     pub fn from_expr(expr: Expr) -> Self {
-        Program {
+        Self {
             module: None,
             imports: Vec::new(),
             includes: Vec::new(),
@@ -351,9 +351,9 @@ pub enum MetaValue {
     /// Boolean value
     Bool(bool),
     /// Array of values
-    Array(Vec<MetaValue>),
+    Array(Vec<Self>),
     /// Nested object
-    Object(BTreeMap<String, MetaValue>),
+    Object(BTreeMap<String, Self>),
 }
 
 /// Import directive: `import "path" as name;` or `import "path" as name { meta };`
@@ -384,7 +384,7 @@ pub enum Pattern {
     /// Object pattern: `{name: $n, age: $a}`
     Object(Vec<PatternEntry>),
     /// Array pattern: `[$first, $second]`
-    Array(Vec<Pattern>),
+    Array(Vec<Self>),
 }
 
 /// An entry in an object destructuring pattern.
@@ -1004,80 +1004,80 @@ pub enum Literal {
 impl Expr {
     /// Create an identity expression.
     pub fn identity() -> Self {
-        Expr::Identity
+        Self::Identity
     }
 
     /// Create a field access expression.
     pub fn field(name: impl Into<String>) -> Self {
-        Expr::Field(name.into())
+        Self::Field(name.into())
     }
 
     /// Create an index expression.
     pub fn index(i: i64) -> Self {
-        Expr::Index(i)
+        Self::Index(i)
     }
 
     /// Create an iterate expression.
     pub fn iterate() -> Self {
-        Expr::Iterate
+        Self::Iterate
     }
 
     /// Create a slice expression.
     pub fn slice(start: Option<i64>, end: Option<i64>) -> Self {
-        Expr::Slice { start, end }
+        Self::Slice { start, end }
     }
 
     /// Make this expression optional.
     pub fn optional(self) -> Self {
-        Expr::Optional(Box::new(self))
+        Self::Optional(Box::new(self))
     }
 
     /// Chain multiple expressions together.
-    pub fn pipe(exprs: Vec<Expr>) -> Self {
+    pub fn pipe(exprs: Vec<Self>) -> Self {
         if exprs.len() == 1 {
             exprs.into_iter().next().unwrap()
         } else {
-            Expr::Pipe(exprs)
+            Self::Pipe(exprs)
         }
     }
 
     /// Create a comma expression (multiple outputs).
-    pub fn comma(exprs: Vec<Expr>) -> Self {
+    pub fn comma(exprs: Vec<Self>) -> Self {
         if exprs.len() == 1 {
             exprs.into_iter().next().unwrap()
         } else {
-            Expr::Comma(exprs)
+            Self::Comma(exprs)
         }
     }
 
     /// Create an array construction expression.
-    pub fn array(inner: Expr) -> Self {
-        Expr::Array(Box::new(inner))
+    pub fn array(inner: Self) -> Self {
+        Self::Array(Box::new(inner))
     }
 
     /// Create an object construction expression.
     pub fn object(entries: Vec<ObjectEntry>) -> Self {
-        Expr::Object(entries)
+        Self::Object(entries)
     }
 
     /// Create a literal expression.
     pub fn literal(lit: Literal) -> Self {
-        Expr::Literal(lit)
+        Self::Literal(lit)
     }
 
     /// Create a recursive descent expression.
     pub fn recursive_descent() -> Self {
-        Expr::RecursiveDescent
+        Self::RecursiveDescent
     }
 
     /// Create a parenthesized expression.
-    pub fn paren(inner: Expr) -> Self {
-        Expr::Paren(Box::new(inner))
+    pub fn paren(inner: Self) -> Self {
+        Self::Paren(Box::new(inner))
     }
 
     /// Create an arithmetic expression.
-    pub fn arithmetic(op: ArithOp, left: Expr, right: Expr) -> Self {
-        Expr::Arithmetic {
+    pub fn arithmetic(op: ArithOp, left: Self, right: Self) -> Self {
+        Self::Arithmetic {
             op,
             left: Box::new(left),
             right: Box::new(right),
@@ -1085,8 +1085,8 @@ impl Expr {
     }
 
     /// Create a comparison expression.
-    pub fn compare(op: CompareOp, left: Expr, right: Expr) -> Self {
-        Expr::Compare {
+    pub fn compare(op: CompareOp, left: Self, right: Self) -> Self {
+        Self::Compare {
             op,
             left: Box::new(left),
             right: Box::new(right),
@@ -1094,28 +1094,28 @@ impl Expr {
     }
 
     /// Create an AND expression.
-    pub fn and(left: Expr, right: Expr) -> Self {
-        Expr::And(Box::new(left), Box::new(right))
+    pub fn and(left: Self, right: Self) -> Self {
+        Self::And(Box::new(left), Box::new(right))
     }
 
     /// Create an OR expression.
-    pub fn or(left: Expr, right: Expr) -> Self {
-        Expr::Or(Box::new(left), Box::new(right))
+    pub fn or(left: Self, right: Self) -> Self {
+        Self::Or(Box::new(left), Box::new(right))
     }
 
     /// Create a NOT expression.
     pub fn not() -> Self {
-        Expr::Not
+        Self::Not
     }
 
     /// Create an alternative expression.
-    pub fn alternative(left: Expr, right: Expr) -> Self {
-        Expr::Alternative(Box::new(left), Box::new(right))
+    pub fn alternative(left: Self, right: Self) -> Self {
+        Self::Alternative(Box::new(left), Box::new(right))
     }
 
     /// Create an if-then-else expression.
-    pub fn if_then_else(cond: Expr, then_branch: Expr, else_branch: Expr) -> Self {
-        Expr::If {
+    pub fn if_then_else(cond: Self, then_branch: Self, else_branch: Self) -> Self {
+        Self::If {
             cond: Box::new(cond),
             then_branch: Box::new(then_branch),
             else_branch: Box::new(else_branch),
@@ -1123,33 +1123,33 @@ impl Expr {
     }
 
     /// Create a try expression.
-    pub fn try_expr(expr: Expr, catch: Option<Expr>) -> Self {
-        Expr::Try {
+    pub fn try_expr(expr: Self, catch: Option<Self>) -> Self {
+        Self::Try {
             expr: Box::new(expr),
             catch: catch.map(Box::new),
         }
     }
 
     /// Create an error expression.
-    pub fn error(msg: Option<Expr>) -> Self {
-        Expr::Error(msg.map(Box::new))
+    pub fn error(msg: Option<Self>) -> Self {
+        Self::Error(msg.map(Box::new))
     }
 
     /// Create a builtin function expression.
     pub fn builtin(b: Builtin) -> Self {
-        Expr::Builtin(b)
+        Self::Builtin(b)
     }
 
     /// Returns true if this is the identity expression.
     pub fn is_identity(&self) -> bool {
-        matches!(self, Expr::Identity)
+        matches!(self, Self::Identity)
     }
 }
 
 impl ObjectEntry {
     /// Create a new object entry with a literal key.
     pub fn new(key: impl Into<String>, value: Expr) -> Self {
-        ObjectEntry {
+        Self {
             key: ObjectKey::Literal(key.into()),
             value,
         }
@@ -1157,7 +1157,7 @@ impl ObjectEntry {
 
     /// Create a new object entry with a dynamic key.
     pub fn dynamic(key_expr: Expr, value: Expr) -> Self {
-        ObjectEntry {
+        Self {
             key: ObjectKey::Expr(Box::new(key_expr)),
             value,
         }
@@ -1167,27 +1167,27 @@ impl ObjectEntry {
 impl Literal {
     /// Create a null literal.
     pub fn null() -> Self {
-        Literal::Null
+        Self::Null
     }
 
     /// Create a boolean literal.
     pub fn bool(b: bool) -> Self {
-        Literal::Bool(b)
+        Self::Bool(b)
     }
 
     /// Create an integer literal.
     pub fn int(n: i64) -> Self {
-        Literal::Int(n)
+        Self::Int(n)
     }
 
     /// Create a float literal.
     pub fn float(f: f64) -> Self {
-        Literal::Float(f)
+        Self::Float(f)
     }
 
     /// Create a string literal.
     pub fn string(s: impl Into<String>) -> Self {
-        Literal::String(s.into())
+        Self::String(s.into())
     }
 }
 
@@ -1262,5 +1262,94 @@ mod tests {
             Expr::literal(Literal::string("hello")),
             Expr::Literal(Literal::String("hello".into()))
         );
+    }
+
+    #[test]
+    fn test_literal_float() {
+        assert_eq!(Literal::float(2.5), Literal::Float(2.5));
+    }
+
+    #[test]
+    fn test_optional_and_paren() {
+        assert_eq!(
+            Expr::field("x").optional(),
+            Expr::Optional(Box::new(Expr::Field("x".into())))
+        );
+        assert_eq!(
+            Expr::paren(Expr::identity()),
+            Expr::Paren(Box::new(Expr::Identity))
+        );
+    }
+
+    #[test]
+    fn test_recursive_descent_and_not() {
+        assert_eq!(Expr::recursive_descent(), Expr::RecursiveDescent);
+        assert_eq!(Expr::not(), Expr::Not);
+    }
+
+    #[test]
+    fn test_arithmetic_and_compare() {
+        let one = || Expr::literal(Literal::int(1));
+        let two = || Expr::literal(Literal::int(2));
+        assert_eq!(
+            Expr::arithmetic(ArithOp::Add, one(), two()),
+            Expr::Arithmetic {
+                op: ArithOp::Add,
+                left: Box::new(Expr::Literal(Literal::Int(1))),
+                right: Box::new(Expr::Literal(Literal::Int(2))),
+            }
+        );
+        assert!(matches!(
+            Expr::compare(CompareOp::Lt, one(), two()),
+            Expr::Compare {
+                op: CompareOp::Lt,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_boolean_and_alternative() {
+        assert!(matches!(
+            Expr::and(Expr::identity(), Expr::identity()),
+            Expr::And(_, _)
+        ));
+        assert!(matches!(
+            Expr::or(Expr::identity(), Expr::identity()),
+            Expr::Or(_, _)
+        ));
+        assert!(matches!(
+            Expr::alternative(Expr::identity(), Expr::literal(Literal::int(0))),
+            Expr::Alternative(_, _)
+        ));
+    }
+
+    #[test]
+    fn test_if_try_error_builtin() {
+        assert!(matches!(
+            Expr::if_then_else(Expr::identity(), Expr::identity(), Expr::identity()),
+            Expr::If { .. }
+        ));
+        assert!(matches!(
+            Expr::try_expr(Expr::identity(), Some(Expr::identity())),
+            Expr::Try { .. }
+        ));
+        assert!(matches!(Expr::error(None), Expr::Error(None)));
+        assert_eq!(Expr::builtin(Builtin::Type), Expr::Builtin(Builtin::Type));
+    }
+
+    #[test]
+    fn test_is_identity() {
+        assert!(Expr::identity().is_identity());
+        assert!(!Expr::field("x").is_identity());
+    }
+
+    #[test]
+    fn test_program_from_expr() {
+        let prog = Program::from_expr(Expr::identity());
+        assert_eq!(prog.expr, Expr::Identity);
+        assert!(prog.module.is_none());
+        assert!(prog.imports.is_empty());
+        assert!(prog.includes.is_empty());
     }
 }

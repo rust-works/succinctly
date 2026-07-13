@@ -38,7 +38,7 @@ fn bench_full_index(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(*file_size));
 
         group.bench_with_input(BenchmarkId::new("JsonIndex", name), &bytes, |b, bytes| {
-            b.iter(|| JsonIndex::build(black_box(bytes)))
+            b.iter(|| JsonIndex::build(black_box(bytes)));
         });
     }
 
@@ -76,12 +76,14 @@ fn bench_pattern_comparison(c: &mut Criterion) {
 
         if is_x86_feature_detected!("avx2") {
             group.bench_with_input(BenchmarkId::new("AVX2", pattern), &bytes, |b, bytes| {
-                b.iter(|| succinctly::json::simd::avx2::build_semi_index_standard(black_box(bytes)))
+                b.iter(|| {
+                    succinctly::json::simd::avx2::build_semi_index_standard(black_box(bytes))
+                });
             });
         }
 
         group.bench_with_input(BenchmarkId::new("PFSM", pattern), &bytes, |b, bytes| {
-            b.iter(|| succinctly::json::standard::build_semi_index(black_box(bytes)))
+            b.iter(|| succinctly::json::standard::build_semi_index(black_box(bytes)));
         });
     }
 
@@ -118,11 +120,11 @@ fn bench_pattern_comparison(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(*file_size));
 
         group.bench_with_input(BenchmarkId::new("NEON", pattern), &bytes, |b, bytes| {
-            b.iter(|| succinctly::json::simd::neon::build_semi_index_standard(black_box(bytes)))
+            b.iter(|| succinctly::json::simd::neon::build_semi_index_standard(black_box(bytes)));
         });
 
         group.bench_with_input(BenchmarkId::new("PFSM", pattern), &bytes, |b, bytes| {
-            b.iter(|| succinctly::json::standard::build_semi_index(black_box(bytes)))
+            b.iter(|| succinctly::json::standard::build_semi_index(black_box(bytes)));
         });
     }
 

@@ -387,7 +387,7 @@ pub struct StructuralPositions<'a, W = Vec<u64>> {
     k: usize,
 }
 
-impl<'a, W: AsRef<[u64]>> Iterator for StructuralPositions<'a, W> {
+impl<W: AsRef<[u64]>> Iterator for StructuralPositions<'_, W> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -405,7 +405,7 @@ pub struct Children<'a, W = Vec<u64>> {
     end_idx: usize,
 }
 
-impl<'a, W: AsRef<[u64]>> Iterator for Children<'a, W> {
+impl<W: AsRef<[u64]>> Iterator for Children<'_, W> {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn test_structural_positions_iterator() {
-        let json = br#"[1,2,3]"#;
+        let json = br"[1,2,3]";
         let index = SimpleJsonIndex::build(json);
 
         let positions: Vec<_> = index.structural_positions(json).collect();

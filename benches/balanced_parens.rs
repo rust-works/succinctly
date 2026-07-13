@@ -145,13 +145,13 @@ fn bench_find_close(c: &mut Criterion) {
             |b, (bp, queries)| {
                 b.iter(|| {
                     let mut sum = 0usize;
-                    for &q in queries.iter() {
+                    for &q in *queries {
                         if let Some(pos) = bp.find_close(black_box(q)) {
                             sum += pos;
                         }
                     }
                     sum
-                })
+                });
             },
         );
 
@@ -162,13 +162,13 @@ fn bench_find_close(c: &mut Criterion) {
             |b, (words, len, queries)| {
                 b.iter(|| {
                     let mut sum = 0usize;
-                    for &q in queries.iter() {
+                    for &q in *queries {
                         if let Some(pos) = bp::find_close(words, *len, black_box(q)) {
                             sum += pos;
                         }
                     }
                     sum
-                })
+                });
             },
         );
     }
@@ -197,13 +197,13 @@ fn bench_find_open(c: &mut Criterion) {
             |b, (bp, queries)| {
                 b.iter(|| {
                     let mut sum = 0usize;
-                    for &q in queries.iter() {
+                    for &q in *queries {
                         if let Some(pos) = bp.find_open(black_box(q)) {
                             sum += pos;
                         }
                     }
                     sum
-                })
+                });
             },
         );
 
@@ -214,13 +214,13 @@ fn bench_find_open(c: &mut Criterion) {
             |b, (words, len, queries)| {
                 b.iter(|| {
                     let mut sum = 0usize;
-                    for &q in queries.iter() {
+                    for &q in *queries {
                         if let Some(pos) = bp::find_open(words, *len, black_box(q)) {
                             sum += pos;
                         }
                     }
                     sum
-                })
+                });
             },
         );
     }
@@ -249,13 +249,13 @@ fn bench_enclose(c: &mut Criterion) {
             |b, (bp, queries)| {
                 b.iter(|| {
                     let mut sum = 0usize;
-                    for &q in queries.iter() {
+                    for &q in *queries {
                         if let Some(pos) = bp.enclose(black_box(q)) {
                             sum += pos;
                         }
                     }
                     sum
-                })
+                });
             },
         );
 
@@ -266,13 +266,13 @@ fn bench_enclose(c: &mut Criterion) {
             |b, (words, len, queries)| {
                 b.iter(|| {
                     let mut sum = 0usize;
-                    for &q in queries.iter() {
+                    for &q in *queries {
                         if let Some(pos) = bp::enclose(words, *len, black_box(q)) {
                             sum += pos;
                         }
                     }
                     sum
-                })
+                });
             },
         );
     }
@@ -293,20 +293,20 @@ fn bench_tree_structures(c: &mut Criterion) {
 
     // Query from root in deep structure
     group.bench_function("deep_10K/rangemin", |b| {
-        b.iter(|| deep_bp.find_close(black_box(0)))
+        b.iter(|| deep_bp.find_close(black_box(0)));
     });
 
     group.bench_function("deep_10K/linear", |b| {
-        b.iter(|| bp::find_close(&deep_words, deep_len, black_box(0)))
+        b.iter(|| bp::find_close(&deep_words, deep_len, black_box(0)));
     });
 
     // Query first pair in flat structure
     group.bench_function("flat_10K/rangemin", |b| {
-        b.iter(|| flat_bp.find_close(black_box(0)))
+        b.iter(|| flat_bp.find_close(black_box(0)));
     });
 
     group.bench_function("flat_10K/linear", |b| {
-        b.iter(|| bp::find_close(&flat_words, flat_len, black_box(0)))
+        b.iter(|| bp::find_close(&flat_words, flat_len, black_box(0)));
     });
 
     group.finish();
@@ -388,7 +388,7 @@ fn bench_navigation(c: &mut Criterion) {
             }
 
             count
-        })
+        });
     });
 
     // Get excess at various positions
@@ -396,11 +396,11 @@ fn bench_navigation(c: &mut Criterion) {
     group.bench_function("excess_1K_queries", |b| {
         b.iter(|| {
             let mut sum = 0i32;
-            for &q in queries.iter() {
+            for &q in &queries {
                 sum += bp.excess(black_box(q));
             }
             sum
-        })
+        });
     });
 
     group.finish();
@@ -429,11 +429,11 @@ fn bench_rank1(c: &mut Criterion) {
             |b, (bp, queries)| {
                 b.iter(|| {
                     let mut sum = 0usize;
-                    for &q in queries.iter() {
+                    for &q in *queries {
                         sum += bp.rank1(black_box(q));
                     }
                     sum
-                })
+                });
             },
         );
     }
@@ -453,11 +453,11 @@ fn bench_excess(c: &mut Criterion) {
     group.bench_function("excess_100K", |b| {
         b.iter(|| {
             let mut sum = 0i32;
-            for &q in queries.iter() {
+            for &q in &queries {
                 sum += bp.excess(black_box(q));
             }
             sum
-        })
+        });
     });
 
     group.finish();

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // x86_64 SSE4.2 SIMD intrinsics
 //! SSE4.2-accelerated JSON semi-indexing for x86_64.
 //!
 //! Processes 16 bytes at a time using x86_64 SSE4.2 PCMPISTRI instructions.
@@ -230,7 +231,7 @@ unsafe fn build_semi_index_standard_sse42(json: &[u8]) -> SemiIndex {
         let mut offset = 0;
 
         while offset + 16 <= json.len() {
-            let chunk = _mm_loadu_si128(json.as_ptr().add(offset) as *const __m128i);
+            let chunk = _mm_loadu_si128(json.as_ptr().add(offset).cast::<__m128i>());
             let class = classify_chars(chunk);
             state =
                 process_chunk_standard(class, state, &mut ib, &mut bp, &json[offset..offset + 16]);
@@ -242,7 +243,7 @@ unsafe fn build_semi_index_standard_sse42(json: &[u8]) -> SemiIndex {
             let remaining = json.len() - offset;
             padded[..remaining].copy_from_slice(&json[offset..]);
 
-            let chunk = _mm_loadu_si128(padded.as_ptr() as *const __m128i);
+            let chunk = _mm_loadu_si128(padded.as_ptr().cast::<__m128i>());
             let class = classify_chars(chunk);
             state = process_chunk_standard(class, state, &mut ib, &mut bp, &json[offset..]);
         }
@@ -334,7 +335,7 @@ unsafe fn build_semi_index_simple_sse42(json: &[u8]) -> SimpleSemiIndex {
         let mut offset = 0;
 
         while offset + 16 <= json.len() {
-            let chunk = _mm_loadu_si128(json.as_ptr().add(offset) as *const __m128i);
+            let chunk = _mm_loadu_si128(json.as_ptr().add(offset).cast::<__m128i>());
             let class = classify_chars(chunk);
             state =
                 process_chunk_simple(class, state, &mut ib, &mut bp, &json[offset..offset + 16]);
@@ -346,7 +347,7 @@ unsafe fn build_semi_index_simple_sse42(json: &[u8]) -> SimpleSemiIndex {
             let remaining = json.len() - offset;
             padded[..remaining].copy_from_slice(&json[offset..]);
 
-            let chunk = _mm_loadu_si128(padded.as_ptr() as *const __m128i);
+            let chunk = _mm_loadu_si128(padded.as_ptr().cast::<__m128i>());
             let class = classify_chars(chunk);
             state = process_chunk_simple(class, state, &mut ib, &mut bp, &json[offset..]);
         }

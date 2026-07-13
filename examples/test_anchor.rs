@@ -10,7 +10,7 @@ fn main() {
 
     println!("\n=== Anchors ===");
     if let Some(anchor_pos) = index.get_anchor_bp_pos("anchor") {
-        println!("Anchor 'anchor' points to bp_pos={}", anchor_pos);
+        println!("Anchor 'anchor' points to bp_pos={anchor_pos}");
         let cursor = index.cursor_at(anchor_pos, yaml);
         println!("  text_pos: {:?}", cursor.text_position());
     }
@@ -22,8 +22,8 @@ fn main() {
             for field in fields {
                 let key = field.key();
                 let val = field.value();
-                println!("Key: {:?}", key);
-                println!("Value: {:?}", val);
+                println!("Key: {key:?}");
+                println!("Value: {val:?}");
             }
         }
     }

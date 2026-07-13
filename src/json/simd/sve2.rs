@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // ARM64 SVE2 SIMD intrinsics
 //! SVE2-accelerated JSON semi-indexing for ARM64.
 //!
 //! Uses SVE2 instructions to classify JSON structural characters in parallel.

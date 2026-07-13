@@ -230,40 +230,40 @@ impl<V: DocumentValue> GenericResult<V> {
     /// Convert to OwnedValue for output.
     pub fn into_owned(self) -> Option<OwnedValue> {
         match self {
-            GenericResult::One(v) => Some(to_owned(&v)),
-            GenericResult::OneCursor(c) => Some(to_owned(&c.value())),
-            GenericResult::Many(vs) => Some(OwnedValue::Array(vs.iter().map(to_owned).collect())),
-            GenericResult::None => None,
-            GenericResult::Error(_) => None,
-            GenericResult::Owned(o) => Some(o),
-            GenericResult::ManyOwned(os) => Some(OwnedValue::Array(os)),
-            GenericResult::Break(_) => None,
+            Self::One(v) => Some(to_owned(&v)),
+            Self::OneCursor(c) => Some(to_owned(&c.value())),
+            Self::Many(vs) => Some(OwnedValue::Array(vs.iter().map(to_owned).collect())),
+            Self::None => None,
+            Self::Error(_) => None,
+            Self::Owned(o) => Some(o),
+            Self::ManyOwned(os) => Some(OwnedValue::Array(os)),
+            Self::Break(_) => None,
         }
     }
 
     /// Collect all results into a Vec of OwnedValues.
     pub fn collect_owned(self) -> Vec<OwnedValue> {
         match self {
-            GenericResult::One(v) => vec![to_owned(&v)],
-            GenericResult::OneCursor(c) => vec![to_owned(&c.value())],
-            GenericResult::Many(vs) => vs.iter().map(to_owned).collect(),
-            GenericResult::None => vec![],
-            GenericResult::Error(_) => vec![],
-            GenericResult::Owned(o) => vec![o],
-            GenericResult::ManyOwned(os) => os,
-            GenericResult::Break(_) => vec![],
+            Self::One(v) => vec![to_owned(&v)],
+            Self::OneCursor(c) => vec![to_owned(&c.value())],
+            Self::Many(vs) => vs.iter().map(to_owned).collect(),
+            Self::None => vec![],
+            Self::Error(_) => vec![],
+            Self::Owned(o) => vec![o],
+            Self::ManyOwned(os) => os,
+            Self::Break(_) => vec![],
         }
     }
 
     /// Check if this is an error.
     pub fn is_error(&self) -> bool {
-        matches!(self, GenericResult::Error(_))
+        matches!(self, Self::Error(_))
     }
 
     /// Get the error if this is an error result.
     pub fn error(&self) -> Option<&EvalError> {
         match self {
-            GenericResult::Error(e) => Some(e),
+            Self::Error(e) => Some(e),
             _ => None,
         }
     }
@@ -284,7 +284,7 @@ impl<V: DocumentValue> GenericResult<V> {
         let mut stats = StreamStats::default();
 
         match self {
-            GenericResult::One(v) => {
+            Self::One(v) => {
                 // Convert to owned for streaming
                 let owned = to_owned(v);
                 owned.stream_json(out)?;
@@ -292,14 +292,14 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.count = 1;
                 stats.last_was_falsy = owned.is_falsy();
             }
-            GenericResult::OneCursor(c) => {
+            Self::OneCursor(c) => {
                 // Stream directly from cursor using DocumentCursor trait
                 c.stream_json(out)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = c.is_falsy();
             }
-            GenericResult::Many(vs) => {
+            Self::Many(vs) => {
                 for v in vs {
                     let owned = to_owned(v);
                     owned.stream_json(out)?;
@@ -308,21 +308,21 @@ impl<V: DocumentValue> GenericResult<V> {
                 }
                 stats.count = vs.len();
             }
-            GenericResult::None => {
+            Self::None => {
                 // No output
             }
-            GenericResult::Error(e) => {
+            Self::Error(e) => {
                 // Write error message (like jq does)
-                write!(out, "jq: error: {}", e)?;
+                write!(out, "jq: error: {e}")?;
                 on_value(out)?;
             }
-            GenericResult::Owned(o) => {
+            Self::Owned(o) => {
                 o.stream_json(out)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = o.is_falsy();
             }
-            GenericResult::ManyOwned(os) => {
+            Self::ManyOwned(os) => {
                 for o in os {
                     o.stream_json(out)?;
                     on_value(out)?;
@@ -330,8 +330,8 @@ impl<V: DocumentValue> GenericResult<V> {
                 }
                 stats.count = os.len();
             }
-            GenericResult::Break(label) => {
-                write!(out, "jq: error: break ${} not in label", label)?;
+            Self::Break(label) => {
+                write!(out, "jq: error: break ${label} not in label")?;
                 on_value(out)?;
             }
         }
@@ -343,7 +343,7 @@ impl<V: DocumentValue> GenericResult<V> {
     ///
     /// This is used to detect if M2 streaming can be applied for navigation queries.
     pub fn is_single_cursor(&self) -> bool {
-        matches!(self, GenericResult::OneCursor(_))
+        matches!(self, Self::OneCursor(_))
     }
 
     /// Stream results as YAML to the output writer.
@@ -363,21 +363,21 @@ impl<V: DocumentValue> GenericResult<V> {
         let mut stats = StreamStats::default();
 
         match self {
-            GenericResult::One(v) => {
+            Self::One(v) => {
                 let owned = to_owned(v);
                 owned.stream_yaml(out, indent_spaces)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = owned.is_falsy();
             }
-            GenericResult::OneCursor(c) => {
+            Self::OneCursor(c) => {
                 // Stream directly from cursor using DocumentCursor trait
                 c.stream_yaml(out, indent_spaces)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = c.is_falsy();
             }
-            GenericResult::Many(vs) => {
+            Self::Many(vs) => {
                 for v in vs {
                     let owned = to_owned(v);
                     owned.stream_yaml(out, indent_spaces)?;
@@ -386,21 +386,21 @@ impl<V: DocumentValue> GenericResult<V> {
                 }
                 stats.count = vs.len();
             }
-            GenericResult::None => {
+            Self::None => {
                 // No output
             }
-            GenericResult::Error(e) => {
+            Self::Error(e) => {
                 // Write error message (like yq does)
-                write!(out, "yq: error: {}", e)?;
+                write!(out, "yq: error: {e}")?;
                 on_value(out)?;
             }
-            GenericResult::Owned(o) => {
+            Self::Owned(o) => {
                 o.stream_yaml(out, indent_spaces)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = o.is_falsy();
             }
-            GenericResult::ManyOwned(os) => {
+            Self::ManyOwned(os) => {
                 for o in os {
                     o.stream_yaml(out, indent_spaces)?;
                     on_value(out)?;
@@ -408,8 +408,8 @@ impl<V: DocumentValue> GenericResult<V> {
                 }
                 stats.count = os.len();
             }
-            GenericResult::Break(label) => {
-                write!(out, "yq: error: break ${} not in label", label)?;
+            Self::Break(label) => {
+                write!(out, "yq: error: break ${label} not in label")?;
                 on_value(out)?;
             }
         }
@@ -475,8 +475,7 @@ fn eval_single<V: DocumentValue>(
                     Some(v) => GenericResult::One(v),
                     None if optional => GenericResult::None,
                     None => GenericResult::Error(EvalError::new(format!(
-                        "index {} out of bounds (length {})",
-                        idx, len
+                        "index {idx} out of bounds (length {len})"
                     ))),
                 }
             } else if optional {
@@ -709,12 +708,12 @@ fn eval_builtin<V: DocumentValue>(
 ) -> GenericResult<V> {
     match builtin {
         Builtin::Line => {
-            let line = cursor.map(|c| c.line()).unwrap_or(0);
+            let line = cursor.map_or(0, |c| c.line());
             GenericResult::Owned(OwnedValue::Int(line as i64))
         }
 
         Builtin::Column => {
-            let column = cursor.map(|c| c.column()).unwrap_or(0);
+            let column = cursor.map_or(0, |c| c.column());
             GenericResult::Owned(OwnedValue::Int(column as i64))
         }
 
@@ -1082,10 +1081,7 @@ fn eval_builtin<V: DocumentValue>(
                 } else if let Ok(f) = s.parse::<f64>() {
                     GenericResult::Owned(OwnedValue::Float(f))
                 } else {
-                    GenericResult::Error(EvalError::new(format!(
-                        "cannot convert '{}' to number",
-                        s
-                    )))
+                    GenericResult::Error(EvalError::new(format!("cannot convert '{s}' to number")))
                 }
             } else {
                 GenericResult::Error(EvalError::new(format!(
@@ -1130,10 +1126,7 @@ fn eval_builtin<V: DocumentValue>(
                     if optional {
                         GenericResult::None
                     } else {
-                        GenericResult::Error(EvalError::new(format!(
-                            "no node at offset {}",
-                            offset
-                        )))
+                        GenericResult::Error(EvalError::new(format!("no node at offset {offset}")))
                     }
                 }
             }
@@ -1193,8 +1186,7 @@ fn eval_builtin<V: DocumentValue>(
                         GenericResult::None
                     } else {
                         GenericResult::Error(EvalError::new(format!(
-                            "no node at position line {} column {}",
-                            line, col
+                            "no node at position line {line} column {col}"
                         )))
                     }
                 }
@@ -1251,7 +1243,7 @@ mod tests {
 
     #[test]
     fn test_generic_array_index() {
-        let json = br#"[1, 2, 3]"#;
+        let json = br"[1, 2, 3]";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
@@ -1264,7 +1256,7 @@ mod tests {
 
     #[test]
     fn test_generic_iterate() {
-        let json = br#"[1, 2, 3]"#;
+        let json = br"[1, 2, 3]";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
@@ -1293,7 +1285,7 @@ mod tests {
 
     #[test]
     fn test_generic_length() {
-        let json = br#"[1, 2, 3, 4, 5]"#;
+        let json = br"[1, 2, 3, 4, 5]";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
@@ -1372,7 +1364,7 @@ mod tests {
                 );
                 assert_eq!(map.get("age"), Some(&OwnedValue::Int(30)));
             }
-            _ => panic!("Expected object, got {:?}", owned),
+            _ => panic!("Expected object, got {owned:?}"),
         }
     }
 
@@ -1813,5 +1805,127 @@ mod tests {
         let expr = crate::jq::parse("at_position(1; 0)").unwrap();
         let result = eval_with_cursor(&expr, cursor);
         assert!(matches!(result, GenericResult::Error(_)));
+    }
+
+    #[test]
+    fn test_generic_result_conversions_all_variants() {
+        // A real document-backed result fixes the generic `V` for the whole
+        // Vec, letting the owned / none / error / break variants sit alongside.
+        let doc = br#"{"a": 1, "b": [1, 2, 3]}"#;
+        let index = JsonIndex::build(doc);
+        let c0 = index.root(doc);
+        let c1 = index.root(doc);
+        let results = vec![
+            eval(&Expr::Field("a".to_string()), c0.value()), // single value
+            eval(
+                &Expr::pipe(vec![Expr::Field("b".to_string()), Expr::Iterate]),
+                c1.value(),
+            ), // Many
+            GenericResult::Owned(OwnedValue::Int(5)),
+            GenericResult::ManyOwned(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+            GenericResult::None,
+            GenericResult::Error(EvalError::new("boom")),
+            GenericResult::Break("lbl".to_string()),
+        ];
+
+        // is_error / error / is_single_cursor (borrow &self)
+        assert!(results[5].is_error());
+        assert!(results[5].error().is_some());
+        assert!(!results[2].is_error());
+        assert!(results[2].error().is_none());
+        assert!(!results[2].is_single_cursor());
+
+        // stream_json / stream_yaml exercise every variant's match arm.
+        for r in &results {
+            let mut j = String::new();
+            r.stream_json(&mut j, |_| Ok(())).unwrap();
+            let mut y = String::new();
+            r.stream_yaml(&mut y, 2, |_| Ok(())).unwrap();
+        }
+        // Spot-check the owned and error stream output.
+        let mut owned_json = String::new();
+        results[2].stream_json(&mut owned_json, |_| Ok(())).unwrap();
+        assert_eq!(owned_json, "5");
+        let mut err_json = String::new();
+        results[5].stream_json(&mut err_json, |_| Ok(())).unwrap();
+        assert!(err_json.contains("boom"));
+
+        // into_owned consumes; check the owned-family variants.
+        let owned: Vec<Option<OwnedValue>> =
+            results.into_iter().map(GenericResult::into_owned).collect();
+        assert_eq!(owned[2], Some(OwnedValue::Int(5))); // Owned
+        assert_eq!(
+            owned[3],
+            Some(OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2)
+            ]))
+        ); // ManyOwned
+        assert_eq!(owned[4], None); // None
+        assert_eq!(owned[5], None); // Error
+        assert_eq!(owned[6], None); // Break
+    }
+
+    #[test]
+    fn test_generic_result_collect_owned_all_variants() {
+        let doc = br#"{"b": [1, 2, 3]}"#;
+        let index = JsonIndex::build(doc);
+        let c = index.root(doc);
+        let results = vec![
+            eval(
+                &Expr::pipe(vec![Expr::Field("b".to_string()), Expr::Iterate]),
+                c.value(),
+            ), // Many
+            GenericResult::ManyOwned(vec![OwnedValue::Int(9)]),
+            GenericResult::None,
+            GenericResult::Error(EvalError::new("e")),
+            GenericResult::Break("l".to_string()),
+            GenericResult::Owned(OwnedValue::Bool(true)),
+        ];
+        let collected: Vec<Vec<OwnedValue>> = results
+            .into_iter()
+            .map(GenericResult::collect_owned)
+            .collect();
+        assert_eq!(collected[0].len(), 3); // Many -> 3 elements
+        assert_eq!(collected[1], vec![OwnedValue::Int(9)]); // ManyOwned
+        assert!(collected[2].is_empty()); // None
+        assert!(collected[3].is_empty()); // Error
+        assert!(collected[4].is_empty()); // Break
+        assert_eq!(collected[5], vec![OwnedValue::Bool(true)]); // Owned
+    }
+
+    #[test]
+    fn test_generic_result_one_cursor_streaming() {
+        // at_offset lands on a node and yields a OneCursor result, exercising
+        // the OneCursor arms of collect_owned / stream_json / stream_yaml.
+        let json = br#"{"a": 1}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse("at_offset(6)").unwrap(); // offset 6 == the `1`
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(result.is_single_cursor());
+        let mut j = String::new();
+        result.stream_json(&mut j, |_| Ok(())).unwrap();
+        assert_eq!(j, "1");
+        let mut y = String::new();
+        result.stream_yaml(&mut y, 2, |_| Ok(())).unwrap();
+
+        let result2 = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result2.collect_owned(), vec![OwnedValue::Int(1)]);
+    }
+
+    #[test]
+    fn test_at_position_no_node_and_tonumber_error() {
+        // at_position with an out-of-range line yields the "no node" error.
+        let json = br#"{"a": "xyz"}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse("at_position(99; 1)").unwrap();
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(result.is_error());
+
+        // tonumber on a non-numeric string yields a conversion error.
+        let expr = crate::jq::parse(".a | tonumber").unwrap();
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(result.is_error());
     }
 }

@@ -29,7 +29,7 @@ fn run_cli(args: &[&str]) -> Result<String> {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("Command failed: {}", stderr);
+            anyhow::bail!("Command failed: {stderr}");
         }
 
         return Ok(String::from_utf8(output.stdout)?);

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // x86_64 BMI2 (PDEP/PEXT) intrinsics
 //! BMI2 bit manipulation helpers for x86_64.
 //!
 //! BMI2 provides PDEP (parallel bit deposit) and PEXT (parallel bit extract)
@@ -246,9 +247,7 @@ mod tests {
                 assert_eq!(
                     pext_u64(src, mask),
                     pext_u64_fallback(src, mask),
-                    "PEXT mismatch for src={:#x}, mask={:#x}",
-                    src,
-                    mask
+                    "PEXT mismatch for src={src:#x}, mask={mask:#x}"
                 );
             }
         }
@@ -271,9 +270,7 @@ mod tests {
                 assert_eq!(
                     pdep_u64(src, mask),
                     pdep_u64_fallback(src, mask),
-                    "PDEP mismatch for src={:#x}, mask={:#x}",
-                    src,
-                    mask
+                    "PDEP mismatch for src={src:#x}, mask={mask:#x}"
                 );
             }
         }

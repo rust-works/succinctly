@@ -40,7 +40,7 @@ fn discover_json_files() -> Vec<(String, PathBuf, u64)> {
                 .file_stem()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown");
-            let name = format!("{}/{}", pattern, size);
+            let name = format!("{pattern}/{size}");
             files.push((name, path, metadata.len()));
         }
     }

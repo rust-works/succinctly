@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // ARM64 SVE2 (BDEP) SIMD intrinsics
 //! SVE2-accelerated DSV indexing for ARM64.
 //!
 //! Uses SVE2 BDEP instruction for quote state masking, providing ~10x speedup

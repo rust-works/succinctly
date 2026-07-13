@@ -68,11 +68,11 @@ fn bench_simd_vs_scalar(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
 
         group.bench_with_input(BenchmarkId::new("simd", size), &input, |b, input| {
-            b.iter(|| find_json_escape(black_box(input), 0))
+            b.iter(|| find_json_escape(black_box(input), 0));
         });
 
         group.bench_with_input(BenchmarkId::new("scalar", size), &input, |b, input| {
-            b.iter(|| find_json_escape_scalar(black_box(input), 0))
+            b.iter(|| find_json_escape_scalar(black_box(input), 0));
         });
     }
 
@@ -88,26 +88,26 @@ fn bench_escape_position(c: &mut Criterion) {
     let no_escape = make_no_escapes(size);
     group.throughput(Throughput::Bytes(size as u64));
     group.bench_function("no_escape", |b| {
-        b.iter(|| find_json_escape(black_box(&no_escape), 0))
+        b.iter(|| find_json_escape(black_box(&no_escape), 0));
     });
 
     // Escape at start (early exit)
     let at_start = make_escape_at_start(size);
     group.bench_function("at_start", |b| {
-        b.iter(|| find_json_escape(black_box(&at_start), 0))
+        b.iter(|| find_json_escape(black_box(&at_start), 0));
     });
 
     // Escape in middle
     let mut at_middle = make_no_escapes(size);
     at_middle[size / 2] = b'"';
     group.bench_function("at_middle", |b| {
-        b.iter(|| find_json_escape(black_box(&at_middle), 0))
+        b.iter(|| find_json_escape(black_box(&at_middle), 0));
     });
 
     // Escape at end
     let at_end = make_escape_at_end(size);
     group.bench_function("at_end", |b| {
-        b.iter(|| find_json_escape(black_box(&at_end), 0))
+        b.iter(|| find_json_escape(black_box(&at_end), 0));
     });
 
     group.finish();
@@ -123,35 +123,35 @@ fn bench_escape_types(c: &mut Criterion) {
     with_quote[size / 2] = b'"';
     group.throughput(Throughput::Bytes(size as u64));
     group.bench_function("quote", |b| {
-        b.iter(|| find_json_escape(black_box(&with_quote), 0))
+        b.iter(|| find_json_escape(black_box(&with_quote), 0));
     });
 
     // Backslash
     let mut with_backslash = make_no_escapes(size);
     with_backslash[size / 2] = b'\\';
     group.bench_function("backslash", |b| {
-        b.iter(|| find_json_escape(black_box(&with_backslash), 0))
+        b.iter(|| find_json_escape(black_box(&with_backslash), 0));
     });
 
     // Newline (control char)
     let mut with_newline = make_no_escapes(size);
     with_newline[size / 2] = b'\n';
     group.bench_function("newline", |b| {
-        b.iter(|| find_json_escape(black_box(&with_newline), 0))
+        b.iter(|| find_json_escape(black_box(&with_newline), 0));
     });
 
     // Tab (control char)
     let mut with_tab = make_no_escapes(size);
     with_tab[size / 2] = b'\t';
     group.bench_function("tab", |b| {
-        b.iter(|| find_json_escape(black_box(&with_tab), 0))
+        b.iter(|| find_json_escape(black_box(&with_tab), 0));
     });
 
     // Null (control char - edge case)
     let mut with_null = make_no_escapes(size);
     with_null[size / 2] = 0;
     group.bench_function("null", |b| {
-        b.iter(|| find_json_escape(black_box(&with_null), 0))
+        b.iter(|| find_json_escape(black_box(&with_null), 0));
     });
 
     group.finish();
@@ -165,21 +165,21 @@ fn bench_realistic(c: &mut Criterion) {
     let short_value = b"hello_world_value_123";
     group.throughput(Throughput::Bytes(short_value.len() as u64));
     group.bench_function("short_value", |b| {
-        b.iter(|| find_json_escape(black_box(short_value), 0))
+        b.iter(|| find_json_escape(black_box(short_value), 0));
     });
 
     // Typical JSON with quotes (common in config files)
     let with_quotes = br#"This string has "quotes" inside it"#;
     group.throughput(Throughput::Bytes(with_quotes.len() as u64));
     group.bench_function("with_quotes", |b| {
-        b.iter(|| find_json_escape(black_box(with_quotes), 0))
+        b.iter(|| find_json_escape(black_box(with_quotes), 0));
     });
 
     // Multiline text with newlines
     let multiline = b"Line one\nLine two\nLine three\nLine four";
     group.throughput(Throughput::Bytes(multiline.len() as u64));
     group.bench_function("multiline", |b| {
-        b.iter(|| find_json_escape(black_box(multiline), 0))
+        b.iter(|| find_json_escape(black_box(multiline), 0));
     });
 
     // Path-like string with backslashes
@@ -191,14 +191,14 @@ fn bench_realistic(c: &mut Criterion) {
     let long_desc = make_no_escapes(500);
     group.throughput(Throughput::Bytes(long_desc.len() as u64));
     group.bench_function("long_desc", |b| {
-        b.iter(|| find_json_escape(black_box(&long_desc), 0))
+        b.iter(|| find_json_escape(black_box(&long_desc), 0));
     });
 
     // Frequent escapes (stress test)
     let frequent = make_frequent_escapes(500);
     group.throughput(Throughput::Bytes(frequent.len() as u64));
     group.bench_function("frequent_escapes", |b| {
-        b.iter(|| find_json_escape(black_box(&frequent), 0))
+        b.iter(|| find_json_escape(black_box(&frequent), 0));
     });
 
     group.finish();
@@ -214,7 +214,7 @@ fn bench_alignment(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &input, |b, input| {
-            b.iter(|| find_json_escape(black_box(input), 0))
+            b.iter(|| find_json_escape(black_box(input), 0));
         });
     }
 

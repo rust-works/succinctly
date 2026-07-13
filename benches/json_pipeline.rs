@@ -105,7 +105,7 @@ const TEST_FILE: &str = "data/bench/generated/comprehensive/10mb.json";
 fn load_test_file() -> Option<Vec<u8>> {
     let path = std::path::Path::new(TEST_FILE);
     if !path.exists() {
-        eprintln!("Skipping benchmark: {} not found", TEST_FILE);
+        eprintln!("Skipping benchmark: {TEST_FILE} not found");
         eprintln!("Run: ./target/release/succinctly json generate-suite");
         return None;
     }
@@ -125,7 +125,7 @@ fn bench_indexing(c: &mut Criterion) {
     group.sample_size(20);
 
     group.bench_function("build_index", |b| {
-        b.iter(|| JsonIndex::build(black_box(&bytes)))
+        b.iter(|| JsonIndex::build(black_box(&bytes)));
     });
 
     group.finish();
@@ -171,7 +171,7 @@ fn bench_navigation(c: &mut Criterion) {
                 }
                 _ => 1,
             }
-        })
+        });
     });
 
     // Deep traversal - count all leaf values
@@ -179,7 +179,7 @@ fn bench_navigation(c: &mut Criterion) {
         b.iter(|| {
             let root = index.root(black_box(&bytes));
             count_leaves(&root.value())
-        })
+        });
     });
 
     // Extract all string values (simulates field extraction)
@@ -187,7 +187,7 @@ fn bench_navigation(c: &mut Criterion) {
         b.iter(|| {
             let root = index.root(black_box(&bytes));
             extract_strings(&root.value())
-        })
+        });
     });
 
     group.finish();
@@ -245,7 +245,7 @@ fn extract_strings(value: &StandardJson) -> usize {
             }
             count
         }
-        StandardJson::String(s) => s.as_str().map(|s| s.len()).unwrap_or(0),
+        StandardJson::String(s) => s.as_str().map_or(0, |s| s.len()),
         _ => 0,
     }
 }
@@ -273,7 +273,7 @@ fn bench_printing(c: &mut Criterion) {
             let root = index.root(black_box(&bytes));
             print_value(&root.value(), &mut buffer);
             buffer.len()
-        })
+        });
     });
 
     // Print just string values (common operation)
@@ -284,7 +284,7 @@ fn bench_printing(c: &mut Criterion) {
             let root = index.root(black_box(&bytes));
             print_strings(&root.value(), &mut buffer);
             buffer.len()
-        })
+        });
     });
 
     group.finish();
@@ -301,9 +301,9 @@ fn print_value<W: Write>(value: &StandardJson, out: &mut W) {
         }
         StandardJson::Number(n) => {
             if let Ok(i) = n.as_i64() {
-                let _ = write!(out, "{}", i);
+                let _ = write!(out, "{i}");
             } else if let Ok(f) = n.as_f64() {
-                let _ = write!(out, "{}", f);
+                let _ = write!(out, "{f}");
             }
         }
         StandardJson::String(s) => {
@@ -409,7 +409,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
             let root = index.root(&bytes);
             print_value(&root.value(), &mut buffer);
             buffer.len()
-        })
+        });
     });
 
     // Just index + count leaves (no printing)
@@ -418,14 +418,14 @@ fn bench_full_pipeline(c: &mut Criterion) {
             let index = JsonIndex::build(black_box(&bytes));
             let root = index.root(&bytes);
             count_leaves(&root.value())
-        })
+        });
     });
 
     // Compare with serde_json parsing (if available)
     group.bench_function("serde_json_parse", |b| {
         b.iter(|| {
             let _: serde_json::Value = serde_json::from_slice(black_box(&bytes)).unwrap();
-        })
+        });
     });
 
     // serde_json parse + serialize
@@ -436,7 +436,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
             let value: serde_json::Value = serde_json::from_slice(black_box(&bytes)).unwrap();
             serde_json::to_writer(&mut buffer, &value).unwrap();
             buffer.len()
-        })
+        });
     });
 
     group.finish();
@@ -479,7 +479,7 @@ fn bench_v1_vs_v2_text_position(c: &mut Criterion) {
                 sum += rank;
             }
             sum
-        })
+        });
     });
 
     // Benchmark V2 text_position
@@ -492,7 +492,7 @@ fn bench_v1_vs_v2_text_position(c: &mut Criterion) {
                 sum += rank;
             }
             sum
-        })
+        });
     });
 
     group.finish();
@@ -519,7 +519,7 @@ fn bench_v1_vs_v2_full_traverse(c: &mut Criterion) {
         b.iter(|| {
             let root = index_v1.root(black_box(&bytes));
             count_leaves(&root.value())
-        })
+        });
     });
 
     // V2: Same traversal pattern but with V2's O(1) rank1
@@ -550,7 +550,7 @@ fn bench_v1_vs_v2_full_traverse(c: &mut Criterion) {
             }
             black_box(text_sum);
             count
-        })
+        });
     });
 
     group.finish();
@@ -600,7 +600,7 @@ fn bench_select_patterns(c: &mut Criterion) {
                 }
             }
             sum
-        })
+        });
     });
 
     // Benchmark sequential access with binary search (suboptimal for iteration)
@@ -613,7 +613,7 @@ fn bench_select_patterns(c: &mut Criterion) {
                 }
             }
             sum
-        })
+        });
     });
 
     // Benchmark random access WITH hints (exponential search - suboptimal for random)
@@ -628,7 +628,7 @@ fn bench_select_patterns(c: &mut Criterion) {
                 }
             }
             sum
-        })
+        });
     });
 
     // Benchmark random access with binary search (optimal for random)
@@ -641,7 +641,7 @@ fn bench_select_patterns(c: &mut Criterion) {
                 }
             }
             sum
-        })
+        });
     });
 
     group.finish();
@@ -688,10 +688,7 @@ fn bench_array_indexing(c: &mut Criterion) {
         unreachable!()
     };
 
-    println!(
-        "Using array with {} elements for indexing benchmark",
-        array_len
-    );
+    println!("Using array with {array_len} elements for indexing benchmark");
 
     let mut group = c.benchmark_group("array_indexing");
     group.sample_size(100);
@@ -705,13 +702,13 @@ fn bench_array_indexing(c: &mut Criterion) {
         }
 
         // Benchmark get() - O(n) IB selects
-        group.bench_function(format!("get_{}", idx), |b| {
-            b.iter(|| black_box(elements.get(black_box(idx))))
+        group.bench_function(format!("get_{idx}"), |b| {
+            b.iter(|| black_box(elements.get(black_box(idx))));
         });
 
         // Benchmark get_fast() - O(n) BP ops + O(log n) IB select
-        group.bench_function(format!("get_fast_{}", idx), |b| {
-            b.iter(|| black_box(elements.get_fast(black_box(idx))))
+        group.bench_function(format!("get_fast_{idx}"), |b| {
+            b.iter(|| black_box(elements.get_fast(black_box(idx))));
         });
     }
 
@@ -740,7 +737,7 @@ fn bench_jq_queries(c: &mut Criterion) {
             let cursor = index.root(black_box(&bytes));
             let result = jq::eval::<Vec<u64>, jq::JqSemantics>(&identity_expr, cursor);
             black_box(result)
-        })
+        });
     });
 
     // Parse a jq expression that accesses array elements by index
@@ -752,7 +749,7 @@ fn bench_jq_queries(c: &mut Criterion) {
             let cursor = index.root(black_box(&bytes));
             let result = jq::eval::<Vec<u64>, jq::JqSemantics>(&expr, cursor);
             black_box(result)
-        })
+        });
     });
 
     // Try field access + array index pattern
@@ -762,7 +759,7 @@ fn bench_jq_queries(c: &mut Criterion) {
                 let cursor = index.root(black_box(&bytes));
                 let result = jq::eval::<Vec<u64>, jq::JqSemantics>(&field_expr, cursor);
                 black_box(result)
-            })
+            });
         });
     }
 
@@ -776,7 +773,7 @@ fn bench_jq_queries(c: &mut Criterion) {
             // Only look at first 51 elements
             let first_51: Vec<_> = result.into_iter().take(51).collect();
             black_box(first_51)
-        })
+        });
     });
 
     group.finish();

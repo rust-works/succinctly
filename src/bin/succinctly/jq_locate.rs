@@ -56,7 +56,7 @@ pub fn run_jq_locate(args: JqLocateArgs) -> Result<i32> {
             let newline_index = NewlineIndex::build(&text);
             newline_index
                 .to_offset(line, column)
-                .with_context(|| format!("Invalid position: line {} column {}", line, column))?
+                .with_context(|| format!("Invalid position: line {line} column {column}"))?
         }
         (None, None, None) => {
             anyhow::bail!("Either --offset or --line/--column must be specified");
@@ -78,7 +78,7 @@ pub fn run_jq_locate(args: JqLocateArgs) -> Result<i32> {
 
     // Locate the position
     let result = locate_offset_detailed(&index, &text, offset)
-        .with_context(|| format!("Could not locate position at offset {}", offset))?;
+        .with_context(|| format!("Could not locate position at offset {offset}"))?;
 
     // Output
     match args.format {

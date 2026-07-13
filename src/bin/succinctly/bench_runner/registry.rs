@@ -39,8 +39,7 @@ impl std::str::FromStr for BenchmarkCategory {
             "dsv" => Ok(Self::Dsv),
             "cross-parser" | "crossparser" | "cross_parser" => Ok(Self::CrossParser),
             _ => Err(format!(
-                "unknown category '{}', expected: core, json, yaml, dsv, cross-parser",
-                s
+                "unknown category '{s}', expected: core, json, yaml, dsv, cross-parser"
             )),
         }
     }

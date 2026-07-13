@@ -226,30 +226,30 @@ fn print_error(err: &ValidationError, input: &[u8], filename: Option<&str>, sche
 fn format_error_kind(kind: &ValidationErrorKind) -> String {
     match kind {
         ValidationErrorKind::UnexpectedCharacter { expected, found } => {
-            format!("expected {}, found '{}'", expected, found)
+            format!("expected {expected}, found '{found}'")
         }
         ValidationErrorKind::UnexpectedEof { expected } => {
-            format!("unexpected end of input, expected {}", expected)
+            format!("unexpected end of input, expected {expected}")
         }
         ValidationErrorKind::TrailingContent => "trailing content after JSON value".to_string(),
         ValidationErrorKind::UnclosedString => "unclosed string".to_string(),
         ValidationErrorKind::InvalidEscape { sequence } => {
-            format!("invalid escape sequence '\\{}'", sequence)
+            format!("invalid escape sequence '\\{sequence}'")
         }
         ValidationErrorKind::InvalidUnicodeEscape { reason } => {
-            format!("invalid unicode escape: {}", reason)
+            format!("invalid unicode escape: {reason}")
         }
         ValidationErrorKind::UnpairedSurrogate { codepoint } => {
-            format!("unpaired surrogate \\u{:04X}", codepoint)
+            format!("unpaired surrogate \\u{codepoint:04X}")
         }
         ValidationErrorKind::ControlCharacter { byte } => {
-            format!("unescaped control character (0x{:02X})", byte)
+            format!("unescaped control character (0x{byte:02X})")
         }
         ValidationErrorKind::LeadingZero => "leading zeros not allowed in numbers".to_string(),
         ValidationErrorKind::LeadingPlus => "leading plus sign not allowed".to_string(),
-        ValidationErrorKind::InvalidNumber { reason } => format!("invalid number: {}", reason),
+        ValidationErrorKind::InvalidNumber { reason } => format!("invalid number: {reason}"),
         ValidationErrorKind::InvalidKeyword { found } => {
-            format!("invalid keyword '{}'", found)
+            format!("invalid keyword '{found}'")
         }
         ValidationErrorKind::InvalidUtf8 => "invalid UTF-8 sequence".to_string(),
     }
@@ -259,7 +259,7 @@ fn format_error_kind(kind: &ValidationErrorKind) -> String {
 fn format_error_hint(kind: &ValidationErrorKind, scheme: &ColorScheme) -> String {
     let hint = match kind {
         ValidationErrorKind::InvalidEscape { sequence } => {
-            Some(format!("unknown escape '\\{}'", sequence))
+            Some(format!("unknown escape '\\{sequence}'"))
         }
         ValidationErrorKind::LeadingZero => Some("remove leading zero".to_string()),
         ValidationErrorKind::LeadingPlus => Some("remove '+' sign".to_string()),
@@ -320,8 +320,7 @@ fn get_error_snippet(
     // Find the end of this line
     let line_end = text[line_start..]
         .find('\n')
-        .map(|i| line_start + i)
-        .unwrap_or(text.len());
+        .map_or(text.len(), |i| line_start + i);
 
     let line_content = &text[line_start..line_end];
 
@@ -332,21 +331,21 @@ fn get_error_snippet(
         if error_col < max_width / 2 {
             // Error is near the start, show beginning
             let truncated = &line_content[..max_width.min(line_content.len())];
-            (format!("{}...", truncated), error_col)
+            (format!("{truncated}..."), error_col)
         } else if error_col >= line_content.len().saturating_sub(max_width / 2) {
             // Error is near the end, show end
             let start = line_content.len().saturating_sub(max_width);
             let truncated = &line_content[start..];
             // caret_offset = position within truncated + length of "..." prefix
             let pos_in_truncated = error_col.saturating_sub(start);
-            (format!("...{}", truncated), pos_in_truncated + 3)
+            (format!("...{truncated}"), pos_in_truncated + 3)
         } else {
             // Error is in the middle, center on it
             let start = error_col.saturating_sub(max_width / 2);
             let end = (start + max_width).min(line_content.len());
             let truncated = &line_content[start..end];
             let pos_in_truncated = error_col.saturating_sub(start);
-            (format!("...{}...", truncated), pos_in_truncated + 3)
+            (format!("...{truncated}..."), pos_in_truncated + 3)
         }
     } else {
         (line_content.to_string(), column.saturating_sub(1))

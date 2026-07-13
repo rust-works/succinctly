@@ -53,7 +53,7 @@ fn test_rank1_pattern_10010010() {
     // rank1 over [0..8] should be 0,1,1,1,2,2,2,3,3
     let expected = [0, 1, 1, 1, 2, 2, 2, 3, 3];
     for (i, &exp) in expected.iter().enumerate() {
-        assert_eq!(bv.rank1(i), exp, "rank1({}) mismatch", i);
+        assert_eq!(bv.rank1(i), exp, "rank1({i}) mismatch");
     }
 }
 
@@ -68,7 +68,7 @@ fn test_rank1_pattern_11011010_00000000() {
     // rank1 over [0..16]
     let expected = [0, 1, 2, 2, 3, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5];
     for (i, &exp) in expected.iter().enumerate() {
-        assert_eq!(bv.rank1(i), exp, "rank1({}) mismatch", i);
+        assert_eq!(bv.rank1(i), exp, "rank1({i}) mismatch");
     }
 }
 
@@ -83,7 +83,7 @@ fn test_rank1_pattern_11011010_10000000() {
     // rank1 over [0..16]
     let expected = [0, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6];
     for (i, &exp) in expected.iter().enumerate() {
-        assert_eq!(bv.rank1(i), exp, "rank1({}) mismatch", i);
+        assert_eq!(bv.rank1(i), exp, "rank1({i}) mismatch");
     }
 }
 
@@ -181,18 +181,12 @@ fn test_roundtrip_various_patterns() {
             let pos = bv.select1(k).unwrap();
             assert!(
                 bv.get(pos),
-                "pattern '{}': select1({}) = {} but bit is not set",
-                pattern,
-                k,
-                pos
+                "pattern '{pattern}': select1({k}) = {pos} but bit is not set"
             );
             assert_eq!(
                 bv.rank1(pos + 1),
                 k + 1,
-                "pattern '{}': rank1(select1({}) + 1) != {} + 1",
-                pattern,
-                k,
-                k
+                "pattern '{pattern}': rank1(select1({k}) + 1) != {k} + 1"
             );
         }
     }
@@ -214,7 +208,7 @@ fn test_long_alternating_pattern() {
     // rank1 at position x should be (x-1)/2 + 1 for x > 0
     for x in 1..=4096 {
         let expected = (x - 1) / 2 + 1;
-        assert_eq!(bv.rank1(x), expected, "rank1({}) mismatch", x);
+        assert_eq!(bv.rank1(x), expected, "rank1({x}) mismatch");
     }
 }
 
@@ -234,7 +228,7 @@ fn test_long_sparse_pattern() {
 
     // select1(k) should be k * 64
     for k in 0..64 {
-        assert_eq!(bv.select1(k), Some(k * 64), "select1({}) mismatch", k);
+        assert_eq!(bv.select1(k), Some(k * 64), "select1({k}) mismatch");
     }
 }
 

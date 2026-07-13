@@ -157,7 +157,7 @@ mod simple_cursor {
             if i > 0 {
                 json.push(b',');
             }
-            json.extend_from_slice(format!("{}", i).as_bytes());
+            json.extend_from_slice(format!("{i}").as_bytes());
         }
         json.push(b']');
 
@@ -302,9 +302,9 @@ mod standard_cursor {
             if i > 0 {
                 json.push(b',');
             }
-            json.extend_from_slice(format!(r#"{{"id":{},"value":"item{}"}}"#, i, i).as_bytes());
+            json.extend_from_slice(format!(r#"{{"id":{i},"value":"item{i}"}}"#).as_bytes());
         }
-        json.extend_from_slice(br#"]}"#);
+        json.extend_from_slice(br"]}");
 
         let semi = standard::build_semi_index(&json);
         assert_eq!(semi.state, standard::State::InJson);
@@ -386,7 +386,7 @@ mod simd_comparison {
     #[test]
     fn test_simd_nested() {
         compare_results(br#"{"a":{"b":{"c":1}}}"#);
-        compare_results(br#"[[[1,2],[3,4]],[[5,6]]]"#);
+        compare_results(br"[[[1,2],[3,4]],[[5,6]]]");
         compare_results(br#"{"a":[1,{"b":2}]}"#);
     }
 
@@ -846,7 +846,7 @@ mod locate_exhaustive {
     fn test_locate_deep_nesting_20() {
         let mut json = Vec::new();
         for i in 0..20 {
-            json.extend(format!(r#"{{"level{}":"v{}","n":"#, i, i).as_bytes());
+            json.extend(format!(r#"{{"level{i}":"v{i}","n":"#).as_bytes());
         }
         json.extend(br#""bottom""#);
         json.resize(json.len() + 20, b'}');
@@ -861,11 +861,8 @@ mod locate_exhaustive {
                 json.push(b',');
             }
             json.extend(
-                format!(
-                    r#"{{"id":{},"name":"user{}","tags":["a","b"],"meta":{{"x":{}}}}}"#,
-                    i, i, i
-                )
-                .as_bytes(),
+                format!(r#"{{"id":{i},"name":"user{i}","tags":["a","b"],"meta":{{"x":{i}}}}}"#)
+                    .as_bytes(),
             );
         }
         json.extend(b"]}");
@@ -882,7 +879,7 @@ mod locate_exhaustive {
             }
             // Varying length strings
             let s = "x".repeat(i % 50 + 1);
-            json.extend(format!(r#""{}""#, s).as_bytes());
+            json.extend(format!(r#""{s}""#).as_bytes());
         }
         json.extend(b"]}");
         test_all_offsets(&json, "String-heavy (200 strings)");

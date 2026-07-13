@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // memory-mapped file access (Mmap) is inherently unsafe
 //! Binary serialization for succinct data structures.
 //!
 //! This module provides zero-copy binary serialization compatible with memory-mapped files.

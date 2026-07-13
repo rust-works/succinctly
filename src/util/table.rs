@@ -48,8 +48,8 @@ mod tests {
         // Single bit set at each position
         for pos in 0..8 {
             let byte = 1u8 << pos;
-            assert_eq!(select_in_byte(byte, 0), pos, "byte={:08b}", byte);
-            assert_eq!(select_in_byte(byte, 1), 8, "byte={:08b}, k=1", byte);
+            assert_eq!(select_in_byte(byte, 0), pos, "byte={byte:08b}");
+            assert_eq!(select_in_byte(byte, 1), 8, "byte={byte:08b}, k=1");
         }
     }
 
@@ -86,22 +86,14 @@ mod tests {
             for k in 0..pop {
                 let pos = SELECT_IN_BYTE_TABLE[(byte as usize) * 8 + k as usize];
                 // Verify the k-th bit is actually set at position pos
-                assert!(
-                    (byte >> pos) & 1 == 1,
-                    "byte={:08b}, k={}, pos={}",
-                    byte,
-                    k,
-                    pos
-                );
+                assert!((byte >> pos) & 1 == 1, "byte={byte:08b}, k={k}, pos={pos}");
             }
             // Verify positions beyond popcount return 8
             for k in pop..8 {
                 assert_eq!(
                     SELECT_IN_BYTE_TABLE[(byte as usize) * 8 + k as usize],
                     8,
-                    "byte={:08b}, k={}",
-                    byte,
-                    k
+                    "byte={byte:08b}, k={k}"
                 );
             }
         }

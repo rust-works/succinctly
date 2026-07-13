@@ -92,33 +92,32 @@ impl fmt::Display for ValidationErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnexpectedCharacter { expected, found } => {
-                write!(f, "expected {}, found {:?}", expected, found)
+                write!(f, "expected {expected}, found {found:?}")
             }
             Self::UnexpectedEof { expected } => {
-                write!(f, "unexpected end of input, expected {}", expected)
+                write!(f, "unexpected end of input, expected {expected}")
             }
             Self::TrailingContent => write!(f, "trailing content after JSON value"),
             Self::UnclosedString => write!(f, "unclosed string"),
             Self::InvalidEscape { sequence } => {
-                write!(f, "invalid escape sequence '\\{}'", sequence)
+                write!(f, "invalid escape sequence '\\{sequence}'")
             }
             Self::InvalidUnicodeEscape { reason } => {
-                write!(f, "invalid unicode escape: {}", reason)
+                write!(f, "invalid unicode escape: {reason}")
             }
             Self::UnpairedSurrogate { codepoint } => {
-                write!(f, "unpaired surrogate \\u{:04X}", codepoint)
+                write!(f, "unpaired surrogate \\u{codepoint:04X}")
             }
             Self::ControlCharacter { byte } => {
-                write!(f, "unescaped control character 0x{:02X}", byte)
+                write!(f, "unescaped control character 0x{byte:02X}")
             }
             Self::LeadingZero => write!(f, "leading zeros not allowed in numbers"),
             Self::LeadingPlus => write!(f, "leading plus sign not allowed in numbers"),
-            Self::InvalidNumber { reason } => write!(f, "invalid number: {}", reason),
+            Self::InvalidNumber { reason } => write!(f, "invalid number: {reason}"),
             Self::InvalidKeyword { found } => {
                 write!(
                     f,
-                    "invalid keyword '{}' (expected null, true, or false)",
-                    found
+                    "invalid keyword '{found}' (expected null, true, or false)"
                 )
             }
             Self::InvalidUtf8 => write!(f, "invalid UTF-8 sequence"),
@@ -194,8 +193,8 @@ impl<'a> Validator<'a> {
             Some(b'{') => self.validate_object(),
             Some(b'[') => self.validate_array(),
             Some(b'"') => self.validate_string(),
-            Some(b'-') | Some(b'0'..=b'9') => self.validate_number(),
-            Some(b't') | Some(b'f') | Some(b'n') => self.validate_keyword(),
+            Some(b'-' | b'0'..=b'9') => self.validate_number(),
+            Some(b't' | b'f' | b'n') => self.validate_keyword(),
             Some(b'+') => Err(self.error(ValidationErrorKind::LeadingPlus)),
             Some(c) => Err(self.error(ValidationErrorKind::UnexpectedCharacter {
                 expected: "JSON value",
@@ -223,7 +222,7 @@ impl<'a> Validator<'a> {
             if self.peek() != Some(b'"') {
                 return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
                     expected: "string key",
-                    found: self.peek().map(|b| b as char).unwrap_or('\0'),
+                    found: self.peek().map_or('\0', |b| b as char),
                 }));
             }
             self.validate_string()?;
@@ -233,7 +232,7 @@ impl<'a> Validator<'a> {
             if self.peek() != Some(b':') {
                 return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
                     expected: "':'",
-                    found: self.peek().map(|b| b as char).unwrap_or('\0'),
+                    found: self.peek().map_or('\0', |b| b as char),
                 }));
             }
             self.advance();
@@ -1046,8 +1045,7 @@ mod tests {
             let err = validate(input.as_bytes()).unwrap_err();
             assert!(
                 matches!(err.kind, ValidationErrorKind::ControlCharacter { byte: b } if b == byte),
-                "Control char 0x{:02X} should be rejected",
-                byte
+                "Control char 0x{byte:02X} should be rejected"
             );
         }
     }
@@ -1136,8 +1134,7 @@ mod tests {
             let err = validate(&input).unwrap_err();
             assert!(
                 matches!(err.kind, ValidationErrorKind::InvalidUtf8),
-                "Lead byte 0x{:02X} should be rejected",
-                lead
+                "Lead byte 0x{lead:02X} should be rejected"
             );
         }
     }
@@ -1322,5 +1319,81 @@ mod tests {
         }
         s.push('"');
         assert!(validate(s.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_validation_error_kind_display() {
+        assert_eq!(
+            ValidationErrorKind::UnexpectedCharacter {
+                expected: "','",
+                found: '}'
+            }
+            .to_string(),
+            "expected ',', found '}'"
+        );
+        assert_eq!(
+            ValidationErrorKind::UnexpectedEof { expected: "value" }.to_string(),
+            "unexpected end of input, expected value"
+        );
+        assert_eq!(
+            ValidationErrorKind::TrailingContent.to_string(),
+            "trailing content after JSON value"
+        );
+        assert_eq!(
+            ValidationErrorKind::UnclosedString.to_string(),
+            "unclosed string"
+        );
+        assert_eq!(
+            ValidationErrorKind::InvalidEscape { sequence: 'x' }.to_string(),
+            "invalid escape sequence '\\x'"
+        );
+        assert_eq!(
+            ValidationErrorKind::InvalidUnicodeEscape { reason: "bad hex" }.to_string(),
+            "invalid unicode escape: bad hex"
+        );
+        assert_eq!(
+            ValidationErrorKind::UnpairedSurrogate { codepoint: 0xD800 }.to_string(),
+            "unpaired surrogate \\uD800"
+        );
+        assert_eq!(
+            ValidationErrorKind::ControlCharacter { byte: 0x01 }.to_string(),
+            "unescaped control character 0x01"
+        );
+        assert_eq!(
+            ValidationErrorKind::LeadingZero.to_string(),
+            "leading zeros not allowed in numbers"
+        );
+        assert_eq!(
+            ValidationErrorKind::LeadingPlus.to_string(),
+            "leading plus sign not allowed in numbers"
+        );
+        assert_eq!(
+            ValidationErrorKind::InvalidNumber {
+                reason: "no digits"
+            }
+            .to_string(),
+            "invalid number: no digits"
+        );
+        assert_eq!(
+            ValidationErrorKind::InvalidKeyword {
+                found: "nul".to_string()
+            }
+            .to_string(),
+            "invalid keyword 'nul' (expected null, true, or false)"
+        );
+        assert_eq!(
+            ValidationErrorKind::InvalidUtf8.to_string(),
+            "invalid UTF-8 sequence"
+        );
+    }
+
+    #[test]
+    fn test_missing_colon_in_object() {
+        // Triggers the object-key colon error path.
+        let err = validate(br#"{"a" 1}"#).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::UnexpectedCharacter { .. }
+        ));
     }
 }

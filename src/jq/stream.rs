@@ -75,7 +75,7 @@ impl StreamableValue for OwnedValue {
     }
 
     fn is_falsy(&self) -> bool {
-        matches!(self, OwnedValue::Null | OwnedValue::Bool(false))
+        matches!(self, Self::Null | Self::Bool(false))
     }
 }
 
@@ -88,13 +88,13 @@ fn stream_owned_value_json<W: core::fmt::Write>(
         OwnedValue::Null => out.write_str("null"),
         OwnedValue::Bool(true) => out.write_str("true"),
         OwnedValue::Bool(false) => out.write_str("false"),
-        OwnedValue::Int(n) => write!(out, "{}", n),
+        OwnedValue::Int(n) => write!(out, "{n}"),
         OwnedValue::Float(f) => {
             if f.is_nan() || f.is_infinite() {
                 // JSON doesn't support NaN or Infinity
                 out.write_str("null")
             } else {
-                write!(out, "{}", f)
+                write!(out, "{f}")
             }
         }
         OwnedValue::String(s) => stream_json_string(out, s),
@@ -190,7 +190,7 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
         OwnedValue::Null => out.write_str("null"),
         OwnedValue::Bool(true) => out.write_str("true"),
         OwnedValue::Bool(false) => out.write_str("false"),
-        OwnedValue::Int(n) => write!(out, "{}", n),
+        OwnedValue::Int(n) => write!(out, "{n}"),
         OwnedValue::Float(f) => {
             if f.is_nan() {
                 out.write_str(".nan")
@@ -201,7 +201,7 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                     out.write_str("-.inf")
                 }
             } else {
-                write!(out, "{}", f)
+                write!(out, "{f}")
             }
         }
         OwnedValue::String(s) => stream_yaml_string(out, s),
@@ -569,6 +569,6 @@ mod tests {
         assert!(OwnedValue::Bool(false).is_falsy());
         assert!(!OwnedValue::Bool(true).is_falsy());
         assert!(!OwnedValue::Int(0).is_falsy());
-        assert!(!OwnedValue::String("".to_string()).is_falsy());
+        assert!(!OwnedValue::String(String::new()).is_falsy());
     }
 }

@@ -82,7 +82,7 @@ const FIELD_QUERIES: &[(&str, &str, &str, &str)] = &[
 ];
 
 fn file_path(pattern: &str, size: &str) -> String {
-    format!("data/bench/generated/yaml/{}/{}.yaml", pattern, size)
+    format!("data/bench/generated/yaml/{pattern}/{size}.yaml")
 }
 
 fn get_succinctly_binary() -> Option<std::path::PathBuf> {
@@ -103,8 +103,7 @@ fn has_system_yq() -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 /// Benchmark succinctly yq with ~5% selection queries
@@ -121,14 +120,14 @@ fn bench_succinctly_select(c: &mut Criterion) {
         let path_obj = std::path::Path::new(&path);
 
         if !path_obj.exists() {
-            eprintln!("Skipping {}/{}: file not found", pattern, size);
+            eprintln!("Skipping {pattern}/{size}: file not found");
             continue;
         }
 
-        let file_size = path_obj.metadata().map(|m| m.len()).unwrap_or(0);
+        let file_size = path_obj.metadata().map_or(0, |m| m.len());
         group.throughput(Throughput::Bytes(file_size));
 
-        let label = format!("{}/{} ({})", pattern, size, desc);
+        let label = format!("{pattern}/{size} ({desc})");
         group.bench_with_input(
             BenchmarkId::from_parameter(&label),
             &(&binary, &path, succinctly_query),
@@ -142,12 +141,10 @@ fn bench_succinctly_select(c: &mut Criterion) {
                         .expect("Failed to execute succinctly");
                     assert!(
                         output.status.success(),
-                        "succinctly yq failed on {} with query {}",
-                        path,
-                        query
+                        "succinctly yq failed on {path} with query {query}"
                     );
                     output.stdout
-                })
+                });
             },
         );
     }
@@ -172,10 +169,10 @@ fn bench_system_yq_select(c: &mut Criterion) {
             continue;
         }
 
-        let file_size = path_obj.metadata().map(|m| m.len()).unwrap_or(0);
+        let file_size = path_obj.metadata().map_or(0, |m| m.len());
         group.throughput(Throughput::Bytes(file_size));
 
-        let label = format!("{}/{} ({})", pattern, size, desc);
+        let label = format!("{pattern}/{size} ({desc})");
         group.bench_with_input(
             BenchmarkId::from_parameter(&label),
             &(&path, yq_query),
@@ -187,9 +184,9 @@ fn bench_system_yq_select(c: &mut Criterion) {
                         .stderr(Stdio::null())
                         .output()
                         .expect("Failed to execute yq");
-                    assert!(output.status.success(), "system yq failed on {}", path);
+                    assert!(output.status.success(), "system yq failed on {path}");
                     output.stdout
-                })
+                });
             },
         );
     }
@@ -214,10 +211,10 @@ fn bench_succinctly_field(c: &mut Criterion) {
             continue;
         }
 
-        let file_size = path_obj.metadata().map(|m| m.len()).unwrap_or(0);
+        let file_size = path_obj.metadata().map_or(0, |m| m.len());
         group.throughput(Throughput::Bytes(file_size));
 
-        let label = format!("{}/{} ({})", pattern, size, desc);
+        let label = format!("{pattern}/{size} ({desc})");
         group.bench_with_input(
             BenchmarkId::from_parameter(&label),
             &(&binary, &path, query),
@@ -231,7 +228,7 @@ fn bench_succinctly_field(c: &mut Criterion) {
                         .expect("Failed to execute succinctly");
                     assert!(output.status.success());
                     output.stdout
-                })
+                });
             },
         );
     }
@@ -256,10 +253,10 @@ fn bench_system_yq_field(c: &mut Criterion) {
             continue;
         }
 
-        let file_size = path_obj.metadata().map(|m| m.len()).unwrap_or(0);
+        let file_size = path_obj.metadata().map_or(0, |m| m.len());
         group.throughput(Throughput::Bytes(file_size));
 
-        let label = format!("{}/{} ({})", pattern, size, desc);
+        let label = format!("{pattern}/{size} ({desc})");
         group.bench_with_input(
             BenchmarkId::from_parameter(&label),
             &(&path, query),
@@ -273,7 +270,7 @@ fn bench_system_yq_field(c: &mut Criterion) {
                         .expect("Failed to execute yq");
                     assert!(output.status.success());
                     output.stdout
-                })
+                });
             },
         );
     }
@@ -327,11 +324,11 @@ fn bench_select_comparison(c: &mut Criterion) {
             continue;
         }
 
-        let file_size = path_obj.metadata().map(|m| m.len()).unwrap_or(0);
+        let file_size = path_obj.metadata().map_or(0, |m| m.len());
         group.throughput(Throughput::Bytes(file_size));
 
         if let Some(ref binary) = succinctly_binary {
-            let label = format!("succinctly/{}", desc);
+            let label = format!("succinctly/{desc}");
             group.bench_with_input(
                 BenchmarkId::from_parameter(&label),
                 &(binary, &path, succinctly_query),
@@ -345,13 +342,13 @@ fn bench_select_comparison(c: &mut Criterion) {
                             .expect("Failed to execute succinctly");
                         assert!(output.status.success());
                         output.stdout
-                    })
+                    });
                 },
             );
         }
 
         if has_yq {
-            let label = format!("yq/{}", desc);
+            let label = format!("yq/{desc}");
             group.bench_with_input(
                 BenchmarkId::from_parameter(&label),
                 &(&path, yq_query),
@@ -365,7 +362,7 @@ fn bench_select_comparison(c: &mut Criterion) {
                             .expect("Failed to execute yq");
                         assert!(output.status.success());
                         output.stdout
-                    })
+                    });
                 },
             );
         }

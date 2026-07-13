@@ -96,7 +96,7 @@ fn run_validate_file(file_path: &str, extra_args: &[&str]) -> Result<(String, St
 #[test]
 fn test_valid_json_exit_code_0() -> Result<()> {
     let (stdout, stderr, exit_code) = run_validate_stdin(r#"{"key": "value"}"#, &[])?;
-    assert_eq!(exit_code, 0, "stdout: {}, stderr: {}", stdout, stderr);
+    assert_eq!(exit_code, 0, "stdout: {stdout}, stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout should be empty for valid JSON");
     Ok(())
 }
@@ -158,8 +158,7 @@ fn test_quiet_mode_no_output() -> Result<()> {
         .join("\n");
     assert!(
         app_stderr.is_empty(),
-        "stderr should be empty in quiet mode, got: {}",
-        app_stderr
+        "stderr should be empty in quiet mode, got: {app_stderr}"
     );
     Ok(())
 }
@@ -363,7 +362,7 @@ fn test_file_input_valid() -> Result<()> {
     file.flush()?;
 
     let (stdout, stderr, exit_code) = run_validate_file(file.path().to_str().unwrap(), &[])?;
-    assert_eq!(exit_code, 0, "stdout: {}, stderr: {}", stdout, stderr);
+    assert_eq!(exit_code, 0, "stdout: {stdout}, stderr: {stderr}");
     Ok(())
 }
 
@@ -499,8 +498,7 @@ fn test_alignment_single_digit_line() -> Result<()> {
     // Verify the error is on line 9
     assert!(
         stderr.contains(":9:"),
-        "Error should be on line 9, got:\n{}",
-        stderr
+        "Error should be on line 9, got:\n{stderr}"
     );
 
     // Verify pipe alignment: all '|' should be at the same column
@@ -513,8 +511,7 @@ fn test_alignment_single_digit_line() -> Result<()> {
     for col in &pipe_cols {
         assert_eq!(
             *col, first_col,
-            "All pipes should be at the same column, got {:?}",
-            pipe_cols
+            "All pipes should be at the same column, got {pipe_cols:?}"
         );
     }
     Ok(())
@@ -531,8 +528,7 @@ fn test_alignment_double_digit_line() -> Result<()> {
     // Verify the error is on line 10
     assert!(
         stderr.contains(":10:"),
-        "Error should be on line 10, got:\n{}",
-        stderr
+        "Error should be on line 10, got:\n{stderr}"
     );
 
     // Verify pipe alignment
@@ -545,8 +541,7 @@ fn test_alignment_double_digit_line() -> Result<()> {
     for col in &pipe_cols {
         assert_eq!(
             *col, first_col,
-            "All pipes should be at the same column, got {:?}",
-            pipe_cols
+            "All pipes should be at the same column, got {pipe_cols:?}"
         );
     }
     Ok(())
@@ -563,8 +558,7 @@ fn test_alignment_triple_digit_line() -> Result<()> {
     // Verify the error is on line 999
     assert!(
         stderr.contains(":999:"),
-        "Error should be on line 999, got:\n{}",
-        stderr
+        "Error should be on line 999, got:\n{stderr}"
     );
 
     // Verify pipe alignment
@@ -577,8 +571,7 @@ fn test_alignment_triple_digit_line() -> Result<()> {
     for col in &pipe_cols {
         assert_eq!(
             *col, first_col,
-            "All pipes should be at the same column, got {:?}",
-            pipe_cols
+            "All pipes should be at the same column, got {pipe_cols:?}"
         );
     }
     Ok(())
@@ -595,8 +588,7 @@ fn test_alignment_four_digit_line() -> Result<()> {
     // Verify the error is on line 1000
     assert!(
         stderr.contains(":1000:"),
-        "Error should be on line 1000, got:\n{}",
-        stderr
+        "Error should be on line 1000, got:\n{stderr}"
     );
 
     // Verify pipe alignment
@@ -609,8 +601,7 @@ fn test_alignment_four_digit_line() -> Result<()> {
     for col in &pipe_cols {
         assert_eq!(
             *col, first_col,
-            "All pipes should be at the same column, got {:?}",
-            pipe_cols
+            "All pipes should be at the same column, got {pipe_cols:?}"
         );
     }
     Ok(())

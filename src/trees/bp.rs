@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // unchecked indexing + SSE4.1 intrinsics on hot BP-navigation paths
 //! Balanced parentheses operations for succinct tree navigation.
 //!
 //! This module provides efficient operations on balanced parentheses (BP) sequences,
@@ -65,7 +66,7 @@ pub struct NoSelect;
 impl SelectSupport for NoSelect {
     #[inline]
     fn build(_words: &[u64], _total_ones: usize) -> Self {
-        NoSelect
+        Self
     }
 
     #[inline]
@@ -87,7 +88,7 @@ pub struct WithSelect {
 impl SelectSupport for WithSelect {
     fn build(words: &[u64], total_ones: usize) -> Self {
         // Use default sample rate of 256 for ~3% overhead
-        WithSelect {
+        Self {
             select_idx: SelectIndex::build(words, total_ones, 256),
         }
     }
@@ -557,12 +558,12 @@ unsafe fn build_l1_index_sse41_impl(
         while i + 8 <= end {
             // Load 8 min_excess values (i8) and widen to i16
             let min_ptr = l0_min_excess.as_ptr().add(i);
-            let min_i8 = _mm_loadl_epi64(min_ptr as *const __m128i); // Load 8 bytes into low 64 bits
+            let min_i8 = _mm_loadl_epi64(min_ptr.cast::<__m128i>()); // Load 8 bytes into low 64 bits
             let min_lo = _mm_cvtepi8_epi16(min_i8); // Sign-extend i8 -> i16
 
             // Load 8 word_excess values (i16)
             let excess_ptr = l0_word_excess.as_ptr().add(i);
-            let excess = _mm_loadu_si128(excess_ptr as *const __m128i);
+            let excess = _mm_loadu_si128(excess_ptr.cast::<__m128i>());
 
             // Compute prefix sum of excess using parallel prefix pattern
             // SSE doesn't have VEXT, so we use shuffles and shifts
@@ -678,11 +679,11 @@ unsafe fn build_l2_index_sse41_impl(
         while i + 8 <= end {
             // Load 8 min_excess values (i16)
             let min_ptr = l1_min_excess.as_ptr().add(i);
-            let min_vals = _mm_loadu_si128(min_ptr as *const __m128i);
+            let min_vals = _mm_loadu_si128(min_ptr.cast::<__m128i>());
 
             // Load 8 block_excess values (i16)
             let excess_ptr = l1_block_excess.as_ptr().add(i);
-            let excess = _mm_loadu_si128(excess_ptr as *const __m128i);
+            let excess = _mm_loadu_si128(excess_ptr.cast::<__m128i>());
 
             // Compute prefix sum using parallel prefix pattern
             let shifted1 = _mm_slli_si128(excess, 2);
@@ -2049,7 +2050,7 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
                 }
 
                 State::CheckL0 => {
-                    debug_assert!(pos % 64 == 0);
+                    debug_assert_eq!(pos % 64, 0);
 
                     let word_idx = pos / 64;
                     if word_idx >= self.l0_min_excess.len() {
@@ -2070,7 +2071,7 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
                 }
 
                 State::CheckL1 => {
-                    debug_assert!(pos % 64 == 0);
+                    debug_assert_eq!(pos % 64, 0);
 
                     let l1_idx = pos / (64 * FACTOR_L1);
                     if l1_idx >= self.l1_min_excess.len() {
@@ -2715,7 +2716,7 @@ mod tests {
         for p in [0, 1, 3] {
             let close = bp.find_close(p).unwrap();
             let open = bp.find_open(close).unwrap();
-            assert_eq!(open, p, "roundtrip failed for position {}", p);
+            assert_eq!(open, p, "roundtrip failed for position {p}");
         }
     }
 
@@ -2730,7 +2731,7 @@ mod tests {
             if bp.is_open(p) {
                 let bp_result = bp.find_close(p);
                 let linear_result = find_close(&words, len, p);
-                assert_eq!(bp_result, linear_result, "mismatch at position {}", p);
+                assert_eq!(bp_result, linear_result, "mismatch at position {p}");
             }
         }
     }
@@ -2859,13 +2860,12 @@ mod tests {
         let bp_result = bp.find_close(p);
 
         // First, make sure we're testing an open position
-        assert!(bp.is_open(p), "Position {} should be open", p);
+        assert!(bp.is_open(p), "Position {p} should be open");
 
         // The results should match
         assert_eq!(
             bp_result, linear_result,
-            "find_close({}) mismatch: accelerated={:?}, linear={:?}",
-            p, bp_result, linear_result
+            "find_close({p}) mismatch: accelerated={bp_result:?}, linear={linear_result:?}"
         );
     }
 
@@ -2942,8 +2942,7 @@ mod tests {
             let linear_result = find_close(&words, len, p);
             assert_eq!(
                 bp_result, linear_result,
-                "L1 boundary: find_close({}) mismatch",
-                p
+                "L1 boundary: find_close({p}) mismatch"
             );
         }
     }
@@ -3258,9 +3257,7 @@ mod tests {
                 assert_eq!(
                     v1.rank1(p),
                     v2.rank1(p),
-                    "rank1({}) mismatch for pattern {:?}",
-                    p,
-                    words
+                    "rank1({p}) mismatch for pattern {words:?}"
                 );
             }
         }
@@ -3284,9 +3281,7 @@ mod tests {
                     assert_eq!(
                         v1.find_close(p),
                         v2.find_close(p),
-                        "find_close({}) mismatch for pattern {:?}",
-                        p,
-                        words
+                        "find_close({p}) mismatch for pattern {words:?}"
                     );
                 }
             }
@@ -3328,8 +3323,7 @@ mod tests {
             assert_eq!(
                 v1.rank1(p),
                 v2.rank1(p),
-                "rank1({}) mismatch on large bitvector",
-                p
+                "rank1({p}) mismatch on large bitvector"
             );
         }
 
@@ -3426,13 +3420,11 @@ mod tests {
 
         assert_eq!(
             scalar_min, sse41_min,
-            "L1 min_excess mismatch: scalar={:?}, sse41={:?}",
-            scalar_min, sse41_min
+            "L1 min_excess mismatch: scalar={scalar_min:?}, sse41={sse41_min:?}"
         );
         assert_eq!(
             scalar_excess, sse41_excess,
-            "L1 block_excess mismatch: scalar={:?}, sse41={:?}",
-            scalar_excess, sse41_excess
+            "L1 block_excess mismatch: scalar={scalar_excess:?}, sse41={sse41_excess:?}"
         );
     }
 
@@ -3457,13 +3449,11 @@ mod tests {
 
         assert_eq!(
             scalar_min, sse41_min,
-            "L1 min_excess mismatch for {} blocks",
-            num_l1
+            "L1 min_excess mismatch for {num_l1} blocks"
         );
         assert_eq!(
             scalar_excess, sse41_excess,
-            "L1 block_excess mismatch for {} blocks",
-            num_l1
+            "L1 block_excess mismatch for {num_l1} blocks"
         );
     }
 
@@ -3554,13 +3544,11 @@ mod tests {
 
         assert_eq!(
             scalar_min, sse41_min,
-            "L2 min_excess mismatch: scalar={:?}, sse41={:?}",
-            scalar_min, sse41_min
+            "L2 min_excess mismatch: scalar={scalar_min:?}, sse41={sse41_min:?}"
         );
         assert_eq!(
             scalar_excess, sse41_excess,
-            "L2 block_excess mismatch: scalar={:?}, sse41={:?}",
-            scalar_excess, sse41_excess
+            "L2 block_excess mismatch: scalar={scalar_excess:?}, sse41={sse41_excess:?}"
         );
     }
 
@@ -3590,8 +3578,7 @@ mod tests {
                 let expected = len - 1 - i;
                 assert_eq!(
                     close, expected,
-                    "find_close({}) = {}, expected {}",
-                    i, close, expected
+                    "find_close({i}) = {close}, expected {expected}"
                 );
             }
         }
@@ -3723,13 +3710,11 @@ mod tests {
 
             assert_eq!(
                 scalar_min, sse41_min,
-                "L1 min_excess mismatch for pattern {}",
-                pattern_idx
+                "L1 min_excess mismatch for pattern {pattern_idx}"
             );
             assert_eq!(
                 scalar_excess, sse41_excess,
-                "L1 block_excess mismatch for pattern {}",
-                pattern_idx
+                "L1 block_excess mismatch for pattern {pattern_idx}"
             );
         }
     }

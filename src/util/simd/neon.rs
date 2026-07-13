@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // ARM64 NEON SIMD intrinsics
 //! ARM NEON SIMD implementations.
 //!
 //! These implementations use NEON intrinsics for accelerated bit operations

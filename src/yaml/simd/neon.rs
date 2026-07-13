@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // ARM64 NEON SIMD intrinsics
 //! NEON-accelerated string scanning for YAML parsing on ARM64.
 //!
 //! Uses 128-bit NEON vectors to process 16 bytes at a time.
@@ -605,8 +606,7 @@ unsafe fn find_json_escape_neon_impl(bytes: &[u8], start: usize) -> usize {
     }
 
     // Handle remaining bytes with scalar fallback
-    for i in offset..data_len {
-        let b = data[i];
+    for (i, &b) in data.iter().enumerate().skip(offset) {
         if b == b'"' || b == b'\\' || b < 0x20 {
             return start + i;
         }
@@ -1114,8 +1114,7 @@ mod tests {
             assert_eq!(
                 find_json_escape_neon(&input, 0),
                 25,
-                "Failed for control char 0x{:02x}",
-                ctrl
+                "Failed for control char 0x{ctrl:02x}"
             );
         }
     }
@@ -1182,8 +1181,7 @@ mod tests {
             let neon = find_json_escape_neon(input, start);
             assert_eq!(
                 scalar, neon,
-                "Mismatch at offset {}: scalar={}, neon={}",
-                start, scalar, neon
+                "Mismatch at offset {start}: scalar={scalar}, neon={neon}"
             );
         }
     }

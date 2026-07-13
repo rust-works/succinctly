@@ -138,20 +138,20 @@ impl PfsmState {
 
     /// Extract the next state from a transition table entry
     #[inline]
-    pub const fn extract_next_state(table_entry: u32, current_state: PfsmState) -> PfsmState {
+    pub const fn extract_next_state(table_entry: u32, current_state: Self) -> Self {
         let byte = ((table_entry >> current_state.byte_offset()) & 0xFF) as u8;
         match byte {
-            0 => PfsmState::InJson,
-            1 => PfsmState::InString,
-            2 => PfsmState::InEscape,
-            3 => PfsmState::InValue,
-            _ => PfsmState::InJson, // Shouldn't happen
+            0 => Self::InJson,
+            1 => Self::InString,
+            2 => Self::InEscape,
+            3 => Self::InValue,
+            _ => Self::InJson, // Shouldn't happen
         }
     }
 
     /// Extract phi bits (IB/OP/CL) from a phi table entry
     #[inline]
-    pub const fn extract_phi(table_entry: u32, current_state: PfsmState) -> u8 {
+    pub const fn extract_phi(table_entry: u32, current_state: Self) -> u8 {
         ((table_entry >> current_state.byte_offset()) & 0xFF) as u8
     }
 }

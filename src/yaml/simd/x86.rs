@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // x86_64 SSE2/AVX2 SIMD intrinsics
 //! x86_64 SIMD-accelerated string scanning for YAML parsing.
 //!
 //! Uses SSE2 (baseline, 16 bytes) with optional AVX2 (32 bytes) when available.
@@ -62,7 +63,7 @@ pub fn classify_yaml_chars(input: &[u8], offset: usize) -> Option<YamlCharClass>
 #[cfg(any(test, feature = "std"))]
 #[target_feature(enable = "avx2")]
 unsafe fn classify_yaml_chars_avx2(input: &[u8], offset: usize) -> YamlCharClass {
-    let chunk = _mm256_loadu_si256(input.as_ptr().add(offset) as *const __m256i);
+    let chunk = _mm256_loadu_si256(input.as_ptr().add(offset).cast::<__m256i>());
 
     // Create comparison vectors for each character
     let v_newline = _mm256_set1_epi8(b'\n' as i8);
@@ -99,7 +100,7 @@ unsafe fn classify_yaml_chars_avx2(input: &[u8], offset: usize) -> YamlCharClass
 /// SSE2 implementation of character classification (16 bytes at a time).
 #[target_feature(enable = "sse2")]
 unsafe fn classify_yaml_chars_sse2(input: &[u8], offset: usize) -> YamlCharClass {
-    let chunk = _mm_loadu_si128(input.as_ptr().add(offset) as *const __m128i);
+    let chunk = _mm_loadu_si128(input.as_ptr().add(offset).cast::<__m128i>());
 
     // Create comparison vectors for each character
     let v_newline = _mm_set1_epi8(b'\n' as i8);
@@ -157,7 +158,7 @@ unsafe fn find_newline_sse2(input: &[u8], start: usize) -> Option<usize> {
     let newline_vec = _mm_set1_epi8(b'\n' as i8);
 
     while offset + 16 <= len {
-        let chunk = _mm_loadu_si128(data.as_ptr().add(offset) as *const __m128i);
+        let chunk = _mm_loadu_si128(data.as_ptr().add(offset).cast::<__m128i>());
         let matches = _mm_cmpeq_epi8(chunk, newline_vec);
         let mask = _mm_movemask_epi8(matches) as u32;
 
@@ -182,7 +183,7 @@ unsafe fn find_newline_avx2(input: &[u8], start: usize) -> Option<usize> {
     let newline_vec = _mm256_set1_epi8(b'\n' as i8);
 
     while offset + 32 <= len {
-        let chunk = _mm256_loadu_si256(data.as_ptr().add(offset) as *const __m256i);
+        let chunk = _mm256_loadu_si256(data.as_ptr().add(offset).cast::<__m256i>());
         let matches = _mm256_cmpeq_epi8(chunk, newline_vec);
         let mask = _mm256_movemask_epi8(matches) as u32;
 
@@ -196,7 +197,7 @@ unsafe fn find_newline_avx2(input: &[u8], start: usize) -> Option<usize> {
     // Handle remaining bytes with SSE2
     if offset + 16 <= len {
         let newline_vec_sse = _mm_set1_epi8(b'\n' as i8);
-        let chunk = _mm_loadu_si128(data.as_ptr().add(offset) as *const __m128i);
+        let chunk = _mm_loadu_si128(data.as_ptr().add(offset).cast::<__m128i>());
         let matches = _mm_cmpeq_epi8(chunk, newline_vec_sse);
         let mask = _mm_movemask_epi8(matches) as u32;
 
@@ -264,7 +265,7 @@ unsafe fn find_quote_or_escape_sse2(input: &[u8], start: usize, end: usize) -> O
     let backslash_vec = _mm_set1_epi8(b'\\' as i8);
 
     while offset + 16 <= len {
-        let chunk = _mm_loadu_si128(data.as_ptr().add(offset) as *const __m128i);
+        let chunk = _mm_loadu_si128(data.as_ptr().add(offset).cast::<__m128i>());
 
         // Compare against both targets
         let quotes = _mm_cmpeq_epi8(chunk, quote_vec);
@@ -299,7 +300,7 @@ unsafe fn find_single_quote_sse2(input: &[u8], start: usize, end: usize) -> Opti
     let quote_vec = _mm_set1_epi8(b'\'' as i8);
 
     while offset + 16 <= len {
-        let chunk = _mm_loadu_si128(data.as_ptr().add(offset) as *const __m128i);
+        let chunk = _mm_loadu_si128(data.as_ptr().add(offset).cast::<__m128i>());
 
         // Compare against single quote
         let matches = _mm_cmpeq_epi8(chunk, quote_vec);
@@ -333,7 +334,7 @@ unsafe fn find_quote_or_escape_avx2(input: &[u8], start: usize, end: usize) -> O
     let backslash_vec = _mm256_set1_epi8(b'\\' as i8);
 
     while offset + 32 <= len {
-        let chunk = _mm256_loadu_si256(data.as_ptr().add(offset) as *const __m256i);
+        let chunk = _mm256_loadu_si256(data.as_ptr().add(offset).cast::<__m256i>());
 
         // Compare against both targets
         let quotes = _mm256_cmpeq_epi8(chunk, quote_vec);
@@ -357,7 +358,7 @@ unsafe fn find_quote_or_escape_avx2(input: &[u8], start: usize, end: usize) -> O
         let quote_vec_sse = _mm_set1_epi8(b'"' as i8);
         let backslash_vec_sse = _mm_set1_epi8(b'\\' as i8);
 
-        let chunk = _mm_loadu_si128(data.as_ptr().add(offset) as *const __m128i);
+        let chunk = _mm_loadu_si128(data.as_ptr().add(offset).cast::<__m128i>());
         let quotes = _mm_cmpeq_epi8(chunk, quote_vec_sse);
         let backslashes = _mm_cmpeq_epi8(chunk, backslash_vec_sse);
         let matches = _mm_or_si128(quotes, backslashes);
@@ -386,7 +387,7 @@ unsafe fn find_single_quote_avx2(input: &[u8], start: usize, end: usize) -> Opti
     let quote_vec = _mm256_set1_epi8(b'\'' as i8);
 
     while offset + 32 <= len {
-        let chunk = _mm256_loadu_si256(data.as_ptr().add(offset) as *const __m256i);
+        let chunk = _mm256_loadu_si256(data.as_ptr().add(offset).cast::<__m256i>());
 
         // Compare against single quote
         let matches = _mm256_cmpeq_epi8(chunk, quote_vec);
@@ -405,7 +406,7 @@ unsafe fn find_single_quote_avx2(input: &[u8], start: usize, end: usize) -> Opti
     if offset + 16 <= len {
         let quote_vec_sse = _mm_set1_epi8(b'\'' as i8);
 
-        let chunk = _mm_loadu_si128(data.as_ptr().add(offset) as *const __m128i);
+        let chunk = _mm_loadu_si128(data.as_ptr().add(offset).cast::<__m128i>());
         let matches = _mm_cmpeq_epi8(chunk, quote_vec_sse);
         let mask = _mm_movemask_epi8(matches) as u32;
 
@@ -447,7 +448,7 @@ unsafe fn count_leading_spaces_sse2(input: &[u8], start: usize) -> usize {
 
     // Process 16-byte chunks
     while offset + 16 <= len {
-        let chunk = _mm_loadu_si128(data.as_ptr().add(offset) as *const __m128i);
+        let chunk = _mm_loadu_si128(data.as_ptr().add(offset).cast::<__m128i>());
 
         // Compare against space
         let matches = _mm_cmpeq_epi8(chunk, space_vec);
@@ -478,7 +479,7 @@ unsafe fn count_leading_spaces_avx2(input: &[u8], start: usize) -> usize {
 
     // Process 32-byte chunks
     while offset + 32 <= len {
-        let chunk = _mm256_loadu_si256(data.as_ptr().add(offset) as *const __m256i);
+        let chunk = _mm256_loadu_si256(data.as_ptr().add(offset).cast::<__m256i>());
 
         // Compare against space
         let matches = _mm256_cmpeq_epi8(chunk, space_vec);
@@ -497,7 +498,7 @@ unsafe fn count_leading_spaces_avx2(input: &[u8], start: usize) -> usize {
     // Handle remaining bytes (16-31 bytes) with SSE2
     if offset + 16 <= len {
         let space_vec_sse = _mm_set1_epi8(b' ' as i8);
-        let chunk = _mm_loadu_si128(data.as_ptr().add(offset) as *const __m128i);
+        let chunk = _mm_loadu_si128(data.as_ptr().add(offset).cast::<__m128i>());
         let matches = _mm_cmpeq_epi8(chunk, space_vec_sse);
         let mask = _mm_movemask_epi8(matches) as u32;
 
@@ -547,7 +548,7 @@ unsafe fn find_block_scalar_end_avx2(input: &[u8], start: usize, min_indent: usi
 
     // Process in 32-byte chunks, looking for newlines
     while pos + 32 < input.len() {
-        let chunk = _mm256_loadu_si256(input.as_ptr().add(pos) as *const __m256i);
+        let chunk = _mm256_loadu_si256(input.as_ptr().add(pos).cast::<__m256i>());
         let nl_matches = _mm256_cmpeq_epi8(chunk, newline_vec);
         let mut nl_mask = _mm256_movemask_epi8(nl_matches) as u32;
 
@@ -568,7 +569,7 @@ unsafe fn find_block_scalar_end_avx2(input: &[u8], start: usize, min_indent: usi
                 // Use SIMD to count spaces
                 if remaining >= 32 {
                     let next_chunk =
-                        _mm256_loadu_si256(input.as_ptr().add(line_start) as *const __m256i);
+                        _mm256_loadu_si256(input.as_ptr().add(line_start).cast::<__m256i>());
                     let space_matches = _mm256_cmpeq_epi8(next_chunk, space_vec);
                     let space_mask = _mm256_movemask_epi8(space_matches) as u32;
 
@@ -620,7 +621,7 @@ unsafe fn find_block_scalar_end_sse2(input: &[u8], start: usize, min_indent: usi
 
     // Process in 16-byte chunks
     while pos + 16 < input.len() {
-        let chunk = _mm_loadu_si128(input.as_ptr().add(pos) as *const __m128i);
+        let chunk = _mm_loadu_si128(input.as_ptr().add(pos).cast::<__m128i>());
         let nl_matches = _mm_cmpeq_epi8(chunk, newline_vec);
         let mut nl_mask = _mm_movemask_epi8(nl_matches) as u32;
 
@@ -639,7 +640,7 @@ unsafe fn find_block_scalar_end_sse2(input: &[u8], start: usize, min_indent: usi
 
                 if remaining >= 16 {
                     let next_chunk =
-                        _mm_loadu_si128(input.as_ptr().add(line_start) as *const __m128i);
+                        _mm_loadu_si128(input.as_ptr().add(line_start).cast::<__m128i>());
                     let space_matches = _mm_cmpeq_epi8(next_chunk, space_vec);
                     let space_mask = _mm_movemask_epi8(space_matches) as u32;
 
@@ -743,7 +744,7 @@ unsafe fn parse_anchor_name_avx2(input: &[u8], start: usize) -> usize {
 
     // Process 32 bytes at a time with AVX2
     while pos + 32 <= end {
-        let chunk = _mm256_loadu_si256(input.as_ptr().add(pos) as *const __m256i);
+        let chunk = _mm256_loadu_si256(input.as_ptr().add(pos).cast::<__m256i>());
 
         // Check for all terminator types
         let is_space = _mm256_cmpeq_epi8(chunk, space);
@@ -844,7 +845,7 @@ unsafe fn find_json_escape_avx2(input: &[u8], start: usize) -> Option<usize> {
 
     // Process 32 bytes at a time with AVX2
     while offset + 32 <= data_len {
-        let chunk = _mm256_loadu_si256(data.as_ptr().add(offset) as *const __m256i);
+        let chunk = _mm256_loadu_si256(data.as_ptr().add(offset).cast::<__m256i>());
 
         // Check for quote
         let is_quote = _mm256_cmpeq_epi8(chunk, quote_vec);
@@ -880,7 +881,7 @@ unsafe fn find_json_escape_avx2(input: &[u8], start: usize) -> Option<usize> {
         let backslash_vec_sse = _mm_set1_epi8(b'\\' as i8);
         let control_threshold_sse = _mm_set1_epi8(0x20);
 
-        let chunk = _mm_loadu_si128(data.as_ptr().add(offset) as *const __m128i);
+        let chunk = _mm_loadu_si128(data.as_ptr().add(offset).cast::<__m128i>());
 
         let is_quote = _mm_cmpeq_epi8(chunk, quote_vec_sse);
         let is_backslash = _mm_cmpeq_epi8(chunk, backslash_vec_sse);
@@ -896,8 +897,7 @@ unsafe fn find_json_escape_avx2(input: &[u8], start: usize) -> Option<usize> {
     }
 
     // Handle remaining bytes (< 16) with scalar
-    for i in offset..data_len {
-        let b = data[i];
+    for (i, &b) in data.iter().enumerate().skip(offset) {
         if b == b'"' || b == b'\\' || b < 0x20 {
             return Some(i);
         }
@@ -924,7 +924,7 @@ unsafe fn find_json_escape_sse2(input: &[u8], start: usize) -> Option<usize> {
 
     // Process 16 bytes at a time with SSE2
     while offset + 16 <= data_len {
-        let chunk = _mm_loadu_si128(data.as_ptr().add(offset) as *const __m128i);
+        let chunk = _mm_loadu_si128(data.as_ptr().add(offset).cast::<__m128i>());
 
         let is_quote = _mm_cmpeq_epi8(chunk, quote_vec);
         let is_backslash = _mm_cmpeq_epi8(chunk, backslash_vec);
@@ -941,8 +941,7 @@ unsafe fn find_json_escape_sse2(input: &[u8], start: usize) -> Option<usize> {
     }
 
     // Handle remaining bytes with scalar
-    for i in offset..data_len {
-        let b = data[i];
+    for (i, &b) in data.iter().enumerate().skip(offset) {
         if b == b'"' || b == b'\\' || b < 0x20 {
             return Some(i);
         }
@@ -1368,8 +1367,7 @@ mod tests {
             assert_eq!(
                 find_json_escape_x86(&input, 0),
                 Some(3),
-                "Control char 0x{:02x} not detected",
-                b
+                "Control char 0x{b:02x} not detected"
             );
         }
 

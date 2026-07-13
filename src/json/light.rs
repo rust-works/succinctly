@@ -520,13 +520,13 @@ pub struct JsonCursor<'a, W = Vec<u64>> {
 }
 
 // Manual Clone/Copy impl since W is only used through a reference
-impl<'a, W> Clone for JsonCursor<'a, W> {
+impl<W> Clone for JsonCursor<'_, W> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, W> Copy for JsonCursor<'a, W> {}
+impl<W> Copy for JsonCursor<'_, W> {}
 
 impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     /// Create a cursor at a specific BP position.
@@ -590,7 +590,7 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     ///
     /// Returns `None` if this position has no children (is a leaf or close paren).
     #[inline]
-    pub fn first_child(&self) -> Option<JsonCursor<'a, W>> {
+    pub fn first_child(&self) -> Option<Self> {
         let new_pos = self.index.bp().first_child(self.bp_pos)?;
         Some(JsonCursor {
             text: self.text,
@@ -603,7 +603,7 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     ///
     /// Returns `None` if this is the last sibling.
     #[inline]
-    pub fn next_sibling(&self) -> Option<JsonCursor<'a, W>> {
+    pub fn next_sibling(&self) -> Option<Self> {
         let new_pos = self.index.bp().next_sibling(self.bp_pos)?;
         Some(JsonCursor {
             text: self.text,
@@ -616,7 +616,7 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     ///
     /// Returns `None` if this is the root.
     #[inline]
-    pub fn parent(&self) -> Option<JsonCursor<'a, W>> {
+    pub fn parent(&self) -> Option<Self> {
         let new_pos = self.index.bp().parent(self.bp_pos)?;
         Some(JsonCursor {
             text: self.text,
@@ -806,7 +806,7 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     /// - The offset doesn't correspond to a valid node
     ///
     /// This enables position-based navigation in jq queries via `at_offset(n)`.
-    pub fn cursor_at_offset(&self, offset: usize) -> Option<JsonCursor<'a, W>> {
+    pub fn cursor_at_offset(&self, offset: usize) -> Option<Self> {
         if offset >= self.text.len() {
             return None;
         }
@@ -876,7 +876,7 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     /// - The position doesn't correspond to a valid node
     ///
     /// This enables position-based navigation in jq queries via `at_position(line; col)`.
-    pub fn cursor_at_position(&self, line: usize, col: usize) -> Option<JsonCursor<'a, W>> {
+    pub fn cursor_at_position(&self, line: usize, col: usize) -> Option<Self> {
         // Convert line/column to byte offset
         let offset = self.index.to_offset(line, col)?;
 
@@ -899,13 +899,13 @@ pub struct JsonChildren<'a, W = Vec<u64>> {
     current: Option<JsonCursor<'a, W>>,
 }
 
-impl<'a, W> Clone for JsonChildren<'a, W> {
+impl<W> Clone for JsonChildren<'_, W> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, W> Copy for JsonChildren<'a, W> {}
+impl<W> Copy for JsonChildren<'_, W> {}
 
 impl<'a, W: AsRef<[u64]>> Iterator for JsonChildren<'a, W> {
     type Item = JsonCursor<'a, W>;
@@ -968,13 +968,13 @@ pub struct JsonFields<'a, W = Vec<u64>> {
 }
 
 // Manual Clone/Copy impl since JsonCursor is Copy
-impl<'a, W> Clone for JsonFields<'a, W> {
+impl<W> Clone for JsonFields<'_, W> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, W> Copy for JsonFields<'a, W> {}
+impl<W> Copy for JsonFields<'_, W> {}
 
 impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     /// Create a new JsonFields from an object cursor.
@@ -993,7 +993,7 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     /// Get the first field and the remaining fields.
     ///
     /// Returns `None` if there are no more fields.
-    pub fn uncons(&self) -> Option<(JsonField<'a, W>, JsonFields<'a, W>)> {
+    pub fn uncons(&self) -> Option<(JsonField<'a, W>, Self)> {
         let key_cursor = self.key_cursor?;
 
         // Next sibling of key is the value
@@ -1052,13 +1052,13 @@ pub struct JsonField<'a, W = Vec<u64>> {
 }
 
 // Manual Clone/Copy impl since JsonCursor is Copy
-impl<'a, W> Clone for JsonField<'a, W> {
+impl<W> Clone for JsonField<'_, W> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, W> Copy for JsonField<'a, W> {}
+impl<W> Copy for JsonField<'_, W> {}
 
 impl<'a, W: AsRef<[u64]>> JsonField<'a, W> {
     /// Get the field key (always a string).
@@ -1105,13 +1105,13 @@ pub struct JsonElements<'a, W = Vec<u64>> {
 }
 
 // Manual Clone/Copy impl since JsonCursor is Copy
-impl<'a, W> Clone for JsonElements<'a, W> {
+impl<W> Clone for JsonElements<'_, W> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, W> Copy for JsonElements<'a, W> {}
+impl<W> Copy for JsonElements<'_, W> {}
 
 impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
     /// Create a new JsonElements from an array cursor.
@@ -1130,7 +1130,7 @@ impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
     /// Get the first element and the remaining elements.
     ///
     /// Returns `None` if there are no more elements.
-    pub fn uncons(&self) -> Option<(StandardJson<'a, W>, JsonElements<'a, W>)> {
+    pub fn uncons(&self) -> Option<(StandardJson<'a, W>, Self)> {
         let element_cursor = self.element_cursor?;
 
         let rest = JsonElements {
@@ -1145,7 +1145,7 @@ impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
     ///
     /// This is like `uncons` but returns the cursor instead of the value.
     /// Useful for lazy evaluation where you want to defer calling `value()`.
-    pub fn uncons_cursor(&self) -> Option<(JsonCursor<'a, W>, JsonElements<'a, W>)> {
+    pub fn uncons_cursor(&self) -> Option<(JsonCursor<'a, W>, Self)> {
         let element_cursor = self.element_cursor?;
 
         let rest = JsonElements {
@@ -1474,10 +1474,10 @@ pub enum JsonError {
 impl core::fmt::Display for JsonError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            JsonError::InvalidUtf8 => write!(f, "invalid UTF-8 in string"),
-            JsonError::InvalidNumber => write!(f, "invalid number format"),
-            JsonError::InvalidEscape => write!(f, "invalid escape sequence in string"),
-            JsonError::InvalidUnicodeEscape => write!(f, "invalid unicode escape sequence"),
+            Self::InvalidUtf8 => write!(f, "invalid UTF-8 in string"),
+            Self::InvalidNumber => write!(f, "invalid number format"),
+            Self::InvalidEscape => write!(f, "invalid escape sequence in string"),
+            Self::InvalidUnicodeEscape => write!(f, "invalid unicode escape sequence"),
         }
     }
 }
@@ -1705,9 +1705,9 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for JsonElements<'a, W> {
 // ============================================================================
 
 /// Stream a JSON value as YAML.
-fn stream_json_as_yaml<'a, W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
+fn stream_json_as_yaml<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
     out: &mut Out,
-    value: StandardJson<'a, W>,
+    value: StandardJson<'_, W>,
     current_indent: usize,
     indent_spaces: usize,
 ) -> core::fmt::Result {
@@ -1717,7 +1717,7 @@ fn stream_json_as_yaml<'a, W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
         StandardJson::Number(n) => {
             // Try integer first, then float
             if let Ok(i) = n.as_i64() {
-                write!(out, "{}", i)
+                write!(out, "{i}")
             } else if let Ok(f) = n.as_f64() {
                 if f.is_nan() {
                     out.write_str(".nan")
@@ -1728,7 +1728,7 @@ fn stream_json_as_yaml<'a, W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                         out.write_str("-.inf")
                     }
                 } else {
-                    write!(out, "{}", f)
+                    write!(out, "{f}")
                 }
             } else {
                 out.write_str("null")
@@ -2045,7 +2045,7 @@ mod tests {
 
     #[test]
     fn test_empty_object() {
-        let json = br#"{}"#;
+        let json = br"{}";
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
@@ -2059,7 +2059,7 @@ mod tests {
 
     #[test]
     fn test_empty_array() {
-        let json = br#"[]"#;
+        let json = br"[]";
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
@@ -2228,7 +2228,7 @@ mod tests {
 
     #[test]
     fn test_array_single_element() {
-        let json = br#"[42]"#;
+        let json = br"[42]";
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
@@ -2250,7 +2250,7 @@ mod tests {
 
     #[test]
     fn test_array_multiple_elements() {
-        let json = br#"[1, 2, 3]"#;
+        let json = br"[1, 2, 3]";
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
@@ -2387,7 +2387,7 @@ mod tests {
     #[test]
     fn test_immutable_iteration() {
         // Test that iteration is truly immutable - we can iterate multiple times
-        let json = br#"[1, 2, 3]"#;
+        let json = br"[1, 2, 3]";
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
@@ -2749,7 +2749,7 @@ mod tests {
 
     #[test]
     fn test_json_elements_iterator() {
-        let json = br#"[1, 2, 3, 4, 5]"#;
+        let json = br"[1, 2, 3, 4, 5]";
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
@@ -2771,7 +2771,7 @@ mod tests {
 
     #[test]
     fn test_iterator_empty_object() {
-        let json = br#"{}"#;
+        let json = br"{}";
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
@@ -2784,7 +2784,7 @@ mod tests {
 
     #[test]
     fn test_iterator_empty_array() {
-        let json = br#"[]"#;
+        let json = br"[]";
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
@@ -2834,7 +2834,7 @@ mod tests {
 
     #[test]
     fn test_is_container_array() {
-        let json = br#"[1, 2, 3]"#;
+        let json = br"[1, 2, 3]";
         let index = JsonIndex::build(json);
         let root = index.root(json);
         assert!(root.is_container());
@@ -2842,7 +2842,7 @@ mod tests {
 
     #[test]
     fn test_is_container_empty_object() {
-        let json = br#"{}"#;
+        let json = br"{}";
         let index = JsonIndex::build(json);
         let root = index.root(json);
         // Empty containers have no children, so is_container returns false
@@ -2851,7 +2851,7 @@ mod tests {
 
     #[test]
     fn test_is_container_empty_array() {
-        let json = br#"[]"#;
+        let json = br"[]";
         let index = JsonIndex::build(json);
         let root = index.root(json);
         // Empty containers have no children, so is_container returns false
@@ -2883,7 +2883,7 @@ mod tests {
 
     #[test]
     fn test_children_array() {
-        let json = br#"[1, 2, 3]"#;
+        let json = br"[1, 2, 3]";
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
@@ -2922,7 +2922,7 @@ mod tests {
 
     #[test]
     fn test_children_empty() {
-        let json = br#"[]"#;
+        let json = br"[]";
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
@@ -3073,8 +3073,7 @@ mod tests {
             assert_eq!(
                 result,
                 Some(offset),
-                "Round-trip failed for offset {}",
-                offset
+                "Round-trip failed for offset {offset}"
             );
         }
     }

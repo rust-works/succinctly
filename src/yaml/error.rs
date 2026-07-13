@@ -133,36 +133,33 @@ pub enum YamlError {
 impl fmt::Display for YamlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            YamlError::InvalidIndentation {
+            Self::InvalidIndentation {
                 line,
                 expected,
                 found,
             } => {
                 write!(
                     f,
-                    "invalid indentation at line {}: expected {} spaces, found {}",
-                    line, expected, found
+                    "invalid indentation at line {line}: expected {expected} spaces, found {found}"
                 )
             }
-            YamlError::TabIndentation { line, offset } => {
+            Self::TabIndentation { line, offset } => {
                 write!(
                     f,
-                    "tab character used for indentation at line {} (offset {})",
-                    line, offset
+                    "tab character used for indentation at line {line} (offset {offset})"
                 )
             }
-            YamlError::UnexpectedCharacter {
+            Self::UnexpectedCharacter {
                 offset,
                 char,
                 context,
             } => {
                 write!(
                     f,
-                    "unexpected character '{}' at offset {}: {}",
-                    char, offset, context
+                    "unexpected character '{char}' at offset {offset}: {context}"
                 )
             }
-            YamlError::UnclosedQuote {
+            Self::UnclosedQuote {
                 start_offset,
                 quote_type,
             } => {
@@ -177,65 +174,54 @@ impl fmt::Display for YamlError {
                     start_offset
                 )
             }
-            YamlError::InvalidEscape { offset, sequence } => {
-                write!(
-                    f,
-                    "invalid escape sequence '{}' at offset {}",
-                    sequence, offset
-                )
+            Self::InvalidEscape { offset, sequence } => {
+                write!(f, "invalid escape sequence '{sequence}' at offset {offset}")
             }
-            YamlError::InvalidUtf8 { offset } => {
-                write!(f, "invalid UTF-8 sequence at offset {}", offset)
+            Self::InvalidUtf8 { offset } => {
+                write!(f, "invalid UTF-8 sequence at offset {offset}")
             }
             #[allow(deprecated)]
             // STYLE-0004: Display arm for a deprecated error variant kept for back-compat
-            YamlError::MultiDocumentNotSupported { offset } => {
+            Self::MultiDocumentNotSupported { offset } => {
                 write!(
                     f,
-                    "multi-document YAML not supported (found `---` at offset {})",
-                    offset
+                    "multi-document YAML not supported (found `---` at offset {offset})"
                 )
             }
             #[allow(deprecated)]
             // STYLE-0004: Display arm for a deprecated error variant kept for back-compat
-            YamlError::FlowStyleNotSupported { offset, char } => {
+            Self::FlowStyleNotSupported { offset, char } => {
+                write!(f, "flow style '{char}' not supported at offset {offset}")
+            }
+            Self::InvalidAnchorName { offset, reason } => {
+                write!(f, "invalid anchor name at offset {offset}: {reason}")
+            }
+            Self::DuplicateAnchor { offset, name } => {
                 write!(
                     f,
-                    "flow style '{}' not supported at offset {}",
-                    char, offset
+                    "duplicate anchor '{name}' at offset {offset} (previously defined)"
                 )
             }
-            YamlError::InvalidAnchorName { offset, reason } => {
-                write!(f, "invalid anchor name at offset {}: {}", offset, reason)
+            Self::ExplicitKeyNotSupported { offset } => {
+                write!(f, "explicit keys (?) not supported at offset {offset}")
             }
-            YamlError::DuplicateAnchor { offset, name } => {
-                write!(
-                    f,
-                    "duplicate anchor '{}' at offset {} (previously defined)",
-                    name, offset
-                )
+            Self::TagNotSupported { offset } => {
+                write!(f, "tags (!) not supported at offset {offset}")
             }
-            YamlError::ExplicitKeyNotSupported { offset } => {
-                write!(f, "explicit keys (?) not supported at offset {}", offset)
-            }
-            YamlError::TagNotSupported { offset } => {
-                write!(f, "tags (!) not supported at offset {}", offset)
-            }
-            YamlError::EmptyInput => {
+            Self::EmptyInput => {
                 write!(f, "empty input")
             }
-            YamlError::ColonWithoutSpace { offset } => {
+            Self::ColonWithoutSpace { offset } => {
                 write!(
                     f,
-                    "colon at offset {} must be followed by space or newline",
-                    offset
+                    "colon at offset {offset} must be followed by space or newline"
                 )
             }
-            YamlError::KeyWithoutValue { offset, line } => {
-                write!(f, "key without value at line {} (offset {})", line, offset)
+            Self::KeyWithoutValue { offset, line } => {
+                write!(f, "key without value at line {line} (offset {offset})")
             }
-            YamlError::UnexpectedEof { context } => {
-                write!(f, "unexpected end of input: {}", context)
+            Self::UnexpectedEof { context } => {
+                write!(f, "unexpected end of input: {context}")
             }
         }
     }

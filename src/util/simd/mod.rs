@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // runtime SIMD feature dispatch
 //! SIMD-accelerated operations.
 //!
 //! This module provides platform-specific SIMD implementations for
@@ -106,8 +107,7 @@ mod tests {
             assert_eq!(
                 popcount_512(&data),
                 popcount_512_scalar(&data),
-                "pattern={:#04x}",
-                pattern
+                "pattern={pattern:#04x}"
             );
         }
     }

@@ -98,7 +98,7 @@ pub enum QueryResult<'a, W = Vec<u64>> {
     Break(String),
 }
 
-impl<'a, W: Clone + AsRef<[u64]>> QueryResult<'a, W> {
+impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
     /// Convert OneCursor to One by materializing the cursor value.
     /// Used internally when we need StandardJson from a result.
     #[inline]
@@ -146,24 +146,24 @@ pub struct EvalError {
 impl EvalError {
     /// Create a new evaluation error with a message.
     pub fn new(message: impl Into<String>) -> Self {
-        EvalError {
+        Self {
             message: message.into(),
         }
     }
 
     /// Create a type error.
     pub fn type_error(expected: &str, got: &str) -> Self {
-        EvalError::new(format!("expected {}, got {}", expected, got))
+        Self::new(format!("expected {expected}, got {got}"))
     }
 
     /// Create a field not found error.
     pub fn field_not_found(name: &str) -> Self {
-        EvalError::new(format!("field '{}' not found", name))
+        Self::new(format!("field '{name}' not found"))
     }
 
     /// Create an index out of bounds error.
     pub fn index_out_of_bounds(index: i64, len: usize) -> Self {
-        EvalError::new(format!("index {} out of bounds (length {})", index, len))
+        Self::new(format!("index {index} out of bounds (length {len})"))
     }
 }
 
@@ -331,8 +331,8 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                 };
 
-                let start_idx = start.map(resolve_idx).unwrap_or(0);
-                let end_idx = end.map(resolve_idx).unwrap_or(len);
+                let start_idx = start.map_or(0, resolve_idx);
+                let end_idx = end.map_or(len, resolve_idx);
 
                 // Check for empty slice
                 if start_idx >= end_idx || start_idx >= len {
@@ -424,7 +424,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Var(name) => {
             // Variable references without context should error
             // In practice, variables are resolved by eval_as which substitutes them
-            QueryResult::Error(EvalError::new(format!("undefined variable: ${}", name)))
+            QueryResult::Error(EvalError::new(format!("undefined variable: ${name}")))
         }
         Expr::Loc { line } => {
             // $__loc__ returns {"file": "<stdin>", "line": N}
@@ -491,8 +491,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // For now, namespaced calls return an error (modules not loaded)
             // This will be properly handled once module loading is implemented
             QueryResult::Error(EvalError::new(format!(
-                "module '{}' not loaded (namespaced call {}::{})",
-                namespace, namespace, name
+                "module '{namespace}' not loaded (namespaced call {namespace}::{name})"
             )))
         }
 
@@ -664,9 +663,9 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Evaluate recursive descent.
-fn eval_recursive_descent<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    value: StandardJson<'a, W>,
-) -> QueryResult<'a, W> {
+fn eval_recursive_descent<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: StandardJson<'_, W>,
+) -> QueryResult<'_, W> {
     let mut results = Vec::new();
     collect_recursive::<W, S>(&value, &mut results);
     QueryResult::Many(results)
@@ -718,7 +717,7 @@ fn result_to_owned<W: Clone + AsRef<[u64]>>(
         }
         QueryResult::None => Err(EvalError::new("no value")),
         QueryResult::Error(e) => Err(e),
-        QueryResult::Break(label) => Err(EvalError::new(format!("break ${} not in label", label))),
+        QueryResult::Break(label) => Err(EvalError::new(format!("break ${label} not in label"))),
     }
 }
 
@@ -1151,7 +1150,7 @@ fn eval_or<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Evaluate boolean NOT.
-fn eval_not<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryResult<'a, W> {
+fn eval_not<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
     let owned = to_owned(&value);
     QueryResult::Owned(OwnedValue::Bool(!owned.is_truthy()))
 }
@@ -1171,8 +1170,8 @@ fn eval_alternative<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::One(v) => to_owned(v).is_truthy(),
         QueryResult::OneCursor(_) => unreachable!("eval_single never produces OneCursor"),
         QueryResult::Owned(v) => v.is_truthy(),
-        QueryResult::Many(vs) => vs.first().map(|v| to_owned(v).is_truthy()).unwrap_or(false),
-        QueryResult::ManyOwned(vs) => vs.first().map(|v| v.is_truthy()).unwrap_or(false),
+        QueryResult::Many(vs) => vs.first().is_some_and(|v| to_owned(v).is_truthy()),
+        QueryResult::ManyOwned(vs) => vs.first().is_some_and(super::value::OwnedValue::is_truthy),
         QueryResult::None => false,
         QueryResult::Error(_) => false,
         QueryResult::Break(label) => return QueryResult::Break(label.clone()),
@@ -1201,8 +1200,8 @@ fn eval_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::One(v) => to_owned(v).is_truthy(),
         QueryResult::OneCursor(_) => unreachable!("eval_single never produces OneCursor"),
         QueryResult::Owned(v) => v.is_truthy(),
-        QueryResult::Many(vs) => vs.first().map(|v| to_owned(v).is_truthy()).unwrap_or(false),
-        QueryResult::ManyOwned(vs) => vs.first().map(|v| v.is_truthy()).unwrap_or(false),
+        QueryResult::Many(vs) => vs.first().is_some_and(|v| to_owned(v).is_truthy()),
+        QueryResult::ManyOwned(vs) => vs.first().is_some_and(super::value::OwnedValue::is_truthy),
         QueryResult::None => false,
         QueryResult::Error(e) => return QueryResult::Error(e.clone()),
         QueryResult::Break(label) => return QueryResult::Break(label.clone()),
@@ -1705,10 +1704,10 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: length
-fn builtin_length<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_length<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Null => QueryResult::Owned(OwnedValue::Int(0)),
         StandardJson::String(s) => {
@@ -1743,10 +1742,10 @@ fn builtin_length<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: utf8bytelength
-fn builtin_utf8bytelength<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_utf8bytelength<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match &value {
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
@@ -1761,11 +1760,11 @@ fn builtin_utf8bytelength<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: keys / keys_unsorted
-fn builtin_keys<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_keys<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
     sorted: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match value {
         StandardJson::Object(fields) => {
             let mut keys: Vec<String> = Vec::new();
@@ -1918,8 +1917,8 @@ fn builtin_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::One(v) => to_owned(v).is_truthy(),
         QueryResult::OneCursor(_) => unreachable!("eval_single never produces OneCursor"),
         QueryResult::Owned(v) => v.is_truthy(),
-        QueryResult::Many(vs) => vs.first().map(|v| to_owned(v).is_truthy()).unwrap_or(false),
-        QueryResult::ManyOwned(vs) => vs.first().map(|v| v.is_truthy()).unwrap_or(false),
+        QueryResult::Many(vs) => vs.first().is_some_and(|v| to_owned(v).is_truthy()),
+        QueryResult::ManyOwned(vs) => vs.first().is_some_and(super::value::OwnedValue::is_truthy),
         QueryResult::None => false,
         QueryResult::Error(e) => return QueryResult::Error(e.clone()),
         QueryResult::Break(label) => return QueryResult::Break(label.clone()),
@@ -2040,10 +2039,10 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: add
-fn builtin_add<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    value: StandardJson<'a, W>,
+fn builtin_add<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
             let items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
@@ -2067,10 +2066,10 @@ fn builtin_add<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: any
-fn builtin_any<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_any<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
             for elem in elements {
@@ -2087,10 +2086,10 @@ fn builtin_any<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: all
-fn builtin_all<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_all<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
             for elem in elements {
@@ -2107,10 +2106,10 @@ fn builtin_all<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: min
-fn builtin_min<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_min<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
             let items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
@@ -2127,10 +2126,10 @@ fn builtin_min<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: max
-fn builtin_max<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_max<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
             let items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
@@ -2223,10 +2222,10 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 // =============================================================================
 
 /// Builtin: ascii_downcase - lowercase ASCII characters
-fn builtin_ascii_downcase<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_ascii_downcase<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match &value {
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
@@ -2242,10 +2241,10 @@ fn builtin_ascii_downcase<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: ascii_upcase - uppercase ASCII characters
-fn builtin_ascii_upcase<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_ascii_upcase<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match &value {
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
@@ -2516,10 +2515,10 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 // =============================================================================
 
 /// Builtin: first - first element (.[0])
-fn builtin_first<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_first<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     _optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => match elements.get(0) {
             Some(v) => QueryResult::One(v),
@@ -2533,10 +2532,10 @@ fn builtin_first<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: last - last element (.[-1])
-fn builtin_last<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_last<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     _optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
             let items: Vec<_> = elements.collect();
@@ -2584,10 +2583,10 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: reverse - reverse array
-fn builtin_reverse<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_reverse<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     _optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
             let mut items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
@@ -2610,11 +2609,11 @@ fn builtin_reverse<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: flatten - flatten nested arrays (1 level)
-fn builtin_flatten<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_flatten<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
     depth: usize,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
             let items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
@@ -2720,10 +2719,10 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: unique - remove duplicates
-fn builtin_unique<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_unique<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
             let mut items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
@@ -2778,10 +2777,10 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: sort - sort array
-fn builtin_sort<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_sort<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
             let mut items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
@@ -2831,10 +2830,10 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 // =============================================================================
 
 /// Builtin: to_entries - {k:v} → [{key:k, value:v}]
-fn builtin_to_entries<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match value {
         StandardJson::Object(fields) => {
             let mut entries: Vec<OwnedValue> = Vec::new();
@@ -2863,10 +2862,10 @@ fn builtin_to_entries<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: from_entries - [{key:k, value:v}] → {k:v}
-fn builtin_from_entries<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_from_entries<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
             let mut result = IndexMap::new();
@@ -3040,19 +3039,19 @@ fn owned_to_string(value: &OwnedValue) -> String {
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(true) => "true".to_string(),
         OwnedValue::Bool(false) => "false".to_string(),
-        OwnedValue::Int(n) => format!("{}", n),
-        OwnedValue::Float(f) => format!("{}", f),
+        OwnedValue::Int(n) => format!("{n}"),
+        OwnedValue::Float(f) => format!("{f}"),
         OwnedValue::String(s) => s.clone(), // Don't quote strings in interpolation
         OwnedValue::Array(_) | OwnedValue::Object(_) => value.to_json(),
     }
 }
 
 /// Evaluate a format string: `@json`, `@uri`, etc.
-fn eval_format<'a, W: Clone + AsRef<[u64]>>(
+fn eval_format<W: Clone + AsRef<[u64]>>(
     format_type: FormatType,
-    value: StandardJson<'a, W>,
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     let owned = to_owned(&value);
 
     let result = match format_type {
@@ -3111,7 +3110,7 @@ fn format_uri(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> 
             result.push(c);
         } else {
             for b in c.to_string().as_bytes() {
-                result.push_str(&format!("%{:02X}", b));
+                result.push_str(&format!("%{b:02X}"));
             }
         }
     }
@@ -3235,8 +3234,8 @@ fn format_base64(value: &OwnedValue, optional: bool) -> Result<String, EvalError
 
             for chunk in bytes.chunks(3) {
                 let b0 = chunk[0] as u32;
-                let b1 = chunk.get(1).map(|&b| b as u32).unwrap_or(0);
-                let b2 = chunk.get(2).map(|&b| b as u32).unwrap_or(0);
+                let b1 = chunk.get(1).map_or(0, |&b| b as u32);
+                let b2 = chunk.get(2).map_or(0, |&b| b as u32);
 
                 let triple = (b0 << 16) | (b1 << 8) | b2;
 
@@ -3353,9 +3352,9 @@ fn shell_quote_value(value: &OwnedValue) -> String {
         OwnedValue::String(s) => {
             if s.contains('\'') {
                 let escaped = s.replace('\'', "'\\''");
-                format!("'{}'", escaped)
+                format!("'{escaped}'")
             } else {
-                format!("'{}'", s)
+                format!("'{s}'")
             }
         }
         // Numbers, bools, null are NOT quoted in jq
@@ -3380,9 +3379,9 @@ fn format_sh(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
             // Use single quotes and escape single quotes
             if s.contains('\'') {
                 let escaped = s.replace('\'', "'\\''");
-                Ok(format!("'{}'", escaped))
+                Ok(format!("'{escaped}'"))
             } else {
-                Ok(format!("'{}'", s))
+                Ok(format!("'{s}'"))
             }
         }
         // jq: [1, 2, 3] | @sh => "1 2 3"
@@ -3427,11 +3426,11 @@ fn format_props(value: &OwnedValue) -> Result<String, EvalError> {
 fn format_props_recursive(value: &OwnedValue, prefix: String, lines: &mut Vec<String>) {
     match value {
         OwnedValue::Object(obj) => {
-            for (key, val) in obj.iter() {
+            for (key, val) in obj {
                 let new_prefix = if prefix.is_empty() {
                     key.clone()
                 } else {
-                    format!("{}.{}", prefix, key)
+                    format!("{prefix}.{key}")
                 };
                 format_props_recursive(val, new_prefix, lines);
             }
@@ -3439,9 +3438,9 @@ fn format_props_recursive(value: &OwnedValue, prefix: String, lines: &mut Vec<St
         OwnedValue::Array(arr) => {
             for (idx, val) in arr.iter().enumerate() {
                 let new_prefix = if prefix.is_empty() {
-                    format!("{}", idx)
+                    format!("{idx}")
                 } else {
-                    format!("{}.{}", prefix, idx)
+                    format!("{prefix}.{idx}")
                 };
                 format_props_recursive(val, new_prefix, lines);
             }
@@ -3453,7 +3452,7 @@ fn format_props_recursive(value: &OwnedValue, prefix: String, lines: &mut Vec<St
                 // Top-level scalar without key
                 lines.push(value_str);
             } else {
-                lines.push(format!("{} = {}", prefix, value_str));
+                lines.push(format!("{prefix} = {value_str}"));
             }
         }
     }
@@ -3465,7 +3464,7 @@ fn props_value_to_string(value: &OwnedValue) -> String {
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(true) => "true".to_string(),
         OwnedValue::Bool(false) => "false".to_string(),
-        OwnedValue::Int(n) => format!("{}", n),
+        OwnedValue::Int(n) => format!("{n}"),
         OwnedValue::Float(f) => {
             if f.is_nan() {
                 ".nan".to_string()
@@ -3476,7 +3475,7 @@ fn props_value_to_string(value: &OwnedValue) -> String {
                     "-.inf".to_string()
                 }
             } else {
-                format!("{}", f)
+                format!("{f}")
             }
         }
         OwnedValue::String(s) => {
@@ -3495,7 +3494,7 @@ fn owned_to_yaml(value: &OwnedValue) -> String {
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(true) => "true".to_string(),
         OwnedValue::Bool(false) => "false".to_string(),
-        OwnedValue::Int(n) => format!("{}", n),
+        OwnedValue::Int(n) => format!("{n}"),
         OwnedValue::Float(f) => {
             if f.is_nan() {
                 ".nan".to_string()
@@ -3506,7 +3505,7 @@ fn owned_to_yaml(value: &OwnedValue) -> String {
                     "-.inf".to_string()
                 }
             } else {
-                format!("{}", f)
+                format!("{f}")
             }
         }
         OwnedValue::String(s) => yaml_quote_string(s),
@@ -3593,28 +3592,28 @@ fn yaml_quote_string(s: &str) -> String {
 // =============================================================================
 
 /// Builtin: tostring - convert any value to string
-fn builtin_tostring<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_tostring<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     _optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     let owned = to_owned(&value);
     let s = match owned {
         OwnedValue::String(s) => s,
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(true) => "true".to_string(),
         OwnedValue::Bool(false) => "false".to_string(),
-        OwnedValue::Int(n) => format!("{}", n),
-        OwnedValue::Float(f) => format!("{}", f),
+        OwnedValue::Int(n) => format!("{n}"),
+        OwnedValue::Float(f) => format!("{f}"),
         OwnedValue::Array(_) | OwnedValue::Object(_) => owned.to_json(),
     };
     QueryResult::Owned(OwnedValue::String(s))
 }
 
 /// Builtin: tonumber - convert string to number
-fn builtin_tonumber<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_tonumber<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Number(n) => {
             // Already a number, return as-is
@@ -3636,7 +3635,7 @@ fn builtin_tonumber<'a, W: Clone + AsRef<[u64]>>(
                 } else if optional {
                     QueryResult::None
                 } else {
-                    QueryResult::Error(EvalError::new(format!("cannot parse '{}' as number", s)))
+                    QueryResult::Error(EvalError::new(format!("cannot parse '{s}' as number")))
                 }
             } else if optional {
                 QueryResult::None
@@ -3651,10 +3650,10 @@ fn builtin_tonumber<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: toboolean - convert to boolean
 /// Accepts: true, false, "true", "false"
-fn builtin_toboolean<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_toboolean<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Bool(b) => QueryResult::Owned(OwnedValue::Bool(*b)),
         StandardJson::String(s) => {
@@ -3664,8 +3663,7 @@ fn builtin_toboolean<'a, W: Clone + AsRef<[u64]>>(
                     "false" => QueryResult::Owned(OwnedValue::Bool(false)),
                     _ if optional => QueryResult::None,
                     other => QueryResult::Error(EvalError::new(format!(
-                        "string ({:?}) cannot be parsed as a boolean",
-                        other
+                        "string ({other:?}) cannot be parsed as a boolean"
                     ))),
                 }
             } else if optional {
@@ -3757,20 +3755,20 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: tojson - convert any value to JSON string
-fn builtin_tojson<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_tojson<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     _optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     let owned = to_owned(&value);
     let json_string = owned.to_json();
     QueryResult::Owned(OwnedValue::String(json_string))
 }
 
 /// Builtin: fromjson - parse JSON string to value
-fn builtin_fromjson<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_fromjson<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match &value {
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
@@ -3779,7 +3777,7 @@ fn builtin_fromjson<'a, W: Clone + AsRef<[u64]>>(
                 match parse_json_string(json_str) {
                     Ok(owned) => QueryResult::Owned(owned),
                     Err(_) if optional => QueryResult::None,
-                    Err(e) => QueryResult::Error(EvalError::new(format!("fromjson: {}", e))),
+                    Err(e) => QueryResult::Error(EvalError::new(format!("fromjson: {e}"))),
                 }
             } else if optional {
                 QueryResult::None
@@ -4160,10 +4158,10 @@ fn parse_json_number(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String
 // =============================================================================
 
 /// Builtin: explode - string to array of Unicode codepoints
-fn builtin_explode<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_explode<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match &value {
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
@@ -4184,10 +4182,10 @@ fn builtin_explode<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: implode - array of codepoints to string
-fn builtin_implode<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_implode<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Array(elements) => {
             let mut result = String::new();
@@ -4200,8 +4198,7 @@ fn builtin_implode<'a, W: Clone + AsRef<[u64]>>(
                             continue;
                         } else {
                             return QueryResult::Error(EvalError::new(format!(
-                                "invalid codepoint: {}",
-                                codepoint
+                                "invalid codepoint: {codepoint}"
                             )));
                         }
                     }
@@ -4390,10 +4387,10 @@ fn builtin_rindex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: tojsonstream - convert to JSON text stream format (simplified)
-fn builtin_tojsonstream<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_tojsonstream<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     _optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     // Simplified: just return the value as JSON lines format
     let owned = to_owned(&value);
     fn collect_stream(value: &OwnedValue, path: &[OwnedValue], results: &mut Vec<OwnedValue>) {
@@ -4406,7 +4403,7 @@ fn builtin_tojsonstream<'a, W: Clone + AsRef<[u64]>>(
                 }
             }
             OwnedValue::Object(obj) => {
-                for (k, v) in obj.iter() {
+                for (k, v) in obj {
                     let mut new_path = path.to_vec();
                     new_path.push(OwnedValue::String(k.clone()));
                     collect_stream(v, &new_path, results);
@@ -4426,10 +4423,10 @@ fn builtin_tojsonstream<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: fromjsonstream - convert from JSON text stream format (simplified)
-fn builtin_fromjsonstream<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_fromjsonstream<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     // This is a complex operation - provide a simplified version
     match &value {
         StandardJson::Array(_) => {
@@ -4513,11 +4510,11 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<regex::Regex, EvalE
         }
         if prefix.len() > 2 {
             prefix.push(')');
-            pattern = format!("{}{}", prefix, pattern);
+            pattern = format!("{prefix}{pattern}");
         }
     }
 
-    regex::Regex::new(&pattern).map_err(|e| EvalError::new(format!("invalid regex: {}", e)))
+    regex::Regex::new(&pattern).map_err(|e| EvalError::new(format!("invalid regex: {e}")))
 }
 
 /// Builtin: match(re) or match(re; flags) - return match object
@@ -4555,7 +4552,7 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Check if global flag is set
-    let global = flags.map(|f| f.contains('g')).unwrap_or(false);
+    let global = flags.is_some_and(|f| f.contains('g'));
 
     if global {
         // Return all matches
@@ -4596,23 +4593,21 @@ fn build_match_object(re: &regex::Regex, matched: &str, offset: usize, input: &s
             let mut cap_obj = IndexMap::new();
             cap_obj.insert(
                 "offset".to_string(),
-                cap.map(|m| OwnedValue::Int(m.start() as i64))
-                    .unwrap_or(OwnedValue::Null),
+                cap.map_or(OwnedValue::Null, |m| OwnedValue::Int(m.start() as i64)),
             );
             cap_obj.insert(
                 "length".to_string(),
-                cap.map(|m| OwnedValue::Int(m.len() as i64))
-                    .unwrap_or(OwnedValue::Int(0)),
+                cap.map_or(OwnedValue::Int(0), |m| OwnedValue::Int(m.len() as i64)),
             );
             cap_obj.insert(
                 "string".to_string(),
-                cap.map(|m| OwnedValue::String(m.as_str().to_string()))
-                    .unwrap_or(OwnedValue::Null),
+                cap.map_or(OwnedValue::Null, |m| {
+                    OwnedValue::String(m.as_str().to_string())
+                }),
             );
             cap_obj.insert(
                 "name".to_string(),
-                name.map(|n| OwnedValue::String(n.to_string()))
-                    .unwrap_or(OwnedValue::Null),
+                name.map_or(OwnedValue::Null, |n| OwnedValue::String(n.to_string())),
             );
             captures.push(OwnedValue::Object(cap_obj));
         }
@@ -5508,10 +5503,10 @@ fn find_field<'a, W: Clone + AsRef<[u64]>>(
 ///
 /// Uses `get_fast` for O(n) BP operations + O(log n) IB select,
 /// instead of `get` which does O(n) IB selects.
-fn get_element_at_index<'a, W: Clone + AsRef<[u64]>>(
-    elements: JsonElements<'a, W>,
+fn get_element_at_index<W: Clone + AsRef<[u64]>>(
+    elements: JsonElements<'_, W>,
     idx: i64,
-) -> Option<StandardJson<'a, W>> {
+) -> Option<StandardJson<'_, W>> {
     if idx >= 0 {
         elements.get_fast(idx as usize)
     } else {
@@ -5532,11 +5527,11 @@ fn count_elements<W: Clone + AsRef<[u64]>>(elements: JsonElements<'_, W>) -> usi
 }
 
 /// Slice elements from an array.
-fn slice_elements<'a, W: Clone + AsRef<[u64]>>(
-    elements: JsonElements<'a, W>,
+fn slice_elements<W: Clone + AsRef<[u64]>>(
+    elements: JsonElements<'_, W>,
     start: Option<i64>,
     end: Option<i64>,
-) -> Vec<StandardJson<'a, W>> {
+) -> Vec<StandardJson<'_, W>> {
     let all: Vec<_> = elements.collect();
     let len = all.len();
 
@@ -5554,8 +5549,8 @@ fn slice_elements<'a, W: Clone + AsRef<[u64]>>(
         }
     };
 
-    let start_idx = start.map(|i| resolve_idx(i, 0)).unwrap_or(0);
-    let end_idx = end.map(|i| resolve_idx(i, len)).unwrap_or(len);
+    let start_idx = start.map_or(0, |i| resolve_idx(i, 0));
+    let end_idx = end.map_or(len, |i| resolve_idx(i, len));
 
     if start_idx >= end_idx || start_idx >= len {
         return Vec::new();
@@ -6792,7 +6787,7 @@ fn eval_owned_expr<S: EvalSemantics>(
         }
         QueryResult::None => Ok(OwnedValue::Null),
         QueryResult::Error(e) => Err(e),
-        QueryResult::Break(label) => Err(EvalError::new(format!("break ${} not in label", label))),
+        QueryResult::Break(label) => Err(EvalError::new(format!("break ${label} not in label"))),
     }
 }
 
@@ -6802,12 +6797,12 @@ fn owned_value_to_json_string(value: &OwnedValue) -> String {
         OwnedValue::Null => "null".into(),
         OwnedValue::Bool(true) => "true".into(),
         OwnedValue::Bool(false) => "false".into(),
-        OwnedValue::Int(i) => format!("{}", i),
+        OwnedValue::Int(i) => format!("{i}"),
         OwnedValue::Float(f) => {
             if f.is_nan() || f.is_infinite() {
                 "null".into() // JSON doesn't have NaN or Infinity
             } else {
-                format!("{}", f)
+                format!("{f}")
             }
         }
         OwnedValue::String(s) => {
@@ -7271,10 +7266,10 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: recurse (recurse(.[]))
-fn builtin_recurse<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    value: StandardJson<'a, W>,
+fn builtin_recurse<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     // Default recurse is equivalent to recurse(.[]?)
     let f = Expr::Optional(Box::new(Expr::Iterate));
     builtin_recurse_f::<W, S>(&f, value, optional)
@@ -8101,10 +8096,10 @@ fn collect_paths(value: &OwnedValue, current_path: &[OwnedValue], paths: &mut Ve
 
 /// Builtin: paths - all paths to values (excluding empty paths)
 /// Returns each path as a separate output (streaming), matching jq behavior
-fn builtin_paths<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_paths<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     _optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     let owned = to_owned(&value);
     let mut paths = Vec::new();
     collect_paths(&owned, &[], &mut paths);
@@ -8226,10 +8221,10 @@ fn collect_leaf_paths(
 
 /// Builtin: leaf_paths - paths to scalar (non-container) values
 /// Returns each path as a separate output (streaming), matching jq's paths(scalars) behavior
-fn builtin_leaf_paths<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_leaf_paths<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     _optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     let owned = to_owned(&value);
     let mut paths = Vec::new();
     collect_leaf_paths(&owned, &[], &mut paths);
@@ -8555,10 +8550,10 @@ fn builtin_now<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
 
 /// Builtin: gmtime - convert Unix timestamp to broken-down UTC time
 /// Returns [year, month(0-11), day(1-31), hour, minute, second, weekday(0-6, Sunday=0), yearday(0-365)]
-fn builtin_gmtime<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_gmtime<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     let timestamp = match get_float_value::<W>(&value, optional) {
         Ok(f) => f,
         Err(r) => return r,
@@ -8589,7 +8584,7 @@ fn builtin_gmtime<'a, W: Clone + AsRef<[u64]>>(
     let mp = (5 * doy + 2) / 153; // month [0, 11] starting from March
     let day = (doy - (153 * mp + 2) / 5 + 1) as i64;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = y + if month <= 2 { 1 } else { 0 };
+    let year = y + i64::from(month <= 2);
 
     // Calculate weekday (0 = Sunday, 6 = Saturday)
     // Jan 1, 1970 was a Thursday (4)
@@ -8620,10 +8615,10 @@ fn builtin_gmtime<'a, W: Clone + AsRef<[u64]>>(
 
 /// Builtin: localtime - convert Unix timestamp to broken-down local time
 /// Returns [year, month(0-11), day(1-31), hour, minute, second, weekday(0-6, Sunday=0), yearday(0-365)]
-fn builtin_localtime<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_localtime<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     #[cfg(feature = "std")]
     {
         let timestamp = match get_float_value::<W>(&value, optional) {
@@ -8639,8 +8634,7 @@ fn builtin_localtime<'a, W: Clone + AsRef<[u64]>>(
         use std::time::{SystemTime, UNIX_EPOCH};
         let now_utc = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs() as i64);
 
         // We need to compute the local offset. A simple approach is to use environment TZ,
         // but that's complex. For simplicity, we'll compute gmtime and apply a local offset.
@@ -8689,7 +8683,7 @@ fn builtin_localtime<'a, W: Clone + AsRef<[u64]>>(
         let mp = (5 * doy + 2) / 153;
         let day = (doy - (153 * mp + 2) / 5 + 1) as i64;
         let month = if mp < 10 { mp + 3 } else { mp - 9 };
-        let year = y + if month <= 2 { 1 } else { 0 };
+        let year = y + i64::from(month <= 2);
 
         let weekday = (days % 7 + 4 + 7) % 7;
 
@@ -8771,10 +8765,10 @@ fn parse_simple_tz_offset(tz: &str) -> Option<i64> {
 }
 
 /// Builtin: mktime - convert broken-down time to Unix timestamp
-fn builtin_mktime<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_mktime<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     let arr = match to_owned(&value) {
         OwnedValue::Array(a) => a,
         _ if optional => return QueryResult::None,
@@ -8796,8 +8790,7 @@ fn builtin_mktime<'a, W: Clone + AsRef<[u64]>>(
             Some(OwnedValue::Int(n)) => Ok(*n),
             Some(OwnedValue::Float(f)) => Ok(*f as i64),
             _ => Err(EvalError::new(format!(
-                "mktime: element {} must be a number",
-                idx
+                "mktime: element {idx} must be a number"
             ))),
         }
     };
@@ -8835,7 +8828,7 @@ fn builtin_mktime<'a, W: Clone + AsRef<[u64]>>(
 
     // Convert to Unix timestamp using inverse of the gmtime algorithm
     // Algorithm from Howard Hinnant's date library (civil_from_days inverse)
-    let y = year - if month <= 2 { 1 } else { 0 };
+    let y = year - i64::from(month <= 2);
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u32; // year of era [0, 399]
     let m = month as u32;
@@ -8922,12 +8915,12 @@ fn format_strftime(
         if c == '%' {
             match chars.next() {
                 Some('%') => result.push('%'),
-                Some('Y') => result.push_str(&format!("{:04}", year)),
+                Some('Y') => result.push_str(&format!("{year:04}")),
                 Some('y') => result.push_str(&format!("{:02}", year % 100)),
-                Some('m') => result.push_str(&format!("{:02}", month)),
-                Some('d') => result.push_str(&format!("{:02}", day)),
-                Some('e') => result.push_str(&format!("{:2}", day)),
-                Some('H') => result.push_str(&format!("{:02}", hour)),
+                Some('m') => result.push_str(&format!("{month:02}")),
+                Some('d') => result.push_str(&format!("{day:02}")),
+                Some('e') => result.push_str(&format!("{day:2}")),
+                Some('H') => result.push_str(&format!("{hour:02}")),
                 Some('I') => result.push_str(&format!(
                     "{:02}",
                     if hour == 0 {
@@ -8938,14 +8931,14 @@ fn format_strftime(
                         hour
                     }
                 )),
-                Some('M') => result.push_str(&format!("{:02}", minute)),
-                Some('S') => result.push_str(&format!("{:02}", second)),
+                Some('M') => result.push_str(&format!("{minute:02}")),
+                Some('S') => result.push_str(&format!("{second:02}")),
                 Some('p') => result.push_str(if hour < 12 { "AM" } else { "PM" }),
                 Some('P') => result.push_str(if hour < 12 { "am" } else { "pm" }),
                 Some('j') => result.push_str(&format!("{:03}", yearday + 1)), // 1-indexed
-                Some('w') => result.push_str(&format!("{}", weekday)),
+                Some('w') => result.push_str(&format!("{weekday}")),
                 Some('u') => {
-                    result.push_str(&format!("{}", if weekday == 0 { 7 } else { weekday }))
+                    result.push_str(&format!("{}", if weekday == 0 { 7 } else { weekday }));
                 } // Monday=1
                 Some('a') => {
                     let names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -8963,7 +8956,7 @@ fn format_strftime(
                     ];
                     result.push_str(names[weekday as usize % 7]);
                 }
-                Some('b') | Some('h') => {
+                Some('b' | 'h') => {
                     let names = [
                         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
                         "Nov", "Dec",
@@ -8989,9 +8982,9 @@ fn format_strftime(
                 }
                 Some('C') => result.push_str(&format!("{:02}", year / 100)),
                 Some('D') => result.push_str(&format!("{:02}/{:02}/{:02}", month, day, year % 100)),
-                Some('F') => result.push_str(&format!("{:04}-{:02}-{:02}", year, month, day)),
-                Some('R') => result.push_str(&format!("{:02}:{:02}", hour, minute)),
-                Some('T') => result.push_str(&format!("{:02}:{:02}:{:02}", hour, minute, second)),
+                Some('F') => result.push_str(&format!("{year:04}-{month:02}-{day:02}")),
+                Some('R') => result.push_str(&format!("{hour:02}:{minute:02}")),
+                Some('T') => result.push_str(&format!("{hour:02}:{minute:02}:{second:02}")),
                 Some('n') => result.push('\n'),
                 Some('t') => result.push('\t'),
                 Some('z') => result.push_str("+0000"), // UTC offset (we're always UTC for gmtime)
@@ -9130,7 +9123,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
                 Some('S') => {
                     second = parse_digits(&mut input_iter, 2)?;
                 }
-                Some('p') | Some('P') => {
+                Some('p' | 'P') => {
                     let mut ampm = String::new();
                     while let Some(&c) = input_iter.peek() {
                         if c.is_ascii_alphabetic() {
@@ -9166,7 +9159,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
                     let w = parse_digits(&mut input_iter, 1)?;
                     weekday = if w == 7 { 0 } else { w };
                 }
-                Some('a') | Some('A') => {
+                Some('a' | 'A') => {
                     // Skip day name
                     while let Some(&c) = input_iter.peek() {
                         if c.is_ascii_alphabetic() {
@@ -9176,7 +9169,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
                         }
                     }
                 }
-                Some('b') | Some('B') | Some('h') => {
+                Some('b' | 'B' | 'h') => {
                     let mut name = String::new();
                     while let Some(&c) = input_iter.peek() {
                         if c.is_ascii_alphabetic() {
@@ -9247,7 +9240,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
                     }
                     second = parse_digits(&mut input_iter, 2)?;
                 }
-                Some('n') | Some('t') => {
+                Some('n' | 't') => {
                     // Skip whitespace
                     while let Some(&c) = input_iter.peek() {
                         if c.is_whitespace() {
@@ -9263,11 +9256,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
                         if c == '+' || c == '-' {
                             input_iter.next();
                             for _ in 0..4 {
-                                if input_iter
-                                    .peek()
-                                    .map(|c| c.is_ascii_digit())
-                                    .unwrap_or(false)
-                                {
+                                if input_iter.peek().is_some_and(char::is_ascii_digit) {
                                     input_iter.next();
                                 }
                             }
@@ -9287,7 +9276,7 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
                 Some(other) => {
                     // Unknown specifier - skip % and match literal
                     if input_iter.next() != Some(other) {
-                        return Err(format!("expected '{}'", other));
+                        return Err(format!("expected '{other}'"));
                     }
                 }
                 None => {
@@ -9310,15 +9299,15 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<BrokenDownTime, String> {
             // Match literal character
             match input_iter.next() {
                 Some(c) if c == fc => {}
-                Some(c) => return Err(format!("expected '{}', got '{}'", fc, c)),
-                None => return Err(format!("expected '{}', got end of input", fc)),
+                Some(c) => return Err(format!("expected '{fc}', got '{c}'")),
+                None => return Err(format!("expected '{fc}', got end of input")),
             }
         }
     }
 
     // Calculate weekday if not explicitly set
     // Using Zeller's congruence or similar
-    let y = year - if month <= 2 { 1 } else { 0 };
+    let y = year - i64::from(month <= 2);
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u32;
     let m = month as u32;
@@ -9376,10 +9365,10 @@ fn parse_digits(
 }
 
 /// Builtin: todate - convert Unix timestamp to ISO 8601 date string
-fn builtin_todate<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_todate<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     let timestamp = match get_float_value::<W>(&value, optional) {
         Ok(f) => f,
         Err(r) => return r,
@@ -9406,21 +9395,18 @@ fn builtin_todate<'a, W: Clone + AsRef<[u64]>>(
     let mp = (5 * doy + 2) / 153;
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = y + if month <= 2 { 1 } else { 0 };
+    let year = y + i64::from(month <= 2);
 
-    let result = format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year, month, day, hour, minute, second
-    );
+    let result = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
 
     QueryResult::Owned(OwnedValue::String(result))
 }
 
 /// Builtin: fromdate - parse ISO 8601 date string to Unix timestamp
-fn builtin_fromdate<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_fromdate<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     let input = match &value {
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => cow.into_owned(),
@@ -9488,7 +9474,7 @@ fn parse_iso8601(input: &str) -> Result<f64, String> {
                 // Skip fractional seconds
                 if chars.peek() == Some(&'.') {
                     chars.next();
-                    while chars.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    while chars.peek().is_some_and(char::is_ascii_digit) {
                         chars.next();
                     }
                 }
@@ -9499,7 +9485,7 @@ fn parse_iso8601(input: &str) -> Result<f64, String> {
 
             // Parse timezone
             let tz_offset = match chars.peek() {
-                Some('Z') | Some('z') => {
+                Some('Z' | 'z') => {
                     chars.next();
                     0
                 }
@@ -9509,7 +9495,7 @@ fn parse_iso8601(input: &str) -> Result<f64, String> {
                     let m = if chars.peek() == Some(&':') {
                         chars.next();
                         parse_digits(&mut chars, 2)?
-                    } else if chars.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    } else if chars.peek().is_some_and(char::is_ascii_digit) {
                         parse_digits(&mut chars, 2)?
                     } else {
                         0
@@ -9522,7 +9508,7 @@ fn parse_iso8601(input: &str) -> Result<f64, String> {
                     let m = if chars.peek() == Some(&':') {
                         chars.next();
                         parse_digits(&mut chars, 2)?
-                    } else if chars.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    } else if chars.peek().is_some_and(char::is_ascii_digit) {
                         parse_digits(&mut chars, 2)?
                     } else {
                         0
@@ -9538,7 +9524,7 @@ fn parse_iso8601(input: &str) -> Result<f64, String> {
         };
 
     // Convert to Unix timestamp
-    let y = year - if month <= 2 { 1 } else { 0 };
+    let y = year - i64::from(month <= 2);
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u32;
     let m = month as u32;
@@ -9556,20 +9542,20 @@ fn parse_iso8601(input: &str) -> Result<f64, String> {
 
 /// Builtin: from_unix - convert Unix epoch to ISO 8601 date string
 /// This is semantically identical to todate/todateiso8601 but with yq naming convention
-fn builtin_from_unix<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_from_unix<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     // from_unix is the same as todate - converts Unix timestamp to ISO 8601 string
     builtin_todate::<W>(value, optional)
 }
 
 /// Builtin: to_unix - convert ISO 8601 date string to Unix epoch
 /// This is semantically identical to fromdate/fromdateiso8601 but with yq naming convention
-fn builtin_to_unix<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_to_unix<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     // to_unix is the same as fromdate - parses ISO 8601 string to Unix timestamp
     builtin_fromdate::<W>(value, optional)
 }
@@ -9598,20 +9584,16 @@ fn format_datetime_with_offset(timestamp: f64, offset_seconds: i64) -> String {
     let mp = (5 * doy + 2) / 153;
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = y + if month <= 2 { 1 } else { 0 };
+    let year = y + i64::from(month <= 2);
 
     if offset_seconds == 0 {
-        format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-            year, month, day, hour, minute, second
-        )
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
     } else {
         let offset_hours = offset_seconds.abs() / 3600;
         let offset_mins = (offset_seconds.abs() % 3600) / 60;
         let sign = if offset_seconds >= 0 { '+' } else { '-' };
         format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
-            year, month, day, hour, minute, second, sign, offset_hours, offset_mins
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{sign}{offset_hours:02}:{offset_mins:02}"
         )
     }
 }
@@ -9751,7 +9733,7 @@ fn get_timezone_offset(zone: &str, timestamp: f64) -> Result<i64, String> {
                             if let Some(offset) = parse_numeric_offset(zone) {
                                 return Ok(offset);
                             }
-                            return Err(format!("unknown timezone: {}", zone));
+                            return Err(format!("unknown timezone: {zone}"));
                         }
                     };
                     return Ok(offset);
@@ -9933,8 +9915,7 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         Err(e) => {
             return QueryResult::Error(EvalError::new(format!(
-                "load: failed to read file '{}': {}",
-                filename, e
+                "load: failed to read file '{filename}': {e}"
             )));
         }
     };
@@ -9944,8 +9925,7 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let is_json = path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("json"))
-        .unwrap_or(false);
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
 
     if is_json {
         // Parse as JSON
@@ -9977,8 +9957,7 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             Err(_) if optional => QueryResult::None,
             Err(e) => QueryResult::Error(EvalError::new(format!(
-                "load: failed to parse YAML file '{}': {}",
-                filename, e
+                "load: failed to parse YAML file '{filename}': {e}"
             ))),
         }
     }
@@ -10088,10 +10067,10 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Builtin: combinations - generate all combinations from array of arrays
 /// Input: [[1,2], [3,4]] -> outputs [1,3], [1,4], [2,3], [2,4]
-fn builtin_combinations<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_combinations<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     // Input must be an array of arrays
     let arrays = match &value {
         StandardJson::Array(elements) => {
@@ -10115,7 +10094,7 @@ fn builtin_combinations<'a, W: Clone + AsRef<[u64]>>(
     };
 
     // If any array is empty, return no results
-    if arrays.iter().any(|a| a.is_empty()) {
+    if arrays.iter().any(alloc::vec::Vec::is_empty) {
         return QueryResult::None;
     }
 
@@ -10419,7 +10398,7 @@ fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
 }
 
 /// Builtin: normals - select only normal numbers (not zero, infinite, NaN, or subnormal)
-fn builtin_normals<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryResult<'a, W> {
+fn builtin_normals<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
     if let StandardJson::Number(n) = &value {
         if let Ok(f) = n.as_f64() {
             if f.is_normal() {
@@ -10431,7 +10410,7 @@ fn builtin_normals<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> Q
 }
 
 /// Builtin: finites - select only finite numbers (not infinite or NaN)
-fn builtin_finites<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryResult<'a, W> {
+fn builtin_finites<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
     if let StandardJson::Number(n) = &value {
         if let Ok(f) = n.as_f64() {
             if f.is_finite() {
@@ -10908,10 +10887,10 @@ fn sqrt_f64(x: f64) -> f64 {
 }
 
 /// Builtin: floor
-fn builtin_floor<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_floor<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Int(floor_f64(n) as i64)),
         Err(r) => r,
@@ -10919,10 +10898,10 @@ fn builtin_floor<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: ceil
-fn builtin_ceil<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_ceil<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Int(ceil_f64(n) as i64)),
         Err(r) => r,
@@ -10930,10 +10909,10 @@ fn builtin_ceil<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: round
-fn builtin_round<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_round<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Int(round_f64(n) as i64)),
         Err(r) => r,
@@ -10941,10 +10920,10 @@ fn builtin_round<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: trunc - truncate toward zero
-fn builtin_trunc<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_trunc<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Int(libm::trunc(n) as i64)),
         Err(r) => r,
@@ -10952,10 +10931,10 @@ fn builtin_trunc<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: sqrt
-fn builtin_sqrt<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_sqrt<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(sqrt_f64(n))),
         Err(r) => r,
@@ -10963,10 +10942,10 @@ fn builtin_sqrt<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: fabs (absolute value)
-fn builtin_fabs<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_fabs<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::fabs(n))),
         Err(r) => r,
@@ -10974,10 +10953,10 @@ fn builtin_fabs<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: log (natural logarithm)
-fn builtin_log<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_log<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::log(n))),
         Err(r) => r,
@@ -10985,10 +10964,10 @@ fn builtin_log<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: log10
-fn builtin_log10<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_log10<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::log10(n))),
         Err(r) => r,
@@ -10996,10 +10975,10 @@ fn builtin_log10<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: log2
-fn builtin_log2<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_log2<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::log2(n))),
         Err(r) => r,
@@ -11007,10 +10986,10 @@ fn builtin_log2<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: exp (e^x)
-fn builtin_exp<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_exp<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::exp(n))),
         Err(r) => r,
@@ -11018,10 +10997,10 @@ fn builtin_exp<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: exp10 (10^x)
-fn builtin_exp10<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_exp10<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::pow(10.0, n))),
         Err(r) => r,
@@ -11029,10 +11008,10 @@ fn builtin_exp10<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: exp2 (2^x)
-fn builtin_exp2<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_exp2<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::exp2(n))),
         Err(r) => r,
@@ -11091,10 +11070,10 @@ fn builtin_pow<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 // Trigonometric functions
 
 /// Builtin: sin
-fn builtin_sin<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_sin<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::sin(n))),
         Err(r) => r,
@@ -11102,10 +11081,10 @@ fn builtin_sin<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: cos
-fn builtin_cos<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_cos<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::cos(n))),
         Err(r) => r,
@@ -11113,10 +11092,10 @@ fn builtin_cos<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: tan
-fn builtin_tan<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_tan<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::tan(n))),
         Err(r) => r,
@@ -11124,10 +11103,10 @@ fn builtin_tan<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: asin
-fn builtin_asin<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_asin<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::asin(n))),
         Err(r) => r,
@@ -11135,10 +11114,10 @@ fn builtin_asin<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: acos
-fn builtin_acos<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_acos<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::acos(n))),
         Err(r) => r,
@@ -11146,10 +11125,10 @@ fn builtin_acos<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: atan
-fn builtin_atan<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_atan<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::atan(n))),
         Err(r) => r,
@@ -11184,10 +11163,10 @@ fn builtin_atan2<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 // Hyperbolic functions
 
 /// Builtin: sinh
-fn builtin_sinh<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_sinh<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::sinh(n))),
         Err(r) => r,
@@ -11195,10 +11174,10 @@ fn builtin_sinh<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: cosh
-fn builtin_cosh<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_cosh<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::cosh(n))),
         Err(r) => r,
@@ -11206,10 +11185,10 @@ fn builtin_cosh<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: tanh
-fn builtin_tanh<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_tanh<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::tanh(n))),
         Err(r) => r,
@@ -11217,10 +11196,10 @@ fn builtin_tanh<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: asinh
-fn builtin_asinh<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_asinh<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::asinh(n))),
         Err(r) => r,
@@ -11228,10 +11207,10 @@ fn builtin_asinh<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: acosh
-fn builtin_acosh<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_acosh<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::acosh(n))),
         Err(r) => r,
@@ -11239,10 +11218,10 @@ fn builtin_acosh<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: atanh
-fn builtin_atanh<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_atanh<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::atanh(n))),
         Err(r) => r,
@@ -11253,10 +11232,10 @@ fn builtin_atanh<'a, W: Clone + AsRef<[u64]>>(
 // Note: is_infinite(), is_nan(), is_normal(), is_finite() are available on f64 in no_std
 
 /// Builtin: isinfinite
-fn builtin_isinfinite<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_isinfinite<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     _optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Number(n) => {
             if let Ok(f) = n.as_f64() {
@@ -11270,10 +11249,10 @@ fn builtin_isinfinite<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: isnan
-fn builtin_isnan<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_isnan<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     _optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Number(n) => {
             if let Ok(f) = n.as_f64() {
@@ -11287,10 +11266,10 @@ fn builtin_isnan<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: isnormal
-fn builtin_isnormal<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_isnormal<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     _optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Number(n) => {
             if let Ok(f) = n.as_f64() {
@@ -11304,10 +11283,10 @@ fn builtin_isnormal<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: isfinite
-fn builtin_isfinite<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_isfinite<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Bool(n.is_finite())),
         Err(_) => QueryResult::Owned(OwnedValue::Bool(false)),
@@ -11317,10 +11296,10 @@ fn builtin_isfinite<'a, W: Clone + AsRef<[u64]>>(
 // Debug functions
 
 /// Builtin: debug - output value to stderr, pass through unchanged
-fn builtin_debug<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_debug<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     _optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     // In a library context we don't actually print to stderr
     // We just pass through the value unchanged
     QueryResult::Owned(to_owned(&value))
@@ -11357,10 +11336,10 @@ fn eval_env<'a, W: Clone + AsRef<[u64]>>(_optional: bool) -> QueryResult<'a, W> 
 
 /// Builtin: env - object of all environment variables
 #[cfg(feature = "std")]
-fn builtin_env<'a, W: Clone + AsRef<[u64]>>(
-    _value: StandardJson<'a, W>,
+fn builtin_env<W: Clone + AsRef<[u64]>>(
+    _value: StandardJson<'_, W>,
     _optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     let mut env_obj = IndexMap::new();
     for (key, value) in std::env::vars() {
         env_obj.insert(key, OwnedValue::String(value));
@@ -11420,8 +11399,7 @@ fn builtin_env_object<'a, W: Clone + AsRef<[u64]>>(
         Ok(val) => QueryResult::Owned(OwnedValue::String(val)),
         Err(_) if optional => QueryResult::None,
         Err(_) => QueryResult::Error(EvalError::new(format!(
-            "value for env variable '{}' not provided in env()",
-            name
+            "value for env variable '{name}' not provided in env()"
         ))),
     }
 }
@@ -11449,8 +11427,7 @@ fn builtin_strenv<'a, W: Clone + AsRef<[u64]>>(name: &str, optional: bool) -> Qu
         Ok(val) => QueryResult::Owned(OwnedValue::String(val)),
         Err(_) if optional => QueryResult::None,
         Err(_) => QueryResult::Error(EvalError::new(format!(
-            "value for env variable '{}' not provided in strenv()",
-            name
+            "value for env variable '{name}' not provided in strenv()"
         ))),
     }
 }
@@ -11470,10 +11447,10 @@ fn builtin_strenv<'a, W: Clone + AsRef<[u64]>>(name: &str, optional: bool) -> Qu
 // String functions
 
 /// Builtin: trim - remove leading/trailing whitespace
-fn builtin_trim<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_trim<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match &value {
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
@@ -11488,10 +11465,10 @@ fn builtin_trim<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: ltrim - remove leading whitespace
-fn builtin_ltrim<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_ltrim<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match &value {
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
@@ -11506,10 +11483,10 @@ fn builtin_ltrim<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: rtrim - remove trailing whitespace
-fn builtin_rtrim<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_rtrim<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match &value {
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
@@ -11526,10 +11503,10 @@ fn builtin_rtrim<'a, W: Clone + AsRef<[u64]>>(
 // Array functions
 
 /// Builtin: transpose - transpose array of arrays
-fn builtin_transpose<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_transpose<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     let elements = match value {
         StandardJson::Array(a) => a,
         _ if optional => return QueryResult::None,
@@ -11555,7 +11532,11 @@ fn builtin_transpose<'a, W: Clone + AsRef<[u64]>>(
     }
 
     // Find max length
-    let max_len = inner_arrays.iter().map(|a| a.len()).max().unwrap_or(0);
+    let max_len = inner_arrays
+        .iter()
+        .map(alloc::vec::Vec::len)
+        .max()
+        .unwrap_or(0);
 
     // Build transposed result
     let mut result = Vec::with_capacity(max_len);
@@ -11841,7 +11822,7 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 // Builtin: tag - return YAML type tag (!!str, !!int, !!map, etc.)
 // Since we evaluate on JSON/OwnedValue (not raw YAML), we derive the tag from the JSON type.
-fn builtin_tag<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryResult<'a, W> {
+fn builtin_tag<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
     let tag = match &value {
         StandardJson::Null => "!!null",
         StandardJson::Bool(_) => "!!bool",
@@ -11873,7 +11854,7 @@ fn builtin_anchor<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
 // Builtin: style - return scalar/collection style
 // Since YAML style metadata is lost during conversion to OwnedValue, this returns
 // reasonable defaults based on the JSON structure.
-fn builtin_style<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryResult<'a, W> {
+fn builtin_style<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
     let style = match &value {
         // Collections: yq returns "flow" for flow-style, empty for block-style
         // Since we lose this info, we return empty string (block-style is more common)
@@ -11887,7 +11868,7 @@ fn builtin_style<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> Que
 
 /// `kind` - returns the node kind: "scalar", "seq", or "map"
 /// This is a yq function that returns the YAML node kind.
-fn builtin_kind<'a, W: Clone + AsRef<[u64]>>(value: StandardJson<'a, W>) -> QueryResult<'a, W> {
+fn builtin_kind<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
     let kind = match &value {
         StandardJson::Array(_) => "seq",
         StandardJson::Object(_) => "map",
@@ -11928,10 +11909,10 @@ fn builtin_document_index<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
 /// `shuffle` - randomly shuffle array elements (yq)
 /// Uses non-cryptographic RNG for performance.
 #[cfg(feature = "cli")]
-fn builtin_shuffle<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_shuffle<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     use rand::seq::SliceRandom;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
@@ -11952,10 +11933,10 @@ fn builtin_shuffle<'a, W: Clone + AsRef<[u64]>>(
 
 /// `shuffle` - fallback when cli feature is not enabled
 #[cfg(not(feature = "cli"))]
-fn builtin_shuffle<'a, W: Clone + AsRef<[u64]>>(
-    _value: StandardJson<'a, W>,
+fn builtin_shuffle<W: Clone + AsRef<[u64]>>(
+    _value: StandardJson<'_, W>,
     _optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     QueryResult::Error(EvalError::new(
         "shuffle requires the 'cli' feature to be enabled",
     ))
@@ -11971,10 +11952,10 @@ fn builtin_shuffle<'a, W: Clone + AsRef<[u64]>>(
 ///   → {name: ["Alice", "Bob"], age: [30, 25]}
 ///
 /// Handles missing keys with null padding.
-fn builtin_pivot<'a, W: Clone + AsRef<[u64]>>(
-    value: StandardJson<'a, W>,
+fn builtin_pivot<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
             let items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
@@ -13419,7 +13400,7 @@ fn eval_func_call<'a, W: Clone + AsRef<[u64]>>(
     _value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    QueryResult::Error(EvalError::new(format!("undefined function: {}", name)))
+    QueryResult::Error(EvalError::new(format!("undefined function: {name}")))
 }
 
 #[cfg(test)]
@@ -13495,23 +13476,23 @@ mod tests {
     #[test]
     fn test_field_on_non_object() {
         // Accessing .field on non-object is an error (unlike missing field on object)
-        query!(br#"123"#, ".field",
+        query!(br"123", ".field",
             QueryResult::Error(e) => {
                 assert!(e.message.contains("expected object"));
             }
         );
 
         // But with optional, it returns nothing (not null)
-        query!(br#"123"#, ".field?",
+        query!(br"123", ".field?",
             QueryResult::None => {}
         );
 
         // For null input, jq returns null (not error)
-        query!(br#"null"#, ".field",
+        query!(br"null", ".field",
             QueryResult::One(StandardJson::Null) => {}
         );
 
-        query!(br#"null"#, ".field?",
+        query!(br"null", ".field?",
             QueryResult::One(StandardJson::Null) => {}
         );
     }
@@ -13536,20 +13517,20 @@ mod tests {
 
     #[test]
     fn test_array_index() {
-        query!(br#"[10, 20, 30]"#, ".[0]",
+        query!(br"[10, 20, 30]", ".[0]",
             QueryResult::One(StandardJson::Number(n)) => {
                 assert_eq!(n.as_i64().unwrap(), 10);
             }
         );
 
-        query!(br#"[10, 20, 30]"#, ".[2]",
+        query!(br"[10, 20, 30]", ".[2]",
             QueryResult::One(StandardJson::Number(n)) => {
                 assert_eq!(n.as_i64().unwrap(), 30);
             }
         );
 
         // Negative index
-        query!(br#"[10, 20, 30]"#, ".[-1]",
+        query!(br"[10, 20, 30]", ".[-1]",
             QueryResult::One(StandardJson::Number(n)) => {
                 assert_eq!(n.as_i64().unwrap(), 30);
             }
@@ -13558,7 +13539,7 @@ mod tests {
 
     #[test]
     fn test_iterate() {
-        query!(br#"[1, 2, 3]"#, ".[]",
+        query!(br"[1, 2, 3]", ".[]",
             QueryResult::Many(values) => {
                 assert_eq!(values.len(), 3);
             }
@@ -13581,7 +13562,7 @@ mod tests {
                     StandardJson::String(s) => {
                         assert_eq!(s.as_str().unwrap().as_ref(), "Alice");
                     }
-                    other => panic!("unexpected: {:?}", other),
+                    other => panic!("unexpected: {other:?}"),
                 }
             }
         );
@@ -13589,19 +13570,19 @@ mod tests {
 
     #[test]
     fn test_slice() {
-        query!(br#"[0, 1, 2, 3, 4, 5]"#, ".[1:4]",
+        query!(br"[0, 1, 2, 3, 4, 5]", ".[1:4]",
             QueryResult::Many(values) => {
                 assert_eq!(values.len(), 3);
             }
         );
 
-        query!(br#"[0, 1, 2, 3, 4, 5]"#, ".[2:]",
+        query!(br"[0, 1, 2, 3, 4, 5]", ".[2:]",
             QueryResult::Many(values) => {
                 assert_eq!(values.len(), 4); // 2, 3, 4, 5
             }
         );
 
-        query!(br#"[0, 1, 2, 3, 4, 5]"#, ".[:2]",
+        query!(br"[0, 1, 2, 3, 4, 5]", ".[:2]",
             QueryResult::Many(values) => {
                 assert_eq!(values.len(), 2); // 0, 1
             }
@@ -13619,19 +13600,19 @@ mod tests {
 
     #[test]
     fn test_literals() {
-        query!(br#"{}"#, "null",
+        query!(br"{}", "null",
             QueryResult::Owned(OwnedValue::Null) => {}
         );
 
-        query!(br#"{}"#, "true",
+        query!(br"{}", "true",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
 
-        query!(br#"{}"#, "42",
+        query!(br"{}", "42",
             QueryResult::Owned(OwnedValue::Int(42)) => {}
         );
 
-        query!(br#"{}"#, "\"hello\"",
+        query!(br"{}", "\"hello\"",
             QueryResult::Owned(OwnedValue::String(s)) if s == "hello" => {}
         );
     }
@@ -13647,7 +13628,7 @@ mod tests {
         );
 
         // Empty array
-        query!(br#"{}"#, "[]",
+        query!(br"{}", "[]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 0);
             }
@@ -13665,7 +13646,7 @@ mod tests {
         );
 
         // Empty object
-        query!(br#"{}"#, "{}",
+        query!(br"{}", "{}",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.len(), 0);
             }
@@ -13761,12 +13742,12 @@ mod tests {
     #[test]
     fn test_arithmetic_precedence() {
         // 2 + 3 * 4 = 2 + 12 = 14
-        query!(br#"{}"#, "2 + 3 * 4",
+        query!(br"{}", "2 + 3 * 4",
             QueryResult::Owned(OwnedValue::Int(14)) => {}
         );
 
         // (2 + 3) * 4 = 5 * 4 = 20
-        query!(br#"{}"#, "(2 + 3) * 4",
+        query!(br"{}", "(2 + 3) * 4",
             QueryResult::Owned(OwnedValue::Int(20)) => {}
         );
     }
@@ -13859,20 +13840,20 @@ mod tests {
 
     #[test]
     fn test_boolean_not() {
-        query!(br#"true"#, ". | not",
+        query!(br"true", ". | not",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
 
-        query!(br#"false"#, ". | not",
+        query!(br"false", ". | not",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
 
-        query!(br#"null"#, ". | not",
+        query!(br"null", ". | not",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
 
         // Numbers are truthy
-        query!(br#"0"#, ". | not",
+        query!(br"0", ". | not",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
     }
@@ -13892,7 +13873,7 @@ mod tests {
         );
 
         // Missing value uses alternative
-        query!(br#"{}"#, ".missing? // \"default\"",
+        query!(br"{}", ".missing? // \"default\"",
             QueryResult::Owned(OwnedValue::String(s)) if s == "default" => {}
         );
 
@@ -14011,27 +13992,27 @@ mod tests {
     fn test_try_catch_error() {
         // try with catch on missing field - no error to catch, returns null
         // (jq returns null for missing fields on objects, not an error)
-        query!(br#"{}"#, "try .missing catch \"default\"",
+        query!(br"{}", "try .missing catch \"default\"",
             QueryResult::One(StandardJson::Null) => {}
         );
 
         // try without catch on missing field - returns null
-        query!(br#"{}"#, "try .missing",
+        query!(br"{}", "try .missing",
             QueryResult::One(StandardJson::Null) => {}
         );
 
         // try with catch on actual error (field access on number) - catch is triggered
-        query!(br#"123"#, "try .foo catch \"default\"",
+        query!(br"123", "try .foo catch \"default\"",
             QueryResult::Owned(OwnedValue::String(s)) if s == "default" => {}
         );
 
         // try without catch on actual error - error is suppressed (returns None)
-        query!(br#"123"#, "try .foo",
+        query!(br"123", "try .foo",
             QueryResult::None => {}
         );
 
         // try with null catch on actual error
-        query!(br#"123"#, "try .foo catch null",
+        query!(br"123", "try .foo catch null",
             QueryResult::Owned(OwnedValue::Null) => {}
         );
     }
@@ -14039,12 +14020,12 @@ mod tests {
     #[test]
     fn test_try_catch_optional() {
         // Optional on missing field returns null, not None
-        query!(br#"{}"#, "try .missing? catch \"default\"",
+        query!(br"{}", "try .missing? catch \"default\"",
             QueryResult::One(StandardJson::Null) => {}
         );
 
         // Optional on actual error (field on number) - optional suppresses error
-        query!(br#"123"#, "try .foo? catch \"default\"",
+        query!(br"123", "try .foo? catch \"default\"",
             QueryResult::None => {}
         );
     }
@@ -14052,21 +14033,21 @@ mod tests {
     #[test]
     fn test_error_basic() {
         // error without message
-        query!(br#"{}"#, "error",
+        query!(br"{}", "error",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "null");
             }
         );
 
         // error with string message
-        query!(br#"{}"#, "error(\"something went wrong\")",
+        query!(br"{}", "error(\"something went wrong\")",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "something went wrong");
             }
         );
 
         // error with number message (gets serialized)
-        query!(br#"{}"#, "error(42)",
+        query!(br"{}", "error(42)",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "42");
             }
@@ -14086,12 +14067,12 @@ mod tests {
     #[test]
     fn test_try_catch_raised_error() {
         // try-catch with error - error is caught
-        query!(br#"{}"#, "try error(\"oops\") catch \"caught\"",
+        query!(br"{}", "try error(\"oops\") catch \"caught\"",
             QueryResult::Owned(OwnedValue::String(s)) if s == "caught" => {}
         );
 
         // try without catch - error is suppressed
-        query!(br#"{}"#, "try error(\"oops\")",
+        query!(br"{}", "try error(\"oops\")",
             QueryResult::None => {}
         );
     }
@@ -14128,19 +14109,19 @@ mod tests {
 
     #[test]
     fn test_builtin_type() {
-        query!(br#"null"#, "type",
+        query!(br"null", "type",
             QueryResult::Owned(OwnedValue::String(s)) if s == "null" => {}
         );
-        query!(br#"true"#, "type",
+        query!(br"true", "type",
             QueryResult::Owned(OwnedValue::String(s)) if s == "boolean" => {}
         );
-        query!(br#"42"#, "type",
+        query!(br"42", "type",
             QueryResult::Owned(OwnedValue::String(s)) if s == "number" => {}
         );
         query!(br#""hello""#, "type",
             QueryResult::Owned(OwnedValue::String(s)) if s == "string" => {}
         );
-        query!(br#"[1, 2]"#, "type",
+        query!(br"[1, 2]", "type",
             QueryResult::Owned(OwnedValue::String(s)) if s == "array" => {}
         );
         query!(br#"{"a": 1}"#, "type",
@@ -14151,23 +14132,23 @@ mod tests {
     #[test]
     fn test_builtin_is_type() {
         // isnull
-        query!(br#"null"#, "isnull",
+        query!(br"null", "isnull",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
-        query!(br#"1"#, "isnull",
+        query!(br"1", "isnull",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
 
         // isboolean
-        query!(br#"true"#, "isboolean",
+        query!(br"true", "isboolean",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
-        query!(br#"1"#, "isboolean",
+        query!(br"1", "isboolean",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
 
         // isnumber
-        query!(br#"42"#, "isnumber",
+        query!(br"42", "isnumber",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
         query!(br#""42""#, "isnumber",
@@ -14178,15 +14159,15 @@ mod tests {
         query!(br#""hello""#, "isstring",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
-        query!(br#"42"#, "isstring",
+        query!(br"42", "isstring",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
 
         // isarray
-        query!(br#"[1, 2]"#, "isarray",
+        query!(br"[1, 2]", "isarray",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
-        query!(br#"{}"#, "isarray",
+        query!(br"{}", "isarray",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
 
@@ -14194,7 +14175,7 @@ mod tests {
         query!(br#"{"a": 1}"#, "isobject",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
-        query!(br#"[]"#, "isobject",
+        query!(br"[]", "isobject",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
     }
@@ -14202,7 +14183,7 @@ mod tests {
     #[test]
     fn test_builtin_length() {
         // null has length 0
-        query!(br#"null"#, "length",
+        query!(br"null", "length",
             QueryResult::Owned(OwnedValue::Int(0)) => {}
         );
 
@@ -14217,7 +14198,7 @@ mod tests {
         );
 
         // array length
-        query!(br#"[1, 2, 3]"#, "length",
+        query!(br"[1, 2, 3]", "length",
             QueryResult::Owned(OwnedValue::Int(3)) => {}
         );
 
@@ -14227,7 +14208,7 @@ mod tests {
         );
 
         // number length is absolute value
-        query!(br#"-5"#, "length",
+        query!(br"-5", "length",
             QueryResult::Owned(OwnedValue::Int(5)) => {}
         );
     }
@@ -14289,10 +14270,10 @@ mod tests {
         );
 
         // Array has index
-        query!(br#"[1, 2, 3]"#, "has(0)",
+        query!(br"[1, 2, 3]", "has(0)",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
-        query!(br#"[1, 2, 3]"#, "has(5)",
+        query!(br"[1, 2, 3]", "has(5)",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
     }
@@ -14310,21 +14291,21 @@ mod tests {
     #[test]
     fn test_builtin_select() {
         // select outputs input only if condition is true
-        query!(br#"5"#, "select(. > 3)",
+        query!(br"5", "select(. > 3)",
             QueryResult::One(StandardJson::Number(n)) => {
                 assert_eq!(n.as_i64().unwrap(), 5);
             }
         );
 
         // select outputs nothing if condition is false
-        query!(br#"2"#, "select(. > 3)",
+        query!(br"2", "select(. > 3)",
             QueryResult::None => {}
         );
     }
 
     #[test]
     fn test_builtin_empty() {
-        query!(br#"1"#, "empty",
+        query!(br"1", "empty",
             QueryResult::None => {}
         );
     }
@@ -14332,7 +14313,7 @@ mod tests {
     #[test]
     fn test_builtin_map() {
         // map applies function to each element
-        query!(br#"[1, 2, 3]"#, "map(. * 2)",
+        query!(br"[1, 2, 3]", "map(. * 2)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 3);
                 assert_eq!(arr[0], OwnedValue::Int(2));
@@ -14342,7 +14323,7 @@ mod tests {
         );
 
         // map with type check
-        query!(br#"[1, 2, 3]"#, "map(. + 1)",
+        query!(br"[1, 2, 3]", "map(. + 1)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr[0], OwnedValue::Int(2));
             }
@@ -14360,7 +14341,7 @@ mod tests {
         );
 
         // map_values on array
-        query!(br#"[1, 2, 3]"#, "map_values(. + 1)",
+        query!(br"[1, 2, 3]", "map_values(. + 1)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr[0], OwnedValue::Int(2));
                 assert_eq!(arr[1], OwnedValue::Int(3));
@@ -14372,7 +14353,7 @@ mod tests {
     #[test]
     fn test_builtin_add() {
         // Add numbers
-        query!(br#"[1, 2, 3]"#, "add",
+        query!(br"[1, 2, 3]", "add",
             QueryResult::Owned(OwnedValue::Int(6)) => {}
         );
 
@@ -14382,69 +14363,69 @@ mod tests {
         );
 
         // Add arrays
-        query!(br#"[[1], [2], [3]]"#, "add",
+        query!(br"[[1], [2], [3]]", "add",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 3);
             }
         );
 
         // Empty array returns null
-        query!(br#"[]"#, "add",
+        query!(br"[]", "add",
             QueryResult::Owned(OwnedValue::Null) => {}
         );
     }
 
     #[test]
     fn test_builtin_any() {
-        query!(br#"[true, false]"#, "any",
+        query!(br"[true, false]", "any",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
-        query!(br#"[false, false]"#, "any",
+        query!(br"[false, false]", "any",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
-        query!(br#"[null, null]"#, "any",
+        query!(br"[null, null]", "any",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
-        query!(br#"[1, 0]"#, "any",
+        query!(br"[1, 0]", "any",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}  // numbers are truthy
         );
     }
 
     #[test]
     fn test_builtin_all() {
-        query!(br#"[true, true]"#, "all",
+        query!(br"[true, true]", "all",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
-        query!(br#"[true, false]"#, "all",
+        query!(br"[true, false]", "all",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
-        query!(br#"[1, 2, 3]"#, "all",
+        query!(br"[1, 2, 3]", "all",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}  // numbers are truthy
         );
     }
 
     #[test]
     fn test_builtin_min() {
-        query!(br#"[3, 1, 2]"#, "min",
+        query!(br"[3, 1, 2]", "min",
             QueryResult::Owned(OwnedValue::Int(1)) => {}
         );
         query!(br#"["c", "a", "b"]"#, "min",
             QueryResult::Owned(OwnedValue::String(s)) if s == "a" => {}
         );
-        query!(br#"[]"#, "min",
+        query!(br"[]", "min",
             QueryResult::Owned(OwnedValue::Null) => {}
         );
     }
 
     #[test]
     fn test_builtin_max() {
-        query!(br#"[3, 1, 2]"#, "max",
+        query!(br"[3, 1, 2]", "max",
             QueryResult::Owned(OwnedValue::Int(3)) => {}
         );
         query!(br#"["c", "a", "b"]"#, "max",
             QueryResult::Owned(OwnedValue::String(s)) if s == "c" => {}
         );
-        query!(br#"[]"#, "max",
+        query!(br"[]", "max",
             QueryResult::Owned(OwnedValue::Null) => {}
         );
     }
@@ -14470,7 +14451,7 @@ mod tests {
     #[test]
     fn test_builtin_combinations() {
         // map alone works
-        query!(br#"[1, 2, 3, 4, 5]"#, "map(. * 2)",
+        query!(br"[1, 2, 3, 4, 5]", "map(. * 2)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 5);
                 assert_eq!(arr[0], OwnedValue::Int(2));
@@ -14478,7 +14459,7 @@ mod tests {
         );
 
         // Use select in map
-        query!(br#"[1, 2, 3, 4, 5]"#, "[.[] | select(. > 2)]",
+        query!(br"[1, 2, 3, 4, 5]", "[.[] | select(. > 2)]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 3);
             }
@@ -14624,7 +14605,7 @@ mod tests {
         );
 
         // Array contains
-        query!(br#"[1, 2, 3]"#, r#"contains([2])"#,
+        query!(br"[1, 2, 3]", r"contains([2])",
             QueryResult::Owned(OwnedValue::Bool(b)) => {
                 assert!(b);
             }
@@ -14641,7 +14622,7 @@ mod tests {
     #[test]
     fn test_builtin_inside() {
         // inside is the inverse of contains
-        query!(br#"[2]"#, r#"inside([1, 2, 3])"#,
+        query!(br"[2]", r"inside([1, 2, 3])",
             QueryResult::Owned(OwnedValue::Bool(b)) => {
                 assert!(b);
             }
@@ -14660,7 +14641,7 @@ mod tests {
 
     #[test]
     fn test_builtin_first() {
-        query!(br#"[1, 2, 3]"#, "first",
+        query!(br"[1, 2, 3]", "first",
             QueryResult::One(StandardJson::Number(n)) => {
                 assert_eq!(n.as_i64().unwrap(), 1);
             }
@@ -14669,7 +14650,7 @@ mod tests {
 
     #[test]
     fn test_builtin_last() {
-        query!(br#"[1, 2, 3]"#, "last",
+        query!(br"[1, 2, 3]", "last",
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 3);
             }
@@ -14678,7 +14659,7 @@ mod tests {
 
     #[test]
     fn test_builtin_nth() {
-        query!(br#"[10, 20, 30]"#, "nth(1)",
+        query!(br"[10, 20, 30]", "nth(1)",
             QueryResult::One(StandardJson::Number(n)) => {
                 assert_eq!(n.as_i64().unwrap(), 20);
             }
@@ -14687,7 +14668,7 @@ mod tests {
 
     #[test]
     fn test_builtin_reverse() {
-        query!(br#"[1, 2, 3]"#, "reverse",
+        query!(br"[1, 2, 3]", "reverse",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![OwnedValue::Int(3), OwnedValue::Int(2), OwnedValue::Int(1)]);
             }
@@ -14703,7 +14684,7 @@ mod tests {
 
     #[test]
     fn test_builtin_flatten() {
-        query!(br#"[[1, 2], [3, [4]]]"#, "flatten",
+        query!(br"[[1, 2], [3, [4]]]", "flatten",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 4);
                 assert_eq!(arr[0], OwnedValue::Int(1));
@@ -14712,7 +14693,7 @@ mod tests {
         );
 
         // Flatten with depth
-        query!(br#"[[1], [[2]], [[[3]]]]"#, "flatten(2)",
+        query!(br"[[1], [[2]], [[[3]]]]", "flatten(2)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 3);
                 assert_eq!(arr[0], OwnedValue::Int(1));
@@ -14734,7 +14715,7 @@ mod tests {
 
     #[test]
     fn test_builtin_unique() {
-        query!(br#"[1, 2, 1, 3, 2]"#, "unique",
+        query!(br"[1, 2, 1, 3, 2]", "unique",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]);
             }
@@ -14752,7 +14733,7 @@ mod tests {
 
     #[test]
     fn test_builtin_sort() {
-        query!(br#"[3, 1, 2]"#, "sort",
+        query!(br"[3, 1, 2]", "sort",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]);
             }
@@ -14865,7 +14846,7 @@ mod tests {
             }
         );
 
-        query!(br#"42"#, "@text",
+        query!(br"42", "@text",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "42");
             }
@@ -15004,7 +14985,7 @@ mod tests {
         );
 
         // Array
-        query!(br#"[1, 2, 3]"#, "@yaml",
+        query!(br"[1, 2, 3]", "@yaml",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "[1, 2, 3]");
             }
@@ -15032,20 +15013,20 @@ mod tests {
         );
 
         // Empty containers
-        query!(br#"[]"#, "@yaml",
+        query!(br"[]", "@yaml",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "[]");
             }
         );
 
-        query!(br#"{}"#, "@yaml",
+        query!(br"{}", "@yaml",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "{}");
             }
         );
 
         // Float values
-        query!(br#"3.14"#, "@yaml",
+        query!(br"3.14", "@yaml",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "3.14");
             }
@@ -15090,7 +15071,7 @@ mod tests {
         );
 
         // Null
-        query!(br#"null"#, "@props",
+        query!(br"null", "@props",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "null");
             }
@@ -15111,14 +15092,14 @@ mod tests {
         );
 
         // Empty object
-        query!(br#"{}"#, "@props",
+        query!(br"{}", "@props",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "");
             }
         );
 
         // Top-level array
-        query!(br#"[1, 2, 3]"#, "@props",
+        query!(br"[1, 2, 3]", "@props",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "0 = 1\n1 = 2\n2 = 3");
             }
@@ -15131,19 +15112,19 @@ mod tests {
 
     #[test]
     fn test_builtin_tostring() {
-        query!(br#"42"#, "tostring",
+        query!(br"42", "tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "42");
             }
         );
 
-        query!(br#"true"#, "tostring",
+        query!(br"true", "tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "true");
             }
         );
 
-        query!(br#"null"#, "tostring",
+        query!(br"null", "tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "null");
             }
@@ -15165,7 +15146,7 @@ mod tests {
         );
 
         // Already a number
-        query!(br#"42"#, "tonumber",
+        query!(br"42", "tonumber",
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 42);
             }
@@ -15190,7 +15171,7 @@ mod tests {
 
     #[test]
     fn test_builtin_implode() {
-        query!(br#"[97, 98, 99]"#, "implode",
+        query!(br"[97, 98, 99]", "implode",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "abc");
             }
@@ -15253,20 +15234,20 @@ mod tests {
             }
         );
 
-        query!(br#"[1, 2, 3]"#, r#"getpath([1])"#,
+        query!(br"[1, 2, 3]", r"getpath([1])",
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 2);
             }
         );
 
         // Negative index support
-        query!(br#"[1, 2, 3]"#, r#"getpath([-1])"#,
+        query!(br"[1, 2, 3]", r"getpath([-1])",
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 3);
             }
         );
 
-        query!(br#"[1, 2, 3]"#, r#"getpath([-2])"#,
+        query!(br"[1, 2, 3]", r"getpath([-2])",
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 2);
             }
@@ -15372,7 +15353,7 @@ mod tests {
     #[test]
     fn test_variable_binding_as() {
         // Simple variable binding: .foo as $x | .bar + $x
-        query!(br#"{"foo": 10, "bar": 5}"#, r#".foo as $x | .bar + $x"#,
+        query!(br#"{"foo": 10, "bar": 5}"#, r".foo as $x | .bar + $x",
             QueryResult::Owned(OwnedValue::Int(15)) => {}
         );
 
@@ -15388,12 +15369,12 @@ mod tests {
     #[test]
     fn test_reduce() {
         // Sum array elements
-        query!(br#"[1, 2, 3, 4, 5]"#, r#"reduce .[] as $x (0; . + $x)"#,
+        query!(br"[1, 2, 3, 4, 5]", r"reduce .[] as $x (0; . + $x)",
             QueryResult::Owned(OwnedValue::Int(15)) => {}
         );
 
         // Count elements
-        query!(br#"["a", "b", "c"]"#, r#"reduce .[] as $x (0; . + 1)"#,
+        query!(br#"["a", "b", "c"]"#, r"reduce .[] as $x (0; . + 1)",
             QueryResult::Owned(OwnedValue::Int(3)) => {}
         );
     }
@@ -15401,7 +15382,7 @@ mod tests {
     #[test]
     fn test_foreach() {
         // Running sum
-        query!(br#"[1, 2, 3]"#, r#"[foreach .[] as $x (0; . + $x)]"#,
+        query!(br"[1, 2, 3]", r"[foreach .[] as $x (0; . + $x)]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 3);
                 assert_eq!(arr[0], OwnedValue::Int(1));
@@ -15414,7 +15395,7 @@ mod tests {
     #[test]
     fn test_range() {
         // range(n) - generates 0 to n-1
-        query!(br#"null"#, r#"[range(5)]"#,
+        query!(br"null", r"[range(5)]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![
                     OwnedValue::Int(0),
@@ -15427,7 +15408,7 @@ mod tests {
         );
 
         // range(a;b) - generates a to b-1
-        query!(br#"null"#, r#"[range(2;5)]"#,
+        query!(br"null", r"[range(2;5)]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![
                     OwnedValue::Int(2),
@@ -15438,7 +15419,7 @@ mod tests {
         );
 
         // range(a;b;step)
-        query!(br#"null"#, r#"[range(0;10;2)]"#,
+        query!(br"null", r"[range(0;10;2)]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![
                     OwnedValue::Int(0),
@@ -15454,7 +15435,7 @@ mod tests {
     #[test]
     fn test_limit() {
         // limit(n; expr) - take first n outputs
-        query!(br#"null"#, r#"[limit(3; range(10))]"#,
+        query!(br"null", r"[limit(3; range(10))]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![
                     OwnedValue::Int(0),
@@ -15468,14 +15449,14 @@ mod tests {
     #[test]
     fn test_first_last_expr() {
         // first(expr) - returns a reference to first element
-        query!(br#"[1, 2, 3]"#, r#"first(.[])"#,
+        query!(br"[1, 2, 3]", r"first(.[])",
             QueryResult::One(StandardJson::Number(n)) => {
                 assert_eq!(n.as_i64().unwrap(), 1);
             }
         );
 
         // last(expr) - returns a reference to last element
-        query!(br#"[1, 2, 3]"#, r#"last(.[])"#,
+        query!(br"[1, 2, 3]", r"last(.[])",
             QueryResult::One(StandardJson::Number(n)) => {
                 assert_eq!(n.as_i64().unwrap(), 3);
             }
@@ -15485,7 +15466,7 @@ mod tests {
     #[test]
     fn test_until() {
         // until(cond; update) - iterate until condition is true
-        query!(br#"1"#, r#"until(. >= 10; . * 2)"#,
+        query!(br"1", r"until(. >= 10; . * 2)",
             QueryResult::Owned(OwnedValue::Int(16)) => {}
         );
     }
@@ -15493,7 +15474,7 @@ mod tests {
     #[test]
     fn test_while() {
         // while(cond; update) - output while condition is true
-        query!(br#"1"#, r#"[while(. < 10; . * 2)]"#,
+        query!(br"1", r"[while(. < 10; . * 2)]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![
                     OwnedValue::Int(1),
@@ -15509,7 +15490,7 @@ mod tests {
     fn test_repeat() {
         // repeat(expr) - repeatedly evaluate expr with original input
         // jq behavior: repeat(. * 2) on input 1 produces 2, 2, 2, ...
-        query!(br#"1"#, r#"[limit(5; repeat(. * 2))]"#,
+        query!(br"1", r"[limit(5; repeat(. * 2))]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![
                     OwnedValue::Int(2),
@@ -15525,7 +15506,7 @@ mod tests {
     #[test]
     fn test_repeat_identity() {
         // repeat(.) produces the same value infinitely
-        query!(br#""hello""#, r#"[limit(3; repeat(.))]"#,
+        query!(br#""hello""#, r"[limit(3; repeat(.))]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![
                     OwnedValue::String("hello".into()),
@@ -15539,7 +15520,7 @@ mod tests {
     #[test]
     fn test_recurse() {
         // Basic recurse with filter - collect all values recursively
-        query!(br#"{"a": 1, "b": {"c": 2}}"#, r#"[recurse | .a? // .c? // empty]"#,
+        query!(br#"{"a": 1, "b": {"c": 2}}"#, r"[recurse | .a? // .c? // empty]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 // Should contain the values 1 and 2
                 assert!(arr.len() >= 2);
@@ -15550,17 +15531,17 @@ mod tests {
     #[test]
     fn test_isvalid() {
         // isvalid returns true for valid expressions
-        query!(br#"{"a": 1}"#, r#"isvalid(.a)"#,
+        query!(br#"{"a": 1}"#, r"isvalid(.a)",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
 
         // isvalid returns true for missing field (returns null, not error)
-        query!(br#"{"a": 1}"#, r#"isvalid(.b)"#,
+        query!(br#"{"a": 1}"#, r"isvalid(.b)",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
 
         // isvalid returns false for actual error-producing expressions
-        query!(br#"123"#, r#"isvalid(.foo)"#,
+        query!(br"123", r"isvalid(.foo)",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
     }
@@ -15582,7 +15563,7 @@ mod tests {
     #[test]
     fn test_destructuring_array_pattern() {
         // Array destructuring: . as [$first, $second] | ...
-        query!(br#"[1, 2, 3]"#, r#". as [$a, $b] | $a + $b"#,
+        query!(br"[1, 2, 3]", r". as [$a, $b] | $a + $b",
             QueryResult::Owned(OwnedValue::Int(3)) => {}
         );
     }
@@ -15590,7 +15571,7 @@ mod tests {
     #[test]
     fn test_destructuring_nested_pattern() {
         // Nested destructuring
-        query!(br#"{"user": {"name": "Bob", "id": 42}}"#, r#". as {user: {name: $n}} | $n"#,
+        query!(br#"{"user": {"name": "Bob", "id": 42}}"#, r". as {user: {name: $n}} | $n",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "Bob");
             }
@@ -15600,7 +15581,7 @@ mod tests {
     #[test]
     fn test_function_def_simple() {
         // Simple function definition without parameters
-        query!(br#"5"#, r#"def double: . * 2; double"#,
+        query!(br"5", r"def double: . * 2; double",
             QueryResult::Owned(OwnedValue::Int(10)) => {}
         );
     }
@@ -15608,7 +15589,7 @@ mod tests {
     #[test]
     fn test_function_def_with_params() {
         // Function with parameters (using 'addtwo' to avoid conflict with builtin 'add')
-        query!(br#"null"#, r#"def addtwo(a; b): a + b; addtwo(3; 4)"#,
+        query!(br"null", r"def addtwo(a; b): a + b; addtwo(3; 4)",
             QueryResult::Owned(OwnedValue::Int(7)) => {}
         );
     }
@@ -15616,23 +15597,23 @@ mod tests {
     #[test]
     fn test_function_def_chained() {
         // Single def, then use in pipe
-        query!(br#"5"#, r#"def inc: . + 1; . | inc"#,
+        query!(br"5", r"def inc: . + 1; . | inc",
             QueryResult::Owned(OwnedValue::Int(6)) => {}
         );
 
         // Two defs, use only second - this exercises nested func def
-        query!(br#"5"#, r#"def double: . * 2; def inc: . + 1; inc"#,
+        query!(br"5", r"def double: . * 2; def inc: . + 1; inc",
             QueryResult::Owned(OwnedValue::Int(6)) => {}
         );
 
         // Two defs, use only first
-        query!(br#"5"#, r#"def double: . * 2; def inc: . + 1; double"#,
+        query!(br"5", r"def double: . * 2; def inc: . + 1; double",
             QueryResult::Owned(OwnedValue::Int(10)) => {}
         );
 
         // This should work: use both in a pipe, but inc is defined first
         // (so inc isn't nested inside double's scope)
-        query!(br#"5"#, r#"def inc: . + 1; def double: . * 2; double | inc"#,
+        query!(br"5", r"def inc: . + 1; def double: . * 2; double | inc",
             QueryResult::Owned(OwnedValue::Int(11)) => {}
         );
     }
@@ -15640,7 +15621,7 @@ mod tests {
     #[test]
     fn test_function_uses_input() {
         // Function that uses the input value
-        query!(br#"{"x": 10}"#, r#"def getx: .x; getx"#,
+        query!(br#"{"x": 10}"#, r"def getx: .x; getx",
             QueryResult::One(StandardJson::Number(n)) => {
                 assert_eq!(n.as_i64().unwrap(), 10);
             }
@@ -15650,7 +15631,7 @@ mod tests {
     #[test]
     fn test_function_with_filter_param() {
         // Function with filter parameter (jq-style)
-        query!(br#"[1, 2, 3]"#, r#"def apply(f): map(f); apply(. * 2)"#,
+        query!(br"[1, 2, 3]", r"def apply(f): map(f); apply(. * 2)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![
                     OwnedValue::Int(2),
@@ -15796,7 +15777,7 @@ mod tests {
 
     #[test]
     fn test_transpose() {
-        query!(br#"[[1, 2], [3, 4], [5, 6]]"#, "transpose",
+        query!(br"[[1, 2], [3, 4], [5, 6]]", "transpose",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 2);
                 match &arr[0] {
@@ -15815,13 +15796,13 @@ mod tests {
     #[test]
     fn test_bsearch() {
         // Found case - returns index
-        query!(br#"[1, 2, 3, 4, 5]"#, "bsearch(3)",
+        query!(br"[1, 2, 3, 4, 5]", "bsearch(3)",
             QueryResult::Owned(OwnedValue::Int(idx)) => {
                 assert_eq!(idx, 2);
             }
         );
         // Not found case - returns object with index
-        query!(br#"[1, 2, 4, 5]"#, "bsearch(3)",
+        query!(br"[1, 2, 4, 5]", "bsearch(3)",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.get("index"), Some(&OwnedValue::Int(2)));
             }
@@ -15894,7 +15875,7 @@ mod tests {
     #[test]
     fn test_leaf_paths_array() {
         // Arrays also work
-        query!(br#"[1, [2, 3]]"#, "[leaf_paths]",
+        query!(br"[1, [2, 3]]", "[leaf_paths]",
             QueryResult::Owned(OwnedValue::Array(paths)) => {
                 // Paths: [0], [1, 0], [1, 1]
                 assert_eq!(paths.len(), 3);
@@ -16149,7 +16130,7 @@ mod tests {
         );
 
         // Test array index
-        query!(br#"[10, 20, 30]"#, "path(.[1])",
+        query!(br"[10, 20, 30]", "path(.[1])",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 1);
                 assert_eq!(arr[0], OwnedValue::Int(1));
@@ -16157,7 +16138,7 @@ mod tests {
         );
 
         // Test negative index (preserved as-is, matching jq)
-        query!(br#"[10, 20, 30]"#, "path(.[-1])",
+        query!(br"[10, 20, 30]", "path(.[-1])",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 1);
                 assert_eq!(arr[0], OwnedValue::Int(-1));
@@ -16311,7 +16292,7 @@ mod tests {
         // OneCursor: identity passes a container through unchanged.
         assert_eq!(owned(br#"{"a":1}"#, ".").len(), 1);
         // Many: iterating an array yields several values.
-        assert_eq!(owned(br#"[1,2,3]"#, ".[]").len(), 3);
+        assert_eq!(owned(br"[1,2,3]", ".[]").len(), 3);
         // One: field access returns a scalar reference.
         assert_eq!(owned(br#"{"a":1}"#, ".a"), vec![OwnedValue::Int(1)]);
     }
@@ -16325,7 +16306,7 @@ mod tests {
         // localtime is timezone-dependent, so assert only the 8-field structure.
         // This still exercises the hour/minute/second/weekday computation
         // regardless of the host's $TZ.
-        query!(b"0", r#"localtime"#,
+        query!(b"0", r"localtime",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 8);
             }
@@ -16335,7 +16316,7 @@ mod tests {
     #[test]
     fn test_gmtime() {
         // Unix epoch (Jan 1, 1970 00:00:00 UTC)
-        query!(b"0", r#"gmtime"#,
+        query!(b"0", r"gmtime",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 8);
                 assert_eq!(arr[0], OwnedValue::Int(1970)); // year
@@ -16353,14 +16334,14 @@ mod tests {
     #[test]
     fn test_mktime() {
         // Round-trip: gmtime | mktime should return original timestamp
-        query!(b"[1970,0,1,0,0,0,4,0]", r#"mktime"#,
+        query!(b"[1970,0,1,0,0,0,4,0]", r"mktime",
             QueryResult::Owned(OwnedValue::Float(n)) => {
                 assert_eq!(n, 0.0);
             }
         );
 
         // Jan 15, 2024 10:30:00 UTC
-        query!(b"[2024,0,15,10,30,0,1,14]", r#"mktime"#,
+        query!(b"[2024,0,15,10,30,0,1,14]", r"mktime",
             QueryResult::Owned(OwnedValue::Float(n)) => {
                 assert_eq!(n, 1705314600.0);
             }
@@ -16400,7 +16381,7 @@ mod tests {
     #[test]
     fn test_todate() {
         // todate converts timestamp to ISO 8601 string
-        query!(b"0", r#"todate"#,
+        query!(b"0", r"todate",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "1970-01-01T00:00:00Z");
             }
@@ -16410,13 +16391,13 @@ mod tests {
     #[test]
     fn test_fromdate() {
         // fromdate parses ISO 8601 string to timestamp
-        query!(br#""1970-01-01T00:00:00Z""#, r#"fromdate"#,
+        query!(br#""1970-01-01T00:00:00Z""#, r"fromdate",
             QueryResult::Owned(OwnedValue::Float(n)) => {
                 assert_eq!(n, 0.0);
             }
         );
 
-        query!(br#""2024-01-15T10:30:00Z""#, r#"fromdate"#,
+        query!(br#""2024-01-15T10:30:00Z""#, r"fromdate",
             QueryResult::Owned(OwnedValue::Float(n)) => {
                 assert_eq!(n, 1705314600.0);
             }
@@ -16426,14 +16407,14 @@ mod tests {
     #[test]
     fn test_date_roundtrip() {
         // gmtime | mktime should return original value
-        query!(b"1705314600", r#"gmtime | mktime"#,
+        query!(b"1705314600", r"gmtime | mktime",
             QueryResult::Owned(OwnedValue::Float(n)) => {
                 assert_eq!(n, 1705314600.0);
             }
         );
 
         // todate | fromdate should return original value
-        query!(b"1705314600", r#"todate | fromdate"#,
+        query!(b"1705314600", r"todate | fromdate",
             QueryResult::Owned(OwnedValue::Float(n)) => {
                 assert_eq!(n, 1705314600.0);
             }
@@ -16447,13 +16428,13 @@ mod tests {
     #[test]
     fn test_from_unix() {
         // from_unix converts timestamp to ISO 8601 string (same as todate)
-        query!(b"0", r#"from_unix"#,
+        query!(b"0", r"from_unix",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "1970-01-01T00:00:00Z");
             }
         );
 
-        query!(b"1705314600", r#"from_unix"#,
+        query!(b"1705314600", r"from_unix",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "2024-01-15T10:30:00Z");
             }
@@ -16463,13 +16444,13 @@ mod tests {
     #[test]
     fn test_to_unix() {
         // to_unix parses ISO 8601 string to timestamp (same as fromdate)
-        query!(br#""1970-01-01T00:00:00Z""#, r#"to_unix"#,
+        query!(br#""1970-01-01T00:00:00Z""#, r"to_unix",
             QueryResult::Owned(OwnedValue::Float(n)) => {
                 assert_eq!(n, 0.0);
             }
         );
 
-        query!(br#""2024-01-15T10:30:00Z""#, r#"to_unix"#,
+        query!(br#""2024-01-15T10:30:00Z""#, r"to_unix",
             QueryResult::Owned(OwnedValue::Float(n)) => {
                 assert_eq!(n, 1705314600.0);
             }
@@ -16479,7 +16460,7 @@ mod tests {
     #[test]
     fn test_from_unix_to_unix_roundtrip() {
         // from_unix | to_unix should return original value
-        query!(b"1705314600", r#"from_unix | to_unix"#,
+        query!(b"1705314600", r"from_unix | to_unix",
             QueryResult::Owned(OwnedValue::Float(n)) => {
                 assert_eq!(n, 1705314600.0);
             }
@@ -16610,7 +16591,7 @@ mod tests {
     #[test]
     fn test_simple_assign() {
         // Simple assignment: .a = value
-        query!(br#"{"a": 1, "b": 2}"#, r#".a = 42"#,
+        query!(br#"{"a": 1, "b": 2}"#, r".a = 42",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 let a = obj.get("a").unwrap();
                 assert_eq!(*a, OwnedValue::Int(42));
@@ -16623,7 +16604,7 @@ mod tests {
     #[test]
     fn test_nested_assign() {
         // Nested assignment: .a.b = value
-        query!(br#"{"a": {"b": 1}}"#, r#".a.b = 99"#,
+        query!(br#"{"a": {"b": 1}}"#, r".a.b = 99",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 let a = obj.get("a").unwrap();
                 if let OwnedValue::Object(inner) = a {
@@ -16639,7 +16620,7 @@ mod tests {
     #[test]
     fn test_array_index_assign() {
         // Array index assignment: .[0] = value
-        query!(br#"[1, 2, 3]"#, r#".[1] = 99"#,
+        query!(br"[1, 2, 3]", r".[1] = 99",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr[0], OwnedValue::Int(1));
                 assert_eq!(arr[1], OwnedValue::Int(99));
@@ -16651,7 +16632,7 @@ mod tests {
     #[test]
     fn test_update_assign() {
         // Update assignment: .a |= . + 1
-        query!(br#"{"a": 5}"#, r#".a |= . + 1"#,
+        query!(br#"{"a": 5}"#, r".a |= . + 1",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 let a = obj.get("a").unwrap();
                 assert_eq!(*a, OwnedValue::Int(6));
@@ -16662,7 +16643,7 @@ mod tests {
     #[test]
     fn test_update_assign_array() {
         // Update assignment on array elements: .[] |= . * 2
-        query!(br#"[1, 2, 3]"#, r#".[] |= . * 2"#,
+        query!(br"[1, 2, 3]", r".[] |= . * 2",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr[0], OwnedValue::Int(2));
                 assert_eq!(arr[1], OwnedValue::Int(4));
@@ -16674,7 +16655,7 @@ mod tests {
     #[test]
     fn test_compound_assign_add() {
         // Compound assignment: .a += 10
-        query!(br#"{"a": 5}"#, r#".a += 10"#,
+        query!(br#"{"a": 5}"#, r".a += 10",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 let a = obj.get("a").unwrap();
                 assert_eq!(*a, OwnedValue::Int(15));
@@ -16685,7 +16666,7 @@ mod tests {
     #[test]
     fn test_compound_assign_sub() {
         // Compound subtraction: .a -= 3
-        query!(br#"{"a": 10}"#, r#".a -= 3"#,
+        query!(br#"{"a": 10}"#, r".a -= 3",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 let a = obj.get("a").unwrap();
                 assert_eq!(*a, OwnedValue::Int(7));
@@ -16696,7 +16677,7 @@ mod tests {
     #[test]
     fn test_compound_assign_mul() {
         // Compound multiplication: .a *= 4
-        query!(br#"{"a": 5}"#, r#".a *= 4"#,
+        query!(br#"{"a": 5}"#, r".a *= 4",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 let a = obj.get("a").unwrap();
                 assert_eq!(*a, OwnedValue::Int(20));
@@ -16708,13 +16689,13 @@ mod tests {
     fn test_compound_assign_div() {
         // Compound division: .a /= 2
         // Division returns float even for integer inputs
-        query!(br#"{"a": 10}"#, r#".a /= 2"#,
+        query!(br#"{"a": 10}"#, r".a /= 2",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 let a = obj.get("a").unwrap();
                 match a {
                     OwnedValue::Float(f) => assert!((f - 5.0).abs() < 0.001),
                     OwnedValue::Int(i) => assert_eq!(*i, 5),
-                    _ => panic!("Expected number, got {:?}", a),
+                    _ => panic!("Expected number, got {a:?}"),
                 }
             }
         );
@@ -16723,7 +16704,7 @@ mod tests {
     #[test]
     fn test_compound_assign_mod() {
         // Compound modulo: .a %= 3
-        query!(br#"{"a": 10}"#, r#".a %= 3"#,
+        query!(br#"{"a": 10}"#, r".a %= 3",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 let a = obj.get("a").unwrap();
                 assert_eq!(*a, OwnedValue::Int(1));
@@ -16756,7 +16737,7 @@ mod tests {
     #[test]
     fn test_del_field() {
         // del(.a) removes a field
-        query!(br#"{"a": 1, "b": 2}"#, r#"del(.a)"#,
+        query!(br#"{"a": 1, "b": 2}"#, r"del(.a)",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert!(!obj.contains_key("a"));
                 assert!(obj.contains_key("b"));
@@ -16767,7 +16748,7 @@ mod tests {
     #[test]
     fn test_del_array_element() {
         // del(.[1]) removes an array element
-        query!(br#"[1, 2, 3]"#, r#"del(.[1])"#,
+        query!(br"[1, 2, 3]", r"del(.[1])",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 2);
                 assert_eq!(arr[0], OwnedValue::Int(1));
@@ -16779,7 +16760,7 @@ mod tests {
     #[test]
     fn test_del_nested() {
         // del(.a.b) removes nested field
-        query!(br#"{"a": {"b": 1, "c": 2}}"#, r#"del(.a.b)"#,
+        query!(br#"{"a": {"b": 1, "c": 2}}"#, r"del(.a.b)",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 let a = obj.get("a").unwrap();
                 if let OwnedValue::Object(inner) = a {
@@ -16795,7 +16776,7 @@ mod tests {
     #[test]
     fn test_chained_assign() {
         // Chained: .a = 1 | .b = 2
-        query!(br#"{"a": 0, "b": 0}"#, r#".a = 1 | .b = 2"#,
+        query!(br#"{"a": 0, "b": 0}"#, r".a = 1 | .b = 2",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 let a = obj.get("a").unwrap();
                 assert_eq!(*a, OwnedValue::Int(1));
@@ -16811,7 +16792,7 @@ mod tests {
 
     #[test]
     fn test_tag_null() {
-        query!(br#"null"#, "tag",
+        query!(br"null", "tag",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "!!null");
             }
@@ -16820,12 +16801,12 @@ mod tests {
 
     #[test]
     fn test_tag_bool() {
-        query!(br#"true"#, "tag",
+        query!(br"true", "tag",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "!!bool");
             }
         );
-        query!(br#"false"#, "tag",
+        query!(br"false", "tag",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "!!bool");
             }
@@ -16834,7 +16815,7 @@ mod tests {
 
     #[test]
     fn test_tag_int() {
-        query!(br#"42"#, "tag",
+        query!(br"42", "tag",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "!!int");
             }
@@ -16843,7 +16824,7 @@ mod tests {
 
     #[test]
     fn test_tag_float() {
-        query!(br#"3.14"#, "tag",
+        query!(br"3.14", "tag",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "!!float");
             }
@@ -16861,7 +16842,7 @@ mod tests {
 
     #[test]
     fn test_tag_array() {
-        query!(br#"[1, 2, 3]"#, "tag",
+        query!(br"[1, 2, 3]", "tag",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "!!seq");
             }
@@ -16905,7 +16886,7 @@ mod tests {
                 assert_eq!(s, "");
             }
         );
-        query!(br#"[1, 2, 3]"#, "style",
+        query!(br"[1, 2, 3]", "style",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "");
             }
@@ -17135,7 +17116,7 @@ mod tests {
         query!(b"null", "builtins | length",
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 // Should have many builtins (at least 100)
-                assert!(n > 100, "should have many builtins, got {}", n);
+                assert!(n > 100, "should have many builtins, got {n}");
             }
         );
         // Check some known builtins exist
@@ -17236,7 +17217,7 @@ mod tests {
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 2, "expected line 2 for $__loc__ on second line");
             }
-            other => panic!("expected Int, got {:?}", other),
+            other => panic!("expected Int, got {other:?}"),
         }
     }
 
@@ -17253,7 +17234,7 @@ mod tests {
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 3, "expected line 3 for $__loc__ on third line");
             }
-            other => panic!("expected Int, got {:?}", other),
+            other => panic!("expected Int, got {other:?}"),
         }
     }
 
@@ -17269,7 +17250,7 @@ mod tests {
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 1, "expected line 1 for $__loc__ in function on line 1");
             }
-            other => panic!("expected Int, got {:?}", other),
+            other => panic!("expected Int, got {other:?}"),
         }
     }
 
@@ -17546,7 +17527,7 @@ mod tests {
     #[test]
     fn test_indices_array() {
         // Find all occurrences of element in array
-        query!(br#"[1, 2, 3, 1, 2]"#, "indices(1)",
+        query!(br"[1, 2, 3, 1, 2]", "indices(1)",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![OwnedValue::Int(0), OwnedValue::Int(3)]);
             }
@@ -17586,7 +17567,7 @@ mod tests {
     #[test]
     fn test_index_array() {
         // First occurrence of element in array
-        query!(br#"[1, 2, 3, 1, 2]"#, "index(2)",
+        query!(br"[1, 2, 3, 1, 2]", "index(2)",
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 1);
             }
@@ -17614,7 +17595,7 @@ mod tests {
     #[test]
     fn test_rindex_array() {
         // Last occurrence of element in array
-        query!(br#"[1, 2, 3, 1, 2]"#, "rindex(2)",
+        query!(br"[1, 2, 3, 1, 2]", "rindex(2)",
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 4);
             }
@@ -17642,7 +17623,7 @@ mod tests {
     #[test]
     fn test_index_array_null() {
         // Find null in array
-        query!(br#"[1, null, 2, null]"#, "index(null)",
+        query!(br"[1, null, 2, null]", "index(null)",
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert_eq!(n, 1);
             }
@@ -17776,7 +17757,7 @@ mod tests {
     #[test]
     fn test_di_json_returns_zero() {
         // For JSON input, di returns 0 (single document assumed)
-        query!(br#"[1, 2, 3]"#, "di",
+        query!(br"[1, 2, 3]", "di",
             QueryResult::Owned(OwnedValue::Int(0)) => {}
         );
     }
@@ -17807,7 +17788,7 @@ mod tests {
     #[cfg(feature = "cli")]
     fn test_shuffle_returns_array_same_length() {
         // shuffle should return an array with the same length
-        query!(br#"[1, 2, 3, 4, 5]"#, "shuffle",
+        query!(br"[1, 2, 3, 4, 5]", "shuffle",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 5);
                 // All original elements should be present (just reordered)
@@ -17839,7 +17820,7 @@ mod tests {
     #[cfg(feature = "cli")]
     fn test_shuffle_empty_array() {
         // shuffle of empty array should return empty array
-        query!(br#"[]"#, "shuffle",
+        query!(br"[]", "shuffle",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert!(arr.is_empty());
             }
@@ -17850,7 +17831,7 @@ mod tests {
     #[cfg(feature = "cli")]
     fn test_shuffle_single_element() {
         // shuffle of single element should return the same element
-        query!(br#"[42]"#, "shuffle",
+        query!(br"[42]", "shuffle",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![OwnedValue::Int(42)]);
             }
@@ -17862,7 +17843,7 @@ mod tests {
         // shuffle requires array input
         query!(br#""not an array""#, "shuffle",
             QueryResult::Error(err) => {
-                let msg = format!("{}", err);
+                let msg = format!("{err}");
                 assert!(msg.contains("array") || msg.contains("cli"));
             }
         );
@@ -17872,7 +17853,7 @@ mod tests {
     #[cfg(feature = "cli")]
     fn test_shuffle_in_pipeline() {
         // shuffle can be used in a pipeline
-        query!(br#"[3, 1, 2]"#, "shuffle | length",
+        query!(br"[3, 1, 2]", "shuffle | length",
             QueryResult::Owned(OwnedValue::Int(3)) => {}
         );
     }
@@ -17894,7 +17875,7 @@ mod tests {
     #[test]
     fn test_pivot_array_of_arrays() {
         // Transpose array of arrays: [[a, b], [x, y]] → [[a, x], [b, y]]
-        query!(br#"[[1, 2], [3, 4]]"#, "pivot",
+        query!(br"[[1, 2], [3, 4]]", "pivot",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 2);
                 assert_eq!(arr[0], OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(3)]));
@@ -17906,7 +17887,7 @@ mod tests {
     #[test]
     fn test_pivot_array_of_arrays_3x3() {
         // 3x3 matrix transpose
-        query!(br#"[[1, 2, 3], [4, 5, 6], [7, 8, 9]]"#, "pivot",
+        query!(br"[[1, 2, 3], [4, 5, 6], [7, 8, 9]]", "pivot",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 3);
                 assert_eq!(arr[0], OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(4), OwnedValue::Int(7)]));
@@ -17919,7 +17900,7 @@ mod tests {
     #[test]
     fn test_pivot_array_of_arrays_ragged() {
         // Ragged arrays get null padding: [[1, 2], [3]] → [[1, 3], [2, null]]
-        query!(br#"[[1, 2], [3]]"#, "pivot",
+        query!(br"[[1, 2], [3]]", "pivot",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 2);
                 assert_eq!(arr[0], OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(3)]));
@@ -17967,7 +17948,7 @@ mod tests {
     #[test]
     fn test_pivot_empty_array() {
         // Empty array returns empty array
-        query!(br#"[]"#, "pivot",
+        query!(br"[]", "pivot",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert!(arr.is_empty());
             }
@@ -17977,7 +17958,7 @@ mod tests {
     #[test]
     fn test_pivot_array_of_empty_arrays() {
         // Array of empty arrays returns empty array
-        query!(br#"[[], []]"#, "pivot",
+        query!(br"[[], []]", "pivot",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert!(arr.is_empty());
             }
@@ -17987,7 +17968,7 @@ mod tests {
     #[test]
     fn test_pivot_array_of_empty_objects() {
         // Array of empty objects returns empty object
-        query!(br#"[{}, {}]"#, "pivot",
+        query!(br"[{}, {}]", "pivot",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert!(obj.is_empty());
             }
@@ -17999,7 +17980,7 @@ mod tests {
         // pivot requires array input
         query!(br#""not an array""#, "pivot",
             QueryResult::Error(err) => {
-                let msg = format!("{}", err);
+                let msg = format!("{err}");
                 assert!(msg.contains("array"));
             }
         );
@@ -18010,7 +17991,7 @@ mod tests {
         // pivot requires all arrays or all objects, not mixed
         query!(br#"[[1], {"a": 2}]"#, "pivot",
             QueryResult::Error(err) => {
-                let msg = format!("{}", err);
+                let msg = format!("{err}");
                 assert!(msg.contains("array of arrays") || msg.contains("array of objects"));
             }
         );
@@ -18019,9 +18000,9 @@ mod tests {
     #[test]
     fn test_pivot_error_on_scalars() {
         // pivot requires arrays or objects, not scalar values
-        query!(br#"[1, 2, 3]"#, "pivot",
+        query!(br"[1, 2, 3]", "pivot",
             QueryResult::Error(err) => {
-                let msg = format!("{}", err);
+                let msg = format!("{err}");
                 assert!(msg.contains("array of arrays") || msg.contains("array of objects"));
             }
         );
@@ -18030,7 +18011,7 @@ mod tests {
     #[test]
     fn test_pivot_in_pipeline() {
         // pivot can be used in a pipeline
-        query!(br#"[[1, 2], [3, 4]]"#, "pivot | .[0]",
+        query!(br"[[1, 2], [3, 4]]", "pivot | .[0]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(3)]);
             }
@@ -18040,7 +18021,7 @@ mod tests {
     #[test]
     fn test_pivot_double_pivot_identity() {
         // Double pivot should return original for square matrices
-        query!(br#"[[1, 2], [3, 4]]"#, "pivot | pivot",
+        query!(br"[[1, 2], [3, 4]]", "pivot | pivot",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 2);
                 assert_eq!(arr[0], OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]));
@@ -18060,7 +18041,7 @@ mod tests {
         where
             F: FnOnce(&str) -> R,
         {
-            let path = format!("/tmp/succinctly_test_{}", name);
+            let path = format!("/tmp/succinctly_test_{name}");
             fs::write(&path, content).unwrap();
             let result = f(&path);
             let _ = fs::remove_file(&path);
@@ -18076,7 +18057,7 @@ mod tests {
                     let json_bytes: &[u8] = b"null";
                     let index = JsonIndex::build(json_bytes);
                     let cursor = index.root(json_bytes);
-                    let query = format!(r#"load("{}")"#, path);
+                    let query = format!(r#"load("{path}")"#);
                     let expr = parse(&query).unwrap();
                     match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                         QueryResult::Owned(OwnedValue::Object(obj)) => {
@@ -18086,7 +18067,7 @@ mod tests {
                             );
                             assert_eq!(obj.get("value"), Some(&OwnedValue::Int(42)));
                         }
-                        other => panic!("unexpected result: {:?}", other),
+                        other => panic!("unexpected result: {other:?}"),
                     }
                 },
             );
@@ -18098,7 +18079,7 @@ mod tests {
                 let json_bytes: &[u8] = b"null";
                 let index = JsonIndex::build(json_bytes);
                 let cursor = index.root(json_bytes);
-                let query = format!(r#"load("{}")"#, path);
+                let query = format!(r#"load("{path}")"#);
                 let expr = parse(&query).unwrap();
                 match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
@@ -18108,7 +18089,7 @@ mod tests {
                         );
                         assert_eq!(obj.get("value"), Some(&OwnedValue::Int(42)));
                     }
-                    other => panic!("unexpected result: {:?}", other),
+                    other => panic!("unexpected result: {other:?}"),
                 }
             });
         }
@@ -18119,7 +18100,7 @@ mod tests {
                 let json_bytes: &[u8] = b"null";
                 let index = JsonIndex::build(json_bytes);
                 let cursor = index.root(json_bytes);
-                let query = format!(r#"load("{}")"#, path);
+                let query = format!(r#"load("{path}")"#);
                 let expr = parse(&query).unwrap();
                 match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
@@ -18133,7 +18114,7 @@ mod tests {
                             _ => panic!("expected array"),
                         }
                     }
-                    other => panic!("unexpected result: {:?}", other),
+                    other => panic!("unexpected result: {other:?}"),
                 }
             });
         }
@@ -18151,7 +18132,7 @@ mod tests {
                             || err.message.contains("No such file")
                     );
                 }
-                other => panic!("expected error, got: {:?}", other),
+                other => panic!("expected error, got: {other:?}"),
             }
         }
 
@@ -18164,7 +18145,7 @@ mod tests {
             let expr = parse(r#"try load("/tmp/nonexistent_file_12345.yaml") catch null"#).unwrap();
             match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                 QueryResult::Owned(OwnedValue::Null) => {}
-                other => panic!("expected null, got: {:?}", other),
+                other => panic!("expected null, got: {other:?}"),
             }
         }
 
@@ -18179,7 +18160,7 @@ mod tests {
                 QueryResult::Owned(OwnedValue::String(s)) => {
                     assert_eq!(s, "not found");
                 }
-                other => panic!("expected 'not found', got: {:?}", other),
+                other => panic!("expected 'not found', got: {other:?}"),
             }
         }
 
@@ -18189,7 +18170,7 @@ mod tests {
                 let json_bytes: &[u8] = br#"{"name": "main"}"#;
                 let index = JsonIndex::build(json_bytes);
                 let cursor = index.root(json_bytes);
-                let query = format!(r#". + {{config: load("{}")}}"#, path);
+                let query = format!(r#". + {{config: load("{path}")}}"#);
                 let expr = parse(&query).unwrap();
                 match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
@@ -18208,7 +18189,7 @@ mod tests {
                             _ => panic!("expected config to be object"),
                         }
                     }
-                    other => panic!("unexpected result: {:?}", other),
+                    other => panic!("unexpected result: {other:?}"),
                 }
             });
         }
@@ -18219,7 +18200,7 @@ mod tests {
                 let json_bytes: &[u8] = b"null";
                 let index = JsonIndex::build(json_bytes);
                 let cursor = index.root(json_bytes);
-                let query = format!(r#"load("{}")"#, path);
+                let query = format!(r#"load("{path}")"#);
                 let expr = parse(&query).unwrap();
                 match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Array(arr)) => {
@@ -18243,7 +18224,7 @@ mod tests {
                             _ => panic!("expected second doc to be object"),
                         }
                     }
-                    other => panic!("expected array of documents, got: {:?}", other),
+                    other => panic!("expected array of documents, got: {other:?}"),
                 }
             });
         }
@@ -18252,16 +18233,16 @@ mod tests {
         fn test_load_with_dynamic_path() {
             with_temp_file("dynamic.json", r#"{"loaded": true}"#, |path| {
                 // Input contains the path to load
-                let json_bytes = format!(r#"{{"path": "{}"}}"#, path);
+                let json_bytes = format!(r#"{{"path": "{path}"}}"#);
                 let json_bytes = json_bytes.as_bytes();
                 let index = JsonIndex::build(json_bytes);
                 let cursor = index.root(json_bytes);
-                let expr = parse(r#"load(.path)"#).unwrap();
+                let expr = parse(r"load(.path)").unwrap();
                 match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
                     QueryResult::Owned(OwnedValue::Object(obj)) => {
                         assert_eq!(obj.get("loaded"), Some(&OwnedValue::Bool(true)));
                     }
-                    other => panic!("unexpected result: {:?}", other),
+                    other => panic!("unexpected result: {other:?}"),
                 }
             });
         }

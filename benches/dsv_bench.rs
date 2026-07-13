@@ -11,10 +11,10 @@ fn bench_dsv_parsing(c: &mut Criterion) {
     let config = DsvConfig::csv();
 
     for (name, path) in sizes {
-        eprintln!("Loading {}...", path);
+        eprintln!("Loading {path}...");
         if let Ok(data) = fs::read(path) {
             eprintln!("Loaded {} bytes", data.len());
-            let mut group = c.benchmark_group(format!("dsv_parse_{}", name));
+            let mut group = c.benchmark_group(format!("dsv_parse_{name}"));
             group.throughput(Throughput::Bytes(data.len() as u64));
 
             // Benchmark 1: Pure parsing (index building)
@@ -22,7 +22,7 @@ fn bench_dsv_parsing(c: &mut Criterion) {
                 b.iter(|| {
                     let index = build_index(black_box(&data), black_box(&config));
                     black_box(index)
-                })
+                });
             });
 
             // Benchmark 2: Parsing + row iteration (no JSON)
@@ -38,7 +38,7 @@ fn bench_dsv_parsing(c: &mut Criterion) {
                         }
                     }
                     black_box(count)
-                })
+                });
             });
 
             // Benchmark 3: Parsing + row iteration + string conversion
@@ -55,7 +55,7 @@ fn bench_dsv_parsing(c: &mut Criterion) {
                         results.push(fields);
                     }
                     black_box(results)
-                })
+                });
             });
 
             group.finish();
@@ -80,7 +80,7 @@ fn bench_dsv_random_access(c: &mut Criterion) {
             let sample_rows: Vec<usize> = (0..row_count).step_by(100).collect();
             let sample_count = sample_rows.len();
 
-            let mut group = c.benchmark_group(format!("dsv_random_access_{}", name));
+            let mut group = c.benchmark_group(format!("dsv_random_access_{name}"));
             group.throughput(Throughput::Elements(sample_count as u64));
 
             // Benchmark: Random access to first field of sampled rows
@@ -95,7 +95,7 @@ fn bench_dsv_random_access(c: &mut Criterion) {
                         }
                     }
                     black_box(total_bytes)
-                })
+                });
             });
 
             // Benchmark: Random access with field iteration
@@ -111,7 +111,7 @@ fn bench_dsv_random_access(c: &mut Criterion) {
                         }
                     }
                     black_box(total_fields)
-                })
+                });
             });
 
             group.finish();

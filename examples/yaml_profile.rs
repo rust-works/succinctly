@@ -124,12 +124,12 @@ fn main() {
 
     // ========== RESULTS ==========
     eprintln!();
-    eprintln!("=== Comparison for {:.1} KiB ===", size_kb);
+    eprintln!("=== Comparison for {size_kb:.1} KiB ===");
     eprintln!();
     eprintln!("OLD (via OwnedValue):");
-    eprintln!("  Parse:     {:>8.2?}", old_parse_time);
-    eprintln!("  Convert:   {:>8.2?}", old_convert_time);
-    eprintln!("  Serialize: {:>8.2?}", old_serialize_time);
+    eprintln!("  Parse:     {old_parse_time:>8.2?}");
+    eprintln!("  Convert:   {old_convert_time:>8.2?}");
+    eprintln!("  Serialize: {old_serialize_time:>8.2?}");
     eprintln!(
         "  Total:     {:>8.2?}  ({:.1} MiB/s)",
         old_total,
@@ -137,8 +137,8 @@ fn main() {
     );
     eprintln!();
     eprintln!("NEW (direct cursor → JSON):");
-    eprintln!("  Parse:     {:>8.2?}", new_parse_time);
-    eprintln!("  Convert:   {:>8.2?}", new_convert_time);
+    eprintln!("  Parse:     {new_parse_time:>8.2?}");
+    eprintln!("  Convert:   {new_convert_time:>8.2?}");
     eprintln!(
         "  Total:     {:>8.2?}  ({:.1} MiB/s)",
         new_total,
@@ -166,7 +166,7 @@ fn main() {
             if old_bytes[i] != new_bytes[i] {
                 let start = i.saturating_sub(20);
                 let end = (i + 40).min(old_bytes.len()).min(new_bytes.len());
-                eprintln!("  First diff at byte {}", i);
+                eprintln!("  First diff at byte {i}");
                 eprintln!(
                     "  Old[{}..{}]: {:?}",
                     start,

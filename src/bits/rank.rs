@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // manual aligned allocation for the rank directory
 //! Rank directory for O(1) rank queries.
 //!
 //! This module implements a Poppy-style 3-level rank directory that provides
@@ -75,7 +76,7 @@ impl CacheAlignedL1L2 {
         let layout = Layout::from_size_align(len * 16, CACHE_LINE_SIZE).expect("layout error");
 
         // Safety: layout is valid (non-zero size, power-of-two alignment)
-        let ptr = unsafe { alloc::alloc::alloc(layout) as *mut u128 };
+        let ptr = unsafe { alloc::alloc::alloc(layout).cast::<u128>() };
         if ptr.is_null() {
             alloc::alloc::handle_alloc_error(layout);
         }
@@ -127,7 +128,7 @@ impl Clone for CacheAlignedL1L2 {
         let layout = Layout::from_size_align(self.len * 16, CACHE_LINE_SIZE).expect("layout error");
 
         // Safety: layout is valid
-        let ptr = unsafe { alloc::alloc::alloc(layout) as *mut u128 };
+        let ptr = unsafe { alloc::alloc::alloc(layout).cast::<u128>() };
         if ptr.is_null() {
             alloc::alloc::handle_alloc_error(layout);
         }
@@ -152,7 +153,7 @@ impl Drop for CacheAlignedL1L2 {
                 Layout::from_size_align(self.len * 16, CACHE_LINE_SIZE).expect("layout error");
             // Safety: ptr was allocated with this layout
             unsafe {
-                alloc::alloc::dealloc(self.ptr.as_ptr() as *mut u8, layout);
+                alloc::alloc::dealloc(self.ptr.as_ptr().cast::<u8>(), layout);
             }
         }
     }
@@ -198,7 +199,7 @@ impl CacheAlignedL1L2Builder {
         let layout = Layout::from_size_align(capacity * 16, CACHE_LINE_SIZE).expect("layout error");
 
         // Safety: layout is valid (non-zero size, power-of-two alignment)
-        let ptr = unsafe { alloc::alloc::alloc(layout) as *mut u128 };
+        let ptr = unsafe { alloc::alloc::alloc(layout).cast::<u128>() };
         if ptr.is_null() {
             alloc::alloc::handle_alloc_error(layout);
         }
@@ -243,7 +244,7 @@ impl CacheAlignedL1L2Builder {
                     Layout::from_size_align(self.capacity * 16, CACHE_LINE_SIZE).expect("layout");
                 // Safety: ptr was allocated with this layout
                 unsafe {
-                    alloc::alloc::dealloc(self.ptr.as_ptr() as *mut u8, layout);
+                    alloc::alloc::dealloc(self.ptr.as_ptr().cast::<u8>(), layout);
                 }
             }
             return CacheAlignedL1L2::empty();
@@ -265,7 +266,7 @@ impl CacheAlignedL1L2Builder {
             Layout::from_size_align(self.len * 16, CACHE_LINE_SIZE).expect("layout error");
 
         // Safety: new_layout is valid
-        let new_ptr = unsafe { alloc::alloc::alloc(new_layout) as *mut u128 };
+        let new_ptr = unsafe { alloc::alloc::alloc(new_layout).cast::<u128>() };
         if new_ptr.is_null() {
             alloc::alloc::handle_alloc_error(new_layout);
         }
@@ -280,7 +281,7 @@ impl CacheAlignedL1L2Builder {
         let old_layout =
             Layout::from_size_align(self.capacity * 16, CACHE_LINE_SIZE).expect("layout");
         unsafe {
-            alloc::alloc::dealloc(self.ptr.as_ptr() as *mut u8, old_layout);
+            alloc::alloc::dealloc(self.ptr.as_ptr().cast::<u8>(), old_layout);
         }
 
         // Prevent Drop from running
@@ -301,7 +302,7 @@ impl Drop for CacheAlignedL1L2Builder {
                 Layout::from_size_align(self.capacity * 16, CACHE_LINE_SIZE).expect("layout error");
             // Safety: ptr was allocated with this layout
             unsafe {
-                alloc::alloc::dealloc(self.ptr.as_ptr() as *mut u8, layout);
+                alloc::alloc::dealloc(self.ptr.as_ptr().cast::<u8>(), layout);
             }
         }
     }

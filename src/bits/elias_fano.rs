@@ -390,7 +390,7 @@ impl EliasFano {
     }
 }
 
-impl<'a> EliasFanoCursor<'a> {
+impl EliasFanoCursor<'_> {
     /// Returns the current element value, or `None` if exhausted.
     #[inline]
     pub fn current(&self) -> Option<u32> {
@@ -568,7 +568,7 @@ pub struct EliasFanoIter<'a> {
     started: bool,
 }
 
-impl<'a> Iterator for EliasFanoIter<'a> {
+impl Iterator for EliasFanoIter<'_> {
     type Item = u32;
 
     #[inline]
@@ -588,7 +588,7 @@ impl<'a> Iterator for EliasFanoIter<'a> {
     }
 }
 
-impl<'a> ExactSizeIterator for EliasFanoIter<'a> {}
+impl ExactSizeIterator for EliasFanoIter<'_> {}
 
 #[cfg(test)]
 mod tests {
@@ -628,7 +628,7 @@ mod tests {
 
         // Test random access
         for (i, &v) in values.iter().enumerate() {
-            assert_eq!(ef.get(i), Some(v), "get({}) failed", i);
+            assert_eq!(ef.get(i), Some(v), "get({i}) failed");
         }
 
         // Test cursor iteration
@@ -649,7 +649,7 @@ mod tests {
 
         // Test random access
         for (i, &v) in values.iter().enumerate() {
-            assert_eq!(ef.get(i), Some(v), "get({}) failed", i);
+            assert_eq!(ef.get(i), Some(v), "get({i}) failed");
         }
 
         // Test cursor iteration
@@ -740,12 +740,11 @@ mod tests {
         // Test various positions
         for &idx in &[0, 1, 10, 50, 100, 255, 256, 257, 500, 512, 513, 999] {
             let cursor = ef.cursor_from(idx);
-            assert_eq!(cursor.index(), idx, "cursor_from({}).index()", idx);
+            assert_eq!(cursor.index(), idx, "cursor_from({idx}).index()");
             assert_eq!(
                 cursor.current(),
                 Some(values[idx]),
-                "cursor_from({}).current()",
-                idx
+                "cursor_from({idx}).current()"
             );
         }
 
@@ -816,9 +815,7 @@ mod tests {
                     assert_eq!(
                         cursor.current(),
                         Some(values[idx]),
-                        "cursor_from({}) near boundary {}",
-                        idx,
-                        boundary
+                        "cursor_from({idx}) near boundary {boundary}"
                     );
                 }
             }
@@ -839,7 +836,7 @@ mod tests {
         let ef = EliasFano::build(&values);
 
         for (i, &v) in values.iter().enumerate() {
-            assert_eq!(ef.get(i), Some(v), "get({}) failed", i);
+            assert_eq!(ef.get(i), Some(v), "get({i}) failed");
         }
 
         let collected: Vec<u32> = ef.into_iter().collect();
@@ -867,17 +864,12 @@ mod tests {
         // EF should be significantly smaller
         assert!(
             ef_size < vec_size,
-            "EF size {} should be less than Vec size {}",
-            ef_size,
-            vec_size
+            "EF size {ef_size} should be less than Vec size {vec_size}"
         );
 
         // Print compression ratio for inspection
         let ratio = vec_size as f64 / ef_size as f64;
-        eprintln!(
-            "Compression: {} bytes -> {} bytes ({:.2}x)",
-            vec_size, ef_size, ratio
-        );
+        eprintln!("Compression: {vec_size} bytes -> {ef_size} bytes ({ratio:.2}x)");
     }
 
     #[test]
@@ -936,7 +928,7 @@ mod tests {
         let ef = EliasFano::build(&values);
 
         eprintln!("\n=== EliasFano Benchmark ===");
-        eprintln!("Elements: {}", n);
+        eprintln!("Elements: {n}");
         eprintln!("Universe: {}", values.last().unwrap());
         eprintln!(
             "Size: Vec<u32>={} bytes, EliasFano={} bytes ({:.2}x compression)",
@@ -970,10 +962,7 @@ mod tests {
         }
         let vec_seq_time = start.elapsed();
 
-        eprintln!(
-            "\nSequential iteration ({} elements × {} iterations):",
-            n, iterations
-        );
+        eprintln!("\nSequential iteration ({n} elements × {iterations} iterations):");
         eprintln!(
             "  Vec<u32>:    {:?} ({:.1} ns/elem)",
             vec_seq_time,
@@ -1061,12 +1050,9 @@ mod tests {
         }
         let vec_skip_time = start.elapsed();
 
-        eprintln!(
-            "\nSkip-by-small (advance_by 2-8 × {} iterations):",
-            iterations
-        );
-        eprintln!("  Vec<u32>:    {:?}", vec_skip_time);
-        eprintln!("  EliasFano:   {:?}", ef_skip_time);
+        eprintln!("\nSkip-by-small (advance_by 2-8 × {iterations} iterations):");
+        eprintln!("  Vec<u32>:    {vec_skip_time:?}");
+        eprintln!("  EliasFano:   {ef_skip_time:?}");
         eprintln!(
             "  Ratio:       {:.2}x",
             ef_skip_time.as_nanos() as f64 / vec_skip_time.as_nanos() as f64

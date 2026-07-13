@@ -1,3 +1,4 @@
+#![allow(unsafe_code)] // NEON intrinsics benchmarked directly
 //! Benchmark comparing different NEON movemask implementations.
 //!
 //! This benchmark measures the performance difference between:
@@ -158,19 +159,19 @@ mod aarch64_benches {
                 let v = vld1q_u8(pattern.as_ptr());
 
                 group.bench_function(BenchmarkId::new("serial", name), |b| {
-                    b.iter(|| movemask_impls::serial(black_box(v)))
+                    b.iter(|| movemask_impls::serial(black_box(v)));
                 });
 
                 group.bench_function(BenchmarkId::new("parallel", name), |b| {
-                    b.iter(|| movemask_impls::parallel(black_box(v)))
+                    b.iter(|| movemask_impls::parallel(black_box(v)));
                 });
 
                 group.bench_function(BenchmarkId::new("parallel_mul", name), |b| {
-                    b.iter(|| movemask_impls::parallel_mul(black_box(v)))
+                    b.iter(|| movemask_impls::parallel_mul(black_box(v)));
                 });
 
                 group.bench_function(BenchmarkId::new("parallel_padd", name), |b| {
-                    b.iter(|| movemask_impls::parallel_padd(black_box(v)))
+                    b.iter(|| movemask_impls::parallel_padd(black_box(v)));
                 });
             }
         }
@@ -200,7 +201,7 @@ mod aarch64_benches {
             let bytes = std::fs::read(test_file).expect("Failed to read test file");
             let file_size = bytes.len() as u64;
 
-            let mut group = c.benchmark_group(format!("json_indexing_{}", name));
+            let mut group = c.benchmark_group(format!("json_indexing_{name}"));
             group.throughput(Throughput::Bytes(file_size));
             group.sample_size(if name == "100mb" { 10 } else { 20 });
 
@@ -208,12 +209,12 @@ mod aarch64_benches {
             group.bench_function("NEON_parallel", |b| {
                 b.iter(|| {
                     succinctly::json::simd::neon::build_semi_index_standard(black_box(&bytes))
-                })
+                });
             });
 
             // Benchmark with scalar (baseline)
             group.bench_function("Scalar", |b| {
-                b.iter(|| succinctly::json::standard::build_semi_index(black_box(&bytes)))
+                b.iter(|| succinctly::json::standard::build_semi_index(black_box(&bytes)));
             });
 
             group.finish();
@@ -247,18 +248,15 @@ mod aarch64_benches {
 
                 assert_eq!(
                     serial, parallel,
-                    "Mismatch: serial={:016b}, parallel={:016b}",
-                    serial, parallel
+                    "Mismatch: serial={serial:016b}, parallel={parallel:016b}"
                 );
                 assert_eq!(
                     serial, parallel_mul,
-                    "Mismatch: serial={:016b}, parallel_mul={:016b}",
-                    serial, parallel_mul
+                    "Mismatch: serial={serial:016b}, parallel_mul={parallel_mul:016b}"
                 );
                 assert_eq!(
                     serial, parallel_padd,
-                    "Mismatch: serial={:016b}, parallel_padd={:016b}",
-                    serial, parallel_padd
+                    "Mismatch: serial={serial:016b}, parallel_padd={parallel_padd:016b}"
                 );
             }
         }

@@ -52,14 +52,14 @@ fn bench_popcount_strategies(c: &mut Criterion) {
 
             #[cfg(feature = "simd")]
             group.bench_with_input(
-                BenchmarkId::new(format!("{}/{}", size_name, pattern_name), "simd"),
+                BenchmarkId::new(format!("{size_name}/{pattern_name}"), "simd"),
                 &words,
                 |b, words| b.iter(|| popcount_words(black_box(words))),
             );
 
             // Always benchmark scalar as baseline
             group.bench_with_input(
-                BenchmarkId::new(format!("{}/{}", size_name, pattern_name), "scalar"),
+                BenchmarkId::new(format!("{size_name}/{pattern_name}"), "scalar"),
                 &words,
                 |b, words| {
                     b.iter(|| {
@@ -68,7 +68,7 @@ fn bench_popcount_strategies(c: &mut Criterion) {
                             total += word.count_ones();
                         }
                         total
-                    })
+                    });
                 },
             );
         }
@@ -109,7 +109,7 @@ fn bench_avx512_alignment(c: &mut Criterion) {
             .collect();
 
         group.bench_with_input(BenchmarkId::new(name, ""), &words, |b, words| {
-            b.iter(|| popcount_words(black_box(words)))
+            b.iter(|| popcount_words(black_box(words)));
         });
     }
 
@@ -138,7 +138,7 @@ fn bench_throughput(c: &mut Criterion) {
                 total += word.count_ones();
             }
             total
-        })
+        });
     });
 
     group.finish();
