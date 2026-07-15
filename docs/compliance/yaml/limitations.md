@@ -12,7 +12,9 @@ cargo test --test yaml_test_suite -- --nocapture
 ```
 
 For scalar type handling specifically (the Norway problem, booleans, quoted numbers),
-see [YAML 1.2 Compliance](1.2.md).
+see [YAML 1.2 Compliance](1.2.md); its known divergences from the 1.2 core schema
+(`Null`/`NULL`, hex and octal ints, bare `nan`/`inf`) are tracked in
+[#226](https://github.com/rust-works/succinctly/issues/226).
 
 ## Summary
 
@@ -65,7 +67,8 @@ An opt-in validation mode is planned, mirroring the JSON side's existing
 `succinctly json validate` / `sjq --validate`. There, validation is a separate pass that
 runs before indexing, so the default path pays nothing for it — see
 [`src/json/validate.rs`](../../../src/json/validate.rs). The 83 cases above are its
-acceptance criteria.
+acceptance criteria. Tracked in
+[#223](https://github.com/rust-works/succinctly/issues/223).
 
 ## Unsupported features
 
@@ -82,7 +85,9 @@ Error: YAML parse error: tags (!) not supported at offset 3
 ```
 
 In flow context they are silently absorbed into the scalar instead, so `[!!str a]` yields
-the string `"!!str a"`. That inconsistency is tracked separately from tag support itself.
+the string `"!!str a"` — silently wrong data rather than an error. Tracked in
+[#224](https://github.com/rust-works/succinctly/issues/224), which covers both tag support
+and that inconsistency.
 
 ### Directives — 16 cases (all load)
 
@@ -93,6 +98,8 @@ plain scalar, which also swallows the `---` that follows it:
 $ printf '%%YAML 1.2\n--- text\n' | succinctly yq '.'
 "%YAML 1.2 --- text"      # expected: "text"
 ```
+
+Tracked in [#225](https://github.com/rust-works/succinctly/issues/225).
 
 ## Two output paths that disagree — 8 cases
 
@@ -116,9 +123,11 @@ the streaming path emits an empty string. Other divergences involve empty keys, 
 scalar folding, and trailing tabs.
 
 An indentation flag changing a document's *value* is a bug in its own right, independent
-of YAML conformance. This page counts the 8 cases where the streaming path fails and the
-DOM path would have passed; the harness tests the streaming path because that is the
-library's public API and the one the performance work targets.
+of YAML conformance; tracked in
+[#222](https://github.com/rust-works/succinctly/issues/222). This page counts the 8 cases
+where the streaming path fails and the DOM path would have passed; the harness tests the
+streaming path because that is the library's public API and the one the performance work
+targets.
 
 ## Full accounting of the 77 load failures
 
