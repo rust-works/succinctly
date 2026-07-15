@@ -26,7 +26,8 @@
 //!   - AWS Graviton 4 (Neoverse V2): 128-bit SVE2 vectors
 //!   - **36% slower than NEON** on 128-bit implementations due to expensive predicate-to-bitmask conversion
 //!   - May be faster on wider SVE2 implementations (256-bit, 512-bit)
-//!   - Enable with `SUCCINCTLY_SVE2=1` environment variable (not recommended)
+//!   - Enable with `SUCCINCTLY_SVE2=1` environment variable (not recommended);
+//!     see `docs/reference/environment-variables.md`
 //!
 //! ## Cursor Algorithms
 //!
@@ -56,6 +57,28 @@ pub mod bmi2;
 // ARM exports with optional runtime dispatch to SVE2 (requires std)
 // ============================================================================
 
+/// Should SVE2 be used instead of NEON?
+///
+/// True only when `SUCCINCTLY_SVE2=1` is set *and* the CPU implements SVE2, so on
+/// hardware without SVE2 the variable is silently a no-op. SVE2 is documented in
+/// `docs/reference/environment-variables.md` as experimental and slower than NEON
+/// on the 128-bit implementations shipping today.
+///
+/// Per STYLE-0003 the decision is cached: dispatch sits on the per-document build
+/// path, and `env::var` there costs ~64ns per build (a linear scan of the
+/// environment block plus a lock and an allocation) to re-derive an answer that
+/// cannot usefully change. That is ~6% of a 1KB index build and noise by 100KB.
+/// The consequence is that the variable is read once per process, so mutating it
+/// mid-run has no effect.
+#[cfg(all(target_arch = "aarch64", feature = "std"))]
+fn use_sve2() -> bool {
+    static USE_SVE2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *USE_SVE2.get_or_init(|| {
+        std::env::var("SUCCINCTLY_SVE2").is_ok_and(|v| v == "1")
+            && std::arch::is_aarch64_feature_detected!("sve2")
+    })
+}
+
 // Runtime dispatch when std is available
 // Priority: SVE2 > NEON (SVE2 is experimental, may not be faster)
 #[cfg(all(target_arch = "aarch64", any(test, feature = "std")))]
@@ -63,9 +86,7 @@ pub fn build_semi_index_standard(json: &[u8]) -> crate::json::standard::SemiInde
     // SVE2 dispatch disabled by default - enable with SUCCINCTLY_SVE2=1
     // SVE2 on 128-bit implementations may not be faster than NEON
     #[cfg(feature = "std")]
-    if std::env::var("SUCCINCTLY_SVE2").is_ok_and(|v| v == "1")
-        && std::arch::is_aarch64_feature_detected!("sve2")
-    {
+    if use_sve2() {
         return unsafe { sve2::build_semi_index_standard(json) };
     }
     neon::build_semi_index_standard(json)
@@ -74,9 +95,7 @@ pub fn build_semi_index_standard(json: &[u8]) -> crate::json::standard::SemiInde
 #[cfg(all(target_arch = "aarch64", any(test, feature = "std")))]
 pub fn build_semi_index_simple(json: &[u8]) -> crate::json::simple::SemiIndex {
     #[cfg(feature = "std")]
-    if std::env::var("SUCCINCTLY_SVE2").is_ok_and(|v| v == "1")
-        && std::arch::is_aarch64_feature_detected!("sve2")
-    {
+    if use_sve2() {
         return unsafe { sve2::build_semi_index_simple(json) };
     }
     neon::build_semi_index_simple(json)
