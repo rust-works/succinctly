@@ -690,6 +690,12 @@ mod tests {
             b"quote\"here",
             b"newline\nhere",
             &[b'x'; 100],
+            // Non-ASCII. These are the cases that matter: `byte < 0x20` must be an
+            // unsigned test, and a signed one flags every byte >= 0x80 instead.
+            "love ♥ and peace ☮".as_bytes(),
+            "aaaaaaaaaaaaaaaa♥".as_bytes(),
+            "日本語のテキストはここにあります".as_bytes(),
+            "emoji 😁 in a string long enough for a full chunk".as_bytes(),
         ];
 
         for &input in test_cases {
@@ -701,6 +707,75 @@ mod tests {
                 "JSON escape mismatch for {:?}",
                 String::from_utf8_lossy(input)
             );
+        }
+    }
+
+    /// Every byte value, at every alignment, against the scalar reference.
+    ///
+    /// This is the test that would have caught issue #230: the x86 path used
+    /// `cmpgt_epi8` (a *signed* compare) for `byte < 0x20`, so bytes >= 0x80 read as
+    /// negative and were reported as control characters. The suite above was
+    /// ASCII-only, so nothing exercised the high half of the byte range.
+    ///
+    /// Sweeping the offset matters as much as sweeping the value: the SIMD path only
+    /// engages on full 16/32-byte chunks, so a byte is only checked by SIMD at some
+    /// positions and by the scalar tail at others.
+    #[test]
+    fn test_find_json_escape_exhaustive_bytes_match_scalar() {
+        for byte in 0u8..=255 {
+            for pos in 0..40usize {
+                let mut input = vec![b'a'; 40];
+                input[pos] = byte;
+
+                let scalar = find_json_escape_scalar(&input, 0);
+                let simd = find_json_escape(&input, 0);
+                assert_eq!(
+                    scalar, simd,
+                    "mismatch for byte {byte:#04x} at offset {pos}: scalar={scalar}, simd={simd}"
+                );
+            }
+        }
+    }
+
+    /// The contract callers rely on: the returned index either is the end of input, or
+    /// points at a byte that genuinely needs escaping.
+    ///
+    /// `write_json_string` (`yaml/light.rs`) and `write_json_escaped` (`jq/stream.rs`)
+    /// both slice `&s[i..escape_pos]`. If the index points anywhere else, they either
+    /// panic on a char boundary or silently corrupt output.
+    #[test]
+    fn test_find_json_escape_never_points_at_a_safe_byte() {
+        let inputs: &[&str] = &[
+            "love ♥ and peace ☮",
+            "aaaaaaaaaaaaaaaa♥bbbbbbbbbbbbbbbb",
+            "日本語のテキストはここにあります、もっと長く",
+            "emoji 😁 in a string long enough for a full chunk",
+            "mixed ♥ with \"quotes\" and \\slashes\\ and \nnewlines",
+        ];
+
+        for s in inputs {
+            let bytes = s.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                let pos = find_json_escape(bytes, i);
+                assert!(
+                    pos >= i && pos <= bytes.len(),
+                    "out of range for {s:?}: {pos} from {i}"
+                );
+                if pos == bytes.len() {
+                    break;
+                }
+                let b = bytes[pos];
+                assert!(
+                    b == b'"' || b == b'\\' || b < 0x20,
+                    "for {s:?}, reported byte {b:#04x} at {pos} needs no escaping"
+                );
+                assert!(
+                    s.is_char_boundary(pos),
+                    "for {s:?}, reported index {pos} is not a char boundary"
+                );
+                i = pos + 1;
+            }
         }
     }
 

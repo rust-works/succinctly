@@ -835,13 +835,17 @@ unsafe fn find_json_escape_avx2(input: &[u8], start: usize) -> Option<usize> {
     // Prepare comparison vectors
     let quote_vec = _mm256_set1_epi8(b'"' as i8);
     let backslash_vec = _mm256_set1_epi8(b'\\' as i8);
-    // For control chars: bytes < 0x20
-    // Use saturating subtract trick: if byte < 0x20, then (0x1F - byte) won't saturate
-    // But it's easier to compare: byte < 0x20 ⟺ byte <= 0x1F
-    // Using unsigned comparison: byte < 0x20 ⟺ max(0, 0x1F - byte) != 0x1F - byte for signed,
-    // but simpler: use _mm256_cmpgt_epi8 with signed comparison
-    // byte < 0x20 (unsigned) ⟺ (byte as i8) < 0x20 for bytes 0x00-0x7F
-    let control_threshold = _mm256_set1_epi8(0x20);
+    // Control chars are `byte < 0x20` as an UNSIGNED comparison, which x86 has no
+    // direct instruction for. Saturating unsigned subtract gives it exactly:
+    // `subs_epu8(b, 0x1F)` saturates to 0 precisely when `b <= 0x1F`.
+    //
+    // Do not reach for `cmpgt_epi8` here: it is a *signed* compare, so every byte
+    // >= 0x80 reads as negative and is misidentified as a control character. That
+    // included UTF-8 continuation bytes, which made this function return an index
+    // in the middle of a multi-byte character and panicked callers slicing on it
+    // (see issue #230).
+    let control_max = _mm256_set1_epi8(0x1F);
+    let zero = _mm256_setzero_si256();
 
     // Process 32 bytes at a time with AVX2
     while offset + 32 <= data_len {
@@ -853,14 +857,8 @@ unsafe fn find_json_escape_avx2(input: &[u8], start: usize) -> Option<usize> {
         // Check for backslash
         let is_backslash = _mm256_cmpeq_epi8(chunk, backslash_vec);
 
-        // Check for control chars (< 0x20)
-        // For ASCII bytes (0x00-0x7F), signed comparison works:
-        // byte < 0x20 as unsigned ⟺ (signed)byte < 0x20 for 0x00-0x1F
-        // (bytes 0x80-0xFF would be negative in signed, but we're checking < 0x20)
-        // Actually need: unsigned byte < 0x20
-        // Trick: use _mm256_cmpgt_epi8(threshold, chunk) which gives 0xFF where threshold > chunk
-        // This works for bytes 0x00-0x1F (all less than 0x20 in both signed and unsigned)
-        let is_control = _mm256_cmpgt_epi8(control_threshold, chunk);
+        // Check for control chars: byte < 0x20, unsigned
+        let is_control = _mm256_cmpeq_epi8(_mm256_subs_epu8(chunk, control_max), zero);
 
         // Combine all escape conditions
         let escape_mask = _mm256_or_si256(_mm256_or_si256(is_quote, is_backslash), is_control);
@@ -879,13 +877,15 @@ unsafe fn find_json_escape_avx2(input: &[u8], start: usize) -> Option<usize> {
     if offset + 16 <= data_len {
         let quote_vec_sse = _mm_set1_epi8(b'"' as i8);
         let backslash_vec_sse = _mm_set1_epi8(b'\\' as i8);
-        let control_threshold_sse = _mm_set1_epi8(0x20);
+        let control_max_sse = _mm_set1_epi8(0x1F);
+        let zero_sse = _mm_setzero_si128();
 
         let chunk = _mm_loadu_si128(data.as_ptr().add(offset).cast::<__m128i>());
 
         let is_quote = _mm_cmpeq_epi8(chunk, quote_vec_sse);
         let is_backslash = _mm_cmpeq_epi8(chunk, backslash_vec_sse);
-        let is_control = _mm_cmpgt_epi8(control_threshold_sse, chunk);
+        // byte < 0x20, unsigned — see the note on `control_max` above.
+        let is_control = _mm_cmpeq_epi8(_mm_subs_epu8(chunk, control_max_sse), zero_sse);
 
         let escape_mask = _mm_or_si128(_mm_or_si128(is_quote, is_backslash), is_control);
         let mask = _mm_movemask_epi8(escape_mask) as u32;
@@ -920,7 +920,9 @@ unsafe fn find_json_escape_sse2(input: &[u8], start: usize) -> Option<usize> {
 
     let quote_vec = _mm_set1_epi8(b'"' as i8);
     let backslash_vec = _mm_set1_epi8(b'\\' as i8);
-    let control_threshold = _mm_set1_epi8(0x20);
+    // byte < 0x20, unsigned — see the note in `find_json_escape_avx2`.
+    let control_max = _mm_set1_epi8(0x1F);
+    let zero = _mm_setzero_si128();
 
     // Process 16 bytes at a time with SSE2
     while offset + 16 <= data_len {
@@ -928,7 +930,7 @@ unsafe fn find_json_escape_sse2(input: &[u8], start: usize) -> Option<usize> {
 
         let is_quote = _mm_cmpeq_epi8(chunk, quote_vec);
         let is_backslash = _mm_cmpeq_epi8(chunk, backslash_vec);
-        let is_control = _mm_cmpgt_epi8(control_threshold, chunk);
+        let is_control = _mm_cmpeq_epi8(_mm_subs_epu8(chunk, control_max), zero);
 
         let escape_mask = _mm_or_si128(_mm_or_si128(is_quote, is_backslash), is_control);
         let mask = _mm_movemask_epi8(escape_mask) as u32;
