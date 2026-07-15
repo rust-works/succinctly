@@ -1,9 +1,9 @@
-//! YAML semi-indexing for succinct YAML parsing (Phase 4: Anchors & Aliases).
+//! YAML semi-indexing for succinct YAML parsing.
 //!
 //! This module provides semi-indexing for YAML 1.2 documents, enabling efficient
 //! navigation using rank/select operations on the balanced parentheses (BP) tree.
 //!
-//! # Phase 4 Scope
+//! # Supported
 //!
 //! - Block mappings and sequences
 //! - Flow mappings `{key: value}` and sequences `[a, b, c]`
@@ -11,9 +11,24 @@
 //! - Simple scalars (unquoted, double-quoted, single-quoted)
 //! - Block scalars: literal (`|`) and folded (`>`)
 //! - Chomping modifiers: strip (`-`), keep (`+`), clip (default)
-//! - **Anchors (`&name`) and aliases (`*name`)**
+//! - Anchors (`&name`) and aliases (`*name`)
+//! - Explicit keys (`?` / `:`)
+//! - Multi-document streams (`---` / `...`), wrapped in an implicit root sequence
 //! - Comments (ignored in block context)
-//! - Single document only
+//!
+//! # Not supported
+//!
+//! - Tags (`!!str`, `!custom`, verbatim `!<...>`) — rejected in block context, absorbed
+//!   as scalar text in flow context
+//! - `%YAML` / `%TAG` directives — parsed as plain scalars
+//! - Merge keys (`<<`) — parsed as an ordinary key
+//!
+//! # Validation
+//!
+//! `YamlIndex::build` performs minimal validation during indexing (structural recognition
+//! only) and accepts many malformed documents. It is a non-validating loader: of the YAML
+//! Test Suite's 94 invalid documents it rejects 11. Do not rely on a parse error to
+//! detect malformed input. See `docs/compliance/yaml/limitations.md`.
 //!
 //! # Example
 //!

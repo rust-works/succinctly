@@ -84,10 +84,20 @@ Key lesson: micro-benchmark wins frequently don't translate to end-to-end gains.
 - **Block scalars**: Literal (`|`) and folded (`>`) block scalars with chomping modifiers (`-`, `+`, default).
 - **Multi-document streams**: Multiple YAML documents (`---` separated) are wrapped in an implicit array. Use `--doc N` to select a specific document.
 
+## Validation
+
+`YamlIndex` performs minimal validation during indexing (structural recognition only) and
+accepts many malformed documents — it rejects 11 of the YAML Test Suite's 94 invalid
+inputs. Unlike JSON, there is no strict mode yet; an opt-in validation pass mirroring
+`json validate` is planned. See [Known Limitations](../compliance/yaml/limitations.md)
+for measured conformance and the list of unsupported features (tags, `%YAML`/`%TAG`
+directives).
+
 ## Depends On
 
 - [BitVec](../architecture/bitvec.md) — all bit vectors use rank/select
 - [BalancedParens](../architecture/balanced-parens.md) — with `WithSelect` generic parameter
+- [YAML Conformance](../compliance/yaml/limitations.md) — measured behavior and limitations
 
 ## Used By
 
