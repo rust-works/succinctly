@@ -2,6 +2,25 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-07-15 — Rust succinct-library evaluation (issue #47)
+
+**Sources ingested:**
+- crates.io + GitHub metadata for `succinct`, `vers-vecs`, `fid`, `bio`, `sucds`, `sux` — versions,
+  maintenance status, `no_std` support (verified by compiling, not by reading the attribute)
+- `src/bits/` — `bitvec.rs`, `rank.rs`, `select.rs`, `popcount.rs`; the ~25% overhead note at `rank.rs:352-354`
+- `src/trees/bp.rs`, `src/json/light.rs`, `src/dsv/index.rs` — coupling that a generic crate cannot supply
+- New measurements from `bench-compare/benches/succinct_libs.rs` (Apple M5 Max)
+
+**Pages created:**
+- [adr-0011.md](adrs/adr-0011.md) — why succinct structures are built in-crate rather than taken from a crate
+- [rust-succinct-libs.md](benchmarks/rust-succinct-libs.md) — rank/select vs vers-vecs, sucds, sux
+
+**Pages corrected:**
+- [prior-art.md](architecture/prior-art.md), `CLAUDE.md`, `README.md`,
+  [hierarchical-structures.md](optimizations/hierarchical-structures.md) — all claimed the rank directory costs
+  ~3% space. That is the Poppy *paper's* figure; succinctly's directory costs ~25% by design
+  (`src/bits/rank.rs:352-354`), and a full `BitVec` measures 27.5–47.5% resident. Corrected throughout.
+
 ## 2026-04-07 — Initial wiki creation
 
 **Sources ingested:**

@@ -448,8 +448,9 @@ Sometimes simpler structures outperform theoretically optimal ones.
 ```
 3-level RankDirectory + SelectIndex + storage
 - O(1) rank, O(log n + k) select
-- ~3% overhead for rank
-- ~3% overhead for select
+- ~25% overhead for rank (128 bits of metadata per 512 bits of data)
+- select overhead scales with the number of ones (sampled every 256)
+- ~28-48% resident overhead in total, rising with bit density
 - Complex access patterns
 ```
 

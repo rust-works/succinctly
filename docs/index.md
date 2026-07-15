@@ -101,7 +101,8 @@ Key lesson: Micro-benchmark wins often don't translate to end-to-end improvement
 Where this knowledge map explains *how* succinctly works today, the
 [Architecture Decision Records](adrs/README.md) record *why* it is shaped that way — and which
 approaches were considered and **rejected**. The corpus covers the core choices (semi-indexing
-over DOM parsing, the PFSM JSON parser, the YAML oracle) and the rejected optimizations
+over DOM parsing, the PFSM JSON parser, the YAML oracle, building succinct structures in-crate
+rather than depending on an existing rank/select library) and the rejected optimizations
 (software prefetching, SIMD threshold tuning, branchless classification, flow-collection SIMD,
 BMI2 quote-indexing, parse-time newline index, AVX-512), each as a stable, citable record. See
 [adrs/README.md](adrs/README.md) for the inventory.

@@ -17,15 +17,16 @@ The benchmarks below compare succinctly against DOM-based tools (jq, yq, serde_j
 
 ## Benchmark Results
 
-| Benchmark                                 | Description                          | Key Finding                                      |
-|-------------------------------------------|--------------------------------------|--------------------------------------------------|
-| [jq](jq.md)                               | succinctly jq vs system jq           | 1.1-2.3x faster across platforms                 |
-| [yq](yq.md)                               | succinctly yq vs system yq           | 4.5-11x faster (Graviton 4), 7-25x (x86_64)      |
-| [JSON Validation](json-validate.md)       | RFC 8259 strict validation           | 530-1800 MiB/s (up to 1.8 GiB/s on nested)       |
-| [Rust JSON Parsers](rust-parsers.md)      | vs serde_json, sonic-rs, simd-json   | Competitive with specialized parsers             |
-| [Rust YAML Parsers](rust-yaml-parsers.md) | vs serde_yaml                        | 8-14x faster parsing, 10-39x less memory         |
-| [Cross-Language](cross-language.md)       | Multi-language parser comparison     | Best-in-class for semi-indexing                  |
-| [DSV](dsv.md)                             | CSV/TSV parsing performance          | 85-1676 MiB/s (API)                              |
+| Benchmark                                        | Description                          | Key Finding                                    |
+|--------------------------------------------------|--------------------------------------|------------------------------------------------|
+| [jq](jq.md)                                      | succinctly jq vs system jq           | 1.1-2.3x faster across platforms               |
+| [yq](yq.md)                                      | succinctly yq vs system yq           | 4.5-11x faster (Graviton 4), 7-25x (x86_64)    |
+| [JSON Validation](json-validate.md)              | RFC 8259 strict validation           | 530-1800 MiB/s (up to 1.8 GiB/s on nested)     |
+| [Rust JSON Parsers](rust-parsers.md)             | vs serde_json, sonic-rs, simd-json   | Competitive with specialized parsers           |
+| [Rust YAML Parsers](rust-yaml-parsers.md)        | vs serde_yaml                        | 8-14x faster parsing, 10-39x less memory       |
+| [Rust Succinct Libraries](rust-succinct-libs.md) | rank/select vs vers-vecs, sucds, sux | Faster rank than vers-vecs, but 5-8x the space |
+| [Cross-Language](cross-language.md)              | Multi-language parser comparison     | Best-in-class for semi-indexing                |
+| [DSV](dsv.md)                                    | CSV/TSV parsing performance          | 85-1676 MiB/s (API)                            |
 
 ## Methodology
 

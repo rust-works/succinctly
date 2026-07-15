@@ -6,18 +6,19 @@ This document provides a comprehensive index of all benchmark reports in the pro
 
 ## Overview
 
-The project contains **8 main benchmark documentation files** with approximately **160+ distinct benchmark report sections**, plus **6 core/internal benchmark suites**.
+The project contains **9 main benchmark documentation files** with approximately **160+ distinct benchmark report sections**, plus **6 core/internal benchmark suites**.
 
-| File                                         | Description                                | Sections |
-|----------------------------------------------|--------------------------------------------|----------|
-| [jq.md](jq.md)                               | JSON query performance vs system jq        | ~40      |
-| [yq.md](yq.md)                               | YAML query performance vs system yq        | ~35      |
-| [json-validate.md](json-validate.md)         | JSON validation (RFC 8259) throughput      | ~12      |
-| [dsv.md](dsv.md)                             | CSV/TSV parsing performance                | ~8       |
-| [cross-language.md](cross-language.md)       | Multi-parser JSON comparison               | ~15      |
-| [rust-parsers.md](rust-parsers.md)           | Rust JSON parser comparison (x86_64 + ARM) | ~20      |
-| [rust-yaml-parsers.md](rust-yaml-parsers.md) | Rust YAML parser comparison (x86_64 + ARM) | ~16      |
-| [../parsing/yaml.md](../parsing/yaml.md)     | YAML optimization phases                   | ~15      |
+| File                                           | Description                                 | Sections |
+|------------------------------------------------|---------------------------------------------|----------|
+| [jq.md](jq.md)                                 | JSON query performance vs system jq         | ~40      |
+| [yq.md](yq.md)                                 | YAML query performance vs system yq         | ~35      |
+| [json-validate.md](json-validate.md)           | JSON validation (RFC 8259) throughput       | ~12      |
+| [dsv.md](dsv.md)                               | CSV/TSV parsing performance                 | ~8       |
+| [cross-language.md](cross-language.md)         | Multi-parser JSON comparison                | ~15      |
+| [rust-parsers.md](rust-parsers.md)             | Rust JSON parser comparison (x86_64 + ARM)  | ~20      |
+| [rust-yaml-parsers.md](rust-yaml-parsers.md)   | Rust YAML parser comparison (x86_64 + ARM)  | ~16      |
+| [rust-succinct-libs.md](rust-succinct-libs.md) | Rust rank/select library comparison (ARM64) | ~4       |
+| [../parsing/yaml.md](../parsing/yaml.md)       | YAML optimization phases                    | ~15      |
 
 ---
 
