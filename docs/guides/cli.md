@@ -475,6 +475,8 @@ succinctly jq --preserve-input . input.json
 SUCCINCTLY_PRESERVE_INPUT=1 succinctly jq . input.json
 ```
 
+See [Environment Variables](../reference/environment-variables.md) for the accepted values.
+
 ### Input Options
 
 - `-n, --null-input`: Don't read any input; use null as the single input value
@@ -637,6 +639,26 @@ succinctly yq-locate config.yaml --line 5 --column 10
 succinctly yq-locate config.yaml --offset 42 --format json
 # Output: {"expression":".users[0].name","type":"string","start":38,"end":52}
 ```
+
+---
+
+## Environment Variables
+
+A command-line flag always beats an environment variable.
+
+| Variable                    | Applies to | Purpose                                        |
+|-----------------------------|------------|------------------------------------------------|
+| `SUCCINCTLY_PRESERVE_INPUT` | `jq`       | Keep the input's number and escape formatting  |
+| `NO_COLOR`                  | `jq`, `yq` | Disable colored output                         |
+| `JQ_COLORS`                 | `jq`       | Customize syntax highlighting colors           |
+| `JQ_LIBRARY_PATH`           | `jq`       | Directories to search for modules              |
+| `HOME`                      | `jq`       | Locates `~/.jq`, which is loaded automatically |
+| `TZ`                        | `jq`, `yq` | Timezone for the date builtins                 |
+
+Queries can read any variable via `env`, `$ENV`, `env(NAME)` and `strenv(NAME)`.
+
+See [Environment Variables](../reference/environment-variables.md) for accepted values, precedence,
+and the library-only `SUCCINCTLY_SVE2`.
 
 ---
 

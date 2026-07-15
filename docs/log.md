@@ -31,6 +31,32 @@ Tracks updates to the knowledge wiki pages in `docs/`.
 - Scalar type resolution is duplicated across 5 sites in `src/`; the `NULL`/`Null`, hex/octal int, and bare `nan`/`inf` divergences from the 1.2 core schema are recorded but not fixed
 - `docs/README.md` and `docs/index.md` still state different yq speedup figures for the same comparison
 
+## 2026-07-15 — Environment variable reference (issue #48)
+
+**Sources ingested:**
+- `src/json/simd/mod.rs` — `SUCCINCTLY_SVE2` dispatch, cfg gating, NEON/SVE2 trade-off
+- `src/bin/succinctly/jq_runner.rs` — `NO_COLOR`, `JQ_COLORS`, `JQ_LIBRARY_PATH`, `HOME`, `SUCCINCTLY_PRESERVE_INPUT`
+- `src/bin/succinctly/yq_runner.rs` — color handling
+- `src/jq/eval.rs` — `TZ` parsing, `$ENV`/`env`/`env()`/`strenv()` builtins
+- `docs/STYLE_GUIDE.md` — STYLE-0003 (document env-switchable dispatch), STYLE-0004
+- Behavior of `jq-1.7.1-apple`, probed directly to establish the compatibility target
+
+**Pages created:**
+- [environment-variables.md](reference/environment-variables.md) — all 8 environment-variable entries,
+  their accepted values, precedence, and caveats
+
+**Findings folded back into the code:**
+- `NO_COLOR=""` wrongly disabled color; the convention and jq both require a non-empty value
+- `succinctly yq` ignored `NO_COLOR` entirely
+- `JQ_COLORS` was unvalidated, interpolating arbitrary text into an escape sequence
+- `SUCCINCTLY_SVE2` was re-read from the environment on every index build
+
+**Not yet covered:**
+- `docs/index.md` Core Data Structures table is a concept map, so the reference page is
+  deliberately not listed there
+- Colored-output layout still differs from jq (reset placement, and jq 1.7's `0;90` default for
+  `null` versus succinctly's `1;30`) — pre-existing, not part of issue #48
+
 ## 2026-04-07 — Initial wiki creation
 
 **Sources ingested:**

@@ -244,7 +244,7 @@ The implementation covers ~95% of jq functionality and is production-ready.
 - [x] `include "path";` - Include module definitions into current scope
 - [x] `module {...}` - Module metadata (parsed)
 - [x] `-L path` / `--library-path` CLI option
-- [x] `JQ_LIBRARY_PATH` environment variable
+- [x] [`JQ_LIBRARY_PATH`](environment-variables.md#jq_library_path) environment variable
 - [x] `~/.jq` auto-loading (file or directory)
 - [x] `namespace::func` - Namespaced function calls
 - [x] Parameterized functions in modules
