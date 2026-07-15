@@ -14,7 +14,7 @@ one-page top-level overview and orientation, start at the root
 | [BitVec](bitvec.md) | Bit vector with O(1) rank and O(log n) select |
 | [Balanced Parentheses](balanced-parens.md) | Succinct tree encoding |
 | [Semi-Indexing](semi-indexing.md) | JSON/YAML/DSV parsing approach |
-| [Prior Art](prior-art.md) | Academic foundations and haskell-works heritage |
+| [Prior Art](prior-art.md) | Academic foundations, haskell-works heritage, and the Rust crates evaluated |
 
 ## Module Structure
 

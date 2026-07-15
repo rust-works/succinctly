@@ -10,35 +10,40 @@ This document records the academic papers, prior implementations, and key refere
 
 ### Rank and Select
 
-| Paper | Authors | Year | Contribution |
-|-------|---------|------|--------------|
-| [Broadword Implementation of Rank/Select Queries](https://vigna.di.unimi.it/ftp/papers/Broadword.pdf) | Vigna | 2008 | Broadword algorithms for 64-bit operations |
-| [Space-Efficient, High-Performance Rank & Select](https://www.cs.cmu.edu/~dga/papers/zhou-sea2013.pdf) | Zhou, Andersen, Kaminsky | 2013 | Poppy structure with 3% overhead |
+| Paper                                                                                                  | Authors                  | Year | Contribution                               |
+|--------------------------------------------------------------------------------------------------------|--------------------------|------|--------------------------------------------|
+| [Broadword Implementation of Rank/Select Queries](https://vigna.di.unimi.it/ftp/papers/Broadword.pdf)  | Vigna                    | 2008 | Broadword algorithms for 64-bit operations |
+| [Space-Efficient, High-Performance Rank & Select](https://www.cs.cmu.edu/~dga/papers/zhou-sea2013.pdf) | Zhou, Andersen, Kaminsky | 2013 | Poppy structure with 3% overhead           |
 
-**Succinctly implementation**: [src/bits/](../../src/bits/) implements Poppy-style 3-level rank directory with ~3% space overhead.
+**Succinctly implementation**: [src/bits/](../../src/bits/) implements a Poppy-*style* 3-level rank directory. It
+borrows Poppy's L0/L1/L2 shape but not its space bound: the 3% figure above is the paper's, and succinctly's
+directory instead spends 128 bits of metadata per 512 bits of data (~25%), deliberately trading space for query
+speed — see the note in [src/bits/rank.rs](../../src/bits/rank.rs) and [bitvec.md](bitvec.md#space-analysis).
+Measured resident overhead for a full `BitVec` (rank directory *and* sampled select index) is **27.5–47.5%**,
+rising with bit density; see [../benchmarks/rust-succinct-libs.md](../benchmarks/rust-succinct-libs.md).
 
 ### Balanced Parentheses
 
-| Paper | Authors | Year | Contribution |
-|-------|---------|------|--------------|
-| Fully-Functional Succinct Trees | Sadakane & Navarro | 2010 | RangeMin structure for O(1) tree navigation |
-| Optimal Succinctness for Parentheses | Navarro & Sadakane | 2014 | Space-optimal BP representation |
+| Paper                                | Authors            | Year | Contribution                                |
+|--------------------------------------|--------------------|------|---------------------------------------------|
+| Fully-Functional Succinct Trees      | Sadakane & Navarro | 2010 | RangeMin structure for O(1) tree navigation |
+| Optimal Succinctness for Parentheses | Navarro & Sadakane | 2014 | Space-optimal BP representation             |
 
 **Succinctly implementation**: [src/trees/bp.rs](../../src/trees/bp.rs) implements hierarchical RangeMin with ~6% overhead.
 
 ### JSON Semi-Indexing
 
-| Paper | Authors | Year | Contribution |
-|-------|---------|------|--------------|
-| [Parsing Gigabytes of JSON per Second](https://arxiv.org/abs/1902.08318) | Langdale & Lemire | 2019 | SIMD-accelerated JSON parsing (simdjson) |
-| [Data-Parallel Finite-State Machines](https://www.microsoft.com/en-us/research/publication/data-parallel-finite-state-machines/) | Mytkowicz et al. | 2014 | PFSM for parallel parsing |
+| Paper                                                                                                                            | Authors           | Year | Contribution                             |
+|----------------------------------------------------------------------------------------------------------------------------------|-------------------|------|------------------------------------------|
+| [Parsing Gigabytes of JSON per Second](https://arxiv.org/abs/1902.08318)                                                         | Langdale & Lemire | 2019 | SIMD-accelerated JSON parsing (simdjson) |
+| [Data-Parallel Finite-State Machines](https://www.microsoft.com/en-us/research/publication/data-parallel-finite-state-machines/) | Mytkowicz et al.  | 2014 | PFSM for parallel parsing                |
 
 **Succinctly implementation**: [src/json/](../../src/json/) uses PFSM with table-driven state machine, achieving ~700 MiB/s throughput.
 
 ### Bit Manipulation
 
-| Paper | Authors | Year | Contribution |
-|-------|---------|------|--------------|
+| Paper                                                                                | Authors            | Year | Contribution                   |
+|--------------------------------------------------------------------------------------|--------------------|------|--------------------------------|
 | [Faster Population Counts Using AVX2 Instructions](https://arxiv.org/abs/1611.07612) | Mula, Kurz, Lemire | 2016 | Harley-Seal popcount algorithm |
 
 **Succinctly implementation**: [src/bits/popcount.rs](../../src/bits/popcount.rs) uses AVX-512 VPOPCNTDQ when available (5.2x speedup).
@@ -51,13 +56,13 @@ Succinctly is a Rust reimplementation of techniques from the [haskell-works](htt
 
 ### Core Packages
 
-| Haskell Package | Succinctly Module | Purpose |
-|-----------------|-------------------|---------|
-| [hw-rankselect](https://github.com/haskell-works/hw-rankselect) | `src/bits/` | Rank/select data structures |
-| [hw-balancedparens](https://github.com/haskell-works/hw-balancedparens) | `src/trees/` | Balanced parentheses operations |
-| [hw-json](https://github.com/haskell-works/hw-json) | `src/json/` | JSON semi-indexing |
-| [hw-json-simd](https://github.com/haskell-works/hw-json-simd) | `src/json/pfsm*.rs` | SIMD-accelerated JSON parser |
-| [hw-dsv](https://github.com/haskell-works/hw-dsv) | `src/dsv/` | DSV/CSV parsing |
+| Haskell Package                                                         | Succinctly Module   | Purpose                         |
+|-------------------------------------------------------------------------|---------------------|---------------------------------|
+| [hw-rankselect](https://github.com/haskell-works/hw-rankselect)         | `src/bits/`         | Rank/select data structures     |
+| [hw-balancedparens](https://github.com/haskell-works/hw-balancedparens) | `src/trees/`        | Balanced parentheses operations |
+| [hw-json](https://github.com/haskell-works/hw-json)                     | `src/json/`         | JSON semi-indexing              |
+| [hw-json-simd](https://github.com/haskell-works/hw-json-simd)           | `src/json/pfsm*.rs` | SIMD-accelerated JSON parser    |
+| [hw-dsv](https://github.com/haskell-works/hw-dsv)                       | `src/dsv/`          | DSV/CSV parsing                 |
 
 ### Key Concepts Ported
 
@@ -68,23 +73,23 @@ Succinctly is a Rust reimplementation of techniques from the [haskell-works](htt
 
 ### Differences from Haskell Implementation
 
-| Aspect | Haskell | Rust |
-|--------|---------|------|
-| Memory model | GC-managed | Zero-copy, no_std compatible |
-| SIMD | FFI to C | Native intrinsics via `std::arch` |
-| ARM support | Limited (disabled) | Full NEON implementation |
-| Streaming | Lazy evaluation | Explicit iterators |
+| Aspect       | Haskell            | Rust                              |
+|--------------|--------------------|-----------------------------------|
+| Memory model | GC-managed         | Zero-copy, no_std compatible      |
+| SIMD         | FFI to C           | Native intrinsics via `std::arch` |
+| ARM support  | Limited (disabled) | Full NEON implementation          |
+| Streaming    | Lazy evaluation    | Explicit iterators                |
 
 ### ARM/NEON Portability
 
 The Haskell packages disable SIMD on ARM (`base < 0` constraint). Succinctly provides full ARM support:
 
-| x86_64 Instruction | ARM/NEON Equivalent | Notes |
-|--------------------|---------------------|-------|
-| `_mm256_cmpeq_epi8` | `vceqq_u8` (128-bit) | Process 16 bytes vs 32 |
-| `_mm256_movemask_epi8` | Manual extraction | Multi-instruction sequence |
-| `_pdep_u64` | Software emulation | No ARM equivalent |
-| `_pext_u64` | Software emulation | No ARM equivalent |
+| x86_64 Instruction     | ARM/NEON Equivalent  | Notes                      |
+|------------------------|----------------------|----------------------------|
+| `_mm256_cmpeq_epi8`    | `vceqq_u8` (128-bit) | Process 16 bytes vs 32     |
+| `_mm256_movemask_epi8` | Manual extraction    | Multi-instruction sequence |
+| `_pdep_u64`            | Software emulation   | No ARM equivalent          |
+| `_pext_u64`            | Software emulation   | No ARM equivalent          |
 
 ---
 
@@ -92,22 +97,37 @@ The Haskell packages disable SIMD on ARM (`base < 0` constraint). Succinctly pro
 
 ### JSON Parsers
 
-| Project | Language | Technique | Performance |
-|---------|----------|-----------|-------------|
-| [simdjson](https://github.com/simdjson/simdjson) | C++ | SIMD + tape | >2 GB/s |
-| [simd-json](https://github.com/simd-lite/simd-json) | Rust | simdjson port | ~1 GB/s |
-| [sonic-rs](https://github.com/cloudwego/sonic-rs) | Rust | SIMD + LazyValue | ~800 MiB/s |
-| succinctly | Rust | Semi-indexing | ~700 MiB/s |
+| Project                                             | Language | Technique        | Performance |
+|-----------------------------------------------------|----------|------------------|-------------|
+| [simdjson](https://github.com/simdjson/simdjson)    | C++      | SIMD + tape      | >2 GB/s     |
+| [simd-json](https://github.com/simd-lite/simd-json) | Rust     | simdjson port    | ~1 GB/s     |
+| [sonic-rs](https://github.com/cloudwego/sonic-rs)   | Rust     | SIMD + LazyValue | ~800 MiB/s  |
+| succinctly                                          | Rust     | Semi-indexing    | ~700 MiB/s  |
 
 **Succinctly's advantage**: 18-46x less memory than DOM parsers due to lazy evaluation.
 
 ### Succinct Data Structure Libraries
 
-| Library | Language | Focus |
-|---------|----------|-------|
-| [sdsl-lite](https://github.com/simongog/sdsl-lite) | C++ | Comprehensive succinct DS |
-| [succinct](https://crates.io/crates/succinct) | Rust | Basic rank/select |
-| [vers-vecs](https://crates.io/crates/vers-vecs) | Rust | Fast pure-Rust rank/select |
+Succinctly implements its own rank/select rather than depending on one of these. The reasoning, and the
+benchmarks behind it, are recorded in [ADR-0011](../adrs/adr-0011.md) — including the cases where an existing
+crate would have served. Measured comparisons live in
+[../benchmarks/rust-succinct-libs.md](../benchmarks/rust-succinct-libs.md).
+
+| Library                                            | Language | `no_std` | Latest | Assessment                                                                        |
+|----------------------------------------------------|----------|----------|--------|-----------------------------------------------------------------------------------|
+| [sdsl-lite](https://github.com/simongog/sdsl-lite) | C++      | n/a      | —      | Comprehensive succinct DS; C++, so not a candidate for a pure-Rust `no_std` crate |
+| [succinct](https://crates.io/crates/succinct)      | Rust     | No       | 0.5.2  | Basic rank/select; last published 2019, effectively unmaintained                  |
+| [fid](https://crates.io/crates/fid)                | Rust     | No       | 0.1.7  | Fully Indexable Dictionary; repository archived February 2025                     |
+| [bio](https://crates.io/crates/bio)                | Rust     | No       | 4.0.1  | Bioinformatics toolkit; rank/select incidental, ~30 direct dependencies           |
+| [vers-vecs](https://crates.io/crates/vers-vecs)    | Rust     | No       | 1.10.1 | **Smallest measured** (5-8x more compact than `BitVec`) and fastest to build      |
+| [sucds](https://crates.io/crates/sucds)            | Rust     | Declared | 0.8.3  | Declares `no_std`, but does not build without `std` — see note below              |
+| [sux](https://crates.io/crates/sux)                | Rust     | No       | 0.14.0 | From Vigna; **fastest queries measured** — beats `BitVec` at rank and select      |
+
+**On sucds and `no_std`**: sucds is the only candidate that advertises `no_std` support, via
+`#![cfg_attr(not(feature = "std"), no_std)]` in its `lib.rs`. That attribute is vestigial as of 0.8.3: building
+with `default-features = false` fails with ~141 errors, because `bit_vectors/rank9sel.rs` and `serial.rs`
+unconditionally `use std::io::{Read, Write}` and the crate has no `alloc` plumbing. Every crate in this table is
+therefore unusable from succinctly's `no_std` core.
 
 ---
 
