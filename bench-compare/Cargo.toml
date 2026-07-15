@@ -10,8 +10,18 @@ serde_json = "1.0"
 simd-json = "0.14"
 sonic-rs = "0.3"
 serde_yaml = "0.9"
-succinctly = { path = ".." }
+succinctly = { path = "..", features = ["simd"] }
 tracking-allocator = "0.4"
+
+# Succinct rank/select crates, compared against succinctly's BitVec in succinct_libs.
+# Each is given its best-available acceleration so the comparison is like-for-like:
+# succinctly's `simd` selects NEON/AVX-512 popcount, vers-vecs' `simd` its AVX-512 select,
+# sucds' `intrinsics` its broadword helpers. sux has no equivalent feature.
+rand = "0.8"
+rand_chacha = "0.3"
+sucds = { version = "0.8", features = ["intrinsics"] }
+sux = "0.14"
+vers-vecs = { version = "1.10", features = ["simd"] }
 
 [[bench]]
 name = "json_parsers"
@@ -19,4 +29,8 @@ harness = false
 
 [[bench]]
 name = "yaml_parsers"
+harness = false
+
+[[bench]]
+name = "succinct_libs"
 harness = false

@@ -327,6 +327,15 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         cli_subcommand: None,
         working_dir: "bench-compare",
     },
+    BenchmarkInfo {
+        name: "succinct_libs",
+        description: "Cross-library rank/select comparison (vers-vecs, sucds, sux)",
+        category: BenchmarkCategory::CrossParser,
+        bench_type: BenchmarkType::CrossParser,
+        criterion_name: Some("succinct_libs"),
+        cli_subcommand: None,
+        working_dir: "bench-compare",
+    },
 ];
 
 /// Filter benchmarks by category.
