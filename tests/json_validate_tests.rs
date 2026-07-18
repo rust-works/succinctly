@@ -4,89 +4,92 @@
 //! Run with: cargo test --features cli --test json_validate_tests
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use tempfile::NamedTempFile;
 
-/// Maximum retries for cargo run commands that fail with exit code 101.
-/// This handles flaky failures from cargo lock contention when tests run in parallel.
-const MAX_CARGO_RETRIES: u32 = 3;
+/// Resolve the path to the pre-built `succinctly` CLI binary, building it once.
+///
+/// The integration-test harness is compiled without the `cli` feature (CI runs
+/// plain `cargo test`), and the `succinctly` binary is gated by
+/// `required-features = ["cli"]`, so `CARGO_BIN_EXE_succinctly` is not available
+/// here. We therefore build the binary once with the `cli` feature and derive its
+/// path from this test executable's own location.
+///
+/// Invoking the built binary directly (rather than `cargo run`) keeps cargo's own
+/// output — compile progress and, on nightly, the future-incompatibility `note:` —
+/// out of each child's captured stderr, so stderr assertions observe only the
+/// application's output. The one-time `cargo build` blocking-waits on the build
+/// lock, so no retry loop for lock contention is needed.
+fn succinctly_bin() -> &'static Path {
+    static BIN: OnceLock<PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let output = Command::new(cargo)
+            .args(["build", "--features", "cli", "--bin", "succinctly"])
+            .output()
+            .expect("failed to spawn `cargo build`");
+        assert!(
+            output.status.success(),
+            "`cargo build --features cli --bin succinctly` failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-/// Helper to run json validate command with input from stdin
-fn run_validate_stdin(input: &str, extra_args: &[&str]) -> Result<(String, String, i32)> {
-    for attempt in 0..MAX_CARGO_RETRIES {
-        let mut cmd = Command::new("cargo")
-            .args([
-                "run",
-                "--features",
-                "cli",
-                "--bin",
-                "succinctly",
-                "--",
-                "json",
-                "validate",
-            ])
-            .args(extra_args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        if let Some(mut stdin) = cmd.stdin.take() {
-            stdin.write_all(input.as_bytes())?;
+        // The test executable lives at `<target>/<profile>/deps/<test>-<hash>`;
+        // the CLI binary is its sibling at `<target>/<profile>/succinctly`.
+        let mut path = std::env::current_exe().expect("resolve current_exe");
+        path.pop(); // drop the test executable's file name -> `.../deps`
+        if path.file_name().and_then(|s| s.to_str()) == Some("deps") {
+            path.pop(); // drop `deps` -> `.../<profile>`
         }
-
-        let output = cmd.wait_with_output()?;
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        // Exit code 101 often indicates cargo lock contention; retry
-        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
-            std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
-            continue;
-        }
-
-        let stdout = String::from_utf8(output.stdout)?;
-        let stderr = String::from_utf8(output.stderr)?;
-        return Ok((stdout, stderr, exit_code));
-    }
-    unreachable!()
+        path.push(format!("succinctly{}", std::env::consts::EXE_SUFFIX));
+        assert!(
+            path.is_file(),
+            "built `succinctly` binary not found at {}",
+            path.display()
+        );
+        path
+    })
 }
 
-/// Helper to run json validate command with file input
-fn run_validate_file(file_path: &str, extra_args: &[&str]) -> Result<(String, String, i32)> {
-    for attempt in 0..MAX_CARGO_RETRIES {
-        let output = Command::new("cargo")
-            .args([
-                "run",
-                "--features",
-                "cli",
-                "--bin",
-                "succinctly",
-                "--",
-                "json",
-                "validate",
-            ])
-            .args(extra_args)
-            .arg(file_path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()?;
+/// Helper to run `json validate` with input from stdin.
+fn run_validate_stdin(input: &str, extra_args: &[&str]) -> Result<(String, String, i32)> {
+    let mut cmd = Command::new(succinctly_bin())
+        .args(["json", "validate"])
+        .args(extra_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
 
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        // Exit code 101 often indicates cargo lock contention; retry
-        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
-            std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
-            continue;
-        }
-
-        let stdout = String::from_utf8(output.stdout)?;
-        let stderr = String::from_utf8(output.stderr)?;
-        return Ok((stdout, stderr, exit_code));
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(input.as_bytes())?;
     }
-    unreachable!()
+
+    let output = cmd.wait_with_output()?;
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    Ok((stdout, stderr, exit_code))
+}
+
+/// Helper to run `json validate` with file input.
+fn run_validate_file(file_path: &str, extra_args: &[&str]) -> Result<(String, String, i32)> {
+    let output = Command::new(succinctly_bin())
+        .args(["json", "validate"])
+        .args(extra_args)
+        .arg(file_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    Ok((stdout, stderr, exit_code))
 }
 
 // ============================================================================
@@ -108,57 +111,16 @@ fn test_invalid_json_exit_code_1() -> Result<()> {
     Ok(())
 }
 
-/// Strip ANSI escape codes from a string.
-fn strip_ansi_codes(s: &str) -> String {
-    // ANSI escape sequences: ESC [ ... m (where ... is digits and semicolons)
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            // Consume the escape sequence
-            if chars.peek() == Some(&'[') {
-                chars.next(); // consume '['
-                              // Consume until 'm' or end
-                while let Some(&c) = chars.peek() {
-                    chars.next();
-                    if c == 'm' {
-                        break;
-                    }
-                }
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    result
-}
-
 #[test]
 fn test_quiet_mode_no_output() -> Result<()> {
     let (stdout, stderr, exit_code) = run_validate_stdin(r#"{"invalid": }"#, &["--quiet"])?;
     assert_eq!(exit_code, 1);
     assert!(stdout.is_empty(), "stdout should be empty in quiet mode");
-    // Filter out cargo compilation output (lines starting with "Compiling", "Finished", etc.)
-    // Note: cargo may output ANSI color codes, so we strip them before checking prefixes
-    let app_stderr: String = stderr
-        .lines()
-        .filter(|line| {
-            let stripped = strip_ansi_codes(line);
-            let trimmed = stripped.trim();
-            !trimmed.starts_with("Compiling")
-                && !trimmed.starts_with("Finished")
-                && !trimmed.starts_with("Running")
-                && !trimmed.starts_with("Blocking")
-                && !trimmed.starts_with("warning:")
-                && !trimmed.starts_with("Downloading")
-                && !trimmed.starts_with("Downloaded")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // The binary is invoked directly (not via `cargo run`), so its stderr carries
+    // no cargo output to filter — quiet mode must produce a truly empty stderr.
     assert!(
-        app_stderr.is_empty(),
-        "stderr should be empty in quiet mode, got: {app_stderr}"
+        stderr.is_empty(),
+        "stderr should be empty in quiet mode, got: {stderr}"
     );
     Ok(())
 }
