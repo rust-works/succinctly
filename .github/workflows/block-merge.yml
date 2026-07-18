@@ -1,0 +1,25 @@
+name: Block Merge
+
+on:
+  pull_request:
+    # labeled/unlabeled are NOT default pull_request activity types; include them
+    # so this check re-runs the moment the do_not_merge label is toggled.
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  do-not-merge:
+    # "Do Not Merge" is the check-context name marked required in the main ruleset.
+    name: Do Not Merge
+    runs-on: ubuntu-latest
+    steps:
+      # The `if` guards the STEP, not the job: the job always runs and reports a
+      # status (green when the label is absent), so a PR can never sit forever
+      # "pending" on a required check that never ran.
+      - name: Fail if labeled do_not_merge
+        if: contains(github.event.pull_request.labels.*.name, 'do_not_merge')
+        run: |
+          echo "::error::PR is labeled 'do_not_merge' — merging is blocked until the label is removed."
+          exit 1
