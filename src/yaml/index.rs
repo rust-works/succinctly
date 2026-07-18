@@ -447,18 +447,15 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             return false;
         };
 
-        // Check for block sequence indicator `-` followed by whitespace
-        if text_pos < text.len() && text[text_pos] == b'-' {
-            // `-` at end of input is a seq_item
-            if text_pos + 1 >= text.len() {
-                return true;
-            }
-            // Check for space, tab, or newline after `-`
-            let next = text[text_pos + 1];
-            next == b' ' || next == b'\t' || next == b'\n' || next == b'\r'
-        } else {
-            false
-        }
+        // Check for block sequence indicator `-` followed by whitespace.
+        // Branchless form (see #106): a `-` at end of input is a seq_item, so a
+        // missing next byte is treated as whitespace via `unwrap_or(b' ')`.
+        text_pos < text.len()
+            && text[text_pos] == b'-'
+            && matches!(
+                text.get(text_pos + 1).copied().unwrap_or(b' '),
+                b' ' | b'\t' | b'\n' | b'\r'
+            )
     }
     /// Debug helper to get open position for a given open index.
     #[cfg(test)]
