@@ -3729,7 +3729,6 @@ Profiling the end-to-end pipeline on 1MB YAML files reveals:
 | **IB** (Interest Bits)  | Mark structural positions      | ✓ `ib_rank` cumulative           |
 | **BP** (Balanced Parens)| Tree structure                 | ✓ RangeMin for O(1) `find_close` |
 | **TY** (Type Bits)      | 0=mapping, 1=sequence          | ✗ Linear scan                    |
-| **seq_items**           | Sequence item markers          | ✗ Linear scan                    |
 | **containers**          | Container markers              | ✓ `containers_rank` cumulative   |
 | **bp_to_text**          | BP position → text start offset| ✓ Dense array O(1)               |
 | **bp_to_text_end**      | BP position → text end offset  | ✓ Dense array O(1)               |
@@ -3742,9 +3741,11 @@ Profiling the end-to-end pipeline on 1MB YAML files reveals:
 
 **Measured Impact**: ~7% improvement in To JSON phase (30ms → 28ms for 1MB).
 
-### Opportunity 2: Cumulative Index for `seq_items`
+### Opportunity 2: Cumulative Index for `seq_items` — Obsolete
 
-Same pattern as containers. Lower priority since seq_items is checked less frequently.
+**Status**: Obsolete. The `seq_items` bitvector was eliminated (issues #75/#104);
+sequence-item wrappers are now detected directly from the text (a `-` followed by
+whitespace or end-of-input), so there is no `seq_items` structure left to index.
 
 ### Opportunity 3: Pack `is_container` Flag into `bp_to_text`
 
@@ -3841,7 +3842,7 @@ for (start, end) in structural_segments {
 | 4. String boundaries       | Medium | High   | **P1**   | ✓ Done  |
 | 3. Pack flag in bp_to_text | Low    | Low    | **P2**   | Pending |
 | 5. SIMD JSON escaping      | Medium | Medium | **P2**   | Pending |
-| 2. `seq_items_rank`        | Low    | Low    | **P3**   | Pending |
+| 2. `seq_items_rank`        | n/a    | n/a    | n/a      | Obsolete|
 | 6. Streaming identity      | High   | High   | **P3**   | Pending |
 
 ### Detailed Bottleneck Analysis

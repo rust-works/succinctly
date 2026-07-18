@@ -57,8 +57,6 @@ pub struct YamlIndex<W = Vec<u64>> {
     /// Uses Advance Index encoding for ~5× compression when end positions are monotonic,
     /// otherwise falls back to `Vec<u32>`.
     bp_to_text_end: EndPositions,
-    /// Sequence item markers - 1 if BP position is a sequence item wrapper
-    seq_items: W,
     /// Container markers - 1 if BP position has a TY entry (is a mapping or sequence)
     containers: W,
     /// Cumulative popcount for containers. O(1) rank via single array lookup.
@@ -163,7 +161,6 @@ impl YamlIndex<Vec<u64>> {
             ty_len: semi.ty_len,
             open_positions,
             bp_to_text_end: EndPositions::build(&semi.bp_to_text_end, ib_len),
-            seq_items: semi.seq_items,
             containers: semi.containers,
             containers_rank,
             anchors: semi.anchors,
@@ -188,7 +185,6 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         ty_len: usize,
         bp_to_text: Vec<u32>,
         bp_to_text_end: Vec<u32>,
-        seq_items: W,
         containers: W,
         anchors: BTreeMap<String, usize>,
         aliases: BTreeMap<usize, usize>,
@@ -214,7 +210,6 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             ty_len,
             open_positions,
             bp_to_text_end: EndPositions::build(&bp_to_text_end, ib_len),
-            seq_items,
             containers,
             containers_rank,
             anchors,
@@ -237,7 +232,6 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         ty_len: usize,
         bp_to_text: Vec<u32>,
         bp_to_text_end: Vec<u32>,
-        seq_items: W,
         containers: W,
         anchors: BTreeMap<String, usize>,
         aliases: BTreeMap<usize, usize>,
@@ -264,7 +258,6 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             ty_len,
             open_positions,
             bp_to_text_end: EndPositions::build(&bp_to_text_end, ib_len),
-            seq_items,
             containers,
             containers_rank,
             anchors,
@@ -441,16 +434,28 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     ///
     /// Sequence items have BP open/close but no TY entry.
     /// They are wrapper nodes around the item's content.
+    /// Derives this from text (starts with `- `) rather than storing a bitvector.
     #[inline]
-    pub fn is_seq_item(&self, bp_pos: usize) -> bool {
-        let word_idx = bp_pos / 64;
-        let bit_idx = bp_pos % 64;
-        let seq_item_words = self.seq_items.as_ref();
-        if word_idx < seq_item_words.len() {
-            (seq_item_words[word_idx] >> bit_idx) & 1 == 1
-        } else {
-            false
+    pub fn is_seq_item(&self, text: &[u8], bp_pos: usize) -> bool {
+        // Fast path: containers (mappings/sequences) are never seq_items
+        if self.is_container(bp_pos) {
+            return false;
         }
+
+        // Get text position for this BP node
+        let Some(text_pos) = self.bp_to_text_pos(bp_pos) else {
+            return false;
+        };
+
+        // Check for block sequence indicator `-` followed by whitespace.
+        // Branchless form (see #106): a `-` at end of input is a seq_item, so a
+        // missing next byte is treated as whitespace via `unwrap_or(b' ')`.
+        text_pos < text.len()
+            && text[text_pos] == b'-'
+            && matches!(
+                text.get(text_pos + 1).copied().unwrap_or(b' '),
+                b' ' | b'\t' | b'\n' | b'\r'
+            )
     }
     /// Debug helper to get open position for a given open index.
     #[cfg(test)]
@@ -824,6 +829,52 @@ mod tests {
         let index = YamlIndex::build(yaml).unwrap();
         let root = index.root(yaml);
         assert_eq!(root.bp_position(), 0);
+    }
+
+    #[test]
+    fn test_is_seq_item_derived_from_text() {
+        // Sequence-item wrappers are recovered from the leading `- ` in the text
+        // rather than a stored bitvector.
+        let yaml = b"- apple\n- banana\n";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        // The two block-sequence item wrappers are detected as seq items.
+        let detected = (0..index.bp().len())
+            .filter(|&bp| index.is_seq_item(yaml, bp))
+            .count();
+        assert!(
+            detected >= 2,
+            "expected the block-sequence item wrappers to be detected, got {detected}"
+        );
+
+        // Fast path: containers (the document-root sequence at bp 0) are never
+        // seq items, even though the text at their position may start with `-`.
+        assert!(index.is_container(0));
+        assert!(!index.is_seq_item(yaml, 0));
+
+        // Defensive guard: a BP position with no text mapping (e.g. the final
+        // closing paren) has `bp_to_text_pos() == None` and must return false
+        // without indexing into the text.
+        let last = index.bp().len() - 1;
+        assert_eq!(index.bp_to_text_pos(last), None);
+        assert!(!index.is_seq_item(yaml, last));
+    }
+
+    #[test]
+    fn test_is_seq_item_ignores_dash_without_space() {
+        // A scalar that merely starts with `-` (e.g. a negative number) is NOT a
+        // sequence-item wrapper: the `-` must be followed by whitespace or EOF.
+        // This exercises the non-matching arm of the `- ` check (see #106).
+        let yaml = b"n: -5\n";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        let detected = (0..index.bp().len())
+            .filter(|&bp| index.is_seq_item(yaml, bp))
+            .count();
+        assert_eq!(
+            detected, 0,
+            "a `-N` scalar must not be detected as a sequence item"
+        );
     }
 
     // ------------------------------------------------------------------------

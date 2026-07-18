@@ -31,7 +31,7 @@ char: a  :  _  &  x  _  b  $  c  :  $  -  _  d  $  -  _  *  x  $  e  :  $  _  _ 
 | `a`, `b`, `c`, `d`, `e`, `f`, `g` | `ib`, `ib_rank`, `bp`, `open_positions`, `bp_to_text_end`      |
 | Root mapping, nested `e:` mapping | `ty` (bit=0), `containers`, `containers_rank`                  |
 | Sequence under `c:`               | `ty` (bit=1), `containers`, `containers_rank`                  |
-| `- d`, `- *x` (sequence items)    | `seq_items`                                                    |
+| `- d`, `- *x` (sequence items)    | text-derived (no `seq_items` buffer)                           |
 | `&x` on `b`                       | `anchors`, `bp_to_anchor`                                      |
 | `*x`                              | `aliases`                                                      |
 | Multi-line                        | `newlines`                                                     |
@@ -178,7 +178,6 @@ bitmap) to support O(1) select queries, needed by the `get()` random access path
       (BalancedParens with internal
        rank, select, min-excess)
 
-      seq_items            (no index)
       bp_to_text_end       (no index)
       newlines             (lazy OnceCell, has internal rank)
       anchors <-- inverse --> bp_to_anchor

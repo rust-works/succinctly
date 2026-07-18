@@ -132,16 +132,16 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             return YamlValue::Sequence(YamlElements::from_sequence_cursor(*self));
         }
 
-        // Special case: sequence item wrappers delegate to their first child's value.
-        // A sequence item is a thin wrapper around the actual content:
-        //   - [item1, item2]  <- sequence item wrappers contain the actual values
-        // The item wrapper's first_child IS the value (could be scalar, mapping, etc.)
-        if self.index.is_seq_item(self.bp_pos) {
-            if let Some(child) = self.first_child() {
-                return child.value();
+        // Check if this is a container FIRST - this takes priority over text-based detection.
+        // This is important for mappings where the key is an alias (e.g., `*alias : value`),
+        // which would otherwise be detected as an alias by looking at the leading `*`.
+        // Note: containers have TY entries and are never seq_items.
+        if self.is_container() {
+            // Determine if mapping or sequence using the TY bits
+            if self.index.is_sequence_at_bp(self.bp_pos) {
+                return YamlValue::Sequence(YamlElements::from_sequence_cursor(*self));
             }
-            // Empty sequence item (null)
-            return YamlValue::Null;
+            return YamlValue::Mapping(YamlFields::from_mapping_cursor(*self));
         }
 
         // Compute open_idx once — reused for both text_pos and text_end_pos
@@ -157,15 +157,22 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             return YamlValue::Null;
         }
 
-        // Check if this is a container FIRST - this takes priority over text-based detection.
-        // This is important for mappings where the key is an alias (e.g., `*alias : value`),
-        // which would otherwise be detected as an alias by looking at the leading `*`.
-        if self.is_container() {
-            // Determine if mapping or sequence using the TY bits
-            if self.index.is_sequence_at_bp(self.bp_pos) {
-                return YamlValue::Sequence(YamlElements::from_sequence_cursor(*self));
+        // Check for sequence item wrapper (non-container node starting with "- ").
+        // Sequence items delegate to their first child's value. Uses the
+        // already-computed text_pos to avoid redundant lookups. Branchless seq-item
+        // test (see #106): a `-` at end of input is a seq_item, so a missing next
+        // byte is treated as whitespace via `unwrap_or(b' ')`.
+        if self.text[text_pos] == b'-'
+            && matches!(
+                self.text.get(text_pos + 1).copied().unwrap_or(b' '),
+                b' ' | b'\t' | b'\n' | b'\r'
+            )
+        {
+            if let Some(child) = self.first_child() {
+                return child.value();
             }
-            return YamlValue::Mapping(YamlFields::from_mapping_cursor(*self));
+            // Empty sequence item (null)
+            return YamlValue::Null;
         }
 
         // Check for alias (only for non-container nodes)
@@ -200,31 +207,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             return YamlValue::Mapping(YamlFields::from_mapping_cursor(*self));
         }
 
-        // Check for block-style sequence (starts with '- ')
-        // Block sequences are nested containers that appear as values.
-        // We need to distinguish:
-        // - Sequence CONTAINER: Its children are item wrappers (also at '- ')
-        // - Item WRAPPER: Its child is the actual value (not at '- ')
-        //
-        // A sequence container has first_child at '- ', while an item wrapper
-        // has first_child at the actual value position.
-        if byte == b'-'
-            && effective_text_pos + 1 < self.text.len()
-            && self.text[effective_text_pos + 1] == b' '
-        {
-            if let Some(first_child) = self.first_child() {
-                if let Some(child_text_pos) = first_child.text_position() {
-                    // If the child also starts with '- ', this is a sequence container
-                    if child_text_pos < self.text.len()
-                        && self.text[child_text_pos] == b'-'
-                        && child_text_pos + 1 < self.text.len()
-                        && self.text[child_text_pos + 1] == b' '
-                    {
-                        return YamlValue::Sequence(YamlElements::from_sequence_cursor(*self));
-                    }
-                }
-            }
-        }
+        // Note: block-style sequences (`- item`) never reach this point. Real
+        // sequence containers carry TY bits and are handled by the `is_container()`
+        // check above; sequence-item wrapper nodes are caught by the inline `- `
+        // check after `text_pos` is computed. Both cases return before here.
 
         // Check for block-style mapping (content that looks like a key: value)
         // This heuristic is for nodes that don't have TY bits (like item wrappers).
