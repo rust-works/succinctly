@@ -1443,4 +1443,102 @@ mod tests {
             }
         }
     }
+
+    // =========================================================================
+    // Error formatting and code-point decoding
+    // =========================================================================
+
+    mod error_formatting {
+        use super::*;
+
+        #[test]
+        fn error_kind_display_covers_all_variants() {
+            let cases = [
+                (Utf8ErrorKind::InvalidLeadByte, "invalid UTF-8 lead byte"),
+                (
+                    Utf8ErrorKind::InvalidContinuationByte,
+                    "invalid UTF-8 continuation byte",
+                ),
+                (Utf8ErrorKind::OverlongEncoding, "overlong UTF-8 encoding"),
+                (
+                    Utf8ErrorKind::SurrogateCodepoint,
+                    "surrogate code point in UTF-8",
+                ),
+                (
+                    Utf8ErrorKind::OutOfRangeCodepoint,
+                    "code point above U+10FFFF",
+                ),
+                (Utf8ErrorKind::TruncatedSequence, "truncated UTF-8 sequence"),
+            ];
+            for (kind, expected) in cases {
+                assert_eq!(alloc::format!("{kind}"), expected);
+            }
+        }
+
+        #[test]
+        fn error_display_includes_position_and_kind() {
+            let err = Utf8Error {
+                offset: 5,
+                line: 2,
+                column: 3,
+                kind: Utf8ErrorKind::InvalidLeadByte,
+            };
+            let text = alloc::format!("{err}");
+            assert!(text.contains("invalid UTF-8 lead byte"), "{text}");
+            assert!(text.contains("byte 5"), "{text}");
+            assert!(text.contains("line 2"), "{text}");
+            assert!(text.contains("column 3"), "{text}");
+        }
+
+        #[test]
+        fn format_byte_distinguishes_graphic_and_non_graphic() {
+            assert_eq!(format_byte(b'A'), "0x41 ('A')");
+            assert_eq!(format_byte(b' '), "0x20 (' ')");
+            // Non-graphic bytes render as bare hex.
+            assert_eq!(format_byte(0x00), "0x00");
+            assert_eq!(format_byte(0x80), "0x80");
+            assert_eq!(format_byte(0x0A), "0x0A");
+        }
+    }
+
+    mod decode_code_point_tests {
+        use super::*;
+
+        #[test]
+        fn decodes_all_sequence_lengths() {
+            assert_eq!(decode_code_point(b"A"), Some((0x41, 1)));
+            assert_eq!(decode_code_point("\u{00E9}".as_bytes()), Some((0x00E9, 2)));
+            assert_eq!(decode_code_point("\u{20AC}".as_bytes()), Some((0x20AC, 3)));
+            assert_eq!(
+                decode_code_point("\u{1F389}".as_bytes()),
+                Some((0x1F389, 4))
+            );
+        }
+
+        #[test]
+        fn rejects_empty_and_truncated() {
+            assert_eq!(decode_code_point(b""), None);
+            // 3-byte lead with only one following byte -> too short.
+            assert_eq!(decode_code_point(&[0xE2, 0x82]), None);
+        }
+
+        #[test]
+        fn rejects_bad_continuation_bytes() {
+            // 2-byte lead, non-continuation second byte.
+            assert_eq!(decode_code_point(&[0xC3, 0x28]), None);
+            // 3-byte lead, bad first / second continuation byte.
+            assert_eq!(decode_code_point(&[0xE2, 0x28, 0xA1]), None);
+            assert_eq!(decode_code_point(&[0xE2, 0x82, 0x28]), None);
+            // 4-byte lead, bad continuation bytes in each position.
+            assert_eq!(decode_code_point(&[0xF0, 0x28, 0x8C, 0xBC]), None);
+            assert_eq!(decode_code_point(&[0xF0, 0x9F, 0x28, 0x8C]), None);
+            assert_eq!(decode_code_point(&[0xF0, 0x9F, 0x8E, 0x28]), None);
+        }
+
+        #[test]
+        fn rejects_invalid_lead_byte() {
+            // 0x80 is a continuation byte, never a lead -> sequence_length 0.
+            assert_eq!(decode_code_point(&[0x80]), None);
+        }
+    }
 }
