@@ -92,14 +92,12 @@ struct OutputConfig {
 
 impl OutputConfig {
     fn from_args(args: &YqCommand) -> Self {
-        let use_color = if args.monochrome_output {
-            false
-        } else if args.color_output {
-            true
-        } else {
-            // Default: color if stdout is a terminal
-            std::io::stdout().is_terminal()
-        };
+        // Shares the jq runner's precedence, documented on `resolve_color`.
+        let use_color = crate::env_config::resolve_color(
+            crate::env_config::ColorChoice::from_flags(args.monochrome_output, args.color_output),
+            crate::env_config::no_color_from_env(),
+            std::io::stdout().is_terminal(),
+        );
 
         // Compact output when indent is 0 (yq-compatible)
         let compact = args.indent == 0;

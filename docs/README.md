@@ -50,7 +50,7 @@ Learn the basics:
 - [Architecture](architecture/) - Design decisions and core concepts
 - [Architecture Decisions](adrs/) - ADRs: why key designs were chosen, and what was rejected
 - [Parsing Implementation](parsing/) - JSON/YAML/DSV parser internals
-- [Reference](reference/) - jq and yq language documentation
+- [Reference](reference/) - jq and yq language documentation, environment variables
 - [Implementation Plans](plan/) - Feature planning documents
 
 ### AI-Assisted Development
@@ -120,6 +120,7 @@ Specification compliance documentation:
 - **Use BitVec or BalancedParens** -> [guides/api.md](guides/api.md)
 - **Query JSON files** -> [guides/cli.md](guides/cli.md#jq-command)
 - **Query YAML files** -> [guides/cli.md](guides/cli.md#yq-command)
+- **Configure an environment variable** -> [reference/environment-variables.md](reference/environment-variables.md)
 - **Understand YAML 1.2 type handling** -> [compliance/yaml/1.2.md](compliance/yaml/1.2.md)
 - **Know what the YAML parser does not support** -> [compliance/yaml/limitations.md](compliance/yaml/limitations.md)
 - **Understand how JSON indexing works** -> [parsing/json.md](parsing/json.md)

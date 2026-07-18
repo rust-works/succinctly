@@ -508,22 +508,12 @@ impl OutputConfig {
             "  ".to_string() // Default: 2 spaces
         };
 
-        // Determine color output with priority:
-        // 1. --monochrome-output (-M) forces off
-        // 2. --color-output (-C) forces on
-        // 3. NO_COLOR env var disables color (https://no-color.org/)
-        // 4. Default: color if stdout is a terminal
-        let color_output = if args.monochrome_output {
-            false
-        } else if args.color_output {
-            true
-        } else if std::env::var("NO_COLOR").is_ok() {
-            // NO_COLOR is set (any value means disable colors)
-            false
-        } else {
-            // Default: color if stdout is a terminal
-            std::io::stdout().is_terminal()
-        };
+        // Priority is documented on `resolve_color`.
+        let color_output = crate::env_config::resolve_color(
+            crate::env_config::ColorChoice::from_flags(args.monochrome_output, args.color_output),
+            crate::env_config::no_color_from_env(),
+            std::io::stdout().is_terminal(),
+        );
 
         // Get color scheme from JQ_COLORS env var (or defaults)
         let color_scheme = ColorScheme::from_env();
@@ -2385,60 +2375,66 @@ impl Default for ColorScheme {
     }
 }
 
+/// Number of colors `JQ_COLORS` can set. Fields past this are ignored, as in jq.
+const JQ_COLORS_FIELDS: usize = 8;
+
+/// Is `sgr` a valid `JQ_COLORS` field?
+///
+/// jq accepts only digits and `;`, so an SGR parameter is the only thing that can
+/// reach the terminal. The empty string is valid and selects `\x1b[m`.
+fn is_valid_sgr(sgr: &str) -> bool {
+    sgr.bytes().all(|b| b.is_ascii_digit() || b == b';')
+}
+
 impl ColorScheme {
-    /// Parse JQ_COLORS environment variable.
-    /// Format: "null:false:true:numbers:strings:arrays:objects:objectkeys"
-    /// Each value is an SGR parameter like "1;30" for bold black.
-    fn from_env() -> Self {
-        let mut scheme = Self::default();
-
-        if let Ok(colors) = std::env::var("JQ_COLORS") {
-            let parts: Vec<&str> = colors.split(':').collect();
-
-            // Parse each color in order
-            if let Some(sgr) = parts.first() {
-                if !sgr.is_empty() {
-                    scheme.null = format!("\x1b[{sgr}m");
-                }
-            }
-            if let Some(sgr) = parts.get(1) {
-                if !sgr.is_empty() {
-                    scheme.false_ = format!("\x1b[{sgr}m");
-                }
-            }
-            if let Some(sgr) = parts.get(2) {
-                if !sgr.is_empty() {
-                    scheme.true_ = format!("\x1b[{sgr}m");
-                }
-            }
-            if let Some(sgr) = parts.get(3) {
-                if !sgr.is_empty() {
-                    scheme.number = format!("\x1b[{sgr}m");
-                }
-            }
-            if let Some(sgr) = parts.get(4) {
-                if !sgr.is_empty() {
-                    scheme.string = format!("\x1b[{sgr}m");
-                }
-            }
-            if let Some(sgr) = parts.get(5) {
-                if !sgr.is_empty() {
-                    scheme.array = format!("\x1b[{sgr}m");
-                }
-            }
-            if let Some(sgr) = parts.get(6) {
-                if !sgr.is_empty() {
-                    scheme.object = format!("\x1b[{sgr}m");
-                }
-            }
-            if let Some(sgr) = parts.get(7) {
-                if !sgr.is_empty() {
-                    scheme.key = format!("\x1b[{sgr}m");
-                }
-            }
+    /// Parse a `JQ_COLORS` spec.
+    ///
+    /// Format: "null:false:true:numbers:strings:arrays:objects:objectkeys".
+    /// Each field is an SGR parameter like "1;30" for bold black.
+    ///
+    /// Returns `None` if any of the first [`JQ_COLORS_FIELDS`] fields is invalid.
+    /// jq rejects a malformed spec as a whole rather than keeping the fields that
+    /// did parse, so callers fall back to the complete default scheme.
+    ///
+    /// Absent trailing fields keep their default; an empty field selects `\x1b[m`;
+    /// fields beyond the eighth are ignored without being validated.
+    fn from_spec(spec: &str) -> Option<Self> {
+        if !spec.split(':').take(JQ_COLORS_FIELDS).all(is_valid_sgr) {
+            return None;
         }
 
-        scheme
+        let mut scheme = Self::default();
+        let fields: [&mut String; JQ_COLORS_FIELDS] = [
+            &mut scheme.null,
+            &mut scheme.false_,
+            &mut scheme.true_,
+            &mut scheme.number,
+            &mut scheme.string,
+            &mut scheme.array,
+            &mut scheme.object,
+            &mut scheme.key,
+        ];
+
+        // zip stops at the shorter side, so a short spec leaves the remaining
+        // colors at their defaults and a long one drops the excess.
+        for (field, sgr) in fields.into_iter().zip(spec.split(':')) {
+            *field = format!("\x1b[{sgr}m");
+        }
+
+        Some(scheme)
+    }
+
+    /// Read the color scheme from the `JQ_COLORS` environment variable.
+    fn from_env() -> Self {
+        let Ok(spec) = std::env::var("JQ_COLORS") else {
+            return Self::default();
+        };
+
+        Self::from_spec(&spec).unwrap_or_else(|| {
+            // Matches jq: warn on stderr, use defaults, but still exit successfully.
+            eprintln!("Failed to set $JQ_COLORS");
+            Self::default()
+        })
     }
 }
 
@@ -2597,6 +2593,86 @@ fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The jq default spec, spelled out. Parsing this must be a no-op.
+    const DEFAULT_SPEC: &str = "1;30:0;39:0;39:0;39:0;32:1;39:1;39:1;34";
+
+    #[test]
+    fn test_jq_colors_valid_sgr() {
+        assert!(is_valid_sgr("0;31"));
+        assert!(is_valid_sgr("1"));
+        assert!(is_valid_sgr("0;31;4"));
+        // An empty field is valid and selects the empty SGR sequence.
+        assert!(is_valid_sgr(""));
+        // A trailing separator is accepted, as in jq.
+        assert!(is_valid_sgr("0;31;"));
+
+        // Anything that is not a digit or ';' is rejected, so arbitrary text can
+        // never be interpolated into the escape sequence.
+        assert!(!is_valid_sgr("0;3a"));
+        assert!(!is_valid_sgr("0;31m"));
+        assert!(!is_valid_sgr("31 "));
+        assert!(!is_valid_sgr("-1"));
+        assert!(!is_valid_sgr("bogus"));
+    }
+
+    #[test]
+    fn test_jq_colors_spec_sets_every_field_in_order() {
+        let scheme = ColorScheme::from_spec("1:2:3:4:5:6:7:8").expect("spec is valid");
+        assert_eq!(scheme.null, "\x1b[1m");
+        assert_eq!(scheme.false_, "\x1b[2m");
+        assert_eq!(scheme.true_, "\x1b[3m");
+        assert_eq!(scheme.number, "\x1b[4m");
+        assert_eq!(scheme.string, "\x1b[5m");
+        assert_eq!(scheme.array, "\x1b[6m");
+        assert_eq!(scheme.object, "\x1b[7m");
+        assert_eq!(scheme.key, "\x1b[8m");
+        // reset is not settable via JQ_COLORS.
+        assert_eq!(scheme.reset, default_colors::RESET);
+    }
+
+    #[test]
+    fn test_jq_colors_default_spec_round_trips() {
+        let scheme = ColorScheme::from_spec(DEFAULT_SPEC).expect("spec is valid");
+        assert_eq!(scheme.null, default_colors::NULL);
+        assert_eq!(scheme.string, default_colors::STRING);
+        assert_eq!(scheme.key, default_colors::KEY);
+    }
+
+    #[test]
+    fn test_jq_colors_empty_field_selects_empty_sgr() {
+        // jq treats an empty field as "\x1b[m", not as "keep the default".
+        let scheme = ColorScheme::from_spec("0;31:::::::").expect("spec is valid");
+        assert_eq!(scheme.null, "\x1b[0;31m");
+        assert_eq!(scheme.false_, "\x1b[m");
+        assert_eq!(scheme.key, "\x1b[m");
+    }
+
+    #[test]
+    fn test_jq_colors_short_spec_keeps_remaining_defaults() {
+        let scheme = ColorScheme::from_spec("0;31").expect("spec is valid");
+        assert_eq!(scheme.null, "\x1b[0;31m");
+        assert_eq!(scheme.false_, default_colors::FALSE);
+        assert_eq!(scheme.key, default_colors::KEY);
+    }
+
+    #[test]
+    fn test_jq_colors_extra_fields_are_ignored_unvalidated() {
+        // jq only looks at the first eight fields, so a ninth is dropped even when
+        // it would not have validated.
+        let scheme =
+            ColorScheme::from_spec(&format!("{DEFAULT_SPEC}:bogus")).expect("spec is valid");
+        assert_eq!(scheme.null, default_colors::NULL);
+        assert_eq!(scheme.key, default_colors::KEY);
+    }
+
+    #[test]
+    fn test_jq_colors_invalid_field_rejects_whole_spec() {
+        // One bad field discards the good ones too, rather than applying them.
+        assert!(ColorScheme::from_spec("bogus:0;39:0;39:0;39:0;32:1;39:1;39:9;95").is_none());
+        assert!(ColorScheme::from_spec("0;31:bogus").is_none());
+        assert!(ColorScheme::from_spec("0;31;4:0;39:0;39:0;39:0;32:1;39:1;39:0;31m").is_none());
+    }
 
     #[test]
     fn test_trim_ascii_ws() {

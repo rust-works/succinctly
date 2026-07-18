@@ -1728,6 +1728,7 @@ fn format_bytes(bytes: usize) -> String {
 mod bench_runner;
 mod dsv_bench;
 mod dsv_generators;
+mod env_config;
 mod generators;
 mod jq_bench;
 mod jq_locate;

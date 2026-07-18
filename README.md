@@ -330,6 +330,7 @@ Choose your path:
 - **New to succinctly?** -> [Getting Started](docs/getting-started/)
 - **Using the library?** -> [API Guide](docs/guides/api.md)
 - **Using the CLI?** -> [CLI Guide](docs/guides/cli.md)
+- **Setting an environment variable?** -> [Environment Variables](docs/reference/environment-variables.md)
 - **Contributing?** -> [CONTRIBUTING.md](CONTRIBUTING.md)
 - **Performance tuning?** -> [Optimization Techniques](docs/optimizations/)
 - **Understanding internals?** -> [Architecture](docs/architecture/)
