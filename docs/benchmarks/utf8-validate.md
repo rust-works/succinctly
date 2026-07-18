@@ -4,6 +4,14 @@ Benchmarks for `succinctly text validate utf8` - scalar UTF-8 validation through
 
 This serves as the baseline for future SIMD implementations.
 
+> **⚠️ Provisional — pending re-measurement.** The figures below were captured on a
+> pre-rebase branch tip; those commits were orphaned when this branch was rebased onto
+> `main`, so the per-platform **Commit** references no longer resolve. The scalar
+> validator is unchanged by the rebase, so the numbers should still hold, but per the
+> project's benchmark-freshness rule they must be re-measured on each named platform
+> (and the commit references restored) before being cited as authoritative. Downstream
+> issues #133 and #134 pin their projected gains to these baselines.
+
 ## Summary
 
 | Platform                      | ASCII (GiB/s) | CJK (GiB/s) | Emoji (GiB/s) | Mixed (GiB/s) |
@@ -17,7 +25,7 @@ This serves as the baseline for future SIMD implementations.
 ## Apple M4 Pro (ARM)
 
 **Date**: 2026-02-06
-**Commit**: b58037f (utf8-validation-scalar branch)
+**Commit**: _orphaned by rebase — provisional, pending re-measurement_
 **CPU**: Apple M4 Pro (12 cores)
 **OS**: macOS 15.6.1
 **Rust**: 1.93.0
@@ -103,7 +111,7 @@ Direct comparison of byte sequence lengths at 1MB:
 ## AMD Ryzen 9 7950X (x86_64)
 
 **Date**: 2026-02-06
-**Commit**: 71ce3fa (utf8-validation-scalar branch)
+**Commit**: _orphaned by rebase — provisional, pending re-measurement_
 **CPU**: AMD Ryzen 9 7950X 16-Core Processor
 **OS**: Ubuntu 22.04.5 LTS
 **Rust**: 1.92.0
@@ -197,7 +205,7 @@ Direct comparison of byte sequence lengths at 1MB:
 ## Apple M1 Max (ARM)
 
 **Date**: 2026-02-06
-**Commit**: b58037fd (utf8-validation-scalar branch)
+**Commit**: _orphaned by rebase — provisional, pending re-measurement_
 **CPU**: Apple M1 Max
 **OS**: macOS 26.1
 **Rust**: 1.89.0
