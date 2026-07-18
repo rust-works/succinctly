@@ -1,0 +1,190 @@
+# YAML Test Suite cases that succinctly does not currently pass.
+#
+# Format:  <case-id>  <category>  <reason>
+#
+# Consumed by tests/yaml_test_suite.rs, which asserts this list matches the actual
+# failure set exactly: a newly failing case and a newly passing case both break the
+# build. Do not add entries to silence a failure without understanding it.
+#
+# See docs/compliance/yaml/limitations.md for the analysis behind these categories.
+#
+# Categories
+# ----------
+#   tags        !!str / !custom / verbatim tags are not supported at all. -> #224
+#   directives  %YAML / %TAG directives are not recognized and parse as
+#               scalars. -> #225
+#   streaming   The library streaming path (to_json / stream_json, used by
+#               `yq -I 0`) disagrees with the CLI's OwnedValue path (used by
+#               pretty output). Two implementations that have drifted apart,
+#               so -I 0 changes values and not just formatting. -> #222
+#   lax:*       Invalid input that indexing accepts because it does not validate.
+#               This is a property of the default mode, not a defect: succinctly
+#               is a non-validating loader. Rejecting these is the job of the
+#               opt-in validation mode, mirroring `json validate`. -> #223
+#   scalars     Scalar content or block-scalar folding differs from the spec.
+#               Not yet individually triaged.
+#   structure   Document or block structure differs from the spec. Not yet
+#               individually triaged.
+
+236B      lax:mapping       mapping/key rules not validated — #223
+26DV      streaming         streaming path diverges from OwnedValue path — #222
+27NA      directives        %YAML/%TAG directive not recognized — #225
+2AUY      tags              tags (!) not supported — #224
+2CMS      lax:mapping       mapping/key rules not validated — #223
+2G84/00   lax:block-scalar  block scalar header not validated — #223
+2G84/01   lax:block-scalar  block scalar header not validated — #223
+2G84/02   streaming         streaming path diverges from OwnedValue path — #222
+2G84/03   scalars           scalar content/folding differs from spec
+2LFX      directives        %YAML/%TAG directive not recognized — #225
+2SXE      structure         document/block structure differs from spec
+2XXW      tags              tag shorthand emitted as scalar text — #224
+33X3      tags              tags (!) not supported — #224
+35KP      tags              tags (!) not supported — #224
+3HFZ      lax:documents     directive/document rules not validated — #223
+4H7K      lax:flow          flow syntax not validated — #223
+4HVU      lax:other         not validated — #223
+4JVG      lax:anchors       anchor/alias rules not validated — #223
+4Q9F      scalars           scalar content/folding differs from spec
+52DL      tags              tags (!) not supported — #224
+55WF      lax:quoting       quoting/escape rules not validated — #223
+565N      tags              tags (!) not supported — #224
+57H4      tags              tags (!) not supported — #224
+5LLU      lax:indentation   indentation not validated — #223
+5TRB      lax:documents     directive/document rules not validated — #223
+5TYM      tags              tags (!) not supported — #224
+5U3A      lax:mapping       mapping/key rules not validated — #223
+62EZ      lax:mapping       mapping/key rules not validated — #223
+6CK3      tags              tags (!) not supported — #224
+6JWB      tags              tags (!) not supported — #224
+6LVF      directives        %YAML/%TAG directive not recognized — #225
+6S55      lax:other         not validated — #223
+6WLZ      tags              tags (!) not supported — #224
+6XDY      structure         document/block structure differs from spec
+6ZKB      directives        %YAML/%TAG directive not recognized — #225
+735Y      tags              tags (!) not supported — #224
+74H7      tags              tags (!) not supported — #224
+7FWL      tags              tags (!) not supported — #224
+7LBH      lax:quoting       quoting/escape rules not validated — #223
+7MNF      lax:other         not validated — #223
+7T8X      scalars           scalar content/folding differs from spec
+7Z25      structure         document/block structure differs from spec
+8MK2      tags              tags (!) not supported — #224
+8XDJ      lax:comments      comment placement not validated — #223
+93WF      scalars           scalar content/folding differs from spec
+9C9N      lax:indentation   indentation not validated — #223
+9CWY      lax:mapping       mapping/key rules not validated — #223
+9DXL      directives        %YAML/%TAG directive not recognized — #225
+9JBA      lax:flow          flow syntax not validated — #223
+9KAX      tags              tags (!) not supported — #224
+9KBC      lax:mapping       mapping/key rules not validated — #223
+9MAG      lax:flow          flow syntax not validated — #223
+9MMA      lax:documents     directive/document rules not validated — #223
+9MQT/01   lax:other         not validated — #223
+9WXW      tags              tags (!) not supported — #224
+AVM7      scalars           scalar content/folding differs from spec
+B63P      lax:documents     directive/document rules not validated — #223
+BD7L      lax:mapping       mapping/key rules not validated — #223
+BEC7      directives        %YAML/%TAG directive not recognized — #225
+BF9H      lax:comments      comment placement not validated — #223
+BS4K      lax:comments      comment placement not validated — #223
+BU8L      tags              tag shorthand emitted as scalar text — #224
+C2SP      lax:flow          flow syntax not validated — #223
+C4HZ      tags              tags (!) not supported — #224
+CC74      directives        %YAML/%TAG directive not recognized — #225
+CTN5      lax:flow          flow syntax not validated — #223
+CUP7      tags              tags (!) not supported — #224
+CVW2      lax:comments      comment placement not validated — #223
+CXX2      lax:anchors       anchor/alias rules not validated — #223
+D49Q      lax:quoting       quoting/escape rules not validated — #223
+DE56/04   streaming         streaming path diverges from OwnedValue path — #222
+DE56/05   streaming         streaming path diverges from OwnedValue path — #222
+DK3J      scalars           scalar content/folding differs from spec
+DK4H      lax:mapping       mapping/key rules not validated — #223
+DK95/00   scalars           scalar content/folding differs from spec
+DK95/01   lax:tabs          tab handling not validated — #223
+DK95/06   lax:tabs          tab handling not validated — #223
+DK95/07   directives        %YAML/%TAG directive not recognized — #225
+DMG6      lax:other         not validated — #223
+E76Z      streaming         streaming path diverges from OwnedValue path — #222
+EB22      lax:documents     directive/document rules not validated — #223
+EHF6      tags              tags (!) not supported — #224
+EW3V      lax:mapping       mapping/key rules not validated — #223
+F2C7      tags              tags (!) not supported — #224
+FH7J      tags              tags (!) not supported — #224
+FP8R      scalars           scalar content/folding differs from spec
+FTA2      structure         document/block structure differs from spec
+G5U8      lax:flow          flow syntax not validated — #223
+G7JE      lax:mapping       mapping/key rules not validated — #223
+G9HC      lax:indentation   indentation not validated — #223
+GT5M      lax:anchors       anchor/alias rules not validated — #223
+H7TQ      lax:documents     directive/document rules not validated — #223
+HMQ5      tags              tags (!) not supported — #224
+HRE5      lax:quoting       quoting/escape rules not validated — #223
+HU3P      lax:mapping       mapping/key rules not validated — #223
+J7PZ      tags              tag shorthand emitted as scalar text — #224
+JEF9/01   structure         document/block structure differs from spec
+JKF3      lax:quoting       quoting/escape rules not validated — #223
+JY7Z      lax:mapping       mapping/key rules not validated — #223
+K527      scalars           scalar content/folding differs from spec
+K54U      scalars           scalar content/folding differs from spec
+K858      streaming         streaming path diverges from OwnedValue path — #222
+KS4U      lax:flow          flow syntax not validated — #223
+L24T/00   scalars           scalar content/folding differs from spec
+L94M      tags              tag shorthand emitted as scalar text — #224
+LE5A      tags              tags (!) not supported — #224
+M5C3      scalars           scalar content/folding differs from spec
+M7A3      streaming         streaming path diverges from OwnedValue path — #222
+MUS6/00   lax:documents     directive/document rules not validated — #223
+MUS6/01   lax:documents     directive/document rules not validated — #223
+MUS6/02   directives        %YAML/%TAG directive not recognized — #225
+MUS6/03   directives        %YAML/%TAG directive not recognized — #225
+MUS6/04   directives        %YAML/%TAG directive not recognized — #225
+MUS6/05   directives        %YAML/%TAG directive not recognized — #225
+MUS6/06   directives        %YAML/%TAG directive not recognized — #225
+N4JP      lax:indentation   indentation not validated — #223
+N782      lax:flow          flow syntax not validated — #223
+NP9H      streaming         streaming path diverges from OwnedValue path — #222
+P2EQ      lax:other         not validated — #223
+P76L      directives        %YAML/%TAG directive not recognized — #225
+PUW8      structure         document/block structure differs from spec
+Q4CL      lax:quoting       quoting/escape rules not validated — #223
+QB6E      lax:indentation   indentation not validated — #223
+QLJ7      lax:documents     directive/document rules not validated — #223
+RHX7      lax:documents     directive/document rules not validated — #223
+RTP8      directives        %YAML/%TAG directive not recognized — #225
+RXY3      lax:documents     directive/document rules not validated — #223
+S4GJ      lax:block-scalar  block scalar header not validated — #223
+S4JQ      tags              tags (!) not supported — #224
+S98Z      lax:block-scalar  block scalar header not validated — #223
+SF5V      lax:documents     directive/document rules not validated — #223
+SR86      lax:anchors       anchor/alias rules not validated — #223
+SU5Z      lax:comments      comment placement not validated — #223
+SU74      lax:anchors       anchor/alias rules not validated — #223
+SY6V      lax:anchors       anchor/alias rules not validated — #223
+T833      lax:flow          flow syntax not validated — #223
+TD5N      lax:other         not validated — #223
+TS54      scalars           scalar content/folding differs from spec
+U3C3      tags              tags (!) not supported — #224
+U44R      lax:indentation   indentation not validated — #223
+UGM3      structure         document/block structure differs from spec
+UKK6/02   tags              tags (!) not supported — #224
+UT92      structure         document/block structure differs from spec
+VJP3/00   lax:flow          flow syntax not validated — #223
+W4TN      directives        %YAML/%TAG directive not recognized — #225
+W5VH      structure         document/block structure differs from spec
+W9L4      lax:block-scalar  block scalar header not validated — #223
+WZ62      tags              tag shorthand emitted as scalar text — #224
+X4QW      lax:block-scalar  block scalar header not validated — #223
+Y79Y/003  lax:tabs          tab handling not validated — #223
+Y79Y/004  lax:tabs          tab handling not validated — #223
+Y79Y/005  lax:tabs          tab handling not validated — #223
+Y79Y/006  lax:tabs          tab handling not validated — #223
+Y79Y/007  lax:tabs          tab handling not validated — #223
+Y79Y/008  lax:tabs          tab handling not validated — #223
+Y79Y/009  lax:tabs          tab handling not validated — #223
+YJV2      lax:flow          flow syntax not validated — #223
+Z67P      tags              tags (!) not supported — #224
+Z9M4      tags              tags (!) not supported — #224
+ZCZ6      lax:mapping       mapping/key rules not validated — #223
+ZL4Z      lax:mapping       mapping/key rules not validated — #223
+ZVH3      lax:indentation   indentation not validated — #223

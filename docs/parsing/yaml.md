@@ -582,7 +582,16 @@ This separation keeps the index small and fast. A higher-level `YamlValue` type 
 
 ### 8. Error Handling
 
-**Decision**: Strict mode only. Reject malformed YAML with clear error messages.
+> **Superseded.** This section recorded an intent that was never implemented, and the
+> "strict mode only" claim below is false. Measured against the YAML Test Suite, the
+> parser rejects 11 of 94 invalid documents (11.7%); several `YamlError` variants named
+> here — including `InvalidIndentation` — are never constructed anywhere in `src/`.
+> succinctly is a **non-validating loader**: the index records structure, not grammar
+> conformance. Validation is planned as an opt-in pass, mirroring `json validate`. See
+> [Known Limitations](../compliance/yaml/limitations.md#validation-is-out-of-scope-by-design)
+> for the measurements and rationale. Retained below as a historical design note.
+
+**Decision** (not implemented): Strict mode only. Reject malformed YAML with clear error messages.
 
 **Rationale**:
 - Consistent with JSON implementation behavior
@@ -615,6 +624,13 @@ Errors include byte offset and line number for IDE integration.
 ### 10. Phased Implementation Plan
 
 Implementation proceeds in phases, each building on the previous and adding YAML features incrementally.
+
+> **Historical.** The per-phase "Not Supported" lists below describe the scope of each
+> phase *at the time it was planned*, not the parser's current capabilities — later phases
+> added flow style, block scalars, anchors/aliases, multi-document streams, and explicit
+> keys. For what is actually unsupported today (tags and `%YAML`/`%TAG` directives),
+> measured against the YAML Test Suite, see
+> [Known Limitations](../compliance/yaml/limitations.md).
 
 ---
 
