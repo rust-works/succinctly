@@ -165,7 +165,7 @@ use succinctly::jq::{parse, eval};
 
 | Structure         | Description                            | Performance (x86_64 Zen 4) |
 |-------------------|----------------------------------------|----------------------------|
-| **BitVec**        | O(1) rank, O(log n) select             | ~3-4% overhead             |
+| **BitVec**        | O(1) rank, O(log n) select             | ~28-48% overhead           |
 | **BalancedParens**| Succinct tree navigation               | ~6% overhead               |
 | **JsonIndex**     | JSON semi-indexing with PFSM parser    | ~880 MiB/s                 |
 | **YamlIndex**     | YAML semi-indexing with oracle parser  | ~250-400 MiB/s             |
@@ -327,6 +327,7 @@ cargo test
 | [docs/benchmarks/jq.md](docs/benchmarks/jq.md)                    | JSON jq benchmark results            |
 | [docs/benchmarks/yq.md](docs/benchmarks/yq.md)                    | YAML yq benchmark results            |
 | [docs/benchmarks/dsv.md](docs/benchmarks/dsv.md)                  | DSV input performance benchmarks     |
+| [docs/adrs/adr-0011.md](docs/adrs/adr-0011.md)                    | Why rank/select is built in-crate    |
 
 ## Performance Summary
 

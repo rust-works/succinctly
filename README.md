@@ -11,7 +11,7 @@ Succinctly provides space-efficient data structures with fast rank and select op
 
 ## Features
 
-- **Bitvector with O(1) rank and O(log n) select** - Poppy-style 3-level directory with ~3% space overhead
+- **Bitvector with O(1) rank and O(log n) select** - Poppy-style 3-level directory, tuned for query speed over compactness (~28-48% overhead)
 - **Balanced parentheses for tree navigation** - RangeMin structure with O(1) operations and ~6% overhead
 - **JSON semi-indexing with SIMD acceleration** - Up to 880 MiB/s throughput on x86_64 (AMD Zen 4) with table-driven PFSM parser
 - **YAML semi-indexing** - Complete YAML 1.2 parser with anchor/alias resolution (~250-400 MiB/s)
@@ -308,7 +308,7 @@ succinctly
 
 ### Core Data Structures
 
-- **`bits::BitVec`** - Bitvector with 3-level Poppy-style rank directory (~3% overhead) and sampled select index (~1-3% overhead)
+- **`bits::BitVec`** - Bitvector with 3-level Poppy-style rank directory (~25% overhead) and sampled select index; ~28-48% resident overhead in total, rising with bit density ([benchmarks](docs/benchmarks/rust-succinct-libs.md))
 - **`trees::BalancedParens`** - Hierarchical min-excess structure for O(1) tree navigation (~6% overhead)
 - **`json::JsonIndex`** - Semi-index combining Interest Bits (IB) and Balanced Parentheses (BP) for fast JSON navigation
 - **`yaml::YamlIndex`** - YAML semi-index with anchor/alias resolution and multi-document support

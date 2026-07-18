@@ -72,17 +72,22 @@ For n bits:
 - Superblock index: n/512 * 64 = n/8 bits (12.5%)
 - Block index: n/64 * 16 = n/4 bits (25%)
 
-Wait, that's too much! We optimize:
+The block index is packed to bring that down:
 
 ### Optimized Block Index
 - Store relative counts within superblock
 - 8 blocks per superblock, max count 64 each
 - Pack into u16 (max 512 total)
 
-Actual overhead:
+Actual overhead of the rank directory:
 - Superblock: n/512 * 64 bits = 0.125n bits
 - Block: n/64 * 9 bits = 0.14n bits
-- Total: ~3-4% overhead
+- Total: ~0.265n bits, i.e. **~25% overhead** — 128 bits of metadata per 512 bits of data
+
+This is a deliberate trade of space for query speed, and is *not* the ~3% of a compact Poppy index;
+see the note in [src/bits/rank.rs](../../src/bits/rank.rs). The sampled `SelectIndex` adds an entry per
+256 set bits on top, so a full `BitVec` measures **27.5-47.5%** resident overhead, rising with bit
+density ([../benchmarks/rust-succinct-libs.md](../benchmarks/rust-succinct-libs.md)).
 
 ## SIMD Optimization
 

@@ -378,13 +378,13 @@ struct Counters {
 
 ## Usage in Succinctly
 
-| Technique              | Location           | Purpose                    | Impact       |
-|------------------------|--------------------|----------------------------|--------------|
-| Cache-aligned L1L2     | `bits/rank.rs`     | Rank directory             | 3-4% faster  |
-| Packed u128 entries    | `bits/rank.rs`     | Reduce memory footprint    | 3% overhead  |
-| Dual select methods    | `bits/select.rs`   | Adapt to access pattern    | 3.1x seq     |
-| Lightweight index      | `dsv/index_*.rs`   | Simpler = cache-friendly   | 5-9x faster  |
-| Zero-copy iteration    | `json/light.rs`    | Avoid allocations          | Varies       |
+| Technique              | Location           | Purpose                    | Impact        |
+|------------------------|--------------------|----------------------------|---------------|
+| Cache-aligned L1L2     | `bits/rank.rs`     | Rank directory             | 3-4% faster   |
+| Packed u128 entries    | `bits/rank.rs`     | Reduce memory footprint    | ~25% overhead |
+| Dual select methods    | `bits/select.rs`   | Adapt to access pattern    | 3.1x seq      |
+| Lightweight index      | `dsv/index_*.rs`   | Simpler = cache-friendly   | 5-9x faster   |
+| Zero-copy iteration    | `json/light.rs`    | Avoid allocations          | Varies        |
 
 **Key insight from DSV optimization**: The "heavyweight" BitVec with 3-level RankDirectory was 5-9x slower than a simple cumulative array despite being theoretically optimal. Cache behavior matters more than asymptotic complexity for practical sizes.
 
