@@ -130,3 +130,36 @@ fn test_bug_26_regression() {
         "Expression should be .[0].age, not .[0].name"
     );
 }
+
+#[test]
+fn test_locate_offset_block_sequence() {
+    // Block sequences exercise `is_seq_item`: `path_to_bp` walks up through the
+    // sequence-item wrapper nodes (which are derived from the leading `- ` in the
+    // text, not a bitvector) and skips them, emitting `[n]` index components.
+    //
+    //   fruits:\n  - apple\n  - banana\ntop:\n  - - 1\n    - 2\n
+    //   0000000000 111111111 12222222222 2333 33333334 44444444 4
+    //   0123456789 012345678 90123456789 0123 45678901 23456789 0
+    let yaml = b"fruits:\n  - apple\n  - banana\ntop:\n  - - 1\n    - 2\n";
+    let index = YamlIndex::build(yaml).unwrap();
+
+    // Offsets inside the two `fruits` items resolve to indexed paths.
+    assert_eq!(
+        locate_offset(&index, yaml, 12), // 'a' in "apple"
+        Some(".[0].fruits[0]".to_string()),
+    );
+    assert_eq!(
+        locate_offset(&index, yaml, 22), // 'b' in "banana"
+        Some(".[0].fruits[1]".to_string()),
+    );
+
+    // Nested block sequence: walking up passes through two seq-item wrappers.
+    assert_eq!(
+        locate_offset(&index, yaml, 40), // '1'
+        Some(".[0].top[0][0]".to_string()),
+    );
+    assert_eq!(
+        locate_offset(&index, yaml, 48), // '2'
+        Some(".[0].top[0][1]".to_string()),
+    );
+}

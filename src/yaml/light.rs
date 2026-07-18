@@ -207,31 +207,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             return YamlValue::Mapping(YamlFields::from_mapping_cursor(*self));
         }
 
-        // Check for block-style sequence (starts with '- ')
-        // Block sequences are nested containers that appear as values.
-        // We need to distinguish:
-        // - Sequence CONTAINER: Its children are item wrappers (also at '- ')
-        // - Item WRAPPER: Its child is the actual value (not at '- ')
-        //
-        // A sequence container has first_child at '- ', while an item wrapper
-        // has first_child at the actual value position.
-        if byte == b'-'
-            && effective_text_pos + 1 < self.text.len()
-            && self.text[effective_text_pos + 1] == b' '
-        {
-            if let Some(first_child) = self.first_child() {
-                if let Some(child_text_pos) = first_child.text_position() {
-                    // If the child also starts with '- ', this is a sequence container
-                    if child_text_pos < self.text.len()
-                        && self.text[child_text_pos] == b'-'
-                        && child_text_pos + 1 < self.text.len()
-                        && self.text[child_text_pos + 1] == b' '
-                    {
-                        return YamlValue::Sequence(YamlElements::from_sequence_cursor(*self));
-                    }
-                }
-            }
-        }
+        // Note: block-style sequences (`- item`) never reach this point. Real
+        // sequence containers carry TY bits and are handled by the `is_container()`
+        // check above; sequence-item wrapper nodes are caught by the inline `- `
+        // check after `text_pos` is computed. Both cases return before here.
 
         // Check for block-style mapping (content that looks like a key: value)
         // This heuristic is for nodes that don't have TY bits (like item wrappers).

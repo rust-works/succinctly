@@ -831,6 +831,52 @@ mod tests {
         assert_eq!(root.bp_position(), 0);
     }
 
+    #[test]
+    fn test_is_seq_item_derived_from_text() {
+        // Sequence-item wrappers are recovered from the leading `- ` in the text
+        // rather than a stored bitvector.
+        let yaml = b"- apple\n- banana\n";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        // The two block-sequence item wrappers are detected as seq items.
+        let detected = (0..index.bp().len())
+            .filter(|&bp| index.is_seq_item(yaml, bp))
+            .count();
+        assert!(
+            detected >= 2,
+            "expected the block-sequence item wrappers to be detected, got {detected}"
+        );
+
+        // Fast path: containers (the document-root sequence at bp 0) are never
+        // seq items, even though the text at their position may start with `-`.
+        assert!(index.is_container(0));
+        assert!(!index.is_seq_item(yaml, 0));
+
+        // Defensive guard: a BP position with no text mapping (e.g. the final
+        // closing paren) has `bp_to_text_pos() == None` and must return false
+        // without indexing into the text.
+        let last = index.bp().len() - 1;
+        assert_eq!(index.bp_to_text_pos(last), None);
+        assert!(!index.is_seq_item(yaml, last));
+    }
+
+    #[test]
+    fn test_is_seq_item_ignores_dash_without_space() {
+        // A scalar that merely starts with `-` (e.g. a negative number) is NOT a
+        // sequence-item wrapper: the `-` must be followed by whitespace or EOF.
+        // This exercises the non-matching arm of the `- ` check (see #106).
+        let yaml = b"n: -5\n";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        let detected = (0..index.bp().len())
+            .filter(|&bp| index.is_seq_item(yaml, bp))
+            .count();
+        assert_eq!(
+            detected, 0,
+            "a `-N` scalar must not be detected as a sequence item"
+        );
+    }
+
     // ------------------------------------------------------------------------
     // Newline index tests
     // ------------------------------------------------------------------------
