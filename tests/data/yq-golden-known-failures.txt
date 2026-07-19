@@ -1,0 +1,17 @@
+# Known divergences of `succinctly yq` from the pinned-yq golden fixtures.
+#
+# Consumed by tests/yq_golden_tests.rs. One line per failing case:
+#
+#   <case>            <category>        <reason — #issue>
+#
+# <case> is a directory name under tests/data/yq-golden/cases/. Columns are
+# whitespace-separated; `#` lines and blank lines are ignored.
+#
+# The check is two-sided: a case failing without a line here fails the build,
+# and a line here for a case that now passes also fails the build — so every
+# fix is forced to shrink this file, and no divergence can hide. The goldens
+# themselves always hold the correct (pinned yq) output; only this manifest
+# records where succinctly currently disagrees. See
+# tests/data/yaml-test-suite-known-failures.txt for the sibling manifest.
+#
+# Currently empty: all cases match yq byte-for-byte.
