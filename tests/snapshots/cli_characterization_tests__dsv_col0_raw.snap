@@ -1,0 +1,7 @@
+---
+source: tests/cli_characterization_tests.rs
+expression: "run(&[\"jq\", \"--input-dsv\", \",\", \"-r\", \".[0]\"], CSV_PEOPLE)?"
+---
+name
+Alice
+Bob

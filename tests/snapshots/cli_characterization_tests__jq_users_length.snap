@@ -1,0 +1,5 @@
+---
+source: tests/cli_characterization_tests.rs
+expression: "run(&[\"jq\", \".users | length\"], JSON_USERS)?"
+---
+2

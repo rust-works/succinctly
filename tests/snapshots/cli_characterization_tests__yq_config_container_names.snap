@@ -1,0 +1,6 @@
+---
+source: tests/cli_characterization_tests.rs
+expression: "run(&[\"yq\", \".spec.containers[].name\"], YAML_CONFIG)?"
+---
+web
+sidecar

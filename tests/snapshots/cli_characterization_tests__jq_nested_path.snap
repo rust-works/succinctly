@@ -1,0 +1,5 @@
+---
+source: tests/cli_characterization_tests.rs
+expression: "run(&[\"jq\", \"-c\", \".a.b.c\"], JSON_NESTED)?"
+---
+[1,2,3]

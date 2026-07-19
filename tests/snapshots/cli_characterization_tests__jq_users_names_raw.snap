@@ -1,0 +1,6 @@
+---
+source: tests/cli_characterization_tests.rs
+expression: "run(&[\"jq\", \"-r\", \".users[].name\"], JSON_USERS)?"
+---
+Alice
+Bob
