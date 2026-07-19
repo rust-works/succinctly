@@ -212,9 +212,19 @@ fn detect_fast_bmi2() -> bool {
 mod tests {
     use super::*;
 
+    /// Detection guard for POPCNT; emits a visible `SKIPPED` line when
+    /// unavailable so a fully-skipped run doesn't read as green (#193).
+    fn has_popcnt() -> bool {
+        let available = is_x86_feature_detected!("popcnt");
+        if !available {
+            crate::util::simd::note_simd_skip("popcnt");
+        }
+        available
+    }
+
     #[test]
     fn test_popcount_512_popcnt() {
-        if !is_x86_feature_detected!("popcnt") {
+        if !has_popcnt() {
             return;
         }
 
@@ -234,7 +244,7 @@ mod tests {
 
     #[test]
     fn test_popcount_words_popcnt() {
-        if !is_x86_feature_detected!("popcnt") {
+        if !has_popcnt() {
             return;
         }
 
@@ -252,14 +262,19 @@ mod tests {
     // BMI2 select_in_word tests
     // -------------------------------------------------------------------------
 
+    /// Detection guard for BMI2; emits a visible `SKIPPED` line when
+    /// unavailable so a fully-skipped run doesn't read as green (#193).
     fn has_bmi2() -> bool {
-        is_x86_feature_detected!("bmi2")
+        let available = is_x86_feature_detected!("bmi2");
+        if !available {
+            crate::util::simd::note_simd_skip("bmi2");
+        }
+        available
     }
 
     #[test]
     fn test_select_in_word_pdep_basic() {
         if !has_bmi2() {
-            eprintln!("Skipping BMI2 test: CPU doesn't support BMI2");
             return;
         }
 

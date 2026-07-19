@@ -167,9 +167,19 @@ fn prefix_xor(x: u64) -> u64 {
 mod tests {
     use super::*;
 
+    /// Detection guard for the AVX2 backend; emits a visible `SKIPPED` line
+    /// when unavailable so a fully-skipped run doesn't read as green (#193).
+    fn has_avx2() -> bool {
+        let available = is_x86_feature_detected!("avx2");
+        if !available {
+            crate::util::simd::note_simd_skip("avx2");
+        }
+        available
+    }
+
     #[test]
     fn test_simple_csv() {
-        if !is_x86_feature_detected!("avx2") {
+        if !has_avx2() {
             return;
         }
 
@@ -183,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_quoted_delimiter() {
-        if !is_x86_feature_detected!("avx2") {
+        if !has_avx2() {
             return;
         }
 
@@ -197,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_simd_matches_scalar() {
-        if !is_x86_feature_detected!("avx2") {
+        if !has_avx2() {
             return;
         }
 
@@ -213,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_large_csv() {
-        if !is_x86_feature_detected!("avx2") {
+        if !has_avx2() {
             return;
         }
 
@@ -230,7 +240,7 @@ mod tests {
 
     #[test]
     fn test_quoted_spanning_chunks() {
-        if !is_x86_feature_detected!("avx2") {
+        if !has_avx2() {
             return;
         }
 

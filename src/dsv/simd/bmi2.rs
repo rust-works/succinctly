@@ -210,14 +210,19 @@ unsafe fn toggle64_bmi2(carry: u64, w: u64) -> (u64, u64) {
 mod tests {
     use super::*;
 
+    /// Detection guard for the BMI2+AVX2 backend; emits a visible `SKIPPED`
+    /// line when unavailable so a fully-skipped run doesn't read as green (#193).
     fn has_bmi2() -> bool {
-        is_x86_feature_detected!("bmi2") && is_x86_feature_detected!("avx2")
+        let available = is_x86_feature_detected!("bmi2") && is_x86_feature_detected!("avx2");
+        if !available {
+            crate::util::simd::note_simd_skip("bmi2+avx2");
+        }
+        available
     }
 
     #[test]
     fn test_simple_csv() {
         if !has_bmi2() {
-            eprintln!("Skipping BMI2 test: CPU doesn't support BMI2");
             return;
         }
 

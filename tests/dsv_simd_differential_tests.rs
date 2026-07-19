@@ -123,11 +123,6 @@ fn assert_backends_match_scalar(
     }
 }
 
-/// Assert the carry-correct (prefix-xor) backends match scalar.
-fn assert_matches_scalar(label: &str, text: &[u8], config: &DsvConfig) {
-    assert_backends_match_scalar(&prefix_xor_backends(), label, text, config);
-}
-
 /// Build an input whose quoted span opens at byte `open`, is longer than one
 /// 64-byte chunk (so it always crosses a boundary), and swallows delimiters and
 /// newlines that must therefore be masked.
@@ -150,11 +145,14 @@ fn spanning_quote_input(open: usize) -> Vec<u8> {
 
 #[test]
 fn test_quote_at_every_offset_matches_scalar() {
+    // Detect backends once so a missing feature prints one SKIPPED line per
+    // test rather than one per assertion (#193).
+    let backends = prefix_xor_backends();
     let config = DsvConfig::default();
     // Opening quote at every byte offset across three 64-byte chunk boundaries.
     for open in 0..192usize {
         let text = spanning_quote_input(open);
-        assert_matches_scalar(&format!("open={open}"), &text, &config);
+        assert_backends_match_scalar(&backends, &format!("open={open}"), &text, &config);
     }
 }
 
@@ -164,6 +162,7 @@ fn test_bit63_carry_regression() {
     // delimiter at offset 64 (first bit of chunk 1) stays masked. Also check the
     // neighboring boundary bits 62/64 and the next boundary at 127/128. The
     // toggle64 backends fail this (#149) and are covered separately below.
+    let backends = prefix_xor_backends();
     let config = DsvConfig::default();
     for open in [62usize, 63, 64, 65, 126, 127, 128, 129] {
         let mut text = vec![b'a'; open + 80];
@@ -172,7 +171,7 @@ fn test_bit63_carry_regression() {
         text[open + 7] = b'\n'; // newline inside quotes -> masked
         text[open + 40] = b'"'; // closes the span in a later chunk
         text[open + 41] = b','; // real delimiter, outside quotes
-        assert_matches_scalar(&format!("boundary open={open}"), &text, &config);
+        assert_backends_match_scalar(&backends, &format!("boundary open={open}"), &text, &config);
     }
 }
 
@@ -181,6 +180,7 @@ fn test_random_csv_matches_scalar() {
     // Deterministic fuzz: randomized bytes over an alphabet of ordinary chars
     // plus every special byte used by the configs below (delimiters, newline,
     // quote, CR). Chunk-spanning quoted regions arise naturally.
+    let backends = prefix_xor_backends();
     let mut rng = ChaCha8Rng::seed_from_u64(0x9E37_79B9_7F4A_7C15);
     let alphabet = *b"ab,\t;\n\r\" ";
     let configs = [
@@ -195,7 +195,7 @@ fn test_random_csv_matches_scalar() {
             .map(|_| alphabet[rng.gen_range(0..alphabet.len())])
             .collect();
         let config = &configs[rng.gen_range(0..configs.len())];
-        assert_matches_scalar("fuzz", &text, config);
+        assert_backends_match_scalar(&backends, "fuzz", &text, config);
     }
 }
 

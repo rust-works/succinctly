@@ -58,12 +58,13 @@ pub fn popcount_512_scalar(data: &[u8; 64]) -> u32 {
 /// suites (and, absent emulation, SVE2) read as "passed" without asserting
 /// anything. Routing every skip through this helper makes the skips visible and
 /// countable (grep the test output for `SKIPPED`), so a fully-skipped SIMD suite
-/// no longer looks green. See #191; applied to the x86 sites in #193 and the
-/// remaining SVE2 sites in #194.
-// Used today only by the aarch64 SVE2 test modules; the x86 BMI2/AVX2/SSE2
-// sites adopt it in #193, so it is dead on x86-only builds until then.
+/// no longer looks green. See #191; wired into the x86 BMI2/AVX2/POPCNT sites
+/// (#193), with the remaining SVE2 sites tracked in #194.
+///
+/// CI additionally pins the expected feature set hard via the
+/// `SUCCINCTLY_EXPECT_SIMD` expectation test (`tests/simd_expectation_tests.rs`),
+/// so a runner that stops exposing a feature fails the leg instead of skipping.
 #[cfg(test)]
-#[allow(dead_code)] // STYLE-0005: test-only skip helper; dead on x86 builds until #193 wires it in
 pub(crate) fn note_simd_skip(feature: &str) {
     eprintln!("SKIPPED: SIMD test - CPU feature `{feature}` unavailable");
 }
