@@ -155,10 +155,13 @@ pub unsafe fn toggle64_sve2(carry: u64, quote_mask: u64) -> (u64, u64) {
     // Formula: ((addend << 1) | c) + !quote_mask
     let comp_w = !quote_mask;
     let shifted = (addend << 1) | c;
-    let (result, overflow) = shifted.overflowing_add(comp_w);
+    let result = shifted.wrapping_add(comp_w);
 
-    // New carry depends on overflow
-    let new_carry = u64::from(overflow);
+    // Quote state after this chunk = incoming state XOR quote-count parity.
+    // The adder's carry-out cannot be used here: `addend << 1` drops a bit
+    // deposited at position 63, so a quote that opens at bit 63 never
+    // produces an overflow and the carry would be lost (#149).
+    let new_carry = (quote_mask.count_ones() as u64 + c) & 1;
 
     (result, new_carry)
 }
@@ -352,48 +355,61 @@ mod tests {
     }
 
     #[test]
-    fn test_toggle64_matches_prefix_xor() {
+    fn test_toggle64_matches_bit_serial_reference() {
         if !has_sve2() {
             return;
         }
 
-        // Reference implementation using the same algorithm as toggle64_sve2/toggle64_bmi2
-        // but without BDEP (uses scalar PDEP-equivalent logic).
+        // Independent bit-serial oracle: walk the word tracking an inside-quotes
+        // flag, exactly like the scalar DSV parser. Deliberately NOT a scalar
+        // port of the BDEP/adder formula — the previous reference re-implemented
+        // that formula and so inherited its bit-63 carry bug (#149).
+        //
+        // Convention (matches the adder formula): a quote bit takes its
+        // post-toggle state — an opening quote reads as inside (0), a closing
+        // quote as outside (1).
         fn toggle64_reference(carry: u64, quote_mask: u64) -> (u64, u64) {
-            const ODDS_MASK: u64 = 0x5555_5555_5555_5555;
-            let c = carry & 0x1;
-
-            // Scalar PDEP equivalent: deposit alternating bits into quote positions
-            let mut addend = 0u64;
-            let mut src_bit = 0;
+            let mut inside = carry & 1 == 1;
+            let mut outside_mask = 0u64;
             for i in 0..64 {
                 if (quote_mask >> i) & 1 == 1 {
-                    let bit = (ODDS_MASK << c >> src_bit) & 1;
-                    addend |= bit << i;
-                    src_bit += 1;
+                    inside = !inside;
+                }
+                if !inside {
+                    outside_mask |= 1 << i;
                 }
             }
-
-            let comp_w = !quote_mask;
-            let shifted = (addend << 1) | c;
-            let (result, overflow) = shifted.overflowing_add(comp_w);
-            let new_carry = u64::from(overflow);
-
-            (result, new_carry)
+            (outside_mask, u64::from(inside))
         }
 
-        // Test various quote patterns
-        let patterns = [
+        // Deterministic PRNG for wide mask coverage without a rand dependency.
+        fn splitmix64(state: &mut u64) -> u64 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        // Fixed edge patterns (bit 63 is the #149 regression), every single-bit
+        // mask, and 512 pseudo-random masks.
+        let mut patterns = vec![
             0u64,
             1,
             0b11,
             0b101,
             0b1001,
             0x8000_0000_0000_0000,
+            0xC000_0000_0000_0000,
+            0x8000_0000_0000_0001,
             0xAAAA_AAAA_AAAA_AAAA,
             0x5555_5555_5555_5555,
             0xFF00_FF00_FF00_FF00,
+            !0u64,
         ];
+        patterns.extend((0..64).map(|i| 1u64 << i));
+        let mut state = 0x149u64;
+        patterns.extend((0..512).map(|_| splitmix64(&mut state)));
 
         for &quote_mask in &patterns {
             for carry in [0u64, 1] {
