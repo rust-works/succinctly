@@ -548,6 +548,103 @@ fn test_exit_status_fast_path_last_value_wins() -> Result<()> {
     Ok(())
 }
 
+// -----------------------------------------------------------------------------
+// Exit status on the NON-fast path (#244).
+//
+// Non-identity filters never hit the identity fast path (the is_identity()
+// gate), regardless of -c. These lock in the currently-correct exit codes so
+// the #178 fast-path fix can't regress the path that already works.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_exit_status_nonfast_true() -> Result<()> {
+    let (out, code) = run_jq_stdin(".a", r#"{"a":true}"#, &["-e"])?;
+    assert_eq!(out, "true\n");
+    assert_eq!(code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_nonfast_false() -> Result<()> {
+    let (out, code) = run_jq_stdin(".a", r#"{"a":false}"#, &["-e"])?;
+    assert_eq!(out, "false\n");
+    assert_eq!(code, 1, "false on the non-fast path must exit 1");
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_nonfast_null() -> Result<()> {
+    let (out, code) = run_jq_stdin(".a", r#"{"a":null}"#, &["-e"])?;
+    assert_eq!(out, "null\n");
+    assert_eq!(code, 1, "null on the non-fast path must exit 1");
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_nonfast_number() -> Result<()> {
+    let (out, code) = run_jq_stdin(".a", r#"{"a":1}"#, &["-e"])?;
+    assert_eq!(out, "1\n");
+    assert_eq!(code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_nonfast_empty_string_is_truthy() -> Result<()> {
+    let (out, code) = run_jq_stdin(".a", r#"{"a":""}"#, &["-e"])?;
+    assert_eq!(out, "\"\"\n");
+    // Only false and null are falsy in jq; the empty string is truthy.
+    assert_eq!(code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_nonfast_missing_key_is_null() -> Result<()> {
+    // A missing key produces null output (exit 1), not empty output (exit 4).
+    let (out, code) = run_jq_stdin(".a", "{}", &["-e"])?;
+    assert_eq!(out, "null\n");
+    assert_eq!(code, 1);
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_nonfast_no_output() -> Result<()> {
+    let (out, code) = run_jq_stdin(".[] | select(. > 5)", "[1,2,3]", &["-e"])?;
+    assert_eq!(out, "");
+    assert_eq!(code, 4, "no output with -e must exit 4");
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_nonfast_last_value_wins() -> Result<()> {
+    // With multiple outputs, exit status reflects the LAST output value.
+    let (out, code) = run_jq_stdin(".[]", "[true,false]", &["-e"])?;
+    assert_eq!(out, "true\nfalse\n");
+    assert_eq!(code, 1);
+
+    let (out, code) = run_jq_stdin(".[]", "[false,true]", &["-e"])?;
+    assert_eq!(out, "false\ntrue\n");
+    assert_eq!(code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_nonfast_long_flag() -> Result<()> {
+    let (out, code) = run_jq_stdin(".a", r#"{"a":false}"#, &["--exit-status"])?;
+    assert_eq!(out, "false\n");
+    assert_eq!(code, 1, "--exit-status must behave like -e");
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_nonfast_compact() -> Result<()> {
+    // Compact mode enables the identity fast path, but only for the identity
+    // filter; a non-identity filter with -c must still exit 1 on false.
+    let (out, code) = run_jq_stdin(".a", r#"{"a":false}"#, &["-c", "-e"])?;
+    assert_eq!(out, "false\n");
+    assert_eq!(code, 1);
+    Ok(())
+}
+
 // =============================================================================
 // Multiple Input Tests
 // =============================================================================
