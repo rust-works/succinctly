@@ -24,12 +24,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Successful results are reused across runs (max-cache-age 1d), so a
+      # retry or re-run only re-checks links that actually failed. lychee
+      # never caches failures, so a flake can't stick.
+      - name: Restore lychee cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .lycheecache
+          key: cache-lychee-${{ github.sha }}
+          restore-keys: cache-lychee-
+
       - name: Check markdown links
+        id: lychee
         uses: lycheeverse/lychee-action@v2
         with:
+          # Don't fail yet; the retry step below decides the job outcome.
+          fail: false
           args: >-
             --verbose
             --no-progress
+            --cache
+            --max-cache-age 1d
+            --max-retries 3
+            --retry-wait-time 2
             --accept 100..=399
             --exclude-path ./target
             --exclude-path ./data
@@ -48,5 +65,44 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Fail if broken links found
-        run: exit ${{ steps.lychee.outputs.exit_code }}
+      # Self-heal transient flakes: the first attempt cached every successful
+      # link, so this re-checks only the links that just failed. lychee does
+      # not retry connect-phase resets internally, so a second in-job attempt
+      # is the only way to heal them without re-running the whole job.
+      - name: Retry links that failed the first attempt
+        if: steps.lychee.outputs.exit_code != '0'
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --verbose
+            --no-progress
+            --cache
+            --max-cache-age 1d
+            --max-retries 3
+            --retry-wait-time 2
+            --accept 100..=399
+            --exclude-path ./target
+            --exclude-path ./data
+            --exclude '^https://crates\.io/crates/'
+            --exclude '^https://docs\.rs/'
+            --exclude '^https://www\.intel\.com/'
+            --exclude '^https://dl\.acm\.org/'
+            --exclude '^https://lib\.rs/'
+            --exclude '^https://developer\.arm\.com/'
+            --exclude '^https://www\.agner\.org/'
+            --exclude '^https://github\.com/rust-works/succinctly/compare/v'
+            --exclude '^https://www\.cs\.cmu\.edu/'
+            --exclude '^https://doi\.org/'
+            --exclude '^https://no-color\.org/'
+            '**/*.md'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # actions/cache's automatic post-save is skipped on job failure; save
+      # explicitly so successes from a failing run still make the next run cheap.
+      - name: Save lychee cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .lycheecache
+          key: cache-lychee-${{ github.sha }}
