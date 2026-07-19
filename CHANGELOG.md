@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `jq -R -s` now yields the entire input as a single string instead of an array of per-line strings, matching jq (#176)
+
 ## [0.7.0] - 2026-04-05
 
 ### Added

@@ -1016,6 +1016,16 @@ fn get_inputs(args: &JqCommand) -> std::result::Result<Result<Vec<OwnedValue>>, 
         inputs
     };
 
+    // jq -R -s: the entire input (all files concatenated) becomes a single
+    // string; no line splitting and no array wrap.
+    if args.raw_input && args.slurp && args.input_dsv.is_none() {
+        let mut combined = String::new();
+        for (_, raw) in &raw_inputs {
+            combined.push_str(raw);
+        }
+        return Ok(Ok(vec![OwnedValue::String(combined)]));
+    }
+
     // Process based on input mode
     let mut values = Vec::new();
 
