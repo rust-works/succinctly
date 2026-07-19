@@ -34,3 +34,6 @@ data/bench/results/
 # Build artifacts
 *.rlib
 libtest_no_std.rlib
+
+# lychee link-checker cache (written by `lychee --cache`, persisted in CI)
+.lycheecache
