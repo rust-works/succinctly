@@ -1399,11 +1399,7 @@ mod tests {
     /// Detection guard for AVX2; emits a visible `SKIPPED` line when
     /// unavailable so a fully-skipped kernel doesn't read as green (#193).
     fn has_avx2() -> bool {
-        let available = is_x86_feature_detected!("avx2");
-        if !available {
-            crate::util::simd::note_simd_skip("avx2");
-        }
-        available
+        crate::util::simd::note_simd_skip_unless(is_x86_feature_detected!("avx2"), "avx2")
     }
 
     /// Multibyte UTF-8 cases sized to hit the SSE2 16-byte loop, the AVX2

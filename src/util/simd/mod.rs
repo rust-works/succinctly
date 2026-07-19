@@ -69,6 +69,20 @@ pub(crate) fn note_simd_skip(feature: &str) {
     eprintln!("SKIPPED: SIMD test - CPU feature `{feature}` unavailable");
 }
 
+/// Note a skip when `available` is false, passing the flag through.
+///
+/// Feature guards call this as a single always-executed expression, so the
+/// skip branch lives here — covered by its own test even on hardware that has
+/// every feature — rather than as a dead line in each guard that coverage on
+/// fully-featured CI runners can never reach (#193).
+#[cfg(test)]
+pub(crate) fn note_simd_skip_unless(available: bool, feature: &str) -> bool {
+    if !available {
+        note_simd_skip(feature);
+    }
+    available
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +98,14 @@ mod tests {
         // Exercise the shared skip-visibility helper directly so it is covered
         // even on arches where no feature-gated SIMD test calls it (see #191).
         note_simd_skip("test-feature");
+    }
+
+    #[test]
+    fn test_note_simd_skip_unless_both_branches() {
+        // Both arms of the shared guard helper, so per-module feature guards
+        // stay fully covered even on hardware that has every feature (#193).
+        assert!(note_simd_skip_unless(true, "test-feature"));
+        assert!(!note_simd_skip_unless(false, "test-feature"));
     }
 
     #[test]

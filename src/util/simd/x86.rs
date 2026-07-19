@@ -215,11 +215,7 @@ mod tests {
     /// Detection guard for POPCNT; emits a visible `SKIPPED` line when
     /// unavailable so a fully-skipped run doesn't read as green (#193).
     fn has_popcnt() -> bool {
-        let available = is_x86_feature_detected!("popcnt");
-        if !available {
-            crate::util::simd::note_simd_skip("popcnt");
-        }
-        available
+        crate::util::simd::note_simd_skip_unless(is_x86_feature_detected!("popcnt"), "popcnt")
     }
 
     #[test]
@@ -265,11 +261,7 @@ mod tests {
     /// Detection guard for BMI2; emits a visible `SKIPPED` line when
     /// unavailable so a fully-skipped run doesn't read as green (#193).
     fn has_bmi2() -> bool {
-        let available = is_x86_feature_detected!("bmi2");
-        if !available {
-            crate::util::simd::note_simd_skip("bmi2");
-        }
-        available
+        crate::util::simd::note_simd_skip_unless(is_x86_feature_detected!("bmi2"), "bmi2")
     }
 
     #[test]

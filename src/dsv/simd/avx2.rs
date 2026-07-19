@@ -170,11 +170,7 @@ mod tests {
     /// Detection guard for the AVX2 backend; emits a visible `SKIPPED` line
     /// when unavailable so a fully-skipped run doesn't read as green (#193).
     fn has_avx2() -> bool {
-        let available = is_x86_feature_detected!("avx2");
-        if !available {
-            crate::util::simd::note_simd_skip("avx2");
-        }
-        available
+        crate::util::simd::note_simd_skip_unless(is_x86_feature_detected!("avx2"), "avx2")
     }
 
     #[test]
