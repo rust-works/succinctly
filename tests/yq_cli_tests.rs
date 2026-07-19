@@ -37,6 +37,33 @@ fn run_yq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(Strin
     Ok((stdout, exit_code))
 }
 
+/// Helper to run yq command with input from stdin, capturing stderr too
+fn run_yq_stdin_with_stderr(
+    filter: &str,
+    input: &str,
+    extra_args: &[&str],
+) -> Result<(String, String, i32)> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(extra_args)
+        .arg(filter)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(input.as_bytes())?;
+    }
+
+    let output = cmd.wait_with_output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    Ok((stdout, stderr, exit_code))
+}
+
 /// Helper to run yq command with file input
 fn run_yq_file(filter: &str, file_path: &str, extra_args: &[&str]) -> Result<(String, i32)> {
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
@@ -796,6 +823,53 @@ fn test_yaml_anchor_alias_without_merge() -> Result<()> {
     let (output, exit_code) = run_yq_stdin(".ref.x", input, &["-o", "json"])?;
     assert_eq!(exit_code, 0);
     assert_eq!(output.trim(), "1");
+    Ok(())
+}
+
+// =============================================================================
+// Alias cycle rejection (#153) - cyclic anchors must be a clean parse error,
+// not a stack-overflow abort
+// =============================================================================
+
+#[test]
+fn test_yaml_alias_cycle_is_parse_error() -> Result<()> {
+    // Issue #153 repro: self-referential anchor + a query that follows it.
+    // Before the fix this aborted with a stack overflow (exit 134).
+    let input = "a: &anchor\n  self: *anchor";
+    let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".a.self.self", input, &[])?;
+    assert_eq!(exit_code, 1, "expected clean error exit, stderr: {stderr}");
+    assert_eq!(stdout, "", "no output should be produced: {stdout}");
+    assert!(
+        stderr.contains("cyclic alias 'anchor'"),
+        "stderr should name the cycle: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_yaml_alias_cycle_fails_for_identity_filter() -> Result<()> {
+    // Rejection happens at parse time, independent of the filter.
+    let input = "a: &anchor\n  self: *anchor";
+    let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", input, &[])?;
+    assert_eq!(exit_code, 1, "expected clean error exit, stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("cyclic alias 'anchor'"),
+        "stderr should name the cycle: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_yaml_direct_self_alias_cycle() -> Result<()> {
+    let input = "a: &x *x";
+    let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", input, &[])?;
+    assert_eq!(exit_code, 1, "expected clean error exit, stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("cyclic alias 'x'"),
+        "stderr should name the cycle: {stderr}"
+    );
     Ok(())
 }
 
