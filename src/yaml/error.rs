@@ -128,6 +128,14 @@ pub enum YamlError {
         /// What was expected
         context: &'static str,
     },
+
+    /// Nesting depth of flow collections / inline sequence items exceeded the cap.
+    NestingTooDeep {
+        /// Byte offset where the limit was exceeded
+        offset: usize,
+        /// The configured depth limit
+        limit: usize,
+    },
 }
 
 impl fmt::Display for YamlError {
@@ -222,6 +230,12 @@ impl fmt::Display for YamlError {
             }
             Self::UnexpectedEof { context } => {
                 write!(f, "unexpected end of input: {context}")
+            }
+            Self::NestingTooDeep { offset, limit } => {
+                write!(
+                    f,
+                    "nesting depth exceeds limit of {limit} at offset {offset}"
+                )
             }
         }
     }

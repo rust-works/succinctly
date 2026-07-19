@@ -114,6 +114,14 @@ pub struct SemiIndex {
     pub aliases: BTreeMap<usize, usize>,
 }
 
+/// Maximum nesting depth for recursively-parsed constructs (flow collections
+/// and inline `- - x` sequence-item chains). Bounds parser stack growth on
+/// pathological input like `[`×20000, which otherwise aborts the process with
+/// a stack overflow (#152). Real documents nest ~30-50 levels;
+/// `tests/deep_nesting_valid_tests.rs` pins depth 100 as must-parse, so this
+/// cap must stay above that.
+const MAX_NESTING_DEPTH: usize = 128;
+
 /// Parser state for the YAML-lite oracle.
 struct Parser<'a> {
     input: &'a [u8],
@@ -154,6 +162,10 @@ struct Parser<'a> {
     // Explicit key tracking
     /// Whether we have a pending explicit key that needs a value (null if not followed by `:`)
     pending_explicit_key: bool,
+
+    /// Current depth of recursively-parsed constructs, capped at
+    /// [`MAX_NESTING_DEPTH`] to bound call-stack growth
+    nesting_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -188,7 +200,22 @@ impl<'a> Parser<'a> {
             aliases: BTreeMap::new(),
             in_document: false,
             pending_explicit_key: false,
+            nesting_depth: 0,
         }
+    }
+
+    /// Enter a recursively-parsed construct, erroring past [`MAX_NESTING_DEPTH`].
+    /// Callers must decrement `nesting_depth` when the construct's frame exits.
+    #[inline]
+    fn enter_nested(&mut self) -> Result<(), YamlError> {
+        if self.nesting_depth >= MAX_NESTING_DEPTH {
+            return Err(YamlError::NestingTooDeep {
+                offset: self.pos,
+                limit: MAX_NESTING_DEPTH,
+            });
+        }
+        self.nesting_depth += 1;
+        Ok(())
     }
 
     /// Push a type onto the type stack and update the cached current type.
@@ -1172,6 +1199,13 @@ impl<'a> Parser<'a> {
 
     /// Parse a sequence item (starts with `- `).
     fn parse_sequence_item(&mut self, indent: usize) -> Result<(), YamlError> {
+        self.enter_nested()?;
+        let result = self.parse_sequence_item_inner(indent);
+        self.nesting_depth -= 1;
+        result
+    }
+
+    fn parse_sequence_item_inner(&mut self, indent: usize) -> Result<(), YamlError> {
         let _item_start = self.pos;
 
         // Mark the `-` position
@@ -2280,6 +2314,13 @@ impl<'a> Parser<'a> {
 
     /// Parse a flow sequence: `[item1, item2, ...]`
     fn parse_flow_sequence(&mut self) -> Result<(), YamlError> {
+        self.enter_nested()?;
+        let result = self.parse_flow_sequence_inner();
+        self.nesting_depth -= 1;
+        result
+    }
+
+    fn parse_flow_sequence_inner(&mut self) -> Result<(), YamlError> {
         // Mark the `[` position
         self.set_ib();
 
@@ -2374,6 +2415,13 @@ impl<'a> Parser<'a> {
 
     /// Parse a flow mapping: `{key: value, ...}`
     fn parse_flow_mapping(&mut self) -> Result<(), YamlError> {
+        self.enter_nested()?;
+        let result = self.parse_flow_mapping_inner();
+        self.nesting_depth -= 1;
+        result
+    }
+
+    fn parse_flow_mapping_inner(&mut self) -> Result<(), YamlError> {
         // Mark the `{` position
         self.set_ib();
 
@@ -4086,5 +4134,75 @@ mod tests {
             }
             other => panic!("expected mapping, got {other:?}"),
         }
+    }
+
+    // #152: pathological nesting must return an error, not abort the process
+    // with a stack overflow. The passing of these tests is itself the proof
+    // (an overflow would kill the test harness).
+
+    #[test]
+    fn test_deep_flow_sequence_errors_instead_of_aborting() {
+        let yaml = format!("a: {}{}", "[".repeat(20_000), "]".repeat(20_000));
+        let result = build_semi_index(yaml.as_bytes());
+        assert!(matches!(result, Err(YamlError::NestingTooDeep { .. })));
+    }
+
+    #[test]
+    fn test_deep_flow_mapping_errors_instead_of_aborting() {
+        let yaml = "{".repeat(20_000);
+        let result = build_semi_index(yaml.as_bytes());
+        assert!(matches!(result, Err(YamlError::NestingTooDeep { .. })));
+    }
+
+    #[test]
+    fn test_deep_alternating_flow_errors_instead_of_aborting() {
+        let yaml = "[{".repeat(10_000);
+        let result = build_semi_index(yaml.as_bytes());
+        assert!(matches!(result, Err(YamlError::NestingTooDeep { .. })));
+    }
+
+    #[test]
+    fn test_deep_inline_sequence_items_error_instead_of_aborting() {
+        let yaml = format!("{}x", "- ".repeat(20_000));
+        let result = build_semi_index(yaml.as_bytes());
+        assert!(matches!(result, Err(YamlError::NestingTooDeep { .. })));
+    }
+
+    #[test]
+    fn test_nesting_at_cap_parses() {
+        let yaml = format!(
+            "a: {}{}",
+            "[".repeat(MAX_NESTING_DEPTH),
+            "]".repeat(MAX_NESTING_DEPTH)
+        );
+        assert!(build_semi_index(yaml.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_nesting_one_past_cap_errors() {
+        let yaml = format!(
+            "a: {}{}",
+            "[".repeat(MAX_NESTING_DEPTH + 1),
+            "]".repeat(MAX_NESTING_DEPTH + 1)
+        );
+        let result = build_semi_index(yaml.as_bytes());
+        // The 129th `[` sits after the 3-byte `a: ` prefix and 128 accepted `[`s.
+        assert!(matches!(
+            result,
+            Err(YamlError::NestingTooDeep { offset, limit })
+                if limit == MAX_NESTING_DEPTH && offset == 3 + MAX_NESTING_DEPTH
+        ));
+    }
+
+    #[test]
+    fn test_nesting_too_deep_display() {
+        let err = YamlError::NestingTooDeep {
+            offset: 131,
+            limit: 128,
+        };
+        assert_eq!(
+            err.to_string(),
+            "nesting depth exceeds limit of 128 at offset 131"
+        );
     }
 }
