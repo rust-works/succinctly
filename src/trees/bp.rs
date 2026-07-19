@@ -438,7 +438,7 @@ fn build_l2_index_neon(
     l1_min_excess: &[i16],
     l1_block_excess: &[i16],
     num_l2: usize,
-) -> (Vec<i16>, Vec<i16>) {
+) -> (Vec<i32>, Vec<i32>) {
     use core::arch::aarch64::*;
 
     let mut l2_min_excess = Vec::with_capacity(num_l2);
@@ -449,8 +449,14 @@ fn build_l2_index_neon(
     for block_idx in 0..num_l2 {
         let start = block_idx * FACTOR_L2;
         let end = (start + FACTOR_L2).min(num_l1);
-        let mut block_min: i16 = 0;
-        let mut running_excess: i16 = 0;
+        // i32: L2 block-relative excess spans [-65536, 65536], beyond i16
+        // (#188). The i16 SIMD lanes below stay chunk-relative and bounded:
+        // each L1 lane is in [-2048, 2048], so the 7-lane exclusive prefix is
+        // in [-14336, 14336], adjusted_min in [-16384, 14336], and the chunk
+        // sum in [-16384, 16384] — all within i16. Only the cross-chunk
+        // accumulation here is i32.
+        let mut block_min: i32 = 0;
+        let mut running_excess: i32 = 0;
 
         // Process 8 L1 blocks at a time with SIMD
         let mut i = start;
@@ -478,22 +484,19 @@ fn build_l2_index_neon(
                 let shifted4 = vextq_s16(vdupq_n_s16(0), sum2, 4);
                 let prefix_sum = vaddq_s16(sum2, shifted4);
 
-                // Add running_excess offset to prefix sum
-                let offset = vdupq_n_s16(running_excess);
-                let adjusted_prefix = vaddq_s16(prefix_sum, offset);
-
-                // We need exclusive prefix sum for min calculation
-                let exclusive_prefix = vextq_s16(offset, adjusted_prefix, 7);
+                // Zero-based exclusive prefix sum (chunk-relative; the
+                // running_excess offset is applied in scalar i32 below)
+                let exclusive_prefix = vextq_s16(vdupq_n_s16(0), prefix_sum, 7);
 
                 // Add to min_excess: min[i] + exclusive_prefix[i]
                 let adjusted_min = vaddq_s16(min_vals, exclusive_prefix);
 
-                // Find minimum using vminvq_s16
+                // Find chunk-relative minimum, then combine in i32
                 let chunk_min = vminvq_s16(adjusted_min);
-                block_min = block_min.min(chunk_min);
+                block_min = block_min.min(running_excess + i32::from(chunk_min));
 
                 // Update running excess with sum of all 8 values
-                running_excess += vaddvq_s16(excess);
+                running_excess += i32::from(vaddvq_s16(excess));
             }
             i += 8;
         }
@@ -502,8 +505,8 @@ fn build_l2_index_neon(
         while i < end {
             let l1_min = l1_min_excess[i];
             let l1_excess = l1_block_excess[i];
-            block_min = block_min.min(running_excess + l1_min);
-            running_excess += l1_excess;
+            block_min = block_min.min(running_excess + i32::from(l1_min));
+            running_excess += i32::from(l1_excess);
             i += 1;
         }
 
@@ -657,7 +660,7 @@ unsafe fn build_l2_index_sse41_impl(
     l1_min_excess: &[i16],
     l1_block_excess: &[i16],
     num_l2: usize,
-) -> (Vec<i16>, Vec<i16>) {
+) -> (Vec<i32>, Vec<i32>) {
     use core::arch::x86_64::*;
 
     let mut l2_min_excess = Vec::with_capacity(num_l2);
@@ -671,8 +674,14 @@ unsafe fn build_l2_index_sse41_impl(
     for block_idx in 0..num_l2 {
         let start = block_idx * FACTOR_L2;
         let end = (start + FACTOR_L2).min(num_l1);
-        let mut block_min: i16 = 0;
-        let mut running_excess: i16 = 0;
+        // i32: L2 block-relative excess spans [-65536, 65536], beyond i16
+        // (#188). The i16 SIMD lanes below stay chunk-relative and bounded:
+        // each L1 lane is in [-2048, 2048], so the 7-lane exclusive prefix is
+        // in [-14336, 14336], adjusted_min in [-16384, 14336], and the chunk
+        // sum in [-16384, 16384] — all within i16. Only the cross-chunk
+        // accumulation here is i32.
+        let mut block_min: i32 = 0;
+        let mut running_excess: i32 = 0;
 
         // Process 8 L1 blocks at a time with SIMD
         let mut i = start;
@@ -695,30 +704,27 @@ unsafe fn build_l2_index_sse41_impl(
             let shifted4 = _mm_slli_si128(sum2, 8);
             let prefix_sum = _mm_add_epi16(sum2, shifted4);
 
-            // Add running_excess offset
-            let offset = _mm_set1_epi16(running_excess);
-            let adjusted_prefix = _mm_add_epi16(prefix_sum, offset);
-
-            // Exclusive prefix sum
-            let exclusive_prefix = _mm_slli_si128(adjusted_prefix, 2);
-            let exclusive_prefix = _mm_insert_epi16(exclusive_prefix, running_excess as i32, 0);
+            // Zero-based exclusive prefix sum (chunk-relative; the shift pulls
+            // a zero into lane 0, and the running_excess offset is applied in
+            // scalar i32 below)
+            let exclusive_prefix = _mm_slli_si128(prefix_sum, 2);
 
             // Add to min_excess
             let adjusted_min = _mm_add_epi16(min_vals, exclusive_prefix);
 
-            // Find minimum with bias trick
+            // Find chunk-relative minimum with bias trick
             let biased = _mm_add_epi16(adjusted_min, bias);
             let minpos = _mm_minpos_epu16(biased);
             let biased_min = _mm_extract_epi16(minpos, 0) as i16;
             let chunk_min = biased_min.wrapping_add(i16::MIN);
 
-            block_min = block_min.min(chunk_min);
+            block_min = block_min.min(running_excess + i32::from(chunk_min));
 
             // Horizontal sum for running excess
             let sum_lo = _mm_add_epi16(excess, _mm_srli_si128(excess, 8));
             let sum_lo = _mm_add_epi16(sum_lo, _mm_srli_si128(sum_lo, 4));
             let sum_lo = _mm_add_epi16(sum_lo, _mm_srli_si128(sum_lo, 2));
-            running_excess += _mm_extract_epi16(sum_lo, 0) as i16;
+            running_excess += i32::from(_mm_extract_epi16(sum_lo, 0) as i16);
 
             i += 8;
         }
@@ -727,8 +733,8 @@ unsafe fn build_l2_index_sse41_impl(
         while i < end {
             let l1_min = l1_min_excess[i];
             let l1_excess = l1_block_excess[i];
-            block_min = block_min.min(running_excess + l1_min);
-            running_excess += l1_excess;
+            block_min = block_min.min(running_excess + i32::from(l1_min));
+            running_excess += i32::from(l1_excess);
             i += 1;
         }
 
@@ -745,7 +751,7 @@ fn build_l2_index_sse41(
     l1_min_excess: &[i16],
     l1_block_excess: &[i16],
     num_l2: usize,
-) -> (Vec<i16>, Vec<i16>) {
+) -> (Vec<i32>, Vec<i32>) {
     // SAFETY: We check for SSE4.1 support before calling
     unsafe { build_l2_index_sse41_impl(l1_min_excess, l1_block_excess, num_l2) }
 }
@@ -793,7 +799,7 @@ fn build_l2_index_scalar(
     l1_min_excess: &[i16],
     l1_block_excess: &[i16],
     num_l2: usize,
-) -> (Vec<i16>, Vec<i16>) {
+) -> (Vec<i32>, Vec<i32>) {
     let mut l2_min_excess = Vec::with_capacity(num_l2);
     let mut l2_block_excess = Vec::with_capacity(num_l2);
 
@@ -803,14 +809,15 @@ fn build_l2_index_scalar(
         let start = block_idx * FACTOR_L2;
         let end = (start + FACTOR_L2).min(num_l1);
 
-        let mut block_min: i16 = 0;
-        let mut running_excess: i16 = 0;
+        // i32: L2 block-relative excess spans [-65536, 65536] (#188).
+        let mut block_min: i32 = 0;
+        let mut running_excess: i32 = 0;
 
         for i in start..end {
             let l1_min = l1_min_excess[i];
             let l1_excess = l1_block_excess[i];
-            block_min = block_min.min(running_excess + l1_min);
-            running_excess += l1_excess;
+            block_min = block_min.min(running_excess + i32::from(l1_min));
+            running_excess += i32::from(l1_excess);
         }
 
         l2_min_excess.push(block_min);
@@ -1418,7 +1425,7 @@ const FACTOR_L2: usize = 32;
 /// Approximately 6-7% overhead:
 /// - L0: 2 bytes per word (min excess + word excess)
 /// - L1: 4 bytes per 32 words
-/// - L2: 4 bytes per 1024 words
+/// - L2: 8 bytes per 1024 words
 /// - Rank: ~1.5 bytes per 8 words
 ///
 /// # Example
@@ -1456,9 +1463,14 @@ pub struct BalancedParens<W = Vec<u64>, S: SelectSupport = NoSelect> {
     l1_block_excess: Vec<i16>,
 
     /// L2: Per-1024-word block min excess (relative to block start)
-    l2_min_excess: Vec<i16>,
+    ///
+    /// `i32`, not `i16`: an L2 block spans 65536 bits, so block-relative excess
+    /// ranges over [-65536, 65536] and would wrap `i16` at nesting depth
+    /// > 32767 (#188). L0/L1 stay narrow because their spans bound the excess
+    /// to [-64, 64] and [-2048, 2048] respectively.
+    l2_min_excess: Vec<i32>,
     /// L2: Per-1024-word block excess (total excess within this block)
-    l2_block_excess: Vec<i16>,
+    l2_block_excess: Vec<i32>,
 
     // --- Cumulative rank directory for O(1) rank1() ---
     /// Cumulative 1-bit count at the start of each 512-bit block (8 words)
@@ -1486,8 +1498,8 @@ fn build_bp_index(
     Vec<i16>,
     Vec<i16>,
     Vec<i16>,
-    Vec<i16>,
-    Vec<i16>,
+    Vec<i32>,
+    Vec<i32>,
     Vec<u32>,
     Vec<u64>,
     usize,
@@ -1600,14 +1612,15 @@ fn build_bp_index(
                 let start = block_idx * FACTOR_L2;
                 let end = (start + FACTOR_L2).min(num_l1);
 
-                let mut block_min: i16 = 0;
-                let mut running_excess: i16 = 0;
+                // i32: L2 block-relative excess spans [-65536, 65536] (#188).
+                let mut block_min: i32 = 0;
+                let mut running_excess: i32 = 0;
 
                 for i in start..end {
                     let l1_min = l1_min_excess[i];
                     let l1_excess = l1_block_excess[i];
-                    block_min = block_min.min(running_excess + l1_min);
-                    running_excess += l1_excess;
+                    block_min = block_min.min(running_excess + i32::from(l1_min));
+                    running_excess += i32::from(l1_excess);
                 }
 
                 l2_min_excess.push(block_min);
@@ -1630,14 +1643,15 @@ fn build_bp_index(
             let start = block_idx * FACTOR_L2;
             let end = (start + FACTOR_L2).min(num_l1);
 
-            let mut block_min: i16 = 0;
-            let mut running_excess: i16 = 0;
+            // i32: L2 block-relative excess spans [-65536, 65536] (#188).
+            let mut block_min: i32 = 0;
+            let mut running_excess: i32 = 0;
 
             for i in start..end {
                 let l1_min = l1_min_excess[i];
                 let l1_excess = l1_block_excess[i];
-                block_min = block_min.min(running_excess + l1_min);
-                running_excess += l1_excess;
+                block_min = block_min.min(running_excess + i32::from(l1_min));
+                running_excess += i32::from(l1_excess);
             }
 
             l2_min_excess.push(block_min);
@@ -2100,14 +2114,14 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
                         return None;
                     }
 
-                    let min_e = self.l2_min_excess[l2_idx] as i32;
+                    let min_e = self.l2_min_excess[l2_idx];
                     if excess + min_e <= 0 {
                         state = State::CheckL1;
                     } else if pos < self.len {
                         if self.is_close(pos) && excess <= 1 {
                             return Some(pos);
                         }
-                        let l2_excess = self.l2_block_excess[l2_idx] as i32;
+                        let l2_excess = self.l2_block_excess[l2_idx];
                         excess += l2_excess;
                         pos += 64 * FACTOR_L1 * FACTOR_L2;
                         state = State::FromL2;
@@ -2597,16 +2611,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "blocked on #188: L1/L2 excess counters are i16 and overflow past \
-                32767-deep nesting (build panics in debug at bp.rs ~1639, \
-                silently wraps in release). Un-ignore once #188 widens the \
-                counters (including the SIMD build path); run with --ignored to \
-                reproduce the overflow today."]
     fn test_bp_nesting_beyond_i16_excess() {
-        // Overflow ceiling for #188 -- CONFIRMED failing today. Build a chain
-        // 40_000 deep (> i16::MAX) and require navigation to stay correct past
-        // the boundary; see test_bp_deep_nesting_navigation for the same
-        // assertions at a safe depth.
+        // Regression test for #188. Build a chain 40_000 deep (> i16::MAX) and
+        // require navigation to stay correct past the boundary; see
+        // test_bp_deep_nesting_navigation for the same assertions at a safe
+        // depth. The L2 excess counters are i32 so this no longer overflows.
         let depth = 40_000usize;
         let (words, len) = deeply_nested(depth);
         let bp = BalancedParens::new(words, len);
@@ -3550,6 +3559,62 @@ mod tests {
             scalar_excess, sse41_excess,
             "L2 block_excess mismatch: scalar={scalar_excess:?}, sse41={sse41_excess:?}"
         );
+    }
+
+    /// Words whose L2 excess exceeds i16::MAX: one full L2 block of opens
+    /// (excess +65536) followed by one full L2 block of closes (#188).
+    #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    fn beyond_i16_l2_words() -> Vec<u64> {
+        let mut words = vec![u64::MAX; 1024];
+        words.extend(vec![0u64; 1024]);
+        words
+    }
+
+    #[test]
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    fn test_sse41_l2_matches_scalar_beyond_i16() {
+        if !is_x86_feature_detected!("sse4.1") {
+            println!("SSE4.1 not available, skipping test");
+            return;
+        }
+
+        let words = beyond_i16_l2_words();
+        let num_words = words.len();
+        let (l0_min, l0_excess) = build_l0_index(&words, num_words * 64, num_words);
+        let num_l1 = num_words.div_ceil(FACTOR_L1);
+        let num_l2 = num_l1.div_ceil(FACTOR_L2);
+
+        let (l1_min, l1_excess) = build_l1_index_scalar(&l0_min, &l0_excess, num_l1);
+        let (scalar_min, scalar_excess) = build_l2_index_scalar(&l1_min, &l1_excess, num_l2);
+        let (sse41_min, sse41_excess) = build_l2_index_sse41(&l1_min, &l1_excess, num_l2);
+
+        // Verify actual values beyond the i16 range, not just SIMD/scalar agreement
+        assert_eq!(scalar_excess[0], 65536);
+        assert_eq!(scalar_excess[1], -65536);
+        assert_eq!(scalar_min[1], -65536);
+        assert_eq!(scalar_min, sse41_min);
+        assert_eq!(scalar_excess, sse41_excess);
+    }
+
+    #[test]
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    fn test_neon_l2_matches_scalar_beyond_i16() {
+        let words = beyond_i16_l2_words();
+        let num_words = words.len();
+        let (l0_min, l0_excess) = build_l0_index(&words, num_words * 64, num_words);
+        let num_l1 = num_words.div_ceil(FACTOR_L1);
+        let num_l2 = num_l1.div_ceil(FACTOR_L2);
+
+        let (l1_min, l1_excess) = build_l1_index_scalar(&l0_min, &l0_excess, num_l1);
+        let (scalar_min, scalar_excess) = build_l2_index_scalar(&l1_min, &l1_excess, num_l2);
+        let (neon_min, neon_excess) = build_l2_index_neon(&l1_min, &l1_excess, num_l2);
+
+        // Verify actual values beyond the i16 range, not just SIMD/scalar agreement
+        assert_eq!(scalar_excess[0], 65536);
+        assert_eq!(scalar_excess[1], -65536);
+        assert_eq!(scalar_min[1], -65536);
+        assert_eq!(scalar_min, neon_min);
+        assert_eq!(scalar_excess, neon_excess);
     }
 
     /// Test that full BalancedParens construction with SSE4.1 produces correct results.
