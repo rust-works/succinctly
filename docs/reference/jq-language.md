@@ -112,9 +112,9 @@ The implementation covers ~95% of jq functionality and is production-ready.
 - [x] `explode` / `implode`
 - [x] `utf8bytelength`
 - [x] `indices(s)` / `index(s)` / `rindex(s)`
-- [x] `test(re)` (substring without regex feature)
+- [x] `test(re)` (regex with `regex` feature; substring fallback without)
 
-### Regular Expressions (with `regex` feature)
+### Regular Expressions (with `regex` feature, included in `cli`)
 - [x] `match(re)` / `match(re; flags)`
 - [x] `capture(re)`
 - [x] `scan(re)`

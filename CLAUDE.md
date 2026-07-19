@@ -286,7 +286,7 @@ echo '{"data": {"nested": {"value": 42}}}' | succinctly jq 'at_offset(9) | .nest
 | `simd`              | Explicit SIMD intrinsics                  |
 | `portable-popcount` | Portable bitwise popcount                 |
 | `serde`             | Serde serialize/deserialize support       |
-| `regex`             | Regex builtins in jq (test, match, sub)   |
+| `regex`             | Regex builtins in jq (included in `cli`)  |
 | `cli`               | CLI tool (jq, yq, locate, generators)     |
 | `bench-runner`      | Unified benchmark runner (bench list/run) |
 | `large-tests`       | 1GB bitvector tests                       |

@@ -239,7 +239,7 @@ See [docs/benchmarks/rust-parsers.md](docs/benchmarks/rust-parsers.md), [docs/be
 | `std`   | Enable std library (default, required for runtime CPU detection) |
 | `serde` | Enable serialization/deserialization support                     |
 | `cli`   | Build the CLI tool                                               |
-| `regex` | Enable regex support in jq queries                               |
+| `regex` | Enable regex support in jq queries (included in `cli`)           |
 
 ### Test Features
 
