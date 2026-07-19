@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use std::string::ToString;
 
 use super::index::YamlIndex;
+use super::scalar::{resolve_plain, ResolvedScalar};
 use super::simd::find_json_escape;
 
 // ============================================================================
@@ -1284,9 +1285,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 match stream_yaml_string_to_json(out, &s) {
                     Ok(true) => Ok(()), // Written directly as JSON string
                     Ok(false) => {
-                        // Unquoted/block scalar - need type detection
                         if let Ok(str_val) = s.as_str() {
-                            stream_yaml_scalar_as_json(out, &str_val)
+                            if s.is_unquoted() {
+                                // Plain scalar - resolve per the core schema
+                                stream_yaml_scalar_as_json(out, &str_val)
+                            } else {
+                                // Block scalars are always strings
+                                stream_json_string(out, &str_val)
+                            }
                         } else {
                             out.write_str("null")
                         }
@@ -1356,9 +1362,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 match write_yaml_string_to_json(output, &s) {
                     Ok(true) => {} // Written directly as JSON string
                     Ok(false) => {
-                        // Unquoted/block scalar - need type detection, fall back to original path
                         if let Ok(str_val) = s.as_str() {
-                            write_yaml_scalar_as_json(output, &str_val);
+                            if s.is_unquoted() {
+                                // Plain scalar - resolve per the core schema
+                                write_yaml_scalar_as_json(output, &str_val);
+                            } else {
+                                // Block scalars are always strings
+                                write_json_string(output, &str_val);
+                            }
                         } else {
                             output.push_str("null");
                         }
@@ -1641,39 +1652,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         match self.value() {
             YamlValue::Null => "!!null",
             YamlValue::String(s) => {
-                // Try to infer type from unquoted scalars
+                // Infer type from plain scalars per the YAML 1.2 core schema
                 if s.is_unquoted() {
                     if let Ok(str_val) = s.as_str() {
-                        let s = str_val.as_ref();
-                        // Check for null
-                        if matches!(s, "null" | "~" | "") {
-                            return "!!null";
-                        }
-                        // Check for bool
-                        if matches!(s, "true" | "True" | "TRUE" | "false" | "False" | "FALSE") {
-                            return "!!bool";
-                        }
-                        // Check for int
-                        if s.parse::<i64>().is_ok() {
-                            return "!!int";
-                        }
-                        // Check for float (including special values)
-                        if s.parse::<f64>().is_ok()
-                            || matches!(
-                                s,
-                                ".inf"
-                                    | ".Inf"
-                                    | ".INF"
-                                    | "-.inf"
-                                    | "-.Inf"
-                                    | "-.INF"
-                                    | ".nan"
-                                    | ".NaN"
-                                    | ".NAN"
-                            )
-                        {
-                            return "!!float";
-                        }
+                        return resolve_plain(&str_val).tag();
                     }
                 }
                 "!!str"
@@ -1809,9 +1791,14 @@ fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlVal
             match write_yaml_string_to_json(output, &s) {
                 Ok(true) => {} // Written directly as JSON string
                 Ok(false) => {
-                    // Unquoted/block scalar - need type detection, fall back to original path
                     if let Ok(str_val) = s.as_str() {
-                        write_yaml_scalar_as_json(output, &str_val);
+                        if s.is_unquoted() {
+                            // Plain scalar - resolve per the core schema
+                            write_yaml_scalar_as_json(output, &str_val);
+                        } else {
+                            // Block scalars are always strings
+                            write_json_string(output, &str_val);
+                        }
                     } else {
                         output.push_str("null");
                     }
@@ -2337,128 +2324,22 @@ fn write_f64(output: &mut String, f: f64) {
 
 /// Fast YAML scalar to JSON conversion.
 ///
-/// This function is optimized to quickly identify the type of a YAML scalar
-/// by checking the first byte before doing more expensive parsing.
+/// Resolution is delegated to [`resolve_plain`] (YAML 1.2 core schema);
+/// this function only maps the resolution onto the JSON output buffer.
+/// Numeric values are emitted from the parsed value, never echoed from the
+/// source text (hex/octal like `0x2A` must appear as `42` in JSON).
 #[inline]
 fn write_yaml_scalar_as_json(output: &mut String, str_val: &str) {
-    let bytes = str_val.as_bytes();
-
-    // Empty string -> null
-    if bytes.is_empty() {
-        output.push_str("null");
-        return;
+    match resolve_plain(str_val) {
+        ResolvedScalar::Null => output.push_str("null"),
+        ResolvedScalar::Bool(true) => output.push_str("true"),
+        ResolvedScalar::Bool(false) => output.push_str("false"),
+        ResolvedScalar::Int(n) => write_i64(output, n),
+        ResolvedScalar::Float(f) if f.is_finite() => write_f64(output, f),
+        // JSON cannot represent the `.inf`/`.nan` family.
+        ResolvedScalar::Float(_) => output.push_str("null"),
+        ResolvedScalar::Str => write_json_string(output, str_val),
     }
-
-    let first = bytes[0];
-
-    // Fast path: check first byte to determine possible types
-    match first {
-        // Could be null or number
-        b'n' => {
-            if str_val == "null" {
-                output.push_str("null");
-                return;
-            }
-        }
-        // Could be "~" (null)
-        b'~' => {
-            if bytes.len() == 1 {
-                output.push_str("null");
-                return;
-            }
-        }
-        // Could be true/True/TRUE
-        b't' => {
-            if str_val == "true" {
-                output.push_str("true");
-                return;
-            }
-        }
-        b'T' => {
-            if str_val == "True" || str_val == "TRUE" {
-                output.push_str("true");
-                return;
-            }
-        }
-        // Could be false/False/FALSE
-        b'f' => {
-            if str_val == "false" {
-                output.push_str("false");
-                return;
-            }
-        }
-        b'F' => {
-            if str_val == "False" || str_val == "FALSE" {
-                output.push_str("false");
-                return;
-            }
-        }
-        // Could be .inf, .nan, etc.
-        b'.' => match str_val {
-            ".inf" | ".Inf" | ".INF" | ".nan" | ".NaN" | ".NAN" => {
-                output.push_str("null");
-                return;
-            }
-            _ => {}
-        },
-        // Could be negative number or -.inf
-        b'-' => {
-            if bytes.len() > 1 {
-                match bytes[1] {
-                    b'.' => {
-                        if str_val == "-.inf" || str_val == "-.Inf" || str_val == "-.INF" {
-                            output.push_str("null");
-                            return;
-                        }
-                    }
-                    b'0'..=b'9' => {
-                        // Likely a negative number - try parsing
-                        if let Ok(n) = str_val.parse::<i64>() {
-                            write_i64(output, n);
-                            return;
-                        }
-                        if let Ok(f) = str_val.parse::<f64>() {
-                            if !f.is_nan() && !f.is_infinite() {
-                                write_f64(output, f);
-                                return;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        // Digits - likely a number
-        b'0'..=b'9' => {
-            if let Ok(n) = str_val.parse::<i64>() {
-                write_i64(output, n);
-                return;
-            }
-            if let Ok(f) = str_val.parse::<f64>() {
-                if !f.is_nan() && !f.is_infinite() {
-                    write_f64(output, f);
-                    return;
-                }
-            }
-        }
-        // Could be +number or +.inf
-        b'+' if bytes.len() > 1 && bytes[1].is_ascii_digit() => {
-            if let Ok(n) = str_val.parse::<i64>() {
-                write_i64(output, n);
-                return;
-            }
-            if let Ok(f) = str_val.parse::<f64>() {
-                if !f.is_nan() && !f.is_infinite() {
-                    write_f64(output, f);
-                    return;
-                }
-            }
-        }
-        _ => {}
-    }
-
-    // It's a string - write with JSON escaping
-    write_json_string(output, str_val);
 }
 
 // ============================================================================
@@ -2476,7 +2357,13 @@ fn stream_yaml_value_as_json<W: AsRef<[u64]>, Out: core::fmt::Write>(
             Ok(true) => Ok(()),
             Ok(false) => {
                 if let Ok(str_val) = s.as_str() {
-                    stream_yaml_scalar_as_json(out, &str_val)
+                    if s.is_unquoted() {
+                        // Plain scalar - resolve per the core schema
+                        stream_yaml_scalar_as_json(out, &str_val)
+                    } else {
+                        // Block scalars are always strings
+                        stream_json_string(out, &str_val)
+                    }
                 } else {
                     out.write_str("null")
                 }
@@ -2929,97 +2816,16 @@ fn stream_yaml_scalar_as_json<Out: core::fmt::Write>(
     out: &mut Out,
     str_val: &str,
 ) -> core::fmt::Result {
-    let bytes = str_val.as_bytes();
-
-    if bytes.is_empty() {
-        return out.write_str("null");
+    match resolve_plain(str_val) {
+        ResolvedScalar::Null => out.write_str("null"),
+        ResolvedScalar::Bool(true) => out.write_str("true"),
+        ResolvedScalar::Bool(false) => out.write_str("false"),
+        ResolvedScalar::Int(n) => write!(out, "{n}"),
+        ResolvedScalar::Float(f) if f.is_finite() => write!(out, "{f}"),
+        // JSON cannot represent the `.inf`/`.nan` family.
+        ResolvedScalar::Float(_) => out.write_str("null"),
+        ResolvedScalar::Str => stream_json_string(out, str_val),
     }
-
-    let first = bytes[0];
-
-    match first {
-        b'n' => {
-            if str_val == "null" {
-                return out.write_str("null");
-            }
-        }
-        b'~' => {
-            if bytes.len() == 1 {
-                return out.write_str("null");
-            }
-        }
-        b't' => {
-            if str_val == "true" {
-                return out.write_str("true");
-            }
-        }
-        b'T' => {
-            if str_val == "True" || str_val == "TRUE" {
-                return out.write_str("true");
-            }
-        }
-        b'f' => {
-            if str_val == "false" {
-                return out.write_str("false");
-            }
-        }
-        b'F' => {
-            if str_val == "False" || str_val == "FALSE" {
-                return out.write_str("false");
-            }
-        }
-        b'.' => match str_val {
-            ".inf" | ".Inf" | ".INF" | ".nan" | ".NaN" | ".NAN" => {
-                return out.write_str("null");
-            }
-            _ => {}
-        },
-        b'-' => {
-            if bytes.len() > 1 {
-                match bytes[1] {
-                    b'.' => {
-                        if str_val == "-.inf" || str_val == "-.Inf" || str_val == "-.INF" {
-                            return out.write_str("null");
-                        }
-                    }
-                    b'0'..=b'9' => {
-                        if let Ok(n) = str_val.parse::<i64>() {
-                            return write!(out, "{n}");
-                        }
-                        if let Ok(f) = str_val.parse::<f64>() {
-                            if !f.is_nan() && !f.is_infinite() {
-                                return write!(out, "{f}");
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        b'0'..=b'9' => {
-            if let Ok(n) = str_val.parse::<i64>() {
-                return write!(out, "{n}");
-            }
-            if let Ok(f) = str_val.parse::<f64>() {
-                if !f.is_nan() && !f.is_infinite() {
-                    return write!(out, "{f}");
-                }
-            }
-        }
-        b'+' if bytes.len() > 1 && bytes[1].is_ascii_digit() => {
-            if let Ok(n) = str_val.parse::<i64>() {
-                return write!(out, "{n}");
-            }
-            if let Ok(f) = str_val.parse::<f64>() {
-                if !f.is_nan() && !f.is_infinite() {
-                    return write!(out, "{f}");
-                }
-            }
-        }
-        _ => {}
-    }
-
-    stream_json_string(out, str_val)
 }
 
 // ============================================================================
@@ -4619,8 +4425,8 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
             YamlValue::String(s) if s.is_unquoted() => {
                 if let Ok(str_val) = s.as_str() {
                     matches!(
-                        str_val.as_ref(),
-                        "null" | "~" | "" | "false" | "False" | "FALSE"
+                        resolve_plain(&str_val),
+                        ResolvedScalar::Null | ResolvedScalar::Bool(false)
                     )
                 } else {
                     false
@@ -4640,9 +4446,9 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
         match self {
             YamlValue::Null => true,
             YamlValue::String(s) if s.is_unquoted() => {
-                // YAML null values: null, ~, empty string
+                // YAML null values: null, Null, NULL, ~, empty string
                 if let Ok(str_val) = s.as_str() {
-                    matches!(str_val.as_ref(), "null" | "~" | "")
+                    resolve_plain(&str_val) == ResolvedScalar::Null
                 } else {
                     false
                 }
@@ -4659,9 +4465,8 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
         match self {
             YamlValue::String(s) if s.is_unquoted() => {
                 let str_val = s.as_str().ok()?;
-                match str_val.as_ref() {
-                    "true" | "True" | "TRUE" => Some(true),
-                    "false" | "False" | "FALSE" => Some(false),
+                match resolve_plain(&str_val) {
+                    ResolvedScalar::Bool(b) => Some(b),
                     _ => None,
                 }
             }
@@ -4674,7 +4479,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
         match self {
             YamlValue::String(s) if s.is_unquoted() => {
                 let str_val = s.as_str().ok()?;
-                str_val.parse().ok()
+                match resolve_plain(&str_val) {
+                    ResolvedScalar::Int(n) => Some(n),
+                    _ => None,
+                }
             }
             YamlValue::Alias { target, .. } => target.and_then(|t| t.value().as_i64()),
             _ => None,
@@ -4685,12 +4493,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
         match self {
             YamlValue::String(s) if s.is_unquoted() => {
                 let str_val = s.as_str().ok()?;
-                // Handle special YAML float values
-                match str_val.as_ref() {
-                    ".inf" | ".Inf" | ".INF" => Some(f64::INFINITY),
-                    "-.inf" | "-.Inf" | "-.INF" => Some(f64::NEG_INFINITY),
-                    ".nan" | ".NaN" | ".NAN" => Some(f64::NAN),
-                    _ => str_val.parse().ok(),
+                // Non-finite floats arise only from the `.inf`/`.nan` family
+                match resolve_plain(&str_val) {
+                    ResolvedScalar::Int(n) => Some(n as f64),
+                    ResolvedScalar::Float(f) => Some(f),
+                    _ => None,
                 }
             }
             YamlValue::Alias { target, .. } => target.and_then(|t| t.value().as_f64()),
@@ -4736,22 +4543,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
         match self {
             YamlValue::Null => "null",
             YamlValue::String(s) => {
-                // Determine effective type based on content
+                // Determine effective type per the YAML 1.2 core schema
                 if s.is_unquoted() {
                     if let Ok(str_val) = s.as_str() {
-                        match str_val.as_ref() {
-                            "null" | "~" | "" => return "null",
-                            "true" | "True" | "TRUE" | "false" | "False" | "FALSE" => {
-                                return "boolean"
-                            }
-                            _ => {
-                                // Check if it's a number
-                                if str_val.parse::<i64>().is_ok() || str_val.parse::<f64>().is_ok()
-                                {
-                                    return "number";
-                                }
-                            }
-                        }
+                        return resolve_plain(&str_val).type_name();
                     }
                 }
                 "string"
@@ -6988,6 +6783,76 @@ mod tests {
             }
         }
         panic!("Could not find value");
+    }
+
+    /// Returns the tag of the value in a single-entry mapping document.
+    #[track_caller]
+    fn value_tag(yaml: &[u8]) -> &'static str {
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(field) = fields.into_iter().next() {
+                return field.value_cursor().tag();
+            }
+        }
+        panic!("Could not find value in {:?}", core::str::from_utf8(yaml));
+    }
+
+    #[test]
+    fn test_tag_core_schema_resolution() {
+        // Null spellings (issue #226): Null/NULL are null, mixed case is not
+        assert_eq!(value_tag(b"key: Null"), "!!null");
+        assert_eq!(value_tag(b"key: NULL"), "!!null");
+        assert_eq!(value_tag(b"key: NuLl"), "!!str");
+        // Hex/octal ints; YAML 1.1 legacy forms stay strings
+        assert_eq!(value_tag(b"key: 0x2A"), "!!int");
+        assert_eq!(value_tag(b"key: 0o52"), "!!int");
+        assert_eq!(value_tag(b"key: 0b101"), "!!str");
+        assert_eq!(value_tag(b"key: 1_000"), "!!str");
+        // Bare nan/inf require the leading dot in 1.2 core
+        assert_eq!(value_tag(b"key: nan"), "!!str");
+        assert_eq!(value_tag(b"key: inf"), "!!str");
+        assert_eq!(value_tag(b"key: Infinity"), "!!str");
+        assert_eq!(value_tag(b"key: .inf"), "!!float");
+        assert_eq!(value_tag(b"key: +.inf"), "!!float");
+        assert_eq!(value_tag(b"key: .nan"), "!!float");
+        // Float overflow to infinity is not a core-schema float
+        assert_eq!(value_tag(b"key: 1e999"), "!!str");
+        assert_eq!(value_tag(b"key: .5"), "!!float");
+    }
+
+    /// Returns `to_json` for a document (exercises the buffer transcoder).
+    /// The root wraps documents in an implicit sequence, hence `[...]`.
+    #[track_caller]
+    fn doc_json(yaml: &[u8]) -> String {
+        let index = YamlIndex::build(yaml).unwrap();
+        index.root(yaml).to_json()
+    }
+
+    #[test]
+    fn test_to_json_core_schema_resolution() {
+        assert_eq!(doc_json(b"a: Null\n"), r#"[{"a":null}]"#);
+        assert_eq!(doc_json(b"a: NULL\n"), r#"[{"a":null}]"#);
+        assert_eq!(doc_json(b"a: NuLl\n"), r#"[{"a":"NuLl"}]"#);
+        assert_eq!(doc_json(b"a: 0x2A\n"), r#"[{"a":42}]"#);
+        assert_eq!(doc_json(b"a: 0o52\n"), r#"[{"a":42}]"#);
+        assert_eq!(doc_json(b"a: nan\n"), r#"[{"a":"nan"}]"#);
+        assert_eq!(doc_json(b"a: Infinity\n"), r#"[{"a":"Infinity"}]"#);
+        // JSON cannot represent the .inf/.nan family
+        assert_eq!(doc_json(b"a: .inf\n"), r#"[{"a":null}]"#);
+        assert_eq!(doc_json(b"a: +.5\n"), r#"[{"a":0.5}]"#);
+        assert_eq!(doc_json(b"a: 1_000\n"), r#"[{"a":"1_000"}]"#);
+        assert_eq!(doc_json(b"a: 1e999\n"), r#"[{"a":"1e999"}]"#);
+    }
+
+    #[test]
+    fn test_to_json_block_scalars_stay_strings() {
+        // Block scalars are always !!str; their content must never be
+        // type-resolved (yq-verified behavior)
+        assert_eq!(doc_json(b"a: |-\n  42\n"), r#"[{"a":"42"}]"#);
+        assert_eq!(doc_json(b"a: |-\n  true\n"), r#"[{"a":"true"}]"#);
+        assert_eq!(doc_json(b"a: |-\n  null\n"), r#"[{"a":"null"}]"#);
+        assert_eq!(doc_json(b"a: >-\n  42\n"), r#"[{"a":"42"}]"#);
     }
 
     #[test]

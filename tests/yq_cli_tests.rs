@@ -237,11 +237,11 @@ fn test_i0_float_one_point_zero() -> Result<()> {
 
 #[test]
 fn test_i0_leading_dot_float_is_number() -> Result<()> {
-    // yq treats `.5` as the number 0.5 -> {"x":0.5}. succinctly currently keeps
-    // it as the string {"x":".5"} -- bug #169.
+    // yq treats `.5` as the number 0.5 -> {"x":0.5}. Matched since the shared
+    // core-schema resolver landed (#170, fixed via #226).
     let (out, code) = run_yq_stdin(".", "x: .5\n", &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), r#"{"x":".5"}"#);
+    assert_eq!(out.trim(), r#"{"x":0.5}"#);
     Ok(())
 }
 

@@ -12,9 +12,12 @@ cargo test --test yaml_test_suite -- --nocapture
 ```
 
 For scalar type handling specifically (the Norway problem, booleans, quoted numbers),
-see [YAML 1.2 Compliance](1.2.md); its known divergences from the 1.2 core schema
-(`Null`/`NULL`, hex and octal ints, bare `nan`/`inf`) are tracked in
-[#226](https://github.com/rust-works/succinctly/issues/226).
+see [YAML 1.2 Compliance](1.2.md). Plain scalars resolve per the 1.2 core schema via a
+single shared resolver (`src/yaml/scalar.rs`, added in
+[#226](https://github.com/rust-works/succinctly/issues/226)); the deliberate rejections
+of YAML 1.1 legacy numeric forms that `yq` still accepts (`1_000`, `0X2A`, `0b101`,
+signed hex/octal) are documented in that page's
+[Differences from System yq](1.2.md#differences-from-system-yq) table.
 
 ## Summary
 
@@ -23,11 +26,11 @@ path:
 
 | Dimension                              | Result              | Meaning                                        |
 |----------------------------------------|---------------------|------------------------------------------------|
-| **Load** (valid YAML, output compared) | **202/279 = 72.4%** | Parses and produces the JSON the suite expects |
+| **Load** (valid YAML, output compared) | **204/279 = 73.1%** | Parses and produces the JSON the suite expects |
 | **Reject** (invalid YAML, must fail)   | **11/94 = 11.7%**   | Correctly refuses malformed input              |
 | **Parse** (valid YAML, no JSON form)   | **27/29 = 93.1%**   | Parses without error                           |
 
-The 162 non-passing cases are enumerated individually, with a category and reason, in
+The 160 non-passing cases are enumerated individually, with a category and reason, in
 [`tests/data/yaml-test-suite-known-failures.txt`](../../../tests/data/yaml-test-suite-known-failures.txt).
 That file is the machine-readable source of truth; the test asserts it matches reality
 exactly, so it cannot silently drift from this page.
@@ -110,8 +113,11 @@ output formatting:
 - **Pretty** (the default) builds an `OwnedValue` DOM instead.
 
 They do not agree. Across the suite they produce different *values* — not merely different
-whitespace — for 29 cases. Where the suite can adjudicate, the DOM path is right 15 times
-and the streaming path twice (3 both wrong, 9 have no JSON form to compare against):
+whitespace — for 27 cases (two block-scalar cases, `2G84/02` and `K858`, were fixed by
+[#226](https://github.com/rust-works/succinctly/issues/226)'s gating change: the streaming
+path no longer type-resolves block scalar content). Where the suite can adjudicate, the
+DOM path is right 13 times and the streaming path twice (3 both wrong, 9 have no JSON
+form to compare against):
 
 ```
 $ succinctly yq -o json '.'      26DV.yaml   # {"top3": {"scalar1": "scalar3"}}  correct
@@ -124,12 +130,12 @@ scalar folding, and trailing tabs.
 
 An indentation flag changing a document's *value* is a bug in its own right, independent
 of YAML conformance; tracked in
-[#222](https://github.com/rust-works/succinctly/issues/222). This page counts the 8 cases
+[#222](https://github.com/rust-works/succinctly/issues/222). This page counts the 6 cases
 where the streaming path fails and the DOM path would have passed; the harness tests the
 streaming path because that is the library's public API and the one the performance work
 targets.
 
-## Full accounting of the 77 load failures
+## Full accounting of the 75 load failures
 
 | Category     | Cases | Cause                                                             |
 |--------------|-------|-------------------------------------------------------------------|
@@ -137,7 +143,7 @@ targets.
 | `directives` | 16    | `%YAML` / `%TAG` not recognized (above)                           |
 | `scalars`    | 13    | Block scalar folding and chomping edge cases; trailing whitespace |
 | `structure`  | 9     | Document end markers; anchors with colons in the name             |
-| `streaming`  | 8     | Streaming path diverges from the DOM path (above)                 |
+| `streaming`  | 6     | Streaming path diverges from the DOM path (above)                 |
 
 The two `parse` failures (`FH7J`, `UKK6/02`) are also tags.
 
@@ -149,7 +155,7 @@ stream. Measuring first changed the picture:
 
 - The load gap is **not** diffuse unsoundness. It is dominated by two absent features —
   tags (33) and directives (16) — that are additive work on the existing parser, plus a
-  self-inflicted divergence between our own two output paths (8).
+  self-inflicted divergence between our own two output paths (6).
 - The rejection gap is **deliberate**. A hybrid would close it, but only by doing the
   grammar checking that semi-indexing exists to avoid. The correct fix is an opt-in
   validation pass, which does not require a third-party parser.

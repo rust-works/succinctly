@@ -9974,7 +9974,7 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
     value: crate::yaml::YamlValue<'_, W>,
 ) -> OwnedValue {
-    use crate::yaml::YamlValue;
+    use crate::yaml::{resolve_plain, ResolvedScalar, YamlValue};
 
     match value {
         YamlValue::Null => OwnedValue::Null,
@@ -9990,33 +9990,14 @@ fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
                 return OwnedValue::String(str_value);
             }
 
-            // Type detection for unquoted scalars
-            match str_value.as_str() {
-                "null" | "~" | "" => return OwnedValue::Null,
-                "true" | "True" | "TRUE" => return OwnedValue::Bool(true),
-                "false" | "False" | "FALSE" => return OwnedValue::Bool(false),
-                _ => {}
+            // Resolve plain scalars per the YAML 1.2 core schema
+            match resolve_plain(&str_value) {
+                ResolvedScalar::Null => OwnedValue::Null,
+                ResolvedScalar::Bool(b) => OwnedValue::Bool(b),
+                ResolvedScalar::Int(n) => OwnedValue::Int(n),
+                ResolvedScalar::Float(f) => OwnedValue::Float(f),
+                ResolvedScalar::Str => OwnedValue::String(str_value),
             }
-
-            // Try to parse as number
-            if let Ok(n) = str_value.parse::<i64>() {
-                return OwnedValue::Int(n);
-            }
-            if let Ok(f) = str_value.parse::<f64>() {
-                if !f.is_nan() {
-                    return OwnedValue::Float(f);
-                }
-            }
-
-            // Check for special float literals
-            match str_value.as_str() {
-                ".inf" | ".Inf" | ".INF" => return OwnedValue::Float(f64::INFINITY),
-                "-.inf" | "-.Inf" | "-.INF" => return OwnedValue::Float(f64::NEG_INFINITY),
-                ".nan" | ".NaN" | ".NAN" => return OwnedValue::Float(f64::NAN),
-                _ => {}
-            }
-
-            OwnedValue::String(str_value)
         }
         YamlValue::Sequence(elements) => {
             let items: Vec<OwnedValue> = elements.into_iter().map(yaml_value_to_owned).collect();

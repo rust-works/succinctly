@@ -33,7 +33,6 @@
 2CMS      lax:mapping       mapping/key rules not validated — #223
 2G84/00   lax:block-scalar  block scalar header not validated — #223
 2G84/01   lax:block-scalar  block scalar header not validated — #223
-2G84/02   streaming         streaming path diverges from OwnedValue path — #222
 2G84/03   scalars           scalar content/folding differs from spec
 2LFX      directives        %YAML/%TAG directive not recognized — #225
 2SXE      structure         document/block structure differs from spec
@@ -127,7 +126,6 @@ JKF3      lax:quoting       quoting/escape rules not validated — #223
 JY7Z      lax:mapping       mapping/key rules not validated — #223
 K527      scalars           scalar content/folding differs from spec
 K54U      scalars           scalar content/folding differs from spec
-K858      streaming         streaming path diverges from OwnedValue path — #222
 KS4U      lax:flow          flow syntax not validated — #223
 L24T/00   scalars           scalar content/folding differs from spec
 L94M      tags              tag shorthand emitted as scalar text — #224

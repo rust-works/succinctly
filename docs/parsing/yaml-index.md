@@ -82,7 +82,8 @@ Key lesson: micro-benchmark wins frequently don't translate to end-to-end gains.
 ## Additional Features
 
 - **Anchors & aliases**: The oracle tracks `&name` anchors and `*name` aliases, storing an anchor-to-position mapping. Aliases are resolved at query time, not during indexing (no automatic expansion).
-- **Block scalars**: Literal (`|`) and folded (`>`) block scalars with chomping modifiers (`-`, `+`, default).
+- **Block scalars**: Literal (`|`) and folded (`>`) block scalars with chomping modifiers (`-`, `+`, default). Block scalar content is always a string — it is never type-resolved.
+- **Scalar type resolution**: Plain (unquoted) scalars resolve to null/bool/int/float/str per the YAML 1.2 core schema via a single shared resolver, [`src/yaml/scalar.rs`](../../src/yaml/scalar.rs) (`resolve_plain`, #226). Used by tag inference, both JSON transcoders, the typed getters, and the yq CLI's DOM conversion. Deliberate divergences from `yq`'s 1.1-legacy forms are tabulated in [compliance/yaml/1.2.md](../compliance/yaml/1.2.md#differences-from-system-yq).
 - **Multi-document streams**: Multiple YAML documents (`---` separated) are wrapped in an implicit array. Use `--doc N` to select a specific document.
 
 ## Validation
@@ -106,7 +107,7 @@ directives).
 
 ## Source & Docs
 
-- Implementation: [src/yaml/](../../src/yaml/) (parser.rs, index.rs, advance_positions.rs, end_positions.rs)
+- Implementation: [src/yaml/](../../src/yaml/) (parser.rs, index.rs, advance_positions.rs, end_positions.rs, scalar.rs)
 - SIMD: [src/yaml/simd/](../../src/yaml/simd/) (neon.rs, x86.rs, broadword.rs)
 - Parsing doc: [yaml.md](yaml.md) (very detailed, includes all optimization history)
 - YAML 1.2 compliance: [compliance/yaml/1.2.md](../compliance/yaml/1.2.md)
