@@ -212,6 +212,18 @@ What each CI runner exercises for real:
 | `ubuntu-24.04-arm` (Test ARM) | Neoverse-N2   | NEON, **SVE2-BITPERM** (BDEP/BEXT)     |
 | `macos-latest` (Test macOS)   | Apple Silicon | NEON                                   |
 
+Kernel-direct differential tests (`tests/simd_level_tests.rs`,
+`tests/dsv_simd_differential_tests.rs`, `src/yaml/simd/x86.rs`) exercise every
+kernel *level* on the AVX2 runner, but they cannot catch caller-side dispatch
+bugs — e.g. the classify/skip-width accounting (#231), where the parser
+consumed a 16-byte SSE2 result as if 32 bytes had been scanned. For that, the
+x86 leg **re-runs the whole suite with `SUCCINCTLY_SIMD=sse2`** (the
+"SSE2-clamped dispatch" step, #247), forcing the yaml parser through the real
+16-byte dispatch path; an in-lib contract test
+(`test_succinctly_simd_env_contract`) fails the step if the clamp stops
+applying. See
+[docs/reference/environment-variables.md](docs/reference/environment-variables.md#succinctly_simd).
+
 **Not covered by routine CI: AVX-512.** The standard x86 runners are Zen 3
 (EPYC 7763), which has no `avx512f`/`avx512vpopcntdq`, so the AVX-512 paths
 (`src/util/simd/x86.rs` `avx512f` branch, `src/bits/popcount.rs` VPOPCNTDQ)

@@ -658,7 +658,7 @@ A command-line flag always beats an environment variable.
 Queries can read any variable via `env`, `$ENV`, `env(NAME)` and `strenv(NAME)`.
 
 See [Environment Variables](../reference/environment-variables.md) for accepted values, precedence,
-and the library-only `SUCCINCTLY_SVE2`.
+and the library-only `SUCCINCTLY_SIMD` and `SUCCINCTLY_SVE2`.
 
 ---
 
