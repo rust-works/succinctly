@@ -663,5 +663,125 @@ mod tests {
             format_json(&value, &opts(FloatStyle::PreserveWholeFloat)),
             "1.0"
         );
+        // Non-whole floats keep the shortest form under both styles.
+        let frac = OwnedValue::Float(1.5);
+        assert_eq!(format_json(&frac, &opts(FloatStyle::Shortest)), "1.5");
+        assert_eq!(
+            format_json(&frac, &opts(FloatStyle::PreserveWholeFloat)),
+            "1.5"
+        );
+    }
+
+    #[test]
+    fn test_escape_json_string_control_and_specials() {
+        assert_eq!(escape_json_string("a\\b"), "a\\\\b");
+        assert_eq!(escape_json_string("\x08\x0C"), "\\b\\f");
+        assert_eq!(escape_json_string("\r\t"), "\\r\\t");
+        // Other controls fall back to \uXXXX, including C1 controls.
+        assert_eq!(escape_json_string("\x01"), "\\u0001");
+        assert_eq!(escape_json_string("\u{7f}"), "\\u007f");
+        assert_eq!(escape_json_string("\u{85}"), "\\u0085");
+        // Non-ASCII passes through unescaped.
+        assert_eq!(escape_json_string("café"), "café");
+    }
+
+    #[test]
+    fn test_escape_json_string_ascii_escapes_non_ascii() {
+        // Shared escape arms match the non-ASCII escaper.
+        assert_eq!(escape_json_string_ascii("say \"hi\""), "say \\\"hi\\\"");
+        assert_eq!(
+            escape_json_string_ascii("a\\b\x08\x0C\r\t\n"),
+            "a\\\\b\\b\\f\\r\\t\\n"
+        );
+        assert_eq!(escape_json_string_ascii("\x01"), "\\u0001");
+        // BMP characters escape as a single \uXXXX unit.
+        assert_eq!(escape_json_string_ascii("é"), "\\u00e9");
+        // Astral characters escape as a UTF-16 surrogate pair.
+        assert_eq!(escape_json_string_ascii("😀"), "\\ud83d\\ude00");
+    }
+
+    #[test]
+    fn test_format_json_non_finite_floats_are_null() {
+        let opts = JsonFormatOpts {
+            indent: "",
+            sort_keys: false,
+            ascii: false,
+            float_style: FloatStyle::PreserveWholeFloat,
+        };
+        assert_eq!(format_json(&OwnedValue::Float(f64::NAN), &opts), "null");
+        assert_eq!(
+            format_json(&OwnedValue::Float(f64::INFINITY), &opts),
+            "null"
+        );
+    }
+
+    #[test]
+    fn test_format_json_empty_containers() {
+        let pretty = JsonFormatOpts {
+            indent: "  ",
+            sort_keys: false,
+            ascii: false,
+            float_style: FloatStyle::Shortest,
+        };
+        assert_eq!(format_json(&OwnedValue::Array(vec![]), &pretty), "[]");
+        assert_eq!(
+            format_json(&OwnedValue::Object(IndexMap::new()), &pretty),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn test_format_json_pretty_ascii_object() {
+        let mut obj = IndexMap::new();
+        obj.insert(
+            "é".to_string(),
+            OwnedValue::Array(vec![OwnedValue::String("ü".to_string())]),
+        );
+        let value = OwnedValue::Object(obj);
+        let opts = JsonFormatOpts {
+            indent: "  ",
+            sort_keys: false,
+            ascii: true,
+            float_style: FloatStyle::Shortest,
+        };
+        assert_eq!(
+            format_json(&value, &opts),
+            "{\n  \"\\u00e9\": [\n    \"\\u00fc\"\n  ]\n}"
+        );
+    }
+
+    #[test]
+    fn test_colorize_json_arrays_keywords_numbers_escapes() {
+        let out = colorize_json(r#"[false,12.5e+1,"a\"b",null]"#, &ColorScheme::default());
+        // Array delimiters take the array color.
+        assert!(
+            out.starts_with("\x1b[1;39m[\x1b[0m"),
+            "open bracket: {out:?}"
+        );
+        assert!(
+            out.ends_with("\x1b[1;39m]\x1b[0m"),
+            "close bracket: {out:?}"
+        );
+        // false and full numbers (incl. exponent) are single colored tokens.
+        assert!(
+            out.contains("\x1b[0;39mfalse\x1b[0m"),
+            "false token: {out:?}"
+        );
+        assert!(
+            out.contains("\x1b[0;39m12.5e+1\x1b[0m"),
+            "number token: {out:?}"
+        );
+        // Escaped quotes inside strings do not terminate the string span.
+        assert!(
+            out.contains("\x1b[0;32m\"a\\\"b\"\x1b[0m"),
+            "escaped string: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_print_build_configuration_smoke() {
+        // Diagnostic output; assert it runs without panicking for both tools.
+        print_build_configuration("jq");
+        print_build_configuration("yq");
     }
 }
