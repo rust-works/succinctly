@@ -1898,3 +1898,40 @@ fn test_seq_with_slurp() -> Result<()> {
     assert_eq!(rest.trim(), "6");
     Ok(())
 }
+
+// =============================================================================
+// Regex builtins (regression tests for #167 - cli feature must bundle regex)
+// =============================================================================
+
+#[test]
+fn test_regex_test_available_in_cli() -> Result<()> {
+    // The #167 repro: must use regex semantics, not substring matching
+    let (output, code) = run_jq_stdin(r#"test("[0-9]+")"#, r#""abc123""#, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "true");
+
+    let (output, code) = run_jq_stdin(r#"test("[0-9]+")"#, r#""abc""#, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "false");
+    Ok(())
+}
+
+#[test]
+fn test_regex_gsub_available_in_cli() -> Result<()> {
+    let (output, code) = run_jq_stdin(r#"gsub("[0-9]"; "X")"#, r#""a1b2""#, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""aXbX""#);
+    Ok(())
+}
+
+#[test]
+fn test_regex_capture_available_in_cli() -> Result<()> {
+    let (output, code) = run_jq_stdin(
+        r#"capture("(?<word>[a-z]+)") | .word"#,
+        r#""hello123""#,
+        &[],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""hello""#);
+    Ok(())
+}
