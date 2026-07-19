@@ -3969,9 +3969,9 @@ if !s.is_unquoted() {
 
 ### Compatibility Verification
 
-**New Test Suite**: `tests/yq_cli_tests.rs` (32 tests, all passing)
+**Test Suites**: `tests/yq_cli_tests.rs` (behavioral tests) plus `tests/yq_golden_tests.rs` (oracle comparison)
 
-**Test categories**:
+**Test categories** (`yq_cli_tests.rs`):
 - Type preservation tests (8 tests) - Verify quoted strings stay strings
 - Argument format tests (4 tests) - Both `-o=json` and `-o json` work
 - File input tests (2 tests) - Type preservation with file input
@@ -3979,20 +3979,19 @@ if !s.is_unquoted() {
 - Complex documents (2 tests) - Nested structures
 - Edge cases (4 tests) - Empty strings, decimals, scientific notation
 - Output formats (2 tests) - YAML and JSON output
-- **Direct comparisons (8 tests)** - Byte-for-byte output comparison with system `yq`
 
-**Direct Comparison Tests**:
-```rust
-fn compare_yq_output(filter: &str, yaml: &str, args: &[&str]) -> Result<bool> {
-    let (succ_out, succ_code) = run_yq_stdin(filter, yaml, args)?;
-    let (sys_out, sys_code) = run_system_yq_stdin(filter, yaml, args)?;
+**Oracle comparison** (`tests/yq_golden_tests.rs`, reworked in #227): byte-for-byte
+comparison against golden fixtures under `tests/data/yq-golden/`, captured from
+mikefarah/yq at the version pinned in `YQ_VERSION` via `scripts/sync-yq-golden.sh`
+— never from succinctly's own output. The original 8 direct-comparison tests
+invoked whatever `yq` was on PATH and silently skipped (while reporting green)
+when it was absent, which was always the case in CI (#227). The golden suite
+needs no external binary, so it runs on every CI leg; divergences are tracked in
+the two-sided manifest `tests/data/yq-golden-known-failures.txt`, and the
+`yq-drift` CI job re-verifies the goldens against the pinned `yq`.
 
-    // Compares both exit code AND output byte-for-byte
-    Ok(succ_code == sys_code && succ_out == sys_out)
-}
-```
-
-All 8 comparison tests pass, proving **100% output compatibility** with system `yq`.
+All golden cases currently match `yq` byte-for-byte (the known-failures manifest
+is empty).
 
 ### Benchmark Standardization
 

@@ -548,7 +548,7 @@ For detailed documentation on optimization techniques used in this project, see 
   - Fixed quoted string type preservation: `"1.0"` stays as string, not converted to number `1`
   - Added early-exit for quoted strings, skipping expensive `parse::<i64>()` and `parse::<f64>()` calls
   - Current performance: 10KB: 1.63ms, 100KB: 2.78ms, 1MB: 13.2ms (with correct output)
-  - Created comprehensive test suite: 32 tests including 8 direct byte-for-byte comparisons with system `yq`
+  - Byte-for-byte output verified against pinned-`yq` golden fixtures (`tests/yq_golden_tests.rs`, captured from mikefarah/yq via `scripts/sync-yq-golden.sh`) that run hermetically on every CI leg, plus a `yq-drift` CI job that re-checks the goldens against the pinned `yq` — see #227
   - **Key achievement**: `succinctly yq` is now a drop-in replacement for `yq` for supported arguments
   - See [docs/parsing/yaml.md#p10-type-preservation-for-yq-compatibility---accepted-](docs/parsing/yaml.md#p10-type-preservation-for-yq-compatibility---accepted-) for full analysis
 - ✅ P11 (BP Select1 for yq-locate): **2.5-5.9x faster** select1 queries, fixes issue #26

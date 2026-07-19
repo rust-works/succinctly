@@ -1,0 +1,8 @@
+
+users:
+  - name: "Alice"
+    id: "001"
+    age: 30
+  - name: "Bob"
+    id: "002"
+    age: 25

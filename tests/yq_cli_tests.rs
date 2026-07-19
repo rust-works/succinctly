@@ -1,94 +1,24 @@
 //! Integration tests for the succinctly yq CLI command
 //!
 //! These tests verify yq-compatible behavior, especially type preservation
-//! for quoted vs unquoted scalars.
+//! for quoted vs unquoted scalars. Byte-for-byte comparison against yq itself
+//! lives in tests/yq_golden_tests.rs, driven by fixtures captured from a
+//! pinned yq version (see #227).
 //!
 //! Run with: cargo test --features cli --test yq_cli_tests
 
+#![cfg(feature = "cli")]
+
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use anyhow::Result;
 use tempfile::NamedTempFile;
 
-/// Maximum retries for flaky cargo run commands (lock contention in CI)
-const MAX_CARGO_RETRIES: usize = 3;
-
 /// Helper to run yq command with input from stdin
 fn run_yq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(String, i32)> {
-    for attempt in 0..MAX_CARGO_RETRIES {
-        let mut cmd = Command::new("cargo")
-            .args([
-                "run",
-                "--features",
-                "cli",
-                "--bin",
-                "succinctly",
-                "--",
-                "yq",
-            ])
-            .args(extra_args)
-            .arg(filter)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        if let Some(mut stdin) = cmd.stdin.take() {
-            stdin.write_all(input.as_bytes())?;
-        }
-
-        let output = cmd.wait_with_output()?;
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        // Exit code 101 often indicates cargo lock contention; retry
-        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
-            std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
-            continue;
-        }
-
-        let stdout = String::from_utf8(output.stdout)?;
-        return Ok((stdout, exit_code));
-    }
-    unreachable!()
-}
-
-/// Helper to run yq command with file input
-fn run_yq_file(filter: &str, file_path: &str, extra_args: &[&str]) -> Result<(String, i32)> {
-    for attempt in 0..MAX_CARGO_RETRIES {
-        let output = Command::new("cargo")
-            .args([
-                "run",
-                "--features",
-                "cli",
-                "--bin",
-                "succinctly",
-                "--",
-                "yq",
-            ])
-            .args(extra_args)
-            .arg(filter)
-            .arg(file_path)
-            .output()?;
-
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        // Exit code 101 often indicates cargo lock contention; retry
-        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
-            std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
-            continue;
-        }
-
-        let stdout = String::from_utf8(output.stdout)?;
-        return Ok((stdout, exit_code));
-    }
-    unreachable!()
-}
-
-/// Helper to run system yq command with input from stdin
-fn run_system_yq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(String, i32)> {
-    let mut cmd = Command::new("yq")
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
         .args(extra_args)
         .arg(filter)
         .stdin(Stdio::piped())
@@ -107,22 +37,19 @@ fn run_system_yq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result
     Ok((stdout, exit_code))
 }
 
-/// Check if system yq is available
-fn has_system_yq() -> bool {
-    Command::new("yq")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
+/// Helper to run yq command with file input
+fn run_yq_file(filter: &str, file_path: &str, extra_args: &[&str]) -> Result<(String, i32)> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(extra_args)
+        .arg(filter)
+        .arg(file_path)
+        .output()?;
 
-/// Compare succinctly yq output with system yq output
-fn compare_yq_output(filter: &str, yaml: &str, args: &[&str]) -> Result<bool> {
-    let (succ_out, succ_code) = run_yq_stdin(filter, yaml, args)?;
-    let (sys_out, sys_code) = run_system_yq_stdin(filter, yaml, args)?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let exit_code = output.status.code().unwrap_or(-1);
 
-    Ok(succ_code == sys_code && succ_out == sys_out)
+    Ok((stdout, exit_code))
 }
 
 // ============================================================================
@@ -520,178 +447,6 @@ c: 3
     assert_eq!(code, 0);
     // Compact output should not have newlines between fields
     assert!(!output.trim().contains('\n'));
-    Ok(())
-}
-
-// ============================================================================
-// Direct yq Comparison Tests (require system yq installed)
-// ============================================================================
-
-#[test]
-fn compare_quoted_string_output() -> Result<()> {
-    if !has_system_yq() {
-        eprintln!("Skipping: system yq not available");
-        return Ok(());
-    }
-
-    let yaml = r#"version: "1.0""#;
-    assert!(
-        compare_yq_output(".", yaml, &["-o=json", "-I=0"])?,
-        "Output differs from system yq for quoted strings"
-    );
-    Ok(())
-}
-
-#[test]
-fn compare_mixed_types_output() -> Result<()> {
-    if !has_system_yq() {
-        eprintln!("Skipping: system yq not available");
-        return Ok(());
-    }
-
-    let yaml = r#"
-version: "1.0"
-id: "001"
-count: 123
-price: 19.99
-"#;
-    assert!(
-        compare_yq_output(".", yaml, &["-o=json", "-I=0"])?,
-        "Output differs from system yq for mixed types"
-    );
-    Ok(())
-}
-
-#[test]
-fn compare_nested_structure_output() -> Result<()> {
-    if !has_system_yq() {
-        eprintln!("Skipping: system yq not available");
-        return Ok(());
-    }
-
-    let yaml = r#"
-users:
-  - name: "Alice"
-    id: "001"
-    age: 30
-  - name: "Bob"
-    id: "002"
-    age: 25
-"#;
-    assert!(
-        compare_yq_output(".users[0]", yaml, &["-o=json", "-I=0"])?,
-        "Output differs from system yq for nested structures"
-    );
-    Ok(())
-}
-
-#[test]
-fn compare_field_selection_output() -> Result<()> {
-    if !has_system_yq() {
-        eprintln!("Skipping: system yq not available");
-        return Ok(());
-    }
-
-    let yaml = r#"
-config:
-  database:
-    version: "5.7"
-    port: 3306
-"#;
-    assert!(
-        compare_yq_output(".config.database.version", yaml, &["-o=json", "-I=0"])?,
-        "Output differs from system yq for field selection"
-    );
-    Ok(())
-}
-
-#[test]
-fn compare_array_iteration_output() -> Result<()> {
-    if !has_system_yq() {
-        eprintln!("Skipping: system yq not available");
-        return Ok(());
-    }
-
-    let yaml = r#"
-items:
-  - "001"
-  - "002"
-  - "003"
-"#;
-    assert!(
-        compare_yq_output(".items", yaml, &["-o=json", "-I=0"])?,
-        "Output differs from system yq for arrays"
-    );
-    Ok(())
-}
-
-#[test]
-fn compare_boolean_values_output() -> Result<()> {
-    if !has_system_yq() {
-        eprintln!("Skipping: system yq not available");
-        return Ok(());
-    }
-
-    let yaml = r#"
-enabled: true
-disabled: false
-quoted: "true"
-"#;
-    assert!(
-        compare_yq_output(".", yaml, &["-o=json", "-I=0"])?,
-        "Output differs from system yq for boolean values"
-    );
-    Ok(())
-}
-
-#[test]
-fn compare_null_values_output() -> Result<()> {
-    if !has_system_yq() {
-        eprintln!("Skipping: system yq not available");
-        return Ok(());
-    }
-
-    let yaml = r#"
-a: null
-b: ~
-c: "null"
-"#;
-    assert!(
-        compare_yq_output(".", yaml, &["-o=json", "-I=0"])?,
-        "Output differs from system yq for null values"
-    );
-    Ok(())
-}
-
-#[test]
-fn compare_complex_document_output() -> Result<()> {
-    if !has_system_yq() {
-        eprintln!("Skipping: system yq not available");
-        return Ok(());
-    }
-
-    let yaml = r#"
-metadata:
-  version: "2.5.1"
-  build: 999
-users:
-  - name: "Alice"
-    id: "001"
-    scores:
-      - 95
-      - 87
-      - 92
-  - name: "Bob"
-    id: "002"
-    scores:
-      - 78
-      - 89
-      - 91
-"#;
-    assert!(
-        compare_yq_output(".", yaml, &["-o=json", "-I=0"])?,
-        "Output differs from system yq for complex documents"
-    );
     Ok(())
 }
 
