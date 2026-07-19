@@ -987,3 +987,21 @@ fn test_colorized_json_output_is_token_aware() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn test_build_configuration_flag() -> Result<()> {
+    // --build-configuration prints diagnostics and exits successfully.
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("--build-configuration")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.starts_with("succinctly yq build configuration:"),
+        "unexpected header: {stdout:?}"
+    );
+    assert!(stdout.contains("Features:"));
+    Ok(())
+}

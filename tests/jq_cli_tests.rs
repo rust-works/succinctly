@@ -1299,6 +1299,82 @@ fn test_monochrome_overrides_jq_colors() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_jq_colors_invalid_spec_warns_and_uses_defaults() -> Result<()> {
+    // A malformed JQ_COLORS spec is rejected as a whole: jq warns on stderr,
+    // falls back to the default scheme, and still exits successfully.
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-C",
+            "-n",
+            "null",
+        ])
+        .env("JQ_COLORS", "bogus")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("Failed to set $JQ_COLORS"),
+        "expected warning on stderr: {stderr:?}"
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("\x1b[1;30mnull\x1b[0m"),
+        "null should use the default color: {stdout:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_color_output_materializes_cursor_values() -> Result<()> {
+    // A non-identity filter yields a cursor result; with -C it must take the
+    // materialize-and-colorize path rather than the streaming printer.
+    let (output, code) = run_jq_stdin(".a", r#"{"a":[1,false]}"#, &["-c", "-C"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        "\x1b[1;39m[\x1b[0m\x1b[0;39m1\x1b[0m,\x1b[0;39mfalse\x1b[0m\x1b[1;39m]\x1b[0m"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_configuration_flag() -> Result<()> {
+    // --build-configuration prints diagnostics and exits successfully.
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "--build-configuration",
+        ])
+        .stdout(Stdio::piped())
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.starts_with("succinctly jq build configuration:"),
+        "unexpected header: {stdout:?}"
+    );
+    assert!(stdout.contains("Features:"));
+    Ok(())
+}
+
 // =============================================================================
 // Module System Tests
 // =============================================================================
