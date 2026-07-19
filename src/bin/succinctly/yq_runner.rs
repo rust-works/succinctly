@@ -305,37 +305,6 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
     }
 }
 
-/// Parse and evaluate YAML bytes directly using the generic evaluator.
-///
-/// This keeps the index alive during evaluation and preserves position metadata.
-#[allow(dead_code)] // STYLE-0005: used in tests
-fn parse_and_evaluate_yaml(bytes: &[u8], expr: &Expr) -> Result<Vec<OwnedValue>> {
-    let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
-    let root = index.root(bytes);
-
-    // YAML documents are wrapped in a sequence at the root
-    match root.value() {
-        YamlValue::Sequence(mut docs) => {
-            let mut all_results = Vec::new();
-            while let Some((cursor, rest)) = docs.uncons_cursor() {
-                let results = evaluate_yaml_cursor(cursor, expr)?;
-                all_results.extend(results);
-                docs = rest;
-            }
-            Ok(all_results)
-        }
-        _ => {
-            // Single document - navigate to actual content
-            if let Some(content_cursor) = root.first_child() {
-                evaluate_yaml_cursor(content_cursor, expr)
-            } else {
-                // Empty document
-                Ok(vec![])
-            }
-        }
-    }
-}
-
 /// Evaluate YAML input directly using the generic evaluator with per-document processing.
 ///
 /// This processes YAML documents directly without intermediate OwnedValue conversion,
@@ -400,17 +369,6 @@ fn evaluate_yaml_direct_filtered(
     }
 }
 
-/// Evaluate YAML input directly using the generic evaluator with per-document processing.
-///
-/// This processes YAML documents directly without intermediate OwnedValue conversion,
-/// preserving position metadata for `line` and `column` builtins. Returns results
-/// grouped by document for proper multi-doc handling (with `---` separators).
-#[allow(dead_code)] // STYLE-0005: used by tests; may be called directly in future
-fn evaluate_yaml_direct(bytes: &[u8], expr: &Expr) -> Result<Vec<Vec<OwnedValue>>> {
-    let (results, _) = evaluate_yaml_direct_filtered(bytes, expr, None)?;
-    Ok(results)
-}
-
 /// Evaluate a jq expression on an OwnedValue by converting to JSON and back.
 fn evaluate_input(
     input: &OwnedValue,
@@ -449,7 +407,6 @@ fn evaluate_input(
 /// Evaluate a jq expression directly on a YAML cursor.
 ///
 /// This uses the generic evaluator to preserve position metadata (line/column).
-#[allow(dead_code)] // STYLE-0005: reachable only via the test-only helper above
 fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     cursor: YamlCursor<'_, W>,
     expr: &Expr,
@@ -2050,11 +2007,17 @@ mod tests {
 
     // Tests for the generic evaluator integration
 
+    /// Evaluate YAML through the production path and flatten per-document groups.
+    fn eval_yaml(bytes: &[u8], expr: &Expr) -> Vec<OwnedValue> {
+        let (groups, _) = evaluate_yaml_direct_filtered(bytes, expr, None).unwrap();
+        groups.into_iter().flatten().collect()
+    }
+
     #[test]
-    fn test_parse_and_evaluate_yaml_identity() {
+    fn test_evaluate_yaml_identity() {
         let yaml = b"name: Alice\nage: 30";
         let expr = Expr::Identity;
-        let results = parse_and_evaluate_yaml(yaml, &expr).unwrap();
+        let results = eval_yaml(yaml, &expr);
 
         assert_eq!(results.len(), 1);
         if let OwnedValue::Object(map) = &results[0] {
@@ -2069,22 +2032,22 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_and_evaluate_yaml_field() {
+    fn test_evaluate_yaml_field() {
         let yaml = b"name: Alice\nage: 30";
         let expr = Expr::Field("name".to_string());
-        let results = parse_and_evaluate_yaml(yaml, &expr).unwrap();
+        let results = eval_yaml(yaml, &expr);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], OwnedValue::String("Alice".to_string()));
     }
 
     #[test]
-    fn test_parse_and_evaluate_yaml_line_builtin() {
+    fn test_evaluate_yaml_line_builtin() {
         use succinctly::jq::Builtin;
 
         let yaml = b"name: Alice\nage: 30";
         let expr = Expr::Builtin(Builtin::Line);
-        let results = parse_and_evaluate_yaml(yaml, &expr).unwrap();
+        let results = eval_yaml(yaml, &expr);
 
         assert_eq!(results.len(), 1);
         // The mapping starts at line 1
@@ -2092,7 +2055,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_and_evaluate_yaml_pipe() {
+    fn test_evaluate_yaml_pipe() {
         let yaml = b"users:\n  - name: Alice\n  - name: Bob";
         // .users | .[0] | .name
         let expr = Expr::Pipe(vec![
@@ -2100,7 +2063,7 @@ mod tests {
             Expr::Index(0),
             Expr::Field("name".to_string()),
         ]);
-        let results = parse_and_evaluate_yaml(yaml, &expr).unwrap();
+        let results = eval_yaml(yaml, &expr);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], OwnedValue::String("Alice".to_string()));
@@ -2192,7 +2155,7 @@ mod tests {
         // Test explicit key syntax with direct YAML evaluation
         let yaml = b"?\n: value\n";
         let expr = Expr::Identity;
-        let results = parse_and_evaluate_yaml(yaml, &expr).unwrap();
+        let results = eval_yaml(yaml, &expr);
 
         assert_eq!(results.len(), 1);
         if let OwnedValue::Object(map) = &results[0] {
