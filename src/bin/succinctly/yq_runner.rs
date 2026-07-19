@@ -9,6 +9,7 @@ use indexmap::IndexMap;
 use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
+use succinctly::jq::document::DocumentCursor;
 use succinctly::jq::eval_generic::{eval_with_cursor, to_owned, GenericResult};
 use succinctly::jq::{self, Builtin, Expr, OwnedValue, QueryResult, YqSemantics};
 use succinctly::json::light::StandardJson;
@@ -1161,6 +1162,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
                         writeln!($writer)?;
                         had_output = true;
+                        // Streaming skips evaluation, so inspect the document
+                        // value directly to keep `-e` falsy tracking (#178).
+                        if args.exit_status {
+                            last_was_falsy = $cursor.is_falsy();
+                        }
                     } else {
                         // M2 YAML path: evaluate and stream YAML results
                         let result = eval_with_cursor(&program.expr, $cursor);
@@ -1181,6 +1187,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
                         writeln!($writer)?;
                         had_output = true;
+                        // Streaming skips evaluation, so inspect the document
+                        // value directly to keep `-e` falsy tracking (#178).
+                        if args.exit_status {
+                            last_was_falsy = $cursor.is_falsy();
+                        }
                     } else {
                         // M2 path: evaluate and stream results
                         let result = eval_with_cursor(&program.expr, $cursor);
@@ -1231,6 +1242,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             }
                             writeln!(writer)?;
                             had_output = true;
+                            // `root` is the virtual document sequence; falsiness
+                            // lives on the actual document value (#178).
+                            if args.exit_status {
+                                last_was_falsy = root.first_child().is_some_and(|c| c.is_falsy());
+                            }
                         } else {
                             // M2 path: need to get the actual document cursor
                             if let Some(doc_cursor) = root.first_child() {
@@ -1278,6 +1294,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 }
                                 writeln!(writer)?;
                                 had_output = true;
+                                // `root` is the virtual document sequence; falsiness
+                                // lives on the actual document value (#178).
+                                if args.exit_status {
+                                    last_was_falsy =
+                                        root.first_child().is_some_and(|c| c.is_falsy());
+                                }
                             } else {
                                 // M2 path: need to get the actual document cursor
                                 if let Some(doc_cursor) = root.first_child() {
