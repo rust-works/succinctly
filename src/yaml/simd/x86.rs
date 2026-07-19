@@ -31,6 +31,11 @@ pub struct YamlCharClass {
     pub backslashes: u32,
     /// Mask of bytes that are '#'
     pub hash: u32,
+    /// Number of bytes actually classified: 32 (AVX2) or 16 (SSE2). Only the
+    /// low `width` bits of each mask are meaningful. Callers must not assume
+    /// 32 bytes were scanned — deriving the width from input length alone
+    /// skipped structural bytes 16..31 on non-AVX2 CPUs (#193).
+    pub width: usize,
 }
 
 /// Classify YAML structural characters in a 32-byte chunk using AVX2.
@@ -94,6 +99,7 @@ unsafe fn classify_yaml_chars_avx2(input: &[u8], offset: usize) -> YamlCharClass
         quotes_single: _mm256_movemask_epi8(eq_quote_single) as u32,
         backslashes: _mm256_movemask_epi8(eq_backslash) as u32,
         hash: _mm256_movemask_epi8(eq_hash) as u32,
+        width: 32,
     }
 }
 
@@ -131,6 +137,7 @@ unsafe fn classify_yaml_chars_sse2(input: &[u8], offset: usize) -> YamlCharClass
         quotes_single: _mm_movemask_epi8(eq_quote_single) as u32,
         backslashes: _mm_movemask_epi8(eq_backslash) as u32,
         hash: _mm_movemask_epi8(eq_hash) as u32,
+        width: 16,
     }
 }
 

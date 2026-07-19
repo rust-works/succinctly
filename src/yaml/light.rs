@@ -5327,6 +5327,21 @@ mod tests {
     }
 
     #[test]
+    fn test_long_plain_scalar_does_not_swallow_next_line() {
+        // Regression for the SSE2 chunk-width bug found by the multibyte tests
+        // above (#193): `skip_unquoted_simd` assumed `classify_yaml_chars`
+        // scanned 32 bytes whenever 32 remained, but on non-AVX2 x86 the SSE2
+        // classifier only scans 16 — so the parser skipped past the newline of
+        // any plain scalar whose line ended in bytes 16..31 of the scan window
+        // and folded the next mapping entry into the value. Pure ASCII, so the
+        // failure is isolated to chunk-width accounting, not UTF-8 handling.
+        let yaml = b"a: love and peace forever more x\nb: x\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let json = index.root(yaml).to_json_document();
+        assert_eq!(json, r#"{"a":"love and peace forever more x","b":"x"}"#);
+    }
+
+    #[test]
     fn test_decode_double_quoted_space_escape() {
         let s = YamlString::DoubleQuoted {
             text: b"\"spaced\\ word\"",

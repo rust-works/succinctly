@@ -399,13 +399,13 @@ impl<'a> Parser<'a> {
             let terminators = class.newlines | class.colons | class.hash;
 
             if terminators == 0 {
-                // No structural characters in this 32-byte chunk - safe to skip all
-                let chunk_size = if self.pos + 32 <= self.input.len() {
-                    32
-                } else {
-                    16
-                };
-                return Some(chunk_size);
+                // No structural characters in the classified chunk — skip
+                // exactly the bytes the classifier scanned (32 with AVX2, 16
+                // with SSE2). Deriving the width from input length alone
+                // assumed AVX2: after a 16-byte SSE2 classify it skipped 32,
+                // swallowing newlines/colons in bytes 16..31 on non-AVX2 CPUs
+                // (#193).
+                return Some(class.width);
             }
 
             // Found a potential terminator - find its position
