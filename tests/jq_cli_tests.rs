@@ -699,6 +699,77 @@ fn test_builtin_length() -> Result<()> {
 }
 
 #[test]
+fn test_builtin_values_is_identity_on_non_null() -> Result<()> {
+    // #161: jq's `values` is `select(. != null)`, not object/array iteration
+    let (output, code) = run_jq_stdin("values", r#"{"a":1}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":1}"#);
+
+    let (output, code) = run_jq_stdin("values", "1", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1");
+    Ok(())
+}
+
+#[test]
+fn test_builtin_values_on_null_outputs_nothing() -> Result<()> {
+    // #161: jq: null | values => (no output)
+    let (output, code) = run_jq_stdin("values", "null", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "");
+    Ok(())
+}
+
+#[test]
+fn test_builtin_first_last_on_empty_array_output_null() -> Result<()> {
+    // #161: jq's `first` is `.[0]`, so `[] | first` => null, not an error
+    let (output, code) = run_jq_stdin("first", "[]", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "null");
+
+    let (output, code) = run_jq_stdin("last", "[]", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "null");
+    Ok(())
+}
+
+#[test]
+fn test_builtin_first_on_non_array_errors() -> Result<()> {
+    // jq: 5 | first => error. The error goes to stderr and nothing to stdout.
+    // (Runtime eval errors do not yet set jq's exit code 5 -- see
+    // exit_codes in jq_runner.rs -- so the exit status is not asserted.)
+    let mut cmd = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "first",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(b"5")?;
+    }
+    let output = cmd.wait_with_output()?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(stdout.trim(), "");
+    assert!(
+        stderr.contains("expected array, got number"),
+        "Should report a type error for `5 | first`: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_builtin_keys() -> Result<()> {
     let (output, code) = run_jq_stdin("keys", r#"{"z":1,"a":2}"#, &["-c"])?;
     assert_eq!(code, 0);
