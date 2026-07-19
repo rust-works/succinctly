@@ -38,6 +38,17 @@ proptest! {
         prop_assert_eq!(bv.rank0(i) + bv.rank1(i), i);
     }
 
+    /// rank0(i) is clamped at len: for i >= len it equals len - count_ones (issue #187)
+    #[test]
+    fn rank0_beyond_len_is_clamped(
+        words in prop::collection::vec(any::<u64>(), 1..20),
+        extra in 0usize..1024
+    ) {
+        let len = words.len() * 64;
+        let bv = BitVec::from_words(words, len);
+        prop_assert_eq!(bv.rank0(len + extra), len - bv.count_ones());
+    }
+
     /// rank1 is monotonically non-decreasing
     #[test]
     fn rank1_is_monotonic(
