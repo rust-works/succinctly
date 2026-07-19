@@ -13,7 +13,7 @@ use succinctly::jq::eval_generic::{eval_with_cursor, to_owned, GenericResult};
 use succinctly::jq::{self, Builtin, Expr, OwnedValue, QueryResult, YqSemantics};
 use succinctly::json::light::StandardJson;
 use succinctly::json::JsonIndex;
-use succinctly::yaml::{YamlCursor, YamlIndex, YamlValue};
+use succinctly::yaml::{resolve_plain, ResolvedScalar, YamlCursor, YamlIndex, YamlValue};
 
 use super::{InputFormat, OutputFormat, YqCommand};
 
@@ -139,35 +139,14 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> Result<Owned
                 return Ok(OwnedValue::String(str_value.into_owned()));
             }
 
-            // Type detection for unquoted scalars only
-            match str_value.as_ref() {
-                "null" | "~" | "" => return Ok(OwnedValue::Null),
-                "true" | "True" | "TRUE" => return Ok(OwnedValue::Bool(true)),
-                "false" | "False" | "FALSE" => return Ok(OwnedValue::Bool(false)),
-                _ => {}
-            }
-
-            // Try to parse as number
-            if let Ok(n) = str_value.parse::<i64>() {
-                return Ok(OwnedValue::Int(n));
-            }
-            if let Ok(f) = str_value.parse::<f64>() {
-                // Check for special float values
-                if !f.is_nan() {
-                    return Ok(OwnedValue::Float(f));
-                }
-            }
-
-            // Check for special float literals
-            match str_value.as_ref() {
-                ".inf" | ".Inf" | ".INF" => return Ok(OwnedValue::Float(f64::INFINITY)),
-                "-.inf" | "-.Inf" | "-.INF" => return Ok(OwnedValue::Float(f64::NEG_INFINITY)),
-                ".nan" | ".NaN" | ".NAN" => return Ok(OwnedValue::Float(f64::NAN)),
-                _ => {}
-            }
-
-            // It's a string
-            Ok(OwnedValue::String(str_value.into_owned()))
+            // Resolve plain scalars per the YAML 1.2 core schema
+            Ok(match resolve_plain(&str_value) {
+                ResolvedScalar::Null => OwnedValue::Null,
+                ResolvedScalar::Bool(b) => OwnedValue::Bool(b),
+                ResolvedScalar::Int(n) => OwnedValue::Int(n),
+                ResolvedScalar::Float(f) => OwnedValue::Float(f),
+                ResolvedScalar::Str => OwnedValue::String(str_value.into_owned()),
+            })
         }
         YamlValue::Mapping(fields) => {
             let mut map = IndexMap::new();
