@@ -15,6 +15,7 @@ Every environment variable succinctly reads, what it accepts, and what it change
 | [`JQ_LIBRARY_PATH`](#jq_library_path)                     | `succinctly jq`                  | `:`-separated directories      | Only `-L` paths and `~/.jq`   |
 | [`HOME`](#home)                                           | `succinctly jq`                  | A directory path               | No `~/.jq` auto-loading       |
 | [`TZ`](#tz)                                               | Library (jq date builtins)       | POSIX `STDoffset[DST]`         | UTC                           |
+| [`SUCCINCTLY_EXPECT_SIMD`](#succinctly_expect_simd)       | Test suite (`cargo test`)        | Comma-separated CPU features   | Expectation check skipped     |
 
 Queries can also read **any** variable through the [`env` builtins](#reading-the-environment-from-a-query).
 
@@ -86,6 +87,34 @@ TZ=EST5EDT succinctly jq -nc '1700000000 | localtime' # [2023,10,14,17,13,20,2,3
 
 For anything requiring true local time, set an explicit numeric offset rather than a zone name, and
 change it yourself across DST boundaries.
+
+## Test-Only Variables
+
+### `SUCCINCTLY_EXPECT_SIMD`
+
+Read only by the test suite ([`tests/simd_expectation_tests.rs`](../../tests/simd_expectation_tests.rs));
+the library and CLI never look at it.
+
+Pins the set of CPU features a `cargo test` run is expected to detect. The SIMD test suites self-skip
+when the running CPU lacks a feature (printing a `SKIPPED` line), which keeps local runs green on any
+hardware — but on CI it would let a runner-fleet change silently skip entire suites. Setting this
+variable turns those soft skips into a hard failure: every listed feature must be runtime-detected or
+`test_expected_simd_features_are_detected` fails the run (#193).
+
+The value is a comma-separated list of runtime feature names:
+
+| Target    | Recognized names                          |
+|-----------|-------------------------------------------|
+| `x86_64`  | `sse2`, `sse4.2`, `avx2`, `bmi2`, `popcnt` |
+| `aarch64` | `neon`, `sve2`, `sve2-bitperm`             |
+
+Unknown names — including names for the *other* architecture — fail the test, so a typo cannot
+silently satisfy the expectation. Unset, the check is skipped entirely.
+
+```bash
+# What CI sets on the x86_64 test legs (.github/workflows/ci.yml)
+SUCCINCTLY_EXPECT_SIMD=sse2,sse4.2,avx2,bmi2,popcnt cargo test --test simd_expectation_tests
+```
 
 ## CLI Variables
 

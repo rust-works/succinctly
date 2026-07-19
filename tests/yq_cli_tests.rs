@@ -929,3 +929,22 @@ fn test_unquoted_bool_becomes_bool() -> Result<()> {
     assert_eq!(output.trim(), "true");
     Ok(())
 }
+
+#[test]
+fn test_multibyte_value_survives_simd_escape_scan() -> Result<()> {
+    // Regression test for the x86 signed-compare bug (#150/#230): the AVX2/
+    // SSE2 `find_json_escape` kernels misread bytes >= 0x80 as control
+    // characters, so a >= 16-byte value with multibyte UTF-8 was cut
+    // mid-character. This is the original repro; the CLI path also covers
+    // the jq streaming caller (`stream_json_string`).
+    let input = "---\nwanted: love \u{2665} and peace \u{262e}\n";
+
+    let (output, exit_code) = run_yq_stdin(".wanted", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "love \u{2665} and peace \u{262e}");
+
+    let (json, exit_code) = run_yq_stdin(".wanted", input, &["-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(json.trim(), "\"love \u{2665} and peace \u{262e}\"");
+    Ok(())
+}

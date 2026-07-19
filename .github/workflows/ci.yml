@@ -56,9 +56,30 @@ jobs:
     name: Test (x86_64)
     needs: gate
     runs-on: ubuntu-latest
+    env:
+      # x86 SIMD CI leg (#193): the SIMD suites self-skip (with a visible
+      # `SKIPPED` line) when a CPU feature is missing, so this pins the runner
+      # contract — tests/simd_expectation_tests.rs fails the leg if any listed
+      # feature stops being detected, instead of the suites silently skipping.
+      # The SSE2 kernels don't need an AVX2-disabled config: the differential
+      # tests (tests/simd_level_tests.rs, tests/dsv_simd_differential_tests.rs,
+      # src/yaml/simd/x86.rs) call each kernel directly, so every level is
+      # exercised on this AVX2 runner. There is deliberately no x86 dispatch
+      # override (docs/reference/environment-variables.md).
+      SUCCINCTLY_EXPECT_SIMD: sse2,sse4.2,avx2,bmi2,popcnt
     steps:
       - uses: actions/checkout@v4
         if: needs.gate.outputs.code == 'true'
+
+      - name: Check CPU features (x86 SIMD)
+        if: needs.gate.outputs.code == 'true'
+        run: |
+          echo "=== CPU Info ==="
+          lscpu | grep -E "Model name|Architecture|CPU" || true
+          echo "=== x86 SIMD Detection (expecting $SUCCINCTLY_EXPECT_SIMD) ==="
+          for feature in sse2 sse4_2 avx2 bmi2 popcnt; do
+            if grep -qw "$feature" /proc/cpuinfo; then echo "$feature: supported"; else echo "$feature: not detected"; fi
+          done
 
       - name: Install Rust
         if: needs.gate.outputs.code == 'true'
@@ -252,6 +273,9 @@ jobs:
       matrix:
         rust: [beta, nightly]
     continue-on-error: ${{ matrix.rust == 'nightly' }}   # beta gates CI; nightly is advisory
+    env:
+      # Same x86 SIMD runner contract as test-x86 (#193).
+      SUCCINCTLY_EXPECT_SIMD: sse2,sse4.2,avx2,bmi2,popcnt
     steps:
       - uses: actions/checkout@v4
 

@@ -5268,6 +5268,79 @@ mod tests {
         assert!(out.contains("\"f\":1.5"), "got {out}");
     }
 
+    /// Values ≥ 16 bytes with multibyte UTF-8, long enough to enter the SIMD
+    /// escape scanners (`find_json_escape`), including the 32-byte AVX2 loop.
+    const MULTIBYTE_JSON_VALUES: &[&str] = &[
+        "love ♥ and peace ☮", // the original #230 repro value
+        "café au lait, s'il vous plaît",
+        "日本語のテキストはここにあります",
+        "emoji 😁 in a string long enough for a full chunk",
+    ];
+
+    fn multibyte_yaml() -> Vec<u8> {
+        format!(
+            "wanted: {}\nlatin: {}\ncjk: {}\nemoji: {}\n",
+            MULTIBYTE_JSON_VALUES[0],
+            MULTIBYTE_JSON_VALUES[1],
+            MULTIBYTE_JSON_VALUES[2],
+            MULTIBYTE_JSON_VALUES[3]
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn test_to_json_multibyte_survives_simd_escape_scan() {
+        // Regression test for the x86 signed-compare bug (#150/#230): the
+        // AVX2/SSE2 `find_json_escape` kernels misread bytes >= 0x80 as
+        // control characters, cutting multibyte UTF-8 mid-character (a panic
+        // in callers slicing on the index, or corrupt output). On x86 this
+        // drives the fixed kernels through the library `to_json()` /
+        // `to_json_document()` path end-to-end.
+        let yaml = multibyte_yaml();
+        let index = YamlIndex::build(&yaml).unwrap();
+        let json = index.root(&yaml).to_json_document();
+        for expect in MULTIBYTE_JSON_VALUES {
+            assert!(
+                json.contains(expect),
+                "multibyte content lost: {expect:?} not in {json}"
+            );
+        }
+
+        // `to_json` (with the document wrapper) takes the same escape path.
+        let wrapped = index.root(&yaml).to_json();
+        assert!(wrapped.contains(MULTIBYTE_JSON_VALUES[0]), "got {wrapped}");
+    }
+
+    #[test]
+    fn test_stream_json_multibyte_survives_simd_escape_scan() {
+        // Streaming counterpart of the test above (#150/#230).
+        let yaml = multibyte_yaml();
+        let index = YamlIndex::build(&yaml).unwrap();
+        let mut out = String::new();
+        index.root(&yaml).stream_json_document(&mut out).unwrap();
+        for expect in MULTIBYTE_JSON_VALUES {
+            assert!(
+                out.contains(expect),
+                "multibyte content lost: {expect:?} not in {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_long_plain_scalar_does_not_swallow_next_line() {
+        // Regression for the SSE2 chunk-width bug found by the multibyte tests
+        // above (#193): `skip_unquoted_simd` assumed `classify_yaml_chars`
+        // scanned 32 bytes whenever 32 remained, but on non-AVX2 x86 the SSE2
+        // classifier only scans 16 — so the parser skipped past the newline of
+        // any plain scalar whose line ended in bytes 16..31 of the scan window
+        // and folded the next mapping entry into the value. Pure ASCII, so the
+        // failure is isolated to chunk-width accounting, not UTF-8 handling.
+        let yaml = b"a: love and peace forever more x\nb: x\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let json = index.root(yaml).to_json_document();
+        assert_eq!(json, r#"{"a":"love and peace forever more x","b":"x"}"#);
+    }
+
     #[test]
     fn test_decode_double_quoted_space_escape() {
         let s = YamlString::DoubleQuoted {
