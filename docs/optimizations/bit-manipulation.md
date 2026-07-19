@@ -184,16 +184,21 @@ Used in DSV parsing to compute regions inside quotes:
 
 ```rust
 // src/dsv/simd/bmi2.rs
-fn toggle64_bmi2(quote_mask: u64, carry: u64) -> (u64, u64) {
+fn toggle64_bmi2(carry: u64, w: u64) -> (u64, u64) {
     // Scatter alternating 0/1 pattern to quote positions
-    let addend = _pdep_u64(0x5555_5555_5555_5555 << carry, quote_mask);
+    let c = carry & 0x1;
+    let addend = _pdep_u64(0x5555_5555_5555_5555 << c, w);
 
     // Use addition with carry propagation to fill between quotes
-    let comp = !quote_mask;
-    let shifted = (addend << 1) | carry;
-    let (result, overflow) = shifted.overflowing_add(comp);
+    let comp_w = !w;
+    let shifted = (addend << 1) | c;
+    let result = shifted.wrapping_add(comp_w);
 
-    (result ^ comp, overflow as u64)
+    // Carry for the next chunk is quote-count parity, NOT the adder's
+    // overflow: `addend << 1` drops an opener deposited at bit 63 (#149).
+    let new_carry = (w.count_ones() as u64 + c) & 1;
+
+    (result, new_carry)
 }
 ```
 
