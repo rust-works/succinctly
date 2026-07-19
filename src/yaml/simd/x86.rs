@@ -1377,4 +1377,102 @@ mod tests {
         let input_space = b"abc def";
         assert_eq!(find_json_escape_x86(input_space, 0), None);
     }
+
+    // ========================================================================
+    // Per-kernel differential tests (#193)
+    //
+    // These call `find_json_escape_sse2` / `find_json_escape_avx2` directly
+    // rather than through `find_json_escape_x86`, so the SSE2 kernel is
+    // exercised even on AVX2 hardware — the dispatcher never reaches it on
+    // CI runners, and there is deliberately no x86 dispatch override. They
+    // are the tests that would have caught the signed-compare bug (#150/#230)
+    // on x86 regardless of which kernel the dispatcher picks.
+    // ========================================================================
+
+    /// Detection guard for AVX2; emits a visible `SKIPPED` line when
+    /// unavailable so a fully-skipped kernel doesn't read as green (#193).
+    fn has_avx2() -> bool {
+        let available = is_x86_feature_detected!("avx2");
+        if !available {
+            crate::util::simd::note_simd_skip("avx2");
+        }
+        available
+    }
+
+    /// Multibyte UTF-8 cases sized to hit the SSE2 16-byte loop, the AVX2
+    /// 32-byte main loop, its 16-byte SSE2 tail, and the scalar tails.
+    fn non_ascii_cases() -> Vec<&'static [u8]> {
+        vec![
+            "café au lait, s'il vous plaît".as_bytes(),
+            "love ♥ and peace ☮".as_bytes(), // the original #230 repro value
+            "日本語のテキストはここにあります".as_bytes(),
+            "emoji 😁 in a string long enough for a full chunk".as_bytes(),
+            "aaaaaaaaaaaaaaaa♥".as_bytes(), // multibyte right at the 16-byte boundary
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa😁".as_bytes(), // at the 32-byte boundary
+            "mixed \"quote\" and café and \\ backslash".as_bytes(),
+            "日本語 with a \n control in the middle of CJK 文字".as_bytes(),
+        ]
+    }
+
+    #[test]
+    fn test_find_json_escape_kernels_match_scalar_non_ascii() {
+        let run_avx2 = has_avx2();
+        for input in non_ascii_cases() {
+            for start in [0usize, 1, 3] {
+                let scalar = find_json_escape_scalar(input, start);
+                // SSE2 is x86_64 baseline, so the kernel is always callable.
+                let sse2 = unsafe { find_json_escape_sse2(input, start) };
+                assert_eq!(
+                    scalar,
+                    sse2,
+                    "SSE2 mismatch for {:?} at start {start}",
+                    String::from_utf8_lossy(input)
+                );
+                if run_avx2 {
+                    let avx2 = unsafe { find_json_escape_avx2(input, start) };
+                    assert_eq!(
+                        scalar,
+                        avx2,
+                        "AVX2 mismatch for {:?} at start {start}",
+                        String::from_utf8_lossy(input)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_json_escape_sse2_exhaustive_bytes_match_scalar() {
+        // Every byte value at every position of a 40-byte buffer: two 16-byte
+        // SSE2 chunks plus the scalar tail. Bytes >= 0x80 are the ones the
+        // signed compare misclassified (#150/#230).
+        for byte in 0u8..=255 {
+            for pos in 0..40 {
+                let mut input = [b'a'; 40];
+                input[pos] = byte;
+                let scalar = find_json_escape_scalar(&input, 0);
+                let sse2 = unsafe { find_json_escape_sse2(&input, 0) };
+                assert_eq!(scalar, sse2, "SSE2 mismatch for byte 0x{byte:02x} at {pos}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_json_escape_avx2_exhaustive_bytes_match_scalar() {
+        if !has_avx2() {
+            return;
+        }
+
+        // 56-byte buffer: one 32-byte AVX2 chunk, one 16-byte SSE2 tail chunk,
+        // and an 8-byte scalar tail — every internal path of the kernel.
+        for byte in 0u8..=255 {
+            for pos in 0..56 {
+                let mut input = [b'a'; 56];
+                input[pos] = byte;
+                let scalar = find_json_escape_scalar(&input, 0);
+                let avx2 = unsafe { find_json_escape_avx2(&input, 0) };
+                assert_eq!(scalar, avx2, "AVX2 mismatch for byte 0x{byte:02x} at {pos}");
+            }
+        }
+    }
 }
