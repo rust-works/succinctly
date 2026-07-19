@@ -1,0 +1,9 @@
+a: nan
+b: NaN
+c: inf
+d: Inf
+e: Infinity
+f: 1e999
+g: .5
+h: +.5
+i: -.5

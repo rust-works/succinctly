@@ -1,0 +1,8 @@
+a: Null
+b: 0x2A
+c: 0o52
+d: nan
+e: inf
+f: 1e999
+g: .5
+h: true
