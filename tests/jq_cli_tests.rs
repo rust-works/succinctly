@@ -764,6 +764,21 @@ fn test_conditional() -> Result<()> {
 }
 
 #[test]
+fn test_object_comparison_operators() -> Result<()> {
+    // Issue #162: object </> comparisons were always false in the CLI path.
+    // jq compares objects by sorted key arrays first, then values in key order.
+    let (output, code) = run_jq_stdin(r#"{"a":1} < {"a":2}"#, "null", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "true\n");
+
+    // Key arrays decide before any values: ["a","b"] < ["a","c"].
+    let (output, code) = run_jq_stdin(r#"{"a":2,"b":1} < {"a":1,"c":9}"#, "null", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "true\n");
+    Ok(())
+}
+
+#[test]
 fn test_try_catch() -> Result<()> {
     // jq returns null for .foo.bar when .foo is null (not an error)
     let (output, code) = run_jq_stdin(r#"try .foo.bar catch "error""#, r#"{"foo":null}"#, &["-r"])?;

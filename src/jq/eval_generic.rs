@@ -135,7 +135,7 @@ fn compare_values(left: &OwnedValue, right: &OwnedValue) -> Option<core::cmp::Or
         (OwnedValue::Int(a), OwnedValue::Float(b)) => (*a as f64).partial_cmp(b),
         (OwnedValue::Float(a), OwnedValue::Int(b)) => a.partial_cmp(&(*b as f64)),
         (OwnedValue::String(a), OwnedValue::String(b)) => Some(a.cmp(b)),
-        // Arrays and objects: compare element-wise (simplified)
+        // Arrays: compare element-wise, then by length
         (OwnedValue::Array(a), OwnedValue::Array(b)) => {
             for (ai, bi) in a.iter().zip(b.iter()) {
                 match compare_values(ai, bi) {
@@ -144,6 +144,25 @@ fn compare_values(left: &OwnedValue, right: &OwnedValue) -> Option<core::cmp::Or
                 }
             }
             Some(a.len().cmp(&b.len()))
+        }
+        // Objects: jq compares the sorted key arrays first, then values in
+        // sorted-key order.
+        (OwnedValue::Object(a), OwnedValue::Object(b)) => {
+            let mut a_keys: Vec<&String> = a.keys().collect();
+            let mut b_keys: Vec<&String> = b.keys().collect();
+            a_keys.sort();
+            b_keys.sort();
+            match a_keys.cmp(&b_keys) {
+                Ordering::Equal => {}
+                other => return Some(other),
+            }
+            for k in a_keys {
+                match compare_values(&a[k], &b[k]) {
+                    Some(Ordering::Equal) => continue,
+                    other => return other,
+                }
+            }
+            Some(Ordering::Equal)
         }
         _ => None,
     }

@@ -1074,22 +1074,23 @@ fn compare_values(left: &OwnedValue, right: &OwnedValue) -> core::cmp::Ordering 
             a.len().cmp(&b.len())
         }
         (OwnedValue::Object(a), OwnedValue::Object(b)) => {
-            // Compare objects by sorted keys, then values
-            let mut a_keys: Vec<_> = a.keys().collect();
-            let mut b_keys: Vec<_> = b.keys().collect();
+            // jq compares the sorted key arrays first, then values in
+            // sorted-key order.
+            let mut a_keys: Vec<&String> = a.keys().collect();
+            let mut b_keys: Vec<&String> = b.keys().collect();
             a_keys.sort();
             b_keys.sort();
-
-            for (ak, bk) in a_keys.iter().zip(b_keys.iter()) {
-                match ak.cmp(bk) {
-                    Ordering::Equal => match compare_values(&a[*ak], &b[*bk]) {
-                        Ordering::Equal => continue,
-                        other => return other,
-                    },
+            match a_keys.cmp(&b_keys) {
+                Ordering::Equal => {}
+                other => return other,
+            }
+            for k in a_keys {
+                match compare_values(&a[k], &b[k]) {
+                    Ordering::Equal => continue,
                     other => return other,
                 }
             }
-            a.len().cmp(&b.len())
+            Ordering::Equal
         }
         _ => Ordering::Equal,
     }
@@ -13803,6 +13804,38 @@ mod tests {
     fn test_comparison_ge() {
         query!(br#"{"a": 2, "b": 2}"#, ".a >= .b",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    #[test]
+    fn test_comparison_objects() {
+        // jq compares objects by [sorted keys] first, then values in
+        // sorted-key order. All expected values verified against real jq.
+        query!(b"null", r#"{"a":1} < {"a":2}"#,
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(b"null", r#"{"a":1} < {"b":1}"#,
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        // Key arrays decide before any values: ["a","b"] < ["a","c"] even
+        // though the value at the shared key "a" compares Greater.
+        query!(b"null", r#"{"a":2,"b":1} < {"a":1,"c":9}"#,
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        // Equal key sets fall through to values in sorted-key order.
+        query!(b"null", r#"{"a":1,"b":2} < {"a":1,"b":3}"#,
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        // A key array that is a strict prefix compares Less.
+        query!(b"null", r#"{"a":1} < {"a":1,"b":2}"#,
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        // Insertion order is irrelevant; these objects are equal.
+        query!(b"null", r#"{"b":1,"a":2} <= {"a":2,"b":1}"#,
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(b"null", r#"{"a":1,"b":2} < {"a":1}"#,
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
     }
 

@@ -98,17 +98,34 @@ fn test_parity_first_last_empty() {
 }
 
 #[test]
-fn test_object_ordering_diverges_157() {
-    // jq compares objects by [sorted keys], then by [values in key order].
-    // Every case below is `true` in jq, which the FULL evaluator matches; the
-    // generic (CLI) path always returns `false` -- bug #157.
-    for filter in [
-        r#"{"a":1} < {"a":2}"#,
-        r#"{"a":2} > {"a":1}"#,
-        r#"{"a":1} < {"b":1}"#,
-        r#"{"a":1,"b":2} < {"a":1,"b":3}"#,
+fn test_object_ordering_parity_162() {
+    // jq compares objects by [sorted keys] first, then by [values in key
+    // order]. Fixed by #162 in BOTH evaluators (eval_generic was missing the
+    // Object arm; eval.rs interleaved key and value comparison). Every
+    // expected value below is pinned against real jq, so the parity assertion
+    // can't lock in an agreed-upon wrong answer.
+    for (filter, expected) in [
+        (r#"{"a":1} < {"a":2}"#, "true"),
+        (r#"{"a":2} > {"a":1}"#, "true"),
+        (r#"{"a":1} < {"b":1}"#, "true"),
+        (r#"{"a":1,"b":2} < {"a":1,"b":3}"#, "true"),
+        // Key arrays decide before any values: ["a","b"] < ["a","c"] even
+        // though the value at the shared key "a" compares Greater.
+        (r#"{"a":2,"b":1} < {"a":1,"c":9}"#, "true"),
+        // Insertion order is irrelevant; these objects are equal.
+        (r#"{"b":1,"a":2} <= {"a":2,"b":1}"#, "true"),
+        (r#"{"a":1} >= {"a":1}"#, "true"),
+        // A key array that is a strict prefix compares Less.
+        (r#"{"a":1} < {"a":1,"b":2}"#, "true"),
+        (r#"{"a":1,"b":2} < {"a":1}"#, "false"),
     ] {
-        assert_divergence(b"null", filter, &["true"], &["false"]);
+        let full = full_outputs(b"null", filter);
+        assert_eq!(
+            as_strs(&full),
+            [expected],
+            "full evaluator disagrees with jq for `{filter}`"
+        );
+        assert_parity(b"null", filter);
     }
 }
 
