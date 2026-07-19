@@ -195,6 +195,31 @@ Requires Intel Ice Lake+ or AMD Zen 4+.
 - Test on both x86_64 and aarch64 if possible
 - Document the expected speedup
 
+#### SIMD CI coverage
+
+SIMD unit tests self-skip when the host CPU lacks the required feature (an
+early `return`, sometimes emitting a `SKIPPED: SIMD test` marker via
+`note_simd_skip`). A fully-skipped suite would otherwise read as a green pass,
+so each test job **asserts its runner actually has the features** (the
+"Verify SIMD CPU features" steps in `.github/workflows/ci.yml`) and fails
+loudly if not.
+
+What each CI runner exercises for real:
+
+| Runner                        | CPU           | Backends asserted in CI                |
+|-------------------------------|---------------|----------------------------------------|
+| `ubuntu-latest` (Test x86_64) | AMD EPYC 7763 | POPCNT, SSE4.1/4.2, **BMI2**, **AVX2** |
+| `ubuntu-24.04-arm` (Test ARM) | Neoverse-N2   | NEON, **SVE2-BITPERM** (BDEP/BEXT)     |
+| `macos-latest` (Test macOS)   | Apple Silicon | NEON                                   |
+
+**Not covered by routine CI: AVX-512.** The standard x86 runners are Zen 3
+(EPYC 7763), which has no `avx512f`/`avx512vpopcntdq`, so the AVX-512 paths
+(`src/util/simd/x86.rs` `avx512f` branch, `src/bits/popcount.rs` VPOPCNTDQ)
+self-skip there. Validate changes to those paths off-CI — on AVX-512 hardware
+or under an emulator (e.g. QEMU `qemu-x86_64 -cpu max`) — and note how you
+tested in the PR. (SVE2 *is* covered: the Neoverse-N2 ARM runner provides
+`sve2-bitperm`.)
+
 ### Unsafe Code
 
 - Minimize `unsafe` blocks
