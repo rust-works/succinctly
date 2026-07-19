@@ -104,6 +104,7 @@ syq-locate config.yaml --line 5 --column 10
 # DSV/CSV operations
 sjq --input-dsv ',' '.[] | select(.[0] == "Alice")' data.csv
 ./target/release/succinctly dsv generate 1mb -p users -o users.csv
+./target/release/succinctly dsv generate 1mb -p users --no-header -o users.csv  # without header row
 
 # Data generation
 ./target/release/succinctly json generate 10mb -o benchmark.json

@@ -348,7 +348,10 @@ cargo run --release --features cli -- yaml generate comprehensive 1mb -o test.ya
 cargo run --release --features cli -- dsv generate-suite
 
 # Individual pattern/size
-cargo run --release --features cli -- dsv generate users 1000 -o users.csv
+cargo run --release --features cli -- dsv generate 1000 -p users -o users.csv
+
+# Omit the header row
+cargo run --release --features cli -- dsv generate 1000 -p users --no-header -o users.csv
 ```
 
 ### Available Patterns
