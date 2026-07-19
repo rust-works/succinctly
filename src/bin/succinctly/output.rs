@@ -8,11 +8,13 @@ use succinctly::jq::OwnedValue;
 /// Exit codes matching jq behavior
 pub mod exit_codes {
     pub const SUCCESS: i32 = 0;
-    pub const FALSE_OR_NULL: i32 = 1; // With -e, last output was false or null
+    // With -e: jq exits 1 when the LAST output was false/null; yq exits 1
+    // when NO result was truthy (its "no matches found" failure).
+    pub const FALSE_OR_NULL: i32 = 1;
     #[allow(dead_code)] // STYLE-0005: complete jq exit-code set; not all emitted yet
     pub const USAGE_ERROR: i32 = 2; // Usage problem or system error
     pub const COMPILE_ERROR: i32 = 3; // jq program compile error
-    pub const NO_OUTPUT: i32 = 4; // With -e, no valid result produced
+    pub const NO_OUTPUT: i32 = 4; // With -e, no valid result produced (jq-only; yq folds into 1)
     #[allow(dead_code)] // STYLE-0005: complete jq exit-code set; not all emitted yet
     pub const HALT_ERROR: i32 = 5; // halt_error without explicit code
 }

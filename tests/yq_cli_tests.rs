@@ -1220,12 +1220,17 @@ fn test_inplace_from_file() -> Result<()> {
 }
 
 // ============================================================================
-// Exit Status Tests (-e / --exit-status) - Identity Fast Path
+// Exit Status Tests (-e / --exit-status)
 //
 // Regression coverage for #178: the M2 identity fast paths streamed output
 // without tracking falsiness, so `-e` wrongly exited 0 on false/null. The
 // compact flags (-I 0) are what route these through the fast path; the
-// default-indent tests at the end cover the non-fast path for contrast.
+// default-indent tests cover the non-fast path for contrast.
+//
+// Semantics match mikefarah yq (verified against v4.53.3), not jq: exit 1
+// unless SOME result is truthy, with empty output and all-falsy output both
+// reported as "Error: no matches found" on stderr. jq's last-value-wins rule
+// and its distinct no-output exit code 4 do not apply to yq.
 // ============================================================================
 
 #[test]
@@ -1282,21 +1287,18 @@ fn test_exit_status_fast_path_mapping_is_truthy() -> Result<()> {
 // a mapping first doc is needed to actually exercise the per-document loop.
 
 #[test]
-fn test_exit_status_fast_path_multidoc_last_falsy() -> Result<()> {
+fn test_exit_status_fast_path_multidoc_any_truthy_wins() -> Result<()> {
+    // yq exits 0 if any document is truthy, even when the last one is falsy
+    // (unlike jq, where only the last output value counts).
     let (_, exit_code) = run_yq_stdin(".", "a: 1\n---\nfalse\n", &["-e", "-I", "0"])?;
-    assert_eq!(exit_code, 1);
-    Ok(())
-}
-
-#[test]
-fn test_exit_status_fast_path_multidoc_last_null() -> Result<()> {
+    assert_eq!(exit_code, 0);
     let (_, exit_code) = run_yq_stdin(".", "a: 1\n---\nnull\n", &["-e", "-I", "0"])?;
-    assert_eq!(exit_code, 1);
+    assert_eq!(exit_code, 0);
     Ok(())
 }
 
 #[test]
-fn test_exit_status_fast_path_multidoc_last_truthy() -> Result<()> {
+fn test_exit_status_fast_path_multidoc_all_truthy() -> Result<()> {
     let (_, exit_code) = run_yq_stdin(".", "a: 1\n---\nb: 2\n", &["-e", "-I", "0"])?;
     assert_eq!(exit_code, 0);
     Ok(())
@@ -1356,5 +1358,85 @@ fn test_exit_status_nonfast_false() -> Result<()> {
 fn test_exit_status_nonfast_true() -> Result<()> {
     let (_, exit_code) = run_yq_stdin(".", "true", &["-e"])?;
     assert_eq!(exit_code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_nonfast_multidoc_any_truthy_wins() -> Result<()> {
+    let (_, exit_code) = run_yq_stdin(".", "a: 1\n---\nfalse\n", &["-e"])?;
+    assert_eq!(exit_code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_comma_any_truthy_wins() -> Result<()> {
+    // Multiple results from one document: any truthy result exits 0,
+    // regardless of order.
+    let (_, exit_code) = run_yq_stdin(".a, .b", "a: true\nb: false\n", &["-e"])?;
+    assert_eq!(exit_code, 0);
+    let (_, exit_code) = run_yq_stdin(".a, .b", "a: false\nb: true\n", &["-e"])?;
+    assert_eq!(exit_code, 0);
+    let (_, exit_code) = run_yq_stdin(".a, .b", "a: false\nb: false\n", &["-e"])?;
+    assert_eq!(exit_code, 1);
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_no_output_exits_one() -> Result<()> {
+    // yq folds "no output" into the same exit code 1 (jq would use 4).
+    let (_, exit_code) = run_yq_stdin(".a | select(. == 2)", "a: 1", &["-e"])?;
+    assert_eq!(exit_code, 1);
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_fast_path_doc_filter_out_of_range_exits_one() -> Result<()> {
+    let (_, exit_code) = run_yq_stdin(".", "a: 1", &["-e", "-I", "0", "--doc", "9"])?;
+    assert_eq!(exit_code, 1);
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_empty_input_exits_one() -> Result<()> {
+    let (_, exit_code) = run_yq_stdin(".", "", &["-e", "-I", "0"])?;
+    assert_eq!(exit_code, 1);
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_prints_no_matches_found_to_stderr() -> Result<()> {
+    // Match yq's exact stderr message; stdout still carries the falsy value.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", "-e", "-I", "0", "."])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(b"false")?;
+    }
+    let output = cmd.wait_with_output()?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stderr)?.trim(),
+        "Error: no matches found"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_exit_status_no_stderr_message_when_truthy() -> Result<()> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", "-e", "-I", "0", "."])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(b"true")?;
+    }
+    let output = cmd.wait_with_output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stderr)?.trim(), "");
     Ok(())
 }

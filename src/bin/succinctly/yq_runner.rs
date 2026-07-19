@@ -1109,9 +1109,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     let stdout = std::io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
 
-    // Track last output for exit status (only need to know if it was falsy, not the full value)
-    let mut last_was_falsy = false;
-    let mut had_output = false;
+    // yq --exit-status semantics: exit 1 unless some result is truthy.
+    // Unlike jq (which inspects only the last output value), yq treats empty
+    // output and all-falsy output alike as "no matches found".
+    let mut any_truthy = false;
 
     // Check if expression contains split_doc - if so, each result is a separate document
     let has_split_doc = contains_split_doc(&program.expr);
@@ -1161,11 +1162,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             .stream_yaml(&mut FmtWriter($writer), 2)
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
                         writeln!($writer)?;
-                        had_output = true;
                         // Streaming skips evaluation, so inspect the document
                         // value directly to keep `-e` falsy tracking (#178).
                         if args.exit_status {
-                            last_was_falsy = $cursor.is_falsy();
+                            any_truthy |= !$cursor.is_falsy();
                         }
                     } else {
                         // M2 YAML path: evaluate and stream YAML results
@@ -1173,10 +1173,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         let stats = result
                             .stream_yaml(&mut FmtWriter($writer), 2, |w| w.write_str("\n"))
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
-                        if stats.count > 0 {
-                            had_output = true;
-                            last_was_falsy = stats.last_was_falsy;
-                        }
+                        any_truthy |= stats.any_truthy;
                     }
                 } else {
                     // M2 path: JSON output streaming
@@ -1186,11 +1183,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             .stream_json(&mut FmtWriter($writer))
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
                         writeln!($writer)?;
-                        had_output = true;
                         // Streaming skips evaluation, so inspect the document
                         // value directly to keep `-e` falsy tracking (#178).
                         if args.exit_status {
-                            last_was_falsy = $cursor.is_falsy();
+                            any_truthy |= !$cursor.is_falsy();
                         }
                     } else {
                         // M2 path: evaluate and stream results
@@ -1198,10 +1194,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         let stats = result
                             .stream_json(&mut FmtWriter($writer), |w| w.write_str("\n"))
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
-                        if stats.count > 0 {
-                            had_output = true;
-                            last_was_falsy = stats.last_was_falsy;
-                        }
+                        any_truthy |= stats.any_truthy;
                     }
                 }
             }};
@@ -1241,11 +1234,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     .map_err(|_| anyhow::anyhow!("Write error"))?;
                             }
                             writeln!(writer)?;
-                            had_output = true;
                             // `root` is the virtual document sequence; falsiness
                             // lives on the actual document value (#178).
                             if args.exit_status {
-                                last_was_falsy = root.first_child().is_some_and(|c| c.is_falsy());
+                                any_truthy |= root.first_child().is_some_and(|c| !c.is_falsy());
                             }
                         } else {
                             // M2 path: need to get the actual document cursor
@@ -1293,12 +1285,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         .map_err(|_| anyhow::anyhow!("Write error"))?;
                                 }
                                 writeln!(writer)?;
-                                had_output = true;
                                 // `root` is the virtual document sequence; falsiness
                                 // lives on the actual document value (#178).
                                 if args.exit_status {
-                                    last_was_falsy =
-                                        root.first_child().is_some_and(|c| c.is_falsy());
+                                    any_truthy |= root.first_child().is_some_and(|c| !c.is_falsy());
                                 }
                             } else {
                                 // M2 path: need to get the actual document cursor
@@ -1318,8 +1308,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         let results = evaluate_input(&OwnedValue::Null, &program.expr, &context)?;
         for result in results {
             split_doc_state.write_separator(&mut writer, &output_config)?;
-            last_was_falsy = matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-            had_output = true;
+            any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
             output_value(&mut writer, &result, &output_config)?;
         }
     } else if args.raw_input {
@@ -1347,8 +1336,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             let results = evaluate_input(&slurped, &program.expr, &context)?;
             for result in results {
                 split_doc_state.write_separator(&mut writer, &output_config)?;
-                last_was_falsy = matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                had_output = true;
+                any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                 output_value(&mut writer, &result, &output_config)?;
             }
         } else {
@@ -1358,8 +1346,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 let results = evaluate_input(&input, &program.expr, &context)?;
                 for result in results {
                     split_doc_state.write_separator(&mut writer, &output_config)?;
-                    last_was_falsy = matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                    had_output = true;
+                    any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                     output_value(&mut writer, &result, &output_config)?;
                 }
             }
@@ -1407,8 +1394,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         let mut split_doc_state = SplitDocState::new(has_split_doc);
         for result in results {
             split_doc_state.write_separator(&mut writer, &output_config)?;
-            last_was_falsy = matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-            had_output = true;
+            any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
             output_value(&mut writer, &result, &output_config)?;
         }
     } else if args.inplace {
@@ -1462,9 +1448,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     no_color_config.use_color = false;
                     for result in results {
                         split_doc_state.write_separator(&mut buf_writer, &no_color_config)?;
-                        last_was_falsy =
-                            matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                        had_output = true;
+                        any_truthy |=
+                            !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                         output_value(&mut buf_writer, &result, &no_color_config)?;
                     }
                 }
@@ -1555,8 +1540,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 }
                 for result in results {
                     split_doc_state.write_separator(&mut writer, &output_config)?;
-                    last_was_falsy = matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                    had_output = true;
+                    any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                     output_value(&mut writer, &result, &output_config)?;
                 }
             }
@@ -1565,14 +1549,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
     writer.flush()?;
 
-    // Determine exit code
-    if args.exit_status {
-        if !had_output {
-            return Ok(exit_codes::NO_OUTPUT);
-        }
-        if last_was_falsy {
-            return Ok(exit_codes::FALSE_OR_NULL);
-        }
+    // Determine exit code. yq compat: empty output and all-falsy output are
+    // the same failure, reported on stderr with a fixed message and exit 1.
+    if args.exit_status && !any_truthy {
+        eprintln!("Error: no matches found");
+        return Ok(exit_codes::FALSE_OR_NULL);
     }
 
     Ok(exit_codes::SUCCESS)
