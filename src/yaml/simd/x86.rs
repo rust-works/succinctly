@@ -7,6 +7,52 @@
 use core::arch::x86_64::*;
 
 // ============================================================================
+// Dispatch clamp (SUCCINCTLY_SIMD)
+// ============================================================================
+
+/// Parsed `SUCCINCTLY_SIMD` value: does it clamp x86 dispatch below AVX2?
+///
+/// - `Some(true)` — a recognized level below AVX2 (`scalar`, `sse2`, `sse42`,
+///   `sse4.2`): use the 16-byte SSE2 kernels. (`scalar` still means SSE2 here;
+///   scalar YAML parsing is compile-time only, via `--features scalar-yaml`.)
+/// - `Some(false)` — recognized no-op (`avx2`, empty): keep detected dispatch.
+/// - `None` — unrecognized. The runtime ignores it (no clamp), but the
+///   `test_succinctly_simd_env_contract` test fails loudly on it so a typo in
+///   a CI leg cannot silently un-clamp the suite.
+#[cfg(any(test, feature = "std"))]
+fn parse_simd_clamp(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "scalar" | "sse2" | "sse42" | "sse4.2" => Some(true),
+        "avx2" | "" => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether `SUCCINCTLY_SIMD` requests clamping dispatch below AVX2.
+#[cfg(any(test, feature = "std"))]
+fn clamp_below_avx2() -> bool {
+    std::env::var("SUCCINCTLY_SIMD").is_ok_and(|v| parse_simd_clamp(&v) == Some(true))
+}
+
+/// Whether the 32-byte AVX2 kernels should be dispatched.
+///
+/// Combines runtime detection with the clamp-down-only `SUCCINCTLY_SIMD`
+/// override: `SUCCINCTLY_SIMD=sse2` forces the 16-byte SSE2 kernels even on an
+/// AVX2 CPU, which is how CI executes the SSE2 classify/skip-width path on
+/// AVX2 runners (#247). Clamping can only lower the level, never raise it —
+/// dispatching an undetected feature would be undefined behaviour.
+///
+/// Cached per STYLE-0003 (see `use_sve2`, `src/json/simd/mod.rs`): dispatch is
+/// on the per-chunk hot path, so the env var is read once per process;
+/// mutating it mid-run has no effect.
+#[cfg(any(test, feature = "std"))]
+#[inline]
+fn avx2_enabled() -> bool {
+    static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVX2.get_or_init(|| is_x86_feature_detected!("avx2") && !clamp_below_avx2())
+}
+
+// ============================================================================
 // Multi-Character Classification (P0 Optimization)
 // ============================================================================
 
@@ -51,7 +97,7 @@ pub fn classify_yaml_chars(input: &[u8], offset: usize) -> Option<YamlCharClass>
 
     #[cfg(any(test, feature = "std"))]
     {
-        if offset + 32 <= input.len() && is_x86_feature_detected!("avx2") {
+        if offset + 32 <= input.len() && avx2_enabled() {
             return Some(unsafe { classify_yaml_chars_avx2(input, offset) });
         }
     }
@@ -148,7 +194,7 @@ unsafe fn classify_yaml_chars_sse2(input: &[u8], offset: usize) -> YamlCharClass
 pub fn find_newline_x86(input: &[u8], start: usize) -> Option<usize> {
     #[cfg(any(test, feature = "std"))]
     {
-        if is_x86_feature_detected!("avx2") {
+        if avx2_enabled() {
             return unsafe { find_newline_avx2(input, start) };
         }
     }
@@ -230,7 +276,7 @@ pub fn find_quote_or_escape_x86(input: &[u8], start: usize, end: usize) -> Optio
     // Runtime dispatch to best available implementation
     #[cfg(any(test, feature = "std"))]
     {
-        if is_x86_feature_detected!("avx2") {
+        if avx2_enabled() {
             // SAFETY: We just checked for AVX2 support
             return unsafe { find_quote_or_escape_avx2(input, start, end) };
         }
@@ -248,7 +294,7 @@ pub fn find_single_quote_x86(input: &[u8], start: usize, end: usize) -> Option<u
     // Runtime dispatch to best available implementation
     #[cfg(any(test, feature = "std"))]
     {
-        if is_x86_feature_detected!("avx2") {
+        if avx2_enabled() {
             // SAFETY: We just checked for AVX2 support
             return unsafe { find_single_quote_avx2(input, start, end) };
         }
@@ -435,7 +481,7 @@ pub fn count_leading_spaces_x86(input: &[u8], start: usize) -> usize {
     // Runtime dispatch to best available implementation
     #[cfg(any(test, feature = "std"))]
     {
-        if is_x86_feature_detected!("avx2") {
+        if avx2_enabled() {
             // SAFETY: We just checked for AVX2 support
             return unsafe { count_leading_spaces_avx2(input, start) };
         }
@@ -536,7 +582,7 @@ pub fn find_block_scalar_end(input: &[u8], start: usize, min_indent: usize) -> O
 
     #[cfg(any(test, feature = "std"))]
     {
-        if is_x86_feature_detected!("avx2") {
+        if avx2_enabled() {
             return Some(unsafe { find_block_scalar_end_avx2(input, start, min_indent) });
         }
     }
@@ -981,7 +1027,7 @@ fn find_json_escape_scalar(input: &[u8], start: usize) -> Option<usize> {
 pub fn find_json_escape_x86(input: &[u8], start: usize) -> Option<usize> {
     #[cfg(any(test, feature = "std"))]
     {
-        if is_x86_feature_detected!("avx2") {
+        if avx2_enabled() {
             return unsafe { find_json_escape_avx2(input, start) };
         }
     }
@@ -998,7 +1044,7 @@ pub fn parse_anchor_name(input: &[u8], start: usize) -> usize {
     if start + 16 <= input.len() {
         #[cfg(any(test, feature = "std"))]
         {
-            if is_x86_feature_detected!("avx2") {
+            if avx2_enabled() {
                 return unsafe { parse_anchor_name_avx2(input, start) };
             }
         }
@@ -1390,10 +1436,12 @@ mod tests {
     //
     // These call `find_json_escape_sse2` / `find_json_escape_avx2` directly
     // rather than through `find_json_escape_x86`, so the SSE2 kernel is
-    // exercised even on AVX2 hardware — the dispatcher never reaches it on
-    // CI runners, and there is deliberately no x86 dispatch override. They
-    // are the tests that would have caught the signed-compare bug (#150/#230)
-    // on x86 regardless of which kernel the dispatcher picks.
+    // exercised even on AVX2 hardware regardless of dispatch. They deliberately
+    // bypass the `SUCCINCTLY_SIMD` clamp (#247) by guarding on raw feature
+    // detection: under the SSE2-clamped CI step the AVX2 *kernels* must still
+    // be differentially tested even though the *dispatcher* never picks them.
+    // They are the tests that would have caught the signed-compare bug
+    // (#150/#230) on x86 regardless of which kernel the dispatcher picks.
     // ========================================================================
 
     /// Detection guard for AVX2; emits a visible `SKIPPED` line when
@@ -1475,6 +1523,162 @@ mod tests {
                 let scalar = find_json_escape_scalar(&input, 0);
                 let avx2 = unsafe { find_json_escape_avx2(&input, 0) };
                 assert_eq!(scalar, avx2, "AVX2 mismatch for byte 0x{byte:02x} at {pos}");
+            }
+        }
+    }
+
+    // ========================================================================
+    // SUCCINCTLY_SIMD dispatch clamp (#247)
+    // ========================================================================
+
+    #[test]
+    fn test_parse_simd_clamp_values() {
+        // Recognized levels below AVX2 clamp (whitespace/case-insensitive).
+        for v in ["scalar", "sse2", "sse42", "sse4.2", " SSE2 ", "Sse4.2"] {
+            assert_eq!(parse_simd_clamp(v), Some(true), "{v:?} should clamp");
+        }
+        // Recognized no-ops.
+        for v in ["avx2", "AVX2", ""] {
+            assert_eq!(parse_simd_clamp(v), Some(false), "{v:?} should be a no-op");
+        }
+        // Unrecognized values parse to None (runtime ignores; contract test
+        // fails loudly when the env var is actually set to one of these).
+        for v in ["banana", "neon", "1", "sse", "avx512"] {
+            assert_eq!(parse_simd_clamp(v), None, "{v:?} should be unrecognized");
+        }
+    }
+
+    /// Contract test for the `SUCCINCTLY_SIMD` clamp, in the spirit of
+    /// `SUCCINCTLY_EXPECT_SIMD` (#192): when a CI leg sets the variable, the
+    /// dispatcher must observably honor it, and a typo'd value must fail the
+    /// leg instead of silently un-clamping the suite. Reads the environment
+    /// only — never sets it — so it is race-free across test threads.
+    #[test]
+    fn test_succinctly_simd_env_contract() {
+        let buf = [b'a'; 64];
+        let width = classify_yaml_chars(&buf, 0).unwrap().width;
+
+        match std::env::var("SUCCINCTLY_SIMD") {
+            Ok(v) => match parse_simd_clamp(&v) {
+                Some(true) => {
+                    assert!(!avx2_enabled(), "SUCCINCTLY_SIMD={v} must clamp dispatch");
+                    assert_eq!(width, 16, "SUCCINCTLY_SIMD={v} must force 16-byte classify");
+                }
+                Some(false) => assert_eq!(
+                    width,
+                    if is_x86_feature_detected!("avx2") {
+                        32
+                    } else {
+                        16
+                    }
+                ),
+                None => panic!(
+                    "SUCCINCTLY_SIMD={v:?} is not a recognized level \
+                     (scalar|sse2|sse42|sse4.2|avx2) — fix the caller so the \
+                     clamp actually applies"
+                ),
+            },
+            Err(_) => assert_eq!(
+                width,
+                if is_x86_feature_detected!("avx2") {
+                    32
+                } else {
+                    16
+                },
+                "unclamped dispatch must classify at the detected width"
+            ),
+        }
+    }
+
+    /// All eight mask channels of a `YamlCharClass`, paired with names for
+    /// assertion messages.
+    fn classify_channels(class: &YamlCharClass) -> [(u32, &'static str); 8] {
+        [
+            (class.newlines, "newlines"),
+            (class.colons, "colons"),
+            (class.hyphens, "hyphens"),
+            (class.spaces, "spaces"),
+            (class.quotes_double, "quotes_double"),
+            (class.quotes_single, "quotes_single"),
+            (class.backslashes, "backslashes"),
+            (class.hash, "hash"),
+        ]
+    }
+
+    /// Per-kernel differential sweep for the classify path (#247, option 2 of
+    /// the issue): a lone structural byte at every position 0..40 of an
+    /// otherwise-inert buffer, asserted against both kernels directly. The
+    /// 16..31 window is exactly where the length-derived skip width swallowed
+    /// terminators after a 16-byte SSE2 classify (#231).
+    #[test]
+    fn test_classify_kernels_differential_terminator_sweep() {
+        let structural: [(u8, usize); 8] = [
+            (b'\n', 0),
+            (b':', 1),
+            (b'-', 2),
+            (b' ', 3),
+            (b'"', 4),
+            (b'\'', 5),
+            (b'\\', 6),
+            (b'#', 7),
+        ];
+        let run_avx2 = has_avx2();
+
+        for &(byte, channel) in &structural {
+            for pos in 0..40usize {
+                let mut buf = [b'a'; 48];
+                buf[pos] = byte;
+
+                // SSE2 kernel at offset 0: sees bytes 0..16 only.
+                let sse2 = unsafe { classify_yaml_chars_sse2(&buf, 0) };
+                assert_eq!(sse2.width, 16, "SSE2 must report a 16-byte width");
+                for (i, (mask, name)) in classify_channels(&sse2).iter().enumerate() {
+                    let expected = if i == channel && pos < 16 {
+                        1u32 << pos
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        *mask, expected,
+                        "SSE2@0 {name} mask for 0x{byte:02x} at {pos}"
+                    );
+                }
+
+                // SSE2 kernel at offset 16: covers the #231 window 16..31.
+                let sse2_hi = unsafe { classify_yaml_chars_sse2(&buf, 16) };
+                for (i, (mask, name)) in classify_channels(&sse2_hi).iter().enumerate() {
+                    let expected = if i == channel && (16..32).contains(&pos) {
+                        1u32 << (pos - 16)
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        *mask, expected,
+                        "SSE2@16 {name} mask for 0x{byte:02x} at {pos}"
+                    );
+                }
+
+                if run_avx2 {
+                    let avx2 = unsafe { classify_yaml_chars_avx2(&buf, 0) };
+                    assert_eq!(avx2.width, 32, "AVX2 must report a 32-byte width");
+                    let sse2_lo = classify_channels(&sse2);
+                    for (i, (mask, name)) in classify_channels(&avx2).iter().enumerate() {
+                        let expected = if i == channel && pos < 32 {
+                            1u32 << pos
+                        } else {
+                            0
+                        };
+                        assert_eq!(
+                            *mask, expected,
+                            "AVX2 {name} mask for 0x{byte:02x} at {pos}"
+                        );
+                        assert_eq!(
+                            *mask & 0xFFFF,
+                            sse2_lo[i].0,
+                            "AVX2 low 16 bits must equal SSE2 ({name}, 0x{byte:02x} at {pos})"
+                        );
+                    }
+                }
             }
         }
     }

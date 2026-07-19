@@ -61,11 +61,18 @@ jobs:
       # `SKIPPED` line) when a CPU feature is missing, so this pins the runner
       # contract — tests/simd_expectation_tests.rs fails the leg if any listed
       # feature stops being detected, instead of the suites silently skipping.
-      # The SSE2 kernels don't need an AVX2-disabled config: the differential
-      # tests (tests/simd_level_tests.rs, tests/dsv_simd_differential_tests.rs,
-      # src/yaml/simd/x86.rs) call each kernel directly, so every level is
-      # exercised on this AVX2 runner. There is deliberately no x86 dispatch
-      # override (docs/reference/environment-variables.md).
+      # Coverage is two-layered on this AVX2 runner:
+      #  - Kernel correctness: the differential tests (tests/simd_level_tests.rs,
+      #    tests/dsv_simd_differential_tests.rs, src/yaml/simd/x86.rs) call each
+      #    kernel directly, so every kernel level is exercised regardless of
+      #    dispatch.
+      #  - Caller integration: kernel-direct tests cannot catch caller-side
+      #    bugs like the classify/skip-width accounting (#231), so the
+      #    "SSE2-clamped dispatch" step below re-runs the suite with
+      #    SUCCINCTLY_SIMD=sse2 (docs/reference/environment-variables.md),
+      #    forcing the yaml parser through the real 16-byte SSE2 dispatch
+      #    path (#247). The clamp affects dispatch only, not detection, so
+      #    this expectation still holds in that step.
       SUCCINCTLY_EXPECT_SIMD: sse2,sse4.2,avx2,bmi2,popcnt
     steps:
       - uses: actions/checkout@v4
@@ -132,6 +139,18 @@ jobs:
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
         run: cargo test --verbose
+
+      # Re-run the suite with yaml x86 dispatch clamped to SSE2 (#247): the
+      # parser and the light.rs regression tests then genuinely execute the
+      # 16-byte classify path, so a reintroduced length-derived skip width
+      # (#231) fails here instead of sailing through on AVX2 dispatch. Same
+      # features as "Run tests", so this reuses the build and costs only
+      # execution time. The in-lib contract test
+      # (test_succinctly_simd_env_contract) fails this step if the clamp ever
+      # stops applying or the value here is typo'd.
+      - name: Run tests (SSE2-clamped dispatch)
+        if: needs.gate.outputs.code == 'true'
+        run: SUCCINCTLY_SIMD=sse2 cargo test --verbose
 
       - name: Run tests (simd feature)
         if: needs.gate.outputs.code == 'true'

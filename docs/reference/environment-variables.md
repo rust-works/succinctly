@@ -8,6 +8,7 @@ Every environment variable succinctly reads, what it accepts, and what it change
 
 | Variable                                                  | Applies to                       | Accepted values                | When unset                    |
 |-----------------------------------------------------------|----------------------------------|--------------------------------|-------------------------------|
+| [`SUCCINCTLY_SIMD`](#succinctly_simd)                     | Library (YAML parsing, x86_64)   | `scalar`/`sse2`/`sse4.2`/`avx2`| Best detected level           |
 | [`SUCCINCTLY_SVE2`](#succinctly_sve2)                     | Library (JSON indexing, ARM)     | Exactly `1`                    | NEON kernels                  |
 | [`SUCCINCTLY_PRESERVE_INPUT`](#succinctly_preserve_input) | `succinctly jq`                  | `1` or `true`                  | jq-compatible formatting      |
 | [`NO_COLOR`](#no_color)                                   | `succinctly jq`, `succinctly yq` | Any non-empty value            | Color if stdout is a terminal |
@@ -24,6 +25,44 @@ Precedence rule of thumb: an explicit command-line flag always beats an environm
 ## Library Variables
 
 These affect the `succinctly` library itself, so they apply to anything built on it, not just the CLI.
+
+### `SUCCINCTLY_SIMD`
+
+Clamps the x86_64 **YAML** SIMD dispatch to a lower instruction-set level than the CPU supports.
+`SUCCINCTLY_SIMD=sse2` makes the YAML parser use the 16-byte SSE2 kernels even on an AVX2 machine.
+
+This is a **clamp, not a selector**: it can only lower the dispatch level, never raise it.
+Requesting a level the CPU does not support would mean executing undetected instructions, which is
+undefined behaviour, so values at or above the detected level are simply no-ops.
+
+Reasons to set it:
+
+- **CI regression coverage** ([#247](https://github.com/rust-works/succinctly/issues/247)): the
+  x86 CI leg re-runs the test suite with `SUCCINCTLY_SIMD=sse2`, so the SSE2 classify/skip-width
+  path (the [#231](https://github.com/rust-works/succinctly/issues/231) bug class) executes for
+  real on AVX2 runners. An in-lib contract test fails loudly if the variable is set to an
+  unrecognized value or the clamp stops applying.
+- A/B benchmarking the SSE2 path against AVX2 on the same machine.
+
+Accepted values (case-insensitive, surrounding whitespace ignored):
+
+| Value                             | Effect on x86_64 YAML dispatch                                 |
+|-----------------------------------|----------------------------------------------------------------|
+| `scalar`, `sse2`, `sse42`/`sse4.2`| 16-byte SSE2 kernels (SSE2 is the x86_64 baseline)             |
+| `avx2`, empty                     | No clamp — best detected level, same as unset                  |
+| Anything else                     | Ignored at runtime; the test-suite contract test fails on it   |
+
+Note that `scalar` still runs the SSE2 kernels: scalar YAML parsing is a compile-time choice
+(`--features scalar-yaml`), not a runtime dispatch level, and SSE2 is unconditionally available on
+x86_64.
+
+Scope worth knowing: it clamps **YAML parsing on x86_64 only**
+([`src/yaml/simd/x86.rs`](../../src/yaml/simd/x86.rs)). JSON, DSV, popcount, and balanced-parens
+dispatch are unaffected (extending the clamp to those sites is tracked as follow-up to #247), and
+`aarch64` never reads it. Requires the `std` feature; `no_std` builds compile straight to SSE2
+dispatch with no AVX2 path at all.
+
+The value is read **once per process**, on first use, and cached. Changing it mid-run has no effect.
 
 ### `SUCCINCTLY_SVE2`
 
@@ -50,13 +89,14 @@ It takes effect only when **all** of the following hold; otherwise it is silentl
 | Requirement                    | Otherwise                                                                    |
 |--------------------------------|------------------------------------------------------------------------------|
 | Value is exactly `1`           | `true`, `yes`, `TRUE`, `0` and empty all mean "unset" — no error, no warning |
-| Target is `aarch64`            | Ignored on x86_64, which dispatches AVX2 > SSE4.2 > SSE2 with no override    |
+| Target is `aarch64`            | Ignored on x86_64 (whose YAML dispatch has its own [`SUCCINCTLY_SIMD`](#succinctly_simd) clamp) |
 | CPU reports the `sve2` feature | Falls back to NEON                                                           |
 | Built with the `std` feature   | `no_std` builds compile straight to NEON, with no dispatch                   |
 
 Scope worth knowing: it switches **JSON index building only** ([`src/json/simd/mod.rs`](../../src/json/simd/mod.rs)).
-YAML has no equivalent override, and DSV and broadword select use the *different* `sve2-bitperm`
-feature unconditionally — so "SVE2" is opt-in for JSON but always-on elsewhere when the CPU supports it.
+YAML's own dispatch override is the x86-only [`SUCCINCTLY_SIMD`](#succinctly_simd) clamp, and DSV
+and broadword select use the *different* `sve2-bitperm` feature unconditionally — so "SVE2" is
+opt-in for JSON but always-on elsewhere when the CPU supports it.
 
 The value is read **once per process**, on first use, and cached. Changing it mid-run has no effect.
 
