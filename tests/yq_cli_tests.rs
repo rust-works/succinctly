@@ -284,12 +284,77 @@ fn test_i0_multidoc_json_stream() -> Result<()> {
 
 #[test]
 fn test_i0_multidoc_yaml_separator() -> Result<()> {
-    // yq emits a `---` separator between YAML documents and preserves numeric
-    // types: expected `a: 1\n---\nb: 2`. succinctly currently omits the
-    // separator AND stringifies the numbers -- bug #175 (+ type preservation).
+    // #175 (fixed): yq emits a `---` separator between YAML documents (never
+    // before the first) and preserves numeric types.
     let (out, code) = run_yq_stdin(".", "a: 1\n---\nb: 2\n", &["-I=0"])?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), "a: \"1\"\nb: \"2\"");
+    assert_eq!(out.trim(), "a: 1\n---\nb: 2");
+    Ok(())
+}
+
+#[test]
+fn test_i0_identity_preserves_scalar_representation() -> Result<()> {
+    // #175 (fixed): the compact-YAML identity fast path re-emits source plain
+    // scalars verbatim, preserving both type and representation exactly as yq
+    // does (`1.0` stays `1.0`, `.5` stays `.5`, `yes` stays unquoted), and
+    // quoted source scalars keep their quotes.
+    let input = "a: 1\nb: true\nc: hello\nd: \"1\"\ne: 1.0\nf: .5\ng: yes\n";
+    let (out, code) = run_yq_stdin(".", input, &["-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.trim(),
+        "a: 1\nb: true\nc: hello\nd: \"1\"\ne: 1.0\nf: .5\ng: yes"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_i0_multidoc_navigation_separator() -> Result<()> {
+    // #175 (fixed): yq also separates per-document results of a navigation
+    // query with `---` in YAML output mode.
+    let (out, code) = run_yq_stdin(".a", "a: 1\n---\na: 2\n", &["-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "1\n---\n2");
+    Ok(())
+}
+
+#[test]
+fn test_i0_multidoc_separator_skips_empty_results() -> Result<()> {
+    // #175: a document whose query yields no values gets no separator either
+    // side (yq prints just `1` here).
+    let (out, code) = run_yq_stdin(".[]", "- 1\n---\n[]\n", &["-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "1");
+    Ok(())
+}
+
+#[test]
+fn test_i0_multidoc_doc_filter_no_separator() -> Result<()> {
+    // #175: selecting a single document with --doc emits no stray separator.
+    let (out, code) = run_yq_stdin(".", "a: 1\n---\nb: 2\n", &["-I=0", "--doc", "1"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "b: 2");
+    Ok(())
+}
+
+#[test]
+fn test_i0_multifile_yaml_separator() -> Result<()> {
+    // #175: documents from separate input files are also `---`-separated,
+    // matching yq's concatenated document stream.
+    let mut f1 = NamedTempFile::new()?;
+    f1.write_all(b"a: 1\n")?;
+    let mut f2 = NamedTempFile::new()?;
+    f2.write_all(b"b: 2\n")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["-I=0", "."])
+        .arg(f1.path())
+        .arg(f2.path())
+        .output()?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout)?.trim(), "a: 1\n---\nb: 2");
     Ok(())
 }
 
