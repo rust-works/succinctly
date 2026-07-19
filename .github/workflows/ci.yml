@@ -76,6 +76,26 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      # The x86 SIMD tests (BMI2, AVX2) self-skip when the feature is absent,
+      # which reads as a silent pass. Fail loudly if this runner can't actually
+      # exercise them, so an all-skipped SIMD suite never looks green (#192).
+      # NOTE: AVX-512 is intentionally NOT required — the standard x86 runners
+      # (Zen 3 EPYC) lack it, so those paths are validated off routine CI. See
+      # CONTRIBUTING.md ("SIMD CI coverage").
+      - name: Verify SIMD CPU features (BMI2 + AVX2)
+        if: needs.gate.outputs.code == 'true'
+        run: |
+          echo "=== CPU Info ==="
+          lscpu | grep -E "Model name|Architecture|Flags" || true
+          missing=""
+          grep -qw avx2 /proc/cpuinfo || missing="$missing avx2"
+          grep -qw bmi2 /proc/cpuinfo || missing="$missing bmi2"
+          if [ -n "$missing" ]; then
+            echo "::error::x86 runner is missing CPU feature(s):$missing — the BMI2/AVX2 SIMD tests would self-skip. See CONTRIBUTING.md (SIMD CI coverage)."
+            exit 1
+          fi
+          echo "BMI2 + AVX2 present: SIMD tests will assert, not skip."
+
       - name: Build
         if: needs.gate.outputs.code == 'true'
         run: cargo build --verbose
@@ -128,14 +148,20 @@ jobs:
             target/
           key: ${{ runner.os }}-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Check CPU features (SVE2)
+      # The aarch64 SVE2 tests self-skip (emitting a `SKIPPED: SIMD test` marker
+      # via note_simd_skip) when sve2-bitperm is absent. The ubuntu-24.04-arm
+      # runner (Neoverse-N2) provides it, so require it here: an all-skipped SVE2
+      # suite must never read as green (#192). NEON is always present on aarch64.
+      - name: Verify SIMD CPU features (NEON + SVE2-BITPERM)
         if: needs.gate.outputs.code == 'true'
         run: |
           echo "=== CPU Info ==="
           lscpu | grep -E "Model name|Architecture|CPU|Flags" || true
-          echo "=== SVE/SVE2 Detection ==="
-          if grep -q sve2 /proc/cpuinfo 2>/dev/null; then echo "SVE2: supported"; else echo "SVE2: not detected"; fi
-          if grep -q svebitperm /proc/cpuinfo 2>/dev/null; then echo "SVE2-BITPERM: supported"; else echo "SVE2-BITPERM: not detected"; fi
+          if ! grep -qw svebitperm /proc/cpuinfo; then
+            echo "::error::ARM runner lacks SVE2-BITPERM — the SVE2 BDEP/BEXT tests would self-skip. See CONTRIBUTING.md (SIMD CI coverage)."
+            exit 1
+          fi
+          echo "NEON (always on aarch64) + SVE2-BITPERM present: SIMD tests will assert, not skip."
 
       - name: Build
         if: needs.gate.outputs.code == 'true'
