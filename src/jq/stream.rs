@@ -58,7 +58,13 @@ pub struct StreamStats {
     /// Number of values streamed.
     pub count: usize,
     /// Whether the last value was falsy (null or false).
+    ///
+    /// jq's `--exit-status` semantics: only the last output value counts.
     pub last_was_falsy: bool,
+    /// Whether any streamed value was truthy (neither null nor false).
+    ///
+    /// yq's `--exit-status` semantics: exit 1 unless some result is truthy.
+    pub any_truthy: bool,
 }
 
 impl StreamableValue for OwnedValue {
