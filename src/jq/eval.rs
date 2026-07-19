@@ -1459,6 +1459,9 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Phase 6: Additional String Functions
         Builtin::Explode => builtin_explode::<W>(value, optional),
         Builtin::Implode => builtin_implode::<W>(value, optional),
+        #[cfg(feature = "regex")]
+        Builtin::Test(re) => builtin_test_regex::<W, S>(re, value, optional),
+        #[cfg(not(feature = "regex"))]
         Builtin::Test(re) => builtin_test::<W, S>(re, value, optional),
         Builtin::Indices(s) => builtin_indices::<W, S>(s, value, optional),
         Builtin::Index(s) => builtin_index::<W, S>(s, value, optional),
@@ -4217,7 +4220,8 @@ fn builtin_implode<W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// Builtin: test(re) - test if string matches (basic substring matching)
+/// Builtin: test(re) - test if string matches (substring fallback without regex feature)
+#[cfg(not(feature = "regex"))]
 fn builtin_test<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     value: StandardJson<'a, W>,
@@ -4521,6 +4525,42 @@ fn build_regex(pattern: &str, flags: Option<&str>) -> Result<regex::Regex, EvalE
     }
 
     regex::Regex::new(&pattern).map_err(|e| EvalError::new(format!("invalid regex: {e}")))
+}
+
+/// Builtin: test(re) - test if string matches the regex
+#[cfg(feature = "regex")]
+fn builtin_test_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    re_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Evaluate the pattern
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    // Get the input string
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+    };
+
+    // Build regex and test for a match
+    let re = match build_regex(&pattern, None) {
+        Ok(r) => r,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    QueryResult::Owned(OwnedValue::Bool(re.is_match(&input)))
 }
 
 /// Builtin: match(re) or match(re; flags) - return match object
@@ -15283,6 +15323,30 @@ mod tests {
     // =========================================================================
     // Phase 7: Regex Functions (requires "regex" feature)
     // =========================================================================
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_test() {
+        // The #167 repro: character classes must match with regex semantics
+        query!(br#""abc123""#, r#"test("[0-9]+")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        // Metacharacter case a substring match would get wrong
+        query!(br#""abc""#, r#"test("a.c")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        query!(br#""abc""#, r#"test("[0-9]+")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+    }
 
     #[cfg(feature = "regex")]
     #[test]
