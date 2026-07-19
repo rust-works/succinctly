@@ -69,6 +69,7 @@ mod index;
 mod light;
 mod locate;
 mod parser;
+mod scalar;
 pub mod simd;
 
 pub use error::YamlError;
@@ -78,3 +79,4 @@ pub use light::{
     YamlValue,
 };
 pub use locate::{locate_offset, locate_offset_detailed, LocateResult};
+pub use scalar::{resolve_plain, ResolvedScalar};
