@@ -84,6 +84,10 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo build --features cli --bin succinctly
 
+      - name: Run cli-gated yq tests
+        if: needs.gate.outputs.code == 'true'
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests
+
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
         run: cargo test --verbose
@@ -141,6 +145,10 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo build --features cli --bin succinctly
 
+      - name: Run cli-gated yq tests
+        if: needs.gate.outputs.code == 'true'
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests
+
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
         run: cargo test --verbose
@@ -184,6 +192,10 @@ jobs:
       - name: Build CLI (for integration tests)
         if: needs.gate.outputs.code == 'true'
         run: cargo build --features cli --bin succinctly
+
+      - name: Run cli-gated yq tests
+        if: needs.gate.outputs.code == 'true'
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
@@ -238,6 +250,9 @@ jobs:
 
       - name: Build CLI (for integration tests)
         run: cargo build --features cli --bin succinctly
+
+      - name: Run cli-gated yq tests
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests
 
       - name: Run tests
         run: cargo test --verbose
@@ -419,3 +434,26 @@ jobs:
           baseline-artifact-name: coverage-baseline-${{ matrix.name }}
           artifact-name: coverage-summary-${{ matrix.name }}
           comment-header: coverage-${{ matrix.name }}
+
+  # Drift detector for the yq golden fixtures (tests/data/yq-golden/): the
+  # goldens are frozen oracle output, so this is the one job that re-checks
+  # them against the pinned mikefarah/yq. Unlike the pre-#227 comparison
+  # tests, a missing or wrong-version yq fails here — it cannot skip.
+  yq-drift:
+    name: yq golden drift check
+    needs: gate
+    if: needs.gate.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned yq
+        run: |
+          V="$(cat tests/data/yq-golden/YQ_VERSION)"
+          curl -fsSL "https://github.com/mikefarah/yq/releases/download/${V}/yq_linux_amd64" \
+            -o /usr/local/bin/yq
+          chmod +x /usr/local/bin/yq
+          yq --version | grep -F "version ${V}"
+
+      - name: Verify goldens against pinned yq
+        run: ./scripts/sync-yq-golden.sh --check
