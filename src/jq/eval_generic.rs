@@ -924,7 +924,11 @@ fn eval_builtin<V: DocumentValue>(
             } else if let Some(fields) = value.as_object() {
                 GenericResult::Owned(OwnedValue::Int(fields.len() as i64))
             } else if let Some(i) = value.as_i64() {
-                GenericResult::Owned(OwnedValue::Int(i.abs()))
+                // checked_abs: i64::MIN has no i64 absolute value; use f64
+                GenericResult::Owned(match i.checked_abs() {
+                    Some(a) => OwnedValue::Int(a),
+                    None => OwnedValue::Float(-(i as f64)),
+                })
             } else if let Some(f) = value.as_f64() {
                 GenericResult::Owned(OwnedValue::Float(f.abs()))
             } else {
@@ -975,22 +979,11 @@ fn eval_builtin<V: DocumentValue>(
         }
 
         Builtin::Values => {
-            if let Some(elements) = value.as_array() {
-                let values = elements.collect_values();
-                GenericResult::ManyOwned(values.iter().map(to_owned).collect())
-            } else if let Some(fields) = value.as_object() {
-                let mut values = Vec::new();
-                let mut f = fields;
-                while let Some((field, rest)) = f.uncons() {
-                    values.push(to_owned(&field.value));
-                    f = rest;
-                }
-                GenericResult::ManyOwned(values)
+            // jq: values == select(. != null)
+            if value.is_null() {
+                GenericResult::None
             } else {
-                GenericResult::Error(EvalError::new(format!(
-                    "values requires object or array, got {}",
-                    value.type_name()
-                )))
+                GenericResult::One(value)
             }
         }
 
@@ -1025,35 +1018,31 @@ fn eval_builtin<V: DocumentValue>(
         }
 
         Builtin::First => {
+            // jq: first == .[0], so [] and null both yield null
             if let Some(elements) = value.as_array() {
                 match elements.get(0) {
                     Some(v) => GenericResult::One(v),
-                    None => GenericResult::Error(EvalError::new("empty array")),
+                    None => GenericResult::Owned(OwnedValue::Null),
                 }
+            } else if value.is_null() {
+                GenericResult::Owned(OwnedValue::Null)
             } else {
-                GenericResult::Error(EvalError::new(format!(
-                    "first requires array, got {}",
-                    value.type_name()
-                )))
+                GenericResult::Error(EvalError::type_error("array", value.type_name()))
             }
         }
 
         Builtin::Last => {
+            // jq: last == .[-1], so [] and null both yield null
             if let Some(elements) = value.as_array() {
                 let len = elements.len();
-                if len == 0 {
-                    GenericResult::Error(EvalError::new("empty array"))
-                } else {
-                    match elements.get(len - 1) {
-                        Some(v) => GenericResult::One(v),
-                        None => GenericResult::Error(EvalError::new("empty array")),
-                    }
+                match len.checked_sub(1).and_then(|i| elements.get(i)) {
+                    Some(v) => GenericResult::One(v),
+                    None => GenericResult::Owned(OwnedValue::Null),
                 }
+            } else if value.is_null() {
+                GenericResult::Owned(OwnedValue::Null)
             } else {
-                GenericResult::Error(EvalError::new(format!(
-                    "last requires array, got {}",
-                    value.type_name()
-                )))
+                GenericResult::Error(EvalError::type_error("array", value.type_name()))
             }
         }
 

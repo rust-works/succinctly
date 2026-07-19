@@ -973,6 +973,57 @@ fn test_integer_subtraction_overflow_converts_to_float() {
     );
 }
 
+#[test]
+fn test_string_multiply_positive_repeats() {
+    // jq: "ab" * 2 => "abab"
+    query!(b"null", r#""ab" * 2"#,
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "abab");
+        }
+    );
+}
+
+#[test]
+fn test_string_multiply_zero_returns_empty_string() {
+    // jq >= 1.7: "ab" * 0 => "" (changed from null in 1.6; jqlang/jq#1593).
+    // #161 suggested null here, but that claim predates jq 1.7 -- verified
+    // against jq-1.7.1.
+    query!(b"null", r#""ab" * 0"#,
+        QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "");
+        }
+    );
+}
+
+#[test]
+fn test_string_multiply_negative_returns_null() {
+    // jq: "ab" * -1 => null
+    query!(b"null", r#""ab" * -1"#,
+        QueryResult::Owned(OwnedValue::Null) => {}
+    );
+}
+
+#[test]
+fn test_length_of_negative_int_is_absolute_value() {
+    // jq: -5 | length => 5
+    query!(b"-5", "length",
+        QueryResult::Owned(OwnedValue::Int(n)) => {
+            assert_eq!(n, 5);
+        }
+    );
+}
+
+#[test]
+fn test_length_of_i64_min_falls_back_to_float() {
+    // jq: -9223372036854775808 | length => 9223372036854775808; -2^63 has no
+    // i64 absolute value, so the result is the exact f64 2^63 (#161)
+    query!(b"-9223372036854775808", "length",
+        QueryResult::Owned(OwnedValue::Float(f)) => {
+            assert_eq!(f, 9_223_372_036_854_775_808.0);
+        }
+    );
+}
+
 // =============================================================================
 // Compatibility tests - has()/in() with negative indices
 // =============================================================================

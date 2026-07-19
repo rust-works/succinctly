@@ -856,7 +856,8 @@ fn arith_mul<S: EvalSemantics>(
         (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 * b)),
         (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a * b as f64)),
         (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a * b)),
-        // String repetition: "ab" * 3 = "ababab"
+        // String repetition: "ab" * 3 = "ababab". jq >= 1.7 yields "" for
+        // n == 0 and null only for n < 0 (jqlang/jq#1593)
         (OwnedValue::String(s), OwnedValue::Int(n))
         | (OwnedValue::Int(n), OwnedValue::String(s)) => {
             if n < 0 {
@@ -1725,9 +1726,13 @@ fn builtin_length<W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(OwnedValue::Int((*fields).count() as i64))
         }
         StandardJson::Number(n) => {
-            // Length of a number is its absolute value
+            // Length of a number is its absolute value.
+            // checked_abs: i64::MIN has no i64 absolute value; use f64
             if let Ok(i) = n.as_i64() {
-                QueryResult::Owned(OwnedValue::Int(i.abs()))
+                QueryResult::Owned(match i.checked_abs() {
+                    Some(a) => OwnedValue::Int(a),
+                    None => OwnedValue::Float(-(i as f64)),
+                })
             } else if let Ok(f) = n.as_f64() {
                 QueryResult::Owned(OwnedValue::Float(f.abs()))
             } else {

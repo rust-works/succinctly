@@ -98,6 +98,35 @@ fn test_parity_first_last_empty() {
 }
 
 #[test]
+fn test_parity_values_bare_is_identity_on_non_null() {
+    // jq: `values` == `select(. != null)` -- identity on any non-null input,
+    // including scalars and whole containers; null yields no output (#161).
+    assert_parity(b"1", "values");
+    assert_parity(br#""abc""#, "values");
+    assert_parity(b"true", "values");
+    assert_parity(br#"{"a":1,"b":null}"#, "values");
+    assert_parity(br"[1,null,2]", "values");
+    assert_parity(b"null", "values");
+}
+
+#[test]
+fn test_parity_first_last_bare_on_empty_and_null() {
+    // jq: `first` == `.[0]` and `last` == `.[-1]`, so `[]` and `null` inputs
+    // yield null rather than erroring (#161).
+    assert_parity(br"[]", "first");
+    assert_parity(br"[]", "last");
+    assert_parity(b"null", "first");
+    assert_parity(b"null", "last");
+}
+
+#[test]
+fn test_parity_length_of_i64_min() {
+    // -2^63 has no i64 absolute value; both evaluators must agree on the
+    // f64 fallback instead of panicking in debug builds (#161).
+    assert_parity(b"-9223372036854775808", "length");
+}
+
+#[test]
 fn test_object_ordering_parity_162() {
     // jq compares objects by [sorted keys] first, then by [values in key
     // order]. Fixed by #162 in BOTH evaluators (eval_generic was missing the
