@@ -33,7 +33,7 @@ The succinct data structures are working as designed:
 | `ty` (type bits)           | M/8 bytes        | Container type markers     |
 | **`bp_to_text`**           | **M × 4 bytes**  | BP→text offset mapping     |
 | **`bp_to_text_end`**       | **M × 4 bytes**  | Scalar end positions       |
-| `seq_items`, `containers`  | M/8 bytes each   | Marker bits                |
+| `containers`               | M/8 bytes        | Marker bits (`seq_items` eliminated in #104/O4) |
 | `newlines` (BitVec)        | N/8 + indices    | Line/column lookup         |
 
 Where:
@@ -121,7 +121,7 @@ Vec<u8> ────────────────────────
   ▼
 YamlIndex::build()
   │
-  ├─ ib, bp, ty, seq_items, containers ──────── [~0.2× input size]
+  ├─ ib, bp, ty, containers ─────────────────── [~0.2× input size]
   ├─ bp_to_text, bp_to_text_end ─────────────── [~0.8× input size]
   └─ rank indices, newlines ─────────────────── [~0.1× input size]
   │                                              ─────────────────

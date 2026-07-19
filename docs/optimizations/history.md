@@ -613,6 +613,28 @@ The IB cursor state (`ib_word_idx`, `ib_ones_before`) remains valid after the ra
 
 **Files**: [src/yaml/end_positions.rs](../../src/yaml/end_positions.rs), [src/yaml/advance_positions.rs](../../src/yaml/advance_positions.rs)
 
+### ✅ O4 seq_items Bitvector Elimination (July 2026)
+
+**Status**: Implemented and measured — [issue #75](https://github.com/rust-works/succinctly/issues/75), [PR #104](https://github.com/rust-works/succinctly/pull/104), [issue #106](https://github.com/rust-works/succinctly/issues/106)
+
+**Problem**: `YamlIndex` stored a `seq_items` bitvector marking sequence-item wrapper nodes. The parser pre-allocated its backing store at 2 bits per input byte (worst-case BP length), marked bits during parsing, and truncated + shrank it at finish — all to store a property that is derivable from the text (a `-` followed by whitespace or end-of-input).
+
+**Technique**: Remove the bitvector and derive `is_seq_item` from the text at both detection sites (`YamlIndex::is_seq_item`, `LightCursor::value`). The naive nested-branch derivation regressed queries 7–15% (#106); the shipped form is a branchless `matches!` with end-of-input folded into the whitespace class.
+
+**Benchmark Results** (Apple M5 Max, `c090e7f6` vs `2a41c2f5`, sequential quiesced A/B):
+
+| Measure                        | Result                                              |
+|--------------------------------|-----------------------------------------------------|
+| yaml_bench (44 benchmarks)     | All improved or neutral; −2 to −6% typical, no regressions |
+| Build peak memory              | **−12.5%** (2.00× → 1.75× of input; −L/4 transient) |
+| Retained index memory          | **−3 to −5%** (19–41 KB per MB of input)            |
+| yq query side (`dev bench yq`) | Neutral-or-better (worst +1.8% noise, best −10.7%)  |
+| Output correctness             | Byte-identical pre↔post on all 80 configurations    |
+
+**Key insight**: Derive, don't store, what the text already encodes — and beware that transient build allocations can dwarf the retained structure (the 2-bit-per-byte scratch was 6–13× the stored bitvector). Full analysis in [parsing/yaml.md O4](../parsing/yaml.md#o4-seq_items-bitvector-elimination--accepted-).
+
+**Files**: [src/yaml/parser.rs](../../src/yaml/parser.rs), [src/yaml/index.rs](../../src/yaml/index.rs), [src/yaml/light.rs](../../src/yaml/light.rs), [src/yaml/locate.rs](../../src/yaml/locate.rs)
+
 ---
 
 ## Future Optimization Opportunities
@@ -660,4 +682,4 @@ See [docs/plan/sve2-optimizations.md](../plan/sve2-optimizations.md#future-neon-
 
 ---
 
-*Last Updated: 2026-01-28*
+*Last Updated: 2026-07-19*

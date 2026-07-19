@@ -127,6 +127,13 @@ The `CompactRank` two-level directory uses ~3.5% overhead per bitmap
 (L1: one `u32` per 128 words + L2: one `u16` per 8 words), meeting the 5%
 target. This replaced the earlier `Vec<u32>` approach (50% overhead).
 
+The same budget-driven reasoning cut the other way for `seq_items`: since the
+sequence-item property is derivable from the text (`-` + whitespace), storing it
+was pure overhead and the bitvector was eliminated outright (issues #75/#104).
+Measured saving: 19–41 KB retained per MB of input (3–5% of the index) plus a
+2-bit-per-byte transient build allocation (−12.5% build peak). See
+[yaml.md O4](yaml.md#o4-seq_items-bitvector-elimination--accepted-).
+
 ## Current derived index structures
 
 Every raw bitmap that needs O(1) rank queries gets a two-level `CompactRank`

@@ -60,7 +60,7 @@ This eliminated the `OwnedValue` intermediate representation, yielding a **2.3x 
 
 ## Optimization Journey
 
-YAML parsing has an extensive documented optimization history (P0-P12, O1-O3):
+YAML parsing has an extensive documented optimization history (P0-P12, O1-O4):
 
 | Phase | Result          | Technique                                    |
 |-------|-----------------|----------------------------------------------|
@@ -73,6 +73,7 @@ YAML parsing has an extensive documented optimization history (P0-P12, O1-O3):
 | P12   | +20-25%         | Advance index (memory-efficient bp_to_text)  |
 | O1    | +3-13%          | Sequential cursor for AdvancePositions       |
 | O3    | 4-12x micro     | SIMD escape scanning (NEON)                  |
+| O4    | −12.5% peak mem | seq_items elimination (text-derived detection)|
 
 **Rejected** (with documented reasons): P2.6 (prefetching), P2.8 (threshold tuning), P3 (branchless), P5-P8 (various), all documented in [yaml.md](yaml.md).
 

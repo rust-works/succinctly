@@ -18,7 +18,6 @@ remaining optimization opportunities.
 | `ib_rank`             | CompactRank              | ~3.5% of ib         | Two-level directory                  |
 | `bp`                  | BalancedParens+Select    | ~2B/8 + indices     | B = BP length                        |
 | `ty`                  | bitmap                   | T/8 bytes           | T = container count                  |
-| `seq_items`           | bitmap                   | B/8 bytes           | 1 bit/BP position                    |
 | `containers`          | bitmap                   | B/8 bytes           | 1 bit/BP position                    |
 | `containers_rank`     | CompactRank              | ~3.5% of containers |                                      |
 | `open_positions`      | AdvancePositions         | ~1.1N bytes         | N = BP opens (compact)               |
@@ -29,6 +28,11 @@ remaining optimization opportunities.
 | `aliases`             | BTreeMap<usize, usize>   | variable            | Alias references                     |
 
 Where L = text length, B = BP length (~2N), N = BP opens, T = container count.
+
+> **Update (2026-07)**: the `seq_items` bitmap (B/8 bytes, originally listed here) was
+> eliminated in [#104](https://github.com/rust-works/succinctly/pull/104) — sequence
+> items are now derived from the text. See
+> [parsing/yaml.md O4](../parsing/yaml.md#o4-seq_items-bitvector-elimination--accepted-).
 
 For typical YAML with N ≈ L/7.5:
 
@@ -170,10 +174,14 @@ pattern as `OpenPositions`.
 
 ---
 
-## Opportunity 2: Remove Dead Code — `count_seq_items_before()`
+## Opportunity 2: Remove Dead Code — `count_seq_items_before()` ✓ DONE (#104)
 
 **Impact: Low (code cleanliness)**
 **Effort: Trivial**
+
+**Status**: Done. `count_seq_items_before()` was removed along with the whole
+`seq_items` bitvector in [#104](https://github.com/rust-works/succinctly/pull/104)
+([O4](../parsing/yaml.md#o4-seq_items-bitvector-elimination--accepted-)).
 
 ### Problem
 
@@ -267,6 +275,10 @@ ib_scalar_rank(pos) = ib_words_rank(pos) - containers_rank(pos) - seq_items_rank
 ```
 
 This eliminates one L/8-byte bitmap and its CompactRank index.
+
+> **Update (2026-07)**: `seq_items` no longer exists (#104), so this derivation no
+> longer applies as written — a `seq_items_rank` would have to be recomputed from
+> text-derived detection, changing this opportunity's cost/benefit.
 
 ### Why this is hard
 
@@ -390,7 +402,7 @@ any remaining unnecessary clones during `SemiIndex` construction.
 | #  | Opportunity                        | Type        | Impact  | Effort  | Depends on  |
 |----|------------------------------------|-------------|---------|---------|-------------|
 | 1  | `bp_to_text_end` compression       | Memory      | High    | Medium  | —           |
-| 2  | Remove dead `count_seq_items_before`| Cleanup    | Low     | Trivial | —           |
+| 2  | Remove dead `count_seq_items_before`| Cleanup    | Low     | Trivial | ✓ Done #104 |
 | 3  | IB select samples                  | Performance | Medium  | Low     | —           |
 | 5  | Remove trivial wrappers            | Cleanup     | Negl.   | Trivial | —           |
 | 7  | Parser clone avoidance             | Build perf  | Medium  | Low     | In progress |
