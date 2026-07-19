@@ -194,6 +194,14 @@ unsafe fn nibble_classify(chars: uint8x16_t) -> uint8x16_t {
 
 **Result**: Replaces 13 comparisons with 6 operations.
 
+**Exactness caveat (#186)**: each bit plane of `lo_table[lo] & hi_table[hi]`
+matches exactly the Cartesian product {lo nibbles} × {hi nibbles} it is set
+for. A byte set that is not such a product (e.g. `,`+`:`, or a range like
+`A-Z` that spans two hi nibbles) needs one bit plane per product — sharing a
+plane over-matches neighbouring bytes (`@ \ ^ _` for a shared "uppercase"
+plane) and silently diverges from backends using exact range compares.
+Exhaustive 256-byte table tests in `json/simd/neon.rs` enforce this.
+
 ### NEON PMULL for Prefix XOR (2026-01-22)
 
 Carryless multiplication computes prefix XOR in O(1) instead of O(log n):

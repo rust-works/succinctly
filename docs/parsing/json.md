@@ -193,6 +193,11 @@ unsafe fn classify_neon(chunk: &[u8; 16]) -> Masks {
 
 This replaces 12+ comparisons with 2 lookups + 1 AND.
 
+Each bit plane of the AND matches exactly a Cartesian product
+{lo nibbles} × {hi nibbles}, so every character class gets one bit plane per
+product it decomposes into; sharing a plane over-matches boundary bytes and
+diverges from the other backends on invalid JSON (#186).
+
 See [simd.md](../optimizations/simd.md) for SIMD technique details.
 
 ---
