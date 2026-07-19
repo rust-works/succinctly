@@ -616,3 +616,10 @@ For detailed documentation on optimization techniques used in this project, see 
   - **16-byte threshold + `#[inline(always)]`**: Both required to prevent regression (threshold alone still caused 3-5% regression)
   - Best for: YAML with long string values (logs, templates, embedded content)
   - See [docs/parsing/yaml.md#o3-simd-escape-scanning-for-json-output--accepted-](docs/parsing/yaml.md#o3-simd-escape-scanning-for-json-output--accepted-) for full analysis
+- ✅ O4 (seq_items Bitvector Elimination): **−12.5% build peak memory, 2-6% faster builds**, issues #75/#104/#106
+  - Removed the stored `seq_items` bitvector; seq-item wrappers are derived from text (`-` + whitespace/EOI)
+  - Branchless `matches!` derivation at both detection sites recovers the 7-15% query regression #106 found in the naive form
+  - **Measured** (Apple M5 Max, c090e7f6 vs 2a41c2f5): build peak 2.00× → 1.75× of input (−L/4 transient scratch), retained index −3-5% (19-41 KB/MB), all 44 yaml_bench benchmarks improved or neutral, yq query side neutral-or-better (worst +1.8% noise, best −10.7%)
+  - Outputs byte-identical pre↔post on all 80 yq A/B configurations
+  - Key insight: derive, don't store, what the text already encodes; transient build allocations can dwarf the retained structure (2-bit-per-byte scratch was 6-13× the stored bitvector)
+  - See [docs/parsing/yaml.md#o4-seq_items-bitvector-elimination--accepted-](docs/parsing/yaml.md#o4-seq_items-bitvector-elimination--accepted-) for full analysis

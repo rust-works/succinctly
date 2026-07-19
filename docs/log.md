@@ -91,7 +91,7 @@ Tracks updates to the knowledge wiki pages in `docs/`.
 - [bitvec.md](architecture/bitvec.md) — BitVec rank/select, Poppy structure, SIMD popcount
 - [balanced-parens.md](architecture/balanced-parens.md) — BP tree encoding, RangeMin, generic SelectSupport
 - [json-index.md](parsing/json-index.md) — JSON semi-indexing, PFSM, SIMD classification pipeline
-- [yaml-index.md](parsing/yaml-index.md) — YAML oracle parser, virtual brackets, P0-P12/O1-O3 optimization history
+- [yaml-index.md](parsing/yaml-index.md) — YAML oracle parser, virtual brackets, P0-P12/O1-O4 optimization history
 - [dsv-index.md](parsing/dsv-index.md) — DSV quote handling, prefix XOR, BMI2 toggle
 - [jq-evaluator.md](reference/jq-evaluator.md) — jq parser/evaluator, JqSemantics vs YqSemantics, supported syntax
 - [simd-strategy.md](optimizations/simd-strategy.md) — Per-module SIMD usage, platform support, lessons learned

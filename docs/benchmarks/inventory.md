@@ -538,6 +538,12 @@ YAML parsing implementation and optimization benchmark results.
   - escape_scan/control_chars (tab character detection)
   - escape_scan/realistic (escape every ~20 chars, 64B-2048B)
 
+##### O4: seq_items Bitvector Elimination - ACCEPTED ✅
+- Issues #75/#104/#106: text-derived seq-item detection replaces stored bitvector
+- Memory A/B (tracking-allocator probe, Apple M5 Max): build peak −12.5% (2.00× → 1.75× input), retained index −3-5% (19-41 KB per MB)
+- yaml_bench criterion A/B: all 44 benchmarks improved or neutral (−2 to −6% typical)
+- dev bench yq A/B via --binary swap: neutral-or-better, outputs byte-identical pre↔post (80 configs)
+
 #### Optimization Phases (Rejected)
 
 ##### P1: YFSM (YAML Finite State Machine) - REJECTED ❌

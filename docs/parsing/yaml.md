@@ -3747,6 +3747,11 @@ Profiling the end-to-end pipeline on 1MB YAML files reveals:
 sequence-item wrappers are now detected directly from the text (a `-` followed by
 whitespace or end-of-input), so there is no `seq_items` structure left to index.
 
+**Measured impact of the elimination** (see [O4](#o4-seq_items-bitvector-elimination--accepted-)
+for full analysis): build peak memory −12.5% (2.00× → 1.75× of input), retained index
+−3–5% (19–41 KB per MB of input), builds 2–6% faster across yaml_bench, query side
+neutral-or-better with the #106 branchless derivation.
+
 ### Opportunity 3: Pack `is_container` Flag into `bp_to_text`
 
 **Current**: Separate bitvector lookup per node.
@@ -3842,7 +3847,7 @@ for (start, end) in structural_segments {
 | 4. String boundaries       | Medium | High   | **P1**   | ✓ Done  |
 | 3. Pack flag in bp_to_text | Low    | Low    | **P2**   | Pending |
 | 5. SIMD JSON escaping      | Medium | Medium | **P2**   | Pending |
-| 2. `seq_items_rank`        | n/a    | n/a    | n/a      | Obsolete|
+| 2. `seq_items_rank`        | n/a    | n/a    | n/a      | Obsolete (O4)|
 | 6. Streaming identity      | High   | High   | **P3**   | Pending |
 
 ### Detailed Bottleneck Analysis
@@ -4639,6 +4644,161 @@ Key optimizations:
 - `src/yaml/light.rs` — Integrated `find_json_escape()` into `write_json_string()`
 - `src/yaml/mod.rs` — Made `simd` module public for benchmark access
 - `benches/yaml_transcode_micro.rs` — Added 5 escape scanning benchmark groups
+
+---
+
+## O4: seq_items Bitvector Elimination — Accepted ✅
+
+**Issues**: [#75](https://github.com/rust-works/succinctly/issues/75) (proposal + memory estimate),
+[#104](https://github.com/rust-works/succinctly/pull/104) (implementation PR),
+[#106](https://github.com/rust-works/succinctly/issues/106) (query-side regression + branchless mitigation)
+
+### Problem
+
+`YamlIndex` stored a `seq_items` bitvector marking which BP positions are sequence-item
+wrapper nodes. The parser pre-allocated the backing `seq_item_words` at **2 bits per input
+byte** (`vec![0u64; input.len().div_ceil(32)]`, sized for the worst-case BP length), set bits
+via `mark_seq_item()` during parsing, then truncated to the actual BP word count and
+`shrink_to_fit()` at finish. Queries answered `is_seq_item()` with an O(1) bit test.
+
+The stored bit is redundant: a node is a sequence-item wrapper **iff** its text position
+starts with a `-` followed by whitespace (or end of input). The text already encodes the
+answer.
+
+### Solution
+
+1. Remove the `seq_items` field and all build/mark/truncate plumbing (`5cf299a0`).
+2. Derive the answer from text at the two detection sites — `YamlIndex::is_seq_item()`
+   ([src/yaml/index.rs](../../src/yaml/index.rs)) and the inlined check in the
+   `LightCursor::value()` hot path ([src/yaml/light.rs](../../src/yaml/light.rs)).
+3. The naive nested-branch form caused a **7–15% query-side regression** (#106). The fix
+   (`4736f040`) is a branchless `matches!` with end-of-input folded into the whitespace
+   class:
+
+```rust
+// Branchless form (see #106): a `-` at end of input is a seq_item, so a
+// missing next byte is treated as whitespace via `unwrap_or(b' ')`.
+text_pos < text.len()
+    && text[text_pos] == b'-'
+    && matches!(
+        text.get(text_pos + 1).copied().unwrap_or(b' '),
+        b' ' | b'\t' | b'\n' | b'\r'
+    )
+```
+
+### Memory Analysis
+
+**Formula** (L = input bytes, B = BP bit length ≈ 2 bits per node):
+- **Transient build allocation (removed)**: `8·ceil(L/32)` bytes ≈ **L/4** (2 bits per input byte)
+- **Retained after build (removed)**: `8·ceil(B/64)` bytes ≈ **B/8** (2 bits per node after truncate + shrink)
+
+**Measured** (tracking-allocator probe around `YamlIndex::build()`, Apple M5 Max,
+baseline `c090e7f6` vs `2a41c2f5`):
+
+| File               | Peak before | Peak after  | Δ peak                | Retained before | Retained after | Δ retained           |
+|--------------------|-------------|-------------|-----------------------|-----------------|----------------|----------------------|
+| comprehensive/1mb  | 2,097,760 B | 1,835,576 B | **−262,184 (−12.5%)** | 681,512 B       | 654,568 B      | **−26,944  (−4.0%)** |
+| comprehensive/10mb | 20.97 MB    | 18.35 MB    | **−2.62 MB (−12.5%)** | 6,738,070 B     | 6,481,414 B    | **−256,656 (−3.8%)** |
+| sequences/1mb      | 3,146,088 B | 2,883,936 B | **−262,152  (−8.3%)** | 760,234 B       | 719,578 B      | **−40,656  (−5.3%)** |
+| users/1mb          | 2,097,688 B | 1,835,512 B | **−262,176 (−12.5%)** | 700,997 B       | 670,829 B      | **−30,168  (−4.3%)** |
+| nested/1mb         | 2,097,488 B | 1,835,336 B | **−262,152 (−12.5%)** | 635,411 B       | 616,395 B      | **−19,016  (−3.0%)** |
+
+The peak delta matches the formula exactly (predicted L/4 = 262,180 B for comprehensive/1mb
+vs 262,184 measured). Build peak drops from **2.00× to 1.75×** input on comprehensive
+(3.00× → 2.75× on sequences); `bench-compare`'s `yaml_peak_memory` group corroborates the
+same ratios independently.
+
+**Versus the #75 estimate** (~125 KB/MB, ~12% of index): that estimate assumed the retained
+bitvector was 1 bit per *text byte*. In reality the stored copy was truncated to BP length
+(2 bits per *node*), so the retained saving is **19–41 KB per MB of input (3–5% of the
+index)** depending on node density — while the *transient* saving is much larger than the
+estimate: **256 KB per MB (12.5% of build peak)**. The estimate sat between the two real
+numbers.
+
+### Benchmark Results
+
+#### yaml_bench — build path (Apple M5 Max, criterion `--baseline` A/B)
+
+**All 44 benchmarks improved or stayed neutral; no significant regressions** (worst case
++0.56%, flagged by criterion as within noise). Notable improvements:
+
+| Benchmark                    | Change      | Benchmark                    | Change      |
+|------------------------------|-------------|------------------------------|-------------|
+| simple_kv/10                 | **−10.5%**  | large/100kb                  | **−5.0%**   |
+| simple_kv/1000               | **−6.0%**   | large/1mb                    | **−3.6%**   |
+| simple_kv/10000              | **−5.1%**   | long_strings/double/64b      | **−8.6%**   |
+| sequences/100                | **−5.2%**   | quoted/single/10             | **−7.6%**   |
+| nested/d5_w2                 | **−5.1%**   | anchors/10                   | **−14.6%**  |
+| nested/d10_w2                | **−3.3%**   | block_scalars/long_100x100   | **−3.8%**   |
+
+The build win comes from eliminating the upfront zero-fill of the 2-bit-per-byte scratch
+vector plus the truncate/shrink (realloc) at finish — the same class of win as P12-A.
+
+#### dev bench yq — query path (Apple M5 Max, system yq v4.53.3)
+
+Method: one harness, two binaries via `--binary` (baseline `c090e7f6` build vs PR build),
+identical data files. Patterns sequences/users/nested/comprehensive × 1kb–10mb × queries
+`.` `.[0]` `.[]` `length`. **Correctness**: succinctly's output hashes were byte-identical
+pre↔post on all 80 configurations.
+
+The harness's default 3-run medians showed process-spawn artifacts swinging **both**
+directions (−42% to +48%) on `.[]`; every outlier was re-measured with 9 runs
+(trimmed median):
+
+| Case                       | Before   | After    | Δ          |
+|----------------------------|----------|----------|------------|
+| users/1kb `.[]`            | 3.49 ms  | 3.12 ms  | **−10.7%** |
+| users/10kb `.[]`           | 3.25 ms  | 3.09 ms  | **−4.8%**  |
+| users/1mb `.[]`            | 16.03 ms | 16.09 ms | +0.4%      |
+| comprehensive/1mb `.[]`    | 14.86 ms | 14.86 ms | ±0.0%      |
+| sequences/1mb `.[]`        | 16.07 ms | 15.65 ms | **−2.6%**  |
+| sequences/10mb `.[]`       | 123.4 ms | 121.8 ms | −1.3%      |
+| nested/10mb `.[]`          | 80.9 ms  | 78.0 ms  | **−3.6%**  |
+| sequences/1mb `length`     | 6.69 ms  | 6.49 ms  | −2.9%      |
+| users/1mb `length`         | 5.18 ms  | 5.27 ms  | +1.7%      |
+| nested/10kb `.[]`          | 3.13 ms  | 3.18 ms  | +1.8%      |
+
+**Verdict**: neutral-or-better across the board (worst +1.8%, within run-to-run noise;
+full-matrix median −2.3%). The #106 branchless mitigation fully recovers the cost of the
+removed O(1) bit test.
+
+### Trade-offs
+
+**Benefits:**
+- ✅ **2–6% faster index builds** across all yaml_bench groups (up to −10% on small inputs)
+- ✅ **−12.5% build peak memory** (−0.25× input: the transient 2-bit-per-byte scratch vector)
+- ✅ **−3–5% retained index memory** (19–41 KB per MB of input)
+- ✅ Less parser plumbing (no `mark_seq_item`/truncate/shrink bookkeeping)
+
+**Costs:**
+- ⚠️ `is_seq_item` now costs two text-byte loads + compares instead of one bit test —
+  measured neutral end-to-end, but only in the branchless form (#106)
+- ⚠️ Detection semantics now tied to text shape (`-` + whitespace/EOI) rather than parser
+  state; covered by `test_is_seq_item_derived_from_text` and
+  `test_is_seq_item_ignores_dash_without_space`
+
+### Key Learnings
+
+1. **Derive, don't store, what the text already encodes** — eliminating a structure beats
+   compressing it (echoes P9's "eliminating phases beats optimizing them").
+2. **Peak ≠ retained**: the transient build scratch (2 bits/byte) was 6–13× larger than the
+   retained structure it produced. Estimates that only consider the stored form (#75) can
+   miss the bigger win.
+3. **Branch shape matters more than instruction count** on the query path: the naive
+   nested-branch derivation regressed 7–15% (#106); the branchless `matches!` form is
+   neutral-or-better.
+4. **3-run process-spawn medians can swing ±40% in both directions** — re-measure outliers
+   (more runs, trimmed medians) before believing either regressions *or* improvements.
+
+### Files Modified
+
+- `src/yaml/parser.rs` — removed `seq_item_words` allocation, `mark_seq_item()`, and the
+  truncate/shrink handoff
+- `src/yaml/index.rs` — removed the `seq_items` field and dead `count_seq_items_before()`;
+  `is_seq_item(text, bp_pos)` is now text-derived and branchless
+- `src/yaml/light.rs` — `LightCursor::value()` reordered (`is_container` first) with the
+  inline branchless seq-item check
+- `src/yaml/locate.rs` — caller updated to pass `text`
 
 ---
 
