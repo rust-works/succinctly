@@ -14,18 +14,18 @@
 //! The SIMD backends fall into two families:
 //!
 //! * **prefix-xor** (`neon`, `sse2`, `avx2`) — track quote state with a running
-//!   `in_quote` flag. These agree with scalar today, including at bit 63, and
-//!   are asserted directly.
-//! * **toggle64** (`bmi2` PDEP, `sve2` BDEP) — share a carry formula that drops
-//!   a quote at bit 63 (`(addend << 1)` loses the top bit), so they currently
-//!   DISAGREE with scalar at the chunk boundary. That is bug #149 (with #182);
-//!   the in-repo `toggle64_reference` re-implements the same buggy formula, so
-//!   the old unit test never caught it. Those backends are exercised only by the
-//!   `#[ignore]`d repro test at the bottom until #149 is fixed.
+//!   `in_quote` flag. These have always agreed with scalar, including at bit 63.
+//! * **toggle64** (`bmi2` PDEP, `sve2` BDEP) — historically derived the
+//!   chunk-boundary carry from the adder's overflow, which dropped a quote
+//!   opening at bit 63 (`addend << 1` loses the top bit) — bug #149 (with
+//!   #182). The carry now comes from quote-count parity, and these backends are
+//!   asserted against scalar exactly like the prefix-xor family, plus a named
+//!   #149 regression sweep at the bottom.
 //!
-//! On this aarch64 host the direct assertions run scalar vs NEON. On x86 CI they
-//! run scalar vs SSE2/AVX2. Absent CPU features print a `SKIPPED` line so a
-//! fully-skipped run does not read as "passed". See #193 (x86) / #194 (SVE2).
+//! On aarch64 hosts the direct assertions run scalar vs NEON (SVE2 where
+//! available). On x86 CI they run scalar vs SSE2/AVX2/BMI2. Absent CPU features
+//! print a `SKIPPED` line so a fully-skipped run does not read as "passed". See
+//! #193 (x86) / #194 (SVE2).
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -33,8 +33,8 @@ use succinctly::dsv::{build_index_scalar, DsvConfig, DsvIndex};
 
 type Builder = fn(&[u8], &DsvConfig) -> DsvIndex;
 
-/// Carry-correct SIMD backends for this target (prefix-xor family). These agree
-/// with the scalar reference today, including at the bit-63 chunk boundary.
+/// The prefix-xor family (running `in_quote` flag). These have always agreed
+/// with the scalar reference, including at the bit-63 chunk boundary.
 fn prefix_xor_backends() -> Vec<(&'static str, Builder)> {
     #[allow(unused_mut)]
     let mut backends: Vec<(&'static str, Builder)> = Vec::new();
@@ -59,10 +59,10 @@ fn prefix_xor_backends() -> Vec<(&'static str, Builder)> {
     backends
 }
 
-/// The `toggle64`-based backends (BMI2 PDEP / SVE2 BDEP). They share the carry
-/// formula that drops a quote at bit 63, so they currently DISAGREE with scalar
-/// at a chunk boundary — bug #149 (with #182). Exercised only by the ignored
-/// repro test until #149 is fixed.
+/// The `toggle64`-based backends (BMI2 PDEP / SVE2 BDEP). Their shared carry
+/// formula used to drop a quote opening at bit 63 (#149, with #182); the carry
+/// is now derived from quote-count parity and they must agree with scalar
+/// everywhere, like the prefix-xor family.
 fn toggle64_backends() -> Vec<(&'static str, Builder)> {
     #[allow(unused_mut)]
     let mut backends: Vec<(&'static str, Builder)> = Vec::new();
@@ -87,6 +87,13 @@ fn toggle64_backends() -> Vec<(&'static str, Builder)> {
         }
     }
 
+    backends
+}
+
+/// Every SIMD backend available on this host, both families.
+fn all_backends() -> Vec<(&'static str, Builder)> {
+    let mut backends = prefix_xor_backends();
+    backends.extend(toggle64_backends());
     backends
 }
 
@@ -147,7 +154,7 @@ fn spanning_quote_input(open: usize) -> Vec<u8> {
 fn test_quote_at_every_offset_matches_scalar() {
     // Detect backends once so a missing feature prints one SKIPPED line per
     // test rather than one per assertion (#193).
-    let backends = prefix_xor_backends();
+    let backends = all_backends();
     let config = DsvConfig::default();
     // Opening quote at every byte offset across three 64-byte chunk boundaries.
     for open in 0..192usize {
@@ -160,9 +167,9 @@ fn test_quote_at_every_offset_matches_scalar() {
 fn test_bit63_carry_regression() {
     // A quote at offset 63 (last bit of chunk 0) must set the carry so the
     // delimiter at offset 64 (first bit of chunk 1) stays masked. Also check the
-    // neighboring boundary bits 62/64 and the next boundary at 127/128. The
-    // toggle64 backends fail this (#149) and are covered separately below.
-    let backends = prefix_xor_backends();
+    // neighboring boundary bits 62/64 and the next boundary at 127/128. This is
+    // the exact case the toggle64 overflow carry used to get wrong (#149).
+    let backends = all_backends();
     let config = DsvConfig::default();
     for open in [62usize, 63, 64, 65, 126, 127, 128, 129] {
         let mut text = vec![b'a'; open + 80];
@@ -180,7 +187,7 @@ fn test_random_csv_matches_scalar() {
     // Deterministic fuzz: randomized bytes over an alphabet of ordinary chars
     // plus every special byte used by the configs below (delimiters, newline,
     // quote, CR). Chunk-spanning quoted regions arise naturally.
-    let backends = prefix_xor_backends();
+    let backends = all_backends();
     let mut rng = ChaCha8Rng::seed_from_u64(0x9E37_79B9_7F4A_7C15);
     let alphabet = *b"ab,\t;\n\r\" ";
     let configs = [
@@ -199,11 +206,12 @@ fn test_random_csv_matches_scalar() {
     }
 }
 
+/// Named regression sweep for #149: the toggle64 (BMI2 PDEP / SVE2 BDEP) carry
+/// formula used to drop a quote opening at bit 63, so bmi2/sve2 disagreed with
+/// scalar at the chunk boundary. Kept as a dedicated test (in addition to the
+/// `all_backends()` sweeps above) so a reintroduction fails with #149 in the
+/// test name.
 #[test]
-#[ignore = "blocked on #149: the toggle64 (BMI2 PDEP / SVE2 BDEP) carry formula \
-            drops a quote at bit 63, so bmi2/sve2 disagree with scalar at the \
-            chunk boundary. Un-ignore once #149 fixes toggle64; run with \
-            `--ignored` on an x86 (bmi2) or SVE2 (sve2) host to reproduce."]
 fn test_toggle64_backends_match_scalar_149() {
     let backends = toggle64_backends();
     if backends.is_empty() {
