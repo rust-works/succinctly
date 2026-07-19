@@ -1,0 +1,5 @@
+---
+source: tests/cli_characterization_tests.rs
+expression: "run(&[\"jq\", \"-c\", \".\"], JSON_USERS)?"
+---
+{"users":[{"name":"Alice","age":30},{"name":"Bob","age":25}],"active":true}

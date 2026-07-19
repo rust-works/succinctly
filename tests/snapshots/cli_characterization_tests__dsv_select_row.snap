@@ -1,0 +1,5 @@
+---
+source: tests/cli_characterization_tests.rs
+expression: "run(&[\"jq\", \"--input-dsv\", \",\", \"-c\", \"select(.[0] == \\\"Alice\\\")\"],\nCSV_PEOPLE)?"
+---
+["Alice","30"]

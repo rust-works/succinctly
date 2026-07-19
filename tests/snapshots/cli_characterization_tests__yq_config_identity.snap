@@ -1,0 +1,16 @@
+---
+source: tests/cli_characterization_tests.rs
+expression: "run(&[\"yq\", \".\"], YAML_CONFIG)?"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: demo
+spec:
+  containers:
+    -
+      name: web
+      image: nginx
+    -
+      name: sidecar
+      image: envoy

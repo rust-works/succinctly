@@ -1,0 +1,11 @@
+---
+source: tests/cli_characterization_tests.rs
+expression: "run(&[\"yq\", \"-o\", \"json\", \".\"], YAML_TYPES)?"
+---
+{
+  "version": "1.0",
+  "enabled": true,
+  "count": 42,
+  "ratio": 3.14,
+  "missing": null
+}
