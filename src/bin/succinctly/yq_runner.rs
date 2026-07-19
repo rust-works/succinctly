@@ -16,6 +16,7 @@ use succinctly::json::JsonIndex;
 use succinctly::yaml::{YamlCursor, YamlIndex, YamlValue};
 
 use super::{InputFormat, OutputFormat, YqCommand};
+use crate::output::{self, exit_codes, ColorScheme, FloatStyle, JsonFormatOpts};
 
 /// Adapter to use `std::io::Write` with `core::fmt::Write` methods.
 /// This enables streaming JSON output without intermediate String allocation.
@@ -25,47 +26,6 @@ impl<W: Write> core::fmt::Write for FmtWriter<W> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         self.0.write_all(s.as_bytes()).map_err(|_| core::fmt::Error)
     }
-}
-
-/// Exit codes matching jq/yq behavior
-pub mod exit_codes {
-    pub const SUCCESS: i32 = 0;
-    pub const FALSE_OR_NULL: i32 = 1; // With -e, last output was false or null
-    #[allow(dead_code)] // STYLE-0005: complete jq exit-code set; not all emitted yet
-    pub const USAGE_ERROR: i32 = 2; // Usage problem or system error
-    #[allow(dead_code)] // STYLE-0005: complete jq exit-code set; not all emitted yet
-    pub const COMPILE_ERROR: i32 = 3; // jq program compile error
-    pub const NO_OUTPUT: i32 = 4; // With -e, no valid result produced
-}
-
-/// Print build configuration information
-fn print_build_configuration() {
-    println!("succinctly yq build configuration:");
-    println!();
-    println!("Version: {}", env!("CARGO_PKG_VERSION"));
-    println!(
-        "Target: {}-{}-{}",
-        std::env::consts::ARCH,
-        std::env::consts::FAMILY,
-        std::env::consts::OS
-    );
-    println!(
-        "Profile: {}",
-        if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        }
-    );
-    println!();
-    println!("Features:");
-    println!("  std: {}", cfg!(feature = "std"));
-    println!("  simd: {}", cfg!(feature = "simd"));
-    println!();
-    println!("Platform:");
-    println!("  OS: {}", std::env::consts::OS);
-    println!("  Arch: {}", std::env::consts::ARCH);
-    println!("  Family: {}", std::env::consts::FAMILY);
 }
 
 /// Evaluation context for passing variables to the jq evaluator.
@@ -532,11 +492,23 @@ fn output_value<W: Write>(writer: &mut W, value: &OwnedValue, config: &OutputCon
         value.to_json()
     } else {
         // Custom pretty-printing with configurable indent
-        pretty_print_json_value(value, config, 0)
+        output::format_json(
+            value,
+            &JsonFormatOpts {
+                indent: &config.indent_str,
+                sort_keys: config.sort_keys,
+                ascii: config.ascii_output,
+                float_style: FloatStyle::PreserveWholeFloat,
+            },
+        )
     };
 
     if config.use_color {
-        write!(writer, "{}", colorize_json(&json_str))?;
+        write!(
+            writer,
+            "{}",
+            output::colorize_json(&json_str, &ColorScheme::default())
+        )?;
     } else {
         write!(writer, "{json_str}")?;
     }
@@ -829,208 +801,6 @@ fn colorize_yaml(yaml: &str) -> String {
     result
 }
 
-/// Pretty print a JSON value with configurable indentation.
-fn pretty_print_json_value(value: &OwnedValue, config: &OutputConfig, depth: usize) -> String {
-    match value {
-        OwnedValue::Null => "null".to_string(),
-        OwnedValue::Bool(b) => b.to_string(),
-        OwnedValue::Int(n) => n.to_string(),
-        OwnedValue::Float(f) => {
-            if f.is_nan() || f.is_infinite() {
-                "null".to_string() // JSON doesn't support NaN or Infinity
-            } else if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
-                format!("{f:.1}") // Preserve decimal point for whole numbers
-            } else {
-                f.to_string()
-            }
-        }
-        OwnedValue::String(s) => {
-            if config.ascii_output {
-                escape_string_ascii(s)
-            } else {
-                escape_json_string(s)
-            }
-        }
-        OwnedValue::Array(arr) => {
-            if arr.is_empty() {
-                "[]".to_string()
-            } else if config.compact || config.indent_str.is_empty() {
-                let items: Vec<_> = arr
-                    .iter()
-                    .map(|v| pretty_print_json_value(v, config, depth + 1))
-                    .collect();
-                format!("[{}]", items.join(","))
-            } else {
-                let indent = config.indent_str.repeat(depth + 1);
-                let close_indent = config.indent_str.repeat(depth);
-                let items: Vec<_> = arr
-                    .iter()
-                    .map(|v| {
-                        format!(
-                            "{}{}",
-                            indent,
-                            pretty_print_json_value(v, config, depth + 1)
-                        )
-                    })
-                    .collect();
-                format!("[\n{}\n{}]", items.join(",\n"), close_indent)
-            }
-        }
-        OwnedValue::Object(obj) => {
-            if obj.is_empty() {
-                "{}".to_string()
-            } else {
-                let entries: Vec<_> = if config.sort_keys {
-                    let mut sorted: Vec<_> = obj.iter().collect();
-                    sorted.sort_by(|a, b| a.0.cmp(b.0));
-                    sorted
-                } else {
-                    obj.iter().collect()
-                };
-
-                if config.compact || config.indent_str.is_empty() {
-                    let items: Vec<_> = entries
-                        .iter()
-                        .map(|(k, v)| {
-                            let key = escape_json_string(k);
-                            format!("{}:{}", key, pretty_print_json_value(v, config, depth + 1))
-                        })
-                        .collect();
-                    format!("{{{}}}", items.join(","))
-                } else {
-                    let indent = config.indent_str.repeat(depth + 1);
-                    let close_indent = config.indent_str.repeat(depth);
-                    let items: Vec<_> = entries
-                        .iter()
-                        .map(|(k, v)| {
-                            let key = escape_json_string(k);
-                            format!(
-                                "{}{}: {}",
-                                indent,
-                                key,
-                                pretty_print_json_value(v, config, depth + 1)
-                            )
-                        })
-                        .collect();
-                    format!("{{\n{}\n{}}}", items.join(",\n"), close_indent)
-                }
-            }
-        }
-    }
-}
-
-/// Escape a string for JSON output.
-fn escape_json_string(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() + 2);
-    result.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            c if c.is_ascii_control() => {
-                result.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            _ => result.push(c),
-        }
-    }
-    result.push('"');
-    result
-}
-
-/// Escape a string with ASCII-only output.
-fn escape_string_ascii(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() + 2);
-    result.push('"');
-    for c in s.chars() {
-        if c.is_ascii() {
-            match c {
-                '"' => result.push_str("\\\""),
-                '\\' => result.push_str("\\\\"),
-                '\n' => result.push_str("\\n"),
-                '\r' => result.push_str("\\r"),
-                '\t' => result.push_str("\\t"),
-                c if c.is_ascii_control() => {
-                    result.push_str(&format!("\\u{:04x}", c as u32));
-                }
-                _ => result.push(c),
-            }
-        } else {
-            // Non-ASCII: escape as \uXXXX
-            for unit in c.encode_utf16(&mut [0; 2]) {
-                result.push_str(&format!("\\u{unit:04x}"));
-            }
-        }
-    }
-    result.push('"');
-    result
-}
-
-/// Colorize JSON output (basic ANSI colors).
-fn colorize_json(json: &str) -> String {
-    // Simple colorization - this could be more sophisticated
-    let mut result = String::with_capacity(json.len() * 2);
-    let mut in_string = false;
-    let mut escape_next = false;
-
-    for c in json.chars() {
-        if escape_next {
-            result.push(c);
-            escape_next = false;
-            continue;
-        }
-
-        if c == '\\' && in_string {
-            result.push(c);
-            escape_next = true;
-            continue;
-        }
-
-        if c == '"' {
-            if in_string {
-                result.push(c);
-                result.push_str("\x1b[0m"); // Reset
-                in_string = false;
-            } else {
-                result.push_str("\x1b[32m"); // Green for strings
-                result.push(c);
-                in_string = true;
-            }
-            continue;
-        }
-
-        if !in_string {
-            match c {
-                't' | 'r' | 'u' | 'e' | 'f' | 'a' | 'l' | 's' => {
-                    // Part of true/false - blue
-                    result.push_str("\x1b[34m");
-                    result.push(c);
-                    result.push_str("\x1b[0m");
-                }
-                'n' => {
-                    // Part of null - magenta
-                    result.push_str("\x1b[35m");
-                    result.push(c);
-                    result.push_str("\x1b[0m");
-                }
-                '0'..='9' | '-' | '.' => {
-                    // Numbers - cyan
-                    result.push_str("\x1b[36m");
-                    result.push(c);
-                    result.push_str("\x1b[0m");
-                }
-                _ => result.push(c),
-            }
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
-}
-
 /// Parse a JSON string into an OwnedValue.
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
     let bytes = s.as_bytes();
@@ -1306,7 +1076,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
     // Handle --build-configuration
     if args.build_configuration {
-        print_build_configuration();
+        output::print_build_configuration("yq");
         return Ok(exit_codes::SUCCESS);
     }
 

@@ -131,8 +131,6 @@ pub enum FloatStyle {
     /// Rust's shortest representation: `1.0` prints as `1` (jq).
     Shortest,
     /// Keep a trailing `.0` on whole floats in i64 range: `1.0` prints as `1.0` (yq).
-    #[allow(dead_code)]
-    // STYLE-0005: constructed by the yq runner migration in the next commit
     PreserveWholeFloat,
 }
 
