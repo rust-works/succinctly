@@ -95,8 +95,6 @@ CUP7      tags              tags (!) not supported — #224
 CVW2      lax:comments      comment placement not validated — #223
 CXX2      lax:anchors       anchor/alias rules not validated — #223
 D49Q      lax:quoting       quoting/escape rules not validated — #223
-DE56/04   streaming         streaming path diverges from OwnedValue path — #222
-DE56/05   streaming         streaming path diverges from OwnedValue path — #222
 DK3J      scalars           scalar content/folding differs from spec
 DK4H      lax:mapping       mapping/key rules not validated — #223
 DK95/00   scalars           scalar content/folding differs from spec
@@ -141,7 +139,6 @@ MUS6/05   directives        %YAML/%TAG directive not recognized — #225
 MUS6/06   directives        %YAML/%TAG directive not recognized — #225
 N4JP      lax:indentation   indentation not validated — #223
 N782      lax:flow          flow syntax not validated — #223
-NP9H      streaming         streaming path diverges from OwnedValue path — #222
 P2EQ      lax:other         not validated — #223
 P76L      directives        %YAML/%TAG directive not recognized — #225
 PUW8      structure         document/block structure differs from spec
