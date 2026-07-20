@@ -125,6 +125,20 @@ fn test_quiet_mode_no_output() -> Result<()> {
     Ok(())
 }
 
+/// Issue #151: deeply nested input must fail validation cleanly instead of
+/// aborting the process with a stack overflow (SIGABRT).
+#[test]
+fn test_deeply_nested_input_errors_instead_of_aborting() -> Result<()> {
+    let input = "[".repeat(20_000);
+    let (_, stderr, exit_code) = run_validate_stdin(&input, &[])?;
+    assert_eq!(exit_code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit"),
+        "stderr should report the nesting cap, got: {stderr}"
+    );
+    Ok(())
+}
+
 // ============================================================================
 // Valid JSON acceptance tests
 // ============================================================================
