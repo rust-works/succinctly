@@ -79,6 +79,11 @@ pub struct JsonIndex<W = Vec<u64>> {
 
 /// Build cumulative popcount index for IB.
 /// Returns a vector where entry i = total 1-bits in words [0, i).
+///
+/// The `u32` accumulator is safe because every constructor asserts
+/// `ib_len <= u32::MAX` (#188), and set bits <= ib_len. Widening to `u64`
+/// would double a hot per-word array (~6.25% of input) for inputs the index
+/// cannot represent anyway.
 fn build_ib_rank(words: &[u64]) -> Vec<u32> {
     let mut rank = Vec::with_capacity(words.len() + 1);
     let mut cumulative: u32 = 0;
@@ -141,7 +146,18 @@ impl JsonIndex<Vec<u64>> {
     ///
     /// On supported platforms (aarch64, x86_64), this automatically uses
     /// SIMD-accelerated indexing for better performance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the input exceeds `u32::MAX` bytes (just under 4 GiB): the
+    /// IB rank directory stores cumulative counts as `u32` (#188). Larger
+    /// inputs would previously truncate silently.
     pub fn build(json: &[u8]) -> Self {
+        assert!(
+            json.len() as u64 <= u64::from(u32::MAX),
+            "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {} bytes (#188)",
+            json.len()
+        );
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         let semi = crate::json::simd::build_semi_index_standard(json);
 
@@ -182,7 +198,18 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     /// * `ib_len` - Number of valid bits in IB (typically == JSON text length)
     /// * `bp` - Balanced parentheses data
     /// * `bp_len` - Number of valid bits in BP
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ib_len` exceeds `u32::MAX` bits (#188): the IB rank
+    /// directory stores cumulative counts as `u32`. (Pathological JSON can
+    /// also push `bp_len` past `u32::MAX` first; `BalancedParens` asserts its
+    /// own ceiling.)
     pub fn from_parts(ib: W, ib_len: usize, bp: W, bp_len: usize) -> Self {
+        assert!(
+            ib_len as u64 <= u64::from(u32::MAX),
+            "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {ib_len} bits (#188)"
+        );
         // Build cumulative popcount index for IB
         let ib_rank = build_ib_rank(ib.as_ref());
 
@@ -204,6 +231,11 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     /// * `bp` - Balanced parentheses data
     /// * `bp_len` - Number of valid bits in BP
     /// * `newlines` - Newline position bitvector
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ib_len` exceeds `u32::MAX` bits (#188): the IB rank
+    /// directory stores cumulative counts as `u32`.
     pub fn from_parts_with_newlines(
         ib: W,
         ib_len: usize,
@@ -211,6 +243,10 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
         bp_len: usize,
         newlines: crate::bits::BitVec,
     ) -> Self {
+        assert!(
+            ib_len as u64 <= u64::from(u32::MAX),
+            "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {ib_len} bits (#188)"
+        );
         let ib_rank = build_ib_rank(ib.as_ref());
 
         Self {
@@ -2033,6 +2069,15 @@ mod tests {
         let json = br#"{"a": 1}"#;
         let index = JsonIndex::build(json);
         assert!(!index.bp().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "up to u32::MAX")]
+    #[cfg(target_pointer_width = "64")]
+    fn test_from_parts_len_guard_panics() {
+        // ib_len is a plain parameter, so exercising the #188 guard needs no
+        // 4 GiB allocation.
+        let _ = JsonIndex::from_parts(vec![], u32::MAX as usize + 1, vec![], 0);
     }
 
     #[test]
