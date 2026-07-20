@@ -154,7 +154,7 @@ impl JsonIndex<Vec<u64>> {
     /// inputs would previously truncate silently.
     pub fn build(json: &[u8]) -> Self {
         assert!(
-            json.len() as u64 <= u64::from(u32::MAX),
+            u32::try_from(json.len()).is_ok(),
             "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {} bytes (#188)",
             json.len()
         );
@@ -207,7 +207,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     /// own ceiling.)
     pub fn from_parts(ib: W, ib_len: usize, bp: W, bp_len: usize) -> Self {
         assert!(
-            ib_len as u64 <= u64::from(u32::MAX),
+            u32::try_from(ib_len).is_ok(),
             "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {ib_len} bits (#188)"
         );
         // Build cumulative popcount index for IB
@@ -244,7 +244,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
         newlines: crate::bits::BitVec,
     ) -> Self {
         assert!(
-            ib_len as u64 <= u64::from(u32::MAX),
+            u32::try_from(ib_len).is_ok(),
             "JsonIndex supports inputs up to u32::MAX (4294967295) bytes; got {ib_len} bits (#188)"
         );
         let ib_rank = build_ib_rank(ib.as_ref());
