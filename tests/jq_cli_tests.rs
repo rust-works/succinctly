@@ -287,9 +287,65 @@ fn test_slurp() -> Result<()> {
 
 #[test]
 fn test_slurp_with_raw_input() -> Result<()> {
+    // jq -R -s: the entire input is one string, not an array of lines
     let (output, code) = run_jq_stdin(".", "a\nb\nc", &["-R", "-s", "-c"])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#"["a","b","c"]"#);
+    assert_eq!(output.trim(), r#""a\nb\nc""#);
+    Ok(())
+}
+
+#[test]
+fn test_slurp_with_raw_input_preserves_trailing_newline() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", "a\nb\n", &["-R", "-s", "-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""a\nb\n""#);
+    Ok(())
+}
+
+#[test]
+fn test_slurp_with_raw_input_raw_output() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", "x\ny", &["-R", "-s", "-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "x\ny\n");
+    Ok(())
+}
+
+#[test]
+fn test_slurp_with_raw_input_empty_input() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", "", &["-R", "-s", "-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""""#);
+    Ok(())
+}
+
+#[test]
+fn test_slurp_with_raw_input_multiple_files() -> Result<()> {
+    let mut file1 = NamedTempFile::new()?;
+    writeln!(file1, "a")?;
+
+    let mut file2 = NamedTempFile::new()?;
+    writeln!(file2, "b")?;
+
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+        ])
+        .arg("-R")
+        .arg("-s")
+        .arg("-c")
+        .arg(".")
+        .arg(file1.path())
+        .arg(file2.path())
+        .output()?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(stdout.trim(), r#""a\nb\n""#);
     Ok(())
 }
 
