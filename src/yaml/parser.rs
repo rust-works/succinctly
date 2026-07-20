@@ -3631,7 +3631,7 @@ pub fn build_semi_index(input: &[u8]) -> Result<SemiIndex, YamlError> {
     // written is <= input.len() (including the input.len() sentinel for null
     // nodes, an exact fit at the maximum), so this single guard makes all
     // downstream u32 casts safe.
-    if input.len() as u64 > u64::from(u32::MAX) {
+    if u32::try_from(input.len()).is_err() {
         return Err(YamlError::InputTooLarge { len: input.len() });
     }
     let mut parser = Parser::new(input);
