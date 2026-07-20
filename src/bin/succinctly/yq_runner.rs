@@ -112,17 +112,10 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> Result<Owned
         YamlValue::Mapping(fields) => {
             let mut map = IndexMap::new();
             for field in fields {
-                let key = match field.key() {
-                    YamlValue::String(s) => s
-                        .as_str()
-                        .map_err(|e| anyhow::anyhow!("invalid YAML key: {e}"))?
-                        .into_owned(),
-                    other => {
-                        // Non-string keys - convert to string representation
-                        let value = yaml_to_owned_value(other)?;
-                        value_to_string(&value)
-                    }
-                };
+                // Keys follow yq semantics (#222): alias-to-scalar resolves to
+                // its content, any other complex key stringifies to "", and the
+                // entry is always kept — matching the streaming/DOM emit paths.
+                let key = field.key().key_string().into_owned();
                 let value = yaml_to_owned_value(field.value())?;
                 map.insert(key, value);
             }
@@ -146,33 +139,6 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> Result<Owned
         }
         YamlValue::Error(msg) => Err(anyhow::anyhow!("YAML error: {msg}")),
         YamlValue::Null => Ok(OwnedValue::Null),
-    }
-}
-
-/// Convert an OwnedValue to a string representation (for non-string keys).
-fn value_to_string(value: &OwnedValue) -> String {
-    match value {
-        OwnedValue::Null => "null".to_string(),
-        OwnedValue::Bool(b) => b.to_string(),
-        OwnedValue::Int(n) => n.to_string(),
-        OwnedValue::Float(f) => {
-            if f.is_nan() {
-                ".nan".to_string()
-            } else if f.is_infinite() {
-                if *f > 0.0 {
-                    ".inf".to_string()
-                } else {
-                    "-.inf".to_string()
-                }
-            } else {
-                f.to_string()
-            }
-        }
-        OwnedValue::String(s) => s.clone(),
-        OwnedValue::Array(_) | OwnedValue::Object(_) => {
-            // Complex types - use JSON representation
-            value.to_json()
-        }
     }
 }
 
