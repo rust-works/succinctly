@@ -209,14 +209,19 @@ unsafe fn neon_movemask(v: uint8x16_t) -> u16 {
 mod tests {
     use super::*;
 
+    /// Feature guard for the tests below. Routes through the shared skip
+    /// helper so every `if !has_sve2() { return; }` prints a visible
+    /// `SKIPPED` line instead of silently passing (#191/#194).
     fn has_sve2() -> bool {
-        crate::util::simd::sve2::has_sve2_bitperm()
+        crate::util::simd::note_simd_skip_unless(
+            crate::util::simd::sve2::has_sve2_bitperm(),
+            "sve2-bitperm",
+        )
     }
 
     #[test]
     fn test_simple_csv() {
         if !has_sve2() {
-            crate::util::simd::note_simd_skip("sve2-bitperm");
             return;
         }
 

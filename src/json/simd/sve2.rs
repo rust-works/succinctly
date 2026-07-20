@@ -499,15 +499,13 @@ pub const fn has_sve2() -> bool {
 mod tests {
     use super::*;
 
+    /// Feature guard for the tests below. Delegates detection to the
+    /// production `has_sve2()` and routes through the shared skip helper so
+    /// every `if !has_sve2_runtime() { return; }` prints a visible `SKIPPED`
+    /// line instead of silently passing (#191/#194). The JSON kernels need
+    /// plain `sve2`, not `sve2-bitperm`.
     fn has_sve2_runtime() -> bool {
-        #[cfg(feature = "std")]
-        {
-            std::arch::is_aarch64_feature_detected!("sve2")
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            false
-        }
+        crate::util::simd::note_simd_skip_unless(has_sve2(), "sve2")
     }
 
     /// Extract bit at position i from a word vector (LSB-first within each word)
@@ -531,7 +529,6 @@ mod tests {
     #[test]
     fn test_sve2_matches_scalar_empty_object() {
         if !has_sve2_runtime() {
-            eprintln!("Skipping SVE2 test: CPU doesn't support SVE2");
             return;
         }
 

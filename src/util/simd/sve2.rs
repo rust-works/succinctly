@@ -240,14 +240,16 @@ pub const fn has_sve2_bitperm() -> bool {
 mod tests {
     use super::*;
 
+    /// Feature guard for the tests below. Routes through the shared skip
+    /// helper so every `if !has_sve2() { return; }` prints a visible
+    /// `SKIPPED` line instead of silently passing (#191/#194).
     fn has_sve2() -> bool {
-        super::has_sve2_bitperm()
+        crate::util::simd::note_simd_skip_unless(super::has_sve2_bitperm(), "sve2-bitperm")
     }
 
     #[test]
     fn test_bdep_basic() {
         if !has_sve2() {
-            crate::util::simd::note_simd_skip("sve2-bitperm");
             return;
         }
 
@@ -272,7 +274,6 @@ mod tests {
     #[test]
     fn test_bext_basic() {
         if !has_sve2() {
-            crate::util::simd::note_simd_skip("sve2-bitperm");
             return;
         }
 
@@ -426,7 +427,6 @@ mod tests {
     #[test]
     fn test_select_in_word_bdep_basic() {
         if !has_sve2() {
-            crate::util::simd::note_simd_skip("sve2-bitperm");
             return;
         }
 
