@@ -1,0 +1,8 @@
+{
+  "top1": {
+    "key1": "scalar1"
+  },
+  "top3": {
+    "scalar1": "scalar3"
+  }
+}
