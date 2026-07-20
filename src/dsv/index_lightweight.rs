@@ -31,6 +31,11 @@ pub struct DsvIndexLightweight {
 
 /// Build cumulative rank array.
 /// Returns a vector where entry i = total 1-bits in words[0..i).
+///
+/// The `u32` accumulator is safe because `new` asserts
+/// `text_len <= u32::MAX` (#188), and set bits <= text_len. Widening both
+/// rank arrays to `u64` would double two hot per-word structures (~12.5% of
+/// input combined) for inputs the index cannot represent anyway.
 fn build_rank(words: &[u64]) -> Vec<u32> {
     let mut rank = Vec::with_capacity(words.len() + 1);
     let mut cumulative: u32 = 0;
@@ -44,7 +49,20 @@ fn build_rank(words: &[u64]) -> Vec<u32> {
 
 impl DsvIndexLightweight {
     /// Create a new lightweight index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `text_len` exceeds `u32::MAX` bytes (just under 4 GiB): the
+    /// cumulative rank arrays store counts as `u32` (#188). Larger inputs
+    /// would previously truncate silently. (The fields are `pub`, so a direct
+    /// struct literal can bypass this check; all crate builders funnel through
+    /// `new`.)
     pub fn new(markers: Vec<u64>, newlines: Vec<u64>, text_len: usize) -> Self {
+        assert!(
+            text_len as u64 <= u64::from(u32::MAX),
+            "DsvIndexLightweight supports inputs up to u32::MAX (4294967295) bytes; \
+             got {text_len} bytes (#188)"
+        );
         let markers_rank = build_rank(&markers);
         let newlines_rank = build_rank(&newlines);
 
@@ -235,5 +253,14 @@ mod tests {
         assert_eq!(index.markers_select1(1), Some(3));
         assert_eq!(index.markers_select1(2), Some(5));
         assert_eq!(index.markers_select1(3), Some(7));
+    }
+
+    #[test]
+    #[should_panic(expected = "up to u32::MAX")]
+    #[cfg(target_pointer_width = "64")]
+    fn test_text_len_guard_panics() {
+        // text_len is a plain parameter, so exercising the #188 guard needs no
+        // 4 GiB allocation.
+        let _ = DsvIndexLightweight::new(vec![], vec![], u32::MAX as usize + 1);
     }
 }
