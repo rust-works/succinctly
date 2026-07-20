@@ -88,7 +88,7 @@ impl ResolvedScalar {
 /// comparisons; full-string comparisons and numeric parses only run inside
 /// the arm that the first byte selects.
 #[must_use]
-#[inline]
+#[inline(always)]
 pub fn resolve_plain(s: &str) -> ResolvedScalar {
     let bytes = s.as_bytes();
     let Some(&first) = bytes.first() else {
@@ -109,7 +109,7 @@ pub fn resolve_plain(s: &str) -> ResolvedScalar {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn keyword(matched: bool, resolved: ResolvedScalar) -> ResolvedScalar {
     if matched {
         resolved
@@ -120,7 +120,7 @@ fn keyword(matched: bool, resolved: ResolvedScalar) -> ResolvedScalar {
 
 /// Resolves scalars starting with `.`: the `.inf`/`.nan` family, else a
 /// leading-dot float such as `.5`.
-#[inline]
+#[inline(always)]
 fn resolve_dot(s: &str) -> ResolvedScalar {
     match s {
         ".inf" | ".Inf" | ".INF" => ResolvedScalar::Float(f64::INFINITY),
@@ -132,7 +132,7 @@ fn resolve_dot(s: &str) -> ResolvedScalar {
 /// Resolves scalars starting with `+` or `-`: signed infinities, else a
 /// signed number. Signed hex/octal (`-0x2A`) is not core schema and falls
 /// through the decimal parses to `Str`.
-#[inline]
+#[inline(always)]
 fn resolve_signed(s: &str, bytes: &[u8]) -> ResolvedScalar {
     match bytes.get(1) {
         Some(b'.') => match s {
@@ -150,7 +150,7 @@ fn resolve_signed(s: &str, bytes: &[u8]) -> ResolvedScalar {
 
 /// Resolves scalars starting with a digit: `0x`/`0o` based integers, else a
 /// decimal int or float.
-#[inline]
+#[inline(always)]
 fn resolve_number(s: &str, bytes: &[u8]) -> ResolvedScalar {
     if bytes[0] == b'0' && bytes.len() > 2 {
         match bytes[1] {
@@ -167,7 +167,7 @@ fn resolve_number(s: &str, bytes: &[u8]) -> ResolvedScalar {
 /// The core schema allows no sign inside based integers, but
 /// `i64::from_str_radix` accepts a leading `+`/`-`, so reject those before
 /// delegating. Invalid digits and `i64` overflow both resolve to `Str`.
-#[inline]
+#[inline(always)]
 fn parse_radix(digits: &str, radix: u32) -> ResolvedScalar {
     if matches!(digits.as_bytes().first(), None | Some(b'+' | b'-')) {
         return ResolvedScalar::Str;
@@ -178,7 +178,7 @@ fn parse_radix(digits: &str, radix: u32) -> ResolvedScalar {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn parse_int_or_float(s: &str) -> ResolvedScalar {
     if let Ok(n) = s.parse::<i64>() {
         return ResolvedScalar::Int(n);
@@ -194,7 +194,7 @@ fn parse_int_or_float(s: &str) -> ResolvedScalar {
 /// exactly go-yaml's accept/reject boundary. The spellings `inf`/`nan`/
 /// `Infinity` never reach this function (first-byte dispatch), and signed
 /// forms like `+inf` that do reach it parse non-finite and are rejected here.
-#[inline]
+#[inline(always)]
 fn parse_float(s: &str) -> ResolvedScalar {
     match s.parse::<f64>() {
         Ok(f) if f.is_finite() => ResolvedScalar::Float(f),
