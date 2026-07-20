@@ -13,10 +13,6 @@
 #   tags        !!str / !custom / verbatim tags are not supported at all. -> #224
 #   directives  %YAML / %TAG directives are not recognized and parse as
 #               scalars. -> #225
-#   streaming   The library streaming path (to_json / stream_json, used by
-#               `yq -I 0`) disagrees with the CLI's OwnedValue path (used by
-#               pretty output). Two implementations that have drifted apart,
-#               so -I 0 changes values and not just formatting. -> #222
 #   lax:*       Invalid input that indexing accepts because it does not validate.
 #               This is a property of the default mode, not a defect: succinctly
 #               is a non-validating loader. Rejecting these is the job of the
@@ -27,7 +23,6 @@
 #               individually triaged.
 
 236B      lax:mapping       mapping/key rules not validated — #223
-26DV      streaming         streaming path diverges from OwnedValue path — #222
 27NA      directives        %YAML/%TAG directive not recognized — #225
 2AUY      tags              tags (!) not supported — #224
 2CMS      lax:mapping       mapping/key rules not validated — #223
@@ -102,7 +97,6 @@ DK95/01   lax:tabs          tab handling not validated — #223
 DK95/06   lax:tabs          tab handling not validated — #223
 DK95/07   directives        %YAML/%TAG directive not recognized — #225
 DMG6      lax:other         not validated — #223
-E76Z      streaming         streaming path diverges from OwnedValue path — #222
 EB22      lax:documents     directive/document rules not validated — #223
 EHF6      tags              tags (!) not supported — #224
 EW3V      lax:mapping       mapping/key rules not validated — #223
@@ -129,7 +123,7 @@ L24T/00   scalars           scalar content/folding differs from spec
 L94M      tags              tag shorthand emitted as scalar text — #224
 LE5A      tags              tags (!) not supported — #224
 M5C3      scalars           scalar content/folding differs from spec
-M7A3      streaming         streaming path diverges from OwnedValue path — #222
+M7A3      structure         bare document / `...` end-marker mis-parsed (both paths agree)
 MUS6/00   lax:documents     directive/document rules not validated — #223
 MUS6/01   lax:documents     directive/document rules not validated — #223
 MUS6/02   directives        %YAML/%TAG directive not recognized — #225

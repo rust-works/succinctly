@@ -1171,7 +1171,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         if let YamlValue::String(s) = field.key() {
                             stream_yaml_string_value(out, &s)?;
                         } else {
-                            out.write_str("\"\"")?;
+                            stream_yaml_nonstring_key(out, &field.key())?;
                         }
                         out.write_str(": ")?;
                         field.value_cursor().stream_yaml_value(out, 0, 0)?;
@@ -1190,7 +1190,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         if let YamlValue::String(s) = field.key() {
                             stream_yaml_string_value(out, &s)?;
                         } else {
-                            out.write_str("\"\"")?;
+                            stream_yaml_nonstring_key(out, &field.key())?;
                         }
                         out.write_char(':')?;
                         // Check if value needs newline
@@ -1322,7 +1322,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             }
                         }
                     } else {
-                        out.write_str("\"\"")?;
+                        // Alias/complex key (#222): resolve alias-to-scalar,
+                        // else "" — the entry is kept, never dropped
+                        stream_json_string(out, &field.key().key_string())?;
                     }
 
                     out.write_char(':')?;
@@ -1400,7 +1402,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             }
                         }
                     } else {
-                        output.push_str("\"\"");
+                        // Alias/complex key (#222): resolve alias-to-scalar,
+                        // else "" — the entry is kept, never dropped
+                        write_json_string(output, &field.key().key_string());
                     }
 
                     output.push(':');
@@ -1829,7 +1833,9 @@ fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlVal
                         }
                     }
                 } else {
-                    output.push_str("\"\"");
+                    // Alias/complex key (#222): resolve alias-to-scalar,
+                    // else "" — the entry is kept, never dropped
+                    write_json_string(output, &field.key().key_string());
                 }
 
                 output.push(':');
@@ -2463,7 +2469,9 @@ fn stream_yaml_value_as_json<W: AsRef<[u64]>, Out: core::fmt::Write>(
                         }
                     }
                 } else {
-                    out.write_str("\"\"")?;
+                    // Alias/complex key (#222): resolve alias-to-scalar,
+                    // else "" — the entry is kept, never dropped
+                    stream_json_string(out, &field.key().key_string())?;
                 }
 
                 out.write_char(':')?;
@@ -4588,6 +4596,35 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 }
 
+impl<'a, W: AsRef<[u64]>> YamlValue<'a, W> {
+    /// Mapping-key text under yq/JSON semantics (issue #222).
+    ///
+    /// A key is always emitted as a string. Unlike a value, a key is never
+    /// type-inferred and an entry with a complex key is never dropped:
+    /// - `String` → its decoded content (raw; no `null`/bool/number coercion)
+    /// - `Alias` whose target resolves to a scalar string → that string
+    /// - anything else (mapping, sequence, null, error, unresolved or
+    ///   non-scalar alias) → `""`
+    ///
+    /// Never fails; returns `""` rather than erroring so keys are never lost.
+    pub fn key_string(&self) -> Cow<'a, str> {
+        match self {
+            YamlValue::String(s) => s.as_str().unwrap_or(Cow::Borrowed("")),
+            YamlValue::Alias {
+                target: Some(target),
+                ..
+            } => {
+                if let YamlValue::String(s) = target.value() {
+                    s.as_str().unwrap_or(Cow::Borrowed(""))
+                } else {
+                    Cow::Borrowed("")
+                }
+            }
+            _ => Cow::Borrowed(""),
+        }
+    }
+}
+
 impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
     type Cursor = YamlCursor<'a, W>;
     type Fields = YamlFields<'a, W>;
@@ -4676,6 +4713,12 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
             }
             _ => None,
         }
+    }
+
+    fn key_string(&self) -> Option<Cow<'_, str>> {
+        // Keys are never dropped and never type-inferred (issue #222):
+        // complex keys stringify to "" rather than resolving to None.
+        Some(YamlValue::key_string(self))
     }
 
     fn as_object(&self) -> Option<Self::Fields> {
@@ -4793,6 +4836,25 @@ fn write_yaml_indent<Out: core::fmt::Write>(out: &mut Out, spaces: usize) -> cor
 }
 
 /// Stream a YAML string value with smart quoting.
+/// Write a non-`String` mapping key as a YAML scalar (issue #222).
+///
+/// Resolves an alias-to-scalar key to its content with smart quoting;
+/// any other complex key (mapping, sequence, null, error, unresolved or
+/// non-scalar alias) becomes `""`. The entry is kept, never dropped.
+#[cold]
+#[inline(never)]
+fn stream_yaml_nonstring_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
+    out: &mut Out,
+    key: &YamlValue<'_, W>,
+) -> core::fmt::Result {
+    let s = key.key_string();
+    if needs_yaml_quoting(&s) {
+        stream_yaml_double_quoted(out, &s)
+    } else {
+        out.write_str(&s)
+    }
+}
+
 fn stream_yaml_string_value<Out: core::fmt::Write>(
     out: &mut Out,
     s: &YamlString<'_>,
@@ -5228,6 +5290,43 @@ mod tests {
         index.root(yaml).stream_json_document(&mut out).unwrap();
         assert!(out.contains("\"i\":123"), "got {out}");
         assert!(out.contains("\"f\":1.5"), "got {out}");
+    }
+
+    /// Issue #222: mapping keys are always strings and never dropped. An
+    /// alias key resolves to its anchored scalar (26DV, E76Z); a complex
+    /// (sequence/mapping/null) key becomes "" but keeps its entry. Both
+    /// emitter twins must produce identical JSON.
+    #[test]
+    fn test_mapping_keys_resolve_and_are_never_dropped() {
+        let cases: &[(&[u8], &str)] = &[
+            // Alias key resolves to the anchored scalar
+            (
+                b"top1:\n  key1: &a scalar1\ntop3:\n  *a : scalar3\n",
+                "{\"top1\":{\"key1\":\"scalar1\"},\"top3\":{\"scalar1\":\"scalar3\"}}",
+            ),
+            // E76Z: alias keys both directions
+            (b"&a a: &b b\n*b : *a\n", "{\"a\":\"b\",\"b\":\"a\"}"),
+            // Complex (sequence) key -> "" but the entry survives
+            (
+                b"{a: [b, c], [d, e]: f}\n",
+                "{\"a\":[\"b\",\"c\"],\"\":\"f\"}",
+            ),
+            // Explicit null key -> "" (kept)
+            (b"? []\n: x\n", "{\"\":\"x\"}"),
+        ];
+
+        for (yaml, expected) in cases {
+            let index = YamlIndex::build(yaml).unwrap();
+            let json = index.root(yaml).to_json_document();
+            let mut streamed = String::new();
+            index
+                .root(yaml)
+                .stream_json_document(&mut streamed)
+                .unwrap();
+            let input = core::str::from_utf8(yaml).unwrap();
+            assert_eq!(json, *expected, "to_json mismatch for {input:?}");
+            assert_eq!(streamed, *expected, "stream_json mismatch for {input:?}");
+        }
     }
 
     /// Issue #222: block scalars are always strings — never type-inferred
