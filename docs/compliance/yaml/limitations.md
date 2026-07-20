@@ -26,11 +26,11 @@ path:
 
 | Dimension                              | Result              | Meaning                                        |
 |----------------------------------------|---------------------|------------------------------------------------|
-| **Load** (valid YAML, output compared) | **204/279 = 73.1%** | Parses and produces the JSON the suite expects |
+| **Load** (valid YAML, output compared) | **209/279 = 74.9%** | Parses and produces the JSON the suite expects |
 | **Reject** (invalid YAML, must fail)   | **11/94 = 11.7%**   | Correctly refuses malformed input              |
 | **Parse** (valid YAML, no JSON form)   | **27/29 = 93.1%**   | Parses without error                           |
 
-The 160 non-passing cases are enumerated individually, with a category and reason, in
+The 155 non-passing cases are enumerated individually, with a category and reason, in
 [`tests/data/yaml-test-suite-known-failures.txt`](../../../tests/data/yaml-test-suite-known-failures.txt).
 That file is the machine-readable source of truth; the test asserts it matches reality
 exactly, so it cannot silently drift from this page.
@@ -114,7 +114,7 @@ $ printf '%%YAML 1.2\n--- text\n' | succinctly yq '.'
 
 Tracked in [#225](https://github.com/rust-works/succinctly/issues/225).
 
-## Two output paths that disagree — 8 cases
+## Two output paths that used to disagree — resolved
 
 `succinctly yq` has two YAML-to-JSON implementations and picks between them based on
 output formatting:
@@ -122,38 +122,44 @@ output formatting:
 - **Compact** (`-I 0`) takes the P9 streaming path (`YamlCursor::to_json` / `stream_json`).
 - **Pretty** (the default) builds an `OwnedValue` DOM instead.
 
-They do not agree. Across the suite they produce different *values* — not merely different
-whitespace — for 27 cases (two block-scalar cases, `2G84/02` and `K858`, were fixed by
-[#226](https://github.com/rust-works/succinctly/issues/226)'s gating change: the streaming
-path no longer type-resolves block scalar content). Where the suite can adjudicate, the
-DOM path is right 13 times and the streaming path twice (3 both wrong, 9 have no JSON
-form to compare against):
+They used to produce different *values* — not merely different whitespace — for 29 cases:
+an alias used as a mapping key resolved on the DOM path but became `""` on the streaming
+path; complex (sequence/mapping) keys were dropped entirely by the DOM path but kept by
+the streaming path; quoted-string line folding trimmed literal versus escaped whitespace
+inconsistently across three separate decoders; and empty or numeric block scalars were
+type-inferred on the streaming path.
 
 ```
-$ succinctly yq -o json '.'      26DV.yaml   # {"top3": {"scalar1": "scalar3"}}  correct
-$ succinctly yq -o json -I 0 '.' 26DV.yaml   # {"top3": {"":        "scalar3"}}  wrong
+$ succinctly yq -o json '.'      26DV.yaml   # {"top3": {"scalar1": "scalar3"}}
+$ succinctly yq -o json -I 0 '.' 26DV.yaml   # {"top3": {"scalar1": "scalar3"}}  — now agrees
 ```
 
-That case uses an alias as a mapping key (`*alias1 : scalar3`); the DOM path resolves it,
-the streaming path emits an empty string. Other divergences involve empty keys, block
-scalar folding, and trailing tabs.
+[#222](https://github.com/rust-works/succinctly/issues/222) fixed all of these: mapping
+keys share one stringification rule (`YamlValue::key_string`) that resolves alias keys and
+keeps complex keys as `""`; the three quoted-string decoders share one fold rule (drop only
+*literal* trailing whitespace before a line break, preserve escaped whitespace as content);
+and block scalars are always emitted as strings. `tests/yq_path_consistency_tests.rs` now
+runs every corpus case through both paths and asserts they agree, so the paths cannot drift
+apart again.
 
-An indentation flag changing a document's *value* is a bug in its own right, independent
-of YAML conformance; tracked in
-[#222](https://github.com/rust-works/succinctly/issues/222). This page counts the 6 cases
-where the streaming path fails and the DOM path would have passed; the harness tests the
-streaming path because that is the library's public API and the one the performance work
-targets.
+Three corpus cases still differ, each from a *separately-tracked* bug rather than the
+key/fold/block-scalar drift #222 fixed, and are listed in
+[`tests/data/yq-path-consistency-known-failures.txt`](../../../tests/data/yq-path-consistency-known-failures.txt):
+`55WF` and `HRE5` (invalid `\`-escapes the non-validating loader accepts, where the
+streaming transcoder cannot roll back and emits malformed JSON —
+[#223](https://github.com/rust-works/succinctly/issues/223)), and `UGM3` (integer-valued
+floats render as integers on the streaming path, `1.0` → `1` —
+[#168](https://github.com/rust-works/succinctly/issues/168) /
+[#170](https://github.com/rust-works/succinctly/issues/170)).
 
-## Full accounting of the 75 load failures
+## Full accounting of the 70 load failures
 
 | Category     | Cases | Cause                                                             |
 |--------------|-------|-------------------------------------------------------------------|
 | `tags`       | 31    | Tags not supported (above)                                        |
 | `directives` | 16    | `%YAML` / `%TAG` not recognized (above)                           |
 | `scalars`    | 13    | Block scalar folding and chomping edge cases; trailing whitespace |
-| `structure`  | 9     | Document end markers; anchors with colons in the name             |
-| `streaming`  | 6     | Streaming path diverges from the DOM path (above)                 |
+| `structure`  | 10    | Document end markers; anchors with colons in the name             |
 
 The two `parse` failures (`FH7J`, `UKK6/02`) are also tags.
 
@@ -164,8 +170,9 @@ libyaml or yaml-rust2 for parsing and emitting our own index bits on top of thei
 stream. Measuring first changed the picture:
 
 - The load gap is **not** diffuse unsoundness. It is dominated by two absent features —
-  tags (33) and directives (16) — that are additive work on the existing parser, plus a
-  self-inflicted divergence between our own two output paths (6).
+  tags (31, plus 2 `parse` cases) and directives (16) — that are additive work on the
+  existing parser. The self-inflicted divergence between our own two output paths that
+  used to sit here has since been fixed ([#222](https://github.com/rust-works/succinctly/issues/222)).
 - The rejection gap is **deliberate**. A hybrid would close it, but only by doing the
   grammar checking that semi-indexing exists to avoid. The correct fix is an opt-in
   validation pass, which does not require a third-party parser.
@@ -179,12 +186,17 @@ is built on. The evidence does not support the trade. **Rejected.**
 The corpus is vendored at a pinned upstream tag so `cargo test` needs no network and the
 exact conformance input is reviewable in-tree:
 
-| Artifact       | Path                                                                                                      |
-|----------------|-----------------------------------------------------------------------------------------------------------|
-| Corpus         | [`tests/data/yaml-test-suite-2022-01-17.json`](../../../tests/data/yaml-test-suite-2022-01-17.json)       |
-| Known failures | [`tests/data/yaml-test-suite-known-failures.txt`](../../../tests/data/yaml-test-suite-known-failures.txt) |
-| Harness        | [`tests/yaml_test_suite.rs`](../../../tests/yaml_test_suite.rs)                                           |
-| Sync script    | [`scripts/sync-yaml-test-suite.sh`](../../../scripts/sync-yaml-test-suite.sh)                             |
+| Artifact         | Path                                                                                                             |
+|------------------|------------------------------------------------------------------------------------------------------------------|
+| Corpus           | [`tests/data/yaml-test-suite-2022-01-17.json`](../../../tests/data/yaml-test-suite-2022-01-17.json)               |
+| Known failures   | [`tests/data/yaml-test-suite-known-failures.txt`](../../../tests/data/yaml-test-suite-known-failures.txt)         |
+| Harness          | [`tests/yaml_test_suite.rs`](../../../tests/yaml_test_suite.rs)                                                   |
+| Sync script      | [`scripts/sync-yaml-test-suite.sh`](../../../scripts/sync-yaml-test-suite.sh)                                     |
+| Path consistency | [`tests/yq_path_consistency_tests.rs`](../../../tests/yq_path_consistency_tests.rs)                               |
+| Path divergences | [`tests/data/yq-path-consistency-known-failures.txt`](../../../tests/data/yq-path-consistency-known-failures.txt) |
+
+The path-consistency harness asserts `-I 0` and pretty output agree on every corpus case
+([#222](https://github.com/rust-works/succinctly/issues/222)).
 
 To move to a newer upstream release, bump `SUITE_TAG` in the sync script and re-run it;
 changes surface as churn in the known-failures manifest.
