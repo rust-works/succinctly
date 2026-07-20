@@ -948,3 +948,60 @@ fn test_multibyte_value_survives_simd_escape_scan() -> Result<()> {
     assert_eq!(json.trim(), "\"love \u{2665} and peace \u{262e}\"");
     Ok(())
 }
+
+// ============================================================================
+// Colorized JSON Output
+// ============================================================================
+
+#[test]
+fn test_colorized_json_output_is_token_aware() -> Result<()> {
+    // Pretty (non--I=0) JSON output goes through the shared jq colorizer:
+    // keys are colored as keys and keywords as whole tokens (#181).
+    let input = "a: true\nn: null\ns: hello\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-C"])?;
+    assert_eq!(exit_code, 0);
+
+    // Object key colored with the key color, not the string color.
+    assert!(
+        output.contains("\u{1b}[1;34m\"a\""),
+        "key coloring missing: {output:?}"
+    );
+    // String values keep the string color.
+    assert!(
+        output.contains("\u{1b}[0;32m\"hello\""),
+        "string coloring missing: {output:?}"
+    );
+    // Keywords are one colored token...
+    assert!(
+        output.contains("\u{1b}[0;39mtrue\u{1b}[0m"),
+        "whole-token true missing: {output:?}"
+    );
+    assert!(
+        output.contains("\u{1b}[1;30mnull\u{1b}[0m"),
+        "whole-token null missing: {output:?}"
+    );
+    // ...never the old per-letter coloring that painted stray `t`/`r`/`u`/`e`.
+    assert!(
+        !output.contains("\u{1b}[34mt\u{1b}[0m"),
+        "per-letter coloring returned: {output:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_configuration_flag() -> Result<()> {
+    // --build-configuration prints diagnostics and exits successfully.
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("--build-configuration")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.starts_with("succinctly yq build configuration:"),
+        "unexpected header: {stdout:?}"
+    );
+    assert!(stdout.contains("Features:"));
+    Ok(())
+}

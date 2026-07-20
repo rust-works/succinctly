@@ -2091,6 +2091,7 @@ mod jq_bench;
 mod jq_locate;
 mod jq_runner;
 mod json_validate;
+mod output;
 mod text_generators;
 mod text_validate;
 mod utf8_bench;
