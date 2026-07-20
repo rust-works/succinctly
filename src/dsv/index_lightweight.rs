@@ -59,7 +59,7 @@ impl DsvIndexLightweight {
     /// `new`.)
     pub fn new(markers: Vec<u64>, newlines: Vec<u64>, text_len: usize) -> Self {
         assert!(
-            text_len as u64 <= u64::from(u32::MAX),
+            u32::try_from(text_len).is_ok(),
             "DsvIndexLightweight supports inputs up to u32::MAX (4294967295) bytes; \
              got {text_len} bytes (#188)"
         );
