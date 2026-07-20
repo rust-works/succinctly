@@ -15,7 +15,7 @@ use std::borrow::Cow;
 use std::string::ToString;
 
 use super::index::YamlIndex;
-use super::scalar::{resolve_plain, ResolvedScalar};
+use super::scalar::{could_be_null_or_bool, resolve_plain, ResolvedScalar};
 use super::simd::find_json_escape;
 
 // ============================================================================
@@ -4424,10 +4424,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
             YamlValue::Null => true,
             YamlValue::String(s) if s.is_unquoted() => {
                 if let Ok(str_val) = s.as_str() {
-                    matches!(
-                        resolve_plain(&str_val),
-                        ResolvedScalar::Null | ResolvedScalar::Bool(false)
-                    )
+                    could_be_null_or_bool(&str_val)
+                        && matches!(
+                            resolve_plain(&str_val),
+                            ResolvedScalar::Null | ResolvedScalar::Bool(false)
+                        )
                 } else {
                     false
                 }
@@ -4448,7 +4449,8 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
             YamlValue::String(s) if s.is_unquoted() => {
                 // YAML null values: null, Null, NULL, ~, empty string
                 if let Ok(str_val) = s.as_str() {
-                    resolve_plain(&str_val) == ResolvedScalar::Null
+                    could_be_null_or_bool(&str_val)
+                        && resolve_plain(&str_val) == ResolvedScalar::Null
                 } else {
                     false
                 }
@@ -4465,6 +4467,9 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
         match self {
             YamlValue::String(s) if s.is_unquoted() => {
                 let str_val = s.as_str().ok()?;
+                if !could_be_null_or_bool(&str_val) {
+                    return None;
+                }
                 match resolve_plain(&str_val) {
                     ResolvedScalar::Bool(b) => Some(b),
                     _ => None,
