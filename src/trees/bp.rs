@@ -1473,9 +1473,9 @@ pub struct BalancedParens<W = Vec<u64>, S: SelectSupport = NoSelect> {
     /// L2: Per-1024-word block min excess (relative to block start)
     ///
     /// `i32`, not `i16`: an L2 block spans 65536 bits, so block-relative excess
-    /// ranges over [-65536, 65536] and would wrap `i16` at nesting depth
-    /// > 32767 (#188). L0/L1 stay narrow because their spans bound the excess
-    /// to [-64, 64] and [-2048, 2048] respectively.
+    /// ranges over [-65536, 65536] and would wrap `i16` at nesting depth above
+    /// 32767 (#188). L0/L1 stay narrow because their spans bound the excess to
+    /// [-64, 64] and [-2048, 2048] respectively.
     l2_min_excess: Vec<i32>,
     /// L2: Per-1024-word block excess (total excess within this block)
     l2_block_excess: Vec<i32>,
@@ -1514,10 +1514,9 @@ fn build_bp_index(
 ) {
     // rank_l1 stores absolute cumulative rank as u32, so the structure cannot
     // represent more than u32::MAX bits (#188). Fail loudly instead of
-    // truncating. The comparison is via u64 so it stays meaningful on 32-bit
-    // targets.
+    // truncating. try_from keeps the check meaningful on 32-bit targets.
     assert!(
-        len as u64 <= u64::from(u32::MAX),
+        u32::try_from(len).is_ok(),
         "BalancedParens supports at most u32::MAX (4294967295) bits; got {len}. \
          The rank directory stores absolute cumulative counts as u32 (#188)"
     );
@@ -2725,7 +2724,7 @@ mod tests {
     fn test_from_words_ignores_stray_bits() {
         // Borrowed storage keeps the stray bits, but counting must not see
         // them (#188).
-        let words = vec![0b0011u64 | (u64::MAX << 4)];
+        let words = [0b0011u64 | (u64::MAX << 4)];
         let bp = BalancedParens::<_, NoSelect>::from_words(&words[..], 4);
         assert_eq!(
             bp.words()[0],
@@ -2742,7 +2741,7 @@ mod tests {
         // Two all-ones words with len = 68: 68 valid 1-bits plus 60 stray
         // 1-bits above len in the final word. select1 must resolve every valid
         // k and reject the rest despite the strays (#188).
-        let words = vec![u64::MAX, u64::MAX];
+        let words = [u64::MAX, u64::MAX];
         let bp = BalancedParens::<_, WithSelect>::from_words_with_select(&words[..], 68);
         assert_eq!(bp.total_ones(), 68);
         for k in 0..68 {
