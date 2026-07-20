@@ -135,6 +135,12 @@ impl YamlIndex<Vec<u64>> {
     ///
     /// The newline index for line/column lookup is built lazily on first
     /// call to `to_line_column()` or `to_offset()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`YamlError::InputTooLarge`] for inputs over `u32::MAX` bytes
+    /// (just under 4 GiB): the semi-index stores text positions as `u32`
+    /// (#188). Other variants report malformed YAML.
     pub fn build(yaml: &[u8]) -> Result<Self, YamlError> {
         let semi = build_semi_index(yaml)?;
 

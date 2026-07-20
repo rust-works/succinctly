@@ -3616,7 +3616,24 @@ impl<'a> Parser<'a> {
 }
 
 /// Build a semi-index from YAML input.
+///
+/// # Errors
+///
+/// Returns [`YamlError::InputTooLarge`] for inputs over `u32::MAX` bytes
+/// (just under 4 GiB): the semi-index stores text positions as `u32` (#188).
+/// Other variants report malformed YAML. (Pathological YAML can also push the
+/// BP bit count past `u32::MAX` before the text does; `BalancedParens`
+/// asserts its own ceiling as a loud backstop.)
 pub fn build_semi_index(input: &[u8]) -> Result<SemiIndex, YamlError> {
+    // Text positions (bp_to_text/bp_to_text_end and the select samples and
+    // rank arrays derived from them) are stored as u32, so inputs past
+    // u32::MAX bytes would silently truncate offsets (#188). Every position
+    // written is <= input.len() (including the input.len() sentinel for null
+    // nodes, an exact fit at the maximum), so this single guard makes all
+    // downstream u32 casts safe.
+    if input.len() as u64 > u64::from(u32::MAX) {
+        return Err(YamlError::InputTooLarge { len: input.len() });
+    }
     let mut parser = Parser::new(input);
     parser.parse()
 }
