@@ -2332,10 +2332,15 @@ fn write_yaml_string_to_json(
             }
             Ok(true) // Always a string, no type detection
         }
-        YamlString::Unquoted { .. }
-        | YamlString::BlockLiteral { .. }
-        | YamlString::BlockFolded { .. } => {
-            // For unquoted and block scalars, we need type detection
+        YamlString::BlockLiteral { .. } | YamlString::BlockFolded { .. } => {
+            // Block scalars are always strings (yq/JSON semantics): no type
+            // detection, and empty content is "" rather than null (#222)
+            let decoded = s.as_str()?;
+            write_json_string(output, &decoded);
+            Ok(true)
+        }
+        YamlString::Unquoted { .. } => {
+            // Plain scalars need type detection
             // Return false to signal caller should use the original path
             Ok(false)
         }
@@ -2930,9 +2935,14 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
             }
             Ok(true)
         }
-        YamlString::Unquoted { .. }
-        | YamlString::BlockLiteral { .. }
-        | YamlString::BlockFolded { .. } => Ok(false),
+        YamlString::BlockLiteral { .. } | YamlString::BlockFolded { .. } => {
+            // Block scalars are always strings (yq/JSON semantics): no type
+            // detection, and empty content is "" rather than null (#222)
+            let decoded = s.as_str()?;
+            stream_json_string(out, &decoded).map_err(|_| YamlStringError::InvalidUtf8)?;
+            Ok(true)
+        }
+        YamlString::Unquoted { .. } => Ok(false),
     }
 }
 
@@ -5218,6 +5228,36 @@ mod tests {
         index.root(yaml).stream_json_document(&mut out).unwrap();
         assert!(out.contains("\"i\":123"), "got {out}");
         assert!(out.contains("\"f\":1.5"), "got {out}");
+    }
+
+    /// Issue #222: block scalars are always strings — never type-inferred
+    /// (`|- 123` is "123", not 123) and never null when empty (K858,
+    /// 2G84/02). Both emitter twins must agree.
+    #[test]
+    fn test_block_scalars_are_always_strings() {
+        let cases: &[(&[u8], &str)] = &[
+            (b"a: |-\n  123\n", "{\"a\":\"123\"}"),
+            (b"a: |-\n  true\n", "{\"a\":\"true\"}"),
+            (b"a: >-\n  null\n", "{\"a\":\"null\"}"),
+            // K858: empty block scalars are "" (and keep chomping preserves \n)
+            (
+                b"strip: >-\n\nclip: >\n\nkeep: |+\n\n",
+                "{\"strip\":\"\",\"clip\":\"\",\"keep\":\"\\n\"}",
+            ),
+        ];
+
+        for (yaml, expected) in cases {
+            let index = YamlIndex::build(yaml).unwrap();
+            let json = index.root(yaml).to_json_document();
+            let mut streamed = String::new();
+            index
+                .root(yaml)
+                .stream_json_document(&mut streamed)
+                .unwrap();
+            let input = core::str::from_utf8(yaml).unwrap();
+            assert_eq!(json, *expected, "to_json mismatch for {input:?}");
+            assert_eq!(streamed, *expected, "stream_json mismatch for {input:?}");
+        }
     }
 
     /// Issue #222: quoted-string line folding must drop trailing *literal*
