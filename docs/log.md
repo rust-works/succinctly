@@ -2,6 +2,24 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-07-20 — SVE2 validation path: skip visibility, CI wiring, QEMU script (issue #194)
+
+**Sources ingested:**
+- `src/util/simd/sve2.rs`, `src/dsv/simd/sve2.rs`, `src/json/simd/sve2.rs` — remaining silent SVE2
+  test self-skips, now routed through `note_simd_skip_unless` (#191 mechanism)
+- `.github/workflows/ci.yml` — ARM64 job now pins `SUCCINCTLY_EXPECT_SIMD=neon,sve2,sve2-bitperm`
+  (macOS: `neon`) and adds a `SUCCINCTLY_SVE2=1` step covering the JSON SVE2 dispatch
+- `scripts/test-sve2-qemu.sh` (new) — local SVE2 validation under `qemu-aarch64 -cpu max` in Docker
+
+**Pages corrected:**
+- `CONTRIBUTING.md` (SIMD CI coverage) — ARM row now asserts SVE2 + SVE2-BITPERM; added the
+  expectation-pin paragraph and the SVE2 validation-path paragraph (Neoverse runner, JSON dispatch
+  step, QEMU script for Apple Silicon)
+- [environment-variables.md](reference/environment-variables.md) — `SUCCINCTLY_SVE2` now documents
+  how the path is validated; `SUCCINCTLY_EXPECT_SIMD` example covers all three CI legs
+- [sve2-optimizations.md](plan/sve2-optimizations.md) — replaced the aspirational `test-arm64-sve2`
+  job stub with the actual mechanism
+
 ## 2026-07-15 — Rust succinct-library evaluation (issue #47)
 
 **Sources ingested:**

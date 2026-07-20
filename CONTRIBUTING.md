@@ -198,19 +198,23 @@ Requires Intel Ice Lake+ or AMD Zen 4+.
 #### SIMD CI coverage
 
 SIMD unit tests self-skip when the host CPU lacks the required feature (an
-early `return`, sometimes emitting a `SKIPPED: SIMD test` marker via
-`note_simd_skip`). A fully-skipped suite would otherwise read as a green pass,
-so each test job **asserts its runner actually has the features** (the
-"Verify SIMD CPU features" steps in `.github/workflows/ci.yml`) and fails
-loudly if not.
+early `return`, emitting a `SKIPPED: SIMD test` marker via `note_simd_skip`).
+A fully-skipped suite would otherwise read as a green pass, so each test job
+**asserts its runner actually has the features** (the "Verify SIMD CPU
+features" steps in `.github/workflows/ci.yml`) and fails loudly if not.
 
 What each CI runner exercises for real:
 
 | Runner                        | CPU           | Backends asserted in CI                |
 |-------------------------------|---------------|----------------------------------------|
 | `ubuntu-latest` (Test x86_64) | AMD EPYC 7763 | POPCNT, SSE4.1/4.2, **BMI2**, **AVX2** |
-| `ubuntu-24.04-arm` (Test ARM) | Neoverse-N2   | NEON, **SVE2-BITPERM** (BDEP/BEXT)     |
+| `ubuntu-24.04-arm` (Test ARM) | Neoverse-N2   | NEON, **SVE2**, **SVE2-BITPERM**       |
 | `macos-latest` (Test macOS)   | Apple Silicon | NEON                                   |
+
+Each test job also pins its expected feature set hard via
+`SUCCINCTLY_EXPECT_SIMD` (`tests/simd_expectation_tests.rs`): if a runner-fleet
+change stops exposing a listed feature, the leg fails instead of the guarded
+suites silently self-skipping (#193 x86, #194 ARM/macOS).
 
 Kernel-direct differential tests (`tests/simd_level_tests.rs`,
 `tests/dsv_simd_differential_tests.rs`, `src/yaml/simd/x86.rs`) exercise every
@@ -224,13 +228,24 @@ x86 leg **re-runs the whole suite with `SUCCINCTLY_SIMD=sse2`** (the
 applying. See
 [docs/reference/environment-variables.md](docs/reference/environment-variables.md#succinctly_simd).
 
+**SVE2 (#194).** The Neoverse-N2 runner detects `sve2` and `sve2-bitperm`, so
+the always-on SVE2 kernels (DSV quote masking, broadword select via BDEP/BEXT)
+run natively on every push. The JSON semi-index SVE2 kernels sit behind the
+opt-in `SUCCINCTLY_SVE2=1` dispatch
+(`docs/reference/environment-variables.md`) and are exercised by the dedicated
+"JSON SVE2 dispatch" step in the ARM job. Apple Silicon (M1-M4) has no
+non-streaming SVE/SVE2, so on a Mac every SVE2 suite prints a `SKIPPED` line
+and asserts nothing; to validate SVE2 changes locally, run
+`scripts/test-sve2-qemu.sh`, which executes the aarch64 suite under
+`qemu-aarch64 -cpu max` (SVE2 + BITPERM emulated at the 128-bit vector length
+of real Neoverse hardware) inside Docker.
+
 **Not covered by routine CI: AVX-512.** The standard x86 runners are Zen 3
 (EPYC 7763), which has no `avx512f`/`avx512vpopcntdq`, so the AVX-512 paths
 (`src/util/simd/x86.rs` `avx512f` branch, `src/bits/popcount.rs` VPOPCNTDQ)
 self-skip there. Validate changes to those paths off-CI — on AVX-512 hardware
 or under an emulator (e.g. QEMU `qemu-x86_64 -cpu max`) — and note how you
-tested in the PR. (SVE2 *is* covered: the Neoverse-N2 ARM runner provides
-`sve2-bitperm`.)
+tested in the PR.
 
 ### Unsafe Code
 
