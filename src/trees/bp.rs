@@ -87,6 +87,14 @@ pub struct WithSelect {
 
 impl SelectSupport for WithSelect {
     fn build(words: &[u64], total_ones: usize) -> Self {
+        // INVARIANT: `total_ones` must count only the valid bits below `len`
+        // (build_bp_index masks the final partial word when counting, #188).
+        // Given that, stray 1-bits above `len` in the final word cannot skew
+        // the samples: every sample's cumulative_before sums only full words
+        // before its target word, and in select1 `remaining` stays below the
+        // masked popcount of the target word, so select_in_word never lands on
+        // a stray bit (the `result < len` check backstops the rest).
+        //
         // Use default sample rate of 256 for ~3% overhead
         Self {
             select_idx: SelectIndex::build(words, total_ones, 256),
@@ -1504,6 +1512,16 @@ fn build_bp_index(
     Vec<u64>,
     usize,
 ) {
+    // rank_l1 stores absolute cumulative rank as u32, so the structure cannot
+    // represent more than u32::MAX bits (#188). Fail loudly instead of
+    // truncating. The comparison is via u64 so it stays meaningful on 32-bit
+    // targets.
+    assert!(
+        len as u64 <= u64::from(u32::MAX),
+        "BalancedParens supports at most u32::MAX (4294967295) bits; got {len}. \
+         The rank directory stores absolute cumulative counts as u32 (#188)"
+    );
+
     if words.is_empty() || len == 0 {
         return (
             Vec::new(),
@@ -1667,6 +1685,17 @@ fn build_bp_index(
 
     let mut cumulative_rank: u64 = 0;
 
+    // Mask stray 1-bits above `len` in the final partial word when counting.
+    // Borrowed storage (`from_words` over mmap) cannot be masked in place, so
+    // count through a masked read instead; otherwise total_ones/rank1/select1
+    // over-count (#188). The excess indices are unaffected: build_l0_index
+    // already scans only the valid bits of the final word. rank_l2 packed
+    // offsets are written before each word's count is added and the partial
+    // word is the last word overall, so strays could only ever leak into
+    // cumulative_rank, fixed here.
+    let tail_bits = len % 64;
+    let last_word_idx = num_words - 1;
+
     for block_idx in 0..num_rank_blocks {
         let block_start = block_idx * WORDS_PER_RANK_BLOCK;
         let block_end = (block_start + WORDS_PER_RANK_BLOCK).min(num_words);
@@ -1683,7 +1712,11 @@ fn build_bp_index(
                 // Pack offset into 9 bits at position (i-1)*9
                 l2_packed |= (block_cumulative as u64) << ((i - 1) * 9);
             }
-            block_cumulative += words[word_idx].count_ones() as u16;
+            let mut word = words[word_idx];
+            if word_idx == last_word_idx && tail_bits != 0 {
+                word &= (1u64 << tail_bits) - 1;
+            }
+            block_cumulative += word.count_ones() as u16;
         }
 
         rank_l2.push(l2_packed);
@@ -1703,11 +1736,31 @@ fn build_bp_index(
     )
 }
 
+/// Clear bits at or above `len` in the final word (same canonicalization as
+/// `BitVec::with_config`), so stray 1-bits cannot skew counting (#188).
+fn mask_final_word_in_place(words: &mut [u64], len: usize) {
+    if len % 64 != 0 {
+        if let Some(last) = words.last_mut() {
+            *last &= (1u64 << (len % 64)) - 1;
+        }
+    }
+}
+
 impl BalancedParens<Vec<u64>, NoSelect> {
     /// Build from an owned bitvector representing balanced parentheses.
     ///
     /// Creates a BalancedParens without select support (default for JSON).
-    pub fn new(words: Vec<u64>, len: usize) -> Self {
+    ///
+    /// Bits at or above `len` in the final word are cleared (as in
+    /// [`BitVec::with_config`](crate::bits::BitVec::with_config)), so stray
+    /// 1-bits cannot skew `total_ones`/`rank1`/`select1` (#188).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds `u32::MAX` bits (#188): the rank directory
+    /// stores absolute cumulative counts as `u32`.
+    pub fn new(mut words: Vec<u64>, len: usize) -> Self {
+        mask_final_word_in_place(&mut words, len);
         let (
             l0_min_excess,
             l0_word_excess,
@@ -1741,7 +1794,16 @@ impl BalancedParens<Vec<u64>, WithSelect> {
     /// Build from an owned bitvector with select support enabled.
     ///
     /// Creates a BalancedParens with O(1) select1 support (for YAML).
-    pub fn new_with_select(words: Vec<u64>, len: usize) -> Self {
+    ///
+    /// Bits at or above `len` in the final word are cleared, so stray 1-bits
+    /// cannot skew `total_ones`/`rank1`/`select1` (#188).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds `u32::MAX` bits (#188): the rank directory
+    /// stores absolute cumulative counts as `u32`.
+    pub fn new_with_select(mut words: Vec<u64>, len: usize) -> Self {
+        mask_final_word_in_place(&mut words, len);
         let (
             l0_min_excess,
             l0_word_excess,
@@ -1778,6 +1840,15 @@ impl<W: AsRef<[u64]>> BalancedParens<W, NoSelect> {
     ///
     /// Creates a BalancedParens without select support (default for JSON).
     /// This is useful for borrowed data, e.g., from mmap.
+    ///
+    /// The storage is not mutated: stray 1-bits at or above `len` in the final
+    /// word are ignored when counting (masked on read), so they cannot skew
+    /// `total_ones`/`rank1`/`select1` (#188).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds `u32::MAX` bits (#188): the rank directory
+    /// stores absolute cumulative counts as `u32`.
     pub fn from_words(words: W, len: usize) -> Self {
         let (
             l0_min_excess,
@@ -1813,6 +1884,15 @@ impl<W: AsRef<[u64]>> BalancedParens<W, WithSelect> {
     ///
     /// Creates a BalancedParens with O(1) select1 support (for YAML).
     /// This is useful for borrowed data, e.g., from mmap.
+    ///
+    /// The storage is not mutated: stray 1-bits at or above `len` in the final
+    /// word are ignored when counting (masked on read), so they cannot skew
+    /// `total_ones`/`rank1`/`select1` (#188).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds `u32::MAX` bits (#188): the rank directory
+    /// stores absolute cumulative counts as `u32`.
     pub fn from_words_with_select(words: W, len: usize) -> Self {
         let (
             l0_min_excess,
@@ -1958,6 +2038,11 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
     }
 
     /// Fallback slow rank1 for edge cases.
+    ///
+    /// Safe against stray 1-bits above `len` in the final word: `rank1` clamps
+    /// `p` to `len` before calling, so the full-word loop below only covers
+    /// words strictly before the partial word, which is always counted through
+    /// the `bit_idx` mask (#188).
     fn rank1_slow(&self, p: usize) -> usize {
         let words = self.words.as_ref();
         let word_idx = p / 64;
@@ -2622,6 +2707,58 @@ mod tests {
         assert_eq!(bp.excess(depth - 1), depth as i32);
         assert_eq!(bp.find_close(32767), Some(len - 1 - 32767));
         assert_eq!(bp.enclose(33000), Some(32999));
+    }
+
+    #[test]
+    fn test_new_masks_stray_bits_in_final_word() {
+        // "(())" (bits 0011) plus 60 stray 1-bits above len; new() must clear
+        // them (#188).
+        let word = 0b0011u64 | (u64::MAX << 4);
+        let bp = BalancedParens::new(vec![word], 4);
+        assert_eq!(bp.words()[0], 0b0011);
+        assert_eq!(bp.total_ones(), 2);
+        assert_eq!(bp.rank1(4), 2);
+        assert_eq!(bp.find_close(0), Some(3));
+    }
+
+    #[test]
+    fn test_from_words_ignores_stray_bits() {
+        // Borrowed storage keeps the stray bits, but counting must not see
+        // them (#188).
+        let words = vec![0b0011u64 | (u64::MAX << 4)];
+        let bp = BalancedParens::<_, NoSelect>::from_words(&words[..], 4);
+        assert_eq!(
+            bp.words()[0],
+            words[0],
+            "borrowed words must not be mutated"
+        );
+        assert_eq!(bp.total_ones(), 2);
+        assert_eq!(bp.rank1(4), 2);
+        assert_eq!(bp.find_close(0), Some(3));
+    }
+
+    #[test]
+    fn test_from_words_with_select_stray_bits() {
+        // Two all-ones words with len = 68: 68 valid 1-bits plus 60 stray
+        // 1-bits above len in the final word. select1 must resolve every valid
+        // k and reject the rest despite the strays (#188).
+        let words = vec![u64::MAX, u64::MAX];
+        let bp = BalancedParens::<_, WithSelect>::from_words_with_select(&words[..], 68);
+        assert_eq!(bp.total_ones(), 68);
+        for k in 0..68 {
+            assert_eq!(bp.select1(k), Some(k), "select1({k})");
+        }
+        assert_eq!(bp.select1(68), None);
+        assert_eq!(bp.select1(69), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "at most u32::MAX")]
+    #[cfg(target_pointer_width = "64")]
+    fn test_bp_len_guard_panics() {
+        // The guard precedes the empty-words early return, so no allocation is
+        // needed to exercise it (#188).
+        let _ = BalancedParens::<_, NoSelect>::from_words(Vec::<u64>::new(), u32::MAX as usize + 1);
     }
 
     /// Build `(` + `pairs` copies of `()` + `)`: one outer pair wrapping a long
