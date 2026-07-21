@@ -42,7 +42,7 @@ portable-popcount = []
 serde = ["dep:serde"]
 
 # CLI tool features
-cli = ["std", "clap", "rand", "rand_chacha", "anyhow", "serde_json", "memmap2", "md5", "serde", "ctrlc"]
+cli = ["std", "clap", "rand", "rand_chacha", "anyhow", "serde_json", "memmap2", "md5", "serde", "ctrlc", "regex"]
 
 # Enable regex support in jq query language
 regex = ["dep:regex"]
