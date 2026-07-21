@@ -1045,6 +1045,25 @@ fn contains_split_doc(expr: &Expr) -> bool {
     }
 }
 
+/// Get input files from arguments.
+fn get_input_files(args: &YqCommand) -> Vec<String> {
+    // When --from-file is used, the 'filter' field becomes the first input file
+    // because the filter comes from a file instead of command line
+    let mut files = Vec::new();
+
+    if args.from_file.is_some() {
+        // When --from-file is used, the first positional arg (if any) is an input file
+        if let Some(ref first_file) = args.filter {
+            files.push(first_file.clone());
+        }
+    }
+
+    // Add remaining files
+    files.extend(args.files.iter().cloned());
+
+    files
+}
+
 /// Main entry point for the yq command.
 pub fn run_yq(args: YqCommand) -> Result<i32> {
     // Handle --version
@@ -1066,6 +1085,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     } else {
         args.filter.clone().unwrap_or_else(|| ".".to_string())
     };
+
+    // Get input files (with --from-file, the filter positional is an input file)
+    let input_files = get_input_files(&args);
 
     // Validate flag compatibility
     if args.document.is_some() && args.raw_input {
@@ -1174,7 +1196,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             }};
         }
 
-        if args.files.is_empty() {
+        if input_files.is_empty() {
             let yaml_bytes = read_stdin()?;
             let index = YamlIndex::build(&yaml_bytes)
                 .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
@@ -1219,7 +1241,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 }
             }
         } else {
-            for file_path in &args.files {
+            for file_path in &input_files {
                 let yaml_bytes = read_file(Path::new(file_path))?;
                 let index = YamlIndex::build(&yaml_bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error in {file_path}: {e}"))?;
@@ -1280,11 +1302,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         }
     } else if args.raw_input {
         // Handle --raw-input: read each line as a string instead of parsing as YAML
-        let input_content = if args.files.is_empty() {
+        let input_content = if input_files.is_empty() {
             read_stdin_string()?
         } else {
             let mut content = String::new();
-            for file_path in &args.files {
+            for file_path in &input_files {
                 let file_content = std::fs::read_to_string(file_path)
                     .with_context(|| format!("failed to read file: {file_path}"))?;
                 content.push_str(&file_content);
@@ -1325,13 +1347,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         let mut all_docs: Vec<OwnedValue> = Vec::new();
 
         // Collect input sources
-        let input_sources: Vec<(Vec<u8>, InputFormat)> = if args.files.is_empty() {
+        let input_sources: Vec<(Vec<u8>, InputFormat)> = if input_files.is_empty() {
             let input_bytes = read_stdin()?;
             let format = resolve_input_format(args.input_format, None);
             vec![(input_bytes, format)]
         } else {
             let mut sources = Vec::new();
-            for file_path in &args.files {
+            for file_path in &input_files {
                 let path = Path::new(file_path);
                 let input_bytes = read_file(path)?;
                 let format = resolve_input_format(args.input_format, Some(path));
@@ -1369,12 +1391,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         }
     } else if args.inplace {
         // Handle --inplace: process each file and write back to it
-        if args.files.is_empty() {
+        if input_files.is_empty() {
             anyhow::bail!("--inplace requires at least one file argument");
         }
 
         let mut global_doc_index: usize = 0;
-        for file_path in &args.files {
+        for file_path in &input_files {
             let path = Path::new(file_path);
             let input_bytes = read_file(path)?;
             let format = resolve_input_format(args.input_format, Some(path));
@@ -1438,13 +1460,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // For JSON inputs, use the OwnedValue path
 
         // Collect input sources with their bytes and formats
-        let input_sources: Vec<(Vec<u8>, InputFormat)> = if args.files.is_empty() {
+        let input_sources: Vec<(Vec<u8>, InputFormat)> = if input_files.is_empty() {
             let input_bytes = read_stdin()?;
             let format = resolve_input_format(args.input_format, None);
             vec![(input_bytes, format)]
         } else {
             let mut sources = Vec::new();
-            for file_path in &args.files {
+            for file_path in &input_files {
                 let path = Path::new(file_path);
                 let input_bytes = read_file(path)?;
                 let format = resolve_input_format(args.input_format, Some(path));

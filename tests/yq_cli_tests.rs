@@ -1079,3 +1079,142 @@ fn test_build_configuration_flag() -> Result<()> {
     assert!(stdout.contains("Features:"));
     Ok(())
 }
+
+// ============================================================================
+// From-File Filter Tests (#177)
+// ============================================================================
+
+/// Helper to run yq with --from-file and positional input files.
+///
+/// stdin is explicitly null so that a regression to reading stdin produces
+/// an empty-input error instead of hanging.
+fn run_yq_from_file(
+    filter_path: &str,
+    files: &[&str],
+    extra_args: &[&str],
+) -> Result<(String, i32)> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(extra_args)
+        .arg("--from-file")
+        .arg(filter_path)
+        .args(files)
+        .stdin(Stdio::null())
+        .output()?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    Ok((stdout, exit_code))
+}
+
+#[test]
+fn test_from_file_with_input_file() -> Result<()> {
+    // Regression test for #177: clap binds the input file positional to
+    // `filter`, and yq dropped it and read stdin instead.
+    let mut filter_file = NamedTempFile::new()?;
+    writeln!(filter_file, ".name")?;
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "name: Alice")?;
+    writeln!(input_file, "age: 30")?;
+
+    let (output, code) = run_yq_from_file(
+        filter_file.path().to_str().unwrap(),
+        &[input_file.path().to_str().unwrap()],
+        &[],
+    )?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output, "Alice\n");
+    Ok(())
+}
+
+#[test]
+fn test_from_file_with_input_file_fast_path() -> Result<()> {
+    // Same as test_from_file_with_input_file, but -o=json -I=0 routes the
+    // query through the M2 streaming fast path's file loop.
+    let mut filter_file = NamedTempFile::new()?;
+    writeln!(filter_file, ".name")?;
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "name: Alice")?;
+
+    let (output, code) = run_yq_from_file(
+        filter_file.path().to_str().unwrap(),
+        &[input_file.path().to_str().unwrap()],
+        &["-o=json", "-I=0"],
+    )?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""Alice""#);
+    Ok(())
+}
+
+#[test]
+fn test_from_file_with_stdin() -> Result<()> {
+    // --from-file with no positional input file must still read stdin.
+    let mut filter_file = NamedTempFile::new()?;
+    writeln!(filter_file, ".name")?;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("--from-file")
+        .arg(filter_file.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(b"name: Bob\n")?;
+    }
+
+    let output = cmd.wait_with_output()?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout)?, "Bob\n");
+    Ok(())
+}
+
+#[test]
+fn test_from_file_with_multiple_input_files() -> Result<()> {
+    let mut filter_file = NamedTempFile::new()?;
+    writeln!(filter_file, ".a")?;
+    let mut input_one = NamedTempFile::new()?;
+    writeln!(input_one, "a: 1")?;
+    let mut input_two = NamedTempFile::new()?;
+    writeln!(input_two, "a: 2")?;
+
+    let (output, code) = run_yq_from_file(
+        filter_file.path().to_str().unwrap(),
+        &[
+            input_one.path().to_str().unwrap(),
+            input_two.path().to_str().unwrap(),
+        ],
+        &[],
+    )?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output, "---\n1\n---\n2\n");
+    Ok(())
+}
+
+#[test]
+fn test_inplace_from_file() -> Result<()> {
+    // Before #177, --inplace --from-file bailed with "requires at least one
+    // file argument" because the input file was swallowed by `filter`.
+    let mut filter_file = NamedTempFile::new()?;
+    writeln!(filter_file, ".name")?;
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "name: Alice")?;
+
+    let (output, code) = run_yq_from_file(
+        filter_file.path().to_str().unwrap(),
+        &[input_file.path().to_str().unwrap()],
+        &["-i"],
+    )?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output, "");
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "Alice\n");
+    Ok(())
+}
