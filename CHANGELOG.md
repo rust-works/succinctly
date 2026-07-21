@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `jq -R -s` now yields the entire input as a single string instead of an array of per-line strings, matching jq (#176)
+- YAML alias cycles (`a: &anchor {self: *anchor}`) are rejected at index build with the
+  new `YamlError::AliasCycle` variant instead of aborting with a stack overflow when the
+  value is materialized (#153). Matches `yq`, which fails at decode time on the same
+  input. Note: exhaustive `match`es on `YamlError` need a new arm.
 
 ## [0.7.0] - 2026-04-05
 

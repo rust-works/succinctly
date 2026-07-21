@@ -94,6 +94,14 @@ pub enum YamlError {
         name: String,
     },
 
+    /// Alias reference that would make an anchor's value contain itself.
+    AliasCycle {
+        /// Byte offset of the alias (`*name`) that closes the cycle
+        offset: usize,
+        /// The referenced anchor name
+        name: String,
+    },
+
     /// Explicit key (`?`) not supported.
     ExplicitKeyNotSupported {
         /// Byte offset of the `?`
@@ -208,6 +216,12 @@ impl fmt::Display for YamlError {
                 write!(
                     f,
                     "duplicate anchor '{name}' at offset {offset} (previously defined)"
+                )
+            }
+            Self::AliasCycle { offset, name } => {
+                write!(
+                    f,
+                    "cyclic alias '{name}' at offset {offset} (anchor value contains itself)"
                 )
             }
             Self::ExplicitKeyNotSupported { offset } => {
@@ -341,6 +355,18 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "duplicate anchor 'base' at offset 15 (previously defined)"
+        );
+    }
+
+    #[test]
+    fn test_alias_cycle_display() {
+        let err = YamlError::AliasCycle {
+            offset: 20,
+            name: "anchor".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "cyclic alias 'anchor' at offset 20 (anchor value contains itself)"
         );
     }
 

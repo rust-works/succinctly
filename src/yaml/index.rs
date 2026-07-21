@@ -152,7 +152,7 @@ impl YamlIndex<Vec<u64>> {
         // Convert bp_to_text to compact storage when positions are monotonic
         let open_positions = OpenPositions::build(&semi.bp_to_text, ib_len);
 
-        Ok(Self {
+        let index = Self {
             ib: semi.ib,
             ib_len,
             ib_rank,
@@ -167,7 +167,9 @@ impl YamlIndex<Vec<u64>> {
             bp_to_anchor,
             aliases: semi.aliases,
             newlines: OnceCell::new(),
-        })
+        };
+        index.validate_alias_acyclicity()?;
+        Ok(index)
     }
 }
 
@@ -539,6 +541,45 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         Some(YamlCursor::new(self, text, *target_bp_pos))
     }
 
+    /// Reject documents whose aliases would make an anchored value contain
+    /// itself (issue #153: unbounded recursion when materializing).
+    ///
+    /// Aliases resolve at parse time against anchors defined earlier in the
+    /// text, so alias edges only point backward. Any materialization cycle
+    /// must therefore include at least one alias whose target node is an
+    /// ancestor of (or equal to) the alias node in the BP tree; rejecting
+    /// exactly those edges rejects exactly the cyclic documents.
+    ///
+    /// The reported anchor name comes from `bp_to_anchor` and may be empty if
+    /// the anchor was redefined after the cycle-forming definition; the
+    /// offset still pinpoints the offending alias.
+    fn validate_alias_acyclicity(&self) -> Result<(), YamlError> {
+        for (&alias_bp, &target_bp) in &self.aliases {
+            // Ancestor test: target opens at-or-before the alias and closes
+            // after it. A target on a close bit (degenerate empty anchored
+            // value) can never be an ancestor, so `find_close` returning
+            // `None` for it must not count as a cycle.
+            let is_cycle = target_bp == alias_bp
+                || (target_bp < alias_bp
+                    && self.bp.is_open(target_bp)
+                    && self
+                        .bp
+                        .find_close(target_bp)
+                        .is_some_and(|close| close > alias_bp));
+            if is_cycle {
+                return Err(YamlError::AliasCycle {
+                    offset: self.bp_to_text_pos(alias_bp).unwrap_or(0),
+                    name: self
+                        .bp_to_anchor
+                        .get(&target_bp)
+                        .cloned()
+                        .unwrap_or_default(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Create a cursor at the given BP position.
     ///
     /// This is useful for navigating to a specific position in the index.
@@ -821,6 +862,86 @@ mod tests {
         let yaml = b"- item1\n- item2";
         let index = YamlIndex::build(yaml);
         assert!(index.is_ok());
+    }
+
+    // ------------------------------------------------------------------------
+    // Alias cycle validation tests (#153)
+    // ------------------------------------------------------------------------
+
+    /// Assert that `yaml` is rejected with `AliasCycle` naming `expected_name`
+    /// at the byte offset of `alias_text` within `yaml`.
+    fn expect_alias_cycle(yaml: &str, expected_name: &str, alias_text: &str) {
+        let expected_offset = yaml.find(alias_text).expect("alias text present in input");
+        let Err(err) = YamlIndex::build(yaml.as_bytes()) else {
+            panic!("cyclic alias must be rejected at build time");
+        };
+        match err {
+            YamlError::AliasCycle { offset, name } => {
+                assert_eq!(name, expected_name);
+                assert_eq!(offset, expected_offset);
+            }
+            other => panic!("expected AliasCycle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_rejects_issue_153_alias_cycle() {
+        expect_alias_cycle("a: &anchor\n  self: *anchor", "anchor", "*anchor");
+    }
+
+    #[test]
+    fn test_build_rejects_direct_self_alias() {
+        expect_alias_cycle("a: &x *x", "x", "*x");
+    }
+
+    #[test]
+    fn test_build_rejects_grandparent_alias_cycle() {
+        expect_alias_cycle("a: &x\n  b:\n    c: *x", "x", "*x");
+    }
+
+    #[test]
+    fn test_build_rejects_flow_alias_cycle() {
+        expect_alias_cycle("a: &x {b: *x}", "x", "*x");
+    }
+
+    #[test]
+    fn test_build_rejects_cycle_in_second_document() {
+        expect_alias_cycle("ok: 1\n---\na: &x\n  b: *x", "x", "*x");
+    }
+
+    #[test]
+    fn test_build_allows_sibling_alias() {
+        assert!(YamlIndex::build(b"a: &x 1\nb: *x").is_ok());
+    }
+
+    #[test]
+    fn test_build_allows_alias_to_closed_nested_target() {
+        assert!(YamlIndex::build(b"a:\n  b: &x 1\nc: *x").is_ok());
+    }
+
+    #[test]
+    fn test_build_allows_merge_key_alias() {
+        assert!(YamlIndex::build(b"base: &b\n  x: 1\nitem:\n  <<: *b\n  y: 2").is_ok());
+    }
+
+    #[test]
+    fn test_build_allows_cross_document_alias() {
+        assert!(YamlIndex::build(b"a: &x 1\n---\nb: *x").is_ok());
+    }
+
+    #[test]
+    fn test_build_allows_undefined_alias() {
+        // Forward/undefined aliases get no `aliases` entry, so validation
+        // skips them and they keep resolving to null at query time.
+        assert!(YamlIndex::build(b"bad: *undefined").is_ok());
+    }
+
+    #[test]
+    fn test_build_allows_empty_anchored_value_alias() {
+        // `&x` anchors an empty value; the recorded anchor BP position may
+        // land on a close bit or a later sibling node, never an ancestor of
+        // the alias, so this must not be reported as a cycle.
+        assert!(YamlIndex::build(b"a: &x\nb: *x").is_ok());
     }
 
     #[test]

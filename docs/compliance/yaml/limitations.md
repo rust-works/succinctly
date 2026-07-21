@@ -73,6 +73,16 @@ runs before indexing, so the default path pays nothing for it — see
 acceptance criteria. Tracked in
 [#223](https://github.com/rust-works/succinctly/issues/223).
 
+### One exception: cyclic aliases are rejected
+
+An alias that would make an anchored value contain itself (`a: &x {self: *x}`) is
+rejected at index build with `YamlError::AliasCycle` ("anchor value contains itself").
+This is the one structural check the non-validating loader performs, because a cyclic
+document cannot be materialized at all — before
+[#153](https://github.com/rust-works/succinctly/issues/153) it aborted the process with
+a stack overflow. YAML 1.2's representation graph technically permits cycles, but `yq`
+rejects the same input at decode time, so rejecting is also the compatible behavior.
+
 ## Unsupported features
 
 These are absent rather than wrong, and account for 47 of the 77 load failures.
