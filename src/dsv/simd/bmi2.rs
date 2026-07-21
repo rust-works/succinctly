@@ -197,11 +197,13 @@ unsafe fn toggle64_bmi2(carry: u64, w: u64) -> (u64, u64) {
     // effectively "filling" the regions between matched quote pairs.
     let comp_w = !w;
     let shifted = (addend << 1) | c;
-    let (result, overflow) = shifted.overflowing_add(comp_w);
+    let result = shifted.wrapping_add(comp_w);
 
-    // The new carry depends on whether addition overflowed
-    // and the final state of the quote parity
-    let new_carry = u64::from(overflow);
+    // Quote state after this chunk = incoming state XOR quote-count parity.
+    // The adder's carry-out cannot be used here: `addend << 1` drops a bit
+    // deposited at position 63, so a quote that opens at bit 63 never
+    // produces an overflow and the carry would be lost (#149).
+    let new_carry = (w.count_ones() as u64 + c) & 1;
 
     (result, new_carry)
 }
@@ -392,6 +394,86 @@ mod tests {
             let (_mask, carry) = toggle64_bmi2(0, 1);
             // After the quote, we're inside, so the mask should have 0s
             assert_eq!(carry, 1, "Odd quotes should set carry");
+
+            // #149 regression: a quote at bit 63 must still toggle the carry.
+            // The overflow-based carry lost an opener at bit 63 because
+            // `addend << 1` shifts the deposited bit out of the word.
+            let (mask, carry) = toggle64_bmi2(0, 1 << 63);
+            assert_eq!(carry, 1, "Opener at bit 63 must carry into next chunk");
+            assert_eq!(mask, !0u64 >> 1, "Bits 0..63 outside, bit 63 inside");
+            let (_mask, carry) = toggle64_bmi2(1, 1 << 63);
+            assert_eq!(carry, 0, "Closer at bit 63 must clear the carry");
+        }
+    }
+
+    #[test]
+    fn test_toggle64_matches_bit_serial_reference() {
+        if !has_bmi2() {
+            return;
+        }
+
+        // Independent bit-serial oracle: walk the word tracking an inside-quotes
+        // flag, exactly like the scalar DSV parser. A quote bit takes its
+        // post-toggle state — an opening quote reads as inside (0), a closing
+        // quote as outside (1). See the SVE2 twin of this test in
+        // `src/util/simd/sve2.rs` (#149).
+        fn toggle64_reference(carry: u64, quote_mask: u64) -> (u64, u64) {
+            let mut inside = carry & 1 == 1;
+            let mut outside_mask = 0u64;
+            for i in 0..64 {
+                if (quote_mask >> i) & 1 == 1 {
+                    inside = !inside;
+                }
+                if !inside {
+                    outside_mask |= 1 << i;
+                }
+            }
+            (outside_mask, u64::from(inside))
+        }
+
+        // Deterministic PRNG for wide mask coverage without a rand dependency.
+        fn splitmix64(state: &mut u64) -> u64 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        let mut patterns = vec![
+            0u64,
+            1,
+            0b11,
+            0b101,
+            0b1001,
+            0x8000_0000_0000_0000,
+            0xC000_0000_0000_0000,
+            0x8000_0000_0000_0001,
+            0xAAAA_AAAA_AAAA_AAAA,
+            0x5555_5555_5555_5555,
+            0xFF00_FF00_FF00_FF00,
+            !0u64,
+        ];
+        patterns.extend((0..64).map(|i| 1u64 << i));
+        let mut state = 0x149u64;
+        patterns.extend((0..512).map(|_| splitmix64(&mut state)));
+
+        for &quote_mask in &patterns {
+            for carry in [0u64, 1] {
+                unsafe {
+                    let (bmi2_mask, bmi2_carry) = toggle64_bmi2(carry, quote_mask);
+                    let (ref_mask, ref_carry) = toggle64_reference(carry, quote_mask);
+
+                    assert_eq!(
+                        bmi2_mask, ref_mask,
+                        "Mask mismatch for quote_mask={quote_mask:#x}, carry={carry}"
+                    );
+                    assert_eq!(
+                        bmi2_carry, ref_carry,
+                        "Carry mismatch for quote_mask={quote_mask:#x}, carry={carry}"
+                    );
+                }
+            }
         }
     }
 

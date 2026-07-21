@@ -126,19 +126,24 @@ See [parallel-prefix.md](../optimizations/parallel-prefix.md) for technique deta
 A 10x faster alternative using hardware PDEP instruction:
 
 ```rust
-unsafe fn toggle64_bmi2(quote_mask: u64, carry: u64) -> (u64, u64) {
+unsafe fn toggle64_bmi2(carry: u64, w: u64) -> (u64, u64) {
     const ODDS_MASK: u64 = 0x5555_5555_5555_5555;  // 0101...
 
     // Scatter alternating pattern to quote positions
     let c = carry & 0x1;
-    let addend = _pdep_u64(ODDS_MASK << c, quote_mask);
+    let addend = _pdep_u64(ODDS_MASK << c, w);
 
     // Use addition for carry propagation
-    let comp_mask = !quote_mask;
+    let comp_w = !w;
     let shifted = (addend << 1) | c;
-    let (result, overflow) = shifted.overflowing_add(comp_mask);
+    let result = shifted.wrapping_add(comp_w);
 
-    (result ^ comp_mask, overflow as u64)
+    // Quote state entering the next chunk = incoming state XOR quote-count
+    // parity. The adder's overflow is NOT a valid carry: `addend << 1` drops
+    // an opener deposited at bit 63, losing the carry (issue #149).
+    let new_carry = (w.count_ones() as u64 + c) & 1;
+
+    (result, new_carry)
 }
 ```
 
@@ -147,6 +152,8 @@ unsafe fn toggle64_bmi2(quote_mask: u64, carry: u64) -> (u64, u64) {
 1. **PDEP scatters bits**: Places alternating 0/1 pattern at quote positions
 2. **Addition propagates carries**: Fills regions between quotes
 3. **Result**: 1-bits where outside quotes, 0-bits where inside
+4. **Carry**: quote-count parity XOR incoming carry — the inside/outside state
+   entering the next 64-byte chunk (do not use the adder's overflow; see #149)
 
 ```
 quote_mask:     0b00100100  (quotes at 2, 5)
@@ -396,12 +403,12 @@ for chunk in data.chunks(64) {
     let (delim_mask, quote_mask, newline_mask) = classify_chunk(chunk);
 
     // Apply quote masking with carry from previous chunk
-    let (in_quote_mask, new_carry) = toggle64_bmi2(quote_mask, carry);
+    let (outside_quotes, new_carry) = toggle64_bmi2(carry, quote_mask);
     carry = new_carry;
 
     // Mask out delimiters inside quotes
-    let valid_delims = delim_mask & !in_quote_mask;
-    let valid_newlines = newline_mask & !in_quote_mask;
+    let valid_delims = delim_mask & outside_quotes;
+    let valid_newlines = newline_mask & outside_quotes;
 
     // Write to index
     markers.push(valid_delims | valid_newlines);
