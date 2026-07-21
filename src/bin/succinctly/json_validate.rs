@@ -252,6 +252,9 @@ fn format_error_kind(kind: &ValidationErrorKind) -> String {
             format!("invalid keyword '{found}'")
         }
         ValidationErrorKind::InvalidUtf8 => "invalid UTF-8 sequence".to_string(),
+        ValidationErrorKind::NestingTooDeep { limit } => {
+            format!("nesting depth exceeds limit of {limit}")
+        }
     }
 }
 

@@ -86,6 +86,8 @@ pub enum ValidationErrorKind {
     InvalidKeyword { found: String },
     /// Invalid UTF-8 sequence.
     InvalidUtf8,
+    /// Container nesting depth exceeded the limit.
+    NestingTooDeep { limit: usize },
 }
 
 impl fmt::Display for ValidationErrorKind {
@@ -121,6 +123,9 @@ impl fmt::Display for ValidationErrorKind {
                 )
             }
             Self::InvalidUtf8 => write!(f, "invalid UTF-8 sequence"),
+            Self::NestingTooDeep { limit } => {
+                write!(f, "nesting depth exceeds limit of {limit}")
+            }
         }
     }
 }
@@ -143,6 +148,15 @@ impl fmt::Display for ValidationError {
 #[cfg(feature = "std")]
 impl std::error::Error for ValidationError {}
 
+/// Maximum nesting depth for containers (objects and arrays).
+///
+/// Bounds call-stack growth in the mutually recursive `validate_value` →
+/// `validate_object`/`validate_array` cycle so deeply nested input fails with
+/// [`ValidationErrorKind::NestingTooDeep`] instead of overflowing the stack.
+/// Matches the YAML parser's cap and keeps depth-100 documents (pinned by
+/// `tests/deep_nesting_valid_tests.rs`) valid.
+const MAX_NESTING_DEPTH: usize = 128;
+
 /// A strict JSON validator with position tracking.
 ///
 /// Uses recursive descent parsing to validate JSON according to RFC 8259.
@@ -151,6 +165,8 @@ pub struct Validator<'a> {
     offset: usize,
     line: usize,
     column: usize,
+    /// Current container nesting depth, capped at [`MAX_NESTING_DEPTH`].
+    nesting_depth: usize,
 }
 
 impl<'a> Validator<'a> {
@@ -161,6 +177,7 @@ impl<'a> Validator<'a> {
             offset: 0,
             line: 1,
             column: 1,
+            nesting_depth: 0,
         }
     }
 
@@ -206,8 +223,30 @@ impl<'a> Validator<'a> {
         }
     }
 
+    /// Enter a nested container, erroring past [`MAX_NESTING_DEPTH`].
+    ///
+    /// Callers must decrement `nesting_depth` when the container's frame
+    /// exits so sibling containers do not accumulate depth.
+    #[inline]
+    fn enter_nested(&mut self) -> Result<(), ValidationError> {
+        if self.nesting_depth >= MAX_NESTING_DEPTH {
+            return Err(self.error(ValidationErrorKind::NestingTooDeep {
+                limit: MAX_NESTING_DEPTH,
+            }));
+        }
+        self.nesting_depth += 1;
+        Ok(())
+    }
+
     /// Validate a JSON object.
     fn validate_object(&mut self) -> Result<(), ValidationError> {
+        self.enter_nested()?;
+        let result = self.validate_object_inner();
+        self.nesting_depth -= 1;
+        result
+    }
+
+    fn validate_object_inner(&mut self) -> Result<(), ValidationError> {
         self.advance(); // consume '{'
         self.skip_whitespace();
 
@@ -276,6 +315,13 @@ impl<'a> Validator<'a> {
 
     /// Validate a JSON array.
     fn validate_array(&mut self) -> Result<(), ValidationError> {
+        self.enter_nested()?;
+        let result = self.validate_array_inner();
+        self.nesting_depth -= 1;
+        result
+    }
+
+    fn validate_array_inner(&mut self) -> Result<(), ValidationError> {
         self.advance(); // consume '['
         self.skip_whitespace();
 
@@ -1273,6 +1319,65 @@ mod tests {
         assert!(validate(br#"{"a":{}}"#).is_ok());
     }
 
+    /// Issue #151: deeply nested input must return an error instead of
+    /// overflowing the stack. Passing at all is the proof — an overflow
+    /// would abort the test process.
+    #[test]
+    fn test_deep_array_errors_instead_of_aborting() {
+        let input = "[".repeat(20_000);
+        let err = validate(input.as_bytes()).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::NestingTooDeep { .. }
+        ));
+    }
+
+    #[test]
+    fn test_deep_object_errors_instead_of_aborting() {
+        let input = r#"{"a":"#.repeat(20_000);
+        let err = validate(input.as_bytes()).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::NestingTooDeep { .. }
+        ));
+    }
+
+    #[test]
+    fn test_deep_alternating_errors_instead_of_aborting() {
+        let input = r#"[{"a":"#.repeat(10_000);
+        let err = validate(input.as_bytes()).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::NestingTooDeep { .. }
+        ));
+    }
+
+    #[test]
+    fn test_nesting_at_cap_validates() {
+        let input = "[".repeat(MAX_NESTING_DEPTH) + &"]".repeat(MAX_NESTING_DEPTH);
+        assert!(validate(input.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_nesting_one_past_cap_errors() {
+        let input = "[".repeat(MAX_NESTING_DEPTH + 1) + &"]".repeat(MAX_NESTING_DEPTH + 1);
+        let err = validate(input.as_bytes()).unwrap_err();
+        assert_eq!(err.kind, ValidationErrorKind::NestingTooDeep { limit: 128 });
+        // The guard fires at the 129th '[', before it is consumed.
+        assert_eq!(err.position.offset, 128);
+        assert_eq!(err.position.column, 129);
+    }
+
+    /// Sibling containers at the same depth must not accumulate: the
+    /// counter is decremented when each container's frame exits, so three
+    /// siblings of depth 65 (195 containers total) stay under the cap.
+    #[test]
+    fn test_wide_but_shallow_nesting_validates() {
+        let element = "[".repeat(64) + &"]".repeat(64);
+        let input = format!("[{element},{element},{element}]");
+        assert!(validate(input.as_bytes()).is_ok());
+    }
+
     /// RFC 8259 Section 2: Whitespace handling.
     #[test]
     fn test_whitespace_edge_cases() {
@@ -1384,6 +1489,10 @@ mod tests {
         assert_eq!(
             ValidationErrorKind::InvalidUtf8.to_string(),
             "invalid UTF-8 sequence"
+        );
+        assert_eq!(
+            ValidationErrorKind::NestingTooDeep { limit: 128 }.to_string(),
+            "nesting depth exceeds limit of 128"
         );
     }
 
