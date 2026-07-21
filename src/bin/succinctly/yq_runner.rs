@@ -1250,14 +1250,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     }
                 }
                 _ => {
-                    // Single document case
+                    // Single document case. Defensive fallback only: the root
+                    // cursor (bp_pos 0) always reports the virtual document
+                    // sequence, so documents — including #175 `---` separator
+                    // handling — go through the Sequence arm above.
                     if args.document.is_none() || args.document == Some(0) {
                         if is_identity {
                             // P9 path for identity on single doc
                             if can_yaml_fast_path {
-                                if yaml_doc_streamed {
-                                    writeln!(writer, "---")?;
-                                }
                                 root.stream_yaml_document(&mut FmtWriter(&mut writer), 2)
                                     .map_err(|_| anyhow::anyhow!("Write error"))?;
                             } else {
@@ -1301,7 +1301,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         }
                     }
                     _ => {
-                        // Single document case
+                        // Single document case. Defensive fallback only: the
+                        // root cursor (bp_pos 0) always reports the virtual
+                        // document sequence, so documents — including #175
+                        // `---` separator handling — go through the Sequence
+                        // arm above.
                         let should_process = args
                             .document
                             .map_or(true, |target| global_doc_index == target);
@@ -1309,9 +1313,6 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             if is_identity {
                                 // P9 path for identity on single doc
                                 if can_yaml_fast_path {
-                                    if yaml_doc_streamed {
-                                        writeln!(writer, "---")?;
-                                    }
                                     root.stream_yaml_document(&mut FmtWriter(&mut writer), 2)
                                         .map_err(|_| anyhow::anyhow!("Write error"))?;
                                 } else {
