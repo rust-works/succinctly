@@ -69,12 +69,13 @@ fn toggle64_backends() -> Vec<(&'static str, Builder)> {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // SVE2 is absent on Apple Silicon; validated under emulation (#194).
-        // NOTE: #194 should tighten this to the exact `sve2-bitperm` feature.
-        if std::arch::is_aarch64_feature_detected!("sve2") {
+        // SVE2-BITPERM is absent on Apple Silicon; runs on Neoverse CI (#194).
+        if std::arch::is_aarch64_feature_detected!("sve2-bitperm") {
             backends.push(("sve2", succinctly::dsv::simd::sve2::build_index_simd));
         } else {
-            eprintln!("SKIPPED dsv toggle64 differential [sve2]: sve2 not detected (see #194)");
+            eprintln!(
+                "SKIPPED dsv toggle64 differential [sve2]: sve2-bitperm not detected (see #194)"
+            );
         }
     }
 

@@ -241,14 +241,7 @@ mod tests {
     use super::*;
 
     fn has_sve2() -> bool {
-        #[cfg(feature = "std")]
-        {
-            std::arch::is_aarch64_feature_detected!("sve2-bitperm")
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            false
-        }
+        super::has_sve2_bitperm()
     }
 
     #[test]
