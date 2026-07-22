@@ -1050,8 +1050,11 @@ fn parse_size(s: &str) -> Result<usize, String> {
     num_str
         .trim()
         .parse::<usize>()
-        .map(|n| n * unit)
         .map_err(|_| format!("Invalid number in size: '{s}'"))
+        .and_then(|n| {
+            n.checked_mul(unit)
+                .ok_or_else(|| format!("Size too large: '{s}'"))
+        })
 }
 
 /// Multi-call binary support: detect if invoked via a known alias name.
@@ -2138,5 +2141,10 @@ mod tests {
         assert!(parse_size("abc").is_err());
         assert!(parse_size("1tb").is_err());
         assert!(parse_size("").is_err());
+
+        // Overflow: rejected cleanly instead of wrapping (issue #179)
+        assert!(parse_size("99999999999gb").is_err());
+        assert!(parse_size(&format!("{}kb", usize::MAX)).is_err());
+        assert_eq!(parse_size(&format!("{}b", usize::MAX)).unwrap(), usize::MAX);
     }
 }
