@@ -281,9 +281,13 @@ fn test_iterate_on_scalar_error() {
 
 #[test]
 fn test_slice_range() {
+    // jq array slicing yields a single sub-array, not a stream (issue #154).
     query!(br"[0, 1, 2, 3, 4, 5]", ".[1:4]",
-        QueryResult::Many(values) => {
-            assert_eq!(values.len(), 3);
+        QueryResult::Owned(OwnedValue::Array(values)) => {
+            assert_eq!(
+                values,
+                vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]
+            );
         }
     );
 }
@@ -291,8 +295,8 @@ fn test_slice_range() {
 #[test]
 fn test_slice_from_start() {
     query!(br"[0, 1, 2, 3, 4]", ".[:2]",
-        QueryResult::Many(values) => {
-            assert_eq!(values.len(), 2);
+        QueryResult::Owned(OwnedValue::Array(values)) => {
+            assert_eq!(values, vec![OwnedValue::Int(0), OwnedValue::Int(1)]);
         }
     );
 }
@@ -300,8 +304,8 @@ fn test_slice_from_start() {
 #[test]
 fn test_slice_to_end() {
     query!(br"[0, 1, 2, 3, 4]", ".[3:]",
-        QueryResult::Many(values) => {
-            assert_eq!(values.len(), 2); // indices 3, 4
+        QueryResult::Owned(OwnedValue::Array(values)) => {
+            assert_eq!(values, vec![OwnedValue::Int(3), OwnedValue::Int(4)]);
         }
     );
 }
@@ -309,16 +313,17 @@ fn test_slice_to_end() {
 #[test]
 fn test_slice_negative_indices() {
     query!(br"[0, 1, 2, 3, 4, 5]", ".[-3:-1]",
-        QueryResult::Many(values) => {
-            assert_eq!(values.len(), 2); // indices 3, 4 (elements 3, 4)
+        QueryResult::Owned(OwnedValue::Array(values)) => {
+            assert_eq!(values, vec![OwnedValue::Int(3), OwnedValue::Int(4)]);
         }
     );
 }
 
 #[test]
 fn test_slice_empty_result() {
+    // Out-of-range slice yields an empty array, not an empty stream.
     query!(br"[0, 1, 2]", ".[5:10]",
-        QueryResult::Many(values) => {
+        QueryResult::Owned(OwnedValue::Array(values)) => {
             assert!(values.is_empty());
         }
     );
@@ -357,6 +362,61 @@ fn test_slice_on_string_to_end() {
         QueryResult::Owned(OwnedValue::String(s)) => {
             assert_eq!(s, "lo");
         }
+    );
+}
+
+#[test]
+fn test_slice_piped_to_length() {
+    // A slice is a single array, so `length` sees the array (issue #154).
+    query!(br"[0, 1, 2, 3, 4]", ".[1:4] | length",
+        QueryResult::Owned(OwnedValue::Int(n)) => {
+            assert_eq!(n, 3);
+        }
+    );
+}
+
+#[test]
+fn test_slice_piped_to_index() {
+    query!(br"[0, 1, 2, 3, 4]", ".[1:4] | .[0]",
+        QueryResult::Owned(OwnedValue::Int(n)) => {
+            assert_eq!(n, 1);
+        }
+    );
+}
+
+#[test]
+fn test_slice_array_construction_nests() {
+    // `[.[1:4]]` wraps the sub-array, producing a nested array.
+    query!(br"[0, 1, 2, 3, 4]", "[.[1:4]]",
+        QueryResult::Owned(OwnedValue::Array(outer)) => {
+            assert_eq!(
+                outer,
+                vec![OwnedValue::Array(vec![
+                    OwnedValue::Int(1),
+                    OwnedValue::Int(2),
+                    OwnedValue::Int(3),
+                ])]
+            );
+        }
+    );
+}
+
+#[test]
+fn test_slice_single_element_stays_array() {
+    // A one-element slice must remain an array, not collapse to the element.
+    query!(br"[0, 1, 2, 3, 4]", "[.[]] | .[1:2]",
+        QueryResult::Owned(OwnedValue::Array(values)) => {
+            assert_eq!(values, vec![OwnedValue::Int(1)]);
+        }
+    );
+}
+
+#[test]
+fn test_full_slice_returns_whole_array() {
+    // `.[:]` is a full slice returning the whole array as a single value,
+    // taking the fast path that returns the original borrowed value.
+    query!(br"[0, 1, 2]", ".[:]",
+        QueryResult::One(StandardJson::Array(_)) => {}
     );
 }
 

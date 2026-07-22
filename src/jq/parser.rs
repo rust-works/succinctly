@@ -613,9 +613,12 @@ impl<'a> Parser<'a> {
             self.skip_ws();
 
             if self.peek() == Some(']') {
-                // `[:]` - full slice (same as iterate)
+                // `[:]` - full slice, returns the whole array as a single value
                 self.next();
-                return Ok(Expr::Iterate);
+                return Ok(Expr::Slice {
+                    start: None,
+                    end: None,
+                });
             }
 
             // `[:n]` - slice from start to n
@@ -4057,6 +4060,14 @@ mod tests {
             Expr::Slice {
                 start: None,
                 end: Some(3)
+            }
+        );
+        // `[:]` is a full slice (returns the whole array), not an iterate
+        assert_eq!(
+            parse(".[:]").unwrap(),
+            Expr::Slice {
+                start: None,
+                end: None
             }
         );
     }
