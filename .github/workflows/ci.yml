@@ -134,7 +134,7 @@ jobs:
 
       - name: Run cli-gated yq tests
         if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
@@ -220,7 +220,7 @@ jobs:
 
       - name: Run cli-gated yq tests
         if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
@@ -283,7 +283,7 @@ jobs:
 
       - name: Run cli-gated yq tests
         if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
@@ -343,7 +343,7 @@ jobs:
         run: cargo build --features cli --bin succinctly
 
       - name: Run cli-gated yq tests
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests
 
       - name: Run tests
         run: cargo test --verbose
