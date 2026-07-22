@@ -205,6 +205,14 @@ fn test_array_slice_out_of_range_is_empty_array() -> Result<()> {
 }
 
 #[test]
+fn test_full_array_slice_returns_whole_array() -> Result<()> {
+    let (output, code) = run_jq_stdin(".[:]", r"[0,1,2,3,4]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "[0,1,2,3,4]\n");
+    Ok(())
+}
+
+#[test]
 fn test_string_slice_unchanged() -> Result<()> {
     let (output, code) = run_jq_stdin(".[1:3]", r#""hello""#, &["-c"])?;
     assert_eq!(code, 0);
