@@ -407,6 +407,24 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) 
     }
 }
 
+/// Write the `---` document separator for fast-path YAML output (#175).
+///
+/// yq separates YAML documents with `---` only between documents that produce
+/// output: never before the first, and never around a document whose query
+/// yields no results. `will_output` says whether the current document is about
+/// to emit anything; `streamed` records that an earlier document already did.
+fn emit_yaml_doc_separator<W: std::io::Write>(
+    writer: &mut W,
+    streamed: &mut bool,
+    will_output: bool,
+) -> std::io::Result<()> {
+    if *streamed && will_output {
+        writeln!(writer, "---")?;
+    }
+    *streamed |= will_output;
+    Ok(())
+}
+
 /// State for tracking split_doc output separators.
 struct SplitDocState {
     has_split_doc: bool,
@@ -1150,6 +1168,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // M2 streaming fast path: evaluate expression and stream results directly
         // Track global document index across all files for --doc filtering
         let mut global_doc_index: usize = 0;
+        // Whether any document has produced YAML output yet — drives `---`
+        // separator placement between documents (#175).
+        let mut yaml_doc_streamed = false;
 
         // Helper macro to stream cursor results (avoiding closure borrow issues)
         macro_rules! stream_cursor {
@@ -1158,6 +1179,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     // M2 YAML path: YAML output streaming
                     if is_identity {
                         // P9 path: stream directly without evaluation
+                        emit_yaml_doc_separator($writer, &mut yaml_doc_streamed, true)?;
                         $cursor
                             .stream_yaml(&mut FmtWriter($writer), 2)
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
@@ -1170,6 +1192,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     } else {
                         // M2 YAML path: evaluate and stream YAML results
                         let result = eval_with_cursor(&program.expr, $cursor);
+                        let will_output = !matches!(
+                            &result,
+                            GenericResult::None | GenericResult::Break(_)
+                        ) && !matches!(&result, GenericResult::Many(vs) if vs.is_empty())
+                            && !matches!(&result, GenericResult::ManyOwned(vs) if vs.is_empty());
+                        emit_yaml_doc_separator($writer, &mut yaml_doc_streamed, will_output)?;
                         let stats = result
                             .stream_yaml(&mut FmtWriter($writer), 2, |w| w.write_str("\n"))
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
@@ -1222,7 +1250,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     }
                 }
                 _ => {
-                    // Single document case
+                    // Single document case. Defensive fallback only: the root
+                    // cursor (bp_pos 0) always reports the virtual document
+                    // sequence, so documents — including #175 `---` separator
+                    // handling — go through the Sequence arm above.
                     if args.document.is_none() || args.document == Some(0) {
                         if is_identity {
                             // P9 path for identity on single doc
@@ -1270,7 +1301,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         }
                     }
                     _ => {
-                        // Single document case
+                        // Single document case. Defensive fallback only: the
+                        // root cursor (bp_pos 0) always reports the virtual
+                        // document sequence, so documents — including #175
+                        // `---` separator handling — go through the Sequence
+                        // arm above.
                         let should_process = args
                             .document
                             .map_or(true, |target| global_doc_index == target);
