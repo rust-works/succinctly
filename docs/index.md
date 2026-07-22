@@ -61,7 +61,7 @@ Succinctly uses runtime CPU detection to select the best SIMD path:
 
 | Platform | Extensions Used            | Modules         |
 |----------|----------------------------|-----------------|
-| x86_64   | AVX2, BMI2, SSE4.2, SSE2   | JSON, DSV, YAML |
+| x86_64   | AVX2, BMI2, SSE4.1, SSE2   | JSON, DSV, YAML |
 | ARM64    | NEON, PMULL, SVE2-BITPERM  | JSON, DSV, YAML |
 | Fallback | Broadword / scalar         | All modules     |
 

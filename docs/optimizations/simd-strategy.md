@@ -9,9 +9,8 @@ Succinctly uses SIMD acceleration across all parsing modules, with platform-spec
 | Extension     | Width   | Platform | Used In                                              |
 |---------------|---------|----------|------------------------------------------------------|
 | AVX2          | 256-bit | x86_64   | JSON, DSV, YAML block scalars, YAML anchors          |
-| BMI2          | 64-bit  | x86_64   | DSV quote masking (PDEP/PEXT), JSON post-processing  |
-| SSE4.2        | 128-bit | x86_64   | JSON character classification                        |
-| SSE2          | 128-bit | x86_64   | DSV baseline                                         |
+| BMI2          | 64-bit  | x86_64   | DSV quote masking (PDEP/PEXT)                        |
+| SSE2          | 128-bit | x86_64   | JSON character classification, DSV baseline          |
 | NEON          | 128-bit | ARM64    | JSON, DSV, YAML, BP RangeMin, escape scanning        |
 | PMULL         | 64-bit  | ARM64    | DSV prefix XOR                                       |
 | SVE2-BITPERM  | varies  | ARM64    | JSON, DSV (BDEP/BEXT)                                |
@@ -19,8 +18,7 @@ Succinctly uses SIMD acceleration across all parsing modules, with platform-spec
 ## Per-Module SIMD Usage
 
 ### JSON ([src/json/simd/](../../src/json/simd/))
-- **Character classification**: AVX2 processes 32 bytes/iteration identifying structural characters (`{}[]:,"`)
-- **SSE4.2**: `PCMPISTRI` for string matching (38% faster than SSE2)
+- **Character classification**: AVX2 processes 32 bytes/iteration identifying structural characters (`{}[]:,"`); SSE2 is the 16-byte/iteration fallback
 - **Result**: ~880 MiB/s indexing throughput
 
 ### DSV ([src/dsv/simd/](../../src/dsv/simd/))

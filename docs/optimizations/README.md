@@ -10,7 +10,7 @@ This directory documents optimization techniques used in the succinctly library,
 |----------------------|----------------------------------------------------------|-------------------------------------------------|
 | **Bit-level**        | [bit-manipulation.md](bit-manipulation.md)               | Popcount, CTZ/CLZ, broadword select, PDEP/PEXT  |
 | **Lookup tables**    | [lookup-tables.md](lookup-tables.md)                     | Byte tables, nibble tables, state machine tables |
-| **SIMD**             | [simd.md](simd.md)                                      | AVX2, AVX-512, SSE4.2, NEON                     |
+| **SIMD**             | [simd.md](simd.md)                                      | AVX2, AVX-512, SSE4.1, NEON                     |
 | **Memory**           | [cache-memory.md](cache-memory.md)                       | Alignment, layout, prefetching, bandwidth        |
 | **Data structures**  | [hierarchical-structures.md](hierarchical-structures.md) | Rank directory, select index, RangeMin           |
 | **Control flow**     | [branchless.md](branchless.md)                           | CMOV, arithmetic selection, SIMD masking         |

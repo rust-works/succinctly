@@ -9,7 +9,6 @@ SIMD enables parallel processing of multiple data elements with a single instruc
 | Extension    | Width   | Platform | Key Instructions           | Best For              |
 |--------------|---------|----------|----------------------------|-----------------------|
 | SSE2         | 128-bit | x86_64   | Basic vector ops           | Baseline              |
-| SSE4.2       | 128-bit | x86_64   | PCMPISTRI, POPCNT          | String matching       |
 | AVX2         | 256-bit | x86_64   | Wide vectors, gather       | Memory-bound work     |
 | AVX-512      | 512-bit | x86_64   | VPOPCNTDQ, masked ops      | Compute-bound only    |
 | BMI2         | 64-bit  | x86_64   | PDEP, PEXT                 | Bit manipulation      |
@@ -45,31 +44,6 @@ unsafe fn classify_sse2(data: &[u8; 16]) -> u16 {
 - `_mm_cmpeq_epi8`: Compare 16 bytes in parallel
 - `_mm_movemask_epi8`: Extract comparison results to 16-bit mask
 - `_mm_loadu_si128`: Unaligned 128-bit load
-
-### SSE4.2
-
-Adds string processing instructions.
-
-```rust
-use core::arch::x86_64::*;
-
-unsafe fn find_structural_sse42(data: &[u8; 16]) -> u16 {
-    let chunk = _mm_loadu_si128(data.as_ptr() as *const __m128i);
-
-    // Find any of these characters: {}[]:,"
-    let chars = _mm_setr_epi8(
-        b'{' as i8, b'}' as i8, b'[' as i8, b']' as i8,
-        b':' as i8, b',' as i8, b'"' as i8, 0, 0, 0, 0, 0, 0, 0, 0, 0
-    );
-
-    _mm_cmpistrm(
-        chars, chunk,
-        _SIDD_UBYTE_OPS | _SIDD_CMP_EQUAL_ANY | _SIDD_BIT_MASK
-    ) as u16
-}
-```
-
-**Result**: 38% faster character classification vs SSE2.
 
 ### AVX2
 
@@ -388,15 +362,13 @@ Used SSE4.1 to accelerate balanced parentheses index construction, mirroring the
 fn select_simd_impl() -> impl Fn(&[u8]) -> Vec<u64> {
     if is_x86_feature_detected!("avx2") {
         avx2_impl
-    } else if is_x86_feature_detected!("sse4.2") {
-        sse42_impl
     } else {
         sse2_impl
     }
 }
 ```
 
-**Dispatch order**: AVX-512 VPOPCNTDQ → AVX2+BMI2 → AVX2 → SSE4.2 → SSE2
+**Dispatch order**: AVX-512 VPOPCNTDQ → AVX2+BMI2 → AVX2 → SSE2
 
 ### ARM64
 
@@ -728,7 +700,6 @@ isolation but cause regression when integrated due to real-world data characteri
 | AVX-512    | `bits/popcount.rs`      | Parallel popcount        | 5.2x    |
 | AVX2       | `json/simd/avx2.rs`     | JSON char classification | 1.78x   |
 | AVX2+BMI2  | `dsv/simd/bmi2.rs`      | DSV quote masking        | 10x     |
-| SSE4.2     | `json/simd/sse42.rs`    | String matching          | 1.38x   |
 | NEON       | `json/simd/neon.rs`     | ARM JSON parsing         | 1.11x   |
 | NEON       | `dsv/simd/neon.rs`      | ARM DSV parsing          | 1.8x    |
 | NEON       | `trees/bp.rs`           | BP L1/L2 index (VMINV)   | 2.8x (L1), 1-3% (L2) |

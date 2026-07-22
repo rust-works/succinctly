@@ -15,7 +15,7 @@ This document records all optimization attempts in the succinctly library, showi
 | PFSM JSON Parser          | **1.33x** (vs scalar), **1.17x** (vs AVX2) | x86_64   | Deployed |
 | AVX2 JSON Parser          | **1.78x**                                  | x86_64   | Deployed |
 | AVX512-VPOPCNTDQ          | **5.2x** (micro), **1.01x** (e2e)          | x86_64   | Deployed |
-| SSE4.2 PCMPISTRI          | **1.38x**                                  | x86_64   | Deployed |
+| SSE4.2 PCMPISTRI (JSON)   | never realized (mask discarded)            | x86_64   | Removed (#184) |
 | NEON 32-byte Processing   | **1.11x** (avg), **1.69x** (strings)       | ARM      | Deployed |
 | NEON Nibble Lookup        | **1.02-1.06x**                             | ARM      | Deployed |
 | NEON 256-byte Popcount    | **1.10-1.15x** (micro), **1.02-1.04x** (e2e) | ARM    | Deployed |
