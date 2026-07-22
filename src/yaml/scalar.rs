@@ -202,6 +202,18 @@ fn parse_float(s: &str) -> ResolvedScalar {
     }
 }
 
+/// Returns true if a plain scalar could resolve to null or bool at all.
+///
+/// A cheap pre-filter for callers that only need the null/bool answer
+/// (`is_null`, `is_falsy`, `as_bool`): scalars starting with a digit, sign,
+/// or dot can only be numeric or string, so those callers can skip the
+/// numeric parses `resolve_plain` would run just to conclude "neither".
+#[must_use]
+#[inline(always)]
+pub fn could_be_null_or_bool(s: &str) -> bool {
+    !matches!(s.as_bytes().first(), Some(b'0'..=b'9' | b'+' | b'-' | b'.'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
