@@ -13,13 +13,19 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_SAMPLE_RATE: u32 = 256;
 
 /// Sample entry storing word index and cumulative count before that word.
+///
+/// Both fields are `u64`, not `u32`: bitvectors past 2^32 set bits (~512 MB of
+/// ones — within the advertised `huge-tests` tier) previously wrapped
+/// `cumulative_before`, and past 2^32 words `word_idx` too (#188). The samples
+/// array holds one entry per `sample_rate` set bits, so the widening cost is
+/// negligible.
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 struct SampleEntry {
     /// Word index containing the sample point.
-    word_idx: u32,
+    word_idx: u64,
     /// Cumulative count of ones before this word (not including this word).
-    cumulative_before: u32,
+    cumulative_before: u64,
 }
 
 /// Sampled select index for accelerated select queries.
@@ -30,10 +36,10 @@ struct SampleEntry {
 ///
 /// # Space Overhead
 ///
-/// With sample rate k, overhead is approximately `8 / k` bytes per bit set.
-/// - Sample rate 64: ~12.5% overhead
-/// - Sample rate 256: ~3% overhead
-/// - Sample rate 512: ~1.5% overhead
+/// With sample rate k, overhead is approximately `16 / k` bytes per bit set.
+/// - Sample rate 64: ~25% overhead
+/// - Sample rate 256: ~6% overhead
+/// - Sample rate 512: ~3% overhead
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SelectIndex {
@@ -80,8 +86,8 @@ impl SelectIndex {
             // Check if any sample points fall within this word
             while next_sample < total_ones && count + pop > next_sample {
                 samples.push(SampleEntry {
-                    word_idx: word_idx as u32,
-                    cumulative_before: count as u32,
+                    word_idx: word_idx as u64,
+                    cumulative_before: count as u64,
                 });
                 next_sample += sample_rate as usize;
             }
@@ -228,5 +234,27 @@ mod tests {
         // Sample rate larger than total ones - only sample at 0
         assert_eq!(idx.jump_to(0), (0, 0));
         assert_eq!(idx.jump_to(15), (0, 15));
+    }
+
+    /// Regression test for #188: `cumulative_before` was u32 and wrapped past
+    /// 2^32 set bits. Needs ~800 MB RAM (512 MB of all-ones words plus the
+    /// sample array), hence the huge-tests gate.
+    #[test]
+    #[cfg(feature = "huge-tests")]
+    fn test_sample_entry_beyond_u32_max() {
+        let num_words = (u32::MAX as usize / 64) + 2;
+        let words = vec![u64::MAX; num_words];
+        let total_ones = num_words * 64;
+        assert!(total_ones > u32::MAX as usize);
+
+        let idx = SelectIndex::build(&words, total_ones, 256);
+
+        // All bits are ones, so the k-th 1-bit lives at bit position k and
+        // cumulative_before == start_word * 64 exactly.
+        let k = u32::MAX as usize + 1;
+        let (start_word, remaining) = idx.jump_to(k);
+        assert_eq!(start_word * 64 + remaining, k);
+        // The sample that answered this query sits beyond the old u32 range.
+        assert!(start_word as u64 * 64 > u64::from(u32::MAX));
     }
 }

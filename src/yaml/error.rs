@@ -144,6 +144,15 @@ pub enum YamlError {
         /// The configured depth limit
         limit: usize,
     },
+
+    /// Input exceeds the maximum indexable size (`u32::MAX` bytes).
+    ///
+    /// Text positions are stored as `u32` in the semi-index (#188), so larger
+    /// inputs would silently truncate offsets instead of failing cleanly.
+    InputTooLarge {
+        /// Actual input length in bytes
+        len: usize,
+    },
 }
 
 impl fmt::Display for YamlError {
@@ -249,6 +258,12 @@ impl fmt::Display for YamlError {
                 write!(
                     f,
                     "nesting depth exceeds limit of {limit} at offset {offset}"
+                )
+            }
+            Self::InputTooLarge { len } => {
+                write!(
+                    f,
+                    "input too large: {len} bytes exceeds the u32::MAX-byte (4 GiB) indexing limit"
                 )
             }
         }
@@ -413,6 +428,15 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "unexpected end of input: while parsing flow sequence"
+        );
+    }
+
+    #[test]
+    fn test_input_too_large_display() {
+        let err = YamlError::InputTooLarge { len: 5_000_000_000 };
+        assert_eq!(
+            err.to_string(),
+            "input too large: 5000000000 bytes exceeds the u32::MAX-byte (4 GiB) indexing limit"
         );
     }
 

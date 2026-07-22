@@ -14,6 +14,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new `YamlError::AliasCycle` variant instead of aborting with a stack overflow when the
   value is materialized (#153). Matches `yq`, which fails at decode time on the same
   input. Note: exhaustive `match`es on `YamlError` need a new arm.
+- **BalancedParens L2 excess overflow** (#188): the per-L2-block excess
+  counters were `i16` and overflowed at nesting depth > 32,767 (debug panic /
+  silent wrap in release). Widened to `i32` across the scalar, NEON, and
+  SSE4.1 build paths; deep nesting is no longer bounded by the index.
+- **BalancedParens stray-bit over-count** (#188): constructors did not mask
+  1-bits above `len` in the final partial word, inflating
+  `total_ones`/`rank1`/`select1`. Owned constructors now canonicalize the
+  final word in place; borrowed (`from_words*`, mmap) paths mask on read.
+- **SelectIndex sample overflow** (#188): `SampleEntry` counters were `u32`
+  and wrapped past 2^32 set bits (~512 MB of ones); widened to `u64`.
+
+### Changed
+
+- **4 GiB input ceilings enforced** (#188): instead of silently truncating
+  `u32` counters, builds now fail loudly for inputs over `u32::MAX` bytes —
+  `YamlIndex::build` returns the new `YamlError::InputTooLarge` variant
+  (minor API addition: exhaustive matches on `YamlError` gain an arm), while
+  `JsonIndex` and `DsvIndexLightweight` constructors panic with a documented
+  message. `BalancedParens` constructors assert a `u32::MAX`-bit ceiling.
+  See [docs/reference/limits.md](docs/reference/limits.md).
+- **SelectIndex sample entries doubled** from 8 to 16 bytes (one entry per
+  `sample_rate` set bits; ~6% of set-bit count at the default rate 256, up
+  from ~3%). Serialized (`serde`) representations of `BitVec`,
+  `BalancedParens`, and `SelectIndex` change accordingly.
 
 ## [0.7.0] - 2026-04-05
 

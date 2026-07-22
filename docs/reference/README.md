@@ -18,6 +18,12 @@ Language and feature reference documentation for succinctly.
 |---------------------------------------------------|---------------------------------|
 | [Environment Variables](environment-variables.md) | Every variable succinctly reads |
 
+## Limits
+
+| Document                    | Description                                 |
+|-----------------------------|---------------------------------------------|
+| [Input Size Limits](limits.md) | Enforced input ceilings and widened counters |
+
 ## See Also
 
 - [CLI Guide](../guides/cli.md) - Command-line tool reference
