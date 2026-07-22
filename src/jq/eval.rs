@@ -1663,11 +1663,6 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::NthStream(n_expr, expr) => {
             builtin_nth_stream::<W, S>(n_expr, expr, value, optional)
         }
-        Builtin::Range(n) => builtin_range::<W, S>(n, value, optional),
-        Builtin::RangeFromTo(from, to) => builtin_range_from_to::<W, S>(from, to, value, optional),
-        Builtin::RangeFromToBy(from, to, by) => {
-            builtin_range_from_to_by::<W, S>(from, to, by, value, optional)
-        }
         Builtin::IsEmpty(expr) => builtin_isempty::<W, S>(expr, value, optional),
 
         // Phase 14: Recursive traversal (extends Phase 8)
@@ -6615,16 +6610,6 @@ fn substitute_var_in_builtin(
             Box::new(substitute_var(n, var_name, replacement)),
             Box::new(substitute_var(e, var_name, replacement)),
         ),
-        Builtin::Range(n) => Builtin::Range(Box::new(substitute_var(n, var_name, replacement))),
-        Builtin::RangeFromTo(from, to) => Builtin::RangeFromTo(
-            Box::new(substitute_var(from, var_name, replacement)),
-            Box::new(substitute_var(to, var_name, replacement)),
-        ),
-        Builtin::RangeFromToBy(from, to, by) => Builtin::RangeFromToBy(
-            Box::new(substitute_var(from, var_name, replacement)),
-            Box::new(substitute_var(to, var_name, replacement)),
-            Box::new(substitute_var(by, var_name, replacement)),
-        ),
         Builtin::IsEmpty(e) => Builtin::IsEmpty(Box::new(substitute_var(e, var_name, replacement))),
         // Phase 14: Recursive traversal (extends Phase 8)
         Builtin::RecurseDown => Builtin::RecurseDown,
@@ -7230,6 +7215,38 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// A numeric argument to `range()`: kept as `i64` when exact so all-integer
+/// ranges emit `Int` values, promoted to `f64` when any argument is a float.
+#[derive(Clone, Copy)]
+enum RangeNum {
+    Int(i64),
+    Float(f64),
+}
+
+impl RangeNum {
+    fn as_f64(self) -> f64 {
+        match self {
+            Self::Int(i) => i as f64,
+            Self::Float(f) => f,
+        }
+    }
+}
+
+/// Extract a numeric `range()` argument from an evaluated expression result.
+fn range_arg<W: Clone + AsRef<[u64]>>(result: QueryResult<'_, W>) -> Result<RangeNum, EvalError> {
+    match result {
+        QueryResult::Owned(OwnedValue::Int(i)) => Ok(RangeNum::Int(i)),
+        QueryResult::Owned(OwnedValue::Float(f)) => Ok(RangeNum::Float(f)),
+        QueryResult::One(v) => match to_owned(&v) {
+            OwnedValue::Int(i) => Ok(RangeNum::Int(i)),
+            OwnedValue::Float(f) => Ok(RangeNum::Float(f)),
+            _ => Err(EvalError::new("range requires numbers")),
+        },
+        QueryResult::Error(e) => Err(e),
+        _ => Err(EvalError::new("range requires numbers")),
+    }
+}
+
 /// Evaluate `range(n)`, `range(a;b)`, or `range(a;b;step)`.
 fn eval_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     from: &Expr,
@@ -7238,53 +7255,39 @@ fn eval_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let from_val = match eval_single::<W, S>(from, value.clone(), optional) {
-        QueryResult::Owned(OwnedValue::Int(i)) => i,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
-        QueryResult::One(v) => match to_owned(&v) {
-            OwnedValue::Int(i) => i,
-            OwnedValue::Float(f) => f as i64,
-            _ => return QueryResult::Error(EvalError::new("range requires numbers")),
-        },
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::new("range requires numbers")),
+    let from_val = match range_arg(eval_single::<W, S>(from, value.clone(), optional)) {
+        Ok(n) => n,
+        Err(e) => return QueryResult::Error(e),
     };
 
     let to_val = if let Some(to_expr) = to {
-        match eval_single::<W, S>(to_expr, value.clone(), optional) {
-            QueryResult::Owned(OwnedValue::Int(i)) => i,
-            QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
-            QueryResult::One(v) => match to_owned(&v) {
-                OwnedValue::Int(i) => i,
-                OwnedValue::Float(f) => f as i64,
-                _ => return QueryResult::Error(EvalError::new("range requires numbers")),
-            },
-            QueryResult::Error(e) => return QueryResult::Error(e),
-            _ => return QueryResult::Error(EvalError::new("range requires numbers")),
+        match range_arg(eval_single::<W, S>(to_expr, value.clone(), optional)) {
+            Ok(n) => n,
+            Err(e) => return QueryResult::Error(e),
         }
     } else {
         // range(n) means range(0; n)
-        let to = from_val;
-        return eval_range_values::<W>(0, to, 1);
+        return match from_val {
+            RangeNum::Int(to) => eval_range_values::<W>(0, to, 1),
+            RangeNum::Float(to) => eval_range_values_f64::<W>(0.0, to, 1.0),
+        };
     };
 
     let step_val = if let Some(step_expr) = step {
-        match eval_single::<W, S>(step_expr, value, optional) {
-            QueryResult::Owned(OwnedValue::Int(i)) if i != 0 => i,
-            QueryResult::Owned(OwnedValue::Float(f)) if f != 0.0 => f as i64,
-            QueryResult::One(v) => match to_owned(&v) {
-                OwnedValue::Int(i) if i != 0 => i,
-                OwnedValue::Float(f) if f != 0.0 => f as i64,
-                _ => return QueryResult::Error(EvalError::new("range step cannot be zero")),
-            },
-            QueryResult::Error(e) => return QueryResult::Error(e),
-            _ => return QueryResult::Error(EvalError::new("range step cannot be zero")),
+        match range_arg(eval_single::<W, S>(step_expr, value, optional)) {
+            Ok(n) => n,
+            Err(e) => return QueryResult::Error(e),
         }
     } else {
-        1
+        RangeNum::Int(1)
     };
 
-    eval_range_values::<W>(from_val, to_val, step_val)
+    match (from_val, to_val, step_val) {
+        (RangeNum::Int(from), RangeNum::Int(to), RangeNum::Int(step)) => {
+            eval_range_values::<W>(from, to, step)
+        }
+        (from, to, step) => eval_range_values_f64::<W>(from.as_f64(), to.as_f64(), step.as_f64()),
+    }
 }
 
 /// Helper to generate range values.
@@ -7306,6 +7309,42 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
         let mut i = from;
         while i > to && values.len() < MAX_RANGE {
             values.push(OwnedValue::Int(i));
+            i += step;
+        }
+    }
+
+    if values.is_empty() {
+        QueryResult::None
+    } else if values.len() == 1 {
+        QueryResult::Owned(values.pop().unwrap())
+    } else {
+        QueryResult::ManyOwned(values)
+    }
+}
+
+/// Helper to generate range values over floats.
+///
+/// Accumulates by repeated addition of `step` (jq semantics), so results carry
+/// the same floating-point drift as jq (e.g. `range(0;1;0.3)` ends at
+/// 0.8999999999999999). A zero or NaN step yields no values, matching jq.
+fn eval_range_values_f64<'a, W: Clone + AsRef<[u64]>>(
+    from: f64,
+    to: f64,
+    step: f64,
+) -> QueryResult<'a, W> {
+    let mut values: Vec<OwnedValue> = Vec::new();
+    const MAX_RANGE: usize = 100000;
+
+    if step > 0.0 {
+        let mut i = from;
+        while i < to && values.len() < MAX_RANGE {
+            values.push(OwnedValue::Float(i));
+            i += step;
+        }
+    } else if step < 0.0 {
+        let mut i = from;
+        while i > to && values.len() < MAX_RANGE {
+            values.push(OwnedValue::Float(i));
             i += step;
         }
     }
@@ -10627,174 +10666,6 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Builtin: range(n) - generate integers from 0 to n-1
-fn builtin_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    n_expr: &Expr,
-    value: StandardJson<'a, W>,
-    optional: bool,
-) -> QueryResult<'a, W> {
-    // Evaluate n
-    let n_result = eval_single::<W, S>(n_expr, value, optional);
-    let n = match n_result {
-        QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                num.as_i64().unwrap_or(0)
-            } else {
-                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
-            }
-        }
-        QueryResult::Owned(OwnedValue::Int(i)) => i,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
-    };
-
-    if n <= 0 {
-        return QueryResult::None;
-    }
-
-    let results: Vec<OwnedValue> = (0..n).map(OwnedValue::Int).collect();
-    if results.len() == 1 {
-        QueryResult::Owned(results.into_iter().next().unwrap())
-    } else {
-        QueryResult::ManyOwned(results)
-    }
-}
-
-/// Builtin: range(from; upto) - generate integers from `from` to `upto-1`
-fn builtin_range_from_to<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    from_expr: &Expr,
-    to_expr: &Expr,
-    value: StandardJson<'a, W>,
-    optional: bool,
-) -> QueryResult<'a, W> {
-    // Evaluate from
-    let from_result = eval_single::<W, S>(from_expr, value.clone(), optional);
-    let from = match from_result {
-        QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                num.as_i64().unwrap_or(0)
-            } else {
-                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
-            }
-        }
-        QueryResult::Owned(OwnedValue::Int(i)) => i,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
-    };
-
-    // Evaluate to
-    let to_result = eval_single::<W, S>(to_expr, value, optional);
-    let to = match to_result {
-        QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                num.as_i64().unwrap_or(0)
-            } else {
-                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
-            }
-        }
-        QueryResult::Owned(OwnedValue::Int(i)) => i,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
-    };
-
-    if from >= to {
-        return QueryResult::None;
-    }
-
-    let results: Vec<OwnedValue> = (from..to).map(OwnedValue::Int).collect();
-    if results.len() == 1 {
-        QueryResult::Owned(results.into_iter().next().unwrap())
-    } else {
-        QueryResult::ManyOwned(results)
-    }
-}
-
-/// Builtin: range(from; upto; by) - generate integers from `from` to `upto-1` stepping by `by`
-fn builtin_range_from_to_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    from_expr: &Expr,
-    to_expr: &Expr,
-    by_expr: &Expr,
-    value: StandardJson<'a, W>,
-    optional: bool,
-) -> QueryResult<'a, W> {
-    // Evaluate from
-    let from_result = eval_single::<W, S>(from_expr, value.clone(), optional);
-    let from = match from_result {
-        QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                num.as_i64().unwrap_or(0)
-            } else {
-                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
-            }
-        }
-        QueryResult::Owned(OwnedValue::Int(i)) => i,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
-    };
-
-    // Evaluate to
-    let to_result = eval_single::<W, S>(to_expr, value.clone(), optional);
-    let to = match to_result {
-        QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                num.as_i64().unwrap_or(0)
-            } else {
-                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
-            }
-        }
-        QueryResult::Owned(OwnedValue::Int(i)) => i,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
-    };
-
-    // Evaluate by
-    let by_result = eval_single::<W, S>(by_expr, value, optional);
-    let by = match by_result {
-        QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                num.as_i64().unwrap_or(1)
-            } else {
-                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
-            }
-        }
-        QueryResult::Owned(OwnedValue::Int(i)) => i,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
-    };
-
-    if by == 0 {
-        return QueryResult::Error(EvalError::new("range step cannot be zero"));
-    }
-
-    let mut results = Vec::new();
-    let mut i = from;
-    if by > 0 {
-        while i < to {
-            results.push(OwnedValue::Int(i));
-            i += by;
-        }
-    } else {
-        while i > to {
-            results.push(OwnedValue::Int(i));
-            i += by;
-        }
-    }
-
-    if results.is_empty() {
-        QueryResult::None
-    } else if results.len() == 1 {
-        QueryResult::Owned(results.into_iter().next().unwrap())
-    } else {
-        QueryResult::ManyOwned(results)
-    }
-}
-
 /// Builtin: isempty(expr) - returns true if expr produces no outputs
 fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
@@ -13063,18 +12934,6 @@ fn expand_func_calls_in_builtin(
             Box::new(expand_func_calls(n, func_name, params, body)),
             Box::new(expand_func_calls(e, func_name, params, body)),
         ),
-        Builtin::Range(n) => {
-            Builtin::Range(Box::new(expand_func_calls(n, func_name, params, body)))
-        }
-        Builtin::RangeFromTo(from, to) => Builtin::RangeFromTo(
-            Box::new(expand_func_calls(from, func_name, params, body)),
-            Box::new(expand_func_calls(to, func_name, params, body)),
-        ),
-        Builtin::RangeFromToBy(from, to, by) => Builtin::RangeFromToBy(
-            Box::new(expand_func_calls(from, func_name, params, body)),
-            Box::new(expand_func_calls(to, func_name, params, body)),
-            Box::new(expand_func_calls(by, func_name, params, body)),
-        ),
         Builtin::IsEmpty(e) => {
             Builtin::IsEmpty(Box::new(expand_func_calls(e, func_name, params, body)))
         }
@@ -13367,16 +13226,6 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::NthStream(n, e) => Builtin::NthStream(
             Box::new(substitute_func_param(n, param, arg)),
             Box::new(substitute_func_param(e, param, arg)),
-        ),
-        Builtin::Range(n) => Builtin::Range(Box::new(substitute_func_param(n, param, arg))),
-        Builtin::RangeFromTo(from, to) => Builtin::RangeFromTo(
-            Box::new(substitute_func_param(from, param, arg)),
-            Box::new(substitute_func_param(to, param, arg)),
-        ),
-        Builtin::RangeFromToBy(from, to, by) => Builtin::RangeFromToBy(
-            Box::new(substitute_func_param(from, param, arg)),
-            Box::new(substitute_func_param(to, param, arg)),
-            Box::new(substitute_func_param(by, param, arg)),
         ),
         Builtin::IsEmpty(e) => Builtin::IsEmpty(Box::new(substitute_func_param(e, param, arg))),
         // Phase 14: Recursive traversal (extends Phase 8)
@@ -17506,6 +17355,82 @@ mod tests {
                 assert_eq!(arr[0], OwnedValue::Int(5));
                 assert_eq!(arr[1], OwnedValue::Int(3));
                 assert_eq!(arr[2], OwnedValue::Int(1));
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_float_step() {
+        // Issue #165: range(0; 1; 0.3) - jq accumulates doubles:
+        // 0, 0.3, 0.6, 0.8999999999999999
+        query!(b"null", "[range(0; 1; 0.3)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 4);
+                assert_eq!(arr[0], OwnedValue::Float(0.0));
+                assert_eq!(arr[1], OwnedValue::Float(0.3));
+                assert_eq!(arr[2], OwnedValue::Float(0.3 + 0.3));
+                assert_eq!(arr[3], OwnedValue::Float(0.3 + 0.3 + 0.3));
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_float_from() {
+        // Issue #165: range(2.5; 5) - jq: 2.5, 3.5, 4.5
+        query!(b"null", "[range(2.5; 5)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0], OwnedValue::Float(2.5));
+                assert_eq!(arr[1], OwnedValue::Float(3.5));
+                assert_eq!(arr[2], OwnedValue::Float(4.5));
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_float_single_arg() {
+        // range(0.5) - jq: [0]
+        query!(b"null", "[range(0.5)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 1);
+                assert_eq!(arr[0], OwnedValue::Float(0.0));
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_float_negative_step() {
+        // range(5; 0; -1.5) - jq: 5, 3.5, 2, 0.5
+        query!(b"null", "[range(5; 0; -1.5)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 4);
+                assert_eq!(arr[0], OwnedValue::Float(5.0));
+                assert_eq!(arr[1], OwnedValue::Float(3.5));
+                assert_eq!(arr[2], OwnedValue::Float(2.0));
+                assert_eq!(arr[3], OwnedValue::Float(0.5));
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_document_float() {
+        // Float bounds sourced from the document, not query literals
+        query!(b"{\"x\": 2.5}", "[range(.x; 5)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0], OwnedValue::Float(2.5));
+                assert_eq!(arr[1], OwnedValue::Float(3.5));
+                assert_eq!(arr[2], OwnedValue::Float(4.5));
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_zero_step_empty() {
+        // jq 1.7.1 yields no values for a zero step (it does not error)
+        query!(b"null", "[range(0; 1; 0)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty());
             }
         );
     }

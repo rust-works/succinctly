@@ -982,7 +982,6 @@ fn contains_split_doc(expr: &Expr) -> bool {
             | Builtin::Capture(e)
             | Builtin::Scan(e)
             | Builtin::Splits(e)
-            | Builtin::Range(e)
             | Builtin::CombinationsN(e)
             | Builtin::Tz(e)
             | Builtin::Load(e) => contains_split_doc(e),
@@ -992,7 +991,6 @@ fn contains_split_doc(expr: &Expr) -> bool {
             | Builtin::Atan2(e1, e2)
             | Builtin::Limit(e1, e2)
             | Builtin::NthStream(e1, e2)
-            | Builtin::RangeFromTo(e1, e2)
             | Builtin::Skip(e1, e2)
             | Builtin::TestFlags(e1, e2)
             | Builtin::MatchFlags(e1, e2)
@@ -1005,9 +1003,7 @@ fn contains_split_doc(expr: &Expr) -> bool {
             Builtin::FirstStream(e) | Builtin::LastStream(e) | Builtin::IsEmpty(e) => {
                 contains_split_doc(e)
             }
-            Builtin::RangeFromToBy(e1, e2, e3)
-            | Builtin::SubFlags(e1, e2, e3)
-            | Builtin::GsubFlags(e1, e2, e3) => {
+            Builtin::SubFlags(e1, e2, e3) | Builtin::GsubFlags(e1, e2, e3) => {
                 contains_split_doc(e1) || contains_split_doc(e2) || contains_split_doc(e3)
             }
             _ => false,
