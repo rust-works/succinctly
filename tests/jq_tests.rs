@@ -1002,6 +1002,23 @@ fn test_integer_modulo_by_zero_returns_error() {
 }
 
 #[test]
+fn test_float_modulo_truncates_operands_to_integers() {
+    // jq: 10.5 % 3 => 1 (both operands truncate to intmax_t)
+    query!(b"null", "10.5 % 3",
+        QueryResult::Owned(OwnedValue::Int(1)) => {}
+    );
+}
+
+#[test]
+fn test_float_modulo_divisor_truncating_to_zero_returns_error() {
+    // jq: 5 % 0.5 => error "cannot be divided (remainder) because the divisor is zero"
+    // (the divisor 0.5 truncates to 0)
+    query!(b"null", "5 % 0.5",
+        QueryResult::Error(_) => {}
+    );
+}
+
+#[test]
 fn test_integer_addition_overflow_converts_to_float() {
     // jq: 9223372036854775807 + 1 => 9223372036854776000 (float)
     query!(b"null", "9223372036854775807 + 1",

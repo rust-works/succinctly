@@ -27,6 +27,8 @@ pub trait EvalSemantics: Copy + Default {
     const DIV_BY_ZERO_IS_INFINITY: bool;
     /// If true, has(-1) on arrays checks if abs(idx) <= len (yq). If false, only non-negative (jq).
     const NEGATIVE_INDEX_IN_HAS: bool;
+    /// If true, `%` truncates float operands to integers (jq). If false, float modulo (yq).
+    const MOD_TRUNCATES_FLOATS: bool;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -41,6 +43,7 @@ impl EvalSemantics for JqSemantics {
     const OVERFLOW_WRAPS: bool = false;
     const DIV_BY_ZERO_IS_INFINITY: bool = false;
     const NEGATIVE_INDEX_IN_HAS: bool = false;
+    const MOD_TRUNCATES_FLOATS: bool = true;
 }
 
 /// yq-compatible evaluation semantics.
@@ -55,6 +58,7 @@ impl EvalSemantics for YqSemantics {
     const OVERFLOW_WRAPS: bool = true;
     const DIV_BY_ZERO_IS_INFINITY: bool = true;
     const NEGATIVE_INDEX_IN_HAS: bool = true;
+    const MOD_TRUNCATES_FLOATS: bool = false;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
@@ -978,35 +982,42 @@ fn arith_mod<S: EvalSemantics>(
                     Err(EvalError::new("modulo by zero"))
                 }
             } else {
-                Ok(OwnedValue::Int(a % b))
+                Ok(OwnedValue::Int(a.wrapping_rem(b)))
             }
         }
-        (OwnedValue::Float(a), OwnedValue::Float(b)) => {
-            if b == 0.0 && !S::DIV_BY_ZERO_IS_INFINITY {
-                Err(EvalError::new("modulo by zero"))
-            } else {
-                Ok(OwnedValue::Float(a % b))
-            }
-        }
-        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
-            if b == 0.0 && !S::DIV_BY_ZERO_IS_INFINITY {
-                Err(EvalError::new("modulo by zero"))
-            } else {
-                Ok(OwnedValue::Float(a as f64 % b))
-            }
-        }
-        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
-            if b == 0 && !S::DIV_BY_ZERO_IS_INFINITY {
-                Err(EvalError::new("modulo by zero"))
-            } else {
-                Ok(OwnedValue::Float(a % b as f64))
-            }
-        }
+        (OwnedValue::Float(a), OwnedValue::Float(b)) => mod_floats::<S>(a, b),
+        (OwnedValue::Int(a), OwnedValue::Float(b)) => mod_floats::<S>(a as f64, b),
+        (OwnedValue::Float(a), OwnedValue::Int(b)) => mod_floats::<S>(a, b as f64),
         (a, b) => Err(EvalError::new(format!(
             "cannot compute modulo of {} and {}",
             a.type_name(),
             b.type_name()
         ))),
+    }
+}
+
+/// Modulo where at least one operand is a float.
+///
+/// jq truncates both operands to integers (`intmax_t`), so `10.5 % 3 == 1` and
+/// `5 % 0.5` errors because the divisor truncates to zero. yq performs float
+/// modulo, returning NaN for a zero divisor.
+fn mod_floats<S: EvalSemantics>(a: f64, b: f64) -> Result<OwnedValue, EvalError> {
+    if S::MOD_TRUNCATES_FLOATS {
+        if a.is_nan() || b.is_nan() {
+            return Ok(OwnedValue::Float(f64::NAN));
+        }
+        // `as` truncates toward zero and saturates, matching jq's intmax_t cast.
+        let (ai, bi) = (a as i64, b as i64);
+        if bi == 0 {
+            Err(EvalError::new("modulo by zero"))
+        } else {
+            // wrapping_rem: i64::MIN % -1 must not panic.
+            Ok(OwnedValue::Int(ai.wrapping_rem(bi)))
+        }
+    } else if b == 0.0 && !S::DIV_BY_ZERO_IS_INFINITY {
+        Err(EvalError::new("modulo by zero"))
+    } else {
+        Ok(OwnedValue::Float(a % b))
     }
 }
 
@@ -13636,6 +13647,48 @@ mod tests {
     }
 
     #[test]
+    fn test_arithmetic_mod_float_truncates() {
+        // jq truncates both operands to integers: 10.5 % 3 == 1
+        query!(br#"{"a": 10.5, "b": 3}"#, ".a % .b",
+            QueryResult::Owned(OwnedValue::Int(1)) => {}
+        );
+
+        // Float % Float: 10.9 % 3.9 == 10 % 3 == 1
+        query!(br#"{"a": 10.9, "b": 3.9}"#, ".a % .b",
+            QueryResult::Owned(OwnedValue::Int(1)) => {}
+        );
+
+        // Truncation is toward zero, not floor: -7.5 % 2 == -7 % 2 == -1
+        query!(br#"{"a": -7.5, "b": 2}"#, ".a % .b",
+            QueryResult::Owned(OwnedValue::Int(-1)) => {}
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_mod_float_divisor_truncates_to_zero() {
+        // jq: 5 % 0.5 errors because the divisor truncates to 0
+        query!(br#"{"a": 5, "b": 0.5}"#, ".a % .b",
+            QueryResult::Error(_) => {}
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_mod_nan_and_infinite() {
+        // jq: a NaN operand yields NaN (serialized as null), not an error
+        query!(b"null", "nan % 2",
+            QueryResult::Owned(OwnedValue::Float(n)) if n.is_nan() => {}
+        );
+        query!(b"null", "2 % nan",
+            QueryResult::Owned(OwnedValue::Float(n)) if n.is_nan() => {}
+        );
+
+        // jq: infinite saturates to i64::MAX, so infinite % 3 == 1
+        query!(b"null", "infinite % 3",
+            QueryResult::Owned(OwnedValue::Int(1)) => {}
+        );
+    }
+
+    #[test]
     fn test_arithmetic_precedence() {
         // 2 + 3 * 4 = 2 + 12 = 14
         query!(br"{}", "2 + 3 * 4",
@@ -16657,6 +16710,17 @@ mod tests {
     fn test_compound_assign_mod() {
         // Compound modulo: .a %= 3
         query!(br#"{"a": 10}"#, r".a %= 3",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                let a = obj.get("a").unwrap();
+                assert_eq!(*a, OwnedValue::Int(1));
+            }
+        );
+    }
+
+    #[test]
+    fn test_compound_assign_mod_float_truncates() {
+        // jq truncates float operands: 10.5 %= 3 leaves 10 % 3 == 1
+        query!(br#"{"a": 10.5}"#, r".a %= 3",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 let a = obj.get("a").unwrap();
                 assert_eq!(*a, OwnedValue::Int(1));
