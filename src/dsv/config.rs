@@ -13,8 +13,6 @@ pub struct DsvConfig {
     pub quote_char: u8,
     /// Record delimiter (default: b'\n')
     pub newline: u8,
-    /// Select sample rate for BitVec (default: 256)
-    pub select_sample_rate: u32,
 }
 
 impl Default for DsvConfig {
@@ -23,7 +21,6 @@ impl Default for DsvConfig {
             delimiter: b',',
             quote_char: b'"',
             newline: b'\n',
-            select_sample_rate: 256,
         }
     }
 }
@@ -59,12 +56,6 @@ impl DsvConfig {
     /// Set the quote character.
     pub fn with_quote_char(mut self, quote_char: u8) -> Self {
         self.quote_char = quote_char;
-        self
-    }
-
-    /// Set the select sample rate for the index.
-    pub fn with_select_sample_rate(mut self, rate: u32) -> Self {
-        self.select_sample_rate = rate;
         self
     }
 }
