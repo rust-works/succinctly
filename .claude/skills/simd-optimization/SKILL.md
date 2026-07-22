@@ -112,6 +112,24 @@ unsafe fn unsigned_le(a: __m128i, b: __m128i) -> __m128i {
 }
 ```
 
+## Nibble Lookup Tables Must Be Exact (#186)
+
+`lo_table[byte & 0xF] & hi_table[byte >> 4]` classifies each bit plane as the
+Cartesian product {lo nibbles} × {hi nibbles} it is set for. A byte set is
+encoded exactly only as a union of such products, **one bit plane per
+product**:
+
+- `A-Z` (0x41-0x5A) spans two hi nibbles → needs two planes
+  (`{1..F}×{4}` and `{0..A}×{5}`). One shared "uppercase" plane matches all
+  of `0x40-0x5F`, over-matching `@ \ ^ _`.
+- `{',' ':'}` is not a product ({A,C} × {2,3} also contains `*` and `<`) →
+  needs a plane per character.
+
+Over-matches hide on valid input (the extra bytes are invalid JSON there) and
+surface as cross-backend index divergence on fuzzed/malformed input. Verify
+tables with an exhaustive 256-byte test against the scalar predicate (see
+`json/simd/neon.rs` table tests).
+
 ## Testing Strategy
 
 **Problem**: Runtime dispatch only tests highest available SIMD level.
@@ -173,6 +191,7 @@ cargo bench --bench json_simd
 4. **Consider architecture** - Zen 4 splits AVX-512, future Zen 5 may not
 5. **Amdahl's Law always wins** - Optimize what matters (the slow 80%)
 6. **Remove failed optimizations** - Slower code creates technical debt
+7. **Nibble tables: one bit plane per Cartesian product** - Shared planes over-match boundary bytes (#186)
 
 ## See Also
 

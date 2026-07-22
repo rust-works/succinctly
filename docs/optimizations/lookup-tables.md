@@ -158,6 +158,13 @@ fn classify_chars_nibble(chars: uint8x16_t) -> uint8x16_t {
 **Benefit**: Replaces 13 comparison operations with 2 lookups + 1 AND.
 **Result**: 2-6% speedup in JSON parsing.
 
+**Exactness caveat (#186)**: each bit plane of the AND matches exactly the
+Cartesian product {lo nibbles} × {hi nibbles} it is set for in the two
+tables. Encode one bit plane per product — a plane shared across products
+(e.g. one "uppercase" bit for hi nibbles 4 and 5) matches the full product
+`0x40-0x5F` and misclassifies boundary bytes like `@ \ ^ _`. Exhaustive
+256-byte table tests in `json/simd/neon.rs` enforce exactness.
+
 ### AVX2 vpshufb
 
 Similar technique on x86:
@@ -304,7 +311,7 @@ fn main() {
 | BYTE_FIND_CLOSE         | 4 KB    | `trees/bp.rs`         | BP find-close per byte     |
 | TRANSITION_TABLE        | 1 KB    | `json/pfsm_tables.rs` | PFSM state transitions     |
 | PHI_TABLE               | 1 KB    | `json/pfsm_tables.rs` | PFSM output generation     |
-| Nibble tables (NEON)    | 32 B    | `json/simd/neon.rs`   | Character classification   |
+| Nibble tables (NEON)    | 64 B    | `json/simd/neon.rs`   | Structural + value classes |
 
 **Total**: ~9 KB of lookup tables
 

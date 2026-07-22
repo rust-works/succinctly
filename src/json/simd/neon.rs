@@ -13,15 +13,20 @@ use crate::json::standard::{SemiIndex, State};
 use crate::json::BitWriter;
 
 // Nibble lookup tables for character classification.
-// Each byte in the result has bit flags indicating character class:
-//   Bit 0: opens ({ [)
-//   Bit 1: closes (} ])
-//   Bit 2: delims (, :)
-//   Bit 3: quote (")
-//   Bit 4: backslash (\)
 //
-// The tables are designed so that lo_table[lo_nibble] & hi_table[hi_nibble]
-// produces the correct flags for each ASCII character.
+// A byte's class is `lo_table[byte & 0x0F] & hi_table[byte >> 4]`, so each bit
+// plane matches exactly the Cartesian product {lo nibbles} x {hi nibbles} it is
+// set for in the two tables. A bit plane therefore encodes a byte set exactly
+// only if that set IS such a product; byte sets that aren't (like {, :}) need
+// one bit plane per product, or the classifier accepts extra bytes and the
+// index diverges from the scalar/x86 backends on invalid JSON (#186).
+//
+//   Bit 0: opens ({ [)      = {B} x {5,7}
+//   Bit 1: closes (} ])     = {D} x {5,7}
+//   Bit 2: comma (,)        = {C} x {2}
+//   Bit 3: quote (")        = {2} x {2}
+//   Bit 4: backslash (\)    = {C} x {5}
+//   Bit 5: colon (:)        = {A} x {3}
 
 /// Low nibble lookup table (indexed by byte & 0x0F)
 const LO_NIBBLE_TABLE: [u8; 16] = [
@@ -35,7 +40,7 @@ const LO_NIBBLE_TABLE: [u8; 16] = [
     0x00, // 7
     0x00, // 8
     0x00, // 9
-    0x04, // A: colon (:) has lo=A
+    0x20, // A: colon (:) has lo=A (bit 5)
     0x01, // B: opens ({ [) have lo=B
     0x14, // C: comma (,) has lo=C (bit 2), backslash (\) has lo=C (bit 4)
     0x02, // D: closes (} ]) have lo=D
@@ -48,7 +53,7 @@ const HI_NIBBLE_TABLE: [u8; 16] = [
     0x00, // 0
     0x00, // 1
     0x0C, // 2: comma (,) and quote (") have hi=2 (bits 2,3)
-    0x04, // 3: colon (:) has hi=3 (bit 2)
+    0x20, // 3: colon (:) has hi=3 (bit 5)
     0x00, // 4
     0x13, // 5: [ ] \ have hi=5 (bits 0,1,4)
     0x00, // 6
@@ -66,55 +71,60 @@ const HI_NIBBLE_TABLE: [u8; 16] = [
 // Classification result bit flags
 const FLAG_OPEN: u8 = 0x01;
 const FLAG_CLOSE: u8 = 0x02;
-const FLAG_DELIM: u8 = 0x04;
+const FLAG_COMMA: u8 = 0x04;
 const FLAG_QUOTE: u8 = 0x08;
 const FLAG_BACKSLASH: u8 = 0x10;
+const FLAG_COLON: u8 = 0x20;
+// Comma and colon need separate bit planes: a shared plane would match the
+// full product {A,C} x {2,3}, wrongly including '*' (0x2A) and '<' (0x3C).
+const DELIM_MASK: u8 = FLAG_COMMA | FLAG_COLON;
 
 // Value character detection lookup tables.
-// These use a different encoding than structural chars because value chars
-// include ranges (0-9, A-Z, a-z) that don't map cleanly to nibble AND.
+// A byte is a value char if `VALUE_LO_TABLE[lo] & VALUE_HI_TABLE[hi]` is
+// non-zero. The target set (matching scalar `standard::is_value_char`:
+// 0-9 A-Z a-z + - .) is not a single {lo} x {hi} product, so each bit plane
+// covers exactly one product; the whole-byte non-zero test then matches
+// exactly their union. Sharing a plane across hi nibbles (e.g. one
+// "uppercase" bit for hi=4 and hi=5) would cover the full product
+// {all lo} x {4,5} = 0x40-0x5F and misclassify `@ \ ^ _` (#186).
 //
-// Strategy: Use bit flags that indicate character classes, then AND the
-// lo and hi results. A character is a value char if the AND result has
-// any bit set in the VALUE_CHAR_MASK.
-//
-// Encoding:
-//   Bit 0: Could be digit (hi=3 with lo=0-9)
-//   Bit 1: Could be uppercase (hi=4 with lo=1-F, or hi=5 with lo=0-A)
-//   Bit 2: Could be lowercase (hi=6 with lo=1-F, or hi=7 with lo=0-A)
-//   Bit 3: Could be punct +/- (hi=2 with lo=B,D)
-//   Bit 4: Could be period (hi=2 with lo=E)
+//   Bit 0: digits 0-9 (0x30-0x39)    = {0..9} x {3}
+//   Bit 1: uppercase A-O (0x41-0x4F) = {1..F} x {4}
+//   Bit 2: uppercase P-Z (0x50-0x5A) = {0..A} x {5}
+//   Bit 3: lowercase a-o (0x61-0x6F) = {1..F} x {6}
+//   Bit 4: lowercase p-z (0x70-0x7A) = {0..A} x {7}
+//   Bit 5: punct + - . (0x2B/2D/2E)  = {B,D,E} x {2}
 
 /// Low nibble lookup for value chars
 const VALUE_LO_TABLE: [u8; 16] = [
-    0x07, // 0: digit, upper (0x50), lower (0x70)
-    0x07, // 1: digit, upper (0x41, 0x51), lower (0x61, 0x71)
-    0x07, // 2: digit, upper (0x42, 0x52), lower (0x62, 0x72)
-    0x07, // 3: digit, upper (0x43, 0x53), lower (0x63, 0x73)
-    0x07, // 4: digit, upper (0x44, 0x54), lower (0x64, 0x74)
-    0x07, // 5: digit, upper (0x45, 0x55), lower (0x65, 0x75)
-    0x07, // 6: digit, upper (0x46, 0x56), lower (0x66, 0x76)
-    0x07, // 7: digit, upper (0x47, 0x57), lower (0x67, 0x77)
-    0x07, // 8: digit, upper (0x48, 0x58), lower (0x68, 0x78)
-    0x07, // 9: digit, upper (0x49, 0x59), lower (0x69, 0x79)
-    0x06, // A: upper (0x4A, 0x5A), lower (0x6A, 0x7A) - NOT digit
-    0x0E, // B: upper (0x4B), lower (0x6B), punct '+' (0x2B)
-    0x06, // C: upper (0x4C), lower (0x6C)
-    0x0E, // D: upper (0x4D), lower (0x6D), punct '-' (0x2D)
-    0x16, // E: upper (0x4E), lower (0x6E), period '.' (0x2E)
-    0x06, // F: upper (0x4F), lower (0x6F)
+    0x15, // 0: digit, upper P-Z (0x50), lower p-z (0x70)
+    0x1F, // 1: digit, upper A-O/P-Z, lower a-o/p-z
+    0x1F, // 2: digit, upper A-O/P-Z, lower a-o/p-z
+    0x1F, // 3: digit, upper A-O/P-Z, lower a-o/p-z
+    0x1F, // 4: digit, upper A-O/P-Z, lower a-o/p-z
+    0x1F, // 5: digit, upper A-O/P-Z, lower a-o/p-z
+    0x1F, // 6: digit, upper A-O/P-Z, lower a-o/p-z
+    0x1F, // 7: digit, upper A-O/P-Z, lower a-o/p-z
+    0x1F, // 8: digit, upper A-O/P-Z, lower a-o/p-z
+    0x1F, // 9: digit, upper A-O/P-Z, lower a-o/p-z
+    0x1E, // A: upper A-O/P-Z (0x4A, 0x5A), lower a-o/p-z (0x6A, 0x7A) - NOT digit
+    0x2A, // B: upper A-O (0x4B), lower a-o (0x6B), punct '+' (0x2B)
+    0x0A, // C: upper A-O (0x4C), lower a-o (0x6C)
+    0x2A, // D: upper A-O (0x4D), lower a-o (0x6D), punct '-' (0x2D)
+    0x2A, // E: upper A-O (0x4E), lower a-o (0x6E), punct '.' (0x2E)
+    0x0A, // F: upper A-O (0x4F), lower a-o (0x6F)
 ];
 
 /// High nibble lookup for value chars
 const VALUE_HI_TABLE: [u8; 16] = [
     0x00, // 0: nothing
     0x00, // 1: nothing
-    0x18, // 2: punct (+,-) and period (.)
+    0x20, // 2: punct (+ - .)
     0x01, // 3: digits
     0x02, // 4: uppercase A-O (0x41-0x4F)
-    0x02, // 5: uppercase P-Z (0x50-0x5A)
-    0x04, // 6: lowercase a-o (0x61-0x6F)
-    0x04, // 7: lowercase p-z (0x70-0x7A)
+    0x04, // 5: uppercase P-Z (0x50-0x5A)
+    0x08, // 6: lowercase a-o (0x61-0x6F)
+    0x10, // 7: lowercase p-z (0x70-0x7A)
     0x00, // 8: nothing
     0x00, // 9: nothing
     0x00, // A: nothing
@@ -239,7 +249,7 @@ unsafe fn classify_chars(chunk: uint8x16_t) -> CharClass {
         // vtstq_u8 returns 0xFF if (a & b) != 0, else 0x00
         let flag_open_vec = vdupq_n_u8(FLAG_OPEN);
         let flag_close_vec = vdupq_n_u8(FLAG_CLOSE);
-        let flag_delim_vec = vdupq_n_u8(FLAG_DELIM);
+        let flag_delim_vec = vdupq_n_u8(DELIM_MASK);
         let flag_quote_vec = vdupq_n_u8(FLAG_QUOTE);
         let flag_backslash_vec = vdupq_n_u8(FLAG_BACKSLASH);
 
@@ -822,6 +832,58 @@ mod tests {
         (0..n)
             .map(|i| if get_bit(words, i) { '1' } else { '0' })
             .collect()
+    }
+
+    /// The nibble-AND value tables must reproduce the scalar
+    /// `standard::is_value_char` predicate for every byte value; any
+    /// over-match diverges the NEON index from all other backends on
+    /// invalid JSON (#186).
+    #[test]
+    fn test_value_tables_match_scalar_predicate() {
+        for b in 0..=255u8 {
+            let classified =
+                VALUE_LO_TABLE[(b & 0x0F) as usize] & VALUE_HI_TABLE[(b >> 4) as usize];
+            let expected = b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.');
+            assert_eq!(
+                classified != 0,
+                expected,
+                "byte 0x{b:02X} misclassified as value char"
+            );
+        }
+    }
+
+    /// Each structural bit plane must match its exact byte set for every
+    /// byte value; a plane covering a larger nibble product than its class
+    /// (e.g. delim matching '*'/'<') diverges the NEON index from all other
+    /// backends on invalid JSON (#186).
+    #[test]
+    fn test_structural_tables_match_exact_byte_sets() {
+        for b in 0..=255u8 {
+            let classified =
+                LO_NIBBLE_TABLE[(b & 0x0F) as usize] & HI_NIBBLE_TABLE[(b >> 4) as usize];
+            let cases = [
+                (
+                    "open",
+                    classified & FLAG_OPEN != 0,
+                    matches!(b, b'{' | b'['),
+                ),
+                (
+                    "close",
+                    classified & FLAG_CLOSE != 0,
+                    matches!(b, b'}' | b']'),
+                ),
+                (
+                    "delim",
+                    classified & DELIM_MASK != 0,
+                    matches!(b, b',' | b':'),
+                ),
+                ("quote", classified & FLAG_QUOTE != 0, b == b'"'),
+                ("backslash", classified & FLAG_BACKSLASH != 0, b == b'\\'),
+            ];
+            for (class, got, expected) in cases {
+                assert_eq!(got, expected, "byte 0x{b:02X} misclassified as {class}");
+            }
+        }
     }
 
     #[test]
