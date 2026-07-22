@@ -162,6 +162,56 @@ fn test_array_iteration() -> Result<()> {
     Ok(())
 }
 
+// Array slicing yields a single sub-array, not a stream of elements (issue #154).
+
+#[test]
+fn test_array_slice_returns_single_array() -> Result<()> {
+    let (output, code) = run_jq_stdin(".[2:4]", r"[0,1,2,3,4]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "[2,3]\n");
+    Ok(())
+}
+
+#[test]
+fn test_array_slice_construction_nests() -> Result<()> {
+    let (output, code) = run_jq_stdin("[.[2:4]]", r"[0,1,2,3,4]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "[[2,3]]\n");
+    Ok(())
+}
+
+#[test]
+fn test_array_slice_then_iterate_streams() -> Result<()> {
+    let (output, code) = run_jq_stdin(".[2:4][]", r"[0,1,2,3,4]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "2\n3\n");
+    Ok(())
+}
+
+#[test]
+fn test_array_slice_piped_to_length() -> Result<()> {
+    let (output, code) = run_jq_stdin(".[2:4] | length", r"[0,1,2,3,4]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "2\n");
+    Ok(())
+}
+
+#[test]
+fn test_array_slice_out_of_range_is_empty_array() -> Result<()> {
+    let (output, code) = run_jq_stdin(".[5:10]", r"[0,1,2,3,4]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "[]\n");
+    Ok(())
+}
+
+#[test]
+fn test_string_slice_unchanged() -> Result<()> {
+    let (output, code) = run_jq_stdin(".[1:3]", r#""hello""#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "\"el\"\n");
+    Ok(())
+}
+
 #[test]
 fn test_arithmetic() -> Result<()> {
     let (output, code) = run_jq_null("1 + 2 * 3", &[])?;

@@ -18,7 +18,7 @@ Support basic jq path syntax for navigating JSON:
 | `.foo.bar` | Chained field access | Compose cursor navigation               |
 | `.[]`      | Iterate all elements | `JsonElements` / `JsonFields` iterators |
 | `.foo[]`   | Field then iterate   | Compose field access + iteration        |
-| `.[2:5]`   | Array slice          | Iterate with skip/take                  |
+| `.[2:5]`   | Array slice          | Single sub-array via skip/take          |
 
 ### Phase 2: Filters and Conditionals
 

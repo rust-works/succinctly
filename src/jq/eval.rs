@@ -290,8 +290,16 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         Expr::Slice { start, end } => match value {
             StandardJson::Array(elements) => {
-                let results = slice_elements::<W>(elements, *start, *end);
-                QueryResult::Many(results)
+                // Fast path: full slice [:] / [0:] returns the original array unchanged
+                if matches!(start, None | Some(0)) && end.is_none() {
+                    return QueryResult::One(value);
+                }
+                // jq array slicing yields a single sub-array, not a stream of elements
+                let items: Vec<OwnedValue> = slice_elements::<W>(elements, *start, *end)
+                    .iter()
+                    .map(to_owned)
+                    .collect();
+                QueryResult::Owned(OwnedValue::Array(items))
             }
             // jq returns null for slice on null
             StandardJson::Null => QueryResult::One(StandardJson::Null),
@@ -13597,21 +13605,33 @@ mod tests {
 
     #[test]
     fn test_slice() {
+        // jq array slicing yields a single sub-array, not a stream of elements.
         query!(br"[0, 1, 2, 3, 4, 5]", ".[1:4]",
-            QueryResult::Many(values) => {
-                assert_eq!(values.len(), 3);
+            QueryResult::Owned(OwnedValue::Array(values)) => {
+                assert_eq!(
+                    values,
+                    vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]
+                );
             }
         );
 
         query!(br"[0, 1, 2, 3, 4, 5]", ".[2:]",
-            QueryResult::Many(values) => {
-                assert_eq!(values.len(), 4); // 2, 3, 4, 5
+            QueryResult::Owned(OwnedValue::Array(values)) => {
+                assert_eq!(
+                    values,
+                    vec![
+                        OwnedValue::Int(2),
+                        OwnedValue::Int(3),
+                        OwnedValue::Int(4),
+                        OwnedValue::Int(5)
+                    ]
+                );
             }
         );
 
         query!(br"[0, 1, 2, 3, 4, 5]", ".[:2]",
-            QueryResult::Many(values) => {
-                assert_eq!(values.len(), 2); // 0, 1
+            QueryResult::Owned(OwnedValue::Array(values)) => {
+                assert_eq!(values, vec![OwnedValue::Int(0), OwnedValue::Int(1)]);
             }
         );
     }
