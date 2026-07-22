@@ -537,9 +537,13 @@ struct GenerateDsv {
     #[arg(short, long, default_value = ",")]
     delimiter: char,
 
-    /// Include header row
-    #[arg(long, default_value = "true")]
+    /// Include header row (default; --header and --no-header override each other)
+    #[arg(long, overrides_with = "no_header")]
     header: bool,
+
+    /// Omit the header row
+    #[arg(long)]
+    no_header: bool,
 
     /// Verify generated DSV can be parsed
     #[arg(long)]
@@ -1180,7 +1184,7 @@ fn main() -> Result<()> {
                     args.pattern.into(),
                     args.seed,
                     args.delimiter,
-                    args.header,
+                    args.header || !args.no_header,
                 );
 
                 if args.verify {
