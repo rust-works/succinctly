@@ -1324,12 +1324,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
         let mut split_doc_state = SplitDocState::new(has_split_doc);
         if args.slurp {
-            // With --slurp, collect all lines into an array
-            let lines: Vec<OwnedValue> = input_content
-                .lines()
-                .map(|line| OwnedValue::String(line.to_string()))
-                .collect();
-            let slurped = OwnedValue::Array(lines);
+            // yq -R -s (jq semantics): the entire input (all files
+            // concatenated) becomes a single string; no line splitting and
+            // no array wrap.
+            let slurped = OwnedValue::String(input_content);
             let results = evaluate_input(&slurped, &program.expr, &context)?;
             for result in results {
                 split_doc_state.write_separator(&mut writer, &output_config)?;

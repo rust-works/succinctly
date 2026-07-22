@@ -566,10 +566,12 @@ fn test_raw_input_json_output() -> Result<()> {
 
 #[test]
 fn test_raw_input_slurp() -> Result<()> {
+    // yq -R -s (jq semantics): the entire input is one string, not an
+    // array of lines
     let input = "line one\nline two\nline three";
     let (output, exit_code) = run_yq_stdin(".", input, &["-R", "-s"])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output, "- line one\n- line two\n- line three\n");
+    assert_eq!(output, "\"line one\\nline two\\nline three\"\n");
     Ok(())
 }
 
@@ -578,16 +580,64 @@ fn test_raw_input_slurp_json() -> Result<()> {
     let input = "a\nb\nc";
     let (output, exit_code) = run_yq_stdin(".", input, &["-R", "-s", "-o", "json", "-I", "0"])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output, "[\"a\",\"b\",\"c\"]\n");
+    assert_eq!(output, "\"a\\nb\\nc\"\n");
     Ok(())
 }
 
 #[test]
 fn test_raw_input_slurp_length() -> Result<()> {
+    // length of the whole input string (13 chars), not the line count
     let input = "one\ntwo\nthree";
     let (output, exit_code) = run_yq_stdin("length", input, &["-R", "-s"])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output.trim(), "3");
+    assert_eq!(output.trim(), "13");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_slurp_preserves_trailing_newline() -> Result<()> {
+    let input = "a\nb\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-R", "-s", "-o", "json", "-I", "0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "\"a\\nb\\n\"\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_slurp_raw_output() -> Result<()> {
+    let input = "x\ny";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-R", "-s", "-r"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "x\ny\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_slurp_empty_input() -> Result<()> {
+    let (output, exit_code) = run_yq_stdin(".", "", &["-R", "-s"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "''\n");
+    Ok(())
+}
+
+#[test]
+fn test_raw_input_slurp_multiple_files() -> Result<()> {
+    let mut file1 = NamedTempFile::new()?;
+    writeln!(file1, "a")?;
+
+    let mut file2 = NamedTempFile::new()?;
+    writeln!(file2, "b")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["-R", "-s", "-o", "json", "-I", "0"])
+        .arg(".")
+        .arg(file1.path())
+        .arg(file2.path())
+        .output()?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8(output.stdout)?, "\"a\\nb\\n\"\n");
     Ok(())
 }
 
@@ -630,9 +680,11 @@ fn test_raw_input_empty_lines() -> Result<()> {
 
 #[test]
 fn test_raw_input_slurp_filter_empty() -> Result<()> {
+    // Under jq -R -s semantics the input is one string, so line handling
+    // uses the split("\n") idiom
     let input = "line1\n\nline2\n\nline3";
     let (output, exit_code) = run_yq_stdin(
-        "map(select(. != \"\"))",
+        "split(\"\\n\") | map(select(. != \"\"))",
         input,
         &["-R", "-s", "-o", "json", "-I", "0"],
     )?;
