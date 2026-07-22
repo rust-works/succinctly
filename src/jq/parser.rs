@@ -2898,40 +2898,8 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Nth(Box::new(n))));
         }
 
-        // range(n), range(from; upto), range(from; upto; by)
-        if self.matches_keyword("range") {
-            self.consume_keyword("range");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let first = self.parse_pipe_expr()?;
-            self.skip_ws();
-            if self.peek() == Some(';') {
-                self.next();
-                self.skip_ws();
-                let second = self.parse_pipe_expr()?;
-                self.skip_ws();
-                if self.peek() == Some(';') {
-                    self.next();
-                    self.skip_ws();
-                    let third = self.parse_pipe_expr()?;
-                    self.skip_ws();
-                    self.expect(')')?;
-                    return Ok(Some(Builtin::RangeFromToBy(
-                        Box::new(first),
-                        Box::new(second),
-                        Box::new(third),
-                    )));
-                }
-                self.expect(')')?;
-                return Ok(Some(Builtin::RangeFromTo(
-                    Box::new(first),
-                    Box::new(second),
-                )));
-            }
-            self.expect(')')?;
-            return Ok(Some(Builtin::Range(Box::new(first))));
-        }
+        // Note: `range(...)` is handled earlier in parse_primary via
+        // parse_range_expr (Expr::Range), so it never reaches this builtin path.
 
         // isempty(expr) - returns true if expr produces no outputs
         if self.matches_keyword("isempty") {

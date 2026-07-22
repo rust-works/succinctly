@@ -1663,11 +1663,6 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::NthStream(n_expr, expr) => {
             builtin_nth_stream::<W, S>(n_expr, expr, value, optional)
         }
-        Builtin::Range(n) => builtin_range::<W, S>(n, value, optional),
-        Builtin::RangeFromTo(from, to) => builtin_range_from_to::<W, S>(from, to, value, optional),
-        Builtin::RangeFromToBy(from, to, by) => {
-            builtin_range_from_to_by::<W, S>(from, to, by, value, optional)
-        }
         Builtin::IsEmpty(expr) => builtin_isempty::<W, S>(expr, value, optional),
 
         // Phase 14: Recursive traversal (extends Phase 8)
@@ -6615,16 +6610,6 @@ fn substitute_var_in_builtin(
             Box::new(substitute_var(n, var_name, replacement)),
             Box::new(substitute_var(e, var_name, replacement)),
         ),
-        Builtin::Range(n) => Builtin::Range(Box::new(substitute_var(n, var_name, replacement))),
-        Builtin::RangeFromTo(from, to) => Builtin::RangeFromTo(
-            Box::new(substitute_var(from, var_name, replacement)),
-            Box::new(substitute_var(to, var_name, replacement)),
-        ),
-        Builtin::RangeFromToBy(from, to, by) => Builtin::RangeFromToBy(
-            Box::new(substitute_var(from, var_name, replacement)),
-            Box::new(substitute_var(to, var_name, replacement)),
-            Box::new(substitute_var(by, var_name, replacement)),
-        ),
         Builtin::IsEmpty(e) => Builtin::IsEmpty(Box::new(substitute_var(e, var_name, replacement))),
         // Phase 14: Recursive traversal (extends Phase 8)
         Builtin::RecurseDown => Builtin::RecurseDown,
@@ -10681,174 +10666,6 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Builtin: range(n) - generate integers from 0 to n-1
-fn builtin_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    n_expr: &Expr,
-    value: StandardJson<'a, W>,
-    optional: bool,
-) -> QueryResult<'a, W> {
-    // Evaluate n
-    let n_result = eval_single::<W, S>(n_expr, value, optional);
-    let n = match n_result {
-        QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                num.as_i64().unwrap_or(0)
-            } else {
-                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
-            }
-        }
-        QueryResult::Owned(OwnedValue::Int(i)) => i,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
-    };
-
-    if n <= 0 {
-        return QueryResult::None;
-    }
-
-    let results: Vec<OwnedValue> = (0..n).map(OwnedValue::Int).collect();
-    if results.len() == 1 {
-        QueryResult::Owned(results.into_iter().next().unwrap())
-    } else {
-        QueryResult::ManyOwned(results)
-    }
-}
-
-/// Builtin: range(from; upto) - generate integers from `from` to `upto-1`
-fn builtin_range_from_to<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    from_expr: &Expr,
-    to_expr: &Expr,
-    value: StandardJson<'a, W>,
-    optional: bool,
-) -> QueryResult<'a, W> {
-    // Evaluate from
-    let from_result = eval_single::<W, S>(from_expr, value.clone(), optional);
-    let from = match from_result {
-        QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                num.as_i64().unwrap_or(0)
-            } else {
-                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
-            }
-        }
-        QueryResult::Owned(OwnedValue::Int(i)) => i,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
-    };
-
-    // Evaluate to
-    let to_result = eval_single::<W, S>(to_expr, value, optional);
-    let to = match to_result {
-        QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                num.as_i64().unwrap_or(0)
-            } else {
-                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
-            }
-        }
-        QueryResult::Owned(OwnedValue::Int(i)) => i,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
-    };
-
-    if from >= to {
-        return QueryResult::None;
-    }
-
-    let results: Vec<OwnedValue> = (from..to).map(OwnedValue::Int).collect();
-    if results.len() == 1 {
-        QueryResult::Owned(results.into_iter().next().unwrap())
-    } else {
-        QueryResult::ManyOwned(results)
-    }
-}
-
-/// Builtin: range(from; upto; by) - generate integers from `from` to `upto-1` stepping by `by`
-fn builtin_range_from_to_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    from_expr: &Expr,
-    to_expr: &Expr,
-    by_expr: &Expr,
-    value: StandardJson<'a, W>,
-    optional: bool,
-) -> QueryResult<'a, W> {
-    // Evaluate from
-    let from_result = eval_single::<W, S>(from_expr, value.clone(), optional);
-    let from = match from_result {
-        QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                num.as_i64().unwrap_or(0)
-            } else {
-                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
-            }
-        }
-        QueryResult::Owned(OwnedValue::Int(i)) => i,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
-    };
-
-    // Evaluate to
-    let to_result = eval_single::<W, S>(to_expr, value.clone(), optional);
-    let to = match to_result {
-        QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                num.as_i64().unwrap_or(0)
-            } else {
-                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
-            }
-        }
-        QueryResult::Owned(OwnedValue::Int(i)) => i,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
-    };
-
-    // Evaluate by
-    let by_result = eval_single::<W, S>(by_expr, value, optional);
-    let by = match by_result {
-        QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                num.as_i64().unwrap_or(1)
-            } else {
-                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
-            }
-        }
-        QueryResult::Owned(OwnedValue::Int(i)) => i,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as i64,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
-    };
-
-    if by == 0 {
-        return QueryResult::Error(EvalError::new("range step cannot be zero"));
-    }
-
-    let mut results = Vec::new();
-    let mut i = from;
-    if by > 0 {
-        while i < to {
-            results.push(OwnedValue::Int(i));
-            i += by;
-        }
-    } else {
-        while i > to {
-            results.push(OwnedValue::Int(i));
-            i += by;
-        }
-    }
-
-    if results.is_empty() {
-        QueryResult::None
-    } else if results.len() == 1 {
-        QueryResult::Owned(results.into_iter().next().unwrap())
-    } else {
-        QueryResult::ManyOwned(results)
-    }
-}
-
 /// Builtin: isempty(expr) - returns true if expr produces no outputs
 fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
@@ -13117,18 +12934,6 @@ fn expand_func_calls_in_builtin(
             Box::new(expand_func_calls(n, func_name, params, body)),
             Box::new(expand_func_calls(e, func_name, params, body)),
         ),
-        Builtin::Range(n) => {
-            Builtin::Range(Box::new(expand_func_calls(n, func_name, params, body)))
-        }
-        Builtin::RangeFromTo(from, to) => Builtin::RangeFromTo(
-            Box::new(expand_func_calls(from, func_name, params, body)),
-            Box::new(expand_func_calls(to, func_name, params, body)),
-        ),
-        Builtin::RangeFromToBy(from, to, by) => Builtin::RangeFromToBy(
-            Box::new(expand_func_calls(from, func_name, params, body)),
-            Box::new(expand_func_calls(to, func_name, params, body)),
-            Box::new(expand_func_calls(by, func_name, params, body)),
-        ),
         Builtin::IsEmpty(e) => {
             Builtin::IsEmpty(Box::new(expand_func_calls(e, func_name, params, body)))
         }
@@ -13421,16 +13226,6 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::NthStream(n, e) => Builtin::NthStream(
             Box::new(substitute_func_param(n, param, arg)),
             Box::new(substitute_func_param(e, param, arg)),
-        ),
-        Builtin::Range(n) => Builtin::Range(Box::new(substitute_func_param(n, param, arg))),
-        Builtin::RangeFromTo(from, to) => Builtin::RangeFromTo(
-            Box::new(substitute_func_param(from, param, arg)),
-            Box::new(substitute_func_param(to, param, arg)),
-        ),
-        Builtin::RangeFromToBy(from, to, by) => Builtin::RangeFromToBy(
-            Box::new(substitute_func_param(from, param, arg)),
-            Box::new(substitute_func_param(to, param, arg)),
-            Box::new(substitute_func_param(by, param, arg)),
         ),
         Builtin::IsEmpty(e) => Builtin::IsEmpty(Box::new(substitute_func_param(e, param, arg))),
         // Phase 14: Recursive traversal (extends Phase 8)

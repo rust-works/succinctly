@@ -800,12 +800,6 @@ pub enum Builtin {
     /// `nth(n; expr)` - output only the nth value from expr (0-indexed)
     /// Note: no-arg `nth(n)` uses `Builtin::Nth` from Phase 5
     NthStream(Box<Expr>, Box<Expr>),
-    /// `range(n)` - generate integers from 0 to n-1
-    Range(Box<Expr>),
-    /// `range(from; upto)` - generate integers from `from` to `upto-1`
-    RangeFromTo(Box<Expr>, Box<Expr>),
-    /// `range(from; upto; by)` - generate integers from `from` to `upto-1` stepping by `by`
-    RangeFromToBy(Box<Expr>, Box<Expr>, Box<Expr>),
     /// `isempty(expr)` - returns true if expr produces no outputs
     IsEmpty(Box<Expr>),
 
