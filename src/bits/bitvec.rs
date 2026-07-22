@@ -218,6 +218,15 @@ impl RankSelect for BitVec {
         dir_rank + partial
     }
 
+    /// Count 0-bits in positions `[0, i)`.
+    ///
+    /// Returns 0 if `i == 0`, and `len() - count_ones()` if `i >= len`,
+    /// consistent with `rank1`'s clamping.
+    #[inline]
+    fn rank0(&self, i: usize) -> usize {
+        i.min(self.len) - self.rank1(i)
+    }
+
     /// Find position of the k-th 1-bit (0-indexed).
     ///
     /// Returns `None` if there are fewer than `k+1` ones.
@@ -359,6 +368,16 @@ mod tests {
     fn test_rank1_beyond_len() {
         let bv = BitVec::from_words(vec![u64::MAX], 64);
         assert_eq!(bv.rank1(100), 64);
+    }
+
+    #[test]
+    fn test_rank0_beyond_len() {
+        let bv = BitVec::from_words(vec![u64::MAX], 64);
+        assert_eq!(bv.rank0(64), 0);
+        assert_eq!(bv.rank0(100), 0); // clamped: no 0-bits exist (issue #187)
+
+        let bv = BitVec::from_words(vec![0b0100_1101], 8);
+        assert_eq!(bv.rank0(100), 4); // len - count_ones = 8 - 4
     }
 
     #[test]

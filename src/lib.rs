@@ -132,7 +132,10 @@ pub trait RankSelect {
 
     /// Count 0-bits in positions `[0, i)`.
     ///
-    /// Default implementation: `i - rank1(i)`
+    /// Default implementation: `i - rank1(i)`. This is only correct while
+    /// `rank1(i)` counts exactly `i` positions; implementations whose `rank1`
+    /// clamps `i` to the bitvector length (like `BitVec`) must override this
+    /// to clamp `i` as well.
     #[inline]
     fn rank0(&self, i: usize) -> usize {
         i - self.rank1(i)
@@ -161,5 +164,39 @@ impl Default for Config {
         Self {
             select_sample_rate: 256,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RankSelect;
+
+    /// Minimal implementer that keeps the trait's default `rank0`
+    /// (unlike `BitVec`, which overrides it to clamp at the length).
+    struct WordRank(u64);
+
+    impl RankSelect for WordRank {
+        fn rank1(&self, i: usize) -> usize {
+            let mask = if i >= 64 { u64::MAX } else { (1u64 << i) - 1 };
+            (self.0 & mask).count_ones() as usize
+        }
+
+        fn select1(&self, k: usize) -> Option<usize> {
+            (0..64).filter(|b| (self.0 >> b) & 1 == 1).nth(k)
+        }
+    }
+
+    #[test]
+    fn default_rank0_counts_zeros() {
+        let w = WordRank(0b0100_1101); // bits set at 0, 2, 3, 6
+        assert_eq!(w.rank0(0), 0);
+        assert_eq!(w.rank0(4), 1); // 4 - rank1(4) = 4 - 3
+        assert_eq!(w.rank0(8), 4); // 8 - rank1(8) = 8 - 4
+
+        // Sanity-check the rest of the impl so the whole implementer is exercised.
+        assert_eq!(w.rank1(4), 3);
+        assert_eq!(w.select1(0), Some(0));
+        assert_eq!(w.select1(3), Some(6));
+        assert_eq!(w.select1(4), None);
     }
 }
