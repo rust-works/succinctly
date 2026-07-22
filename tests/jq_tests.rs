@@ -1101,6 +1101,16 @@ fn test_length_of_i64_min_falls_back_to_float() {
     );
 }
 
+#[test]
+fn test_large_integer_literal_evaluates_to_float() {
+    // jq: 9999999999999999999 => 10000000000000000000 (float; issue #166)
+    query!(b"null", "9999999999999999999",
+        QueryResult::Owned(OwnedValue::Float(f)) => {
+            assert_eq!(f, 1e19, "expected literal to degrade to 1e19, got {f}");
+        }
+    );
+}
+
 // =============================================================================
 // Compatibility tests - has()/in() with negative indices
 // =============================================================================

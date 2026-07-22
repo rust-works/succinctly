@@ -1174,6 +1174,16 @@ fn test_jq_compat_default() -> Result<()> {
 }
 
 #[test]
+fn test_large_integer_literal_prints_like_jq() -> Result<()> {
+    // Integer literals beyond i64 degrade to floats like jq (issue #166):
+    // jq -n '9999999999999999999' => 10000000000000000000
+    let (output, code) = run_jq_stdin("9999999999999999999", "null", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "10000000000000000000");
+    Ok(())
+}
+
+#[test]
 fn test_args_positional() -> Result<()> {
     // Test --args: positional args become $ARGS.positional
     // Note: Use pipe syntax since parser doesn't support $VAR.field directly
