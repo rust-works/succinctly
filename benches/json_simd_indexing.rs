@@ -1,6 +1,6 @@
 //! Criterion benchmarks for JSON SIMD indexing operations.
 //!
-//! Measures performance of different SIMD implementations (AVX2, SSE4.2, SSE2, NEON, PFSM)
+//! Measures performance of different SIMD implementations (AVX2, SSE2, NEON, PFSM)
 //! on real JSON files from data/bench/generated/.
 //!
 //! This is the heaviest json_simd benchmark - tests all SIMD variants on files up to 100MB.
@@ -50,15 +50,6 @@ fn bench_json_indexing(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::new("AVX2", name), &bytes, |b, bytes| {
                 b.iter(|| {
                     succinctly::json::simd::avx2::build_semi_index_standard(black_box(bytes))
-                });
-            });
-        }
-
-        // SSE4.2 (if available)
-        if is_x86_feature_detected!("sse4.2") {
-            group.bench_with_input(BenchmarkId::new("SSE4.2", name), &bytes, |b, bytes| {
-                b.iter(|| {
-                    succinctly::json::simd::sse42::build_semi_index_standard(black_box(bytes))
                 });
             });
         }
