@@ -109,12 +109,12 @@ impl DsvIndexLightweight {
             return None;
         }
 
-        // Binary search to find the word containing the k-th bit
-        let target_rank = (k + 1) as u32;
-        let word_idx = match self.markers_rank.binary_search(&target_rank) {
-            Ok(idx) => idx.saturating_sub(1),
-            Err(idx) => idx.saturating_sub(1),
-        };
+        // Find the word containing the k-th bit: the last word whose
+        // cumulative rank is <= k. partition_point is duplicate-stable, unlike
+        // binary_search, which returns an arbitrary index among the equal
+        // entries produced by zero-marker words (issue #196). rank[0] == 0, so
+        // the partition point is always >= 1.
+        let word_idx = self.markers_rank.partition_point(|&r| r as usize <= k) - 1;
 
         if word_idx >= self.markers.len() {
             return None;
@@ -168,11 +168,8 @@ impl DsvIndexLightweight {
             return None;
         }
 
-        let target_rank = (k + 1) as u32;
-        let word_idx = match self.newlines_rank.binary_search(&target_rank) {
-            Ok(idx) => idx.saturating_sub(1),
-            Err(idx) => idx.saturating_sub(1),
-        };
+        // See markers_select1: duplicate-stable word lookup (issue #196).
+        let word_idx = self.newlines_rank.partition_point(|&r| r as usize <= k) - 1;
 
         if word_idx >= self.newlines.len() {
             return None;
@@ -262,5 +259,40 @@ mod tests {
         // text_len is a plain parameter, so exercising the #188 guard needs no
         // 4 GiB allocation.
         let _ = DsvIndexLightweight::new(vec![], vec![], u32::MAX as usize + 1);
+    }
+
+    /// Issue #196: a word with zero markers produces duplicate entries in the
+    /// cumulative rank array, and select1 must still find the right word.
+    #[test]
+    fn test_select1_zero_marker_word_regression_196() {
+        let markers = vec![0b1u64, 0, 0b11];
+        let newlines = vec![0b1u64, 0, 0b10];
+        let index = DsvIndexLightweight::new(markers, newlines, 192);
+
+        assert_eq!(index.markers_rank, vec![0, 1, 1, 3]);
+        assert_eq!(index.markers_select1(0), Some(0));
+        assert_eq!(index.markers_select1(1), Some(128));
+        assert_eq!(index.markers_select1(2), Some(129));
+        assert_eq!(index.markers_select1(3), None);
+
+        assert_eq!(index.newlines_rank, vec![0, 1, 1, 2]);
+        assert_eq!(index.newlines_select1(0), Some(0));
+        assert_eq!(index.newlines_select1(1), Some(129));
+        assert_eq!(index.newlines_select1(2), None);
+    }
+
+    #[test]
+    fn test_select1_leading_zero_word() {
+        let markers = vec![0u64, 0b101];
+        let newlines = vec![0u64, 0b10];
+        let index = DsvIndexLightweight::new(markers, newlines, 128);
+
+        assert_eq!(index.markers_rank, vec![0, 0, 2]);
+        assert_eq!(index.markers_select1(0), Some(64));
+        assert_eq!(index.markers_select1(1), Some(66));
+        assert_eq!(index.markers_select1(2), None);
+
+        assert_eq!(index.newlines_select1(0), Some(65));
+        assert_eq!(index.newlines_select1(1), None);
     }
 }

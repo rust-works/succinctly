@@ -396,6 +396,47 @@ mod tests {
         assert_eq!(row.get(3), None);
     }
 
+    /// Issue #196: a field spanning a full 64-byte word leaves that word with
+    /// zero markers, producing duplicate cumulative rank entries that made
+    /// select1 underflow during field navigation.
+    #[test]
+    fn test_field_navigation_across_zero_marker_word_regression_196() {
+        // Markers at 0, 128, 129; word 1 (bytes 64..128) has none.
+        let mut csv = vec![b'a'; 130];
+        csv[0] = b',';
+        csv[128] = b',';
+        csv[129] = b'\n';
+        let config = DsvConfig::default();
+        let index = build_index(&csv, &config);
+
+        let mut cursor = DsvCursor::new(&csv, &index);
+        assert_eq!(cursor.current_field(), b"");
+        assert!(cursor.next_field());
+        assert_eq!(cursor.current_field(), &csv[1..128]);
+        assert!(cursor.next_field());
+        assert_eq!(cursor.current_field(), b"");
+        assert!(!cursor.next_field());
+    }
+
+    /// Issue #196: same underflow through goto_row when a row spans a full
+    /// 64-byte word without newlines.
+    #[test]
+    fn test_goto_row_across_zero_newline_word_regression_196() {
+        // Newlines at 1 and 131; word 1 (bytes 64..128) has none.
+        let mut csv = vec![b'a'; 132];
+        csv[0] = b'x';
+        csv[1] = b'\n';
+        csv[131] = b'\n';
+        let config = DsvConfig::default();
+        let index = build_index(&csv, &config);
+
+        let mut cursor = DsvCursor::new(&csv, &index);
+        assert!(cursor.goto_row(1));
+        assert_eq!(cursor.position(), 2);
+        assert_eq!(cursor.current_field(), &csv[2..131]);
+        assert!(!cursor.goto_row(2)); // text ends after row 1
+    }
+
     #[test]
     fn test_strip_quotes() {
         assert_eq!(strip_quotes(b"\"hello\""), b"hello");
