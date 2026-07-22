@@ -330,9 +330,12 @@ impl<'a> Parser<'a> {
                 .map(Literal::Float)
                 .map_err(|_| ParseError::new("invalid number", start))
         } else {
+            // Integer literal; on i64 overflow fall back to float like jq,
+            // which represents all numbers as doubles.
             num_str
                 .parse::<i64>()
                 .map(Literal::Int)
+                .or_else(|_| num_str.parse::<f64>().map(Literal::Float))
                 .map_err(|_| ParseError::new("invalid number", start))
         }
     }
@@ -4179,6 +4182,37 @@ mod tests {
         assert_eq!(
             parse("\"hello\\nworld\"").unwrap(),
             Expr::Literal(Literal::String("hello\nworld".into()))
+        );
+    }
+
+    #[test]
+    fn test_large_integer_literal_falls_back_to_float() {
+        // Literals beyond i64 range degrade to floats like jq (issue #166).
+        assert_eq!(
+            parse("9999999999999999999").unwrap(),
+            Expr::Literal(Literal::Float(1e19))
+        );
+        assert_eq!(
+            parse("-9999999999999999999").unwrap(),
+            Expr::Literal(Literal::Float(-1e19))
+        );
+        // One past the boundary in each direction.
+        assert_eq!(
+            parse("9223372036854775808").unwrap(),
+            Expr::Literal(Literal::Float(9.223372036854776e18))
+        );
+        assert_eq!(
+            parse("-9223372036854775809").unwrap(),
+            Expr::Literal(Literal::Float(-9.223372036854776e18))
+        );
+        // Boundary values stay exact integers.
+        assert_eq!(
+            parse("9223372036854775807").unwrap(),
+            Expr::Literal(Literal::Int(i64::MAX))
+        );
+        assert_eq!(
+            parse("-9223372036854775808").unwrap(),
+            Expr::Literal(Literal::Int(i64::MIN))
         );
     }
 
