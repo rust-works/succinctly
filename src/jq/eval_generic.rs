@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use indexmap::IndexMap;
 
 use super::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
-use super::eval::{eval as full_eval, EvalError, JqSemantics, QueryResult};
+use super::eval::{eval as full_eval, EvalError, EvalSemantics, JqSemantics, QueryResult};
 use super::expr::{Builtin, CompareOp, Expr, Literal};
 use super::value::OwnedValue;
 use crate::json::JsonIndex;
@@ -172,13 +172,16 @@ fn compare_values(left: &OwnedValue, right: &OwnedValue) -> Option<core::cmp::Or
 ///
 /// This converts the OwnedValue to JSON, evaluates using the full evaluator,
 /// and converts the result back to GenericResult.
-fn eval_on_owned<V: DocumentValue>(expr: &Expr, owned: OwnedValue) -> GenericResult<V> {
+fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    owned: OwnedValue,
+) -> GenericResult<V> {
     let json_str = owned.to_json();
     let json_bytes = json_str.as_bytes();
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
 
-    match full_eval::<Vec<u64>, JqSemantics>(expr, cursor) {
+    match full_eval::<Vec<u64>, S>(expr, cursor) {
         QueryResult::One(v) => GenericResult::Owned(standard_json_to_owned(&v)),
         QueryResult::OneCursor(c) => GenericResult::Owned(standard_json_to_owned(&c.value())),
         QueryResult::Many(vs) => {
@@ -193,13 +196,13 @@ fn eval_on_owned<V: DocumentValue>(expr: &Expr, owned: OwnedValue) -> GenericRes
 }
 
 /// Evaluate an expression on multiple OwnedValues using the full evaluator.
-fn eval_on_many_owned<V: DocumentValue>(
+fn eval_on_many_owned<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     owned_values: Vec<OwnedValue>,
 ) -> GenericResult<V> {
     let mut results = Vec::new();
     for owned in owned_values {
-        match eval_on_owned::<V>(expr, owned) {
+        match eval_on_owned::<S, V>(expr, owned) {
             GenericResult::One(_) => unreachable!("eval_on_owned never returns One"),
             GenericResult::OneCursor(_) => unreachable!("eval_on_owned never returns OneCursor"),
             GenericResult::Many(_) => unreachable!("eval_on_owned never returns Many"),
@@ -449,21 +452,42 @@ impl<V: DocumentValue> GenericResult<V> {
 
 /// Evaluate an expression against a document value.
 ///
-/// This is the main entry point for generic evaluation.
+/// This is the main entry point for generic evaluation. It uses jq semantics;
+/// use [`eval_using`] to select yq semantics.
 pub fn eval<V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
-    eval_single(expr, value, false, None)
+    eval_using::<JqSemantics, V>(expr, value)
+}
+
+/// Evaluate an expression against a document value with explicit semantics.
+///
+/// Arithmetic that falls back to the full evaluator (division, modulo, overflow)
+/// follows `S`, so yq keeps yq numeric behavior instead of jq's.
+pub fn eval_using<S: EvalSemantics, V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
+    eval_single::<S, V>(expr, value, false, None)
 }
 
 /// Evaluate an expression against a cursor.
 ///
 /// This entry point preserves cursor position metadata, enabling
-/// `line` and `column` builtins to return actual values.
+/// `line` and `column` builtins to return actual values. It uses jq semantics;
+/// use [`eval_with_cursor_using`] to select yq semantics.
 pub fn eval_with_cursor<C: DocumentCursor>(expr: &Expr, cursor: C) -> GenericResult<C::Value> {
-    eval_single(expr, cursor.value(), false, Some(cursor))
+    eval_with_cursor_using::<JqSemantics, C>(expr, cursor)
+}
+
+/// Evaluate an expression against a cursor with explicit semantics.
+///
+/// Like [`eval_with_cursor`] but arithmetic follows `S` (jq vs yq), so yq's
+/// modulo/division/overflow behavior is preserved on the cursor path.
+pub fn eval_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
+    expr: &Expr,
+    cursor: C,
+) -> GenericResult<C::Value> {
+    eval_single::<S, C::Value>(expr, cursor.value(), false, Some(cursor))
 }
 
 /// Evaluate a single expression against a value with optional cursor context.
-fn eval_single<V: DocumentValue>(
+fn eval_single<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,
     optional: bool,
@@ -547,23 +571,25 @@ fn eval_single<V: DocumentValue>(
             }
         }
 
-        Expr::Optional(inner) => eval_single(inner, value, true, cursor),
+        Expr::Optional(inner) => eval_single::<S, _>(inner, value, true, cursor),
 
         Expr::Pipe(exprs) => {
             if exprs.is_empty() {
                 return GenericResult::One(value);
             }
 
-            let mut current = eval_single(&exprs[0], value, optional, cursor);
+            let mut current = eval_single::<S, _>(&exprs[0], value, optional, cursor);
 
             for expr in &exprs[1..] {
                 current = match current {
-                    GenericResult::One(v) => eval_single(expr, v, optional, None),
-                    GenericResult::OneCursor(c) => eval_single(expr, c.value(), optional, Some(c)),
+                    GenericResult::One(v) => eval_single::<S, _>(expr, v, optional, None),
+                    GenericResult::OneCursor(c) => {
+                        eval_single::<S, _>(expr, c.value(), optional, Some(c))
+                    }
                     GenericResult::Many(vs) => {
                         let mut results = Vec::new();
                         for v in vs {
-                            match eval_single(expr, v, optional, None) {
+                            match eval_single::<S, _>(expr, v, optional, None) {
                                 GenericResult::One(r) => results.push(to_owned(&r)),
                                 GenericResult::OneCursor(c) => results.push(to_owned(&c.value())),
                                 GenericResult::Many(rs) => {
@@ -586,11 +612,11 @@ fn eval_single<V: DocumentValue>(
                     GenericResult::Error(e) => return GenericResult::Error(e),
                     GenericResult::Owned(o) => {
                         // Continue piping from owned value via JSON round-trip
-                        eval_on_owned(expr, o)
+                        eval_on_owned::<S, _>(expr, o)
                     }
                     GenericResult::ManyOwned(os) => {
                         // Continue piping from owned values via JSON round-trip
-                        eval_on_many_owned(expr, os)
+                        eval_on_many_owned::<S, _>(expr, os)
                     }
                     GenericResult::Break(label) => return GenericResult::Break(label),
                 };
@@ -607,13 +633,13 @@ fn eval_single<V: DocumentValue>(
             Literal::String(s) => GenericResult::Owned(OwnedValue::String(s.clone())),
         },
 
-        Expr::Builtin(builtin) => eval_builtin(builtin, value, optional, cursor),
+        Expr::Builtin(builtin) => eval_builtin::<S, _>(builtin, value, optional, cursor),
 
         // Comparison operations - handle locally to preserve cursor context
         Expr::Compare { op, left, right } => {
             // Evaluate left and right with cursor context preserved
-            let left_result = eval_single(left, value.clone(), false, cursor);
-            let right_result = eval_single(right, value, false, cursor);
+            let left_result = eval_single::<S, _>(left, value.clone(), false, cursor);
+            let right_result = eval_single::<S, _>(right, value, false, cursor);
 
             // Convert results to OwnedValue for comparison
             let left_owned = match left_result {
@@ -707,7 +733,7 @@ fn eval_single<V: DocumentValue>(
             let cursor = index.root(json_bytes);
 
             // Evaluate using the full evaluator
-            match full_eval::<Vec<u64>, JqSemantics>(expr, cursor) {
+            match full_eval::<Vec<u64>, S>(expr, cursor) {
                 QueryResult::One(v) => {
                     // Convert StandardJson back to OwnedValue
                     GenericResult::Owned(standard_json_to_owned(&v))
@@ -729,7 +755,7 @@ fn eval_single<V: DocumentValue>(
 }
 
 /// Evaluate a builtin function.
-fn eval_builtin<V: DocumentValue>(
+fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
     builtin: &Builtin,
     value: V,
     optional: bool,
@@ -754,7 +780,7 @@ fn eval_builtin<V: DocumentValue>(
         Builtin::Select(cond) => {
             // Evaluate condition with cursor context preserved
             // This is critical for select(di == N) to work correctly
-            let cond_result = eval_single(cond, value.clone(), false, cursor);
+            let cond_result = eval_single::<S, _>(cond, value.clone(), false, cursor);
 
             // Helper to check if an OwnedValue is truthy
             let is_truthy = |v: &OwnedValue| -> bool {
@@ -1112,7 +1138,7 @@ fn eval_builtin<V: DocumentValue>(
         // Phase 23: Position-based navigation (succinctly extension)
         Builtin::AtOffset(offset_expr) => {
             // Evaluate the offset expression
-            let offset_result = eval_single(offset_expr, value.clone(), false, cursor);
+            let offset_result = eval_single::<S, _>(offset_expr, value.clone(), false, cursor);
             let offset = match offset_result {
                 GenericResult::Owned(OwnedValue::Int(i)) if i >= 0 => i as usize,
                 GenericResult::One(v) => match v.as_i64() {
@@ -1152,7 +1178,7 @@ fn eval_builtin<V: DocumentValue>(
 
         Builtin::AtPosition(line_expr, col_expr) => {
             // Evaluate the line expression
-            let line_result = eval_single(line_expr, value.clone(), false, cursor);
+            let line_result = eval_single::<S, _>(line_expr, value.clone(), false, cursor);
             let line = match line_result {
                 GenericResult::Owned(OwnedValue::Int(i)) if i > 0 => i as usize,
                 GenericResult::One(v) => match v.as_i64() {
@@ -1171,7 +1197,7 @@ fn eval_builtin<V: DocumentValue>(
             };
 
             // Evaluate the column expression
-            let col_result = eval_single(col_expr, value.clone(), false, cursor);
+            let col_result = eval_single::<S, _>(col_expr, value.clone(), false, cursor);
             let col = match col_result {
                 GenericResult::Owned(OwnedValue::Int(i)) if i > 0 => i as usize,
                 GenericResult::One(v) => match v.as_i64() {
@@ -1214,7 +1240,7 @@ fn eval_builtin<V: DocumentValue>(
         // For other builtins, fall back to full evaluator via JSON
         _ => {
             let owned = to_owned(&value);
-            eval_on_owned(&Expr::Builtin(builtin.clone()), owned)
+            eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned)
         }
     }
 }
@@ -1945,5 +1971,24 @@ mod tests {
         let expr = crate::jq::parse(".a | tonumber").unwrap();
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(result.is_error());
+    }
+
+    #[test]
+    fn test_arithmetic_semantics_are_threaded() {
+        // The generic evaluator delegates arithmetic to the full evaluator; the
+        // semantics parameter must reach that fallback so jq truncates float
+        // modulo (issue #164) while yq keeps float modulo.
+        use crate::jq::YqSemantics;
+
+        let expr = crate::jq::parse("10.5 % 3").unwrap();
+
+        let json = b"null";
+        let index = JsonIndex::build(json);
+
+        let jq_result = eval_using::<JqSemantics, _>(&expr, index.root(json).value());
+        assert_eq!(jq_result.into_owned(), Some(OwnedValue::Int(1)));
+
+        let yq_result = eval_using::<YqSemantics, _>(&expr, index.root(json).value());
+        assert_eq!(yq_result.into_owned(), Some(OwnedValue::Float(1.5)));
     }
 }
