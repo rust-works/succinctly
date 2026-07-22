@@ -10,7 +10,7 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
 use succinctly::jq::document::DocumentCursor;
-use succinctly::jq::eval_generic::{eval_with_cursor, to_owned, GenericResult};
+use succinctly::jq::eval_generic::{eval_with_cursor_using, to_owned, GenericResult};
 use succinctly::jq::{self, Builtin, Expr, OwnedValue, QueryResult, YqSemantics};
 use succinctly::json::light::StandardJson;
 use succinctly::json::JsonIndex;
@@ -317,7 +317,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     cursor: YamlCursor<'_, W>,
     expr: &Expr,
 ) -> Result<Vec<OwnedValue>> {
-    let result = eval_with_cursor(expr, cursor);
+    let result = eval_with_cursor_using::<YqSemantics, _>(expr, cursor);
 
     // Convert GenericResult to Vec<OwnedValue>
     match result {
@@ -1153,7 +1153,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         }
                     } else {
                         // M2 YAML path: evaluate and stream YAML results
-                        let result = eval_with_cursor(&program.expr, $cursor);
+                        let result = eval_with_cursor_using::<YqSemantics, _>(&program.expr, $cursor);
                         let will_output = !matches!(
                             &result,
                             GenericResult::None | GenericResult::Break(_)
@@ -1180,7 +1180,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         }
                     } else {
                         // M2 path: evaluate and stream results
-                        let result = eval_with_cursor(&program.expr, $cursor);
+                        let result = eval_with_cursor_using::<YqSemantics, _>(&program.expr, $cursor);
                         let stats = result
                             .stream_json(&mut FmtWriter($writer), |w| w.write_str("\n"))
                             .map_err(|_| anyhow::anyhow!("Write error"))?;

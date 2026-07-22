@@ -1128,6 +1128,17 @@ fn test_colorized_json_output_is_token_aware() -> Result<()> {
 }
 
 #[test]
+fn test_float_modulo_uses_float_semantics() -> Result<()> {
+    // yq (unlike jq) performs float modulo: 10.5 % 3 => 1.5.
+    // This guards against the jq integer-truncation fix (issue #164)
+    // leaking into yq's semantics.
+    let (output, exit_code) = run_yq_stdin("10.5 % 3", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "1.5");
+    Ok(())
+}
+
+#[test]
 fn test_build_configuration_flag() -> Result<()> {
     // --build-configuration prints diagnostics and exits successfully.
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
@@ -1503,5 +1514,22 @@ fn test_exit_status_no_stderr_message_when_truthy() -> Result<()> {
     let output = cmd.wait_with_output()?;
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(String::from_utf8(output.stderr)?.trim(), "");
+    Ok(())
+}
+
+#[test]
+fn test_arithmetic_semantics_match_between_stdin_and_null_input() -> Result<()> {
+    // The stdin/file path (generic evaluator) and the -n path (full evaluator)
+    // must agree on yq numeric semantics. Before threading EvalSemantics through
+    // the generic evaluator, the stdin path silently used jq semantics.
+    for expr in ["10.5 % 3", "1 / 0", "7.5 % 2.5"] {
+        let (stdin_out, stdin_code) = run_yq_stdin(expr, "null", &["-o=json", "-I=0"])?;
+        let (null_out, null_code) = run_yq_stdin(expr, "", &["-n", "-o=json", "-I=0"])?;
+        assert_eq!(
+            (stdin_out.trim(), stdin_code),
+            (null_out.trim(), null_code),
+            "stdin vs -n disagree for `{expr}`",
+        );
+    }
     Ok(())
 }
