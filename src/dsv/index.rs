@@ -1,7 +1,6 @@
 //! Semi-index for DSV data.
 
 use super::index_lightweight::DsvIndexLightweight;
-use crate::bits::BitVec;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -26,14 +25,6 @@ pub struct DsvIndex {
 impl DsvIndex {
     /// Create a new DsvIndex from lightweight index.
     pub fn new_lightweight(inner: DsvIndexLightweight) -> Self {
-        Self { inner }
-    }
-
-    /// Create a new DsvIndex from BitVec (legacy API).
-    pub fn new(markers: BitVec, newlines: BitVec, text_len: usize) -> Self {
-        let markers_words = markers.words().to_vec();
-        let newlines_words = newlines.words().to_vec();
-        let inner = DsvIndexLightweight::new(markers_words, newlines_words, text_len);
         Self { inner }
     }
 
