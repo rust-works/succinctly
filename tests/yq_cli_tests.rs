@@ -1141,7 +1141,7 @@ fn test_multibyte_value_survives_simd_escape_scan() -> Result<()> {
 }
 
 // ============================================================================
-// Colorized JSON Output
+// Colorized Output (JSON and YAML)
 // ============================================================================
 
 #[test]
@@ -1187,6 +1187,63 @@ fn test_float_modulo_uses_float_semantics() -> Result<()> {
     let (output, exit_code) = run_yq_stdin("10.5 % 3", "null", &["-o=json", "-I=0"])?;
     assert_eq!(exit_code, 0);
     assert_eq!(output.trim(), "1.5");
+    Ok(())
+}
+
+#[test]
+fn test_colorized_yaml_output_mapping() -> Result<()> {
+    // Default (YAML) output with -C goes through the YAML colorizer, which is
+    // a separate path from the JSON colorizer above: mapping keys are cyan.
+    let input = "name: Alice\nage: 30\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-C"])?;
+    assert_eq!(exit_code, 0);
+
+    // Keys are wrapped in cyan (\x1b[36m ... \x1b[0m); the plain text survives.
+    assert!(
+        output.contains("\u{1b}[36mname\u{1b}[0m"),
+        "cyan key coloring missing: {output:?}"
+    );
+    assert!(
+        output.contains("\u{1b}[36mage\u{1b}[0m"),
+        "cyan key coloring missing: {output:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_colorized_yaml_output_sequence_dash() -> Result<()> {
+    // Block-sequence dashes are colored yellow by the YAML colorizer.
+    let input = "items:\n  - a\n  - b\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-C"])?;
+    assert_eq!(exit_code, 0);
+    assert!(
+        output.contains("\u{1b}[33m-\u{1b}[0m"),
+        "yellow sequence dash missing: {output:?}"
+    );
+    Ok(())
+}
+
+// ============================================================================
+// Special float values (NaN / Infinity)
+// ============================================================================
+
+#[test]
+fn test_yaml_special_floats_passthrough() -> Result<()> {
+    // .nan / .inf / -.inf round-trip through YAML output unchanged.
+    let input = "x: .nan\ny: .inf\nz: -.inf\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "x: .nan\ny: .inf\nz: -.inf\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_special_floats_to_json_are_null() -> Result<()> {
+    // JSON has no NaN/Infinity literals, so non-finite floats serialize as null.
+    let input = "x: .nan\ny: .inf\nz: -.inf\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o", "json", "-I", "0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "{\"x\":null,\"y\":null,\"z\":null}\n");
     Ok(())
 }
 
