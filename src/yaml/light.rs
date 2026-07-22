@@ -5161,6 +5161,44 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_yaml_block_scalar_smart_quoting() {
+        // Block scalars decode to plain strings and take the smart-quoting
+        // path (needs_yaml_quoting / looks_like_yaml_number): multiline
+        // content and anything that would re-parse as a keyword or number
+        // must be double-quoted to stay a string; everything else stays bare.
+        let yaml = b"a: |-\n  hello\n  world\nb: |-\n  plain\nc: |-\n  true\nd: |-\n  123\ne: |-\n  1.5e+3\nf: |-\n  12x\ng: |-\n  1.5.5\nh: |-\n  +\ni: |-\n  +x\nj: |-\n  +5x\nk: >-\n  folded here\nl: |-\n  -foo\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        assert_eq!(
+            out,
+            "a: \"hello\\nworld\"\n\
+             b: plain\n\
+             c: \"true\"\n\
+             d: \"123\"\n\
+             e: \"1.5e+3\"\n\
+             f: 12x\n\
+             g: 1.5.5\n\
+             h: +\n\
+             i: +x\n\
+             j: +5x\n\
+             k: folded here\n\
+             l: \"-foo\""
+        );
+    }
+
+    #[test]
+    fn test_stream_yaml_block_scalar_trailing_space_quoted() {
+        // A literal block scalar preserves trailing spaces; the decoded value
+        // cannot round-trip as a plain scalar and must be double-quoted.
+        let yaml = b"t: |-\n  x \n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index.root(yaml).stream_yaml_document(&mut out, 2).unwrap();
+        assert_eq!(out, "t: \"x \"");
+    }
+
+    #[test]
     fn test_stream_yaml_multiline_plain_folds_to_one_line() {
         // A multiline plain scalar decodes with folded spaces; verbatim
         // re-emission on one line preserves the decoded value. Blank lines
