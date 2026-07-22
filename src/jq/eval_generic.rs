@@ -310,6 +310,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = owned.is_falsy();
+                stats.any_truthy = !stats.last_was_falsy;
             }
             Self::OneCursor(c) => {
                 // Stream directly from cursor using DocumentCursor trait
@@ -317,6 +318,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = c.is_falsy();
+                stats.any_truthy = !stats.last_was_falsy;
             }
             Self::Many(vs) => {
                 for v in vs {
@@ -324,6 +326,7 @@ impl<V: DocumentValue> GenericResult<V> {
                     owned.stream_json(out)?;
                     on_value(out)?;
                     stats.last_was_falsy = owned.is_falsy();
+                    stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = vs.len();
             }
@@ -340,12 +343,14 @@ impl<V: DocumentValue> GenericResult<V> {
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = o.is_falsy();
+                stats.any_truthy = !stats.last_was_falsy;
             }
             Self::ManyOwned(os) => {
                 for o in os {
                     o.stream_json(out)?;
                     on_value(out)?;
                     stats.last_was_falsy = o.is_falsy();
+                    stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = os.len();
             }
@@ -388,6 +393,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = owned.is_falsy();
+                stats.any_truthy = !stats.last_was_falsy;
             }
             Self::OneCursor(c) => {
                 // Stream directly from cursor using DocumentCursor trait
@@ -395,6 +401,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = c.is_falsy();
+                stats.any_truthy = !stats.last_was_falsy;
             }
             Self::Many(vs) => {
                 for v in vs {
@@ -402,6 +409,7 @@ impl<V: DocumentValue> GenericResult<V> {
                     owned.stream_yaml(out, indent_spaces)?;
                     on_value(out)?;
                     stats.last_was_falsy = owned.is_falsy();
+                    stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = vs.len();
             }
@@ -418,12 +426,14 @@ impl<V: DocumentValue> GenericResult<V> {
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = o.is_falsy();
+                stats.any_truthy = !stats.last_was_falsy;
             }
             Self::ManyOwned(os) => {
                 for o in os {
                     o.stream_yaml(out, indent_spaces)?;
                     on_value(out)?;
                     stats.last_was_falsy = o.is_falsy();
+                    stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = os.len();
             }
