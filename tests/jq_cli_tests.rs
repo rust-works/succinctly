@@ -1993,3 +1993,44 @@ fn test_regex_capture_available_in_cli() -> Result<()> {
     assert_eq!(output.trim(), r#""hello""#);
     Ok(())
 }
+
+// =============================================================================
+// range() float support (issue #165)
+// =============================================================================
+
+#[test]
+fn test_range_float_step() -> Result<()> {
+    // Issue #165 repro: fractional step was truncated to 0, yielding [].
+    // jq 1.7.1 accumulates doubles: [0,0.3,0.6,0.8999999999999999]
+    let (output, code) = run_jq_null("[range(0;1;0.3)]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[0,0.3,0.6,0.8999999999999999]");
+    Ok(())
+}
+
+#[test]
+fn test_range_float_from() -> Result<()> {
+    // Issue #165 repro: fractional lower bound was truncated to 2.
+    let (output, code) = run_jq_null("[range(2.5;5)]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[2.5,3.5,4.5]");
+    Ok(())
+}
+
+#[test]
+fn test_range_int_unchanged() -> Result<()> {
+    // All-integer ranges keep exact integer output.
+    let (output, code) = run_jq_null("[range(0;10;2)]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[0,2,4,6,8]");
+    Ok(())
+}
+
+#[test]
+fn test_range_zero_step_empty() -> Result<()> {
+    // jq 1.7.1 emits no values for a zero step rather than erroring.
+    let (output, code) = run_jq_null("[range(0;1;0)]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[]");
+    Ok(())
+}
