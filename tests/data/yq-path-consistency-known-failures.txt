@@ -1,0 +1,26 @@
+# YAML Test Suite cases where `yq -o=json` and `yq -o=json -I=0` still disagree.
+#
+# Format:  <case-id>  <category>  <reason>
+#
+# Consumed by tests/yq_path_consistency_tests.rs, which runs every corpus case
+# through both the compact (streaming) and pretty (OwnedValue) output paths and
+# asserts they produce the same JSON *values*. The list must match the actual
+# divergence set exactly: a new divergence and a newly-agreeing case both break
+# the build. See issue #222 for why the paths must agree; entries here are
+# divergences whose root cause is a *different*, separately-tracked bug.
+#
+# Categories
+# ----------
+#   float-format  The streaming path renders integer-valued floats as integers
+#                 (1.0 -> 1, 450.00 -> 450) while the OwnedValue path keeps the
+#                 float (1.0, 450.0). A scalar-formatting bug, not a key/fold
+#                 divergence. -> #168 / #170
+#   invalid-escape  Double-quoted string with an escape yq rejects outright
+#                 (\., \'). The non-validating loader accepts it, and the
+#                 streaming transcoder — already mid-string when it hits the
+#                 bad escape — cannot roll back, so it emits malformed JSON
+#                 where the OwnedValue path emits a clean null. -> #223
+
+55WF      invalid-escape    invalid \-escape; streaming emits malformed JSON, DOM emits null — #223
+HRE5      invalid-escape    invalid \-escape; streaming emits malformed JSON, DOM emits null — #223
+UGM3      float-format      450.00 renders as 450 (streaming) vs 450.0 (DOM) — #168/#170

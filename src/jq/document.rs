@@ -138,6 +138,19 @@ pub trait DocumentValue: Sized + Clone {
     /// Try to get as a string.
     fn as_str(&self) -> Option<Cow<'_, str>>;
 
+    /// String form of this value when it appears as a mapping key.
+    ///
+    /// Unlike [`as_str`](Self::as_str), a key is always representable as a
+    /// string and is never dropped: the default matches `as_str` (JSON object
+    /// keys are always strings), but formats with non-string keys (YAML alias
+    /// or complex keys) override this to stringify them rather than return
+    /// `None`. Returning `None` here causes the entry to be discarded, so
+    /// overrides should return `Some("")` instead of `None` for keys that have
+    /// no scalar form (issue #222).
+    fn key_string(&self) -> Option<Cow<'_, str>> {
+        self.as_str()
+    }
+
     /// Try to get as object fields.
     fn as_object(&self) -> Option<Self::Fields>;
 
@@ -248,8 +261,11 @@ pub struct DocumentField<V, C> {
 
 impl<V: DocumentValue, C: DocumentCursor> DocumentField<V, C> {
     /// Get the key as a string.
+    ///
+    /// Uses [`DocumentValue::key_string`] so non-string keys (YAML alias or
+    /// complex keys) stringify rather than dropping the entry (issue #222).
     pub fn key_str(&self) -> Option<Cow<'_, str>> {
-        self.key.as_str()
+        self.key.key_string()
     }
 }
 

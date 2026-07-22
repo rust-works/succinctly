@@ -1,0 +1,4 @@
+top1:
+  key1: &a scalar1
+top3:
+  *a : scalar3

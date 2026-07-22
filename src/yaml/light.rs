@@ -1171,7 +1171,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         if let YamlValue::String(s) = field.key() {
                             stream_yaml_string_value(out, &s)?;
                         } else {
-                            out.write_str("\"\"")?;
+                            stream_yaml_nonstring_key(out, &field.key())?;
                         }
                         out.write_str(": ")?;
                         field.value_cursor().stream_yaml_value(out, 0, 0)?;
@@ -1190,7 +1190,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         if let YamlValue::String(s) = field.key() {
                             stream_yaml_string_value(out, &s)?;
                         } else {
-                            out.write_str("\"\"")?;
+                            stream_yaml_nonstring_key(out, &field.key())?;
                         }
                         out.write_char(':')?;
                         // Check if value needs newline
@@ -1322,7 +1322,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             }
                         }
                     } else {
-                        out.write_str("\"\"")?;
+                        // Alias/complex key (#222): resolve alias-to-scalar,
+                        // else "" — the entry is kept, never dropped
+                        stream_json_string(out, &field.key().key_string())?;
                     }
 
                     out.write_char(':')?;
@@ -1400,7 +1402,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             }
                         }
                     } else {
-                        output.push_str("\"\"");
+                        // Alias/complex key (#222): resolve alias-to-scalar,
+                        // else "" — the entry is kept, never dropped
+                        write_json_string(output, &field.key().key_string());
                     }
 
                     output.push(':');
@@ -1829,7 +1833,9 @@ fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlVal
                         }
                     }
                 } else {
-                    output.push_str("\"\"");
+                    // Alias/complex key (#222): resolve alias-to-scalar,
+                    // else "" — the entry is kept, never dropped
+                    write_json_string(output, &field.key().key_string());
                 }
 
                 output.push(':');
@@ -1975,6 +1981,21 @@ fn write_json_escape(output: &mut String, ch: char) {
     }
 }
 
+/// Scan a run of literal spaces/tabs starting at `i`.
+///
+/// Returns the end of the run and whether the run is immediately followed by
+/// a literal line break — in which case YAML line folding (spec 7.3) discards
+/// the run. Escaped whitespace (`\t`, `\ `) never reaches this helper: escape
+/// arms emit it directly, so it is always preserved as content.
+#[inline]
+fn scan_ws_run(bytes: &[u8], i: usize) -> (usize, bool) {
+    let mut j = i;
+    while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
+        j += 1;
+    }
+    (j, j < bytes.len() && matches!(bytes[j], b'\r' | b'\n'))
+}
+
 /// Transcode a double-quoted YAML string directly to JSON output.
 /// Avoids intermediate String allocation by decoding YAML escapes and
 /// re-encoding as JSON escapes in a single pass.
@@ -2083,6 +2104,21 @@ fn transcode_double_quoted_to_json(
                 output.push_str("\\\"");
                 i += 1;
             }
+            b'\t' => {
+                // Literal whitespace run: folded away before a literal line
+                // break, otherwise content (tabs escaped for JSON)
+                let (j, at_break) = scan_ws_run(bytes, i);
+                if !at_break {
+                    for &b in &bytes[i..j] {
+                        if b == b'\t' {
+                            output.push_str("\\t");
+                        } else {
+                            output.push(' ');
+                        }
+                    }
+                }
+                i = j;
+            }
             b if b < 0x20 => {
                 // Control character needs escaping
                 write_json_escape(output, b as char);
@@ -2098,8 +2134,20 @@ fn transcode_double_quoted_to_json(
                     }
                     i += 1;
                 }
+                // Trailing literal whitespace folds away before a literal
+                // line break (the span can only end in spaces; tabs break it)
+                let mut end = i;
+                if i < bytes.len() {
+                    let (j, at_break) = scan_ws_run(bytes, i);
+                    if at_break {
+                        while end > start && bytes[end - 1] == b' ' {
+                            end -= 1;
+                        }
+                        i = j;
+                    }
+                }
                 // Copy the safe span
-                let chunk = core::str::from_utf8(&bytes[start..i])
+                let chunk = core::str::from_utf8(&bytes[start..end])
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
                 output.push_str(chunk);
             }
@@ -2139,6 +2187,21 @@ fn transcode_single_quoted_to_json(
                 output.push_str("\\\\");
                 i += 1;
             }
+            b'\t' => {
+                // Literal whitespace run: folded away before a literal line
+                // break, otherwise content (tabs escaped for JSON)
+                let (j, at_break) = scan_ws_run(bytes, i);
+                if !at_break {
+                    for &b in &bytes[i..j] {
+                        if b == b'\t' {
+                            output.push_str("\\t");
+                        } else {
+                            output.push(' ');
+                        }
+                    }
+                }
+                i = j;
+            }
             b if b < 0x20 => {
                 // Control character needs escaping
                 write_json_escape(output, b as char);
@@ -2158,7 +2221,19 @@ fn transcode_single_quoted_to_json(
                     }
                     i += 1;
                 }
-                let chunk = core::str::from_utf8(&bytes[start..i])
+                // Trailing literal whitespace folds away before a literal
+                // line break (the span can only end in spaces; tabs break it)
+                let mut end = i;
+                if i < bytes.len() {
+                    let (j, at_break) = scan_ws_run(bytes, i);
+                    if at_break {
+                        while end > start && bytes[end - 1] == b' ' {
+                            end -= 1;
+                        }
+                        i = j;
+                    }
+                }
+                let chunk = core::str::from_utf8(&bytes[start..end])
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
                 output.push_str(chunk);
             }
@@ -2171,12 +2246,10 @@ fn transcode_single_quoted_to_json(
 
 /// Handle line folding during direct transcoding.
 /// Returns the new position after processing the line break(s).
+/// Trailing literal whitespace before the break is handled by the callers
+/// (folded away per YAML 7.3); escaped whitespace already in `output` is
+/// content and must not be trimmed here.
 fn transcode_fold_line_break_to_json(bytes: &[u8], mut i: usize, output: &mut String) -> usize {
-    // Trim trailing whitespace from output
-    while output.ends_with(' ') || output.ends_with('\t') {
-        output.pop();
-    }
-
     // Skip the first line break
     if bytes[i] == b'\r' {
         i += 1;
@@ -2265,10 +2338,15 @@ fn write_yaml_string_to_json(
             }
             Ok(true) // Always a string, no type detection
         }
-        YamlString::Unquoted { .. }
-        | YamlString::BlockLiteral { .. }
-        | YamlString::BlockFolded { .. } => {
-            // For unquoted and block scalars, we need type detection
+        YamlString::BlockLiteral { .. } | YamlString::BlockFolded { .. } => {
+            // Block scalars are always strings (yq/JSON semantics): no type
+            // detection, and empty content is "" rather than null (#222)
+            let decoded = s.as_str()?;
+            write_json_string(output, &decoded);
+            Ok(true)
+        }
+        YamlString::Unquoted { .. } => {
+            // Plain scalars need type detection
             // Return false to signal caller should use the original path
             Ok(false)
         }
@@ -2391,7 +2469,9 @@ fn stream_yaml_value_as_json<W: AsRef<[u64]>, Out: core::fmt::Write>(
                         }
                     }
                 } else {
-                    out.write_str("\"\"")?;
+                    // Alias/complex key (#222): resolve alias-to-scalar,
+                    // else "" — the entry is kept, never dropped
+                    stream_json_string(out, &field.key().key_string())?;
                 }
 
                 out.write_char(':')?;
@@ -2656,6 +2736,23 @@ fn stream_transcode_double_quoted_to_json<Out: core::fmt::Write>(
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
                 i += 1;
             }
+            b'\t' => {
+                // Literal whitespace run: folded away before a literal line
+                // break, otherwise content (tabs escaped for JSON)
+                let (j, at_break) = scan_ws_run(bytes, i);
+                if !at_break {
+                    for &b in &bytes[i..j] {
+                        if b == b'\t' {
+                            out.write_str("\\t")
+                                .map_err(|_| YamlStringError::InvalidUtf8)?;
+                        } else {
+                            out.write_char(' ')
+                                .map_err(|_| YamlStringError::InvalidUtf8)?;
+                        }
+                    }
+                }
+                i = j;
+            }
             b if b < 0x20 => {
                 stream_json_escape(out, b as char).map_err(|_| YamlStringError::InvalidUtf8)?;
                 i += 1;
@@ -2669,7 +2766,19 @@ fn stream_transcode_double_quoted_to_json<Out: core::fmt::Write>(
                     }
                     i += 1;
                 }
-                let chunk = core::str::from_utf8(&bytes[start..i])
+                // Trailing literal whitespace folds away before a literal
+                // line break (the span can only end in spaces; tabs break it)
+                let mut end = i;
+                if i < bytes.len() {
+                    let (j, at_break) = scan_ws_run(bytes, i);
+                    if at_break {
+                        while end > start && bytes[end - 1] == b' ' {
+                            end -= 1;
+                        }
+                        i = j;
+                    }
+                }
+                let chunk = core::str::from_utf8(&bytes[start..end])
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
                 out.write_str(chunk)
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
@@ -2711,6 +2820,23 @@ fn stream_transcode_single_quoted_to_json<Out: core::fmt::Write>(
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
                 i += 1;
             }
+            b'\t' => {
+                // Literal whitespace run: folded away before a literal line
+                // break, otherwise content (tabs escaped for JSON)
+                let (j, at_break) = scan_ws_run(bytes, i);
+                if !at_break {
+                    for &b in &bytes[i..j] {
+                        if b == b'\t' {
+                            out.write_str("\\t")
+                                .map_err(|_| YamlStringError::InvalidUtf8)?;
+                        } else {
+                            out.write_char(' ')
+                                .map_err(|_| YamlStringError::InvalidUtf8)?;
+                        }
+                    }
+                }
+                i = j;
+            }
             b if b < 0x20 => {
                 stream_json_escape(out, b as char).map_err(|_| YamlStringError::InvalidUtf8)?;
                 i += 1;
@@ -2724,7 +2850,19 @@ fn stream_transcode_single_quoted_to_json<Out: core::fmt::Write>(
                     }
                     i += 1;
                 }
-                let chunk = core::str::from_utf8(&bytes[start..i])
+                // Trailing literal whitespace folds away before a literal
+                // line break (the span can only end in spaces; tabs break it)
+                let mut end = i;
+                if i < bytes.len() {
+                    let (j, at_break) = scan_ws_run(bytes, i);
+                    if at_break {
+                        while end > start && bytes[end - 1] == b' ' {
+                            end -= 1;
+                        }
+                        i = j;
+                    }
+                }
+                let chunk = core::str::from_utf8(&bytes[start..end])
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
                 out.write_str(chunk)
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
@@ -2805,9 +2943,14 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
             }
             Ok(true)
         }
-        YamlString::Unquoted { .. }
-        | YamlString::BlockLiteral { .. }
-        | YamlString::BlockFolded { .. } => Ok(false),
+        YamlString::BlockLiteral { .. } | YamlString::BlockFolded { .. } => {
+            // Block scalars are always strings (yq/JSON semantics): no type
+            // detection, and empty content is "" rather than null (#222)
+            let decoded = s.as_str()?;
+            stream_json_string(out, &decoded).map_err(|_| YamlStringError::InvalidUtf8)?;
+            Ok(true)
+        }
+        YamlString::Unquoted { .. } => Ok(false),
     }
 }
 
@@ -3757,7 +3900,16 @@ fn decode_double_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
                 while i < bytes.len() && !matches!(bytes[i], b'\\' | b'\n' | b'\r') {
                     i += 1;
                 }
-                let chunk = core::str::from_utf8(&bytes[start..i])
+                // Trailing literal whitespace folds away before a literal
+                // line break; escaped whitespace was pushed by the escape
+                // arms and is never trimmed
+                let mut end = i;
+                if i < bytes.len() && matches!(bytes[i], b'\r' | b'\n') {
+                    while end > start && matches!(bytes[end - 1], b' ' | b'\t') {
+                        end -= 1;
+                    }
+                }
+                let chunk = core::str::from_utf8(&bytes[start..end])
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
                 result.push_str(chunk);
             }
@@ -3797,7 +3949,15 @@ fn decode_single_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
                 {
                     i += 1;
                 }
-                let chunk = core::str::from_utf8(&bytes[start..i])
+                // Trailing literal whitespace folds away before a literal
+                // line break
+                let mut end = i;
+                if i < bytes.len() && matches!(bytes[i], b'\r' | b'\n') {
+                    while end > start && matches!(bytes[end - 1], b' ' | b'\t') {
+                        end -= 1;
+                    }
+                }
+                let chunk = core::str::from_utf8(&bytes[start..end])
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
                 result.push_str(chunk);
             }
@@ -3811,17 +3971,15 @@ fn decode_single_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
 /// Returns the new position after processing the line break(s).
 ///
 /// Rules:
-/// - Trim trailing whitespace from the previous line (already in result)
 /// - Skip the line break
 /// - Count consecutive empty lines (they become \n)
 /// - Skip leading whitespace on the continuation line
 /// - Add a space for the line break (or \n for each empty line)
+///
+/// Trailing literal whitespace before the break is trimmed by the callers;
+/// escaped whitespace already in `result` is content and must not be
+/// trimmed here.
 fn fold_quoted_line_break(bytes: &[u8], mut i: usize, result: &mut String) -> usize {
-    // Trim trailing whitespace from what we've accumulated
-    while result.ends_with(' ') || result.ends_with('\t') {
-        result.pop();
-    }
-
     // Skip the first line break
     if bytes[i] == b'\r' {
         i += 1;
@@ -4438,6 +4596,35 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 }
 
+impl<'a, W: AsRef<[u64]>> YamlValue<'a, W> {
+    /// Mapping-key text under yq/JSON semantics (issue #222).
+    ///
+    /// A key is always emitted as a string. Unlike a value, a key is never
+    /// type-inferred and an entry with a complex key is never dropped:
+    /// - `String` → its decoded content (raw; no `null`/bool/number coercion)
+    /// - `Alias` whose target resolves to a scalar string → that string
+    /// - anything else (mapping, sequence, null, error, unresolved or
+    ///   non-scalar alias) → `""`
+    ///
+    /// Never fails; returns `""` rather than erroring so keys are never lost.
+    pub fn key_string(&self) -> Cow<'a, str> {
+        match self {
+            YamlValue::String(s) => s.as_str().unwrap_or(Cow::Borrowed("")),
+            YamlValue::Alias {
+                target: Some(target),
+                ..
+            } => {
+                if let YamlValue::String(s) = target.value() {
+                    s.as_str().unwrap_or(Cow::Borrowed(""))
+                } else {
+                    Cow::Borrowed("")
+                }
+            }
+            _ => Cow::Borrowed(""),
+        }
+    }
+}
+
 impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
     type Cursor = YamlCursor<'a, W>;
     type Fields = YamlFields<'a, W>;
@@ -4526,6 +4713,12 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
             }
             _ => None,
         }
+    }
+
+    fn key_string(&self) -> Option<Cow<'_, str>> {
+        // Keys are never dropped and never type-inferred (issue #222):
+        // complex keys stringify to "" rather than resolving to None.
+        Some(YamlValue::key_string(self))
     }
 
     fn as_object(&self) -> Option<Self::Fields> {
@@ -4643,6 +4836,25 @@ fn write_yaml_indent<Out: core::fmt::Write>(out: &mut Out, spaces: usize) -> cor
 }
 
 /// Stream a YAML string value with smart quoting.
+/// Write a non-`String` mapping key as a YAML scalar (issue #222).
+///
+/// Resolves an alias-to-scalar key to its content with smart quoting;
+/// any other complex key (mapping, sequence, null, error, unresolved or
+/// non-scalar alias) becomes `""`. The entry is kept, never dropped.
+#[cold]
+#[inline(never)]
+fn stream_yaml_nonstring_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
+    out: &mut Out,
+    key: &YamlValue<'_, W>,
+) -> core::fmt::Result {
+    let s = key.key_string();
+    if needs_yaml_quoting(&s) {
+        stream_yaml_double_quoted(out, &s)
+    } else {
+        out.write_str(&s)
+    }
+}
+
 fn stream_yaml_string_value<Out: core::fmt::Write>(
     out: &mut Out,
     s: &YamlString<'_>,
@@ -5078,6 +5290,158 @@ mod tests {
         index.root(yaml).stream_json_document(&mut out).unwrap();
         assert!(out.contains("\"i\":123"), "got {out}");
         assert!(out.contains("\"f\":1.5"), "got {out}");
+    }
+
+    /// Issue #222: mapping keys are always strings and never dropped. An
+    /// alias key resolves to its anchored scalar (26DV, E76Z); a complex
+    /// (sequence/mapping/null) key becomes "" but keeps its entry. Both
+    /// emitter twins must produce identical JSON.
+    #[test]
+    fn test_mapping_keys_resolve_and_are_never_dropped() {
+        let cases: &[(&[u8], &str)] = &[
+            // Alias key resolves to the anchored scalar
+            (
+                b"top1:\n  key1: &a scalar1\ntop3:\n  *a : scalar3\n",
+                "{\"top1\":{\"key1\":\"scalar1\"},\"top3\":{\"scalar1\":\"scalar3\"}}",
+            ),
+            // E76Z: alias keys both directions
+            (b"&a a: &b b\n*b : *a\n", "{\"a\":\"b\",\"b\":\"a\"}"),
+            // Complex (sequence) key -> "" but the entry survives
+            (
+                b"{a: [b, c], [d, e]: f}\n",
+                "{\"a\":[\"b\",\"c\"],\"\":\"f\"}",
+            ),
+            // Explicit null key -> "" (kept)
+            (b"? []\n: x\n", "{\"\":\"x\"}"),
+        ];
+
+        for (yaml, expected) in cases {
+            let index = YamlIndex::build(yaml).unwrap();
+            let json = index.root(yaml).to_json_document();
+            let mut streamed = String::new();
+            index
+                .root(yaml)
+                .stream_json_document(&mut streamed)
+                .unwrap();
+            let input = core::str::from_utf8(yaml).unwrap();
+            assert_eq!(json, *expected, "to_json mismatch for {input:?}");
+            assert_eq!(streamed, *expected, "stream_json mismatch for {input:?}");
+        }
+    }
+
+    /// Issue #222: block scalars are always strings — never type-inferred
+    /// (`|- 123` is "123", not 123) and never null when empty (K858,
+    /// 2G84/02). Both emitter twins must agree.
+    #[test]
+    fn test_block_scalars_are_always_strings() {
+        let cases: &[(&[u8], &str)] = &[
+            (b"a: |-\n  123\n", "{\"a\":\"123\"}"),
+            (b"a: |-\n  true\n", "{\"a\":\"true\"}"),
+            (b"a: >-\n  null\n", "{\"a\":\"null\"}"),
+            // K858: empty block scalars are "" (and keep chomping preserves \n)
+            (
+                b"strip: >-\n\nclip: >\n\nkeep: |+\n\n",
+                "{\"strip\":\"\",\"clip\":\"\",\"keep\":\"\\n\"}",
+            ),
+        ];
+
+        for (yaml, expected) in cases {
+            let index = YamlIndex::build(yaml).unwrap();
+            let json = index.root(yaml).to_json_document();
+            let mut streamed = String::new();
+            index
+                .root(yaml)
+                .stream_json_document(&mut streamed)
+                .unwrap();
+            let input = core::str::from_utf8(yaml).unwrap();
+            assert_eq!(json, *expected, "to_json mismatch for {input:?}");
+            assert_eq!(streamed, *expected, "stream_json mismatch for {input:?}");
+        }
+    }
+
+    /// Issue #222: quoted-string line folding must drop trailing *literal*
+    /// whitespace before a literal line break while preserving *escaped*
+    /// whitespace as content, and all three decoders — `as_str` (DOM),
+    /// `to_json_document` (String twin), `stream_json_document` (stream twin)
+    /// — must agree. Expected values are pinned by the YAML Test Suite
+    /// (DE56, NP9H, 6WPF, 7A4E, PRH3, NAT4) and mikefarah/yq v4.53.3.
+    #[test]
+    fn test_quoted_fold_whitespace_three_decoders_agree() {
+        let cases: &[(&[u8], &str)] = &[
+            // DE56: escaped tabs (\t and \<TAB>) are content and survive the
+            // fold; literal tabs/spaces before the break fold away
+            (b"\"1 trailing\\t\n    tab\"", "1 trailing\t tab"),
+            (b"\"2 trailing\\t  \n    tab\"", "2 trailing\t tab"),
+            (b"\"3 trailing\\\t\n    tab\"", "3 trailing\t tab"),
+            (b"\"4 trailing\\\t  \n    tab\"", "4 trailing\t tab"),
+            (b"\"5 trailing\t\n    tab\"", "5 trailing tab"),
+            (b"\"6 trailing\t  \n    tab\"", "6 trailing tab"),
+            // NP9H: literal tab before an escaped line break is content
+            (
+                b"\"folded \nto a space,\t\n \nto a line feed, or \t\\\n \\ \tnon-content\"",
+                "folded to a space,\nto a line feed, or \t \tnon-content",
+            ),
+            // 6WPF: flow folding with empty lines
+            (b"\"\n  foo \n \n    bar\n\n  baz\n\"", " foo\nbar\nbaz "),
+            // 7A4E / PRH3: trailing space folds, leading tab on the
+            // continuation line is indentation
+            (
+                b"\" 1st non-empty\n\n 2nd non-empty \n\t3rd non-empty \"",
+                " 1st non-empty\n2nd non-empty 3rd non-empty ",
+            ),
+            (
+                b"' 1st non-empty\n\n 2nd non-empty \n\t3rd non-empty '",
+                " 1st non-empty\n2nd non-empty 3rd non-empty ",
+            ),
+            // NAT4: whitespace-only quoted strings
+            (b"'  \n  '", " "),
+            (b"\"  \n  \"", " "),
+            (b"'\n\n  '", "\n"),
+            // Escaped space before a fold is content (yq v4.53.3)
+            (b"\"x\\ \ny\"", "x  y"),
+            // Mid-line literal whitespace is content (yq v4.53.3)
+            (b"\"a\tb\nc\"", "a\tb c"),
+            (b"'a \t\nb'", "a b"),
+        ];
+
+        for (yaml, expected) in cases {
+            let index = YamlIndex::build(yaml).unwrap();
+
+            // DOM decoder (as_str)
+            match first_doc(index.root(yaml)) {
+                YamlValue::String(s) => {
+                    assert_eq!(
+                        &*s.as_str().unwrap(),
+                        *expected,
+                        "as_str mismatch for {:?}",
+                        core::str::from_utf8(yaml).unwrap()
+                    );
+                }
+                other => panic!("expected string document, got {other:?}"),
+            }
+
+            // String twin vs stream twin vs independently escaped expected
+            let json = index.root(yaml).to_json_document();
+            let mut streamed = String::new();
+            index
+                .root(yaml)
+                .stream_json_document(&mut streamed)
+                .unwrap();
+            let mut expected_json = String::new();
+            write_json_string(&mut expected_json, expected);
+            assert_eq!(
+                json,
+                expected_json,
+                "to_json mismatch for {:?}",
+                core::str::from_utf8(yaml).unwrap()
+            );
+            assert_eq!(
+                streamed,
+                expected_json,
+                "stream_json mismatch for {:?}",
+                core::str::from_utf8(yaml).unwrap()
+            );
+        }
     }
 
     /// Values ≥ 16 bytes with multibyte UTF-8, long enough to enter the SIMD
