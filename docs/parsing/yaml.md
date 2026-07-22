@@ -2654,7 +2654,7 @@ let output_bits = (phi >> (state * 8)) & 0x07;
 
 **Benefit:** Branch-free state machine, predictable memory access
 
-#### 3. **BMI2 Bit Manipulation** ([bmi2.rs](../../src/json/simd/bmi2.rs))
+#### 3. **BMI2 Bit Manipulation** ([bmi2.rs](../../src/dsv/simd/bmi2.rs))
 
 PDEP/PEXT for efficient bitmask manipulation:
 - **PEXT:** Extract bits matching mask positions
@@ -3032,7 +3032,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release --example yaml_profile
 - [SIMD x86 module](../../src/json/simd/x86.rs)
 - [AVX2 module](../../src/json/simd/avx2.rs)
 - [PFSM tables](../../src/json/pfsm_tables.rs)
-- [BMI2 utilities](../../src/json/simd/bmi2.rs)
+- [BMI2 utilities](../../src/dsv/simd/bmi2.rs)
 
 **Optimization Documentation:**
 - [SIMD techniques](../optimizations/simd.md)

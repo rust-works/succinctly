@@ -3,7 +3,7 @@
 // feature detection); every call site here is gated on `sve2::has_sve2()`.
 //! Cross-level SIMD testing to ensure all instruction set levels work correctly.
 //!
-//! This test suite explicitly tests all SIMD levels (SSE2, SSE4.2, AVX2 on
+//! This test suite explicitly tests all SIMD levels (SSE2, AVX2 on
 //! x86_64; NEON, SVE2 on aarch64) and verifies they produce identical results.
 //! Unlike regular tests which use runtime dispatch to select the best level,
 //! these tests force-test each specific level regardless of what the CPU
@@ -49,16 +49,6 @@ mod x86_simd_levels {
 
     use super::test_cases;
 
-    /// Detection guard for SSE4.2; emits a visible `SKIPPED` line when
-    /// unavailable so a fully-skipped level doesn't read as green (#193).
-    fn has_sse42() -> bool {
-        let available = is_x86_feature_detected!("sse4.2");
-        if !available {
-            eprintln!("SKIPPED simd level [sse4.2]: sse4.2 not detected (see #193)");
-        }
-        available
-    }
-
     /// Detection guard for AVX2; emits a visible `SKIPPED` line when
     /// unavailable so a fully-skipped level doesn't read as green (#193).
     fn has_avx2() -> bool {
@@ -71,7 +61,6 @@ mod x86_simd_levels {
 
     #[test]
     fn test_all_simd_levels_match_scalar_standard() {
-        let run_sse42 = has_sse42();
         let run_avx2 = has_avx2();
         for (name, json) in test_cases() {
             // Scalar reference
@@ -82,14 +71,6 @@ mod x86_simd_levels {
             assert_eq!(sse2.ib, scalar.ib, "{name}: SSE2 IB mismatch");
             assert_eq!(sse2.bp, scalar.bp, "{name}: SSE2 BP mismatch");
             assert_eq!(sse2.state, scalar.state, "{name}: SSE2 state mismatch");
-
-            // SSE4.2 (if supported)
-            if run_sse42 {
-                let sse42 = json::simd::sse42::build_semi_index_standard(json);
-                assert_eq!(sse42.ib, scalar.ib, "{name}: SSE4.2 IB mismatch");
-                assert_eq!(sse42.bp, scalar.bp, "{name}: SSE4.2 BP mismatch");
-                assert_eq!(sse42.state, scalar.state, "{name}: SSE4.2 state mismatch");
-            }
 
             // AVX2 (if supported)
             if run_avx2 {
@@ -103,7 +84,6 @@ mod x86_simd_levels {
 
     #[test]
     fn test_all_simd_levels_match_scalar_simple() {
-        let run_sse42 = has_sse42();
         let run_avx2 = has_avx2();
         for (name, json) in test_cases() {
             // Scalar reference
@@ -114,14 +94,6 @@ mod x86_simd_levels {
             assert_eq!(sse2.ib, scalar.ib, "{name}: SSE2 IB mismatch");
             assert_eq!(sse2.bp, scalar.bp, "{name}: SSE2 BP mismatch");
             assert_eq!(sse2.state, scalar.state, "{name}: SSE2 state mismatch");
-
-            // SSE4.2 (if supported)
-            if run_sse42 {
-                let sse42 = json::simd::sse42::build_semi_index_simple(json);
-                assert_eq!(sse42.ib, scalar.ib, "{name}: SSE4.2 IB mismatch");
-                assert_eq!(sse42.bp, scalar.bp, "{name}: SSE4.2 BP mismatch");
-                assert_eq!(sse42.state, scalar.state, "{name}: SSE4.2 state mismatch");
-            }
 
             // AVX2 (if supported)
             if run_avx2 {
@@ -135,21 +107,10 @@ mod x86_simd_levels {
 
     #[test]
     fn test_simd_levels_match_each_other_standard() {
-        let run_sse42 = has_sse42();
         let run_avx2 = has_avx2();
         // This test ensures all SIMD levels produce identical results to each other
         for (name, json) in test_cases() {
             let sse2 = json::simd::x86::build_semi_index_standard(json);
-
-            if run_sse42 {
-                let sse42 = json::simd::sse42::build_semi_index_standard(json);
-                assert_eq!(sse42.ib, sse2.ib, "{name}: SSE4.2 vs SSE2 IB mismatch");
-                assert_eq!(sse42.bp, sse2.bp, "{name}: SSE4.2 vs SSE2 BP mismatch");
-                assert_eq!(
-                    sse42.state, sse2.state,
-                    "{name}: SSE4.2 vs SSE2 state mismatch"
-                );
-            }
 
             if run_avx2 {
                 let avx2 = json::simd::avx2::build_semi_index_standard(json);
@@ -165,20 +126,9 @@ mod x86_simd_levels {
 
     #[test]
     fn test_simd_levels_match_each_other_simple() {
-        let run_sse42 = has_sse42();
         let run_avx2 = has_avx2();
         for (name, json) in test_cases() {
             let sse2 = json::simd::x86::build_semi_index_simple(json);
-
-            if run_sse42 {
-                let sse42 = json::simd::sse42::build_semi_index_simple(json);
-                assert_eq!(sse42.ib, sse2.ib, "{name}: SSE4.2 vs SSE2 IB mismatch");
-                assert_eq!(sse42.bp, sse2.bp, "{name}: SSE4.2 vs SSE2 BP mismatch");
-                assert_eq!(
-                    sse42.state, sse2.state,
-                    "{name}: SSE4.2 vs SSE2 state mismatch"
-                );
-            }
 
             if run_avx2 {
                 let avx2 = json::simd::avx2::build_semi_index_simple(json);
@@ -197,7 +147,7 @@ mod x86_simd_levels {
         let run_avx2 = has_avx2();
         // Test inputs that align with and cross SIMD chunk boundaries
 
-        // Exactly 16 bytes (SSE2/SSE4.2 boundary)
+        // Exactly 16 bytes (SSE2 boundary)
         let json_16 = br#"{"ab":"cdefghi"}"#;
         assert_eq!(json_16.len(), 16);
 
@@ -342,12 +292,6 @@ mod per_byte_differential {
         #[cfg(target_arch = "x86_64")]
         {
             backends.push(("sse2", Box::new(json::simd::x86::build_semi_index_standard)));
-            if is_x86_feature_detected!("sse4.2") {
-                backends.push((
-                    "sse4.2",
-                    Box::new(json::simd::sse42::build_semi_index_standard),
-                ));
-            }
             if is_x86_feature_detected!("avx2") {
                 backends.push((
                     "avx2",
@@ -376,12 +320,6 @@ mod per_byte_differential {
         #[cfg(target_arch = "x86_64")]
         {
             backends.push(("sse2", Box::new(json::simd::x86::build_semi_index_simple)));
-            if is_x86_feature_detected!("sse4.2") {
-                backends.push((
-                    "sse4.2",
-                    Box::new(json::simd::sse42::build_semi_index_simple),
-                ));
-            }
             if is_x86_feature_detected!("avx2") {
                 backends.push(("avx2", Box::new(json::simd::avx2::build_semi_index_simple)));
             }

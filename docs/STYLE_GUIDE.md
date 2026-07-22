@@ -103,10 +103,8 @@ src/json/
 ├── ...
 └── simd/
     ├── mod.rs      # runtime dispatch + feature detection (see STYLE-0003)
-    ├── x86.rs      # x86_64 dispatch entry
+    ├── x86.rs      # x86_64 SSE2 kernel + dispatch entry
     ├── avx2.rs     # AVX2 kernel
-    ├── sse42.rs    # SSE4.2 kernel
-    ├── bmi2.rs     # BMI2 (PDEP/PEXT) kernel
     ├── neon.rs     # ARM NEON kernel
     └── sve2.rs     # ARM SVE2 kernel
 ```

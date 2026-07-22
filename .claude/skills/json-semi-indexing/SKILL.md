@@ -45,8 +45,6 @@ _mm256_movemask_epi8(cmp)      // AVX2: Extract as u32 bitmask
 #[cfg(target_arch = "x86_64")]
 if is_x86_feature_detected!("avx2") {
     avx2::build_semi_index_standard(json)
-} else if is_x86_feature_detected!("sse4.2") {
-    sse42::build_semi_index_standard(json)
 } else {
     x86::build_semi_index_standard(json)  // SSE2 fallback
 }

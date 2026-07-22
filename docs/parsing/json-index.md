@@ -20,7 +20,7 @@ After indexing, a cursor API navigates the document structure in O(1) per step, 
 
 ```mermaid
 graph TD
-    A[JSON bytes] --> B[SIMD Character Classification\nAVX2 / SSE4.2 / NEON]
+    A[JSON bytes] --> B[SIMD Character Classification\nAVX2 / SSE2 / NEON]
     B --> C[PFSM State Machine\n4-state: InJson, InString, InEscape, InValue]
     C --> D[BitWriter]
     D --> E[IB bits, BP bits]
@@ -41,9 +41,8 @@ Before the state machine runs, SIMD identifies structural characters in parallel
 | Platform | Width              | Throughput                             |
 |----------|--------------------|----------------------------------------|
 | AVX2     | 32 bytes/iteration | ~880 MiB/s                             |
-| SSE4.2   | 16 bytes/iteration | —                                      |
+| SSE2     | 16 bytes/iteration | —                                      |
 | NEON     | 16 bytes/iteration | —                                      |
-| BMI2     | Bit manipulation   | Used for PDEP/PEXT in post-processing  |
 
 Based on [simdjson](https://arxiv.org/abs/1902.08318) (Langdale & Lemire 2019).
 
@@ -98,6 +97,6 @@ let name: &str = cursor.as_str();
 ## Source & Docs
 
 - Implementation: [src/json/](../../src/json/) (mod.rs, pfsm_optimized.rs, bit_writer.rs, validate.rs)
-- SIMD variants: [src/json/simd/](../../src/json/simd/) (avx2.rs, sse42.rs, neon.rs, bmi2.rs, sve2.rs)
+- SIMD variants: [src/json/simd/](../../src/json/simd/) (avx2.rs, x86.rs, neon.rs, sve2.rs)
 - Parsing doc: [json.md](json.md)
 - Benchmark: [benchmarks/jq.md](../benchmarks/jq.md), [benchmarks/rust-parsers.md](../benchmarks/rust-parsers.md)

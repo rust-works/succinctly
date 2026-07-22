@@ -217,11 +217,10 @@ fn state_machine(c: u8, state: State) -> (State, Phi) {
 
 /// Build a semi-index from JSON bytes using the Standard Cursor algorithm.
 ///
-/// This function automatically selects the best implementation based on available
-/// CPU features:
-/// 1. **PFSM (Parallel Finite State Machine)**: Fastest - table-driven approach (40-77% faster than scalar)
-/// 2. **AVX2 SIMD**: Fast - 256-bit vector processing (x86_64 only)
-/// 3. **Scalar fallback**: Portable - direct state machine implementation
+/// Always uses the PFSM (Parallel Finite State Machine) implementation - a
+/// table-driven approach that is 40-77% faster than the scalar state machine
+/// and requires no special CPU features. The direct state machine is available
+/// separately as [`build_semi_index_scalar`].
 ///
 /// # Example
 ///

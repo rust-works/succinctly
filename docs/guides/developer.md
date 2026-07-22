@@ -36,7 +36,6 @@ src/
 │   └── simd/              # SIMD implementations
 │       ├── mod.rs         # Runtime dispatch
 │       ├── avx2.rs        # AVX2 (32 bytes/iter)
-│       ├── sse42.rs       # SSE4.2 with PCMPISTRI
 │       ├── x86.rs         # SSE2 baseline
 │       └── neon.rs        # ARM NEON
 ├── jq/                 # jq query language
@@ -208,8 +207,6 @@ perf report
 {
     if is_x86_feature_detected!("avx2") {
         // Use AVX2 path
-    } else if is_x86_feature_detected!("sse4.2") {
-        // Use SSE4.2 path
     } else {
         // Use SSE2 baseline
     }
