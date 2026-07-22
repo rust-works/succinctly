@@ -363,15 +363,14 @@ data[offset..].iter().position(|&b| b == target)
        └── sve2.rs          # New: YAML with predication
    ```
 
-3. **Add CI for SVE2 testing**
-   ```yaml
-   # .github/workflows/ci.yml
-   jobs:
-     test-arm64-sve2:
-       runs-on: ubuntu-24.04-arm
-       steps:
-         - run: cargo test --features simd,sve2
-   ```
+3. **Add CI for SVE2 testing** — done, via the existing `Test (ARM64)` job
+   rather than a dedicated one (#192/#194). The `ubuntu-24.04-arm` runner
+   (Neoverse-N2) hard-verifies `svebitperm` in cpuinfo and pins
+   `SUCCINCTLY_EXPECT_SIMD=neon,sve2,sve2-bitperm`, so the SVE2 suites assert
+   rather than self-skip; a dedicated step re-runs the suite with
+   `SUCCINCTLY_SVE2=1` to cover the JSON SVE2 dispatch. Local validation on
+   Apple Silicon (no SVE2) uses `scripts/test-sve2-qemu.sh` (QEMU `-cpu max`
+   emulation). See CONTRIBUTING.md ("SIMD CI coverage").
 
 ### Phase 2: BDEP Implementation (High Priority)
 

@@ -100,6 +100,13 @@ opt-in for JSON but always-on elsewhere when the CPU supports it.
 
 The value is read **once per process**, on first use, and cached. Changing it mid-run has no effect.
 
+How this path is validated (#194): the ARM64 CI job runs the full `--features simd` suite once more
+with `SUCCINCTLY_SVE2=1` on its Neoverse-N2 runner (the only routine coverage of the JSON SVE2
+dispatch — the plain runs cover the always-on `sve2-bitperm` kernels). Apple Silicon has no
+non-streaming SVE2, so locally the equivalent check is
+[`scripts/test-sve2-qemu.sh`](../../scripts/test-sve2-qemu.sh), which runs the suite under
+`qemu-aarch64 -cpu max` emulation. See CONTRIBUTING.md ("SIMD CI coverage").
+
 ### `TZ`
 
 Sets the timezone used by the jq `localtime` and `mktime` family of date builtins
@@ -152,8 +159,10 @@ Unknown names — including names for the *other* architecture — fail the test
 silently satisfy the expectation. Unset, the check is skipped entirely.
 
 ```bash
-# What CI sets on the x86_64 test legs (.github/workflows/ci.yml)
-SUCCINCTLY_EXPECT_SIMD=sse2,sse4.2,avx2,bmi2,popcnt cargo test --test simd_expectation_tests
+# What CI sets per test leg (.github/workflows/ci.yml)
+SUCCINCTLY_EXPECT_SIMD=sse2,sse4.2,avx2,bmi2,popcnt cargo test --test simd_expectation_tests  # x86_64
+SUCCINCTLY_EXPECT_SIMD=neon,sve2,sve2-bitperm cargo test --test simd_expectation_tests       # ARM64 Linux
+SUCCINCTLY_EXPECT_SIMD=neon cargo test --test simd_expectation_tests                         # macOS ARM64
 ```
 
 ## CLI Variables

@@ -168,6 +168,13 @@ jobs:
     name: Test (ARM64)
     needs: gate
     runs-on: ubuntu-24.04-arm
+    env:
+      # ARM SIMD CI leg (#194, mirroring the x86 pattern from #193): the SVE2
+      # suites self-skip (with a visible `SKIPPED` line) when a CPU feature is
+      # missing, so this pins the runner contract —
+      # tests/simd_expectation_tests.rs fails the leg if any listed feature
+      # stops being detected, instead of the suites silently skipping.
+      SUCCINCTLY_EXPECT_SIMD: neon,sve2,sve2-bitperm
     steps:
       - uses: actions/checkout@v4
         if: needs.gate.outputs.code == 'true'
@@ -223,6 +230,15 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo test --verbose --features simd
 
+      # SUCCINCTLY_SVE2=1 switches JSON semi-index building to the SVE2
+      # kernels (src/json/simd/mod.rs use_sve2()); DSV and broadword SVE2 are
+      # always-on via sve2-bitperm detection and covered by the runs above.
+      # Without this step the JSON SVE2 dispatch has no routine CI coverage
+      # (#194). Neoverse-N2 provides sve2, so use_sve2() is true here.
+      - name: Run tests (simd feature, JSON SVE2 dispatch)
+        if: needs.gate.outputs.code == 'true'
+        run: SUCCINCTLY_SVE2=1 cargo test --verbose --features simd
+
       - name: Run tests (portable-popcount feature)
         if: needs.gate.outputs.code == 'true'
         run: cargo test --verbose --features portable-popcount
@@ -231,6 +247,12 @@ jobs:
     name: Test (macOS ARM64)
     needs: gate
     runs-on: macos-latest
+    env:
+      # Apple Silicon has NEON but no SVE/SVE2, so only NEON is pinned; the
+      # SVE2 suites are *expected* to print `SKIPPED` lines on this leg. SVE2
+      # coverage comes from the ARM64 Linux leg above (and locally via
+      # scripts/test-sve2-qemu.sh, #194).
+      SUCCINCTLY_EXPECT_SIMD: neon
     steps:
       - uses: actions/checkout@v4
         if: needs.gate.outputs.code == 'true'

@@ -59,7 +59,8 @@ pub fn popcount_512_scalar(data: &[u8; 64]) -> u32 {
 /// anything. Routing every skip through this helper makes the skips visible and
 /// countable (grep the test output for `SKIPPED`), so a fully-skipped SIMD suite
 /// no longer looks green. See #191; wired into the x86 BMI2/AVX2/POPCNT sites
-/// (#193), with the remaining SVE2 sites tracked in #194.
+/// (#193) and the aarch64 SVE2 sites (#194) via each test module's local
+/// feature-guard helper.
 ///
 /// CI additionally pins the expected feature set hard via the
 /// `SUCCINCTLY_EXPECT_SIMD` expectation test (`tests/simd_expectation_tests.rs`),

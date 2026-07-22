@@ -69,7 +69,10 @@ fn toggle64_backends() -> Vec<(&'static str, Builder)> {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // SVE2-BITPERM is absent on Apple Silicon; runs on Neoverse CI (#194).
+        // SVE2-BITPERM is absent on Apple Silicon; validated on the
+        // Neoverse-N2 CI runner and locally under emulation via
+        // scripts/test-sve2-qemu.sh (#194). `build_index_sve2` uses BDEP, so
+        // this gates on the exact `sve2-bitperm` feature it requires.
         if std::arch::is_aarch64_feature_detected!("sve2-bitperm") {
             backends.push(("sve2", succinctly::dsv::simd::sve2::build_index_simd));
         } else {
