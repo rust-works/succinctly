@@ -1,0 +1,30 @@
+# Known divergences of `succinctly jq` from the pinned-jq golden fixtures.
+#
+# Consumed by tests/jq_golden_tests.rs. One line per failing case:
+#
+#   <case>            <category>        <reason — #issue>
+#
+# <case> is a directory name under tests/data/jq-golden/cases/. Columns are
+# whitespace-separated; `#` lines and blank lines are ignored.
+#
+# The check is two-sided: a case failing without a line here fails the build,
+# and a line here for a case that now passes also fails the build — so every
+# fix is forced to shrink this file, and no divergence can hide. The goldens
+# themselves always hold the correct (pinned jq) output; only this manifest
+# records where succinctly currently disagrees. See
+# tests/data/yq-golden-known-failures.txt for the sibling manifest.
+#
+# Seeded from the #300 initial capture: 8 of 41 cases diverge from jq-1.7.1.
+# Six map to enumerated jq issues; two were surfaced by this capture itself and
+# filed fresh — format_csv (#306) and index_oob_null (#307, whose CLI path
+# still errors despite the closed #157) — exactly the systematic bug-surfacing
+# #300 anticipated.
+
+alt_multi_output   alternative   `//` inspects only the first output of its LHS — #160
+assign_rhs_root    assignment    compound-assign RHS evaluated against the sub-value, not the root — #159
+collect_map_pipe   iterator      `[.[] | f]` collects to `[]` (eval_pipe drops Owned/ManyOwned) — #295
+comma_in_index     parser        comma generator rejected inside index brackets — #155
+format_csv         format        @csv omits quotes on plain string fields; jq always quotes strings — #306
+index_oob_null     indexing      out-of-bounds array index errors instead of returning null — #307 (CLI path still errors despite closed #157)
+int_float_eq       equality      `1 == 1.0` is false (Int vs Float derived PartialEq) — #156
+try_catch_error    try-catch     catch runs on the input and discards the error value — #158
