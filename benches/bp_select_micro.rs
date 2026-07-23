@@ -31,7 +31,7 @@ fn generate_bp(num_opens: usize, seed: u64) -> Vec<u64> {
 
         let is_open = if can_open && can_close {
             // Random choice, but bias toward opens if depth is low
-            rng.gen_bool(0.5 + 0.1 * (1.0 - depth as f64 / num_opens as f64).max(0.0))
+            rng.random_bool(0.5 + 0.1 * (1.0 - depth as f64 / num_opens as f64).max(0.0))
         } else {
             can_open
         };
@@ -59,7 +59,7 @@ fn bench_select1_with_select(c: &mut Criterion) {
 
         // Generate random queries
         let mut rng = ChaCha8Rng::seed_from_u64(123);
-        let queries: Vec<usize> = (0..10000).map(|_| rng.gen_range(0..num_opens)).collect();
+        let queries: Vec<usize> = (0..10000).map(|_| rng.random_range(0..num_opens)).collect();
 
         group.bench_with_input(
             BenchmarkId::new("select1", format!("{}k", num_opens / 1000)),

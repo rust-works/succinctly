@@ -581,7 +581,7 @@ fn bench_select_patterns(c: &mut Criterion) {
     use rand_chacha::ChaCha8Rng;
     let mut rng = ChaCha8Rng::seed_from_u64(42);
     let random_queries: Vec<usize> = (0..10_000)
-        .map(|_| rng.gen_range(0..total_ones as usize))
+        .map(|_| rng.random_range(0..total_ones as usize))
         .collect();
 
     let mut group = c.benchmark_group("select_patterns");

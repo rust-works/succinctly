@@ -22,10 +22,10 @@ fn generate_bp_to_text(n: usize, seed: u64) -> Vec<u32> {
     for _ in 0..n {
         values.push(pos);
         // Varying gaps: small for scalars (10-30), larger for containers (50-150)
-        let gap = if rng.gen_bool(0.8) {
-            rng.gen_range(10..30) // 80% small gaps (scalar values)
+        let gap = if rng.random_bool(0.8) {
+            rng.random_range(10..30) // 80% small gaps (scalar values)
         } else {
-            rng.gen_range(50..150) // 20% larger gaps (containers)
+            rng.random_range(50..150) // 20% larger gaps (containers)
         };
         pos = pos.saturating_add(gap);
     }
@@ -36,7 +36,7 @@ fn generate_bp_to_text(n: usize, seed: u64) -> Vec<u32> {
 /// Generate random query indices.
 fn generate_queries(count: usize, max: usize, seed: u64) -> Vec<usize> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    (0..count).map(|_| rng.gen_range(0..max)).collect()
+    (0..count).map(|_| rng.random_range(0..max)).collect()
 }
 
 fn bench_construction(c: &mut Criterion) {

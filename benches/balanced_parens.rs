@@ -31,7 +31,7 @@ fn generate_balanced_parens(node_count: usize, max_depth: usize, seed: u64) -> (
             depth -= 1;
         } else {
             // Random choice, biased towards opening to create varied structures
-            if rng.gen_bool(0.55) {
+            if rng.random_bool(0.55) {
                 bits.push(true);
                 depth += 1;
             } else {
@@ -98,7 +98,7 @@ fn generate_open_queries(bp: &BalancedParens, count: usize, seed: u64) -> Vec<us
     let len = bp.len();
 
     while queries.len() < count {
-        let pos = rng.gen_range(0..len);
+        let pos = rng.random_range(0..len);
         if bp.is_open(pos) {
             queries.push(pos);
         }
@@ -114,7 +114,7 @@ fn generate_close_queries(bp: &BalancedParens, count: usize, seed: u64) -> Vec<u
     let len = bp.len();
 
     while queries.len() < count {
-        let pos = rng.gen_range(0..len);
+        let pos = rng.random_range(0..len);
         if bp.is_close(pos) {
             queries.push(pos);
         }

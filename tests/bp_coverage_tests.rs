@@ -526,8 +526,8 @@ mod cross_verification_tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         for _ in 0..100 {
-            let num_words = rng.gen_range(1..=4);
-            let words: Vec<u64> = (0..num_words).map(|_| rng.r#gen()).collect();
+            let num_words = rng.random_range(1..=4);
+            let words: Vec<u64> = (0..num_words).map(|_| rng.random()).collect();
             let len = num_words * 64;
             verify_implementations(words, len);
         }
@@ -538,15 +538,15 @@ mod cross_verification_tests {
         let mut rng = ChaCha8Rng::seed_from_u64(123);
 
         for _ in 0..20 {
-            let num_words = rng.gen_range(10..=100);
-            let words: Vec<u64> = (0..num_words).map(|_| rng.r#gen()).collect();
+            let num_words = rng.random_range(10..=100);
+            let words: Vec<u64> = (0..num_words).map(|_| rng.random()).collect();
             let len = num_words * 64;
 
             let bp = BalancedParens::new(words.clone(), len);
 
             // Sample positions rather than all
             for _ in 0..100 {
-                let p = rng.gen_range(0..len);
+                let p = rng.random_range(0..len);
 
                 if bp.is_open(p) {
                     let bp_result = bp.find_close(p);
@@ -563,14 +563,14 @@ mod cross_verification_tests {
 
         // Large random bitvector
         let num_words = 1024; // 64K bits
-        let words: Vec<u64> = (0..num_words).map(|_| rng.r#gen()).collect();
+        let words: Vec<u64> = (0..num_words).map(|_| rng.random()).collect();
         let len = num_words * 64;
 
         let bp = BalancedParens::new(words.clone(), len);
 
         // Sample 500 positions
         for _ in 0..500 {
-            let p = rng.gen_range(0..len);
+            let p = rng.random_range(0..len);
 
             if bp.is_open(p) {
                 let bp_result = bp.find_close(p);

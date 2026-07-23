@@ -2,4 +2,4 @@
 source: tests/cli_golden_tests.rs
 expression: output
 ---
-{"literals":[true,null,true,null,false,false,null,true,true,null,null,null,true,false,false,false,null,null,null,null,true,false,true,true,true,false,true,true,null,true,false,true,false,true,null,false,null,false,null,null,null,false,null,null,true,true,null,true,true,null,true,null,null,false,true,true,false,null,true,false,null,null,null,true,null,null,null,false,false,null,null,true,true,true,false,false,null,false,true,true,true,null,null,null,null,null,true,false,false,true,false]}
+{"literals":[true,null,true,null,null,false,false,false,null,true,false,true,true,true,true,null,false,null,null,true,false,false,false,null,false,null,null,false,null,null,true,true,null,false,true,true,true,false,true,true,null,true,false,true,true,null,false,true,false,true,false,true,true,null,false,null,false,null,null,null,false,null,null,true,true,true,null,true,true,null,true,null,null,false,true,true,false,null,true,false,false,null,null,null,null,true,true,null,null,null,false]}

@@ -15,7 +15,7 @@ fn generate_bitvec(size: usize, density: f64, seed: u64) -> BitVec {
     for _ in 0..word_count {
         let mut word = 0u64;
         for bit in 0..64 {
-            if rng.r#gen::<u64>() < threshold {
+            if rng.random::<u64>() < threshold {
                 word |= 1 << bit;
             }
         }
@@ -28,7 +28,7 @@ fn generate_bitvec(size: usize, density: f64, seed: u64) -> BitVec {
 /// Generate random query positions.
 fn generate_queries(count: usize, max: usize, seed: u64) -> Vec<usize> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    (0..count).map(|_| rng.gen_range(0..max)).collect()
+    (0..count).map(|_| rng.random_range(0..max)).collect()
 }
 
 fn bench_rank(c: &mut Criterion) {

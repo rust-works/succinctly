@@ -201,11 +201,11 @@ fn test_random_csv_matches_scalar() {
     ];
 
     for _ in 0..3000 {
-        let len = rng.gen_range(0..300);
+        let len = rng.random_range(0..300);
         let text: Vec<u8> = (0..len)
-            .map(|_| alphabet[rng.gen_range(0..alphabet.len())])
+            .map(|_| alphabet[rng.random_range(0..alphabet.len())])
             .collect();
-        let config = &configs[rng.gen_range(0..configs.len())];
+        let config = &configs[rng.random_range(0..configs.len())];
         assert_backends_match_scalar(&backends, "fuzz", &text, config);
     }
 }

@@ -71,7 +71,7 @@ fn generate_ascii(target_size: usize, seed: Option<u64>) -> Vec<u8> {
     let mut line_len = 0;
     while result.len() < target_size {
         let idx = rng.as_mut().map_or(result.len() % sentences.len(), |r| {
-            r.gen_range(0..sentences.len())
+            r.random_range(0..sentences.len())
         });
         let sentence = sentences[idx];
 
@@ -132,9 +132,9 @@ fn generate_latin(target_size: usize, seed: Option<u64>) -> Vec<u8> {
 
     let mut line_len = 0;
     while result.len() < target_size {
-        let idx = rng
-            .as_mut()
-            .map_or(result.len() % words.len(), |r| r.gen_range(0..words.len()));
+        let idx = rng.as_mut().map_or(result.len() % words.len(), |r| {
+            r.random_range(0..words.len())
+        });
         let word = words[idx];
         let word_bytes = word.as_bytes();
 
@@ -220,9 +220,9 @@ fn generate_greek_cyrillic(target_size: usize, seed: Option<u64>) -> Vec<u8> {
     let mut use_greek = true;
     while result.len() < target_size {
         let words = if use_greek { &greek[..] } else { &cyrillic[..] };
-        let idx = rng
-            .as_mut()
-            .map_or(result.len() % words.len(), |r| r.gen_range(0..words.len()));
+        let idx = rng.as_mut().map_or(result.len() % words.len(), |r| {
+            r.random_range(0..words.len())
+        });
         let word = words[idx];
         let word_bytes = word.as_bytes();
 
@@ -292,7 +292,7 @@ fn generate_cjk(target_size: usize, seed: Option<u64>) -> Vec<u8> {
     let mut line_len = 0;
     while result.len() < target_size {
         let idx = rng.as_mut().map_or(result.len() % phrases.len(), |r| {
-            r.gen_range(0..phrases.len())
+            r.random_range(0..phrases.len())
         });
         let phrase = phrases[idx];
         let phrase_bytes = phrase.as_bytes();
@@ -302,7 +302,7 @@ fn generate_cjk(target_size: usize, seed: Option<u64>) -> Vec<u8> {
             line_len = 0;
         } else if line_len > 0 {
             // CJK typically doesn't use spaces, but add occasionally
-            if rng.as_mut().is_some_and(|r| r.gen_bool(0.3)) {
+            if rng.as_mut().is_some_and(|r| r.random_bool(0.3)) {
                 result.push(b' ');
                 line_len += 1;
             }
@@ -339,7 +339,7 @@ fn generate_emoji(target_size: usize, seed: Option<u64>) -> Vec<u8> {
 
     while result.len() < target_size {
         let idx = rng.as_mut().map_or(result.len() % emojis.len(), |r| {
-            r.gen_range(0..emojis.len())
+            r.random_range(0..emojis.len())
         });
         let emoji = emojis[idx];
         let emoji_bytes = emoji.as_bytes();
@@ -352,7 +352,7 @@ fn generate_emoji(target_size: usize, seed: Option<u64>) -> Vec<u8> {
 
         // Occasionally add space or newline
         if result.len() < target_size {
-            let choice = rng.as_mut().map_or(0, |r| r.gen_range(0..10));
+            let choice = rng.as_mut().map_or(0, |r| r.random_range(0..10));
             if choice == 0 {
                 result.push(b'\n');
             } else if choice < 3 {
@@ -398,7 +398,7 @@ fn generate_mixed(target_size: usize, seed: Option<u64>) -> Vec<u8> {
     let mut line_len = 0;
     while result.len() < target_size {
         let idx = rng.as_mut().map_or(result.len() % phrases.len(), |r| {
-            r.gen_range(0..phrases.len())
+            r.random_range(0..phrases.len())
         });
         let phrase = phrases[idx];
         let phrase_bytes = phrase.as_bytes();
@@ -442,23 +442,33 @@ fn generate_all_lengths(target_size: usize, seed: Option<u64>) -> Vec<u8> {
     let four_byte = ["😀", "🎉", "🚀", "💻", "🔥", "⭐", "🌍", "💡", "🎯", "🎨"];
 
     while result.len() < target_size {
-        let choice = rng.as_mut().map_or(result.len() % 4, |r| r.gen_range(0..4));
+        let choice = rng
+            .as_mut()
+            .map_or(result.len() % 4, |r| r.random_range(0..4));
 
         let bytes: &[u8] = match choice {
             0 => {
-                let idx = rng.as_mut().map_or(0, |r| r.gen_range(0..one_byte.len()));
+                let idx = rng
+                    .as_mut()
+                    .map_or(0, |r| r.random_range(0..one_byte.len()));
                 &one_byte[idx..=idx]
             }
             1 => {
-                let idx = rng.as_mut().map_or(0, |r| r.gen_range(0..two_byte.len()));
+                let idx = rng
+                    .as_mut()
+                    .map_or(0, |r| r.random_range(0..two_byte.len()));
                 two_byte[idx].as_bytes()
             }
             2 => {
-                let idx = rng.as_mut().map_or(0, |r| r.gen_range(0..three_byte.len()));
+                let idx = rng
+                    .as_mut()
+                    .map_or(0, |r| r.random_range(0..three_byte.len()));
                 three_byte[idx].as_bytes()
             }
             _ => {
-                let idx = rng.as_mut().map_or(0, |r| r.gen_range(0..four_byte.len()));
+                let idx = rng
+                    .as_mut()
+                    .map_or(0, |r| r.random_range(0..four_byte.len()));
                 four_byte[idx].as_bytes()
             }
         };
@@ -471,7 +481,7 @@ fn generate_all_lengths(target_size: usize, seed: Option<u64>) -> Vec<u8> {
 
         // Occasionally add whitespace
         if result.len() < target_size {
-            let add_ws = rng.as_mut().map_or(0, |r| r.gen_range(0..8));
+            let add_ws = rng.as_mut().map_or(0, |r| r.random_range(0..8));
             if add_ws == 0 {
                 result.push(b'\n');
             } else if add_ws == 1 {
@@ -536,24 +546,28 @@ fn generate_log_file(target_size: usize, seed: Option<u64>) -> Vec<u8> {
         result.push(b' ');
 
         // Level
-        let level_idx = rng.as_mut().map_or(0, |r| r.gen_range(0..levels.len()));
+        let level_idx = rng.as_mut().map_or(0, |r| r.random_range(0..levels.len()));
         result.extend_from_slice(levels[level_idx].as_bytes());
         result.push(b' ');
 
         // Component
-        let comp_idx = rng.as_mut().map_or(0, |r| r.gen_range(0..components.len()));
+        let comp_idx = rng
+            .as_mut()
+            .map_or(0, |r| r.random_range(0..components.len()));
         result.push(b'[');
         result.extend_from_slice(components[comp_idx].as_bytes());
         result.push(b']');
         result.push(b' ');
 
         // Message
-        let msg_idx = rng.as_mut().map_or(0, |r| r.gen_range(0..messages.len()));
+        let msg_idx = rng
+            .as_mut()
+            .map_or(0, |r| r.random_range(0..messages.len()));
         result.extend_from_slice(messages[msg_idx].as_bytes());
         result.push(b'\n');
 
         // Advance time
-        ms += rng.as_mut().map_or(100, |r| r.gen_range(1..500));
+        ms += rng.as_mut().map_or(100, |r| r.random_range(1..500));
         if ms >= 1000 {
             ms = 0;
             second += 1;
@@ -616,7 +630,7 @@ fn generate_source_code(target_size: usize, seed: Option<u64>) -> Vec<u8> {
 
     while result.len() < target_size {
         let idx = rng.as_mut().map_or(result.len() % code_lines.len(), |r| {
-            r.gen_range(0..code_lines.len())
+            r.random_range(0..code_lines.len())
         });
         let line = code_lines[idx];
         let line_bytes = line.as_bytes();
@@ -676,12 +690,12 @@ fn generate_json_like(target_size: usize, seed: Option<u64>) -> Vec<u8> {
         }
         first = false;
 
-        let name_idx = rng.as_mut().map_or(0, |r| r.gen_range(0..names.len()));
-        let city_idx = rng.as_mut().map_or(0, |r| r.gen_range(0..cities.len()));
+        let name_idx = rng.as_mut().map_or(0, |r| r.random_range(0..names.len()));
+        let city_idx = rng.as_mut().map_or(0, |r| r.random_range(0..cities.len()));
         let desc_idx = rng
             .as_mut()
-            .map_or(0, |r| r.gen_range(0..descriptions.len()));
-        let age = rng.as_mut().map_or(30, |r| r.gen_range(20..70));
+            .map_or(0, |r| r.random_range(0..descriptions.len()));
+        let age = rng.as_mut().map_or(30, |r| r.random_range(20..70));
 
         let entry = format!(
             "  {{\n    \"name\": \"{}\",\n    \"city\": \"{}\",\n    \"description\": \"{}\",\n    \"age\": {}\n  }}",
@@ -717,7 +731,7 @@ fn generate_pathological(target_size: usize, seed: Option<u64>) -> Vec<u8> {
         let idx = rng
             .as_mut()
             .map_or(result.len() % four_byte_chars.len(), |r| {
-                r.gen_range(0..four_byte_chars.len())
+                r.random_range(0..four_byte_chars.len())
             });
         let char_bytes = four_byte_chars[idx].as_bytes();
 
