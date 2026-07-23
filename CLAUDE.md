@@ -178,9 +178,9 @@ The jq implementation supports format functions for converting values to strings
 
 | Format       | Syntax              | Description                                       | Example Output      |
 |--------------|---------------------|---------------------------------------------------|---------------------|
-| **@csv**     | `@csv`              | Comma-separated values (fixed delimiter)          | `a,b,c`             |
+| **@csv**     | `@csv`              | Comma-separated values (fixed delimiter)          | `"a","b","c"`       |
 | **@tsv**     | `@tsv`              | Tab-separated values (fixed delimiter)            | `a\tb\tc`           |
-| **@dsv**     | `@dsv(delimiter)`   | Generic DSV with custom delimiter                 | `a\|b\|c`           |
+| **@dsv**     | `@dsv(delimiter)`   | Generic DSV with custom delimiter                 | `"a"\|"b"\|"c"`     |
 | **@json**    | `@json`             | JSON format                                       | `{"a":1}`           |
 | **@text**    | `@text`             | Convert to string (same as tostring)              | `42`                |
 | **@uri**     | `@uri`              | URI percent encoding                              | `hello%20world`     |
@@ -194,15 +194,15 @@ The jq implementation supports format functions for converting values to strings
 
 **@dsv(delimiter) specifics:**
 - Custom delimiters: Any single or multi-character string
-- Smart quoting: Auto-quotes fields containing delimiter, `"`, or `\n`
+- Always-quoted strings: every string field is double-quoted (matching jq's `@csv`), regardless of content; non-strings are bare and null is empty
 - CSV-compatible: `@dsv(",")` produces identical output to `@csv`
-- Escape handling: Quotes are escaped as `""`
+- Escape handling: Inner `"` is doubled (`""`)
 
 ```bash
 # Examples
-echo '["a","b","c"]' | jq -r '@dsv("|")'        # Output: a|b|c
-echo '["a","b|c","d"]' | jq -r '@dsv("|")'      # Output: a|"b|c"|d
-echo '["a","b","c"]' | jq -r '@dsv(";")'        # Output: a;b;c
+echo '["a","b","c"]' | jq -r '@dsv("|")'        # Output: "a"|"b"|"c"
+echo '["a","b|c","d"]' | jq -r '@dsv("|")'      # Output: "a"|"b|c"|"d"
+echo '["a","b","c"]' | jq -r '@dsv(";")'        # Output: "a";"b";"c"
 ```
 
 ### jq Assignment Operators
