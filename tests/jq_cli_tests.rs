@@ -2044,3 +2044,38 @@ fn test_range_zero_step_empty() -> Result<()> {
     assert_eq!(output.trim(), "[]");
     Ok(())
 }
+
+// Collecting an iterator pipe `[.[] | f]` must gather one output per element,
+// matching `map(f)` and jq — not yield `[]` (issue #295). Expected outputs
+// ground-truthed against jq-1.7.1.
+#[test]
+fn test_collect_iterator_pipe_issue_295() -> Result<()> {
+    // Array construction over a computed inner filter, and equality with map.
+    let (out, code) = run_jq_stdin("[.[] | . + 1]", r"[1,2,3]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[2,3,4]");
+    let (out_map, _) = run_jq_stdin("map(. + 1)", r"[1,2,3]", &["-c"])?;
+    assert_eq!(out.trim(), out_map.trim());
+
+    // Object value context.
+    let (out, code) = run_jq_stdin("{a: [.[] | . + 1]}", r"[1,2,3]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[2,3,4]}"#);
+
+    // Reduction over the collected pipe.
+    let (out, code) = run_jq_stdin("[.[] | . + 1] | length", r"[1,2,3]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "3");
+
+    // Owned array-construction inner filter.
+    let (out, code) = run_jq_stdin("[.[] | [.]]", r"[1,2,3]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[[1],[2],[3]]");
+
+    // first/1 over the array construction returns the single collected array.
+    let (out, code) = run_jq_stdin("first([.[] | . + 1])", r"[1,2,3]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[2,3,4]");
+
+    Ok(())
+}
