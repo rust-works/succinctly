@@ -5469,22 +5469,49 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::One(v) => eval_pipe::<W, S>(rest, v, optional),
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(values) => {
-            let mut all_results = Vec::new();
+            // Rest-of-pipe applied per element may yield borrowed (One/Many) OR
+            // computed owned (Owned/ManyOwned) results — e.g. `.+1`, `[.]`,
+            // `tostring`. Keep the borrowed fast-path (return `Many`), but the
+            // moment any owned result appears, promote the whole batch to owned
+            // so nothing is dropped (#295). Order is preserved across promotion.
+            let mut borrowed: Vec<StandardJson<'a, W>> = Vec::new();
+            let mut owned: Option<Vec<OwnedValue>> = None;
             for v in values {
                 match eval_pipe::<W, S>(rest, v, optional).materialize_cursor() {
-                    QueryResult::One(r) => all_results.push(r),
+                    QueryResult::One(r) => match owned.as_mut() {
+                        Some(acc) => acc.push(to_owned(&r)),
+                        None => borrowed.push(r),
+                    },
                     QueryResult::OneCursor(_) => unreachable!(),
-                    QueryResult::Many(rs) => all_results.extend(rs),
+                    QueryResult::Many(rs) => match owned.as_mut() {
+                        Some(acc) => acc.extend(rs.iter().map(to_owned)),
+                        None => borrowed.extend(rs),
+                    },
+                    QueryResult::Owned(r) => owned
+                        .get_or_insert_with(|| {
+                            core::mem::take(&mut borrowed)
+                                .iter()
+                                .map(to_owned)
+                                .collect()
+                        })
+                        .push(r),
+                    QueryResult::ManyOwned(rs) => owned
+                        .get_or_insert_with(|| {
+                            core::mem::take(&mut borrowed)
+                                .iter()
+                                .map(to_owned)
+                                .collect()
+                        })
+                        .extend(rs),
                     QueryResult::None => {}
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
-                    QueryResult::Owned(_) | QueryResult::ManyOwned(_) => {
-                        // TODO: Handle owned values in pipe properly
-                        // For now, skip (this would need refactoring)
-                    }
                 }
             }
-            QueryResult::Many(all_results)
+            match owned {
+                Some(acc) => QueryResult::ManyOwned(acc),
+                None => QueryResult::Many(borrowed),
+            }
         }
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
@@ -14453,8 +14480,68 @@ mod tests {
             }
         );
 
-        // Note: Piping owned values (e.g., "map(...) | add" or "keys | map(...)")
-        // requires fixing eval_pipe to handle owned values, which is deferred.
+        // Piping owned values through the rest of a pipe now works (#295):
+        // each `.+1` yields an owned value that eval_pipe's Many branch collects.
+        query!(br"[1, 2, 3]", "[.[] | . + 1] | add",
+            QueryResult::Owned(OwnedValue::Int(sum)) => {
+                assert_eq!(sum, 9);
+            }
+        );
+    }
+
+    /// Regression tests for #295: collecting an iterator pipe `[.[] | f]` must
+    /// yield one output per element (matching `map(f)` and jq), not `[]`. The
+    /// bug dropped every *computed/owned* inner result in `eval_pipe`'s `Many`
+    /// branch. Expected outputs ground-truthed against `jq-1.7.1`.
+    #[test]
+    fn test_collect_iterator_pipe() {
+        let int_arr =
+            |xs: &[i64]| OwnedValue::Array(xs.iter().map(|&i| OwnedValue::Int(i)).collect());
+
+        // [.[] | .+1] == [2,3,4] and must equal map(.+1).
+        query!(br"[1, 2, 3]", "[.[] | . + 1]",
+            QueryResult::Owned(v) => assert_eq!(v, int_arr(&[2, 3, 4])));
+        query!(br"[1, 2, 3]", "map(. + 1)",
+            QueryResult::Owned(v) => assert_eq!(v, int_arr(&[2, 3, 4])));
+
+        // [.[] | [.]] == [[1],[2],[3]] (owned array-construction inner filter).
+        query!(br"[1, 2, 3]", "[.[] | [.]]",
+        QueryResult::Owned(OwnedValue::Array(arr)) => {
+            assert_eq!(arr, vec![int_arr(&[1]), int_arr(&[2]), int_arr(&[3])]);
+        });
+
+        // [.[] | tostring] == ["1","2","3"].
+        query!(br"[1, 2, 3]", "[.[] | tostring]",
+        QueryResult::Owned(OwnedValue::Array(arr)) => {
+            assert_eq!(
+                arr,
+                vec![
+                    OwnedValue::String("1".to_string()),
+                    OwnedValue::String("2".to_string()),
+                    OwnedValue::String("3".to_string()),
+                ]
+            );
+        });
+
+        // {a: [.[] | .+1]} == {"a":[2,3,4]} (object value context).
+        query!(br"[1, 2, 3]", "{a: [.[] | . + 1]}",
+        QueryResult::Owned(OwnedValue::Object(obj)) => {
+            assert_eq!(obj.get("a"), Some(&int_arr(&[2, 3, 4])));
+        });
+
+        // [.[] | .+1] | length == 3 (reduction over the collected pipe).
+        query!(br"[1, 2, 3]", "[.[] | . + 1] | length",
+            QueryResult::Owned(OwnedValue::Int(len)) => assert_eq!(len, 3));
+
+        // first([.[] | .+1]) == [2,3,4] (jq: first of the single array output).
+        query!(br"[1, 2, 3]", "first([.[] | . + 1])",
+            QueryResult::Owned(v) => assert_eq!(v, int_arr(&[2, 3, 4])));
+
+        // [.[] | .[1:2]] == [[2],[5]] (array-slice inner filter, ref #154).
+        query!(br"[[1, 2, 3], [4, 5, 6]]", "[.[] | .[1:2]]",
+        QueryResult::Owned(OwnedValue::Array(arr)) => {
+            assert_eq!(arr, vec![int_arr(&[2]), int_arr(&[5])]);
+        });
     }
 
     // ==========================================================================
