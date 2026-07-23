@@ -1,17 +1,25 @@
 //! Detailed popcount strategy benchmarks.
 //!
-//! Compares performance across different popcount implementations:
-//! - Default: Rust's count_ones() (auto-vectorizes)
-//! - SIMD: Explicit SIMD intrinsics with AVX512-VPOPCNTDQ dispatch
-//! - Portable: Pure bitwise algorithm
+//! Compares performance across the three popcount implementations:
+//! - `scalar`: Rust's `count_ones()` — the default strategy; auto-vectorizes to
+//!   POPCNT on x86_64 and CNT on aarch64.
+//! - `portable`: pure broadword (SWAR) bitwise algorithm (`portable-popcount`).
+//! - `simd`: explicit SIMD intrinsics — AVX-512 VPOPCNTDQ dispatch on x86_64,
+//!   256-byte-unrolled NEON on aarch64.
 //!
-//! Run with:
+//! The `scalar` and `portable` arms are always measured; the `simd` arm is
+//! compiled only with `--features simd`. A single run therefore reports all
+//! three strategies side by side:
+//!
 //! - `cargo bench --bench popcount_strategies --features simd`
+//!
+//! Without `--features simd`, only `scalar` and `portable` are reported.
 
 #[cfg(feature = "simd")]
 use criterion::black_box;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
+use succinctly::popcount_word_portable;
 #[cfg(feature = "simd")]
 use succinctly::popcount_words;
 
@@ -57,7 +65,7 @@ fn bench_popcount_strategies(c: &mut Criterion) {
                 |b, words| b.iter(|| popcount_words(black_box(words))),
             );
 
-            // Always benchmark scalar as baseline
+            // Always benchmark scalar (default count_ones) as baseline
             group.bench_with_input(
                 BenchmarkId::new(format!("{size_name}/{pattern_name}"), "scalar"),
                 &words,
@@ -66,6 +74,21 @@ fn bench_popcount_strategies(c: &mut Criterion) {
                         let mut total = 0u32;
                         for &word in words {
                             total += word.count_ones();
+                        }
+                        total
+                    });
+                },
+            );
+
+            // Always benchmark the portable broadword algorithm for comparison
+            group.bench_with_input(
+                BenchmarkId::new(format!("{size_name}/{pattern_name}"), "portable"),
+                &words,
+                |b, words| {
+                    b.iter(|| {
+                        let mut total = 0u32;
+                        for &word in words {
+                            total += popcount_word_portable(word);
                         }
                         total
                     });
@@ -136,6 +159,16 @@ fn bench_throughput(c: &mut Criterion) {
             let mut total = 0u32;
             for word in &words {
                 total += word.count_ones();
+            }
+            total
+        });
+    });
+
+    group.bench_function("portable_1MB", |b| {
+        b.iter(|| {
+            let mut total = 0u32;
+            for &word in &words {
+                total += popcount_word_portable(word);
             }
             total
         });
