@@ -308,24 +308,24 @@ let expr = parse(".. | .name?").unwrap();
 Format functions convert values to strings with specific formatting:
 
 ```rust
-// CSV format (comma-separated values)
+// CSV format (comma-separated values) — every string field is quoted (like jq)
 let expr = parse(r#"["a", "b", "c"] | @csv"#).unwrap();
-// Output: "a,b,c"
+// Output: "\"a\",\"b\",\"c\""
 
-// TSV format (tab-separated values)
+// TSV format (tab-separated values) — tabs escaped, not quoted
 let expr = parse(r#"["a", "b", "c"] | @tsv"#).unwrap();
 // Output: "a\tb\tc"
 
-// Generic DSV format with custom delimiter
+// Generic DSV format with custom delimiter — string fields always quoted
 let expr = parse(r#"["a", "b", "c"] | @dsv("|")"#).unwrap();
-// Output: "a|b|c"
+// Output: "\"a\"|\"b\"|\"c\""
 
 let expr = parse(r#"["a", "b", "c"] | @dsv(";")"#).unwrap();
-// Output: "a;b;c"
+// Output: "\"a\";\"b\";\"c\""
 
-// Auto-quoting when data contains delimiter
+// Embedded delimiter needs no extra handling — fields are already quoted
 let expr = parse(r#"["a", "b|c", "d"] | @dsv("|")"#).unwrap();
-// Output: "a|\"b|c\"|d"
+// Output: "\"a\"|\"b|c\"|\"d\""
 
 // JSON format
 let expr = parse(r#"{"name": "Alice"} | @json"#).unwrap();
@@ -357,12 +357,9 @@ let expr = parse(r#""hello world" | @sh"#).unwrap();
 The `@dsv(delimiter)` format function provides flexible delimiter-separated value output:
 
 - **Custom delimiters**: Any single or multi-character string
-- **Smart quoting**: Automatically quotes fields containing:
-  - The delimiter character
-  - Quote characters (`"`)
-  - Newlines (`\n`)
+- **Always-quoted strings**: every string field is double-quoted (matching jq's `@csv`), regardless of content; non-strings are emitted bare and null is empty
 - **CSV-compatible**: `@dsv(",")` produces identical output to `@csv`
-- **Escape handling**: Quotes in data are escaped as `""`
+- **Escape handling**: inner `"` in data is doubled (`""`)
 
 Example use cases:
 

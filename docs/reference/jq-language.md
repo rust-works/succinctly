@@ -125,7 +125,7 @@ The implementation covers ~95% of jq functionality and is production-ready.
 - [x] `@text` - Convert to string
 - [x] `@json` - JSON encoding
 - [x] `@csv` / `@tsv` - Delimited formats
-- [x] `@dsv(delimiter)` - Custom delimiter with smart quoting
+- [x] `@dsv(delimiter)` - Custom delimiter; string fields always quoted (like `@csv`)
 - [x] `@base64` / `@base64d`
 - [x] `@uri` / `@urid` - Percent encoding / decoding
 - [x] `@html` - HTML entity escaping
