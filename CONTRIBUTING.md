@@ -240,12 +240,35 @@ and asserts nothing; to validate SVE2 changes locally, run
 `qemu-aarch64 -cpu max` (SVE2 + BITPERM emulated at the 128-bit vector length
 of real Neoverse hardware) inside Docker.
 
-**Not covered by routine CI: AVX-512.** The standard x86 runners are Zen 3
-(EPYC 7763), which has no `avx512f`/`avx512vpopcntdq`, so the AVX-512 paths
-(`src/util/simd/x86.rs` `avx512f` branch, `src/bits/popcount.rs` VPOPCNTDQ)
-self-skip there. Validate changes to those paths off-CI — on AVX-512 hardware
-or under an emulator (e.g. QEMU `qemu-x86_64 -cpu max`) — and note how you
+**Not covered by routine CI: AVX-512.** The standard x86 runners usually draw
+Zen 3 (EPYC 7763) CPUs, which have no `avx512f`/`avx512vpopcntdq`, so the
+AVX-512 paths (`src/util/simd/x86.rs` `avx512f` branch,
+`src/bits/popcount.rs` VPOPCNTDQ) self-skip on most runs. The runner fleet is
+not CPU-homogeneous — an occasional host does have AVX-512 (the source of the
+coverage wobble described below) — but no run is guaranteed one, so treat the
+paths as uncovered. Validate changes to them off-CI — on AVX-512 hardware or
+under an emulator (e.g. QEMU `qemu-x86_64 -cpu max`) — and note how you
 tested in the PR.
+
+Because the AVX-512 gate is a runtime CPU check, not a `#[cfg]`, the ~30
+executable lines behind the VPOPCNTDQ dispatch in `src/bits/popcount.rs` are
+still *compiled* under `--features cli,simd,regex,serde` and counted in the
+coverage denominator — but only *executed* on a runner whose CPU has
+`avx512vpopcntdq`. The coverage job is also `ubuntu-latest` with no guaranteed
+VPOPCNTDQ (`SUCCINCTLY_EXPECT_SIMD` intentionally omits it — see the note in
+[docs/reference/environment-variables.md](docs/reference/environment-variables.md#succinctly_expect_simd)),
+so **`src/bits/popcount.rs` reports a non-deterministic x86 coverage number**:
+~93% when the run happens to draw a VPOPCNTDQ-capable host, ~66% when it
+doesn't — a ±~26pp swing driven purely by which CPU the run landed on, not by
+any code change. This is expected, not a regression. The coverage bot
+quarantines it into the "N unchanged file(s) also moved (not attributed to this
+PR)" section, it doesn't count against patch coverage on PRs that leave the
+file untouched, and the
+`fail-under-lines` gate has ~19pp of headroom over the ~74.5% total, so the
+wobble can't trip the build. If you see `popcount.rs` move by ±26pp on an
+otherwise-unrelated PR (e.g. a dependabot bump), that's this — no need to
+re-triage it. Tracked in #302; the kernel's correctness is still validated on
+capable hardware by the two host-gated tests in `popcount.rs`.
 
 ### Unsafe Code
 
