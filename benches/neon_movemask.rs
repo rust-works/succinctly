@@ -7,6 +7,7 @@
 //! - Alternative approaches (SHRN-based, etc.)
 
 use criterion::{criterion_group, criterion_main, Criterion};
+#[cfg(target_arch = "aarch64")]
 use criterion::{BenchmarkId, Throughput};
 #[cfg(target_arch = "aarch64")]
 use std::hint::black_box;
