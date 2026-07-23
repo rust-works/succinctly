@@ -300,7 +300,7 @@ fn test_100k_bits_random_pattern() {
     let mut rng = ChaCha8Rng::seed_from_u64(42);
 
     // 102,400 bits
-    let words: Vec<u64> = (0..1600).map(|_| rng.r#gen()).collect();
+    let words: Vec<u64> = (0..1600).map(|_| rng.random()).collect();
     let bv = BitVec::from_words(words.clone(), 102400);
 
     // Verify count_ones matches manual count
@@ -1030,7 +1030,7 @@ fn test_large_mixed_structure() {
         let can_close = close_count < open_count;
 
         if can_open && can_close {
-            if rng.r#gen::<bool>() {
+            if rng.random::<bool>() {
                 bits.push(true);
                 open_count += 1;
             } else {
@@ -1093,13 +1093,13 @@ fn test_million_bit_random() {
     let mut rng = ChaCha8Rng::seed_from_u64(99999);
     let num_words = 15625;
     let len = num_words * 64;
-    let words: Vec<u64> = (0..num_words).map(|_| rng.r#gen()).collect();
+    let words: Vec<u64> = (0..num_words).map(|_| rng.random()).collect();
 
     let bp = BalancedParens::new(words.clone(), len);
 
     // Sample 1000 random positions
     for _ in 0..1000 {
-        let p = rng.gen_range(0..len);
+        let p = rng.random_range(0..len);
         let bp_result = bp.find_close(p);
         let linear_result = find_close(&words, len, p);
         assert_eq!(

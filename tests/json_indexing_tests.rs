@@ -502,16 +502,16 @@ mod simd_comparison {
     ) {
         if out.len() >= max_size || depth == 0 {
             // Generate a simple value
-            match rng.gen_range(0..5) {
+            match rng.random_range(0..5) {
                 0 => out.extend_from_slice(b"null"),
                 1 => out.extend_from_slice(b"true"),
                 2 => out.extend_from_slice(b"false"),
-                3 => out.extend_from_slice(format!("{}", rng.gen_range(-100..100)).as_bytes()),
+                3 => out.extend_from_slice(format!("{}", rng.random_range(-100..100)).as_bytes()),
                 _ => {
                     out.push(b'"');
-                    let len = rng.gen_range(0..10);
+                    let len = rng.random_range(0..10);
                     for _ in 0..len {
-                        let c = rng.gen_range(b'a'..=b'z');
+                        let c = rng.random_range(b'a'..=b'z');
                         out.push(c);
                     }
                     out.push(b'"');
@@ -520,16 +520,16 @@ mod simd_comparison {
             return;
         }
 
-        match rng.gen_range(0..7) {
+        match rng.random_range(0..7) {
             0 => out.extend_from_slice(b"null"),
             1 => out.extend_from_slice(b"true"),
             2 => out.extend_from_slice(b"false"),
-            3 => out.extend_from_slice(format!("{}", rng.gen_range(-100..100)).as_bytes()),
+            3 => out.extend_from_slice(format!("{}", rng.random_range(-100..100)).as_bytes()),
             4 => {
                 out.push(b'"');
-                let len = rng.gen_range(0..10);
+                let len = rng.random_range(0..10);
                 for _ in 0..len {
-                    let c = rng.gen_range(b'a'..=b'z');
+                    let c = rng.random_range(b'a'..=b'z');
                     out.push(c);
                 }
                 out.push(b'"');
@@ -537,7 +537,7 @@ mod simd_comparison {
             5 => {
                 // Array
                 out.push(b'[');
-                let count = rng.gen_range(0..4);
+                let count = rng.random_range(0..4);
                 for i in 0..count {
                     if i > 0 {
                         out.push(b',');
@@ -549,13 +549,13 @@ mod simd_comparison {
             _ => {
                 // Object
                 out.push(b'{');
-                let count = rng.gen_range(0..3);
+                let count = rng.random_range(0..3);
                 for i in 0..count {
                     if i > 0 {
                         out.push(b',');
                     }
                     out.push(b'"');
-                    out.push(rng.gen_range(b'a'..=b'z'));
+                    out.push(rng.random_range(b'a'..=b'z'));
                     out.push(b'"');
                     out.push(b':');
                     generate_random_value(rng, out, depth - 1, max_size);

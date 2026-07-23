@@ -111,7 +111,7 @@ fn add_simple_values(json: &mut String, target_size: usize, rng: &mut Option<Cha
         }
 
         let key = format!("field_{count}");
-        let val = match rng.as_mut().map_or(count % 4, |r| r.gen_range(0..4)) {
+        let val = match rng.as_mut().map_or(count % 4, |r| r.random_range(0..4)) {
             0 => "true".to_string(),
             1 => "false".to_string(),
             2 => "null".to_string(),
@@ -164,7 +164,7 @@ fn add_string_variations(
         let use_escape = rng
             .as_mut()
             .map_or(count % 10 < (escape_density * 10.0) as usize, |r| {
-                r.r#gen::<f64>() < escape_density
+                r.random::<f64>() < escape_density
             });
 
         if use_escape {
@@ -201,7 +201,7 @@ fn add_number_variations(json: &mut String, target_size: usize, rng: &mut Option
             _ => {
                 let val = rng
                     .as_mut()
-                    .map_or(count as f64, |r| r.r#gen::<f64>() * 1000000.0 - 500000.0);
+                    .map_or(count as f64, |r| r.random::<f64>() * 1000000.0 - 500000.0);
                 format!("{val:.6}")
             }
         };
@@ -271,7 +271,7 @@ fn add_array_variations(
         }
         first = false;
         json.push('[');
-        let array_len = rng.as_mut().map_or(5, |r| r.gen_range(3..10));
+        let array_len = rng.as_mut().map_or(5, |r| r.random_range(3..10));
         for i in 0..array_len {
             if i > 0 {
                 json.push(',');
@@ -331,7 +331,7 @@ fn add_tree_structure(
         return;
     }
 
-    let num_children = rng.as_mut().map_or(3, |r| r.gen_range(2..5));
+    let num_children = rng.as_mut().map_or(3, |r| r.random_range(2..5));
 
     for i in 0..num_children {
         if i > 0 {
@@ -364,17 +364,19 @@ fn add_realistic_records(
             json.push(',');
         }
 
-        let age = rng.as_mut().map_or(25, |r| r.gen_range(18..80));
-        let score = rng.as_mut().map_or(count * 10, |r| r.gen_range(0..1000));
-        let active = rng.as_mut().map_or(count % 2 == 0, rand::Rng::gen::<bool>);
+        let age = rng.as_mut().map_or(25, |r| r.random_range(18..80));
+        let score = rng.as_mut().map_or(count * 10, |r| r.random_range(0..1000));
+        let active = rng
+            .as_mut()
+            .map_or(count % 2 == 0, rand::Rng::random::<bool>);
         let salary = rng
             .as_mut()
-            .map_or(50000.0, |r| r.r#gen::<f64>() * 200000.0);
+            .map_or(50000.0, |r| r.random::<f64>() * 200000.0);
 
         // Add escaped characters to some fields
         let name = if rng
             .as_mut()
-            .is_some_and(|r| r.r#gen::<f64>() < escape_density)
+            .is_some_and(|r| r.random::<f64>() < escape_density)
         {
             format!(r#"User \"{count}\" Smith"#)
         } else {
@@ -455,8 +457,8 @@ pub fn generate_users_json(target_size: usize, seed: Option<u64>) -> String {
             json.push(',');
         }
 
-        let age = rng.as_mut().map_or(25, |r| r.gen_range(18..80));
-        let score = rng.as_mut().map_or(i * 10, |r| r.gen_range(0..1000));
+        let age = rng.as_mut().map_or(25, |r| r.random_range(18..80));
+        let score = rng.as_mut().map_or(i * 10, |r| r.random_range(0..1000));
 
         json.push_str(&format!(
             r#"{{"id":{i},"name":"User{i}","email":"user{i}@example.com","age":{age},"active":true,"score":{score}}}"#
@@ -514,7 +516,7 @@ pub fn generate_arrays_json(target_size: usize, seed: Option<u64>) -> String {
             if j > 0 {
                 json.push(',');
             }
-            let val = rng.as_mut().map_or(j, |r| r.gen_range(0..1000));
+            let val = rng.as_mut().map_or(j, |r| r.random_range(0..1000));
             json.push_str(&val.to_string());
         }
         json.push(']');
@@ -544,7 +546,7 @@ pub fn generate_mixed_json(target_size: usize, seed: Option<u64>) -> String {
 
         let pattern_idx = rng
             .as_mut()
-            .map_or(i % patterns.len(), |r| r.gen_range(0..patterns.len()));
+            .map_or(i % patterns.len(), |r| r.random_range(0..patterns.len()));
 
         match patterns[pattern_idx] {
             "string" => json.push_str(&format!(r#""value_{i}""#)),
@@ -608,7 +610,7 @@ pub fn generate_numbers_json(target_size: usize, seed: Option<u64>) -> String {
         }
 
         let num = rng.as_mut().map_or(i as f64 * std::f64::consts::PI, |r| {
-            r.r#gen::<f64>() * 1000000.0
+            r.random::<f64>() * 1000000.0
         });
 
         json.push_str(&format!("{num:.6}"));
@@ -634,7 +636,7 @@ pub fn generate_literals_json(target_size: usize, seed: Option<u64>) -> String {
             json.push(',');
         }
 
-        let val = match rng.as_mut().map_or(count % 3, |r| r.gen_range(0..3)) {
+        let val = match rng.as_mut().map_or(count % 3, |r| r.random_range(0..3)) {
             0 => "true",
             1 => "false",
             _ => "null",

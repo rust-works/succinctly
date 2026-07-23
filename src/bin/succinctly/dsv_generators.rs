@@ -69,9 +69,13 @@ fn generate_tabular(
 
     let mut row_id = 1;
     while csv.len() < target_size {
-        let age = rng.as_mut().map_or(25, |r| r.gen_range(18..80));
-        let score = rng.as_mut().map_or(row_id * 10, |r| r.gen_range(0..10000));
-        let active = rng.as_mut().map_or(row_id % 2 == 0, rand::Rng::gen::<bool>);
+        let age = rng.as_mut().map_or(25, |r| r.random_range(18..80));
+        let score = rng
+            .as_mut()
+            .map_or(row_id * 10, |r| r.random_range(0..10000));
+        let active = rng
+            .as_mut()
+            .map_or(row_id % 2 == 0, rand::Rng::random::<bool>);
         let day = (row_id % 28) + 1;
         let month = (row_id % 12) + 1;
 
@@ -128,9 +132,11 @@ fn generate_users(
         let last = last_names[(row_id / 10) % last_names.len()];
         let city = cities[row_id % cities.len()];
         let country = countries[row_id % countries.len()];
-        let age = rng.as_mut().map_or(30, |r| r.gen_range(22..65));
-        let salary = rng.as_mut().map_or(50000, |r| r.gen_range(30000..200000));
-        let phone_suffix = rng.as_mut().map_or(1234, |r| r.gen_range(1000..9999));
+        let age = rng.as_mut().map_or(30, |r| r.random_range(22..65));
+        let salary = rng
+            .as_mut()
+            .map_or(50000, |r| r.random_range(30000..200000));
+        let phone_suffix = rng.as_mut().map_or(1234, |r| r.random_range(1000..9999));
 
         csv.push_str(&format!(
             "{}{}{}{}{}{}{}.{}@example.com{}+1-555-{:04}{}{}{}{}{}{}{}{}",
@@ -181,19 +187,19 @@ fn generate_numeric(
     while csv.len() < target_size {
         let v1: f64 = rng
             .as_mut()
-            .map_or(row_id as f64, |r| r.r#gen::<f64>() * 1000.0);
+            .map_or(row_id as f64, |r| r.random::<f64>() * 1000.0);
         let v2: f64 = rng
             .as_mut()
-            .map_or(row_id as f64 * 1.5, |r| r.r#gen::<f64>() * 1000.0);
+            .map_or(row_id as f64 * 1.5, |r| r.random::<f64>() * 1000.0);
         let v3: f64 = rng
             .as_mut()
-            .map_or(row_id as f64 * 2.0, |r| r.r#gen::<f64>() * 1000.0);
+            .map_or(row_id as f64 * 2.0, |r| r.random::<f64>() * 1000.0);
         let v4: f64 = rng
             .as_mut()
-            .map_or(row_id as f64 * 2.5, |r| r.r#gen::<f64>() * 1000.0);
+            .map_or(row_id as f64 * 2.5, |r| r.random::<f64>() * 1000.0);
         let v5: f64 = rng
             .as_mut()
-            .map_or(row_id as f64 * 3.0, |r| r.r#gen::<f64>() * 1000.0);
+            .map_or(row_id as f64 * 3.0, |r| r.random::<f64>() * 1000.0);
         let total = v1 + v2 + v3 + v4 + v5;
         let avg = total / 5.0;
 
@@ -246,21 +252,21 @@ fn generate_strings(
     let mut row_id = 1;
     while csv.len() < target_size {
         // Generate title (3-5 words)
-        let title_len = rng.as_mut().map_or(4, |r| r.gen_range(3..6));
+        let title_len = rng.as_mut().map_or(4, |r| r.random_range(3..6));
         let title: String = (0..title_len)
             .map(|i| lorem_words[(row_id + i) % lorem_words.len()])
             .collect::<Vec<_>>()
             .join(" ");
 
         // Generate description (10-20 words)
-        let desc_len = rng.as_mut().map_or(15, |r| r.gen_range(10..21));
+        let desc_len = rng.as_mut().map_or(15, |r| r.random_range(10..21));
         let description: String = (0..desc_len)
             .map(|i| lorem_words[(row_id * 2 + i) % lorem_words.len()])
             .collect::<Vec<_>>()
             .join(" ");
 
         // Generate notes (5-10 words)
-        let notes_len = rng.as_mut().map_or(7, |r| r.gen_range(5..11));
+        let notes_len = rng.as_mut().map_or(7, |r| r.random_range(5..11));
         let notes: String = (0..notes_len)
             .map(|i| lorem_words[(row_id * 3 + i) % lorem_words.len()])
             .collect::<Vec<_>>()
@@ -300,7 +306,7 @@ fn generate_quoted(
 
     let mut row_id = 1;
     while csv.len() < target_size {
-        let street_num = rng.as_mut().map_or(123, |r| r.gen_range(1..9999));
+        let street_num = rng.as_mut().map_or(123, |r| r.random_range(1..9999));
         let street = street_names[row_id % street_names.len()];
         let city = cities[row_id % cities.len()];
         let zip = 10000 + (row_id % 90000);
@@ -345,7 +351,7 @@ fn generate_multiline(
 
     let mut row_id = 1;
     while csv.len() < target_size {
-        let num_lines = rng.as_mut().map_or(3, |r| r.gen_range(2..5));
+        let num_lines = rng.as_mut().map_or(3, |r| r.random_range(2..5));
 
         // Body contains newlines, must be quoted
         let body_lines: Vec<String> = (0..num_lines)
@@ -385,7 +391,9 @@ fn generate_wide(
     while csv.len() < target_size {
         let values: Vec<String> = (0..num_columns)
             .map(|col| {
-                let val = rng.as_mut().map_or(row_id * col, |r| r.gen_range(0..1000));
+                let val = rng
+                    .as_mut()
+                    .map_or(row_id * col, |r| r.random_range(0..1000));
                 val.to_string()
             })
             .collect();
@@ -415,7 +423,7 @@ fn generate_long(
 
     let mut row_id = 1;
     while csv.len() < target_size {
-        let value = rng.as_mut().map_or(row_id, |r| r.gen_range(0..1000000));
+        let value = rng.as_mut().map_or(row_id, |r| r.random_range(0..1000000));
         csv.push_str(&format!("{row_id}{delimiter}{value}\n"));
         row_id += 1;
     }
@@ -441,11 +449,13 @@ fn generate_mixed(
 
     let mut row_id = 1;
     while csv.len() < target_size {
-        let int_val = rng.as_mut().map_or(row_id, |r| r.gen_range(-1000..1000));
+        let int_val = rng.as_mut().map_or(row_id, |r| r.random_range(-1000..1000));
         let float_val: f64 = rng
             .as_mut()
-            .map_or(row_id as f64 * 1.5, |r| r.r#gen::<f64>() * 1000.0 - 500.0);
-        let bool_val = rng.as_mut().map_or(row_id % 2 == 0, rand::Rng::gen::<bool>);
+            .map_or(row_id as f64 * 1.5, |r| r.random::<f64>() * 1000.0 - 500.0);
+        let bool_val = rng
+            .as_mut()
+            .map_or(row_id % 2 == 0, rand::Rng::random::<bool>);
         let day = (row_id % 28) + 1;
         let month = (row_id % 12) + 1;
 
@@ -478,7 +488,7 @@ fn generate_pathological(
     let mut row_id = 1;
     while csv.len() < target_size {
         // Every field contains delimiter, quotes, or both
-        let extra = rng.as_mut().map_or(row_id, |r| r.gen_range(0..100));
+        let extra = rng.as_mut().map_or(row_id, |r| r.random_range(0..100));
 
         // Field with embedded delimiter
         let field1 = format!("value{delimiter}with{extra}delimiter");

@@ -839,7 +839,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 if let Some(elements) = value.as_array() {
                     let mut values: Vec<OwnedValue> =
                         elements.collect_values().iter().map(to_owned).collect();
-                    let mut rng = ChaCha8Rng::from_entropy();
+                    let mut rng = ChaCha8Rng::from_os_rng();
                     values.shuffle(&mut rng);
                     GenericResult::Owned(OwnedValue::Array(values))
                 } else {
