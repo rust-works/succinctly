@@ -3178,13 +3178,10 @@ fn format_csv(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
             let parts: Vec<String> = arr
                 .iter()
                 .map(|v| match v {
-                    OwnedValue::String(s) => {
-                        if s.contains('"') || s.contains(',') || s.contains('\n') {
-                            format!("\"{}\"", s.replace('"', "\"\""))
-                        } else {
-                            s.clone()
-                        }
-                    }
+                    // jq unconditionally double-quotes every string field
+                    // (inner `"` doubled), regardless of whether it contains a
+                    // delimiter — see #306.
+                    OwnedValue::String(s) => format!("\"{}\"", s.replace('"', "\"\"")),
                     OwnedValue::Null => String::new(),
                     other => owned_to_string(other),
                 })
@@ -3226,14 +3223,9 @@ fn format_dsv(value: &OwnedValue, delimiter: &str, optional: bool) -> Result<Str
             let parts: Vec<String> = arr
                 .iter()
                 .map(|v| match v {
-                    OwnedValue::String(s) => {
-                        // Quote if string contains delimiter, quote, or newline
-                        if s.contains(delimiter) || s.contains('"') || s.contains('\n') {
-                            format!("\"{}\"", s.replace('"', "\"\""))
-                        } else {
-                            s.clone()
-                        }
-                    }
+                    // Match @csv: always double-quote string fields (inner `"`
+                    // doubled) so @dsv(",") stays byte-identical to @csv — #306.
+                    OwnedValue::String(s) => format!("\"{}\"", s.replace('"', "\"\"")),
                     OwnedValue::Null => String::new(),
                     other => owned_to_string(other),
                 })
@@ -14932,16 +14924,24 @@ mod tests {
 
     #[test]
     fn test_format_csv() {
+        // jq always double-quotes every string field (#306).
         query!(br#"["a", "b", "c"]"#, "@csv",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "a,b,c");
+                assert_eq!(s, r#""a","b","c""#);
             }
         );
 
-        // CSV with quotes
+        // CSV with an embedded delimiter — still one pair of quotes.
         query!(br#"["hello, world", "test"]"#, "@csv",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "\"hello, world\",test");
+                assert_eq!(s, r#""hello, world","test""#);
+            }
+        );
+
+        // Non-strings stay bare; null is empty (matches jq).
+        query!(br#"["a", "b,c", 1, true, null]"#, "@csv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, r#""a","b,c",1,true,"#);
             }
         );
     }
@@ -14959,7 +14959,7 @@ mod tests {
     fn test_format_dsv_pipe() {
         query!(br#"["a", "b", "c"]"#, r#"@dsv("|")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "a|b|c");
+                assert_eq!(s, r#""a"|"b"|"c""#);
             }
         );
     }
@@ -14968,7 +14968,7 @@ mod tests {
     fn test_format_dsv_semicolon() {
         query!(br#"["a", "b", "c"]"#, r#"@dsv(";")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "a;b;c");
+                assert_eq!(s, r#""a";"b";"c""#);
             }
         );
     }
@@ -14977,7 +14977,7 @@ mod tests {
     fn test_format_dsv_with_quoting() {
         query!(br#"["a", "b|c", "d"]"#, r#"@dsv("|")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, r#"a|"b|c"|d"#);
+                assert_eq!(s, r#""a"|"b|c"|"d""#);
             }
         );
     }
@@ -14986,7 +14986,7 @@ mod tests {
     fn test_format_dsv_with_quotes_in_data() {
         query!(br#"["a", "b\"c", "d"]"#, r#"@dsv(",")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, r#"a,"b""c",d"#);
+                assert_eq!(s, r#""a","b""c","d""#);
             }
         );
     }
@@ -14995,7 +14995,7 @@ mod tests {
     fn test_format_dsv_with_newline() {
         query!(br#"["a", "b\nc", "d"]"#, r#"@dsv(",")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "a,\"b\nc\",d");
+                assert_eq!(s, "\"a\",\"b\nc\",\"d\"");
             }
         );
     }
