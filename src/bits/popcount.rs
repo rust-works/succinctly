@@ -83,9 +83,12 @@ fn popcount_words_default(words: &[u64]) -> usize {
 
 /// Portable bitwise popcount (no intrinsics).
 ///
-/// Uses the classic parallel bit-counting algorithm.
+/// Uses the classic parallel bit-counting (broadword SWAR) algorithm. This is
+/// always compiled (not gated behind `portable-popcount`) so the popcount
+/// benchmark harness can measure the broadword strategy alongside `count_ones()`
+/// and the explicit-SIMD path in a single run; the `portable-popcount` feature
+/// only controls whether `popcount_word`/`popcount_words` dispatch to it.
 #[inline(always)]
-#[cfg(feature = "portable-popcount")]
 pub fn popcount_word_portable(mut x: u64) -> u32 {
     // Parallel bit count using magic constants
     const M1: u64 = 0x5555_5555_5555_5555; // 01010101...
