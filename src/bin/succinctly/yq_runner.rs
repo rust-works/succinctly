@@ -17,7 +17,7 @@ use succinctly::json::JsonIndex;
 use succinctly::yaml::{resolve_plain, ResolvedScalar, YamlCursor, YamlIndex, YamlValue};
 
 use super::{InputFormat, OutputFormat, YqCommand};
-use crate::output::{self, exit_codes, ColorScheme, FloatStyle, JsonFormatOpts};
+use crate::output::{self, exit_codes, ColorScheme, ControlEscape, FloatStyle, JsonFormatOpts};
 
 /// Adapter to use `std::io::Write` with `core::fmt::Write` methods.
 /// This enables streaming JSON output without intermediate String allocation.
@@ -451,21 +451,30 @@ fn output_value<W: Write>(writer: &mut W, value: &OwnedValue, config: &OutputCon
         return Ok(());
     }
 
-    // JSON output format
-    let json_str = if config.compact {
-        value.to_json()
-    } else {
-        // Custom pretty-printing with configurable indent
-        output::format_json(
-            value,
-            &JsonFormatOpts {
-                indent: &config.indent_str,
-                sort_keys: config.sort_keys,
-                ascii: config.ascii_output,
-                float_style: FloatStyle::PreserveWholeFloat,
+    // JSON output format. Both compact and pretty route through the shared
+    // formatter with yq's control-char escaping so the two agree byte-for-byte
+    // on control characters — `\u0008`/`\u000c` (not jq's `\b`/`\f`) and raw
+    // DEL/C1 controls — matching `mikefarah/yq` and the M2 streaming fast path
+    // (#262). Compact keeps jq-shortest floats (e.g. `1`) to match the streaming
+    // path; pretty preserves whole floats (e.g. `1.0`).
+    let json_str = output::format_json(
+        value,
+        &JsonFormatOpts {
+            indent: if config.compact {
+                ""
+            } else {
+                &config.indent_str
             },
-        )
-    };
+            sort_keys: config.sort_keys,
+            ascii: config.ascii_output,
+            float_style: if config.compact {
+                FloatStyle::Shortest
+            } else {
+                FloatStyle::PreserveWholeFloat
+            },
+            control_escape: ControlEscape::Yq,
+        },
+    );
 
     if config.use_color {
         write!(

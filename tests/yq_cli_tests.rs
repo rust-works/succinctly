@@ -1642,3 +1642,39 @@ fn test_arithmetic_semantics_match_between_stdin_and_null_input() -> Result<()> 
     }
     Ok(())
 }
+
+/// #262: yq JSON control-char escaping must be identical across all three yq
+/// output paths — pretty (`-o json`), the compact M2 streaming fast path, and
+/// the compact DOM formatter (`OwnedValue`) — and must match `mikefarah/yq`:
+/// backspace/form-feed as `\u0008`/`\u000c` (NOT jq's `\b`/`\f`), C1 controls
+/// left raw, other C0 controls as `\u00xx`.
+#[test]
+fn test_yq_json_control_char_escaping_consistent_across_paths() -> Result<()> {
+    // s = "a<BS>b<FF>c<U+0085>d<NUL>e" via YAML double-quoted escapes
+    // (\b, \f, \x85 = C1 NEL, \x00 = NUL).
+    let yaml = "s: \"a\\bb\\fc\\x85d\\x00e\"\n";
+    // yq re-emits BS/FF as \u0008/\u000c, leaves the C1 (U+0085) byte raw,
+    // and escapes NUL as \u0000.
+    let expected = "\"a\\u0008b\\u000cc\u{85}d\\u0000e\"";
+
+    // Compact streaming fast path: `.s` is M2-streamable.
+    let (stream, code) = run_yq_stdin(".s", yaml, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stream.trim(), expected, "compact streaming path");
+
+    // Compact DOM path: `.s + ""` is not streamable, so it routes through the
+    // OwnedValue formatter.
+    let (dom, code) = run_yq_stdin(".s + \"\"", yaml, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(dom.trim(), expected, "compact DOM path");
+
+    // Pretty path: a bare scalar has no indentation, so its bytes equal compact.
+    let (pretty, code) = run_yq_stdin(".s", yaml, &["-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty.trim(), expected, "pretty path");
+
+    // Mutual consistency is the core guarantee (#262).
+    assert_eq!(stream.trim(), dom.trim(), "streaming vs DOM");
+    assert_eq!(stream.trim(), pretty.trim(), "streaming vs pretty");
+    Ok(())
+}

@@ -18,8 +18,8 @@ use succinctly::json::JsonIndex;
 
 use super::JqCommand;
 use crate::output::{
-    self, escape_json_string, escape_json_string_ascii, exit_codes, ColorScheme, FloatStyle,
-    JsonFormatOpts,
+    self, escape_json_string, escape_json_string_ascii, exit_codes, ColorScheme, ControlEscape,
+    FloatStyle, JsonFormatOpts,
 };
 
 /// Evaluation context for passing variables to the jq evaluator.
@@ -2078,6 +2078,7 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
         sort_keys: config.sort_keys,
         ascii: config.ascii_output,
         float_style: FloatStyle::Shortest,
+        control_escape: ControlEscape::Jq,
     };
     let json = output::format_json(value, &opts);
 
