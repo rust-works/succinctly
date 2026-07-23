@@ -61,6 +61,7 @@ jobs:
             --exclude '^https://www\.cs\.cmu\.edu/'
             --exclude '^https://doi\.org/'
             --exclude '^https://no-color\.org/'
+            --exclude '^https://www\.reddit\.com/'
             '**/*.md'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -94,6 +95,7 @@ jobs:
             --exclude '^https://www\.cs\.cmu\.edu/'
             --exclude '^https://doi\.org/'
             --exclude '^https://no-color\.org/'
+            --exclude '^https://www\.reddit\.com/'
             '**/*.md'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
