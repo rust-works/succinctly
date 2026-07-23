@@ -31,6 +31,6 @@ mod select;
 pub use bitvec::BitVec;
 pub use compact_rank::CompactRank;
 pub use elias_fano::{EliasFano, EliasFanoCursor, EliasFanoIter};
-pub use popcount::{popcount_word, popcount_words};
+pub use popcount::{popcount_word, popcount_word_portable, popcount_words};
 pub use rank::RankDirectory;
 pub use select::SelectIndex;

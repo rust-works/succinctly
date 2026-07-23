@@ -83,7 +83,12 @@ unsafe fn popcount_avx512(words: &[u64; 8]) -> u64 {
 }
 ```
 
-**When AVX-512 wins**: Compute-bound operations like popcount (5.2x faster).
+**When AVX-512 wins**: Compute-bound operations like popcount — but *only against a
+baseline build*. Explicit VPOPCNTDQ is 5–9× faster than `count_ones()` when the latter is
+left as scalar broadword (default `cargo build`), yet drops to ≈1× once you compile with
+`-C target-cpu=native` and LLVM auto-vectorizes `count_ones()` to VPOPCNTDQ itself. See
+[Popcount Strategies](#popcount-strategies-explicit-simd-vs-auto-vectorized-count_ones) for
+the full measured data.
 
 **When AVX-512 loses**: Memory-bound operations like JSON parsing (7-17% slower) and YAML parsing (7% slower at 64B).
 
@@ -693,22 +698,159 @@ isolation but cause regression when integrated due to real-world data characteri
 
 ---
 
+## Popcount Strategies: Explicit SIMD vs Auto-Vectorized `count_ones()`
+
+*Measured for [issue #45](https://github.com/rust-works/succinctly/issues/45), raised on
+[r/rust](https://www.reddit.com/r/rust/comments/1qleizg/comment/o1f6w6c/): has explicit
+SIMD popcount actually been benchmarked against LLVM's auto-vectorized `count_ones()`?*
+
+The crate offers three popcount strategies for the `popcount_words()` hot path
+([`bits/popcount.rs`](../../src/bits/popcount.rs)), selected at compile time:
+
+| Strategy     | Feature flag                  | Implementation                                                            |
+|--------------|-------------------------------|---------------------------------------------------------------------------|
+| **default**  | *(none)*                      | `w.count_ones()` in a loop — LLVM lowers the `ctpop` intrinsic            |
+| **simd**     | `--features simd`             | explicit AVX-512 VPOPCNTDQ (x86, runtime-detected) / 256-byte-unrolled NEON (ARM) |
+| **portable** | `--features portable-popcount`| broadword SWAR (`popcount_word_portable`)                                 |
+
+The [`popcount_strategies`](../../benches/popcount_strategies.rs) benchmark measures all
+three in one run — the `scalar` (= default `count_ones()`) and `portable` arms are always
+present; the `simd` arm is compiled with `--features simd`.
+
+**Methodology.** Criterion, 100 samples, median times, `random` word pattern. Popcount is
+branchless and fixed-cost per word, so it is **data-independent**: across all six bit
+patterns (`zeros`…`random`) at 256 KiB the medians agree within noise (simd ≤ 0.6%, scalar
+≤ 2%). The axis that matters is **working-set size** (cache residency), not bit density.
+Two machines, two build modes each: **x86_64** = AMD Ryzen 9 7950X (Zen 4, AVX-512
+VPOPCNTDQ), Linux, rustc 1.97, pinned to one core; **aarch64** = Apple M4 Pro, macOS,
+rustc 1.96.
+
+### TL;DR
+
+- **On x86_64 it is a build-flag question, not a size question.** In a **default** build
+  `count_ones()` lowers to the *scalar broadword* sequence (byte-for-byte as fast as the
+  `portable` arm), and explicit AVX-512 is **5–9× faster**. Rebuild with
+  `-C target-cpu=native` (or `+avx512vpopcntdq`) and `count_ones()` auto-vectorizes to
+  VPOPCNTDQ, reaching **parity** with the explicit path (within ±15%, usually a hair
+  *faster*).
+- **On aarch64 explicit NEON always wins ~1.55–1.6×**, at every size and in every build
+  mode. `CNT` is baseline on ARM so `count_ones()` already vectorizes — but LLVM does not
+  reproduce the 256-byte-unrolled loop's *deferred horizontal reduction*.
+- **`portable-popcount` is never distinguishable from default `count_ones()`** on either
+  platform in any build — LLVM lowers both to the same instructions. It buys nothing
+  performance-wise; it exists only to force a pure-arithmetic lowering.
+
+### x86_64 — AMD Ryzen 9 7950X (Zen 4), `simd` = AVX-512 VPOPCNTDQ
+
+**Default build** (`cargo bench --bench popcount_strategies --features simd`).
+`count_ones()` compiles to broadword — note `count_ones() ≈ portable`:
+
+| Size    | `count_ones()` | simd     | portable | SIMD×    |
+|---------|----------------|----------|----------|----------|
+| 64 B    | 3.50 ns        | 1.83 ns  | 3.51 ns  | 1.9×     |
+| 512 B   | 25.6 ns        | 3.52 ns  | 25.5 ns  | 7.3×     |
+| 4 KiB   | 203 ns         | 22.5 ns  | 203 ns   | **9.0×** |
+| 32 KiB  | 1.61 µs        | 199 ns   | 1.61 µs  | 8.1×     |
+| 256 KiB | 12.9 µs        | 1.76 µs  | 12.9 µs  | 7.3×     |
+| 1 MiB   | 51.9 µs        | 8.74 µs  | 51.8 µs  | 5.9×     |
+| 10 MiB  | 521 µs         | 106 µs   | 520 µs   | 4.9×     |
+
+Throughput @ 1 MiB: simd **112.7 GiB/s**, `count_ones()`/portable 18.8 GiB/s.
+
+**`target-cpu=native` build** (`RUSTFLAGS="-C target-cpu=native" cargo bench …`).
+`count_ones()` now auto-vectorizes to VPOPCNTDQ and reaches parity:
+
+| Size    | `count_ones()` | simd     | portable | SIMD×             |
+|---------|----------------|----------|----------|-------------------|
+| 64 B    | 0.92 ns        | 1.10 ns  | 0.92 ns  | 0.83× (scalar wins) |
+| 512 B   | 3.23 ns        | 2.84 ns  | 3.23 ns  | 1.14×             |
+| 4 KiB   | 21.9 ns        | 23.0 ns  | 22.0 ns  | 0.95×             |
+| 32 KiB  | 159 ns         | 181 ns   | 160 ns   | 0.88×             |
+| 256 KiB | 1.79 µs        | 1.72 µs  | 1.78 µs  | 1.04×             |
+| 1 MiB   | 7.92 µs        | 8.24 µs  | 7.90 µs  | 0.96×             |
+| 10 MiB  | 109 µs         | 103 µs   | 109 µs   | 1.06×             |
+
+Throughput @ 1 MiB: `count_ones()` **126 GiB/s**, simd 122 GiB/s. Criterion's A/B delta
+between the two builds records `count_ones()` @ 1 MiB dropping **−85%** in time
+(18.8 → 126 GiB/s) — that is the switch from broadword to VPOPCNTDQ.
+
+### aarch64 — Apple M4 Pro, `simd` = 256-byte-unrolled NEON
+
+`CNT` is baseline on ARM, so the build mode barely matters (`native` matches the numbers
+below within ~2%). `count_ones() ≈ portable` again; the explicit NEON path is uniformly
+ahead:
+
+| Size    | `count_ones()` | simd     | portable | SIMD×  |
+|---------|----------------|----------|----------|--------|
+| 64 B    | 1.17 ns        | 0.95 ns  | 1.18 ns  | 1.24×  |
+| 512 B   | 7.40 ns        | 4.59 ns  | 7.40 ns  | 1.61×  |
+| 4 KiB   | 57.2 ns        | 36.0 ns  | 57.2 ns  | 1.59×  |
+| 32 KiB  | 457 ns         | 289 ns   | 457 ns   | 1.58×  |
+| 256 KiB | 3.76 µs        | 2.43 µs  | 3.77 µs  | 1.55×  |
+| 1 MiB   | 15.1 µs        | 9.69 µs  | 15.2 µs  | 1.56×  |
+| 10 MiB  | 154 µs         | 98.7 µs  | 155 µs   | 1.56×  |
+
+Throughput @ 1 MiB: simd **99.8 GiB/s**, `count_ones()`/portable 63.7 GiB/s.
+
+### Answers to the issue's questions
+
+1. **When does explicit SIMD beat `count_ones()`?**
+   - *x86_64*: only when the build does **not** enable the POPCNT/AVX-512 target features.
+     A default `cargo build`/`cargo bench` (baseline `x86-64-v1`) leaves `count_ones()` as
+     scalar broadword, and explicit AVX-512 wins 5–9×. Under `-C target-cpu=native` the
+     win vanishes (parity).
+   - *aarch64*: always, by ~1.55–1.6×, independent of build flags and array size — the
+     explicit loop's batched reduction is something the auto-vectorizer does not emit.
+2. **Is the `simd` feature worth the maintenance burden?**
+   - *x86_64*: as a *speed* feature, no — a `target-cpu=native` build gets the same
+     VPOPCNTDQ for free. Its remaining value is narrow but real: a **portable binary**
+     compiled for a baseline target still reaches VPOPCNTDQ through the runtime
+     `is_x86_feature_detected!` dispatch, which auto-vectorization cannot provide.
+   - *aarch64*: yes — the ~1.56× is real, unconditional, and not recovered by the compiler.
+3. **Where is the crossover (small vs large arrays)?**
+   - There is **no size crossover**. The ratio is essentially flat across 64 B → 10 MiB on
+     both platforms (it only sags on x86 at ≤ 512 B where loop/setup overhead dominates).
+     The real "crossover" on x86 is the *build flag*, not the input size.
+
+**Caveat.** These numbers isolate the popcount kernel over a contiguous `&[u64]`. In real
+rank/select index building, popcount is interleaved with loads, shifts and stores, so these
+ratios are an upper bound on what the strategy contributes end-to-end — consistent with
+this project's recurring "micro-benchmarks mislead" finding.
+
+### Reproduce
+
+```bash
+# All three arms in one report (scalar / simd / portable):
+cargo bench --bench popcount_strategies --features simd
+
+# Let count_ones() auto-vectorize to VPOPCNTDQ (x86) / native CNT (ARM):
+RUSTFLAGS="-C target-cpu=native" cargo bench --bench popcount_strategies --features simd
+```
+
+---
+
 ## Usage in Succinctly
 
 | SIMD Level | Location                | Purpose                  | Speedup |
 |------------|-------------------------|--------------------------|---------|
-| AVX-512    | `bits/popcount.rs`      | Parallel popcount        | 5.2x    |
+| AVX-512    | `bits/popcount.rs`      | Parallel popcount        | 5–9× / ≈1×‡ |
 | AVX2       | `json/simd/avx2.rs`     | JSON char classification | 1.78x   |
 | AVX2+BMI2  | `dsv/simd/bmi2.rs`      | DSV quote masking        | 10x     |
 | NEON       | `json/simd/neon.rs`     | ARM JSON parsing         | 1.11x   |
 | NEON       | `dsv/simd/neon.rs`      | ARM DSV parsing          | 1.8x    |
 | NEON       | `trees/bp.rs`           | BP L1/L2 index (VMINV)   | 2.8x (L1), 1-3% (L2) |
 | SSE4.1     | `trees/bp.rs`           | BP L1/L2 index (PHMINPOSUW) | 1-3% (10M+ nodes) |
-| NEON       | `bits/popcount.rs`      | 256-byte unrolling       | 1.15x   |
+| NEON       | `bits/popcount.rs`      | 256-byte unrolling       | 1.6×‡   |
 | NEON/AVX2  | `yaml/simd/`            | YAML unquoted structural | 3-8%    |
 | NEON       | `yaml/simd/neon.rs`     | Block scalar scanning    | 11-23%  |
 | NEON       | `yaml/simd/neon.rs`     | Anchor name scanning     | 3-6%    |
 | SVE2-BDEP  | `util/broadword.rs`     | select_in_word           | 5-17x (micro), 2-5% (e2e) |
+
+‡ Popcount speedups are **measured**, and depend on build flags. AVX-512 VPOPCNTDQ is 5–9×
+faster than a *baseline*-build `count_ones()` but ≈1× once `count_ones()` auto-vectorizes
+under `-C target-cpu=native`; the NEON 1.6× (Apple M4 Pro) holds regardless of build flags.
+Full data and methodology:
+[Popcount Strategies](#popcount-strategies-explicit-simd-vs-auto-vectorized-count_ones).
 
 ---
 

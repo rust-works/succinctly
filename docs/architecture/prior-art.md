@@ -46,7 +46,7 @@ rising with bit density; see [../benchmarks/rust-succinct-libs.md](../benchmarks
 |--------------------------------------------------------------------------------------|--------------------|------|--------------------------------|
 | [Faster Population Counts Using AVX2 Instructions](https://arxiv.org/abs/1611.07612) | Mula, Kurz, Lemire | 2016 | Harley-Seal popcount algorithm |
 
-**Succinctly implementation**: [src/bits/popcount.rs](../../src/bits/popcount.rs) uses AVX-512 VPOPCNTDQ when available (5.2x speedup).
+**Succinctly implementation**: [src/bits/popcount.rs](../../src/bits/popcount.rs) uses AVX-512 VPOPCNTDQ when available — 5–9× faster than a baseline-build `count_ones()`, but ≈1× once `count_ones()` auto-vectorizes to VPOPCNTDQ under `-C target-cpu=native` (see [optimizations/simd.md](../optimizations/simd.md#popcount-strategies-explicit-simd-vs-auto-vectorized-count_ones)).
 
 ---
 

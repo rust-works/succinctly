@@ -151,6 +151,10 @@ The only beneficial SVE2 feature is **SVEBITPERM** (BDEP/BEXT instructions), whi
 **Note**: DSV quote masking gap was closed on 2026-01-22 by using NEON PMULL (carryless multiplication)
 for prefix XOR instead of the 6-shift scalar algorithm. This works on ALL ARM64 including Apple Silicon.
 
+**Note (popcount, #45)**: The "5.2× with AVX-512" above is vs a *baseline* build; under
+`-C target-cpu=native` `count_ones()` auto-vectorizes to VPOPCNTDQ and the x86 advantage over the
+"1× baseline" closes to ≈1×. See [Popcount Strategies](../optimizations/simd.md#popcount-strategies-explicit-simd-vs-auto-vectorized-count_ones).
+
 ---
 
 ## SVE2 Capabilities Analysis

@@ -60,7 +60,13 @@ fn popcount_hw(x: u64) -> u32 {
 }
 ```
 
-**Rust**: Use `x.count_ones()` which compiles to `POPCNT` when available.
+**Rust**: Use `x.count_ones()`. It compiles to `POPCNT`/`VPOPCNTDQ` (x86) or `CNT` (ARM)
+only when the target enables the feature — `-C target-cpu=native`, or `+popcnt` on x86;
+`CNT` is always available on aarch64 — and falls back to the broadword sequence above
+otherwise. See
+[SIMD → Popcount Strategies](simd.md#popcount-strategies-explicit-simd-vs-auto-vectorized-count_ones)
+for a measured comparison of `count_ones()` against explicit SIMD popcount across build
+modes and array sizes (issue #45).
 
 ### Prior Art
 
