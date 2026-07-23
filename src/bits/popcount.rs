@@ -386,7 +386,9 @@ mod tests {
         assert_eq!(popcount_words(&words), expected);
     }
 
-    #[cfg(feature = "portable-popcount")]
+    // Not gated behind `portable-popcount`: `popcount_word_portable` is always
+    // compiled (see its definition), so its correctness test must run in every
+    // build that compiles it — including the coverage build (`cli,simd,regex,serde`).
     #[test]
     fn test_portable_matches_builtin() {
         for i in 0u64..1000 {
