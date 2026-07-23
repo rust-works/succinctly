@@ -799,6 +799,11 @@ mod tests {
 
     #[test]
     fn test_escape_json_string_ascii_yq_escapes_non_ascii() {
+        // Quote/backslash and the \n/\r/\t short forms escape as usual.
+        assert_eq!(
+            escape_json_string_ascii_yq("a\"\\b\n\r\t"),
+            "a\\\"\\\\b\\n\\r\\t"
+        );
         // Same control-char rules as escape_json_string_yq...
         assert_eq!(escape_json_string_ascii_yq("\x08\x0C"), "\\u0008\\u000c");
         assert_eq!(escape_json_string_ascii_yq("\u{7f}"), "\u{7f}"); // DEL stays raw (ASCII)
@@ -806,6 +811,29 @@ mod tests {
         assert_eq!(escape_json_string_ascii_yq("\u{85}"), "\\u0085");
         assert_eq!(escape_json_string_ascii_yq("é"), "\\u00e9");
         assert_eq!(escape_json_string_ascii_yq("😀"), "\\ud83d\\ude00");
+    }
+
+    #[test]
+    fn test_format_json_yq_ascii_routes_through_ascii_yq_escaper() {
+        // yq control-escape + ASCII mode escapes both keys and values via
+        // escape_json_string_ascii_yq: BS -> \u0008 (long form), C1/non-ASCII
+        // -> \uXXXX. Exercises the (Yq, ascii) dispatch arm in format_json.
+        let mut obj = IndexMap::new();
+        obj.insert(
+            "ké".to_string(),
+            OwnedValue::String("a\x08\u{85}é".to_string()),
+        );
+        let opts = JsonFormatOpts {
+            indent: "",
+            sort_keys: false,
+            ascii: true,
+            float_style: FloatStyle::Shortest,
+            control_escape: ControlEscape::Yq,
+        };
+        assert_eq!(
+            format_json(&OwnedValue::Object(obj), &opts),
+            r#"{"k\u00e9":"a\u0008\u0085\u00e9"}"#
+        );
     }
 
     #[test]
