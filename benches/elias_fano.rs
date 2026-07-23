@@ -8,9 +8,10 @@
 //!
 //! Run with: cargo bench --bench elias_fano
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use std::hint::black_box;
 use succinctly::bits::EliasFano;
 
 /// Generate realistic bp_to_text-like data: monotone positions with varying gaps.

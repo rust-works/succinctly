@@ -3,8 +3,9 @@
 //! Both use the standard cursor (4-state, marks value starts).
 //! - PFSM: Uses 256-entry lookup tables for state transitions
 //! - Scalar: Byte-by-byte processing with explicit state machine
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::fs;
+use std::hint::black_box;
 use succinctly::json::standard;
 
 fn benchmark_pfsm_vs_scalar(c: &mut Criterion) {

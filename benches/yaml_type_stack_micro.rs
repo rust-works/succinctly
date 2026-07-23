@@ -9,7 +9,8 @@
 //! cargo bench --bench yaml_type_stack_micro
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 use succinctly::yaml::YamlIndex;
 
 /// Generate YAML with heavy type checking (nested mappings and sequences).

@@ -4,9 +4,10 @@
 //! 1. O(1) select1 using WithSelect (new)
 //! 2. O(log n) binary search on rank1 (old approach)
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use std::hint::black_box;
 use succinctly::trees::{BalancedParens, WithSelect};
 
 /// Generate a balanced parentheses sequence of given depth.

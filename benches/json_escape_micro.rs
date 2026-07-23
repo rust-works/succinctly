@@ -3,7 +3,8 @@
 //! Measures the performance of `find_json_escape` which uses SIMD to find bytes
 //! that need JSON escaping (", \, or control characters 0x00-0x1F).
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 use succinctly::yaml::simd::find_json_escape;
 
 /// Scalar implementation for comparison

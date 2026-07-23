@@ -5,9 +5,10 @@
 //! - Various tree depths and sizes
 //! - find_close, find_open, enclose operations
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use std::hint::black_box;
 use succinctly::bp::{self, BalancedParens};
 
 /// Generate a balanced parentheses sequence with specified properties.
