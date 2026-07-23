@@ -526,10 +526,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 };
                 match elements.get(actual_idx) {
                     Some(v) => GenericResult::One(v),
-                    None if optional => GenericResult::None,
-                    None => GenericResult::Error(EvalError::new(format!(
-                        "index {idx} out of bounds (length {len})"
-                    ))),
+                    // jq returns null for out-of-bounds array indices (positive
+                    // or negative), not an error. `.[n]` and `.[n]?` both yield
+                    // null since there is no error for `?` to suppress. See #307.
+                    None => GenericResult::Owned(OwnedValue::Null),
                 }
             } else if optional {
                 GenericResult::None
