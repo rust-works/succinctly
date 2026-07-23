@@ -418,7 +418,7 @@ jobs:
         run: cargo bench --bench rank_select --features portable-popcount -- --noplot | tee bench-portable.txt
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-results-${{ matrix.arch }}
           path: bench-*.txt
