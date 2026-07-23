@@ -1678,3 +1678,66 @@ fn test_yq_json_control_char_escaping_consistent_across_paths() -> Result<()> {
     assert_eq!(stream.trim(), pretty.trim(), "streaming vs pretty");
     Ok(())
 }
+
+// ============================================================================
+// Variable Tests - --arg / --argjson / $ARGS (jq-inherited extensions, #284)
+// ============================================================================
+
+#[test]
+fn test_arg_string_variable() -> Result<()> {
+    // --arg NAME VALUE binds $NAME to the string VALUE.
+    let (output, code) = run_yq_stdin("$g", "a: 1", &["--arg", "g", "hello"])?;
+    assert_eq!(output.trim(), "hello");
+    assert_eq!(code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_argjson_variable() -> Result<()> {
+    // --argjson NAME VALUE binds $NAME to the parsed JSON VALUE.
+    let (output, code) = run_yq_stdin(
+        ".n = $n",
+        "{}",
+        &["--argjson", "n", "42", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(output.trim(), r#"{"n":42}"#);
+    assert_eq!(code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_multiple_variables() -> Result<()> {
+    // Multiple --arg pairs all resolve.
+    let (output, code) = run_yq_stdin("$a + $b", "a: 1", &["--arg", "a", "x", "--arg", "b", "y"])?;
+    assert_eq!(output.trim(), "xy");
+    assert_eq!(code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_args_named_object() -> Result<()> {
+    // $ARGS.named exposes all --arg/--argjson values (jq special variable).
+    let (output, code) = run_yq_stdin(
+        "$ARGS.named",
+        "a: 1",
+        &["--arg", "g", "hello", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(output.trim(), r#"{"g":"hello"}"#);
+    assert_eq!(code, 0);
+    Ok(())
+}
+
+#[test]
+fn test_argjson_invalid_value_errors() -> Result<()> {
+    // Malformed --argjson is rejected (RFC 8259 strict), matching jq, with the
+    // "invalid JSON for --argjson" context surfaced on stderr.
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("$n", "a: 1", &["--argjson", "n", "not json"])?;
+    assert!(stdout.is_empty(), "expected no stdout, got: {stdout:?}");
+    assert_ne!(code, 0, "expected non-zero exit for invalid --argjson");
+    assert!(
+        stderr.contains("invalid JSON for --argjson"),
+        "stderr missing context, got: {stderr:?}",
+    );
+    Ok(())
+}

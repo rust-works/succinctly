@@ -276,11 +276,10 @@ fn evaluate_yaml_direct_filtered(
 }
 
 /// Evaluate a jq expression on an OwnedValue by converting to JSON and back.
-fn evaluate_input(
-    input: &OwnedValue,
-    expr: &jq::Expr,
-    _context: &EvalContext,
-) -> Result<Vec<OwnedValue>> {
+///
+/// Variables (`--arg`/`--argjson`, `$ARGS`) are substituted into `expr` up
+/// front in `run_yq`, so this function needs no evaluation context (#284).
+fn evaluate_input(input: &OwnedValue, expr: &jq::Expr) -> Result<Vec<OwnedValue>> {
     // Convert OwnedValue to JSON bytes for indexing
     let json_str = input.to_json();
     let json_bytes = json_str.as_bytes();
@@ -774,12 +773,47 @@ fn colorize_yaml(yaml: &str) -> String {
     result
 }
 
-/// Parse a JSON string into an OwnedValue.
+/// Parse a `--argjson` value into an `OwnedValue`.
+///
+/// Validates strictly (RFC 8259) via `serde_json`, matching jq's `--argjson`
+/// (see `jq_runner::parse_json_value`). The lenient JSON semi-index would
+/// otherwise silently coerce malformed input (e.g. `42 garbage` → `42`)
+/// instead of surfacing an error (#284).
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
-    let bytes = s.as_bytes();
-    let index = JsonIndex::build(bytes);
-    let cursor = index.root(bytes);
-    Ok(standard_json_to_owned(&cursor.value()))
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(OwnedValue::Null);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(s).with_context(|| format!("invalid JSON: {s}"))?;
+    Ok(serde_json_to_owned(&value))
+}
+
+/// Convert a `serde_json::Value` into an `OwnedValue`
+/// (mirrors `jq_runner::serde_to_owned`).
+fn serde_json_to_owned(value: &serde_json::Value) -> OwnedValue {
+    match value {
+        serde_json::Value::Null => OwnedValue::Null,
+        serde_json::Value::Bool(b) => OwnedValue::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                OwnedValue::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                OwnedValue::Float(f)
+            } else {
+                OwnedValue::Null
+            }
+        }
+        serde_json::Value::String(s) => OwnedValue::String(s.clone()),
+        serde_json::Value::Array(arr) => {
+            OwnedValue::Array(arr.iter().map(serde_json_to_owned).collect())
+        }
+        serde_json::Value::Object(obj) => OwnedValue::Object(
+            obj.iter()
+                .map(|(k, v)| (k.clone(), serde_json_to_owned(v)))
+                .collect(),
+        ),
+    }
 }
 
 /// Parse variables from command line arguments.
@@ -806,6 +840,21 @@ fn parse_variables(args: &YqCommand) -> Result<EvalContext> {
     }
 
     Ok(context)
+}
+
+/// Build the `$ARGS` special variable (`{named, positional}`), mirroring
+/// `jq_runner::build_args_var`.
+///
+/// yq has no positional-argument flags (`--args`/`--jsonargs`), so `positional`
+/// is always an empty array; `named` carries the `--arg`/`--argjson` values.
+fn build_args_var(context: &EvalContext) -> OwnedValue {
+    let mut args_obj = IndexMap::new();
+    args_obj.insert(
+        "named".to_string(),
+        OwnedValue::Object(context.named.clone()),
+    );
+    args_obj.insert("positional".to_string(), OwnedValue::Array(Vec::new()));
+    OwnedValue::Object(args_obj)
 }
 
 /// Check if an expression can use M2 streaming path.
@@ -1085,11 +1134,23 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     }
 
     // Parse the jq program (use Yq mode for extended identifier syntax like kebab-case)
-    let program = jq::parse_program_with_mode(&filter_str, jq::ParserMode::Yq)
+    let mut program = jq::parse_program_with_mode(&filter_str, jq::ParserMode::Yq)
         .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
 
     // Parse variables
     let context = parse_variables(&args)?;
+
+    // Substitute named variables (--arg/--argjson) and the $ARGS special
+    // variable into the expression AST before evaluating, mirroring the jq
+    // runner (see jq_runner.rs). Without this, filter references like `$g`
+    // error as "undefined variable" even though the values were parsed (#284).
+    {
+        let args_value = build_args_var(&context);
+        let mut all_vars: Vec<(&str, &OwnedValue)> =
+            context.named.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        all_vars.push(("ARGS", &args_value));
+        program.expr = jq::substitute_vars(&program.expr, all_vars);
+    }
 
     // Output configuration
     let output_config = OutputConfig::from_args(&args);
@@ -1311,7 +1372,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     } else if args.null_input {
         // Handle --null-input
         let mut split_doc_state = SplitDocState::new(has_split_doc);
-        let results = evaluate_input(&OwnedValue::Null, &program.expr, &context)?;
+        let results = evaluate_input(&OwnedValue::Null, &program.expr)?;
         for result in results {
             split_doc_state.write_separator(&mut writer, &output_config)?;
             any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
@@ -1337,7 +1398,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // concatenated) becomes a single string; no line splitting and
             // no array wrap.
             let slurped = OwnedValue::String(input_content);
-            let results = evaluate_input(&slurped, &program.expr, &context)?;
+            let results = evaluate_input(&slurped, &program.expr)?;
             for result in results {
                 split_doc_state.write_separator(&mut writer, &output_config)?;
                 any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
@@ -1347,7 +1408,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // Without --slurp, process each line independently
             for line in input_content.lines() {
                 let input = OwnedValue::String(line.to_string());
-                let results = evaluate_input(&input, &program.expr, &context)?;
+                let results = evaluate_input(&input, &program.expr)?;
                 for result in results {
                     split_doc_state.write_separator(&mut writer, &output_config)?;
                     any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
@@ -1394,7 +1455,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
         // Create slurped array and evaluate
         let slurped = OwnedValue::Array(all_docs);
-        let results = evaluate_input(&slurped, &program.expr, &context)?;
+        let results = evaluate_input(&slurped, &program.expr)?;
         let mut split_doc_state = SplitDocState::new(has_split_doc);
         for result in results {
             split_doc_state.write_separator(&mut writer, &output_config)?;
@@ -1446,7 +1507,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     {
                         writeln!(buf_writer, "---")?;
                     }
-                    let results = evaluate_input(input, &program.expr, &context)?;
+                    let results = evaluate_input(input, &program.expr)?;
                     // Write without color for inplace editing
                     let mut no_color_config = output_config.clone();
                     no_color_config.use_color = false;
@@ -1515,7 +1576,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 continue;
                             }
                         }
-                        let results = evaluate_input(&input, &program.expr, &context)?;
+                        let results = evaluate_input(&input, &program.expr)?;
                         json_results.push(results);
                         global_doc_index += 1;
                     }
@@ -1899,7 +1960,7 @@ mod tests {
         let slurped = OwnedValue::Array(inputs);
 
         let expr = succinctly::jq::parse("length").unwrap();
-        let results = evaluate_input(&slurped, &expr, &EvalContext::default()).unwrap();
+        let results = evaluate_input(&slurped, &expr).unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], OwnedValue::Int(3));
