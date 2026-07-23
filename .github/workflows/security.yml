@@ -19,7 +19,7 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Prebuilt binary via taiki-e/install-action (cacheable), rather than
       # `cargo install cargo-audit`, which recompiles from source every run.
@@ -34,7 +34,7 @@ jobs:
     name: Dependency Policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: EmbarkStudios/cargo-deny-action@v2.1.1
         with:
@@ -44,7 +44,7 @@ jobs:
     name: Secret Scanning
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 

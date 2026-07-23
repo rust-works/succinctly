@@ -26,7 +26,7 @@ jobs:
     outputs:
       code: ${{ steps.decide.outputs.code }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dorny/paths-filter@v4
         id: filter
@@ -75,7 +75,7 @@ jobs:
       #    this expectation still holds in that step.
       SUCCINCTLY_EXPECT_SIMD: sse2,sse4.2,avx2,bmi2,popcnt
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
 
       - name: Check CPU features (x86 SIMD)
@@ -176,7 +176,7 @@ jobs:
       # stops being detected, instead of the suites silently skipping.
       SUCCINCTLY_EXPECT_SIMD: neon,sve2,sve2-bitperm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
 
       - name: Install Rust
@@ -254,7 +254,7 @@ jobs:
       # scripts/test-sve2-qemu.sh, #194).
       SUCCINCTLY_EXPECT_SIMD: neon
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
 
       - name: Install Rust
@@ -318,7 +318,7 @@ jobs:
       # Same x86 SIMD runner contract as test-x86 (#193).
       SUCCINCTLY_EXPECT_SIMD: sse2,sse4.2,avx2,bmi2,popcnt
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -375,7 +375,7 @@ jobs:
             arch: arm64-macos
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -428,7 +428,7 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
 
       - name: Install Rust
@@ -446,7 +446,7 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
 
       - name: Install Rust
@@ -463,7 +463,7 @@ jobs:
     name: Skill manifest casing
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check SKILL.md casing (#189)
         run: |
@@ -479,7 +479,7 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: needs.gate.outputs.code == 'true'
 
       - name: Install Rust
@@ -511,7 +511,7 @@ jobs:
       contents: read
       pull-requests: write          # required to post the sticky coverage comment
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0            # full history for git merge-base (PR fork point)
 
@@ -536,7 +536,7 @@ jobs:
     if: needs.gate.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install pinned yq
         run: |

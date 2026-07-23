@@ -22,7 +22,7 @@ jobs:
     name: Check Links
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Successful results are reused across runs (max-cache-age 1d), so a
       # retry or re-run only re-checks links that actually failed. lychee
