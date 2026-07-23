@@ -127,6 +127,78 @@ pub fn escape_json_string_ascii(s: &str) -> String {
     result
 }
 
+/// Escape special characters in a JSON string using yq's control-char rules.
+///
+/// Matches `mikefarah/yq`: only `"`, `\`, and C0 controls (`< 0x20`) are
+/// escaped — with `\t`/`\n`/`\r` short forms and `\u00xx` for the rest. Unlike
+/// [`escape_json_string`] (jq style), backspace/form-feed stay as
+/// `\u0008`/`\u000c` (not `\b`/`\f`), and DEL (`0x7f`) plus the C1 controls
+/// (`0x80..=0x9f`) are emitted raw. Returns the body without surrounding quotes.
+pub fn escape_json_string_yq(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                result.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => result.push(c),
+        }
+    }
+    result
+}
+
+/// yq-style escaping (see [`escape_json_string_yq`]) that also escapes
+/// non-ASCII as `\uXXXX`, for yq's ASCII output mode.
+///
+/// Returns the escaped body without surrounding quotes; callers add them.
+pub fn escape_json_string_ascii_yq(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                result.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c if !c.is_ascii() => {
+                // Escape non-ASCII characters as \uXXXX
+                // For characters outside BMP, use surrogate pairs
+                let code = c as u32;
+                if code <= 0xFFFF {
+                    result.push_str(&format!("\\u{code:04x}"));
+                } else {
+                    // Surrogate pair for characters above U+FFFF
+                    let adjusted = code - 0x10000;
+                    let high = 0xD800 + (adjusted >> 10);
+                    let low = 0xDC00 + (adjusted & 0x3FF);
+                    result.push_str(&format!("\\u{high:04x}\\u{low:04x}"));
+                }
+            }
+            c => result.push(c),
+        }
+    }
+    result
+}
+
+/// Which tool's control-character escaping convention [`format_json`] uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlEscape {
+    /// jq style: `\b`/`\f` short escapes, DEL and C1 controls escaped as
+    /// `\u00xx`. See [`escape_json_string`].
+    Jq,
+    /// yq style: backspace/form-feed as `\u0008`/`\u000c`, DEL and C1 controls
+    /// left raw. See [`escape_json_string_yq`].
+    Yq,
+}
+
 /// How to render finite floats with no fractional part.
 #[derive(Clone, Copy, Debug)]
 pub enum FloatStyle {
@@ -146,6 +218,18 @@ pub struct JsonFormatOpts<'a> {
     pub ascii: bool,
     /// Rendering of whole floats.
     pub float_style: FloatStyle,
+    /// Control-character escaping convention (jq vs yq).
+    pub control_escape: ControlEscape,
+}
+
+/// Escape a JSON string body per the opts' control-escape style and ASCII mode.
+fn escape_json_body(s: &str, opts: &JsonFormatOpts) -> String {
+    match (opts.control_escape, opts.ascii) {
+        (ControlEscape::Jq, false) => escape_json_string(s),
+        (ControlEscape::Jq, true) => escape_json_string_ascii(s),
+        (ControlEscape::Yq, false) => escape_json_string_yq(s),
+        (ControlEscape::Yq, true) => escape_json_string_ascii_yq(s),
+    }
 }
 
 /// Format a value as JSON text (compact or pretty, per `opts`).
@@ -191,11 +275,7 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
             }
         }
         OwnedValue::String(s) => {
-            if opts.ascii {
-                format!("\"{}\"", escape_json_string_ascii(s))
-            } else {
-                format!("\"{}\"", escape_json_string(s))
-            }
+            format!("\"{}\"", escape_json_body(s, opts))
         }
         OwnedValue::Array(arr) => {
             if arr.is_empty() {
@@ -231,11 +311,7 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                 let items: Vec<String> = entries
                     .iter()
                     .map(|(k, v)| {
-                        let key = if opts.ascii {
-                            escape_json_string_ascii(k)
-                        } else {
-                            escape_json_string(k)
-                        };
+                        let key = escape_json_body(k, opts);
                         format!("\"{}\":{}", key, format_json_impl(v, opts, level + 1))
                     })
                     .collect();
@@ -244,11 +320,7 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                 let items: Vec<String> = entries
                     .iter()
                     .map(|(k, v)| {
-                        let key = if opts.ascii {
-                            escape_json_string_ascii(k)
-                        } else {
-                            escape_json_string(k)
-                        };
+                        let key = escape_json_body(k, opts);
                         format!(
                             "\"{}\":{}{}",
                             key,
@@ -647,6 +719,7 @@ mod tests {
             sort_keys: true,
             ascii: false,
             float_style: FloatStyle::Shortest,
+            control_escape: ControlEscape::Jq,
         };
         assert_eq!(format_json(&value, &opts), r#"{"a":2,"z":1}"#);
     }
@@ -659,6 +732,7 @@ mod tests {
             sort_keys: false,
             ascii: false,
             float_style,
+            control_escape: ControlEscape::Jq,
         };
         assert_eq!(format_json(&value, &opts(FloatStyle::Shortest)), "1");
         assert_eq!(
@@ -703,12 +777,45 @@ mod tests {
     }
 
     #[test]
+    fn test_escape_json_string_yq_matches_mikefarah_yq() {
+        // Backspace/form-feed use the long \u00xx form (NOT jq's \b/\f) — #262.
+        assert_eq!(escape_json_string_yq("\x08\x0C"), "\\u0008\\u000c");
+        // \t/\n/\r keep their short forms.
+        assert_eq!(escape_json_string_yq("\t\n\r"), "\\t\\n\\r");
+        // Quotes/backslashes escape as usual.
+        assert_eq!(escape_json_string_yq("a\"\\b"), "a\\\"\\\\b");
+        // Other C0 controls fall back to \u00xx.
+        assert_eq!(
+            escape_json_string_yq("\x00\x07\x0b\x1b"),
+            "\\u0000\\u0007\\u000b\\u001b"
+        );
+        // DEL (0x7f) and C1 controls (0x80..=0x9f) are emitted RAW, like yq.
+        assert_eq!(escape_json_string_yq("\u{7f}"), "\u{7f}");
+        assert_eq!(escape_json_string_yq("\u{85}"), "\u{85}");
+        assert_eq!(escape_json_string_yq("\u{80}\u{9f}"), "\u{80}\u{9f}");
+        // Printable ASCII and non-ASCII pass through unescaped.
+        assert_eq!(escape_json_string_yq("café"), "café");
+    }
+
+    #[test]
+    fn test_escape_json_string_ascii_yq_escapes_non_ascii() {
+        // Same control-char rules as escape_json_string_yq...
+        assert_eq!(escape_json_string_ascii_yq("\x08\x0C"), "\\u0008\\u000c");
+        assert_eq!(escape_json_string_ascii_yq("\u{7f}"), "\u{7f}"); // DEL stays raw (ASCII)
+                                                                     // ...but non-ASCII (including C1) escapes as \uXXXX.
+        assert_eq!(escape_json_string_ascii_yq("\u{85}"), "\\u0085");
+        assert_eq!(escape_json_string_ascii_yq("é"), "\\u00e9");
+        assert_eq!(escape_json_string_ascii_yq("😀"), "\\ud83d\\ude00");
+    }
+
+    #[test]
     fn test_format_json_non_finite_floats_are_null() {
         let opts = JsonFormatOpts {
             indent: "",
             sort_keys: false,
             ascii: false,
             float_style: FloatStyle::PreserveWholeFloat,
+            control_escape: ControlEscape::Jq,
         };
         assert_eq!(format_json(&OwnedValue::Float(f64::NAN), &opts), "null");
         assert_eq!(
@@ -724,6 +831,7 @@ mod tests {
             sort_keys: false,
             ascii: false,
             float_style: FloatStyle::Shortest,
+            control_escape: ControlEscape::Jq,
         };
         assert_eq!(format_json(&OwnedValue::Array(vec![]), &pretty), "[]");
         assert_eq!(
@@ -745,6 +853,7 @@ mod tests {
             sort_keys: false,
             ascii: true,
             float_style: FloatStyle::Shortest,
+            control_escape: ControlEscape::Jq,
         };
         assert_eq!(
             format_json(&value, &opts),
