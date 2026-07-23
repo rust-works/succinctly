@@ -1,5 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::fs;
+use std::hint::black_box;
 use succinctly::dsv::{build_index, Dsv, DsvConfig, DsvRows};
 
 fn bench_dsv_parsing(c: &mut Criterion) {

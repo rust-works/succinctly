@@ -8,7 +8,8 @@
 //! Issue #87: Also includes micro-benchmarks for the SIMD escape scanning
 //! optimization that accelerates `write_json_string`.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 use succinctly::yaml::simd::find_json_escape;
 use succinctly::yaml::YamlIndex;
 

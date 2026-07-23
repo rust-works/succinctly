@@ -16,7 +16,8 @@
 //! Benchmarks run at multiple sizes to show scaling characteristics:
 //! - 1KB, 10KB, 100KB, 1MB, 10MB
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 use succinctly::text::utf8::validate_utf8;
 
 /// Generate pure ASCII content of the specified size.

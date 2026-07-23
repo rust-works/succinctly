@@ -2,8 +2,9 @@
 //!
 //! PFSM (Parallel Finite State Machine) uses lookup tables for state transitions.
 //! SIMD implementations use vectorized instructions (AVX2/NEON) for parallel processing.
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::fs;
+use std::hint::black_box;
 use std::path::PathBuf;
 
 fn discover_json_files() -> Vec<(String, PathBuf, u64)> {

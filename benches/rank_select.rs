@@ -1,8 +1,9 @@
 //! Criterion benchmarks for rank/select operations.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use std::hint::black_box;
 use succinctly::{BitVec, RankSelect};
 
 /// Generate a bitvector with specified size and density.

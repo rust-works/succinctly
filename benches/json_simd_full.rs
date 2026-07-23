@@ -11,8 +11,9 @@
 
 mod json_simd_common;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use json_simd_common::{discover_json_files, filter_by_max_size};
+use std::hint::black_box;
 use succinctly::json::JsonIndex;
 
 /// Benchmark full JsonIndex construction (includes BP RangeMin).

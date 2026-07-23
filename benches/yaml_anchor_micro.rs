@@ -1,5 +1,6 @@
 #![allow(unsafe_code)] // SIMD anchor scan benchmarked directly
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 
 /// Scalar version: parse anchor name byte-by-byte
 fn parse_anchor_name_scalar(input: &[u8], start: usize) -> usize {
