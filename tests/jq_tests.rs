@@ -1246,11 +1246,11 @@ fn test_split_consecutive_delimiters() {
 
 #[test]
 fn test_csv_quotes_fields_with_comma() {
-    // jq: ["a","b,c"] | @csv => "\"a\",\"b,c\""
+    // jq: ["a","b,c"] | @csv => "\"a\",\"b,c\"" — every string field is
+    // quoted, including the plain "a" (#306).
     query!(br#"["a", "b,c"]"#, "@csv",
         QueryResult::Owned(OwnedValue::String(s)) => {
-            // Must contain quoted "b,c"
-            assert!(s.contains("\"b,c\""), "comma in field should be quoted: {s}");
+            assert_eq!(s, r#""a","b,c""#);
         }
     );
 }

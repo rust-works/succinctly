@@ -2,5 +2,5 @@
 source: tests/cli_characterization_tests.rs
 expression: "run(&[\"jq\", \"-r\", \".users[] | [.name, .age] | @csv\"], JSON_USERS)?"
 ---
-Alice,30
-Bob,25
+"Alice",30
+"Bob",25
