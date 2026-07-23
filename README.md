@@ -215,10 +215,12 @@ Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
 
 | Platform             | Operation                    | Throughput | Speedup         |
 |----------------------|------------------------------|------------|-----------------|
-| **x86_64**           | Popcount (AVX-512 VPOPCNTDQ) | 96.8 GiB/s |  5.2x vs scalar |
+| **x86_64**           | Popcount (AVX-512 VPOPCNTDQ) | 96.8 GiB/s | 5.2x vs scalar† |
 | **ARM (M1 Max)**     | NEON JSON (string-heavy)     |  3.7 GiB/s | 1.69x vs scalar |
 | **ARM (Neoverse-V1)**| Popcount (NEON)              | 46.5 GiB/s |  N/A            |
 |                      | NEON movemask (parallel)     |  1.37 ns   | 2.5x vs serial  |
+
+† Popcount speedup is measured against a *baseline* build, where `count_ones()` lowers to scalar broadword. Compiled with `-C target-cpu=native`, `count_ones()` auto-vectorizes to VPOPCNTDQ and the explicit path drops to ≈1× (parity); the ~5–9× win holds only for baseline/portable builds. Full measured data: [Popcount Strategies](docs/optimizations/simd.md#popcount-strategies-explicit-simd-vs-auto-vectorized-count_ones) (#45).
 
 See [docs/benchmarks/rust-parsers.md](docs/benchmarks/rust-parsers.md), [docs/benchmarks/jq.md](docs/benchmarks/jq.md), and [docs/optimizations/history.md](docs/optimizations/history.md) for detailed benchmarks.
 

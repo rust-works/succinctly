@@ -13,14 +13,14 @@ Patterns and learnings from SIMD optimization in this codebase.
 
 Two AVX-512 optimizations implemented with dramatically different results:
 
-### AVX512-VPOPCNTDQ: 5.2x Speedup (Compute-Bound)
+### AVX512-VPOPCNTDQ: ~5–9× vs a Baseline `count_ones()`, ≈1× Native (Compute-Bound)
 
 **Implementation**: `src/bits/popcount.rs`
 - Processes 8 u64 words (512 bits) in parallel
 - Hardware `_mm512_popcnt_epi64` instruction
-- **Result**: 96.8 GiB/s vs 18.5 GiB/s (scalar) = **5.2x faster**
+- **Result**: ~5–9× faster than a *baseline-build* `count_ones()` (which lowers to scalar broadword) — e.g. 96.8 GiB/s vs 18.5 GiB/s.
 
-**Why it wins**: Pure compute-bound, embarrassingly parallel, no dependencies
+**Why it wins — but only vs a baseline build**: Pure compute-bound and embarrassingly parallel, so explicit VPOPCNTDQ crushes scalar broadword. But compile with `-C target-cpu=native` and `count_ones()` auto-vectorizes to VPOPCNTDQ itself, reaching **≈1× parity** — the explicit path's remaining value is portable binaries that still reach VPOPCNTDQ via runtime `is_x86_feature_detected!` dispatch. Measured data: [Popcount Strategies](../../../docs/optimizations/simd.md#popcount-strategies-explicit-simd-vs-auto-vectorized-count_ones) (#45).
 
 ### AVX-512 JSON Parser: 7-17% Slower (Memory-Bound) - REMOVED
 

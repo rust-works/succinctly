@@ -31,6 +31,8 @@ This document records all optimization attempts in the succinctly library, showi
 | O1 Sequential Cursor      | **3-13%** (yq identity queries, 1-100KB)    | All      | Deployed |
 | O2 Gap-Skip rank1         | **2-6%** (yq identity queries, nested/users) | All      | Deployed |
 
+> **Popcount build-flag caveat (#45):** The **AVX512-VPOPCNTDQ 5.2×** and **NEON 256-byte 1.10–1.15×** micro figures above are measured against a *baseline* build, where `count_ones()` stays scalar broadword. Under `-C target-cpu=native`, `count_ones()` auto-vectorizes and the x86 explicit path reaches **≈1× parity**; on Apple M4 Pro the NEON path re-measures at **1.56×**. Full measured data: [Popcount Strategies](simd.md#popcount-strategies-explicit-simd-vs-auto-vectorized-count_ones).
+
 **Total Successful**: 18 optimizations
 **Best Result**: Cumulative index (627x)
 
@@ -83,7 +85,7 @@ Parallel popcount of 8 u64 words (512 bits) using `_mm512_popcnt_epi64`.
 | 4KB (512 words)  | 342 ns  | 27.7 ns          | **+1135%**  |
 | 1MB (131K words) | 52.6 us | 10.1 us          | **+421%**   |
 
-**Throughput**: 96.8 GiB/s (AVX-512) vs 18.5 GiB/s (scalar) = **5.2x faster**
+**Throughput**: 96.8 GiB/s (AVX-512) vs 18.5 GiB/s (scalar, *baseline build*) = **5.2x faster** — but ≈1× once `count_ones()` auto-vectorizes to VPOPCNTDQ under `-C target-cpu=native` (see [Popcount Strategies](simd.md#popcount-strategies-explicit-simd-vs-auto-vectorized-count_ones), #45)
 
 **End-to-End Impact**: ~1-2% overall (Amdahl's Law - popcount is ~1.6% of total time)
 
@@ -354,7 +356,7 @@ Before implementing an optimization, ask:
 
 **x86_64 (Zen 4)**:
 - JSON parsing: ~2.4x faster (PFSM BMI2 vs scalar baseline)
-- Popcount: 5.2x faster (AVX512-VPOPCNTDQ vs scalar)
+- Popcount: 5.2x faster vs *baseline-build* scalar; ≈1× once `count_ones()` auto-vectorizes under `-C target-cpu=native` (#45)
 
 **ARM (Apple Silicon)**:
 - JSON parsing: 1.52x faster (NEON vs scalar)
