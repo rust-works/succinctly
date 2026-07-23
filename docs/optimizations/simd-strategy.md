@@ -74,6 +74,7 @@ SIMD paths are selected via `#[cfg(target_arch)]` and Rust's `is_x86_feature_det
 ## See Also
 
 - [SIMD](simd.md) — detailed technique reference for each SIMD extension
+- [SIMD → Popcount Strategies](simd.md#popcount-strategies-explicit-simd-vs-auto-vectorized-count_ones) — measured explicit SIMD popcount vs auto-vectorized `count_ones()` across build modes (issue #45)
 - [Targets](targets.md) — CPU-specific build configurations
 
 ## Source & Docs
