@@ -132,9 +132,9 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo build --features cli --bin succinctly
 
-      - name: Run cli-gated yq tests
+      - name: Run cli-gated yq/jq tests
         if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
@@ -218,9 +218,9 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo build --features cli --bin succinctly
 
-      - name: Run cli-gated yq tests
+      - name: Run cli-gated yq/jq tests
         if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
@@ -281,9 +281,9 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo build --features cli --bin succinctly
 
-      - name: Run cli-gated yq tests
+      - name: Run cli-gated yq/jq tests
         if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
@@ -548,3 +548,26 @@ jobs:
 
       - name: Verify goldens against pinned yq
         run: ./scripts/sync-yq-golden.sh --check
+
+  # Drift detector for the jq golden fixtures (tests/data/jq-golden/): the
+  # goldens are frozen oracle output, so this is the one job that re-checks
+  # them against the pinned jqlang/jq. A missing or wrong-version jq fails
+  # here — it cannot skip. Sibling of yq-drift above (#300 mirrors #227).
+  jq-drift:
+    name: jq golden drift check
+    needs: gate
+    if: needs.gate.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned jq
+        run: |
+          V="$(cat tests/data/jq-golden/JQ_VERSION)"
+          curl -fsSL "https://github.com/jqlang/jq/releases/download/${V}/jq-linux-amd64" \
+            -o /usr/local/bin/jq
+          chmod +x /usr/local/bin/jq
+          jq --version | grep -F "${V}"
+
+      - name: Verify goldens against pinned jq
+        run: ./scripts/sync-jq-golden.sh --check
