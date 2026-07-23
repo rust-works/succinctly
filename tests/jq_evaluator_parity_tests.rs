@@ -57,6 +57,10 @@ fn assert_parity(json: &[u8], filter: &str) {
 /// Assert the two evaluators currently DISAGREE, pinning both observed outputs.
 /// When the referenced fix aligns them, the `assert_ne!` fails, forcing whoever
 /// lands the fix to convert this into `assert_parity`.
+///
+/// Currently unused -- the last pinned divergence (#307) is now parity -- but
+/// retained as scaffolding for the next divergence this file needs to pin.
+#[allow(dead_code)]
 fn assert_divergence(json: &[u8], filter: &str, full_expected: &[&str], generic_expected: &[&str]) {
     let full = full_outputs(json, filter);
     let generic = generic_outputs(json, filter);
@@ -159,11 +163,12 @@ fn test_object_ordering_parity_162() {
 }
 
 #[test]
-fn test_out_of_bounds_index_diverges_161_162() {
+fn test_out_of_bounds_index_parity_307() {
     // jq: indexing an array out of bounds (positive or negative) yields `null`.
-    // The FULL evaluator matches; the generic (CLI) path yields NO output --
-    // bug #161/#162.
+    // Both evaluators now agree; the generic (CLI) path previously erred -- #307.
     for filter in [".[5]", ".[-5]", ".[100]"] {
-        assert_divergence(br"[1,2,3]", filter, &["null"], &[]);
+        assert_parity(br"[1,2,3]", filter);
     }
+    // The `?` variant also yields null (no error for `?` to suppress).
+    assert_parity(br"[1,2,3]", ".[10]?");
 }
