@@ -22,7 +22,6 @@
 
 alt_multi_output   alternative   `//` inspects only the first output of its LHS — #160
 assign_rhs_root    assignment    compound-assign RHS evaluated against the sub-value, not the root — #159
-collect_map_pipe   iterator      `[.[] | f]` collects to `[]` (eval_pipe drops Owned/ManyOwned) — #295
 comma_in_index     parser        comma generator rejected inside index brackets — #155
 format_csv         format        @csv omits quotes on plain string fields; jq always quotes strings — #306
 index_oob_null     indexing      out-of-bounds array index errors instead of returning null — #307 (CLI path still errors despite closed #157)
