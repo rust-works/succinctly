@@ -929,6 +929,7 @@ dependencies = [
  "insta",
  "libm",
  "md5",
+ "memchr",
  "memmap2",
  "proptest",
  "rand",

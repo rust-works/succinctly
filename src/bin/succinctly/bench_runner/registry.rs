@@ -211,6 +211,15 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         working_dir: ".",
     },
     BenchmarkInfo {
+        name: "jq_string_ops_bench",
+        description: "Micro: jq substring search — std vs memchr::memmem (issue #303)",
+        category: BenchmarkCategory::Json,
+        bench_type: BenchmarkType::Criterion,
+        criterion_name: Some("jq_string_ops_bench"),
+        cli_subcommand: None,
+        working_dir: ".",
+    },
+    BenchmarkInfo {
         name: "jq_bench",
         description: "CLI: succinctly jq vs system jq (with memory)",
         category: BenchmarkCategory::Json,
