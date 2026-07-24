@@ -69,7 +69,11 @@ unsafe fn neon_movemask(v: uint8x16_t) -> u16 {
 /// `yaml/simd`, so it does not honor the `SUCCINCTLY_SIMD` dispatch clamp; both
 /// kernels compute the same answer, so escape output is identical either way).
 /// Cached per process (STYLE-0003): dispatch is on the per-chunk hot path.
-#[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(feature = "scalar-yaml"),
+    any(test, feature = "std")
+))]
 #[inline]
 fn avx2_enabled() -> bool {
     static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -545,9 +549,10 @@ mod tests {
     // Per-kernel differential tests (#193): exercise each x86 kernel directly,
     // regardless of what the dispatcher would pick, so the SSE2 kernel is tested
     // on AVX2 hardware and both are checked against the scalar reference across
-    // the byte range (the tests that would have caught #150/#230).
+    // the byte range (the tests that would have caught #150/#230). Gated off under
+    // `scalar-yaml`, which cfg-excludes the very kernels these tests call.
     // ------------------------------------------------------------------------
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
     mod x86_kernels {
         use super::reference;
 
