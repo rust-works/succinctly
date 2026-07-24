@@ -21,7 +21,7 @@
 //! | `length`, complex | OwnedValue | 5-8x input |
 
 use super::value::OwnedValue;
-use crate::yaml::simd::find_json_escape;
+use crate::util::simd::escape::find_json_escape;
 
 /// A value that can be streamed directly to output without intermediate allocation.
 ///
