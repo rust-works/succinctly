@@ -18,7 +18,25 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
-use succinctly::text::utf8::validate_utf8;
+use succinctly::text::utf8::validate_utf8_scalar;
+#[cfg(target_arch = "x86_64")]
+use succinctly::text::utf8::validate_utf8_simd;
+
+/// Benchmark both validation engines on the same input: the portable scalar
+/// path always, and the AVX2 SIMD path on x86_64. Each becomes a `scalar`/`simd`
+/// arm under the enclosing group so results compare directly.
+macro_rules! bench_engines {
+    ($group:expr, $name:expr, $data:expr) => {{
+        let data: &[u8] = $data;
+        $group.bench_with_input(BenchmarkId::new("scalar", $name), data, |b, data| {
+            b.iter(|| validate_utf8_scalar(black_box(data)));
+        });
+        #[cfg(target_arch = "x86_64")]
+        $group.bench_with_input(BenchmarkId::new("simd", $name), data, |b, data| {
+            b.iter(|| validate_utf8_simd(black_box(data)));
+        });
+    }};
+}
 
 /// Generate pure ASCII content of the specified size.
 fn generate_ascii(size: usize) -> Vec<u8> {
@@ -130,9 +148,7 @@ fn bench_ascii(c: &mut Criterion) {
         let size_name = format_size(size);
 
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(&size_name), &data, |b, data| {
-            b.iter(|| validate_utf8(black_box(data)));
-        });
+        bench_engines!(group, &size_name, &data);
     }
 
     group.finish();
@@ -146,9 +162,7 @@ fn bench_mixed(c: &mut Criterion) {
         let size_name = format_size(size);
 
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(&size_name), &data, |b, data| {
-            b.iter(|| validate_utf8(black_box(data)));
-        });
+        bench_engines!(group, &size_name, &data);
     }
 
     group.finish();
@@ -162,9 +176,7 @@ fn bench_cjk(c: &mut Criterion) {
         let size_name = format_size(size);
 
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(&size_name), &data, |b, data| {
-            b.iter(|| validate_utf8(black_box(data)));
-        });
+        bench_engines!(group, &size_name, &data);
     }
 
     group.finish();
@@ -178,9 +190,7 @@ fn bench_emoji(c: &mut Criterion) {
         let size_name = format_size(size);
 
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(&size_name), &data, |b, data| {
-            b.iter(|| validate_utf8(black_box(data)));
-        });
+        bench_engines!(group, &size_name, &data);
     }
 
     group.finish();
@@ -194,9 +204,7 @@ fn bench_2byte(c: &mut Criterion) {
         let size_name = format_size(size);
 
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(&size_name), &data, |b, data| {
-            b.iter(|| validate_utf8(black_box(data)));
-        });
+        bench_engines!(group, &size_name, &data);
     }
 
     group.finish();
@@ -210,12 +218,7 @@ fn bench_error_at_end(c: &mut Criterion) {
         let size_name = format_size(size);
 
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(&size_name), &data, |b, data| {
-            b.iter(|| {
-                let result = validate_utf8(black_box(data));
-                black_box(result)
-            });
-        });
+        bench_engines!(group, &size_name, &data);
     }
 
     group.finish();
@@ -226,40 +229,27 @@ fn bench_sequence_types(c: &mut Criterion) {
     let mut group = c.benchmark_group("utf8_sequence_types_1mb");
     let size = 1024 * 1024; // 1MB
 
+    group.throughput(Throughput::Bytes(size as u64));
+
     // ASCII (1-byte)
     let ascii = generate_ascii(size);
-    group.throughput(Throughput::Bytes(size as u64));
-    group.bench_with_input(BenchmarkId::new("ascii_1byte", "1mb"), &ascii, |b, data| {
-        b.iter(|| validate_utf8(black_box(data)));
-    });
+    bench_engines!(group, "ascii_1byte", &ascii);
 
     // 2-byte sequences
     let twobyte = generate_2byte(size);
-    group.bench_with_input(
-        BenchmarkId::new("extended_2byte", "1mb"),
-        &twobyte,
-        |b, data| {
-            b.iter(|| validate_utf8(black_box(data)));
-        },
-    );
+    bench_engines!(group, "extended_2byte", &twobyte);
 
     // 3-byte sequences (CJK)
     let cjk = generate_cjk(size);
-    group.bench_with_input(BenchmarkId::new("cjk_3byte", "1mb"), &cjk, |b, data| {
-        b.iter(|| validate_utf8(black_box(data)));
-    });
+    bench_engines!(group, "cjk_3byte", &cjk);
 
     // 4-byte sequences (emoji)
     let emoji = generate_emoji(size);
-    group.bench_with_input(BenchmarkId::new("emoji_4byte", "1mb"), &emoji, |b, data| {
-        b.iter(|| validate_utf8(black_box(data)));
-    });
+    bench_engines!(group, "emoji_4byte", &emoji);
 
     // Mixed
     let mixed = generate_mixed(size);
-    group.bench_with_input(BenchmarkId::new("mixed", "1mb"), &mixed, |b, data| {
-        b.iter(|| validate_utf8(black_box(data)));
-    });
+    bench_engines!(group, "mixed", &mixed);
 
     group.finish();
 }

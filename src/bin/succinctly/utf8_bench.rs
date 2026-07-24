@@ -209,8 +209,11 @@ fn benchmark_file(file_path: &Path, config: &BenchConfig) -> Result<BenchmarkRes
 fn write_markdown_summary(results: &[BenchmarkResult], path: &Path) -> Result<()> {
     let mut md = String::new();
 
-    md.push_str("# UTF-8 Validation Benchmark Results (Scalar)\n\n");
-    md.push_str("Baseline scalar implementation of `succinctly::text::utf8::validate_utf8`.\n\n");
+    md.push_str("# UTF-8 Validation Benchmark Results\n\n");
+    md.push_str(
+        "Default `succinctly::text::utf8::validate_utf8` engine \
+         (AVX2 SIMD on x86_64, scalar fallback elsewhere).\n\n",
+    );
 
     // Group by pattern
     let mut patterns: Vec<&str> = results.iter().map(|r| r.pattern.as_str()).collect();
