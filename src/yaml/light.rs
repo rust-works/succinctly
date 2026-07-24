@@ -16,7 +16,7 @@ use std::string::ToString;
 
 use super::index::YamlIndex;
 use super::scalar::{could_be_null_or_bool, resolve_plain, ResolvedScalar};
-use super::simd::find_json_escape;
+use crate::util::simd::escape::find_json_escape;
 
 // ============================================================================
 // YamlCursor: Position in the YAML structure
