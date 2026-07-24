@@ -411,64 +411,17 @@ pub fn parse_anchor_name(input: &[u8], start: usize) -> usize {
 }
 
 // ============================================================================
-// Issue #87: JSON Escape Scanning for Streaming Output
+// Issue #87 / #125: JSON Escape Scanning for Streaming Output
 // ============================================================================
 
-/// Find the next JSON escapable character in the input.
+/// Find the next JSON-escapable byte in the input (`"`, `\`, or `< 0x20`).
 ///
-/// Searches for characters that need escaping in JSON strings:
-/// - Double quote (`"`)
-/// - Backslash (`\`)
-/// - Control characters (bytes < 0x20)
-///
-/// Returns the index of the first escapable character, or `bytes.len()`
-/// if no escapable character is found.
-///
-/// This is the main optimization for `write_json_string` in the YAML→JSON
-/// streaming path. Uses SIMD to process 16-32 bytes at a time.
-#[inline(always)]
-pub fn find_json_escape(bytes: &[u8], start: usize) -> usize {
-    if start >= bytes.len() {
-        return bytes.len();
-    }
-
-    // ARM64 with NEON (default)
-    #[cfg(all(
-        target_arch = "aarch64",
-        not(feature = "broadword-yaml"),
-        not(feature = "scalar-yaml")
-    ))]
-    {
-        neon::find_json_escape_neon(bytes, start)
-    }
-
-    // x86_64 - use AVX2/SSE2 SIMD
-    #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
-    {
-        x86::find_json_escape_x86(bytes, start).map_or(bytes.len(), |offset| start + offset)
-    }
-
-    // Scalar fallback for other platforms
-    #[cfg(any(
-        feature = "scalar-yaml",
-        not(any(target_arch = "aarch64", target_arch = "x86_64"))
-    ))]
-    {
-        find_json_escape_scalar(bytes, start)
-    }
-}
-
-/// Scalar implementation of find_json_escape.
-#[inline(always)]
-#[allow(dead_code)] // STYLE-0005: scalar fallback (SIMD path used when detected)
-fn find_json_escape_scalar(bytes: &[u8], start: usize) -> usize {
-    for (i, &b) in bytes[start..].iter().enumerate() {
-        if b == b'"' || b == b'\\' || b < 0x20 {
-            return start + i;
-        }
-    }
-    bytes.len()
-}
+/// The scanner moved to the shared [`crate::util::simd::escape`] module in #125 so
+/// consumers (jq streaming, jq/yq output escaping) no longer reach into yaml
+/// internals. Re-exported here so `super::simd::find_json_escape` and the public
+/// `succinctly::yaml::simd::find_json_escape` path keep resolving for existing
+/// consumers (`yaml/light.rs`, the escape benches).
+pub use crate::util::simd::escape::find_json_escape;
 
 /// Scalar fallback for parse_anchor_name
 #[allow(dead_code)] // STYLE-0005: scalar fallback (SIMD path used when detected)
@@ -640,143 +593,6 @@ mod tests {
         let mut input = vec![b'a'; 32];
         input[16] = b'"';
         assert_eq!(find_quote_or_escape(&input, 0, input.len()), Some(16));
-    }
-
-    // ========================================================================
-    // JSON escape scanning tests (Issue #87)
-    // ========================================================================
-
-    #[test]
-    fn test_find_json_escape_basic() {
-        let input = b"hello\"world";
-        assert_eq!(find_json_escape(input, 0), 5);
-    }
-
-    #[test]
-    fn test_find_json_escape_backslash() {
-        let input = b"hello\\world";
-        assert_eq!(find_json_escape(input, 0), 5);
-    }
-
-    #[test]
-    fn test_find_json_escape_control() {
-        let input = b"hello\nworld";
-        assert_eq!(find_json_escape(input, 0), 5);
-    }
-
-    #[test]
-    fn test_find_json_escape_none() {
-        let input = b"hello world";
-        // Returns input.len() when no escape character found
-        assert_eq!(find_json_escape(input, 0), input.len());
-    }
-
-    #[test]
-    fn test_find_json_escape_long() {
-        let mut input = vec![b'a'; 100];
-        input[50] = b'"';
-        assert_eq!(find_json_escape(&input, 0), 50);
-    }
-
-    #[test]
-    fn test_find_json_escape_simd_matches_scalar() {
-        let test_cases: &[&[u8]] = &[
-            b"",
-            b"\"",
-            b"\\",
-            b"\n",
-            b"\t",
-            b"no special chars",
-            b"quote\"here",
-            b"newline\nhere",
-            &[b'x'; 100],
-            // Non-ASCII. These are the cases that matter: `byte < 0x20` must be an
-            // unsigned test, and a signed one flags every byte >= 0x80 instead.
-            "love ♥ and peace ☮".as_bytes(),
-            "aaaaaaaaaaaaaaaa♥".as_bytes(),
-            "日本語のテキストはここにあります".as_bytes(),
-            "emoji 😁 in a string long enough for a full chunk".as_bytes(),
-        ];
-
-        for &input in test_cases {
-            let scalar = find_json_escape_scalar(input, 0);
-            let simd = find_json_escape(input, 0);
-            assert_eq!(
-                scalar,
-                simd,
-                "JSON escape mismatch for {:?}",
-                String::from_utf8_lossy(input)
-            );
-        }
-    }
-
-    /// Every byte value, at every alignment, against the scalar reference.
-    ///
-    /// This is the test that would have caught issue #230: the x86 path used
-    /// `cmpgt_epi8` (a *signed* compare) for `byte < 0x20`, so bytes >= 0x80 read as
-    /// negative and were reported as control characters. The suite above was
-    /// ASCII-only, so nothing exercised the high half of the byte range.
-    ///
-    /// Sweeping the offset matters as much as sweeping the value: the SIMD path only
-    /// engages on full 16/32-byte chunks, so a byte is only checked by SIMD at some
-    /// positions and by the scalar tail at others.
-    #[test]
-    fn test_find_json_escape_exhaustive_bytes_match_scalar() {
-        for byte in 0u8..=255 {
-            for pos in 0..40usize {
-                let mut input = vec![b'a'; 40];
-                input[pos] = byte;
-
-                let scalar = find_json_escape_scalar(&input, 0);
-                let simd = find_json_escape(&input, 0);
-                assert_eq!(
-                    scalar, simd,
-                    "mismatch for byte {byte:#04x} at offset {pos}: scalar={scalar}, simd={simd}"
-                );
-            }
-        }
-    }
-
-    /// The contract callers rely on: the returned index either is the end of input, or
-    /// points at a byte that genuinely needs escaping.
-    ///
-    /// `write_json_string` (`yaml/light.rs`) and `write_json_escaped` (`jq/stream.rs`)
-    /// both slice `&s[i..escape_pos]`. If the index points anywhere else, they either
-    /// panic on a char boundary or silently corrupt output.
-    #[test]
-    fn test_find_json_escape_never_points_at_a_safe_byte() {
-        let inputs: &[&str] = &[
-            "love ♥ and peace ☮",
-            "aaaaaaaaaaaaaaaa♥bbbbbbbbbbbbbbbb",
-            "日本語のテキストはここにあります、もっと長く",
-            "emoji 😁 in a string long enough for a full chunk",
-            "mixed ♥ with \"quotes\" and \\slashes\\ and \nnewlines",
-        ];
-
-        for s in inputs {
-            let bytes = s.as_bytes();
-            let mut i = 0;
-            while i < bytes.len() {
-                let pos = find_json_escape(bytes, i);
-                assert!(
-                    pos >= i && pos <= bytes.len(),
-                    "out of range for {s:?}: {pos} from {i}"
-                );
-                if pos == bytes.len() {
-                    break;
-                }
-                let b = bytes[pos];
-                assert!(
-                    b == b'"' || b == b'\\' || b < 0x20,
-                    "for {s:?}, reported byte {b:#04x} at {pos} needs no escaping"
-                );
-                assert!(
-                    s.is_char_boundary(pos),
-                    "for {s:?}, reported index {pos} is not a char boundary"
-                );
-                i = pos + 1;
-            }
-        }
     }
 
     // Compare SIMD vs scalar for correctness
