@@ -551,16 +551,22 @@ jobs:
   # Drift detector for the yq golden fixtures (tests/data/yq-golden/): the
   # goldens are frozen oracle output, so this is the one job that re-checks
   # them against the pinned mikefarah/yq. Unlike the pre-#227 comparison
-  # tests, a missing or wrong-version yq fails here — it cannot skip.
+  # tests, a missing or wrong-version yq fails the check — it cannot silently
+  # self-skip when it runs. The gate is applied per-STEP (not as a job-level
+  # `if`) so that on the docs-only fast path every step skips but the job still
+  # reports a genuine `success` rather than a `skipped` conclusion whose
+  # branch-protection semantics vary — matching the required Test/Clippy/Format
+  # jobs above, so this context is safe to mark required.
   yq-drift:
     name: yq golden drift check
     needs: gate
-    if: needs.gate.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        if: needs.gate.outputs.code == 'true'
 
       - name: Install pinned yq
+        if: needs.gate.outputs.code == 'true'
         run: |
           V="$(cat tests/data/yq-golden/YQ_VERSION)"
           curl -fsSL "https://github.com/mikefarah/yq/releases/download/${V}/yq_linux_amd64" \
@@ -569,21 +575,24 @@ jobs:
           yq --version | grep -F "version ${V}"
 
       - name: Verify goldens against pinned yq
+        if: needs.gate.outputs.code == 'true'
         run: ./scripts/sync-yq-golden.sh --check
 
   # Drift detector for the jq golden fixtures (tests/data/jq-golden/): the
   # goldens are frozen oracle output, so this is the one job that re-checks
-  # them against the pinned jqlang/jq. A missing or wrong-version jq fails
-  # here — it cannot skip. Sibling of yq-drift above (#300 mirrors #227).
+  # them against the pinned jqlang/jq. A missing or wrong-version jq fails the
+  # check — it cannot silently self-skip when it runs. Per-STEP gate for the
+  # same required-context-safe reason as yq-drift above (#300 mirrors #227).
   jq-drift:
     name: jq golden drift check
     needs: gate
-    if: needs.gate.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        if: needs.gate.outputs.code == 'true'
 
       - name: Install pinned jq
+        if: needs.gate.outputs.code == 'true'
         run: |
           V="$(cat tests/data/jq-golden/JQ_VERSION)"
           curl -fsSL "https://github.com/jqlang/jq/releases/download/${V}/jq-linux-amd64" \
@@ -592,4 +601,5 @@ jobs:
           jq --version | grep -F "${V}"
 
       - name: Verify goldens against pinned jq
+        if: needs.gate.outputs.code == 'true'
         run: ./scripts/sync-jq-golden.sh --check
