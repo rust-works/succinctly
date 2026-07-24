@@ -254,6 +254,41 @@ fn validate_forced_color_has_ansi() -> Result<()> {
 }
 
 #[test]
+fn validate_no_simd_matches_default_on_valid() -> Result<()> {
+    // A multi-byte buffer large enough to span several 32-byte SIMD blocks, so
+    // the default (SIMD) path and the forced-scalar path both do real work.
+    let mut input = Vec::new();
+    for _ in 0..16 {
+        input.extend_from_slice("ASCII, café, 日本語, 😀 emoji — mix.\n".as_bytes());
+    }
+    let (o_def, e_def, c_def) = run_validate_stdin(&input, &["--no-color"])?;
+    let (o_no, e_no, c_no) = run_validate_stdin(&input, &["--no-color", "--no-simd"])?;
+    assert_eq!(c_def, 0, "default path stderr: {e_def}");
+    assert_eq!(
+        (&o_def, &e_def, c_def),
+        (&o_no, &e_no, c_no),
+        "SIMD and --no-simd must agree on valid input"
+    );
+    Ok(())
+}
+
+#[test]
+fn validate_no_simd_matches_default_on_invalid() -> Result<()> {
+    let mut input = b"prefix text that is perfectly fine ".to_vec();
+    input.push(0xF8); // invalid lead byte
+    input.extend_from_slice(b" trailing content");
+    let (o_def, e_def, c_def) = run_validate_stdin(&input, &["--no-color"])?;
+    let (o_no, e_no, c_no) = run_validate_stdin(&input, &["--no-color", "--no-simd"])?;
+    assert_eq!(c_def, 1);
+    assert_eq!(
+        (&o_def, &e_def, c_def),
+        (&o_no, &e_no, c_no),
+        "SIMD and --no-simd must produce identical diagnostics"
+    );
+    Ok(())
+}
+
+#[test]
 fn validate_file_error_reports_filename_and_position() -> Result<()> {
     let mut f = NamedTempFile::new()?;
     // Valid first line, then an invalid byte on line 2.
