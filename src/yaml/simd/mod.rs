@@ -416,7 +416,7 @@ pub fn parse_anchor_name(input: &[u8], start: usize) -> usize {
 
 /// Find the next JSON-escapable byte in the input (`"`, `\`, or `< 0x20`).
 ///
-/// The scanner moved to the shared [`crate::util::simd::escape`] module in #125 so
+/// The scanner moved to the shared `crate::util::simd::escape` module in #125 so
 /// consumers (jq streaming, jq/yq output escaping) no longer reach into yaml
 /// internals. Re-exported here so `super::simd::find_json_escape` and the public
 /// `succinctly::yaml::simd::find_json_escape` path keep resolving for existing
