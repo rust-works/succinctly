@@ -262,4 +262,40 @@ mod tests {
         assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
     }
+
+    #[test]
+    fn write_markdown_summary_emits_header_and_rows() {
+        let results = vec![
+            BenchmarkResult {
+                file: "ascii-1kb.txt".into(),
+                pattern: "ascii".into(),
+                size: "1kb".into(),
+                filesize: 1024,
+                valid: true,
+                wall_time_ms: 0.5,
+                throughput_mib_s: 2000.0,
+            },
+            BenchmarkResult {
+                file: "mixed-1kb.txt".into(),
+                pattern: "mixed".into(),
+                size: "1kb".into(),
+                filesize: 1024,
+                valid: true,
+                wall_time_ms: 0.7,
+                throughput_mib_s: 1400.0,
+            },
+        ];
+
+        let path =
+            std::env::temp_dir().join(format!("succinctly-utf8-bench-{}.md", std::process::id()));
+        write_markdown_summary(&results, &path).expect("write summary");
+        let md = std::fs::read_to_string(&path).expect("read summary");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(md.contains("# UTF-8 Validation Benchmark Results"));
+        assert!(md.contains("AVX2 SIMD on x86_64, scalar fallback"));
+        assert!(md.contains("## ascii"));
+        assert!(md.contains("## mixed"));
+        assert!(md.contains("| 1kb |"));
+    }
 }

@@ -483,21 +483,19 @@ mod simd_x86 {
         }
     }
 
-    /// Test-only: drive the raw AVX2 kernel directly.
+    /// Test-only: run the raw AVX2 kernel over `input`.
     ///
-    /// Returns `Some(is_valid)` on AVX2-capable CPUs, or `None` when AVX2 is
-    /// absent (so tests can skip). Unlike [`validate_utf8_simd`], this exposes
-    /// the kernel's verdict without the scalar fallback, so a differential test
-    /// against `core::str::from_utf8` catches both false accepts *and* false
-    /// rejects.
+    /// The kernel-vs-std differential test gates on `is_x86_feature_detected!`
+    /// once and then calls this across its whole corpus. Exposing the raw kernel
+    /// verdict (rather than the scalar-fallback [`validate_utf8_simd`] wrapper)
+    /// lets the differential catch both false accepts *and* false rejects.
+    ///
+    /// # Safety
+    /// The CPU must support AVX2; the caller checks `is_x86_feature_detected!`.
     #[cfg(test)]
-    pub(crate) fn avx2_accepts_for_test(input: &[u8]) -> Option<bool> {
-        if is_x86_feature_detected!("avx2") {
-            // SAFETY: guarded by the AVX2 feature check above.
-            Some(unsafe { validate_utf8_avx2(input) })
-        } else {
-            None
-        }
+    pub(crate) unsafe fn validate_utf8_avx2_unchecked(input: &[u8]) -> bool {
+        // SAFETY: the caller guarantees AVX2 is available.
+        unsafe { validate_utf8_avx2(input) }
     }
 }
 
@@ -1726,6 +1724,8 @@ mod tests {
 /// only unsafe failure mode) surfaces here as a disagreement with std.
 #[cfg(test)]
 mod validate_utf8_differential_tests {
+    #![allow(unsafe_code)] // the x86_64 test drives the raw AVX2 kernel directly
+
     use super::{validate_utf8, validate_utf8_scalar};
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -1846,22 +1846,56 @@ mod validate_utf8_differential_tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
-    fn assert_kernel_agrees(bytes: &[u8], exercised: &mut bool) {
-        if let Some(valid) = super::simd_x86::avx2_accepts_for_test(bytes) {
-            *exercised = true;
-            let std_ok = core::str::from_utf8(bytes).is_ok();
-            assert_eq!(
-                valid, std_ok,
-                "AVX2 kernel disagreed with std on {bytes:02x?}"
-            );
-            // If these ever differ, the bug is in the intrinsics, not the logic.
-            assert_eq!(
-                valid,
-                avx2_logic_reference(bytes),
-                "AVX2 kernel disagreed with its portable twin on {bytes:02x?}"
-            );
+    /// Invalid fixtures: one per error kind, placed at offsets that straddle the
+    /// 32/64-byte SIMD block edges and land at end-of-input.
+    fn invalid_boundary_fixtures() -> Vec<Vec<u8>> {
+        let bad_seqs: &[&[u8]] = &[
+            &[0x80],                   // stray continuation
+            &[0xC0, 0x80],             // overlong 2-byte
+            &[0xC1, 0xBF],             // overlong 2-byte
+            &[0xE0, 0x80, 0x80],       // overlong 3-byte
+            &[0xED, 0xA0, 0x80],       // surrogate U+D800
+            &[0xF0, 0x80, 0x80, 0x80], // overlong 4-byte
+            &[0xF4, 0x90, 0x80, 0x80], // above U+10FFFF
+            &[0xF5],                   // invalid lead
+            &[0xFF],                   // invalid lead
+            &[0xC2],                   // truncated 2-byte at EOF
+            &[0xE0, 0xA0],             // truncated 3-byte at EOF
+            &[0xF0, 0x90, 0x80],       // truncated 4-byte at EOF
+        ];
+        let offsets = [0usize, 1, 30, 31, 32, 33, 62, 63, 64, 65];
+        let mut out = Vec::new();
+        for seq in bad_seqs {
+            for &off in &offsets {
+                let mut buf: Vec<u8> = core::iter::repeat(b'a').take(off).collect();
+                buf.extend_from_slice(seq);
+                out.push(buf);
+            }
         }
+        out
+    }
+
+    /// Valid fixtures: valid multi-byte sequences straddling block edges (guards
+    /// against false rejects at the cross-block `prev1/prev2/prev3` carry).
+    fn valid_boundary_fixtures() -> Vec<Vec<u8>> {
+        let good_seqs: &[&[u8]] = &[
+            "é".as_bytes(),          // 2-byte
+            "€".as_bytes(),          // 3-byte
+            "😀".as_bytes(),         // 4-byte
+            "\u{D7FF}".as_bytes(),   // just below surrogate range (3-byte)
+            "\u{10FFFF}".as_bytes(), // maximum code point (4-byte)
+        ];
+        let offsets = [0usize, 1, 29, 30, 31, 32, 33, 60, 61, 62, 63, 64, 65];
+        let mut out = Vec::new();
+        for seq in good_seqs {
+            for &off in &offsets {
+                let mut buf: Vec<u8> = core::iter::repeat(b'a').take(off).collect();
+                buf.extend_from_slice(seq);
+                buf.push(b'z');
+                out.push(buf);
+            }
+        }
+        out
     }
 
     /// Portable oracle: the scalar validator agrees with std on validity for
@@ -1906,17 +1940,37 @@ mod validate_utf8_differential_tests {
         }
     }
 
-    /// The AVX2 kernel itself agrees with std over a large corpus (catches both
-    /// false accepts and false rejects). Skipped on non-AVX2 hosts.
+    /// The AVX2 kernel itself agrees with std over a large random corpus and the
+    /// targeted boundary fixtures — catching both false accepts and false
+    /// rejects. The whole test skips on the rare non-AVX2 x86 host (a single
+    /// guard, rather than a per-input check, keeps this coverage-clean).
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx2_kernel_matches_std() {
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("avx2_kernel_matches_std: AVX2 unavailable, skipping");
+            return;
+        }
+        let check = |bytes: &[u8]| {
+            // SAFETY: AVX2 availability was confirmed above.
+            let valid = unsafe { super::simd_x86::validate_utf8_avx2_unchecked(bytes) };
+            assert_eq!(
+                valid,
+                core::str::from_utf8(bytes).is_ok(),
+                "AVX2 kernel disagreed with std on {bytes:02x?}"
+            );
+            // If these ever differ, the bug is in the intrinsics, not the logic.
+            assert_eq!(
+                valid,
+                avx2_logic_reference(bytes),
+                "AVX2 kernel disagreed with its portable twin on {bytes:02x?}"
+            );
+        };
+
         let mut rng = Rng(0xcafe_babe_1337_0042);
-        let mut exercised = false;
         for _ in 0..50_000 {
             let len = rng.below(140) as usize;
-            let bytes = random_bytes(&mut rng, len);
-            assert_kernel_agrees(&bytes, &mut exercised);
+            check(&random_bytes(&mut rng, len));
         }
         for _ in 0..10_000 {
             let min_len = rng.below(300) as usize;
@@ -1925,75 +1979,37 @@ mod validate_utf8_differential_tests {
                 let i = rng.below(bytes.len() as u32) as usize;
                 bytes[i] = (rng.next_u32() & 0xFF) as u8;
             }
-            assert_kernel_agrees(&bytes, &mut exercised);
+            check(&bytes);
         }
-        if !exercised {
-            eprintln!("avx2_kernel_matches_std: AVX2 unavailable, kernel not exercised");
+        for buf in invalid_boundary_fixtures() {
+            check(&buf);
+        }
+        for buf in valid_boundary_fixtures() {
+            check(&buf);
         }
     }
 
     /// Every error kind, injected at offsets straddling 32/64-byte block edges
-    /// and at end-of-input, must be rejected by both the scalar validator and
-    /// (on AVX2 hosts) the kernel.
+    /// and at end-of-input, must be rejected by std and the scalar validator.
+    /// (The AVX2 kernel runs the same fixtures in `avx2_kernel_matches_std`.)
     #[test]
     fn boundary_error_matrix() {
-        let bad_seqs: &[&[u8]] = &[
-            &[0x80],                   // stray continuation
-            &[0xC0, 0x80],             // overlong 2-byte
-            &[0xC1, 0xBF],             // overlong 2-byte
-            &[0xE0, 0x80, 0x80],       // overlong 3-byte
-            &[0xED, 0xA0, 0x80],       // surrogate U+D800
-            &[0xF0, 0x80, 0x80, 0x80], // overlong 4-byte
-            &[0xF4, 0x90, 0x80, 0x80], // above U+10FFFF
-            &[0xF5],                   // invalid lead
-            &[0xFF],                   // invalid lead
-            &[0xC2],                   // truncated 2-byte at EOF
-            &[0xE0, 0xA0],             // truncated 3-byte at EOF
-            &[0xF0, 0x90, 0x80],       // truncated 4-byte at EOF
-        ];
-        let offsets = [0usize, 1, 30, 31, 32, 33, 62, 63, 64, 65];
-        for seq in bad_seqs {
-            for &off in &offsets {
-                let mut buf: Vec<u8> = core::iter::repeat(b'a').take(off).collect();
-                buf.extend_from_slice(seq);
-                assert!(
-                    core::str::from_utf8(&buf).is_err(),
-                    "fixture should be invalid: {buf:02x?}"
-                );
-                assert!(validate_utf8_scalar(&buf).is_err(), "scalar: {buf:02x?}");
-                #[cfg(target_arch = "x86_64")]
-                if let Some(valid) = super::simd_x86::avx2_accepts_for_test(&buf) {
-                    assert!(!valid, "kernel accepted invalid: {buf:02x?}");
-                }
-            }
+        for buf in invalid_boundary_fixtures() {
+            assert!(
+                core::str::from_utf8(&buf).is_err(),
+                "fixture should be invalid: {buf:02x?}"
+            );
+            assert!(validate_utf8_scalar(&buf).is_err(), "scalar: {buf:02x?}");
         }
     }
 
-    /// Valid multi-byte sequences straddling block edges must be accepted by the
-    /// scalar validator and the kernel (guards against false rejects at the
-    /// cross-block `prev1/prev2/prev3` carry).
+    /// Valid multi-byte sequences straddling block edges must be accepted by std
+    /// and the scalar validator.
     #[test]
     fn boundary_valid_multibyte() {
-        let good_seqs: &[&[u8]] = &[
-            "é".as_bytes(),          // 2-byte
-            "€".as_bytes(),          // 3-byte
-            "😀".as_bytes(),         // 4-byte
-            "\u{D7FF}".as_bytes(),   // just below surrogate range (3-byte)
-            "\u{10FFFF}".as_bytes(), // maximum code point (4-byte)
-        ];
-        let offsets = [0usize, 1, 29, 30, 31, 32, 33, 60, 61, 62, 63, 64, 65];
-        for seq in good_seqs {
-            for &off in &offsets {
-                let mut buf: Vec<u8> = core::iter::repeat(b'a').take(off).collect();
-                buf.extend_from_slice(seq);
-                buf.push(b'z');
-                assert!(core::str::from_utf8(&buf).is_ok());
-                assert!(validate_utf8_scalar(&buf).is_ok(), "scalar: {buf:02x?}");
-                #[cfg(target_arch = "x86_64")]
-                if let Some(valid) = super::simd_x86::avx2_accepts_for_test(&buf) {
-                    assert!(valid, "kernel rejected valid: {buf:02x?}");
-                }
-            }
+        for buf in valid_boundary_fixtures() {
+            assert!(core::str::from_utf8(&buf).is_ok());
+            assert!(validate_utf8_scalar(&buf).is_ok(), "scalar: {buf:02x?}");
         }
     }
 }
