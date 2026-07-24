@@ -18,6 +18,10 @@ pub struct ValidateUtf8Args {
     #[arg(short, long)]
     pub quiet: bool,
 
+    /// Force scalar (non-SIMD) validation
+    #[arg(long)]
+    pub no_simd: bool,
+
     /// Force color output even when not a TTY
     #[arg(short = 'C', long = "color")]
     pub color: bool,
@@ -148,7 +152,15 @@ fn validate_input(
     args: &ValidateUtf8Args,
     scheme: &ColorScheme,
 ) -> Result<i32> {
-    match utf8::validate_utf8(input) {
+    // `--no-simd` forces the scalar validator; both paths return an identical
+    // `Utf8Error`, so the error-reporting below is unaffected by the choice.
+    let result = if args.no_simd {
+        utf8::validate_utf8_scalar(input)
+    } else {
+        utf8::validate_utf8(input)
+    };
+
+    match result {
         Ok(()) => Ok(exit_codes::SUCCESS),
         Err(err) => {
             if !args.quiet {
