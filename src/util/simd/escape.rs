@@ -545,6 +545,33 @@ mod tests {
         }
     }
 
+    /// The module-level `scalar` fallback is only reached through the SIMD
+    /// kernels' short-string path (arch-dependent) or a scalar-only build, so
+    /// exercise it directly on every target for parity and coverage.
+    #[test]
+    fn scalar_fallback_matches_reference() {
+        let cases: &[&[u8]] = &[
+            b"",
+            b"\"",
+            b"\\",
+            b"\n",
+            b"plain text",
+            b"quote\"in\\the\tmiddle",
+            "caf\u{e9} \u{2665} unicode".as_bytes(),
+            &[b'x'; 40],
+        ];
+        for &input in cases {
+            for start in 0..=input.len() {
+                assert_eq!(
+                    reference(input, start),
+                    super::json_escape::scalar(input, start),
+                    "scalar mismatch for {:?} at start {start}",
+                    String::from_utf8_lossy(input)
+                );
+            }
+        }
+    }
+
     // ------------------------------------------------------------------------
     // Per-kernel differential tests (#193): exercise each x86 kernel directly,
     // regardless of what the dispatcher would pick, so the SSE2 kernel is tested
@@ -648,6 +675,20 @@ mod tests {
                 }
             }
         }
+
+        #[test]
+        fn kernels_return_early_when_start_at_or_past_end() {
+            // The `start >= len` guard in each kernel is never reached through
+            // find() (which guards start earlier); exercise it directly.
+            assert_eq!(sse2_index(b"", 0), 0);
+            assert_eq!(sse2_index(b"abc", 3), 3);
+            assert_eq!(sse2_index(b"abc", 9), 3);
+            if has_avx2() {
+                assert_eq!(avx2_index(b"", 0), 0);
+                assert_eq!(avx2_index(b"abc", 3), 3);
+                assert_eq!(avx2_index(b"abc", 9), 3);
+            }
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -677,6 +718,12 @@ mod tests {
                     }
                 }
             }
+        }
+
+        #[test]
+        fn neon_returns_len_when_start_past_end() {
+            // The kernel's own `start >= len` guard, not reached through find().
+            assert_eq!(super::super::json_escape::neon(b"abc", 9), 3);
         }
     }
 }
