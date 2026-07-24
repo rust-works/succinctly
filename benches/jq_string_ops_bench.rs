@@ -36,9 +36,10 @@
 //! Adoption is gated **end-to-end** on a realistic large-single-string workload
 //! (#301), which does not yet exist. See `docs/optimizations/jq-string-search.md`.
 
+use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use memchr::memmem;
 
 // ---------------------------------------------------------------------------
