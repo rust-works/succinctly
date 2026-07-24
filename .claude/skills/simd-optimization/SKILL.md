@@ -112,6 +112,29 @@ unsafe fn unsigned_le(a: __m128i, b: __m128i) -> __m128i {
 }
 ```
 
+## `#[inline(always)]` + `#[target_feature]` Won't Compile
+
+A `#[target_feature]` function may **not** also be `#[inline(always)]` — modern
+rustc rejects the combination outright ([rust#145574]). Put `#[inline]` on the
+SIMD kernel (the compiler still inlines it under `-O`), and reserve
+`#[inline(always)]` for the *non*-`target_feature` dispatch wrapper. This split is
+load-bearing for escape scanning: O3 (#87) showed `#[inline(always)]` on the
+public entry is required to avoid a 3-5% regression, so the wrapper is
+`#[inline(always)]` while the per-backend mask kernels are `#[inline]`.
+
+[rust#145574]: https://github.com/rust-lang/rust/issues/145574
+
+## Shared Predicate-Parameterized Escape Scanner (#125)
+
+`src/util/simd/escape.rs` factors the 16/32-byte chunk loop + scalar remainder
+behind a `define_escape_scanner!` macro parameterized by the escape predicate, so
+a new scanner (`@html`/`@uri`/`@csv`; #124) is a macro invocation rather than a
+copy of the SIMD machinery. `find_json_escape` is the only instantiation today;
+it is re-exported from `yaml::simd` for compatibility. The scalar predicate and
+three per-backend mask helpers (NEON/AVX2/SSE2) are the only predicate-specific
+code — verify each new predicate with an exhaustive 256-byte × offset parity test
+against its scalar reference (the test that caught the signed-compare bug #230).
+
 ## Nibble Lookup Tables Must Be Exact (#186)
 
 `lo_table[byte & 0xF] & hi_table[byte >> 4]` classifies each bit plane as the
