@@ -639,6 +639,30 @@ The IB cursor state (`ib_word_idx`, `ib_ones_before`) remains valid after the ra
 
 ---
 
+### ⏸️ jq Substring Search: `memchr::memmem` vs std Two-Way (July 2026)
+
+**Status**: Measured (bench-only) and **deferred** — [issue #303](https://github.com/rust-works/succinctly/issues/303), follow-up to [#126](https://github.com/rust-works/succinctly/issues/126), gated on [#301](https://github.com/rust-works/succinctly/issues/301)
+
+**Problem**: Rust std substring search (`str::find`/`rfind`/`contains`/`split(&str)`) is the scalar Two-Way algorithm; `memchr::memmem` is SIMD. #126 flagged one narrow cell with headroom — long haystacks with a rare needle — in the jq builtins `index`/`rindex`/`indices`/`contains`/`split`.
+
+**Technique tested**: Both implementations A/B'd inside [benches/jq_string_ops_bench.rs](../../benches/jq_string_ops_bench.rs); `eval.rs` untouched. A `check_parity` guard runs before timing (guards `indices` overlap and `split` empty-part semantics).
+
+**Benchmark Results** (Apple M4 Pro, criterion median, memmem vs std):
+
+| Shape                                   | memmem vs std |
+|-----------------------------------------|---------------|
+| `index` absent, 64 KB haystack          | **5.9×** (8.4 → 49.6 GiB/s) |
+| `index` absent, 1-byte needle @ 16 KB   | **52×**       |
+| `index` absent, 64-byte needle @ 16 KB  | 0.76× (memmem loses) |
+| `contains` miss, 64 B                    | 0.31× (memmem loses) |
+| `split` dense sep / `indices` overlap    | 1.1–1.5× (allocation-bound) |
+
+**Key insight**: Green in memmem's target regime, but the scan is a minority of every candidate op's wall-time (all allocate output or materialize input), and there is no jq benchmark or realistic large-single-string workload (#301) to validate end-to-end. Per the #126 gate (>40% scan share + real workload), and the P2.6/P2.8/P3/P5/P8 micro-bench-win / end-to-end-reject precedents, the disciplined result is reject/defer. Full analysis in [jq-string-search.md](jq-string-search.md).
+
+**Files**: [benches/jq_string_ops_bench.rs](../../benches/jq_string_ops_bench.rs), [docs/optimizations/jq-string-search.md](jq-string-search.md)
+
+---
+
 ## Future Optimization Opportunities
 
 Based on analysis of ARM NEON instructions for indexing and data structures (January 2026):
