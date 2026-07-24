@@ -13,6 +13,9 @@ pub mod sve2;
 #[cfg(target_arch = "x86_64")]
 pub mod x86;
 
+/// Shared SIMD escape scanning (portable; SIMD kernels are gated internally).
+pub(crate) mod escape;
+
 /// Popcount of a 512-bit (64-byte) block.
 ///
 /// Uses the best available implementation for the current platform.
