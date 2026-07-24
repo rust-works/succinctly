@@ -117,7 +117,17 @@ impl core::fmt::Display for Utf8ErrorKind {
 /// ```
 #[inline]
 pub fn validate_utf8(input: &[u8]) -> Result<(), Utf8Error> {
-    validate_utf8_scalar(input)
+    // On x86_64 with runtime feature detection available (std or test), prefer
+    // the AVX2 fast path, which falls back to the scalar validator on any error
+    // (and on non-AVX2 hardware) so the reported `Utf8Error` is identical.
+    #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
+    {
+        validate_utf8_simd(input)
+    }
+    #[cfg(not(all(target_arch = "x86_64", any(test, feature = "std"))))]
+    {
+        validate_utf8_scalar(input)
+    }
 }
 
 /// Validate UTF-8 using a scalar (byte-by-byte) algorithm.
@@ -322,6 +332,173 @@ pub fn validate_utf8_scalar(input: &[u8]) -> Result<(), Utf8Error> {
 #[inline(always)]
 fn is_continuation_byte(byte: u8) -> bool {
     (byte & 0xC0) == 0x80
+}
+
+/// Validate UTF-8 using AVX2 SIMD, falling back to the scalar validator for the
+/// precise [`Utf8Error`] (and on CPUs without AVX2).
+///
+/// The AVX2 kernel only decides *validity* (a fast accept scan); it never
+/// pinpoints errors. On any detected error — or when AVX2 is unavailable — this
+/// re-runs [`validate_utf8_scalar`], so callers get byte-identical diagnostics
+/// regardless of which path ran. Available on `x86_64` when runtime feature
+/// detection is usable (the `std` feature, or under test).
+#[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
+pub use self::simd_x86::validate_utf8_simd;
+
+/// x86_64 AVX2 UTF-8 validation.
+///
+/// This is a first-principles port of the Keiser–Lemire "Validating UTF-8 In
+/// Less Than One Instruction Per Byte" approach (<https://arxiv.org/abs/2010.03090>),
+/// expressed with explicit range comparisons rather than packed lookup tables so
+/// that every check maps directly onto the rules in [`validate_utf8_scalar`].
+#[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
+mod simd_x86 {
+    #![allow(unsafe_code)] // x86_64 AVX2 SIMD intrinsics
+    #![allow(clippy::cast_possible_wrap)] // u8 byte constants deliberately reinterpreted as i8 lanes
+
+    use super::{validate_utf8_scalar, Utf8Error};
+    use core::arch::x86_64::*;
+
+    /// Validate `input` as UTF-8 using AVX2 when available.
+    ///
+    /// Returns `Ok(())` only when the AVX2 accept scan proves the whole buffer
+    /// valid; otherwise defers to the scalar validator for the exact error.
+    pub fn validate_utf8_simd(input: &[u8]) -> Result<(), Utf8Error> {
+        // SAFETY: `validate_utf8_avx2` is only entered once the CPU is confirmed
+        // to support AVX2 by `is_x86_feature_detected!`.
+        if is_x86_feature_detected!("avx2") && unsafe { validate_utf8_avx2(input) } {
+            Ok(())
+        } else {
+            validate_utf8_scalar(input)
+        }
+    }
+
+    /// Unsigned `a >= k` per byte lane; result lanes are `0xFF` (true) or `0x00`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn uge(a: __m256i, k: u8) -> __m256i {
+        // max_epu8(a, k) == a  iff  a >= k (unsigned). These register-only AVX2
+        // intrinsics are safe to call within a `#[target_feature]` fn.
+        let vk = _mm256_set1_epi8(k as i8);
+        _mm256_cmpeq_epi8(_mm256_max_epu8(a, vk), a)
+    }
+
+    /// Unsigned `a < k` per byte lane; result lanes are `0xFF` (true) or `0x00`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn ult(a: __m256i, k: u8) -> __m256i {
+        unsafe { _mm256_xor_si256(uge(a, k), _mm256_set1_epi8(-1)) }
+    }
+
+    /// Accumulate UTF-8 errors for one 32-byte block into `error`.
+    ///
+    /// `prev_input` holds the previous block (zeros before the first block) so
+    /// that `prev1`/`prev2`/`prev3` — the bytes 1/2/3 positions back — are
+    /// available across the block boundary.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn check_block(chunk: __m256i, prev_input: __m256i, error: &mut __m256i) {
+        unsafe {
+            // Shift the 256-bit vector right by 1/2/3 bytes, pulling in the tail
+            // of `prev_input` (the canonical simdjson `prev<N>` idiom).
+            let shifted = _mm256_permute2x128_si256(prev_input, chunk, 0x21);
+            let prev1 = _mm256_alignr_epi8(chunk, shifted, 15);
+            let prev2 = _mm256_alignr_epi8(chunk, shifted, 14);
+            let prev3 = _mm256_alignr_epi8(chunk, shifted, 13);
+
+            // is_cont = (chunk & 0xC0) == 0x80
+            let c0 = _mm256_set1_epi8(0xC0u8 as i8);
+            let is_cont =
+                _mm256_cmpeq_epi8(_mm256_and_si256(chunk, c0), _mm256_set1_epi8(0x80u8 as i8));
+
+            // A byte MUST be a continuation iff the byte 1 back is any lead
+            // (>=0xC0), or 2 back is a 3/4-byte lead (>=0xE0), or 3 back is a
+            // 4-byte lead (>=0xF0). Missing OR stray continuations => is_cont
+            // disagrees with must_cont.
+            let must_cont = _mm256_or_si256(
+                _mm256_or_si256(uge(prev1, 0xC0), uge(prev2, 0xE0)),
+                uge(prev3, 0xF0),
+            );
+            let mut err = _mm256_xor_si256(is_cont, must_cont);
+
+            // Bytes that are never valid anywhere: 0xC0/0xC1 (overlong 2-byte
+            // leads) and 0xF5..=0xFF (beyond U+10FFFF / not UTF-8 lead bytes).
+            let invalid_c0c1 =
+                _mm256_cmpeq_epi8(_mm256_and_si256(chunk, _mm256_set1_epi8(0xFEu8 as i8)), c0);
+            err = _mm256_or_si256(err, _mm256_or_si256(invalid_c0c1, uge(chunk, 0xF5)));
+
+            // Special cases keyed on the lead byte (prev1) and the byte after it
+            // (chunk), each firing only within the continuation range:
+            //   E0 followed by <0xA0 -> overlong 3-byte
+            //   ED followed by >=0xA0 -> surrogate (U+D800..U+DFFF)
+            //   F0 followed by <0x90 -> overlong 4-byte
+            //   F4 followed by >=0x90 -> above U+10FFFF
+            let e0 = _mm256_cmpeq_epi8(prev1, _mm256_set1_epi8(0xE0u8 as i8));
+            let ed = _mm256_cmpeq_epi8(prev1, _mm256_set1_epi8(0xEDu8 as i8));
+            let f0 = _mm256_cmpeq_epi8(prev1, _mm256_set1_epi8(0xF0u8 as i8));
+            let f4 = _mm256_cmpeq_epi8(prev1, _mm256_set1_epi8(0xF4u8 as i8));
+            err = _mm256_or_si256(err, _mm256_and_si256(e0, ult(chunk, 0xA0)));
+            err = _mm256_or_si256(err, _mm256_and_si256(ed, uge(chunk, 0xA0)));
+            err = _mm256_or_si256(err, _mm256_and_si256(f0, ult(chunk, 0x90)));
+            err = _mm256_or_si256(err, _mm256_and_si256(f4, uge(chunk, 0x90)));
+
+            *error = _mm256_or_si256(*error, err);
+        }
+    }
+
+    /// Return `true` iff `input` is entirely valid UTF-8.
+    ///
+    /// End-of-input truncation is caught by always processing a final
+    /// zero-padded block: a dangling multi-byte lead's absent continuation lands
+    /// on a `0x00` pad byte, which fails the continuation requirement.
+    #[target_feature(enable = "avx2")]
+    unsafe fn validate_utf8_avx2(input: &[u8]) -> bool {
+        unsafe {
+            let len = input.len();
+            if len == 0 {
+                return true;
+            }
+
+            let mut error = _mm256_setzero_si256();
+            let mut prev_input = _mm256_setzero_si256();
+
+            let mut pos = 0;
+            while pos + 32 <= len {
+                let chunk = _mm256_loadu_si256(input.as_ptr().add(pos).cast::<__m256i>());
+                check_block(chunk, prev_input, &mut error);
+                prev_input = chunk;
+                pos += 32;
+            }
+
+            // Final zero-padded tail. Runs even when `len % 32 == 0` (tail all
+            // zeros) so a lead byte at the very end is still flagged as truncated
+            // via the carried `prev_input`.
+            let mut tail = [0u8; 32];
+            tail[..len - pos].copy_from_slice(&input[pos..]);
+            let chunk = _mm256_loadu_si256(tail.as_ptr().cast::<__m256i>());
+            check_block(chunk, prev_input, &mut error);
+
+            // Valid iff no error bit was set anywhere.
+            _mm256_testz_si256(error, error) == 1
+        }
+    }
+
+    /// Test-only: drive the raw AVX2 kernel directly.
+    ///
+    /// Returns `Some(is_valid)` on AVX2-capable CPUs, or `None` when AVX2 is
+    /// absent (so tests can skip). Unlike [`validate_utf8_simd`], this exposes
+    /// the kernel's verdict without the scalar fallback, so a differential test
+    /// against `core::str::from_utf8` catches both false accepts *and* false
+    /// rejects.
+    #[cfg(test)]
+    pub(crate) fn avx2_accepts_for_test(input: &[u8]) -> Option<bool> {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by the AVX2 feature check above.
+            Some(unsafe { validate_utf8_avx2(input) })
+        } else {
+            None
+        }
+    }
 }
 
 /// Get the expected sequence length from a lead byte.
@@ -1539,6 +1716,284 @@ mod tests {
         fn rejects_invalid_lead_byte() {
             // 0x80 is a continuation byte, never a lead -> sequence_length 0.
             assert_eq!(decode_code_point(&[0x80]), None);
+        }
+    }
+}
+
+/// Differential tests: every validation path must agree with the standard
+/// library (`core::str::from_utf8`) on validity. The AVX2 kernel was written
+/// from first principles, so this is its correctness gate — a false accept (the
+/// only unsafe failure mode) surfaces here as a disagreement with std.
+#[cfg(test)]
+mod validate_utf8_differential_tests {
+    use super::{validate_utf8, validate_utf8_scalar};
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// Tiny deterministic xorshift64 RNG — keeps the corpus reproducible without
+    /// a dev-dependency on `rand`.
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn next_u32(&mut self) -> u32 {
+            (self.next_u64() >> 32) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.next_u32() % n
+        }
+    }
+
+    /// `len` uniformly random bytes.
+    fn random_bytes(rng: &mut Rng, len: usize) -> Vec<u8> {
+        (0..len).map(|_| (rng.next_u32() & 0xFF) as u8).collect()
+    }
+
+    /// A pseudo-random *valid* UTF-8 buffer of at least `min_len` bytes, mixing
+    /// all four sequence lengths. `char::from_u32` guarantees validity by
+    /// rejecting surrogates and out-of-range code points.
+    fn random_valid_utf8(rng: &mut Rng, min_len: usize) -> Vec<u8> {
+        let mut s = String::new();
+        while s.len() < min_len {
+            let cp = match rng.below(4) {
+                0 => rng.below(0x80),
+                1 => 0x80 + rng.below(0x800 - 0x80),
+                2 => 0x800 + rng.below(0x1_0000 - 0x800),
+                _ => 0x1_0000 + rng.below(0x11_0000 - 0x1_0000),
+            };
+            if let Some(c) = char::from_u32(cp) {
+                s.push(c);
+            }
+        }
+        s.into_bytes()
+    }
+
+    /// Portable twin of the AVX2 kernel's *logic*: the identical per-byte
+    /// predicate (`is_cont` vs `must_cont`, the never-valid bytes, and the E0/
+    /// ED/F0/F4 special cases), evaluated over positions `0..=len` — where index
+    /// `len` is the first byte of the kernel's always-run zero-padded tail block,
+    /// which is what catches end-of-input truncation. Out-of-range indices read
+    /// as `0`, matching the zero fill.
+    ///
+    /// Testing this against `core::str::from_utf8` validates the block algorithm
+    /// on non-x86 hosts; any divergence localized purely to the intrinsics is
+    /// left for the x86 [`avx2_kernel_matches_std`] leg.
+    fn avx2_logic_reference(input: &[u8]) -> bool {
+        let len = input.len();
+        if len == 0 {
+            return true;
+        }
+        let at = |i: isize| -> u8 {
+            if i < 0 || i as usize >= len {
+                0
+            } else {
+                input[i as usize]
+            }
+        };
+        for i in 0..=len as isize {
+            let c = at(i);
+            let p1 = at(i - 1);
+            let p2 = at(i - 2);
+            let p3 = at(i - 3);
+            let is_cont = (c & 0xC0) == 0x80;
+            let must_cont = p1 >= 0xC0 || p2 >= 0xE0 || p3 >= 0xF0;
+            let err = (is_cont != must_cont)
+                || (c & 0xFE) == 0xC0 // 0xC0 / 0xC1 (overlong 2-byte lead)
+                || c >= 0xF5 // 0xF5..=0xFF (never a valid lead)
+                || (p1 == 0xE0 && c < 0xA0) // overlong 3-byte
+                || (p1 == 0xED && c >= 0xA0) // surrogate
+                || (p1 == 0xF0 && c < 0x90) // overlong 4-byte
+                || (p1 == 0xF4 && c >= 0x90); // above U+10FFFF
+            if err {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The block algorithm (portable twin of the AVX2 kernel) agrees with std
+    /// over a large corpus. Runs on every architecture, so it gates the kernel's
+    /// *logic* even where AVX2 can't execute.
+    #[test]
+    fn avx2_logic_matches_std() {
+        let mut rng = Rng(0x5eed_1234_9999_0001);
+        for _ in 0..60_000 {
+            let len = rng.below(140) as usize;
+            let bytes = random_bytes(&mut rng, len);
+            assert_eq!(
+                avx2_logic_reference(&bytes),
+                core::str::from_utf8(&bytes).is_ok(),
+                "block logic disagreed with std on {bytes:02x?}"
+            );
+        }
+        for _ in 0..10_000 {
+            let min_len = rng.below(300) as usize;
+            let mut bytes = random_valid_utf8(&mut rng, min_len);
+            if !bytes.is_empty() && rng.below(2) == 0 {
+                let i = rng.below(bytes.len() as u32) as usize;
+                bytes[i] = (rng.next_u32() & 0xFF) as u8;
+            }
+            assert_eq!(
+                avx2_logic_reference(&bytes),
+                core::str::from_utf8(&bytes).is_ok(),
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn assert_kernel_agrees(bytes: &[u8], exercised: &mut bool) {
+        if let Some(valid) = super::simd_x86::avx2_accepts_for_test(bytes) {
+            *exercised = true;
+            let std_ok = core::str::from_utf8(bytes).is_ok();
+            assert_eq!(
+                valid, std_ok,
+                "AVX2 kernel disagreed with std on {bytes:02x?}"
+            );
+            // If these ever differ, the bug is in the intrinsics, not the logic.
+            assert_eq!(
+                valid,
+                avx2_logic_reference(bytes),
+                "AVX2 kernel disagreed with its portable twin on {bytes:02x?}"
+            );
+        }
+    }
+
+    /// Portable oracle: the scalar validator agrees with std on validity for
+    /// random byte soup (lengths straddle the 32/64-byte SIMD block edges) and
+    /// for valid UTF-8 with occasional single-byte corruption.
+    #[test]
+    fn scalar_matches_std() {
+        let mut rng = Rng(0x1234_5678_9abc_def0);
+        for _ in 0..20_000 {
+            let len = rng.below(80) as usize;
+            let bytes = random_bytes(&mut rng, len);
+            assert_eq!(
+                validate_utf8_scalar(&bytes).is_ok(),
+                core::str::from_utf8(&bytes).is_ok(),
+                "scalar disagreed with std on {bytes:02x?}"
+            );
+        }
+        for _ in 0..5_000 {
+            let min_len = rng.below(200) as usize;
+            let mut bytes = random_valid_utf8(&mut rng, min_len);
+            if !bytes.is_empty() && rng.below(2) == 0 {
+                let i = rng.below(bytes.len() as u32) as usize;
+                bytes[i] ^= 0xFF;
+            }
+            assert_eq!(
+                validate_utf8_scalar(&bytes).is_ok(),
+                core::str::from_utf8(&bytes).is_ok(),
+            );
+        }
+    }
+
+    /// The public dispatcher agrees with the scalar validator on validity AND
+    /// returns a byte-identical `Utf8Error` when both fail (the SIMD path falls
+    /// back to the scalar validator for diagnostics, so `Result`s must match).
+    #[test]
+    fn dispatch_matches_scalar_including_error() {
+        let mut rng = Rng(0x0f0f_0f0f_dead_beef);
+        for _ in 0..20_000 {
+            let len = rng.below(96) as usize;
+            let bytes = random_bytes(&mut rng, len);
+            assert_eq!(validate_utf8(&bytes), validate_utf8_scalar(&bytes));
+        }
+    }
+
+    /// The AVX2 kernel itself agrees with std over a large corpus (catches both
+    /// false accepts and false rejects). Skipped on non-AVX2 hosts.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_kernel_matches_std() {
+        let mut rng = Rng(0xcafe_babe_1337_0042);
+        let mut exercised = false;
+        for _ in 0..50_000 {
+            let len = rng.below(140) as usize;
+            let bytes = random_bytes(&mut rng, len);
+            assert_kernel_agrees(&bytes, &mut exercised);
+        }
+        for _ in 0..10_000 {
+            let min_len = rng.below(300) as usize;
+            let mut bytes = random_valid_utf8(&mut rng, min_len);
+            if !bytes.is_empty() && rng.below(2) == 0 {
+                let i = rng.below(bytes.len() as u32) as usize;
+                bytes[i] = (rng.next_u32() & 0xFF) as u8;
+            }
+            assert_kernel_agrees(&bytes, &mut exercised);
+        }
+        if !exercised {
+            eprintln!("avx2_kernel_matches_std: AVX2 unavailable, kernel not exercised");
+        }
+    }
+
+    /// Every error kind, injected at offsets straddling 32/64-byte block edges
+    /// and at end-of-input, must be rejected by both the scalar validator and
+    /// (on AVX2 hosts) the kernel.
+    #[test]
+    fn boundary_error_matrix() {
+        let bad_seqs: &[&[u8]] = &[
+            &[0x80],                   // stray continuation
+            &[0xC0, 0x80],             // overlong 2-byte
+            &[0xC1, 0xBF],             // overlong 2-byte
+            &[0xE0, 0x80, 0x80],       // overlong 3-byte
+            &[0xED, 0xA0, 0x80],       // surrogate U+D800
+            &[0xF0, 0x80, 0x80, 0x80], // overlong 4-byte
+            &[0xF4, 0x90, 0x80, 0x80], // above U+10FFFF
+            &[0xF5],                   // invalid lead
+            &[0xFF],                   // invalid lead
+            &[0xC2],                   // truncated 2-byte at EOF
+            &[0xE0, 0xA0],             // truncated 3-byte at EOF
+            &[0xF0, 0x90, 0x80],       // truncated 4-byte at EOF
+        ];
+        let offsets = [0usize, 1, 30, 31, 32, 33, 62, 63, 64, 65];
+        for seq in bad_seqs {
+            for &off in &offsets {
+                let mut buf: Vec<u8> = core::iter::repeat(b'a').take(off).collect();
+                buf.extend_from_slice(seq);
+                assert!(
+                    core::str::from_utf8(&buf).is_err(),
+                    "fixture should be invalid: {buf:02x?}"
+                );
+                assert!(validate_utf8_scalar(&buf).is_err(), "scalar: {buf:02x?}");
+                #[cfg(target_arch = "x86_64")]
+                if let Some(valid) = super::simd_x86::avx2_accepts_for_test(&buf) {
+                    assert!(!valid, "kernel accepted invalid: {buf:02x?}");
+                }
+            }
+        }
+    }
+
+    /// Valid multi-byte sequences straddling block edges must be accepted by the
+    /// scalar validator and the kernel (guards against false rejects at the
+    /// cross-block `prev1/prev2/prev3` carry).
+    #[test]
+    fn boundary_valid_multibyte() {
+        let good_seqs: &[&[u8]] = &[
+            "é".as_bytes(),          // 2-byte
+            "€".as_bytes(),          // 3-byte
+            "😀".as_bytes(),         // 4-byte
+            "\u{D7FF}".as_bytes(),   // just below surrogate range (3-byte)
+            "\u{10FFFF}".as_bytes(), // maximum code point (4-byte)
+        ];
+        let offsets = [0usize, 1, 29, 30, 31, 32, 33, 60, 61, 62, 63, 64, 65];
+        for seq in good_seqs {
+            for &off in &offsets {
+                let mut buf: Vec<u8> = core::iter::repeat(b'a').take(off).collect();
+                buf.extend_from_slice(seq);
+                buf.push(b'z');
+                assert!(core::str::from_utf8(&buf).is_ok());
+                assert!(validate_utf8_scalar(&buf).is_ok(), "scalar: {buf:02x?}");
+                #[cfg(target_arch = "x86_64")]
+                if let Some(valid) = super::simd_x86::avx2_accepts_for_test(&buf) {
+                    assert!(valid, "kernel rejected valid: {buf:02x?}");
+                }
+            }
         }
     }
 }

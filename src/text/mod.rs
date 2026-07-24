@@ -25,4 +25,9 @@
 pub mod utf8;
 
 // Re-export commonly used types
-pub use utf8::{validate_utf8, Utf8Error, Utf8ErrorKind};
+pub use utf8::{validate_utf8, validate_utf8_scalar, Utf8Error, Utf8ErrorKind};
+
+// The AVX2 fast path is only present on x86_64 when runtime feature detection
+// is available (the `std` feature, or under test).
+#[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
+pub use utf8::validate_utf8_simd;
