@@ -5,6 +5,12 @@ on:
     # labeled/unlabeled are NOT default pull_request activity types; include them
     # so this check re-runs the moment the do_not_merge label is toggled.
     types: [opened, reopened, synchronize, labeled, unlabeled]
+  # Merge-queue leg (#310). "Do Not Merge" is a required context, so it must also
+  # report on the `gh-readonly-queue/main/*` builds or queued PRs would hang on it
+  # until the queue times out and drops them. No logic change is needed — see the
+  # step comment below.
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -18,6 +24,12 @@ jobs:
       # The `if` guards the STEP, not the job: the job always runs and reports a
       # status (green when the label is absent), so a PR can never sit forever
       # "pending" on a required check that never ran.
+      #
+      # This is also what makes the job correct on `merge_group` (#310): that
+      # event carries no `github.event.pull_request`, so the guard is false, the
+      # step is skipped, and the job still reports success on the required
+      # context. The label therefore gates queue *entry* only — labelling a PR
+      # that is already in the queue will not evict it.
       - name: Fail if labeled do_not_merge
         if: contains(github.event.pull_request.labels.*.name, 'do_not_merge')
         run: |
