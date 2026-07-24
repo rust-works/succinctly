@@ -1,8 +1,26 @@
 # UTF-8 Validation Benchmarks
 
-Benchmarks for `succinctly text validate utf8` - scalar UTF-8 validation throughput.
+Benchmarks for `succinctly text validate utf8`, which validates UTF-8 with two
+interchangeable engines:
 
-This serves as the baseline for future SIMD implementations.
+- **AVX2 SIMD** (x86_64, default) — a first-principles port of the Keiser–Lemire
+  "Validating UTF-8 In Less Than One Instruction Per Byte" algorithm
+  ([arXiv:2010.03090](https://arxiv.org/abs/2010.03090)): 32-byte blocks with a
+  fast accept scan that falls back to the scalar validator for the exact error
+  position, so diagnostics are byte-identical either way. Selected at runtime via
+  `is_x86_feature_detected!("avx2")`.
+- **Scalar** — the portable byte-by-byte validator, used on non-x86_64 targets, on
+  x86_64 CPUs without AVX2, and whenever `--no-simd` is passed.
+
+`benches/utf8_validate_bench.rs` reports a `scalar` and a `simd` arm per input so
+the two compare directly (`cargo bench --bench utf8_validate_bench`).
+
+> **⚠️ SIMD figures not yet measured.** Every table below is the **scalar** baseline
+> only. AVX2 throughput must be measured on an AVX2-capable x86_64 host (CI's x86_64
+> leg or the 7950X bench box) and — per the perf-cluster convention shared with #133
+> (broadword) and #134 (broadword + DFA) — gated on the #301 real-workload corpus
+> before being cited. JSON-validation experience suggests several GiB/s, with the
+> largest wins on ASCII-heavy and mixed content.
 
 > **⚠️ Provisional — pending re-measurement.** The figures below were captured on a
 > pre-rebase branch tip; those commits were orphaned when this branch was rebased onto
