@@ -5,6 +5,17 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Merge-queue leg (#310). `merge_group` is a distinct event from
+  # `push`/`pull_request`: when a PR is queued, GitHub builds a throwaway
+  # `gh-readonly-queue/main/*` ref (the PR replayed onto the latest `main`) and
+  # expects the required contexts to report *there*. Without this trigger a
+  # queued PR would hang on all six required checks until the queue's
+  # `check_response_timeout_minutes` elapsed and then be dropped — so this must
+  # be on `main` *before* the `merge_queue` rule is added to ruleset 11913990.
+  # `checks_requested` is the only activity type today; pinning it keeps the
+  # workflow specific if more are added later.
+  merge_group:
+    types: [checks_requested]
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,10 +27,13 @@ jobs:
   # in seconds without deadlocking branch protection. A single gate is the source
   # of truth for the split — no twin `ci-skip.yml` whose stub job names must be
   # hand-mirrored against this matrix (which would silently rot when the matrix or
-  # protection set changes). Non-PR events (main pushes) always take the full
-  # path. No markdown is `include_str!`-compiled here, but the doc set still
-  # scopes `*.md` to the repo root only — never `**/*.md` — so anything not
-  # explicitly a doc runs full CI (fail-safe).
+  # protection set changes). Non-PR events (main pushes, merge-queue builds)
+  # always take the full path — on a `merge_group` event the `paths-filter` step
+  # self-skips and `decide` sets `code=true`, so whatever is about to become
+  # `main` always gets the full required matrix (#310). No markdown is
+  # `include_str!`-compiled here, but the doc set still scopes `*.md` to the repo
+  # root only — never `**/*.md` — so anything not explicitly a doc runs full CI
+  # (fail-safe).
   gate:
     name: Gate
     runs-on: ubuntu-latest
@@ -303,11 +317,13 @@ jobs:
   # above stays on `stable` so we don't triple CI minutes. `beta` gates CI;
   # `nightly` is advisory (`continue-on-error`) because it is the flakiest. Not a
   # required status context, so it skips wholesale on the docs-only fast path
-  # (job-level `if`, like bench/coverage) rather than run-and-skip-steps.
+  # (job-level `if`, like bench/coverage) rather than run-and-skip-steps. Also
+  # skipped on `merge_group` (#310): it is advisory, not required, so running it
+  # per queue entry would just add latency to every merge without gating it.
   test-x86-upstream:
     name: Test (x86_64) (${{ matrix.rust }})
     needs: gate
-    if: needs.gate.outputs.code == 'true'
+    if: needs.gate.outputs.code == 'true' && github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false                                   # beta breakage must not cancel nightly
@@ -357,10 +373,12 @@ jobs:
       - name: Check no_std compatibility
         run: cargo check --no-default-features
 
+  # Skipped on `merge_group` (#310): a 3-arch `cargo bench` fan-out is far too
+  # slow to run per queue entry, and it gates nothing.
   bench:
     name: Bench (${{ matrix.name }})
     needs: gate
-    if: needs.gate.outputs.code == 'true'
+    if: needs.gate.outputs.code == 'true' && github.event_name != 'merge_group'
     strategy:
       matrix:
         include:
@@ -492,10 +510,14 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # Skipped on `merge_group` (#310): this posts a sticky *PR* comment and needs
+  # `pull-requests: write`, but a merge-group build has no associated PR
+  # (`github.event.pull_request` is absent), so it could only error or no-op.
+  # Patch coverage is reported on the PR before it is ever queued.
   coverage:
     name: Coverage (${{ matrix.name }})
     needs: gate
-    if: needs.gate.outputs.code == 'true'
+    if: needs.gate.outputs.code == 'true' && github.event_name != 'merge_group'
     strategy:
       fail-fast: false
       matrix:

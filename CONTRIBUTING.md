@@ -178,7 +178,12 @@ Requires Intel Ice Lake+ or AMD Zen 4+.
 
 6. **Address review feedback**: Make requested changes and push updates
 
-7. **Merge**: Once approved, your PR will be merged
+7. **Merge**: Once approved and green, use **"Merge when ready"** to add the PR to
+   the merge queue. The queue replays your commits onto the current `main` and
+   re-runs CI on that combination before merging, so a PR that was green in
+   isolation can't silently break `main` by racing another merge. You don't need
+   to update your branch first — the queue does that for you. Merges are done by
+   **rebase**: your commits are replayed onto `main` with no merge commit.
 
 ## Architecture Guidelines
 
