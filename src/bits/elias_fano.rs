@@ -15,6 +15,7 @@
 //! | Operation | Complexity | Notes |
 //! |-----------|------------|-------|
 //! | `get(i)` | O(1) | Uses select samples |
+//! | `predecessor(v)` | O(log n) | Binary search over `get`; cold paths only |
 //! | `advance_one()` | O(1) amortized | Scans for next 1-bit |
 //! | `advance_by(k)` | O(k/64) | Word-by-word scanning |
 //! | `seek(i)` | O(1) | Uses select samples |
@@ -245,6 +246,47 @@ impl EliasFano {
 
         let value = ((high_value as u64) << self.low_width) | low_value;
         Some(value as u32)
+    }
+
+    /// Find the largest element `<= value`, returning its index and value.
+    ///
+    /// Returns `None` if the sequence is empty or every element exceeds `value`.
+    /// When the sequence contains duplicates of the answer, the **last** such
+    /// index is returned.
+    ///
+    /// # Performance
+    ///
+    /// O(log n) binary search over [`get`](Self::get), so O(log n) sampled
+    /// selects. Intended for cold paths (line/column lookup); use
+    /// [`EliasFanoCursor`] for sequential access.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use succinctly::bits::EliasFano;
+    ///
+    /// let ef = EliasFano::build(&[0, 15, 23, 45]);
+    /// assert_eq!(ef.predecessor(23), Some((2, 23))); // exact hit
+    /// assert_eq!(ef.predecessor(30), Some((2, 23))); // largest <= 30
+    /// assert_eq!(ef.predecessor(99), Some((3, 45))); // past the end
+    /// ```
+    pub fn predecessor(&self, value: u32) -> Option<(usize, u32)> {
+        let mut lo = 0usize;
+        let mut hi = self.len;
+        let mut best = None;
+
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let v = self.get(mid).expect("mid < len");
+            if v <= value {
+                best = Some((mid, v));
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        best
     }
 
     /// Create a cursor starting at element 0.
@@ -844,6 +886,85 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_predecessor_empty() {
+        let ef = EliasFano::build(&[]);
+        assert_eq!(ef.predecessor(0), None);
+        assert_eq!(ef.predecessor(u32::MAX), None);
+    }
+
+    #[test]
+    fn test_predecessor_single_element() {
+        let ef = EliasFano::build(&[42]);
+        assert_eq!(ef.predecessor(41), None, "below the only element");
+        assert_eq!(ef.predecessor(42), Some((0, 42)), "exact hit");
+        assert_eq!(ef.predecessor(43), Some((0, 42)), "above the only element");
+    }
+
+    #[test]
+    fn test_predecessor_exact_and_between() {
+        let values = [0u32, 15, 23, 45, 52, 78, 120, 256];
+        let ef = EliasFano::build(&values);
+
+        for (i, &v) in values.iter().enumerate() {
+            assert_eq!(ef.predecessor(v), Some((i, v)), "exact hit on {v}");
+        }
+
+        assert_eq!(ef.predecessor(1), Some((0, 0)));
+        assert_eq!(ef.predecessor(14), Some((0, 0)));
+        assert_eq!(ef.predecessor(22), Some((1, 15)));
+        assert_eq!(ef.predecessor(255), Some((6, 120)));
+        assert_eq!(ef.predecessor(u32::MAX), Some((7, 256)), "past the end");
+    }
+
+    #[test]
+    fn test_predecessor_below_first() {
+        // The first element is non-zero, so small queries have no predecessor.
+        let ef = EliasFano::build(&[10, 20, 30]);
+        assert_eq!(ef.predecessor(0), None);
+        assert_eq!(ef.predecessor(9), None);
+        assert_eq!(ef.predecessor(10), Some((0, 10)));
+    }
+
+    #[test]
+    fn test_predecessor_duplicates_returns_last() {
+        // Elias-Fano permits non-decreasing input; the contract is that
+        // `predecessor` returns the LAST index holding the answer.
+        let ef = EliasFano::build(&[5, 7, 7, 7, 9]);
+        assert_eq!(ef.predecessor(7), Some((3, 7)));
+        assert_eq!(ef.predecessor(8), Some((3, 7)));
+        assert_eq!(ef.predecessor(9), Some((4, 9)));
+    }
+
+    #[test]
+    fn test_predecessor_across_sample_boundaries() {
+        // Crosses SELECT_SAMPLE_RATE (256) and 2x it.
+        let values: Vec<u32> = (0..1000).map(|i| i * 5).collect();
+        let ef = EliasFano::build(&values);
+
+        for idx in [0usize, 255, 256, 257, 511, 512, 513, 999] {
+            let v = values[idx];
+            assert_eq!(ef.predecessor(v), Some((idx, v)), "exact hit at {idx}");
+            // v + 1..v + 5 all resolve back to the same element.
+            assert_eq!(ef.predecessor(v + 3), Some((idx, v)), "gap after {idx}");
+        }
+    }
+
+    #[test]
+    fn test_predecessor_matches_partition_point() {
+        // Exhaustive cross-check against the obvious slice implementation.
+        let values: Vec<u32> = (0..300).map(|i| i * 3 + 7).collect();
+        let ef = EliasFano::build(&values);
+
+        for query in 0..(values[values.len() - 1] + 5) {
+            let expected = match values.partition_point(|&x| x <= query) {
+                0 => None,
+                n => Some((n - 1, values[n - 1])),
+            };
+            assert_eq!(ef.predecessor(query), expected, "query {query}");
         }
     }
 
