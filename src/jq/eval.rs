@@ -472,7 +472,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             eval_string_interpolation::<W, S>(parts, value, optional)
         }
 
-        Expr::Format(format_type) => eval_format::<W>(format_type.clone(), value, optional),
+        Expr::Format(format_type) => eval_format::<W>(format_type, value, optional),
 
         // Phase 8: Variables and Advanced Control Flow
         Expr::As { expr, var, body } => eval_as::<W, S>(expr, var, body, value, optional),
@@ -3867,31 +3867,42 @@ fn owned_to_string(value: &OwnedValue) -> String {
     }
 }
 
-/// Evaluate a format string: `@json`, `@uri`, etc.
-fn eval_format<W: Clone + AsRef<[u64]>>(
-    format_type: FormatType,
-    value: StandardJson<'_, W>,
+/// Apply a format (`@json`, `@uri`, ...) to an already-materialized value.
+///
+/// Split out of [`eval_format`] so the generic evaluator can format an
+/// `OwnedValue` directly, instead of serializing it back to JSON and rebuilding
+/// a `JsonIndex` purely to re-enter this evaluator (#124). Formats are pure
+/// functions of the value -- they touch neither the cursor nor the index -- so
+/// this is the whole of the work `Expr::Format` needs.
+pub(crate) fn format_owned(
+    format_type: &FormatType,
+    owned: &OwnedValue,
     optional: bool,
-) -> QueryResult<'_, W> {
-    let owned = to_owned(&value);
+) -> Result<String, EvalError> {
+    match format_type {
+        FormatType::Text => format_text(owned),
+        FormatType::Json => format_json(owned),
+        FormatType::Uri => format_uri(owned, optional),
+        FormatType::Csv => format_csv(owned, optional),
+        FormatType::Tsv => format_tsv(owned, optional),
+        FormatType::Dsv(delimiter) => format_dsv(owned, delimiter, optional),
+        FormatType::Base64 => format_base64(owned, optional),
+        FormatType::Base64d => format_base64d(owned, optional),
+        FormatType::Html => format_html(owned, optional),
+        FormatType::Sh => format_sh(owned, optional),
+        FormatType::Urid => format_urid(owned, optional),
+        FormatType::Yaml => format_yaml(owned),
+        FormatType::Props => format_props(owned),
+    }
+}
 
-    let result = match format_type {
-        FormatType::Text => format_text(&owned),
-        FormatType::Json => format_json(&owned),
-        FormatType::Uri => format_uri(&owned, optional),
-        FormatType::Csv => format_csv(&owned, optional),
-        FormatType::Tsv => format_tsv(&owned, optional),
-        FormatType::Dsv(delimiter) => format_dsv(&owned, &delimiter, optional),
-        FormatType::Base64 => format_base64(&owned, optional),
-        FormatType::Base64d => format_base64d(&owned, optional),
-        FormatType::Html => format_html(&owned, optional),
-        FormatType::Sh => format_sh(&owned, optional),
-        FormatType::Urid => format_urid(&owned, optional),
-        FormatType::Yaml => format_yaml(&owned),
-        FormatType::Props => format_props(&owned),
-    };
-
-    match result {
+/// Evaluate a format string: `@json`, `@uri`, etc.
+fn eval_format<'a, W: Clone + AsRef<[u64]>>(
+    format_type: &FormatType,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match format_owned(format_type, &to_owned(&value), optional) {
         Ok(s) => QueryResult::Owned(OwnedValue::String(s)),
         Err(e) => QueryResult::Error(e),
     }

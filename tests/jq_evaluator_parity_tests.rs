@@ -136,6 +136,219 @@ fn test_object_ordering_parity_162() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Format functions (#124)
+//
+// Formats are pure functions of the value, so the two evaluators must agree on
+// every one. The generic evaluator has no `Expr::Format` arm, so today it
+// reaches them only via the catch-all's `to_json` + `JsonIndex::build`
+// round-trip. These cases pin current behaviour so giving it a direct arm can
+// be proven output-neutral.
+// ---------------------------------------------------------------------------
+
+/// Formats that accept scalars, over every scalar shape.
+#[test]
+fn test_parity_formats_scalar_inputs() {
+    for filter in ["@text", "@json", "@uri", "@html", "@sh", "@yaml", "@props"] {
+        for json in [
+            b"null".as_slice(),
+            b"true",
+            b"false",
+            b"42",
+            b"-1.5",
+            br#""hello world/?&=x""#,
+            br#""<a href=\"x\">&y</a>""#,
+            br#""it's""#,
+            br#""""#,
+        ] {
+            assert_parity(json, filter);
+        }
+    }
+}
+
+/// Array-shaped formats, including the quoting/escaping edge cases.
+#[test]
+fn test_parity_formats_array_inputs() {
+    for json in [
+        br#"["a","b,c",1,true,null]"#.as_slice(),
+        br#"["q\"uote","tab\there","nl\nhere","back\\slash"]"#,
+        br#"["it's",-2.5]"#,
+        br"[]",
+    ] {
+        for filter in [
+            "@csv",
+            "@tsv",
+            r#"@dsv("|")"#,
+            r#"@dsv(",")"#,
+            "@sh",
+            "@json",
+            "@text",
+            "@yaml",
+            "@props",
+        ] {
+            assert_parity(json, filter);
+        }
+    }
+}
+
+/// Formats that only accept strings.
+#[test]
+fn test_parity_formats_string_only() {
+    for filter in ["@base64", "@base64d", "@urid"] {
+        for json in [
+            br#""hello""#.as_slice(),
+            br#""aGVsbG8=""#,
+            br#""%C3%A9""#,
+            br#""a%2Fb%20c""#,
+            br#""100%""#,
+            br#""""#,
+        ] {
+            assert_parity(json, filter);
+        }
+    }
+}
+
+/// A format that rejects its input must reject it identically in both.
+#[test]
+fn test_parity_formats_type_errors() {
+    for (json, filter) in [
+        (br#"{"a":1}"#.as_slice(), "@uri"),
+        (br#"{"a":1}"#, "@html"),
+        (br#"{"a":1}"#, "@sh"),
+        (b"42", "@csv"),
+        (b"42", "@tsv"),
+        (b"42", "@base64"),
+        (b"42", "@urid"),
+        (br#""notanarray""#, "@csv"),
+    ] {
+        assert_parity(json, filter);
+    }
+}
+
+/// The shape that matters most for #124: a *constructed* value piped into a
+/// format routes through `eval_on_owned`, not `eval_single`, so it needs its
+/// own coverage.
+#[test]
+fn test_parity_formats_piped_from_constructed() {
+    let json = br#"{"a":"x y","b":2,"c":"q\"uote"}"#;
+    for filter in [
+        r"[.a,.b] | @csv",
+        r"[.a,.c] | @csv",
+        r"[.a,.b] | @tsv",
+        r#"[.a,.b] | @dsv(";")"#,
+        r"[.a,.b] | @json",
+        r"[.a,.b] | @sh",
+        r"[.a,.b] | @text",
+        r".a | @uri",
+        r".a | @html",
+        r".c | @sh",
+    ] {
+        assert_parity(json, filter);
+    }
+}
+
+/// Formats applied per-element across an iteration -- the CLI's common shape.
+#[test]
+fn test_parity_formats_over_iteration() {
+    let json = br#"{"u":[{"n":"a b","v":1},{"n":"c&d","v":2}]}"#;
+    for filter in [
+        ".u[] | .n | @uri",
+        ".u[] | .n | @html",
+        ".u[] | [.n,.v] | @csv",
+        ".u[] | [.n,.v] | @tsv",
+        "[.u[].n] | @csv",
+        ".u[] | @json",
+    ] {
+        assert_parity(json, filter);
+    }
+}
+
+/// Non-finite floats exercise `numeric_display_string`/`owned_to_yaml`/
+/// `props_value_to_string` (eval.rs), which already rendered `"inf"`/`".nan"`/
+/// etc. correctly before #124 -- both evaluators agreed on these even when the
+/// generic evaluator had no direct `Expr::Format` arm, since its catch-all
+/// round-trip goes through `to_json_for_reindex` (preserving, #561), not plain
+/// `to_json` (nulling). #124's direct arm doesn't change that outcome, only
+/// how cheaply it's reached.
+///
+/// The pinned full-evaluator values below are asserted explicitly so parity
+/// can't silently re-agree on a *new* wrong answer.
+///
+/// Note neither evaluator matches real jq here: jq 1.7.1 preserves the source
+/// literal and prints `1E+400` for all of these. That literal-preservation gap
+/// is a separate pre-existing issue, out of scope for #124.
+#[test]
+fn test_formats_non_finite_parity_124() {
+    for (json, filter, expected) in [
+        (b"1e400".as_slice(), "@text", r#""inf""#),
+        (b"-1e400", "@text", r#""-inf""#),
+        (b"1e400", "@uri", r#""inf""#),
+        (b"1e400", "@html", r#""inf""#),
+        (b"1e400", "@yaml", r#"".inf""#),
+        (b"1e400", "@props", r#"".inf""#),
+        (b"[1e400]", "@csv", r#""inf""#),
+        (b"[1e400]", "@tsv", r#""inf""#),
+        (b"[1e400]", "@sh", r#""inf""#),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(json, filter)),
+            [expected],
+            "full evaluator output changed for `{filter}`"
+        );
+        assert_parity(json, filter);
+    }
+}
+
+/// `@json` is immune: `format_json` calls `to_json`, which nulls non-finites
+/// itself, so both evaluators already agree.
+#[test]
+fn test_formats_non_finite_json_parity() {
+    assert_parity(b"1e400", "@json");
+    assert_parity(b"[1e400]", "@json");
+}
+
+/// When the format's input is a *constructed* value, the full evaluator also
+/// round-trips it through JSON (`eval_owned_pipe`/`eval_owned_input`), and that
+/// round-trip is likewise `to_json_for_reindex`-based rather than nulling
+/// (#561), so both evaluators already agree on the non-finite rendering here
+/// too. `eval_on_owned`'s `Format` fast path (#124) formats these directly with
+/// no guard, for the same reason `eval_single`'s arm needs none.
+#[test]
+fn test_formats_non_finite_owned_pipe_parity() {
+    assert_parity(b"[1e400]", "[.[]] | @csv");
+    assert_parity(b"[1e400]", "[.[]] | @tsv");
+    assert_parity(b"[1e400]", "[.[]] | @sh");
+    assert_parity(b"1e400", "[.] | @csv");
+}
+
+/// `?` on a format applied to a *constructed* value (arithmetic, array/object
+/// construction, ...) must still suppress a type-mismatch error. These formats
+/// suppress it internally (`format_csv`/`format_tsv`/`format_dsv`/
+/// `format_base64`/`format_base64d`/`format_urid` return `Ok("")` rather than
+/// `Err` when their `optional` argument is set) -- that is the only mechanism
+/// that makes `?` work here, there is no separate `Expr::Optional`-catches-
+/// `Error` fallback for this path. A constructed value reaches the format via
+/// `eval_on_owned`'s fast path (#124), which must therefore forward the real
+/// `optional` flag rather than hardcoding `false`.
+#[test]
+fn test_formats_optional_owned_type_error_parity_124() {
+    for (json, filter, expected) in [
+        (b"null".as_slice(), "(1+1 | @csv)?", r#""""#),
+        (b"null", "(1+1 | @tsv)?", r#""""#),
+        (b"null", r#"(1+1 | @dsv("|"))?"#, r#""""#),
+        (b"null", "(1+1 | @base64)?", r#""""#),
+        (b"null", "(1+1 | @base64d)?", r#""""#),
+        (b"null", "(1+1 | @urid)?", r#""""#),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(json, filter)),
+            [expected],
+            "full evaluator output changed for `{filter}`"
+        );
+        assert_parity(json, filter);
+    }
+}
+
 #[test]
 fn test_numeric_equality_parity_156() {
     // `OwnedValue`'s equality is now numeric-aware (#156), so both evaluators
