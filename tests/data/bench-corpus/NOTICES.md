@@ -23,6 +23,8 @@ retains its upstream license below.
 | `yaml/lint/sass-lint.yml`             | [istio/istio](https://github.com/istio/istio) `common/config/sass-lint.yml` (bare-dash sequence items: `-` alone on its line) | Apache-2.0 |
 | `yaml/home-assistant/air-quality-conditions.yaml` | [home-assistant/core](https://github.com/home-assistant/core) `homeassistant/components/air_quality/conditions.yaml` (anchors, aliases, and merge keys: `&name`, `*name`, `<<: *name`) | Apache-2.0 |
 | `json/charts/bullet-data.json`        | [plotly/datasets](https://github.com/plotly/datasets) `BulletData.json`                                | MIT        |
+| `json/npm/express-package.json`       | [expressjs/express](https://github.com/expressjs/express) `package.json` (string-heavy: names, URLs, SPDX ranges) | MIT |
+| `json/openapi/swagger-v2-schema.json` | [OAI/OpenAPI-Specification](https://github.com/OAI/OpenAPI-Specification) `_archive_/schemas/v2.0/schema.json` (prose-heavy JSON Schema; the corpus's only JSON escapes) | Apache-2.0 |
 | `dsv/world-gdp/world-gdp-with-codes.csv` | [plotly/datasets](https://github.com/plotly/datasets) `2014_world_gdp_with_codes.csv` (genuine quoting: `"Bahamas, The"`) | MIT |
 
 ## Fetched on demand (not committed)
