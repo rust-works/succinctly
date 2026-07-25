@@ -37,7 +37,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
-use succinctly::yaml::{YamlIndex, YamlValue};
+use succinctly::yaml::{locate_offset_detailed, YamlIndex, YamlValue};
 
 const CORPUS: &str = include_str!("data/yaml-test-suite-2022-01-17.json");
 const KNOWN_FAILURES: &str = include_str!("data/yaml-crlf-known-failures.txt");
@@ -411,6 +411,16 @@ mod issue_324 {
         assert_json(b"a: [1, 2]\rb: {c: 3}\r", r#"{"a":[1,2],"b":{"c":3}}"#);
     }
 
+    /// `--- - a` puts a sequence item on the document-marker line, which is its
+    /// own dispatch arm in `parse_inline_document_value` and reaches none of
+    /// the tests above.
+    #[test]
+    fn sequence_item_on_the_document_marker_line() {
+        assert_json(b"--- - a\n- b\n", r#"["a","b"]"#);
+        assert_json(b"--- - a\r\n- b\r\n", r#"["a","b"]"#);
+        assert_json(b"--- - a\r- b\r", r#"["a","b"]"#);
+    }
+
     #[test]
     fn literal_block_scalars_drop_the_cr() {
         assert_json(b"a: |\r\n  one\r\n  two\r\n", r#"{"a":"one\ntwo\n"}"#);
@@ -508,6 +518,53 @@ mod line_column {
                     String::from_utf8_lossy(&yaml)
                 );
             }
+        }
+    }
+
+    /// The byte range `yq-locate` reports comes from `YamlCursor::raw_bytes`,
+    /// which re-derives a plain scalar's end from the text rather than reusing
+    /// the index. That scan is a second place a `\r` can leak in: the range
+    /// would be one byte too long and point at `hello\r` instead of `hello`.
+    #[test]
+    fn locate_byte_range_excludes_the_line_break() {
+        for (yaml, break_form) in [
+            (b"a: hello\nb: 2\n".as_slice(), "LF"),
+            (b"a: hello\r\nb: 2\r\n".as_slice(), "CRLF"),
+            (b"a: hello\rb: 2\r".as_slice(), "CR"),
+        ] {
+            let index = YamlIndex::build(yaml).expect("parses");
+            let found =
+                locate_offset_detailed(&index, yaml, 4).expect("offset 4 is inside `hello`");
+            let (start, end) = found.byte_range;
+            assert_eq!(
+                &yaml[start..end],
+                b"hello",
+                "{break_form}: byte range {:?} covers {:?}",
+                found.byte_range,
+                String::from_utf8_lossy(&yaml[start..end])
+            );
+        }
+    }
+
+    /// The same scan stops at a comment, so a trailing comment must not extend
+    /// the range either — under any break form.
+    #[test]
+    fn locate_byte_range_stops_before_a_trailing_comment() {
+        for yaml in [
+            b"a: hi # note\n".as_slice(),
+            b"a: hi # note\r\n".as_slice(),
+            b"a: hi # note\r".as_slice(),
+        ] {
+            let index = YamlIndex::build(yaml).expect("parses");
+            let found = locate_offset_detailed(&index, yaml, 3).expect("offset 3 is inside `hi`");
+            let (start, end) = found.byte_range;
+            assert_eq!(
+                &yaml[start..end],
+                b"hi",
+                "byte range {:?} in {:?}",
+                found.byte_range,
+                String::from_utf8_lossy(yaml)
+            );
         }
     }
 }
