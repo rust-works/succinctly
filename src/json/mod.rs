@@ -12,8 +12,13 @@
 //!
 //! SIMD-accelerated versions are available on supported platforms (x86_64, aarch64):
 //! - [`simd`](crate::json::simd): Platform-specific SIMD acceleration (AVX2, NEON, etc.)
+//!
+//! JSON *output* has its own home: [`escape`](crate::json::escape) holds the
+//! SIMD-backed string escaper shared by every jq, yq, and YAML→JSON output path
+//! in the crate, along with the escape scanners it dispatches to.
 
 mod bit_writer;
+pub mod escape;
 pub mod light;
 pub mod locate;
 mod pfsm_optimized;

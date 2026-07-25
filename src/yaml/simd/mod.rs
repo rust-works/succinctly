@@ -418,10 +418,10 @@ pub fn parse_anchor_name(input: &[u8], start: usize) -> usize {
 ///
 /// The scanner moved to the shared `crate::util::simd::escape` module in #125 so
 /// consumers (jq streaming, jq/yq output escaping) no longer reach into yaml
-/// internals. Re-exported here so `super::simd::find_json_escape` and the public
-/// `succinctly::yaml::simd::find_json_escape` path keep resolving for existing
-/// consumers (`yaml/light.rs`, the escape benches).
-pub use crate::util::simd::escape::find_json_escape;
+/// internals, and #91 gave it a public home alongside the escapers that use it.
+/// [`crate::json::escape`] is the canonical path; this re-export only keeps
+/// `succinctly::yaml::simd::find_json_escape` resolving for existing consumers.
+pub use crate::json::escape::find_json_escape;
 
 /// Scalar fallback for parse_anchor_name
 #[allow(dead_code)] // STYLE-0005: scalar fallback (SIMD path used when detected)
