@@ -5071,6 +5071,148 @@ removed O(1) bit test.
 
 ---
 
+## O6: Lazy `ib_rank` and Index Memory Accounting — Accepted ✅
+
+GitHub issue #56. The issue asked to shrink `bp_to_text` / `bp_to_text_end` from
+"4 bytes per node ×2", but that baseline had already been superseded by P12
+(`AdvancePositions`) and `EndPositions`. The real blocker was that **nothing in
+production could measure the index**, so no claim about its size — including the
+repo's own documented "3-6% overhead" — was checkable.
+
+### What shipped
+
+1. **`YamlIndex::memory()`** returning a per-component `YamlIndexMemory`
+   breakdown, plus `BalancedParens::index_heap_size()` / `words_bytes()`,
+   `SelectIndex::heap_size()`, and `EndPositions::heap_size()` / `is_compact()`
+   promoted out of `#[cfg(test)]`.
+2. **A `## YAML index memory` section in `corpus-stats`**, reporting L, node
+   count M, density L/M, per-component bytes, the chosen position encoding and
+   the counterfactual cost of the other one. It is part of the CI-checked
+   golden, so index size can no longer drift silently — the pre-existing unit
+   tests only asserted `compact < dense`, which a regression from 1.6 to 3.9
+   bytes/node would have passed.
+3. **`AdvancePositions::ib_rank` built lazily** via `OnceCell`. It costs L/16
+   bytes — a third of the structure — and its only reader is
+   `find_last_open_at_text_pos`, the reverse text→BP lookup behind `yq-locate`
+   and the jq `at_offset` / `at_position` builtins. Building it eagerly charged
+   every parse for a query most callers never make. Same treatment as
+   `newlines` in P12-A/A4.
+
+### Measured (Apple M4 Pro, 1 MB synthetic corpus)
+
+Retained index, via `YamlIndex::memory()`:
+
+| Metric                    | Before    | After     | Change      |
+|---------------------------|-----------|-----------|-------------|
+| Total index               | 3,262,295 | 2,934,567 | **−10.0%**  |
+| Index as % of input       | 62.2%     | 56.0%     | −6.2 pp     |
+| `open_positions`          | 1,087,540 |   759,812 | **−30.1%**  |
+
+Process RSS on a build-only workload fell by 49-82 KB per MB of input,
+consistent with removing exactly one L/16 array.
+
+`yaml_bench`, 44 benchmarks: **38 significant improvements, 0 regressions**,
+median **−3.88%** (best −31.2%, worst +0.46% and not significant). Lazy
+`ib_rank` removes an O(L/64) pass from every build, so the build path gets
+strictly less work. `yq` output verified byte-identical across 120
+query/format/file configurations.
+
+### What the measurement revealed
+
+**The compact position encodings are not uniformly a win.** Their dominant term
+is proportional to text length and independent of node count, so the ratio to a
+dense `Vec<u32>` is roughly `0.05·(L/M)` — unbounded. The synthetic generators
+emit `L/M ≈ 4.5-19`, but real config YAML in the benchmark corpus measures
+`L/M ≈ 9.7-23.9`.
+
+Before this change break-even sat at `L/M ≈ 20`, and **two of the eight real
+files in the corpus were already on the wrong side of it** — choosing a compact
+encoding that cost more than the dense fallback it replaced:
+
+| File                        | L/M  | compact | dense | after |
+|-----------------------------|------|---------|-------|-------|
+| `actions/prometheus-ci.yml` | 20.7 | 3752    | 3660  | 2564  |
+| `actions/stale.yml`         | 23.9 | 276     | 216   | 188   |
+
+Dropping the eager `ib_rank` removed `L/16` from the text-proportional term and
+moved break-even to `L/M ≈ 30`, bringing both back onto the winning side. So the
+lazy-`ib_rank` change is not only a 10% saving — it widens the density range
+over which the compact encoding is the right choice at all.
+
+The crossover is still reachable, because selection is by monotonicity alone
+rather than by size: a document that is one large block scalar (k8s ConfigMap,
+Helm values, an Actions `run: |`) has a handful of nodes and pays kilobytes.
+
+This is why the corpus-shape check (#301) gates this issue: every existing
+memory benchmark runs on the synthetic ladder, precisely where the encoding
+wins by its largest margin.
+
+### Rejected: trimming the parser's transient pre-allocations ❌
+
+`Parser::new` pre-allocates ~1.75× input (`bp_words` and `container_words` at
+L/32 words, `ty_words` and `ib_words` at L/64, and both position vectors at
+`4·L/8`). Since `write_bp_open_at`, `write_bp_close` and `write_ty` all grow on
+demand, sizing the three BP-domain bitmaps from the node estimate instead cut
+**allocator-counted** build peak from 1.75× to 1.20-1.49× input (−15 to −31%).
+
+**Real RSS barely moved.** Measured with `/usr/bin/time -l`, the change saved
+0-1.8%, and all of it was attributable to the lazy `ib_rank` landing in the same
+build; on `sequences` it made RSS slightly *worse*. The reason is that
+`vec![0u64; n]` obtains lazily-zeroed pages from the OS, and the unused tail is
+never faulted in — so it costs address space, not residency. Incremental growth
+replaces free untouched pages with real `memcpy` on each doubling.
+
+**Lesson: a tracking allocator counts requested bytes, not resident pages.** For
+`alloc_zeroed` allocations the two diverge sharply, and only the second is
+memory the user pays for. This also retires the "parser vector pre-allocation
+`/32` → `/64`, −30% peak memory during parse" idea recorded in issue #74 — that
+estimate was allocator-counted.
+
+### Bugs fixed along the way
+
+- **IB bitmap one bit too small.** `AdvancePositions` sized IB from `text_len`,
+  but `close_pending_explicit_key` records a null-value node *at* `input.len()`.
+  When the document length was an exact multiple of 64 that position fell one
+  word past the bitmap, so the IB bit was dropped while the advance bit was
+  still written; the two desynchronised and `get()` returned `None` for a node
+  that exists. `CompactEndPositions` had always sized `text_len + 1` for exactly
+  this reason.
+- **Binary search over an unsorted vector.**
+  `OpenPositions::find_last_open_at_text_pos` binary-searched the `Dense`
+  variant — but `Dense` is selected precisely when positions are non-monotonic,
+  so it is unsorted by construction. On `? a\nb: 1\n` every node recorded after
+  the out-of-order sentinel was unreachable: `yq-locate` and jq
+  `at_offset`/`at_position` returned nothing for offsets 4 and 7. Replaced with
+  a reverse linear scan.
+
+### Files changed
+
+- `src/yaml/index.rs` — `YamlIndexMemory`, `YamlIndex::memory()`
+- `src/yaml/advance_positions.rs` — lazy `ib_rank`, IB sizing fix, Dense reverse-lookup fix
+- `src/yaml/end_positions.rs` — accounting promoted out of `#[cfg(test)]`
+- `src/trees/bp.rs`, `src/bits/select.rs` — heap accounting
+- `src/bin/succinctly/corpus_stats.rs` — `## YAML index memory` section
+
+### Remaining opportunities (not taken here)
+
+Ranked by measured share of the retained index:
+
+1. **Restore `CompactRank`** on the four remaining cumulative-rank arrays
+   (~−21% of the index). Plain `Vec<u32>` costs 50% of the bitmap it indexes;
+   `CompactRank` costs 3.5% and is already implemented and unused. Deferred
+   because `containers_rank` feeds `value()`, so it needs benchmarking that a
+   no-hot-path-risk change should not absorb.
+2. **Size IB bitmaps by `max_position + 1` rather than `text_len`** — the direct
+   fix for the block-scalar blowup described above.
+3. **Size-driven compact-vs-dense selection**, decided in O(1) from (L, M)
+   before building rather than from monotonicity alone.
+4. **The two 0.5L position vectors** are now the dominant build transient; they
+   are `Vec<u32>` growth, not `alloc_zeroed`, so unlike the bitmaps their cost
+   is real.
+
+
+---
+
 ## See Also
 
 - [YamlIndex wiki page](yaml-index.md) — concept overview, dependencies, and academic references

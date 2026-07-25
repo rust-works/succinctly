@@ -10,6 +10,15 @@
 > layout table is out of date too. Read
 > [../parsing/yaml-succinct.md](../parsing/yaml-succinct.md) for the current
 > layout and [../parsing/yaml.md](../parsing/yaml.md) for what was accepted.
+>
+> Opportunity 4 rests on a further premise that was never true: **`ib_words` is
+> not a strict superset of `ib`** (#56). `parser.rs` sets IB on flow-collection
+> closers that have no BP open, and writes BP opens with no IB bit for the virtual
+> root and for the explicit-key null sentinel. Merging the two bitmaps would need
+> parser changes, not just a rank subtraction.
+>
+> For current, measured numbers use `succinctly dev bench corpus-stats`, which
+> reports the index per component.
 
 Analysis of optimization opportunities after replacing `Vec<u32>` rank indices
 with `CompactRank` (~3.5% overhead).

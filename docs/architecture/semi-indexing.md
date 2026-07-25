@@ -121,13 +121,35 @@ Semi-indexing delivers significant memory and speed improvements over traditiona
 | vs jq | **5-25x less** | 1.2-6.3x faster |
 | vs yq | similar | **16-40x faster** |
 
-The index overhead (3-6%) is dwarfed by the memory savings from not materializing the entire document.
+The index overhead is dwarfed by the memory savings from not materializing the entire document —
+but it is substantial in absolute terms, not the "3-6%" this document previously claimed.
+
+### Measured index size
+
+`succinctly dev bench corpus-stats` reports the YAML index per component via
+`YamlIndex::memory()`. Over the 1 MB synthetic corpus the retained index is **~56% of input
+size** (build peak is higher again — see [../parsing/yaml.md](../parsing/yaml.md)):
+
+| Component                        | % of index | % of input |
+|----------------------------------|------------|------------|
+| `open_positions` (BP → start)    | 25.9%      | 14.5%      |
+| `end_positions` (BP → end)       | 25.8%      | 14.5%      |
+| `ib` + `ib_rank`                 | 33.5%      | 18.8%      |
+| `bp` words + auxiliary indices   | 8.0%       | 4.5%       |
+| `containers` + rank              | 6.6%       | 3.7%       |
+
+The former 3-6% figure was never measured against this implementation; it described the
+theoretical semi-index literature, not the encodings actually built here. This is the same
+correction ADR-0011 applied to `BitVec`'s rank/select overhead — see
+[../adrs/adr-0011.md](../adrs/adr-0011.md) and #56. Any claim about succinctly's index
+compactness should cite the `corpus-stats` report, which CI checks against a golden so it
+cannot silently drift.
 
 See [../benchmarks/](../benchmarks/) for detailed numbers across file sizes and patterns.
 
 ## Trade-offs
 
-1. **Memory**: Index overhead (3-6%)
+1. **Memory**: Index overhead (~56% of input for YAML; measured, see above)
 2. **Latency**: Index build is upfront cost
 3. **Complexity**: More complex than DOM parsing
 

@@ -37,7 +37,10 @@ Semi-indexing is the unifying architectural idea. Instead of building a DOM tree
 3. **Navigate** — O(1) tree operations (parent, child, sibling) via rank/select on the BP bitvector
 4. **Extract** — Values are parsed only when accessed by a query
 
-This yields 3-6% memory overhead vs 100%+ for DOM parsers. See [architecture/semi-indexing.md](architecture/semi-indexing.md) for the full design.
+The index is far smaller than a materialized DOM, but it is not free: the YAML index measures
+**~56% of input size** retained (`succinctly dev bench corpus-stats`). See
+[architecture/semi-indexing.md](architecture/semi-indexing.md) for the full design and the
+measured per-component breakdown.
 
 ## Academic Foundations
 
