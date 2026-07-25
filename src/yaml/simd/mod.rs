@@ -703,4 +703,48 @@ mod tests {
             );
         }
     }
+    /// The scalar fallback must agree with the dispatched SIMD kernel on every
+    /// line-break form, including a lone CR — a `\n`-only scan finds no line
+    /// starts at all in a classic-Mac document and runs to EOF (#324).
+    #[test]
+    fn find_block_scalar_end_scalar_matches_the_dispatched_kernel() {
+        let cases: &[(&[u8], usize)] = &[
+            (b"  a\n  b\nc\n", 2),
+            (b"  a\r\n  b\r\nc\r\n", 2),
+            (b"  a\r  b\rc\r", 2),
+            // Blank lines stay inside the block; only real content can end it.
+            (b"  a\r\n\r\n  b\r\nc\r\n", 2),
+            (b"  a\r\r  b\rc\r", 2),
+            // No dedent at all: the block runs to end of input.
+            (b"  a\r  b\r", 2),
+        ];
+        for (input, min_indent) in cases {
+            assert_eq!(
+                find_block_scalar_end_scalar(input, 0, *min_indent),
+                find_block_scalar_end(input, 0, *min_indent),
+                "scalar fallback disagrees with SIMD on {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// Every break form ends the block at the same *place* — the dedented `c`.
+    /// The byte offsets differ because CRLF is two bytes wide, so the invariant
+    /// is what the returned position points at, not the number itself.
+    #[test]
+    fn find_block_scalar_end_lands_on_the_dedent_under_every_break_form() {
+        for (input, form) in [
+            (b"  a\n  b\nc\n".as_slice(), "LF"),
+            (b"  a\r\n  b\r\nc\r\n".as_slice(), "CRLF"),
+            (b"  a\r  b\rc\r".as_slice(), "lone CR"),
+        ] {
+            let end = find_block_scalar_end(input, 0, 2).expect("kernel returns a position");
+            assert_eq!(
+                input.get(end).copied(),
+                Some(b'c'),
+                "{form}: block ended at {end}, which is {:?} not the dedented line",
+                input.get(end).map(|&b| b as char)
+            );
+        }
+    }
 }
