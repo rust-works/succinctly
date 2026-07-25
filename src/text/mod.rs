@@ -1,6 +1,22 @@
 //! Text processing utilities.
 //!
-//! This module provides utilities for text processing, including UTF-8 validation.
+//! This module provides utilities for text processing, including UTF-8
+//! validation and line/column lookup.
+//!
+//! ## Line/column lookup
+//!
+//! [`LineIndex`](crate::text::LineIndex) maps byte offsets to 1-indexed
+//! line/column positions and back,
+//! storing line starts Elias-Fano encoded so the index scales with the number
+//! of lines rather than the size of the text.
+//!
+//! ```
+//! use succinctly::text::LineIndex;
+//!
+//! let index = LineIndex::build(b"line1\nline2");
+//! assert_eq!(index.to_line_column(6), (2, 1));
+//! assert_eq!(index.to_offset(2, 1), Some(6));
+//! ```
 //!
 //! ## UTF-8 Validation
 //!
@@ -22,9 +38,11 @@
 //! assert_eq!(err.offset, 0);
 //! ```
 
+pub mod lines;
 pub mod utf8;
 
 // Re-export commonly used types
+pub use lines::LineIndex;
 pub use utf8::{validate_utf8, validate_utf8_scalar, Utf8Error, Utf8ErrorKind};
 
 // The AVX2 fast path is only present on x86_64 when runtime feature detection
