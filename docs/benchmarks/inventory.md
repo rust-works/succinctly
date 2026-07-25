@@ -179,6 +179,13 @@ Benchmarks for `succinctly text validate utf8` - scalar UTF-8 validation through
 
 Benchmarks comparing `succinctly yq .` vs `yq .` (Mike Farah's yq) for YAML formatting/printing.
 
+> The generated suite grew from 11 to 16 patterns in #327, adding `flow`,
+> `anchors`, `block-scalars`, `explicit-keys` and `multi-doc`. Results recorded
+> before that cover the original 11 only; the pre-existing patterns are
+> byte-identical across the change, so their numbers remain comparable. See
+> [../guides/benchmarking.md](../guides/benchmarking.md) for what each pattern
+> covers and which constructs are deliberately out of scope.
+
 ### Platforms Covered
 - ARM Neoverse-V2 (AWS Graviton 4)
 - ARM Neoverse-V1 (AWS Graviton 3)

@@ -335,12 +335,78 @@ cargo run --release --features cli -- json generate-suite
 ### YAML Test Data
 
 ```bash
-# All patterns and sizes
-cargo run --release --features cli -- yaml generate-suite
+# All patterns and sizes (defaults to --max-size 1gb; 16 patterns x 7 sizes is
+# a lot of disk, so cap it unless you need the largest files)
+cargo run --release --features cli -- yaml generate-suite --max-size 100mb
 
-# Individual pattern/size
-cargo run --release --features cli -- yaml generate comprehensive 1mb -o test.yaml
+# Individual pattern/size (size is positional, pattern is a flag)
+cargo run --release --features cli -- yaml generate 1mb --pattern comprehensive -o test.yaml
 ```
+
+#### Patterns and what they cover
+
+The generated suite is what exercises the **query and streaming** paths
+(`dev bench yq`, `yq_comparison`, `yq_select`); `benches/yaml_bench.rs` covers
+index **build** over its own fixtures. A construct absent from the suite cannot
+be measured end-to-end, so "the benchmarks are neutral" would say nothing about
+it — the gap that let the quadratic sequence-iteration bug of #106 survive a
+full benchmark run.
+
+| Pattern         | Shape                                                    |
+|-----------------|----------------------------------------------------------|
+| `comprehensive` | Mixed features, the default comparison target             |
+| `users`         | Records with realistic field mixes                        |
+| `nested`        | Deep block mappings (depth 6)                             |
+| `sequences`     | Sequence-heavy block content                              |
+| `mixed`         | Mappings and sequences interleaved                        |
+| `strings`       | Quoted and plain scalars                                  |
+| `numbers`       | Integers, decimals, scientific notation                   |
+| `unicode`       | Multi-script strings                                      |
+| `pathological`  | Wide sibling sets with nesting                            |
+| `navigation`    | Top-level array for M2 streaming queries                  |
+| `config`        | Realistic fixed-size config template                      |
+| `flow`          | Flow `{...}` / `[...]`, bimodal sizes plus deep nesting    |
+| `anchors`       | `&name` / `*name`, three anchor-name length buckets        |
+| `block-scalars` | `\|` and `>` with all three chomping modes                 |
+| `explicit-keys` | `? ` / `: `, including the valueless form                 |
+| `multi-doc`     | `---` / `...` streams                                     |
+
+The last five were added by #327; before that, **none** of flow, anchors, block
+scalars, explicit keys or multi-document input appeared anywhere in the suite.
+Their sizing is deliberate:
+
+- `flow` is bimodal — most collections are 10-30 bytes (the size the P5
+  rejection argued real flow collections are), with a 64-256 byte tail that
+  spans the ~32-byte threshold where SIMD scanning starts to win. That makes the
+  P5 question answerable end-to-end rather than by argument.
+- `anchors` uses 2-8, ~24 and ~48 character anchor names, because P4's SIMD
+  anchor scanning only pulls ahead from ~32 bytes up.
+- `block-scalars` includes ~100-line bodies, the shape P2.7 was measured on.
+- `explicit-keys` emits valueless explicit keys (`? a` with no `: value`
+  followed by another entry), the specific form that selects the
+  `OpenPositions::Dense` fallback. Ordinary `? key` / `: value` pairs stay
+  monotonic and use the compact encoding.
+
+`tests/yaml_bench_suite_coverage.rs` asserts on every CI leg that each supported
+construct still appears in some pattern, so a future omission fails the build
+instead of silently narrowing what the benchmarks can see.
+
+#### Deliberately out of scope
+
+These are **not** generated. Each would make the affected files diverge from
+`yq`, so a comparison over them would be timing two different computations. The
+coverage test asserts their absence, so fixing one forces a decision here rather
+than letting the gap persist unnoticed.
+
+| Construct                            | Why not generated                                                                 |
+|--------------------------------------|-----------------------------------------------------------------------------------|
+| Merge keys `<<:`                     | Parsed as an ordinary key: output is `{"<<": {...}}` where yq splices (#171)       |
+| Tags (`!!str`, `!custom`)            | Rejected outright in block context (documented non-support in `src/yaml/mod.rs`)   |
+| `- &anchor` + a collection value     | Mis-parsed: `- &m` then an indented mapping yields `["k"]`, not `[{"k": "v"}]`     |
+| Blank lines in a **folded** scalar   | Emits one newline too many per blank line (`"a\n\nb\n"` where yq folds to `"a\nb\n"`) |
+
+The last two were found while building the suite for #327 (the generator matches
+`yq` byte-for-byte on everything it does emit, which is how they surfaced).
 
 ### DSV Test Data
 
