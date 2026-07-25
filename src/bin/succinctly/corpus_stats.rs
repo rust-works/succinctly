@@ -861,4 +861,155 @@ mod tests {
         assert_eq!(Dist::percentile(&sorted, 100.0), 10);
         assert_eq!(Dist::percentile(&sorted, 0.0), 1);
     }
+
+    // --- report-generation path -------------------------------------------
+
+    /// Write `content` to `root/rel`, creating parent directories.
+    fn write_file(root: &Path, rel: &str, content: &[u8]) -> PathBuf {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    #[test]
+    fn generate_report_covers_all_formats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_file(root, "yaml/svc/app.yaml", b"name: web\nports: [80, 443]\n");
+        write_file(
+            root,
+            "json/api/resp.json",
+            br#"{"a":"x","b":[1,2,3],"c":{"d":true}}"#,
+        );
+        write_file(root, "dsv/tab/data.csv", b"h1,h2\n1,\"x,y\"\n3,4\n");
+        // a non-corpus extension is ignored by the walk
+        write_file(root, "notes/readme.txt", b"ignore me");
+
+        let (md, records) = generate_report(root).unwrap();
+
+        assert!(md.contains("## Corpus inventory"));
+        assert!(md.contains("## YAML") && md.contains("## JSON") && md.contains("## DSV"));
+        assert!(md.contains("flow-collection size")); // YAML flow row rendered
+        assert!(md.contains("quoted fields:")); // DSV summary line rendered
+        assert!(md.contains("| json   |")); // inventory row for the json file
+
+        // .txt ignored; three corpus files, workload = parent-dir basename
+        assert_eq!(records.len(), 3);
+        assert!(records
+            .iter()
+            .any(|r| r.format == "yaml" && r.workload == "svc" && r.file == "app.yaml"));
+        assert!(records
+            .iter()
+            .any(|r| r.format == "dsv" && r.workload == "tab"));
+    }
+
+    #[test]
+    fn generate_report_on_empty_dir_reports_no_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (md, records) = generate_report(tmp.path()).unwrap();
+        assert!(records.is_empty());
+        assert!(md.contains("No corpus files found"));
+        // empty distributions still render their section tables (dist_row None path)
+        assert!(md.contains("scalar length") && md.contains("field length"));
+    }
+
+    #[test]
+    fn run_write_then_check_roundtrips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("corpus");
+        write_file(&root, "json/x/a.json", br#"{"k":"v","n":[1,2]}"#);
+        let md_path = tmp.path().join("report.md");
+        let jsonl_path = tmp.path().join("out.jsonl");
+
+        // write mode + JSONL output
+        assert_eq!(
+            run(&root, Some(&md_path), Some(&jsonl_path), false).unwrap(),
+            0
+        );
+        assert!(md_path.exists());
+        assert!(std::fs::read_to_string(&jsonl_path)
+            .unwrap()
+            .contains("\"format\":\"json\""));
+
+        // check mode against the just-written golden -> match
+        assert_eq!(run(&root, Some(&md_path), None, true).unwrap(), 0);
+
+        // mutate the golden -> mismatch returns exit code 1 (not an error)
+        std::fs::write(&md_path, "different\n").unwrap();
+        assert_eq!(run(&root, Some(&md_path), None, true).unwrap(), 1);
+
+        // check without --markdown is a usage error
+        assert!(run(&root, None, None, true).is_err());
+    }
+
+    #[test]
+    fn run_stdout_mode_returns_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("c");
+        write_file(&root, "yaml/w/a.yaml", b"a: 1\n");
+        assert_eq!(run(&root, None, None, false).unwrap(), 0);
+    }
+
+    #[test]
+    fn classify_maps_extensions() {
+        assert_eq!(classify(Path::new("a/b.json")), Some(("json", None)));
+        assert_eq!(classify(Path::new("a/b.geojson")), Some(("json", None)));
+        assert_eq!(classify(Path::new("a/b.ndjson")), Some(("json", None)));
+        assert_eq!(classify(Path::new("a/b.yaml")), Some(("yaml", None)));
+        assert_eq!(classify(Path::new("a/b.yml")), Some(("yaml", None)));
+        assert_eq!(classify(Path::new("a/b.csv")), Some(("dsv", Some(b','))));
+        assert_eq!(classify(Path::new("a/b.tsv")), Some(("dsv", Some(b'\t'))));
+        assert_eq!(classify(Path::new("a/b.psv")), Some(("dsv", Some(b'|'))));
+        assert_eq!(classify(Path::new("a/b.txt")), None);
+        assert_eq!(classify(Path::new("noext")), None);
+    }
+
+    #[test]
+    fn labels_derive_workload_and_file() {
+        let (w, f) = labels(
+            Path::new("/corpus"),
+            Path::new("/corpus/yaml/k8s/deploy.yaml"),
+        );
+        assert_eq!(w, "k8s");
+        assert_eq!(f, "deploy.yaml");
+    }
+
+    #[test]
+    fn render_table_pads_and_tolerates_short_rows() {
+        let t = render_table(
+            &["a", "bb"],
+            &[vec!["x".into(), "yy".into()], vec!["z".into()]],
+        );
+        let lines: Vec<&str> = t.lines().collect();
+        assert_eq!(lines.len(), 4); // header, separator, two rows
+        assert_eq!(lines[0], "| a | bb |"); // cols padded to max width (1, 2)
+        assert_eq!(lines[1], "| - | -- |"); // separator sized per column
+        assert_eq!(lines[2], "| x | yy |");
+        assert_eq!(lines[3], "| z |    |"); // missing 2nd cell -> blank-padded
+    }
+
+    #[test]
+    fn density_row_formats_two_decimals() {
+        let mut d = Dist::default();
+        push_escape_density(&mut d, 3, 1024); // 3 escapes / 1 KiB -> 3.00
+        let row = density_row("escape density", &d);
+        assert_eq!(row[0], "escape density");
+        assert_eq!(row[3], "3.00"); // min
+        assert_eq!(row[7], "3.00"); // max
+
+        // zero-byte input contributes no sample
+        let mut e = Dist::default();
+        push_escape_density(&mut e, 5, 0);
+        assert!(e.values.is_empty());
+        // empty density falls back to the placeholder row
+        assert_eq!(density_row("escape density", &e)[3], "-");
+    }
+
+    #[test]
+    fn dist_row_empty_uses_placeholder() {
+        let row = dist_row("m", "u", &Dist::default());
+        assert_eq!(row[2], "0"); // count
+        assert_eq!(row[3], "-"); // min placeholder
+    }
 }
