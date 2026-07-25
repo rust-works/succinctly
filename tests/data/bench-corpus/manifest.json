@@ -1,0 +1,115 @@
+{
+  "_note": "Real-workload benchmark corpus manifest (#301). Every file has recorded provenance (source_url + license) and a sha256 content pin. `vendored: true` files are committed under seed/ (tiny, offline, CI-verifiable); `vendored: false` files are fetched on demand by scripts/sync-bench-corpus.sh into the git-ignored data/bench/corpus/. `file` is the path relative to the corpus root and is identical under seed/ and data/bench/corpus/. `tier` is a nominal ladder bucket (1kb/10kb/100kb/1mb/10mb) for grouping only; the real size is `bytes`. source_url pins a commit SHA so re-fetch is byte-stable.",
+  "files": [
+    {
+      "format": "yaml",
+      "workload": "compose",
+      "tier": "1kb",
+      "file": "yaml/compose/wordpress.yaml",
+      "bytes": 815,
+      "sha256": "1a7d44cefdb903ae9dbaa785342fbe99a7f08e5b31be99cb9145695defe3938d",
+      "source_url": "https://raw.githubusercontent.com/docker/awesome-compose/30f4b7f6a6c3b0c0ecf4d4efb0de203c48d11562/wordpress-mysql/compose.yaml",
+      "license": "CC0-1.0",
+      "vendored": true
+    },
+    {
+      "format": "yaml",
+      "workload": "compose",
+      "tier": "1kb",
+      "file": "yaml/compose/nginx-flask-mysql.yaml",
+      "bytes": 1239,
+      "sha256": "9243a613ba323bbe1994cb5a1d33a519c94affc261ad0d5d00c8afa0b5559cbe",
+      "source_url": "https://raw.githubusercontent.com/docker/awesome-compose/30f4b7f6a6c3b0c0ecf4d4efb0de203c48d11562/nginx-flask-mysql/compose.yaml",
+      "license": "CC0-1.0",
+      "vendored": true
+    },
+    {
+      "format": "yaml",
+      "workload": "actions",
+      "tier": "1kb",
+      "file": "yaml/actions/codeql-analysis.yml",
+      "bytes": 925,
+      "sha256": "0ce037cedafd2952b248fd3f83d61154600a7579e42db0d3b8b7621cb12829ed",
+      "source_url": "https://raw.githubusercontent.com/prometheus/prometheus/ab225f6ef5a833551ea0130be468f1d1b1968daa/.github/workflows/codeql-analysis.yml",
+      "license": "Apache-2.0",
+      "vendored": true
+    },
+    {
+      "format": "yaml",
+      "workload": "actions",
+      "tier": "1kb",
+      "file": "yaml/actions/stale.yml",
+      "bytes": 1290,
+      "sha256": "d4ed8e5bb5f56f9e6aac4ae6ab220b44992305bd8b7cdc51823989d2b8d6ae79",
+      "source_url": "https://raw.githubusercontent.com/prometheus/prometheus/ab225f6ef5a833551ea0130be468f1d1b1968daa/.github/workflows/stale.yml",
+      "license": "Apache-2.0",
+      "vendored": true
+    },
+    {
+      "format": "yaml",
+      "workload": "k8s",
+      "tier": "1kb",
+      "file": "yaml/k8s/nginx-deployment.yml",
+      "bytes": 836,
+      "sha256": "8d339f430b7d33c23df501724bda66309dfd81f5a6e08f8edddb84dae3076c26",
+      "source_url": "https://raw.githubusercontent.com/kubernetes/examples/d6b8cd27eacb51e651a1aa6f7c190a28713eff6e/nginx-platform-app/deployment.yml",
+      "license": "Apache-2.0",
+      "vendored": true
+    },
+    {
+      "format": "json",
+      "workload": "charts",
+      "tier": "1kb",
+      "file": "json/charts/bullet-data.json",
+      "bytes": 548,
+      "sha256": "a1f491be4387e503eb41cbf8c1f5f4c653368b4b1c6f8ac85a2d495d278c53c4",
+      "source_url": "https://raw.githubusercontent.com/plotly/datasets/0c447c47b757ad74edecab31f0d72f849d2e67c2/BulletData.json",
+      "license": "MIT",
+      "vendored": true
+    },
+    {
+      "format": "dsv",
+      "workload": "world-gdp",
+      "tier": "10kb",
+      "file": "dsv/world-gdp/world-gdp-with-codes.csv",
+      "bytes": 4515,
+      "sha256": "5b2311d1c6302c2b700fd1107fd0f4b550266b746fad16c22331d998c244f6ef",
+      "source_url": "https://raw.githubusercontent.com/plotly/datasets/0c447c47b757ad74edecab31f0d72f849d2e67c2/2014_world_gdp_with_codes.csv",
+      "license": "MIT",
+      "vendored": true
+    },
+    {
+      "format": "yaml",
+      "workload": "actions",
+      "tier": "10kb",
+      "file": "yaml/actions/prometheus-ci.yml",
+      "bytes": 18935,
+      "sha256": "f61b4ff89aa1a1a95272562c067e150b5ae528c255877a2e5d30b0b932e28c38",
+      "source_url": "https://raw.githubusercontent.com/prometheus/prometheus/ab225f6ef5a833551ea0130be468f1d1b1968daa/.github/workflows/ci.yml",
+      "license": "Apache-2.0",
+      "vendored": false
+    },
+    {
+      "format": "json",
+      "workload": "geojson",
+      "tier": "100kb",
+      "file": "json/geojson/us-election.geojson",
+      "bytes": 99715,
+      "sha256": "d2290e5dcc442ed6cd5e0ab4b306466cad4c673e65323f13828dea8f221cf134",
+      "source_url": "https://raw.githubusercontent.com/plotly/datasets/0c447c47b757ad74edecab31f0d72f849d2e67c2/election.geojson",
+      "license": "MIT",
+      "vendored": false
+    },
+    {
+      "format": "dsv",
+      "workload": "gapminder",
+      "tier": "100kb",
+      "file": "dsv/gapminder/gapminder-five-year.csv",
+      "bytes": 82079,
+      "sha256": "714f8a23e9d7429052a1e9b45d20b9adeb64f46c067ed46320e68182e4607b6d",
+      "source_url": "https://raw.githubusercontent.com/plotly/datasets/0c447c47b757ad74edecab31f0d72f849d2e67c2/gapminderDataFiveYear.csv",
+      "license": "MIT",
+      "vendored": false
+    }
+  ]
+}
