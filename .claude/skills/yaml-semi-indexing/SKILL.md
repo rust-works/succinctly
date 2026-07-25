@@ -119,6 +119,44 @@ close_deeper_indents(indent);  // Close first
 let need_new = type_stack.last() != expected;  // Then check
 ```
 
+### Never Test for `b'\n'` by Hand
+
+YAML 1.2 §5.4 has three line breaks — `\n`, `\r\n`, and a lone `\r` — and §5.7
+requires normalizing all of them to `\n`. A raw `\r` is never scalar content, so
+a scan that stops only at `\n` is a bug in two distinct ways (#324):
+
+- **CRLF**: the scan still stops on the right *line*, so nothing looks broken — it
+  just leaves the `\r` inside the preceding token's extent. The plain-scalar
+  folding decoder then turns that trailing break into a space, and `a: 1` resolves
+  as the string `"1 "` instead of the number `1`. Silent and well-formed.
+- **Lone CR**: there is no `\n` to stop on, so the scan runs to EOF and swallows
+  the rest of the document.
+
+Use the helpers instead of hand-rolling the test:
+
+```rust
+// src/yaml/parser.rs — the oracle
+Self::is_break(b)          // \n or \r
+self.break_len_at(pos)     // 2 for \r\n, 1 for a lone \r or \n, 0 otherwise
+self.at_break()
+self.skip_line_break()     // consumes exactly one break, whatever its width
+
+// src/yaml/light.rs — the query side
+is_line_break(b)
+line_break_len(text, pos)
+```
+
+Two extra traps:
+
+- **Trailing-whitespace trims** must include `\r`, not just `' '` and `'\t'` — the
+  SIMD classifier can skip a CR to land on the LF after it.
+- **SIMD scans** need `\r` in their terminator set (`YamlCharClass::carriage_returns`,
+  `find_block_scalar_end`), or a 32-byte chunk steps straight over a lone CR.
+
+`tests/yaml_crlf_tests.rs` is the guard: it parses the whole YAML Test Suite
+corpus under all three break forms and demands identical output. Run it after any
+change to a line-scanning loop.
+
 ## Test Suite Notes
 
 The YAML test suite (`tests/yaml_test_suite.rs`) is generated from the official YAML test suite.
