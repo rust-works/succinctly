@@ -1045,6 +1045,18 @@ fn test_yaml_anchor_on_flow_mapping_key_binds_to_key() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_yaml_anchor_on_null_explicit_value_resolves_to_null() -> Result<()> {
+    // Also found by the invariant (corpus case PW8X): an anchor on an explicit
+    // value that turns out to be null had no node to point at, so the alias
+    // resolved to the following key.
+    let input = "? e\n: &a\nz: *a\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"e":null,"z":null}"#);
+    Ok(())
+}
+
 // =============================================================================
 // Alias cycle rejection (#153) - cyclic anchors must be a clean parse error,
 // not a stack-overflow abort
