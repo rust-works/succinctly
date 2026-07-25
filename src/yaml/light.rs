@@ -65,6 +65,21 @@ fn line_break_len(text: &[u8], pos: usize) -> usize {
     }
 }
 
+/// Width in bytes of the line break ending immediately *before* `pos`: 2 for
+/// `\r\n`, 1 for a lone `\r` or `\n`, 0 if `pos` is not preceded by one.
+///
+/// The mirror of [`line_break_len`], for backwards scans. Stepping back a fixed
+/// one byte lands in the middle of a CRLF, which leaves the `\r` attached to the
+/// previous line's text (#324).
+#[inline]
+fn line_break_len_before(text: &[u8], pos: usize) -> usize {
+    match pos.checked_sub(1).and_then(|i| text.get(i)) {
+        Some(b'\n') if pos >= 2 && text[pos - 2] == b'\r' => 2,
+        Some(b'\n' | b'\r') => 1,
+        _ => 0,
+    }
+}
+
 impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// Create a new cursor at the given BP position.
     #[inline]
@@ -570,14 +585,21 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 return (0, true);
             }
 
-            // Go to previous line
-            let mut prev_line_start = line_start - 1;
+            // Step back over the break that ended the previous line — the whole
+            // break, not one byte. Stepping back a fixed 1 landed on the `\n`
+            // of a CRLF, so the walk below stopped dead on its `\r` and the
+            // previous line came out as `---\r`, which never matched the
+            // document marker (#324).
+            let prev_line_end = line_start - line_break_len_before(self.text, line_start).max(1);
+
+            // Go to the start of that line
+            let mut prev_line_start = prev_line_end;
             while prev_line_start > 0 && !is_line_break(self.text[prev_line_start - 1]) {
                 prev_line_start -= 1;
             }
 
             // Check if previous line is "---" (document start marker)
-            let prev_line = &self.text[prev_line_start..line_start.saturating_sub(1)];
+            let prev_line = &self.text[prev_line_start..prev_line_end];
             let trimmed = prev_line
                 .iter()
                 .copied()
@@ -736,7 +758,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             // Find end of current line content
             while end < self.text.len() {
                 match self.text[end] {
-                    b'\n' => break,
+                    b'\n' | b'\r' => break,
                     b'#' => {
                         // # preceded by whitespace (space or tab) is a comment
                         if end > start && matches!(self.text[end - 1], b' ' | b'\t') {
@@ -760,21 +782,22 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 }
             }
 
-            // Trim trailing whitespace (spaces and tabs) from current line
+            // Trim trailing whitespace (spaces, tabs, and a CR that a SIMD skip
+            // may have carried past) from current line
             let mut line_end = end;
-            while line_end > start && matches!(self.text[line_end - 1], b' ' | b'\t') {
+            while line_end > start && matches!(self.text[line_end - 1], b' ' | b'\t' | b'\r') {
                 line_end -= 1;
             }
 
             // Check if there's a continuation line
-            if end >= self.text.len() || self.text[end] != b'\n' {
-                // No newline, end of text or hit delimiter
+            if end >= self.text.len() || !is_line_break(self.text[end]) {
+                // No line break, end of text or hit delimiter
                 return line_end;
             }
 
             // Look ahead to see if next line is a continuation
             let newline_pos = end;
-            end += 1; // Skip newline
+            end += line_break_len(self.text, end); // Skip the line break
 
             // Skip empty lines (they can be part of multiline scalar)
             let mut empty_lines_end = end;
