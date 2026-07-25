@@ -537,7 +537,7 @@ fn density_row(metric: &str, dist: &Dist) -> Vec<String> {
 }
 
 /// Extension → (format tag, optional DSV delimiter).
-fn classify(path: &Path) -> Option<(&'static str, Option<u8>)> {
+pub(crate) fn classify(path: &Path) -> Option<(&'static str, Option<u8>)> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("json" | "geojson" | "ndjson") => Some(("json", None)),
         Some("yaml" | "yml") => Some(("yaml", None)),
@@ -549,7 +549,7 @@ fn classify(path: &Path) -> Option<(&'static str, Option<u8>)> {
 }
 
 /// Recursively collect corpus files under `dir`, sorted for deterministic output.
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+pub(crate) fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
         .with_context(|| format!("reading directory {}", dir.display()))?
         .map(|e| e.map(|e| e.path()))
