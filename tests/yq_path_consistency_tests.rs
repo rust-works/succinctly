@@ -253,6 +253,14 @@ fn paths_agree_on_key_and_scalar_constructs() {
         // quoted-string folding: literal trailing whitespace dropped, escaped kept
         "\"folded \nto a space,\t\n \nto a line feed, or \t\\\n \\ \tnon-content\"\n",
         "\"1 trailing\\t\n    tab\"\n",
+        // #332: a plain scalar beginning `- ` in flow context is preserved, not
+        // dropped — and both emitters must preserve the same thing
+        "[- x]\n",
+        "[- x, 1]\n",
+        "{a: - x}\n",
+        "{a: [- x]}\n",
+        // and an empty block sequence item stays null on both paths
+        "a:\n  -\n  - y\n",
     ];
     for yaml in inputs {
         compare(yaml).unwrap_or_else(|e| panic!("paths diverge on {yaml:?}:\n{e}"));

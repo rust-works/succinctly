@@ -26,12 +26,20 @@
 //!
 //! # API Note
 //!
-//! The Compact variant may return `Some(value)` for container entries (which
-//! get the previous scalar's end position due to zero-filling). The Dense
-//! variant returns `None` for zero entries. This inconsistency is acceptable
-//! because the only production caller (`value()` in `light.rs`) only calls
-//! `get()` for scalar nodes — containers exit before reaching the end position
-//! lookup.
+//! The two variants disagree on entries the parser never recorded: Compact returns
+//! `Some(previous non-zero end)` (an artefact of the zero-filling above), Dense returns
+//! `None`. What both guarantee, and what callers may rely on, is:
+//!
+//! > `get(i)` returns either node `i`'s own end, or a non-decreasing end recorded for an
+//! > *earlier* node. Since the parser writes a node's open position while positioned at
+//! > it, and every end it records is at or before the current position, an inherited value
+//! > is always at or before the node's own text position. So `end > text_pos` means "this
+//! > node has an extent of its own".
+//!
+//! `value()` in `light.rs` depends on exactly that: it distinguishes an empty block
+//! sequence-item wrapper (no extent, reads as null) from a plain scalar that merely begins
+//! `- ` (#332). The parser upholds the invariant with a debug assertion in
+//! `set_bp_text_end`.
 
 #[cfg(not(test))]
 use alloc::boxed::Box;
@@ -156,14 +164,15 @@ impl EndPositions {
 
     /// Get the end position for the `open_idx`-th BP open.
     ///
-    /// For the Dense variant, returns `None` if the entry is 0 (container).
-    /// For the Compact variant, may return `Some(value)` for containers
-    /// (they inherit the previous scalar's end position due to zero-filling).
-    /// Returns `None` only for leading containers (before any scalar) or
-    /// out of bounds.
+    /// For the Dense variant, returns `None` if the entry is 0 (no end recorded).
+    /// For the Compact variant, an unrecorded entry instead yields `Some(previous
+    /// non-zero end)` because of zero-filling; `None` comes back only for leading
+    /// entries (before any end was recorded) or out of bounds.
     ///
-    /// In production, this is only called for scalar nodes from `value()`,
-    /// so the container behavior is irrelevant.
+    /// Either way the result is node `open_idx`'s own end or an earlier node's, never a
+    /// later one — so a caller holding the node's text position can test `end > text_pos`
+    /// to ask "does this node have an extent of its own?". See the module-level API note;
+    /// `value()` in `light.rs` relies on this for #332.
     #[inline]
     pub fn get(&self, open_idx: usize) -> Option<usize> {
         match self {

@@ -1956,3 +1956,89 @@ fn test_argjson_invalid_value_errors() -> Result<()> {
     );
     Ok(())
 }
+
+// ============================================================================
+// Sequence-entry indicator in flow context (#332)
+//
+// These inputs are invalid YAML — `-` followed by whitespace is always the
+// sequence-entry indicator, and no block sequence can start inside a flow
+// collection — and real `yq` rejects every one of them. So they cannot be yq
+// goldens: `scripts/sync-yq-golden.sh` has no `expected.out` to capture. The
+// loader is deliberately lenient here (`succinctly yaml validate` is the layer
+// that rejects them); what it must not do is silently discard the content,
+// which is what it did before #332.
+// ============================================================================
+
+#[test]
+fn test_flow_dash_space_scalar_content_is_not_dropped() -> Result<()> {
+    for (yaml, expected) in [
+        ("[- x]\n", r#"["- x"]"#),
+        ("{a: - x}\n", r#"{"a":"- x"}"#),
+        ("[- x, 1]\n", r#"["- x",1]"#),
+        ("[a, - b]\n", r#"["a","- b"]"#),
+        ("{a: [- x]}\n", r#"{"a":["- x"]}"#),
+    ] {
+        let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(output.trim(), expected, "for {yaml:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_flow_dash_without_whitespace_is_still_a_scalar() -> Result<()> {
+    // A `-` not followed by whitespace is a legitimate plain scalar in flow
+    // context and was never affected; pinned so #332's fix cannot regress it.
+    for (yaml, expected) in [
+        ("[-]\n", r#"["-"]"#),
+        ("{a: -}\n", r#"{"a":"-"}"#),
+        ("[-1, -2]\n", "[-1,-2]"),
+    ] {
+        let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(output.trim(), expected, "for {yaml:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_empty_block_sequence_items_remain_null() -> Result<()> {
+    // The other shape that reaches the same branch. These are valid YAML and
+    // must keep reading as null — `yq` agrees.
+    for (yaml, expected) in [
+        ("-\n", "[null]"),
+        ("- # comment\n", "[null]"),
+        ("a:\n  -\n  - y\n", r#"{"a":[null,"y"]}"#),
+    ] {
+        let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(output.trim(), expected, "for {yaml:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_flow_dash_space_scalar_round_trips_through_yaml_output() -> Result<()> {
+    // Default `-o yaml` must quote the scalar: emitted bare under a `- ` marker
+    // it would read back as a nested sequence.
+    let (yaml_out, code) = run_yq_stdin(".", "[- x]\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(yaml_out, "- \"- x\"\n");
+
+    let (json_out, code) = run_yq_stdin(".", &yaml_out, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(json_out.trim(), r#"["- x"]"#);
+    Ok(())
+}
+
+#[test]
+fn test_flow_container_key_does_not_leak_its_closing_bracket() -> Result<()> {
+    // The end position of a flow key/value that is itself a nested container
+    // used to be written onto the innermost node inside it, stretching that
+    // node's extent past the closing bracket (#332). Observable via at_offset:
+    // offset 5 is the `e` of `[d, e]`, which decoded as "e]".
+    let (output, code) = run_yq_stdin("at_offset(5)", "{[d, e]: f}\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""e""#);
+    Ok(())
+}

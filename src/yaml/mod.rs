@@ -74,6 +74,43 @@ mod scalar;
 pub mod simd;
 pub mod validate;
 
+/// Does `next` terminate a `-` sequence-entry indicator? That is whitespace, a line
+/// break, or end of input.
+///
+/// The one definition of the terminator set. It lives at the module root because the
+/// parser (which sees the next byte as it scans) and the reader (which indexes into the
+/// text) both need it, and #332 was caused by each site spelling it out separately —
+/// five copies with three different acceptance sets.
+#[inline]
+pub(crate) fn is_seq_indicator_next(next: Option<u8>) -> bool {
+    matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None)
+}
+
+/// Does `text` at `pos` begin with the block sequence-entry indicator?
+///
+/// A `-` followed by anything outside [`is_seq_indicator_next`] (`-1`, `-`, `[-]`) starts
+/// a plain scalar instead. A trailing `-` *is* an indicator (see #106).
+#[inline]
+pub(crate) fn starts_seq_entry(text: &[u8], pos: usize) -> bool {
+    text.get(pos) == Some(&b'-') && is_seq_indicator_next(text.get(pos + 1).copied())
+}
+
+/// Is the sequence-entry indicator at `pos` followed by content on the *same* line?
+///
+/// Deliberately narrower than [`starts_seq_entry`]: a bare `-` — line break or end of
+/// input after it — is excluded. `YamlElements::uncons_cursor` uses this so that a bare
+/// `-` keeps yielding the wrapper node rather than its child, because callers that use the
+/// returned cursor *positionally* depend on it: `corpus_stats` counts bare-dash items by
+/// the cursor's text position, and `is_yaml_cursor_container` decides block-vs-inline YAML
+/// layout from it.
+///
+/// Value decoding is unaffected either way — `value()` applies the wider
+/// [`starts_seq_entry`] and unwraps a bare-`-` wrapper itself.
+#[inline]
+pub(crate) fn starts_inline_seq_entry(text: &[u8], pos: usize) -> bool {
+    text.get(pos) == Some(&b'-') && matches!(text.get(pos + 1), Some(b' ' | b'\t'))
+}
+
 pub use error::YamlError;
 pub use index::YamlIndex;
 pub use light::{

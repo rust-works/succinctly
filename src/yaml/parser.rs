@@ -432,9 +432,13 @@ impl<'a> Parser<'a> {
 
     /// Does `next` terminate a `-` sequence indicator? That is whitespace, a
     /// line break, or end of input.
+    ///
+    /// Delegates to the module-level definition the reader also uses, so the terminator
+    /// set has one spelling (#332). Kept as an associated fn because the guard it appears
+    /// in must stay on one line for `llvm-cov` to see it (#324).
     #[inline]
     fn is_seq_indicator_next(next: Option<u8>) -> bool {
-        matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None)
+        super::is_seq_indicator_next(next)
     }
 
     /// Consume the line break at the current position, if any.

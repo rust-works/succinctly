@@ -17,6 +17,7 @@ use std::string::ToString;
 use super::index::YamlIndex;
 use super::line_break::{is_line_break, line_break_len, line_break_len_before};
 use super::scalar::{could_be_null_or_bool, resolve_plain, ResolvedScalar};
+use super::{starts_inline_seq_entry, starts_seq_entry};
 use crate::util::simd::escape::find_json_escape;
 
 // ============================================================================
@@ -161,20 +162,35 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
 
         // Check for sequence item wrapper (non-container node starting with "- ").
         // Sequence items delegate to their first child's value. Uses the
-        // already-computed text_pos to avoid redundant lookups. Branchless seq-item
-        // test (see #106): a `-` at end of input is a seq_item, so a missing next
-        // byte is treated as whitespace via `unwrap_or(b' ')`.
-        if self.text[text_pos] == b'-'
-            && matches!(
-                self.text.get(text_pos + 1).copied().unwrap_or(b' '),
-                b' ' | b'\t' | b'\n' | b'\r'
-            )
-        {
+        // already-computed text_pos to avoid redundant lookups.
+        if starts_seq_entry(self.text, text_pos) {
             if let Some(child) = self.first_child() {
                 return child.value();
             }
-            // Empty sequence item (null)
-            return YamlValue::Null;
+
+            // Childless. Two different shapes reach here (#332):
+            //
+            //   * a genuine empty block sequence item (`-`, `- `, `- # comment`). The
+            //     parser opens the wrapper while positioned *at* the `-` and never records
+            //     an end for it, so the lookup below yields `None` (dense storage) or a
+            //     stale earlier scalar's end at or before the dash (compact storage).
+            //
+            //   * a plain scalar that merely *begins* `- `, which is what `[- x]` and
+            //     `a: - x` produce. Invalid YAML — the strict validator rejects both — but
+            //     the parser records a real trimmed end past the content, and dropping that
+            //     content silently is a worse failure mode than preserving the text.
+            //
+            // So `end > text_pos` means "this node has an extent of its own". Cold path:
+            // only reached when a `- `-prefixed node has no BP child, i.e. for empty
+            // sequence items. Every `- x` short-circuits above with zero extra work.
+            if self
+                .index
+                .text_end_pos_by_open_idx(open_idx)
+                .map_or(true, |end| end <= text_pos)
+            {
+                return YamlValue::Null;
+            }
+            // Otherwise fall through and decode `- …` as the plain scalar it is.
         }
 
         // Check for alias (only for non-container nodes)
@@ -3130,26 +3146,25 @@ impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
             element_cursor: element_cursor.next_sibling(),
         };
 
-        // For block sequences, navigate to the actual value cursor
+        // For a block sequence, element_cursor points at the item wrapper node (at the
+        // `-`) and the value lives in its first child; unwrap so callers that use the
+        // cursor *positionally* — `is_yaml_cursor_container`, which decides block-vs-inline
+        // YAML layout — see the content rather than the wrapper. For flow sequences,
+        // virtual root sequences, and document containers the element IS the value.
+        //
+        // Deliberately `starts_inline_seq_entry`, not the wider `starts_seq_entry` that
+        // `value()` uses: a bare `-` stays pointed at the wrapper, which is what
+        // `corpus_stats`'s bare-dash counting reads. Value decoding is the same either way.
+        //
+        // A childless wrapper is returned as-is: `value()` decides whether it is an empty
+        // sequence item (null) or a plain scalar that merely begins `- ` (#332).
         if element_cursor.is_container() {
             Some((element_cursor, rest))
-        } else if let Some(text_pos) = element_cursor.text_position() {
-            if text_pos < element_cursor.text.len()
-                && element_cursor.text[text_pos] == b'-'
-                && text_pos + 1 < element_cursor.text.len()
-                && (element_cursor.text[text_pos + 1] == b' '
-                    || element_cursor.text[text_pos + 1] == b'\t')
-            {
-                // Block sequence item - return child cursor if exists
-                if let Some(child) = element_cursor.first_child() {
-                    Some((child, rest))
-                } else {
-                    // Empty item - return element cursor (will produce null)
-                    Some((element_cursor, rest))
-                }
-            } else {
-                Some((element_cursor, rest))
-            }
+        } else if element_cursor
+            .text_position()
+            .is_some_and(|text_pos| starts_inline_seq_entry(element_cursor.text, text_pos))
+        {
+            Some((element_cursor.first_child().unwrap_or(element_cursor), rest))
         } else {
             Some((element_cursor, rest))
         }
@@ -3157,50 +3172,10 @@ impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
 
     /// Get the first element and the remaining elements.
     pub fn uncons(&self) -> Option<(YamlValue<'a, W>, Self)> {
-        let element_cursor = self.element_cursor?;
-
-        let rest = YamlElements {
-            element_cursor: element_cursor.next_sibling(),
-        };
-
-        // For block sequences, element_cursor points to the item wrapper node (at `-`).
-        // We need to navigate to the item's first child to get the actual value.
-        // However, for flow sequences, virtual root sequences, and document containers,
-        // the element IS the value directly.
-        //
-        // Block sequence items are detected by:
-        // 1. Text starts with `-`
-        // 2. The element is NOT itself a container (containers starting with `-` are sequences)
-        //
-        // If the element is a container (like a nested sequence or mapping), use it directly.
-        let value = if element_cursor.is_container() {
-            // This is a container (mapping or sequence) - use it directly
-            element_cursor.value()
-        } else if let Some(text_pos) = element_cursor.text_position() {
-            // Not a container - check if it's a block sequence item wrapper
-            if text_pos < element_cursor.text.len()
-                && element_cursor.text[text_pos] == b'-'
-                && text_pos + 1 < element_cursor.text.len()
-                && (element_cursor.text[text_pos + 1] == b' '
-                    || element_cursor.text[text_pos + 1] == b'\t')
-            {
-                // This is a block sequence item marker `- `
-                if let Some(child) = element_cursor.first_child() {
-                    // Block sequence item with content - unwrap to get the actual value
-                    child.value()
-                } else {
-                    // Empty sequence item (like `- # comment` or `- ` with nothing)
-                    // This should be null
-                    YamlValue::Null
-                }
-            } else {
-                // Scalar value
-                element_cursor.value()
-            }
-        } else {
-            element_cursor.value()
-        };
-        Some((value, rest))
+        // Delegate rather than re-deriving the sequence-item unwrap: this used to be a
+        // third open-coded copy of the `- ` test with its own acceptance set (#332).
+        let (cursor, rest) = self.uncons_cursor()?;
+        Some((cursor.value(), rest))
     }
 
     /// Get element by index.
@@ -3209,22 +3184,9 @@ impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
         for _ in 0..index {
             cursor = cursor.next_sibling()?;
         }
-        // Same logic as uncons - containers are used directly, block sequence items are unwrapped
-        let value_cursor = if cursor.is_container() {
-            cursor
-        } else if let Some(text_pos) = cursor.text_position() {
-            if text_pos < cursor.text.len()
-                && cursor.text[text_pos] == b'-'
-                && cursor.first_child().is_some()
-            {
-                cursor.first_child().unwrap()
-            } else {
-                cursor
-            }
-        } else {
-            cursor
-        };
-        Some(value_cursor.value())
+        // `value()` performs the sequence-item unwrap itself, so no `- ` test is needed
+        // here — this site used to carry one that omitted the whitespace check entirely.
+        Some(cursor.value())
     }
 }
 
@@ -4790,9 +4752,14 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
             // Source plain scalar: re-emit verbatim so both the scalar type and
             // its representation survive (`1`, `true`, `1.0`, `.5`, `yes`),
             // matching yq. Quote only when the decoded value cannot round-trip
-            // as a plain scalar (empty, or control chars / newlines from folded
-            // multiline plains with blank lines).
-            if str_val.is_empty() || str_val.bytes().any(|b| b < 0x20) {
+            // as a plain scalar (empty, control chars / newlines from folded
+            // multiline plains with blank lines, or a leading sequence-entry
+            // indicator — `- x` emitted bare under a `- ` would read back as a
+            // nested sequence, #332).
+            if str_val.is_empty()
+                || str_val.bytes().any(|b| b < 0x20)
+                || starts_seq_entry(str_val.as_bytes(), 0)
+            {
                 stream_yaml_double_quoted(out, &str_val)
             } else {
                 out.write_str(&str_val)
@@ -8340,5 +8307,197 @@ mod tests {
             );
             assert!(!root.is_in_flow_context(0), "column 0 is outside any flow");
         }
+    }
+
+    // ========================================================================
+    // Sequence-entry indicator (`- `) classification — #332
+    // ========================================================================
+
+    /// JSON for the first document, asserting the buffered (`to_json`) and streaming
+    /// (`stream_json`, what `yq -o json -I0` takes) emitters agree.
+    #[track_caller]
+    fn first_doc_json(yaml: &[u8]) -> String {
+        let index = YamlIndex::build(yaml).expect("builds");
+        let root = index.root(yaml);
+        let YamlValue::Sequence(elements) = root.value() else {
+            panic!("expected root document sequence");
+        };
+        let (cursor, _rest) = elements.uncons_cursor().expect("one document");
+
+        let buffered = cursor.to_json();
+        let mut streamed = String::new();
+        cursor.stream_json(&mut streamed).expect("streams");
+        assert_eq!(
+            buffered,
+            streamed,
+            "buffered and streaming JSON differ for {}",
+            String::from_utf8_lossy(yaml)
+        );
+        buffered
+    }
+
+    /// A plain scalar beginning `- ` is only reachable where no block sequence can
+    /// start: inside a flow collection, and as a same-line block mapping value. The
+    /// input is invalid YAML (the strict validator rejects it) but the loader is
+    /// lenient, and preserving the text beats silently dropping it (#332).
+    #[test]
+    fn test_dash_space_plain_scalar_content_is_preserved() {
+        // Flow sequence — the shapes from the issue report
+        assert_eq!(first_doc_json(b"[- x]\n"), r#"["- x"]"#);
+        assert_eq!(first_doc_json(b"[- x, 1]\n"), r#"["- x",1]"#);
+        assert_eq!(first_doc_json(b"[a, - b]\n"), r#"["a","- b"]"#);
+        // Flow mapping value, and a flow sequence nested in a flow mapping
+        assert_eq!(first_doc_json(b"{a: - x}\n"), r#"{"a":"- x"}"#);
+        assert_eq!(first_doc_json(b"{a: [- x]}\n"), r#"{"a":["- x"]}"#);
+        // Multi-line flow collection: the `-` is followed by a newline, so a
+        // line-local text scan would misread this as a block sequence item
+        assert_eq!(first_doc_json(b"[\n  - x\n]\n"), r#"["- x"]"#);
+        // `- ` with nothing after it inside flow: trailing space is trimmed, so the
+        // extent is the dash alone
+        assert_eq!(first_doc_json(b"[- ]\n"), r#"["-"]"#);
+        // Same-line block mapping value. #325 covers this input and may later make
+        // the parser emit a real sequence here; until then the text survives.
+        assert_eq!(first_doc_json(b"key: - a\n"), r#"{"key":"- a"}"#);
+    }
+
+    /// A `-` *not* followed by whitespace is an ordinary plain scalar in flow
+    /// context and must keep decoding as one.
+    #[test]
+    fn test_dash_without_whitespace_stays_a_plain_scalar() {
+        assert_eq!(first_doc_json(b"[-]\n"), r#"["-"]"#);
+        assert_eq!(first_doc_json(b"{a: -}\n"), r#"{"a":"-"}"#);
+        assert_eq!(first_doc_json(b"[-1, -2]\n"), "[-1,-2]");
+        assert_eq!(first_doc_json(b"[-a]\n"), r#"["-a"]"#);
+    }
+
+    /// The other shape that reaches the childless `- ` branch: a genuine empty
+    /// block sequence item, for which the parser records no end position. These
+    /// must stay null — this is what the end-position discriminator protects.
+    #[test]
+    fn test_empty_block_sequence_items_are_null() {
+        assert_eq!(first_doc_json(b"-\n"), "[null]");
+        assert_eq!(first_doc_json(b"- \n"), "[null]");
+        assert_eq!(first_doc_json(b"- # comment\n"), "[null]");
+        assert_eq!(first_doc_json(b"a:\n  -\n  - y\n"), r#"{"a":[null,"y"]}"#);
+        // An anchor before an inline `- ` used to leave the wrapper with neither a
+        // child nor an end, so it reached this branch and read as null. #328 made
+        // it a real nested sequence, so it now short-circuits at `is_container()`
+        // long before the discriminator — kept as a pin that the two fixes compose.
+        assert_eq!(first_doc_json(b"- &a - x\n"), r#"[["x"]]"#);
+    }
+
+    /// Ordinary block sequence items still unwrap to their content — the hot path
+    /// the discriminator must not disturb.
+    #[test]
+    fn test_block_sequence_items_still_unwrap_to_their_content() {
+        assert_eq!(first_doc_json(b"- x\n"), r#"["x"]"#);
+        assert_eq!(first_doc_json(b"- x\n- y\n"), r#"["x","y"]"#);
+        assert_eq!(first_doc_json(b"- - x\n"), r#"[["x"]]"#);
+        assert_eq!(first_doc_json(b"- k: v\n"), r#"[{"k":"v"}]"#);
+        assert_eq!(first_doc_json(b"-\n  a: b\n"), r#"[{"a":"b"}]"#);
+        assert_eq!(first_doc_json(b"-\tx\n"), r#"["x"]"#);
+    }
+
+    /// `YamlElements` has three accessors and they used to open-code the `- ` test
+    /// three different ways, with three different acceptance sets. They now all
+    /// route through `value()`; this asserts they *agree*, so re-divergence fails a
+    /// test instead of shipping (#332, and the same class of bug as #106).
+    #[test]
+    fn test_sequence_element_accessors_agree() {
+        let inputs: &[&[u8]] = &[
+            b"[- x, 1, - y]\n",
+            b"[-, -1, - ]\n",
+            b"- x\n- y\n- - z\n",
+            b"-\n- y\n",
+            b"- # c\n- y\n",
+            b"a:\n  -\n  - y\n  - k: v\n",
+            b"[\n  - x,\n  y\n]\n",
+            b"- &a x\n- *a\n",
+        ];
+        for yaml in inputs {
+            let index = YamlIndex::build(yaml).expect("builds");
+            let root = index.root(yaml);
+            let YamlValue::Sequence(docs) = root.value() else {
+                panic!("expected document sequence");
+            };
+            let (doc, _) = docs.uncons_cursor().expect("one document");
+            // Only sequence documents have elements to compare.
+            let YamlValue::Sequence(elements) = doc.value() else {
+                continue;
+            };
+
+            let mut via_uncons = Vec::new();
+            let mut rest = elements;
+            while let Some((value, next)) = rest.uncons() {
+                via_uncons.push(write_yaml_value_as_json_string(value));
+                rest = next;
+            }
+
+            let mut via_uncons_cursor = Vec::new();
+            let mut rest = elements;
+            while let Some((cursor, next)) = rest.uncons_cursor() {
+                via_uncons_cursor.push(cursor.to_json());
+                rest = next;
+            }
+
+            let via_get: Vec<String> = (0..via_uncons.len())
+                .map(|i| {
+                    write_yaml_value_as_json_string(
+                        elements.get(i).expect("element index in range"),
+                    )
+                })
+                .collect();
+
+            assert_eq!(
+                via_uncons,
+                via_uncons_cursor,
+                "uncons and uncons_cursor disagree on {}",
+                String::from_utf8_lossy(yaml)
+            );
+            assert_eq!(
+                via_uncons,
+                via_get,
+                "uncons and get disagree on {}",
+                String::from_utf8_lossy(yaml)
+            );
+            assert!(
+                elements.get(via_uncons.len()).is_none(),
+                "get past the end returned a value for {}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
+    /// A plain scalar that begins `- ` cannot be re-emitted bare: written under a
+    /// `- ` item marker it would read back as a nested sequence. Before #332 no
+    /// unquoted scalar could start that way, so this is a new obligation.
+    #[test]
+    fn test_dash_space_plain_scalar_is_quoted_in_yaml_output() {
+        for (yaml, expected) in [
+            (&b"[- x]\n"[..], "- \"- x\""),
+            (&b"{a: - x}\n"[..], "a: \"- x\""),
+            (&b"[- x, 1]\n"[..], "- \"- x\"\n- 1"),
+        ] {
+            let index = YamlIndex::build(yaml).expect("builds");
+            let root = index.root(yaml);
+            let mut out = String::new();
+            root.stream_yaml_document(&mut out, 2).expect("streams");
+            assert_eq!(out, expected, "for {}", String::from_utf8_lossy(yaml));
+
+            // And the emitted YAML must read back as the same value.
+            assert_eq!(
+                first_doc_json(out.as_bytes()),
+                first_doc_json(yaml),
+                "round-trip changed the value of {}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
+    /// Helper: render a `YamlValue` as JSON, matching `to_json`'s output.
+    fn write_yaml_value_as_json_string<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> String {
+        let mut out = String::new();
+        write_yaml_value_as_json(&mut out, value);
+        out
     }
 }
