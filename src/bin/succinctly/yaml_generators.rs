@@ -30,11 +30,6 @@
 //!   `{"<<": {…}}` where yq splices the target mapping (#171).
 //! - **Tags (`!!str`, `!custom`)** — rejected outright in block context; a
 //!   documented non-support in `src/yaml/mod.rs`.
-//! - **Blank lines inside a *folded* block scalar** — succinctly emits one
-//!   newline too many per blank line (`fold: >` over `a`, blank, `b` yields
-//!   `"a\n\nb\n"`; yq and the spec fold it to `"a\nb\n"`) (#329). The
-//!   `block-scalars` pattern puts blank lines in literal blocks only, where the
-//!   two agree.
 //!
 //! # Why this file exists in this shape (#327)
 //!
@@ -696,6 +691,10 @@ fn generate_anchors(target_size: usize, seed: Option<u64>) -> String {
 /// Body lengths run from a single line to ~100, since P2.7's accepted 19-25%
 /// SIMD win was measured on 100x100-line blocks and had no end-to-end number.
 ///
+/// Blank lines appear mid-body in both styles — in a folded block they are the
+/// `b-l-trimmed` shape that #329 got wrong, so the suite is only informative
+/// about folding if it generates them.
+///
 /// More-indented lines appear only inside literal blocks: in a folded block
 /// they suppress folding, which is a distinct shape better covered explicitly
 /// than mixed in here by accident.
@@ -743,11 +742,10 @@ fn generate_block_scalars(target_size: usize, seed: Option<u64>) -> String {
             // content under `|+` and would make the shape depend on where the
             // size budget happened to stop.
             //
-            // Literal blocks only. In a *folded* block succinctly emits one
-            // newline too many per blank line (`a\n\nb` where yq and the spec
-            // fold to `a\nb`), so generating that here would bake a wrong shape
-            // into every benchmark run — see the module docs.
-            if literal && i > 0 && i + 1 < lines && i % 7 == 0 {
+            // In both styles. Folded blocks were excluded until #329, which had
+            // succinctly emit one newline too many per blank line — the shape
+            // the folding rewrite in `decode_block_folded` fixed.
+            if i > 0 && i + 1 < lines && i % 7 == 0 {
                 yaml.push('\n');
                 continue;
             }
