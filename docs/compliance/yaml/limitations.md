@@ -27,18 +27,23 @@ path:
 | Dimension                              | Result              | Meaning                                        |
 |----------------------------------------|---------------------|------------------------------------------------|
 | **Load** (valid YAML, output compared) | **209/279 = 74.9%** | Parses and produces the JSON the suite expects |
-| **Reject** (invalid YAML, must fail)   | **11/94 = 11.7%**   | Correctly refuses malformed input              |
+| **Reject** (invalid YAML, must fail)   | **70/94 = 74.5%**   | Refused by the loader or the opt-in validator  |
 | **Parse** (valid YAML, no JSON form)   | **27/29 = 93.1%**   | Parses without error                           |
 
-The 155 non-passing cases are enumerated individually, with a category and reason, in
+The **Reject** figure is what the conformance harness rejects with the opt-in
+validator enabled (loader OR validator, see below). The *default non-validating
+loader alone* still rejects only 11/94 (11.7%) by design — the opt-in validator
+([#223](https://github.com/rust-works/succinctly/issues/223)) closes 59 more.
+
+The 96 non-passing cases are enumerated individually, with a category and reason, in
 [`tests/data/yaml-test-suite-known-failures.txt`](../../../tests/data/yaml-test-suite-known-failures.txt).
 That file is the machine-readable source of truth; the test asserts it matches reality
 exactly, so it cannot silently drift from this page.
 
-## Validation is out of scope by design
+## Validation: default loader vs. the opt-in validator
 
-**succinctly is a non-validating YAML loader.** It rejects 11 of the suite's 94 invalid
-documents; the other 83 are accepted and produce a value.
+**The default loader is non-validating by design.** `YamlIndex::build` rejects 11 of the
+suite's 94 invalid documents; the other 83 are accepted and produce a value.
 
 This follows from semi-indexing. The index records *structure* — where values start and
 end, and how they nest — not grammar conformance. The parser is a structure recognizer:
@@ -47,11 +52,21 @@ anything it does not recognize as scalar text. Checking the ~1200 productions of
 1.2 grammar is work it deliberately does not do, and that omission is a large part of why
 it is 5-10x faster than `yq`.
 
-If you need malformed YAML rejected, you need a validating parser. Passing untrusted or
-unverified YAML through succinctly and relying on a parse error to catch problems will
-not work.
+**When you need malformed YAML rejected, use the opt-in validator.**
+[`succinctly yaml validate`](../../guides/cli.md) / `syq --validate` runs a separate strict
+pass ([`src/yaml/validate.rs`](../../../src/yaml/validate.rs)) before indexing — mirroring
+`json validate` / `sjq --validate`, so the default path pays nothing. It rejects **59 of
+the 83** documents below with zero false positives on the valid corpus (a guardrail test,
+`validator_accepts_all_valid_cases`, enforces that). The conformance harness treats a
+must-fail case as handled if the loader *or* the validator rejects it, which is why the
+Reject figure above is 70/94 rather than 11/94.
 
-The 83 accepted-but-invalid documents break down as:
+The 24 documents the validator does not yet reject (marked `lax:*` in the manifest) need
+deeper structural analysis — cross-line anchor binding, block-scalar content indentation,
+flow multi-line implicit keys — and are tracked in
+[#223](https://github.com/rust-works/succinctly/issues/223).
+
+The 83 accepted-but-invalid documents (of which the validator now rejects 59) break down as:
 
 | Category           | Cases | What is not checked                          |
 |--------------------|-------|----------------------------------------------|
@@ -66,12 +81,12 @@ The 83 accepted-but-invalid documents break down as:
 | `lax:anchors`      | 6     | Anchor and alias rules                       |
 | `lax:comments`     | 5     | Comment placement                            |
 
-An opt-in validation mode is planned, mirroring the JSON side's existing
-`succinctly json validate` / `sjq --validate`. There, validation is a separate pass that
-runs before indexing, so the default path pays nothing for it — see
-[`src/json/validate.rs`](../../../src/json/validate.rs). The 83 cases above are its
-acceptance criteria. Tracked in
-[#223](https://github.com/rust-works/succinctly/issues/223).
+The opt-in validation mode now exists ([#223](https://github.com/rust-works/succinctly/issues/223)),
+mirroring the JSON side's `succinctly json validate` / `sjq --validate`. Validation is a
+separate pass run before indexing, so the default path pays nothing for it — see
+[`src/yaml/validate.rs`](../../../src/yaml/validate.rs). The 83 cases above were its
+acceptance criteria; it rejects 59 of them today (each `lax:*` line removed from the
+manifest is a case now rejected), with the 24 harder cases still tracked in #223.
 
 ### One exception: cyclic aliases are rejected
 

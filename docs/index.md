@@ -103,11 +103,11 @@ rather than asserted:
 
 - [compliance/yaml/limitations.md](compliance/yaml/limitations.md) — YAML Test Suite conformance (402 cases), unsupported features, and why validation is opt-in
 - [compliance/yaml/1.2.md](compliance/yaml/1.2.md) — YAML 1.2 scalar type resolution: the Norway problem, booleans, quoted numbers
-- [guides/cli.md](guides/cli.md) — JSON's strict RFC 8259 validation (`json validate`, `sjq --validate`)
+- [guides/cli.md](guides/cli.md) — strict validation for both formats: JSON's RFC 8259 (`json validate`, `sjq --validate`) and YAML's opt-in validator (`yaml validate`, `syq --validate`)
 
 Key point: both JSON and YAML semi-indexing are **non-validating by design** — the index
-records structure, not grammar conformance. JSON offers a separate opt-in validation pass;
-the YAML equivalent is planned.
+records structure, not grammar conformance. Each format offers a separate opt-in validation
+pass that runs before indexing, so the default path pays nothing for it.
 
 ## Architecture Decisions (ADRs)
 
