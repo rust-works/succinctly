@@ -523,7 +523,15 @@ impl<'a> Validator<'a> {
                         i += 1;
                         if c == b'\\' {
                             i += 1;
-                        } else if c == b'"' || c == b'\n' || c == b'\r' {
+                        } else if c == b'"' || c == b'\n' {
+                            break;
+                        } else if c == b'\r' {
+                            // A CRLF is a single line break: consume the LF too,
+                            // so an unterminated quote resumes this scan exactly
+                            // where the LF-only spelling would (#324).
+                            if self.input.get(i) == Some(&b'\n') {
+                                i += 1;
+                            }
                             break;
                         }
                     }
