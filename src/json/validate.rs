@@ -183,6 +183,21 @@ const SCALAR_PROBE_BYTES: usize = 16;
 /// complete even a single vector iteration, so it is all tail work anyway (#123).
 const UTF8_SIMD_MIN_SPAN: usize = 16;
 
+/// Out-of-line entry to the vector scanner.
+///
+/// [`find_json_string_stop`] is `#[inline(always)]` for its transcoder callers,
+/// where the scan *is* the hot loop. Here it is not: `validate_string` sits
+/// inside the recursive-descent core, and inlining the AVX2 + SSE2 + scalar-tail
+/// kernel into it bloats that core enough to cost +13.7% on `pathological` and
+/// +8.7% on `arrays` (x86_64/AVX2, where the inlined blob is largest) — patterns
+/// of one-character keys that never execute a vector instruction at all. The
+/// scalar probe already absorbs every short run, so runs reaching here are long
+/// enough to amortize an ordinary call.
+#[inline(never)]
+fn scan_long_run(input: &[u8], from: usize) -> usize {
+    find_json_string_stop(input, from)
+}
+
 /// Is `b` ordinary JSON string content, needing no decision from the validator?
 ///
 /// The exact complement of the [`find_json_string_stop`] predicate — the two are
@@ -411,6 +426,13 @@ impl<'a> Validator<'a> {
     /// machinery, because a raw byte `< 0x20` inside a string is an error: no
     /// newline can occur here, `line` cannot change, and `column` counts bytes
     /// (a 3-byte character advances it by 3, exactly as `advance()` would).
+    ///
+    /// Kept out of line so its size cannot perturb `validate_value`, the
+    /// dispatcher every value type flows through. String scanning grew this
+    /// function enough to change that inlining decision, which cost ~8% on
+    /// `arrays` and ~3% on `numbers` — files containing zero and one string
+    /// respectively, so not a byte of the scanning code was even executing.
+    #[inline(never)]
     fn validate_string(&mut self) -> Result<(), ValidationError> {
         self.advance(); // consume opening quote
 
@@ -454,17 +476,24 @@ impl<'a> Validator<'a> {
         // falls every 2-3 bytes. Answering that case with a single compare, as
         // the old `peek()` loop did, avoids paying the probe's slice and
         // iterator setup for it (+13% on `unicode` before this fast path).
-        match self.input.get(self.offset) {
-            Some(&b) if is_plain_string_byte(b) => {}
-            _ => return self.offset,
+        //
+        // Two bytes are unrolled, not one: one-character keys (`{"a":{"b":...}}`)
+        // and empty strings are common in structural JSON, and stopping at byte 1
+        // is what closes them. Both cases then return without ever constructing
+        // the probe slice.
+        for k in 0..2 {
+            match self.input.get(self.offset + k) {
+                Some(&b) if is_plain_string_byte(b) => {}
+                _ => return self.offset + k,
+            }
         }
 
         let probe_end = self.input.len().min(self.offset + SCALAR_PROBE_BYTES);
-        let probe = &self.input[self.offset + 1..probe_end];
+        let probe = &self.input[self.offset + 2..probe_end];
         match probe.iter().position(|&b| !is_plain_string_byte(b)) {
-            Some(i) => self.offset + 1 + i,
+            Some(i) => self.offset + 2 + i,
             // Still plain content after the probe: long enough for SIMD to pay.
-            None => find_json_string_stop(self.input, probe_end),
+            None => scan_long_run(self.input, probe_end),
         }
     }
 
