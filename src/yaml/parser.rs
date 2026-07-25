@@ -1979,25 +1979,11 @@ impl<'a> Parser<'a> {
         // Parse the value
         match self.peek() {
             Some(b'-') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
-                // Sequence as value
-                self.write_bp_open();
-                self.write_ty(true); // sequence
-                self.indent_stack.push(indent + 2);
-                self.push_type(NodeType::Sequence);
-
-                // Parse first sequence item
-                self.write_bp_open(); // item node
-                self.advance(); // skip `-`
-                self.skip_inline_whitespace();
-
-                if !self.at_line_end() {
-                    if self.looks_like_mapping_entry() {
-                        self.parse_compact_mapping_entry(indent + 3)?;
-                    } else {
-                        self.parse_value(indent + 2)?;
-                    }
-                }
-                self.write_bp_close(); // close item
+                // Sequence as value. Routed through the shared sequence-item
+                // parser rather than an inlined copy of its dispatch, so anchor
+                // handling (#328) and every future fix land here too — this was
+                // the third divergent copy of this decision (#106).
+                self.parse_sequence_item(self.current_column())?;
             }
             Some(b'[') => {
                 self.parse_flow_sequence()?;
