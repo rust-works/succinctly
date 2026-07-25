@@ -127,6 +127,19 @@ struct YamlStats {
     escape_density: Dist, // per file
     anchors_per_file: Dist,
     aliases_per_file: Dist,
+    bare_dash_items_per_file: Dist,
+}
+
+/// Counters that are accumulated over a whole file rather than per node, so the
+/// distribution gets one sample per file (like `anchors_per_file`) instead of one
+/// per occurrence. Threaded through `visit_yaml` as a single `&mut` to keep the
+/// recursion's parameter count down as counters are added.
+#[derive(Default)]
+struct YamlFileCounters {
+    /// `\` bytes across every scalar and key, for the escape-density metric.
+    escapes: u64,
+    /// Block-sequence items whose `-` indicator sits alone on its own line.
+    bare_dash_items: u64,
 }
 
 #[derive(Default)]
@@ -258,7 +271,7 @@ fn visit_yaml(
     bytes: &[u8],
     cur: YamlCursor<'_, Vec<u64>>,
     st: &mut YamlStats,
-    escapes: &mut u64,
+    counters: &mut YamlFileCounters,
 ) {
     st.depth
         .push(index.bp().depth(cur.bp_position()).unwrap_or(0) as u64);
@@ -267,7 +280,7 @@ fn visit_yaml(
         YamlValue::String(ys) => {
             let raw = ys.raw_bytes();
             st.scalar_len.push(raw.len() as u64);
-            *escapes += raw.iter().filter(|&&b| b == b'\\').count() as u64;
+            counters.escapes += raw.iter().filter(|&&b| b == b'\\').count() as u64;
         }
         YamlValue::Mapping(fields) => {
             record_flow(bytes, &cur, st);
@@ -277,19 +290,25 @@ fn visit_yaml(
                 if let YamlValue::String(ks) = field.key() {
                     let raw = ks.raw_bytes();
                     st.scalar_len.push(raw.len() as u64);
-                    *escapes += raw.iter().filter(|&&b| b == b'\\').count() as u64;
+                    counters.escapes += raw.iter().filter(|&&b| b == b'\\').count() as u64;
                 }
-                visit_yaml(index, bytes, field.value_cursor(), st, escapes);
+                visit_yaml(index, bytes, field.value_cursor(), st, counters);
             }
             st.keys_per_mapping.push(keys);
         }
         YamlValue::Sequence(elements) => {
             record_flow(bytes, &cur, st);
+            // Only block sequences carry a `-` indicator to classify; flow
+            // sequences (`[a, b]`) have none.
+            let block = cur.style() != "flow";
             let mut es = elements;
             let mut n = 0u64;
             while let Some((child, rest)) = es.uncons_cursor() {
                 n += 1;
-                visit_yaml(index, bytes, child, st, escapes);
+                if block && has_bare_dash_indicator(bytes, &child) {
+                    counters.bare_dash_items += 1;
+                }
+                visit_yaml(index, bytes, child, st, counters);
                 es = rest;
             }
             st.items_per_sequence.push(n);
@@ -297,6 +316,40 @@ fn visit_yaml(
         // Aliases are counted via the BP scan below; do not recurse (cycle-safe).
         YamlValue::Alias { .. } | YamlValue::Null | YamlValue::Error(_) => {}
     }
+}
+
+/// Whether a block-sequence item's `-` indicator sits alone on its own line
+/// (`-\n  key: value`) rather than inline with the content (`- key: value`).
+///
+/// Derived from the item's own text position rather than a bespoke re-scan of the
+/// document, on the same principle as O4's seq-item wrappers: the text already
+/// encodes it. The index distinguishes the two forms by where it anchors the item
+/// — an inline item's position is its *content* (the `b` of `- b: 2`), while a
+/// bare-dash item has no content on that line so the position is the `-` itself.
+/// So the test is: the position is a `-`, and the rest of that line is blank.
+///
+/// Both halves are load-bearing. Requiring a `-` rejects inline items; requiring
+/// the rest of the line to be blank rejects the two shapes whose *content* also
+/// starts with a dash — a negative number (`- -5`) and a nested inline sequence
+/// (`- - deep`) — which the first check alone would miscount.
+///
+/// One deliberate undercount: a comment between the indicator and the content
+/// (`-  # note\n  key: v`) anchors the item at the content, so it reads as inline.
+/// The metric is therefore a lower bound on bare-dash usage.
+fn has_bare_dash_indicator(bytes: &[u8], child: &YamlCursor<'_, Vec<u64>>) -> bool {
+    child.text_position().is_some_and(|start| {
+        bytes.get(start) == Some(&b'-')
+            // The indicator is bare only if nothing but horizontal whitespace
+            // follows it on that line. Running out of input counts: a trailing
+            // `-` with no newline after it is still alone on its line.
+            && match bytes[start + 1..]
+                .iter()
+                .find(|&&b| !matches!(b, b' ' | b'\t' | b'\r'))
+            {
+                Some(&b) => b == b'\n',
+                None => true,
+            }
+    })
 }
 
 /// Record a flow collection's byte extent (the P5 metric) when `cur` is a flow
@@ -382,18 +435,22 @@ fn ingest_yaml(bytes: &[u8], st: &mut YamlStats) -> Result<()> {
 
     // The YAML root is a virtual sequence of documents; visit each document so
     // the doc-list does not pollute the sequence-item distribution.
-    let mut escapes = 0u64;
+    let mut counters = YamlFileCounters::default();
     let root = index.root(bytes);
     match root.value() {
         YamlValue::Sequence(mut docs) => {
             while let Some((doc, rest)) = docs.uncons_cursor() {
-                visit_yaml(&index, bytes, doc, st, &mut escapes);
+                visit_yaml(&index, bytes, doc, st, &mut counters);
                 docs = rest;
             }
         }
-        _ => visit_yaml(&index, bytes, root, st, &mut escapes),
+        // Defensive, and not reachable for any input observed: `index.root()`
+        // returns the virtual document sequence for empty, comment-only, scalar,
+        // flow, block-scalar and multi-document input alike.
+        _ => visit_yaml(&index, bytes, root, st, &mut counters),
     }
-    push_escape_density(&mut st.escape_density, escapes, bytes.len());
+    st.bare_dash_items_per_file.push(counters.bare_dash_items);
+    push_escape_density(&mut st.escape_density, counters.escapes, bytes.len());
     st.files += 1;
     st.total_bytes += bytes.len() as u64;
     Ok(())
@@ -630,11 +687,17 @@ percentiles use nearest-rank.\n\n",
     // YAML
     md.push_str("## YAML\n\n");
     md.push_str(&format!(
-        "files: {}, total bytes: {}, anchors: {}, aliases: {}\n\n",
+        "files: {}, total bytes: {}, anchors: {}, aliases: {}, bare-dash items: {}\n\n",
         corpus.yaml.files,
         corpus.yaml.total_bytes,
         corpus.yaml.anchors_per_file.values.iter().sum::<u64>(),
         corpus.yaml.aliases_per_file.values.iter().sum::<u64>(),
+        corpus
+            .yaml
+            .bare_dash_items_per_file
+            .values
+            .iter()
+            .sum::<u64>(),
     ));
     md.push_str(&render_table(
         DIST_HEADERS,
@@ -649,6 +712,11 @@ percentiles use nearest-rank.\n\n",
                 "sequence items",
                 "items/seq",
                 &corpus.yaml.items_per_sequence,
+            ),
+            dist_row(
+                "bare-dash seq items",
+                "count/file",
+                &corpus.yaml.bare_dash_items_per_file,
             ),
             dist_row(
                 "flow-collection size",
@@ -822,6 +890,68 @@ mod tests {
         // exactly one flow collection recorded, of length == "[1, 2, 3]"
         assert_eq!(st.flow_collection_bytes.values.len(), 1);
         assert_eq!(st.flow_collection_bytes.values[0], "[1, 2, 3]".len() as u64);
+    }
+
+    #[test]
+    fn yaml_bare_dash_items_counted() {
+        // Two bare-dash items (the `-` alone on its line) and one inline `- `.
+        let doc = b"rules:\n  -\n    a: 1\n  - b: 2\n  -\n    c: 3\n";
+        let mut st = YamlStats::default();
+        ingest_yaml(doc, &mut st).unwrap();
+        assert_eq!(st.bare_dash_items_per_file.values, vec![2]);
+        // The sequence itself still reports all three items.
+        assert_eq!(st.items_per_sequence.values, vec![3]);
+    }
+
+    #[test]
+    fn yaml_inline_and_flow_items_are_not_bare_dash() {
+        // Inline block items and flow sequences carry no bare-dash indicator.
+        let doc = b"block:\n  - one\n  - two\nflow: [1, 2, 3]\nnested:\n  - - deep\n";
+        let mut st = YamlStats::default();
+        ingest_yaml(doc, &mut st).unwrap();
+        assert_eq!(st.bare_dash_items_per_file.values, vec![0]);
+    }
+
+    #[test]
+    fn yaml_bare_dash_nests_and_counts_empty_items() {
+        // A bare dash whose content is itself a bare-dash sequence, plus a trailing
+        // empty item (`-` with no content) — which is also a dash alone on its own
+        // line, so it counts too.
+        let doc = b"outer:\n  -\n    inner:\n      -\n        x: 1\n  -\n";
+        let mut st = YamlStats::default();
+        ingest_yaml(doc, &mut st).unwrap();
+        assert_eq!(st.bare_dash_items_per_file.values, vec![3]);
+    }
+
+    #[test]
+    fn bare_dash_counts_a_trailing_indicator_at_end_of_input() {
+        // A `-` that is the last byte of the file, with no newline after it, is
+        // still alone on its line — the "ran out of input" arm of the scan.
+        let doc = b"k:\n  -";
+        let mut st = YamlStats::default();
+        ingest_yaml(doc, &mut st).unwrap();
+        assert_eq!(st.bare_dash_items_per_file.values, vec![1]);
+    }
+
+    #[test]
+    fn bare_dash_ignores_content_that_starts_with_a_dash() {
+        // `- -5` anchors the item at the `-` of the negative number, so the
+        // "rest of the line is blank" half of the check is what keeps it out.
+        let doc = b"neg:\n  - -5\n  -\n    z: 1\n";
+        let mut st = YamlStats::default();
+        ingest_yaml(doc, &mut st).unwrap();
+        assert_eq!(st.bare_dash_items_per_file.values, vec![1]);
+    }
+
+    #[test]
+    fn bare_dash_undercounts_when_a_comment_follows_the_indicator() {
+        // A comment sits between the indicator and the content, so the index
+        // anchors the item at the content and it reads as inline. This is the
+        // documented undercount, pinned so it stays a deliberate choice.
+        let doc = b"k:\n  -  # note\n    a: 1\n";
+        let mut st = YamlStats::default();
+        ingest_yaml(doc, &mut st).unwrap();
+        assert_eq!(st.bare_dash_items_per_file.values, vec![0]);
     }
 
     #[test]
