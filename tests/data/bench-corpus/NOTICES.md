@@ -20,6 +20,7 @@ retains its upstream license below.
 | `yaml/actions/codeql-analysis.yml`    | [prometheus/prometheus](https://github.com/prometheus/prometheus) `.github/workflows/codeql-analysis.yml` | Apache-2.0 |
 | `yaml/actions/stale.yml`              | [prometheus/prometheus](https://github.com/prometheus/prometheus) `.github/workflows/stale.yml`        | Apache-2.0 |
 | `yaml/k8s/nginx-deployment.yml`       | [kubernetes/examples](https://github.com/kubernetes/examples) `nginx-platform-app/deployment.yml`      | Apache-2.0 |
+| `yaml/lint/sass-lint.yml`             | [istio/istio](https://github.com/istio/istio) `common/config/sass-lint.yml` (bare-dash sequence items: `-` alone on its line) | Apache-2.0 |
 | `json/charts/bullet-data.json`        | [plotly/datasets](https://github.com/plotly/datasets) `BulletData.json`                                | MIT        |
 | `dsv/world-gdp/world-gdp-with-codes.csv` | [plotly/datasets](https://github.com/plotly/datasets) `2014_world_gdp_with_codes.csv` (genuine quoting: `"Bahamas, The"`) | MIT |
 
@@ -31,11 +32,30 @@ retains its upstream license below.
 | `json/geojson/us-election.geojson`   | 100kb | [plotly/datasets](https://github.com/plotly/datasets) `election.geojson`                      | MIT        |
 | `dsv/gapminder/gapminder-five-year.csv` | 100kb | [plotly/datasets](https://github.com/plotly/datasets) `gapminderDataFiveYear.csv`         | MIT        |
 
+## What the corpus can and cannot tell you
+
+The corpus establishes **existence** — that a shape occurs in real files, and what
+it looks like at what size. It cannot establish **frequency**: seven files can never
+proportionally represent a shape that appears in a fraction of a percent of real
+input. `yaml/lint/sass-lint.yml` is the worked example. It was added for #326 so the
+bare-dash sequence item (`-` alone on its line) is sampled at all, but a survey of
+46 upstream repositories found that shape in under 0.1% of real YAML files. Reading
+its presence here as "roughly one YAML file in six uses bare dashes" inverts the
+error the corpus exists to prevent. Frequency questions belong to
+[`docs/benchmarks/yaml-shape-survey.md`](../../../docs/benchmarks/yaml-shape-survey.md).
+
 ## Extending the corpus
 
 The 1MB/10MB ladder tiers and anchor/alias-heavy YAML (real workloads use anchors
-far less than the P4 micro-benchmarks assumed — the seed shows `anchors: 0`) are
-follow-up curation: add a `manifest.json` entry (`vendored: false`) with a
+far less than the P4 micro-benchmarks assumed — the corpus still shows `anchors: 0`,
+and the survey above confirms that is upstream reality rather than a sampling gap)
+are follow-up curation: add a `manifest.json` entry (`vendored: false`) with a
 commit-pinned `source_url`, `license`, `bytes`, and `sha256`, then run
 `./scripts/sync-bench-corpus.sh` to fetch and verify it. Prefer public-domain or
 permissive (CC0 / MIT / Apache-2.0 / BSD) sources and always record provenance.
+
+Test-parse any candidate before committing it (`succinctly yq -o json '.' <file>`).
+`ingest_yaml` turns a parse failure into an error that aborts the whole report, and
+plausible-looking sources do fail: the densest bare-dash file found during the #326
+search was an AWS CloudFormation template, which is unusable here because its
+`!Ref`/`!GetAtt` shorthand tags hit `YamlError::TagNotSupported`.
