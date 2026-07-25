@@ -1,0 +1,1 @@
+{"block_mapping":[{"k":"v"},{"k":"v"}],"block_sequence":[["a","b"],["a","b"]],"flow_mapping":[{"id":1},{"id":1}],"flow_sequence":[[1,2],[1,2]],"compact_key":[{"k":"v"},"k"],"trailing_comment":[{"k":"v"},{"k":"v"}],"empty":[null,null],"scalar":["val","val"],"block_scalar":["line\n","line\n"],"explicit_key":{"outer":[{"a":1},{"a":1}]}}

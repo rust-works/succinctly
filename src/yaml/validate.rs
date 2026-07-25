@@ -1499,6 +1499,27 @@ mod tests {
         assert!(validate(b"---\nseq:\n &anchor\n- a\n- b\n").is_ok()); // SKE5
     }
 
+    /// Issue #328: every shape the loader now handles must also pass the
+    /// validator, or `syq --validate` would reject documents `syq` reads fine.
+    ///
+    /// The validator is a separate pass, so this is not implied by the parser
+    /// tests; it is asserted here so a later tightening of `scan_anchor` cannot
+    /// silently take these away.
+    #[test]
+    fn accepts_anchored_sequence_items_with_collection_values() {
+        assert!(validate(b"list:\n  - &m\n    k: v\n  - *m\n").is_ok());
+        assert!(validate(b"items:\n  - &m\n    - a\n    - b\n  - *m\n").is_ok());
+        assert!(validate(b"items:\n  - &first {id: 1}\n  - *first\n").is_ok());
+        assert!(validate(b"items:\n  - &m [1, 2]\n  - *m\n").is_ok());
+        assert!(validate(b"items:\n  - &a k: v\n  - *a\n").is_ok());
+        assert!(validate(b"list:\n  - &m # note: here\n    k: v\n  - *m\n").is_ok());
+        assert!(validate(b"items:\n  - &m\n  - *m\n").is_ok());
+        assert!(validate(b"items:\n  - &m\n").is_ok());
+        assert!(validate(b"items:\n  - &m |\n    line\n  - *m\n").is_ok());
+        assert!(validate(b"? k\n: - &m\n    a: 1\n").is_ok());
+        assert!(validate(b"a: { &e e: f }\nb: *e\n").is_ok());
+    }
+
     #[test]
     fn accepts_multiline_and_folded_scalars() {
         assert!(validate(b"a\nb\n c\nd\n\ne\n").is_ok()); // 9YRD plain multiline

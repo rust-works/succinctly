@@ -6234,6 +6234,134 @@ mod tests {
         }
     }
 
+    /// Issue #328: an anchor on a block sequence item binds to the item's
+    /// value, whatever its kind. Before the fix, `- &m` followed by an indented
+    /// collection was read as a multi-line plain scalar (yielding `["k"]` with
+    /// the rest of the mapping leaking out as a sibling), and `- &m {...}` had
+    /// its anchor swallowed into the key text so the alias resolved to nothing.
+    ///
+    /// Every expectation here is the output of mikefarah/yq v4.53.3, the same
+    /// oracle `tests/data/yq-golden/cases/anchored_seq_item_*` is captured from.
+    /// Note `- &a k: v` anchors the *key*, not the mapping — that is yq's
+    /// behaviour and matches how `parse_mapping_entry` treats `&a k: v`.
+    #[test]
+    fn test_anchored_sequence_item_with_collection_value() {
+        let cases: &[(&[u8], &str)] = &[
+            // Block mapping on the following lines - the headline #328 repro
+            (
+                b"list:\n  - &m\n    k: v\n  - *m\n",
+                "{\"list\":[{\"k\":\"v\"},{\"k\":\"v\"}]}",
+            ),
+            // Block sequence on the following lines
+            (
+                b"items:\n  - &m\n    - a\n    - b\n  - *m\n",
+                "{\"items\":[[\"a\",\"b\"],[\"a\",\"b\"]]}",
+            ),
+            // Flow mapping on the same line - the second #328 repro
+            (
+                b"items:\n  - &first {id: 1}\n  - *first\n",
+                "{\"items\":[{\"id\":1},{\"id\":1}]}",
+            ),
+            // Flow sequence on the same line
+            (
+                b"items:\n  - &m [1, 2]\n  - *m\n",
+                "{\"items\":[[1,2],[1,2]]}",
+            ),
+            // Compact mapping entry: the anchor binds to the key
+            (
+                b"items:\n  - &a k: v\n  - *a\n",
+                "{\"items\":[{\"k\":\"v\"},\"k\"]}",
+            ),
+            // A trailing comment containing `: ` must not read as a mapping entry
+            (
+                b"list:\n  - &m # note: here\n    k: v\n  - *m\n",
+                "{\"list\":[{\"k\":\"v\"},{\"k\":\"v\"}]}",
+            ),
+            // Blank line between the anchor and its value
+            (
+                b"list:\n  - &m\n\n    k: v\n  - *m\n",
+                "{\"list\":[{\"k\":\"v\"},{\"k\":\"v\"}]}",
+            ),
+            // Value at exactly indent + 1, the boundary of "is this a child?"
+            (b"- &m\n k: v\n- *m\n", "[{\"k\":\"v\"},{\"k\":\"v\"}]"),
+            // Null value: the anchor still needs an explicit node to point at
+            (b"items:\n  - &m\n  - *m\n", "{\"items\":[null,null]}"),
+            // Null value at EOF
+            (b"items:\n  - &m\n", "{\"items\":[null]}"),
+            // A deeper comment line is not a value
+            (b"items:\n  - &m\n    # c\n", "{\"items\":[null]}"),
+            // A column-0 comment does not end the item
+            (
+                b"list:\n  - &m\n# c\n    k: v\n  - *m\n",
+                "{\"list\":[{\"k\":\"v\"},{\"k\":\"v\"}]}",
+            ),
+            // Already worked before the fix - guard against regression
+            (
+                b"items:\n  - &s val\n  - *s\n",
+                "{\"items\":[\"val\",\"val\"]}",
+            ),
+            (
+                b"items:\n  - &m |\n    line\n  - *m\n",
+                "{\"items\":[\"line\\n\",\"line\\n\"]}",
+            ),
+            // Sequence as an explicit-key value routes through the same parser
+            (b"? k\n: - &m\n    a: 1\n", "{\"k\":[{\"a\":1}]}"),
+        ];
+
+        for (yaml, expected) in cases {
+            let index = YamlIndex::build(yaml).unwrap();
+            let json = index.root(yaml).to_json_document();
+            let mut streamed = String::new();
+            index
+                .root(yaml)
+                .stream_json_document(&mut streamed)
+                .unwrap();
+            let input = core::str::from_utf8(yaml).unwrap();
+            assert_eq!(json, *expected, "to_json mismatch for {input:?}");
+            assert_eq!(streamed, *expected, "stream_json mismatch for {input:?}");
+        }
+    }
+
+    /// Issue #328: an anchored sequence item exposes the kind of the collection
+    /// it names, and the alias resolves to that same collection rather than to
+    /// a stray scalar.
+    #[test]
+    fn test_anchored_sequence_item_alias_resolves_to_collection() {
+        let yaml = b"list:\n  - &m\n    k: v\n  - *m\n";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        let items: Vec<_> = match first_doc(index.root(yaml)) {
+            YamlValue::Mapping(fields) => {
+                let field = fields.into_iter().next().expect("one field");
+                match field.value_cursor.value() {
+                    YamlValue::Sequence(elements) => elements.collect(),
+                    other => panic!("expected sequence, got {other:?}"),
+                }
+            }
+            other => panic!("expected mapping, got {other:?}"),
+        };
+        assert_eq!(items.len(), 2, "expected 2 items");
+
+        assert!(
+            matches!(&items[0], YamlValue::Mapping(_)),
+            "anchored item should be a mapping"
+        );
+        match &items[1] {
+            YamlValue::Alias {
+                anchor_name,
+                target,
+            } => {
+                assert_eq!(*anchor_name, "m");
+                let target = target.as_ref().expect("alias must resolve");
+                assert!(
+                    matches!(target.value(), YamlValue::Mapping(_)),
+                    "alias must resolve to the anchored mapping"
+                );
+            }
+            other => panic!("expected alias, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_multiple_anchors() {
         let yaml = b"a: &x 1\nb: &y 2\nc: [*x, *y]";

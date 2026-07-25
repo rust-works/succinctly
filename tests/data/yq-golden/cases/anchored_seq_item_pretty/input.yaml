@@ -1,0 +1,38 @@
+# An anchor on a block sequence item whose value is a collection (#328)
+block_mapping:
+  - &bm
+    k: v
+  - *bm
+block_sequence:
+  - &bs
+    - a
+    - b
+  - *bs
+flow_mapping:
+  - &fm {id: 1}
+  - *fm
+flow_sequence:
+  - &fs [1, 2]
+  - *fs
+compact_key:
+  - &ck k: v
+  - *ck
+trailing_comment:
+  - &tc # note: a colon in a comment
+    k: v
+  - *tc
+empty:
+  - &e
+  - *e
+scalar:
+  - &s val
+  - *s
+block_scalar:
+  - &blk |
+    line
+  - *blk
+explicit_key:
+  ? outer
+  : - &ek
+      a: 1
+    - *ek
