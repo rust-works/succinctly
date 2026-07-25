@@ -871,6 +871,90 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
+    // Anchor targeting (#328)
+    // ------------------------------------------------------------------------
+
+    /// Every anchor must name a node.
+    ///
+    /// `parse_anchor` records `bp_pos` — the *next* BP bit — as the anchor's
+    /// target, betting that the anchored node's open comes next. `bp_pos`
+    /// counts closes as well as opens, so any parse path that emits a close
+    /// first, or none at all, leaves the anchor pointing at a close bit or at a
+    /// node that is not the anchored one. The reader then resolves aliases to
+    /// an unrelated node and emits a well-formed but wrong document, which is
+    /// exactly how #328 stayed invisible.
+    ///
+    /// Checking the invariant over the whole corpus catches that class on
+    /// shapes no example test would think to write. This is a unit test rather
+    /// than an integration one because `anchors` is private.
+    #[test]
+    fn test_every_anchor_targets_an_open_bit() {
+        const CORPUS: &str = include_str!("../../tests/data/yaml-test-suite-2022-01-17.json");
+        let cases: Vec<serde_json::Value> =
+            serde_json::from_str(CORPUS).expect("corpus is valid JSON");
+
+        let mut checked = 0usize;
+        let mut anchors_seen = 0usize;
+        let mut violations: Vec<String> = Vec::new();
+        for case in &cases {
+            let yaml = case["yaml"].as_str().expect("case has yaml");
+            // Invalid documents are the reject harness's business, not ours.
+            let Ok(index) = YamlIndex::build(yaml.as_bytes()) else {
+                continue;
+            };
+            checked += 1;
+            let id = case["id"].as_str().unwrap_or("<no id>");
+            for (name, &bp_pos) in &index.anchors {
+                anchors_seen += 1;
+                if bp_pos >= index.bp.len() || !index.bp.is_open(bp_pos) {
+                    violations.push(format!("{id}: anchor {name:?} at bp {bp_pos}"));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "{} anchor(s) do not target a node open:\n  {}",
+            violations.len(),
+            violations.join("\n  ")
+        );
+
+        // Guard the guard: a corpus that stopped parsing, or an anchor map that
+        // stopped being populated, would make the loop above vacuously true.
+        assert!(checked > 300, "only {checked} cases parsed; corpus broken?");
+        assert!(
+            anchors_seen > 50,
+            "only {anchors_seen} anchors seen; anchor recording broken?"
+        );
+    }
+
+    /// Issue #328: the anchor on a sequence item names the item's collection
+    /// value, so an alias to it resolves to that collection.
+    #[test]
+    fn test_anchored_sequence_item_targets_its_collection() {
+        for (yaml, kind_is_seq) in [
+            (&b"- &m\n    k: v\n- *m\n"[..], false),
+            (&b"- &m\n    - a\n- *m\n"[..], true),
+            (&b"- &m {k: v}\n- *m\n"[..], false),
+            (&b"- &m [a]\n- *m\n"[..], true),
+        ] {
+            let index = YamlIndex::build(yaml).expect("must parse");
+            let target = index.get_anchor_bp_pos("m").expect("anchor m recorded");
+            assert!(
+                index.bp.is_open(target),
+                "anchor must target an open bit for {:?}",
+                core::str::from_utf8(yaml).unwrap()
+            );
+            assert_eq!(
+                index.is_sequence_at_bp(target),
+                kind_is_seq,
+                "anchor must target the collection itself for {:?}",
+                core::str::from_utf8(yaml).unwrap()
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------------
     // Open-position storage selection (#327)
     // ------------------------------------------------------------------------
 
