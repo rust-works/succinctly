@@ -148,7 +148,7 @@ jobs:
 
       - name: Run cli-gated yq/jq tests
         if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
@@ -234,7 +234,7 @@ jobs:
 
       - name: Run cli-gated yq/jq tests
         if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
@@ -297,7 +297,7 @@ jobs:
 
       - name: Run cli-gated yq/jq tests
         if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
@@ -359,7 +359,7 @@ jobs:
         run: cargo build --features cli --bin succinctly
 
       - name: Run cli-gated yq tests
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test yaml_bench_suite_coverage
 
       - name: Run tests
         run: cargo test --verbose
