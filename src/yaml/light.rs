@@ -1213,7 +1213,25 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         current_indent: usize,
         indent_spaces: usize,
     ) -> core::fmt::Result {
-        match self.value() {
+        Self::stream_yaml_value_of(self.value(), out, current_indent, indent_spaces)
+    }
+
+    /// Internal: stream an already-materialized value as YAML.
+    ///
+    /// Callers that must inspect the value before streaming it — to choose
+    /// between inline and indented block layout — pass it in here instead of
+    /// letting [`Self::stream_yaml_value`] re-read it. A second `value()` on the
+    /// same cursor repeats the same `open_idx`, which `OpenPositions` sees as a
+    /// *backwards* access: it leaves the sequential fast path for the full
+    /// rank+select path and resets its IB scan cursor to word 0, so the next
+    /// genuinely-sequential lookup has to re-scan from the start.
+    fn stream_yaml_value_of<Out: core::fmt::Write>(
+        value: YamlValue<'a, W>,
+        out: &mut Out,
+        current_indent: usize,
+        indent_spaces: usize,
+    ) -> core::fmt::Result {
+        match value {
             YamlValue::Null => out.write_str("null"),
             YamlValue::String(s) => stream_yaml_string_value(out, &s),
             YamlValue::Mapping(fields) => {
@@ -1255,24 +1273,24 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             stream_yaml_nonstring_key(out, &field.key())?;
                         }
                         out.write_char(':')?;
-                        // Check if value needs newline
-                        let value = field.value_cursor();
-                        if is_yaml_cursor_container(&value) {
+                        // Check if value needs newline. Materialize the value
+                        // once and reuse it: re-reading it from the cursor would
+                        // be a backwards position lookup (see
+                        // `stream_yaml_value_of`).
+                        let value_cursor = field.value_cursor();
+                        let value = value_cursor.value();
+                        if is_yaml_value_container(&value) {
                             out.write_char('\n')?;
                             write_yaml_indent(out, current_indent + indent_spaces)?;
-                            value.stream_yaml_value(
-                                out,
-                                current_indent + indent_spaces,
-                                indent_spaces,
-                            )?;
                         } else {
                             out.write_char(' ')?;
-                            value.stream_yaml_value(
-                                out,
-                                current_indent + indent_spaces,
-                                indent_spaces,
-                            )?;
                         }
+                        Self::stream_yaml_value_of(
+                            value,
+                            out,
+                            current_indent + indent_spaces,
+                            indent_spaces,
+                        )?;
                     }
                     Ok(())
                 }
@@ -1310,23 +1328,24 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         // own indented line — matching real yq and the
                         // DOM/pretty-printer, and avoiding a stray trailing
                         // space before the newline.
-                        if is_yaml_cursor_container(&cursor) {
+                        //
+                        // Materialize the value once and reuse it: re-reading
+                        // it from the cursor would be a backwards position
+                        // lookup (see `stream_yaml_value_of`).
+                        let value = cursor.value();
+                        if is_yaml_value_container(&value) {
                             out.write_char('-')?;
                             out.write_char('\n')?;
                             write_yaml_indent(out, current_indent + indent_spaces)?;
-                            cursor.stream_yaml_value(
-                                out,
-                                current_indent + indent_spaces,
-                                indent_spaces,
-                            )?;
                         } else {
                             out.write_str("- ")?;
-                            cursor.stream_yaml_value(
-                                out,
-                                current_indent + indent_spaces,
-                                indent_spaces,
-                            )?;
                         }
+                        Self::stream_yaml_value_of(
+                            value,
+                            out,
+                            current_indent + indent_spaces,
+                            indent_spaces,
+                        )?;
                         elems = rest;
                     }
                     Ok(())
@@ -3547,9 +3566,10 @@ impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
 
         // For a block sequence, element_cursor points at the item wrapper node (at the
         // `-`) and the value lives in its first child; unwrap so callers that use the
-        // cursor *positionally* — `is_yaml_cursor_container`, which decides block-vs-inline
-        // YAML layout — see the content rather than the wrapper. For flow sequences,
-        // virtual root sequences, and document containers the element IS the value.
+        // cursor *positionally* — `is_yaml_value_container`, which decides block-vs-inline
+        // YAML layout from the materialized value — see the content rather than the
+        // wrapper. For flow sequences, virtual root sequences, and document containers
+        // the element IS the value.
         //
         // Deliberately `starts_inline_seq_entry`, not the wider `starts_seq_entry` that
         // `value()` uses: a bare `-` stays pointed at the wrapper, which is what
@@ -5107,9 +5127,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for YamlElements<'a, W> {
 // YAML Streaming Helpers
 // ============================================================================
 
-/// Check if a cursor points to a non-empty container.
-fn is_yaml_cursor_container<W: AsRef<[u64]>>(cursor: &YamlCursor<'_, W>) -> bool {
-    match cursor.value() {
+/// Check if a value is a non-empty container.
+///
+/// Takes the value rather than the cursor so callers can materialize it once
+/// and pass the same value on to `stream_yaml_value_of` — see the note there on
+/// why a second `value()` call is costly.
+fn is_yaml_value_container<W: AsRef<[u64]>>(value: &YamlValue<'_, W>) -> bool {
+    match value {
         YamlValue::Mapping(fields) => !fields.is_empty(),
         YamlValue::Sequence(elements) => !elements.is_empty(),
         _ => false,

@@ -104,8 +104,8 @@ pub(crate) fn starts_seq_entry(text: &[u8], pos: usize) -> bool {
 /// input after it — is excluded. `YamlElements::uncons_cursor` uses this so that a bare
 /// `-` keeps yielding the wrapper node rather than its child, because callers that use the
 /// returned cursor *positionally* depend on it: `corpus_stats` counts bare-dash items by
-/// the cursor's text position, and `is_yaml_cursor_container` decides block-vs-inline YAML
-/// layout from it.
+/// the cursor's text position, and `is_yaml_value_container` decides block-vs-inline YAML
+/// layout from the value materialized off it.
 ///
 /// Value decoding is unaffected either way — `value()` applies the wider
 /// [`starts_seq_entry`] and unwraps a bare-`-` wrapper itself.
