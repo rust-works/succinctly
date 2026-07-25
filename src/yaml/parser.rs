@@ -1325,6 +1325,18 @@ impl<'a> Parser<'a> {
 
         self.check_unsupported()?;
 
+        // An anchor prefixes the item's value, so consume it here — before the
+        // dispatch below, which would otherwise test its predicates against the
+        // `&name` instead of the value and mis-classify the item (#328).
+        //
+        // The exception is `- &a k: v`, where the anchor binds to the *key* of
+        // the compact mapping (matching yq); that shape is left for
+        // parse_compact_mapping_entry to record.
+        let anchored_item = self.peek() == Some(b'&') && !self.anchor_prefixes_mapping_entry();
+        if anchored_item {
+            self.parse_anchor()?;
+        }
+
         // Track the sequence item on the stack so close_deeper_indents can close it.
         // We use indent + 1 as a virtual indent - any content at indent > indent
         // is considered part of this item.
@@ -1336,6 +1348,17 @@ impl<'a> Parser<'a> {
 
         // Check what follows
         if self.at_line_end() {
+            // An anchor records the *next* BP position as its target, so an
+            // anchored item whose value turns out to be null needs an explicit
+            // empty node to point at — otherwise the anchor would land on a
+            // sibling's open, or on a close bit. parse_mapping_entry does the
+            // same for `key: &a` with no value.
+            if anchored_item && self.following_value_is_null(indent) {
+                self.set_ib();
+                self.write_bp_open();
+                self.write_bp_close();
+            }
+
             // Content is on the next line(s) at greater indentation.
             // Leave the item open - subsequent content at indent > this item's
             // indent will be parsed as the item's value. The item will be closed
@@ -1378,6 +1401,26 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Look ahead from the end of the current line to decide whether the value
+    /// that would continue on the following lines exists at all.
+    ///
+    /// Deliberately reuses `skip_newlines`, which also skips indented comment
+    /// lines: a hand-rolled blank-line scan would disagree with what the main
+    /// loop does next, and every failure mode of the anchored-item null node is
+    /// exactly that disagreement.
+    ///
+    /// There is no same-indent-sequence exception: callers that need one (a
+    /// block sequence may sit at its parent key's indent) test for it
+    /// themselves. Restores `self.pos` before returning.
+    fn following_value_is_null(&mut self, indent: usize) -> bool {
+        let saved_pos = self.pos;
+        self.skip_to_eol();
+        self.skip_newlines();
+        let is_null = self.peek().is_none() || self.count_indent().unwrap_or(0) <= indent;
+        self.pos = saved_pos;
+        is_null
+    }
+
     /// Parse a compact mapping entry within a sequence item.
     /// This handles `- key: value` where the mapping is inline with the sequence item.
     fn parse_compact_mapping_entry(&mut self, indent: usize) -> Result<(), YamlError> {
@@ -1392,6 +1435,11 @@ impl<'a> Parser<'a> {
 
         // Open key node
         self.write_bp_open();
+
+        // Check for anchor on key (`- &a k: v`) - record it pointing to this key
+        if self.peek() == Some(b'&') {
+            self.record_key_anchor()?;
+        }
 
         // Parse the key
         let key_end = match self.peek() {
@@ -1511,16 +1559,8 @@ impl<'a> Parser<'a> {
         self.write_bp_open();
 
         // Check for anchor on key - record it pointing to this key BP
-        // The key BP was just opened, so bp_pos is now one past the key's position
         if self.peek() == Some(b'&') {
-            // Consume `&`
-            self.advance();
-            // Parse anchor name
-            let name = self.parse_anchor_name()?;
-            // Skip whitespace after anchor name
-            self.skip_inline_whitespace();
-            // Record anchor pointing to the key (bp_pos - 1, since we just opened the key BP)
-            self.anchors.insert(name, self.bp_pos - 1);
+            self.record_key_anchor()?;
         }
 
         // Parse the key - check for empty key first (colon at start)
@@ -3240,6 +3280,26 @@ impl<'a> Parser<'a> {
         self.anchors.insert(name.clone(), self.bp_pos);
 
         Ok(name)
+    }
+
+    /// Record an anchor that prefixes a mapping key whose BP node is already
+    /// open, as in `&a k: v`.
+    ///
+    /// The anchor names the key, so its target is `bp_pos - 1` — the open just
+    /// written — not `bp_pos`, which `parse_anchor` would record and which lands
+    /// on the key's *close* for a scalar key. Callers that have not yet opened
+    /// the anchored node want `parse_anchor` instead.
+    ///
+    /// One definition for all three key-anchor sites (block, compact and flow
+    /// mappings): they diverged before, and the flow one was silently binding
+    /// anchors to the value.
+    fn record_key_anchor(&mut self) -> Result<(), YamlError> {
+        debug_assert_eq!(self.peek(), Some(b'&'));
+        self.advance();
+        let name = self.parse_anchor_name()?;
+        self.skip_inline_whitespace();
+        self.anchors.insert(name, self.bp_pos - 1);
+        Ok(())
     }
 
     /// Parse an alias reference (`*name`).

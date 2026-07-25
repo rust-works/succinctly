@@ -944,6 +944,96 @@ fn test_yaml_anchor_alias_without_merge() -> Result<()> {
 }
 
 // =============================================================================
+// Anchored sequence items (#328) - an anchor on `- ` binds to the item's value
+// whatever its kind. Expectations are mikefarah/yq v4.53.3 output.
+// =============================================================================
+
+#[test]
+fn test_yaml_anchored_seq_item_with_block_collection() -> Result<()> {
+    // The headline #328 repro: the mapping used to be read as the plain scalar
+    // "k", with `v` leaking out as a top-level key.
+    let input = "list:\n  - &m\n    k: v\n  - *m\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"list":[{"k":"v"},{"k":"v"}]}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_anchored_seq_item_with_flow_collection() -> Result<()> {
+    // The anchor used to be swallowed into the key text, so the alias resolved
+    // to nothing and the mapping came out as {"": "1}"}.
+    let input = "items:\n  - &first {id: 1}\n  - *first\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"items":[{"id":1},{"id":1}]}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_anchored_seq_item_alias_is_navigable() -> Result<()> {
+    // Not just identity: the alias must resolve to a real mapping you can index.
+    let input = "list:\n  - &m\n    k: v\n  - *m\n";
+    let (output, exit_code) = run_yq_stdin(".list[1].k", input, &["-o=json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#""v""#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_anchor_on_compact_mapping_key_binds_to_key() -> Result<()> {
+    // `- &a k: v` anchors the *key*, matching yq. Before the fix `&a k` was
+    // swallowed into the key text and the alias resolved to nothing.
+    let input = "items:\n  - &a k: v\n  - *a\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"items":[{"k":"v"},"k"]}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_anchored_tag_in_seq_item_is_rejected() -> Result<()> {
+    // Consuming the anchor before dispatching means the tag is now seen rather
+    // than absorbed into a plain scalar, so `- &a !!str x` errors instead of
+    // silently yielding the string "!!str x". Tags are documented non-support
+    // (#224); `a: !!str 1` already errored the same way.
+    let input = "items:\n  - &a !!str x\n";
+    let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", input, &[])?;
+    assert_eq!(exit_code, 1, "expected clean error exit, stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("tags (!) not supported"),
+        "stderr should name the tag: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_yaml_anchored_seq_item_is_line_break_agnostic() -> Result<()> {
+    // #328 and #324 have to compose: the anchor fix reads the item's value
+    // through `at_line_end` and `looks_like_mapping_entry`, and the line-break
+    // fix is what taught those two to stop at `\r`. Neither alone is enough —
+    // this landed as a characterization test pinning the CRLF corruption while
+    // #324 was open, and #324 turned it green.
+    //
+    // All three break forms must give the one answer yq gives, per YAML 1.2 §5.4.
+    for (name, input) in [
+        ("LF", "list:\n  - &m\n    k: v\n  - *m\n"),
+        ("CRLF", "list:\r\n  - &m\r\n    k: v\r\n  - *m\r\n"),
+        ("CR", "list:\r  - &m\r    k: v\r  - *m\r"),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(exit_code, 0, "{name} input should parse");
+        assert_eq!(
+            output.trim(),
+            r#"{"list":[{"k":"v"},{"k":"v"}]}"#,
+            "{name} line breaks should give the same document"
+        );
+    }
+    Ok(())
+}
+
+// =============================================================================
 // Alias cycle rejection (#153) - cyclic anchors must be a clean parse error,
 // not a stack-overflow abort
 // =============================================================================
