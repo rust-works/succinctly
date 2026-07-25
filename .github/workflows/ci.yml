@@ -603,3 +603,33 @@ jobs:
       - name: Verify goldens against pinned jq
         if: needs.gate.outputs.code == 'true'
         run: ./scripts/sync-jq-golden.sh --check
+
+  # Drift detector for the real-workload corpus shape statistics (#301). Runs
+  # entirely offline over the committed seed (tests/data/bench-corpus/seed/): it
+  # (1) verifies each vendored seed file's sha256 against the manifest, then
+  # (2) regenerates the shape report and diffs it against the committed golden
+  # (tests/data/bench-corpus/expected-shape.md). The golden is all-integer
+  # (structural counts derived from the semi-index), so it is arch-stable and a
+  # single x86 leg is authoritative. This guards the tooling and the
+  # representativeness lookup from silently rotting as the parsers change.
+  # Per-STEP gate for the same required-context-safe reason as jq/yq-drift.
+  corpus-shape-drift:
+    name: corpus shape drift check
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        if: needs.gate.outputs.code == 'true'
+
+      - name: Verify vendored seed corpus against the manifest
+        if: needs.gate.outputs.code == 'true'
+        run: ./scripts/sync-bench-corpus.sh --check
+
+      - name: Verify shape golden matches the seed corpus
+        if: needs.gate.outputs.code == 'true'
+        run: |
+          cargo run --features cli --bin succinctly -- \
+            dev bench corpus-stats \
+            --data-dir tests/data/bench-corpus/seed \
+            --markdown tests/data/bench-corpus/expected-shape.md \
+            --check
