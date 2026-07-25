@@ -2647,9 +2647,12 @@ impl<'a> Parser<'a> {
     /// Parse a key in flow context.
     /// Keys can be scalars, flow sequences, or flow mappings (complex keys).
     fn parse_flow_key(&mut self) -> Result<(), YamlError> {
-        // Check for anchor on key
+        // Check for anchor on key. The caller already opened the key's BP node,
+        // so this records `bp_pos - 1`; using `parse_anchor` here bound the
+        // anchor to the key's close bit, and aliases to it resolved to the
+        // *value* instead of the key (corpus case CN3R).
         if self.peek() == Some(b'&') {
-            let _ = self.parse_anchor()?;
+            self.record_key_anchor()?;
             self.skip_flow_whitespace();
         }
 
