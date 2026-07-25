@@ -27,6 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **YAML explicit keys as block sequence items** (#339): `- ? k` followed by
+  `  : v` loaded as `["? k","v"]` — the `? ` indicator folded into a plain
+  scalar and the `: v` line became a *phantom second element*, so the sequence
+  gained an item and the mapping vanished. `- ? k` alone gave `["? k"]` where
+  `yq` gives `[{"k":null}]`. Silent: no error, well-formed JSON out. The same
+  key was already correct at top level and as a mapping value —
+  `parse_sequence_item_inner`'s dispatch simply had no `?` arm, so it fell
+  through to the plain-scalar path. It now routes the item through the same
+  `parse_explicit_key` the mapping-level dispatch uses, rather than a fourth
+  copy of that decision (#106), which fixes every spelling at once: quoted,
+  block-scalar and flow-collection keys, keys on the following line, anchored
+  keys and values, further entries joining the item's mapping, and all three
+  YAML 1.2 §5.4 line-break forms. Two new pinned-`yq` golden cases cover the
+  family, and the `explicit-keys` bench pattern now generates the shape — no
+  benchmark input contained one before, so none could have measured it.
 - **CRLF and lone-CR line breaks in YAML** (#324): a `\r` was folded into every
   *plain* scalar as a trailing space, which also destroyed type resolution — a
   Windows-authored `a: 1` loaded as the string `"1 "` rather than the number `1`,
