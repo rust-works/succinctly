@@ -371,6 +371,58 @@ cargo run --release --features cli -- dsv generate 1000 -p users --no-header -o 
 
 ---
 
+## Real-Workload Corpus (#301)
+
+The generators above produce *synthetic* inputs. Some performance decisions hinge
+on whether an input *shape* (flow-collection size, escape density, nesting depth,
+anchor/alias counts, keys per object) actually occurs in real files — the check
+that rejected **P5** (real flow collections are 10–30 B, not the 64–128 B the
+micro-benchmark favoured). To make that a lookup instead of a bespoke
+investigation, a versioned corpus of real, permissively-licensed files is
+assembled by a sync script, with per-file provenance in
+[`tests/data/bench-corpus/manifest.json`](../../tests/data/bench-corpus/manifest.json)
+([provenance & licenses](../../tests/data/bench-corpus/NOTICES.md)).
+
+```bash
+# Populate data/bench/corpus/ (copies the committed seed + fetches the large
+# tier, verifying each file's sha256 against the manifest).
+./scripts/sync-bench-corpus.sh
+
+# Verify the committed seed against the manifest (offline; what CI runs).
+./scripts/sync-bench-corpus.sh --check
+```
+
+The corpus mirrors the `<workload>/<file>` layout the runners expect, so it feeds
+the existing benchmarks with no code changes:
+
+```bash
+succinctly dev bench yq  --data-dir data/bench/corpus/yaml
+succinctly dev bench jq  --data-dir data/bench/corpus/json
+succinctly dev bench dsv --data-dir data/bench/corpus/dsv
+```
+
+### Shape-statistics lookup
+
+`corpus-stats` derives shape distributions directly from the crate's own
+semi-index (so they measure exactly what the parsers see) and writes the
+representativeness table:
+
+```bash
+# Regenerate the human-facing report over the full corpus (after a sync).
+succinctly dev bench corpus-stats --data-dir data/bench/corpus \
+  --markdown docs/benchmarks/corpus-shape.md
+```
+
+Before making any performance doc claim (per #235 Phase 6), consult
+[docs/benchmarks/corpus-shape.md](../benchmarks/corpus-shape.md): **confirm the
+input shape you are optimising for actually appears at the size you expect.**
+This gates the open perf issues #40 #56 #58 #64 #91 #106 #122 #123 #124 #126 #130
+#133 #134. The committed golden over the seed
+([`tests/data/bench-corpus/expected-shape.md`](../../tests/data/bench-corpus/expected-shape.md))
+is drift-checked in CI so the tooling and report cannot silently rot.
+
+---
+
 ## Platforms and Hardware
 
 ### Primary Benchmark Platforms

@@ -15,6 +15,7 @@ The project contains **10 main benchmark documentation files** with approximatel
 | [json-validate.md](json-validate.md)           | JSON validation (RFC 8259) throughput       | ~12      |
 | [utf8-validate.md](utf8-validate.md)           | UTF-8 validation throughput (scalar)        | ~15      |
 | [dsv.md](dsv.md)                               | CSV/TSV parsing performance                 | ~8       |
+| [corpus-shape.md](corpus-shape.md)             | Real-workload input shape statistics (#301) | ~4       |
 | [cross-language.md](cross-language.md)         | Multi-parser JSON comparison                | ~15      |
 | [rust-parsers.md](rust-parsers.md)             | Rust JSON parser comparison (x86_64 + ARM)  | ~20      |
 | [rust-yaml-parsers.md](rust-yaml-parsers.md)   | Rust YAML parser comparison (x86_64 + ARM)  | ~16      |
