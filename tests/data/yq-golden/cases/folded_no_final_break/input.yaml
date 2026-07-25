@@ -1,0 +1,12 @@
+# This file deliberately ends without a trailing line break. A folded block
+# that runs to EOF unterminated has no `b-chomped-last` to keep, so `>+` here is
+# "p\nq" and not "p\nq\n" (#329). Adding a final newline changes yq output, so
+# the golden fails loudly rather than silently losing the shape it exists for.
+before: >
+  a
+
+  b
+no_final_break: >+
+  p
+
+  q

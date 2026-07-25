@@ -1,0 +1,1 @@
+{"one_blank":"a\nb\n","two_blank":"a\n\nb\n","three_blank":"a\n\n\nb\n","whitespace_only_blank":"a\nb\n","leading_blank":"\na\n","two_leading_blanks":"\n\na\n","no_blank":"a b\n","strip":"a\nb","keep":"a\nb\n","keep_no_blank":"a\n","keep_trailing_blanks":"a\n\n\n","explicit_indent":"a\nb\n"}
