@@ -30,10 +30,6 @@
 //!   `{"<<": {…}}` where yq splices the target mapping (#171).
 //! - **Tags (`!!str`, `!custom`)** — rejected outright in block context; a
 //!   documented non-support in `src/yaml/mod.rs`.
-//! - **`- &anchor` immediately followed by a collection** — mis-parsed today:
-//!   `- &m\n    k: v` yields `["k"]` rather than `[{"k": "v"}]` (#328). The
-//!   `anchors` pattern anchors mapping *values* and scalar sequence items
-//!   instead.
 //! - **Blank lines inside a *folded* block scalar** — succinctly emits one
 //!   newline too many per blank line (`fold: >` over `a`, blank, `b` yields
 //!   `"a\n\nb\n"`; yq and the spec fold it to `"a\nb\n"`) (#329). The
@@ -619,11 +615,11 @@ fn generate_flow(target_size: usize, seed: Option<u64>) -> String {
 /// outnumber definitions roughly 3:1 as they do in real Kubernetes and CI
 /// manifests.
 ///
-/// Anchors attach to mapping values and to scalar sequence items only. An
-/// anchor on a sequence item whose value is a collection (`- &m` then an
-/// indented mapping) is mis-parsed today — see the module docs — so the
-/// generator stays clear of that form rather than baking a wrong shape into
-/// every benchmark run.
+/// Anchors attach to mapping values, to scalar sequence items, and — since
+/// #328 fixed the mis-parse that kept them out — to sequence items whose value
+/// is a block mapping, a block sequence or a flow collection. That last family
+/// is what makes the anchor pattern exercise `parse_sequence_item_inner`'s
+/// dispatch rather than only the mapping-value path.
 fn generate_anchors(target_size: usize, seed: Option<u64>) -> String {
     let mut rng = seed.map(ChaCha8Rng::seed_from_u64);
     let mut yaml = String::with_capacity(target_size);
@@ -654,11 +650,29 @@ fn generate_anchors(target_size: usize, seed: Option<u64>) -> String {
             yaml.push_str(&format!("  policy: &{}\n", long(group)));
             yaml.push_str("    enabled: true\n");
             yaml.push_str(&format!("    weight: {}\n", group % 10));
-            // Anchored scalars as sequence items (the safe seq-item form)
+            // Anchored scalars as sequence items
             yaml.push_str("  shared:\n");
             yaml.push_str(&format!("    - &s{group} shared-value-{group}\n"));
             yaml.push_str(&format!("    - *s{group}\n"));
             yaml.push_str(&format!("    - *s{group}\n"));
+            // Anchored *collections* as sequence items (#328). Each of the three
+            // shapes takes a different branch of the sequence-item dispatch:
+            // block mapping and block sequence leave the item open for the main
+            // loop, the flow forms are parsed inline.
+            yaml.push_str("  templates:\n");
+            yaml.push_str(&format!("    - &m{group}\n"));
+            yaml.push_str("      cpu: 500m\n");
+            yaml.push_str(&format!("      memory: {}Mi\n", 128 + group % 8 * 64));
+            yaml.push_str(&format!("    - &q{group}\n"));
+            yaml.push_str("      - read\n");
+            yaml.push_str("      - write\n");
+            yaml.push_str(&format!(
+                "    - &f{group} {{tier: {}, spot: true}}\n",
+                group % 3
+            ));
+            yaml.push_str(&format!("    - *m{group}\n"));
+            yaml.push_str(&format!("    - *q{group}\n"));
+            yaml.push_str(&format!("    - *f{group}\n"));
         }
 
         let replicas = rng.as_mut().map_or(1 + count % 5, |r| r.random_range(1..6));
@@ -1278,10 +1292,23 @@ mod tests {
             "no long anchor name"
         );
         assert!(yaml.contains(" *a0\n"), "no alias");
-        // The mis-parsed `- &name` + collection form must never be generated
+        // #328: sequence items anchoring a collection are the point of this
+        // pattern's seq-item coverage, so assert each dispatch branch appears.
         assert!(
-            !yaml.contains("- &") || yaml.contains("- &s"),
-            "anchored sequence item must be a scalar"
+            yaml.contains("    - &m0\n      cpu: 500m\n"),
+            "no sequence item anchoring a block mapping"
+        );
+        assert!(
+            yaml.contains("    - &q0\n      - read\n"),
+            "no sequence item anchoring a block sequence"
+        );
+        assert!(
+            yaml.contains("- &f0 {tier: "),
+            "no sequence item anchoring a flow collection"
+        );
+        assert!(
+            yaml.contains("    - *m0\n"),
+            "anchored collections must be aliased"
         );
     }
 

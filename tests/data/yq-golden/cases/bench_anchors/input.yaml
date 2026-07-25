@@ -13,6 +13,17 @@ defs_0:
     - &s0 shared-value-0
     - *s0
     - *s0
+  templates:
+    - &m0
+      cpu: 500m
+      memory: 128Mi
+    - &q0
+      - read
+      - write
+    - &f0 {tier: 0, spot: true}
+    - *m0
+    - *q0
+    - *f0
 svc_0:
   name: service-0
   replicas: 2
