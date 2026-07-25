@@ -27,6 +27,7 @@ The benchmarks below compare succinctly against DOM-based tools (jq, yq, serde_j
 | [Rust Succinct Libraries](rust-succinct-libs.md) | rank/select vs vers-vecs, sucds, sux | Faster rank than vers-vecs, but 5-8x the space |
 | [Cross-Language](cross-language.md)              | Multi-language parser comparison     | Best-in-class for semi-indexing                |
 | [DSV](dsv.md)                                    | CSV/TSV parsing performance          | 85-1676 MiB/s (API)                            |
+| [Corpus Shape](corpus-shape.md)                  | Real-workload input shape statistics | Representativeness lookup for perf proposals   |
 
 ## Methodology
 
