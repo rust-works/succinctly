@@ -4937,7 +4937,7 @@ answer.
 ### Solution
 
 1. Remove the `seq_items` field and all build/mark/truncate plumbing (`5cf299a0`).
-2. Derive the answer from text at the two detection sites — `YamlIndex::is_seq_item()`
+2. Derive the answer from text at the then-known detection sites — `YamlIndex::is_seq_item()`
    ([src/yaml/index.rs](../../src/yaml/index.rs)) and the inlined check in the
    `LightCursor::value()` hot path ([src/yaml/light.rs](../../src/yaml/light.rs)).
 3. The naive nested-branch form caused a **7–15% query-side regression** (#106). The fix
@@ -5068,6 +5068,200 @@ removed O(1) bit test.
 - `src/yaml/light.rs` — `LightCursor::value()` reordered (`is_container` first) with the
   inline branchless seq-item check
 - `src/yaml/locate.rs` — caller updated to pass `text`
+
+---
+
+## O5: Seq-Item Detection Alternatives — Rejected ❌
+
+**Issues**: [#106](https://github.com/rust-works/succinctly/issues/106)
+
+O4 replaced the stored `seq_items` bitvector with a text derivation. #106 asked whether the
+O(1) lookup should be restored, proposing two mechanisms, and additionally noted a 7–15%
+regression in the naive nested-branch form. That regression was already retired by the
+branchless `matches!` predicate (Option 1, shipped with O4).
+
+Both remaining proposals are rejected. The investigation instead found a much larger win in
+*consolidating* the derivation, which shipped separately — see [O6](#o6-seq-item-predicate-consolidation--accepted-).
+
+### Option 2: High-Bit Encoding — Rejected ❌
+
+The proposal steals bit 31 of the `u32` text position as a seq-item tag. The issue itself
+flagged that this "only works with the `Vec<u32>` fallback path", and asked how often that
+path is used. Measured answer: **never, on real input**.
+
+| corpus                  | files/cases | on `OpenPositions::Dense` |
+| ----------------------- | ----------- | ------------------------- |
+| Real-workload corpus    | 6           | **0**                     |
+| YAML Test Suite (valid) | 279         | 5 (1.8%)                  |
+
+The five suite cases (`5WE3`, `7W2P`, `KK5P`, `PW8X`, `ZWK4`) are all explicit-key (`?`)
+constructs, which is what makes open positions non-monotonic and forces the fallback.
+
+The structural reason this cannot be patched: in the `Compact` (`AdvancePositions`)
+representation there is **no per-open `u32` at all**. Positions live as interest bits keyed by
+text *byte* offset, shared between duplicate opens, plus a per-open advance bitmap
+(`src/yaml/advance_positions.rs:186-209`). There is nothing to tag. Tagging positions *before*
+`OpenPositions::build` would additionally break its monotonicity test
+(`advance_positions.rs:70`) and push every tagged document onto `Dense` — a memory regression,
+achieving the opposite of the goal. Tagging only `Dense` would mean two mechanisms for one
+question, with the text derivation still required on the path 100% of real files take.
+
+Cost side: the guard at `src/yaml/parser.rs:3618-3639` documents `input.len()` as "an exact fit
+at the maximum" because the null sentinel *is* `input.len()`. Stealing bit 31 drops the
+supported input ceiling from `u32::MAX` to `0x7FFF_FFFE` — halving it, deliberately, for a
+query micro-optimisation. It would also reorder `find_last_open_at_text_pos`, which does a
+`binary_search` on the `Dense` variant (`advance_positions.rs:115`).
+
+Upper bound on the benefit: O4's A/B measured the *inverse* change — removing exactly this O(1)
+bit test in favour of the text derivation — at median −2.3%, worst +1.8% across 80 yq
+configurations. Option 2's entire upside is bounded by a delta already measured at
+approximately zero.
+
+### Option 3: Sparse Seq-Item Index — Rejected ❌
+
+The proposal stores a sorted `Vec<u32>` of seq-item positions and binary-searches it.
+
+**The stated break-even is wrong by 4×.** The issue gives "full bitvector `n_nodes / 8` bytes
+vs sparse `4 * n_seq_items` bytes → break-even 12.5%", but those two expressions give
+`4S = N/8` → `S/N = 1/32` = **3.125%**. The 12.5% figure drops the bits-to-bytes conversion.
+Against the 2-bits-per-BP-position form O4 actually removed, the break-even is 6.25%. The
+issue's framing — "seq-items are relatively rare (typical case)" — rests entirely on the 4×
+error.
+
+**Measured density** (`succinctly dev bench seq-item-stats`, full real-workload corpus):
+
+| file                           | nodes | seq-items | density    |
+| ------------------------------ | ----- | --------- | ---------- |
+| actions/codeql-analysis.yml    | 73    | 5         | 6.85%      |
+| actions/prometheus-ci.yml      | 915   | 80        | 8.74%      |
+| actions/stale.yml              | 54    | 2         | 3.70%      |
+| compose/nginx-flask-mysql.yaml | 112   | 14        | 12.50%     |
+| compose/wordpress.yaml         | 56    | 12        | **21.43%** |
+| k8s/nginx-deployment.yml       | 86    | 2         | 2.33%      |
+| **aggregate**                  | 1296  | 115       | **8.87%**  |
+
+Aggregate 8.87% against a 3.125% gate; per-file maximum 21.43% against 6.25%. Only one of six
+files is under the break-even. The YAML Test Suite agrees at 10.10% over 279 valid cases.
+
+Because the gate is a *ceiling*, a small corpus can only under-estimate the maximum — which
+makes this rejection robust to sample size in the direction that matters.
+
+**The baseline is 0 bytes, not a bitvector.** O4 deleted the structure, so Option 3 is a pure
+retained-memory addition. At measured density it costs 6.4–60.3 KB per MiB of input, against
+the 19–41 KB/MB that O4's elimination *saved* — handing back 68–148% of that win, in order to
+replace two byte loads from text with an `O(log S)` probe into an array. The text bytes are
+already in L1 because `value()` reads them immediately afterwards.
+
+### Decision Rationale
+
+Gates were written before the numbers were collected. Option 2 required ≥50% of real files on
+`Dense` (measured: 0%), a design with no dual code path (structurally impossible), and sign-off
+on halving the input ceiling. Option 3 required density below 3.125% (measured: 8.87%), per-file
+max below 6.25% (measured: 21.43%), and added bytes well under the O4 saving (measured: at or
+above it). Every gate fails, so neither was prototyped — the same analysis-stage rejection as
+P5, P6, P7 and P8.
+
+Option 1 (branchless predicate) is retained. It is what recovered the regression #106 opened on.
+
+### Key Learnings
+
+1. **Check where the data physically lives before proposing to tag it.** Option 2 was framed as
+   "zero extra memory, O(1) lookup", and would have been, had positions been a `Vec<u32>`. They
+   are not, on any real file.
+2. **Re-derive a break-even before trusting it.** A dropped bits-to-bytes conversion made an
+   infeasible option look comfortable by 4×, and the qualitative story ("rare in the typical
+   case") was built on top of the arithmetic slip.
+3. **Ask what the baseline actually is.** Both options were framed against a bitvector that no
+   longer exists; measured against 0 bytes they are regressions, not optimisations.
+4. **A ceiling gate is robust to a small corpus in one direction only** — a rejection stands,
+   an acceptance would have needed more files.
+5. **`is_compact()` had zero callers before this work.** A representation choice that decides
+   whether an entire optimisation class is applicable was unobservable; that is why the
+   proposal survived to be scheduled.
+
+### Files Added
+
+- `src/bin/succinctly/seq_item_stats.rs` — `dev bench seq-item-stats`; density, `Compact`/`Dense`
+  split, Option 3 sizing, and two predicate-correctness invariants
+- `docs/benchmarks/seq-item-density.md` — generated report
+
+---
+
+## O6: Seq-Item Predicate Consolidation — Accepted ✅
+
+**Issues**: [#106](https://github.com/rust-works/succinctly/issues/106)
+
+While investigating O5, seq-item detection turned out to exist at **five** sites with **three**
+different predicates. Only `YamlIndex::is_seq_item` and `YamlCursor::value()` had O4's
+branchless form; the three `YamlElements` methods (`uncons`, `uncons_cursor`, `get`) each
+carried a narrower copy accepting only space and tab — rejecting `\n`, `\r` and end-of-input.
+`get` had no lookahead at all.
+
+### The Pathology
+
+The divergence was not cosmetic. On an item whose `-` indicator is followed by a newline,
+`uncons`'s narrow check fails and falls through to `element_cursor.value()`, which re-reads the
+open index it just read. That backwards jump takes `AdvancePositions::get_random`, which resets
+the sequential cursor's IB scan state to word 0 (`advance_positions.rs:454-461`), so the next
+read rescans the interest bitmap from the start — **O(N·L/64)** for a document of N such items.
+The gap path deliberately preserves that state (`advance_positions.rs:427-436`); only the
+backwards jump destroys it.
+
+`Iterator::next` delegates to `uncons`, so this was the sequence-iteration hot path.
+
+### Why It Was Never Measured
+
+Every sequence-bearing generator emitted `- ` (dash-space), which the narrow predicate accepts.
+The `users` generator even carried a comment claiming the parser "requires `- ` (dash-space) not
+just `-`" — untrue; the parser handles `-\n`, and suite cases 229Q/M6YH cover it. The seed
+corpus contains zero bare-dash items. The shape simply had no benchmark.
+
+### Results
+
+Extract `is_seq_item_at(text, text_pos)` as the single definition; route all five sites through
+it. Interleaved A/B (alternating binaries per rep, min of 21):
+
+| shape               | before  | after   | speedup   |
+| ------------------- | ------- | ------- | --------- |
+| seqwrap/1mb `.`     | 64.6 ms | 39.7 ms | **1.63x** |
+| seqwrap/1mb `.[]`   | 65.2 ms | 40.7 ms | **1.60x** |
+| dense bare-dash 1MB | 81.8 ms | 37.6 ms | **2.17x** |
+| dense bare-dash 4MB | 829 ms  | 135 ms  | **6.15x** |
+| users/1mb `.`       | 37.4 ms | 37.3 ms | 1.00x     |
+| sequences/1mb `.`   | 32.4 ms | 31.6 ms | 1.03x     |
+| nested/1mb `.`      | 23.7 ms | 23.6 ms | 1.01x     |
+
+The speedup **grows with file size** (1.32x at 250 KB → 2.17x at 1 MB → 6.15x at 4 MB), which
+is the signature of removing an O(N·L) term rather than a constant factor. Shapes that never hit
+the divergent path are neutral. Output is byte-identical on all 32 pattern × size × query
+configurations, and every one still matches system `yq`.
+
+### Rejected Sub-Optimisation: Hoisting Wrapper-Ness Per Sequence
+
+Since `YamlElements` re-derives wrapper status per element, caching it once per sequence looked
+free. It is **unsound**: wrapper emission is context-dependent. Two sibling sequences under one
+mapping where the first is followed by a dedent — a shape both committed docker-compose files
+contain — produce block-sequence children with *no* wrapper node. So "every child of a block
+sequence is a wrapper" is false, and a cached flag would mishandle sequences mixing the two
+forms. Pinned by `wrapper_emission_is_context_dependent` in `seq_item_stats.rs`.
+
+### Key Learnings
+
+1. **Duplicated predicates diverge silently.** Three copies, three behaviours, one of them
+   quadratic. The fix is one definition plus a test that the access paths agree.
+2. **A stateful sequential cursor turns a redundant read into a complexity change.** Re-reading
+   the same index is free with a stateless lookup and O(L/64) here.
+3. **A wrong comment can hide a shape from every benchmark.** One stale claim about `- ` kept
+   `-\n` out of the entire generated suite.
+4. **Neutral micro-benchmarks do not mean neutral code** — the regression lived in a shape
+   nothing generated.
+
+### Files Modified
+
+- `src/yaml/index.rs` — added `is_seq_item_at`; `is_seq_item` reduced to a wrapper
+- `src/yaml/light.rs` — `value()` and all three `YamlElements` methods route through it; tests
+  for cross-path agreement
+- `src/bin/succinctly/yaml_generators.rs` — `seqwrap` pattern with bare-dash items
 
 ---
 

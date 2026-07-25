@@ -647,7 +647,7 @@ For detailed documentation on optimization techniques used in this project, see 
   - See [docs/parsing/yaml.md#buying-it-back-the-has_cr-specialization](docs/parsing/yaml.md#buying-it-back-the-has_cr-specialization) for full analysis
 - ✅ O4 (seq_items Bitvector Elimination): **−12.5% build peak memory, 2-6% faster builds**, issues #75/#104/#106
   - Removed the stored `seq_items` bitvector; seq-item wrappers are derived from text (`-` + whitespace/EOI)
-  - Branchless `matches!` derivation at both detection sites recovers the 7-15% query regression #106 found in the naive form
+  - Branchless `matches!` derivation recovers the 7-15% query regression #106 found in the naive form (applied to two sites here; O6 later found five and consolidated them)
   - **Measured** (Apple M5 Max, c090e7f6 vs 2a41c2f5): build peak 2.00× → 1.75× of input (−L/4 transient scratch), retained index −3-5% (19-41 KB/MB), all 44 yaml_bench benchmarks improved or neutral, yq query side neutral-or-better (worst +1.8% noise, best −10.7%)
   - Outputs byte-identical pre↔post on all 80 yq A/B configurations
   - Key insight: derive, don't store, what the text already encodes; transient build allocations can dwarf the retained structure (2-bit-per-byte scratch was 6-13× the stored bitvector)
@@ -659,6 +659,23 @@ For detailed documentation on optimization techniques used in this project, see 
   - `yaml_bench` build-side clean (< 2% on 38/39 groups, both platforms) except one x86-only `block_scalars` anomaly (12-28%, reproduced twice), investigated and attributed to binary code-layout rather than the new logic: the BP structure for that workload is a fixed 7 words regardless of document size, too small to mechanistically explain the delta, and the same workload is neutral on ARM — filed as #595
   - Also surfaced a pre-existing, unrelated `yaml_bench` bug: the `anchors` group panics with `UnknownAnchor` on unmodified `main` too — filed as #594
   - See [docs/plan/cspoppy.md](docs/plan/cspoppy.md#5a-results-2026-08-03) for full analysis
+- ❌ O5 (Seq-Item Detection Alternatives): **REJECTED** - rejected at analysis stage before implementation, issue #106
+  - Option 2 (steal bit 31 of the text position): **0 of 6** real corpus files store a taggable per-open `u32`; `OpenPositions::Compact` holds positions as interest bits keyed by text offset, shared between duplicate opens, so there is nothing to tag. Only 5 of 279 YAML-suite cases reach `Dense`, all explicit-key (`?`) constructs
+  - Tagging before `build()` would break the monotonicity test and force every tagged document onto `Dense` — the opposite of the goal — and would halve the input ceiling from `u32::MAX` (the null sentinel is an exact fit at `input.len()`)
+  - Option 3 (sparse `Vec<u32>`): **the issue's 12.5% break-even is wrong by 4×** — `4S = N/8` gives 1/32 = 3.125%. Measured density is **8.87% aggregate, 21.43% per-file max**; only 1 of 6 files is under the gate
+  - The baseline is **0 bytes**, not a bitvector (O4 deleted it), so Option 3 is a pure retained-memory addition costing 6.4-60.3 KB/MiB — handing back 68-148% of the 19-41 KB/MB O4 saved
+  - Upper bound on Option 2's benefit: O4 measured the *inverse* change (removing exactly this O(1) bit test) at median −2.3%, worst +1.8%
+  - Key insight: check where the data physically lives before proposing to tag it, and re-derive a break-even before trusting it — `is_compact()` had zero callers, so the representation choice that decides the whole option class was unobservable
+  - See [docs/parsing/yaml.md#o5-seq-item-detection-alternatives--rejected-](docs/parsing/yaml.md#o5-seq-item-detection-alternatives--rejected-) for full analysis
+- ✅ O6 (Seq-Item Predicate Consolidation): **1.6-6.15x faster on bare-dash sequence items**, issue #106
+  - Detection existed at **five** sites with **three** predicates; the three `YamlElements` methods (`uncons`, `uncons_cursor`, `get`) rejected `\n`/`\r`/EOI, and `get` had no lookahead at all
+  - On a `-\n` item, `uncons` fell through to `value()`, which re-read the same open index — a backwards jump into `get_random` that resets the `AdvancePositions` IB scan cursor to word 0, so the next read rescans from the start: **O(N·L/64)** per document
+  - **Measured** (interleaved A/B, min of 21 alternating reps): seqwrap/1mb 1.63x, dense bare-dash 1MB 2.17x, **4MB 6.15x**; speedup grows with size (the signature of removing an O(N·L) term). users/sequences/nested neutral (1.00-1.03x)
+  - Outputs byte-identical pre↔post on all 32 configurations, all still matching system `yq`
+  - Never caught because every generator emitted `- ` (dash-space) — one stale comment claiming the parser "requires `- `" kept `-\n` out of the whole suite. Added a `seqwrap` pattern
+  - Sub-optimisation **rejected**: caching wrapper-ness per sequence is unsound — wrapper emission is context-dependent, and both committed docker-compose files contain sequences whose children include no wrapper node
+  - Key insight: duplicated predicates diverge silently, and with a stateful sequential cursor a merely-redundant read becomes a complexity change
+  - See [docs/parsing/yaml.md#o6-seq-item-predicate-consolidation--accepted-](docs/parsing/yaml.md#o6-seq-item-predicate-consolidation--accepted-) for full analysis
 
 **UTF-8 validation optimizations:**
 - ⚠️ Broadword (SWAR) UTF-8 accept scan: opt-in only, **not the default** — issue #134

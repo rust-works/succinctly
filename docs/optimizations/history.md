@@ -621,7 +621,7 @@ The IB cursor state (`ib_word_idx`, `ib_ones_before`) remains valid after the ra
 
 **Problem**: `YamlIndex` stored a `seq_items` bitvector marking sequence-item wrapper nodes. The parser pre-allocated its backing store at 2 bits per input byte (worst-case BP length), marked bits during parsing, and truncated + shrank it at finish — all to store a property that is derivable from the text (a `-` followed by whitespace or end-of-input).
 
-**Technique**: Remove the bitvector and derive `is_seq_item` from the text at both detection sites (`YamlIndex::is_seq_item`, `LightCursor::value`). The naive nested-branch derivation regressed queries 7–15% (#106); the shipped form is a branchless `matches!` with end-of-input folded into the whitespace class.
+**Technique**: Remove the bitvector and derive `is_seq_item` from the text at the two then-known detection sites (`YamlIndex::is_seq_item`, `LightCursor::value`; O6 later found five and consolidated them). The naive nested-branch derivation regressed queries 7–15% (#106); the shipped form is a branchless `matches!` with end-of-input folded into the whitespace class.
 
 **Benchmark Results** (Apple M5 Max, `c090e7f6` vs `2a41c2f5`, sequential quiesced A/B):
 
@@ -666,6 +666,68 @@ The IB cursor state (`ib_word_idx`, `ib_ones_before`) remains valid after the ra
 ## Future Optimization Opportunities
 
 Based on analysis of ARM NEON instructions for indexing and data structures (January 2026):
+
+### ❌ O5 Seq-Item Detection Alternatives (July 2026)
+
+**Status**: Rejected at analysis stage — no implementation.
+
+**Problem**: O4 replaced the stored `seq_items` bitvector with a text derivation. #106 asked whether
+the O(1) lookup should be restored by tagging bit 31 of the `u32` text position (Option 2) or by a
+sparse sorted `Vec<u32>` with binary search (Option 3).
+
+**Measured** (`succinctly dev bench seq-item-stats`, real-workload corpus + YAML Test Suite):
+
+| Gate                            | Required      | Measured        |
+| ------------------------------- | ------------- | --------------- |
+| Files on `OpenPositions::Dense` | ≥ 50%         | **0 of 6**      |
+| Density, aggregate              | < 3.125%      | **8.87%**       |
+| Density, per-file max           | < 6.25%       | **21.43%**      |
+| Added retained bytes            | ≪ 19-41 KB/MB | 6.4-60.3 KB/MiB |
+
+**Why Option 2 cannot work**: `OpenPositions::Compact` stores positions as interest bits keyed by text
+byte offset, shared between duplicate opens, plus a per-open advance bitmap — there is no per-open
+`u32` to tag. Tagging before `build()` breaks the monotonicity test and forces every tagged document
+onto `Dense`. It would also halve the input ceiling, since the null sentinel is an exact fit at
+`input.len()`.
+
+**Why Option 3 cannot work**: the issue's 12.5% break-even drops a bits-to-bytes conversion —
+`4S = N/8` gives 3.125%. Measured density is 2.8× that. And the baseline is 0 bytes, not a bitvector,
+so this is a pure retained-memory addition handing back 68-148% of the O4 saving.
+
+**Key insight**: check where the data physically lives before proposing to tag it, and re-derive a
+break-even before trusting it. `is_compact()` had zero callers, so the representation choice that
+decides the entire option class was unobservable.
+
+**Files**: `src/bin/succinctly/seq_item_stats.rs`, `docs/benchmarks/seq-item-density.md`
+
+### ✅ O6 Seq-Item Predicate Consolidation (July 2026)
+
+**Status**: Accepted.
+
+**Problem**: seq-item detection existed at five sites with three predicates. The three `YamlElements`
+methods rejected `\n`, `\r` and end-of-input, so a `-\n` item fell through to `value()`, which
+re-read the same open index. That backwards jump resets the `AdvancePositions` IB scan cursor to word
+0, making the next read rescan from the start: O(N·L/64) per document.
+
+**Technique**: extract `is_seq_item_at` as the single definition; route all five sites through it.
+
+**Measured** (interleaved A/B, min of 21 alternating reps):
+
+| Shape               | Before  | After   | Speedup   |
+| ------------------- | ------- | ------- | --------- |
+| seqwrap/1mb `.`     | 64.6 ms | 39.7 ms | **1.63×** |
+| dense bare-dash 1MB | 81.8 ms | 37.6 ms | **2.17×** |
+| dense bare-dash 4MB | 829 ms  | 135 ms  | **6.15×** |
+| users/1mb `.`       | 37.4 ms | 37.3 ms | 1.00×     |
+
+Speedup grows with size — the signature of removing an O(N·L) term. Byte-identical output on all 32
+configurations.
+
+**Key insight**: duplicated predicates diverge silently, and with a stateful sequential cursor a
+merely-redundant read becomes a complexity change. The shape was invisible because every generator
+emitted `- ` (dash-space), justified by a stale comment claiming the parser required it.
+
+**Files**: `src/yaml/index.rs`, `src/yaml/light.rs`, `src/bin/succinctly/yaml_generators.rs`
 
 ### ✅ ~~Medium Priority: Popcount Loop Unrolling~~ — DEPLOYED
 

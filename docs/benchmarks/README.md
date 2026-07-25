@@ -18,7 +18,7 @@ The benchmarks below compare succinctly against DOM-based tools (jq, yq, serde_j
 ## Benchmark Results
 
 | Benchmark                                        | Description                          | Key Finding                                    |
-|--------------------------------------------------|--------------------------------------|------------------------------------------------|
+| ------------------------------------------------ | ------------------------------------ | ---------------------------------------------- |
 | [jq](jq.md)                                      | succinctly jq vs system jq           | 1.1-2.3x faster across platforms               |
 | [yq](yq.md)                                      | succinctly yq vs system yq           | 4.5-11x faster (Graviton 4), 7-25x (x86_64)    |
 | [JSON Validation](json-validate.md)              | RFC 8259 strict validation           | 530-1800 MiB/s (up to 1.8 GiB/s on nested)     |
@@ -29,6 +29,7 @@ The benchmarks below compare succinctly against DOM-based tools (jq, yq, serde_j
 | [DSV](dsv.md)                                    | CSV/TSV parsing performance          | 85-1676 MiB/s (API)                            |
 | [Corpus Shape](corpus-shape.md)                  | Real-workload input shape statistics | Representativeness lookup for perf proposals   |
 | [YAML Shape Survey](yaml-shape-survey.md)        | Upstream shape frequency (26 repos)  | Bare dashes 0.042% of files; anchors 100x more |
+| [Seq-Item Density](seq-item-density.md)          | YAML seq-item density and storage    | Decision inputs for #106 (O5 rejection)        |
 
 ## Methodology
 

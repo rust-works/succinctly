@@ -16,21 +16,28 @@ YAML uses more components than JSON due to its richer structure:
 - **Interest Bits (IB)**: Marks structural positions (keys, values, items)
 - **Balanced Parentheses (BP)**: Encodes tree structure for navigation
 - **Type Bits (TY)**: Distinguishes mappings (0) from sequences (1)
-- **Sequence Item Bits (seq_items)**: Marks BP positions that are sequence item wrappers
+- **Sequence item wrappers**: derived from text, not stored. A non-container node whose
+  byte is `-` followed by whitespace or end-of-input. See `is_seq_item_at` in `src/yaml/index.rs`
+  (the single definition -- O4 removed the `seq_items` bitvector, O6 consolidated five call sites)
 
 ### Key Insight: Sequence Items vs Containers
 
 Sequence items have BP open/close pairs but NO TY entry. This affects TY index calculations:
 
 ```rust
-// WRONG: Direct rank gives incorrect TY index when seq_items exist
+// WRONG: Direct rank gives incorrect TY index when seq-item wrappers exist
 let ty_idx = bp.rank1(bp_pos);
 
-// CORRECT: Subtract sequence items to get real container index
-let bp_opens_before = bp.rank1(bp_pos);
-let seq_items_before = count_seq_items_before(bp_pos);
-let ty_idx = bp_opens_before.saturating_sub(seq_items_before);
+// CORRECT: Count containers, which is what TY is indexed by
+let ty_idx = index.count_containers_before(bp_pos);
 ```
+
+`count_seq_items_before()` and the `seq_items` bitvector no longer exist (O4). The
+`containers` bitvector plus `containers_rank` is the surviving per-node structure.
+
+Note wrapper emission is **context-dependent**: the parser emits a wrapper only for items
+with structured content, so not every child of a block sequence is a wrapper. Never cache
+wrapper-ness across a sequence (O6).
 
 ## Block Sequence Parsing
 

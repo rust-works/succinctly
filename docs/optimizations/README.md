@@ -55,19 +55,20 @@ This directory documents optimization techniques used in the succinctly library,
 
 ### Notable Failures (Instructive)
 
-| Technique                   | Penalty        | Reason                                       | Document                                       |
-|-----------------------------|----------------|----------------------------------------------|-------------------------------------------------|
-| BMI2 PDEP BitWriter         | **-71%**       | Wrong use case (consecutive bits)            | [bit-manipulation.md](bit-manipulation.md)     |
-| NEON PFSM Shuffle           | **-47%**       | Serial dependency overhead                   | [state-machines.md](state-machines.md)         |
-| BMI1 Mask Iteration         | **-26%**       | Optimised <1% of runtime                     | [simd.md](simd.md)                            |
-| NEON Batched Popcount       | **-25%**       | Prefix sum inherently sequential             | [parallel-prefix.md](parallel-prefix.md)       |
-| AVX-512 JSON Parser         | **-10%**       | Memory-bound, not compute-bound              | [simd.md](simd.md)                            |
-| AVX-512 YAML Parser         | **-7%**        | Memory bandwidth bottleneck + benchmark flaw | [simd.md](simd.md)                            |
-| SIMD Lookahead Quote Skip   | **-2 to -6%** | Short strings, SIMD overhead dominates       | [state-machines.md](state-machines.md)         |
-| jq `#[inline(always)]` on generics | **Hangs tests** (60s vs 2s) | Code explosion in 18K-line generic-heavy file | src/jq/eval.rs |
-| jq `#[cold]` on error paths | **-0.3%**      | Compiler already optimizes cold paths         | src/jq/eval.rs |
-| jq `#[inline]` hint         | **-1.3%**      | Compiler's decisions were already optimal      | src/jq/eval.rs |
-| jq `memchr::memmem` substring | **Deferred**  | Green micro (5.9×/52×) but scan is a minority of allocation-bound ops; no end-to-end workload (#301) | [jq-string-search.md](jq-string-search.md) |
+| Technique                          | Penalty                     | Reason                                                                                               | Document                                   |
+| ---------------------------------- | --------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| BMI2 PDEP BitWriter                | **-71%**                    | Wrong use case (consecutive bits)                                                                    | [bit-manipulation.md](bit-manipulation.md) |
+| NEON PFSM Shuffle                  | **-47%**                    | Serial dependency overhead                                                                           | [state-machines.md](state-machines.md)     |
+| BMI1 Mask Iteration                | **-26%**                    | Optimised <1% of runtime                                                                             | [simd.md](simd.md)                         |
+| NEON Batched Popcount              | **-25%**                    | Prefix sum inherently sequential                                                                     | [parallel-prefix.md](parallel-prefix.md)   |
+| AVX-512 JSON Parser                | **-10%**                    | Memory-bound, not compute-bound                                                                      | [simd.md](simd.md)                         |
+| AVX-512 YAML Parser                | **-7%**                     | Memory bandwidth bottleneck + benchmark flaw                                                         | [simd.md](simd.md)                         |
+| SIMD Lookahead Quote Skip          | **-2 to -6%**               | Short strings, SIMD overhead dominates                                                               | [state-machines.md](state-machines.md)     |
+| jq `#[inline(always)]` on generics | **Hangs tests** (60s vs 2s) | Code explosion in 18K-line generic-heavy file                                                        | src/jq/eval.rs                             |
+| jq `#[cold]` on error paths        | **-0.3%**                   | Compiler already optimizes cold paths                                                                | src/jq/eval.rs                             |
+| jq `#[inline]` hint                | **-1.3%**                   | Compiler's decisions were already optimal                                                            | src/jq/eval.rs                             |
+| jq `memchr::memmem` substring      | **Deferred**                | Green micro (5.9×/52×) but scan is a minority of allocation-bound ops; no end-to-end workload (#301) | [jq-string-search.md](jq-string-search.md) |
+| YAML seq-item stored bit           | **Rejected**                | Density 8.87% vs 3.125% break-even; `Compact` path has no per-open `u32` to tag (#106)               | [../parsing/yaml.md](../parsing/yaml.md)   |
 
 ---
 
