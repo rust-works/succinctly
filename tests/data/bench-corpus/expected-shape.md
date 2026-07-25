@@ -57,6 +57,38 @@ files: 7, total bytes: 17150, anchors: 41, aliases: 86, bare-dash items: 5, CRLF
 | aliases              | count/file   | 7   | 0    | 0    | 86   | 86   | 86   |
 | escape density       | per KiB/file | 7   | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
 
+## YAML index memory
+
+Measured with `YamlIndex::memory()`. `L` is input bytes, `M` is BP opens (nodes), and `L/M` is the text-per-node density that decides whether the compact position encodings pay off: their dominant term is proportional to `L` and independent of `M`, so they win on node-dense input and lose on scalar-heavy input (#56). The `alt` columns give what the *other* encoding would have cost for the same file.
+
+| workload       | file                        | L    | M   | L/M  | index | % of L | open enc | open | open alt | end enc | end  | end alt |
+| -------------- | --------------------------- | ---- | --- | ---- | ----- | ------ | -------- | ---- | -------- | ------- | ---- | ------- |
+| actions        | codeql-analysis.yml         | 925  | 73  | 12.7 | 1473  | 159.2% | compact  | 216  | 292      | compact | 152  | 292     |
+| actions        | stale.yml                   | 1290 | 54  | 23.9 | 1618  | 125.4% | compact  | 276  | 216      | compact | 188  | 216     |
+| compose        | nginx-flask-mysql.yaml      | 1239 | 112 | 11.1 | 1656  | 133.7% | compact  | 276  | 448      | compact | 192  | 448     |
+| compose        | wordpress.yaml              | 815  | 56  | 14.6 | 1362  | 167.1% | compact  | 180  | 224      | compact | 124  | 224     |
+| home-assistant | air-quality-conditions.yaml | 9990 | 890 | 11.2 | 14922 | 149.4% | compact  | 2072 | 3560     | compact | 1440 | 3560    |
+| k8s            | nginx-deployment.yml        | 836  | 86  | 9.7  | 1441  | 172.4% | compact  | 204  | 344      | compact | 144  | 344     |
+| lint           | sass-lint.yml               | 2055 | 184 | 11.2 | 2142  | 104.2% | compact  | 444  | 736      | compact | 308  | 736     |
+
+Corpus totals: L = 17150 bytes, M = 1455 opens, index = 24614 bytes (143.5%) — 16.92 bytes/node, 11.8 text bytes/node.
+
+| component       | bytes | % of index | % of L |
+| --------------- | ----- | ---------- | ------ |
+| inline struct   | 5600  | 22.8%      | 32.7%  |
+| ib              | 2184  | 8.9%       | 12.7%  |
+| ib_rank         | 1120  | 4.6%       | 6.5%   |
+| bp words        | 384   | 1.6%       | 2.2%   |
+| bp index        | 508   | 2.1%       | 3.0%   |
+| ty              | 80    | 0.3%       | 0.5%   |
+| open_positions  | 3668  | 14.9%      | 21.4%  |
+| end_positions   | 2548  | 10.4%      | 14.9%  |
+| containers      | 384   | 1.6%       | 2.2%   |
+| containers_rank | 220   | 0.9%       | 1.3%   |
+| anchors/aliases | 7918  | 32.2%      | 46.2%  |
+
+`inline struct` is `size_of::<YamlIndex>()` — a fixed per-index cost that holds every `Vec`/`BTreeMap` header in one place, so nothing is double-counted. It does not scale with input, and therefore dominates `% of L` on kilobyte-sized files while vanishing on megabyte-sized ones; read the scaling components, not the total, when comparing across sizes. `newlines` is omitted: it is built lazily and stays unallocated for parse-only and query workloads that never ask for line/column positions.
+
 ## JSON
 
 files: 3, total bytes: 43526

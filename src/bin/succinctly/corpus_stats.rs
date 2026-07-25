@@ -26,7 +26,7 @@ use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
 use succinctly::json::light::{JsonCursor, StandardJson};
 use succinctly::json::JsonIndex;
 use succinctly::text::LineIndex;
-use succinctly::yaml::{YamlCursor, YamlIndex, YamlValue};
+use succinctly::yaml::{YamlCursor, YamlIndex, YamlIndexMemory, YamlValue};
 
 /// A distribution of integer samples, summarised as min/median/p90/p99/max.
 #[derive(Default)]
@@ -134,6 +134,8 @@ struct YamlStats {
     /// what #340's `has_cr` fast path actually gates on, per `docs/parsing/yaml.md`.
     cr_line_breaks_files: u64,
     cr_line_breaks_per_file: Dist,
+    /// Per-file `(workload, file, memory)` for the index-memory section.
+    index_memory: Vec<(String, String, YamlIndexMemory)>,
 }
 
 /// Counters that are accumulated over a whole file rather than per node, so the
@@ -479,7 +481,7 @@ fn flow_extent(bytes: &[u8], start: usize) -> Option<usize> {
     None
 }
 
-fn ingest_yaml(bytes: &[u8], st: &mut YamlStats) -> Result<()> {
+fn ingest_yaml(bytes: &[u8], workload: &str, file: &str, st: &mut YamlStats) -> Result<()> {
     let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse failed: {e:?}"))?;
 
     // \r-based line breaks (CRLF or lone CR) — a raw-byte property of the whole
@@ -502,6 +504,12 @@ fn ingest_yaml(bytes: &[u8], st: &mut YamlStats) -> Result<()> {
     if cr_line_breaks > 0 {
         st.cr_line_breaks_files += 1;
     }
+
+    // Index cost, measured before any query materializes the lazy structures
+    // (`newlines`, and `ib_rank` inside the compact open-position encoding) so
+    // the figure reflects what a parse-only workload actually retains.
+    st.index_memory
+        .push((workload.to_string(), file.to_string(), index.memory()));
 
     // Anchor/alias totals from the BP structure (no bulk accessor exists).
     let bp = index.bp();
@@ -703,6 +711,148 @@ fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
 
 const DIST_HEADERS: &[&str] = &["metric", "unit", "n", "min", "p50", "p90", "p99", "max"];
 
+/// Render the YAML index-memory section: per-file cost plus a corpus-wide
+/// component breakdown.
+///
+/// Every figure comes from `YamlIndex::memory()`, so this section moves
+/// whenever the index layout does — which is the point. It is part of the
+/// CI-checked golden, so an unintended size change fails `corpus-shape-drift`
+/// rather than passing silently (the existing `compact < dense` assertions in
+/// the unit tests cannot catch a regression from 1.6 to 3.9 bytes/node).
+fn render_yaml_index_memory(st: &YamlStats) -> String {
+    let mut md = String::new();
+    md.push_str("## YAML index memory\n\n");
+
+    if st.index_memory.is_empty() {
+        md.push_str("_No YAML files in corpus._\n\n");
+        return md;
+    }
+
+    md.push_str(
+        "Measured with `YamlIndex::memory()`. `L` is input bytes, `M` is BP opens \
+(nodes), and `L/M` is the text-per-node density that decides whether the \
+compact position encodings pay off: their dominant term is proportional to `L` \
+and independent of `M`, so they win on node-dense input and lose on \
+scalar-heavy input (#56). The `alt` columns give what the *other* encoding \
+would have cost for the same file.\n\n",
+    );
+
+    let pct = |n: usize, d: usize| {
+        if d == 0 {
+            "-".to_string()
+        } else {
+            format!("{:.1}%", n as f64 * 100.0 / d as f64)
+        }
+    };
+
+    let mut rows: Vec<Vec<String>> = st
+        .index_memory
+        .iter()
+        .map(|(workload, file, m)| {
+            vec![
+                workload.clone(),
+                file.clone(),
+                m.text_len.to_string(),
+                m.num_opens.to_string(),
+                format!("{:.1}", m.bytes_per_node()),
+                m.total().to_string(),
+                format!("{:.1}%", m.percent_of_text()),
+                if m.open_positions_compact {
+                    "compact"
+                } else {
+                    "dense"
+                }
+                .to_string(),
+                m.open_positions.to_string(),
+                m.open_positions_alternative.to_string(),
+                if m.end_positions_compact {
+                    "compact"
+                } else {
+                    "dense"
+                }
+                .to_string(),
+                m.end_positions.to_string(),
+                m.end_positions_alternative.to_string(),
+            ]
+        })
+        .collect();
+    rows.sort();
+    md.push_str(&render_table(
+        &[
+            "workload", "file", "L", "M", "L/M", "index", "% of L", "open enc", "open", "open alt",
+            "end enc", "end", "end alt",
+        ],
+        &rows,
+    ));
+    md.push('\n');
+
+    // Corpus-wide component breakdown.
+    let total_text: usize = st.index_memory.iter().map(|(_, _, m)| m.text_len).sum();
+    let total_opens: usize = st.index_memory.iter().map(|(_, _, m)| m.num_opens).sum();
+    let sum = |f: fn(&YamlIndexMemory) -> usize| -> usize {
+        st.index_memory.iter().map(|(_, _, m)| f(m)).sum()
+    };
+
+    let components: [(&str, usize); 11] = [
+        ("inline struct", sum(|m| m.inline)),
+        ("ib", sum(|m| m.ib)),
+        ("ib_rank", sum(|m| m.ib_rank)),
+        ("bp words", sum(|m| m.bp_words)),
+        ("bp index", sum(|m| m.bp_index)),
+        ("ty", sum(|m| m.ty)),
+        ("open_positions", sum(|m| m.open_positions)),
+        ("end_positions", sum(|m| m.end_positions)),
+        ("containers", sum(|m| m.containers)),
+        ("containers_rank", sum(|m| m.containers_rank)),
+        ("anchors/aliases", sum(|m| m.anchors)),
+    ];
+    let total_index: usize = components.iter().map(|(_, b)| *b).sum();
+
+    md.push_str(&format!(
+        "Corpus totals: L = {total_text} bytes, M = {total_opens} opens, \
+index = {total_index} bytes ({}) — {} bytes/node, {} text bytes/node.\n\n",
+        pct(total_index, total_text),
+        if total_opens == 0 {
+            "-".to_string()
+        } else {
+            format!("{:.2}", total_index as f64 / total_opens as f64)
+        },
+        if total_opens == 0 {
+            "-".to_string()
+        } else {
+            format!("{:.1}", total_text as f64 / total_opens as f64)
+        },
+    ));
+
+    let comp_rows: Vec<Vec<String>> = components
+        .iter()
+        .map(|(name, bytes)| {
+            vec![
+                (*name).to_string(),
+                bytes.to_string(),
+                pct(*bytes, total_index),
+                pct(*bytes, total_text),
+            ]
+        })
+        .collect();
+    md.push_str(&render_table(
+        &["component", "bytes", "% of index", "% of L"],
+        &comp_rows,
+    ));
+    md.push('\n');
+    md.push_str(
+        "`inline struct` is `size_of::<YamlIndex>()` — a fixed per-index cost \
+that holds every `Vec`/`BTreeMap` header in one place, so nothing is \
+double-counted. It does not scale with input, and therefore dominates `% of L` \
+on kilobyte-sized files while vanishing on megabyte-sized ones; read the \
+scaling components, not the total, when comparing across sizes. `newlines` is \
+omitted: it is built lazily and stays unallocated for parse-only and query \
+workloads that never ask for line/column positions.\n\n",
+    );
+
+    md
+}
+
 /// Build the full deterministic markdown report for a corpus root directory.
 pub fn generate_report(data_dir: &Path) -> Result<(String, Vec<FileRecord>)> {
     let mut files = Vec::new();
@@ -728,7 +878,7 @@ pub fn generate_report(data_dir: &Path) -> Result<(String, Vec<FileRecord>)> {
         ));
         match fmt {
             "json" => ingest_json(&bytes, &mut corpus.json),
-            "yaml" => ingest_yaml(&bytes, &mut corpus.yaml)
+            "yaml" => ingest_yaml(&bytes, &workload, &file, &mut corpus.yaml)
                 .with_context(|| format!("in {}", path.display()))?,
             "dsv" => ingest_dsv(&bytes, delim.unwrap(), &mut corpus.dsv),
             _ => unreachable!(),
@@ -868,6 +1018,8 @@ CRLF/CR files: {:.2}% ({}/{})\n\n",
         ],
     ));
     md.push('\n');
+
+    md.push_str(&render_yaml_index_memory(&corpus.yaml));
 
     // JSON
     md.push_str("## JSON\n\n");
@@ -1021,10 +1173,26 @@ mod tests {
         // flow sequence [1, 2, 3] plus an anchor/alias pair
         let doc = b"base: &a\n  k: v\nuse: *a\nflow: [1, 2, 3]\n";
         let mut st = YamlStats::default();
-        ingest_yaml(doc, &mut st).unwrap();
+        ingest_yaml(doc, "wl", "f.yaml", &mut st).unwrap();
 
         assert_eq!(st.anchors_per_file.values, vec![1]);
         assert_eq!(st.aliases_per_file.values, vec![1]);
+
+        // index memory is recorded per file, labelled, and non-trivial
+        assert_eq!(st.index_memory.len(), 1);
+        let (workload, file, mem) = &st.index_memory[0];
+        assert_eq!(workload, "wl");
+        assert_eq!(file, "f.yaml");
+        assert_eq!(mem.text_len, doc.len());
+        assert!(mem.num_opens > 0);
+        assert!(mem.total() > mem.inline);
+        // newlines is lazy and nothing here asks for line/column
+        assert!(!mem.newlines_materialized);
+        assert_eq!(mem.newlines, 0);
+        // ib_rank inside the compact open-position encoding is lazy too, so a
+        // parse-only workload must not have paid for it
+        assert!(mem.open_positions_compact);
+        assert!(mem.open_positions < mem.open_positions_alternative);
         // exactly one flow collection recorded, of length == "[1, 2, 3]"
         assert_eq!(st.flow_collection_bytes.values.len(), 1);
         assert_eq!(st.flow_collection_bytes.values[0], "[1, 2, 3]".len() as u64);
@@ -1034,7 +1202,7 @@ mod tests {
     fn yaml_lf_only_has_no_cr_line_breaks() {
         let doc = b"a: 1\nb: 2\n";
         let mut st = YamlStats::default();
-        ingest_yaml(doc, &mut st).unwrap();
+        ingest_yaml(doc, "wl", "f.yaml", &mut st).unwrap();
         assert_eq!(st.cr_line_breaks_per_file.values, vec![0]);
         assert_eq!(st.cr_line_breaks_files, 0);
     }
@@ -1043,7 +1211,7 @@ mod tests {
     fn yaml_crlf_counts_one_break_per_crlf_pair() {
         let doc = b"a: 1\r\nb: 2\r\n";
         let mut st = YamlStats::default();
-        ingest_yaml(doc, &mut st).unwrap();
+        ingest_yaml(doc, "wl", "f.yaml", &mut st).unwrap();
         // Two CRLF pairs, not four bytes counted individually.
         assert_eq!(st.cr_line_breaks_per_file.values, vec![2]);
         assert_eq!(st.cr_line_breaks_files, 1);
@@ -1054,7 +1222,7 @@ mod tests {
         // A lone `\r` with no trailing `\n` still counts as one break.
         let doc = b"a: 1\rb: 2\n";
         let mut st = YamlStats::default();
-        ingest_yaml(doc, &mut st).unwrap();
+        ingest_yaml(doc, "wl", "f.yaml", &mut st).unwrap();
         assert_eq!(st.cr_line_breaks_per_file.values, vec![1]);
         assert_eq!(st.cr_line_breaks_files, 1);
     }
@@ -1064,7 +1232,7 @@ mod tests {
         // Two bare-dash items (the `-` alone on its line) and one inline `- `.
         let doc = b"rules:\n  -\n    a: 1\n  - b: 2\n  -\n    c: 3\n";
         let mut st = YamlStats::default();
-        ingest_yaml(doc, &mut st).unwrap();
+        ingest_yaml(doc, "wl", "f.yaml", &mut st).unwrap();
         assert_eq!(st.bare_dash_items_per_file.values, vec![2]);
         // The sequence itself still reports all three items.
         assert_eq!(st.items_per_sequence.values, vec![3]);
@@ -1075,7 +1243,7 @@ mod tests {
         // Inline block items and flow sequences carry no bare-dash indicator.
         let doc = b"block:\n  - one\n  - two\nflow: [1, 2, 3]\nnested:\n  - - deep\n";
         let mut st = YamlStats::default();
-        ingest_yaml(doc, &mut st).unwrap();
+        ingest_yaml(doc, "wl", "f.yaml", &mut st).unwrap();
         assert_eq!(st.bare_dash_items_per_file.values, vec![0]);
     }
 
@@ -1086,7 +1254,7 @@ mod tests {
         // line, so it counts too.
         let doc = b"outer:\n  -\n    inner:\n      -\n        x: 1\n  -\n";
         let mut st = YamlStats::default();
-        ingest_yaml(doc, &mut st).unwrap();
+        ingest_yaml(doc, "wl", "f.yaml", &mut st).unwrap();
         assert_eq!(st.bare_dash_items_per_file.values, vec![3]);
     }
 
@@ -1096,7 +1264,7 @@ mod tests {
         // still alone on its line — the "ran out of input" arm of the scan.
         let doc = b"k:\n  -";
         let mut st = YamlStats::default();
-        ingest_yaml(doc, &mut st).unwrap();
+        ingest_yaml(doc, "wl", "f.yaml", &mut st).unwrap();
         assert_eq!(st.bare_dash_items_per_file.values, vec![1]);
     }
 
@@ -1106,7 +1274,7 @@ mod tests {
         // "rest of the line is blank" half of the check is what keeps it out.
         let doc = b"neg:\n  - -5\n  -\n    z: 1\n";
         let mut st = YamlStats::default();
-        ingest_yaml(doc, &mut st).unwrap();
+        ingest_yaml(doc, "wl", "f.yaml", &mut st).unwrap();
         assert_eq!(st.bare_dash_items_per_file.values, vec![1]);
     }
 
@@ -1117,7 +1285,7 @@ mod tests {
         // documented undercount, pinned so it stays a deliberate choice.
         let doc = b"k:\n  -  # note\n    a: 1\n";
         let mut st = YamlStats::default();
-        ingest_yaml(doc, &mut st).unwrap();
+        ingest_yaml(doc, "wl", "f.yaml", &mut st).unwrap();
         assert_eq!(st.bare_dash_items_per_file.values, vec![0]);
     }
 
