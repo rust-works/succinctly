@@ -17,10 +17,7 @@ use succinctly::json::validate::{self, ValidationError};
 use succinctly::json::JsonIndex;
 
 use super::JqCommand;
-use crate::output::{
-    self, escape_json_string, escape_json_string_ascii, exit_codes, ColorScheme, ControlEscape,
-    FloatStyle, JsonFormatOpts,
-};
+use crate::output::{self, exit_codes, ColorScheme, EscapeStyle, FloatStyle, JsonFormatOpts};
 
 /// Evaluation context for passing variables to the jq evaluator.
 #[derive(Debug, Default)]
@@ -1701,14 +1698,7 @@ where
                         out.write_all(raw)?;
                     } else if let Ok(decoded) = s.as_str() {
                         // Has escapes or ASCII mode - decode and re-encode for normalization
-                        out.write_all(b"\"")?;
-                        let escaped = if config.ascii_output {
-                            escape_json_string_ascii(&decoded)
-                        } else {
-                            escape_json_string(&decoded)
-                        };
-                        out.write_all(escaped.as_bytes())?;
-                        out.write_all(b"\"")?;
+                        out.write_all(output::jq_quoted(&decoded, config.ascii_output).as_bytes())?;
                     } else {
                         // Decode failed - output raw bytes as fallback
                         out.write_all(raw)?;
@@ -1764,14 +1754,10 @@ where
                                     out.write_all(raw)?;
                                     out.write_all(b":")?;
                                 } else if let Ok(decoded) = k.as_str() {
-                                    out.write_all(b"\"")?;
-                                    let escaped = if config.ascii_output {
-                                        escape_json_string_ascii(&decoded)
-                                    } else {
-                                        escape_json_string(&decoded)
-                                    };
-                                    out.write_all(escaped.as_bytes())?;
-                                    out.write_all(b"\":")?;
+                                    out.write_all(
+                                        output::jq_quoted(&decoded, config.ascii_output).as_bytes(),
+                                    )?;
+                                    out.write_all(b":")?;
                                 } else {
                                     out.write_all(raw)?;
                                     out.write_all(b":")?;
@@ -1800,14 +1786,10 @@ where
                                     out.write_all(b":")?;
                                     out.write_all(space_after_colon.as_bytes())?;
                                 } else if let Ok(decoded) = k.as_str() {
-                                    out.write_all(b"\"")?;
-                                    let escaped = if config.ascii_output {
-                                        escape_json_string_ascii(&decoded)
-                                    } else {
-                                        escape_json_string(&decoded)
-                                    };
-                                    out.write_all(escaped.as_bytes())?;
-                                    out.write_all(b"\":")?;
+                                    out.write_all(
+                                        output::jq_quoted(&decoded, config.ascii_output).as_bytes(),
+                                    )?;
+                                    out.write_all(b":")?;
                                     out.write_all(space_after_colon.as_bytes())?;
                                 } else {
                                     out.write_all(raw)?;
@@ -1827,14 +1809,7 @@ where
             }
         }
         JqValue::String(s) => {
-            out.write_all(b"\"")?;
-            let escaped = if config.ascii_output {
-                escape_json_string_ascii(s)
-            } else {
-                escape_json_string(s)
-            };
-            out.write_all(escaped.as_bytes())?;
-            out.write_all(b"\"")?;
+            out.write_all(output::jq_quoted(s, config.ascii_output).as_bytes())?;
         }
         JqValue::Array(arr) => {
             if arr.is_empty() {
@@ -1873,14 +1848,8 @@ where
                     if i > 0 {
                         out.write_all(b",")?;
                     }
-                    out.write_all(b"\"")?;
-                    let escaped = if config.ascii_output {
-                        escape_json_string_ascii(k)
-                    } else {
-                        escape_json_string(k)
-                    };
-                    out.write_all(escaped.as_bytes())?;
-                    out.write_all(b"\":")?;
+                    out.write_all(output::jq_quoted(k, config.ascii_output).as_bytes())?;
+                    out.write_all(b":")?;
                     print_json(out, v, formatter, config, level + 1)?;
                 }
                 out.write_all(b"}")?;
@@ -1893,14 +1862,8 @@ where
                         out.write_all(separator.as_bytes())?;
                     }
                     out.write_all(next_indent.as_bytes())?;
-                    out.write_all(b"\"")?;
-                    let escaped = if config.ascii_output {
-                        escape_json_string_ascii(k)
-                    } else {
-                        escape_json_string(k)
-                    };
-                    out.write_all(escaped.as_bytes())?;
-                    out.write_all(b"\":")?;
+                    out.write_all(output::jq_quoted(k, config.ascii_output).as_bytes())?;
+                    out.write_all(b":")?;
                     out.write_all(space_after_colon.as_bytes())?;
                     print_json(out, v, formatter, config, level + 1)?;
                 }
@@ -2078,7 +2041,7 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
         sort_keys: config.sort_keys,
         ascii: config.ascii_output,
         float_style: FloatStyle::Shortest,
-        control_escape: ControlEscape::Jq,
+        control_escape: EscapeStyle::Jq,
     };
     let json = output::format_json(value, &opts);
 

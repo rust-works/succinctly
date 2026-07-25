@@ -17,7 +17,7 @@ use succinctly::json::JsonIndex;
 use succinctly::yaml::{resolve_plain, ResolvedScalar, YamlCursor, YamlIndex, YamlValue};
 
 use super::{InputFormat, OutputFormat, YqCommand};
-use crate::output::{self, exit_codes, ColorScheme, ControlEscape, FloatStyle, JsonFormatOpts};
+use crate::output::{self, exit_codes, ColorScheme, EscapeStyle, FloatStyle, JsonFormatOpts};
 
 /// Adapter to use `std::io::Write` with `core::fmt::Write` methods.
 /// This enables streaming JSON output without intermediate String allocation.
@@ -471,7 +471,7 @@ fn output_value<W: Write>(writer: &mut W, value: &OwnedValue, config: &OutputCon
             } else {
                 FloatStyle::PreserveWholeFloat
             },
-            control_escape: ControlEscape::Yq,
+            control_escape: EscapeStyle::Yq,
         },
     );
 

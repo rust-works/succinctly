@@ -20,15 +20,14 @@
 # systematic bug-surfacing #300 anticipated. collect_map_pipe, index_oob_null
 # (#307) and format_csv (#306) have since been fixed and dropped, leaving 5.
 #
-# The two escape_* / format_json_controls entries were added by the #91 capture,
-# which extended the corpus into string escaping (previously unrepresented — all
-# 41 seed cases were escape-free ASCII, so the oracle was blind to it). Both are
-# scheduled for removal within #91 itself.
+# #91 extended the corpus into string escaping, which was previously
+# unrepresented — all 41 seed cases were escape-free ASCII, so the oracle was
+# blind to it. That capture added two entries (escape_del_and_c1 and
+# format_json_controls) and #91 then removed both, leaving all five escaping
+# cases conformant.
 
 alt_multi_output   alternative   `//` inspects only the first output of its LHS — #160
 assign_rhs_root    assignment    compound-assign RHS evaluated against the sub-value, not the root — #159
 comma_in_index     parser        comma generator rejected inside index brackets — #155
-escape_del_and_c1  escaping      C1 controls escaped as `\u00xx`; jq emits them raw — #91
-format_json_controls escaping    `@json` lacks `\b`/`\f` short forms and escapes C1 — #91
 int_float_eq       equality      `1 == 1.0` is false (Int vs Float derived PartialEq) — #156
 try_catch_error    try-catch     catch runs on the input and discards the error value — #158

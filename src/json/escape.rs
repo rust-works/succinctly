@@ -626,6 +626,82 @@ mod tests {
         }
     }
 
+    /// yq's control-character rules, ported verbatim from the CLI's
+    /// `escape_json_string_yq` tests when it moved here (#91).
+    ///
+    /// These are compatibility pins against mikefarah/yq (#262), not preferences
+    /// — the yq golden suite depends on every one of them. If one of these has
+    /// to change, yq's output changed with it.
+    #[test]
+    fn yq_style_matches_mikefarah_yq() {
+        // Backspace/form-feed use the long form, NOT jq's short escapes.
+        assert_eq!(body_to_string("\u{8}\u{c}", Yq, false), "\\u0008\\u000c");
+        // Tab/newline/carriage-return keep their short forms.
+        assert_eq!(body_to_string("\t\n\r", Yq, false), "\\t\\n\\r");
+        // Quotes and backslashes escape as usual.
+        assert_eq!(body_to_string("a\"\\b", Yq, false), "a\\\"\\\\b");
+        // Other C0 controls fall back to the long form.
+        assert_eq!(
+            body_to_string("\u{0}\u{7}\u{b}\u{1b}", Yq, false),
+            "\\u0000\\u0007\\u000b\\u001b"
+        );
+        // DEL and the C1 block are emitted RAW, like yq.
+        assert_eq!(body_to_string("\u{7f}", Yq, false), "\u{7f}");
+        assert_eq!(body_to_string("\u{85}", Yq, false), "\u{85}");
+        assert_eq!(body_to_string("\u{80}\u{9f}", Yq, false), "\u{80}\u{9f}");
+        // Printable ASCII and non-ASCII pass through unescaped.
+        assert_eq!(body_to_string("café", Yq, false), "café");
+    }
+
+    /// yq's ASCII mode: same control rules, plus non-ASCII as `\uXXXX`.
+    #[test]
+    fn yq_ascii_style_matches_mikefarah_yq() {
+        assert_eq!(
+            body_to_string("a\"\\b\n\r\t", Yq, true),
+            "a\\\"\\\\b\\n\\r\\t"
+        );
+        assert_eq!(body_to_string("\u{8}\u{c}", Yq, true), "\\u0008\\u000c");
+        // DEL stays raw even here — it is ASCII, so the non-ASCII rule misses it.
+        assert_eq!(body_to_string("\u{7f}", Yq, true), "\u{7f}");
+        // ...but C1 and the rest of non-ASCII do escape.
+        assert_eq!(body_to_string("\u{85}", Yq, true), "\\u0085");
+        assert_eq!(body_to_string("é", Yq, true), "\\u00e9");
+        assert_eq!(body_to_string("😀", Yq, true), "\\ud83d\\ude00");
+    }
+
+    /// jq's control-character rules, ported from the CLI's `escape_json_string`
+    /// tests. One assertion changed on the way: U+0085 was pinned to `\u0085`
+    /// and is now raw, matching jq 1.7.1 (#91).
+    #[test]
+    fn jq_style_matches_jq() {
+        assert_eq!(body_to_string("hello", Jq, false), "hello");
+        assert_eq!(body_to_string("hello\nworld", Jq, false), "hello\\nworld");
+        assert_eq!(body_to_string("say \"hi\"", Jq, false), "say \\\"hi\\\"");
+        assert_eq!(body_to_string("a\\b", Jq, false), "a\\\\b");
+        assert_eq!(body_to_string("\u{8}\u{c}", Jq, false), "\\b\\f");
+        assert_eq!(body_to_string("\r\t", Jq, false), "\\r\\t");
+        assert_eq!(body_to_string("\u{1}", Jq, false), "\\u0001");
+        assert_eq!(body_to_string("\u{7f}", Jq, false), "\\u007f");
+        // Was `\u0085` before #91; jq emits the C1 block raw.
+        assert_eq!(body_to_string("\u{85}", Jq, false), "\u{85}");
+        // Non-ASCII passes through unescaped.
+        assert_eq!(body_to_string("café", Jq, false), "café");
+    }
+
+    /// jq's ASCII mode, ported from `escape_json_string_ascii`.
+    #[test]
+    fn jq_ascii_style_matches_jq() {
+        assert_eq!(body_to_string("say \"hi\"", Jq, true), "say \\\"hi\\\"");
+        assert_eq!(
+            body_to_string("a\\b\u{8}\u{c}\r\t\n", Jq, true),
+            "a\\\\b\\b\\f\\r\\t\\n"
+        );
+        assert_eq!(body_to_string("\u{1}", Jq, true), "\\u0001");
+        // BMP characters escape as a single unit; astral ones as a pair.
+        assert_eq!(body_to_string("é", Jq, true), "\\u00e9");
+        assert_eq!(body_to_string("😀", Jq, true), "\\ud83d\\ude00");
+    }
+
     /// A string needing no escaping must come back byte-identical, and cost no
     /// more than its own length in capacity.
     #[test]
