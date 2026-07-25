@@ -68,6 +68,56 @@ grep -c "is_ok()" tests/generated_suite.rs
 
 If `is_ok()` count >> `assert_eq!` count, tests aren't verifying correctness.
 
+### 3. Benchmark Generators Are Test Coverage Too
+
+A shape that no generator emits is invisible to the entire benchmark suite, so "all benchmarks
+neutral" is not evidence about it. In #106 every YAML generator emitted `- ` (dash-space), so
+block-sequence items written as a bare `-` on its own line had **zero** coverage — and hid a
+quadratic path worth up to 16x. The omission was justified by a stale comment claiming the parser
+required dash-space, which was never true.
+
+Before concluding a change is neutral, confirm a generator actually produces the shape it
+touches. If not, add the pattern first (`src/bin/succinctly/yaml_generators.rs` and the
+`YamlPattern` enum, plus both `yq_bench` pattern lists), then measure.
+
+## Characterization Tests: Pinning Known-Wrong Behaviour
+
+When you find a pre-existing defect that is out of scope to fix, lock in the current behaviour
+with a test that says so explicitly, rather than leaving it undocumented:
+
+```rust
+#[test]
+fn test_crlf_sequence_items_characterize_preexisting_bug() {
+    // CRLF is mishandled independently of this change: `\r` is folded into plain
+    // scalars as a trailing space, so `a: 1\r\n` yields the string "1 " not 1.
+    // Verified identical before and after, so this is characterization of an
+    // existing defect. If CRLF handling is fixed, update the expectation.
+    let agreed = assert_seq_paths_agree_on(b"-\r\n  a: 1\r\n");
+    assert_eq!(agreed, "[\"a\",\"1 \"]",
+        "CRLF handling changed - if this is the fix, update this test");
+}
+```
+
+Three requirements: name it `*_characterize_preexisting_bug` or similar so nobody mistakes it for
+desired behaviour, state in the comment that before/after were verified identical, and tell the
+future fixer to update it. The failure message should point at the fix, not the assertion.
+
+This is distinct from a regression test — it asserts what the code *does*, not what it *should*
+do, and is expected to fail when someone fixes the bug.
+
+## Invariant Tests Over Duplicated Logic
+
+When the same predicate exists at several call sites, add a test that the sites **agree with each
+other**, not just that each is individually correct. #106 had five seq-item detection sites with
+three different predicates; one was quadratic and no test noticed, because every test exercised
+one path at a time. The permanent guard asserts `uncons`, `get(i)` and `uncons_cursor` produce
+identical values for the same sequence, so re-divergence fails a test instead of shipping.
+
+Pair this with a structural cross-check where one is available. For a predicate derived from the
+input text, assert it never disagrees with the balanced-parens structure the parser built — that
+oracle held across the whole real-workload corpus and all 279 valid YAML-suite cases when #106
+added it, and it catches classes of bug that example-based tests cannot reach.
+
 ## Testing Levels
 
 ### Unit Tests (in-module)

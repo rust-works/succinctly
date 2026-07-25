@@ -11,6 +11,35 @@ This skill ensures proper handling of benchmark documentation across multiple pl
 
 This skill focuses on **documentation-specific rules** and multi-platform considerations.
 
+## A/B Measurement Rules (before/after a code change)
+
+Full method and evidence: [docs/guides/benchmarking.md § A/B Benchmarking Method](../../../docs/guides/benchmarking.md#ab-benchmarking-method).
+These seven rules each cost a wrong conclusion on #106 — the naive method reported a 16x win as
+a regression.
+
+1. **Interleave the two binaries within each repetition.** Never run all of A then all of B —
+   the second half starts thermally loaded, which made an improved binary measure up to **2x
+   slower** on every workload. This is a design fix; more reps do not help, and min/median can
+   agree with each other while both are wrong.
+2. **Process-spawn A/B needs inputs >= 1 MB.** Startup is ~4-6 ms, i.e. the whole runtime at
+   1kb/10kb/100kb — which are in `dev bench yq`'s defaults. Use `--sizes 1mb,10mb`.
+3. **Report the scaling curve across 2-3 sizes.** A speedup that grows with input size is the
+   signature of an algorithmic fix and corroborates the claimed mechanism; one ratio does not.
+4. **Gate on output identity first.** Diff both binaries over every input x query and confirm
+   they still match `jq`/`yq`. A faster binary that changed behaviour is not a win.
+5. **Measure both architectures — the effect size differs, not just the noise.** #106 was 6.1x
+   on M4 Pro and 16.4x on Zen 4 for the same commit, because cache-bound costs do not port.
+6. **Verify the box is idle, and distrust macOS load average** — it counts uninterruptible-wait
+   threads, reading 1.4 on a machine using 2.4% CPU. Sum `ps -Ao pcpu`, check for
+   `cargo|rustc|claude`, and require AC power.
+7. **A benchmark cannot measure a shape it does not generate.** "All neutral" is not evidence if
+   the suite lacks the relevant input; add the generator pattern first, then measure.
+
+**Always name the platform in the results.** Every perf table in this repo names the chip; a
+table without one is unreviewable. Benchmark on the boxes in
+[Platforms and Hardware](../../../docs/guides/benchmarking.md#platforms-and-hardware), not a
+laptop on battery.
+
 ## Critical Rules
 
 **NEVER replace platform-specific benchmarks with each other.**
