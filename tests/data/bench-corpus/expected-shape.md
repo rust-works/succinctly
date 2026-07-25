@@ -57,6 +57,18 @@ files: 7, total bytes: 17150, anchors: 41, aliases: 86, bare-dash items: 5, CRLF
 | aliases              | count/file   | 7   | 0    | 0    | 86   | 86   | 86   |
 | escape density       | per KiB/file | 7   | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
 
+### Semi-index shape
+
+BP opens: 1455, index bytes: 16326 (95% of input), `open_positions`: 3668 B, `bp_to_text_end`: 2548 B, dense fallbacks: 0 start / 0 end
+
+| metric              | unit       | n | min | p50 | p90 | p99 | max |
+| ------------------- | ---------- | - | --- | --- | --- | --- | --- |
+| text per open       | bytes/open | 7 | 9   | 11  | 23  | 23  | 23  |
+| duplicate positions | % of opens | 7 | 7   | 21  | 25  | 25  | 25  |
+| index size          | % of input | 7 | 63  | 69  | 114 | 114 | 114 |
+| open_positions      | % of input | 7 | 20  | 22  | 24  | 24  | 24  |
+| bp_to_text_end      | % of input | 7 | 14  | 15  | 17  | 17  | 17  |
+
 ## JSON
 
 files: 3, total bytes: 43526

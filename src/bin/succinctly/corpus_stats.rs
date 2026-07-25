@@ -134,6 +134,7 @@ struct YamlStats {
     /// what #340's `has_cr` fast path actually gates on, per `docs/parsing/yaml.md`.
     cr_line_breaks_files: u64,
     cr_line_breaks_per_file: Dist,
+    index: IndexShapeStats,
 }
 
 /// Counters that are accumulated over a whole file rather than per node, so the
@@ -146,6 +147,36 @@ struct YamlFileCounters {
     escapes: u64,
     /// Block-sequence items whose `-` indicator sits alone on its own line.
     bare_dash_items: u64,
+}
+
+/// Shape of the built semi-index, as opposed to the shape of the input text.
+///
+/// These are the numbers the position-encoding trade-off turns on: the compact
+/// bitmap encoding's interest-bit map costs one bit per *text byte*, so its size
+/// tracks `text_bytes_per_open`, while a position array costs a fixed 4 bytes
+/// per open. Which is cheaper is therefore a property of the input's density,
+/// not of the encoding — see `docs/parsing/yaml.md` (P12).
+#[derive(Default)]
+struct IndexShapeStats {
+    /// Text bytes divided by BP opens, one sample per file.
+    text_bytes_per_open: Dist,
+    /// Share of opens whose start position repeats the previous open's, in
+    /// percent — containers share a position with their first child.
+    duplicate_position_pct: Dist,
+    /// Whole index size as a percentage of input size, one sample per file.
+    index_pct_of_input: Dist,
+    /// `open_positions` size as a percentage of input size.
+    open_positions_pct: Dist,
+    /// `bp_to_text_end` size as a percentage of input size.
+    end_positions_pct: Dist,
+    /// Totals, for the aggregate ratios reported alongside the distributions.
+    total_opens: u64,
+    total_index_bytes: u64,
+    total_open_positions_bytes: u64,
+    total_end_positions_bytes: u64,
+    /// Files where a position map fell back to dense `Vec<u32>` storage.
+    dense_open_positions: u64,
+    dense_end_positions: u64,
 }
 
 #[derive(Default)]
@@ -537,9 +568,55 @@ fn ingest_yaml(bytes: &[u8], st: &mut YamlStats) -> Result<()> {
     }
     st.bare_dash_items_per_file.push(counters.bare_dash_items);
     push_escape_density(&mut st.escape_density, counters.escapes, bytes.len());
+    ingest_yaml_index_shape(bytes, &index, &mut st.index);
     st.files += 1;
     st.total_bytes += bytes.len() as u64;
     Ok(())
+}
+
+/// Record the built index's shape and per-component sizes for one file.
+fn ingest_yaml_index_shape(bytes: &[u8], index: &YamlIndex<Vec<u64>>, st: &mut IndexShapeStats) {
+    let opens = index.num_opens();
+    if opens == 0 || bytes.is_empty() {
+        return;
+    }
+
+    let size = index.size_breakdown();
+    let input = bytes.len() as u64;
+
+    st.text_bytes_per_open.push(input / opens as u64);
+
+    // Duplicate rate: opens whose start position equals the previous open's.
+    // This is what the advance bitmap compresses away.
+    let open_positions = index.open_positions();
+    let mut duplicates = 0u64;
+    let mut previous = None;
+    for open_idx in 0..opens {
+        let position = open_positions.get(open_idx);
+        if position.is_some() && position == previous {
+            duplicates += 1;
+        }
+        previous = position;
+    }
+    st.duplicate_position_pct
+        .push(duplicates * 100 / opens as u64);
+
+    let pct = |bytes: usize| (bytes as u64) * 100 / input;
+    st.index_pct_of_input.push(pct(size.total()));
+    st.open_positions_pct.push(pct(size.open_positions));
+    st.end_positions_pct.push(pct(size.bp_to_text_end));
+
+    st.total_opens += opens as u64;
+    st.total_index_bytes += size.total() as u64;
+    st.total_open_positions_bytes += size.open_positions as u64;
+    st.total_end_positions_bytes += size.bp_to_text_end as u64;
+
+    if !index.open_positions_compact() {
+        st.dense_open_positions += 1;
+    }
+    if !index.end_positions_compact() {
+        st.dense_end_positions += 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +779,46 @@ fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
 }
 
 const DIST_HEADERS: &[&str] = &["metric", "unit", "n", "min", "p50", "p90", "p99", "max"];
+
+/// Render the YAML semi-index shape subsection.
+///
+/// Reported separately from the text-shape table because these describe what
+/// the index costs, not what the input looks like.
+fn render_yaml_index_shape(st: &IndexShapeStats, total_bytes: u64) -> String {
+    if st.total_opens == 0 || total_bytes == 0 {
+        return String::new();
+    }
+
+    let mut md = String::from("### Semi-index shape\n\n");
+    md.push_str(&format!(
+        "BP opens: {}, index bytes: {} ({}% of input), \
+         `open_positions`: {} B, `bp_to_text_end`: {} B, \
+         dense fallbacks: {} start / {} end\n\n",
+        st.total_opens,
+        st.total_index_bytes,
+        st.total_index_bytes * 100 / total_bytes,
+        st.total_open_positions_bytes,
+        st.total_end_positions_bytes,
+        st.dense_open_positions,
+        st.dense_end_positions,
+    ));
+    md.push_str(&render_table(
+        DIST_HEADERS,
+        &[
+            dist_row("text per open", "bytes/open", &st.text_bytes_per_open),
+            dist_row(
+                "duplicate positions",
+                "% of opens",
+                &st.duplicate_position_pct,
+            ),
+            dist_row("index size", "% of input", &st.index_pct_of_input),
+            dist_row("open_positions", "% of input", &st.open_positions_pct),
+            dist_row("bp_to_text_end", "% of input", &st.end_positions_pct),
+        ],
+    ));
+    md.push('\n');
+    md
+}
 
 /// Build the full deterministic markdown report for a corpus root directory.
 pub fn generate_report(data_dir: &Path) -> Result<(String, Vec<FileRecord>)> {
@@ -868,6 +985,10 @@ CRLF/CR files: {:.2}% ({}/{})\n\n",
         ],
     ));
     md.push('\n');
+    md.push_str(&render_yaml_index_shape(
+        &corpus.yaml.index,
+        corpus.yaml.total_bytes,
+    ));
 
     // JSON
     md.push_str("## JSON\n\n");
@@ -1190,6 +1311,14 @@ mod tests {
         assert!(md.contains("flow-collection size")); // YAML flow row rendered
         assert!(md.contains("quoted fields:")); // DSV summary line rendered
         assert!(md.contains("| json   |")); // inventory row for the json file
+
+        // Semi-index shape subsection: the representativeness lookup for
+        // position-encoding work (#58) needs bytes-per-open and the duplicate
+        // rate, not just the text-shape distributions.
+        assert!(md.contains("### Semi-index shape"));
+        assert!(md.contains("text per open"));
+        assert!(md.contains("duplicate positions"));
+        assert!(md.contains("dense fallbacks:"));
 
         // .txt ignored; three corpus files, workload = parent-dir basename
         assert_eq!(records.len(), 3);
