@@ -1,0 +1,83 @@
+{
+  "scalar_key": [
+    {
+      "e": "v"
+    }
+  ],
+  "null_value": [
+    {
+      "e": null
+    }
+  ],
+  "following_item": [
+    {
+      "e": "v"
+    },
+    "x"
+  ],
+  "two_entries": [
+    {
+      "e": "v",
+      "f": "w"
+    }
+  ],
+  "mixed_entry": [
+    {
+      "e": "v",
+      "g": "h"
+    }
+  ],
+  "implicit_first": [
+    {
+      "g": "h",
+      "e": "v"
+    }
+  ],
+  "each_item": [
+    {
+      "e": null
+    },
+    {
+      "f": null
+    }
+  ],
+  "key_on_next_line": [
+    {
+      "e": "v"
+    }
+  ],
+  "quoted_key": [
+    {
+      "q k": "v"
+    }
+  ],
+  "block_scalar_key": [
+    {
+      "lit\n": "v"
+    }
+  ],
+  "flow_seq_key": [
+    {
+      "": "v"
+    }
+  ],
+  "wide_indent": [
+    {
+      "e": "v"
+    }
+  ],
+  "anchored_key": [
+    {
+      "e": "v"
+    }
+  ],
+  "anchored_value": [
+    {
+      "e": "v"
+    },
+    "v"
+  ],
+  "plain_scalar_qmark": [
+    "?foo"
+  ]
+}
