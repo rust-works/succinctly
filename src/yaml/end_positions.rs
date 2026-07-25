@@ -185,7 +185,6 @@ impl EndPositions {
     }
 
     /// Returns the heap memory usage in bytes.
-    #[cfg(test)]
     pub fn heap_size(&self) -> usize {
         match self {
             Self::Compact(c) => c.heap_size(),
@@ -193,8 +192,27 @@ impl EndPositions {
         }
     }
 
+    /// Returns what the *other* encoding would have cost, in bytes.
+    ///
+    /// Used by index accounting to report the counterfactual alongside the
+    /// chosen encoding, so the compact-vs-dense trade-off is visible per file.
+    pub fn alternative_heap_size(&self, num_opens: usize, text_len: usize) -> usize {
+        match self {
+            // Dense stores one u32 per BP open.
+            Self::Compact(_) => num_opens * 4,
+            // Compact stores an IB bitmap over text (plus one bit for
+            // end positions at EOF), an advance bitmap over opens, a
+            // cumulative rank over the latter, and IB select samples.
+            Self::Dense(_) => {
+                (text_len + 1).div_ceil(64) * 8
+                    + num_opens.div_ceil(64) * 8
+                    + (num_opens.div_ceil(64) + 1) * 4
+                    + num_opens.div_ceil(SELECT_SAMPLE_RATE) * 4
+            }
+        }
+    }
+
     /// Returns true if using compact storage.
-    #[cfg(test)]
     #[inline]
     pub fn is_compact(&self) -> bool {
         matches!(self, Self::Compact(_))
@@ -526,7 +544,6 @@ impl CompactEndPositions {
     }
 
     /// Returns the heap memory usage in bytes.
-    #[cfg(test)]
     pub fn heap_size(&self) -> usize {
         self.ib_words.len() * 8
             + self.ib_select_samples.len() * 4

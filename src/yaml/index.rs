@@ -72,6 +72,136 @@ pub struct YamlIndex<W = Vec<u64>> {
     lines: OnceCell<crate::text::LineIndex>,
 }
 
+/// Nominal per-entry overhead charged to `BTreeMap` storage.
+///
+/// `BTreeMap` allocates B-tree nodes holding up to 11 entries each, so the
+/// true per-entry cost depends on fill factor and is not observable from
+/// outside the map. This constant approximates the amortised node and edge
+/// overhead; anchor/alias maps are a rounding error next to the bitmaps, so
+/// the approximation does not affect any conclusion drawn from the totals.
+const BTREE_ENTRY_OVERHEAD: usize = 16;
+
+/// Approximate the heap cost of the anchor name → BP position map.
+fn anchor_map_bytes(map: &BTreeMap<String, usize>) -> usize {
+    map.keys()
+        .map(|name| {
+            name.len()
+                + core::mem::size_of::<String>()
+                + core::mem::size_of::<usize>()
+                + BTREE_ENTRY_OVERHEAD
+        })
+        .sum()
+}
+
+/// Approximate the heap cost of the BP position → anchor name map.
+fn reverse_anchor_map_bytes(map: &BTreeMap<usize, String>) -> usize {
+    map.values()
+        .map(|name| {
+            name.len()
+                + core::mem::size_of::<String>()
+                + core::mem::size_of::<usize>()
+                + BTREE_ENTRY_OVERHEAD
+        })
+        .sum()
+}
+
+/// Per-component memory accounting for a [`YamlIndex`].
+///
+/// Produced by [`YamlIndex::memory`]. All fields are byte counts.
+///
+/// # Accounting rules
+///
+/// - `inline` is `size_of::<YamlIndex<W>>()` — the struct's own footprint,
+///   which covers every `Vec`/`BTreeMap` header in one place. The remaining
+///   fields count *only* heap allocations, so nothing is double-counted.
+/// - `bp_words`, `ib`, `ty` and `containers` are backed by `W`. When `W`
+///   borrows (e.g. from an mmap) those bytes are not this index's allocation;
+///   the counts are reported regardless, since they are the structure's cost
+///   either way.
+/// - `newlines` is built lazily and reads as 0 until something calls
+///   `to_line_column()` / `to_offset()`. `newlines_materialized` disambiguates
+///   "not built" from "built and empty".
+/// - `anchors` merges the anchor, reverse-anchor and alias maps, and is
+///   approximate — see [`BTREE_ENTRY_OVERHEAD`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct YamlIndexMemory {
+    /// `size_of::<YamlIndex<W>>()`: all inline field headers.
+    pub inline: usize,
+    /// Interest-bits bitmap (one bit per text byte).
+    pub ib: usize,
+    /// Cumulative popcount over IB.
+    pub ib_rank: usize,
+    /// Balanced-parens bit vector.
+    pub bp_words: usize,
+    /// Balanced-parens auxiliary indices (min-excess, rank, select).
+    pub bp_index: usize,
+    /// Type bits (mapping vs sequence, one bit per container).
+    pub ty: usize,
+    /// Chosen encoding of BP open → text start position.
+    pub open_positions: usize,
+    /// Whether `open_positions` uses the compact encoding.
+    pub open_positions_compact: bool,
+    /// What the other `open_positions` encoding would have cost.
+    pub open_positions_alternative: usize,
+    /// Chosen encoding of BP open → text end position.
+    pub end_positions: usize,
+    /// Whether `end_positions` uses the compact encoding.
+    pub end_positions_compact: bool,
+    /// What the other `end_positions` encoding would have cost.
+    pub end_positions_alternative: usize,
+    /// Container markers (one bit per BP position).
+    pub containers: usize,
+    /// Cumulative popcount over containers.
+    pub containers_rank: usize,
+    /// Anchor, reverse-anchor and alias maps (approximate).
+    pub anchors: usize,
+    /// Lazily-built newline bitmap; 0 until first use.
+    pub newlines: usize,
+    /// Whether the newline bitmap has been materialized.
+    pub newlines_materialized: bool,
+    /// Length of the indexed text in bytes.
+    pub text_len: usize,
+    /// Number of BP opens (nodes).
+    pub num_opens: usize,
+}
+
+impl YamlIndexMemory {
+    /// Total index size in bytes, inline footprint included.
+    pub fn total(&self) -> usize {
+        self.inline
+            + self.ib
+            + self.ib_rank
+            + self.bp_words
+            + self.bp_index
+            + self.ty
+            + self.open_positions
+            + self.end_positions
+            + self.containers
+            + self.containers_rank
+            + self.anchors
+            + self.newlines
+    }
+
+    /// Total index size as a percentage of the indexed text length.
+    ///
+    /// Returns 0.0 for empty input.
+    pub fn percent_of_text(&self) -> f64 {
+        if self.text_len == 0 {
+            return 0.0;
+        }
+        self.total() as f64 * 100.0 / self.text_len as f64
+    }
+
+    /// Text bytes per BP open — the density that decides whether the compact
+    /// position encodings pay off. Returns 0.0 when there are no opens.
+    pub fn bytes_per_node(&self) -> f64 {
+        if self.num_opens == 0 {
+            return 0.0;
+        }
+        self.text_len as f64 / self.num_opens as f64
+    }
+}
+
 /// Build cumulative popcount index for IB.
 #[inline]
 fn build_ib_rank(words: &[u64]) -> Vec<u32> {
@@ -250,6 +380,44 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     #[inline]
     pub fn bp(&self) -> &BalancedParens<W, WithCsPoppy> {
         &self.bp
+    }
+
+    /// Break the index down into its per-component memory cost.
+    ///
+    /// This is the accounting entry point used by `succinctly dev bench
+    /// corpus-stats` to report measured index size. See [`YamlIndexMemory`]
+    /// for the exact accounting rules.
+    pub fn memory(&self) -> YamlIndexMemory {
+        let num_opens = self.open_positions.len();
+        let text_len = self.ib_len;
+
+        YamlIndexMemory {
+            inline: core::mem::size_of::<Self>(),
+            ib: self.ib.as_ref().len() * 8,
+            ib_rank: self.ib_rank.len() * 4,
+            bp_words: self.bp.words_bytes(),
+            bp_index: self.bp.index_heap_size(),
+            ty: self.ty.as_ref().len() * 8,
+            open_positions: self.open_positions.heap_size(),
+            open_positions_compact: self.open_positions.is_compact(),
+            open_positions_alternative: self
+                .open_positions
+                .alternative_heap_size(num_opens, text_len),
+            end_positions: self.bp_to_text_end.heap_size(),
+            end_positions_compact: self.bp_to_text_end.is_compact(),
+            end_positions_alternative: self
+                .bp_to_text_end
+                .alternative_heap_size(num_opens, text_len),
+            containers: self.containers.as_ref().len() * 8,
+            containers_rank: self.containers_rank.len() * 4,
+            anchors: anchor_map_bytes(&self.anchors)
+                + reverse_anchor_map_bytes(&self.bp_to_anchor)
+                + self.aliases.len() * (core::mem::size_of::<usize>() * 2 + BTREE_ENTRY_OVERHEAD),
+            newlines: self.newlines.get().map_or(0, |nl| nl.words().len() * 8),
+            newlines_materialized: self.newlines.get().is_some(),
+            text_len,
+            num_opens,
+        }
     }
 
     /// Get a reference to the type bits.
