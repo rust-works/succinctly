@@ -21,6 +21,7 @@ use indexmap::IndexMap;
 #[cfg(test)]
 use std::borrow::Cow;
 
+use crate::json::escape::{write_quoted, EscapeStyle};
 use crate::json::light::{JsonCursor, StandardJson};
 
 use super::expr::Literal;
@@ -492,16 +493,12 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                     if i > 0 {
                         out.write_char(',')?;
                     }
-                    // Write key
-                    out.write_char('"')?;
-                    for c in k.chars() {
-                        match c {
-                            '"' => out.write_str("\\\"")?,
-                            '\\' => out.write_str("\\\\")?,
-                            c => out.write_char(c)?,
-                        }
-                    }
-                    out.write_str("\":")?;
+                    // Keys are escaped exactly like string values. The hand-written
+                    // loop this replaces handled only `"` and `\`, so a key
+                    // containing a newline, tab, or NUL was emitted raw and the
+                    // whole document became invalid JSON (#91).
+                    write_quoted(out, k, EscapeStyle::Jq, false)?;
+                    out.write_char(':')?;
                     v.write_json(out)?;
                 }
                 out.write_char('}')
@@ -813,5 +810,44 @@ mod tests {
     fn test_jqvalue_float_json() {
         let f: JqValue<'_, Vec<u64>> = JqValue::Float(2.5);
         assert_eq!(f.to_json_string(), "2.5");
+    }
+
+    /// Object keys must be escaped exactly like string values (#91).
+    ///
+    /// The key writer used to handle only `"` and `\`, so a key holding a
+    /// newline, tab, or NUL was emitted as a raw byte inside a quoted string and
+    /// the document stopped being JSON at all. `write_json` has no caller outside
+    /// this module, so this test is the only thing standing between that bug and
+    /// its return.
+    #[test]
+    fn test_jqvalue_object_key_control_chars_are_escaped() {
+        let obj: JqValue<'_, Vec<u64>> = JqValue::object([
+            ("line\nbreak".to_string(), JqValue::Int(1)),
+            ("tab\there".to_string(), JqValue::Int(2)),
+            ("nul\0byte".to_string(), JqValue::Int(3)),
+            ("quote\"and\\slash".to_string(), JqValue::Int(4)),
+            ("back\u{8}space".to_string(), JqValue::Int(5)),
+        ]);
+        let json = obj.to_json_string();
+
+        // No raw control byte may survive into the output.
+        assert!(
+            !json.bytes().any(|b| b < 0x20),
+            "raw control byte in object key output: {json:?}"
+        );
+
+        // And the result must actually parse back to the same keys.
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .unwrap_or_else(|e| panic!("object key output is not valid JSON: {json:?}: {e}"));
+        let map = parsed.as_object().expect("object");
+        for key in [
+            "line\nbreak",
+            "tab\there",
+            "nul\0byte",
+            "quote\"and\\slash",
+            "back\u{8}space",
+        ] {
+            assert!(map.contains_key(key), "key {key:?} lost in {json:?}");
+        }
     }
 }
