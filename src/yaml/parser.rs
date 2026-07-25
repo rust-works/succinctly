@@ -682,6 +682,27 @@ impl<'a> Parser<'a> {
         false
     }
 
+    /// Check whether an anchor at the current position prefixes a mapping entry
+    /// rather than the anchored node itself, as in `&a k: v`. In that shape the
+    /// anchor binds to the *key*, so the caller must leave it for the mapping
+    /// parser instead of consuming it (see `parse_mapping_entry`, which records
+    /// the key's own BP position).
+    ///
+    /// Assumes `self.peek() == Some(b'&')`. Restores `self.pos` before returning.
+    fn anchor_prefixes_mapping_entry(&mut self) -> bool {
+        let saved_pos = self.pos;
+        // Skip `&` and the anchor name. Deliberately uses the scanner rather
+        // than `parse_anchor_name`, which errors on an empty name and would turn
+        // this speculative lookahead into a hard parse failure on `- & x: y`.
+        self.pos = super::simd::parse_anchor_name(self.input, self.pos + 1);
+        self.skip_inline_whitespace();
+        // `looks_like_mapping_entry` does not stop at `#`, so a trailing comment
+        // containing `: ` would otherwise read as a mapping entry.
+        let result = !self.at_line_end() && self.looks_like_mapping_entry();
+        self.pos = saved_pos;
+        result
+    }
+
     /// Skip to end of line (handles comments).
     ///
     /// Stops *before* the line break, whichever of the three forms it is, so
@@ -3505,42 +3526,7 @@ impl<'a> Parser<'a> {
                 self.close_deeper_indents(indent);
 
                 // Look ahead to see if this is `&anchor key:` pattern
-                let is_anchor_on_mapping_key = {
-                    let saved_pos = self.pos;
-                    // Skip `&`
-                    self.advance();
-                    // Skip anchor name
-                    while let Some(b) = self.peek() {
-                        match b {
-                            b' ' | b'\t' | b'\n' | b'\r' | b'[' | b']' | b'{' | b'}' | b',' => {
-                                break
-                            }
-                            b':' => {
-                                if let Some(next) = self.peek_at(1) {
-                                    if next == b' '
-                                        || next == b'\t'
-                                        || next == b'\n'
-                                        || next == b'\r'
-                                    {
-                                        break;
-                                    }
-                                }
-                                self.advance();
-                            }
-                            _ => self.advance(),
-                        }
-                    }
-                    // Skip whitespace after anchor
-                    while self.peek() == Some(b' ') || self.peek() == Some(b'\t') {
-                        self.advance();
-                    }
-                    // Check if what follows looks like a mapping entry
-                    let result = self.looks_like_mapping_entry();
-                    self.pos = saved_pos;
-                    result
-                };
-
-                if is_anchor_on_mapping_key {
+                if self.anchor_prefixes_mapping_entry() {
                     // Let parse_mapping_entry handle the anchor
                     self.parse_mapping_entry(indent)?;
                 } else {
