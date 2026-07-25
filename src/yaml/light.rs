@@ -16,7 +16,7 @@ use std::string::ToString;
 
 use super::index::YamlIndex;
 use super::scalar::{could_be_null_or_bool, resolve_plain, ResolvedScalar};
-use crate::util::simd::escape::find_json_escape;
+use crate::json::escape::{write_quoted, EscapeStyle};
 
 // ============================================================================
 // YamlCursor: Position in the YAML structure
@@ -1868,55 +1868,16 @@ fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlVal
 
 /// Write a string with JSON escaping.
 ///
-/// Uses a fast path for ASCII-only strings without special characters,
-/// which is the common case for YAML data.
+/// Delegates to the shared escaper (#91), which SIMD-scans for escapable bytes
+/// and bulk-copies the safe spans between them. yq's convention: DEL and the C1
+/// controls stay raw, and backspace/form-feed use the long `\u00xx` form.
 ///
-/// Uses SIMD (NEON on ARM64) to scan for escapable characters in 16-byte chunks,
-/// with automatic scalar fallback for short strings and remainders.
+/// Replaces a hand-rolled loop whose final match arm silently *dropped* a byte if
+/// the scanner ever returned a non-special index — unreachable in practice, but a
+/// data-loss failure mode rather than a loud one.
 fn write_json_string(output: &mut String, s: &str) {
-    output.push('"');
-
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        // Find the next byte that needs escaping using SIMD
-        // The SIMD function handles short strings internally with scalar fallback
-        let escape_pos = find_json_escape(bytes, i);
-
-        // Copy the safe span directly
-        if i < escape_pos {
-            // SAFETY: We're copying valid UTF-8 bytes that don't contain
-            // any multi-byte sequence starters that would be split
-            output.push_str(&s[i..escape_pos]);
-        }
-
-        i = escape_pos;
-
-        // Handle the escape character if any
-        if i < len {
-            let b = bytes[i];
-            match b {
-                b'"' => output.push_str("\\\""),
-                b'\\' => output.push_str("\\\\"),
-                b'\n' => output.push_str("\\n"),
-                b'\r' => output.push_str("\\r"),
-                b'\t' => output.push_str("\\t"),
-                b if b < 0x20 => {
-                    // Control character - use \uXXXX
-                    output.push_str("\\u00");
-                    const HEX: &[u8; 16] = b"0123456789abcdef";
-                    output.push(HEX[(b >> 4) as usize] as char);
-                    output.push(HEX[(b & 0xf) as usize] as char);
-                }
-                _ => {} // Not an escape character (shouldn't happen)
-            }
-            i += 1;
-        }
-    }
-
-    output.push('"');
+    // Writing into a String is infallible.
+    let _ = write_quoted(output, s, EscapeStyle::Yq, false);
 }
 
 // ============================================================================
@@ -2503,47 +2464,14 @@ fn stream_yaml_value_as_json<W: AsRef<[u64]>, Out: core::fmt::Write>(
 }
 
 /// Stream a string with JSON escaping.
+///
+/// Delegates to the shared escaper (#91). This previously hand-rolled a scalar
+/// byte loop over exactly the `find_json_escape` predicate, so the M2 streaming
+/// path — the hot one for `yq '.'` — was the only JSON string writer in the crate
+/// still scanning one byte at a time.
+#[inline]
 fn stream_json_string<Out: core::fmt::Write>(out: &mut Out, s: &str) -> core::fmt::Result {
-    out.write_char('"')?;
-
-    let bytes = s.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        let start = i;
-        while i < bytes.len() {
-            let b = bytes[i];
-            if b == b'"' || b == b'\\' || b < 0x20 {
-                break;
-            }
-            i += 1;
-        }
-
-        if start < i {
-            out.write_str(&s[start..i])?;
-        }
-
-        if i < bytes.len() {
-            let b = bytes[i];
-            match b {
-                b'"' => out.write_str("\\\"")?,
-                b'\\' => out.write_str("\\\\")?,
-                b'\n' => out.write_str("\\n")?,
-                b'\r' => out.write_str("\\r")?,
-                b'\t' => out.write_str("\\t")?,
-                b if b < 0x20 => {
-                    out.write_str("\\u00")?;
-                    const HEX: &[u8; 16] = b"0123456789abcdef";
-                    out.write_char(HEX[(b >> 4) as usize] as char)?;
-                    out.write_char(HEX[(b & 0xf) as usize] as char)?;
-                }
-                _ => unreachable!(),
-            }
-            i += 1;
-        }
-    }
-
-    out.write_char('"')
+    write_quoted(out, s, EscapeStyle::Yq, false)
 }
 
 /// Stream a JSON character escape sequence.
@@ -5359,6 +5287,32 @@ mod tests {
         }
     }
 
+    /// A JSON string literal, escaped per-char with yq's rules.
+    ///
+    /// Deliberately independent of `crate::json::escape` so the decoder-agreement
+    /// test below has a real oracle: all of this file's JSON string output routes
+    /// through the shared escaper since #91, and a test that used it to build its
+    /// own expected value would compare that escaper against itself.
+    #[cfg(test)]
+    fn independently_escaped(s: &str) -> String {
+        let mut out = String::from("\"");
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
     /// Issue #222: quoted-string line folding must drop trailing *literal*
     /// whitespace before a literal line break while preserving *escaped*
     /// whitespace as content, and all three decoders — `as_str` (DOM),
@@ -5420,15 +5374,18 @@ mod tests {
                 other => panic!("expected string document, got {other:?}"),
             }
 
-            // String twin vs stream twin vs independently escaped expected
+            // String twin vs stream twin vs independently escaped expected.
+            //
+            // `expected_json` must NOT be built with `write_json_string`: since
+            // #91 both twins delegate to it, so using it here would compare the
+            // shared escaper against itself and assert nothing about the output.
             let json = index.root(yaml).to_json_document();
             let mut streamed = String::new();
             index
                 .root(yaml)
                 .stream_json_document(&mut streamed)
                 .unwrap();
-            let mut expected_json = String::new();
-            write_json_string(&mut expected_json, expected);
+            let expected_json = independently_escaped(expected);
             assert_eq!(
                 json,
                 expected_json,
