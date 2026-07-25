@@ -1324,4 +1324,43 @@ mod tests {
             );
         }
     }
+    /// Every BP open must have a recoverable text position, including the
+    /// null-value sentinel a valueless explicit key records at `input.len()`
+    /// (#56).
+    ///
+    /// The compact open-position encoding sized its interest-bit bitmap from
+    /// the text length, but that sentinel sits *at* the text length. When the
+    /// document length was an exact multiple of 64 the position fell one word
+    /// past the bitmap, so the IB bit was dropped while the matching advance
+    /// bit was still written. The two bitmaps desynchronised and the sentinel
+    /// became unrecoverable — `get()` returned `None` for a node that exists.
+    #[test]
+    fn test_open_positions_recoverable_at_64_byte_boundary() {
+        for multiple in 1..=3usize {
+            let target = 64 * multiple;
+            let filler = target - "# \n? k\n".len();
+            let yaml = format!("# {}\n? k\n", "x".repeat(filler));
+            assert_eq!(yaml.len(), target, "input must be a multiple of 64");
+
+            let index = YamlIndex::build(yaml.as_bytes()).unwrap();
+            let open_positions = index.open_positions();
+
+            for i in 0..open_positions.len() {
+                assert!(
+                    open_positions.get(i).is_some(),
+                    "open {i} of {} has no text position at length {target}",
+                    open_positions.len()
+                );
+            }
+
+            // The sentinel is the last open and sits exactly at input.len().
+            let last = open_positions.len() - 1;
+            assert_eq!(
+                open_positions.get(last),
+                Some(target as u32),
+                "null sentinel must be recorded at input.len() = {target}"
+            );
+        }
+    }
+
 }

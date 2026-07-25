@@ -265,8 +265,18 @@ impl AdvancePositions {
 
         let num_opens = positions.len();
 
-        // Build IB: set bit at each unique position
-        let ib_num_words = text_len.div_ceil(64);
+        // Build IB: set bit at each unique position.
+        //
+        // Sized `text_len + 1`, not `text_len`: an open position can legally
+        // equal `text_len`. `close_pending_explicit_key` emits a null-value
+        // node at `input.len()` for a valueless explicit key. Without the
+        // extra bit, a document whose length is a multiple of 64 would push
+        // that position into word `ib_words.len()`, so the guard below would
+        // skip the IB bit while the advance bit was still set — leaving
+        // `ib_ones` one short, `get()` returning `None`, and `value()`
+        // reporting an error instead of `Null`. `CompactEndPositions` has
+        // always sized this way for the same reason.
+        let ib_num_words = (text_len + 1).div_ceil(64);
         let mut ib_words = vec![0u64; ib_num_words];
 
         // Build advance bitmap: set bit when position changes
@@ -1169,6 +1179,30 @@ mod tests {
         for _ in 0..20_000 {
             let i = rng.random_range(0..positions.len());
             assert_eq!(ap.get(i), Some(positions[i]), "random access i={i}");
+        }
+    }
+
+    /// An open position may equal `text_len`: `close_pending_explicit_key`
+    /// records a null-value node at `input.len()`. When the text length is an
+    /// exact multiple of 64 that position lands in the word just past a
+    /// `text_len`-sized IB bitmap, so the IB bit used to be dropped while the
+    /// advance bit was still set — desynchronising the two and making `get()`
+    /// return `None` for a node that exists. `CompactEndPositions` guards this
+    /// with `test_end_position_at_text_len_multiple_of_64`; this is the
+    /// open-position half of the same bug.
+    #[test]
+    fn test_open_position_at_text_len_multiple_of_64() {
+        for text_len in [64usize, 128, 192] {
+            let positions = vec![0, 4, text_len as u32];
+            let ap = AdvancePositions::build_unchecked(&positions, text_len);
+
+            assert_eq!(ap.get(0), Some(0), "text_len={text_len}");
+            assert_eq!(ap.get(1), Some(4), "text_len={text_len}");
+            assert_eq!(
+                ap.get(2),
+                Some(text_len as u32),
+                "null sentinel at text_len={text_len} must be recoverable"
+            );
         }
     }
 }
