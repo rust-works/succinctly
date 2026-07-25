@@ -167,6 +167,17 @@ struct Parser<'a> {
     /// Current depth of recursively-parsed constructs, capped at
     /// [`MAX_NESTING_DEPTH`] to bound call-stack growth
     nesting_depth: usize,
+
+    /// One flag per `bp_to_text_end` slot, set for block sequence-item wrapper nodes.
+    ///
+    /// `YamlCursor::value` tells a childless wrapper from a plain scalar that merely
+    /// begins `- ` by whether an end position was recorded (#332). That rests on the
+    /// parser *never* recording one for a wrapper — an invariant the code held only by
+    /// accident of left-to-right parsing, whose failure mode is silent: `- a` would
+    /// start decoding as the string `"- a"`. Debug builds assert it in
+    /// [`Self::set_bp_text_end`]; release builds carry nothing.
+    #[cfg(debug_assertions)]
+    wrapper_slots: Vec<bool>,
 }
 
 impl<'a> Parser<'a> {
@@ -202,6 +213,8 @@ impl<'a> Parser<'a> {
             in_document: false,
             pending_explicit_key: false,
             nesting_depth: 0,
+            #[cfg(debug_assertions)]
+            wrapper_slots: Vec::with_capacity(estimated_opens),
         }
     }
 
@@ -275,13 +288,44 @@ impl<'a> Parser<'a> {
         self.bp_to_text.push(text_pos as u32);
         // Placeholder for end position (will be set by set_bp_text_end for scalars)
         self.bp_to_text_end.push(0);
+        #[cfg(debug_assertions)]
+        self.wrapper_slots.push(false);
         self.bp_pos += 1;
+    }
+
+    /// Open a block sequence-item wrapper node.
+    ///
+    /// Distinct from [`Self::write_bp_open`] only in debug builds, where it records the
+    /// slot so [`Self::set_bp_text_end`] can assert no end is ever stored for it — the
+    /// invariant `YamlCursor::value` relies on to tell an empty item from a plain scalar
+    /// beginning `- ` (#332).
+    #[inline]
+    fn write_bp_open_seq_item(&mut self) {
+        self.write_bp_open();
+        #[cfg(debug_assertions)]
+        if let Some(last) = self.wrapper_slots.last_mut() {
+            *last = true;
+        }
     }
 
     /// Set the end text position for the most recently opened BP node.
     /// Call this before write_bp_close for scalar nodes.
+    ///
+    /// "Most recently opened" means the last slot *pushed*, not the node the caller is
+    /// about to close. If the content just parsed opened BP nodes of its own — a nested
+    /// flow container, an alias — this writes the innermost of those instead, corrupting
+    /// its extent (#332). Such nodes need no end anyway: `value()` recognises them from
+    /// their leading `[`, `{` or `*`. So don't call this after them.
     #[inline]
     fn set_bp_text_end(&mut self, end_pos: usize) {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            self.wrapper_slots.last() != Some(&true),
+            "recorded an end position for a block sequence-item wrapper at text {}; \
+             YamlCursor::value would decode it as the plain scalar `- …` instead of \
+             unwrapping to its content (#332)",
+            self.bp_to_text.last().copied().unwrap_or_default()
+        );
         if let Some(last) = self.bp_to_text_end.last_mut() {
             *last = end_pos as u32;
         }
@@ -1297,7 +1341,7 @@ impl<'a> Parser<'a> {
         }
 
         // Open the sequence item node
-        self.write_bp_open();
+        self.write_bp_open_seq_item();
 
         // Skip `- `
         self.advance(); // -
@@ -1940,7 +1984,7 @@ impl<'a> Parser<'a> {
                 self.push_type(NodeType::Sequence);
 
                 // Parse first sequence item inline
-                self.write_bp_open(); // item node
+                self.write_bp_open_seq_item(); // item node
                 self.advance(); // skip `-`
                 self.skip_inline_whitespace();
 
@@ -2045,7 +2089,9 @@ impl<'a> Parser<'a> {
                 // Sequence as value. Routed through the shared sequence-item
                 // parser rather than an inlined copy of its dispatch, so anchor
                 // handling (#328) and every future fix land here too — this was
-                // the third divergent copy of this decision (#106).
+                // the third divergent copy of this decision (#106). That shared
+                // parser opens the item wrapper via `write_bp_open_seq_item`, so
+                // the #332 wrapper-end invariant is enforced here too.
                 self.parse_sequence_item(self.current_column())?;
             }
             Some(b'[') => {
@@ -2305,27 +2351,29 @@ impl<'a> Parser<'a> {
         // Parse key - can be scalar, quoted, flow mapping, or flow sequence
         self.set_ib();
         self.write_bp_open();
-        let key_end = match self.peek() {
+        match self.peek() {
+            // Nested flow containers open their own BP nodes and need no end of their
+            // own; recording one here would clobber the innermost of them (#332).
             Some(b'{') => {
                 self.parse_flow_mapping()?;
-                self.pos
             }
             Some(b'[') => {
                 self.parse_flow_sequence()?;
-                self.pos
             }
             Some(b':') => {
                 // Empty key (null) - ?: means null key
                 // Don't consume anything, write empty node
-                self.pos
+                self.set_bp_text_end(self.pos);
             }
             Some(b',' | b']' | b'}') => {
                 // Empty key (null) - ? followed by terminator
-                self.pos
+                self.set_bp_text_end(self.pos);
             }
-            _ => self.parse_explicit_flow_key_scalar()?,
-        };
-        self.set_bp_text_end(key_end);
+            _ => {
+                let key_end = self.parse_explicit_flow_key_scalar()?;
+                self.set_bp_text_end(key_end);
+            }
+        }
         self.write_bp_close();
 
         // Skip whitespace before possible colon
@@ -2341,13 +2389,12 @@ impl<'a> Parser<'a> {
                 self.set_ib();
                 self.write_bp_open();
                 match self.peek() {
+                    // Nested flow containers need no end of their own (#332)
                     Some(b'[') => {
                         self.parse_flow_sequence()?;
-                        self.set_bp_text_end(self.pos);
                     }
                     Some(b'{') => {
                         self.parse_flow_mapping()?;
-                        self.set_bp_text_end(self.pos);
                     }
                     _ => {
                         let end = self.parse_flow_scalar()?;
@@ -2386,18 +2433,19 @@ impl<'a> Parser<'a> {
         // Parse key - can be scalar, quoted, flow mapping, or flow sequence
         self.set_ib();
         self.write_bp_open();
-        let key_end = match self.peek() {
+        match self.peek() {
+            // Nested flow containers need no end of their own (#332)
             Some(b'{') => {
                 self.parse_flow_mapping()?;
-                self.pos
             }
             Some(b'[') => {
                 self.parse_flow_sequence()?;
-                self.pos
             }
-            _ => self.parse_flow_key_scalar()?,
-        };
-        self.set_bp_text_end(key_end);
+            _ => {
+                let key_end = self.parse_flow_key_scalar()?;
+                self.set_bp_text_end(key_end);
+            }
+        }
         self.write_bp_close();
 
         // Skip whitespace before colon
@@ -2418,18 +2466,19 @@ impl<'a> Parser<'a> {
         if !matches!(self.peek(), Some(b',' | b']' | b'}') | None) {
             self.set_ib();
             self.write_bp_open();
-            let val_end = match self.peek() {
+            match self.peek() {
+                // Nested flow containers need no end of their own (#332)
                 Some(b'[') => {
                     self.parse_flow_sequence()?;
-                    self.pos
                 }
                 Some(b'{') => {
                     self.parse_flow_mapping()?;
-                    self.pos
                 }
-                _ => self.parse_flow_scalar()?,
-            };
-            self.set_bp_text_end(val_end);
+                _ => {
+                    let val_end = self.parse_flow_scalar()?;
+                    self.set_bp_text_end(val_end);
+                }
+            }
             self.write_bp_close();
         } else {
             // Empty value (null)
@@ -2597,8 +2646,12 @@ impl<'a> Parser<'a> {
             // Parse key
             self.set_ib();
             self.write_bp_open();
-            self.parse_flow_key()?;
-            self.set_bp_text_end(self.pos);
+            // A complex key (nested flow container) or an alias opened its own BP nodes
+            // and carries its own end; recording one here would clobber the innermost of
+            // them (#332).
+            if !self.parse_flow_key()? {
+                self.set_bp_text_end(self.pos);
+            }
             self.write_bp_close();
 
             self.skip_flow_whitespace();
@@ -2669,7 +2722,11 @@ impl<'a> Parser<'a> {
 
     /// Parse a key in flow context.
     /// Keys can be scalars, flow sequences, or flow mappings (complex keys).
-    fn parse_flow_key(&mut self) -> Result<(), YamlError> {
+    ///
+    /// Returns `true` when the key opened BP nodes of its own — a nested flow container,
+    /// or an alias. The caller must **not** record an end position in that case — see
+    /// [`Self::set_bp_text_end`].
+    fn parse_flow_key(&mut self) -> Result<bool, YamlError> {
         // Check for anchor on key. The caller already opened the key's BP node,
         // so this records `bp_pos - 1`; using `parse_anchor` here bound the
         // anchor to the key's close bit, and aliases to it resolved to the
@@ -2694,9 +2751,11 @@ impl<'a> Parser<'a> {
                 }
                 Some(b'[') => {
                     self.parse_flow_sequence()?;
+                    return Ok(true);
                 }
                 Some(b'{') => {
                     self.parse_flow_mapping()?;
+                    return Ok(true);
                 }
                 Some(b':' | b',' | b'}') => {
                     // Empty key (null) - don't consume anything
@@ -2705,7 +2764,7 @@ impl<'a> Parser<'a> {
                     self.parse_explicit_flow_unquoted_key()?;
                 }
             }
-            return Ok(());
+            return Ok(false);
         }
 
         match self.peek() {
@@ -2718,20 +2777,24 @@ impl<'a> Parser<'a> {
             Some(b'[') => {
                 // Flow sequence as key (complex key)
                 self.parse_flow_sequence()?;
+                return Ok(true);
             }
             Some(b'{') => {
                 // Flow mapping as key (complex key)
                 self.parse_flow_mapping()?;
+                return Ok(true);
             }
             Some(b'*') => {
-                // Alias as key
+                // Alias as key — `parse_alias` opens and closes its own node, and
+                // records its own end
                 self.parse_alias()?;
+                return Ok(true);
             }
             _ => {
                 self.parse_flow_unquoted_key()?;
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Parse an unquoted key in flow context.
