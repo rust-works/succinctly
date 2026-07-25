@@ -31,12 +31,14 @@
 //! - **Tags (`!!str`, `!custom`)** — rejected outright in block context; a
 //!   documented non-support in `src/yaml/mod.rs`.
 //! - **`- &anchor` immediately followed by a collection** — mis-parsed today:
-//!   `- &m\n    k: v` yields `["k"]` rather than `[{"k": "v"}]`. The `anchors`
-//!   pattern anchors mapping *values* and scalar sequence items instead.
+//!   `- &m\n    k: v` yields `["k"]` rather than `[{"k": "v"}]` (#328). The
+//!   `anchors` pattern anchors mapping *values* and scalar sequence items
+//!   instead.
 //! - **Blank lines inside a *folded* block scalar** — succinctly emits one
 //!   newline too many per blank line (`fold: >` over `a`, blank, `b` yields
-//!   `"a\n\nb\n"`; yq and the spec fold it to `"a\nb\n"`). The `block-scalars`
-//!   pattern puts blank lines in literal blocks only, where the two agree.
+//!   `"a\n\nb\n"`; yq and the spec fold it to `"a\nb\n"`) (#329). The
+//!   `block-scalars` pattern puts blank lines in literal blocks only, where the
+//!   two agree.
 //!
 //! # Why this file exists in this shape (#327)
 //!
