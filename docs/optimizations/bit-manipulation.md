@@ -266,6 +266,46 @@ fn rotate_left(x: u64, n: u32) -> u64 {
 
 ---
 
+## Broadword ASCII Skipping
+
+UTF-8 validation clears runs of ASCII with a single high-bit test rather than
+inspecting each byte, which is the whole reason
+[`text/utf8/broadword.rs`](../../src/text/utf8/broadword.rs) exists:
+
+```rust
+const HI: u64 = 0x8080_8080_8080_8080;
+
+// All eight bytes are ASCII iff no byte has its high bit set.
+if u64::from_ne_bytes(chunk) & HI == 0 {
+    pos += 8;
+}
+```
+
+Two details make it work in practice:
+
+**Width matters more than the test.** Eight bytes per test beats a byte-at-a-time
+loop several times over, but four words OR-ed together before one test — 32 bytes
+— is what closes the gap to `core::str::from_utf8`, which tests sixteen. On an
+M4 Pro that step took pure-ASCII throughput from 14.9 to 57.2 GiB/s.
+
+**Locating the first non-ASCII byte** uses CTZ on the masked word. Memory byte
+`k` has its high bit at `8k + 7` on a little-endian host, so `(8k + 7) >> 3 == k`:
+
+```rust
+fn first_high_byte_le(hi: u64) -> usize { (hi.trailing_zeros() >> 3) as usize }
+fn first_high_byte_be(hi: u64) -> usize { (hi.leading_zeros()  >> 3) as usize }
+```
+
+Guard the load on the current byte already being ASCII. Attempting the skip
+unconditionally costs a wasted load and test on every sequence of multi-byte-heavy
+text, which measured as a 2.7x regression against the scalar validator on emoji.
+
+See [utf8-validate.md](../benchmarks/utf8-validate.md#engine-comparison-134) for
+the full engine comparison, including why a table-driven DFA lost to
+whole-sequence validation for the multi-byte step.
+
+---
+
 ## Usage in Succinctly
 
 | Technique      | Location                     | Purpose                           |
@@ -275,6 +315,8 @@ fn rotate_left(x: u64, n: u32) -> u64 {
 | Bit clearing   | `util/broadword.rs`          | Set bit iteration                 |
 | PDEP toggle    | `util/simd/x86.rs`           | Quote region masking (10x faster) |
 | Broadword      | `bits/popcount.rs`           | Portable popcount fallback        |
+| High-bit test  | `text/utf8/broadword.rs`     | ASCII run skipping (2.0x UTF-8)   |
+| CTZ >> 3       | `text/utf8/broadword.rs`     | First non-ASCII byte in a word    |
 
 ---
 
@@ -284,6 +326,7 @@ fn rotate_left(x: u64, n: u32) -> u64 {
 2. **Profile before optimizing**: CTZ loop often beats "optimal" broadword due to branch prediction
 3. **Know your instructions**: PDEP is for sparse patterns, not consecutive bits
 4. **Bit clearing idiom**: `x &= x - 1` is fundamental for iteration
+5. **Shorten the loop-carried chain, not the table**: a compact DFA table still serializes one byte per `state -> step -> state` hop; independent range comparisons retire a whole sequence per iteration and won UTF-8 validation by 26%
 
 ---
 

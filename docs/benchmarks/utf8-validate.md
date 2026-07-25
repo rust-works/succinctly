@@ -1,6 +1,6 @@
 # UTF-8 Validation Benchmarks
 
-Benchmarks for `succinctly text validate utf8`, which validates UTF-8 with two
+Benchmarks for `succinctly text validate utf8`, which validates UTF-8 with three
 interchangeable engines:
 
 - **AVX2 SIMD** (x86_64, default) — a first-principles port of the Keiser–Lemire
@@ -9,34 +9,127 @@ interchangeable engines:
   fast accept scan that falls back to the scalar validator for the exact error
   position, so diagnostics are byte-identical either way. Selected at runtime via
   `is_x86_feature_detected!("avx2")`.
-- **Scalar** — the portable validator, used on non-x86_64 targets, on x86_64 CPUs
-  without AVX2, and whenever `--no-simd` is passed. Multi-byte sequences are
-  checked one character at a time; runs of ASCII are skipped eight bytes at a time
-  with a broadword (SWAR) test (`word & 0x8080_8080_8080_8080 == 0`), and
-  line/column for an error are derived from its byte offset rather than tracked
-  per byte (#133). This is the **only** path on ARM64 and in `no_std` builds.
+- **Broadword (SWAR)** (default everywhere else) — a portable accept scan that
+  clears ASCII in 32- and 8-byte strides with ordinary 64-bit arithmetic, then
+  validates each multi-byte sequence with independent range comparisons. No
+  intrinsics and no feature detection, so it also serves `no_std` builds and
+  pre-AVX2 x86_64. Added by #134.
+- **Scalar** — the portable byte-by-byte validator. It remains the reference
+  implementation and the sole producer of `Utf8Error`: both accept scans re-run
+  it on rejection. Selected directly by `--no-simd`.
 
-`benches/utf8_validate_bench.rs` reports a `scalar` and a `simd` arm per input so
-the two compare directly (`cargo bench --bench utf8_validate_bench`). Its
+`benches/utf8_validate_bench.rs` reports a `std`, `scalar`, `broadword` and (on
+x86_64) `simd` arm per input (`cargo bench --bench utf8_validate_bench`). The
+`std` arm calls `core::str::from_utf8` and exists to keep the hand-written
+kernels honest — see [Engine comparison](#engine-comparison-134). Its
 `utf8_corpus` group validates the real-workload corpus (#301): the fully synced
 `data/bench/corpus/` when present, otherwise the always-committed seed under
-`tests/data/bench-corpus/seed/`.
+`tests/data/bench-corpus/seed/`. `succinctly dev bench utf8 --engine
+<auto|scalar|broadword|std>` runs the same per-engine comparison over the
+realistic generated corpus.
 
-> **⚠️ SIMD figures not yet measured.** Every table below is the **scalar** engine
-> only. AVX2 throughput must be measured on an AVX2-capable x86_64 host (CI's x86_64
-> leg or the 7950X bench box) and — per the perf-cluster convention shared with #134
-> (broadword + DFA) — gated on the #301 real-workload corpus before being cited.
-> JSON-validation experience suggests several GiB/s, with the largest wins on
-> ASCII-heavy and mixed content.
+> **⚠️ Mixed vintage — read the per-platform dates.** The **Apple M4 Pro** section
+> below was re-measured on 2026-07-25 and reflects the #133 broadword ASCII fast
+> path. The **AMD Ryzen 9 7950X** and **Apple M1 Max** sections still hold
+> pre-#133 figures captured on a pre-rebase branch tip whose commits were
+> orphaned by a rebase, so their **Commit** references no longer resolve; they
+> are scalar-only, produced by the Criterion synthetic generators, and must be
+> re-measured before being cited as authoritative. Do **not** compare an M4 Pro
+> row against a 7950X or M1 Max row — they are different code. The
+> [Engine comparison](#engine-comparison-134) section immediately below is
+> freshly measured across both platforms and supersedes all three per-platform
+> sections for engine-selection purposes.
 
-> **⚠️ Mixed vintage — read the per-platform dates.** The **Apple M4 Pro** section was
-> re-measured on 2026-07-25 and reflects the #133 broadword ASCII fast path. The
-> **AMD Ryzen 9 7950X** and **Apple M1 Max** sections still hold pre-#133 figures
-> captured on a pre-rebase branch tip whose commits were orphaned by a rebase, so
-> their **Commit** references no longer resolve; they are byte-per-byte slower than
-> what the current scalar validator achieves and must be re-measured before being
-> cited as authoritative. Do **not** compare an M4 Pro row against a 7950X or M1 Max
-> row — they are different code.
+## Engine comparison (#134)
+
+Measured with `succinctly dev bench utf8`, which times each engine over the
+eleven realistic patterns produced by `succinctly text generate-suite` rather
+than the synthetic Criterion generators. 10MB files, median of 7 runs after 2
+warmups, one machine at a time.
+
+Throughput in GiB/s; the final column is broadword against the scalar validator.
+
+### Apple M4 Pro (aarch64)
+
+Broadword is what `validate_utf8` dispatches to here — there is no NEON kernel,
+so before #134 this platform ran the scalar validator.
+
+| Pattern            |     scalar |        std |  broadword | vs scalar |
+|--------------------|------------|------------|------------|-----------|
+| ascii              |       1.81 |      51.51 |      57.25 |    31.70x |
+| source_code        |       1.62 |       4.83 |       4.68 |     2.89x |
+| log_file           |       1.72 |       9.25 |      11.03 |     6.42x |
+| json_like          |       1.57 |       3.48 |       3.66 |     2.33x |
+| mixed              |       1.58 |       2.21 |       2.51 |     1.59x |
+| latin              |       0.77 |       0.78 |       1.48 |     1.92x |
+| all_lengths        |       0.44 |       0.38 |       0.44 |     1.00x |
+| greek_cyrillic     |       1.23 |       1.16 |       1.02 |     0.83x |
+| cjk                |       1.50 |       1.28 |       1.12 |     0.75x |
+| emoji              |       1.01 |       0.88 |       0.83 |     0.83x |
+| pathological       |       2.88 |       2.92 |       2.92 |     1.01x |
+| **geometric mean** |      1.00x |      1.86x |      2.01x |           |
+
+### AMD Ryzen 9 7950X (x86_64)
+
+AVX2 remains the dispatch target here, so #134 changes nothing for this platform
+in practice; the broadword column is what a pre-AVX2 or `no_std` x86_64 build
+would get.
+
+| Pattern            |     scalar |        std |  broadword |       AVX2 | vs scalar |
+|--------------------|------------|------------|------------|------------|-----------|
+| ascii              |       2.21 |      80.10 |      71.59 |      14.17 |    32.41x |
+| source_code        |       1.97 |       4.99 |       5.36 |      14.15 |     2.72x |
+| log_file           |       2.11 |      10.58 |      11.74 |      13.97 |     5.56x |
+| json_like          |       1.91 |       3.65 |       4.30 |      14.05 |     2.25x |
+| mixed              |       1.80 |       2.20 |       3.13 |      14.04 |     1.74x |
+| latin              |       0.84 |       0.86 |       1.84 |      14.08 |     2.18x |
+| all_lengths        |       0.49 |       0.47 |       0.52 |      14.02 |     1.07x |
+| greek_cyrillic     |       1.29 |       1.29 |       1.18 |      14.09 |     0.91x |
+| cjk                |       1.62 |       1.38 |       1.33 |      14.04 |     0.82x |
+| emoji              |       1.04 |       1.03 |       1.00 |      14.04 |     0.96x |
+| pathological       |       2.57 |       4.03 |       3.35 |      14.06 |     1.30x |
+| **geometric mean** |      1.00x |      1.93x |      2.14x |      9.52x |           |
+
+These are the first measured AVX2 figures, replacing the "not yet measured"
+caveat this document previously carried. AVX2 throughput is essentially
+content-independent at ~14 GiB/s because it does the same work on every byte —
+which is also why the skip-based engines beat it by 5x on pure ASCII, where they
+read memory and do almost nothing else. Giving the AVX2 kernel an ASCII fast
+path is an open follow-up.
+
+### Findings
+
+**Broadword beats `core::str::from_utf8` on both platforms** (2.01x vs 1.86x,
+2.14x vs 1.93x geometric mean). This is the result that justifies a hand-written
+kernel at all: had std won, the correct answer to #134 would have been the
+two-line `if core::str::from_utf8(input).is_ok() { Ok(()) } else {
+validate_utf8_scalar(input) }`. std wins on long ASCII runs, where its wider
+aligned loop pays, but it cannot enter that loop at all on text with a non-ASCII
+byte every few bytes — hence `latin` at 1.48 GiB/s against std's 0.78.
+
+**The regression on multi-byte-dense content is real.** CJK, Greek/Cyrillic and
+emoji lose 17–25% against the scalar validator, because the ASCII skip cannot
+fire and is pure overhead. For a library whose inputs are JSON, YAML, DSV and
+log files that is the right side of the trade, but it is a cost, not a wash.
+
+**The DFA that #134 specified was rejected.** A Höhrmann-style nine-state DFA was
+implemented and benchmarked head-to-head against whole-sequence validation; it
+averaged 1.73x the scalar validator against 2.18x, losing on nine of the eleven
+patterns, and was removed. The cause is dependency structure rather than table
+size: a DFA carries `state -> step -> state` around its loop and retires one byte
+per two-to-three cycle chain however compact the table, whereas validating a
+whole sequence issues its range comparisons independently and retires three or
+four bytes per iteration. That is the same effect that made the scalar validator
+*faster* on emoji (1.01 GiB/s) than on ASCII (1.81 GiB/s at one iteration per
+byte) in the first place.
+
+**Note on the `std` arm and invalid input.** The comparison is only like-for-like
+on valid input. `core::str::from_utf8` returns `valid_up_to`/`error_len` from its
+single scan, while every succinctly engine re-runs the scalar validator to
+produce line, column and error kind — so std looks artificially fast on
+error-bearing inputs.
+
+---
 
 ## Summary
 
@@ -53,6 +146,11 @@ warning above.
 M4 Pro scalar validation went from 2.2 to 29.2 GiB/s (#133). Multi-byte content
 improves far less (roughly 1.3-1.6x), because every multi-byte character is still
 decoded one at a time; closing that gap is #134's job.
+
+**Key Finding**: the scalar validator is *slower* on ASCII than on multi-byte
+content, because it costs one loop iteration per byte — a 4-byte emoji costs one
+iteration where four ASCII bytes cost four. That inversion is what the broadword
+engine exists to fix.
 
 ## Apple M4 Pro (ARM)
 

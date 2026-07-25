@@ -659,3 +659,20 @@ For detailed documentation on optimization techniques used in this project, see 
   - `yaml_bench` build-side clean (< 2% on 38/39 groups, both platforms) except one x86-only `block_scalars` anomaly (12-28%, reproduced twice), investigated and attributed to binary code-layout rather than the new logic: the BP structure for that workload is a fixed 7 words regardless of document size, too small to mechanistically explain the delta, and the same workload is neutral on ARM — filed as #595
   - Also surfaced a pre-existing, unrelated `yaml_bench` bug: the `anchors` group panics with `UnknownAnchor` on unmodified `main` too — filed as #594
   - See [docs/plan/cspoppy.md](docs/plan/cspoppy.md#5a-results-2026-08-03) for full analysis
+
+**UTF-8 validation optimizations:**
+- ✅ Broadword (SWAR) UTF-8 accept scan: **2.01x geometric mean on ARM**, issue #134
+  - Clears ASCII in 32- and 8-byte strides with plain 64-bit arithmetic, then validates each multi-byte sequence with independent range comparisons
+  - Now the default engine on aarch64, wasm, riscv, pre-AVX2 x86_64 and `no_std` — all of which previously ran the byte-at-a-time scalar validator
+  - **Measured** (M4 Pro / 7950X, 10MB, median of 7, 11 realistic `generate-suite` patterns): geomean vs scalar 2.01x / 2.14x; ASCII 1.81 → 57.25 GiB/s, log_file 1.72 → 11.03, latin 0.77 → 1.48
+  - **Beats `core::str::from_utf8`** on both platforms (2.01x vs 1.86x, 2.14x vs 1.93x) — the check that justified a hand-written kernel over a two-line delegation to std
+  - **Honest cost**: CJK/Greek/emoji regress 17-25% vs scalar, where the ASCII skip cannot fire and is pure overhead
+  - Key insight: std's wider aligned loop wins long ASCII runs but cannot enter at all when a non-ASCII byte appears every few bytes; an unaligned 8-byte skip fires from any offset
+  - See [docs/benchmarks/utf8-validate.md#engine-comparison-134](docs/benchmarks/utf8-validate.md#engine-comparison-134) for full analysis
+- ❌ Höhrmann DFA for the multi-byte step: **REJECTED** — 1.73x vs whole-sequence validation's 2.18x, issue #134
+  - Implemented as specified in #134 (9 states × 12 byte classes, packed-nibble transition table verified against Höhrmann's published `utf8d`), benchmarked head-to-head, and removed
+  - Lost on **9 of 11** realistic patterns; worst at emoji (0.83 GiB/s vs 0.95) and mixed
+  - **Cause is dependency structure, not table size**: a DFA carries `state -> step -> state` around its loop, retiring one byte per 2-3 cycle chain however compact the table; whole-sequence validation issues its range comparisons independently and retires 3-4 bytes per iteration
+  - Same effect already visible in the baseline: the scalar validator was *faster* on emoji (1.01 GiB/s) than on ASCII (1.81) precisely because it consumed a whole sequence per iteration
+  - **Also**: #134's proposed 10-class byte table cannot work — lumping all of `0x80-0xBF` into one class makes a `(state, class)` table unable to distinguish `E0 80` (overlong) from `E0 A0` (valid), silently accepting overlong encodings and surrogates. 12 classes (split at `0x90`/`0xA0`) are the minimum.
+  - Key lesson: for a validator, prefer the formulation with the shortest loop-carried dependency, not the smallest table
