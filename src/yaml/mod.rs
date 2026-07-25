@@ -71,6 +71,7 @@ mod locate;
 mod parser;
 mod scalar;
 pub mod simd;
+pub mod validate;
 
 pub use error::YamlError;
 pub use index::YamlIndex;
