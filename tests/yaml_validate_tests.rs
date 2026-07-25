@@ -185,7 +185,10 @@ fn yq_validate_passes_valid_yaml() -> Result<()> {
 fn yq_validate_rejects_invalid_yaml_before_output() -> Result<()> {
     let (stdout, stderr, code) = run_yq_validate_stdin("a: b: c: d\n", ".")?;
     assert_ne!(code, 0);
-    assert!(stdout.is_empty(), "no query output on validation failure: {stdout}");
+    assert!(
+        stdout.is_empty(),
+        "no query output on validation failure: {stdout}"
+    );
     assert!(stderr.contains("validation error"), "stderr: {stderr}");
     Ok(())
 }
