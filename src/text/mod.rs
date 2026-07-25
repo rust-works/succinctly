@@ -23,6 +23,13 @@
 //! The [`utf8`](crate::text::utf8) module provides high-performance UTF-8 validation with detailed
 //! error reporting including byte offset, line number, and column position.
 //!
+//! [`validate_utf8`](crate::text::validate_utf8) picks the fastest engine for
+//! the target: an AVX2 kernel on x86_64 with runtime feature detection, and a
+//! portable broadword (SWAR) scan everywhere else. Both are accept scans that
+//! defer to [`validate_utf8_scalar`](crate::text::validate_utf8_scalar) — the
+//! reference implementation — for the exact error, so diagnostics do not
+//! depend on which engine ran.
+//!
 //! ```
 //! use succinctly::text::utf8::{validate_utf8, Utf8Error, Utf8ErrorKind};
 //!
@@ -42,9 +49,13 @@ pub(crate) mod line_break;
 pub mod lines;
 pub mod utf8;
 
-// Re-export commonly used types
+// Re-export commonly used types. The broadword engines are portable, so unlike
+// the AVX2 path below they need no `cfg`.
 pub use lines::LineIndex;
-pub use utf8::{validate_utf8, validate_utf8_scalar, Utf8Error, Utf8ErrorKind};
+pub use utf8::{
+    validate_utf8, validate_utf8_broadword, validate_utf8_broadword_seqwise, validate_utf8_scalar,
+    Utf8Error, Utf8ErrorKind,
+};
 
 // The AVX2 fast path is only present on x86_64 when runtime feature detection
 // is available (the `std` feature, or under test).
