@@ -448,6 +448,22 @@ For detailed documentation on optimization techniques used in this project, see 
 - SIMD newline scanning + indentation checking enables fast block boundary detection (block scalars: 19-25% improvement!)
 - Micro-benchmark wins ≠ real-world improvements (threshold tuning: +8-15% regression despite micro-bench suggesting improvement)
 - Eliminating phases beats optimizing them (YAML streaming: removed DOM conversion entirely for 2.3x gain)
+- Derive, don't store, what the text already encodes (seq_items bitvector elimination: −12.5% build peak memory)
+- Duplicated predicates diverge silently — one definition, plus a test that the call sites agree (#106: three copies of one predicate, one of them quadratic)
+- Check where data physically lives before proposing to tag it (#106: the proposal assumed a `Vec<u32>`; no real file has one)
+- Re-derive a break-even before trusting it (#106: the issue's stated 12.5% dropped a bits-to-bytes conversion; the real gate was 3.125%)
+
+### Benchmarking Discipline
+
+**Read [docs/guides/benchmarking.md § A/B Benchmarking Method](docs/guides/benchmarking.md#ab-benchmarking-method) before measuring a before/after change.** The naive method reported a 16x win as a regression (#106). The rules that matter most:
+
+- **Interleave the two binaries within each repetition.** Running all of A then all of B made an improved binary measure up to **2x slower** on every workload — the second half starts thermally loaded. Not fixable with more reps; min and median can agree with each other and both be wrong.
+- **Process-spawn A/B needs inputs ≥ 1 MB.** Startup is ~4-6 ms, the entire runtime at 1kb/10kb/100kb — which are in `dev bench yq`'s defaults.
+- **Report the scaling curve over 2-3 sizes**, not one ratio. Growth with input size is the signature of an algorithmic fix and corroborates the claimed mechanism.
+- **Gate on output identity before believing any timing**, and confirm both still match `jq`/`yq`.
+- **Memory-bound effects do not port across architectures** — measure ARM *and* x86_64, and name the chip in every table. #106 was 6.1x on M4 Pro, 16.4x on Zen 4.
+- **Verify the box is idle; macOS load average lies** (read 1.4 on a machine using 2.4% CPU — it counts uninterruptible-wait threads). Never benchmark a laptop on battery.
+- **A benchmark cannot measure a shape it does not generate** — "all neutral" is not evidence. Add the generator pattern first.
 
 **Recent YAML optimizations:**
 - ✅ P2.5 (Cached Type Checking): 1-17% improvement depending on nesting depth

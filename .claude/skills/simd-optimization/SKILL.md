@@ -9,6 +9,22 @@ Patterns and learnings from SIMD optimization in this codebase.
 
 **Comprehensive documentation**: See [docs/optimizations/simd.md](../../../docs/optimizations/simd.md) for full details on SIMD techniques.
 
+## Key Insight: Memory-Bound Effects Do Not Port Across Platforms
+
+For anything cache- or bandwidth-bound, the **effect size** differs by architecture, not just the
+noise — so a single-platform measurement can mischaracterise a change, not merely blur it.
+
+O6 (#106) removed a repeated interest-bitmap rescan. The same commit measured **6.1x on Apple
+M4 Pro and 16.4x on Ryzen 9 7950X**. Post-fix times were comparable (124 ms vs 137 ms); the
+*pre*-fix times differed 3x (758 ms vs 2240 ms), because Apple's memory subsystem absorbed the
+thrashing far better than Zen 4. Measuring only Apple Silicon understated the fix by 2.7x. The
+same asymmetry is why [`project_benchmark_feature_flags`-style](../../../docs/guides/benchmarking.md#platforms-and-hardware)
+AVX-512 findings must never be presented as universal.
+
+Rule: any claim about a memory-bound path needs both an ARM and an x86_64 number, and the tables
+must name the chip. See
+[docs/guides/benchmarking.md § A/B Benchmarking Method](../../../docs/guides/benchmarking.md#ab-benchmarking-method).
+
 ## Key Insight: Wider SIMD != Automatically Faster
 
 Two AVX-512 optimizations implemented with dramatically different results:

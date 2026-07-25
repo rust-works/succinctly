@@ -11,6 +11,7 @@ This guide provides complete information for running, interpreting, and document
 - [Types of Benchmarks](#types-of-benchmarks)
 - [When to Run Benchmarks](#when-to-run-benchmarks)
 - [How to Run Benchmarks](#how-to-run-benchmarks)
+- [A/B Benchmarking Method](#ab-benchmarking-method)
 - [Data Generation](#data-generation)
 - [Platforms and Hardware](#platforms-and-hardware)
 - [CI/CD Integration](#cicd-integration)
@@ -540,6 +541,112 @@ To add a benchmark to CI, edit `.github/workflows/ci.yml`:
 - Use `--noplot` to skip graph generation
 - Use `tee` to save results to artifact
 - Avoid requiring external tools or large files
+
+---
+
+## A/B Benchmarking Method
+
+Before/after measurement of a code change has its own failure modes, distinct from running a
+benchmark suite. Every rule below cost a wrong conclusion at least once, during the seq-item
+detection work in #106; that investigation's write-up in `docs/parsing/yaml.md` (optimisations
+O5 and O6) carries the full numbers.
+
+### 1. Interleave the two binaries; never run all of A then all of B
+
+Alternate them **within** each repetition, then compare min-of-N and median:
+
+```python
+for i in range(reps):
+    if i % 2 == 0: B.append(time(before)); A.append(time(after))
+    else:          A.append(time(after));  B.append(time(before))
+```
+
+Running the halves back-to-back made an *improved* binary measure **0.47-0.9x — i.e. up to 2x
+slower** — on every workload, because the second half starts on a thermally loaded machine.
+Interleaving on the same machine showed the truth (neutral where expected, 1.6-16x on the
+affected shape).
+
+This is a **design** fix, not a statistical one: more repetitions and trimmed means do not
+rescue a sequentially-run A/B, because the bias is monotonic drift rather than noise. Note that
+min and median can *agree with each other* and still both be wrong, so their agreement is
+necessary but not sufficient evidence.
+
+Interleaving is not concurrency — one process still runs at a time.
+
+### 2. Process-spawn A/B needs inputs >= 1 MB
+
+Binary startup is ~4-6 ms, which is the entire runtime for 1kb/10kb/100kb inputs — yet those
+sizes are in `dev bench yq`'s default list. Deltas there measure startup jitter, not the change.
+Use `--sizes 1mb,10mb` for CLI A/B work, or a Criterion in-process benchmark for smaller inputs.
+
+### 3. Report the scaling curve, not a single ratio
+
+Generate two or three sizes. A speedup that **grows with input size** is the signature of an
+algorithmic term being removed rather than a constant-factor win, and that shape is far more
+robust to timing noise than any absolute number:
+
+| input               | 100 KB | 1 MB  | 4 MB   |
+|---------------------|--------|-------|--------|
+| #106 speedup (Zen 4)| 1.16x  | 2.97x | 16.37x |
+
+A constant-factor change cannot produce that curve, so the curve independently corroborates the
+mechanism claimed for the fix.
+
+### 4. Gate on output identity before believing any timing
+
+Diff both binaries' stdout across every input x query combination, and confirm they still match
+the reference tool (`jq`/`yq`). #106 compared 48 configurations per machine, 0 differences. A
+faster binary that changed behaviour is not a win, and this check is cheap.
+
+### 5. Measure both architectures — the effect size differs, not just the noise
+
+The same #106 commit measured **6.1x on Apple M4 Pro and 16.4x on Ryzen 9 7950X**. Post-fix
+times were comparable (124 ms vs 137 ms); the *pre*-fix times differed 3x (758 ms vs 2240 ms),
+because the removed pathology was a cache-thrashing bitmap rescan that Apple's memory subsystem
+absorbed far better than Zen 4. An Apple-only measurement understated the win by 2.7x.
+
+Cache- and memory-bound results do not port between platforms. Name the chip in every table —
+see [Platforms and Hardware](#platforms-and-hardware).
+
+### 6. Verify the machine is idle — and read the right signal
+
+**On macOS the load average is misleading.** A bench Mac showed a steady load of 1.4-1.5 while
+total CPU across all processes was **2.4% of 12 cores**; macOS load counts uninterruptible-wait
+threads, so an otherwise-idle desktop with an editor open reads as loaded. Check actual CPU and
+look for real work:
+
+```bash
+ps -Ao pcpu | awk '{s+=$1} END {printf "total %.1f%%\n", s}'   # actual CPU
+pgrep -fl "cargo|rustc|criterion|claude"                        # builds or agent runs
+pmset -g batt | head -2                                         # must be AC, not battery
+```
+
+On Linux the load average is trustworthy. Never benchmark a laptop on battery.
+
+### 7. A benchmark cannot measure a shape it does not generate
+
+"All benchmarks neutral" is not evidence when the suite lacks the relevant input. In #106 every
+YAML generator emitted `- ` (dash-space), so the `-\n` shape carrying a quadratic bug had zero
+coverage — justified by a stale comment claiming the parser required dash-space. The fix was to
+add a generator pattern for that shape *first*, then measure.
+
+Before trusting a neutral result, confirm the suite contains the shape the change touches. If it
+does not, add a pattern to `src/bin/succinctly/yaml_generators.rs` (or the JSON/DSV equivalent)
+and regenerate.
+
+### Building both halves on a remote box
+
+A source-only tarball plus a reverse patch of the commit under test is enough, with no pushing:
+
+```bash
+git diff HEAD <commit>~1 -- <changed files> > /tmp/revert.patch
+tar czf /tmp/src.tgz --exclude=target --exclude=.git --exclude=data \
+    Cargo.toml Cargo.lock src benches tests scripts        # ~770 KB
+# remote: build HEAD -> succ-after; patch -p1 < revert.patch; build -> succ-before
+```
+
+Under `ssh -o BatchMode=yes` the login profile is not read, so prepend
+`export PATH="$HOME/.cargo/bin:$PATH"` in the remote script (or use `bash -lc`).
 
 ---
 
