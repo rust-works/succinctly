@@ -1,0 +1,1 @@
+{"blocks":{"clip":"line 0 starting worker pool\nline 1 connection established to upstream service\n","strip":"line 0 ok\n    detail 1: indented continuation\nline 2 done","keep":"line 0 ok\n\nline 2 after a blank line\n","folded":"line 0 starting worker pool line 1 connection established to upstream service\n","folded_strip":"line 0 ok line 1 done","trailing":"end"}}
