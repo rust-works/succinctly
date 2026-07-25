@@ -20,13 +20,14 @@ Distributions are derived from the crate's own semi-index (`JsonIndex` / `YamlIn
 
 ## YAML
 
-files: 5, total bytes: 5105, anchors: 0, aliases: 0
+files: 5, total bytes: 5105, anchors: 0, aliases: 0, bare-dash items: 0
 
 | metric               | unit         | n   | min  | p50  | p90  | p99  | max  |
 | -------------------- | ------------ | --- | ---- | ---- | ---- | ---- | ---- |
 | scalar length        | bytes/scalar | 254 | 0    | 7    | 20   | 71   | 92   |
 | mapping keys         | keys/mapping | 61  | 0    | 2    | 5    | 9    | 9    |
 | sequence items       | items/seq    | 24  | 1    | 1    | 4    | 4    | 4    |
+| bare-dash seq items  | count/file   | 5   | 0    | 0    | 0    | 0    | 0    |
 | flow-collection size | bytes/flow   | 4   | 2    | 2    | 100  | 100  | 100  |
 | nesting depth        | levels/node  | 192 | 2    | 6    | 9    | 11   | 12   |
 | anchors              | count/file   | 5   | 0    | 0    | 0    | 0    | 0    |
