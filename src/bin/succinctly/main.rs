@@ -202,6 +202,8 @@ enum YamlSubcommand {
     Generate(GenerateYaml),
     /// Generate a suite of YAML files with various sizes and patterns
     GenerateSuite(GenerateYamlSuite),
+    /// Validate YAML files strictly (opt-in; mirrors `json validate`)
+    Validate(yaml_validate::ValidateArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -1254,6 +1256,10 @@ fn main() -> Result<()> {
                 Ok(())
             }
             YamlSubcommand::GenerateSuite(args) => generate_yaml_suite(args),
+            YamlSubcommand::Validate(args) => {
+                let exit_code = yaml_validate::run(args)?;
+                std::process::exit(exit_code);
+            }
         },
         Command::Dev(dev_cmd) => match dev_cmd.command {
             DevSubcommand::Bench(bench_cmd) => match bench_cmd.command {
@@ -2135,6 +2141,7 @@ mod text_generators;
 mod text_validate;
 mod utf8_bench;
 mod yaml_generators;
+mod yaml_validate;
 mod yq_bench;
 mod yq_locate;
 mod yq_runner;
