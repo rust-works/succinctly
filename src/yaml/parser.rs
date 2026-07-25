@@ -1767,7 +1767,13 @@ impl<'a> Parser<'a> {
                 // Restore position after checking
                 self.pos = pos_before_check;
 
-                if next_indent <= indent && !is_sequence_at_same_indent {
+                // A block sequence may sit at its parent key's indent, so it is
+                // only that key's value when the indents are *equal*. One at a
+                // lower indent belongs to an outer container, and treating it
+                // as this key's value left the key's anchor dangling
+                // (`m:\n  b: &b\n- x`). Same test as
+                // `parse_compact_mapping_entry`, which had it right.
+                if next_indent < indent || (next_indent == indent && !is_sequence_at_same_indent) {
                     // Next line is at same or lower indent and not a sequence - value is null
                     // Create explicit null node for anchor to point to
                     self.pos = saved_pos;
@@ -2004,13 +2010,26 @@ impl<'a> Parser<'a> {
         self.skip_inline_whitespace();
 
         // Check for anchor
-        if self.peek() == Some(b'&') {
+        let anchored_value = self.peek() == Some(b'&');
+        if anchored_value {
             let _ = self.parse_anchor()?;
             self.skip_inline_whitespace();
         }
 
         // Check if value is on this line or next
         if self.at_line_end() {
+            // An anchor on a value that turns out to be null needs an explicit
+            // node to point at, or it dangles on whatever BP bit comes next -
+            // a close, or the open of an unrelated node. `? e` / `: &a` then
+            // `z: *a` resolved the alias to the *key* `z`, and inside a
+            // sequence the anchor landed on the alias's own open and tripped a
+            // spurious cycle rejection.
+            if anchored_value && self.following_value_is_null(indent) {
+                self.set_ib();
+                self.write_bp_open();
+                self.write_bp_close();
+            }
+
             // Value is on next line(s) or null
             self.skip_to_eol();
             return Ok(());
