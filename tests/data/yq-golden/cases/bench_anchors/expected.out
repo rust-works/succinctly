@@ -1,0 +1,1 @@
+{"defs_0":{"retry":{"retries":3,"timeout":30},"logging":{"level":"info","format":"json"},"policy":{"enabled":true,"weight":0},"shared":["shared-value-0","shared-value-0","shared-value-0"]},"svc_0":{"name":"service-0","replicas":2,"config":{"retries":3,"timeout":30},"logging":{"level":"info","format":"json"},"policy":{"enabled":true,"weight":0}}}

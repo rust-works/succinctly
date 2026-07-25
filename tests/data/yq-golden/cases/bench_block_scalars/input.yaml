@@ -1,0 +1,20 @@
+# Distilled from the `block-scalars` bench pattern
+blocks:
+  clip: |
+    line 0 starting worker pool
+    line 1 connection established to upstream service
+  strip: |-
+    line 0 ok
+        detail 1: indented continuation
+    line 2 done
+  keep: |+
+    line 0 ok
+
+    line 2 after a blank line
+  folded: >
+    line 0 starting worker pool
+    line 1 connection established to upstream service
+  folded_strip: >-
+    line 0 ok
+    line 1 done
+  trailing: end

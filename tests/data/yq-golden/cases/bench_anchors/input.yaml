@@ -1,0 +1,21 @@
+# Distilled from the `anchors` bench pattern
+defs_0:
+  retry: &a0
+    retries: 3
+    timeout: 30
+  logging: &anchor_group_0000_mid
+    level: info
+    format: json
+  policy: &anchor_group_0000_long_name_for_simd_scan
+    enabled: true
+    weight: 0
+  shared:
+    - &s0 shared-value-0
+    - *s0
+    - *s0
+svc_0:
+  name: service-0
+  replicas: 2
+  config: *a0
+  logging: *anchor_group_0000_mid
+  policy: *anchor_group_0000_long_name_for_simd_scan

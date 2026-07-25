@@ -1,0 +1,23 @@
+# Distilled from the `multi-doc` bench pattern
+---
+doc: 0
+kind: Deployment
+name: document-0
+items:
+  - item_0
+  - item_1
+meta:
+  seq: 0
+  active: false
+---
+doc: 1
+kind: Service
+name: document-1
+items:
+  - item_0
+  - item_1
+  - item_2
+meta:
+  seq: 1
+  active: true
+...
