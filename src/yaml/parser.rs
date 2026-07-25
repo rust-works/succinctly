@@ -367,11 +367,15 @@ impl<'a> Parser<'a> {
     fn current_line(&self) -> usize {
         // Count line breaks from start to current position. A CRLF is one
         // break, so a `\r` only counts when it is not part of one (#324).
-        let text = &self.input[..self.pos];
-        let breaks = text
+        //
+        // The lookahead reads `self.input`, not the truncated prefix: when the
+        // cursor sits on the LF of a CRLF, that CR's partner is one byte past
+        // the prefix, and checking the prefix would read it as a lone CR and
+        // report a line too many.
+        let breaks = self.input[..self.pos]
             .iter()
             .enumerate()
-            .filter(|&(i, &b)| b == b'\n' || (b == b'\r' && text.get(i + 1) != Some(&b'\n')))
+            .filter(|&(i, &b)| b == b'\n' || (b == b'\r' && self.input.get(i + 1) != Some(&b'\n')))
             .count();
         breaks + 1
     }
