@@ -1,0 +1,21 @@
+# YAML Test Suite cases whose parse is NOT invariant under line-break form (#324).
+#
+# Format:  <case-id>/<variant>  <category>  <reason>
+#
+# `<variant>` is `crlf` (\r\n) or `cr` (a lone \r). The baseline is the same case
+# with LF breaks, so an entry here means rewriting the document's line breaks
+# changed what the parser produced — which YAML 1.2 §5.4/§5.7 forbid, since a
+# processor must normalize all three forms to \n on input.
+#
+# Consumed by tests/yaml_crlf_tests.rs, which asserts this list matches the actual
+# divergence set exactly: a newly divergent case and a newly invariant case both
+# break the build. Do not add entries to silence a failure without understanding
+# it.
+#
+# Note this is an *invariance* manifest, not a correctness one: a case that is
+# wrong under LF is expected to be wrong the same way under CRLF, and so does not
+# belong here. Correctness under LF is pinned by tests/yaml_test_suite.rs.
+#
+# Categories
+# ----------
+#   (none yet — the list is empty, and should stay that way)
