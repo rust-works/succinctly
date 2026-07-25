@@ -5219,22 +5219,56 @@ corpus contains zero bare-dash items. The shape simply had no benchmark.
 ### Results
 
 Extract `is_seq_item_at(text, text_pos)` as the single definition; route all five sites through
-it. Interleaved A/B (alternating binaries per rep, min of 21):
+it.
 
-| shape               | before  | after   | speedup   |
-| ------------------- | ------- | ------- | --------- |
-| seqwrap/1mb `.`     | 64.6 ms | 39.7 ms | **1.63x** |
-| seqwrap/1mb `.[]`   | 65.2 ms | 40.7 ms | **1.60x** |
-| dense bare-dash 1MB | 81.8 ms | 37.6 ms | **2.17x** |
-| dense bare-dash 4MB | 829 ms  | 135 ms  | **6.15x** |
-| users/1mb `.`       | 37.4 ms | 37.3 ms | 1.00x     |
-| sequences/1mb `.`   | 32.4 ms | 31.6 ms | 1.03x     |
-| nested/1mb `.`      | 23.7 ms | 23.6 ms | 1.01x     |
+Method: interleaved A/B — the two binaries alternate within each repetition so thermal drift
+cannot bias one of them — reporting min of 15. Both machines were verified idle first. Sizes at
+or below 100 KB are close to the ~4-6 ms process-spawn floor, so treat those rows as directional.
 
-The speedup **grows with file size** (1.32x at 250 KB → 2.17x at 1 MB → 6.15x at 4 MB), which
-is the signature of removing an O(N·L) term rather than a constant factor. Shapes that never hit
-the divergent path are neutral. Output is byte-identical on all 32 pattern × size × query
-configurations, and every one still matches system `yq`.
+#### Apple M4 Pro (`johns-mac-mini`, arm64, 12 cores)
+
+| shape                 | before   | after    | speedup   |
+| --------------------- | -------- | -------- | --------- |
+| seqwrap/100kb `.`     | 6.3 ms   | 6.1 ms   | 1.03x     |
+| seqwrap/1mb `.`       | 53.5 ms  | 33.1 ms  | **1.62x** |
+| seqwrap/1mb `.[]`     | 51.7 ms  | 32.0 ms  | **1.62x** |
+| bare-dash 1MB `.`     | 74.4 ms  | 34.0 ms  | **2.19x** |
+| bare-dash 4MB `.`     | 757.6 ms | 123.9 ms | **6.12x** |
+| bare-dash 4MB `.[]`   | 756.8 ms | 118.7 ms | **6.38x** |
+| users/1mb `.`         | 29.7 ms  | 29.8 ms  | 1.00x     |
+| sequences/1mb `.`     | 26.0 ms  | 26.1 ms  | 1.00x     |
+| nested/1mb `.`        | 19.1 ms  | 19.2 ms  | 1.00x     |
+| comprehensive/1mb `.` | 25.8 ms  | 25.5 ms  | 1.01x     |
+
+#### AMD Ryzen 9 7950X (`terminus`, x86_64 Zen 4, 32 threads)
+
+| shape                 | before    | after    | speedup    |
+| --------------------- | --------- | -------- | ---------- |
+| seqwrap/100kb `.`     | 4.9 ms    | 4.2 ms   | **1.16x**  |
+| seqwrap/1mb `.`       | 102.1 ms  | 34.4 ms  | **2.97x**  |
+| seqwrap/1mb `.[]`     | 101.7 ms  | 32.4 ms  | **3.14x**  |
+| bare-dash 1MB `.`     | 170.2 ms  | 35.7 ms  | **4.77x**  |
+| bare-dash 4MB `.`     | 2239.6 ms | 136.8 ms | **16.37x** |
+| bare-dash 4MB `.[]`   | 2224.3 ms | 126.9 ms | **17.52x** |
+| users/1mb `.`         | 34.2 ms   | 34.3 ms  | 1.00x      |
+| sequences/1mb `.`     | 29.1 ms   | 29.1 ms  | 1.00x      |
+| nested/1mb `.`        | 32.4 ms   | 32.6 ms  | 0.99x      |
+| comprehensive/1mb `.` | 29.0 ms   | 28.6 ms  | 1.01x      |
+
+Three things to read off these.
+
+**The speedup grows with file size** — 1.16x at 100 KB → 2.97x at 1 MB → 16.4x at 4 MB on Zen 4.
+That is the signature of removing an O(N·L) term, not a constant factor.
+
+**Zen 4 was hurt far more than Apple Silicon by the same code.** The *post-fix* times are
+comparable across the two machines (136.8 ms vs 123.9 ms at 4 MB), but the *pre-fix* times differ
+by 3x (2239.6 ms vs 757.6 ms). The pathology is an IB-bitmap rescan from word 0, i.e. a
+cache-thrashing streaming read, and Apple's memory subsystem absorbed it much better. A win
+measured only on Apple Silicon would have understated this by 2.7x.
+
+**Shapes that never hit the divergent path are neutral on both**, 0.99–1.01x at 1 MB. Output is
+byte-identical before/after on 48 configurations per machine (12 inputs × 4 queries), 0
+differences, and every one still matches system `yq`.
 
 ### Rejected Sub-Optimisation: Hoisting Wrapper-Ness Per Sequence
 

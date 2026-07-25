@@ -711,17 +711,30 @@ re-read the same open index. That backwards jump resets the `AdvancePositions` I
 
 **Technique**: extract `is_seq_item_at` as the single definition; route all five sites through it.
 
-**Measured** (interleaved A/B, min of 21 alternating reps):
+**Measured**: interleaved A/B (binaries alternate within each rep, so thermal drift cannot bias
+one), min of 15, both machines verified idle first.
 
-| Shape               | Before  | After   | Speedup   |
-| ------------------- | ------- | ------- | --------- |
-| seqwrap/1mb `.`     | 64.6 ms | 39.7 ms | **1.63×** |
-| dense bare-dash 1MB | 81.8 ms | 37.6 ms | **2.17×** |
-| dense bare-dash 4MB | 829 ms  | 135 ms  | **6.15×** |
-| users/1mb `.`       | 37.4 ms | 37.3 ms | 1.00×     |
+Apple M4 Pro (`johns-mac-mini`):
 
-Speedup grows with size — the signature of removing an O(N·L) term. Byte-identical output on all 32
-configurations.
+| Shape             | Before   | After    | Speedup   |
+| ----------------- | -------- | -------- | --------- |
+| seqwrap/1mb `.`   | 53.5 ms  | 33.1 ms  | **1.62×** |
+| bare-dash 1MB `.` | 74.4 ms  | 34.0 ms  | **2.19×** |
+| bare-dash 4MB `.` | 757.6 ms | 123.9 ms | **6.12×** |
+| users/1mb `.`     | 29.7 ms  | 29.8 ms  | 1.00×     |
+
+AMD Ryzen 9 7950X (`terminus`):
+
+| Shape             | Before    | After    | Speedup    |
+| ----------------- | --------- | -------- | ---------- |
+| seqwrap/1mb `.`   | 102.1 ms  | 34.4 ms  | **2.97×**  |
+| bare-dash 1MB `.` | 170.2 ms  | 35.7 ms  | **4.77×**  |
+| bare-dash 4MB `.` | 2239.6 ms | 136.8 ms | **16.37×** |
+| users/1mb `.`     | 34.2 ms   | 34.3 ms  | 1.00×      |
+
+Speedup grows with size — the signature of removing an O(N·L) term. Byte-identical output on 48
+configurations per machine. Zen 4 was hurt ~3× more than Apple Silicon pre-fix (post-fix times are
+comparable), because the pathology is a cache-thrashing IB rescan.
 
 **Key insight**: duplicated predicates diverge silently, and with a stateful sequential cursor a
 merely-redundant read becomes a complexity change. The shape was invisible because every generator
