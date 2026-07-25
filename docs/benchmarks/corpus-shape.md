@@ -20,22 +20,23 @@ Distributions are derived from the crate's own semi-index (`JsonIndex` / `YamlIn
 | yaml   | compose   | nginx-flask-mysql.yaml   | 1239  |
 | yaml   | compose   | wordpress.yaml           | 815   |
 | yaml   | k8s       | nginx-deployment.yml     | 836   |
+| yaml   | lint      | sass-lint.yml            | 2055  |
 
 ## YAML
 
-files: 6, total bytes: 24040, anchors: 0, aliases: 0, bare-dash items: 0
+files: 7, total bytes: 26095, anchors: 0, aliases: 0, bare-dash items: 5
 
-| metric               | unit         | n   | min  | p50  | p90  | p99  | max  |
-| -------------------- | ------------ | --- | ---- | ---- | ---- | ---- | ---- |
-| scalar length        | bytes/scalar | 896 | 0    | 7    | 43   | 146  | 374  |
-| mapping keys         | keys/mapping | 225 | 0    | 2    | 4    | 9    | 20   |
-| sequence items       | items/seq    | 52  | 1    | 2    | 8    | 12   | 12   |
-| bare-dash seq items  | count/file   | 6   | 0    | 0    | 0    | 0    | 0    |
-| flow-collection size | bytes/flow   | 14  | 2    | 11   | 91   | 100  | 100  |
-| nesting depth        | levels/node  | 669 | 2    | 7    | 9    | 11   | 12   |
-| anchors              | count/file   | 6   | 0    | 0    | 0    | 0    | 0    |
-| aliases              | count/file   | 6   | 0    | 0    | 0    | 0    | 0    |
-| escape density       | per KiB/file | 6   | 0.00 | 0.00 | 0.05 | 0.05 | 0.05 |
+| metric               | unit         | n    | min  | p50  | p90  | p99  | max  |
+| -------------------- | ------------ | ---- | ---- | ---- | ---- | ---- | ---- |
+| scalar length        | bytes/scalar | 1052 | 0    | 7    | 38   | 109  | 374  |
+| mapping keys         | keys/mapping | 233  | 0    | 2    | 4    | 9    | 69   |
+| sequence items       | items/seq    | 58   | 1    | 2    | 8    | 12   | 12   |
+| bare-dash seq items  | count/file   | 7    | 0    | 0    | 5    | 5    | 5    |
+| flow-collection size | bytes/flow   | 14   | 2    | 11   | 91   | 100  | 100  |
+| nesting depth        | levels/node  | 761  | 2    | 7    | 9    | 11   | 12   |
+| anchors              | count/file   | 7    | 0    | 0    | 0    | 0    | 0    |
+| aliases              | count/file   | 7    | 0    | 0    | 0    | 0    | 0    |
+| escape density       | per KiB/file | 7    | 0.00 | 0.00 | 0.05 | 0.05 | 0.05 |
 
 ## JSON
 

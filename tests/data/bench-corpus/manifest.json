@@ -57,6 +57,17 @@
       "vendored": true
     },
     {
+      "format": "yaml",
+      "workload": "lint",
+      "tier": "1kb",
+      "file": "yaml/lint/sass-lint.yml",
+      "bytes": 2055,
+      "sha256": "9fa69044cf3acfebc48245f6d174d9e458f5f6c553f310899f7a6dc4290471fb",
+      "source_url": "https://raw.githubusercontent.com/istio/istio/03387cfe484b4c285c460f499035cb722fceff72/common/config/sass-lint.yml",
+      "license": "Apache-2.0",
+      "vendored": true
+    },
+    {
       "format": "json",
       "workload": "charts",
       "tier": "1kb",
