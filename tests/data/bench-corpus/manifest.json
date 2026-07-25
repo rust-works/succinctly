@@ -90,6 +90,17 @@
       "vendored": true
     },
     {
+      "format": "json",
+      "workload": "graph",
+      "tier": "10kb",
+      "file": "json/graph/miserables.json",
+      "bytes": 11536,
+      "sha256": "6cb4a82266aca5671010104af4532b6add6d2fca7ca2b24e38d57fe322971ee4",
+      "source_url": "https://raw.githubusercontent.com/plotly/datasets/0c447c47b757ad74edecab31f0d72f849d2e67c2/miserables.json",
+      "license": "MIT",
+      "vendored": false
+    },
+    {
       "format": "dsv",
       "workload": "world-gdp",
       "tier": "10kb",
@@ -141,6 +152,28 @@
       "bytes": 99715,
       "sha256": "d2290e5dcc442ed6cd5e0ab4b306466cad4c673e65323f13828dea8f221cf134",
       "source_url": "https://raw.githubusercontent.com/plotly/datasets/0c447c47b757ad74edecab31f0d72f849d2e67c2/election.geojson",
+      "license": "MIT",
+      "vendored": false
+    },
+    {
+      "format": "json",
+      "workload": "tabular",
+      "tier": "100kb",
+      "file": "json/tabular/carshare-data.json",
+      "bytes": 35815,
+      "sha256": "b573a4bdbc3ad293886e4886c44a02b0dceaa2ab1daca6e64a6f7a90b3c0cd3f",
+      "source_url": "https://raw.githubusercontent.com/plotly/datasets/0c447c47b757ad74edecab31f0d72f849d2e67c2/carshare_data.json",
+      "license": "MIT",
+      "vendored": false
+    },
+    {
+      "format": "json",
+      "workload": "pretty",
+      "tier": "1mb",
+      "file": "json/pretty/3d-ribbon.json",
+      "bytes": 823218,
+      "sha256": "fd0aeda5c6c567d3149cf4e6fa1ea71a2cf10c884f55df45a1c269f00eb88cdd",
+      "source_url": "https://raw.githubusercontent.com/plotly/datasets/0c447c47b757ad74edecab31f0d72f849d2e67c2/3d-ribbon.json",
       "license": "MIT",
       "vendored": false
     },

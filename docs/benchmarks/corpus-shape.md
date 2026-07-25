@@ -8,22 +8,23 @@ Distributions are derived from the crate's own semi-index (`JsonIndex` / `YamlIn
 
 ## Corpus inventory
 
-| format | workload       | file                        | bytes |
-| ------ | -------------- | --------------------------- | ----- |
-| dsv    | gapminder      | gapminder-five-year.csv     | 82079 |
-| dsv    | world-gdp      | world-gdp-with-codes.csv    | 4515  |
-| json   | charts         | bullet-data.json            | 548   |
-| json   | geojson        | us-election.geojson         | 99715 |
-| json   | npm            | express-package.json        | 2731  |
-| json   | openapi        | swagger-v2-schema.json      | 40247 |
-| yaml   | actions        | codeql-analysis.yml         | 925   |
-| yaml   | actions        | prometheus-ci.yml           | 18935 |
-| yaml   | actions        | stale.yml                   | 1290  |
-| yaml   | compose        | nginx-flask-mysql.yaml      | 1239  |
-| yaml   | compose        | wordpress.yaml              | 815   |
-| yaml   | home-assistant | air-quality-conditions.yaml | 9990  |
-| yaml   | k8s            | nginx-deployment.yml        | 836   |
-| yaml   | lint           | sass-lint.yml               | 2055  |
+| format | workload       | file                        | bytes  |
+| ------ | -------------- | --------------------------- | ------ |
+| dsv    | gapminder      | gapminder-five-year.csv     | 82079  |
+| dsv    | world-gdp      | world-gdp-with-codes.csv    | 4515   |
+| json   | charts         | bullet-data.json            | 548    |
+| json   | geojson        | us-election.geojson         | 99715  |
+| json   | graph          | miserables.json             | 11536  |
+| json   | pretty         | 3d-ribbon.json              | 823218 |
+| json   | tabular        | carshare-data.json          | 35815  |
+| yaml   | actions        | codeql-analysis.yml         | 925    |
+| yaml   | actions        | prometheus-ci.yml           | 18935  |
+| yaml   | actions        | stale.yml                   | 1290   |
+| yaml   | compose        | nginx-flask-mysql.yaml      | 1239   |
+| yaml   | compose        | wordpress.yaml              | 815    |
+| yaml   | home-assistant | air-quality-conditions.yaml | 9990   |
+| yaml   | k8s            | nginx-deployment.yml        | 836    |
+| yaml   | lint           | sass-lint.yml               | 2055   |
 
 ## Line index
 
@@ -50,28 +51,28 @@ files: 8, total bytes: 36085, anchors: 41, aliases: 86, bare-dash items: 5
 
 | metric               | unit         | n    | min  | p50  | p90  | p99  | max  |
 | -------------------- | ------------ | ---- | ---- | ---- | ---- | ---- | ---- |
-| scalar length        | bytes/scalar | 1599 | 0    | 7    | 24   | 89   | 374  |
-| mapping keys         | keys/mapping | 398  | 0    | 2    | 4    | 9    | 69   |
+| scalar length        | bytes/scalar | 1587 | 0    | 7    | 25   | 89   | 374  |
+| mapping keys         | keys/mapping | 392  | 0    | 2    | 4    | 9    | 69   |
 | sequence items       | items/seq    | 94   | 1    | 2    | 4    | 12   | 12   |
 | bare-dash seq items  | count/file   | 8    | 0    | 0    | 5    | 5    | 5    |
 | flow-collection size | bytes/flow   | 14   | 2    | 11   | 91   | 100  | 100  |
-| nesting depth        | levels/node  | 1218 | 2    | 6    | 8    | 10   | 12   |
+| nesting depth        | levels/node  | 1206 | 2    | 6    | 8    | 10   | 12   |
 | anchors              | count/file   | 8    | 0    | 0    | 41   | 41   | 41   |
 | aliases              | count/file   | 8    | 0    | 0    | 86   | 86   | 86   |
 | escape density       | per KiB/file | 8    | 0.00 | 0.00 | 0.05 | 0.05 | 0.05 |
 
 ## JSON
 
-files: 4, total bytes: 143241
+files: 5, total bytes: 970832
 
-| metric          | unit         | n     | min  | p50  | p90  | p99  | max   |
-| --------------- | ------------ | ----- | ---- | ---- | ---- | ---- | ----- |
-| string length   | bytes/string | 2345  | 1    | 7    | 23   | 67   | 111   |
-| object keys     | keys/object  | 634   | 0    | 1    | 4    | 21   | 61    |
-| array elements  | elems/array  | 2733  | 1    | 2    | 2    | 38   | 140   |
-| collection size | bytes/coll   | 3367  | 2    | 36   | 184  | 2883 | 99714 |
-| nesting depth   | levels/node  | 10813 | 1    | 8    | 9    | 9    | 9     |
-| escape density  | per KiB/file | 4     | 0.00 | 0.00 | 0.15 | 0.15 | 0.15  |
+| metric          | unit         | n     | min  | p50  | p90  | p99  | max    |
+| --------------- | ------------ | ----- | ---- | ---- | ---- | ---- | ------ |
+| string length   | bytes/string | 3736  | 0    | 9    | 18   | 20   | 51     |
+| object keys     | keys/object  | 779   | 1    | 3    | 4    | 6    | 13     |
+| array elements  | elems/array  | 11201 | 1    | 2    | 2    | 2    | 401    |
+| collection size | bytes/coll   | 11980 | 4    | 72   | 88   | 1655 | 823218 |
+| nesting depth   | levels/node  | 38729 | 1    | 6    | 8    | 9    | 9      |
+| escape density  | per KiB/file | 5     | 0.00 | 0.00 | 0.00 | 0.00 | 0.00   |
 
 ## DSV
 
