@@ -539,6 +539,19 @@ YAML parsing implementation and optimization benchmark results.
   - escape_scan/control_chars (tab character detection)
   - escape_scan/realistic (escape every ~20 chars, 64B-2048B)
 
+##### O5/#91: Shared SIMD JSON String Escaper - ACCEPTED ✅
+- Issue #91: eleven escaping routines in three semantics collapsed to one implementation
+- Escaper micro-benchmark (`jq_escape_micro`, M4 Pro and Ryzen 9 7950X, median of 7):
+  - Sized by the real-corpus percentiles from [corpus-shape.md](corpus-shape.md), not round numbers
+  - p50 (7B) −8 to −25%, p90 (11B) −24 to −37%, p99 (24B) −48 to −58% on ARM
+  - 1-byte strings +8 to +14% slower (accepted; a length threshold is the rejected P2.8 shape)
+  - Benchmark groups: jq_escape/{short, object_shaped, shapes, long}
+  - `latin1_heavy` is a standing guard, not a measurement: it prices any future `0xC2` lane
+- Scanner micro-benchmark (`json_escape_micro`): `json_escape/predicates` compares all three predicates
+- End-to-end: `jq -a` −6 to −38%, `yq -o json` −1 to −11%; **default `jq` neutral**
+  because the CLI zero-copy passthrough bypasses escaping on escape-free input
+- Full analysis: [optimizations/json-escaping.md](../optimizations/json-escaping.md)
+
 ##### O4: seq_items Bitvector Elimination - ACCEPTED ✅
 - Issues #75/#104/#106: text-derived seq-item detection replaces stored bitvector
 - Memory A/B (tracking-allocator probe, Apple M5 Max): build peak −12.5% (2.00× → 1.75× input), retained index −3-5% (19-41 KB per MB)

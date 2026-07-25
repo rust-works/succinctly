@@ -624,3 +624,12 @@ For detailed documentation on optimization techniques used in this project, see 
   - Outputs byte-identical pre↔post on all 80 yq A/B configurations
   - Key insight: derive, don't store, what the text already encodes; transient build allocations can dwarf the retained structure (2-bit-per-byte scratch was 6-13× the stored bitvector)
   - See [docs/parsing/yaml.md#o4-seq_items-bitvector-elimination--accepted-](docs/parsing/yaml.md#o4-seq_items-bitvector-elimination--accepted-) for full analysis
+- ✅ #91 (Shared SIMD JSON String Escaper): **2-4x on the escaper, 6-38% end-to-end on `jq -a`**, issue #91
+  - Eleven escaping routines in three incompatible semantics collapsed into `succinctly::json::escape`
+  - Two new scanner predicates via `define_escape_scanner!`: `find_jq_escape`, `find_ascii_escape`
+  - **Measured** (M4 Pro / Ryzen 9 7950X, median of 7): escaper −24 to −37% at corpus p90, −48 to −65% at p99; `jq -a -c .` −14 to −38%; `yq -o json` −1 to −11%
+  - **Default `jq` output is neutral, structurally**: `jq_runner.rs` echoes source bytes verbatim when a string has no backslash, so the escaper is never called on escape-free input. `-a` removes that bypass and the win appears
+  - 1-byte strings are 8-14% slower on ARM (~1.5 ns) — accepted, since the remedy is the length threshold P2.8 already rejected
+  - Fixed three jq-conformance defects: object keys with control chars emitted *invalid JSON*; `tojson`/`@json` lacked `\b`/`\f`; C1 controls were escaped where jq emits them raw
+  - Key insight: check the oracle before preserving a behaviour. Matching jq on C1 deleted a `0xC2` lane that would have false-positive-stopped on every NBSP and Latin-1 punctuation character — faster, simpler, *and* more conformant
+  - See [docs/optimizations/json-escaping.md](docs/optimizations/json-escaping.md) for full analysis

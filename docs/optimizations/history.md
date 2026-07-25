@@ -663,6 +663,47 @@ The IB cursor state (`ib_word_idx`, `ib_ones_before`) remains valid after the ra
 
 ---
 
+### ✅ Shared SIMD JSON String Escaper (July 2026)
+
+**Status**: **Accepted** — [issue #91](https://github.com/rust-works/succinctly/issues/91), building on [#87](https://github.com/rust-works/succinctly/issues/87) (O3) and [#125](https://github.com/rust-works/succinctly/issues/125) (O5)
+
+**Problem**: #91 was filed as "reuse the #87 scanner in the jq output path". Surveying the callers first found **eleven** escaping routines in three mutually incompatible sets of semantics — not the "~4 copies" the issue estimated — of which only two were SIMD-accelerated and two more hand-rolled a scalar loop over the scanner's exact predicate. The jq-library family agreed with neither the jq CLI beside it nor jq itself.
+
+**Technique**: Two layers. `util/simd/escape` (crate-private) locates the next byte of interest; the new public `json/escape` decides what to emit. Two scanner predicates joined `find_json_escape` via the existing `define_escape_scanner!` macro: `find_jq_escape` (`"` `\` `<0x20` `0x7F`) and `find_ascii_escape` (`"` `\` `<0x20` `>=0x7F`, serving both ASCII modes). Four monomorphizations of one loop replace the eleven routines.
+
+**Representativeness first**: [corpus-shape.md](../benchmarks/corpus-shape.md) puts real JSON string length at p50 = 7 bytes, p90 = 11, escape density 0.00/KiB. With SIMD engaging at 16 bytes, >90% of real strings never reach a kernel — so the win could not be the SIMD, and had to come from the restructure it forces: bulk `write_str` per span instead of per-`char` `push`, and a nibble table instead of a `format!` allocation per control character.
+
+**Benchmark Results** (median of 7; `johns-mac-mini` M4 Pro and `terminus` Ryzen 9 7950X):
+
+| Escaper micro, by size    | M4 Pro          | 7950X           |
+|---------------------------|-----------------|-----------------|
+| 1 B                       | **+8% … +14%**  | −3% … +7%       |
+| 4 B                       | −3% … −12%      | **+5% … +12%**  |
+| 7 B (corpus p50)          | −8% … −25%      | −4% … +2%       |
+| 11 B (p90)                | −24% … −37%     | −10% … −24%     |
+| 24 B (p99)                | −48% … −58%     | −50% … −65%     |
+| object-shaped mix         | −6.5% … −16.9%  | −13% … +6%      |
+
+| End-to-end                | M4 Pro          | 7950X           |
+|---------------------------|-----------------|-----------------|
+| `jq -c .` (default)       | ±0.4%           | —               |
+| `jq -a -c .` unicode/1mb  | **−38.3%**      | **−30.2%**      |
+| `jq -a -c .` strings/1mb  | **−14.0%**      | **−23.1%**      |
+| `yq -o json .` strings/1mb| **−10.9%**      | **−8.3%**       |
+| `yq -o json .` users/1mb  | −5.8%           | −5.6%           |
+
+**Key insight — know *why* a neutral result is neutral.** Default `jq` output showed ±0.4%, and a first `dev bench jq` sweep came back within ±2.6% while the system-`jq` drift control swung 3–41% between passes. That sweep was discarded as uninformative rather than reported. The cause turned out to be structural: `jq_runner.rs` echoes a string's source bytes verbatim when they hold no backslash, so on escape-free input the escaper is never called. `-a` removes the bypass, and the win appears. The claim changed from "no effect" to "no effect *here*, 14–38% where the code actually runs".
+
+**Second insight — check the oracle before preserving a behaviour.** succinctly escaped the C1 block because `char::is_control()` covers category Cc; jq 1.7.1 emits it raw. Matching jq deleted the `0xC2` lane, which would also have flagged NBSP and the Latin-1 punctuation `¡ ¢ £ ° » ¿` as false-positive stops. The result is faster, simpler, *and* more conformant, and leaves `find_jq_escape` pure-ASCII so its index is unconditionally a char boundary.
+
+**Sub-corpus regression, deliberately not chased**: 1-byte strings remain ~8–14% slower on ARM (~1.5 ns). The obvious remedy is a length threshold in the escaper — the exact shape of [P2.8](../parsing/yaml.md#p28-simd-threshold-tuning---rejected-), rejected for regressing 8–15% end-to-end. What *was* fixed: the first A/B had 1-byte at +16–24% and the realistic object mix at **+5% slower**; fast-pathing the escape-free case in the `*_to_string` entry points moved the object mix to −6.5…−16.9%.
+
+**Correctness, which outlasts the throughput**: three jq-conformance defects fixed — object keys with control characters produced *invalid JSON* (latent, no non-test caller); `tojson`/`@json` lacked jq's `\b`/`\f`; C1 controls were escaped. The golden corpus could not have caught any: all 41 seed cases were escape-free ASCII, so the only external oracle was blind to escaping entirely. #91 added five cases; two hit the known-failures manifest at capture and both were removed by the end of the issue.
+
+**Files**: [src/json/escape.rs](../../src/json/escape.rs), [src/util/simd/escape.rs](../../src/util/simd/escape.rs), [benches/jq_escape_micro.rs](../../benches/jq_escape_micro.rs), [docs/optimizations/json-escaping.md](json-escaping.md)
+
+---
+
 ## Future Optimization Opportunities
 
 Based on analysis of ARM NEON instructions for indexing and data structures (January 2026):

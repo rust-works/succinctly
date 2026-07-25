@@ -4545,6 +4545,16 @@ fn advance_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
 > future `@html`/`@uri` scanner is a drop-in, per #124). File paths and the NEON
 > snippet below describe the pre-#125 layout and are kept as a historical record.
 
+> **Update (#91):** the *escapers* that consume this scanner were themselves
+> consolidated — eleven routines across `jq`, `yaml`, and the CLI became one
+> implementation in [`src/json/escape.rs`](../../src/json/escape.rs), and two
+> further predicates joined `find_json_escape` (`find_jq_escape`,
+> `find_ascii_escape`). The YAML side gained SIMD in two more places: the M2
+> streaming writer `stream_json_string` had still been hand-rolling a scalar loop
+> over this exact predicate, and the String twin `write_json_string` shed a
+> byte-dropping `_ => {}` arm. `yq -o json` is 1–11% faster as a result. See
+> [json-escaping.md](../optimizations/json-escaping.md).
+
 ### Problem
 
 When streaming YAML to JSON via `to_json_document()`, the `write_json_string()` function scans strings for characters that need JSON escaping (`"`, `\`, and control chars `< 0x20`). The original scalar implementation checked each byte sequentially, which became a bottleneck for long strings.

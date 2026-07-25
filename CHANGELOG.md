@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq object keys with control characters produced invalid JSON** (#91):
+  `JqValue::write_json` escaped only `"` and `\` in object keys, so a key
+  containing a newline, tab, or NUL was emitted as a raw byte inside a quoted
+  string. Keys are now escaped exactly like string values.
+- **`tojson` and `@json` now match jq's control-character escaping** (#91):
+  backspace and form feed use jq's `\b` / `\f` short forms rather than the
+  long `\u0008` / `\u000c`, and the C1 block (U+0080-U+009F) is emitted raw as
+  jq 1.7.1 does, instead of being escaped by `char::is_control()`. The same
+  alignment applies to `succinctly jq`'s own output. Verified against pinned-jq
+  golden fixtures, which #91 also extended to cover string escaping for the
+  first time.
 - `jq -R -s` now yields the entire input as a single string instead of an array of per-line strings, matching jq (#176)
 - `yq -R -s` now yields the entire input as a single string instead of an array of per-line strings, matching jq and `jq -R -s` (#271)
 - YAML alias cycles (`a: &anchor {self: *anchor}`) are rejected at index build with the
@@ -27,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and wrapped past 2^32 set bits (~512 MB of ones); widened to `u64`.
 
 ### Changed
+
+- **JSON string escaping consolidated into `succinctly::json::escape`** (#91):
+  eleven separate escaping routines across `jq`, `yaml`, and the CLI - in three
+  mutually incompatible sets of semantics - now share one SIMD-backed
+  implementation selected by the new public `EscapeStyle` enum. The escaper is
+  2-4x faster at and above the real-corpus p90; end-to-end, `jq --ascii-output`
+  is 6-38% faster and `yq -o json` 1-11%, while default `jq` output is unchanged
+  (its zero-copy passthrough bypasses escaping on escape-free input).
 
 - **4 GiB input ceilings enforced** (#188): instead of silently truncating
   `u32` counters, builds now fail loudly for inputs over `u32::MAX` bytes —

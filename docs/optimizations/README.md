@@ -20,6 +20,7 @@ This directory documents optimization techniques used in the succinctly library,
 | **Parsing**          | [state-machines.md](state-machines.md)                   | PFSM, fast-path bypass, two-stage pipeline       |
 | **Compact encoding** | [end-positions.md](end-positions.md)                     | Bitmap encoding, advance index, sequential cursor|
 | **String search**    | [jq-string-search.md](jq-string-search.md)               | memmem vs std Two-Way for jq substring builtins   |
+| **Text output**      | [json-escaping.md](json-escaping.md)                     | One shared SIMD-backed JSON string escaper        |
 | **Targets**          | [targets.md](targets.md)                                 | CPU target configurations, architecture flags    |
 | **SIMD Strategy**    | [simd-strategy.md](simd-strategy.md)                     | Per-module SIMD usage, platform support, lessons |
 
@@ -65,6 +66,7 @@ This directory documents optimization techniques used in the succinctly library,
 | jq `#[inline(always)]` on generics | **Hangs tests** (60s vs 2s) | Code explosion in 18K-line generic-heavy file | src/jq/eval.rs |
 | jq `#[cold]` on error paths | **-0.3%**      | Compiler already optimizes cold paths         | src/jq/eval.rs |
 | jq `#[inline]` hint         | **-1.3%**      | Compiler's decisions were already optimal      | src/jq/eval.rs |
+| Shared JSON string escaper    | **Accepted**  | 11 escapers -> 1; 2-4x on the escaper, 6-38% on `jq -a` and `yq -o json`; default `jq` neutral (zero-copy bypass) | [json-escaping.md](json-escaping.md) |
 | jq `memchr::memmem` substring | **Deferred**  | Green micro (5.9×/52×) but scan is a minority of allocation-bound ops; no end-to-end workload (#301) | [jq-string-search.md](jq-string-search.md) |
 
 ---

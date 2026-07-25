@@ -124,16 +124,52 @@ public entry is required to avoid a 3-5% regression, so the wrapper is
 
 [rust#145574]: https://github.com/rust-lang/rust/issues/145574
 
-## Shared Predicate-Parameterized Escape Scanner (#125)
+## Shared Predicate-Parameterized Escape Scanner (#125, #91)
 
 `src/util/simd/escape.rs` factors the 16/32-byte chunk loop + scalar remainder
 behind a `define_escape_scanner!` macro parameterized by the escape predicate, so
 a new scanner (`@html`/`@uri`/`@csv`; #124) is a macro invocation rather than a
-copy of the SIMD machinery. `find_json_escape` is the only instantiation today;
-it is re-exported from `yaml::simd` for compatibility. The scalar predicate and
-three per-backend mask helpers (NEON/AVX2/SSE2) are the only predicate-specific
-code — verify each new predicate with an exhaustive 256-byte × offset parity test
-against its scalar reference (the test that caught the signed-compare bug #230).
+copy of the SIMD machinery. Three are instantiated (#91): `find_json_escape`
+(`"` `\` `<0x20`), `find_jq_escape` (+ DEL), and `find_ascii_escape`
+(`"` `\` `<0x20` `>=0x7F`). The scalar predicate and three per-backend mask
+helpers (NEON/AVX2/SSE2) are the only predicate-specific code — verify each new
+predicate with an exhaustive 256-byte × offset parity test against its scalar
+reference (the test that caught the signed-compare bug #230). `escape_scanner_tests!`
+generates that battery, so a new scanner gets the full suite rather than a subset.
+
+### Ordering comparisons: constant *and* operand order (#91)
+
+`subs_epu8` expresses both directions of an unsigned byte compare, but they are
+not symmetric — get either wrong and the predicate silently widens:
+
+```rust
+// b <= 0x1F  (i.e. b < 0x20)
+_mm_cmpeq_epi8(_mm_subs_epu8(chunk, _mm_set1_epi8(0x1F)), zero)
+// b >= 0x7F  — operands REVERSED, and 0x7F, not 0x7E
+_mm_cmpeq_epi8(_mm_subs_epu8(_mm_set1_epi8(0x7Fu8 as i8), chunk), zero)
+```
+
+`0x7E` would also flag `~`; swapping the operands inverts the test. Both survive
+casual review and both are caught by the exhaustive parity test — which is why
+every scanner gets one.
+
+### A predicate matching bytes ≥ 0x80 changes the caller contract
+
+`find_json_escape` and `find_jq_escape` are pure-ASCII predicates, so their
+returned index is *unconditionally* a UTF-8 char boundary. `find_ascii_escape`
+matches `>= 0x7F`, which includes continuation bytes (`0x80..=0xBF`); it is sound
+only because a scan starting on a char boundary always meets the lead byte
+(`>= 0xC2`) first. **Callers must then advance by `len_utf8()`, not by one byte**
+— a one-byte advance resumes mid-character and the next scan returns a
+continuation-byte index that panics anything slicing on it. Pin this with a
+negative test (`advancing_one_byte_desyncs_the_ascii_scanner`) so it stays a
+demonstrated fact rather than a comment.
+
+Corollary: prefer a pure-ASCII predicate when the semantics allow. #91 dropped a
+`0xC2` lane (which would have matched the C1 control block's lead byte) after
+checking that jq emits C1 raw — that single decision removed a false-positive
+stop on every NBSP and Latin-1 punctuation character, a compare per chunk, and an
+entire class of boundary test.
 
 ## Nibble Lookup Tables Must Be Exact (#186)
 
