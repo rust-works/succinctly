@@ -43,6 +43,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which are 8–18% *faster* on x86; end-to-end `yq` on a 1 MB document moves
   +1.8% (`.`) to +6.4% (`.[].name`). See `docs/parsing/yaml.md` for the
   per-change attribution and the const-generic option that would buy it back.
+- **YAML anchors on sequence items whose value is a collection** (#328): `- &m`
+  followed by an indented mapping was read as a multi-line plain scalar, so
+  `list:\n  - &m\n    k: v\n  - *m` came out as `{"list":["k"],"v":["k"]}` — a
+  well-formed but wrong document, with no error raised. The flow form
+  `- &first {id: 1}` corrupted differently, swallowing the anchor into the key
+  text so the alias resolved to `null`. `parse_sequence_item_inner` now consumes
+  the anchor before deciding the item's node type, and `- &a k: v` binds the
+  anchor to the key as `yq` does. Sequences as explicit-key values (`? k` /
+  `: - &m`) route through the same parser instead of an inlined copy of its
+  dispatch, so they are fixed too.
+- **YAML anchors that never named a node** (#328): three further anchor-target
+  bugs, found by a new whole-corpus invariant that every anchor must point at a
+  node's opening parenthesis.
+  - An anchor on a **flow mapping key** (`a: { &e e: f }`) bound to the value
+    rather than the key, so `*e` yielded `"f"` where `yq` gives `"e"`.
+  - An anchor on an **explicit value that turns out to be null** (`? e` / `: &a`)
+    had nothing to point at, so `*a` resolved to the following key — and inside
+    a sequence it landed on the alias's own node and raised a spurious
+    `AliasCycle` error on a valid document.
+  - A **block sequence at a lower indent than a mapping key** was treated as
+    that key's value, leaving the key's anchor dangling.
 - `jq -R -s` now yields the entire input as a single string instead of an array of per-line strings, matching jq (#176)
 - `yq -R -s` now yields the entire input as a single string instead of an array of per-line strings, matching jq and `jq -R -s` (#271)
 - YAML alias cycles (`a: &anchor {self: *anchor}`) are rejected at index build with the
@@ -62,6 +83,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A tag on an anchored sequence item is now rejected** (#328): `- &a !!str x`
+  previously parsed as the plain scalar `"!!str x"`; consuming the anchor before
+  dispatching means the tag is seen rather than absorbed, so it now returns
+  `YamlError::TagNotSupported`. Consistent with `a: !!str 1`, which already
+  errored. Tags remain documented non-support (#224).
+- **Self-referential anchors on sequence items are now rejected** (#328):
+  `- &m\n  - *m` records a real alias edge for the first time and is caught by
+  the existing `AliasCycle` check, where it previously produced garbage. `yq`
+  instead emits a depth-limited expansion; rejecting cycles is the documented
+  policy (see `docs/compliance/yaml/limitations.md`).
 - **4 GiB input ceilings enforced** (#188): instead of silently truncating
   `u32` counters, builds now fail loudly for inputs over `u32::MAX` bytes —
   `YamlIndex::build` returns the new `YamlError::InputTooLarge` variant
