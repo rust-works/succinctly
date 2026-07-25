@@ -88,6 +88,27 @@ separate pass run before indexing, so the default path pays nothing for it — s
 acceptance criteria; it rejects 59 of them today (each `lax:*` line removed from the
 manifest is a case now rejected), with the 24 harder cases still tracked in #223.
 
+### What "accepted" means: the text is kept, not dropped
+
+For an accepted-but-invalid document the loader's job is to produce *some* value without
+losing input. Where a construct has no valid reading, the parser absorbs it as scalar text
+rather than discarding it — the same principle as the tag handling below.
+
+`- ` followed by content is one such case. It is always the sequence-entry indicator, and
+no block sequence can begin inside a flow collection or after a `:` on the same line, so
+`[- x]` and `key: - a` are invalid (`yq` rejects both, and so does the validator). The
+loader reads them as the plain scalar `"- x"` / `"- a"`:
+
+```
+$ printf '[- x]\n' | succinctly yq -o json -I0 '.'
+["- x"]                   # yq: did not find expected node content
+```
+
+Until [#332](https://github.com/rust-works/succinctly/issues/332) these yielded `[null]`
+and `{"key":null}` — the content was silently discarded, which is a worse failure mode than
+either erroring or keeping the text. A `-` *not* followed by whitespace is an ordinary flow
+plain scalar and always was: `[-]` is `["-"]`, `[-1]` is `[-1]`.
+
 ### One exception: cyclic aliases are rejected
 
 An alias that would make an anchored value contain itself (`a: &x {self: *x}`) is
