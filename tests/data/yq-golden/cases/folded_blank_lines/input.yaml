@@ -1,0 +1,47 @@
+one_blank: >
+  a
+
+  b
+two_blank: >
+  a
+
+
+  b
+three_blank: >
+  a
+
+
+
+  b
+whitespace_only_blank: >
+  a
+  
+  b
+leading_blank: >
+
+  a
+two_leading_blanks: >
+
+
+  a
+no_blank: >
+  a
+  b
+strip: >-
+  a
+
+  b
+keep: >+
+  a
+
+  b
+keep_no_blank: >+
+  a
+keep_trailing_blanks: >+
+  a
+
+
+explicit_indent: >2
+  a
+
+  b

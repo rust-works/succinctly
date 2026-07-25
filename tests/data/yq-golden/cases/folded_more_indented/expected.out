@@ -1,0 +1,1 @@
+{"trailing_more_indented":"a\n x\n","blank_then_more_indented":"a\n\n x\n","more_indented_then_blank":"a\n x\n\nb\n","more_indented_both_sides":"a\n\n x\n\nb\n","more_indented_run":"a\n x\n y\nb\n","tab_continuation":"a\n\tx\nb\n","keep_more_indented":"a\n x\n\n\n","strip_more_indented":"a\n\n x"}

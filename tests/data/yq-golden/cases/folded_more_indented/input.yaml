@@ -1,0 +1,36 @@
+trailing_more_indented: >
+  a
+   x
+blank_then_more_indented: >
+  a
+
+   x
+more_indented_then_blank: >
+  a
+   x
+
+  b
+more_indented_both_sides: >
+  a
+
+   x
+
+  b
+more_indented_run: >
+  a
+   x
+   y
+  b
+tab_continuation: >
+  a
+  	x
+  b
+keep_more_indented: >+
+  a
+   x
+
+
+strip_more_indented: >-
+  a
+
+   x

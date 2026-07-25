@@ -14,7 +14,12 @@ blocks:
   folded: >
     line 0 starting worker pool
     line 1 connection established to upstream service
+  folded_blank: >
+    line 0 ok
+
+    line 2 after a blank line
   folded_strip: >-
     line 0 ok
-    line 1 done
+
+    line 2 done
   trailing: end
