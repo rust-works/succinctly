@@ -2249,6 +2249,28 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
         self.total_ones
     }
 
+    /// Bytes of storage this structure occupies, excluding the struct itself.
+    ///
+    /// Counts the parenthesis words plus every index built over them: the
+    /// L0/L1/L2 min-excess and excess arrays, the rank directory, and any
+    /// select support ([`NoSelect`] contributes zero).
+    ///
+    /// The word storage is counted whether or not `W` owns it, so for a
+    /// borrowed `W` (e.g. `&[u64]` over an mmap) this reports the size of the
+    /// structure rather than the bytes allocated on this process's heap.
+    pub fn heap_size(&self) -> usize {
+        core::mem::size_of_val(self.words.as_ref())
+            + self.l0_min_excess.len() * core::mem::size_of::<i8>()
+            + self.l0_word_excess.len() * core::mem::size_of::<i16>()
+            + self.l1_min_excess.len() * core::mem::size_of::<i16>()
+            + self.l1_block_excess.len() * core::mem::size_of::<i16>()
+            + self.l2_min_excess.len() * core::mem::size_of::<i32>()
+            + self.l2_block_excess.len() * core::mem::size_of::<i32>()
+            + self.rank_l1.len() * core::mem::size_of::<u32>()
+            + self.rank_l2.len() * core::mem::size_of::<u64>()
+            + self.select.heap_size()
+    }
+
     /// Find the position of the k-th 1-bit (0-indexed).
     ///
     /// Returns `None` if k >= total_ones.
