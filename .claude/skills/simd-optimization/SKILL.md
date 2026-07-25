@@ -151,6 +151,61 @@ three per-backend mask helpers (NEON/AVX2/SSE2) are the only predicate-specific
 code — verify each new predicate with an exhaustive 256-byte × offset parity test
 against its scalar reference (the test that caught the signed-compare bug #230).
 
+`find_json_string_stop` (#123) is the second instantiation: the JSON validator's
+stop set, `"` / `\` / `< 0x20` / `>= 0x80`. Adding it was a macro invocation plus
+three mask helpers, exactly as designed.
+
+## A Vector Scanner Needs a Scalar Probe in Front of It (#123)
+
+Pointing `find_json_string_stop` at every string run made long-string patterns
+5-15x faster **and** regressed `users` (2-17 byte keys) by **+343%** and
+`unicode` (a stop every 2-3 bytes) by **+198%**. A vector load, a movemask and a
+call into the non-inlined kernel cost several times the handful of byte compares
+they replace. Three guards, each added against a measured regression:
+
+1. **Answer an immediate stop with one compare** — the next byte is already a
+   stop for short values and non-Latin text (unicode +13% → +7%).
+2. **Probe ~16 bytes scalar-ly first**, then vectorize — one SIMD chunk width is
+   the natural floor, since a shorter run cannot complete a vector iteration
+   anyway (users +343% → −9%).
+3. **Consume non-ASCII runs in place** rather than re-entering the probe per
+   character (unicode +18% → +13%).
+
+Also: `#[inline(always)]` on a shared scanner is a property of *its* callers, not
+a universal good. In a transcoder the scan is the hot loop; in the validator it
+sits inside recursive descent, and inlining the AVX2+SSE2+scalar-tail blob there
+cost +13.7% on one-character-key JSON. Give such callers an `#[inline(never)]`
+entry point.
+
+## Small Deltas on String-Free Corpora Are Codegen, Not Your Change (#123)
+
+`arrays/1mb.json` has **zero** `"` bytes, yet showed +8.8% after a
+string-validation change — no scanning code executed at all. Rebuilding both arms
+with `codegen-units=1` collapsed it to +1.8%: adding code to a module repartitions
+its CGUs and changes inlining for *everything* in it.
+
+Before attributing a single-digit delta, rule out in this order:
+
+1. **Does the corpus even exercise the code?** (`tr -cd '"' < f.json | wc -c`)
+2. **Harness noise** — run the same binary as both arms; should be < 1%.
+3. **Layout roulette** — rebuild baseline plus a dead, never-called function;
+   moved everything ≤ 1.4% here.
+4. **Function alignment** — `-Cllvm-args=-align-all-functions=6`; was *not* the
+   cause here, despite being the usual suspect.
+5. **CGU partitioning** — `codegen-units=1`; this was the cause.
+
+## Never A/B a Benchmark Suite on a Laptop (#123)
+
+Baseline-vs-baseline on an Apple M5 Max swung **−21% to +39%** between two runs of
+*identical* binaries, with criterion reporting `p = 0.00` and "Performance has
+regressed". Thermal drift is not noise criterion can model away.
+
+If a dedicated idle host is unavailable, pair the arms tightly and take the
+minimum: run arm A and arm B back to back **per benchmark** (~2s apart, not ~25s),
+repeat N times, keep the minimum per arm. Throttling only ever *adds* time, so the
+minimum is the cleanest estimate. Suite-per-arm ordering still showed ±10% swings;
+per-benchmark pairing brought spurious deltas under ±1.5%.
+
 ## Nibble Lookup Tables Must Be Exact (#186)
 
 `lo_table[byte & 0xF] & hi_table[byte >> 4]` classifies each bit plane as the
@@ -231,6 +286,9 @@ cargo bench --bench json_simd
 5. **Amdahl's Law always wins** - Optimize what matters (the slow 80%)
 6. **Remove failed optimizations** - Slower code creates technical debt
 7. **Nibble tables: one bit plane per Cartesian product** - Shared planes over-match boundary bytes (#186)
+8. **Put a scalar probe in front of every vector scanner** - short runs cost more to vectorize than to compare (#123)
+9. **Check the corpus before believing a delta** - `arrays` has zero strings yet "regressed" 8.8% (#123)
+10. **Pair A/B arms tightly and take the minimum** - laptop baseline-vs-baseline swings ±39% (#123)
 
 ## See Also
 

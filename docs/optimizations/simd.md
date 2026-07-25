@@ -255,6 +255,38 @@ block minimums in a single instruction instead of a scalar loop.
 
 ---
 
+### NEON UTF-8 Validation (Keiser–Lemire, 2026-07-25)
+
+`src/text/utf8.rs` carries both an AVX2 and a NEON kernel for
+[Validating UTF-8 In Less Than One Instruction Per Byte](https://arxiv.org/abs/2010.03090).
+Porting AVX2 → NEON here got *simpler*, not harder:
+
+| AVX2                                                        | NEON                              | Why simpler                         |
+|-------------------------------------------------------------|-----------------------------------|-------------------------------------|
+| `_mm256_permute2x128_si256` + `_mm256_alignr_epi8(…,15/14/13)` | `vextq_u8::<15/14/13>(prev, chunk)` | No 128-bit lanes to cross           |
+| `uge(a,k)` via `_mm256_max_epu8(a,k) == a`                    | `vcgeq_u8(a, vdupq_n_u8(k))`      | Native unsigned compare             |
+| `_mm256_testz_si256(error, error)`                            | `vmaxvq_u8(error) == 0`           | Horizontal reduction                |
+
+`vextq_u8::<N>(a, b)` yields bytes `N..N+16` of `a ++ b`, so `N = 15/14/13` gives
+the `prev1/prev2/prev3` carry across the block boundary.
+
+Two structural points carry over from the paper and matter for correctness:
+
+- **Always run a final zero-padded block**, even when `len % 16 == 0`. A dangling
+  multi-byte lead at end of input then has its missing continuation land on a
+  `0x00` pad byte, which fails the continuation requirement.
+- **The kernel decides validity only.** On any error, re-run the scalar validator
+  to produce the diagnostic, so error offsets are byte-identical on every
+  architecture. Both kernels are transliterations of one portable per-byte
+  reference (`avx2_logic_reference` in the tests), so a differential failure
+  localizes to the intrinsics rather than the algorithm.
+
+**Result in succinctly**: 7.5 GiB/s vs 2.9 GiB/s scalar on CJK (Apple M5 Max,
+**2.6x**). Consumed by the JSON validator for non-ASCII string runs (#123), worth
+−30% to −39% on the `unicode` benchmark pattern.
+
+---
+
 ## ARM SVE2-BITPERM (Graviton 4+)
 
 SVE2-BITPERM provides BDEP (bit deposit) and BEXT (bit extract) instructions equivalent to x86 BMI2 PDEP/PEXT. Available on Neoverse-V2 (AWS Graviton 4) and Azure Cobalt 100.

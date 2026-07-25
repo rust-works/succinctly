@@ -12,7 +12,8 @@ Performance benchmarks for `succinctly json validate` - strict RFC 8259 JSON val
 | **Peak**       | 1.8 GiB/s (nested)   | 1.81 GiB/s (nested)  |
 | **Patterns**   | 10 (1KB-10MB each)   | 10 (1KB-10MB each)   |
 
-**Note**: The validator is purely scalar (no SIMD). High throughput comes from efficient recursive descent parsing with good branch prediction.
+**Note**: The per-platform tables below are the **pre-#123 scalar baseline**, captured 2026-02-04. String scanning is now SIMD-accelerated — see
+[SIMD string scanning (#123)](#simd-string-scanning-123) for the measured deltas, which reach −97% on string-heavy patterns.
 
 ## Platforms
 
@@ -227,7 +228,49 @@ Performance benchmarks for `succinctly json validate` - strict RFC 8259 JSON val
 
 4. **Literals are slowest**: JSON with many `true`/`false`/`null` values requires keyword matching, reducing throughput to ~466-820 MiB/s.
 
-5. **Cross-platform consistency**: ARM and x86_64 achieve comparable peak throughput (~1.8 GiB/s). The validator is purely scalar (no SIMD) - performance comes from efficient branch prediction and cache-friendly sequential access.
+5. **Cross-platform consistency**: ARM and x86_64 achieve comparable peak throughput (~1.8 GiB/s) on the scalar baseline, from efficient branch prediction and cache-friendly sequential access.
+
+---
+
+## SIMD string scanning (#123)
+
+`validate_string` no longer steps byte by byte. It skips runs of printable ASCII with `find_json_string_stop`
+(32B AVX2 / 16B SSE2 / 16B NEON) and hands whole non-ASCII runs to the vectorized UTF-8 validator, which
+gained a NEON kernel in the same change. See [docs/optimizations/simd.md](../optimizations/simd.md).
+
+### Measured deltas vs. the scalar baseline
+
+1MB files, minimum of 5 tightly-paired A/B rounds (both arms run back to back per benchmark, so paired
+samples share a thermal state; the minimum discards throttled samples).
+
+| Pattern           | Apple M5 Max (NEON) | Ryzen 9 7950X (AVX2) | Notes                                    |
+|-------------------|---------------------|----------------------|------------------------------------------|
+| **nested**        | **−93.4%**          | **−97.3%**           | long padding strings                     |
+| **strings**       | **−75.3%**          | **−79.4%**           | ~120-byte values                         |
+| **unicode**       | **−38.8%**          | **−30.6%**           | bulk UTF-8 on non-ASCII runs             |
+| **comprehensive** | −2.1%               | −6.6%                | mixed                                    |
+| **pathological**  | −0.4%               | +8.6%                | 287k one-character keys (see below)       |
+| **users**         | +2.9%               | +1.3%                | realistic short strings, within noise     |
+| others            | −0.0%..+2.4%        | +2.0%..+8.0%         | see the codegen caveat below              |
+
+`nested` on x86_64 goes from 490 µs to 13.5 µs — roughly 1.8 GiB/s to 70 GiB/s.
+
+### Reading the small deltas
+
+Single-digit deltas on this suite are **not** reliably attributable to the validator:
+
+- `arrays/1mb.json` contains **zero** `"` bytes and `numbers/1mb.json` contains **two**, so `validate_string`
+  is never called for them. Their deltas are compilation artifacts of adding code to the module — rebuilding
+  both arms with `codegen-units=1` collapses `arrays` from +8.8% to +1.8%.
+- A control build (baseline plus a dead, never-called function) moved every pattern by at most 1.4%, and
+  base-vs-base is within 0.6%, so the harness itself is tight. Function alignment was separately ruled out
+  with `-Cllvm-args=-align-all-functions=6`.
+- `pathological` is the one genuine remaining cost: single-character keys, where per-string setup cannot
+  amortize. It is an adversarial corpus, not a realistic one; `users` is the realistic short-string pattern.
+
+**Do not A/B this suite on a laptop.** Baseline-vs-baseline on an Apple M5 Max swung −21% to +39% between two
+runs of identical binaries, with criterion reporting p = 0.00. Use an idle dedicated host, and pair the arms
+tightly.
 
 ## Running Benchmarks
 
