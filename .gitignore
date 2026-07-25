@@ -42,3 +42,11 @@ libtest_no_std.rlib
 
 # lychee link-checker cache (written by `lychee --cache`, persisted in CI)
 .lycheecache
+
+# Fuzzing: generated seed corpus (materialised by fuzz/seed-corpus.sh from the
+# vendored corpora), libFuzzer's own corpus, and crash artifacts.
+fuzz/seed-corpus/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/target/

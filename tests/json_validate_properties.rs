@@ -17,50 +17,14 @@
 //! `.claude/skills/testing/SKILL.md` opens by forbidding success-only checks.
 
 use proptest::prelude::*;
-use succinctly::json::validate::{self, Position, ValidationErrorKind};
+use succinctly::json::validate::{self, ValidationErrorKind};
 
-// ---------------------------------------------------------------------------
-// Position as a function of offset
-// ---------------------------------------------------------------------------
-
-/// Recompute a [`Position`] from scratch for a byte offset.
-///
-/// The validator tracks `line`/`column` incrementally, but it only ever mutates
-/// `line` inside `skip_whitespace`; `advance` bumps `column` alone, and a raw
-/// `\n`/`\r` can never reach it (inside a string those bytes hit the `< 0x20`
-/// control-character arm and error first). So position is fully determined by
-/// the prefix, and this reimplementation must agree everywhere.
-///
-/// CRLF counts as a single line break, matching `skip_whitespace`.
-fn position_of(input: &[u8], offset: usize) -> Position {
-    let mut line = 1usize;
-    let mut line_start = 0usize;
-    let mut i = 0usize;
-    while i < offset.min(input.len()) {
-        match input[i] {
-            b'\r' => {
-                line += 1;
-                i += if input.get(i + 1) == Some(&b'\n') {
-                    2
-                } else {
-                    1
-                };
-                line_start = i;
-            }
-            b'\n' => {
-                line += 1;
-                i += 1;
-                line_start = i;
-            }
-            _ => i += 1,
-        }
-    }
-    Position {
-        offset,
-        line,
-        column: offset - line_start + 1,
-    }
-}
+#[path = "common/json_oracle.rs"]
+mod oracle;
+use oracle::{
+    assert_position_invariant, assert_serde_agreement, classify_divergence, position_of, render,
+    KnownDivergence,
+};
 
 // ---------------------------------------------------------------------------
 // Valid-JSON generation
@@ -203,142 +167,6 @@ fn arb_node() -> impl Strategy<Value = Node> {
             prop::collection::vec(("[a-z]{0,8}", inner), 0..6).prop_map(Node::Obj),
         ]
     })
-}
-
-// ---------------------------------------------------------------------------
-// serde_json differential
-// ---------------------------------------------------------------------------
-
-/// A disagreement with `serde_json` that is understood and deliberate.
-#[derive(Debug, PartialEq, Eq)]
-enum KnownDivergence {
-    /// serde_json's recursion budget starts at 128 and errors when it hits 0,
-    /// so its deepest accepted nesting is 127; ours is 128
-    /// (`enter_nested` errors on `>= 128` *before* incrementing). The two
-    /// disagree at exactly depth 128.
-    DepthLimit,
-    /// serde_json errors when a number overflows f64 (`de.rs` rejects an
-    /// infinite `f64_from_parts` result). RFC 8259 §6 places no range or
-    /// precision limit on numbers — it only constrains the grammar — so we
-    /// accept them. JSONTestSuite agrees this is implementation-defined
-    /// (the `i_number_*` cases; see tests/data/json-test-suite-i-decisions.txt).
-    NumberRange,
-}
-
-/// Explain a scalar-vs-serde_json disagreement, or `None` if it is a real bug.
-///
-/// A code-level classifier rather than a data allowlist on purpose: the
-/// divergence set is closed and reasoned, and extending it should require a
-/// human writing down an RFC clause, not appending a line to a text file.
-fn classify_divergence(input: &[u8], ours: bool, theirs: bool) -> Option<KnownDivergence> {
-    // We accept, serde rejects.
-    if ours && !theirs {
-        if max_nesting_depth(input) >= 127 {
-            return Some(KnownDivergence::DepthLimit);
-        }
-        if has_f64_overflowing_number(input) {
-            return Some(KnownDivergence::NumberRange);
-        }
-    }
-    None
-}
-
-/// Maximum bracket nesting depth, ignoring brackets inside strings.
-fn max_nesting_depth(input: &[u8]) -> usize {
-    let (mut depth, mut max, mut i) = (0usize, 0usize, 0usize);
-    while i < input.len() {
-        match input[i] {
-            b'"' => {
-                i += 1;
-                while i < input.len() {
-                    match input[i] {
-                        b'\\' => i += 2,
-                        b'"' => break,
-                        _ => i += 1,
-                    }
-                }
-            }
-            b'{' | b'[' => {
-                depth += 1;
-                max = max.max(depth);
-            }
-            b'}' | b']' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-        i += 1;
-    }
-    max
-}
-
-/// Whether any number literal outside a string overflows or underflows `f64`.
-fn has_f64_overflowing_number(input: &[u8]) -> bool {
-    let mut i = 0usize;
-    while i < input.len() {
-        match input[i] {
-            b'"' => {
-                i += 1;
-                while i < input.len() {
-                    match input[i] {
-                        b'\\' => i += 2,
-                        b'"' => break,
-                        _ => i += 1,
-                    }
-                }
-                i += 1;
-            }
-            b'-' | b'0'..=b'9' => {
-                let start = i;
-                i += 1;
-                while i < input.len()
-                    && matches!(input[i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
-                {
-                    i += 1;
-                }
-                if let Ok(text) = core::str::from_utf8(&input[start..i]) {
-                    match text.parse::<f64>() {
-                        Ok(v) if v.is_infinite() => return true,
-                        // Underflow to zero from a non-zero literal.
-                        Ok(v) if v == 0.0 && text.contains(['e', 'E']) => return true,
-                        Err(_) => return true,
-                        _ => {}
-                    }
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    false
-}
-
-/// Assert we and `serde_json` agree on validity, modulo classified divergences.
-fn assert_serde_agreement(label: &str, input: &[u8]) {
-    let ours = validate::validate(input).is_ok();
-    let theirs = serde_json::from_slice::<serde_json::Value>(input).is_ok();
-    if ours == theirs {
-        return;
-    }
-    assert!(
-        classify_divergence(input, ours, theirs).is_some(),
-        "{label}: unclassified disagreement with serde_json\n  \
-         succinctly: {}\n  serde_json: {}\n  input: {}",
-        if ours { "accept" } else { "reject" },
-        if theirs { "accept" } else { "reject" },
-        render(input),
-    );
-}
-
-/// Render bytes for an assertion message: lossy text plus a hex dump, because
-/// much of what reaches these assertions is deliberately not UTF-8.
-fn render(bytes: &[u8]) -> String {
-    let n = bytes.len().min(64);
-    let hex: Vec<String> = bytes[..n].iter().map(|b| format!("{b:02x}")).collect();
-    format!(
-        "{:?}{} [{}{}]",
-        String::from_utf8_lossy(&bytes[..n]),
-        if bytes.len() > n { "..." } else { "" },
-        hex.join(" "),
-        if bytes.len() > n { " ..." } else { "" },
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -533,17 +361,9 @@ fn every_byte_in_every_context_agrees_with_serde() {
             input.push(byte);
             input.extend_from_slice(suffix.as_bytes());
 
-            if let Err(e) = validate::validate(&input) {
-                assert_eq!(
-                    e.position,
-                    position_of(&input, e.position.offset),
-                    "byte {byte:#04x} in {prefix:?}_{suffix:?}: position disagrees"
-                );
-            }
-            assert_serde_agreement(
-                &format!("byte {byte:#04x} in {prefix:?}_{suffix:?}"),
-                &input,
-            );
+            let label = format!("byte {byte:#04x} in {prefix:?}_{suffix:?}");
+            assert_position_invariant(&label, &input);
+            assert_serde_agreement(&label, &input);
         }
     }
 }
@@ -591,15 +411,9 @@ fn constructs_at_every_offset_across_three_chunks() {
                 doc.push_str(&format!(",{}]", "2,".repeat(32).trim_end_matches(',')));
 
                 let input = doc.as_bytes();
-                if let Err(e) = validate::validate(input) {
-                    assert_eq!(
-                        e.position,
-                        position_of(input, e.position.offset),
-                        "{label}/{variant} at offset {offset}: position disagrees\n  {}",
-                        render(input)
-                    );
-                }
-                assert_serde_agreement(&format!("{label}/{variant}@{offset}"), input);
+                let case = format!("{label}/{variant}@{offset}");
+                assert_position_invariant(&case, input);
+                assert_serde_agreement(&case, input);
             }
         }
     }
