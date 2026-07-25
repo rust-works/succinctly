@@ -23,18 +23,48 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use std::fs;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
-use succinctly::text::utf8::validate_utf8_scalar;
 #[cfg(target_arch = "x86_64")]
 use succinctly::text::utf8::validate_utf8_simd;
+use succinctly::text::utf8::{
+    validate_utf8_broadword, validate_utf8_broadword_seqwise, validate_utf8_scalar,
+};
 
-/// Benchmark both validation engines on the same input: the portable scalar
-/// path always, and the AVX2 SIMD path on x86_64. Each becomes a `scalar`/`simd`
-/// arm under the enclosing group so results compare directly.
+/// Benchmark every validation engine on the same input, plus a `std` baseline.
+/// Each becomes an arm under the enclosing group so results compare directly.
+///
+/// | Arm         | Engine                                                    |
+/// |-------------|-----------------------------------------------------------|
+/// | `std`       | `core::str::from_utf8` — the bar to clear (see below)      |
+/// | `scalar`    | portable byte-at-a-time reference validator               |
+/// | `broadword` | broadword ASCII skip + table-driven DFA                   |
+/// | `seqwise`   | broadword ASCII skip + whole-sequence validation          |
+/// | `simd`      | AVX2 block kernel (x86_64 only)                           |
+///
+/// The `std` arm is not decoration. `core::str::from_utf8` already has a
+/// two-word ASCII fast path with an alignment prologue and works under
+/// `no_std`, so it is the honest bar this optimisation has to clear: if the
+/// broadword kernels cannot beat it, the right implementation of
+/// `validate_utf8` is a delegation to std rather than a hand-written kernel.
+///
+/// Caveat: on *invalid* input the comparison is not like-for-like. `std`
+/// returns `valid_up_to`/`error_len` from its single scan, while every
+/// succinctly engine re-runs `validate_utf8_scalar` to produce line, column
+/// and error kind — so `std` looks artificially fast in the
+/// `utf8_error_at_end` group. Only the valid-input groups compare directly.
 macro_rules! bench_engines {
     ($group:expr, $name:expr, $data:expr) => {{
         let data: &[u8] = $data;
+        $group.bench_with_input(BenchmarkId::new("std", $name), data, |b, data| {
+            b.iter(|| std::str::from_utf8(black_box(data)).is_ok());
+        });
         $group.bench_with_input(BenchmarkId::new("scalar", $name), data, |b, data| {
             b.iter(|| validate_utf8_scalar(black_box(data)));
+        });
+        $group.bench_with_input(BenchmarkId::new("broadword", $name), data, |b, data| {
+            b.iter(|| validate_utf8_broadword(black_box(data)));
+        });
+        $group.bench_with_input(BenchmarkId::new("seqwise", $name), data, |b, data| {
+            b.iter(|| validate_utf8_broadword_seqwise(black_box(data)));
         });
         #[cfg(target_arch = "x86_64")]
         $group.bench_with_input(BenchmarkId::new("simd", $name), data, |b, data| {
@@ -130,6 +160,31 @@ fn generate_2byte(size: usize) -> Vec<u8> {
         }
     }
     result.truncate(size);
+    result
+}
+
+/// Generate content with ASCII runs of exactly `run` bytes separated by a
+/// single 3-byte character.
+///
+/// The other generators all sit at the extremes — 100% ASCII, or multi-byte
+/// every few bytes — so none of them shows where the broadword ASCII skip stops
+/// paying for itself. That crossover is the only thing the broadword engines
+/// change, and it should land near the 8-byte word: below it the skip rarely
+/// fires and the per-sequence handoff dominates, above it the skip should win
+/// outright.
+fn generate_ascii_runs(size: usize, run: usize) -> Vec<u8> {
+    let separator = "€".as_bytes(); // 3-byte sequence
+    let mut result = Vec::with_capacity(size + separator.len());
+    while result.len() < size {
+        for i in 0..run {
+            result.push(b'a' + (i % 26) as u8);
+        }
+        result.extend_from_slice(separator);
+    }
+    // Truncate on a character boundary so the input stays valid UTF-8.
+    while !result.is_empty() && std::str::from_utf8(&result).is_err() {
+        result.pop();
+    }
     result
 }
 
@@ -259,6 +314,25 @@ fn bench_sequence_types(c: &mut Criterion) {
     group.finish();
 }
 
+/// Sweep ASCII run length to locate the broadword crossover point.
+///
+/// Fixed 1MB total so only the run length varies. Runs shorter than the 8-byte
+/// word should favour the engines that do not pay for a failed skip; longer
+/// runs should favour the broadword ones.
+fn bench_ascii_runs(c: &mut Criterion) {
+    let mut group = c.benchmark_group("utf8_ascii_runs_1mb");
+    let size = 1024 * 1024;
+
+    group.throughput(Throughput::Bytes(size as u64));
+
+    for run in [4usize, 8, 16, 64, 256] {
+        let data = generate_ascii_runs(size, run);
+        bench_engines!(group, &format!("run{run}"), &data);
+    }
+
+    group.finish();
+}
+
 /// Validate the committed real-workload corpus seed.
 ///
 /// The synthetic generators above are uniform by construction; real text mixes
@@ -356,6 +430,7 @@ criterion_group!(
     bench_2byte,
     bench_error_at_end,
     bench_sequence_types,
+    bench_ascii_runs,
     bench_corpus,
 );
 
