@@ -4,6 +4,14 @@
 
 Benchmarks comparing `succinctly yq .` (identity filter) vs `yq .` (Mike Farah's yq v4.48.1) for YAML formatting/printing.
 
+> **Pattern coverage note (#327).** Every table below predates the five
+> feature-focused patterns — `flow`, `anchors`, `block-scalars`,
+> `explicit-keys`, `multi-doc` — added to the generated suite, so none of these
+> numbers exercise flow collections, anchors, block scalars, explicit keys or
+> multi-document input. The 11 original patterns are byte-identical across that
+> change, so the results here remain valid for what they measure. See
+> [../guides/benchmarking.md](../guides/benchmarking.md#patterns-and-what-they-cover).
+
 **See also**: [YamlIndex wiki page](../parsing/yaml-index.md) for architecture overview and academic references | [YAML 1.2 Compliance](../compliance/yaml/1.2.md) for type handling details (Norway problem, booleans, etc.)
 
 ## Architectural Differences

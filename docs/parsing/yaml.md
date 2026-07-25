@@ -1179,6 +1179,23 @@ YAML parsing **fails all criteria**:
 
 **Impact:** **19-25% improvement** on block scalar parsing - largest single optimization in YAML Phase 2!
 
+> **Evidence is micro-benchmark only.** These numbers come from
+> `benches/yaml_bench.rs`, which measures **index build** over inline fixtures.
+> There is no end-to-end (query/streaming) number, because until #327 the
+> generated benchmark suite contained no block scalars at all — so no
+> `dev bench yq` result ever exercised this code path.
+>
+> The suite now has a `block-scalars` pattern (including the ~100-line bodies
+> this was measured on), so an end-to-end A/B is possible. It has not been run;
+> to produce it, build with and without the SIMD path and compare on a quiet
+> dedicated machine:
+>
+> ```bash
+> cargo build --release --features cli                 # SIMD paths active
+> cargo build --release --features cli,scalar-yaml     # all YAML SIMD disabled
+> succinctly dev bench yq --patterns block-scalars --sizes 100kb,1mb,10mb --queries identity
+> ```
+
 **Problem:** Block scalars (literal `|` and folded `>` styles) require line-by-line indentation checking to find where the block ends. The original implementation processed one line per iteration:
 1. Count leading spaces on current line
 2. Check if indent < min_indent (block ends)
@@ -1496,6 +1513,18 @@ All showed micro-benchmark improvements but end-to-end regressions!
 
 **Status:** Implemented and accepted 2026-01-17
 
+> **Evidence is micro-benchmark only**, for the same reason as P2.7: the
+> generated suite contained no anchors or aliases until #327, so the accepted
+> 6-17% has no end-to-end counterpart. The suite now has an `anchors` pattern
+> whose anchor names span 2-8, ~24 and ~48 characters — the last bucket being
+> where SIMD scanning is expected to pay. To produce the number:
+>
+> ```bash
+> cargo build --release --features cli                 # SIMD paths active
+> cargo build --release --features cli,scalar-yaml     # all YAML SIMD disabled
+> succinctly dev bench yq --patterns anchors --sizes 100kb,1mb,10mb --queries identity
+> ```
+
 **Hypothesis:** Use AVX2 SIMD to accelerate anchor/alias name parsing by scanning for terminator characters in parallel, reducing hot-path overhead in Kubernetes and CI/CD YAML configurations.
 
 **Expected Impact:** 5-15% improvement on anchor-heavy files
@@ -1660,6 +1689,15 @@ The smaller NEON improvement is expected: 16-byte chunks vs 32-byte AVX2 chunks 
 ### P5: Flow Collection Fast Path - REJECTED ❌
 
 **Status:** Analyzed and rejected 2026-01-17 (not implemented)
+
+> **The rejection rests on a size argument that was untestable end-to-end at the
+> time.** It turns on real flow collections being 10-30 bytes, below the ~32-byte
+> point where SIMD wins — but the generated suite contained no flow collections
+> at all until #327, so no end-to-end measurement could have supported or
+> refuted it. The suite's `flow` pattern is now deliberately bimodal (mostly
+> 10-30 B, with a 64-256 B tail spanning the threshold), so the question can be
+> settled by measurement if it is ever reopened. The corpus-shape evidence for
+> the size claim itself is in `dev bench corpus-stats`.
 
 **Hypothesis:** Use SIMD techniques from JSON parser to accelerate flow collection parsing (`[a, b, c]` and `{key: value}`), since flow collections are structurally similar to JSON.
 
