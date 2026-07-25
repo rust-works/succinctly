@@ -402,8 +402,8 @@ than letting the gap persist unnoticed.
 |--------------------------------------|-----------------------------------------------------------------------------------|
 | Merge keys `<<:`                     | Parsed as an ordinary key: output is `{"<<": {...}}` where yq splices (#171)       |
 | Tags (`!!str`, `!custom`)            | Rejected outright in block context (documented non-support in `src/yaml/mod.rs`)   |
-| `- &anchor` + a collection value     | Mis-parsed: `- &m` then an indented mapping yields `["k"]`, not `[{"k": "v"}]`     |
-| Blank lines in a **folded** scalar   | Emits one newline too many per blank line (`"a\n\nb\n"` where yq folds to `"a\nb\n"`) |
+| `- &anchor` + a collection value     | Mis-parsed: `- &m` then an indented mapping yields `["k"]`, not `[{"k": "v"}]` (#328) |
+| Blank lines in a **folded** scalar   | Emits one newline too many per blank line (`"a\n\nb\n"` where yq folds to `"a\nb\n"`) (#329) |
 
 The last two were found while building the suite for #327 (the generator matches
 `yq` byte-for-byte on everything it does emit, which is how they surfaced).
