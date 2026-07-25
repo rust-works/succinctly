@@ -11,16 +11,6 @@ use core::fmt;
 /// Errors that can occur during YAML parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum YamlError {
-    /// Inconsistent indentation (e.g., mixing 2-space and 4-space).
-    InvalidIndentation {
-        /// Line number (1-indexed)
-        line: usize,
-        /// Expected indentation level
-        expected: usize,
-        /// Actual indentation level found
-        found: usize,
-    },
-
     /// Tab character used for indentation (YAML forbids tabs).
     TabIndentation {
         /// Line number where tab was found
@@ -45,14 +35,6 @@ pub enum YamlError {
         start_offset: usize,
         /// The quote character (" or ')
         quote_type: char,
-    },
-
-    /// Invalid escape sequence in a double-quoted string.
-    InvalidEscape {
-        /// Byte offset of the backslash
-        offset: usize,
-        /// The invalid escape sequence
-        sequence: String,
     },
 
     /// Invalid UTF-8 sequence.
@@ -102,12 +84,6 @@ pub enum YamlError {
         name: String,
     },
 
-    /// Explicit key (`?`) not supported.
-    ExplicitKeyNotSupported {
-        /// Byte offset of the `?`
-        offset: usize,
-    },
-
     /// Tag not supported.
     TagNotSupported {
         /// Byte offset of the `!`
@@ -116,12 +92,6 @@ pub enum YamlError {
 
     /// Empty input.
     EmptyInput,
-
-    /// Colon found without following space (ambiguous).
-    ColonWithoutSpace {
-        /// Byte offset of the colon
-        offset: usize,
-    },
 
     /// Key without value in mapping.
     KeyWithoutValue {
@@ -158,16 +128,6 @@ pub enum YamlError {
 impl fmt::Display for YamlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidIndentation {
-                line,
-                expected,
-                found,
-            } => {
-                write!(
-                    f,
-                    "invalid indentation at line {line}: expected {expected} spaces, found {found}"
-                )
-            }
             Self::TabIndentation { line, offset } => {
                 write!(
                     f,
@@ -198,9 +158,6 @@ impl fmt::Display for YamlError {
                     },
                     start_offset
                 )
-            }
-            Self::InvalidEscape { offset, sequence } => {
-                write!(f, "invalid escape sequence '{sequence}' at offset {offset}")
             }
             Self::InvalidUtf8 { offset } => {
                 write!(f, "invalid UTF-8 sequence at offset {offset}")
@@ -233,20 +190,11 @@ impl fmt::Display for YamlError {
                     "cyclic alias '{name}' at offset {offset} (anchor value contains itself)"
                 )
             }
-            Self::ExplicitKeyNotSupported { offset } => {
-                write!(f, "explicit keys (?) not supported at offset {offset}")
-            }
             Self::TagNotSupported { offset } => {
                 write!(f, "tags (!) not supported at offset {offset}")
             }
             Self::EmptyInput => {
                 write!(f, "empty input")
-            }
-            Self::ColonWithoutSpace { offset } => {
-                write!(
-                    f,
-                    "colon at offset {offset} must be followed by space or newline"
-                )
             }
             Self::KeyWithoutValue { offset, line } => {
                 write!(f, "key without value at line {line} (offset {offset})")
@@ -279,16 +227,6 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        let err = YamlError::InvalidIndentation {
-            line: 5,
-            expected: 2,
-            found: 4,
-        };
-        assert_eq!(
-            err.to_string(),
-            "invalid indentation at line 5: expected 2 spaces, found 4"
-        );
-
         let err = YamlError::TabIndentation {
             line: 3,
             offset: 20,
@@ -335,15 +273,6 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_escape_display() {
-        let err = YamlError::InvalidEscape {
-            offset: 4,
-            sequence: "\\q".to_string(),
-        };
-        assert_eq!(err.to_string(), "invalid escape sequence '\\q' at offset 4");
-    }
-
-    #[test]
     fn test_invalid_utf8_display() {
         let err = YamlError::InvalidUtf8 { offset: 9 };
         assert_eq!(err.to_string(), "invalid UTF-8 sequence at offset 9");
@@ -386,15 +315,6 @@ mod tests {
     }
 
     #[test]
-    fn test_explicit_key_not_supported_display() {
-        let err = YamlError::ExplicitKeyNotSupported { offset: 6 };
-        assert_eq!(
-            err.to_string(),
-            "explicit keys (?) not supported at offset 6"
-        );
-    }
-
-    #[test]
     fn test_tag_not_supported_display() {
         let err = YamlError::TagNotSupported { offset: 8 };
         assert_eq!(err.to_string(), "tags (!) not supported at offset 8");
@@ -403,15 +323,6 @@ mod tests {
     #[test]
     fn test_empty_input_display() {
         assert_eq!(YamlError::EmptyInput.to_string(), "empty input");
-    }
-
-    #[test]
-    fn test_colon_without_space_display() {
-        let err = YamlError::ColonWithoutSpace { offset: 11 };
-        assert_eq!(
-            err.to_string(),
-            "colon at offset 11 must be followed by space or newline"
-        );
     }
 
     #[test]
