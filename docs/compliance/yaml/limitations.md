@@ -129,6 +129,38 @@ $ printf '%%YAML 1.2\n--- text\n' | succinctly yq '.'
 
 Tracked in [#225](https://github.com/rust-works/succinctly/issues/225).
 
+### An explicit key and its `: ` on one line
+
+`? k: v` — the explicit-key indicator and a value indicator on the *same* line —
+diverges from `yq`, which reads the whole `k: v` as a mapping used as the key and
+so renders the key as `""` (complex keys stringify to `""`, as above):
+
+```
+$ printf '? k\n: v\n' | succinctly yq -o=json -I=0 '.'
+{"k":"v"}                            # multi-line: agrees with yq
+$ printf '? k: v\n' | succinctly yq -o=json -I=0 '.'
+{"k":"v"}                            # yq: {"":null}
+$ printf 'm:\n  ? k: v\n' | succinctly yq -o=json -I=0 '.'
+{"m":{"k":null}}                     # yq: {"m":{"":null}}
+$ printf -- '- ? k: v\n' | succinctly yq -o=json -I=0 '.'
+[{"k":null}]                         # yq: [{"":null}]
+```
+
+`parse_explicit_key` ends the key at the `: ` and returns with the parser
+*mid-line*. The main loop then re-derives that line's indentation from the
+mid-line position and reads it as 0, so `parse_explicit_value` closes the mapping
+it should have been filling — which is why the nested spellings lose the value,
+while at top level the mapping is at indent 0 and survives.
+
+The multi-line spelling — the one every real document uses, and the only one the
+YAML Test Suite corpus exercises — is unaffected in all three positions.
+
+Since [#339](https://github.com/rust-works/succinctly/issues/339) the sequence-item
+position shares this wart instead of having one of its own: routing `- ? k`
+through the shared `parse_explicit_key` replaced a *fourth*, different corruption
+(the `? ` folded into a plain scalar) with the behaviour the nested mapping case
+already had. Fixing the mid-line return would fix all of them at once.
+
 ## Line breaks — resolved
 
 All three YAML 1.2 §5.4 line-break forms — LF (`\n`), CRLF (`\r\n`) and a lone CR
