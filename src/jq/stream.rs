@@ -21,7 +21,7 @@
 //! | `length`, complex | OwnedValue | 5-8x input |
 
 use super::value::OwnedValue;
-use crate::util::simd::escape::find_json_escape;
+use crate::json::escape::{write_quoted, EscapeStyle};
 
 /// A value that can be streamed directly to output without intermediate allocation.
 ///
@@ -129,53 +129,19 @@ fn stream_owned_value_json<W: core::fmt::Write>(
     }
 }
 
-/// Stream a string as JSON with proper escaping.
+/// Stream a string as JSON, escaped with **yq's** control-character rules.
 ///
-/// Uses SIMD-accelerated escape detection (O3 optimization from issue #81) to
-/// find characters that need escaping in 16-32 byte chunks, then copies safe
-/// spans directly to output.
+/// Despite living in `jq/`, this writer serves the yq CLI: `stream_json` is
+/// reached only from `yq_runner`, and #262 deliberately aligned it with
+/// mikefarah/yq — DEL and the C1 controls raw, backspace and form feed as the
+/// long `\u00xx` form rather than jq's `\b` / `\f`. Passing [`EscapeStyle::Jq`]
+/// here would silently change yq's output.
+///
+/// Delegates to the shared escaper (#91); the SIMD scan it used to open-code
+/// (O3, #81/#87) now lives there.
+#[inline]
 fn stream_json_string<W: core::fmt::Write>(out: &mut W, s: &str) -> core::fmt::Result {
-    out.write_char('"')?;
-
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        // SIMD-accelerated scan for next escapable character (", \, or < 0x20)
-        // Returns index of first match, or len if no escapes needed
-        let escape_pos = find_json_escape(bytes, i);
-
-        // Copy the safe span directly (no escaping needed)
-        if i < escape_pos {
-            out.write_str(&s[i..escape_pos])?;
-        }
-
-        i = escape_pos;
-
-        // Handle escape sequence if needed
-        if i < len {
-            let b = bytes[i];
-            match b {
-                b'"' => out.write_str("\\\"")?,
-                b'\\' => out.write_str("\\\\")?,
-                b'\n' => out.write_str("\\n")?,
-                b'\r' => out.write_str("\\r")?,
-                b'\t' => out.write_str("\\t")?,
-                b if b < 0x20 => {
-                    // Control character - escape as \u00XX
-                    out.write_str("\\u00")?;
-                    const HEX: &[u8; 16] = b"0123456789abcdef";
-                    out.write_char(HEX[(b >> 4) as usize] as char)?;
-                    out.write_char(HEX[(b & 0xf) as usize] as char)?;
-                }
-                _ => out.write_char(b as char)?,
-            }
-            i += 1;
-        }
-    }
-
-    out.write_char('"')
+    write_quoted(out, s, EscapeStyle::Yq, false)
 }
 
 // ============================================================================
