@@ -528,6 +528,8 @@ enum PatternArg {
     Unicode,
     /// Worst-case for parsing (maximum structural density)
     Pathological,
+    /// Indented, pretty-printed documents (tests whitespace skipping)
+    Pretty,
 }
 
 /// Generate a suite of JSON files with various sizes and patterns for benchmarking
@@ -1085,6 +1087,7 @@ impl From<PatternArg> for generators::Pattern {
             PatternArg::Literals => Self::Literals,
             PatternArg::Unicode => Self::Unicode,
             PatternArg::Pathological => Self::Pathological,
+            PatternArg::Pretty => Self::Pretty,
         }
     }
 }
@@ -1711,6 +1714,7 @@ const SUITE_PATTERNS: &[(&str, generators::Pattern)] = &[
     ("literals", generators::Pattern::Literals),
     ("unicode", generators::Pattern::Unicode),
     ("pathological", generators::Pattern::Pathological),
+    ("pretty", generators::Pattern::Pretty),
 ];
 
 /// Sizes to generate for each pattern (name, bytes)

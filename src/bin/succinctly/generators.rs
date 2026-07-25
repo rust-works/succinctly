@@ -15,6 +15,7 @@ pub enum Pattern {
     Literals,
     Unicode,
     Pathological,
+    Pretty,
 }
 
 /// Generate JSON of approximately target_size bytes
@@ -38,6 +39,7 @@ pub fn generate_json(
         Pattern::Literals => generate_literals_json(target_size, seed),
         Pattern::Unicode => generate_unicode_json(target_size, seed),
         Pattern::Pathological => generate_pathological_json(target_size, seed),
+        Pattern::Pretty => generate_pretty_json(target_size, seed),
     }
 }
 
@@ -684,4 +686,122 @@ pub fn generate_pathological_json(target_size: usize, _seed: Option<u64>) -> Str
     }
     json.push(']');
     json
+}
+
+/// Generate indented, pretty-printed JSON (whitespace-heavy).
+///
+/// Every other pattern in the suite is minified, so none of them exercise the
+/// inter-token whitespace skipping that dominates real `json validate` input:
+/// formatted config files, saved API responses, and anything that has been
+/// through `jq .`. Roughly 40-50% of the bytes here are whitespace, which is
+/// the regime where a chunk scanner that skips runs of whitespace wholesale
+/// should show its largest win — and where the minified patterns are blind.
+///
+/// Shape mirrors [`generate_users_json`] so the two are directly comparable:
+/// same fields, same value distribution, differing only in layout.
+pub fn generate_pretty_json(target_size: usize, seed: Option<u64>) -> String {
+    let mut rng = seed.map(ChaCha8Rng::seed_from_u64);
+    let mut json = String::with_capacity(target_size);
+    json.push_str("{\n  \"users\": [\n");
+
+    // Each indented user record is ~145 bytes. Deliberately under-estimate so
+    // the count is an over-estimate and the size guard below governs the stop;
+    // otherwise the loop runs out of records before reaching target_size.
+    let num_users = target_size / 130;
+
+    for i in 0..num_users {
+        if i > 0 {
+            json.push_str(",\n");
+        }
+
+        let age = rng.as_mut().map_or(25, |r| r.random_range(18..80));
+        let score = rng.as_mut().map_or(i * 10, |r| r.random_range(0..1000));
+
+        json.push_str("    {\n");
+        json.push_str(&format!("      \"id\": {i},\n"));
+        json.push_str(&format!("      \"name\": \"User{i}\",\n"));
+        json.push_str(&format!("      \"email\": \"user{i}@example.com\",\n"));
+        json.push_str(&format!("      \"age\": {age},\n"));
+        json.push_str("      \"active\": true,\n");
+        json.push_str(&format!("      \"score\": {score}\n"));
+        json.push_str("    }");
+
+        // Stop if we've exceeded target size (leave room for the closers).
+        if json.len() >= target_size.saturating_sub(20) {
+            break;
+        }
+    }
+
+    json.push_str("\n  ]\n}\n");
+    json
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fraction of bytes that are JSON insignificant whitespace.
+    fn whitespace_fraction(s: &str) -> f64 {
+        let ws = s
+            .bytes()
+            .filter(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+            .count();
+        ws as f64 / s.len() as f64
+    }
+
+    #[test]
+    fn test_generate_pretty_is_valid_json() {
+        for size in [1024, 10 * 1024, 100 * 1024] {
+            let json = generate_json(size, Pattern::Pretty, Some(42), 5, 0.1);
+            serde_json::from_str::<serde_json::Value>(&json)
+                .unwrap_or_else(|e| panic!("pretty/{size} generated invalid JSON: {e}"));
+            succinctly::json::validate::validate(json.as_bytes())
+                .unwrap_or_else(|e| panic!("pretty/{size} failed strict validation: {e}"));
+        }
+    }
+
+    /// The whole point of this pattern: every other suite pattern is minified,
+    /// so none of them exercise whitespace skipping. If this drops toward zero
+    /// the pattern has silently become a duplicate of `users`.
+    #[test]
+    fn test_generate_pretty_is_whitespace_heavy() {
+        let json = generate_json(100 * 1024, Pattern::Pretty, Some(42), 5, 0.1);
+        let frac = whitespace_fraction(&json);
+        assert!(
+            frac > 0.30,
+            "pretty pattern should be >30% whitespace, got {:.1}%",
+            frac * 100.0
+        );
+
+        // Contrast with the minified pattern it mirrors.
+        let minified = generate_json(100 * 1024, Pattern::Users, Some(42), 5, 0.1);
+        assert!(
+            whitespace_fraction(&minified) < 0.01,
+            "users pattern is expected to be minified"
+        );
+    }
+
+    /// Guards the record-size estimate: too high a divisor and the loop runs
+    /// out of records before reaching target_size, silently generating a file
+    /// far smaller than its name claims.
+    #[test]
+    fn test_generate_pretty_hits_target_size() {
+        for size in [1024, 10 * 1024, 100 * 1024] {
+            let json = generate_json(size, Pattern::Pretty, Some(42), 5, 0.1);
+            let ratio = json.len() as f64 / size as f64;
+            assert!(
+                (0.95..1.15).contains(&ratio),
+                "pretty/{size}: generated {} bytes ({:.2}x target)",
+                json.len(),
+                ratio
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_pretty_is_deterministic() {
+        let a = generate_json(4096, Pattern::Pretty, Some(42), 5, 0.1);
+        let b = generate_json(4096, Pattern::Pretty, Some(42), 5, 0.1);
+        assert_eq!(a, b);
+    }
 }
