@@ -109,10 +109,19 @@ fn run_case(yaml: &str, expectation: &Expectation) -> Result<(), String> {
     match expectation {
         Expectation::MustFail => match produced {
             Err(_) => Ok(()),
-            Ok(docs) => Err(format!(
-                "accepted invalid input, produced {}",
-                docs.join(" ")
-            )),
+            // #223: the opt-in validator is the second line of defence. A
+            // must-fail case is handled correctly if EITHER the default loader
+            // (`YamlIndex::build`, above) or the strict validator rejects it.
+            Ok(docs) => {
+                if succinctly::yaml::validate::validate(yaml.as_bytes()).is_err() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "accepted invalid input, produced {}",
+                        docs.join(" ")
+                    ))
+                }
+            }
         },
         Expectation::Parses => produced
             .map(|_| ())
@@ -292,5 +301,33 @@ fn known_failures_manifest_is_wellformed() {
     assert!(
         unknown.is_empty(),
         "manifest lists case IDs that are not in the corpus: {unknown:?}"
+    );
+}
+
+/// #223 false-positive guardrail: the opt-in validator must **accept** every
+/// valid corpus case (the ~236 loads/parses). Without this, the validator could
+/// "pass" the reject side of the conformance test simply by over-rejecting —
+/// e.g. wrongly rejecting the valid tag/directive documents the loader merely
+/// mishandles. The exceptions list is the escape hatch (ideally empty): a valid
+/// case the validator cannot yet accept goes here with an issue link, exactly
+/// as reject-side gaps go in the known-failures manifest.
+#[test]
+fn validator_accepts_all_valid_cases() {
+    const ACCEPT_EXCEPTIONS: &[&str] = &[];
+
+    let mut rejected = Vec::new();
+    for case in corpus() {
+        if case.fail || ACCEPT_EXCEPTIONS.contains(&case.id.as_str()) {
+            continue;
+        }
+        if let Err(e) = succinctly::yaml::validate::validate(case.yaml.as_bytes()) {
+            rejected.push(format!("  {}: {} — {e}", case.id, case.name));
+        }
+    }
+    assert!(
+        rejected.is_empty(),
+        "the validator rejected {} valid case(s):\n{}",
+        rejected.len(),
+        rejected.join("\n")
     );
 }
