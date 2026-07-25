@@ -111,21 +111,12 @@ impl OpenPositions {
         match self {
             Self::Compact(ap) => ap.find_last_open_at_text_pos(text_pos),
             Self::Dense(v) => {
-                // Binary search for non-compact storage
-                let text_pos_u32 = text_pos as u32;
-                let search_result = v.binary_search(&text_pos_u32);
-
-                match search_result {
-                    Ok(idx) => {
-                        // Found a match, scan right to find the last one
-                        let mut last = idx;
-                        while last + 1 < v.len() && v[last + 1] == text_pos_u32 {
-                            last += 1;
-                        }
-                        Some(last)
-                    }
-                    Err(_) => None,
-                }
+                // `Dense` is selected precisely *because* the positions are not
+                // monotonic (explicit `?` keys emit positions out of text order),
+                // so binary search would be searching unsorted data. Scan
+                // backwards instead, which also yields the last match directly.
+                let text_pos_u32 = u32::try_from(text_pos).ok()?;
+                v.iter().rposition(|&pos| pos == text_pos_u32)
             }
         }
     }
@@ -1170,5 +1161,44 @@ mod tests {
             let i = rng.random_range(0..positions.len());
             assert_eq!(ap.get(i), Some(positions[i]), "random access i={i}");
         }
+    }
+
+    /// Reverse lookup must work on the `Dense` variant, whose positions are
+    /// non-monotonic by construction (that is why it was selected).
+    ///
+    /// Regression: this previously used `binary_search`, which requires sorted
+    /// input. On the sequence below it reported `None` for position 10 (which is
+    /// present at index 1) and index 2 for position 5 (whose last occurrence is
+    /// index 4).
+    #[test]
+    fn test_find_last_open_at_text_pos_dense_non_monotonic() {
+        let positions = vec![0, 10, 5, 20, 5];
+        let op = OpenPositions::build(&positions, 100);
+
+        assert!(
+            !op.is_compact(),
+            "non-monotonic positions must select Dense storage"
+        );
+
+        assert_eq!(op.find_last_open_at_text_pos(0), Some(0));
+        assert_eq!(op.find_last_open_at_text_pos(10), Some(1));
+        assert_eq!(op.find_last_open_at_text_pos(20), Some(3));
+        // 5 appears at indices 2 and 4 → the *last* one wins.
+        assert_eq!(op.find_last_open_at_text_pos(5), Some(4));
+        // Absent position.
+        assert_eq!(op.find_last_open_at_text_pos(7), None);
+    }
+
+    /// A text position outside the `u32` domain cannot be present; it must
+    /// report absent rather than truncate into a false match.
+    #[test]
+    fn test_find_last_open_at_text_pos_dense_out_of_u32_range() {
+        let positions = vec![0, 10, 5];
+        let op = OpenPositions::build(&positions, 100);
+        assert!(!op.is_compact());
+
+        // 2^32 truncates to 0, which *is* present at index 0 — must not match.
+        assert_eq!(op.find_last_open_at_text_pos(1usize << 32), None);
+        assert_eq!(op.find_last_open_at_text_pos(usize::MAX), None);
     }
 }

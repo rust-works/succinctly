@@ -1324,4 +1324,74 @@ mod tests {
             );
         }
     }
+
+    /// Reverse lookup must find every node position in documents that fall back
+    /// to `Dense` storage.
+    ///
+    /// Explicit block mapping entries with missing values (`? a` with no `:`)
+    /// make the parser emit positions out of text order, selecting
+    /// `OpenPositions::Dense`. Its reverse lookup previously used `binary_search`
+    /// on that deliberately-unsorted data and reported "no node here" for
+    /// positions where a node exists — silently breaking `at_offset()` and
+    /// `yq-locate --offset`.
+    ///
+    /// These are all five `Dense`-selecting cases in the YAML test suite
+    /// (`tests/data/yaml-test-suite-2022-01-17.json`). Four of them — every one
+    /// except `7W2P` — had a position the old implementation reported as absent.
+    #[test]
+    fn test_find_bp_at_text_pos_dense_documents() {
+        let docs: &[(&str, &[u8])] = &[
+            ("ZWK4", b"---\na: 1\n? b\n&anchor c: 3\n"),
+            (
+                "5WE3",
+                b"? explicit key # Empty value\n? |\n  block key\n: - one # Explicit compact\n  - two # block value\n",
+            ),
+            (
+                "KK5P",
+                b"complex1:\n  ? - a\ncomplex2:\n  ? - a\n  : b\ncomplex3:\n  ? - a\n  : >\n    b\ncomplex4:\n  ? >\n    a\n  :\ncomplex5:\n  ? - a\n  : - b\n",
+            ),
+            (
+                "PW8X",
+                b"- &a\n- a\n-\n  &a : a\n  b: &b\n-\n  &c : &a\n-\n  ? &d\n-\n  ? &e\n  : &a\n",
+            ),
+            ("7W2P", b"? a\n? b\nc:\n"),
+        ];
+
+        for (id, yaml) in docs {
+            let index = YamlIndex::build(yaml).unwrap();
+            let open_positions = index.open_positions();
+
+            assert!(
+                !open_positions.is_compact(),
+                "{id}: expected Dense storage; if the parser now emits monotonic \
+                 positions here, this test needs a different document"
+            );
+
+            // Every position the index stores must be findable, and must resolve
+            // to the *last* open at that position.
+            for open_idx in 0..open_positions.len() {
+                let Some(text_pos) = open_positions.get(open_idx) else {
+                    continue;
+                };
+                let text_pos = text_pos as usize;
+
+                let expected = (0..open_positions.len())
+                    .rev()
+                    .find(|&i| open_positions.get(i) == Some(text_pos as u32));
+
+                assert_eq!(
+                    open_positions.find_last_open_at_text_pos(text_pos),
+                    expected,
+                    "{id}: reverse lookup wrong at text position {text_pos}"
+                );
+
+                // The BP-level entry point must resolve too.
+                assert!(
+                    index.find_bp_at_text_pos(text_pos).is_some(),
+                    "{id}: find_bp_at_text_pos({text_pos}) returned None, but an \
+                     open exists at that position"
+                );
+            }
+        }
+    }
 }
