@@ -14,6 +14,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::yaml_generators;
+
+/// Every generated suite pattern, alphabetically.
+///
+/// Derived from `yaml_generators::ALL_PATTERNS` rather than duplicated, so a
+/// pattern added to the suite is benchmarked by `--patterns all` and appears in
+/// the markdown tables without a second edit (#327).
+fn pattern_names() -> Vec<String> {
+    let mut names: Vec<String> = yaml_generators::ALL_PATTERNS
+        .iter()
+        .map(|(name, _, _)| (*name).to_string())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
 /// Query types for benchmarking different execution paths
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryType {
@@ -123,19 +139,7 @@ impl Default for BenchConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("data/bench/generated/yaml"),
-            patterns: vec![
-                "comprehensive".into(),
-                "config".into(),
-                "mixed".into(),
-                "navigation".into(),
-                "nested".into(),
-                "numbers".into(),
-                "pathological".into(),
-                "sequences".into(),
-                "strings".into(),
-                "unicode".into(),
-                "users".into(),
-            ],
+            patterns: pattern_names(),
             sizes: vec![
                 "1kb".into(),
                 "10kb".into(),
@@ -690,19 +694,8 @@ pub fn generate_markdown(results: &[BenchmarkResult], has_yq: bool, memory_mode:
         .collect();
 
     // Group by pattern (alphabetical order)
-    let patterns = [
-        "comprehensive",
-        "config",
-        "mixed",
-        "navigation",
-        "nested",
-        "numbers",
-        "pathological",
-        "sequences",
-        "strings",
-        "unicode",
-        "users",
-    ];
+    let pattern_names = pattern_names();
+    let patterns: Vec<&str> = pattern_names.iter().map(String::as_str).collect();
 
     // Size order: largest to smallest
     let size_order = ["100mb", "10mb", "1mb", "100kb", "10kb", "1kb"];
