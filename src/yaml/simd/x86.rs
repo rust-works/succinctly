@@ -63,6 +63,12 @@ fn avx2_enabled() -> bool {
 pub struct YamlCharClass {
     /// Mask of bytes that are '\n'
     pub newlines: u32,
+    /// Mask of bytes that are '\r'.
+    ///
+    /// YAML 1.2 §5.4 makes `\r` a line break in its own right, so scalar scans
+    /// must stop at one exactly as they stop at `\n`. Kept separate from
+    /// `newlines` so callers that genuinely mean LF still get LF (#324).
+    pub carriage_returns: u32,
     /// Mask of bytes that are ':'
     pub colons: u32,
     /// Mask of bytes that are '-'
@@ -118,6 +124,7 @@ unsafe fn classify_yaml_chars_avx2(input: &[u8], offset: usize) -> YamlCharClass
 
     // Create comparison vectors for each character
     let v_newline = _mm256_set1_epi8(b'\n' as i8);
+    let v_carriage_return = _mm256_set1_epi8(b'\r' as i8);
     let v_colon = _mm256_set1_epi8(b':' as i8);
     let v_hyphen = _mm256_set1_epi8(b'-' as i8);
     let v_space = _mm256_set1_epi8(b' ' as i8);
@@ -128,6 +135,7 @@ unsafe fn classify_yaml_chars_avx2(input: &[u8], offset: usize) -> YamlCharClass
 
     // Compare and extract masks
     let eq_newline = _mm256_cmpeq_epi8(chunk, v_newline);
+    let eq_carriage_return = _mm256_cmpeq_epi8(chunk, v_carriage_return);
     let eq_colon = _mm256_cmpeq_epi8(chunk, v_colon);
     let eq_hyphen = _mm256_cmpeq_epi8(chunk, v_hyphen);
     let eq_space = _mm256_cmpeq_epi8(chunk, v_space);
@@ -138,6 +146,7 @@ unsafe fn classify_yaml_chars_avx2(input: &[u8], offset: usize) -> YamlCharClass
 
     YamlCharClass {
         newlines: _mm256_movemask_epi8(eq_newline) as u32,
+        carriage_returns: _mm256_movemask_epi8(eq_carriage_return) as u32,
         colons: _mm256_movemask_epi8(eq_colon) as u32,
         hyphens: _mm256_movemask_epi8(eq_hyphen) as u32,
         spaces: _mm256_movemask_epi8(eq_space) as u32,
@@ -156,6 +165,7 @@ unsafe fn classify_yaml_chars_sse2(input: &[u8], offset: usize) -> YamlCharClass
 
     // Create comparison vectors for each character
     let v_newline = _mm_set1_epi8(b'\n' as i8);
+    let v_carriage_return = _mm_set1_epi8(b'\r' as i8);
     let v_colon = _mm_set1_epi8(b':' as i8);
     let v_hyphen = _mm_set1_epi8(b'-' as i8);
     let v_space = _mm_set1_epi8(b' ' as i8);
@@ -166,6 +176,7 @@ unsafe fn classify_yaml_chars_sse2(input: &[u8], offset: usize) -> YamlCharClass
 
     // Compare and extract masks
     let eq_newline = _mm_cmpeq_epi8(chunk, v_newline);
+    let eq_carriage_return = _mm_cmpeq_epi8(chunk, v_carriage_return);
     let eq_colon = _mm_cmpeq_epi8(chunk, v_colon);
     let eq_hyphen = _mm_cmpeq_epi8(chunk, v_hyphen);
     let eq_space = _mm_cmpeq_epi8(chunk, v_space);
@@ -176,6 +187,7 @@ unsafe fn classify_yaml_chars_sse2(input: &[u8], offset: usize) -> YamlCharClass
 
     YamlCharClass {
         newlines: _mm_movemask_epi8(eq_newline) as u32,
+        carriage_returns: _mm_movemask_epi8(eq_carriage_return) as u32,
         colons: _mm_movemask_epi8(eq_colon) as u32,
         hyphens: _mm_movemask_epi8(eq_hyphen) as u32,
         spaces: _mm_movemask_epi8(eq_space) as u32,
@@ -595,6 +607,7 @@ pub fn find_block_scalar_end(input: &[u8], start: usize, min_indent: usize) -> O
 #[target_feature(enable = "avx2")]
 unsafe fn find_block_scalar_end_avx2(input: &[u8], start: usize, min_indent: usize) -> usize {
     let newline_vec = _mm256_set1_epi8(b'\n' as i8);
+    let carriage_return_vec = _mm256_set1_epi8(b'\r' as i8);
     let space_vec = _mm256_set1_epi8(b' ' as i8);
 
     let mut pos = start;
@@ -602,7 +615,12 @@ unsafe fn find_block_scalar_end_avx2(input: &[u8], start: usize, min_indent: usi
     // Process in 32-byte chunks, looking for newlines
     while pos + 32 < input.len() {
         let chunk = _mm256_loadu_si256(input.as_ptr().add(pos).cast::<__m256i>());
-        let nl_matches = _mm256_cmpeq_epi8(chunk, newline_vec);
+        // Match either line-break byte (#324). A CRLF sets both bits; the CR's
+        // "next line" is the LF itself, which the empty-line guard below skips.
+        let nl_matches = _mm256_or_si256(
+            _mm256_cmpeq_epi8(chunk, newline_vec),
+            _mm256_cmpeq_epi8(chunk, carriage_return_vec),
+        );
         let mut nl_mask = _mm256_movemask_epi8(nl_matches) as u32;
 
         if nl_mask != 0 {
@@ -668,6 +686,7 @@ unsafe fn find_block_scalar_end_avx2(input: &[u8], start: usize, min_indent: usi
 #[target_feature(enable = "sse2")]
 unsafe fn find_block_scalar_end_sse2(input: &[u8], start: usize, min_indent: usize) -> usize {
     let newline_vec = _mm_set1_epi8(b'\n' as i8);
+    let carriage_return_vec = _mm_set1_epi8(b'\r' as i8);
     let space_vec = _mm_set1_epi8(b' ' as i8);
 
     let mut pos = start;
@@ -675,7 +694,11 @@ unsafe fn find_block_scalar_end_sse2(input: &[u8], start: usize, min_indent: usi
     // Process in 16-byte chunks
     while pos + 16 < input.len() {
         let chunk = _mm_loadu_si128(input.as_ptr().add(pos).cast::<__m128i>());
-        let nl_matches = _mm_cmpeq_epi8(chunk, newline_vec);
+        // Match either line-break byte — see the AVX2 path (#324).
+        let nl_matches = _mm_or_si128(
+            _mm_cmpeq_epi8(chunk, newline_vec),
+            _mm_cmpeq_epi8(chunk, carriage_return_vec),
+        );
         let mut nl_mask = _mm_movemask_epi8(nl_matches) as u32;
 
         if nl_mask != 0 {
@@ -734,7 +757,7 @@ fn find_block_scalar_end_scalar(input: &[u8], start: usize, min_indent: usize) -
     let mut pos = start;
 
     while pos < input.len() {
-        if input[pos] == b'\n' {
+        if matches!(input[pos], b'\n' | b'\r') {
             let line_start = pos + 1;
 
             if line_start >= input.len() {
