@@ -3,9 +3,13 @@
 //! YAML 1.2 §5.4 spells a line break three ways: `\n`, a lone `\r`, and `\r\n`
 //! as the two-byte spelling of a *single* break. Every scalar consumer of YAML
 //! text in this module — the oracle ([`super::parser`]), the cursor
-//! ([`super::light`]), the strict validator ([`super::validate`]), and the
-//! newline index ([`super::index`]) — needs the same two answers: *is this byte
-//! a break*, and *how wide is the break here*.
+//! ([`super::light`]), and the strict validator ([`super::validate`]) — needs
+//! the same two answers: *is this byte a break*, and *how wide is the break
+//! here*.
+//!
+//! Line/column lookup was a fourth caller until #228 moved it to
+//! [`crate::text::LineIndex`], which carries its own copy of the rule because
+//! it indexes JSON and DSV text too, where the YAML spelling does not apply.
 //!
 //! Before #341 each of them carried its own copy: roughly twenty open-coded
 //! `if b == b'\r' { … if next == b'\n' { … } } else if b == b'\n' { … }` chains,
