@@ -260,6 +260,28 @@ enum BenchSubcommand {
     Dsv(BenchDsvArgs),
     /// Benchmark succinctly UTF-8 validation vs std::str::from_utf8
     Utf8(BenchUtf8Args),
+    /// Report shape statistics for the real-workload corpus (#301)
+    CorpusStats(BenchCorpusStatsArgs),
+}
+
+/// Arguments for the real-workload corpus shape-statistics report.
+#[derive(Debug, Parser)]
+struct BenchCorpusStatsArgs {
+    /// Corpus root directory to scan (recursively, by file extension)
+    #[arg(short, long, default_value = "data/bench/corpus")]
+    data_dir: PathBuf,
+
+    /// Markdown report to write (or, with --check, the golden to compare against)
+    #[arg(short, long)]
+    markdown: Option<PathBuf>,
+
+    /// Optional JSONL file of per-file inventory records
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Verify the generated report matches --markdown instead of writing it
+    #[arg(long)]
+    check: bool,
 }
 
 /// Arguments for jq benchmark
@@ -1239,6 +1261,15 @@ fn main() -> Result<()> {
                 BenchSubcommand::Yq(args) => run_yq_benchmark(args),
                 BenchSubcommand::Dsv(args) => run_dsv_benchmark(args),
                 BenchSubcommand::Utf8(args) => run_utf8_benchmark(args),
+                BenchSubcommand::CorpusStats(args) => {
+                    let exit_code = corpus_stats::run(
+                        &args.data_dir,
+                        args.markdown.as_deref(),
+                        args.output.as_deref(),
+                        args.check,
+                    )?;
+                    std::process::exit(exit_code);
+                }
             },
         },
         Command::InstallAliases(args) => install_aliases(args),
@@ -2090,6 +2121,7 @@ fn format_bytes(bytes: usize) -> String {
 
 #[cfg(feature = "bench-runner")]
 mod bench_runner;
+mod corpus_stats;
 mod dsv_bench;
 mod dsv_generators;
 mod env_config;

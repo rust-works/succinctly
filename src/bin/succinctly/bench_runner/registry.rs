@@ -15,6 +15,7 @@ pub enum BenchmarkCategory {
     Dsv,
     Text,
     CrossParser,
+    Corpus,
 }
 
 impl fmt::Display for BenchmarkCategory {
@@ -26,6 +27,7 @@ impl fmt::Display for BenchmarkCategory {
             Self::Dsv => write!(f, "dsv"),
             Self::Text => write!(f, "text"),
             Self::CrossParser => write!(f, "cross-parser"),
+            Self::Corpus => write!(f, "corpus"),
         }
     }
 }
@@ -41,8 +43,9 @@ impl std::str::FromStr for BenchmarkCategory {
             "dsv" => Ok(Self::Dsv),
             "text" => Ok(Self::Text),
             "cross-parser" | "crossparser" | "cross_parser" => Ok(Self::CrossParser),
+            "corpus" => Ok(Self::Corpus),
             _ => Err(format!(
-                "unknown category '{s}', expected: core, json, yaml, dsv, text, cross-parser"
+                "unknown category '{s}', expected: core, json, yaml, dsv, text, cross-parser, corpus"
             )),
         }
     }
@@ -339,6 +342,16 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         cli_subcommand: Some("utf8"),
         working_dir: ".",
     },
+    // ========== CORPUS ==========
+    BenchmarkInfo {
+        name: "corpus_stats",
+        description: "Shape statistics for the real-workload corpus (#301)",
+        category: BenchmarkCategory::Corpus,
+        bench_type: BenchmarkType::CliBench,
+        criterion_name: None,
+        cli_subcommand: Some("corpus-stats"),
+        working_dir: ".",
+    },
     // ========== CROSS-PARSER ==========
     BenchmarkInfo {
         name: "json_parsers",
@@ -408,6 +421,7 @@ mod tests {
         assert!(!filter_by_category(BenchmarkCategory::Dsv).is_empty());
         assert!(!filter_by_category(BenchmarkCategory::Text).is_empty());
         assert!(!filter_by_category(BenchmarkCategory::CrossParser).is_empty());
+        assert!(!filter_by_category(BenchmarkCategory::Corpus).is_empty());
     }
 
     #[test]
