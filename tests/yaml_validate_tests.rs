@@ -150,3 +150,67 @@ fn valid_file_exits_zero() -> Result<()> {
     assert_eq!(code, 0, "stderr: {stderr}");
     Ok(())
 }
+
+// ============================================================================
+// `syq --validate` (the yq runner's opt-in validation flag).
+// ============================================================================
+
+fn run_yq_validate_stdin(input: &str, filter: &str) -> Result<(String, String, i32)> {
+    let mut cmd = Command::new(succinctly_bin())
+        .args(["yq", "--validate", filter])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(input.as_bytes())?;
+    }
+    let output = cmd.wait_with_output()?;
+    Ok((
+        String::from_utf8(output.stdout)?,
+        String::from_utf8(output.stderr)?,
+        output.status.code().unwrap_or(-1),
+    ))
+}
+
+#[test]
+fn yq_validate_passes_valid_yaml() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_validate_stdin("a: 1\nb: 2\n", ".a")?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "1");
+    Ok(())
+}
+
+#[test]
+fn yq_validate_rejects_invalid_yaml_before_output() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_validate_stdin("a: b: c: d\n", ".")?;
+    assert_ne!(code, 0);
+    assert!(stdout.is_empty(), "no query output on validation failure: {stdout}");
+    assert!(stderr.contains("validation error"), "stderr: {stderr}");
+    Ok(())
+}
+
+#[test]
+fn yq_without_validate_accepts_the_same_invalid_yaml() -> Result<()> {
+    // The default loader is non-validating: the same input succeeds without
+    // `--validate`, proving the flag is opt-in.
+    let (_, _, code) = {
+        let mut cmd = Command::new(succinctly_bin())
+            .args(["yq", "."])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = cmd.stdin.take() {
+            stdin.write_all(b"a: b: c: d\n")?;
+        }
+        let output = cmd.wait_with_output()?;
+        (
+            String::from_utf8(output.stdout)?,
+            String::from_utf8(output.stderr)?,
+            output.status.code().unwrap_or(-1),
+        )
+    };
+    assert_eq!(code, 0);
+    Ok(())
+}

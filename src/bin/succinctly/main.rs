@@ -939,6 +939,11 @@ pub struct YqCommand {
     #[arg(short = 's', long)]
     pub slurp: bool,
 
+    /// Validate YAML strictly (opt-in) before processing. Reports line:column
+    /// errors and exits without producing output on the first violation.
+    #[arg(long)]
+    pub validate: bool,
+
     /// Input format type [auto, yaml, json] (default: auto)
     #[arg(
         short = 'p',
