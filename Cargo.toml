@@ -181,6 +181,10 @@ name = "bp_select_micro"
 harness = false
 
 [[bench]]
+name = "select_scan_micro"
+harness = false
+
+[[bench]]
 name = "elias_fano"
 harness = false
 
