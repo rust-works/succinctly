@@ -117,14 +117,22 @@ impl core::fmt::Display for Utf8ErrorKind {
 /// ```
 #[inline]
 pub fn validate_utf8(input: &[u8]) -> Result<(), Utf8Error> {
-    // On x86_64 with runtime feature detection available (std or test), prefer
-    // the AVX2 fast path, which falls back to the scalar validator on any error
-    // (and on non-AVX2 hardware) so the reported `Utf8Error` is identical.
+    // Prefer a SIMD accept scan where one exists; each falls back to the scalar
+    // validator on any error so the reported `Utf8Error` is identical either way.
+    //   * aarch64: NEON, mandatory on the target, so no detection and no `std`.
+    //   * x86_64: AVX2, needing runtime feature detection (hence `std` or test).
+    #[cfg(target_arch = "aarch64")]
+    {
+        validate_utf8_simd(input)
+    }
     #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
     {
         validate_utf8_simd(input)
     }
-    #[cfg(not(all(target_arch = "x86_64", any(test, feature = "std"))))]
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", any(test, feature = "std"))
+    )))]
     {
         validate_utf8_scalar(input)
     }
@@ -496,6 +504,156 @@ mod simd_x86 {
     pub(crate) unsafe fn validate_utf8_avx2_unchecked(input: &[u8]) -> bool {
         // SAFETY: the caller guarantees AVX2 is available.
         unsafe { validate_utf8_avx2(input) }
+    }
+}
+
+/// Validate `input` as UTF-8 using NEON.
+///
+/// The aarch64 twin of [`validate_utf8_simd`]'s x86 counterpart, and the same
+/// contract: the kernel only decides *validity*, and on any detected error this
+/// re-runs [`validate_utf8_scalar`] so callers get byte-identical diagnostics on
+/// every architecture. NEON is mandatory on aarch64, so unlike the AVX2 path this
+/// needs no runtime detection and is therefore available without `std`.
+#[cfg(target_arch = "aarch64")]
+pub use self::simd_neon::validate_utf8_simd;
+
+/// aarch64 NEON UTF-8 validation.
+///
+/// A direct transliteration of [`simd_x86`]'s block algorithm to 16-byte NEON
+/// vectors — same Keiser–Lemire structure, same explicit range comparisons, same
+/// per-byte predicate, so the portable `avx2_logic_reference` twin in the tests
+/// validates both kernels. Two things get simpler than on AVX2: `vextq_u8`
+/// shifts across the whole 128-bit vector (no `permute2x128` lane dance, since
+/// there are no 128-bit lanes to cross), and `vcgeq_u8`/`vcltq_u8` are native
+/// unsigned compares (no `max_epu8` identity trick).
+#[cfg(target_arch = "aarch64")]
+mod simd_neon {
+    #![allow(unsafe_code)] // aarch64 NEON SIMD intrinsics
+
+    use super::{validate_utf8_scalar, Utf8Error};
+    use core::arch::aarch64::*;
+
+    /// Validate `input` as UTF-8, deferring to the scalar validator for errors.
+    pub fn validate_utf8_simd(input: &[u8]) -> Result<(), Utf8Error> {
+        // SAFETY: NEON is mandatory on aarch64, so the kernel is always callable.
+        if unsafe { validate_utf8_neon(input) } {
+            Ok(())
+        } else {
+            validate_utf8_scalar(input)
+        }
+    }
+
+    /// Accumulate UTF-8 errors for one 16-byte block into `error`.
+    ///
+    /// `prev_input` holds the previous block (zeros before the first block) so
+    /// that `prev1`/`prev2`/`prev3` — the bytes 1/2/3 positions back — are
+    /// available across the block boundary.
+    ///
+    /// Needs no inner `unsafe` block: with `neon` enabled on the fn, every
+    /// intrinsic below is a safe call, and unlike the x86 twin there are no
+    /// `unsafe fn` compare helpers to forward to.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn check_block(chunk: uint8x16_t, prev_input: uint8x16_t, error: &mut uint8x16_t) {
+        // `vextq_u8::<N>(a, b)` yields bytes N..N+16 of `a ++ b`, so N=15/14/13
+        // shift `chunk` right by 1/2/3 bytes, pulling in the tail of `prev_input`.
+        let prev1 = vextq_u8::<15>(prev_input, chunk);
+        let prev2 = vextq_u8::<14>(prev_input, chunk);
+        let prev3 = vextq_u8::<13>(prev_input, chunk);
+
+        // is_cont = (chunk & 0xC0) == 0x80
+        let is_cont = vceqq_u8(vandq_u8(chunk, vdupq_n_u8(0xC0)), vdupq_n_u8(0x80));
+
+        // A byte MUST be a continuation iff the byte 1 back is any lead
+        // (>=0xC0), or 2 back is a 3/4-byte lead (>=0xE0), or 3 back is a
+        // 4-byte lead (>=0xF0). Missing OR stray continuations => is_cont
+        // disagrees with must_cont.
+        let must_cont = vorrq_u8(
+            vorrq_u8(
+                vcgeq_u8(prev1, vdupq_n_u8(0xC0)),
+                vcgeq_u8(prev2, vdupq_n_u8(0xE0)),
+            ),
+            vcgeq_u8(prev3, vdupq_n_u8(0xF0)),
+        );
+        let mut err = veorq_u8(is_cont, must_cont);
+
+        // Bytes that are never valid anywhere: 0xC0/0xC1 (overlong 2-byte
+        // leads) and 0xF5..=0xFF (beyond U+10FFFF / not UTF-8 lead bytes).
+        let invalid_c0c1 = vceqq_u8(vandq_u8(chunk, vdupq_n_u8(0xFE)), vdupq_n_u8(0xC0));
+        err = vorrq_u8(
+            err,
+            vorrq_u8(invalid_c0c1, vcgeq_u8(chunk, vdupq_n_u8(0xF5))),
+        );
+
+        // Special cases keyed on the lead byte (prev1) and the byte after it
+        // (chunk), each firing only within the continuation range:
+        //   E0 followed by <0xA0 -> overlong 3-byte
+        //   ED followed by >=0xA0 -> surrogate (U+D800..U+DFFF)
+        //   F0 followed by <0x90 -> overlong 4-byte
+        //   F4 followed by >=0x90 -> above U+10FFFF
+        let e0 = vceqq_u8(prev1, vdupq_n_u8(0xE0));
+        let ed = vceqq_u8(prev1, vdupq_n_u8(0xED));
+        let f0 = vceqq_u8(prev1, vdupq_n_u8(0xF0));
+        let f4 = vceqq_u8(prev1, vdupq_n_u8(0xF4));
+        err = vorrq_u8(err, vandq_u8(e0, vcltq_u8(chunk, vdupq_n_u8(0xA0))));
+        err = vorrq_u8(err, vandq_u8(ed, vcgeq_u8(chunk, vdupq_n_u8(0xA0))));
+        err = vorrq_u8(err, vandq_u8(f0, vcltq_u8(chunk, vdupq_n_u8(0x90))));
+        err = vorrq_u8(err, vandq_u8(f4, vcgeq_u8(chunk, vdupq_n_u8(0x90))));
+
+        *error = vorrq_u8(*error, err);
+    }
+
+    /// Return `true` iff `input` is entirely valid UTF-8.
+    ///
+    /// End-of-input truncation is caught by always processing a final
+    /// zero-padded block: a dangling multi-byte lead's absent continuation lands
+    /// on a `0x00` pad byte, which fails the continuation requirement.
+    ///
+    /// # Safety
+    /// Requires NEON, which is mandatory on every aarch64 target.
+    #[target_feature(enable = "neon")]
+    unsafe fn validate_utf8_neon(input: &[u8]) -> bool {
+        unsafe {
+            let len = input.len();
+            if len == 0 {
+                return true;
+            }
+
+            let mut error = vdupq_n_u8(0);
+            let mut prev_input = vdupq_n_u8(0);
+
+            let mut pos = 0;
+            while pos + 16 <= len {
+                let chunk = vld1q_u8(input.as_ptr().add(pos));
+                check_block(chunk, prev_input, &mut error);
+                prev_input = chunk;
+                pos += 16;
+            }
+
+            // Final zero-padded tail. Runs even when `len % 16 == 0` (tail all
+            // zeros) so a lead byte at the very end is still flagged as truncated
+            // via the carried `prev_input`.
+            let mut tail = [0u8; 16];
+            tail[..len - pos].copy_from_slice(&input[pos..]);
+            check_block(vld1q_u8(tail.as_ptr()), prev_input, &mut error);
+
+            // Valid iff no error bit was set in any lane.
+            vmaxvq_u8(error) == 0
+        }
+    }
+
+    /// Test-only: run the raw NEON kernel over `input`.
+    ///
+    /// Mirrors the x86 `validate_utf8_avx2_unchecked` escape hatch so the
+    /// differential test can see the kernel's own verdict rather than the
+    /// scalar-fallback wrapper's, catching false accepts *and* false rejects.
+    ///
+    /// # Safety
+    /// Requires NEON, which is mandatory on every aarch64 target.
+    #[cfg(test)]
+    pub(crate) unsafe fn validate_utf8_neon_unchecked(input: &[u8]) -> bool {
+        // SAFETY: NEON is mandatory on aarch64.
+        unsafe { validate_utf8_neon(input) }
     }
 }
 
@@ -1986,6 +2144,72 @@ mod validate_utf8_differential_tests {
         }
         for buf in valid_boundary_fixtures() {
             check(&buf);
+        }
+    }
+
+    /// The NEON kernel itself agrees with std over a large random corpus and the
+    /// targeted boundary fixtures — catching both false accepts and false
+    /// rejects. No detection guard: NEON is mandatory on aarch64, so this always
+    /// runs where it is compiled. Also cross-checked against the portable twin,
+    /// which both kernels are transliterations of, so a divergence localizes the
+    /// bug to the intrinsics rather than the algorithm.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_kernel_matches_std() {
+        let check = |bytes: &[u8]| {
+            // SAFETY: NEON is mandatory on aarch64.
+            let valid = unsafe { super::simd_neon::validate_utf8_neon_unchecked(bytes) };
+            assert_eq!(
+                valid,
+                core::str::from_utf8(bytes).is_ok(),
+                "NEON kernel disagreed with std on {bytes:02x?}"
+            );
+            assert_eq!(
+                valid,
+                avx2_logic_reference(bytes),
+                "NEON kernel disagreed with its portable twin on {bytes:02x?}"
+            );
+        };
+
+        let mut rng = Rng(0xbeef_f00d_5555_0007);
+        for _ in 0..50_000 {
+            let len = rng.below(140) as usize;
+            check(&random_bytes(&mut rng, len));
+        }
+        for _ in 0..10_000 {
+            let min_len = rng.below(300) as usize;
+            let mut bytes = random_valid_utf8(&mut rng, min_len);
+            if !bytes.is_empty() && rng.below(2) == 0 {
+                let i = rng.below(bytes.len() as u32) as usize;
+                bytes[i] = (rng.next_u32() & 0xFF) as u8;
+            }
+            check(&bytes);
+        }
+        // 16-byte block edges matter for NEON specifically; the shared fixtures
+        // straddle 32/64, so add the 15/16/17 neighbourhood explicitly.
+        for buf in invalid_boundary_fixtures() {
+            check(&buf);
+        }
+        for buf in valid_boundary_fixtures() {
+            check(&buf);
+        }
+        let seqs: &[&[u8]] = &[
+            "é".as_bytes(),
+            "€".as_bytes(),
+            "😀".as_bytes(),
+            &[0x80],
+            &[0xC2],
+            &[0xED, 0xA0, 0x80],
+            &[0xF4, 0x90, 0x80, 0x80],
+        ];
+        for seq in seqs {
+            for off in 0..40usize {
+                let mut buf: Vec<u8> = core::iter::repeat(b'a').take(off).collect();
+                buf.extend_from_slice(seq);
+                check(&buf);
+                buf.push(b'z');
+                check(&buf);
+            }
         }
     }
 

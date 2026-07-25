@@ -19,19 +19,20 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
 use succinctly::text::utf8::validate_utf8_scalar;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use succinctly::text::utf8::validate_utf8_simd;
 
 /// Benchmark both validation engines on the same input: the portable scalar
-/// path always, and the AVX2 SIMD path on x86_64. Each becomes a `scalar`/`simd`
-/// arm under the enclosing group so results compare directly.
+/// path always, and the SIMD path where one exists (AVX2 on x86_64, NEON on
+/// aarch64). Each becomes a `scalar`/`simd` arm under the enclosing group so
+/// results compare directly.
 macro_rules! bench_engines {
     ($group:expr, $name:expr, $data:expr) => {{
         let data: &[u8] = $data;
         $group.bench_with_input(BenchmarkId::new("scalar", $name), data, |b, data| {
             b.iter(|| validate_utf8_scalar(black_box(data)));
         });
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         $group.bench_with_input(BenchmarkId::new("simd", $name), data, |b, data| {
             b.iter(|| validate_utf8_simd(black_box(data)));
         });

@@ -29,7 +29,7 @@ use alloc::string::String;
 
 use core::fmt;
 
-use crate::util::simd::escape::find_json_string_stop;
+use crate::util::simd::escape::{find_json_escape, find_json_string_stop};
 
 /// Position information for error reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +174,14 @@ const MAX_NESTING_DEPTH: usize = 128;
 /// the probe covers exactly the region where the vector path could not have
 /// completed a single iteration anyway (#123).
 const SCALAR_PROBE_BYTES: usize = 16;
+
+/// Shortest non-ASCII run handed to the vectorized UTF-8 validator.
+///
+/// Below this, the fixed cost of the call — dispatch, the zero-padded tail copy,
+/// and a block's worth of setup — outweighs decoding the two or three characters
+/// scalar-ly. One NEON/SSE2 block is the natural floor: a shorter span cannot
+/// complete even a single vector iteration, so it is all tail work anyway (#123).
+const UTF8_SIMD_MIN_SPAN: usize = 16;
 
 /// Is `b` ordinary JSON string content, needing no decision from the validator?
 ///
@@ -424,19 +432,8 @@ impl<'a> Validator<'a> {
                     return Err(self.error(ValidationErrorKind::ControlCharacter { byte: b }));
                 }
                 Some(_) => {
-                    // >= 0x80: a UTF-8 sequence. Consume the whole non-ASCII run
-                    // here rather than returning to the probe after each
-                    // character. In CJK, Cyrillic, Arabic or emoji text a stop
-                    // falls every 2-3 bytes, so re-entering the probe per
-                    // character costs more setup than the compares it saves
-                    // (+18% on the `unicode` pattern before this loop existed).
-                    loop {
-                        self.validate_utf8_char()?;
-                        match self.peek() {
-                            Some(b) if b >= 0x80 => {}
-                            _ => break,
-                        }
-                    }
+                    // >= 0x80: the start of a UTF-8 sequence.
+                    self.validate_non_ascii()?;
                 }
                 None => {
                     return Err(self.error(ValidationErrorKind::UnclosedString));
@@ -468,6 +465,43 @@ impl<'a> Validator<'a> {
             Some(i) => self.offset + 1 + i,
             // Still plain content after the probe: long enough for SIMD to pay.
             None => find_json_string_stop(self.input, probe_end),
+        }
+    }
+
+    /// Validate a run of string content starting at a UTF-8 lead byte.
+    ///
+    /// Long runs go to [`crate::text::utf8::validate_utf8`], which is 2-3x faster
+    /// than per-character decoding (AVX2 / NEON Keiser–Lemire). Short runs, and
+    /// *every* invalid run, fall to the scalar loop — the SIMD kernel only ever
+    /// decides validity, so the scalar path remains the sole source of error
+    /// positions and `InvalidUtf8` keeps pointing at the lead byte rather than
+    /// wherever the shared UTF-8 helper would place it.
+    fn validate_non_ascii(&mut self) -> Result<(), ValidationError> {
+        // `find_json_escape` stops only at `"` / `\` / `< 0x20`, so it runs past
+        // every high byte — and past interior ASCII — to the end of the string's
+        // content. That whole stretch is one UTF-8 validation.
+        //
+        // The span is self-contained: `input[end]` is always ASCII (or end of
+        // input), never a continuation byte, so a sequence straddling `end` is
+        // correctly reported as truncated rather than silently accepted.
+        let end = find_json_escape(self.input, self.offset);
+        let span = &self.input[self.offset..end];
+        if span.len() >= UTF8_SIMD_MIN_SPAN && crate::text::utf8::validate_utf8(span).is_ok() {
+            self.column += span.len();
+            self.offset = end;
+            return Ok(());
+        }
+
+        // Consume the non-ASCII characters in place rather than returning to the
+        // probe after each one: in CJK, Cyrillic, Arabic or emoji text a stop
+        // falls every 2-3 bytes, so re-entering the probe per character costs
+        // more setup than the compares it saves.
+        loop {
+            self.validate_utf8_char()?;
+            match self.peek() {
+                Some(b) if b >= 0x80 => {}
+                _ => return Ok(()),
+            }
         }
     }
 
