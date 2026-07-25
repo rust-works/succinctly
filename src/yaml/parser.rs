@@ -365,12 +365,66 @@ impl<'a> Parser<'a> {
     /// Only called on error paths, so we pay the cost only when needed.
     #[inline]
     fn current_line(&self) -> usize {
-        // Count newlines from start to current position
-        self.input[..self.pos]
+        // Count line breaks from start to current position. A CRLF is one
+        // break, so a `\r` only counts when it is not part of one (#324).
+        let text = &self.input[..self.pos];
+        let breaks = text
             .iter()
-            .filter(|&&b| b == b'\n')
-            .count()
-            + 1
+            .enumerate()
+            .filter(|&(i, &b)| b == b'\n' || (b == b'\r' && text.get(i + 1) != Some(&b'\n')))
+            .count();
+        breaks + 1
+    }
+
+    /// Is `b` a YAML line break? Per YAML 1.2 §5.4 that is `\n` or `\r`;
+    /// `\r\n` is the two-byte spelling of a single break (#324).
+    #[inline]
+    fn is_break(b: u8) -> bool {
+        matches!(b, b'\n' | b'\r')
+    }
+
+    /// Width in bytes of the line break at `pos`: 2 for `\r\n`, 1 for a lone
+    /// `\r` or `\n`, 0 if `pos` is not at a break.
+    #[inline]
+    fn break_len_at(&self, pos: usize) -> usize {
+        match self.input.get(pos) {
+            Some(b'\r') => {
+                if self.input.get(pos + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                }
+            }
+            Some(b'\n') => 1,
+            _ => 0,
+        }
+    }
+
+    /// Is the current position at a line break?
+    #[inline]
+    fn at_break(&self) -> bool {
+        self.peek().is_some_and(Self::is_break)
+    }
+
+    /// Consume the line break at the current position, if any.
+    ///
+    /// Dispatches on the byte rather than going through `break_len_at`, so the
+    /// overwhelmingly common LF case costs one bounds-checked load and an
+    /// increment — exactly what the `if peek() == Some(b'\n') { advance() }` it
+    /// replaced cost. Routing it through `advance_by(break_len_at(..))` instead
+    /// doubled the bounds checks on a per-line path.
+    #[inline]
+    fn skip_line_break(&mut self) {
+        match self.input.get(self.pos) {
+            Some(b'\n') => self.pos += 1,
+            Some(b'\r') => {
+                self.pos += 1;
+                if self.input.get(self.pos) == Some(&b'\n') {
+                    self.pos += 1;
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Skip whitespace on the current line (spaces and tabs, not newlines).
@@ -422,8 +476,11 @@ impl<'a> Parser<'a> {
     fn skip_unquoted_simd(&self, _value_start: usize) -> Option<usize> {
         // Use classify_yaml_chars to scan 32 bytes at once
         if let Some(class) = super::simd::classify_yaml_chars(self.input, self.pos) {
-            // Check for any potential terminators: newline, colon, or hash
-            let terminators = class.newlines | class.colons | class.hash;
+            // Check for any potential terminators: line break, colon, or hash.
+            // `\r` counts: it is a YAML 1.2 §5.4 line break, and without it the
+            // classifier skips straight over a lone CR and swallows the rest of
+            // the document into one scalar (#324).
+            let terminators = class.newlines | class.carriage_returns | class.colons | class.hash;
 
             if terminators == 0 {
                 // No structural characters in the classified chunk — skip
@@ -513,7 +570,7 @@ impl<'a> Parser<'a> {
     fn current_column(&self) -> usize {
         // Find the start of the current line
         let mut line_start = self.pos;
-        while line_start > 0 && self.input[line_start - 1] != b'\n' {
+        while line_start > 0 && !Self::is_break(self.input[line_start - 1]) {
             line_start -= 1;
         }
         self.pos - line_start
@@ -524,7 +581,7 @@ impl<'a> Parser<'a> {
         let mut i = self.pos;
         while i < self.input.len() {
             match self.input[i] {
-                b'\n' => return true,
+                b'\n' | b'\r' => return true,
                 b'#' => return true, // Comment starts
                 b' ' => i += 1,
                 _ => return false,
@@ -543,7 +600,7 @@ impl<'a> Parser<'a> {
             // Empty key: `:` at start followed by whitespace/newline/EOF
             Some(b':') => {
                 let next = self.peek_at(1);
-                if matches!(next, Some(b' ' | b'\t' | b'\n') | None) {
+                if matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
                     return true;
                 }
                 // Colon not followed by whitespace - continue checking
@@ -568,7 +625,7 @@ impl<'a> Parser<'a> {
                     break;
                 } else if self.input[i] == b'\\' && quote == b'"' {
                     i += 2; // Skip escape sequence in double-quoted
-                } else if self.input[i] == b'\n' {
+                } else if Self::is_break(self.input[i]) {
                     return false; // Unclosed quote
                 } else {
                     i += 1;
@@ -585,7 +642,7 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                return matches!(next, Some(b' ' | b'\t' | b'\n') | None);
+                return matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None);
             }
             return false;
         }
@@ -593,7 +650,7 @@ impl<'a> Parser<'a> {
         // Scan for `: ` pattern in unquoted key
         while i < self.input.len() {
             match self.input[i] {
-                b'\n' => return false, // Line ended without finding `: `
+                b'\n' | b'\r' => return false, // Line ended without finding `: `
                 b':' => {
                     // Check what follows the colon
                     let next = if i + 1 < self.input.len() {
@@ -602,7 +659,7 @@ impl<'a> Parser<'a> {
                         None
                     };
                     match next {
-                        Some(b' ' | b'\t' | b'\n') | None => return true,
+                        Some(b' ' | b'\t' | b'\n' | b'\r') | None => return true,
                         _ => i += 1, // Colon not followed by whitespace, continue
                     }
                 }
@@ -615,9 +672,12 @@ impl<'a> Parser<'a> {
     }
 
     /// Skip to end of line (handles comments).
+    ///
+    /// Stops *before* the line break, whichever of the three forms it is, so
+    /// callers can consume it with `skip_line_break` (#324).
     #[inline]
     fn skip_to_eol(&mut self) {
-        while self.pos < self.input.len() && self.input[self.pos] != b'\n' {
+        while self.pos < self.input.len() && !Self::is_break(self.input[self.pos]) {
             self.pos += 1;
         }
     }
@@ -625,8 +685,8 @@ impl<'a> Parser<'a> {
     /// Skip newline and empty/comment lines.
     fn skip_newlines(&mut self) {
         while let Some(b) = self.peek() {
-            if b == b'\n' {
-                self.advance();
+            if Self::is_break(b) {
+                self.skip_line_break();
             } else if b == b'#' {
                 // Comment line
                 self.skip_to_eol();
@@ -634,8 +694,7 @@ impl<'a> Parser<'a> {
                 // Check if rest of line is whitespace or comment
                 let start = self.pos;
                 self.skip_inline_whitespace();
-                if self.peek() == Some(b'\n') || self.peek() == Some(b'#') || self.peek().is_none()
-                {
+                if self.at_break() || self.peek() == Some(b'#') || self.peek().is_none() {
                     if self.peek() == Some(b'#') {
                         self.skip_to_eol();
                     }
@@ -686,8 +745,8 @@ impl<'a> Parser<'a> {
         if slice != b"---" {
             return false;
         }
-        // Must be followed by space, newline, or EOF
-        self.peek_at(3) == Some(b' ') || self.peek_at(3) == Some(b'\n') || self.peek_at(3).is_none()
+        // Must be followed by space, line break, or EOF
+        matches!(self.peek_at(3), Some(b' ' | b'\n' | b'\r') | None)
     }
 
     /// Check if we're at a document end marker (`...`).
@@ -699,8 +758,8 @@ impl<'a> Parser<'a> {
         if slice != b"..." {
             return false;
         }
-        // Must be followed by space, newline, or EOF
-        self.peek_at(3) == Some(b' ') || self.peek_at(3) == Some(b'\n') || self.peek_at(3).is_none()
+        // Must be followed by space, line break, or EOF
+        matches!(self.peek_at(3), Some(b' ' | b'\n' | b'\r') | None)
     }
 
     /// Skip past a document marker (`---` or `...`).
@@ -760,12 +819,7 @@ impl<'a> Parser<'a> {
                 // Flow collection
                 self.parse_value(0)?;
             }
-            Some(b'-')
-                if self.peek_at(1) == Some(b' ')
-                    || self.peek_at(1) == Some(b'\t')
-                    || self.peek_at(1) == Some(b'\n')
-                    || self.peek_at(1).is_none() =>
-            {
+            Some(b'-') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
                 // Block sequence item
                 self.parse_sequence_item(0)?;
             }
@@ -918,7 +972,7 @@ impl<'a> Parser<'a> {
             // Use inline scalar loop for common case, SIMD for long runs
             while let Some(b) = self.peek() {
                 match b {
-                    b'\n' => break,
+                    b'\n' | b'\r' => break,
                     b'#' => {
                         // # is only a comment if preceded by whitespace (space or tab)
                         if self.pos > start && matches!(self.input[self.pos - 1], b' ' | b'\t') {
@@ -929,10 +983,7 @@ impl<'a> Parser<'a> {
                     b':' => {
                         // Colon followed by whitespace ends the value (could be a key)
                         // But in value context, colons in URLs etc. are allowed
-                        if self.peek_at(1) == Some(b' ')
-                            || self.peek_at(1) == Some(b'\t')
-                            || self.peek_at(1) == Some(b'\n')
-                        {
+                        if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r')) {
                             break;
                         }
                         self.advance();
@@ -967,12 +1018,12 @@ impl<'a> Parser<'a> {
             }
 
             // Check if we can continue to next line
-            if self.peek() != Some(b'\n') {
+            if !self.at_break() {
                 break;
             }
 
             // Look ahead to see if next line is a continuation
-            let mut lookahead = self.pos + 1; // Skip \n
+            let mut lookahead = self.pos + self.break_len_at(self.pos); // Skip the line break
             let mut next_indent = 0;
 
             // Count indentation on next line (only spaces count as indent in YAML)
@@ -991,20 +1042,17 @@ impl<'a> Parser<'a> {
 
             // If empty line (just whitespace then newline), skip it and continue
             // This includes lines with only spaces, tabs, or a mix
-            if next_char == b'\n' || next_char == b'\t' {
+            if matches!(next_char, b'\n' | b'\r' | b'\t') {
                 // Check if rest of line is whitespace
                 let mut check_pos = lookahead;
                 while check_pos < self.input.len() && matches!(self.input[check_pos], b' ' | b'\t')
                 {
                     check_pos += 1;
                 }
-                if check_pos >= self.input.len()
-                    || self.input[check_pos] == b'\n'
-                    || self.input[check_pos] == b'\r'
-                {
+                if check_pos >= self.input.len() || Self::is_break(self.input[check_pos]) {
                     // Empty line - skip it and continue
-                    self.advance(); // Skip current \n
-                                    // Skip to end of empty line
+                    self.skip_line_break(); // Skip the current line break
+                                            // Skip to end of empty line
                     while matches!(self.peek(), Some(b' ' | b'\t')) {
                         self.advance();
                     }
@@ -1015,8 +1063,8 @@ impl<'a> Parser<'a> {
                 // The tabs become part of the folded content (converted to space).
                 if start_indent == 0 && next_char == b'\t' {
                     // Continue to next line - this is a valid continuation
-                    self.advance(); // Skip \n
-                                    // Skip leading whitespace (tabs are content, but we're at the scalar's level)
+                    self.skip_line_break();
+                    // Skip leading whitespace (tabs are content, but we're at the scalar's level)
                     while matches!(self.peek(), Some(b' ' | b'\t')) {
                         self.advance();
                     }
@@ -1047,11 +1095,11 @@ impl<'a> Parser<'a> {
                 && !sequence_indicator_is_block_structure
                 && !(next_char == b':'
                     && lookahead + 1 < self.input.len()
-                    && matches!(self.input[lookahead + 1], b' ' | b'\n'))
+                    && matches!(self.input[lookahead + 1], b' ' | b'\n' | b'\r'))
             {
                 // Continue to next line
-                self.advance(); // Skip \n
-                                // Skip leading whitespace
+                self.skip_line_break();
+                // Skip leading whitespace
                 while matches!(self.peek(), Some(b' ' | b'\t')) {
                     self.advance();
                 }
@@ -1061,9 +1109,13 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Trim trailing whitespace from content_end
+        // Trim trailing whitespace from content_end. `\r` is a line break, never
+        // scalar content, so it is trimmed too: the SIMD classifier can skip a
+        // CR to land on the LF that follows it, leaving the CR inside the
+        // extent, which is what made `a: 1\r\n` resolve as the string `"1 "`
+        // rather than the number 1 (#324).
         let mut end = content_end;
-        while end > start && matches!(self.input[end - 1], b' ' | b'\t') {
+        while end > start && matches!(self.input[end - 1], b' ' | b'\t' | b'\r') {
             end -= 1;
         }
 
@@ -1078,19 +1130,15 @@ impl<'a> Parser<'a> {
         while let Some(b) = self.peek() {
             match b {
                 b':' => {
-                    // Check for colon + whitespace or colon + newline
-                    if self.peek_at(1) == Some(b' ')
-                        || self.peek_at(1) == Some(b'\t')
-                        || self.peek_at(1) == Some(b'\n')
-                        || self.peek_at(1).is_none()
-                    {
+                    // Check for colon + whitespace or colon + line break
+                    if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
                         break;
                     }
                     // Colon not followed by whitespace is part of the key
                     // (e.g., "key::" or URLs like "http://example.com")
                     self.advance();
                 }
-                b'\n' => {
+                b'\n' | b'\r' => {
                     // Key without colon
                     return Err(YamlError::KeyWithoutValue {
                         offset: start,
@@ -1130,9 +1178,11 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Trim trailing whitespace
+        // Trim trailing whitespace. `\r` goes with it for the same reason as in
+        // `parse_unquoted_value_with_indent_impl`: it is a line break, so it is
+        // never part of the key (#324).
         let mut end = self.pos;
-        while end > start && self.input[end - 1] == b' ' {
+        while end > start && matches!(self.input[end - 1], b' ' | b'\r') {
             end -= 1;
         }
 
@@ -1360,7 +1410,7 @@ impl<'a> Parser<'a> {
                 let saved_pos = self.pos;
                 self.advance_by(next_indent);
                 let is_sequence_indicator = matches!(self.peek(), Some(b'-'))
-                    && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n') | None);
+                    && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None);
                 self.pos = saved_pos;
 
                 if next_indent < indent || (next_indent == indent && !is_sequence_indicator) {
@@ -1445,7 +1495,7 @@ impl<'a> Parser<'a> {
         let key_end = if self.peek() == Some(b':') {
             // Empty key - check that it's followed by proper terminator
             let next = self.peek_at(1);
-            if matches!(next, Some(b' ' | b'\t' | b'\n') | None) {
+            if matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
                 // Empty key case - key length is 0, don't advance yet
                 self.pos
             } else {
@@ -1531,7 +1581,7 @@ impl<'a> Parser<'a> {
             self.advance_by(next_indent);
             let next_char = self.peek();
             let is_sequence_indicator = matches!(next_char, Some(b'-'))
-                && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n') | None);
+                && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None);
             self.pos = saved_pos;
 
             if next_indent < indent {
@@ -1556,12 +1606,14 @@ impl<'a> Parser<'a> {
 
             // Check if this is a nested structure or a plain scalar value
             match self.peek() {
-                Some(b'-') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n') | None) => {
+                Some(b'-')
+                    if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) =>
+                {
                     // Sequence - will be handled by main loop
                     self.pos = saved_pos;
                     return Ok(());
                 }
-                Some(b'?') if matches!(self.peek_at(1), Some(b' ' | b'\n') | None) => {
+                Some(b'?') if matches!(self.peek_at(1), Some(b' ' | b'\n' | b'\r') | None) => {
                     // Explicit key - will be handled by main loop
                     self.pos = saved_pos;
                     return Ok(());
@@ -1638,7 +1690,7 @@ impl<'a> Parser<'a> {
                     // Skip past indent spaces to check what follows (SIMD accelerated)
                     self.skip_spaces_simd();
                     matches!(self.peek(), Some(b'-'))
-                        && matches!(self.peek_at(1), Some(b' ' | b'\n') | None)
+                        && matches!(self.peek_at(1), Some(b' ' | b'\n' | b'\r') | None)
                 };
                 // Restore position after checking
                 self.pos = pos_before_check;
@@ -1761,7 +1813,7 @@ impl<'a> Parser<'a> {
                     && (next_indent == indent)
                     && matches!(
                         self.input.get(saved_pos + next_indent + 1).copied(),
-                        Some(b' ' | b'\t' | b'\n') | None
+                        Some(b' ' | b'\t' | b'\n' | b'\r') | None
                     )
                 {
                     // `: value` at same indent - empty key (null), value follows
@@ -2135,7 +2187,7 @@ impl<'a> Parser<'a> {
         // Scan unquoted content for `: ` pattern
         while i < self.input.len() {
             match self.input[i] {
-                b',' | b']' | b'}' | b'\n' => return false,
+                b',' | b']' | b'}' | b'\n' | b'\r' => return false,
                 b':' => {
                     let next = if i + 1 < self.input.len() {
                         Some(self.input[i + 1])
@@ -2995,23 +3047,14 @@ impl<'a> Parser<'a> {
 
             // Check what's on this line
             match self.peek() {
-                Some(b'\n') => {
+                Some(b'\n' | b'\r') => {
                     // Empty line - skip and continue
-                    self.advance();
+                    self.skip_line_break();
                 }
                 Some(b'#') => {
                     // Comment line - skip to end
                     self.skip_to_eol();
-                    if self.peek() == Some(b'\n') {
-                        self.advance();
-                    }
-                }
-                Some(b'\r') => {
-                    // Handle \r\n
-                    self.advance();
-                    if self.peek() == Some(b'\n') {
-                        self.advance();
-                    }
+                    self.skip_line_break();
                 }
                 None => {
                     // EOF
@@ -3057,18 +3100,10 @@ impl<'a> Parser<'a> {
 
             // Check what's on this line
             match self.peek() {
-                Some(b'\n') => {
+                Some(b'\n' | b'\r') => {
                     // Empty line - part of trailing newlines
                     trailing_newline_start = line_start;
-                    self.advance();
-                }
-                Some(b'\r') => {
-                    // Handle \r\n
-                    trailing_newline_start = line_start;
-                    self.advance();
-                    if self.peek() == Some(b'\n') {
-                        self.advance();
-                    }
+                    self.skip_line_break();
                 }
                 None => {
                     break; // EOF
@@ -3078,15 +3113,7 @@ impl<'a> Parser<'a> {
                     self.skip_to_eol();
                     last_content_end = self.pos;
                     trailing_newline_start = self.pos;
-
-                    if self.peek() == Some(b'\n') {
-                        self.advance();
-                    } else if self.peek() == Some(b'\r') {
-                        self.advance();
-                        if self.peek() == Some(b'\n') {
-                            self.advance();
-                        }
-                    }
+                    self.skip_line_break();
                 }
             }
         }
@@ -3098,9 +3125,10 @@ impl<'a> Parser<'a> {
         match chomping {
             ChompingIndicator::Strip => last_content_end,
             ChompingIndicator::Clip => {
-                // Include one trailing newline if there was content
+                // Include one trailing line break if there was content — two
+                // bytes wide when that break is a CRLF (#324)
                 if last_content_end > 0 && trailing_newline_start > last_content_end {
-                    last_content_end + 1 // Include one newline
+                    last_content_end + self.break_len_at(last_content_end)
                 } else {
                     last_content_end
                 }
@@ -3120,14 +3148,7 @@ impl<'a> Parser<'a> {
 
         // Skip to end of indicator line (may have trailing comment)
         self.skip_to_eol();
-        if self.peek() == Some(b'\n') {
-            self.advance();
-        } else if self.peek() == Some(b'\r') {
-            self.advance();
-            if self.peek() == Some(b'\n') {
-                self.advance();
-            }
-        }
+        self.skip_line_break();
 
         // Determine content indentation
         let content_indent = if header.explicit_indent > 0 {
@@ -3414,9 +3435,7 @@ impl<'a> Parser<'a> {
                         self.close_deeper_indents(0);
                         self.parse_value(0)?;
                         // Move to next line if we haven't already
-                        if self.peek() == Some(b'\n') {
-                            self.advance();
-                        }
+                        self.skip_line_break();
                         return Ok(());
                     }
                     _ => {
@@ -3454,9 +3473,9 @@ impl<'a> Parser<'a> {
                 // Comment line - skip
                 self.skip_to_eol();
             }
-            Some(b'\n') => {
+            Some(b'\n' | b'\r') => {
                 // Empty line
-                self.advance();
+                self.skip_line_break();
             }
             Some(b'{' | b'[') => {
                 // Flow mapping or sequence at document root
@@ -3515,11 +3534,14 @@ impl<'a> Parser<'a> {
                     self.skip_inline_whitespace();
                     // Check what follows
                     match self.peek() {
-                        Some(b'\n') | None => {
+                        Some(b'\n' | b'\r') | None => {
                             // Anchor with value on next line - will be parsed in next iteration
                         }
                         Some(b'-')
-                            if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n') | None) =>
+                            if matches!(
+                                self.peek_at(1),
+                                Some(b' ' | b'\t' | b'\n' | b'\r') | None
+                            ) =>
                         {
                             // Anchor before block sequence on same line
                             self.parse_sequence_item(indent)?;
@@ -3607,9 +3629,7 @@ impl<'a> Parser<'a> {
         }
 
         // Move to next line if we haven't already
-        if self.peek() == Some(b'\n') {
-            self.advance();
-        }
+        self.skip_line_break();
 
         Ok(())
     }
