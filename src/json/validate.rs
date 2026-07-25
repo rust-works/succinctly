@@ -551,6 +551,24 @@ impl<'a> Validator<'a> {
         Ok(value)
     }
 
+    /// Consume a run of ASCII digits, returning how many were consumed.
+    ///
+    /// Replaces `while matches!(self.peek(), Some(b'0'..=b'9')) { self.advance(); }`,
+    /// which paid a bounds check and an `Option` construction per digit. Digits
+    /// can contain no line terminator, so bumping `column` by the run length is
+    /// exactly equivalent to that many `advance()` calls.
+    #[inline]
+    fn skip_digits(&mut self) -> usize {
+        let rest = &self.input[self.offset..];
+        let n = rest
+            .iter()
+            .position(|b| !b.is_ascii_digit())
+            .unwrap_or(rest.len());
+        self.offset += n;
+        self.column += n;
+        n
+    }
+
     /// Validate a JSON number.
     fn validate_number(&mut self) -> Result<(), ValidationError> {
         // Optional minus sign
@@ -569,9 +587,7 @@ impl<'a> Validator<'a> {
             }
             Some(b'1'..=b'9') => {
                 self.advance();
-                while matches!(self.peek(), Some(b'0'..=b'9')) {
-                    self.advance();
-                }
+                self.skip_digits();
             }
             Some(_) | None => {
                 return Err(self.error(ValidationErrorKind::InvalidNumber {
@@ -585,14 +601,10 @@ impl<'a> Validator<'a> {
             self.advance();
 
             // Must have at least one digit after decimal point
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+            if self.skip_digits() == 0 {
                 return Err(self.error(ValidationErrorKind::InvalidNumber {
                     reason: "expected digit after decimal point",
                 }));
-            }
-
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.advance();
             }
         }
 
@@ -606,14 +618,10 @@ impl<'a> Validator<'a> {
             }
 
             // Must have at least one digit
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+            if self.skip_digits() == 0 {
                 return Err(self.error(ValidationErrorKind::InvalidNumber {
                     reason: "expected digit in exponent",
                 }));
-            }
-
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.advance();
             }
         }
 
@@ -1020,6 +1028,64 @@ mod tests {
             err.kind,
             ValidationErrorKind::UnexpectedEof { .. }
         ));
+    }
+
+    /// A keyword immediately followed by more `[a-z]` is one bad keyword, not a
+    /// good keyword plus trailing content.
+    ///
+    /// This is the constraint that forces `validate_keyword`'s fast path to
+    /// look one byte past the literal. Without that lookahead `truex` would
+    /// match the `true` prefix and be reported as `UnexpectedCharacter` at the
+    /// `x`; the greedy `[a-z]*` slow path reports `InvalidKeyword` at the `t`.
+    /// The two differ in kind *and* offset, and the CLI renders both.
+    #[test]
+    fn test_keyword_prefix_of_longer_run_is_one_bad_keyword() {
+        for (input, found, offset) in [
+            (&b"truex"[..], "truex", 0),
+            (&b"nulll"[..], "nulll", 0),
+            (&b"falsey"[..], "falsey", 0),
+            (&b"[truex]"[..], "truex", 1),
+        ] {
+            let err = validate(input).unwrap_err();
+            assert_eq!(
+                err.kind,
+                ValidationErrorKind::InvalidKeyword {
+                    found: found.to_string()
+                },
+                "{}",
+                String::from_utf8_lossy(input)
+            );
+            assert_eq!(
+                err.position.offset,
+                offset,
+                "{}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// The mirror case: a keyword followed by a non-`[a-z]` byte really is a
+    /// complete keyword, so the error belongs to what follows it.
+    #[test]
+    fn test_keyword_followed_by_non_letter_is_complete() {
+        let err = validate(b"true1").unwrap_err();
+        assert_eq!(err.kind, ValidationErrorKind::TrailingContent);
+        assert_eq!(err.position.offset, 4);
+
+        let err = validate(b"[true1]").unwrap_err();
+        assert_eq!(
+            err.kind,
+            ValidationErrorKind::UnexpectedCharacter {
+                expected: "',' or ']'",
+                found: '1'
+            }
+        );
+        assert_eq!(err.position.offset, 5);
+
+        // And the plain forms still validate.
+        for ok in [&b"true"[..], b"false", b"null", b"[true,false,null]"] {
+            assert!(validate(ok).is_ok(), "{}", String::from_utf8_lossy(ok));
+        }
     }
 
     #[test]
