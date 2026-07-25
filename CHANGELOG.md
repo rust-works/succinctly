@@ -27,6 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CRLF and lone-CR line breaks in YAML** (#324): a `\r` was folded into every
+  *plain* scalar as a trailing space, which also destroyed type resolution — a
+  Windows-authored `a: 1` loaded as the string `"1 "` rather than the number `1`,
+  and `a: true` as `"true "`. There was no error and no warning, and the output
+  was well-formed JSON, so nothing downstream could detect it. Quoted scalars and
+  LF input were unaffected, which is why the whole suite missed it: every fixture
+  and benchmark input in the repo uses LF. The fix treats `\r\n` and a lone `\r`
+  as line breaks throughout — plain scalar and key extents, document markers,
+  blank lines, comment termination, block-scalar content and chomping, `raw_bytes`,
+  and the strict validator — per YAML 1.2 §5.4. `succinctly yq` now produces
+  byte-identical output for a document whichever of the three break forms it uses.
+  Correctness here has a measured price on LF input: `yaml_bench` index build is
+  +14.9% median on x86 (7950X) and +6.9% on ARM (M4 Pro) excluding block scalars,
+  which are 8–18% *faster* on x86; end-to-end `yq` on a 1 MB document moves
+  +1.8% (`.`) to +6.4% (`.[].name`). See `docs/parsing/yaml.md` for the
+  per-change attribution and the const-generic option that would buy it back.
 - `jq -R -s` now yields the entire input as a single string instead of an array of per-line strings, matching jq (#176)
 - `yq -R -s` now yields the entire input as a single string instead of an array of per-line strings, matching jq and `jq -R -s` (#271)
 - YAML alias cycles (`a: &anchor {self: *anchor}`) are rejected at index build with the

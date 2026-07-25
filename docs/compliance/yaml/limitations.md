@@ -129,6 +129,25 @@ $ printf '%%YAML 1.2\n--- text\n' | succinctly yq '.'
 
 Tracked in [#225](https://github.com/rust-works/succinctly/issues/225).
 
+## Line breaks — resolved
+
+All three YAML 1.2 §5.4 line-break forms — LF (`\n`), CRLF (`\r\n`) and a lone CR
+(`\r`) — are normalized to `\n` on input, so the same document loads identically
+whichever one it uses.
+
+This was not always so. Until [#324](https://github.com/rust-works/succinctly/issues/324)
+the `\r` was folded into every *plain* scalar as a trailing space, which also
+destroyed type resolution: a Windows-authored `a: 1` loaded as the string `"1 "`
+rather than the number `1`, and `a: true` as `"true "`. It was silent — no error,
+no diagnostic, and well-formed JSON out — and it went unnoticed because every
+fixture and benchmark input in this repo uses LF.
+
+`tests/yaml_crlf_tests.rs` now holds the line against it: every case in the YAML
+Test Suite corpus is parsed under all three break forms and the outputs must be
+identical, and `tests/yq_golden_tests.rs` runs the pinned-`yq` goldens the same
+way. Both assertions are on invariance, so a document's line-break form can never
+again change what it loads as.
+
 ## Two output paths that used to disagree — resolved
 
 `succinctly yq` has two YAML-to-JSON implementations and picks between them based on

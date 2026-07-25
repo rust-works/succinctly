@@ -185,6 +185,83 @@ Unlike JSON where each structural character has unambiguous meaning, YAML charac
 
 **Resolution**: Oracle tracks block scalar state and flow depth.
 
+### 9. Line Breaks `\n` `\r\n` `\r`
+
+YAML 1.2 §5.4 makes all three a line break, and §5.7 requires a processor to
+normalize them to `\n` on input. There is *no* context in which a raw `\r` is
+scalar content, so every scan that stops at `\n` must stop at `\r` too.
+
+| Form   | Width   | Note                                                      |
+|--------|---------|-----------------------------------------------------------|
+| `\n`   | 1 byte  | Unix                                                       |
+| `\r\n` | 2 bytes | Windows — **one** break, so a scan must consume both       |
+| `\r`   | 1 byte  | Classic Mac — a break with no LF to backstop a `\n`-only scan |
+
+**Resolution**: `Parser::{is_break, break_len_at, at_break, skip_line_break}` are
+the single source of truth in the oracle; `light.rs` has the free-function pair
+`is_line_break` / `line_break_len` for the query side. Use them rather than
+testing `b'\n'` by hand.
+
+Two failure modes are worth naming, because [#324](https://github.com/rust-works/succinctly/issues/324)
+hit both:
+
+- **A CRLF costs one byte of token extent.** A `\n`-only scan still stops on the
+  right *line*, so nothing looks broken — it just leaves the `\r` inside the
+  preceding token. In a plain scalar the folding decoder then turns that trailing
+  break into a space, and `a: 1` resolves as the string `"1 "` instead of the
+  number `1`. Silent, well-formed, wrong.
+- **A lone CR costs the rest of the document.** With no `\n` to stop on, a
+  `\n`-only scan runs to EOF. This is why `\r` belongs in the SIMD classifier's
+  terminator set (`YamlCharClass::carriage_returns`, consumed by
+  `skip_unquoted_simd`) and in `find_block_scalar_end`'s line-start scan: without
+  it the 32-byte classifier skips straight over the break.
+
+`tests/yaml_crlf_tests.rs` parses the whole YAML Test Suite corpus under all
+three forms and demands identical output, which is what makes this property
+test-enforced rather than aspirational.
+
+#### What correctness here costs
+
+Making every line scan CR-aware is not free, and the cost was measured rather
+than assumed. Interleaved A/B (3 reps, arms alternating per rep), `yaml_bench`,
+`c5dab403` vs. the #324 fix:
+
+| Machine                | median | excl. block scalars | block scalars      |
+|------------------------|--------|---------------------|--------------------|
+| AMD Ryzen 9 7950X      | +10.3% | +14.9%              | **−8% to −18%**    |
+| Apple M4 Pro           |  +5.0% |  +6.9%              | −7% to +2%         |
+
+End-to-end `succinctly yq` on a generated 1 MB document (7950X) moves far less,
+because index build is only part of the pipeline: `.` +1.8%, `.[0]` +5.2%,
+`.[].name` +6.4%.
+
+Block scalars got materially *faster* on x86 — `consume_block_scalar_content`
+and `parse_block_scalar` lost their hand-rolled `\r`/`\n` ladders in favour of
+`skip_to_eol` + `skip_line_break`.
+
+Per-change attribution on x86 (revert one change, re-measure):
+
+| Change                                   | Cost   | Needed for |
+|------------------------------------------|--------|------------|
+| SIMD classifier CR mask                  | ~2 pp  | lone CR only |
+| `looks_like_mapping_entry` CR arm        | ~3 pp  | lone CR only |
+| `parse_unquoted_value_…` CR arm          | ~2 pp  | **CRLF**   |
+| `skip_to_eol` → `is_break`               | ~1 pp  | **CRLF**   |
+| remainder (~7 pp)                        | diffuse | codegen in the large, heavily-inlined scalar path |
+
+The individual reverts do not sum to the total, which is the signal that most of
+it is codegen perturbation rather than any single added compare. Note the second
+row in particular: dropping lone-CR support would recover only ~5 pp of ~15 pp,
+because the per-byte CR arms in the value scanner are load-bearing for **CRLF**
+too — a blank line between mapping entries makes `a: 1\r\n\r\nb: 2\r\n` resolve
+as `{"a": "1\n", …}` without them. "CRLF is nearly free, only lone CR costs" is
+an appealing theory that the differential harness disproves in 8 corpus cases.
+
+Recovering the rest would mean gating the parser on a `has_cr` flag via a const
+generic, so LF documents keep the original codegen exactly. That buys back the
+diffuse cost at the price of one input scan (~2%), a doubled parser
+monomorphization, and CR-conditioning roughly 25 call sites.
+
 ---
 
 ## Additional Index Storage Required
