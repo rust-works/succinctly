@@ -1,14 +1,20 @@
 //! Micro-benchmark for BP select1 performance.
 //!
 //! Compares:
-//! 1. O(1) select1 using WithSelect (new)
-//! 2. O(log n) binary search on rank1 (old approach)
+//! 1. `WithCsPoppy` — combined sampling into the rank directory (#64 Step B)
+//! 2. `WithSelect` — sampled (word, cumulative) pairs, deprecated
+//! 3. O(log n) binary search on rank1 (the approach both replaced)
+//!
+//! Arms 1 and 2 are the acceptance gate for #64: combined sampling must not be
+//! slower than the index it replaces, at any size.
+
+#![allow(deprecated)] // benchmarks the deprecated WithSelect against its replacement
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::hint::black_box;
-use succinctly::trees::{BalancedParens, WithSelect};
+use succinctly::trees::{BalancedParens, WithCsPoppy, WithSelect};
 
 /// Generate a balanced parentheses sequence of given depth.
 fn generate_bp(num_opens: usize, seed: u64) -> Vec<u64> {
@@ -56,7 +62,10 @@ fn bench_select1_with_select(c: &mut Criterion) {
     for num_opens in [1_000, 10_000, 100_000, 1_000_000] {
         let words = generate_bp(num_opens, 42);
         let len = num_opens * 2;
-        let bp: BalancedParens<Vec<u64>, WithSelect> = BalancedParens::new_with_select(words, len);
+        let bp: BalancedParens<Vec<u64>, WithSelect> =
+            BalancedParens::new_with_select(words.clone(), len);
+        let bp_cs: BalancedParens<Vec<u64>, WithCsPoppy> =
+            BalancedParens::new_with_cspoppy(words, len);
 
         // Generate random queries
         let mut rng = ChaCha8Rng::seed_from_u64(123);
@@ -65,6 +74,22 @@ fn bench_select1_with_select(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("select1", format!("{}k", num_opens / 1000)),
             &(&bp, &queries),
+            |b, (bp, queries)| {
+                b.iter(|| {
+                    let mut sum = 0usize;
+                    for &q in *queries {
+                        if let Some(pos) = bp.select1(black_box(q)) {
+                            sum += pos;
+                        }
+                    }
+                    sum
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("select1_cspoppy", format!("{}k", num_opens / 1000)),
+            &(&bp_cs, &queries),
             |b, (bp, queries)| {
                 b.iter(|| {
                     let mut sum = 0usize;
