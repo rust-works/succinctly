@@ -1033,6 +1033,18 @@ fn test_yaml_anchored_seq_item_is_line_break_agnostic() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_yaml_anchor_on_flow_mapping_key_binds_to_key() -> Result<()> {
+    // Found by the anchor-targets-an-open-bit invariant (corpus case CN3R): the
+    // key's BP node is opened before the anchor is read, so recording the
+    // *next* position bound the anchor to the value instead of the key.
+    let input = "a: { &e e: f }\nb: *e\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":{"e":"f"},"b":"e"}"#);
+    Ok(())
+}
+
 // =============================================================================
 // Alias cycle rejection (#153) - cyclic anchors must be a clean parse error,
 // not a stack-overflow abort
