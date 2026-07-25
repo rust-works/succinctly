@@ -1,48 +1,49 @@
-//! Broadword (SWAR) UTF-8 accept scans.
+//! Broadword (SWAR) UTF-8 accept scan.
 //!
-//! Portable validation kernels that clear ASCII eight bytes at a time using
-//! ordinary 64-bit integer arithmetic — no SIMD intrinsics, no runtime feature
-//! detection, and available on every target including `no_std` builds. This is
-//! the default engine everywhere the AVX2 path in [`super::simd_x86`] is
-//! unavailable, which today means aarch64, wasm, riscv, pre-AVX2 x86_64, and
-//! any build without the `std` feature.
+//! A portable validation kernel that clears ASCII in 32- and 8-byte strides
+//! using ordinary 64-bit integer arithmetic — no SIMD intrinsics, no runtime
+//! feature detection, and available on every target including `no_std` builds.
+//! This is the default engine everywhere the AVX2 path in [`super::simd_x86`]
+//! is unavailable: aarch64, wasm, riscv, pre-AVX2 x86_64, and any build without
+//! the `std` feature.
 //!
 //! ## Why this exists
 //!
 //! [`super::validate_utf8_scalar`] costs one loop iteration per *byte* of
-//! ASCII, so on ASCII-heavy input it is slower than on multi-byte input — the
-//! M4 Pro measurements in `docs/benchmarks/utf8-validate.md` show ASCII at
-//! 2.00 GiB/s against emoji at 2.87 GiB/s, because a 4-byte emoji costs one
-//! iteration where four ASCII bytes cost four. Clearing eight ASCII bytes with
-//! a single `word & HI` test attacks exactly that.
+//! ASCII, so it is slower on ASCII-heavy input than on multi-byte input: a
+//! 4-byte emoji costs one iteration where four ASCII bytes cost four. Measured
+//! on an M4 Pro over the realistic corpus, that put pure ASCII at 1.81 GiB/s
+//! and log files at 1.38 GiB/s. Clearing 32 ASCII bytes with a single high-bit
+//! test attacks exactly that, taking those to 58.0 and 10.6 GiB/s.
 //!
 //! ## Diagnostics
 //!
-//! Both kernels are pure accept scans returning `bool`. They carry no line or
-//! column state and never classify an error, because a validator that must also
-//! produce [`Utf8ErrorKind`](super::Utf8ErrorKind) cannot keep its hot loop
-//! this tight. On rejection the public wrappers re-run
+//! [`accepts`] is a pure accept scan returning `bool`. It carries no line or
+//! column state and never classifies an error, because a validator that must
+//! also produce [`Utf8ErrorKind`](super::Utf8ErrorKind) cannot keep its hot
+//! loop this tight. On rejection [`validate_utf8_broadword`] re-runs
 //! [`super::validate_utf8_scalar`], which is the sole producer of
-//! [`Utf8Error`] — so diagnostics are byte-identical no matter which engine ran.
-//! This mirrors the AVX2 path exactly. The cost is that invalid input is
+//! [`Utf8Error`] — so diagnostics are byte-identical no matter which engine
+//! ran. This mirrors the AVX2 path exactly. The cost is that invalid input is
 //! scanned twice; valid input, the overwhelmingly common case, is scanned once.
 //!
-//! ## Two candidates
+//! ## Why not a DFA
 //!
-//! Both kernels share the broadword ASCII skip and differ only in how they
-//! consume a multi-byte sequence:
+//! Issue #134 specified a table-driven [Höhrmann] DFA for the multi-byte step.
+//! That was implemented, benchmarked head-to-head against the whole-sequence
+//! approach used here, and **rejected**: across the eleven realistic patterns on
+//! an M4 Pro it averaged 1.73x the scalar validator against this kernel's
+//! 2.18x, losing on nine of the eleven.
 //!
-//! - [`accepts`] steps a [table-driven DFA](super::dfa) one byte at a time.
-//!   This is the design in issue #134.
-//! - [`accepts_seqwise`] validates a whole sequence per iteration with
-//!   independent range comparisons.
+//! The cause is dependency structure. A DFA carries `state -> step -> state`
+//! around its loop, so one byte retires per two-to-three cycle chain no matter
+//! how compact the table. Validating a whole sequence at once issues its range
+//! comparisons independently, retiring three or four bytes per iteration — the
+//! same shape that already made the scalar validator faster on emoji than on
+//! ASCII. See `docs/benchmarks/utf8-validate.md` for the full comparison.
 //!
-//! The DFA's `state -> step -> state` loop-carried dependency makes it the
-//! riskier of the two on CJK and emoji, where the ASCII skip never fires and
-//! the per-byte chain is all that is left. Both are benchmarked
-//! (`benches/utf8_validate_bench.rs`) and the loser will be removed.
+//! [Höhrmann]: https://bjoern.hoehrmann.de/utf-8/decoder/dfa/
 
-use super::dfa;
 use super::{validate_utf8_scalar, Utf8Error};
 
 /// High bit of each byte in a 64-bit word.
@@ -52,6 +53,16 @@ const HI: u64 = 0x8080_8080_8080_8080;
 
 /// Bytes consumed per broadword iteration.
 const WORD: usize = 8;
+
+/// Bytes tested per iteration of the wide ASCII loop: four `u64` words.
+///
+/// Four words are OR-ed together before a single high-bit test, which gives
+/// LLVM a shape it can lower to a handful of NEON/SSE ops. Eight bytes at a
+/// time is enough to beat the byte-at-a-time scalar validator many times over,
+/// but not enough to match `core::str::from_utf8` on long ASCII runs — std
+/// tests sixteen bytes per iteration, and on a 1MB pure-ASCII buffer that gap
+/// measured as 14.9 GiB/s against 52.0 GiB/s.
+const BLOCK: usize = 4 * WORD;
 
 /// Load eight bytes at `pos` as a native-endian word, or `None` if fewer than
 /// eight remain.
@@ -65,6 +76,24 @@ fn load_word(input: &[u8], pos: usize) -> Option<u64> {
     let mut bytes = [0u8; WORD];
     bytes.copy_from_slice(chunk);
     Some(u64::from_ne_bytes(bytes))
+}
+
+/// OR together the four words at `pos`, or `None` if fewer than [`BLOCK`]
+/// bytes remain.
+///
+/// Only the high bits of the result are meaningful: `load_block(..) & HI == 0`
+/// iff all 32 bytes are ASCII. Callers fall back to [`load_word`] once this
+/// returns `None` or reports a non-ASCII byte somewhere in the block.
+#[inline(always)]
+fn load_block(input: &[u8], pos: usize) -> Option<u64> {
+    let chunk = input.get(pos..pos.checked_add(BLOCK)?)?;
+    let mut acc = 0u64;
+    for word in chunk.chunks_exact(WORD) {
+        let mut bytes = [0u8; WORD];
+        bytes.copy_from_slice(word);
+        acc |= u64::from_ne_bytes(bytes);
+    }
+    Some(acc)
 }
 
 /// Index in memory order (`0..8`) of the first non-ASCII byte, given
@@ -160,92 +189,55 @@ fn validate_sequence(input: &[u8], pos: usize) -> Option<usize> {
     }
 }
 
-/// Return `true` iff `input` is well-formed UTF-8, using the broadword ASCII
-/// skip with a [DFA](super::dfa) for multi-byte sequences.
+/// Return `true` iff `input` is well-formed UTF-8.
+///
+/// Two nested ASCII skips, then whole-sequence validation for everything else:
+///
+/// 1. A wide pass clearing [`BLOCK`] (32) bytes per high-bit test.
+/// 2. A narrow pass clearing [`WORD`] (8) bytes, which also covers the
+///    sub-block tail and lands `pos` on the first non-ASCII byte.
+/// 3. [`validate_sequence`], consuming one whole multi-byte sequence with
+///    independent range comparisons.
 ///
 /// The loop maintains one invariant: **at the top of each iteration `pos` sits
 /// on a code-point boundary** and `input[..pos]` is well-formed. That is what
-/// makes it legal to discard the DFA state and reload a word at an arbitrary
-/// offset each time round.
-///
-/// A sequence straddling a word boundary needs no special case: the inner loop
+/// makes it legal to reload a word at an arbitrary offset each time round, and
+/// why a sequence straddling a word boundary needs no special case — step 3
 /// indexes the whole slice rather than the loaded word, so it simply runs on
-/// past the end of the word and the next iteration reloads at wherever it
-/// finished.
+/// past the end of the word.
 pub(crate) fn accepts(input: &[u8]) -> bool {
     let len = input.len();
     let mut pos = 0usize;
 
-    while let Some(word) = load_word(input, pos) {
-        let hi = word & HI;
-        if hi == 0 {
-            pos += WORD;
-            continue;
-        }
-
-        // Skip the ASCII prefix. `hi != 0` bounds the skip by `WORD - 1`, so
-        // `pos < len` still holds and `input[pos]` is in range below.
-        pos += first_high_byte(hi);
-
-        // Consume exactly one multi-byte sequence, restoring the invariant.
-        let mut state = dfa::ACCEPT;
-        loop {
-            state = dfa::step(state, input[pos]);
-            pos += 1;
-            if state == dfa::ACCEPT {
-                break;
-            }
-            if state == dfa::REJECT {
-                return false;
-            }
-            if pos == len {
-                return false; // truncated at end of input
-            }
-        }
-    }
-
-    // Fewer than eight bytes remain, still on a boundary.
-    let mut state = dfa::ACCEPT;
     while pos < len {
-        state = dfa::step(state, input[pos]);
-        if state == dfa::REJECT {
-            return false;
-        }
-        pos += 1;
-    }
-
-    // Any non-ground state here means a sequence was cut off by end of input.
-    state == dfa::ACCEPT
-}
-
-/// Return `true` iff `input` is well-formed UTF-8, using the broadword ASCII
-/// skip with whole-sequence validation for multi-byte sequences.
-///
-/// Same ASCII skip and same boundary invariant as [`accepts`], but each
-/// multi-byte sequence is checked in one step by [`validate_sequence`] using
-/// independent range comparisons. That trades the DFA's compact table for a
-/// shorter dependency chain — three or four bytes retire per iteration instead
-/// of one — which is the shape the existing scalar validator already uses to
-/// reach 2.87 GiB/s on emoji.
-pub(crate) fn accepts_seqwise(input: &[u8]) -> bool {
-    let len = input.len();
-    let mut pos = 0usize;
-
-    while let Some(word) = load_word(input, pos) {
-        let hi = word & HI;
-        if hi == 0 {
-            pos += WORD;
-            continue;
+        // See `accepts`: guard the skip on the current byte being ASCII, so
+        // multi-byte-heavy text does not pay for one that cannot fire.
+        if input[pos] < 0x80 {
+            // Wide pass first: clear 32 bytes at a time. This must `continue`
+            // rather than fall through, so that the `input[pos] < 0x80` guard
+            // above is re-evaluated at the new position — the narrow pass below
+            // relies on it, and skipping the re-check let a stray continuation
+            // byte immediately after a cleared block be consumed unvalidated.
+            if let Some(block) = load_block(input, pos) {
+                if block & HI == 0 {
+                    pos += BLOCK;
+                    continue;
+                }
+            }
+            // Narrow pass, which also handles the sub-block tail.
+            if let Some(word) = load_word(input, pos) {
+                let hi = word & HI;
+                if hi == 0 {
+                    pos += WORD;
+                    continue;
+                }
+                pos += first_high_byte(hi);
+            } else {
+                pos += 1;
+                continue;
+            }
         }
 
-        pos += first_high_byte(hi);
-        match validate_sequence(input, pos) {
-            Some(consumed) => pos += consumed,
-            None => return false,
-        }
-    }
-
-    while pos < len {
         match validate_sequence(input, pos) {
             Some(consumed) => pos += consumed,
             None => return false,
@@ -255,7 +247,7 @@ pub(crate) fn accepts_seqwise(input: &[u8]) -> bool {
     true
 }
 
-/// Validate UTF-8 with the broadword + DFA hybrid, falling back to the scalar
+/// Validate UTF-8 with the broadword accept scan, falling back to the scalar
 /// validator for the precise [`Utf8Error`].
 ///
 /// Portable: no SIMD intrinsics and no runtime feature detection, so it is
@@ -285,21 +277,6 @@ pub(crate) fn accepts_seqwise(input: &[u8]) -> bool {
 /// ```
 pub fn validate_utf8_broadword(input: &[u8]) -> Result<(), Utf8Error> {
     if accepts(input) {
-        Ok(())
-    } else {
-        validate_utf8_scalar(input)
-    }
-}
-
-/// Validate UTF-8 with the broadword ASCII skip and whole-sequence multi-byte
-/// validation, falling back to the scalar validator for the precise
-/// [`Utf8Error`].
-///
-/// Behaves identically to [`validate_utf8_broadword`] — same accepted language,
-/// same diagnostics — and exists so the two multi-byte strategies can be
-/// benchmarked against each other. See the module documentation.
-pub fn validate_utf8_broadword_seqwise(input: &[u8]) -> Result<(), Utf8Error> {
-    if accepts_seqwise(input) {
         Ok(())
     } else {
         validate_utf8_scalar(input)
@@ -400,7 +377,31 @@ mod tests {
         assert_eq!(validate_sequence(&[0xF4, 0x8F, 0x80, 0x80], 0), Some(4));
     }
 
-    /// Both kernels agree with `core::str::from_utf8` on a sequence that
+    /// An invalid byte immediately after a cleared wide block is still caught.
+    ///
+    /// Regression test. The wide ASCII pass advances `pos` by a whole block, so
+    /// it must re-enter the loop rather than fall through to the narrow pass —
+    /// the narrow pass's "fewer than eight bytes remain, consume one ASCII
+    /// byte" branch assumes `input[pos]` was checked as ASCII, and once the
+    /// block advance invalidated that assumption a stray continuation byte at
+    /// `BLOCK` was consumed unvalidated. That is a *false accept* of invalid
+    /// UTF-8, the worst failure direction for a validator.
+    #[test]
+    fn invalid_byte_immediately_after_a_cleared_block() {
+        for tail in [0x80u8, 0xC0, 0xF5, 0xFF] {
+            for pad in [BLOCK, BLOCK + 1, 2 * BLOCK, BLOCK + WORD] {
+                let mut buf = vec![b'a'; pad];
+                buf.push(tail);
+                assert!(
+                    core::str::from_utf8(&buf).is_err(),
+                    "fixture should be invalid: pad {pad}, tail {tail:#04X}"
+                );
+                assert!(!accepts(&buf), "pad {pad}, tail {tail:#04X}");
+            }
+        }
+    }
+
+    /// The kernel agrees with `core::str::from_utf8` on a sequence that
     /// straddles the eight-byte word boundary — the case the invariant-based
     /// loop handles with no special code.
     #[test]
@@ -409,13 +410,11 @@ mod tests {
             let mut good = vec![b'a'; pad];
             good.extend_from_slice("日本語".as_bytes());
             assert!(accepts(&good), "pad {pad}");
-            assert!(accepts_seqwise(&good), "pad {pad}");
             assert!(core::str::from_utf8(&good).is_ok(), "pad {pad}");
 
             let mut bad = vec![b'a'; pad];
             bad.extend_from_slice(&[0xE0, 0x80, 0x80]); // overlong
             assert!(!accepts(&bad), "pad {pad}");
-            assert!(!accepts_seqwise(&bad), "pad {pad}");
             assert!(core::str::from_utf8(&bad).is_err(), "pad {pad}");
         }
     }

@@ -49,12 +49,11 @@ pub(crate) mod line_break;
 pub mod lines;
 pub mod utf8;
 
-// Re-export commonly used types. The broadword engines are portable, so unlike
-// the AVX2 path below they need no `cfg`.
+// Re-export commonly used types. The broadword engine is portable, so unlike
+// the AVX2 path below it needs no `cfg`.
 pub use lines::LineIndex;
 pub use utf8::{
-    validate_utf8, validate_utf8_broadword, validate_utf8_broadword_seqwise, validate_utf8_scalar,
-    Utf8Error, Utf8ErrorKind,
+    validate_utf8, validate_utf8_broadword, validate_utf8_scalar, Utf8Error, Utf8ErrorKind,
 };
 
 // The AVX2 fast path is only present on x86_64 when runtime feature detection

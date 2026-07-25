@@ -424,9 +424,8 @@ pub use self::simd_x86::validate_utf8_simd;
 mod simd_x86;
 
 mod broadword;
-mod dfa;
 
-pub use self::broadword::{validate_utf8_broadword, validate_utf8_broadword_seqwise};
+pub use self::broadword::validate_utf8_broadword;
 
 /// Get the expected sequence length from a lead byte.
 /// Returns 0 for invalid lead bytes (continuation bytes or 0xF8+).
@@ -2308,7 +2307,7 @@ mod validate_utf8_differential_tests {
         Ok(())
     }
 
-    /// Both broadword kernels agree with std over a large corpus.
+    /// The broadword kernel agrees with std over a large corpus.
     ///
     /// The counterpart of [`avx2_kernel_matches_std`], but unguarded by any
     /// `cfg` — the broadword scan is portable, so this gates it on every
@@ -2324,12 +2323,7 @@ mod validate_utf8_differential_tests {
             assert_eq!(
                 super::broadword::accepts(bytes),
                 expected,
-                "broadword DFA kernel disagreed with std on {bytes:02x?}"
-            );
-            assert_eq!(
-                super::broadword::accepts_seqwise(bytes),
-                expected,
-                "broadword seqwise kernel disagreed with std on {bytes:02x?}"
+                "broadword kernel disagreed with std on {bytes:02x?}"
             );
         };
 
@@ -2355,7 +2349,7 @@ mod validate_utf8_differential_tests {
     }
 
     /// Every input of length 0, 1 or 2 — all 65,793 of them — validates the same
-    /// as std under both kernels.
+    /// as std.
     ///
     /// Exhaustive rather than random, and short enough that the main loop never
     /// runs, so it pins the sub-word tail path on its own.
@@ -2363,16 +2357,7 @@ mod validate_utf8_differential_tests {
     fn broadword_exhaustive_short_inputs() {
         let check = |bytes: &[u8]| {
             let expected = core::str::from_utf8(bytes).is_ok();
-            assert_eq!(
-                super::broadword::accepts(bytes),
-                expected,
-                "dfa {bytes:02x?}"
-            );
-            assert_eq!(
-                super::broadword::accepts_seqwise(bytes),
-                expected,
-                "seqwise {bytes:02x?}"
-            );
+            assert_eq!(super::broadword::accepts(bytes), expected, "{bytes:02x?}");
         };
 
         check(&[]);
@@ -2406,19 +2391,15 @@ mod validate_utf8_differential_tests {
                     core::str::from_utf8(&buf).is_err(),
                     "fixture should be invalid: {buf:02x?}"
                 );
-                assert!(!super::broadword::accepts(&buf), "dfa: {buf:02x?}");
-                assert!(
-                    !super::broadword::accepts_seqwise(&buf),
-                    "seqwise: {buf:02x?}"
-                );
+                assert!(!super::broadword::accepts(&buf), "{buf:02x?}");
             }
         }
     }
 
-    /// Both broadword wrappers return byte-identical `Utf8Error`s to the scalar
+    /// The broadword wrapper returns byte-identical `Utf8Error`s to the scalar
     /// validator — offset, line, column and kind.
     ///
-    /// True by construction today, since both delegate to
+    /// True by construction today, since it delegates to
     /// [`validate_utf8_scalar`] on rejection. The test exists so that any later
     /// attempt to build errors inside the kernel fails loudly rather than
     /// silently shifting a reported line or column.
@@ -2432,12 +2413,7 @@ mod validate_utf8_differential_tests {
             assert_eq!(
                 super::validate_utf8_broadword(&bytes),
                 expected,
-                "broadword DFA differed from scalar on {bytes:02x?}"
-            );
-            assert_eq!(
-                super::validate_utf8_broadword_seqwise(&bytes),
-                expected,
-                "broadword seqwise differed from scalar on {bytes:02x?}"
+                "broadword differed from scalar on {bytes:02x?}"
             );
         }
     }

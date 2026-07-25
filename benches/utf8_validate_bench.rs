@@ -25,9 +25,7 @@ use std::hint::black_box;
 use std::path::{Path, PathBuf};
 #[cfg(target_arch = "x86_64")]
 use succinctly::text::utf8::validate_utf8_simd;
-use succinctly::text::utf8::{
-    validate_utf8_broadword, validate_utf8_broadword_seqwise, validate_utf8_scalar,
-};
+use succinctly::text::utf8::{validate_utf8_broadword, validate_utf8_scalar};
 
 /// Benchmark every validation engine on the same input, plus a `std` baseline.
 /// Each becomes an arm under the enclosing group so results compare directly.
@@ -36,8 +34,7 @@ use succinctly::text::utf8::{
 /// |-------------|-----------------------------------------------------------|
 /// | `std`       | `core::str::from_utf8` — the bar to clear (see below)      |
 /// | `scalar`    | portable byte-at-a-time reference validator               |
-/// | `broadword` | broadword ASCII skip + table-driven DFA                   |
-/// | `seqwise`   | broadword ASCII skip + whole-sequence validation          |
+/// | `broadword` | broadword ASCII skip + whole-sequence validation          |
 /// | `simd`      | AVX2 block kernel (x86_64 only)                           |
 ///
 /// The `std` arm is not decoration. `core::str::from_utf8` already has a
@@ -62,9 +59,6 @@ macro_rules! bench_engines {
         });
         $group.bench_with_input(BenchmarkId::new("broadword", $name), data, |b, data| {
             b.iter(|| validate_utf8_broadword(black_box(data)));
-        });
-        $group.bench_with_input(BenchmarkId::new("seqwise", $name), data, |b, data| {
-            b.iter(|| validate_utf8_broadword_seqwise(black_box(data)));
         });
         #[cfg(target_arch = "x86_64")]
         $group.bench_with_input(BenchmarkId::new("simd", $name), data, |b, data| {
