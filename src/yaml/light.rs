@@ -44,6 +44,27 @@ impl<W> Clone for YamlCursor<'_, W> {
 
 impl<W> Copy for YamlCursor<'_, W> {}
 
+/// Is `b` a YAML line break? Per YAML 1.2 §5.4 that is `\n` or `\r`; `\r\n` is
+/// the two-byte spelling of a single break.
+///
+/// Scans that look only for `\n` run straight past a lone `\r`, which is how a
+/// classic-Mac document turned every block scalar into the empty string (#324).
+#[inline]
+fn is_line_break(b: u8) -> bool {
+    matches!(b, b'\n' | b'\r')
+}
+
+/// Width in bytes of the line break at `pos`: 2 for `\r\n`, 1 for a lone `\r`
+/// or `\n`, 0 if `pos` is not at a break.
+#[inline]
+fn line_break_len(text: &[u8], pos: usize) -> usize {
+    match text.get(pos) {
+        Some(b'\r') if text.get(pos + 1) == Some(&b'\n') => 2,
+        Some(b'\r' | b'\n') => 1,
+        _ => 0,
+    }
+}
+
 impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// Create a new cursor at the given BP position.
     #[inline]
@@ -386,7 +407,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     fn compute_line_indent_static(text: &[u8], pos: usize) -> usize {
         // Find start of line
         let mut line_start = pos;
-        while line_start > 0 && text[line_start - 1] != b'\n' {
+        while line_start > 0 && !is_line_break(text[line_start - 1]) {
             line_start -= 1;
         }
 
@@ -404,7 +425,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     fn compute_scalar_base_indent(&self, value_pos: usize) -> usize {
         // Find start of current line
         let mut line_start = value_pos;
-        while line_start > 0 && self.text[line_start - 1] != b'\n' {
+        while line_start > 0 && !is_line_break(self.text[line_start - 1]) {
             line_start -= 1;
         }
 
@@ -422,7 +443,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     fn compute_base_indent_and_root_flag(&self, value_pos: usize) -> (usize, bool) {
         // Find start of current line
         let mut line_start = value_pos;
-        while line_start > 0 && self.text[line_start - 1] != b'\n' {
+        while line_start > 0 && !is_line_break(self.text[line_start - 1]) {
             line_start -= 1;
         }
 
@@ -447,7 +468,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             }
             if self.text[scan] == b':' {
                 // Check if this colon is a key separator (followed by space/tab/newline)
-                if scan + 1 < self.text.len() && matches!(self.text[scan + 1], b' ' | b'\t' | b'\n')
+                if scan + 1 < self.text.len()
+                    && matches!(self.text[scan + 1], b' ' | b'\t' | b'\n' | b'\r')
                 {
                     // Check if this is an explicit value indicator at start of content
                     if scan == line_start + line_indent {
@@ -502,7 +524,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // Check if this colon is a key separator (followed by space/tab/newline)
                 if scan + 1 < self.text.len() {
                     let next = self.text[scan + 1];
-                    if next == b' ' || next == b'\t' || next == b'\n' {
+                    if matches!(next, b' ' | b'\t' | b'\n' | b'\r') {
                         has_colon_before = true;
                         colon_pos = scan;
                     }
@@ -550,7 +572,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
 
             // Go to previous line
             let mut prev_line_start = line_start - 1;
-            while prev_line_start > 0 && self.text[prev_line_start - 1] != b'\n' {
+            while prev_line_start > 0 && !is_line_break(self.text[prev_line_start - 1]) {
                 prev_line_start -= 1;
             }
 
@@ -584,7 +606,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     fn is_in_flow_context(&self, pos: usize) -> bool {
         // Find start of line containing pos
         let mut line_start = pos;
-        while line_start > 0 && self.text[line_start - 1] != b'\n' {
+        while line_start > 0 && !is_line_break(self.text[line_start - 1]) {
             line_start -= 1;
         }
 
@@ -624,7 +646,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // Scan back up to 4KB or start of text
         let scan_start = if line_start > 4096 {
             let mut start = line_start.saturating_sub(4096);
-            while start > 0 && self.text[start - 1] != b'\n' {
+            while start > 0 && !is_line_break(self.text[start - 1]) {
                 start -= 1;
             }
             start
@@ -671,13 +693,13 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         depth > 0
     }
 
-    /// Find the end of a single-line unquoted scalar (stops at newline).
+    /// Find the end of a single-line unquoted scalar (stops at a line break).
     fn find_scalar_end(&self, start: usize) -> usize {
         let mut end = start;
         while end < self.text.len() {
             match self.text[end] {
                 // Block context delimiters
-                b'\n' | b'#' => break,
+                b'\n' | b'\r' | b'#' => break,
                 // Flow context delimiters
                 b',' | b']' | b'}' => break,
                 b':' => {
@@ -686,7 +708,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         // Colon at EOF - this is a key separator
                         break;
                     }
-                    if self.text[end + 1] == b' ' || self.text[end + 1] == b'\n' {
+                    if matches!(self.text[end + 1], b' ' | b'\n' | b'\r') {
                         break;
                     }
                     end += 1;
@@ -695,7 +717,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             }
         }
         // Trim trailing whitespace
-        while end > start && self.text[end - 1] == b' ' {
+        while end > start && matches!(self.text[end - 1], b' ' | b'\r') {
             end -= 1;
         }
         end
@@ -729,10 +751,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         if end + 1 >= self.text.len() {
                             break;
                         }
-                        if self.text[end + 1] == b' '
-                            || self.text[end + 1] == b'\n'
-                            || self.text[end + 1] == b'\t'
-                        {
+                        if matches!(self.text[end + 1], b' ' | b'\t' | b'\n' | b'\r') {
                             break;
                         }
                         end += 1;
@@ -3491,15 +3510,15 @@ impl<'a> YamlString<'a> {
         // In this case, content can be at indent 0 (zero-indented block scalar)
         let on_document_start_line = Self::is_document_start_line(text, indicator_pos);
 
-        // Skip indicator and modifiers to find newline
+        // Skip indicator and modifiers to find the end of the indicator line
         let mut pos = indicator_pos + 1;
-        while pos < text.len() && text[pos] != b'\n' {
+        while pos < text.len() && !is_line_break(text[pos]) {
             pos += 1;
         }
         if pos >= text.len() {
             return (pos, pos); // Empty block scalar
         }
-        pos += 1; // Skip newline
+        pos += line_break_len(text, pos); // Skip the line break
 
         let content_start = pos;
 
@@ -3671,7 +3690,7 @@ impl<'a> YamlString<'a> {
     fn compute_key_indent(text: &[u8], indicator_pos: usize) -> usize {
         // Find start of line
         let mut line_start = indicator_pos;
-        while line_start > 0 && text[line_start - 1] != b'\n' {
+        while line_start > 0 && !is_line_break(text[line_start - 1]) {
             line_start -= 1;
         }
 
@@ -3712,7 +3731,7 @@ impl<'a> YamlString<'a> {
     fn is_document_start_line(text: &[u8], pos: usize) -> bool {
         // Find start of line
         let mut line_start = pos;
-        while line_start > 0 && text[line_start - 1] != b'\n' {
+        while line_start > 0 && !is_line_break(text[line_start - 1]) {
             line_start -= 1;
         }
 
@@ -4225,8 +4244,11 @@ fn decode_block_literal(
     } else {
         YamlString::detect_block_indent(text, content_start).unwrap_or(0)
     };
-    if indent == 0 {
-        // No indentation to strip - just convert to string
+    if indent == 0 && !content.contains(&b'\r') {
+        // No indentation to strip and no line breaks to normalize - borrow as is.
+        // Content holding a `\r` must go through the loop below, which rewrites
+        // every break form to `\n` as YAML 1.2 §5.4 requires; borrowing it would
+        // emit the raw CRs instead (#324).
         let s = core::str::from_utf8(content).map_err(|_| YamlStringError::InvalidUtf8)?;
         return Ok(Cow::Borrowed(s));
     }
