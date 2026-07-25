@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6e4751dc41647c94f71d2b57cf83eac7ce1635bee0774388788efd43d3294c7f # shrinks to bytes = [10]
+cc c894eac49d12be78836a2dc5a7d56db2d9767038e5dd701329732ae99bdb82f1 # shrinks to node = Obj([("", Null)])
