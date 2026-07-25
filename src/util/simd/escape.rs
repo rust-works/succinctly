@@ -403,6 +403,106 @@ pub fn find_json_escape(bytes: &[u8], start: usize) -> usize {
     json_escape::find(bytes, start)
 }
 
+// ---- JSON string-content predicate -----------------------------------------
+//
+// The strict validator (`json::validate`) needs a *stricter* stop set than the
+// transcoder: on top of `"` / `\` / `< 0x20` it must also stop at every byte
+// `>= 0x80`, because those begin a UTF-8 sequence whose well-formedness the
+// validator has to check. Everything between two stops is plain printable ASCII
+// that is unconditionally valid string content, so the validator can skip the
+// whole run with one `offset`/`column` addition (#123).
+//
+// The `>= 0x80` term is written as an explicit compare rather than by folding the
+// raw chunk into the mask. Folding the chunk in would also work — the scanner
+// machinery only ever `movemask`s the result, and `movemask` reads exactly the
+// high bit — but it would break the all-ones/all-zeros per-lane contract these
+// helpers are documented to uphold, for one instruction.
+
+/// NEON match mask for the JSON string-content predicate (`"`, `\`, `< 0x20`, `>= 0x80`).
+#[cfg(all(
+    target_arch = "aarch64",
+    not(feature = "broadword-yaml"),
+    not(feature = "scalar-yaml")
+))]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn json_stop_neon_mask(chunk: uint8x16_t) -> uint8x16_t {
+    // SAFETY: forwarding a loaded chunk to a sibling `neon` target-feature fn.
+    unsafe {
+        vorrq_u8(
+            json_neon_mask(chunk),
+            vcgeq_u8(chunk, vdupq_n_u8(0x80)), // unsigned byte >= 0x80
+        )
+    }
+}
+
+/// AVX2 match mask for the JSON string-content predicate.
+#[cfg(all(
+    target_arch = "x86_64",
+    not(feature = "scalar-yaml"),
+    any(test, feature = "std")
+))]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn json_stop_avx2_mask(chunk: __m256i) -> __m256i {
+    // SAFETY: forwarding a loaded chunk to a sibling `avx2` target-feature fn.
+    unsafe {
+        let high = _mm256_set1_epi8(0x80u8 as i8);
+        _mm256_or_si256(
+            json_avx2_mask(chunk),
+            // byte >= 0x80, i.e. the high bit is set. `cmpgt_epi8` would be a
+            // signed compare here and is never correct — see the note above.
+            _mm256_cmpeq_epi8(_mm256_and_si256(chunk, high), high),
+        )
+    }
+}
+
+/// SSE2 match mask for the JSON string-content predicate.
+#[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
+#[inline]
+#[target_feature(enable = "sse2")]
+unsafe fn json_stop_sse2_mask(chunk: __m128i) -> __m128i {
+    // SAFETY: forwarding a loaded chunk to a sibling `sse2` target-feature fn.
+    unsafe {
+        let high = _mm_set1_epi8(0x80u8 as i8);
+        _mm_or_si128(
+            json_sse2_mask(chunk),
+            _mm_cmpeq_epi8(_mm_and_si128(chunk, high), high),
+        )
+    }
+}
+
+define_escape_scanner! {
+    /// JSON string-content scanner (validator stop set).
+    mod json_string_stop;
+    // `!(0x20..0x80)` is "not printable ASCII": control chars and UTF-8 lead /
+    // continuation bytes alike. Spelled as a range so clippy::manual_range_contains
+    // is satisfied; the SIMD helpers test the two halves separately.
+    scalar: |b| b == b'"' || b == b'\\' || !(0x20..0x80).contains(&b);
+    neon_mask: json_stop_neon_mask;
+    avx2_mask: json_stop_avx2_mask;
+    sse2_mask: json_stop_sse2_mask;
+}
+
+/// Find the next byte in `bytes` at or after `start` that the strict JSON
+/// validator must stop and inspect.
+///
+/// Stops at `"` (string end), `\` (escape), a control character (`< 0x20`, always
+/// an error inside a string), or any byte `>= 0x80` (the start of a UTF-8
+/// sequence needing validation). Returns `bytes.len()` if none is found.
+///
+/// Every byte strictly between two stops is printable ASCII, which is always
+/// valid JSON string content — so `json::validate` advances over the whole run at
+/// once instead of byte at a time (#123).
+///
+/// `#[inline(always)]` matches [`find_json_escape`] and is load-bearing for the
+/// same reason (O3 / #87): without it the SIMD path regresses versus scalar on
+/// short strings, and JSON keys are typically short.
+#[inline(always)]
+pub fn find_json_string_stop(bytes: &[u8], start: usize) -> usize {
+    json_string_stop::find(bytes, start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,6 +852,175 @@ mod tests {
         fn neon_returns_len_when_start_past_end() {
             // The kernel's own `start >= len` guard, not reached through find().
             assert_eq!(super::super::json_escape::neon(b"abc", 9), 3);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // `find_json_string_stop` (#123): same machinery, stricter predicate — it also
+    // stops at every byte >= 0x80. The `>= 0x80` term is where a signed compare
+    // would silently do the right thing for the wrong reason, so these mirror the
+    // exhaustive sweeps above rather than spot-checking.
+    // ------------------------------------------------------------------------
+    mod string_stop {
+        use super::super::find_json_string_stop;
+
+        /// Independent scalar reference, deliberately spelled with explicit
+        /// comparisons rather than the range form the scanner uses — clippy's
+        /// `!(0x20..0x80).contains(&b)` rewrite would make this a copy of the
+        /// implementation and defeat the point of an independent reference.
+        #[allow(clippy::manual_range_contains)]
+        fn reference(bytes: &[u8], start: usize) -> usize {
+            for (i, &b) in bytes[start..].iter().enumerate() {
+                if b == b'"' || b == b'\\' || b < 0x20 || b >= 0x80 {
+                    return start + i;
+                }
+            }
+            bytes.len()
+        }
+
+        #[test]
+        fn basic_stops() {
+            assert_eq!(find_json_string_stop(b"hello\"world", 0), 5);
+            assert_eq!(find_json_string_stop(b"hello\\world", 0), 5);
+            assert_eq!(find_json_string_stop(b"hello\nworld", 0), 5);
+            assert_eq!(find_json_string_stop(b"hello\x00world", 0), 5);
+            // The term `find_json_escape` does not have: a UTF-8 lead byte.
+            assert_eq!(find_json_string_stop("hello♥world".as_bytes(), 0), 5);
+            assert_eq!(find_json_string_stop(b"hello world", 0), 11);
+        }
+
+        #[test]
+        fn empty_and_start_past_end() {
+            assert_eq!(find_json_string_stop(b"", 0), 0);
+            assert_eq!(find_json_string_stop(b"hello", 10), 5);
+            assert_eq!(find_json_string_stop(b"hello", 5), 5);
+        }
+
+        /// Every byte value at every alignment across a 56-byte buffer: one AVX2
+        /// 32-byte chunk, a 16-byte SSE2/NEON tail, and an 8-byte scalar remainder,
+        /// so each byte is checked by SIMD at some offsets and scalar at others.
+        #[test]
+        fn exhaustive_bytes_match_scalar() {
+            for byte in 0u8..=255 {
+                for pos in 0..56usize {
+                    let mut input = vec![b'a'; 56];
+                    input[pos] = byte;
+                    for &start in &[0usize, 1, 16, 33] {
+                        assert_eq!(
+                            reference(&input, start),
+                            find_json_string_stop(&input, start),
+                            "mismatch for byte {byte:#04x} at offset {pos}, start {start}"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// The contract `validate_string` relies on: everything strictly between
+        /// two stops is printable ASCII, so the run can be skipped wholesale.
+        #[test]
+        fn runs_between_stops_are_printable_ascii() {
+            let inputs: &[&str] = &[
+                "love ♥ and peace ☮",
+                "aaaaaaaaaaaaaaaa♥bbbbbbbbbbbbbbbb",
+                "日本語のテキストはここにあります、もっと長く",
+                "emoji 😁 in a string long enough for a full chunk",
+                "mixed ♥ with \"quotes\" and \\slashes\\ and \nnewlines",
+                "plain ascii with no stops at all in this run",
+            ];
+            for s in inputs {
+                let bytes = s.as_bytes();
+                let mut i = 0;
+                while i < bytes.len() {
+                    let pos = find_json_string_stop(bytes, i);
+                    assert!(pos >= i && pos <= bytes.len(), "out of range for {s:?}");
+                    for &b in &bytes[i..pos] {
+                        assert!(
+                            (0x20..0x80).contains(&b) && b != b'"' && b != b'\\',
+                            "skipped byte {b:#04x} in {s:?} is not plain string content"
+                        );
+                    }
+                    if pos == bytes.len() {
+                        break;
+                    }
+                    i = pos + 1;
+                }
+            }
+        }
+
+        /// The module's own scalar fallback is reached only via the short-string
+        /// path or a scalar-only build; exercise it directly on every target.
+        #[test]
+        fn scalar_fallback_matches_reference() {
+            let cases: &[&[u8]] = &[
+                b"",
+                b"\"",
+                b"\\",
+                b"\n",
+                b"plain text",
+                b"quote\"in\\the\tmiddle",
+                "caf\u{e9} \u{2665} unicode".as_bytes(),
+                &[b'x'; 40],
+            ];
+            for &input in cases {
+                for start in 0..=input.len() {
+                    assert_eq!(
+                        reference(input, start),
+                        super::super::json_string_stop::scalar(input, start),
+                        "scalar mismatch for {input:?} at start {start}"
+                    );
+                }
+            }
+        }
+
+        /// Drive each x86 kernel directly so the SSE2 one is covered on AVX2
+        /// hardware, where dispatch would never choose it.
+        #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
+        #[test]
+        fn x86_kernels_match_scalar() {
+            let run_avx2 =
+                crate::util::simd::note_simd_skip_unless(is_x86_feature_detected!("avx2"), "avx2");
+            for byte in 0u8..=255 {
+                for pos in 0..56usize {
+                    let mut input = [b'a'; 56];
+                    input[pos] = byte;
+                    let want = reference(&input, 0);
+                    // SAFETY: SSE2 is the x86_64 baseline.
+                    let got = unsafe { super::super::json_string_stop::sse2(&input, 0) }
+                        .map_or(input.len(), |off| off);
+                    assert_eq!(want, got, "SSE2 mismatch for {byte:#04x} at {pos}");
+                    if run_avx2 {
+                        // SAFETY: guarded by the AVX2 runtime detection above.
+                        let got = unsafe { super::super::json_string_stop::avx2(&input, 0) }
+                            .map_or(input.len(), |off| off);
+                        assert_eq!(want, got, "AVX2 mismatch for {byte:#04x} at {pos}");
+                    }
+                }
+            }
+        }
+
+        /// Drive the NEON kernel directly, including its 16-byte boundary and the
+        /// sub-16-byte scalar remainder.
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(feature = "broadword-yaml"),
+            not(feature = "scalar-yaml")
+        ))]
+        #[test]
+        fn neon_kernel_matches_scalar() {
+            for byte in 0u8..=255 {
+                for &pos in &[0usize, 1, 7, 15, 16, 17, 31, 32, 33, 47] {
+                    let mut input = vec![b'A'; 48];
+                    input[pos] = byte;
+                    for &start in &[0usize, 3, 16] {
+                        assert_eq!(
+                            reference(&input, start),
+                            super::super::json_string_stop::neon(&input, start),
+                            "NEON mismatch for byte {byte:#04x} at pos {pos}, start {start}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

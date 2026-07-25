@@ -29,6 +29,8 @@ use alloc::string::String;
 
 use core::fmt;
 
+use crate::util::simd::escape::find_json_string_stop;
+
 /// Position information for error reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
@@ -156,6 +158,31 @@ impl std::error::Error for ValidationError {}
 /// Matches the YAML parser's cap and keeps depth-100 documents (pinned by
 /// `tests/deep_nesting_valid_tests.rs`) valid.
 const MAX_NESTING_DEPTH: usize = 128;
+
+/// Plain-ASCII bytes accepted with scalar compares before the SIMD scanner runs.
+///
+/// Most JSON strings are short — object keys, ids, enum values, short names — and
+/// in text with many non-ASCII characters the next stop is only a byte or two
+/// away. For those, a vector load plus a movemask plus a call into the
+/// non-inlined kernel costs several times the handful of byte compares it
+/// replaces. Handing *every* run to the scanner measured +343% on the `users`
+/// pattern (keys and values of 2-17 bytes) and +198% on `unicode` (a stop every
+/// 2-3 bytes), even while long-string patterns improved 5-10x.
+///
+/// Probing this many bytes first confines the scanner to runs long enough to pay
+/// for it. The width matches the narrowest SIMD chunk (NEON/SSE2, 16 bytes), so
+/// the probe covers exactly the region where the vector path could not have
+/// completed a single iteration anyway (#123).
+const SCALAR_PROBE_BYTES: usize = 16;
+
+/// Is `b` ordinary JSON string content, needing no decision from the validator?
+///
+/// The exact complement of the [`find_json_string_stop`] predicate — the two are
+/// pinned together by `test_probe_predicate_is_scanner_complement`.
+#[inline]
+fn is_plain_string_byte(b: u8) -> bool {
+    (0x20..0x80).contains(&b) && b != b'"' && b != b'\\'
+}
 
 /// A strict JSON validator with position tracking.
 ///
@@ -367,11 +394,25 @@ impl<'a> Validator<'a> {
     }
 
     /// Validate a JSON string.
+    ///
+    /// Skips runs of printable ASCII — always-valid string content — with
+    /// [`find_json_string_stop`], stopping only at the four byte classes that need
+    /// a decision: `"`, `\`, a control character, or a UTF-8 lead byte (#123).
+    ///
+    /// The bulk skip keeps `line`/`column` exact without any lazy-position
+    /// machinery, because a raw byte `< 0x20` inside a string is an error: no
+    /// newline can occur here, `line` cannot change, and `column` counts bytes
+    /// (a 3-byte character advances it by 3, exactly as `advance()` would).
     fn validate_string(&mut self) -> Result<(), ValidationError> {
         self.advance(); // consume opening quote
 
         loop {
-            match self.peek() {
+            let stop = self.find_string_stop();
+            let run = stop - self.offset;
+            self.offset = stop;
+            self.column += run;
+
+            match self.input.get(stop).copied() {
                 Some(b'"') => {
                     self.advance();
                     return Ok(());
@@ -383,13 +424,50 @@ impl<'a> Validator<'a> {
                     return Err(self.error(ValidationErrorKind::ControlCharacter { byte: b }));
                 }
                 Some(_) => {
-                    // Validate UTF-8 sequence
-                    self.validate_utf8_char()?;
+                    // >= 0x80: a UTF-8 sequence. Consume the whole non-ASCII run
+                    // here rather than returning to the probe after each
+                    // character. In CJK, Cyrillic, Arabic or emoji text a stop
+                    // falls every 2-3 bytes, so re-entering the probe per
+                    // character costs more setup than the compares it saves
+                    // (+18% on the `unicode` pattern before this loop existed).
+                    loop {
+                        self.validate_utf8_char()?;
+                        match self.peek() {
+                            Some(b) if b >= 0x80 => {}
+                            _ => break,
+                        }
+                    }
                 }
                 None => {
                     return Err(self.error(ValidationErrorKind::UnclosedString));
                 }
             }
+        }
+    }
+
+    /// Index of the next byte inside a string that needs a decision.
+    ///
+    /// Probes [`SCALAR_PROBE_BYTES`] scalar-ly first and only vectorizes if the
+    /// run is still going, so short strings never touch a SIMD kernel. See
+    /// [`SCALAR_PROBE_BYTES`] for why that split is load-bearing.
+    #[inline]
+    fn find_string_stop(&self) -> usize {
+        // The next byte is very often already a stop — the closing quote of a
+        // short value, or the next character of non-Latin text, where a stop
+        // falls every 2-3 bytes. Answering that case with a single compare, as
+        // the old `peek()` loop did, avoids paying the probe's slice and
+        // iterator setup for it (+13% on `unicode` before this fast path).
+        match self.input.get(self.offset) {
+            Some(&b) if is_plain_string_byte(b) => {}
+            _ => return self.offset,
+        }
+
+        let probe_end = self.input.len().min(self.offset + SCALAR_PROBE_BYTES);
+        let probe = &self.input[self.offset + 1..probe_end];
+        match probe.iter().position(|&b| !is_plain_string_byte(b)) {
+            Some(i) => self.offset + 1 + i,
+            // Still plain content after the probe: long enough for SIMD to pay.
+            None => find_json_string_stop(self.input, probe_end),
         }
     }
 
@@ -1504,5 +1582,183 @@ mod tests {
             err.kind,
             ValidationErrorKind::UnexpectedCharacter { .. }
         ));
+    }
+
+    // ========================================================================
+    // SIMD string-scanning equivalence (#123)
+    //
+    // `validate_string` skips runs of printable ASCII wholesale instead of
+    // stepping byte by byte. The skip is only sound if `offset`/`column`
+    // advance exactly as the byte-at-a-time loop would, at every alignment —
+    // SIMD engages on 16/32-byte chunks, so a byte is handled by a vector
+    // kernel at some offsets and by a scalar tail at others. These sweep the
+    // interesting byte classes across every offset spanning two AVX2 chunks.
+    // ========================================================================
+
+    /// Independent byte-at-a-time model of the string scan, deliberately written
+    /// without the scanner. `input` is a document whose root is a string starting
+    /// at offset 0. Returns `Ok(closing_quote_offset)` when the string is well
+    /// formed, or `Err(offset)` at the byte the byte-at-a-time loop would reject.
+    /// Escapes are out of scope (covered by the dedicated escape/surrogate tests
+    /// above), so the model is only fed bodies without backslashes.
+    fn model_string_scan(input: &[u8]) -> Result<usize, usize> {
+        let mut pos = 1; // past the opening quote
+        loop {
+            match input.get(pos) {
+                None => return Err(pos), // UnclosedString, reported at EOF
+                Some(b'"') => return Ok(pos),
+                Some(&b) if b < 0x20 => return Err(pos),
+                Some(&b) if b < 0x80 => pos += 1,
+                Some(&b) => {
+                    let len = match b {
+                        0xC0..=0xDF => 2,
+                        0xE0..=0xEF => 3,
+                        0xF0..=0xF7 => 4,
+                        _ => return Err(pos),
+                    };
+                    if pos + len > input.len() {
+                        return Err(pos);
+                    }
+                    if input[pos + 1..pos + len].iter().any(|c| c & 0xC0 != 0x80) {
+                        return Err(pos);
+                    }
+                    pos += len;
+                }
+            }
+        }
+    }
+
+    /// The scalar probe and the SIMD scanner must agree on every byte value, or
+    /// `find_string_stop` would return a different index depending on how far
+    /// into a string the byte happens to fall.
+    #[test]
+    fn test_probe_predicate_is_scanner_complement() {
+        for b in 0u8..=255 {
+            // A 32-byte run of `b` puts the first occurrence inside the probe
+            // window and later ones past it, in the scanner's domain.
+            let buf = vec![b; 32];
+            let scanner_stops = find_json_string_stop(&buf, 0) == 0;
+            assert_eq!(
+                is_plain_string_byte(b),
+                !scanner_stops,
+                "probe and scanner disagree on byte {b:#04x}"
+            );
+        }
+    }
+
+    /// Every stop-byte class at every offset across two AVX2 chunks: the result
+    /// and the exact error position must match the byte-at-a-time model.
+    #[test]
+    fn test_string_scan_matches_model_at_every_offset() {
+        // A terminator, control chars at both ends of the range, a bare
+        // continuation byte, and lead bytes that are never valid.
+        for &probe in &[b'"', b'\t', b'\x00', b'\x1F', 0x80u8, 0xC0, 0xF8, 0xFF] {
+            for pos in 0..70usize {
+                let mut body = vec![b'a'; 70];
+                body[pos] = probe;
+                let mut input = vec![b'"'];
+                input.extend_from_slice(&body);
+                input.push(b'"');
+
+                let got = validate(&input);
+                // No newline can occur inside a string, so every position in
+                // these documents is on line 1 and column is offset + 1.
+                let expected_offset = match model_string_scan(&input) {
+                    // A `"` probe closes the string early; the remainder of the
+                    // document is then trailing content, reported just past it.
+                    Ok(end) if end + 1 < input.len() => end + 1,
+                    Ok(_) => {
+                        assert!(
+                            got.is_ok(),
+                            "expected valid for probe {probe:#04x} at {pos}, got {got:?}"
+                        );
+                        continue;
+                    }
+                    Err(offset) => offset,
+                };
+                let err =
+                    got.expect_err(&format!("expected error for probe {probe:#04x} at {pos}"));
+                assert_eq!(
+                    err.position.offset, expected_offset,
+                    "offset mismatch for probe {probe:#04x} at {pos}"
+                );
+                assert_eq!(err.position.line, 1);
+                assert_eq!(err.position.column, expected_offset + 1);
+            }
+        }
+    }
+
+    /// Valid multi-byte characters at every alignment, including straddling the
+    /// 16-, 32- and 64-byte chunk edges, must all validate.
+    #[test]
+    fn test_valid_multibyte_at_every_chunk_alignment() {
+        for ch in ['é', '♥', '😁'] {
+            let mut buf = [0u8; 4];
+            let encoded = ch.encode_utf8(&mut buf).as_bytes();
+            for pos in 0..=(70 - encoded.len()) {
+                let mut body = vec![b'a'; 70];
+                body[pos..pos + encoded.len()].copy_from_slice(encoded);
+                let mut input = vec![b'"'];
+                input.extend_from_slice(&body);
+                input.push(b'"');
+                assert!(
+                    validate(&input).is_ok(),
+                    "{ch:?} at offset {pos} should validate"
+                );
+            }
+        }
+    }
+
+    /// A multi-byte sequence truncated by the closing quote must be reported at
+    /// the lead byte — the position the byte-at-a-time loop reported — at every
+    /// alignment, not at the continuation byte the shared UTF-8 helper favours.
+    #[test]
+    fn test_truncated_multibyte_reports_lead_byte_offset() {
+        for &lead in &[0xC3u8, 0xE2, 0xF0] {
+            for pad in 0..40usize {
+                let mut input = vec![b'"'];
+                input.extend(core::iter::repeat(b'a').take(pad));
+                let lead_offset = input.len();
+                input.push(lead);
+                input.push(b'"');
+
+                let err = validate(&input).unwrap_err();
+                assert!(matches!(err.kind, ValidationErrorKind::InvalidUtf8));
+                assert_eq!(
+                    err.position.offset, lead_offset,
+                    "lead {lead:#04x} with {pad} padding"
+                );
+                assert_eq!(err.position.column, lead_offset + 1);
+            }
+        }
+    }
+
+    /// The bulk skip must leave `column` correct for errors reported *after* a
+    /// long string, at every string length spanning the chunk sizes.
+    #[test]
+    fn test_column_after_long_string_is_exact() {
+        for len in 0..70usize {
+            let body = "a".repeat(len);
+            // Trailing comma: the error is reported at the '}' just past it.
+            let input = format!("{{\"{body}\": 1,}}");
+            let err = validate(input.as_bytes()).unwrap_err();
+            let brace = input.len() - 1;
+            assert_eq!(err.position.offset, brace, "body length {len}");
+            assert_eq!(err.position.line, 1);
+            assert_eq!(err.position.column, brace + 1, "body length {len}");
+        }
+    }
+
+    /// Line tracking must survive long strings: newlines only ever occur in
+    /// whitespace, so a string spanning chunk boundaries must not disturb them.
+    #[test]
+    fn test_line_tracking_across_long_strings() {
+        for len in [0usize, 15, 16, 31, 32, 33, 64, 100] {
+            let body = "a".repeat(len);
+            let input = format!("{{\n  \"{body}\": \"{body}\",\n}}");
+            let err = validate(input.as_bytes()).unwrap_err();
+            assert_eq!(err.position.line, 3, "body length {len}");
+            assert_eq!(err.position.column, 1, "body length {len}");
+        }
     }
 }
