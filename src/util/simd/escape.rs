@@ -176,14 +176,33 @@ macro_rules! define_escape_scanner {
             pub(crate) fn x86(bytes: &[u8], start: usize) -> usize {
                 #[cfg(any(test, feature = "std"))]
                 {
-                    if super::avx2_enabled() {
-                        // SAFETY: guarded by runtime AVX2 detection.
-                        return unsafe { avx2(bytes, start) }
-                            .map_or(bytes.len(), |off| start + off);
-                    }
+                    dispatch(bytes, start, super::avx2_enabled())
                 }
-                // SAFETY: SSE2 is the x86_64 baseline.
-                unsafe { sse2(bytes, start) }.map_or(bytes.len(), |off| start + off)
+                // No runtime detection without std: SSE2 is the x86_64 baseline.
+                #[cfg(not(any(test, feature = "std")))]
+                {
+                    // SAFETY: SSE2 is the x86_64 baseline.
+                    unsafe { sse2(bytes, start) }.map_or(bytes.len(), |off| start + off)
+                }
+            }
+
+            /// Tier selection split out so both branches are deterministically
+            /// testable: on an AVX2 runner the SSE2-baseline branch is otherwise
+            /// never taken by dispatch.
+            #[cfg(all(
+                target_arch = "x86_64",
+                not(feature = "scalar-yaml"),
+                any(test, feature = "std")
+            ))]
+            #[inline(always)]
+            pub(crate) fn dispatch(bytes: &[u8], start: usize, use_avx2: bool) -> usize {
+                if use_avx2 {
+                    // SAFETY: callers pass true only when AVX2 is detected.
+                    unsafe { avx2(bytes, start) }.map_or(bytes.len(), |off| start + off)
+                } else {
+                    // SAFETY: SSE2 is the x86_64 baseline.
+                    unsafe { sse2(bytes, start) }.map_or(bytes.len(), |off| start + off)
+                }
             }
 
             /// AVX2 kernel: 32-byte main loop, 16-byte SSE2 tail, scalar remainder.
@@ -486,8 +505,7 @@ mod tests {
                 assert_eq!(
                     reference(input, start),
                     find_json_escape(input, start),
-                    "mismatch for {:?} at start {start}",
-                    String::from_utf8_lossy(input)
+                    "mismatch for {input:?} at start {start}"
                 );
             }
         }
@@ -565,8 +583,7 @@ mod tests {
                 assert_eq!(
                     reference(input, start),
                     super::json_escape::scalar(input, start),
-                    "scalar mismatch for {:?} at start {start}",
-                    String::from_utf8_lossy(input)
+                    "scalar mismatch for {input:?} at start {start}"
                 );
             }
         }
@@ -624,15 +641,13 @@ mod tests {
                     assert_eq!(
                         reference(input, start),
                         sse2_index(input, start),
-                        "SSE2 mismatch for {:?} at start {start}",
-                        String::from_utf8_lossy(input)
+                        "SSE2 mismatch for {input:?} at start {start}"
                     );
                     if run_avx2 {
                         assert_eq!(
                             reference(input, start),
                             avx2_index(input, start),
-                            "AVX2 mismatch for {:?} at start {start}",
-                            String::from_utf8_lossy(input)
+                            "AVX2 mismatch for {input:?} at start {start}"
                         );
                     }
                 }
@@ -658,20 +673,20 @@ mod tests {
 
         #[test]
         fn avx2_exhaustive_bytes_match_scalar() {
-            if !has_avx2() {
-                return;
-            }
             // 56-byte buffer: one 32-byte AVX2 chunk, one 16-byte SSE2 tail, and
-            // an 8-byte scalar tail — every internal path of the kernel.
-            for byte in 0u8..=255 {
-                for pos in 0..56 {
-                    let mut input = [b'a'; 56];
-                    input[pos] = byte;
-                    assert_eq!(
-                        reference(&input, 0),
-                        avx2_index(&input, 0),
-                        "AVX2 mismatch for byte 0x{byte:02x} at {pos}"
-                    );
+            // an 8-byte scalar tail — every internal path of the kernel. Skipped
+            // (visibly, via has_avx2) on hardware without AVX2.
+            if has_avx2() {
+                for byte in 0u8..=255 {
+                    for pos in 0..56 {
+                        let mut input = [b'a'; 56];
+                        input[pos] = byte;
+                        assert_eq!(
+                            reference(&input, 0),
+                            avx2_index(&input, 0),
+                            "AVX2 mismatch for byte 0x{byte:02x} at {pos}"
+                        );
+                    }
                 }
             }
         }
@@ -687,6 +702,19 @@ mod tests {
                 assert_eq!(avx2_index(b"", 0), 0);
                 assert_eq!(avx2_index(b"abc", 3), 3);
                 assert_eq!(avx2_index(b"abc", 9), 3);
+            }
+        }
+
+        #[test]
+        fn dispatch_selects_both_tiers() {
+            // Cover both dispatch branches: the SSE2 baseline (always reachable)
+            // and the AVX2 tier (when detected). find() only ever picks AVX2 on
+            // this runner, so the SSE2-baseline branch needs an explicit call.
+            let input = b"a long enough plain string \"with\" some \\ escapes inside";
+            let want = reference(input, 0);
+            assert_eq!(super::super::json_escape::dispatch(input, 0, false), want);
+            if has_avx2() {
+                assert_eq!(super::super::json_escape::dispatch(input, 0, true), want);
             }
         }
     }
