@@ -777,6 +777,14 @@ fn generate_block_scalars(target_size: usize, seed: Option<u64>) -> String {
 /// construct, and valueless explicit keys so the Dense representation is
 /// actually exercised end-to-end rather than only by unit tests.
 ///
+/// It also emits explicit keys at **block-sequence-item** position (`- ? k` /
+/// `  : v`), which take a different route into `parse_explicit_key`: the
+/// sequence-item dispatch in `parse_sequence_item_inner` rather than the main
+/// loop. That branch was mis-parsed until #339, and no benchmark could see it
+/// because this generator only ever emitted top-level explicit keys — the same
+/// "a benchmark cannot measure a shape it does not generate" blind spot #327
+/// exists to close.
+///
 /// Roughly one key in five is explicit, so the document still looks like
 /// something a human would write.
 fn generate_explicit_keys(target_size: usize, seed: Option<u64>) -> String {
@@ -800,6 +808,15 @@ fn generate_explicit_keys(target_size: usize, seed: Option<u64>) -> String {
             // Non-scalar explicit key
             yaml.push_str(&format!("? [tag_{count}, tag_{}]\n", count + 1));
             yaml.push_str(&format!(": composite value {value}\n"));
+        } else if count % 11 == 0 {
+            // Explicit keys as block sequence items (#339) - the shape that
+            // reaches `parse_explicit_key` through the sequence-item dispatch.
+            // Both forms appear: a `? k` / `: v` pair, and the valueless form
+            // whose null value is supplied when the item's mapping is popped.
+            yaml.push_str(&format!("seq_item_keys_{count}:\n"));
+            yaml.push_str(&format!("  - ? item key {count}\n"));
+            yaml.push_str(&format!("    : item value {value}\n"));
+            yaml.push_str(&format!("  - ? valueless item key {count}\n"));
         } else if count % 5 == 0 {
             yaml.push_str(&format!("? explicit key {count}\n"));
             yaml.push_str(&format!(": explicit value {value}\n"));
@@ -1336,6 +1353,17 @@ mod tests {
         assert!(
             yaml.contains("? valueless key "),
             "no valueless explicit key: the Dense fallback would go uncovered"
+        );
+        // #339: the sequence-item spelling reaches `parse_explicit_key` through
+        // a different dispatch than the top-level one, and was mis-parsed until
+        // that issue. Without it no benchmark input contains the shape.
+        assert!(
+            yaml.contains("  - ? item key "),
+            "no explicit key at sequence-item position"
+        );
+        assert!(
+            yaml.contains("  - ? valueless item key "),
+            "no valueless explicit key at sequence-item position"
         );
     }
 
