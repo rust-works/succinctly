@@ -115,12 +115,28 @@ impl SelectSupport for NoSelect {
 /// halves the index relative to the `u64` width `BitVec` needs, which matters
 /// here because balanced parens are ~50% ones by construction — the densest
 /// case, where a sampled select index is at its most expensive (#64).
+///
+/// # Deprecated
+///
+/// Superseded by [`WithCsPoppy`], which answers the same queries from half the
+/// memory by sampling into the rank directory instead of alongside it. Migrate
+/// by swapping the type parameter and the constructor:
+///
+/// ```text
+/// BalancedParens::new_with_select(words, len)        -> new_with_cspoppy
+/// BalancedParens::from_words_with_select(words, len) -> from_words_with_cspoppy
+/// ```
+#[deprecated(
+    since = "0.8.0",
+    note = "use `WithCsPoppy`: same queries, half the select-index memory (#64)"
+)]
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct WithSelect {
     select_idx: SelectIndex<u32>,
 }
 
+#[allow(deprecated)] // STYLE-0004: keeps the deprecated WithSelect path compiling and tested
 impl SelectSupport for WithSelect {
     fn build(words: &[u64], total_ones: usize) -> Self {
         // INVARIANT: `total_ones` must count only the valid bits below `len`
@@ -1994,6 +2010,7 @@ impl BalancedParens<Vec<u64>, NoSelect> {
     }
 }
 
+#[allow(deprecated)] // STYLE-0004: keeps the deprecated WithSelect path compiling and tested
 impl BalancedParens<Vec<u64>, WithSelect> {
     /// Build from an owned bitvector with select support enabled.
     ///
@@ -2160,6 +2177,7 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
     }
 }
 
+#[allow(deprecated)] // STYLE-0004: keeps the deprecated WithSelect path compiling and tested
 impl<W: AsRef<[u64]>> BalancedParens<W, WithSelect> {
     /// Build from a generic storage type with select support enabled.
     ///
@@ -3037,6 +3055,7 @@ mod tests {
         assert_eq!(bp.find_close(0), Some(3));
     }
 
+    #[allow(deprecated)] // STYLE-0004: deliberately exercises the deprecated WithSelect path
     #[test]
     fn test_from_words_with_select_stray_bits() {
         // Two all-ones words with len = 68: 68 valid 1-bits plus 60 stray
@@ -3116,6 +3135,7 @@ mod tests {
     }
 
     /// The gate for Step B: combined sampling must not change a single answer.
+    #[allow(deprecated)] // STYLE-0004: deliberately exercises the deprecated WithSelect path
     #[test]
     fn test_cspoppy_matches_with_select() {
         for (label, words, len) in cspoppy_fixtures() {
@@ -3184,6 +3204,7 @@ mod tests {
 
     /// Step B's claim: a quarter of what the pair cost before Step A, half of
     /// what it costs after — 6.25% of the bitmap at parenthesis density.
+    #[allow(deprecated)] // STYLE-0004: deliberately exercises the deprecated WithSelect path
     #[test]
     fn test_cspoppy_index_is_half_of_with_select() {
         let pairs = 100_000;
@@ -3220,6 +3241,7 @@ mod tests {
     /// Balanced parens are exactly 50% ones, so with 8-byte entries every
     /// `rate` ones the index is `8 * (len/2) / 256` bytes against a `len/8`
     /// byte bitmap — one eighth.
+    #[allow(deprecated)] // STYLE-0004: deliberately exercises the deprecated WithSelect path
     #[test]
     fn test_select_index_costs_one_eighth_of_bitmap() {
         let pairs = 100_000;

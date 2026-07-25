@@ -21,4 +21,5 @@ mod bp;
 
 pub use bp::BalancedParens;
 pub use bp::{enclose, find_close, find_close_in_word, find_open, find_unmatched_close_in_word};
+#[allow(deprecated)] // STYLE-0004: WithSelect stays re-exported for backward compatibility
 pub use bp::{BpSelectCtx, NoSelect, SelectSupport, WithCsPoppy, WithSelect};
