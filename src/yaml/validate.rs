@@ -876,13 +876,20 @@ impl<'a> Validator<'a> {
                     // same line (5U3A `key: - a`); the sequence must be on its own
                     // lines. `key: -1` (a scalar starting with `-`) is fine, and an
                     // explicit value (`? k\n: - v`, suppressed) legitimately may.
+                    //
+                    // End-of-input counts as a terminator, so a bare `a: -` with no
+                    // trailing newline is rejected too (#325). Same `None | Some(..)`
+                    // spelling as `scan_anchor`'s structurally identical SY6V check.
                     let mut k = self.offset;
                     while matches!(self.input.get(k), Some(b' ' | b'\t')) {
                         k += 1;
                     }
                     if !suppress_nested
                         && self.input.get(k) == Some(&b'-')
-                        && matches!(self.input.get(k + 1), Some(b' ' | b'\t' | b'\n' | b'\r'))
+                        && matches!(
+                            self.input.get(k + 1),
+                            None | Some(b' ' | b'\t' | b'\n' | b'\r')
+                        )
                     {
                         return Err(self.error(YamlValidationErrorKind::TrailingContent));
                     }
@@ -1607,6 +1614,12 @@ mod tests {
     fn accepts_same_indent_sequence_value() {
         // A block sequence value may sit at its mapping key's indentation.
         assert!(validate(b"one:\n- 2\n- 3\nfour: 5\n").is_ok()); // AZ63
+                                                                 // Widening the 5U3A check to end-of-input (#325) must not swallow these:
+                                                                 // a `-` not followed by whitespace is an ordinary plain scalar.
+        assert!(validate(b"a: -1\n").is_ok());
+        assert!(validate(b"a: -1").is_ok());
+        assert!(validate(b"a: -x\n").is_ok());
+        assert!(validate(b"a:\n  - x\n").is_ok());
         assert!(validate(b"foo:\n- 42\nbar:\n  - 44\n").is_ok()); // RLU9
         assert!(validate(b"nested sequences:\n- - - []\n- - - {}\nkey1: []\nkey2: {}\n").is_ok());
     }
@@ -1878,6 +1891,9 @@ mod tests {
         )); // TD5N
         assert!(matches!(kind(b"a\nb: 1\nc\n d: 1\n"), TrailingContent)); // G7JE
         assert!(matches!(kind(b"key: - a\n     - b\n"), TrailingContent)); // 5U3A
+        assert!(matches!(kind(b"a: - x\n"), TrailingContent)); // 5U3A, single line
+        assert!(matches!(kind(b"a: -\n"), TrailingContent)); // bare `-` as value
+        assert!(matches!(kind(b"a: -"), TrailingContent)); // ...and at end of input (#325)
         assert!(matches!(
             kind(b"word1  # comment\nword2\n"),
             TrailingContent

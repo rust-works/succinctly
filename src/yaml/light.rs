@@ -9147,9 +9147,10 @@ mod tests {
         // `- ` with nothing after it inside flow: trailing space is trimmed, so the
         // extent is the dash alone
         assert_eq!(first_doc_json(b"[- ]\n"), r#"["-"]"#);
-        // Same-line block mapping value. #325 covers this input and may later make
-        // the parser emit a real sequence here; until then the text survives.
-        assert_eq!(first_doc_json(b"key: - a\n"), r#"{"key":"- a"}"#);
+        // Same-line block mapping value is NOT this rule's business any more: #325
+        // made the parser emit a real block sequence there, exactly as the note this
+        // replaces anticipated. Pinned in `test_inline_seq_as_mapping_value_*` below.
+        assert_eq!(first_doc_json(b"key: - a\n"), r#"{"key":["a"]}"#);
     }
 
     /// A same-line block mapping value that is a bare sequence-entry indicator, with
@@ -9162,11 +9163,18 @@ mod tests {
     /// becomes the empty item `{"a":[null]}`. `yq` rejects the input either way
     /// (`block sequence entries are not allowed in this context`).
     #[test]
-    fn test_bare_dash_as_same_line_mapping_value_keeps_the_dash() {
-        assert_eq!(first_doc_json(b"a: - \n"), r#"{"a":"-"}"#);
-        assert_eq!(first_doc_json(b"a: -\n"), r#"{"a":"-"}"#);
-        assert_eq!(first_doc_json(b"a: -  \n"), r#"{"a":"-"}"#);
-        assert_eq!(first_doc_json(b"a: -\t\n"), r#"{"a":"-"}"#);
+    fn test_bare_dash_as_same_line_mapping_value_is_an_empty_item() {
+        // Renamed and re-pinned by #325. #332 made these read back as the string
+        // "-" so the byte would not be lost; #325 makes the same-line mapping value
+        // a real block sequence, so the `-` is an *indicator* with an empty item
+        // after it, not content. Nothing is dropped either way — the dash was never
+        // a scalar to begin with (YAML 1.2 `ns-plain-first`) — and this now agrees
+        // with `a: - x` on the line above it instead of splitting on whether the
+        // item happens to be empty.
+        assert_eq!(first_doc_json(b"a: - \n"), r#"{"a":[null]}"#);
+        assert_eq!(first_doc_json(b"a: -\n"), r#"{"a":[null]}"#);
+        assert_eq!(first_doc_json(b"a: -  \n"), r#"{"a":[null]}"#);
+        assert_eq!(first_doc_json(b"a: -\t\n"), r#"{"a":[null]}"#);
         // The same `- ` on the *next* line is a real block sequence whose one item is
         // empty: a childless wrapper, which stays null. That is the discriminator's
         // other side, and it is why the parser must never record an end for a wrapper.
@@ -9486,5 +9494,105 @@ mod tests {
         assert_eq!(item.keys(), vec!["a".to_string(), "b".to_string()]);
         assert_eq!(item.len(), 2);
         assert!(!item.is_empty());
+    }
+    // =========================================================================
+    // Inline block sequence as a mapping value (#325)
+    // =========================================================================
+    // `a: - x` is invalid YAML (test-suite case 5U3A: a block sequence may not
+    // begin on the same line as its parent mapping key) and the opt-in strict
+    // validator rejects it. The loader does minimal validation by design, so it
+    // parses the obvious extension instead of silently discarding the content,
+    // which is what it used to do -- `a: - x` read back as `{"a":null}`.
+
+    // These reuse #332's `first_doc_json` above, which additionally asserts that the
+    // buffered and streaming JSON writers agree, rather than adding a second helper.
+
+    #[test]
+    fn test_inline_seq_as_mapping_value_keeps_content() {
+        // The #325 repro: `x` used to be silently dropped.
+        assert_eq!(first_doc_json(b"a: - x\n"), r#"{"a":["x"]}"#);
+        // Extra spaces before the `-` must not change the result.
+        assert_eq!(first_doc_json(b"a:   - x\n"), r#"{"a":["x"]}"#);
+        // A sibling entry after it still parses.
+        assert_eq!(first_doc_json(b"a: - x\nb: 1\n"), r#"{"a":["x"],"b":1}"#);
+        // No trailing newline.
+        assert_eq!(first_doc_json(b"a: - x"), r#"{"a":["x"]}"#);
+    }
+
+    #[test]
+    fn test_inline_seq_as_mapping_value_item_shapes() {
+        // Nested inline sequence.
+        assert_eq!(first_doc_json(b"a: - - x\n"), r#"{"a":[["x"]]}"#);
+        // Compact mapping as the item.
+        assert_eq!(first_doc_json(b"a: - k: v\n"), r#"{"a":[{"k":"v"}]}"#);
+        // Bare `-` is an empty item, not the scalar "-": per YAML 1.2
+        // `ns-plain-first` a `-` before whitespace or end-of-input is always the
+        // sequence-entry indicator and never starts a plain scalar.
+        assert_eq!(first_doc_json(b"a: -\n"), r#"{"a":[null]}"#);
+        assert_eq!(first_doc_json(b"a: -"), r#"{"a":[null]}"#);
+        assert_eq!(first_doc_json(b"a: -\r\n"), r#"{"a":[null]}"#);
+    }
+
+    #[test]
+    fn test_inline_seq_continuation_line_joins_same_sequence() {
+        // 5U3A. The sequence is registered at the actual column of the `-`
+        // (5 here), so the next line's `-` at the same column is a sibling item
+        // rather than a new nested sequence. Registering it at `indent + 2`
+        // would produce {"key":[["a"],["b"]]} or worse.
+        assert_eq!(
+            first_doc_json(b"key: - a\n     - b\n"),
+            r#"{"key":["a","b"]}"#
+        );
+        assert_eq!(
+            first_doc_json(b"key: - a\n     - b\n     - c\n"),
+            r#"{"key":["a","b","c"]}"#
+        );
+    }
+
+    #[test]
+    fn test_inline_seq_as_explicit_value() {
+        // `parse_value`'s dash arm used to be a no-op, so the nested item's
+        // content was dropped: `: - - x` read back as {"k":[null]}.
+        assert_eq!(first_doc_json(b"? k\n: - - x\n"), r#"{"k":[["x"]]}"#);
+        assert_eq!(first_doc_json(b"? k\n: - k2: v\n"), r#"{"k":[{"k2":"v"}]}"#);
+        // Single-level explicit value was already correct; keep it that way.
+        assert_eq!(first_doc_json(b"? k\n: - x\n"), r#"{"k":["x"]}"#);
+    }
+
+    #[test]
+    fn test_dash_in_mapping_value_non_sequence_cases_unchanged() {
+        // A `-` NOT followed by whitespace starts a plain scalar as usual.
+        assert_eq!(first_doc_json(b"a: -1\n"), r#"{"a":-1}"#);
+        assert_eq!(first_doc_json(b"a: -x\n"), r#"{"a":"-x"}"#);
+        // Quoting forces the scalar reading.
+        assert_eq!(first_doc_json(b"a: \"- x\"\n"), r#"{"a":"- x"}"#);
+        assert_eq!(first_doc_json(b"a: '- x'\n"), r#"{"a":"- x"}"#);
+        // In flow context the byte after `-` is `}`, so it stays a scalar.
+        assert_eq!(first_doc_json(b"{a: -}\n"), r#"{"a":"-"}"#);
+    }
+
+    #[test]
+    fn test_double_anchor_before_nested_dash_keeps_content() {
+        // The one shape that actually reaches `parse_value`'s dash arm. Every other
+        // caller either dispatches only on `{`/`[` or intercepts the `-` first; it
+        // takes an anchor between the two dashes to slip past, and *two* anchors at
+        // that, because `parse_value`'s prologue consumes one before dispatching.
+        // With that arm still a no-op the item's content was silently dropped.
+        assert_eq!(first_doc_json(b"- &a &b - x\n"), r#"[["x"]]"#);
+        // One anchor is intercepted upstream and never reaches the arm; pinned so a
+        // future change to the prologue cannot silently move which path handles it.
+        assert_eq!(first_doc_json(b"- &a - x\n"), r#"[["x"]]"#);
+    }
+
+    #[test]
+    fn test_valid_block_sequence_spellings_still_correct() {
+        // The two legal spellings must be unaffected by the lenient inline path.
+        assert_eq!(first_doc_json(b"a:\n  - x\n"), r#"{"a":["x"]}"#);
+        assert_eq!(first_doc_json(b"a:\n- x\n"), r#"{"a":["x"]}"#);
+        assert_eq!(first_doc_json(b"a:\n  - x\n  - y\n"), r#"{"a":["x","y"]}"#);
+        // Empty first item on its own line is still null.
+        assert_eq!(first_doc_json(b"a:\n  -\n  - y\n"), r#"{"a":[null,"y"]}"#);
+        // Top-level nested sequences.
+        assert_eq!(first_doc_json(b"- - x\n- y\n"), r#"[["x"],"y"]"#);
     }
 }
