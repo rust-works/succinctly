@@ -410,6 +410,13 @@ impl<'a> Parser<'a> {
         self.peek().is_some_and(Self::is_break)
     }
 
+    /// Does `next` terminate a `-` sequence indicator? That is whitespace, a
+    /// line break, or end of input.
+    #[inline]
+    fn is_seq_indicator_next(next: Option<u8>) -> bool {
+        matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None)
+    }
+
     /// Consume the line break at the current position, if any.
     ///
     /// Dispatches on the byte rather than going through `break_len_at`, so the
@@ -3473,6 +3480,11 @@ impl<'a> Parser<'a> {
                 // Explicit value indicator (value for previous explicit key)
                 self.parse_explicit_value(indent)?;
             }
+            // These two arms are defensive and carry no coverage: `parse_documents`
+            // calls `skip_newlines` before each line, and that consumes comment
+            // lines and blank lines (including whitespace-only ones) itself, so a
+            // `#` or a line break is never the first byte here. Kept as a backstop
+            // for any future caller that dispatches a line without pre-skipping.
             Some(b'#') => {
                 // Comment line - skip
                 self.skip_to_eol();
@@ -3541,12 +3553,11 @@ impl<'a> Parser<'a> {
                         Some(b'\n' | b'\r') | None => {
                             // Anchor with value on next line - will be parsed in next iteration
                         }
-                        Some(b'-')
-                            if matches!(
-                                self.peek_at(1),
-                                Some(b' ' | b'\t' | b'\n' | b'\r') | None
-                            ) =>
-                        {
+                        // Keep this guard on one line: rustfmt splitting the
+                        // `matches!` across lines gives the opening line its own
+                        // coverage region that never reports as executed, even
+                        // though the arm body does.
+                        Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
                             // Anchor before block sequence on same line
                             self.parse_sequence_item(indent)?;
                         }
