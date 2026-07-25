@@ -113,11 +113,24 @@ fn write_unicode_escape<W: fmt::Write>(out: &mut W, c: char) -> fmt::Result {
     }
 }
 
+/// Pick this style's scanner. Const-folded: exactly one call survives per
+/// monomorphization.
+#[inline(always)]
+fn scan<const JQ: bool, const ASCII: bool>(bytes: &[u8], start: usize) -> usize {
+    if ASCII {
+        find_ascii_escape(bytes, start)
+    } else if JQ {
+        find_jq_escape(bytes, start)
+    } else {
+        find_json_escape(bytes, start)
+    }
+}
+
 /// The escaping loop, monomorphized over the two style axes.
 ///
 /// Const generics rather than runtime flags so each of the four combinations
 /// compiles to a straight-line loop with its own scanner call and no branching on
-/// style — the `if ASCII` / `if JQ` tests below const-fold away entirely.
+/// style — the `if ASCII` / `if JQ` tests const-fold away entirely.
 fn write_body_impl<W: fmt::Write, const JQ: bool, const ASCII: bool>(
     out: &mut W,
     s: &str,
@@ -127,14 +140,7 @@ fn write_body_impl<W: fmt::Write, const JQ: bool, const ASCII: bool>(
     let mut i = 0;
 
     while i < len {
-        // Const-folded: exactly one of these survives per monomorphization.
-        let pos = if ASCII {
-            find_ascii_escape(bytes, i)
-        } else if JQ {
-            find_jq_escape(bytes, i)
-        } else {
-            find_json_escape(bytes, i)
-        };
+        let pos = scan::<JQ, ASCII>(bytes, i);
 
         debug_assert!(
             s.is_char_boundary(pos),
@@ -237,6 +243,30 @@ pub fn write_quoted<W: fmt::Write>(
     out.write_char('"')
 }
 
+/// Whether `s` survives escaping unchanged — one scan, no emit.
+///
+/// The overwhelmingly common case: real JSON strings carry no escapes at all
+/// (`docs/benchmarks/corpus-shape.md` measures an escape density of 0.00 per
+/// KiB). Checking first lets the `*_to_string` entry points answer with a single
+/// bulk copy instead of running the emit loop, which matters most on the short
+/// strings that dominate real input — at 1–4 bytes the loop's own bookkeeping
+/// costs more than the per-`char` escaper it replaced, and this is what buys
+/// that back.
+///
+/// The writer forms deliberately do NOT do this: they cannot copy in bulk, so a
+/// pre-scan would be pure duplicated work.
+#[inline]
+fn nothing_to_escape(s: &str, style: EscapeStyle, ascii: bool) -> bool {
+    let bytes = s.as_bytes();
+    let end = bytes.len();
+    end == match (style, ascii) {
+        (EscapeStyle::Jq, false) => scan::<true, false>(bytes, 0),
+        (EscapeStyle::Jq, true) => scan::<true, true>(bytes, 0),
+        (EscapeStyle::Yq, false) => scan::<false, false>(bytes, 0),
+        (EscapeStyle::Yq, true) => scan::<false, true>(bytes, 0),
+    }
+}
+
 /// Return the escaped body of `s`, without surrounding quotes.
 ///
 /// # Examples
@@ -247,6 +277,9 @@ pub fn write_quoted<W: fmt::Write>(
 /// assert_eq!(body_to_string("tab\there", EscapeStyle::Jq, false), r"tab\there");
 /// ```
 pub fn body_to_string(s: &str, style: EscapeStyle, ascii: bool) -> String {
+    if nothing_to_escape(s, style, ascii) {
+        return String::from(s);
+    }
     let mut out = String::with_capacity(s.len());
     // Writing into a String is infallible.
     let _ = write_body(&mut out, s, style, ascii);
@@ -264,8 +297,14 @@ pub fn body_to_string(s: &str, style: EscapeStyle, ascii: bool) -> String {
 /// ```
 pub fn quoted_to_string(s: &str, style: EscapeStyle, ascii: bool) -> String {
     let mut out = String::with_capacity(s.len() + 2);
-    // Writing into a String is infallible.
-    let _ = write_quoted(&mut out, s, style, ascii);
+    out.push('"');
+    if nothing_to_escape(s, style, ascii) {
+        out.push_str(s);
+    } else {
+        // Writing into a String is infallible.
+        let _ = write_body(&mut out, s, style, ascii);
+    }
+    out.push('"');
     out
 }
 
