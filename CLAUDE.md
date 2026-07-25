@@ -586,8 +586,8 @@ For detailed documentation on optimization techniques used in this project, see 
   - **Fixes GitHub issue #26**: YAML `at_offset` and `yq-locate` now return correct nodes
   - See [docs/parsing/yaml.md#p11-bp-select1-for-yq-locate---accepted-](docs/parsing/yaml.md#p11-bp-select1-for-yq-locate---accepted-) for full analysis
 - ✅ P12 (Advance Index for bp_to_text): **20-25% faster** yq identity queries on 1MB files, fixes issue #62
-  - Replaced `Vec<u32>` with memory-efficient `BpToTextPositions` enum (IB + Advance bitmaps)
-  - **~1.5× memory compression** for bp_to_text structure (measured with 33% duplicates)
+  - Replaced `Vec<u32>` with memory-efficient `OpenPositions` enum (IB + Advance bitmaps)
+  - **1.1-2.2× memory compression** for the `open_positions` structure, falling as text-bytes-per-open rises (the IB map costs one bit per text byte, so it breaks even against `Vec<u32>` near 20 bytes/open); `succinctly dev bench corpus-stats` reports the ratio per file
   - **Automatic fallback** to `Vec<u32>` for non-monotonic positions (explicit keys)
   - **End-to-end yq benchmarks**:
     - users/1mb: **-24.6%** time (+32.7% throughput)

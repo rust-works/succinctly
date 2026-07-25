@@ -23,10 +23,23 @@
 //!
 //! # Memory
 //!
-//! With typical YAML density (N opens, L text bytes, N ≈ L/7.5):
-//! - Dense `Vec<u32>`: 4N bytes
-//! - Advance Index: L/8 + N/8 ≈ 1.1N bytes
-//! - **~3.5× smaller** (when monotonic)
+//! For N opens over L text bytes, including the rank directories:
+//! - Dense `Vec<u32>`: 4N bytes (32N bits)
+//! - Advance Index: ~1.5L bits (IB + its rank) + ~1.5N bits (advance + its rank)
+//!
+//! The IB map costs one bit per *text byte*, so this encoding's size tracks the
+//! text length rather than the node count. It beats `Vec<u32>` only while
+//! L/N stays under ~20 bytes per open, and the win shrinks as that ratio rises.
+//!
+//! Measured `open_positions` compression against `Vec<u32>` (1 MB generated
+//! inputs; `succinctly dev bench corpus-stats` reports these ratios per file):
+//!
+//! | workload      | bytes/open | compression |
+//! |---------------|------------|-------------|
+//! | users         | 8          | 2.16×       |
+//! | comprehensive | 9          | 1.95×       |
+//! | nested        | 14         | 1.35×       |
+//! | strings       | 19         | 1.06×       |
 //!
 //! # Performance
 //!
@@ -56,7 +69,8 @@ pub(super) const SELECT_SAMPLE_RATE: usize = 256;
 /// may emit positions out of text order.
 #[derive(Clone, Debug)]
 pub enum OpenPositions {
-    /// Memory-efficient encoding for monotonic positions (~3.5× compression).
+    /// Compact bitmap encoding for monotonic positions (1.1-2.2× smaller than
+    /// `Vec<u32>`, falling as text-bytes-per-open rises; see the module docs).
     Compact(AdvancePositions),
     /// Fallback for non-monotonic positions (explicit keys, etc.).
     Dense(Vec<u32>),
@@ -172,8 +186,9 @@ impl Default for SequentialCursor {
 
 /// Advance Index for memory-efficient BP-to-text position mapping.
 ///
-/// Stores positions using two bitmaps instead of a dense `Vec<u32>`,
-/// achieving ~3.5× compression for typical YAML files.
+/// Stores positions using two bitmaps instead of a dense `Vec<u32>`. The
+/// compression achieved depends on the input's text-bytes-per-open ratio —
+/// see the module docs for measured figures.
 #[derive(Clone, Debug)]
 pub struct AdvancePositions {
     /// Interest bits - one bit per text byte, set at unique node positions.

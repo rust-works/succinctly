@@ -22,7 +22,9 @@
 //! With typical YAML density (N opens, L text bytes):
 //! - Dense `Vec<u32>`: 4N bytes
 //! - Compact: L/8 (IB) + N/8 (advance) + rank/select overhead
-//! - **~4-5x smaller** (when monotonic)
+//! - **~1.4-2.5x smaller** (when monotonic; like `open_positions`, the ratio
+//!   falls as text-bytes-per-open rises, because the IB map costs one bit per
+//!   text byte — see `advance_positions` module docs)
 //!
 //! # API Note
 //!

@@ -49,12 +49,13 @@ pub struct YamlIndex<W = Vec<u64>> {
     #[allow(dead_code)] // STYLE-0005: index metadata field retained for parity with ib_len
     ty_len: usize,
     /// Memory-efficient BP open index to text position mapping.
-    /// Uses Advance Index encoding for ~1.5× compression when positions are monotonic,
-    /// otherwise falls back to `Vec<u32>` for non-monotonic cases (explicit keys, etc.).
+    /// Uses Advance Index encoding when positions are monotonic (1.1-2.2× smaller
+    /// than `Vec<u32>`, falling as text-bytes-per-open rises), otherwise falls
+    /// back to `Vec<u32>` for non-monotonic cases (explicit keys, etc.).
     open_positions: OpenPositions,
     /// End positions for scalars using memory-efficient encoding.
-    /// Uses Advance Index encoding for ~5× compression when end positions are monotonic,
-    /// otherwise falls back to `Vec<u32>`.
+    /// Uses Advance Index encoding when end positions are monotonic (~1.4-2.5×
+    /// smaller than `Vec<u32>`), otherwise falls back to `Vec<u32>`.
     bp_to_text_end: EndPositions,
     /// Container markers - 1 if BP position has a TY entry (is a mapping or sequence)
     containers: W,

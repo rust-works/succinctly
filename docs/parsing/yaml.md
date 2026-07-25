@@ -4451,25 +4451,29 @@ let advance_rank = advance_rank1(open_idx + 1);  // Count 1-bits in [0, open_idx
 let text_pos = ib_select1(advance_rank - 1);     // Find (advance_rank-1)th IB bit
 ```
 
-### Implementation: BpToTextPositions Enum
+### Implementation: OpenPositions Enum
+
+> **Naming**: this type was called `BpToTextPositions` when P12 landed. It is now
+> `OpenPositions` in [`src/yaml/advance_positions.rs`](../../src/yaml/advance_positions.rs),
+> and the `YamlIndex` field is `open_positions`, not `bp_to_text`.
 
 The implementation auto-detects position monotonicity and chooses the optimal storage:
 
 ```rust
-pub enum BpToTextPositions {
-    /// Memory-efficient encoding for monotonic positions (~3.5× compression)
+pub enum OpenPositions {
+    /// Compact bitmap encoding for monotonic positions
     Compact(AdvancePositions),
     /// Fallback for non-monotonic positions (explicit keys, etc.)
     Dense(Vec<u32>),
 }
 
-impl BpToTextPositions {
+impl OpenPositions {
     pub fn build(positions: &[u32], text_len: usize) -> Self {
         let is_monotonic = positions.windows(2).all(|w| w[0] <= w[1]);
         if is_monotonic {
-            BpToTextPositions::Compact(AdvancePositions::build_unchecked(positions, text_len))
+            Self::Compact(AdvancePositions::build_unchecked(positions, text_len))
         } else {
-            BpToTextPositions::Dense(positions.to_vec())
+            Self::Dense(positions.to_vec())
         }
     }
 }
@@ -4477,31 +4481,63 @@ impl BpToTextPositions {
 
 ### Why Non-Monotonic Fallback?
 
-During implementation, tests revealed that YAML explicit keys (`?`) can cause positions to be emitted out of text order:
+Explicit block mapping entries with *missing values* make the parser emit
+positions out of text order:
 
 ```yaml
-? complex_key
-: value
+? a
+? b
+c:
 ```
 
-The parser processes the value before backtracking to handle the key, producing non-monotonic positions. The hybrid enum handles this edge case automatically.
+The parser processes the value before backtracking to handle the key, producing
+non-monotonic positions. The hybrid enum handles this edge case automatically.
+
+This path is rare but real: 5 of the 402 documents in the YAML test suite select
+`Dense` (`5WE3`, `7W2P`, `KK5P`, `PW8X`, `ZWK4`) — all explicit keys with missing
+values, or anchors on empty scalars. A plain `? complex_key` / `: value` pair
+does *not* trigger it. `corpus-stats` reports a `dense fallbacks` count so the
+frequency stays visible.
 
 ### Memory Analysis
 
-**Formula** (for monotonic positions with N opens, L text bytes, U unique positions):
-- **Dense `Vec<u32>`**: 4N bytes
-- **Advance Index**: L/8 (IB) + N/8 (advance) + rank/select overhead
-- **Compression**: Varies with L/N ratio and duplicate frequency
+**Formula** (N opens, L text bytes), counting the cumulative rank directories,
+which are one `u32` per 64-bit word and so add 50% on top of each bitmap:
 
-**Key insight**: The IB bitmap scales with text length (L), not positions (N). YAML files typically have L >> N (many text bytes per node), so compression depends on the ratio and duplicate frequency.
+| Storage            | Size                                    |
+|--------------------|-----------------------------------------|
+| Dense `Vec<u32>`   | 4N bytes = **32N bits**                 |
+| Advance Index      | ~1.5L bits (IB + rank) + ~1.5N bits (advance + rank) |
 
-**Actual measured** (1000 positions with 33% duplicates, ~13KB text):
-- `Vec<u32>`: 4000 bytes
-- `AdvancePositions`: 2672 bytes (**1.5× compression**)
+**Key insight**: the IB bitmap costs one bit per *text byte*, so this encoding's
+size tracks **text length**, not node count. Setting the two equal gives a
+break-even at **L/N ≈ 20 bytes per open**: below that the bitmaps win, above it
+a dense `Vec<u32>` would be smaller. Compression is therefore a property of the
+input, not of the encoding.
+
+**Measured** (`succinctly dev bench corpus-stats`, which reports bytes-per-open
+and per-component index sizes directly from a built `YamlIndex`):
+
+| workload             | bytes/open | `open_positions` | `Vec<u32>` equivalent | compression |
+|----------------------|------------|------------------|-----------------------|-------------|
+| users/1mb            | 8          | 220,680 B        | 475,856 B             | **2.16×**   |
+| comprehensive/1mb    | 9          | 218,240 B        | 425,512 B             | **1.95×**   |
+| nested/1mb           | 14         | 211,160 B        | 286,120 B             | **1.35×**   |
+| strings/1mb          | 19         | 207,784 B        | 219,640 B             | **1.06×**   |
+| real-workload corpus | 12 (p50)   | 4,904 B          | 5,184 B               | **1.06×**   |
+
+Note that `open_positions` is nearly **constant in absolute bytes** across all
+four 1 MB workloads (208–221 KB) despite node counts varying by 2.2×: the IB
+bitmap over 1 MB of text dominates, and it does not care how many nodes there
+are. That is the same fact as the break-even above, seen from the other side.
+
+Earlier revisions of this document and the module doc-comments claimed ~3.5×.
+That figure was never measured; the only measurement of record was 1.5× on a
+synthetic 1000-position array. The table above supersedes both.
 
 **Compression is best when:**
-- High duplicate rate (deeply nested structures)
 - Small text-to-node ratio (dense YAML with many small values)
+- High duplicate rate (deeply nested structures) — 18–25% on the real corpus
 - Sequential traversal (amortizes lookup overhead)
 
 ### Benchmark Results
@@ -4546,7 +4582,7 @@ The parser processes the value before backtracking to handle the key, producing 
 **Benefits:**
 - ✅ **20-25% faster** yq identity queries on 1MB files (primary use case)
 - ✅ **3-5% faster** across most YAML parsing benchmarks
-- ✅ **~3.5× memory reduction** for bp_to_text structure
+- ✅ **1.1-2.2× memory reduction** for the `open_positions` structure, falling as text-bytes-per-open rises (see Memory Analysis)
 - ✅ Better cache locality from compact bitmap representation
 - ✅ Automatic fallback for non-monotonic edge cases
 
@@ -4559,7 +4595,7 @@ The parser processes the value before backtracking to handle the key, producing 
 
 1. **Hybrid approach handles edge cases**: YAML's explicit keys create non-monotonic positions that would break pure bitmap encoding. Auto-detecting and falling back to dense storage makes the optimization safe.
 
-2. **Cache locality wins**: The compact representation improves cache behavior, especially for large files where the 3.5× smaller bp_to_text structure fits better in cache.
+2. **Cache locality wins**: The compact representation improves cache behavior, especially for large files where the smaller `open_positions` structure fits better in cache.
 
 3. **yq benefits most**: The 20-25% improvement on yq identity queries is because these queries traverse the entire document, benefiting most from improved cache locality.
 
@@ -4568,7 +4604,7 @@ The parser processes the value before backtracking to handle the key, producing 
 ### Files Modified
 
 - `src/yaml/advance_positions.rs` (new file, 727 lines)
-  - `BpToTextPositions` enum for automatic optimization
+  - `OpenPositions` enum for automatic optimization (named `BpToTextPositions` at the time)
   - `AdvancePositions` struct with IB + Advance bitmaps
   - `AdvancePositionsCursor` for O(1) sequential iteration
   - Comprehensive test suite
@@ -4576,7 +4612,7 @@ The parser processes the value before backtracking to handle the key, producing 
 - `src/yaml/mod.rs` - Added `mod advance_positions;`
 
 - `src/yaml/index.rs`
-  - Changed `bp_to_text: Vec<u32>` to `bp_to_text: BpToTextPositions`
+  - Changed `bp_to_text: Vec<u32>` to what is now `open_positions: OpenPositions`
   - Updated `bp_to_text_pos()` to use new `get()` method
   - Updated `find_bp_at_text_pos()` to use `find_last_open_at_text_pos()`
 
@@ -4586,7 +4622,7 @@ The parser processes the value before backtracking to handle the key, producing 
 
 ### Problem Statement
 
-GitHub issue [#72](https://github.com/rust-works/succinctly/issues/72) identified that the P12 compact bitmap encoding introduced an 11-24% `yaml_bench` regression compared to the `Vec<u32>` baseline. While the bitmap encoding provides ~3.5× memory reduction and 20-25% faster yq identity queries, the build-time cost of constructing bitmaps and rank/select indices is inherently higher than simple array allocation.
+GitHub issue [#72](https://github.com/rust-works/succinctly/issues/72) identified that the P12 compact bitmap encoding introduced an 11-24% `yaml_bench` regression compared to the `Vec<u32>` baseline. While the bitmap encoding provides a 1.1-2.2× memory reduction and 20-25% faster yq identity queries, the build-time cost of constructing bitmaps and rank/select indices is inherently higher than simple array allocation.
 
 Four actionable optimisations (A1-A4) were proposed. A1, A2, and A4 were implemented.
 
@@ -4778,7 +4814,33 @@ fn advance_cursor_to(&self, cursor: &mut SequentialCursor, target: usize) {
 
 ### Analysis
 
-**Why results are noisy**: The forward-gap path is infrequently hit during typical streaming. Most accesses are sequential (hit the O(1) fast path), and backward jumps are rare (random path). The gap path fires when depth-first traversal skips container open indices that don't correspond to child nodes — typically 1-3 positions per nesting level.
+**Why results are noisy**: The forward-gap path is infrequently hit during typical streaming. Most accesses are sequential (hit the O(1) fast path). The gap path fires when depth-first traversal skips container open indices that don't correspond to child nodes — typically 1-3 positions per nesting level.
+
+> **Correction (#58 groundwork).** This section originally also asserted that
+> backward jumps are rare. On the YAML **output** path they were not: about **a
+> third** of all `OpenPositions::get()` calls took the backwards branch, because
+> `is_yaml_cursor_container()` probed a cursor with `value()` and
+> `stream_yaml_value()` then immediately called `value()` again on the same
+> cursor. The repeat of an identical `open_idx` reads as a backwards access, so
+> it fell to `get_random` *and* reset the IB scan cursor to word 0, forcing the
+> next sequential lookup to re-scan from the start.
+>
+> Counting dispatch-path hits during `stream_yaml_document` (temporary
+> instrumentation on the three-way dispatch):
+>
+> | input                | sequential | forward-gap | backwards (before → after) |
+> |----------------------|-----------:|------------:|---------------------------:|
+> | users/1mb            |    104,089 |       7,437 |            52,045 → **0**  |
+> | nested/1mb           |     71,107 |         211 |            35,554 → **0**  |
+> | corpus `stale.yml`   |         31 |          11 |                 16 → **0** |
+>
+> The fix threads the already-materialized value into `stream_yaml_value_of()`
+> instead of re-reading it. Output is byte-identical (304 file × query × format
+> configurations compared). The wall-clock effect was **not** measurable on a
+> laptop — three interleaved 9-run repetitions swung ±35%, consistent with the
+> process-spawn noise recorded in O4 — so no speedup is claimed here; the
+> dispatch counts above are exact and machine-independent, and any timing claim
+> needs the designated bench machines.
 
 **Strongest signals**: nested/1kb (-6.1%) and users/10kb (-6.0%) — these workloads have the most container nesting, producing more gap-path invocations.
 
