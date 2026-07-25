@@ -7,7 +7,8 @@ use clap::ValueEnum;
 use std::path::PathBuf;
 
 use succinctly::json::light::JsonIndex;
-use succinctly::json::locate::{locate_offset_detailed, NewlineIndex};
+use succinctly::json::locate::locate_offset_detailed;
+use succinctly::text::LineIndex;
 
 /// Arguments for jq-locate command
 #[derive(Debug, clap::Parser)]
@@ -52,9 +53,9 @@ pub fn run_jq_locate(args: JqLocateArgs) -> Result<i32> {
     let offset = match (args.offset, args.line, args.column) {
         (Some(off), None, None) => off,
         (None, Some(line), Some(column)) => {
-            // Build newline index to convert line/column to offset
-            let newline_index = NewlineIndex::build(&text);
-            newline_index
+            // Build the line index to convert line/column to offset
+            let line_index = LineIndex::build(&text);
+            line_index
                 .to_offset(line, column)
                 .with_context(|| format!("Invalid position: line {line} column {column}"))?
         }

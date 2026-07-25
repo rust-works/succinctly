@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use std::path::PathBuf;
 
-use succinctly::json::locate::NewlineIndex;
+use succinctly::text::LineIndex;
 use succinctly::yaml::{locate_offset_detailed, YamlIndex};
 
 /// Arguments for yq-locate command
@@ -52,9 +52,9 @@ pub fn run_yq_locate(args: YqLocateArgs) -> Result<i32> {
     let offset = match (args.offset, args.line, args.column) {
         (Some(off), None, None) => off,
         (None, Some(line), Some(column)) => {
-            // Build newline index to convert line/column to offset
-            let newline_index = NewlineIndex::build(&text);
-            newline_index
+            // Build the line index to convert line/column to offset
+            let line_index = LineIndex::build(&text);
+            line_index
                 .to_offset(line, column)
                 .with_context(|| format!("Invalid position: line {line} column {column}"))?
         }
