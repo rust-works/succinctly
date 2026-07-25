@@ -311,6 +311,46 @@ Reproduce with `succinctly dev bench corpus-stats --data-dir data/bench/corpus`
 for the shape statistics and `cargo bench --bench json_validate_bench --
 validate_real_corpus` for the throughput column.
 
+## Per-token scalar optimisations
+
+ADR-0012's finding — the slow patterns are slow because they are *token-dense* —
+points the optimisation effort at per-token cost rather than at skipping bytes
+between tokens. Two changes were written and measured against that.
+
+**Method.** Three interleaved A/B/A/B rounds on an Apple M4 Pro, Criterion
+baselines, 100 KB tier. `nested` and `strings` contain neither numbers nor
+keywords, so any movement there is pure noise; they calibrate the floor at
+**±3.4%**. An earlier all-A-then-all-B run was discarded: it showed ±10% swings
+on those same control patterns, which the changes cannot affect, so thermal
+drift — not the code — dominated it.
+
+| change | numbers | literals | arrays | users | verdict |
+|---|---|---|---|---|---|
+| digit-run scanning | **−9.0%** | −0.9% | +0.3% | +1.9% | ✅ accepted |
+| keyword literal compare | +2.6% | **+6.0%** | −0.9% | +0.8% | ❌ rejected |
+
+**Accepted — digit-run scanning.** `validate_number`'s three digit loops called
+`advance()` per digit, each re-checking bounds and constructing an `Option`.
+Scanning the run once and adjusting `offset`/`column` in one step is exactly
+equivalent (digits contain no line terminator) and worth 9% on number-heavy
+input, with nothing else moving beyond noise.
+
+**Rejected — keyword literal compare.** Replacing `validate_keyword`'s
+byte-at-a-time loop with a first-byte dispatch plus a whole-literal compare made
+`literals` **6% slower** — the one pattern it was written for. The original loop
+runs four or five perfectly-predicted iterations; the dispatch, `starts_with`,
+and the mandatory one-byte lookahead together cost more than they save. This is
+[ADR-0006](../adrs/adr-0006.md)'s finding again, in a new place: on short,
+highly-predictable runs the branch predictor beats bulk comparison. Reverted
+rather than threshold-tuned, per [ADR-0005](../adrs/adr-0005.md).
+
+The lookahead that made it correct is worth recording even though the code is
+gone: without it, `truex` matches the `true` prefix and is reported as an
+unexpected `x`, where the greedy path reports `InvalidKeyword{found:"truex"}` at
+the `t` — different kind *and* offset, both rendered by the CLI. Two named tests
+in `src/json/validate.rs` now pin that contract so a future fast path cannot
+quietly lose it.
+
 ## Running Benchmarks
 
 ```bash
