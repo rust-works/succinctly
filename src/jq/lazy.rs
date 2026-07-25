@@ -462,21 +462,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                 let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
                 out.write_str(s)
             }
-            JqValue::String(s) => {
-                out.write_char('"')?;
-                for c in s.chars() {
-                    match c {
-                        '"' => out.write_str("\\\"")?,
-                        '\\' => out.write_str("\\\\")?,
-                        '\n' => out.write_str("\\n")?,
-                        '\r' => out.write_str("\\r")?,
-                        '\t' => out.write_str("\\t")?,
-                        c if c.is_control() => write!(out, "\\u{:04x}", c as u32)?,
-                        c => out.write_char(c)?,
-                    }
-                }
-                out.write_char('"')
-            }
+            JqValue::String(s) => write_quoted(out, s, EscapeStyle::Jq, false),
             JqValue::Array(arr) => {
                 out.write_char('[')?;
                 for (i, v) in arr.iter().enumerate() {

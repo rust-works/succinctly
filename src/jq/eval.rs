@@ -61,6 +61,7 @@ impl EvalSemantics for YqSemantics {
     const MOD_TRUNCATES_FLOATS: bool = false;
 }
 
+use crate::json::escape::{quoted_to_string, EscapeStyle};
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
@@ -6874,26 +6875,7 @@ fn owned_value_to_json_string(value: &OwnedValue) -> String {
                 format!("{f}")
             }
         }
-        OwnedValue::String(s) => {
-            // Escape the string for JSON
-            let mut result = String::with_capacity(s.len() + 2);
-            result.push('"');
-            for c in s.chars() {
-                match c {
-                    '"' => result.push_str("\\\""),
-                    '\\' => result.push_str("\\\\"),
-                    '\n' => result.push_str("\\n"),
-                    '\r' => result.push_str("\\r"),
-                    '\t' => result.push_str("\\t"),
-                    c if c.is_control() => {
-                        result.push_str(&format!("\\u{:04x}", c as u32));
-                    }
-                    c => result.push(c),
-                }
-            }
-            result.push('"');
-            result
-        }
+        OwnedValue::String(s) => quoted_to_string(s, EscapeStyle::Jq, false),
         OwnedValue::Array(arr) => {
             let mut result = String::from("[");
             for (i, v) in arr.iter().enumerate() {

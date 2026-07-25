@@ -14,6 +14,7 @@ use alloc::vec::Vec;
 use indexmap::IndexMap;
 
 use super::expr::Literal;
+use crate::json::escape::{quoted_to_string, EscapeStyle};
 
 /// An owned JSON value.
 ///
@@ -202,7 +203,7 @@ impl OwnedValue {
                     format!("{f}")
                 }
             }
-            Self::String(s) => format!("\"{}\"", escape_json_string(s)),
+            Self::String(s) => quoted_to_string(s, EscapeStyle::Jq, false),
             Self::Array(arr) => {
                 let elements: Vec<String> = arr.iter().map(Self::to_json).collect();
                 format!("[{}]", elements.join(","))
@@ -210,31 +211,18 @@ impl OwnedValue {
             Self::Object(obj) => {
                 let entries: Vec<String> = obj
                     .iter()
-                    .map(|(k, v)| format!("\"{}\":{}", escape_json_string(k), v.to_json()))
+                    .map(|(k, v)| {
+                        format!(
+                            "{}:{}",
+                            quoted_to_string(k, EscapeStyle::Jq, false),
+                            v.to_json()
+                        )
+                    })
                     .collect();
                 format!("{{{}}}", entries.join(","))
             }
         }
     }
-}
-
-/// Escape a string for JSON output.
-fn escape_json_string(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            c if c.is_control() => {
-                result.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => result.push(c),
-        }
-    }
-    result
 }
 
 impl From<Literal> for OwnedValue {
@@ -288,6 +276,64 @@ impl<T: Into<Self>> From<Vec<T>> for OwnedValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `to_json` must match jq 1.7.1's escaping (#91).
+    ///
+    /// Pinned against the oracle: `\b`/`\f` short forms, DEL as ``, and the
+    /// C1 block emitted raw. This is what `@json`, `tojson`, and every
+    /// serialize-then-reparse seam in the evaluator produce.
+    #[test]
+    fn test_to_json_escaping_matches_jq() {
+        let v = OwnedValue::String("a\u{8}b\u{c}c\u{7f}d\u{85}e".into());
+        assert_eq!(v.to_json(), "\"a\\bb\\fc\\u007fd\u{85}e\"");
+
+        // Short forms and the long form for the remaining C0 controls.
+        let v = OwnedValue::String("\"\\\n\r\t\u{0}\u{1f}".into());
+        assert_eq!(v.to_json(), "\"\\\"\\\\\\n\\r\\t\\u0000\\u001f\"");
+
+        // Non-ASCII passes through unescaped in the default (non-ASCII) mode.
+        let v = OwnedValue::String("café 😀".into());
+        assert_eq!(v.to_json(), "\"café 😀\"");
+    }
+
+    /// Object keys are escaped exactly like string values.
+    #[test]
+    fn test_to_json_escapes_object_keys() {
+        let mut obj = IndexMap::new();
+        obj.insert("a\u{8}b".to_string(), OwnedValue::Int(1));
+        obj.insert("c\nd".to_string(), OwnedValue::Int(2));
+        let v = OwnedValue::Object(obj);
+        assert_eq!(v.to_json(), "{\"a\\bb\":1,\"c\\nd\":2}");
+    }
+
+    /// The evaluator serializes an `OwnedValue` to JSON and re-parses it (see
+    /// `eval_owned_expr`), so the escaper feeds straight back into the parser.
+    /// Anything it emits must survive that round trip byte-for-byte.
+    #[test]
+    fn test_to_json_round_trips_through_the_parser() {
+        let cases = [
+            "a\u{8}b\u{c}c",
+            "\u{7f}\u{85}\u{9f}\u{a0}",
+            "\u{0}\u{1f}\n\r\t\"\\",
+            "café 😀 日本語",
+            "",
+        ];
+        for case in cases {
+            let json = OwnedValue::String(case.into()).to_json();
+
+            // Strict RFC 8259: proves we never emit a raw control byte.
+            let mut validator = crate::json::validate::Validator::new(json.as_bytes());
+            assert!(
+                validator.validate().is_ok(),
+                "to_json emitted invalid JSON for {case:?}: {json:?}"
+            );
+
+            // And the value survives a real parse.
+            let parsed: String = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("reparse failed for {case:?}: {json:?}: {e}"));
+            assert_eq!(parsed, case, "round trip lost data for {case:?}");
+        }
+    }
 
     #[test]
     fn test_constructors() {
