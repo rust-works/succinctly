@@ -6567,6 +6567,110 @@ mod tests {
         }
     }
 
+    /// Issue #339: an explicit key (`? `) at block-sequence-item position is a
+    /// mapping, not a plain scalar. Before the fix the item's dispatch had no
+    /// `?` arm, so `- ? e` fell through to `parse_value` and read as the scalar
+    /// `"? e"`, while the following `  : v` line landed in the *sequence* as a
+    /// phantom sibling: `["? e","v"]` instead of `[{"e":"v"}]`. No error — a
+    /// well-formed, wrong document.
+    ///
+    /// The fix routes the item through the same `parse_explicit_key` the
+    /// mapping-level dispatch already uses, so these cases are the sequence-item
+    /// spelling of shapes that were already correct at top level and in
+    /// mapping-value position. Both spellings are asserted below for exactly
+    /// that reason: they must not drift apart again.
+    ///
+    /// Every expectation is the output of mikefarah/yq v4.53.3, the same oracle
+    /// `tests/data/yq-golden/cases/explicit_key_seq_item_*` is captured from.
+    #[test]
+    fn test_explicit_key_as_sequence_item() {
+        let cases: &[(&[u8], &str)] = &[
+            // The headline #339 repro, and its null-value twin
+            (b"- ? e\n  : v\n", "[{\"e\":\"v\"}]"),
+            (b"- ? e\n", "[{\"e\":null}]"),
+            // A following item is a sibling of the mapping, not of its value
+            (b"- ? e\n  : v\n- x\n", "[{\"e\":\"v\"},\"x\"]"),
+            // Further entries join the item's mapping rather than starting one
+            (
+                b"- ? e\n  : v\n  ? f\n  : w\n",
+                "[{\"e\":\"v\",\"f\":\"w\"}]",
+            ),
+            (b"- ? e\n  : v\n  g: h\n", "[{\"e\":\"v\",\"g\":\"h\"}]"),
+            // ...and an implicit entry first, explicit second
+            (b"- g: h\n  ? e\n  : v\n", "[{\"g\":\"h\",\"e\":\"v\"}]"),
+            // Each item gets its own mapping
+            (b"- ? e\n- ? f\n", "[{\"e\":null},{\"f\":null}]"),
+            // Key content on the following line
+            (b"- ?\n    e\n  : v\n", "[{\"e\":\"v\"}]"),
+            // Non-plain keys reach parse_explicit_key's own dispatch
+            (b"- ? \"q k\"\n  : v\n", "[{\"q k\":\"v\"}]"),
+            (b"- ? 'q k'\n  : v\n", "[{\"q k\":\"v\"}]"),
+            (b"- ? |\n    lit\n  : v\n", "[{\"lit\\n\":\"v\"}]"),
+            (b"- ? [1, 2]\n  : v\n", "[{\"\":\"v\"}]"),
+            // The mapping's indent is the `?`'s own column, not `indent + 2`
+            (b"-   ? e\n    : v\n", "[{\"e\":\"v\"}]"),
+            // Nested one level down: the sequence is a mapping value
+            (b"k:\n  - ? e\n    : v\n", "{\"k\":[{\"e\":\"v\"}]}"),
+            // A sequence item inside an explicit key's value
+            (b"? k\n: - ? e\n    : v\n", "{\"k\":[{\"e\":\"v\"}]}"),
+            // Anchors compose with the new arm (#328 consumes `- &a` first)
+            (b"- ? &a e\n  : v\n", "[{\"e\":\"v\"}]"),
+            (b"- ? e\n  : &a v\n- *a\n", "[{\"e\":\"v\"},\"v\"]"),
+            // `?` without a following space is a plain scalar, as in yq
+            (b"- ?foo\n", "[\"?foo\"]"),
+            // #324 composition: the arm's guard admits all three YAML 1.2 §5.4
+            // line breaks, so the break form cannot change the structure
+            (b"- ? e\r\n  : v\r\n", "[{\"e\":\"v\"}]"),
+            (b"- ? e\r  : v\r", "[{\"e\":\"v\"}]"),
+            // The same shapes in the positions that already worked - these are
+            // the reference the sequence-item spelling must agree with
+            (b"? e\n: v\n", "{\"e\":\"v\"}"),
+            (b"m:\n  ? e\n  : v\n", "{\"m\":{\"e\":\"v\"}}"),
+        ];
+
+        for (yaml, expected) in cases {
+            let index = YamlIndex::build(yaml).unwrap();
+            let json = index.root(yaml).to_json_document();
+            let mut streamed = String::new();
+            index
+                .root(yaml)
+                .stream_json_document(&mut streamed)
+                .unwrap();
+            let input = core::str::from_utf8(yaml).unwrap();
+            assert_eq!(json, *expected, "to_json mismatch for {input:?}");
+            assert_eq!(streamed, *expected, "stream_json mismatch for {input:?}");
+        }
+    }
+
+    /// Issue #339: the item wrapper must expose a *mapping*, and its key must
+    /// be the key alone — the `? ` indicator is not part of the key text.
+    ///
+    /// `to_json_document` alone cannot show this: a scalar item whose text
+    /// happened to be `{"e":"v"}` would serialize identically. This walks the
+    /// cursor to prove the BP tree really is `seq( item( map( key value ) ) )`.
+    #[test]
+    fn test_explicit_key_sequence_item_exposes_mapping() {
+        let yaml = b"- ? e\n  : v\n";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        let items: Vec<_> = match first_doc(index.root(yaml)) {
+            YamlValue::Sequence(elements) => elements.collect(),
+            other => panic!("expected sequence, got {other:?}"),
+        };
+        assert_eq!(items.len(), 1, "the `: v` line must not add an element");
+
+        let fields = match &items[0] {
+            YamlValue::Mapping(fields) => *fields,
+            other => panic!("expected mapping, got {other:?}"),
+        };
+        let field = fields.into_iter().next().expect("one field");
+        assert_eq!(&*field.key().as_str().unwrap(), "e", "`? ` is not key text");
+        match field.value_cursor.value() {
+            YamlValue::String(s) => assert_eq!(&*s.as_str().unwrap(), "v"),
+            other => panic!("expected string value, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_multiple_anchors() {
         let yaml = b"a: &x 1\nb: &y 2\nc: [*x, *y]";

@@ -1058,6 +1058,107 @@ fn test_yaml_anchor_on_null_explicit_value_resolves_to_null() -> Result<()> {
 }
 
 // =============================================================================
+// Explicit keys as sequence items (#339) - `- ? k` / `  : v` is a mapping, not
+// a plain scalar. Expectations are mikefarah/yq v4.53.3 output.
+// =============================================================================
+
+#[test]
+fn test_yaml_explicit_key_seq_item_is_a_mapping() -> Result<()> {
+    // The headline #339 repro: the item used to read as the plain scalar "? e",
+    // and the `: v` line became a phantom second element — ["? e","v"].
+    let input = "- ? e\n  : v\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"e":"v"}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_key_seq_item_without_value_is_null() -> Result<()> {
+    // The second repro: `- ? e` alone. The pending key is closed with a null
+    // when the item's mapping is popped, so the item is {"e":null}, not "? e".
+    let input = "- ? e\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"e":null}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_key_seq_item_is_navigable() -> Result<()> {
+    // Not just identity: the element must be a real mapping you can index, and
+    // the sequence must have exactly one element rather than the old two.
+    let input = "list:\n  - ? e\n    : v\n";
+    let (output, exit_code) = run_yq_stdin(".list[0].e", input, &["-o=json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#""v""#);
+
+    let (output, exit_code) = run_yq_stdin(".list | length", input, &["-o=json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "1", "the `: v` line must not add an element");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_key_seq_item_shares_the_items_mapping() -> Result<()> {
+    // Later entries at the mapping's indent join it rather than starting a new
+    // element — the same reuse `parse_explicit_key` gives at mapping level.
+    let input = "- ? e\n  : v\n  ? f\n  : w\n  g: h\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"e":"v","f":"w","g":"h"}]"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_key_seq_item_agrees_across_positions() -> Result<()> {
+    // The fix is "route the item through the path that was already right", so
+    // the three positions must agree. They diverged before: only the last one
+    // produced a mapping.
+    for (name, input, expected) in [
+        ("top level", "? e\n: v\n", r#"{"e":"v"}"#),
+        ("map value", "m:\n  ? e\n  : v\n", r#"{"m":{"e":"v"}}"#),
+        ("seq item", "m:\n  - ? e\n    : v\n", r#"{"m":[{"e":"v"}]}"#),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(exit_code, 0, "{name} should parse");
+        assert_eq!(output.trim(), expected, "{name} mismatch");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_key_seq_item_is_line_break_agnostic() -> Result<()> {
+    // Composes with #324: the new arm's guard admits `\n`, `\r` and EOI after
+    // the `?`, so all three YAML 1.2 §5.4 break forms give the one document.
+    for (name, input) in [
+        ("LF", "- ? e\n  : v\n"),
+        ("CRLF", "- ? e\r\n  : v\r\n"),
+        ("CR", "- ? e\r  : v\r"),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(exit_code, 0, "{name} input should parse");
+        assert_eq!(
+            output.trim(),
+            r#"[{"e":"v"}]"#,
+            "{name} line breaks should give the same document"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_seq_item_question_mark_without_space_is_a_scalar() -> Result<()> {
+    // `?` is only an indicator when followed by whitespace or EOI, so a plain
+    // scalar that merely starts with `?` must not be dragged into the new arm.
+    let input = "- ?foo\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"["?foo"]"#);
+    Ok(())
+}
+
+// =============================================================================
 // Alias cycle rejection (#153) - cyclic anchors must be a clean parse error,
 // not a stack-overflow abort
 // =============================================================================

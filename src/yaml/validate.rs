@@ -1520,6 +1520,32 @@ mod tests {
         assert!(validate(b"a: { &e e: f }\nb: *e\n").is_ok());
     }
 
+    /// Issue #339: every shape the loader now reads as an explicit key at
+    /// block-sequence-item position must also pass the validator, or
+    /// `syq --validate` would reject documents `syq` reads fine.
+    ///
+    /// The validator is a separate pass with its own line classifier, so this
+    /// is not implied by the parser tests — it is asserted here so a later
+    /// tightening of `LineKind` detection cannot silently take these away.
+    #[test]
+    fn accepts_explicit_keys_as_sequence_items() {
+        assert!(validate(b"- ? e\n  : v\n").is_ok());
+        assert!(validate(b"- ? e\n").is_ok());
+        assert!(validate(b"- ? e\n  : v\n- x\n").is_ok());
+        assert!(validate(b"- ? e\n  : v\n  ? f\n  : w\n").is_ok());
+        assert!(validate(b"- ? e\n  : v\n  g: h\n").is_ok());
+        assert!(validate(b"- ? e\n- ? f\n").is_ok());
+        assert!(validate(b"- ?\n    e\n  : v\n").is_ok());
+        assert!(validate(b"- ? \"q k\"\n  : v\n").is_ok());
+        assert!(validate(b"- ? |\n    lit\n  : v\n").is_ok());
+        assert!(validate(b"- ? [1, 2]\n  : v\n").is_ok());
+        assert!(validate(b"-   ? e\n    : v\n").is_ok());
+        assert!(validate(b"k:\n  - ? e\n    : v\n").is_ok());
+        assert!(validate(b"- ? &a e\n  : v\n").is_ok());
+        assert!(validate(b"- ? e\n  : &a v\n- *a\n").is_ok());
+        assert!(validate(b"? k\n: - ? e\n    : v\n").is_ok());
+    }
+
     #[test]
     fn accepts_multiline_and_folded_scalars() {
         assert!(validate(b"a\nb\n c\nd\n\ne\n").is_ok()); // 9YRD plain multiline

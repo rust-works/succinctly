@@ -1,0 +1,52 @@
+# An explicit key (`? `) as a block sequence item (#339)
+scalar_key:
+  - ? e
+    : v
+null_value:
+  - ? e
+following_item:
+  - ? e
+    : v
+  - x
+two_entries:
+  - ? e
+    : v
+    ? f
+    : w
+mixed_entry:
+  - ? e
+    : v
+    g: h
+implicit_first:
+  - g: h
+    ? e
+    : v
+each_item:
+  - ? e
+  - ? f
+key_on_next_line:
+  - ?
+      e
+    : v
+quoted_key:
+  - ? "q k"
+    : v
+block_scalar_key:
+  - ? |
+      lit
+    : v
+flow_seq_key:
+  - ? [1, 2]
+    : v
+wide_indent:
+  -   ? e
+      : v
+anchored_key:
+  - ? &ak e
+    : v
+anchored_value:
+  - ? e
+    : &av v
+  - *av
+plain_scalar_qmark:
+  - ?foo

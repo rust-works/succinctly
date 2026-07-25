@@ -1378,6 +1378,30 @@ impl<'a> Parser<'a> {
             self.parse_sequence_item(nested_indent)?;
             // Don't close the outer item - it will be closed when we return
             // to a lower indent level.
+        } else if self.peek() == Some(b'?')
+            && matches!(self.peek_at(1), Some(b' ' | b'\n' | b'\r') | None)
+        {
+            // Explicit key as the item's value: `- ? k` / `  : v` (#339).
+            //
+            // Routed through the same `parse_explicit_key` the mapping-level
+            // dispatch uses rather than a fourth copy of the decision (#106) —
+            // that path is already correct at top level and in mapping-value
+            // position, and reaching it is the whole fix. Without this arm the
+            // `?` reaches `parse_value` as a plain scalar and the `: v` line
+            // becomes a phantom sibling element.
+            //
+            // Ordered *before* `looks_like_mapping_entry`, matching the main
+            // loop's dispatch order in `parse_document_line`: the `?` indicator
+            // wins over a `: ` later on the line.
+            //
+            // `current_column()` — the `?`'s own column — is the mapping's
+            // indent, not `indent + 2`, so `-   ? k` / `    : v` lines up. It is
+            // always >= `indent + 2`, which is why `parse_explicit_key`'s
+            // opening `close_deeper_indents` cannot close the item we just
+            // pushed at virtual indent `indent + 1`.
+            self.parse_explicit_key(self.current_column())?;
+            // Don't close anything - mapping and item are closed by
+            // close_deeper_indents when we see content at lower indent.
         } else if self.looks_like_mapping_entry() {
             // Check for compact mapping: `- key: value`
             // This is a mapping entry directly as the sequence item value
