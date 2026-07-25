@@ -1,0 +1,78 @@
+# Recorded verdicts for JSONTestSuite's implementation-defined cases.
+#
+# Format:  <case-id>  <accept|reject>  <rationale>
+#
+# RFC 8259 leaves these open, so neither verdict is "wrong" — but our verdict
+# should never change by accident. tests/json_test_suite.rs asserts actual
+# behaviour equals the record, in both directions, and that this file covers the
+# i_ cases exactly. Together they make this the written description of which
+# JSON dialect succinctly accepts.
+#
+# The verdicts below fall into five groups, each with one reason.
+
+# --- Numbers outside IEEE 754 double range -----------------------------------
+# RFC 8259 §6 constrains number *grammar* only; it explicitly sets no range or
+# precision limit and notes that interoperability expectations are a separate
+# matter. A validator answers "is this well-formed JSON", not "does this survive
+# a round trip through f64", so magnitude is not its business. (serde_json takes
+# the opposite view and errors on f64 overflow — a known, deliberate divergence;
+# see classify_divergence in tests/json_validate_properties.rs.)
+i_number_double_huge_neg_exp.json         accept  RFC 8259 §6 sets no range on numbers
+i_number_huge_exp.json                    accept  RFC 8259 §6 sets no range on numbers
+i_number_neg_int_huge_exp.json            accept  RFC 8259 §6 sets no range on numbers
+i_number_pos_double_huge_exp.json         accept  RFC 8259 §6 sets no range on numbers
+i_number_real_neg_overflow.json           accept  RFC 8259 §6 sets no range on numbers
+i_number_real_pos_overflow.json           accept  RFC 8259 §6 sets no range on numbers
+i_number_real_underflow.json              accept  RFC 8259 §6 sets no range on numbers
+i_number_too_big_neg_int.json             accept  RFC 8259 §6 sets no range on numbers
+i_number_too_big_pos_int.json             accept  RFC 8259 §6 sets no range on numbers
+i_number_very_big_negative_int.json       accept  RFC 8259 §6 sets no range on numbers
+
+# --- Surrogates in \u escapes -------------------------------------------------
+# RFC 8259 §7 defines characters outside the BMP as a \uD800-\uDBFF escape
+# followed by a \uDC00-\uDFFF escape. We require that pairing: an unpaired or
+# inverted surrogate names no Unicode scalar value, so it cannot be encoded as
+# UTF-8 and would have to be silently replaced to be accepted.
+i_object_key_lone_2nd_surrogate.json      reject  RFC 8259 §7 requires paired surrogate escapes
+i_string_1st_surrogate_but_2nd_missing.json  reject  RFC 8259 §7 requires paired surrogate escapes
+i_string_1st_valid_surrogate_2nd_invalid.json  reject  RFC 8259 §7 requires paired surrogate escapes
+i_string_incomplete_surrogate_and_escape_valid.json  reject  RFC 8259 §7 requires paired surrogate escapes
+i_string_incomplete_surrogate_pair.json   reject  RFC 8259 §7 requires paired surrogate escapes
+i_string_incomplete_surrogates_escape_valid.json  reject  RFC 8259 §7 requires paired surrogate escapes
+i_string_invalid_lonely_surrogate.json    reject  RFC 8259 §7 requires paired surrogate escapes
+i_string_invalid_surrogate.json           reject  RFC 8259 §7 requires paired surrogate escapes
+i_string_inverted_surrogates_U+1D11E.json reject  RFC 8259 §7 requires paired surrogate escapes
+i_string_lone_second_surrogate.json       reject  RFC 8259 §7 requires paired surrogate escapes
+
+# --- Malformed UTF-8 in the raw bytes ----------------------------------------
+# RFC 8259 §8.1 requires JSON text exchanged between systems to be encoded in
+# UTF-8. Raw bytes that are not well-formed UTF-8 — overlong forms, truncated
+# sequences, lone continuation bytes, surrogates encoded directly, code points
+# above U+10FFFF — are rejected rather than repaired.
+i_string_UTF-8_invalid_sequence.json      reject  RFC 8259 §8.1 requires well-formed UTF-8
+i_string_UTF8_surrogate_U+D800.json       reject  RFC 8259 §8.1 requires well-formed UTF-8
+i_string_invalid_utf-8.json               reject  RFC 8259 §8.1 requires well-formed UTF-8
+i_string_iso_latin_1.json                 reject  RFC 8259 §8.1 requires well-formed UTF-8
+i_string_lone_utf8_continuation_byte.json reject  RFC 8259 §8.1 requires well-formed UTF-8
+i_string_not_in_unicode_range.json        reject  RFC 8259 §8.1 requires well-formed UTF-8
+i_string_overlong_sequence_2_bytes.json   reject  RFC 8259 §8.1 requires well-formed UTF-8
+i_string_overlong_sequence_6_bytes.json   reject  RFC 8259 §8.1 requires well-formed UTF-8
+i_string_overlong_sequence_6_bytes_null.json  reject  RFC 8259 §8.1 requires well-formed UTF-8
+i_string_truncated-utf-8.json             reject  RFC 8259 §8.1 requires well-formed UTF-8
+
+# --- Non-UTF-8 encodings and byte order marks --------------------------------
+# Same clause, different cause: UTF-16 input and a leading UTF-8 BOM are not
+# UTF-8 JSON text. RFC 8259 §8.1 further states implementations MUST NOT add a
+# BOM and MAY ignore one; we do not ignore it, so the BOM bytes surface as an
+# unexpected character at offset 0.
+i_string_UTF-16LE_with_BOM.json           reject  RFC 8259 §8.1 requires UTF-8; BOM not skipped
+i_string_utf16BE_no_BOM.json              reject  RFC 8259 §8.1 requires UTF-8
+i_string_utf16LE_no_BOM.json              reject  RFC 8259 §8.1 requires UTF-8
+i_structure_UTF-8_BOM_empty_object.json   reject  RFC 8259 §8.1 requires UTF-8; BOM not skipped
+
+# --- Nesting depth ------------------------------------------------------------
+# RFC 8259 §9 explicitly permits an implementation to set limits on nesting
+# depth. Ours is MAX_NESTING_DEPTH = 128 (src/json/validate.rs), added for #151:
+# the validator is recursive descent and reachable from the CLI on
+# attacker-controlled input, so unbounded depth was a stack-overflow DoS.
+i_structure_500_nested_arrays.json        reject  MAX_NESTING_DEPTH = 128 per RFC 8259 §9 (#151)

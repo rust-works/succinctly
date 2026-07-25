@@ -708,3 +708,21 @@ jobs:
             --data-dir tests/data/bench-corpus/seed \
             --markdown tests/data/bench-corpus/expected-shape.md \
             --check
+
+  # Drift detector for the vendored JSONTestSuite corpus
+  # (tests/data/json-test-suite-<sha>.json). The corpus is vendored so that
+  # `cargo test` needs no network; this job is the one place that re-fetches
+  # nst/JSONTestSuite at the pinned SHA and confirms the in-tree copy still
+  # matches, so the conformance suite cannot silently drift from upstream.
+  # Per-STEP gate for the same required-context-safe reason as jq/yq-drift.
+  json-suite-drift:
+    name: JSONTestSuite corpus drift check
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        if: needs.gate.outputs.code == 'true'
+
+      - name: Verify vendored corpus against pinned upstream
+        if: needs.gate.outputs.code == 'true'
+        run: ./scripts/sync-json-test-suite.sh --check

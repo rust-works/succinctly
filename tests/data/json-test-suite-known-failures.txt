@@ -1,0 +1,10 @@
+# Known JSONTestSuite failures (tests/json_test_suite.rs).
+#
+# Format:  <case-id>  <category>  <reason>
+#
+# Only y_ (must-accept) and n_ (must-reject) cases belong here. Implementation-
+# defined i_ cases are recorded in json-test-suite-i-decisions.txt instead.
+#
+# The check is two-sided: a case failing without a line here fails the build, and
+# a line here for a case that now passes also fails the build — so every fix is
+# forced to shrink this file, and no divergence can hide.

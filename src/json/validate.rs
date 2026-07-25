@@ -131,7 +131,11 @@ impl fmt::Display for ValidationErrorKind {
 }
 
 /// A JSON validation error with position information.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq`/`Eq` make the whole error comparable, so differential tests can
+/// assert byte-for-byte agreement on *which* error is reported and *where*,
+/// rather than merely that validation failed. Both fields already derived them.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationError {
     /// The kind of error.
     pub kind: ValidationErrorKind,
