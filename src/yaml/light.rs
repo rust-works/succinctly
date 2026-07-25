@@ -7722,4 +7722,263 @@ mod tests {
             }
         }
     }
+
+    // ========================================================================
+    // Line-break helpers and the alternate-parse-path scanners (#324)
+    //
+    // The `#[allow(dead_code)]` STYLE-0005 helpers below are not on the current
+    // parse path, so no integration test can reach them. They were still made
+    // CR-aware, because a helper that silently keeps LF-only semantics is a
+    // trap for whoever re-enables it. These tests pin that behaviour directly
+    // so it cannot rot unnoticed.
+    // ========================================================================
+
+    #[test]
+    fn line_break_len_measures_each_break_form() {
+        assert_eq!(
+            line_break_len(b"a\r\nb", 1),
+            2,
+            "CRLF is one two-byte break"
+        );
+        assert_eq!(line_break_len(b"a\rb", 1), 1, "lone CR");
+        assert_eq!(line_break_len(b"a\nb", 1), 1, "LF");
+        // A CR at end of input has no LF to pair with.
+        assert_eq!(line_break_len(b"a\r", 1), 1);
+        // Not at a break, and past the end, both measure zero.
+        assert_eq!(line_break_len(b"ab", 0), 0);
+        assert_eq!(line_break_len(b"a\n", 9), 0);
+        assert_eq!(line_break_len(b"", 0), 0);
+    }
+
+    #[test]
+    fn line_break_len_before_measures_backwards() {
+        // b"a\r\nb\rc\nd"
+        //   0 1 2 3 4 5 6 7
+        let text = b"a\r\nb\rc\nd";
+        assert_eq!(line_break_len_before(text, 3), 2, "CRLF ends before `b`");
+        assert_eq!(line_break_len_before(text, 2), 1, "just the CR of a CRLF");
+        assert_eq!(line_break_len_before(text, 5), 1, "lone CR ends before `c`");
+        assert_eq!(line_break_len_before(text, 7), 1, "LF ends before `d`");
+        assert_eq!(line_break_len_before(text, 1), 0, "`a` is not a break");
+        assert_eq!(
+            line_break_len_before(text, 0),
+            0,
+            "nothing before the start"
+        );
+        assert_eq!(line_break_len_before(b"", 0), 0);
+        // A bare LF at index 0 is a one-byte break with no CR in front of it.
+        assert_eq!(line_break_len_before(b"\nx", 1), 1);
+    }
+
+    #[test]
+    fn is_line_break_accepts_both_break_bytes() {
+        assert!(is_line_break(b'\n'));
+        assert!(is_line_break(b'\r'));
+        for b in [b' ', b'\t', b'a', 0x0b, 0x0c] {
+            assert!(!is_line_break(b), "{b:#04x} is not a YAML line break");
+        }
+    }
+
+    /// Build an index and hand back the root cursor, for the private scanners
+    /// below that need a `YamlCursor` but not a particular node.
+    fn cursor_over(yaml: &[u8]) -> (YamlIndex<Vec<u64>>, &[u8]) {
+        (YamlIndex::build(yaml).expect("parses"), yaml)
+    }
+
+    #[test]
+    fn find_plain_scalar_end_stops_at_every_break_form() {
+        // `value` starts at offset 3 in each spelling; the scan must end at 8,
+        // never carrying the break into the scalar.
+        for yaml in [
+            b"a: value\nb: 2\n".as_slice(),
+            b"a: value\r\nb: 2\r\n".as_slice(),
+            b"a: value\rb: 2\r".as_slice(),
+        ] {
+            let (index, text) = cursor_over(yaml);
+            let root = index.root(text);
+            assert_eq!(
+                root.find_plain_scalar_end(3, 0, false),
+                8,
+                "input {:?}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
+    #[test]
+    fn find_plain_scalar_end_folds_continuation_lines() {
+        // A more-indented next line continues the scalar under every spelling.
+        for yaml in [
+            b"a: one\n  two\n".as_slice(),
+            b"a: one\r\n  two\r\n".as_slice(),
+            b"a: one\r  two\r".as_slice(),
+        ] {
+            let (index, text) = cursor_over(yaml);
+            let root = index.root(text);
+            let end = root.find_plain_scalar_end(3, 0, false);
+            let scanned = &text[3..end];
+            assert!(
+                scanned.ends_with(b"two"),
+                "input {:?} scanned {:?}",
+                String::from_utf8_lossy(yaml),
+                String::from_utf8_lossy(scanned)
+            );
+        }
+    }
+
+    #[test]
+    fn find_plain_scalar_end_keeps_a_colon_that_is_not_a_separator() {
+        // `12:30` and `http://` hold colons the scan must walk past — only a
+        // colon followed by whitespace or a break ends the scalar.
+        for yaml in [
+            b"a: at 12:30 sharp\nb: 2\n".as_slice(),
+            b"a: at 12:30 sharp\r\nb: 2\r\n".as_slice(),
+            b"a: at 12:30 sharp\rb: 2\r".as_slice(),
+        ] {
+            let (index, text) = cursor_over(yaml);
+            let root = index.root(text);
+            let end = root.find_plain_scalar_end(3, 0, false);
+            assert_eq!(
+                &text[3..end],
+                b"at 12:30 sharp",
+                "input {:?}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
+    #[test]
+    fn compute_base_indent_and_root_flag_finds_the_line_start() {
+        // Second line's value sits at indent 2 and is not document root. The
+        // walk back to the line start has to recognise the preceding break.
+        for yaml in [
+            b"top:\n  key: value\n".as_slice(),
+            b"top:\r\n  key: value\r\n".as_slice(),
+            b"top:\r  key: value\r".as_slice(),
+        ] {
+            let (index, text) = cursor_over(yaml);
+            let root = index.root(text);
+            let value_pos = text
+                .windows(5)
+                .position(|w| w == b"value")
+                .expect("input holds `value`");
+            let (indent, is_root) = root.compute_base_indent_and_root_flag(value_pos);
+            assert_eq!(
+                (indent, is_root),
+                (2, false),
+                "input {:?}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
+    /// The line scan also recognises an explicit-key indicator (`? `), whose
+    /// terminator set includes both break bytes.
+    #[test]
+    fn compute_base_indent_and_root_flag_sees_an_explicit_key_indicator() {
+        for yaml in [
+            b"? key\n: value\n".as_slice(),
+            b"? key\r\n: value\r\n".as_slice(),
+            b"? key\r: value\r".as_slice(),
+        ] {
+            let (index, text) = cursor_over(yaml);
+            let root = index.root(text);
+            let key_pos = text
+                .windows(3)
+                .position(|w| w == b"key")
+                .expect("input holds `key`");
+            // Reached at all is the point: the `?` branch is on this path only
+            // when the indicator is followed by whitespace or a break.
+            let (indent, _) = root.compute_base_indent_and_root_flag(key_pos);
+            assert_eq!(indent, 0, "input {:?}", String::from_utf8_lossy(yaml));
+        }
+    }
+
+    #[test]
+    fn compute_base_indent_and_root_flag_looks_back_for_a_document_marker() {
+        // A value alone on its line sends the scan back over the *previous*
+        // line to look for `---`. That walk-back is a second line-start scan,
+        // and a lone CR hides the boundary from an LF-only one.
+        for (yaml, expect_root) in [
+            (b"---\nplain\n".as_slice(), true),
+            (b"---\r\nplain\r\n".as_slice(), true),
+            (b"---\rplain\r".as_slice(), true),
+            // No marker on the previous line: not document root.
+            (b"key:\nplain\n".as_slice(), false),
+            (b"key:\r\nplain\r\n".as_slice(), false),
+            (b"key:\rplain\r".as_slice(), false),
+        ] {
+            let (index, text) = cursor_over(yaml);
+            let root = index.root(text);
+            let value_pos = text
+                .windows(5)
+                .position(|w| w == b"plain")
+                .expect("input holds `plain`");
+            let (_, is_root) = root.compute_base_indent_and_root_flag(value_pos);
+            assert_eq!(
+                is_root,
+                expect_root,
+                "input {:?}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
+    #[test]
+    fn is_in_flow_context_rewinds_to_a_line_start_past_4kb() {
+        // Past 4 KB into the document the scan no longer starts at byte 0: it
+        // rewinds ~4 KB and then back to the enclosing line start, so it never
+        // begins mid-line. That rewind is its own line-start walk, and a lone
+        // CR hides the boundary from an LF-only one.
+        //
+        // The scan window is deliberately bounded, so the opener has to sit
+        // *inside* the last 4 KB for the answer to be `true` — this pads before
+        // the opener, not after it.
+        for (nl, form) in [("\n", "LF"), ("\r\n", "CRLF"), ("\r", "CR")] {
+            let mut yaml = String::new();
+            for i in 0..400 {
+                yaml.push_str(&alloc::format!("pad{i}: value{nl}"));
+            }
+            let opener = yaml.len();
+            yaml.push_str(&alloc::format!("opener: [1,{nl}  last]{nl}"));
+            let bytes = yaml.as_bytes();
+            assert!(
+                opener > 4096,
+                "{form}: opener must sit past the 4 KB rewind"
+            );
+
+            let index = YamlIndex::build(bytes).expect("parses");
+            let root = index.root(bytes);
+            let inside = yaml.rfind("last").expect("holds `last`");
+            assert!(
+                root.is_in_flow_context(inside),
+                "{form}: `last` is inside the flow sequence opened on the line before"
+            );
+            assert!(
+                !root.is_in_flow_context(opener),
+                "{form}: the opener line's own start is not yet inside the flow"
+            );
+        }
+    }
+
+    #[test]
+    fn is_in_flow_context_sees_an_opener_on_an_earlier_line() {
+        // The scan walks back over line starts; with an LF-only walk a lone CR
+        // hides the line boundary and the answer flips.
+        for yaml in [
+            b"a: [1,\n  2]\n".as_slice(),
+            b"a: [1,\r\n  2]\r\n".as_slice(),
+            b"a: [1,\r  2]\r",
+        ] {
+            let (index, text) = cursor_over(yaml);
+            let root = index.root(text);
+            let inside = text.iter().position(|&b| b == b'2').expect("holds `2`");
+            assert!(
+                root.is_in_flow_context(inside),
+                "input {:?}",
+                String::from_utf8_lossy(yaml)
+            );
+            assert!(!root.is_in_flow_context(0), "column 0 is outside any flow");
+        }
+    }
 }

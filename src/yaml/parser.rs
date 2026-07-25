@@ -4257,4 +4257,77 @@ mod tests {
             "nesting depth exceeds limit of 128 at offset 131"
         );
     }
+    /// The oracle's line-break primitives (#324). `break_len_at` is what tells
+    /// every caller that a CRLF is *one* break two bytes wide; getting it wrong
+    /// leaves a stray `\r` inside the preceding token, which is the whole bug.
+    #[test]
+    fn line_break_primitives_measure_each_form() {
+        let parser = Parser::new(b"a\r\nb\rc\nd");
+        //                        0 1 2 3 4 5 6 7
+        assert_eq!(parser.break_len_at(1), 2, "CRLF at 1");
+        assert_eq!(
+            parser.break_len_at(2),
+            1,
+            "the LF of a CRLF, measured alone"
+        );
+        assert_eq!(parser.break_len_at(4), 1, "lone CR at 4");
+        assert_eq!(parser.break_len_at(6), 1, "LF at 6");
+        assert_eq!(parser.break_len_at(0), 0, "`a` is not a break");
+        assert_eq!(parser.break_len_at(99), 0, "past end of input");
+
+        // A CR at end of input has no LF to pair with.
+        assert_eq!(Parser::new(b"a\r").break_len_at(1), 1);
+        assert_eq!(Parser::new(b"").break_len_at(0), 0);
+
+        assert!(Parser::is_break(b'\n'));
+        assert!(Parser::is_break(b'\r'));
+        assert!(!Parser::is_break(b'\t'));
+        assert!(!Parser::is_break(b' '));
+    }
+
+    /// `skip_line_break` consumes exactly one break, never half of a CRLF and
+    /// never a byte when the cursor is not on one.
+    #[test]
+    fn skip_line_break_consumes_exactly_one_break() {
+        let mut parser = Parser::new(b"\r\n\r\nx");
+        parser.skip_line_break();
+        assert_eq!(parser.pos, 2, "first CRLF consumed whole");
+        parser.skip_line_break();
+        assert_eq!(parser.pos, 4, "second CRLF consumed whole");
+        parser.skip_line_break();
+        assert_eq!(parser.pos, 4, "`x` is not a break, so nothing moves");
+
+        let mut lone = Parser::new(b"\r\rx");
+        lone.skip_line_break();
+        assert_eq!(lone.pos, 1, "a lone CR is a complete break");
+        assert!(lone.at_break());
+        lone.skip_line_break();
+        assert_eq!(lone.pos, 2);
+        assert!(!lone.at_break());
+    }
+
+    /// `current_line` counts breaks, and a CRLF is one of them — not two.
+    #[test]
+    fn current_line_counts_a_crlf_once() {
+        // b"a\r\nb\r\nc"
+        //   0 1 2 3 4 5 6
+        let mut parser = Parser::new(b"a\r\nb\r\nc");
+        assert_eq!(parser.current_line(), 1);
+        parser.pos = 3;
+        assert_eq!(parser.current_line(), 2, "`b` is on line 2");
+        // Sitting on the LF of the second CRLF is still line 2: that CR's
+        // partner lies past the counted prefix and must not read as a lone CR.
+        parser.pos = 5;
+        assert_eq!(
+            parser.current_line(),
+            2,
+            "the LF of a CRLF is not a new line"
+        );
+        parser.pos = 6;
+        assert_eq!(parser.current_line(), 3, "`c` is on line 3");
+
+        let mut lone = Parser::new(b"a\rb\rc");
+        lone.pos = 4;
+        assert_eq!(lone.current_line(), 3, "lone CRs each start a line");
+    }
 }

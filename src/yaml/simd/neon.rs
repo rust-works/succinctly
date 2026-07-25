@@ -961,4 +961,30 @@ mod tests {
             );
         }
     }
+    /// The broadword classifiers are kept as a reference/fallback and are not
+    /// on the dispatched path, so nothing else exercises their accessors. They
+    /// still have to agree that a CR terminates a value — a classifier that
+    /// quietly omits it is what let a lone CR swallow a whole document (#324).
+    #[test]
+    fn broadword_classifiers_treat_cr_as_a_value_terminator() {
+        let input = b"abcdefg\rhijklmno";
+        let class = classify_yaml_chars_broadword(input, 0).expect("8 bytes available");
+        assert_eq!(class.carriage_returns, 1 << 7, "CR is at offset 7");
+        assert!(class.has_any());
+        assert!(
+            class.value_terminators() & (1 << 7) != 0,
+            "CR must terminate an unquoted value"
+        );
+
+        let class16 = classify_yaml_chars_16(input, 0).expect("16 bytes available");
+        assert_eq!(class16.carriage_returns, 1 << 7);
+        assert!(class16.value_terminators() & (1 << 7) != 0);
+
+        // A chunk with no CR reports none, so the mask is not just always set.
+        let plain = b"abcdefghijklmnop";
+        let none = classify_yaml_chars_broadword(plain, 0).expect("8 bytes available");
+        assert_eq!(none.carriage_returns, 0);
+        assert!(!none.has_any(), "no structural bytes in {plain:?}");
+        assert_eq!(none.value_terminators(), 0);
+    }
 }
