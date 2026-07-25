@@ -31,6 +31,11 @@ data/bench/generated/
 # Generated benchmark results
 data/bench/results/
 
+# Real-workload corpus fetched by scripts/sync-bench-corpus.sh (#301).
+# The committed seed lives in tests/data/bench-corpus/seed/; this is the
+# fetched large tier + seed copies, populated on demand and never committed.
+data/bench/corpus/
+
 # Build artifacts
 *.rlib
 libtest_no_std.rlib
