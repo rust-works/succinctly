@@ -103,6 +103,11 @@ fn known_failures() -> BTreeMap<String, String> {
 /// Run `succinctly yq <args> <filter>` with the case input on stdin and demand
 /// exit code 0 plus stdout byte-equal to the golden.
 fn run_case(case: &Case) -> Result<(), String> {
+    run_case_with_input(case, &case.input)
+}
+
+/// As [`run_case`], but with the document's line breaks possibly rewritten.
+fn run_case_with_input(case: &Case, input: &str) -> Result<(), String> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .arg("yq")
         .args(&case.args)
@@ -116,7 +121,7 @@ fn run_case(case: &Case) -> Result<(), String> {
         .stdin
         .take()
         .expect("stdin piped")
-        .write_all(case.input.as_bytes())
+        .write_all(input.as_bytes())
         .map_err(|e| format!("write stdin: {e}"))?;
     let output = child.wait_with_output().map_err(|e| format!("wait: {e}"))?;
 
@@ -186,6 +191,70 @@ fn yq_golden_conformance() {
         report.push_str("\nNice — remove these lines from the manifest.\n");
     }
     assert!(report.is_empty(), "{report}");
+}
+
+/// The same goldens, with the input's line breaks rewritten to CRLF and to a
+/// lone CR (#324).
+///
+/// No new fixtures are needed: YAML 1.2 §5.4/§5.7 make a processor normalize all
+/// three break forms to `\n` on input, so `yq`'s output is identical for all
+/// three spellings of the same document — the existing `expected.out` is the
+/// oracle for every variant. Rewriting `\n` is sound because a raw LF in YAML is
+/// always a line break; the `\n` inside a double-quoted scalar is the two
+/// characters `\` and `n`, which `str::replace` leaves alone.
+///
+/// The assertion is invariance: each variant must fail on exactly the cases the
+/// LF run fails on, so this stays honest without a second manifest.
+#[test]
+fn yq_golden_conformance_under_crlf_and_lone_cr() {
+    let cases = cases();
+    let baseline: BTreeSet<String> = cases
+        .iter()
+        .filter(|c| run_case(c).is_err())
+        .map(|c| c.name.clone())
+        .collect();
+
+    for (variant, rewrite) in [("CRLF", "\r\n"), ("CR", "\r")] {
+        let mut failures: BTreeMap<String, String> = BTreeMap::new();
+        for case in &cases {
+            let input = case.input.replace('\n', rewrite);
+            if let Err(reason) = run_case_with_input(case, &input) {
+                failures.insert(case.name.clone(), reason);
+            }
+        }
+
+        let actual: BTreeSet<String> = failures.keys().cloned().collect();
+        let regressed: Vec<_> = actual.difference(&baseline).collect();
+        let inverted: Vec<_> = baseline.difference(&actual).collect();
+
+        let mut report = String::new();
+        if !regressed.is_empty() {
+            report.push_str(&format!(
+                "\n{} case(s) match pinned yq under LF but not under {variant}:\n",
+                regressed.len()
+            ));
+            for name in &regressed {
+                report.push_str(&format!("  {name}: {}\n", failures[name.as_str()]));
+            }
+        }
+        if !inverted.is_empty() {
+            report.push_str(&format!(
+                "\n{} case(s) diverge from pinned yq under LF but match under {variant} — \
+                 line-break form must not change the output at all:\n",
+                inverted.len()
+            ));
+            for name in &inverted {
+                report.push_str(&format!("  {name}\n"));
+            }
+        }
+        assert!(report.is_empty(), "{report}");
+
+        println!(
+            "yq golden conformance under {variant}: {}/{} cases, same failure set as LF",
+            cases.len() - failures.len(),
+            cases.len()
+        );
+    }
 }
 
 /// The manifest is hand-maintained; keep it honest about the corpus it describes.
