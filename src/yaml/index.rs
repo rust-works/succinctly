@@ -871,6 +871,63 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
+    // Open-position storage selection (#327)
+    // ------------------------------------------------------------------------
+
+    /// What actually selects the `OpenPositions::Dense` fallback.
+    ///
+    /// The fallback exists for non-monotonic open positions, and the docs on
+    /// `AdvancePositions` attribute that to "explicit keys". Measured against
+    /// the YAML test suite (6 of 362 parsed cases reach Dense), the trigger is
+    /// narrower: a **valueless** explicit key — `? a` with no `: value` — that
+    /// is followed by another mapping entry. An ordinary `? key` / `: value`
+    /// pair stays monotonic and uses the compact encoding, as do block-scalar
+    /// and sequence keys.
+    ///
+    /// This matters beyond the assertion: the benchmark suite's
+    /// `explicit-keys` pattern emits valueless keys specifically so this
+    /// representation is exercised end-to-end (#327). If the trigger changes,
+    /// that pattern needs to change with it.
+    #[test]
+    fn test_valueless_explicit_key_selects_dense_open_positions() {
+        for yaml in [
+            &b"? a\n? b\nc: 1\n"[..],
+            &b"? a\nc: 1\n"[..],
+            &b"? a\n? b\n"[..],
+        ] {
+            let index = YamlIndex::build(yaml).expect("valueless explicit keys must parse");
+            assert!(
+                !index.open_positions.is_compact(),
+                "a valueless explicit key followed by another entry should force \
+                 the Dense fallback, in:\n{}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
+    #[test]
+    fn test_monotonic_documents_use_compact_open_positions() {
+        for yaml in [
+            // Ordinary block mapping
+            &b"key one: value one\nkey two: value two\n"[..],
+            // Explicit key *with* a value: still monotonic
+            &b"? a\n: 1\n? b\n: 2\n"[..],
+            // A single valueless explicit key, with nothing after it
+            &b"? a\n"[..],
+            // Block-scalar and sequence keys
+            &b"? |\n  block key\n: v\n"[..],
+            &b"outer:\n  ? - a\n  : b\n"[..],
+        ] {
+            let index = YamlIndex::build(yaml).expect("must parse");
+            assert!(
+                index.open_positions.is_compact(),
+                "monotonic open positions should use the Advance Index encoding, in:\n{}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------------
     // Alias cycle validation tests (#153)
     // ------------------------------------------------------------------------
 
