@@ -228,6 +228,9 @@ const fn extract_mask_u64(x: u64) -> u8 {
 #[allow(dead_code)] // STYLE-0005: broadword classifier kept as reference/fallback
 pub struct YamlCharClassBroadword {
     pub newlines: u8,
+    /// Mask of bytes that are '\r' — a YAML 1.2 §5.4 line break in its own
+    /// right, so a value terminator just like '\n' (#324).
+    pub carriage_returns: u8,
     pub colons: u8,
     pub hyphens: u8,
     pub spaces: u8,
@@ -243,6 +246,7 @@ impl YamlCharClassBroadword {
     #[inline(always)]
     pub fn has_any(&self) -> bool {
         (self.newlines
+            | self.carriage_returns
             | self.colons
             | self.hyphens
             | self.spaces
@@ -257,7 +261,7 @@ impl YamlCharClassBroadword {
     /// Terminators: newline, colon, space, hash, comma (flow), brackets (flow)
     #[inline(always)]
     pub fn value_terminators(&self) -> u8 {
-        self.newlines | self.colons | self.spaces | self.hash
+        self.newlines | self.carriage_returns | self.colons | self.spaces | self.hash
     }
 }
 
@@ -284,6 +288,7 @@ pub fn classify_yaml_chars_broadword(
 
     // Find each character type using broadword operations
     let newlines = find_byte(chunk, b'\n');
+    let carriage_returns = find_byte(chunk, b'\r');
     let colons = find_byte(chunk, b':');
     let hyphens = find_byte(chunk, b'-');
     let spaces = find_byte(chunk, b' ');
@@ -294,6 +299,7 @@ pub fn classify_yaml_chars_broadword(
 
     Some(YamlCharClassBroadword {
         newlines: extract_mask_u64(newlines),
+        carriage_returns: extract_mask_u64(carriage_returns),
         colons: extract_mask_u64(colons),
         hyphens: extract_mask_u64(hyphens),
         spaces: extract_mask_u64(spaces),
@@ -314,6 +320,8 @@ pub fn classify_yaml_chars_broadword(
 #[allow(dead_code)] // STYLE-0005: broadword classifier kept as reference/fallback
 pub struct YamlCharClass16 {
     pub newlines: u16,
+    /// Mask of bytes that are '\r' — see [`YamlCharClassBroadword`] (#324).
+    pub carriage_returns: u16,
     pub colons: u16,
     pub hyphens: u16,
     pub spaces: u16,
@@ -328,7 +336,7 @@ impl YamlCharClass16 {
     /// Get mask of value terminators.
     #[inline(always)]
     pub fn value_terminators(&self) -> u16 {
-        self.newlines | self.colons | self.spaces | self.hash
+        self.newlines | self.carriage_returns | self.colons | self.spaces | self.hash
     }
 }
 
@@ -353,6 +361,7 @@ pub fn classify_yaml_chars_16(input: &[u8], offset: usize) -> Option<YamlCharCla
 
     Some(YamlCharClass16 {
         newlines: classify_both(chunk0, chunk1, b'\n'),
+        carriage_returns: classify_both(chunk0, chunk1, b'\r'),
         colons: classify_both(chunk0, chunk1, b':'),
         hyphens: classify_both(chunk0, chunk1, b'-'),
         spaces: classify_both(chunk0, chunk1, b' '),
@@ -548,6 +557,7 @@ pub fn find_block_scalar_end_neon(input: &[u8], start: usize, min_indent: usize)
 #[target_feature(enable = "neon")]
 unsafe fn find_block_scalar_end_neon_impl(input: &[u8], start: usize, min_indent: usize) -> usize {
     let newline_vec = vdupq_n_u8(b'\n');
+    let carriage_return_vec = vdupq_n_u8(b'\r');
     let space_vec = vdupq_n_u8(b' ');
 
     let mut pos = start;
@@ -555,7 +565,12 @@ unsafe fn find_block_scalar_end_neon_impl(input: &[u8], start: usize, min_indent
     // Process in 16-byte chunks, looking for newlines
     while pos + 16 < input.len() {
         let chunk = vld1q_u8(input.as_ptr().add(pos));
-        let nl_matches = vceqq_u8(chunk, newline_vec);
+        // Match either line-break byte (#324). A CRLF sets both bits; the CR's
+        // "next line" is the LF itself, which the empty-line guard below skips.
+        let nl_matches = vorrq_u8(
+            vceqq_u8(chunk, newline_vec),
+            vceqq_u8(chunk, carriage_return_vec),
+        );
         let mut nl_mask = neon_movemask(nl_matches);
 
         if nl_mask != 0 {
@@ -622,7 +637,7 @@ fn find_block_scalar_end_scalar(input: &[u8], start: usize, min_indent: usize) -
     let mut pos = start;
 
     while pos < input.len() {
-        if input[pos] == b'\n' {
+        if matches!(input[pos], b'\n' | b'\r') {
             let line_start = pos + 1;
 
             if line_start >= input.len() {

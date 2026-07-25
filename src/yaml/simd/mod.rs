@@ -454,7 +454,7 @@ fn find_block_scalar_end_scalar(input: &[u8], start: usize, min_indent: usize) -
     let mut pos = start;
 
     while pos < input.len() {
-        if input[pos] == b'\n' {
+        if matches!(input[pos], b'\n' | b'\r') {
             let line_start = pos + 1;
 
             if line_start >= input.len() {
