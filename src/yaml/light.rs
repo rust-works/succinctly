@@ -4341,7 +4341,29 @@ fn decode_block_literal(
     Ok(Cow::Owned(result))
 }
 
-/// Decode a folded block scalar (folds newlines to spaces).
+/// Decode a folded block scalar, applying YAML 1.2 §8.1.3 line folding.
+///
+/// Only *some* breaks fold. Between two content lines separated by `k` blank
+/// lines:
+///
+/// | | `k == 0` | `k > 0` |
+/// |---------------------------|----------|---------------------|
+/// | neither line more-indented | `" "`   | `"\n"` × `k`        |
+/// | either line more-indented  | `"\n"`  | `"\n"` × (`1 + k`)  |
+///
+/// That is: the break *preceding* a run of blank lines is folded away and each
+/// blank line contributes the newline (`b-l-trimmed`), so N blank lines give N
+/// newlines — not N+1 (#329). A more-indented line on either side suppresses
+/// folding, so its break survives *in addition to* the blank lines
+/// (`b-l-spaced`). Blank lines before the first content line contribute one
+/// newline each.
+///
+/// After the last content line comes `b-chomped-last` (one newline) plus one
+/// newline per trailing blank line; the chomping match at the end trims that
+/// tail to strip/clip/keep. Every newline in that tail must correspond to a
+/// break that is actually present in the text: a block scalar whose last line
+/// runs to EOF without a break has no `b-chomped-last` to keep, and `yq` agrees
+/// (`>+` over `  x` with no final newline is `"x"`, not `"x\n"`).
 fn decode_block_folded(
     text: &[u8],
     indicator_pos: usize,
@@ -4375,9 +4397,15 @@ fn decode_block_folded(
     // Build result by folding newlines
     let mut result = String::with_capacity(content.len());
     let mut pos = 0;
-    let mut prev_was_blank = false;
+    // Blank lines seen since the last content line. Counted rather than emitted
+    // eagerly: how many newlines they are worth depends on the line that
+    // follows them, which has not been read yet.
+    let mut pending_empty = 0usize;
     let mut prev_was_more_indented = false;
     let mut first_line = true;
+    // Did the most recent content line end with a break? False when the block
+    // runs to EOF unterminated, in which case there is no `b-chomped-last`.
+    let mut last_line_had_break = false;
 
     while pos < content.len() {
         // Count indentation
@@ -4392,15 +4420,11 @@ fn decode_block_folded(
             || content[pos + line_indent] == b'\r';
 
         if is_blank {
-            // Blank line = paragraph break
-            if !result.is_empty() && !result.ends_with('\n') {
-                result.push('\n');
-            }
-            result.push('\n');
-            prev_was_blank = true;
-            prev_was_more_indented = false;
-
-            // Skip to next line
+            // Count it only if its break is really there — trailing whitespace
+            // running to EOF is not a line. The next content line decides what
+            // the count is worth. `prev_was_more_indented` deliberately
+            // survives a blank run: it is what distinguishes 1+k newlines
+            // from k.
             pos += line_indent;
             if pos < content.len() {
                 if content[pos] == b'\r' {
@@ -4408,8 +4432,10 @@ fn decode_block_folded(
                     if pos < content.len() && content[pos] == b'\n' {
                         pos += 1;
                     }
+                    pending_empty += 1;
                 } else if content[pos] == b'\n' {
                     pos += 1;
+                    pending_empty += 1;
                 }
             }
         } else {
@@ -4429,36 +4455,65 @@ fn decode_block_folded(
                 pos += 1;
             }
 
-            // Add joining character
-            if !first_line && !result.is_empty() && !result.ends_with('\n') {
-                if is_more_indented || prev_was_more_indented || prev_was_blank {
+            // Join to what came before (see the table on this fn)
+            if first_line {
+                // Leading blank lines: one newline each, no join character
+                for _ in 0..pending_empty {
                     result.push('\n');
-                } else {
-                    result.push(' ');
                 }
+            } else if pending_empty > 0 {
+                // The break before the blank run only survives when folding is
+                // suppressed by a more-indented line on either side
+                if is_more_indented || prev_was_more_indented {
+                    result.push('\n');
+                }
+                for _ in 0..pending_empty {
+                    result.push('\n');
+                }
+            } else if is_more_indented || prev_was_more_indented {
+                result.push('\n');
+            } else {
+                result.push(' ');
             }
+            pending_empty = 0;
 
             // Append line content
             let line = core::str::from_utf8(&content[line_start..pos])
                 .map_err(|_| YamlStringError::InvalidUtf8)?;
             result.push_str(line);
 
-            prev_was_blank = false;
             prev_was_more_indented = is_more_indented;
             first_line = false;
 
-            // Skip line ending
+            // Skip line ending, remembering whether there was one
+            last_line_had_break = false;
             if pos < content.len() {
                 if content[pos] == b'\r' {
                     pos += 1;
                     if pos < content.len() && content[pos] == b'\n' {
                         pos += 1;
                     }
+                    last_line_had_break = true;
                 } else if content[pos] == b'\n' {
                     pos += 1;
+                    last_line_had_break = true;
                 }
             }
         }
+    }
+
+    // Emit the tail as keep-chomping would see it: `b-chomped-last` (the break
+    // that ends the final content line) plus one newline per trailing blank
+    // line. The chomping match below then trims it. Without the first push,
+    // `>+` loses the final line break entirely (`>+` over `a\n` yielded `"a"`
+    // where yq yields `"a\n"`); without its guard, an unterminated final line
+    // gains one it never had (`>+` over `a` — no final break — would yield
+    // `"a\n"` where yq yields `"a"`).
+    if last_line_had_break {
+        result.push('\n');
+    }
+    for _ in 0..pending_empty {
+        result.push('\n');
     }
 
     // Apply chomping at the end
@@ -4469,11 +4524,13 @@ fn decode_block_folded(
             }
         }
         ChompingIndicator::Clip => {
+            // Trim to at most one trailing newline. Never *add* one: the tail
+            // above already emitted `b-chomped-last` whenever the text has it,
+            // so a result not ending in `\n` here is an unterminated final line
+            // that clip must leave alone (`>` over `  x` with no final break is
+            // `"x"` in yq, not `"x\n"`).
             while result.ends_with("\n\n") {
                 result.pop();
-            }
-            if !result.is_empty() && !result.ends_with('\n') {
-                result.push('\n');
             }
         }
         ChompingIndicator::Keep => {
@@ -5921,12 +5978,8 @@ mod tests {
 
         if let YamlValue::Mapping(fields) = first_doc(root) {
             if let Some(YamlValue::String(s)) = fields.find("text") {
-                // Block literal should preserve newlines
-                let decoded = s.as_str().unwrap();
-                assert!(
-                    decoded.contains("Line 1") && decoded.contains("Line 2"),
-                    "block literal should contain both lines, got: {decoded:?}"
-                );
+                // Block literal preserves every line break verbatim
+                assert_eq!(&*s.as_str().unwrap(), "Line 1\nLine 2\n");
             } else {
                 panic!("expected string for text");
             }
@@ -5943,17 +5996,169 @@ mod tests {
 
         if let YamlValue::Mapping(fields) = first_doc(root) {
             if let Some(YamlValue::String(s)) = fields.find("text") {
-                // Block folded should fold newlines to spaces
-                let decoded = s.as_str().unwrap();
-                assert!(
-                    decoded.contains("First part") && decoded.contains("second part"),
-                    "block folded should contain both parts, got: {decoded:?}"
-                );
+                // Block folded folds the break between two ordinary lines to a space
+                assert_eq!(&*s.as_str().unwrap(), "First part second part\n");
             } else {
                 panic!("expected string for text");
             }
         } else {
             panic!("expected mapping");
+        }
+    }
+
+    /// Folded block scalar line folding, YAML 1.2 §8.1.3.
+    ///
+    /// Every expectation below is the output of mikefarah/yq v4.53.3 on the
+    /// same input, not a transcription of the spec — the two disagreed on
+    /// nothing here, but yq is what `succinctly yq` claims to be a drop-in
+    /// replacement for.
+    ///
+    /// Regression coverage for two defects that shipped together:
+    ///
+    /// * #329 — a blank line produced N+1 newlines where the spec and yq give
+    ///   N, because the folded break *and* the blank line both emitted one.
+    /// * `>+` dropped `b-chomped-last` entirely, so `>+` over `a\n` yielded
+    ///   `"a"` instead of `"a\n"`.
+    ///
+    /// Every input here ends in a line break. The shapes that do not are in
+    /// [`test_block_folded_unterminated_final_line`] — a distinction the first
+    /// round of this fix got wrong precisely because nothing covered it.
+    #[test]
+    fn test_block_folded_line_folding() {
+        // (input, expected) — `fold` is the only key in each document
+        assert_folded(&[
+            // No blank lines: the break folds to a space
+            (b"fold: >\n  a\n  b\n", "a b\n"),
+            (b"fold: >\n  a\n", "a\n"),
+            // N blank lines between ordinary lines give N newlines, not N+1 (#329)
+            (b"fold: >\n  a\n\n  b\n", "a\nb\n"),
+            (b"fold: >\n  a\n\n\n  b\n", "a\n\nb\n"),
+            (b"fold: >\n  a\n\n\n\n  b\n", "a\n\n\nb\n"),
+            // A whitespace-only line is a blank line
+            (b"fold: >\n  a\n  \n  b\n", "a\nb\n"),
+            // Blank lines before the first content line: one newline each
+            (b"fold: >\n\n  a\n", "\na\n"),
+            (b"fold: >\n\n\n  a\n", "\n\na\n"),
+            // A more-indented line suppresses folding on both of its breaks,
+            // and that break survives *in addition to* any blank lines
+            (b"fold: >\n  a\n   x\n  b\n", "a\n x\nb\n"),
+            (b"fold: >\n  a\n\n   x\n", "a\n\n x\n"),
+            (b"fold: >\n  a\n   x\n\n  b\n", "a\n x\n\nb\n"),
+            (b"fold: >\n  a\n\n   x\n  b\n", "a\n\n x\nb\n"),
+            (b"fold: >\n  a\n\n   x\n\n  b\n", "a\n\n x\n\nb\n"),
+            // Chomping: strip drops the tail, clip keeps one newline, ...
+            (b"fold: >-\n  a\n", "a"),
+            (b"fold: >-\n  a\n\n  b\n", "a\nb"),
+            (b"fold: >\n  a\n\n\n", "a\n"),
+            // ... and keep preserves the final break plus every trailing blank
+            (b"fold: >+\n  a\n", "a\n"),
+            (b"fold: >+\n  a\n\n  b\n", "a\nb\n"),
+            (b"fold: >+\n  a\n\n\n", "a\n\n\n"),
+            (b"fold: >+\n  a\n   x\n\n\n", "a\n x\n\n\n"),
+            // Explicit indentation indicator takes the same path
+            (b"fold: >2\n  a\n\n  b\n", "a\nb\n"),
+            // CRLF input folds identically
+            (b"fold: >\r\n  a\r\n\r\n  b\r\n", "a\nb\n"),
+            (b"fold: >\r\n  a\r\n\r\n\r\n  b\r\n", "a\n\nb\n"),
+        ]);
+    }
+
+    /// A folded block whose last line runs to EOF with no line break after it.
+    ///
+    /// There is no `b-chomped-last` to keep in that case, so *no* chomping
+    /// indicator produces a trailing newline the text never had — `>`, `>-` and
+    /// `>+` over an unterminated `a` are all `"a"`. Every expectation is
+    /// mikefarah/yq v4.53.3's output on the same bytes.
+    ///
+    /// This shape is easy to miss because it cannot be written into a fixture
+    /// file that a well-behaved editor will leave alone, and every input in
+    /// [`test_block_folded_line_folding`] ends in a break. The first cut of the
+    /// #329 fix emitted `b-chomped-last` unconditionally and so regressed all
+    /// of `>+` here while fixing the terminated cases.
+    #[test]
+    fn test_block_folded_unterminated_final_line() {
+        assert_folded(&[
+            // Clip: the folding rules are unchanged, only the tail differs
+            (b"fold: >\n  a", "a"),
+            (b"fold: >\n  a\n  b", "a b"),
+            (b"fold: >\n  a\n\n  b", "a\nb"),
+            (b"fold: >\n  a\n\n\n  b", "a\n\nb"),
+            (b"fold: >\n  a\n   x", "a\n x"),
+            (b"fold: >\n  a\n\n   x", "a\n\n x"),
+            // Strip has nothing extra to strip
+            (b"fold: >-\n  a", "a"),
+            (b"fold: >-\n  a\n\n  b", "a\nb"),
+            // Keep has nothing to keep — the case the guard on the tail exists for
+            (b"fold: >+\n  a", "a"),
+            (b"fold: >+\n  a\n\n  b", "a\nb"),
+            (b"fold: >+\n  a\n   x", "a\n x"),
+            // Explicit indentation indicator takes the same path
+            (b"fold: >2+\n  a", "a"),
+            (b"fold: >2\n  a\n\n  b", "a\nb"),
+            // Trailing whitespace running to EOF is not a blank *line*: it has
+            // no break, so it contributes nothing
+            (b"fold: >+\n  a\n  ", "a\n"),
+            (b"fold: >+\n  a\n\n  ", "a\n\n"),
+            // A lone CR does terminate the line, so `b-chomped-last` survives
+            (b"fold: >+\n  a\r", "a\n"),
+            (b"fold: >\r\n  a\r\n\r\n  b", "a\nb"),
+        ]);
+    }
+
+    /// Decode the sole `fold` key of each document and compare against the
+    /// pinned-yq expectation, so a new folding case is one line rather than a
+    /// copied loop.
+    fn assert_folded(cases: &[(&[u8], &str)]) {
+        for (yaml, expected) in cases {
+            let index = YamlIndex::build(yaml).unwrap();
+            let root = index.root(yaml);
+            let YamlValue::Mapping(fields) = first_doc(root) else {
+                panic!("expected mapping for {:?}", String::from_utf8_lossy(yaml));
+            };
+            let Some(YamlValue::String(s)) = fields.find("fold") else {
+                panic!("expected string for {:?}", String::from_utf8_lossy(yaml));
+            };
+            assert_eq!(
+                &*s.as_str().unwrap(),
+                *expected,
+                "folding {:?}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
+    /// The folded decoder is reached through three different call paths; a fix
+    /// in one must not leave the others behind. Asserts the JSON each produces
+    /// for the #329 repro, terminated and unterminated.
+    #[test]
+    fn test_block_folded_blank_line_agrees_across_paths() {
+        // (input, JSON both paths must produce) — pinned-yq output
+        let cases: &[(&[u8], &str)] = &[
+            (b"fold: >\n  a\n\n  b\n", r#"{"fold":"a\nb\n"}"#),
+            // No final break: no `b-chomped-last`, even under keep chomping
+            (b"fold: >+\n  a\n\n  b", r#"{"fold":"a\nb"}"#),
+        ];
+
+        for (yaml, expected) in cases {
+            let index = YamlIndex::build(yaml).unwrap();
+            let root = index.root(yaml);
+
+            // DOM path (`to_json`) and streaming path (`stream_json`, P9)
+            assert_eq!(
+                root.to_json_document(),
+                *expected,
+                "DOM path for {:?}",
+                String::from_utf8_lossy(yaml)
+            );
+
+            let mut streamed = String::new();
+            root.stream_json_document(&mut streamed).unwrap();
+            assert_eq!(
+                streamed,
+                *expected,
+                "streaming path for {:?}",
+                String::from_utf8_lossy(yaml)
+            );
         }
     }
 

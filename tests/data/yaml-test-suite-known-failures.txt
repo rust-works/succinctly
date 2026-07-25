@@ -36,7 +36,6 @@
 33X3      tags              tags (!) not supported — #224
 35KP      tags              tags (!) not supported — #224
 4JVG      lax:anchors       anchor/alias rules not validated — #223
-4Q9F      scalars           scalar content/folding differs from spec
 52DL      tags              tags (!) not supported — #224
 565N      tags              tags (!) not supported — #224
 57H4      tags              tags (!) not supported — #224
@@ -51,11 +50,9 @@
 735Y      tags              tags (!) not supported — #224
 74H7      tags              tags (!) not supported — #224
 7FWL      tags              tags (!) not supported — #224
-7T8X      scalars           scalar content/folding differs from spec
 7Z25      structure         document/block structure differs from spec
 8MK2      tags              tags (!) not supported — #224
 8XDJ      lax:comments      comment placement not validated — #223
-93WF      scalars           scalar content/folding differs from spec
 9C9N      lax:indentation   indentation not validated — #223
 9DXL      directives        %YAML/%TAG directive not recognized — #225
 9KAX      tags              tags (!) not supported — #224
@@ -86,7 +83,6 @@ HMQ5      tags              tags (!) not supported — #224
 HU3P      lax:mapping       mapping/key rules not validated — #223
 J7PZ      tags              tag shorthand emitted as scalar text — #224
 JEF9/01   structure         document/block structure differs from spec
-K527      scalars           scalar content/folding differs from spec
 K54U      scalars           scalar content/folding differs from spec
 KS4U      lax:flow          flow syntax not validated — #223
 L24T/00   scalars           scalar content/folding differs from spec
@@ -107,7 +103,6 @@ RTP8      directives        %YAML/%TAG directive not recognized — #225
 S4JQ      tags              tags (!) not supported — #224
 S98Z      lax:block-scalar  block scalar header not validated — #223
 T833      lax:flow          flow syntax not validated — #223
-TS54      scalars           scalar content/folding differs from spec
 U3C3      tags              tags (!) not supported — #224
 U44R      lax:indentation   indentation not validated — #223
 UGM3      structure         document/block structure differs from spec
