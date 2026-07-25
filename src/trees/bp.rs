@@ -2249,6 +2249,32 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
         self.total_ones
     }
 
+    /// Returns the heap memory usage of the auxiliary indices in bytes.
+    ///
+    /// Covers the min-excess levels (L0/L1/L2), the cumulative rank directory,
+    /// and any select support. Excludes the `words` bit vector itself, which
+    /// may be borrowed rather than owned (e.g. from an mmap) — use
+    /// [`words_bytes`](Self::words_bytes) for that.
+    pub fn index_heap_size(&self) -> usize {
+        self.l0_min_excess.len()
+            + self.l0_word_excess.len() * 2
+            + self.l1_min_excess.len() * 2
+            + self.l1_block_excess.len() * 2
+            + self.l2_min_excess.len() * 4
+            + self.l2_block_excess.len() * 4
+            + self.rank_l1.len() * 4
+            + self.rank_l2.len() * 8
+            + self.select.heap_size()
+    }
+
+    /// Returns the size of the underlying bit vector in bytes.
+    ///
+    /// Note this storage is only heap-owned when `W` owns its data (e.g.
+    /// `Vec<u64>`); for a borrowed `W` it is not an allocation of this index.
+    pub fn words_bytes(&self) -> usize {
+        self.words.as_ref().len() * 8
+    }
+
     /// Find the position of the k-th 1-bit (0-indexed).
     ///
     /// Returns `None` if k >= total_ones.
