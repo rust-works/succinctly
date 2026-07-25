@@ -23,10 +23,34 @@
 //!
 //! # Memory
 //!
-//! With typical YAML density (N opens, L text bytes, N ≈ L/7.5):
-//! - Dense `Vec<u32>`: 4N bytes
-//! - Advance Index: L/8 + N/8 ≈ 1.1N bytes
-//! - **~3.5× smaller** (when monotonic)
+//! For N opens over L text bytes, the compact encoding costs
+//! `L/8` (IB bitmap) + `N/8` (advance bitmap) + `N/16` (advance rank) +
+//! `U/64` (IB select samples), against `4N` for a dense `Vec<u32>`.
+//! `ib_rank` adds a further `L/16` but is built lazily and so costs nothing
+//! for parse-and-query workloads (see the field docs).
+//!
+//! The dominant term is proportional to **L and independent of N**, so the
+//! ratio to dense is roughly `0.05·(L/N)` — compact wins on node-dense input
+//! and loses on scalar-heavy input, with no bound on how badly. Break-even is
+//! around `L/N ≈ 30`; a document that is one big block scalar (`data: |` plus
+//! 100 KiB) has N = 4 and pays ~12 KB where dense would pay 16 bytes.
+//!
+//! Measured densities (`succinctly dev bench corpus-stats`):
+//! - synthetic benchmark corpus: `L/N ≈ 4.5–19`, compact 1.4–2.9× smaller
+//! - real config YAML (compose, Actions, k8s): `L/N ≈ 9.7–23.9`, compact
+//!   1.1–2.4× smaller
+//!
+//! Making `ib_rank` lazy moved break-even from `L/N ≈ 20` to `≈ 30`, which is
+//! what pulled the two real corpus files that had been choosing the losing
+//! encoding back onto the winning side: `actions/prometheus-ci.yml`
+//! (`L/N = 20.7`) went from 3752 bytes compact against 3660 dense to 2564, and
+//! `actions/stale.yml` (`L/N = 23.9`) from 276 against 216 to 188. Selection is
+//! still by monotonicity alone, not by size, so a sufficiently scalar-heavy
+//! document will still pick the losing encoding.
+//!
+//! Earlier revisions of this note claimed "~3.5× smaller" by omitting both
+//! rank arrays and assuming `N ≈ L/7.5`, a density only the synthetic
+//! generators produce. See #56.
 //!
 //! # Performance
 //!
@@ -38,7 +62,7 @@ use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
-use core::cell::Cell;
+use core::cell::{Cell, OnceCell};
 
 use crate::bits::scan_select;
 use crate::util::broadword::select_in_word;
@@ -210,8 +234,16 @@ pub struct AdvancePositions {
     ib_words: Vec<u64>,
     /// Number of valid bits in IB (= text length).
     ib_len: usize,
-    /// Cumulative popcount for IB. O(1) rank via single array lookup.
-    ib_rank: Vec<u32>,
+    /// Cumulative popcount for IB, built lazily on first use.
+    ///
+    /// Costs L/16 bytes — a third of this structure — but its only reader is
+    /// [`find_last_open_at_text_pos`](Self::find_last_open_at_text_pos), the
+    /// reverse text→BP lookup behind `yq-locate` and the jq `at_offset` /
+    /// `at_position` builtins. The hot streaming path (`value()`, element
+    /// iteration) never touches it, so building it eagerly charged every
+    /// parse for a query most callers never make (#56). Same treatment as
+    /// `YamlIndex::newlines` (P12-A/A4).
+    ib_rank: OnceCell<Vec<u32>>,
     /// Sampled select index for IB: entry i = position of (i * SAMPLE_RATE)-th 1-bit.
     ib_select_samples: Vec<u32>,
     /// Total number of unique positions (1-bits in IB).
@@ -274,7 +306,7 @@ impl AdvancePositions {
             return Self {
                 ib_words: Vec::new(),
                 ib_len: text_len,
-                ib_rank: vec![0],
+                ib_rank: OnceCell::new(),
                 ib_select_samples: Vec::new(),
                 ib_ones: 0,
                 advance_words: Vec::new(),
@@ -331,8 +363,8 @@ impl AdvancePositions {
             prev_pos = Some(pos);
         }
 
-        // Build cumulative rank for IB
-        let ib_rank = build_cumulative_rank(&ib_words);
+        // IB's cumulative rank is deliberately NOT built here — see the
+        // `ib_rank` field docs. Only reverse lookup needs it.
 
         // Build cumulative rank for advance (small bitmap: one bit per BP open)
         let advance_rank = build_cumulative_rank(&advance_words);
@@ -343,7 +375,7 @@ impl AdvancePositions {
         Self {
             ib_words,
             ib_len: text_len,
-            ib_rank,
+            ib_rank: OnceCell::new(),
             ib_select_samples,
             ib_ones,
             advance_words,
@@ -691,9 +723,11 @@ impl AdvancePositions {
     }
 
     /// Returns the heap memory usage in bytes.
+    ///
+    /// `ib_rank` contributes 0 until a reverse lookup materializes it.
     pub fn heap_size(&self) -> usize {
         self.ib_words.len() * 8
-            + self.ib_rank.len() * 4
+            + self.ib_rank.get().map_or(0, |r| r.len() * 4)
             + self.ib_select_samples.len() * 4
             + self.advance_words.len() * 8
             + self.advance_rank.len() * 4
@@ -737,17 +771,24 @@ impl AdvancePositions {
     }
 
     /// Count 1-bits in IB in [0, pos).
+    ///
+    /// Materializes the cumulative rank array on first call; see the `ib_rank`
+    /// field docs for why it is not built during indexing.
     #[inline]
     fn ib_rank1(&self, pos: usize) -> usize {
         if pos == 0 {
             return 0;
         }
 
+        let ib_rank = self
+            .ib_rank
+            .get_or_init(|| build_cumulative_rank(&self.ib_words));
+
         let word_idx = pos / 64;
         let bit_idx = pos % 64;
 
         // Use cumulative rank for full words (single array lookup)
-        let mut count = self.ib_rank[word_idx.min(self.ib_words.len())] as usize;
+        let mut count = ib_rank[word_idx.min(self.ib_words.len())] as usize;
 
         // Add partial word
         if word_idx < self.ib_words.len() && bit_idx > 0 {
@@ -1252,5 +1293,34 @@ mod tests {
         // Positions no node starts at still report nothing.
         assert_eq!(op.find_last_open_at_text_pos(1), None);
         assert_eq!(op.find_last_open_at_text_pos(8), None);
+    }
+
+    /// `ib_rank` costs L/16 bytes and only reverse lookup reads it, so a
+    /// parse-only workload must not pay for it (#56).
+    #[test]
+    fn test_ib_rank_is_not_built_until_reverse_lookup() {
+        let positions = vec![0, 64, 128, 4096];
+        let ap = AdvancePositions::build_unchecked(&positions, 8192);
+
+        let parse_only = ap.heap_size();
+        assert!(ap.ib_rank.get().is_none(), "ib_rank must start unbuilt");
+
+        // Forward access is the hot path and must not materialize it.
+        for (i, &pos) in positions.iter().enumerate() {
+            assert_eq!(ap.get(i), Some(pos));
+        }
+        assert!(
+            ap.ib_rank.get().is_none(),
+            "forward access must not build ib_rank"
+        );
+        assert_eq!(ap.heap_size(), parse_only);
+
+        // Reverse lookup is what needs it.
+        assert_eq!(ap.find_last_open_at_text_pos(4096), Some(3));
+        assert!(ap.ib_rank.get().is_some(), "reverse lookup must build it");
+        assert!(
+            ap.heap_size() > parse_only,
+            "materializing ib_rank must be visible in heap_size"
+        );
     }
 }
