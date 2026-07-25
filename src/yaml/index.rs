@@ -72,6 +72,71 @@ pub struct YamlIndex<W = Vec<u64>> {
     lines: OnceCell<crate::text::LineIndex>,
 }
 
+/// Per-component byte sizes of a [`YamlIndex`], as returned by
+/// [`YamlIndex::size_breakdown`].
+///
+/// Fields are bytes. Kept as a plain struct of named components rather than a
+/// map so that adding a component is a compile error at every consumer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YamlIndexSize {
+    /// Interest-bit words.
+    pub ib: usize,
+    /// Cumulative rank directory over the interest bits.
+    pub ib_rank: usize,
+    /// Balanced-parentheses words plus their excess/rank/select indices.
+    pub bp: usize,
+    /// Type-bit words (mapping vs sequence per container).
+    pub ty: usize,
+    /// BP-open index to text start position (`OpenPositions`).
+    pub open_positions: usize,
+    /// BP-open index to text end position (`EndPositions`).
+    pub bp_to_text_end: usize,
+    /// Container-marker words.
+    pub containers: usize,
+    /// Cumulative rank directory over the container markers.
+    pub containers_rank: usize,
+    /// Anchor name maps, both directions, including the name bytes.
+    pub anchors: usize,
+    /// Alias BP position to target BP position map.
+    pub aliases: usize,
+    /// Newline index; zero until it is lazily built.
+    pub newlines: usize,
+}
+
+impl YamlIndexSize {
+    /// Total bytes across all components.
+    pub fn total(&self) -> usize {
+        self.ib
+            + self.ib_rank
+            + self.bp
+            + self.ty
+            + self.open_positions
+            + self.bp_to_text_end
+            + self.containers
+            + self.containers_rank
+            + self.anchors
+            + self.aliases
+            + self.newlines
+    }
+}
+
+/// Approximate the bytes held by the anchor maps.
+///
+/// Counts each entry's key and value plus the name bytes themselves. `BTreeMap`
+/// node overhead is not modelled; anchors are a small share of the index and an
+/// exact figure would depend on unstable allocation details.
+fn anchors_heap_size(
+    anchors: &BTreeMap<String, usize>,
+    bp_to_anchor: &BTreeMap<usize, String>,
+) -> usize {
+    let entry = core::mem::size_of::<usize>() + core::mem::size_of::<String>();
+    anchors
+        .keys()
+        .map(|name| entry + name.len())
+        .chain(bp_to_anchor.values().map(|name| entry + name.len()))
+        .sum()
+}
+
 /// Build cumulative popcount index for IB.
 #[inline]
 fn build_ib_rank(words: &[u64]) -> Vec<u32> {
@@ -232,6 +297,68 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     #[inline]
     pub fn text_end_pos_by_open_idx(&self, open_idx: usize) -> Option<usize> {
         self.bp_to_text_end.get(open_idx)
+    }
+
+    /// Per-component byte sizes of this index.
+    ///
+    /// Use this to attribute index overhead to individual structures — which
+    /// component dominates depends strongly on the input's text-bytes-per-node
+    /// ratio, so a single total hides the interesting variation.
+    ///
+    /// The lazily-built newline index is counted only once it exists; it is
+    /// built on first use by `to_line_column` / `to_offset`.
+    pub fn size_breakdown(&self) -> YamlIndexSize {
+        YamlIndexSize {
+            ib: core::mem::size_of_val(self.ib.as_ref()),
+            ib_rank: self.ib_rank.len() * core::mem::size_of::<u32>(),
+            bp: self.bp.heap_size(),
+            ty: core::mem::size_of_val(self.ty.as_ref()),
+            open_positions: self.open_positions.heap_size(),
+            bp_to_text_end: self.bp_to_text_end.heap_size(),
+            containers: core::mem::size_of_val(self.containers.as_ref()),
+            containers_rank: self.containers_rank.len() * core::mem::size_of::<u32>(),
+            anchors: anchors_heap_size(&self.anchors, &self.bp_to_anchor),
+            aliases: self.aliases.len()
+                * (core::mem::size_of::<usize>() + core::mem::size_of::<usize>()),
+            newlines: self
+                .lines
+                .get()
+                .map_or(0, crate::text::LineIndex::heap_size),
+        }
+    }
+
+    /// Total bytes occupied by this index, excluding the source text.
+    ///
+    /// Equivalent to `self.size_breakdown().total()`. Word storage is counted
+    /// whether or not `W` owns it, so for a borrowed `W` this reports the size
+    /// of the structure rather than bytes allocated on this process's heap.
+    pub fn heap_size(&self) -> usize {
+        self.size_breakdown().total()
+    }
+
+    /// Number of BP opens, i.e. the number of nodes the index addresses.
+    ///
+    /// This is the `N` in the index's memory formulas; comparing it against the
+    /// text length gives the text-bytes-per-node ratio that determines which
+    /// position encoding is cheapest.
+    #[inline]
+    pub fn num_opens(&self) -> usize {
+        self.open_positions.len()
+    }
+
+    /// Whether the start-position map chose the compact bitmap encoding.
+    ///
+    /// False means it fell back to a dense `Vec<u32>` because the positions
+    /// were not monotonic (explicit `?` keys with missing values).
+    #[inline]
+    pub fn open_positions_compact(&self) -> bool {
+        self.open_positions.is_compact()
+    }
+
+    /// Whether the end-position map chose the compact bitmap encoding.
+    #[inline]
+    pub fn end_positions_compact(&self) -> bool {
+        self.bp_to_text_end.is_compact()
     }
 
     /// Get a reference to the interest bits words.
@@ -1323,6 +1450,64 @@ mod tests {
                 "Round-trip failed for offset {offset}"
             );
         }
+    }
+
+    #[test]
+    fn test_size_breakdown_sums_to_heap_size() {
+        let yaml = b"users:\n  - name: Alice\n    age: 30\n  - name: Bob\n    age: 25\n";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        let size = index.size_breakdown();
+        assert_eq!(size.total(), index.heap_size());
+
+        // Every structural component is non-empty for this document.
+        assert!(size.ib > 0, "ib");
+        assert!(size.bp > 0, "bp");
+        assert!(size.open_positions > 0, "open_positions");
+        assert!(size.bp_to_text_end > 0, "bp_to_text_end");
+
+        // The newline index is lazy: absent until a line/column query builds it.
+        assert_eq!(size.newlines, 0);
+        let _ = index.to_line_column(5, yaml);
+        let after = index.size_breakdown();
+        assert!(
+            after.newlines > 0,
+            "newline index should be counted once built"
+        );
+        assert_eq!(after.total(), index.heap_size());
+    }
+
+    /// `open_positions` compression against a dense `Vec<u32>` depends on the
+    /// input's text-bytes-per-open ratio, because the compact encoding's
+    /// interest-bit map costs one bit per *text byte*. Sparse text must
+    /// therefore compress worse than dense text, not better.
+    #[test]
+    fn test_open_positions_compression_falls_as_text_per_open_rises() {
+        // Same node count, very different text lengths.
+        let dense_text = b"a: 1\nb: 2\nc: 3\nd: 4\ne: 5\n".to_vec();
+        let mut sparse_text = Vec::new();
+        for key in ["a", "b", "c", "d", "e"] {
+            sparse_text.extend_from_slice(key.as_bytes());
+            sparse_text.extend_from_slice(b": ");
+            sparse_text.extend_from_slice(&[b'x'; 200]);
+            sparse_text.push(b'\n');
+        }
+
+        let ratio = |text: &[u8]| {
+            let index = YamlIndex::build(text).unwrap();
+            let opens = index.num_opens();
+            assert!(opens > 0);
+            let dense_bytes = opens * core::mem::size_of::<u32>();
+            dense_bytes as f64 / index.size_breakdown().open_positions as f64
+        };
+
+        let dense_ratio = ratio(&dense_text);
+        let sparse_ratio = ratio(&sparse_text);
+        assert!(
+            dense_ratio > sparse_ratio,
+            "compression should fall as text per open rises: \
+             dense={dense_ratio:.2}x sparse={sparse_ratio:.2}x"
+        );
     }
 
     /// Reverse lookup must find every node position in documents that fall back

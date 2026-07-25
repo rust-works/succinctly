@@ -185,7 +185,6 @@ impl EndPositions {
     }
 
     /// Returns the heap memory usage in bytes.
-    #[cfg(test)]
     pub fn heap_size(&self) -> usize {
         match self {
             Self::Compact(c) => c.heap_size(),
@@ -194,7 +193,6 @@ impl EndPositions {
     }
 
     /// Returns true if using compact storage.
-    #[cfg(test)]
     #[inline]
     pub fn is_compact(&self) -> bool {
         matches!(self, Self::Compact(_))
@@ -526,7 +524,6 @@ impl CompactEndPositions {
     }
 
     /// Returns the heap memory usage in bytes.
-    #[cfg(test)]
     pub fn heap_size(&self) -> usize {
         self.ib_words.len() * 8
             + self.ib_select_samples.len() * 4

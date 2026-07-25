@@ -268,7 +268,7 @@ pub(crate) enum QuotedSpanEnd {
 }
 
 pub use error::YamlError;
-pub use index::YamlIndex;
+pub use index::{YamlIndex, YamlIndexSize};
 pub use light::{
     format_float_with_fraction, ChompingIndicator, YamlCursor, YamlElements, YamlField, YamlFields,
     YamlNumber, YamlString, YamlValue,
