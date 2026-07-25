@@ -229,6 +229,88 @@ Performance benchmarks for `succinctly json validate` - strict RFC 8259 JSON val
 
 5. **Cross-platform consistency**: ARM and x86_64 achieve comparable peak throughput (~1.8 GiB/s). The validator is purely scalar (no SIMD) - performance comes from efficient branch prediction and cache-friendly sequential access.
 
+## Shape analysis: what a chunk scanner could win (#130)
+
+Issue #130 proposes replacing the scalar recursive-descent validator with a
+64-byte SIMD chunk scanner feeding an explicit state machine. Per
+[docs/guides/benchmarking.md](../guides/benchmarking.md), #130 is gated on the
+corpus-shape check. This section is that check.
+
+### The metric that decides it
+
+Run length is the wrong metric. A chunk scanner does not need *long* runs of
+skippable bytes — it needs **few positions its state machine must visit per
+chunk**. Call that the *interesting density*: structural characters outside
+strings, plus one visit per string (the body and closing quote are skipped),
+plus one per atom start, plus any garbage byte.
+
+Measured over the pinned real-workload corpus (5 JSON files, 971 KB), against
+current M4 Pro throughput:
+
+| corpus file            | visits / 64 B | bytes / visit | current throughput |
+| ---------------------- | ------------- | ------------- | ------------------ |
+| pretty/3d-ribbon.json  |           4.0 |          16.0 | **1.79 GiB/s**     |
+| tabular/carshare-data  |           8.0 |           8.0 | 1.21 GiB/s         |
+| geojson/us-election    |          10.9 |           5.9 | 1.19 GiB/s         |
+| charts/bullet-data     |          20.0 |           3.2 | 856 MiB/s          |
+| graph/miserables.json  |          24.0 |           2.7 | 789 MiB/s          |
+
+Throughput is almost perfectly inverse to density — unsurprising, since scalar
+cost tracks token count.
+
+### Where break-even sits
+
+#130's own prototype measured **1.16–1.32×** on string-heavy input (density ≈ 1)
+and **0.86–0.91×** on ASCII-heavy structured objects (density ≈ 18–22).
+Interpolating those two measured points puts break-even at roughly **8–12
+visits per 64-byte chunk**.
+
+### The answer
+
+**Every real corpus file falls on the wrong side of that line, in one of two
+ways:**
+
+* **Below break-even, but no headroom.** `3d-ribbon.json` is the one file with a
+  favourable density (4.0). It already validates at **1.79 GiB/s** — statistically
+  indistinguishable from the `nested` pattern (1.81 GiB/s) that this document
+  already describes as "near memory bandwidth limit". There is nothing left to
+  capture.
+* **Headroom, but above break-even.** The two slowest files, `miserables.json`
+  (789 MiB/s) and `bullet-data.json` (856 MiB/s), sit at densities of 24.0 and
+  20.0 — squarely in the band where #130's prototype measured a **regression**.
+
+No corpus file is both slow enough to be worth optimising and sparse enough for
+a chunk scanner to help.
+
+### Two supporting findings
+
+* **String skipping is dead on real input.** String bodies are 4.6% of corpus
+  bytes; the longest string in the corpus is **51 bytes**, against the ~300 B
+  regime where #130 measured its win. Only 0.03% of strings reach even 32 bytes.
+* **The escape machinery never pays.** Escape density is **0.00 per KiB in all
+  five files** — not one backslash. The odd-backslash-run mask (`find_escaped`)
+  is the most intricate and highest-risk primitive in the design, has no
+  equivalent anywhere in this crate, and is nonetheless *structurally required*:
+  a single `\"` desynchronises the in-string mask for the rest of the document.
+  On real input it is pure cost that can never be recovered.
+
+Note also that whitespace fraction is a misleading proxy. `3d-ribbon.json` is
+85% whitespace, but in runs of p50=19 / max=23 bytes — **0.00% of whitespace
+runs in the entire corpus reach 32 bytes**, so no single SIMD lane is ever
+filled by whitespace alone.
+
+### Consequence
+
+The optimisation with real headroom is the opposite of #130: the slow files are
+slow because they are *token-dense*, so the win is in making per-token work
+cheaper (keyword and number scanning in the scalar path), not in skipping bytes
+between tokens. See #122/#123 for the adjacent SIMD proposals, which the same
+analysis constrains.
+
+Reproduce with `succinctly dev bench corpus-stats --data-dir data/bench/corpus`
+for the shape statistics and `cargo bench --bench json_validate_bench --
+validate_real_corpus` for the throughput column.
+
 ## Running Benchmarks
 
 ```bash
