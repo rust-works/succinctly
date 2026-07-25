@@ -582,13 +582,15 @@ This separation keeps the index small and fast. A higher-level `YamlValue` type 
 
 ### 8. Error Handling
 
-> **Superseded.** This section recorded an intent that was never implemented, and the
-> "strict mode only" claim below is false. Measured against the YAML Test Suite, the
-> parser rejects 11 of 94 invalid documents (11.7%); several `YamlError` variants named
-> here — including `InvalidIndentation` — are never constructed anywhere in `src/`.
-> succinctly is a **non-validating loader**: the index records structure, not grammar
-> conformance. Validation is planned as an opt-in pass, mirroring `json validate`. See
-> [Known Limitations](../compliance/yaml/limitations.md#validation-is-out-of-scope-by-design)
+> **Superseded.** This section recorded an intent that was never implemented as described.
+> succinctly's default loader is **non-validating**: `YamlIndex::build` rejects only 11 of
+> the YAML Test Suite's 94 invalid documents (11.7%). The four `YamlError` variants that
+> were never constructed — including `InvalidIndentation` — have since been removed (#223).
+> Strict rejection is instead provided by an **opt-in** validator
+> ([`src/yaml/validate.rs`](../../src/yaml/validate.rs), `succinctly yaml validate` /
+> `syq --validate`), mirroring `json validate`: a separate pass before indexing with its
+> own `YamlValidationError`. See
+> [Known Limitations](../compliance/yaml/limitations.md#validation-default-loader-vs-the-opt-in-validator)
 > for the measurements and rationale. Retained below as a historical design note.
 
 **Decision** (not implemented): Strict mode only. Reject malformed YAML with clear error messages.

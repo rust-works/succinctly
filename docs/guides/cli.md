@@ -196,6 +196,69 @@ The validator enforces strict RFC 8259 compliance:
 
 ---
 
+### YAML Validation
+
+`succinctly` is a non-validating YAML loader by design (see
+[YAML limitations](../compliance/yaml/limitations.md)). `yaml validate` is the **opt-in**
+strict counterpart, mirroring `json validate`: a separate pass, run before indexing, that
+rejects invalid YAML. The default indexing path (`syq`, `YamlIndex::build`) is unaffected
+and still accepts the same input unless you ask for validation.
+
+```bash
+succinctly yaml validate [OPTIONS] [FILES...]
+```
+
+#### Options
+
+- `-q`, `--quiet`: Exit code only, no diagnostic output
+- `-C`, `--color`: Force color output even when not a TTY
+- `-M`, `--no-color`: Disable color output
+
+#### Exit Codes
+
+- `0`: All inputs are valid
+- `1`: At least one input is invalid
+- `2`: I/O error (file not found, permission denied, etc.)
+
+#### Examples
+
+```bash
+# Validate stdin
+echo 'a: b: c' | succinctly yaml validate
+
+# Validate a file (rustc-style caret diagnostics)
+succinctly yaml validate config.yaml
+
+# Exit code only, for scripts
+succinctly yaml validate --quiet config.yaml && echo "Valid"
+
+# Validate before querying, in one step (bails before producing output)
+syq --validate '.users[]' config.yaml
+```
+
+#### Validation Rules (YAML)
+
+The validator rejects the classes of malformed YAML below (the YAML Test Suite's `lax:*`
+cases). It is deliberately not a full grammar checker: anything it does not recognize as
+invalid, it accepts.
+
+- **Indentation & tabs** — indentation that matches no open block level; tabs used where
+  indentation is expected (`\t` before a mapping key or between block indicators).
+- **Structure & mappings** — a second root node after a block collection; a compact nested
+  mapping key (`a: b: c`); an inline block sequence after `:` (`key: - a`).
+- **Scalars & quoting** — invalid double-quoted escapes (`"\."`); trailing content after a
+  quoted scalar; a multi-line scalar used as an implicit key; invalid block-scalar headers
+  (`|0`, `|10`, `> text`).
+- **Flow collections** — leading/doubled commas, unbalanced or unclosed brackets, bare `-`
+  items, document markers inside a flow collection.
+- **Anchors** — an anchor immediately followed by an alias (`&a *b`) or a block indicator.
+- **Comments** — a `#` not separated from the preceding token by whitespace; a comment
+  interrupting a multi-line plain scalar.
+- **Documents & directives** — content after a `...` marker; a `%YAML` directive with no
+  following `---`, malformed, or duplicated; a document marker inside an open quoted scalar.
+
+---
+
 ## Examples
 
 ### Basic Generation
@@ -363,6 +426,7 @@ succinctly yq '.users[]' input.yaml
 - `-R, --raw-input`: Read each line as a string instead of parsing as YAML/JSON
 - `-s, --slurp`: Read all inputs into an array and use it as the single input value
 - `-p, --input-format <FORMAT>`: Input format: `auto` (default), `yaml`, `json`
+- `--validate`: Validate YAML strictly (opt-in) before processing; reports line:column errors and bails without producing output (see [YAML Validation](#yaml-validation))
 - `-i, --inplace`: Update the file in place
 - `--doc <N>`: Select specific document by 0-based index from multi-document stream
 

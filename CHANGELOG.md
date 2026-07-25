@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in strict YAML validation** (#223): a new `succinctly::yaml::validate`
+  pass, exposed as `succinctly yaml validate [FILES]...` and `syq --validate`,
+  that rejects invalid YAML. It mirrors `json validate` — a separate pass run
+  before indexing, so the default non-validating loader path is unchanged and
+  pays nothing. It rejects 59 of the 83 previously-accepted-but-invalid YAML
+  Test Suite cases (reject conformance 11/94 → 70/94) with no false positives on
+  the valid corpus; the remaining structurally-deep cases stay on record.
+
+### Removed
+
+- Removed four never-constructed `YamlError` variants — `InvalidEscape`,
+  `InvalidIndentation`, `ExplicitKeyNotSupported`, and `ColonWithoutSpace`
+  (#223). **Breaking**: exhaustive `match`es on the public `YamlError` lose four
+  arms. The opt-in validator's `YamlValidationError` is the real rejection
+  surface.
+
 ### Fixed
 
 - `jq -R -s` now yields the entire input as a single string instead of an array of per-line strings, matching jq (#176)

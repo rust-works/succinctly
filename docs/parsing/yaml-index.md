@@ -89,11 +89,13 @@ Key lesson: micro-benchmark wins frequently don't translate to end-to-end gains.
 ## Validation
 
 `YamlIndex` performs minimal validation during indexing (structural recognition only) and
-accepts many malformed documents — it rejects 11 of the YAML Test Suite's 94 invalid
-inputs. Unlike JSON, there is no strict mode yet; an opt-in validation pass mirroring
-`json validate` is planned. See [Known Limitations](../compliance/yaml/limitations.md)
-for measured conformance and the list of unsupported features (tags, `%YAML`/`%TAG`
-directives).
+accepts many malformed documents — `YamlIndex::build` rejects 11 of the YAML Test Suite's
+94 invalid inputs. When strict validation is needed, an opt-in pass
+([`src/yaml/validate.rs`](../../src/yaml/validate.rs), `succinctly yaml validate` /
+`syq --validate`) mirrors `json validate`: a separate pass before indexing that rejects
+59 more of those cases without affecting the default path. See
+[Known Limitations](../compliance/yaml/limitations.md) for measured conformance and the
+list of unsupported features (tags, `%YAML`/`%TAG` directives).
 
 ## Depends On
 
