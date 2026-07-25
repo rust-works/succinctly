@@ -48,6 +48,11 @@ pub enum YamlPattern {
     /// Childless bare-dash items interleaved with items carrying inline
     /// scalar content (`- x`)
     HalfEmptyItems,
+    /// Records whose `-` item indicator sits alone on its line, with the item
+    /// body indented beneath it. Every other sequence pattern here emits
+    /// dash-space (`- `), so this shape had no benchmark coverage at all — which
+    /// is how the seq-item detection divergence in #106 stayed hidden.
+    SeqWrap,
 }
 
 /// How the suite generator sizes a pattern.
@@ -119,4 +124,5 @@ pub const ALL_PATTERNS: &[(&str, YamlPattern, PatternScale)] = &[
         YamlPattern::HalfEmptyItems,
         PatternScale::Scalable,
     ),
+    ("seqwrap", YamlPattern::SeqWrap, PatternScale::Scalable),
 ];

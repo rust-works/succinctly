@@ -72,7 +72,23 @@ pub fn generate_yaml(target_size: usize, pattern: YamlPattern, seed: Option<u64>
         YamlPattern::MultiDoc => generate_multidoc(target_size, seed),
         YamlPattern::EmptyItems => generate_empty_items(target_size),
         YamlPattern::HalfEmptyItems => generate_half_empty_items(target_size),
+        YamlPattern::SeqWrap => generate_seq_wrap(target_size, seed),
     }
+}
+
+/// Top-level sequence of mapping records where the item indicator is a bare `-`
+/// on its own line.
+///
+/// Structurally identical to `users` apart from `-\n` in place of `- `, so the
+/// two can be diffed to isolate the cost of seq-item wrapper handling.
+fn generate_seq_wrap(target_size: usize, seed: Option<u64>) -> String {
+    let mut rng = seed.map(ChaCha8Rng::seed_from_u64);
+    let mut yaml = String::with_capacity(target_size);
+
+    yaml.push_str("# Sequence items with the `-` indicator on its own line\n");
+    add_user_records_bare_dash(&mut yaml, target_size.saturating_sub(60), &mut rng, 0);
+
+    yaml
 }
 
 /// Comprehensive YAML with various features
@@ -1092,9 +1108,70 @@ fn add_user_records(
             .map_or(25 + count % 50, |r| r.random_range(18..80));
         let score = rng.as_mut().map_or(count * 10, |r| r.random_range(0..1000));
 
-        // Use block style for sequence items with mappings
-        // Note: YAML-lite parser requires `- ` (dash-space) not just `-`
+        // Use block style for sequence items with mappings.
+        // Dash-space here; see `add_user_records_bare_dash` for the `-\n` variant.
         yaml.push_str(&format!("{ind}- \n"));
+        yaml.push_str(&format!("{inner_ind}id: {count}\n"));
+        yaml.push_str(&format!("{inner_ind}name: {first} {last}\n"));
+        yaml.push_str(&format!(
+            "{}email: {}.{}@example.com\n",
+            inner_ind,
+            first.to_lowercase(),
+            last.to_lowercase()
+        ));
+        yaml.push_str(&format!("{inner_ind}age: {age}\n"));
+        yaml.push_str(&format!("{inner_ind}city: {city}\n"));
+        yaml.push_str(&format!("{inner_ind}score: {score}\n"));
+        yaml.push_str(&format!("{inner_ind}active: true\n"));
+
+        count += 1;
+    }
+}
+
+/// Same records as `add_user_records`, but with a bare `-` item indicator on its
+/// own line instead of `- `.
+///
+/// This is the shape that exercises seq-item wrapper detection where the byte
+/// after `-` is a newline rather than a space (#106).
+fn add_user_records_bare_dash(
+    yaml: &mut String,
+    target_size: usize,
+    rng: &mut Option<ChaCha8Rng>,
+    indent_level: usize,
+) {
+    let start_len = yaml.len();
+    let ind = indent(indent_level);
+    let inner_ind = indent(indent_level + 2);
+    let mut count = 0;
+
+    let first_names = [
+        "Alice", "Bob", "Charlie", "Diana", "Eve", "Frank", "Grace", "Henry",
+    ];
+    let last_names = [
+        "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller",
+    ];
+    let cities = [
+        "New York",
+        "Los Angeles",
+        "Chicago",
+        "Houston",
+        "Phoenix",
+        "Philadelphia",
+        "San Antonio",
+        "San Diego",
+    ];
+
+    while yaml.len().saturating_sub(start_len) < target_size {
+        let first = first_names[count % first_names.len()];
+        let last = last_names[(count / 8) % last_names.len()];
+        let city = cities[count % cities.len()];
+        let age = rng
+            .as_mut()
+            .map_or(25 + count % 50, |r| r.random_range(18..80));
+        let score = rng.as_mut().map_or(count * 10, |r| r.random_range(0..1000));
+
+        // Bare `-` on its own line: the byte after the indicator is `\n`.
+        yaml.push_str(&format!("{ind}-\n"));
         yaml.push_str(&format!("{inner_ind}id: {count}\n"));
         yaml.push_str(&format!("{inner_ind}name: {first} {last}\n"));
         yaml.push_str(&format!(
