@@ -22,6 +22,24 @@ Distributions are derived from the crate's own semi-index (`JsonIndex` / `YamlIn
 | yaml   | k8s            | nginx-deployment.yml        | 836   |
 | yaml   | lint           | sass-lint.yml               | 2055  |
 
+## Line index
+
+Bytes retained by `text::LineIndex` per corpus file, against what the dense-bitmap newline index it replaced would have cost for the same text (#228). Both columns are the structures' own `heap_size()`, not a formula, so this section is a space-regression guard as well as a record: the dense representation cost ~1.27 bits per *input byte* whatever the line count, while the Elias-Fano one costs ~2 + log2(average line length) bits per *line*. `permille` is parts-per-thousand of the file.
+
+| format | file                                       | bytes | lines | bitvec bytes | line index bytes | bitvec permille | line index permille |
+| ------ | ------------------------------------------ | ----- | ----- | ------------ | ---------------- | --------------- | ------------------- |
+| dsv    | world-gdp/world-gdp-with-codes.csv         | 4515  | 223   | 728          | 180              | 161             | 39                  |
+| json   | charts/bullet-data.json                    | 548   | 7     | 120          | 20               | 218             | 36                  |
+| json   | npm/express-package.json                   | 2731  | 99    | 456          | 100              | 166             | 36                  |
+| json   | openapi/swagger-v2-schema.json             | 40247 | 1607  | 6408         | 1356             | 159             | 33                  |
+| yaml   | actions/codeql-analysis.yml                | 925   | 39    | 168          | 44               | 181             | 47                  |
+| yaml   | actions/stale.yml                          | 1290  | 34    | 232          | 44               | 179             | 34                  |
+| yaml   | compose/nginx-flask-mysql.yaml             | 1239  | 62    | 224          | 60               | 180             | 48                  |
+| yaml   | compose/wordpress.yaml                     | 815   | 33    | 152          | 44               | 186             | 53                  |
+| yaml   | home-assistant/air-quality-conditions.yaml | 9990  | 466   | 1608         | 384              | 160             | 38                  |
+| yaml   | k8s/nginx-deployment.yml                   | 836   | 43    | 160          | 44               | 191             | 52                  |
+| yaml   | lint/sass-lint.yml                         | 2055  | 98    | 360          | 92               | 175             | 44                  |
+
 ## YAML
 
 files: 7, total bytes: 17150, anchors: 41, aliases: 86, bare-dash items: 5

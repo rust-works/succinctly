@@ -21,9 +21,11 @@ use serde::Serialize;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use succinctly::bits::BitVec;
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
 use succinctly::json::light::{JsonCursor, StandardJson};
 use succinctly::json::JsonIndex;
+use succinctly::text::LineIndex;
 use succinctly::yaml::{YamlCursor, YamlIndex, YamlValue};
 
 /// A distribution of integer samples, summarised as min/median/p90/p99/max.
@@ -171,6 +173,65 @@ pub struct FileRecord {
     pub workload: String,
     pub file: String,
     pub bytes: u64,
+}
+
+/// Space taken by the line index for one corpus file, against what the
+/// pre-#228 dense-bitmap representation would have cost for the same text.
+///
+/// Both figures come from the structures' own `heap_size()`, not from a
+/// formula, so the row cannot drift away from what the code actually
+/// allocates. All-integer, so it is arch-stable and safe to hold as a golden.
+struct LineSpaceRecord {
+    format: String,
+    file: String,
+    bytes: usize,
+    lines: usize,
+    bitvec_bytes: usize,
+    line_index_bytes: usize,
+}
+
+impl LineSpaceRecord {
+    fn measure(format: &str, file: &str, text: &[u8]) -> Self {
+        let index = LineIndex::build(text);
+
+        // Reconstruct the representation this replaced: one bit per input
+        // byte, set at each line start after line 1, plus a rank directory
+        // and select samples.
+        let mut bits = vec![0u64; text.len().div_ceil(64)];
+        for line in 2..=index.line_count() {
+            let pos = index.line_start(line).expect("line within count");
+            bits[pos / 64] |= 1 << (pos % 64);
+        }
+        let dense = BitVec::from_words(bits, text.len());
+
+        Self {
+            format: format.to_string(),
+            file: file.to_string(),
+            bytes: text.len(),
+            lines: index.line_count(),
+            bitvec_bytes: dense.heap_size(),
+            line_index_bytes: index.heap_size(),
+        }
+    }
+
+    /// Index size as parts-per-thousand of the input, rounded down.
+    /// An empty file reports 0 rather than dividing by zero.
+    fn permille(&self, index_bytes: usize) -> usize {
+        (index_bytes * 1000).checked_div(self.bytes).unwrap_or(0)
+    }
+
+    fn row(&self) -> Vec<String> {
+        vec![
+            self.format.clone(),
+            self.file.clone(),
+            self.bytes.to_string(),
+            self.lines.to_string(),
+            self.bitvec_bytes.to_string(),
+            self.line_index_bytes.to_string(),
+            self.permille(self.bitvec_bytes).to_string(),
+            self.permille(self.line_index_bytes).to_string(),
+        ]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +685,7 @@ pub fn generate_report(data_dir: &Path) -> Result<(String, Vec<FileRecord>)> {
         .with_context(|| format!("scanning corpus at {}", data_dir.display()))?;
 
     let mut corpus = Corpus::default();
+    let mut line_space = Vec::new();
     for path in &files {
         let (fmt, delim) = classify(path).expect("filtered by classify");
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -634,6 +696,11 @@ pub fn generate_report(data_dir: &Path) -> Result<(String, Vec<FileRecord>)> {
             file: file.clone(),
             bytes: bytes.len() as u64,
         });
+        line_space.push(LineSpaceRecord::measure(
+            fmt,
+            &format!("{workload}/{file}"),
+            &bytes,
+        ));
         match fmt {
             "json" => ingest_json(&bytes, &mut corpus.json),
             "yaml" => ingest_yaml(&bytes, &mut corpus.yaml)
@@ -680,6 +747,38 @@ percentiles use nearest-rank.\n\n",
         md.push_str(&render_table(
             &["format", "workload", "file", "bytes"],
             &inv_rows,
+        ));
+        md.push('\n');
+    }
+
+    // Line index space (#228)
+    md.push_str("## Line index\n\n");
+    md.push_str(
+        "Bytes retained by `text::LineIndex` per corpus file, against what the \
+dense-bitmap newline index it replaced would have cost for the same text \
+(#228). Both columns are the structures' own `heap_size()`, not a formula, so \
+this section is a space-regression guard as well as a record: the dense \
+representation cost ~1.27 bits per *input byte* whatever the line count, \
+while the Elias-Fano one costs ~2 + log2(average line length) bits per \
+*line*. `permille` is parts-per-thousand of the file.\n\n",
+    );
+    let mut space_rows: Vec<Vec<String>> = line_space.iter().map(LineSpaceRecord::row).collect();
+    space_rows.sort();
+    if space_rows.is_empty() {
+        md.push_str("_No corpus files found. Run `./scripts/sync-bench-corpus.sh` first._\n\n");
+    } else {
+        md.push_str(&render_table(
+            &[
+                "format",
+                "file",
+                "bytes",
+                "lines",
+                "bitvec bytes",
+                "line index bytes",
+                "bitvec permille",
+                "line index permille",
+            ],
+            &space_rows,
         ));
         md.push('\n');
     }
@@ -1032,6 +1131,44 @@ mod tests {
         assert!(records
             .iter()
             .any(|r| r.format == "dsv" && r.workload == "tab"));
+    }
+
+    #[test]
+    fn line_space_section_shows_the_line_index_beating_the_dense_bitmap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // 20 bytes per line, the corpus median shape.
+        let mut yaml = Vec::new();
+        for _ in 0..200 {
+            yaml.extend_from_slice(b"key: value-abcdefg\n");
+        }
+        write_file(root, "yaml/svc/app.yaml", &yaml);
+
+        let (md, _) = generate_report(root).unwrap();
+
+        assert!(md.contains("## Line index"));
+        assert!(md.contains("line index permille"));
+
+        let record = LineSpaceRecord::measure("yaml", "svc/app.yaml", &yaml);
+        assert!(
+            record.line_index_bytes * 3 < record.bitvec_bytes,
+            "line index {} should be several times smaller than bitvec {}",
+            record.line_index_bytes,
+            record.bitvec_bytes
+        );
+        assert_eq!(record.lines, 200);
+        assert_eq!(record.permille(0), 0, "zero bytes is zero permille");
+    }
+
+    #[test]
+    fn line_space_record_handles_empty_input() {
+        let record = LineSpaceRecord::measure("json", "empty/x.json", b"");
+
+        assert_eq!(record.bytes, 0);
+        assert_eq!(record.lines, 1, "empty text still has one line");
+        // No division by zero when the file is empty.
+        assert_eq!(record.permille(record.line_index_bytes), 0);
+        assert_eq!(record.row().len(), 8);
     }
 
     #[test]
