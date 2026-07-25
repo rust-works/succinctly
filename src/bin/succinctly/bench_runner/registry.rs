@@ -223,6 +223,15 @@ pub static BENCHMARKS: &[BenchmarkInfo] = &[
         working_dir: ".",
     },
     BenchmarkInfo {
+        name: "jq_escape_micro",
+        description: "Micro: JSON string escaping — per-char vs shared escaper (issue #91)",
+        category: BenchmarkCategory::Json,
+        bench_type: BenchmarkType::Criterion,
+        criterion_name: Some("jq_escape_micro"),
+        cli_subcommand: None,
+        working_dir: ".",
+    },
+    BenchmarkInfo {
         name: "jq_bench",
         description: "CLI: succinctly jq vs system jq (with memory)",
         category: BenchmarkCategory::Json,

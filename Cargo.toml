@@ -200,6 +200,10 @@ harness = false
 name = "jq_string_ops_bench"
 harness = false
 
+[[bench]]
+name = "jq_escape_micro"
+harness = false
+
 # =============================================================================
 # Lints
 #

@@ -1,16 +1,44 @@
 //! Micro-benchmarks for JSON escape scanning SIMD optimization (Issue #87).
 //!
-//! Measures the performance of `find_json_escape` which uses SIMD to find bytes
-//! that need JSON escaping (", \, or control characters 0x00-0x1F).
+//! Measures the escape *scanners* — the SIMD primitives that locate the next
+//! byte needing attention. #91 added two more predicates beside the original
+//! `find_json_escape`, so `bench_predicates` compares all three.
+//!
+//! For whole-escaper throughput (scan plus emit, which is what callers pay),
+//! see `benches/jq_escape_micro.rs`.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
-use succinctly::yaml::simd::find_json_escape;
+use succinctly::json::escape::{find_ascii_escape, find_jq_escape, find_json_escape};
 
 /// Scalar implementation for comparison
 fn find_json_escape_scalar(input: &[u8], start: usize) -> usize {
     for (i, &b) in input[start..].iter().enumerate() {
         if b == b'"' || b == b'\\' || b < 0x20 {
+            return start + i;
+        }
+    }
+    input.len()
+}
+
+/// Scalar reference for the jq predicate (#91): adds DEL to the JSON set.
+fn find_jq_escape_scalar(input: &[u8], start: usize) -> usize {
+    for (i, &b) in input[start..].iter().enumerate() {
+        if b == b'"' || b == b'\\' || b < 0x20 || b == 0x7F {
+            return start + i;
+        }
+    }
+    input.len()
+}
+
+/// Scalar reference for the ASCII-output predicate (#91).
+///
+/// Written as an explicit OR of the same lanes the SIMD mask computes, one
+/// term per compare, so the two can be read against each other.
+#[allow(clippy::manual_range_contains)]
+fn find_ascii_escape_scalar(input: &[u8], start: usize) -> usize {
+    for (i, &b) in input[start..].iter().enumerate() {
+        if b == b'"' || b == b'\\' || b < 0x20 || b >= 0x7F {
             return start + i;
         }
     }
@@ -75,6 +103,44 @@ fn bench_simd_vs_scalar(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("scalar", size), &input, |b, input| {
             b.iter(|| find_json_escape_scalar(black_box(input), 0));
         });
+    }
+
+    group.finish();
+}
+
+/// A scanner: index of the next byte needing attention, or `bytes.len()`.
+type Scanner = fn(&[u8], usize) -> usize;
+
+/// The three predicates against each other and their scalar references (#91).
+///
+/// `find_jq_escape` adds one compare (DEL) to the JSON predicate;
+/// `find_ascii_escape` adds an ordering compare (`>= 0x7F`). Both should track
+/// `find_json_escape` closely on escape-free ASCII — if one does not, a mask
+/// helper is doing more work than its predicate needs.
+fn bench_predicates(c: &mut Criterion) {
+    let mut group = c.benchmark_group("json_escape/predicates");
+
+    let scanners: [(&str, Scanner, Scanner); 3] = [
+        ("json", find_json_escape, find_json_escape_scalar),
+        ("jq", find_jq_escape, find_jq_escape_scalar),
+        ("ascii", find_ascii_escape, find_ascii_escape_scalar),
+    ];
+
+    for size in [16, 32, 64, 256, 1024] {
+        let input = make_no_escapes(size);
+        group.throughput(Throughput::Bytes(size as u64));
+        for (name, simd, scalar) in scanners {
+            group.bench_with_input(
+                BenchmarkId::new(format!("{name}/simd"), size),
+                &input,
+                |b, input| b.iter(|| simd(black_box(input), 0)),
+            );
+            group.bench_with_input(
+                BenchmarkId::new(format!("{name}/scalar"), size),
+                &input,
+                |b, input| b.iter(|| scalar(black_box(input), 0)),
+            );
+        }
     }
 
     group.finish();
@@ -225,6 +291,7 @@ fn bench_alignment(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_simd_vs_scalar,
+    bench_predicates,
     bench_escape_position,
     bench_escape_types,
     bench_realistic,
