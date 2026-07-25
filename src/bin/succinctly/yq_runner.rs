@@ -165,6 +165,54 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("failed to read file: {}", path.display()))
 }
 
+/// When `--validate` is set and the resolved input format is YAML, run the
+/// opt-in strict validator (`succinctly::yaml::validate`) before indexing and,
+/// on the first violation, print a rustc-style diagnostic and return the exit
+/// code to bail with. Mirrors `sjq --validate` (`jq_runner::validate_json_input`);
+/// JSON input is left to jq-side validation.
+fn yaml_validate_guard(
+    input: &[u8],
+    format: InputFormat,
+    validate: bool,
+    filename: Option<&str>,
+) -> Option<i32> {
+    if !validate || !matches!(format, InputFormat::Yaml | InputFormat::Auto) {
+        return None;
+    }
+    match succinctly::yaml::validate::validate(input) {
+        Ok(()) => None,
+        Err(err) => {
+            print_yaml_validation_error(&err, input, filename);
+            Some(exit_codes::COMPILE_ERROR)
+        }
+    }
+}
+
+/// Print a YAML validation error with a line/column location and a caret snippet.
+fn print_yaml_validation_error(
+    err: &succinctly::yaml::validate::YamlValidationError,
+    input: &[u8],
+    filename: Option<&str>,
+) {
+    let pos = &err.position;
+    eprintln!("yq: validation error: {}", err.kind);
+    let location = filename.map_or_else(
+        || format!("<stdin>:{}:{}", pos.line, pos.column),
+        |f| format!("{}:{}:{}", f, pos.line, pos.column),
+    );
+    eprintln!("  --> {location}");
+
+    let text = String::from_utf8_lossy(input);
+    if let Some(line_content) = text.lines().nth(pos.line.saturating_sub(1)) {
+        let width = pos.line.to_string().len().max(3);
+        let pad = " ".repeat(width + 2);
+        eprintln!("{pad}|");
+        eprintln!(" {:>width$} | {}", pos.line, line_content, width = width);
+        eprintln!("{}| {}^", pad, " ".repeat(pos.column.saturating_sub(1)));
+    }
+    eprintln!();
+}
+
 /// Detect input format from file extension.
 fn detect_format_from_path(path: &Path) -> InputFormat {
     match path.extension().and_then(|e| e.to_str()) {
@@ -1262,6 +1310,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
         if input_files.is_empty() {
             let yaml_bytes = read_stdin()?;
+            let fmt = resolve_input_format(args.input_format, None);
+            if let Some(code) = yaml_validate_guard(&yaml_bytes, fmt, args.validate, None) {
+                return Ok(code);
+            }
             let index = YamlIndex::build(&yaml_bytes)
                 .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
             let root = index.root(&yaml_bytes);
@@ -1313,7 +1365,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             }
         } else {
             for file_path in &input_files {
-                let yaml_bytes = read_file(Path::new(file_path))?;
+                let path = Path::new(file_path);
+                let yaml_bytes = read_file(path)?;
+                let fmt = resolve_input_format(args.input_format, Some(path));
+                if let Some(code) =
+                    yaml_validate_guard(&yaml_bytes, fmt, args.validate, Some(file_path))
+                {
+                    return Ok(code);
+                }
                 let index = YamlIndex::build(&yaml_bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error in {file_path}: {e}"))?;
                 let root = index.root(&yaml_bytes);
@@ -1424,6 +1483,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         let input_sources: Vec<(Vec<u8>, InputFormat)> = if input_files.is_empty() {
             let input_bytes = read_stdin()?;
             let format = resolve_input_format(args.input_format, None);
+            if let Some(code) = yaml_validate_guard(&input_bytes, format, args.validate, None) {
+                return Ok(code);
+            }
             vec![(input_bytes, format)]
         } else {
             let mut sources = Vec::new();
@@ -1431,6 +1493,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 let path = Path::new(file_path);
                 let input_bytes = read_file(path)?;
                 let format = resolve_input_format(args.input_format, Some(path));
+                if let Some(code) =
+                    yaml_validate_guard(&input_bytes, format, args.validate, Some(file_path))
+                {
+                    return Ok(code);
+                }
                 sources.push((input_bytes, format));
             }
             sources
@@ -1473,6 +1540,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             let path = Path::new(file_path);
             let input_bytes = read_file(path)?;
             let format = resolve_input_format(args.input_format, Some(path));
+            if let Some(code) =
+                yaml_validate_guard(&input_bytes, format, args.validate, Some(file_path))
+            {
+                return Ok(code);
+            }
             let inputs = parse_input(&input_bytes, format)?;
 
             // Collect all output into a buffer
@@ -1535,6 +1607,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         let input_sources: Vec<(Vec<u8>, InputFormat)> = if input_files.is_empty() {
             let input_bytes = read_stdin()?;
             let format = resolve_input_format(args.input_format, None);
+            if let Some(code) = yaml_validate_guard(&input_bytes, format, args.validate, None) {
+                return Ok(code);
+            }
             vec![(input_bytes, format)]
         } else {
             let mut sources = Vec::new();
@@ -1542,6 +1617,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 let path = Path::new(file_path);
                 let input_bytes = read_file(path)?;
                 let format = resolve_input_format(args.input_format, Some(path));
+                if let Some(code) =
+                    yaml_validate_guard(&input_bytes, format, args.validate, Some(file_path))
+                {
+                    return Ok(code);
+                }
                 sources.push((input_bytes, format));
             }
             sources
