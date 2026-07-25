@@ -28,6 +28,7 @@ The benchmarks below compare succinctly against DOM-based tools (jq, yq, serde_j
 | [Cross-Language](cross-language.md)              | Multi-language parser comparison     | Best-in-class for semi-indexing                |
 | [DSV](dsv.md)                                    | CSV/TSV parsing performance          | 85-1676 MiB/s (API)                            |
 | [Corpus Shape](corpus-shape.md)                  | Real-workload input shape statistics | Representativeness lookup for perf proposals   |
+| [YAML Shape Survey](yaml-shape-survey.md)        | Upstream shape frequency (26 repos)  | Bare dashes 0.042% of files; anchors 100x more |
 
 ## Methodology
 

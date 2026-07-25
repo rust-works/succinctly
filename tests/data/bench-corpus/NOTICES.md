@@ -39,17 +39,20 @@ it looks like at what size. It cannot establish **frequency**: seven files can n
 proportionally represent a shape that appears in a fraction of a percent of real
 input. `yaml/lint/sass-lint.yml` is the worked example. It was added for #326 so the
 bare-dash sequence item (`-` alone on its line) is sampled at all, but a survey of
-46 upstream repositories found that shape in under 0.1% of real YAML files. Reading
-its presence here as "roughly one YAML file in six uses bare dashes" inverts the
-error the corpus exists to prevent. Frequency questions belong to
+26 upstream repositories (33,575 YAML files) found that shape in 0.042% of them.
+Reading its presence here as "roughly one YAML file in six uses bare dashes" inverts
+the error the corpus exists to prevent. Frequency questions belong to
 [`docs/benchmarks/yaml-shape-survey.md`](../../../docs/benchmarks/yaml-shape-survey.md).
 
 ## Extending the corpus
 
-The 1MB/10MB ladder tiers and anchor/alias-heavy YAML (real workloads use anchors
-far less than the P4 micro-benchmarks assumed — the corpus still shows `anchors: 0`,
-and the survey above confirms that is upstream reality rather than a sampling gap)
-are follow-up curation: add a `manifest.json` entry (`vendored: false`) with a
+The 1MB/10MB ladder tiers and anchor/alias-heavy YAML are follow-up curation. The
+anchor gap is the more urgent of the two: the corpus still shows `anchors: 0`, and the
+survey establishes that this is a **sampling artefact**, not upstream reality — the
+corpus over-samples Kubernetes and Compose, the two families that genuinely avoid
+anchors, while ecosystems that use them (Home Assistant, Salt, Concourse, GitLab CI)
+carry anchors in 4–11% of files, roughly 100x the bare-dash rate. To add one: add a
+`manifest.json` entry (`vendored: false`) with a
 commit-pinned `source_url`, `license`, `bytes`, and `sha256`, then run
 `./scripts/sync-bench-corpus.sh` to fetch and verify it. Prefer public-domain or
 permissive (CC0 / MIT / Apache-2.0 / BSD) sources and always record provenance.
