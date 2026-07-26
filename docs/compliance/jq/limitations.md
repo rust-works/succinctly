@@ -24,25 +24,25 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 102 probes in
+Measured against jq-1.7.1 over the 111 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
-| Dimension                                   | Result             | Meaning                                            |
-|---------------------------------------------|--------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **98/102 = 96.1%** | Byte-identical to jq                               |
-| **Wording divergences**                      | **0**              | Every probe that errors in both errors identically |
-| **Behaviour / parser gaps**                  | **4**              | succinctly does not raise the error at all         |
+| Dimension                                    | Result              | Meaning                                            |
+|----------------------------------------------|---------------------|----------------------------------------------------|
+| **Message text** (both evaluators, verbatim) | **108/111 = 97.3%** | Byte-identical to jq                               |
+| **Wording divergences**                      | **0**               | Every probe that errors in both errors identically |
+| **Behaviour / parser gaps**                  | **3**               | succinctly does not raise the error at all         |
 
-The four non-passing probes are enumerated individually, with a category, reason and issue
+The three non-passing probes are enumerated individually, with a category, reason and issue
 link, in
 [`tests/data/jq-error-known-divergences.txt`](../../../tests/data/jq-error-known-divergences.txt).
 That file is the machine-readable source of truth; the test asserts it matches reality
 exactly in both directions — a newly diverging probe and a newly matching one both break
 the build — so it cannot silently drift from this page.
 
-Crucially, **none of the four is a wording bug**. In each case succinctly returns a value
+Crucially, **none of the three is a wording bug**. In each case succinctly returns a value
 or fails to compile the filter, so there is no message to compare; the wording is already
 correct in `src/jq/error.rs` and will be reached once the underlying bug is fixed.
 
@@ -168,14 +168,31 @@ shortest rendering differs from their source spelling.
 
 ## Behaviour and parser gaps
 
-The four probes on record are not wording problems — succinctly never raises the error, so
+The three probes on record are not wording problems — succinctly never raises the error, so
 there is nothing to word. Each has its own issue and is listed in
 [`tests/data/jq-error-known-divergences.txt`](../../../tests/data/jq-error-known-divergences.txt).
 
 | Probe(s)                                                          | Divergence                                                       | Issue |
 |-------------------------------------------------------------------|------------------------------------------------------------------|-------|
-| `setpath_on_number`                                               | Builds a container on a scalar instead of refusing to index it   | [#359](https://github.com/rust-works/succinctly/issues/359) |
 | `index_null_key_on_object`, `index_bool_key_on_object`, `index_object_key_on_object` | `.[null]`, `.[true]`, `.[{}]` are rejected by the parser | [#360](https://github.com/rust-works/succinctly/issues/360) |
+
+`setpath_on_number` was a fourth; the other two of #356's six were the `contains`/`inside`
+pair, fixed by [#358](https://github.com/rust-works/succinctly/issues/358) before this page
+existed. [#359](https://github.com/rust-works/succinctly/issues/359) fixed
+`setpath_on_number`: `setpath` now auto-vivifies only `null`, as jq does, and refuses to
+index anything else at any depth. The `setpath_*` probes added alongside it pin the rest of that
+surface — wrong-key-type on a real container, out-of-bounds negative and NaN indices, and a
+non-array path argument.
+
+## Assigning through a slice is not implemented
+
+jq models `.[1:2]` as indexing with `{"start":1,"end":2}`, and `setpath` assigns through
+one: `[1,2,3] | setpath([{"start":1,"end":2}]; ["x"])` is `[1,"x",3]`. succinctly leaves the
+value untouched instead. That is a missing feature rather than a wording divergence, and it
+is deliberately *not* raised as an error — inventing a message jq does not print would be a
+fresh divergence. Only the containers jq would slice get that pass; on a scalar, an object
+path element is refused with jq's `Cannot index <type> with object`
+(probe `setpath_slice_key_on_number`).
 
 ## Errors reach the CLI with the right text but the wrong exit code
 
