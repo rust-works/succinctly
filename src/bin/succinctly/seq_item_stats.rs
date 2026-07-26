@@ -748,3 +748,220 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn write_file(root: &Path, rel: &str, content: &[u8]) -> PathBuf {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    /// A corpus with a known answer, so the report's numbers can be asserted
+    /// rather than merely smoke-tested: `svc/a.yaml` has 2 wrapped items out of a
+    /// small node count, `svc/b.yaml` has none.
+    fn fixture(root: &Path) {
+        write_file(
+            root,
+            "svc/a.yaml",
+            b"rules:\n  -\n    a: 1\n  -\n    b: 2\n",
+        );
+        write_file(root, "svc/b.yaml", b"name: web\nport: 80\n");
+        // Not YAML: must be ignored by the scan.
+        write_file(root, "svc/notes.txt", b"ignore me\n");
+    }
+
+    #[test]
+    fn generate_report_has_every_section_and_consistent_totals() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path());
+        let (report, stats) = generate_report(tmp.path()).unwrap();
+
+        for heading in [
+            "# Seq-Item Density and Position Storage",
+            "## Seq-item density",
+            "## Predicate vs structure",
+            "## Position storage: Compact vs Dense",
+            "## Option 3 sizing",
+            "## Verdict",
+        ] {
+            assert!(report.contains(heading), "missing section: {heading}");
+        }
+
+        // Only the two YAML files, not the .txt.
+        assert_eq!(stats.len(), 2, "unexpected files: {stats:?}");
+        assert!(stats.iter().all(|s| s.workload == "svc"));
+
+        // The aggregate line must agree with the per-file numbers.
+        let s: usize = stats.iter().map(|f| f.seq_items).sum();
+        let n: usize = stats.iter().map(|f| f.opens).sum();
+        assert!(
+            report.contains(&format!("({s} / {n})")),
+            "aggregate mismatch"
+        );
+
+        // Both invariants clean on well-formed input, so the report says so.
+        assert!(report.contains("predicate is exact"));
+    }
+
+    #[test]
+    fn generate_report_on_empty_dir_is_well_formed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (report, stats) = generate_report(tmp.path()).unwrap();
+        assert!(stats.is_empty());
+        assert!(report.contains("Scanned 0 YAML file(s)"));
+        // Verdict still renders rather than dividing by zero.
+        assert!(report.contains("## Verdict"));
+    }
+
+    #[test]
+    fn run_writes_markdown_and_jsonl() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path());
+        let md = tmp.path().join("out.md");
+        let jsonl = tmp.path().join("out.jsonl");
+        assert_eq!(
+            run(tmp.path(), Some(&md), Some(&jsonl)).unwrap(),
+            0,
+            "run should succeed"
+        );
+
+        let written = std::fs::read_to_string(&md).unwrap();
+        assert!(written.contains("## Seq-item density"));
+
+        // One JSONL record per YAML file, each deserialising to the same fields.
+        let lines: Vec<&str> = std::fs::read_to_string(&jsonl)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| Box::leak(l.to_string().into_boxed_str()) as &str)
+            .collect();
+        assert_eq!(lines.len(), 2);
+        for l in lines {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            for key in [
+                "workload",
+                "file",
+                "bytes",
+                "opens",
+                "seq_items",
+                "open_compact",
+            ] {
+                assert!(v.get(key).is_some(), "record missing {key}: {l}");
+            }
+        }
+    }
+
+    #[test]
+    fn run_without_markdown_prints_to_stdout() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path());
+        assert_eq!(run(tmp.path(), None, None).unwrap(), 0);
+    }
+
+    #[test]
+    fn run_test_suite_reads_a_suite_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let suite = tmp.path().join("suite.json");
+        // Mirrors the vendored suite's shape: id/name/yaml/fail, with one
+        // fail-case that must be skipped and one explicit-key case.
+        std::fs::write(
+            &suite,
+            br#"[
+              {"id":"AAAA","name":"plain","yaml":"- a\n- b\n"},
+              {"id":"BBBB","name":"wrapped","yaml":"-\n  a: 1\n"},
+              {"id":"CCCC","name":"explicit","yaml":"? k\n: v\n"},
+              {"id":"DDDD","name":"invalid","yaml":"\t- bad\n","fail":true}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(run_test_suite(&suite).unwrap(), 0);
+    }
+
+    #[test]
+    fn run_all_dispatches_report_suite_and_explain() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path());
+        let suite = tmp.path().join("suite.json");
+        std::fs::write(&suite, br#"[{"id":"AAAA","name":"x","yaml":"- a\n"}]"#).unwrap();
+
+        // report + suite
+        assert_eq!(
+            run_all(tmp.path(), None, None, Some(&suite), false).unwrap(),
+            0
+        );
+        // explain path short-circuits before the report
+        assert_eq!(run_all(tmp.path(), None, None, None, true).unwrap(), 0);
+    }
+
+    #[test]
+    fn explain_mismatch_runs_on_clean_and_adversarial_input() {
+        // Clean input prints a header and no rows; the adversarial dash shapes
+        // must not panic on out-of-range or sentinel positions.
+        explain_mismatch(b"- a\n- b\n", "clean").unwrap();
+        explain_mismatch(b"? -\n: v\n", "explicit-key").unwrap();
+        // A valueless explicit key stores `text.len()` as the position, so this
+        // reaches the null-sentinel arm of the snippet renderer.
+        explain_mismatch(b"? k\n", "valueless-explicit-key").unwrap();
+        // Empty input is a parse error, surfaced rather than silently reported as
+        // a clean document.
+        assert!(explain_mismatch(b"", "empty").is_err());
+    }
+
+    #[test]
+    fn the_false_positive_invariant_catches_the_dash_scalar_shape() {
+        // `a: -` is the #325 shape: the parser emits a plain scalar (its
+        // mapping-value dash guard is narrow) which the wide reader predicate then
+        // calls a wrapper. It is not a block-sequence child, so it registers as a
+        // false positive — the invariant is doing its job, and this pins that.
+        //
+        // It stays out of the corpus and suite numbers because neither contains
+        // the shape, which is why both report 0. See #325.
+        let s = measure(b"a: -\n", "w".into(), "f".into()).unwrap();
+        assert_eq!(s.false_positives, 1);
+        assert_eq!(s.block_seq_children, 0);
+        // Well-formed input has none.
+        let ok = measure(b"- a\n- b\n", "w".into(), "f".into()).unwrap();
+        assert_eq!((ok.false_positives, ok.undetected_wrappers), (0, 0));
+    }
+
+    #[test]
+    fn file_stats_helpers_handle_the_degenerate_cases() {
+        let mut s = measure(b"- a\n", "w".into(), "f".into()).unwrap();
+        assert!(s.density() > 0.0);
+        assert_eq!(s.sparse_bytes(), 4 * s.seq_items);
+        assert!(s.sparse_kb_per_mib() > 0.0);
+
+        // No nodes and no bytes must not divide by zero.
+        s.opens = 0;
+        s.bytes = 0;
+        s.seq_items = 0;
+        assert_eq!(s.density(), 0.0);
+        assert_eq!(s.sparse_bytes(), 0);
+        assert_eq!(s.sparse_kb_per_mib(), 0.0);
+    }
+
+    #[test]
+    fn pct_formats_two_decimals() {
+        assert_eq!(pct(0.0), "0.00%");
+        assert_eq!(pct(1.0), "100.00%");
+        assert_eq!(pct(1.0 / 32.0), "3.12%");
+        assert_eq!(pct(0.0887), "8.87%");
+    }
+
+    #[test]
+    fn unreadable_yaml_is_skipped_not_fatal() {
+        // A file the parser rejects must be reported and skipped, leaving the
+        // report over the remaining files rather than failing the whole run.
+        let tmp = tempfile::tempdir().unwrap();
+        fixture(tmp.path());
+        write_file(tmp.path(), "svc/broken.yaml", b"\t- tab indented\n");
+        let (report, stats) = generate_report(tmp.path()).unwrap();
+        assert!(stats.len() >= 2, "good files still reported");
+        assert!(report.contains("## Verdict"));
+    }
+}
