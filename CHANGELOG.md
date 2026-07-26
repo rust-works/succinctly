@@ -68,6 +68,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was; and the scan now skips quoted scalars and comments, so `a:\n \t"x: y"`
   and `a: 1\n \t# c: d` are accepted while `a:\n \t"b": 1` — a quoted *key*, so
   really indentation — is still refused.
+- **Double free in `RankDirectory`'s cache-aligned builder** (#321):
+  `CacheAlignedL1L2Builder::build()` freed its allocation and then returned
+  without `mem::forget(self)`, so `Drop` freed the same pointer again — an
+  immediate abort. Only the "capacity allocated but nothing pushed" path did
+  this; the two paths that transfer ownership always forgot `self`. That path is
+  unreachable from any public API today (`RankDirectory::build` returns early for
+  empty input, so a builder with capacity always gets at least one push), which
+  is why it was never hit. The explicit free is gone; `Drop` now owns the
+  release.
 - **jq `try/catch` discarded the raised error** (#158): the catch handler ran
   against the *original input* rather than the error value, so a handler could
   never see what went wrong — `try error("boom") catch .` gave `null` where jq
