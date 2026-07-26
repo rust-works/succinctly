@@ -3961,6 +3961,21 @@ mod tests {
         assert!(build_semi_index(b"\t[\n\t]\n").is_ok());
     }
 
+    /// A quoted scalar after the tab is a *node*, so the tab is separation — the `:`
+    /// inside the quotes is content, not a value indicator. Rejecting these would be
+    /// a false positive on valid YAML (same production as DK95/00), which is why
+    /// `line_is_structural` skips quoted spans.
+    #[test]
+    fn a_quoted_scalar_after_the_tab_is_not_indentation() {
+        assert!(build_semi_index(b"a:\n \t\"x: y\"\n").is_ok());
+        assert!(build_semi_index(b"a:\n \t'x: y'\n").is_ok());
+        // A quoted *key*, though, is a mapping entry and the tab really is indentation.
+        assert!(matches!(
+            build_semi_index(b"a:\n \t\"b\": 1\n"),
+            Err(YamlError::TabIndentation { .. })
+        ));
+    }
+
     /// `parse_document_line` is not always entered at a line start — the flow scanner
     /// stops just past `]`, leaving the cursor mid-line, and the main loop then
     /// re-derives an "indent" from there. The tab below is separation in the middle

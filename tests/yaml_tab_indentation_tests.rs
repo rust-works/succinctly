@@ -4,7 +4,9 @@
 //! structure follows it. Before a plain scalar the same byte is separation and
 //! perfectly legal — `foo:\n \tbar` (DK95/00) and `x:\n - x\n  \tx` (UV7Q, "Legal
 //! tab after indentation") are both valid documents. That distinction is what
-//! `succinctly::yaml::line_is_structural` encodes.
+//! the crate-private `yaml::line_is_structural` encodes (`src/yaml/mod.rs`); from
+//! out here it is reachable only through its two call sites, which is what this
+//! file exercises.
 //!
 //! Before #173 only the strict validator applied the rule; the default loader
 //! rejected a tab at column 0 and treated a tab after one or more spaces as
@@ -23,6 +25,7 @@
 //!
 //! Run with: `cargo test --test yaml_tab_indentation_tests`
 
+use succinctly::yaml::validate::YamlValidationErrorKind;
 use succinctly::yaml::{YamlError, YamlIndex, YamlValue};
 
 const CORPUS: &str = include_str!("data/yaml-test-suite-2022-01-17.json");
@@ -52,8 +55,26 @@ fn loader_reports_tab_indentation(yaml: &[u8]) -> bool {
     )
 }
 
-fn validator_rejects(yaml: &[u8]) -> bool {
-    succinctly::yaml::validate::validate(yaml).is_err()
+/// What the opt-in strict validator makes of a document.
+///
+/// Deliberately finer than `is_err()`: a row that rejects for an unrelated reason
+/// would otherwise read as agreement with the loader's tab verdict, and would keep
+/// passing if the tab rule stopped firing entirely.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Validator {
+    Accepts,
+    /// Rejected as `TabInIndentation` — the same judgement the loader makes.
+    RejectsTheTab,
+    /// Rejected, but for something else; the tab verdict is not what is under test.
+    RejectsOtherwise,
+}
+
+fn validator_verdict(yaml: &[u8]) -> Validator {
+    match succinctly::yaml::validate::validate(yaml) {
+        Ok(()) => Validator::Accepts,
+        Err(e) if e.kind == YamlValidationErrorKind::TabInIndentation => Validator::RejectsTheTab,
+        Err(_) => Validator::RejectsOtherwise,
+    }
 }
 
 /// One row of the agreement table.
@@ -61,8 +82,8 @@ struct Verdict {
     yaml: &'static [u8],
     /// Does `YamlIndex::build` reject it as `TabIndentation`?
     loader: bool,
-    /// Does the opt-in strict validator reject it (for any reason)?
-    validator: bool,
+    /// What the opt-in strict validator makes of it.
+    validator: Validator,
     /// Why — and, where the two disagree, why that is not a tab bug.
     why: &'static str,
 }
@@ -72,58 +93,86 @@ const VERDICTS: &[Verdict] = &[
     Verdict {
         yaml: b"a:\n \tb: 1\n",
         loader: true,
-        validator: true,
+        validator: Validator::RejectsTheTab,
         why: "#173 repro: loaded as {\"a\":{\"\\tb\":1}} before the fix",
     },
     Verdict {
         yaml: b"foo:\n  a: 1\n  \tb: 2\n",
         loader: true,
-        validator: true,
+        validator: Validator::RejectsTheTab,
         why: "DK95/06, the suite's must-fail case for this shape",
     },
     Verdict {
         yaml: b"  \t- a\n",
         loader: true,
-        validator: true,
+        validator: Validator::RejectsTheTab,
         why: "a tab before a sequence entry is indentation too",
     },
     // ---- A tab that is separation. Both must accept. ---------------------------
     Verdict {
         yaml: b"foo:\n \tbar\n",
         loader: false,
-        validator: false,
+        validator: Validator::Accepts,
         why: "DK95/00: a tab before a plain scalar is separation, not indentation",
     },
     Verdict {
         yaml: b"x:\n - x\n  \tx\n",
         loader: false,
-        validator: false,
+        validator: Validator::Accepts,
         why: "UV7Q, named upstream 'Legal tab after indentation'",
     },
     Verdict {
         yaml: b"\t{}\n",
         loader: false,
-        validator: false,
+        validator: Validator::Accepts,
         why: "Q5MG: a root flow node's leading separation may contain tabs",
     },
     Verdict {
         yaml: b"\t[\n\t]\n",
         loader: false,
-        validator: false,
+        validator: Validator::Accepts,
         why: "6CA3, the sequence form of Q5MG",
     },
     Verdict {
         yaml: b"a: |\n  x\n  \tb: c\n",
         loader: false,
-        validator: false,
+        validator: Validator::Accepts,
         why: "inside a block scalar the tab is content; the body never reaches \
               either line dispatcher",
+    },
+    Verdict {
+        yaml: b"a:\n \t\"x: y\"\n",
+        loader: false,
+        validator: Validator::Accepts,
+        why: "the `:` is inside a quoted scalar, so the line is a node and the tab \
+              is separation — same production as DK95/00",
+    },
+    Verdict {
+        yaml: b"a:\n \t'x: y'\n",
+        loader: false,
+        validator: Validator::Accepts,
+        why: "the single-quoted form of the row above",
+    },
+    Verdict {
+        yaml: b"a:\n \t\"b\": 1\n",
+        loader: true,
+        validator: Validator::RejectsTheTab,
+        why: "a quoted *key* is still a mapping entry, so the tab is indentation — \
+              the pair to the two rows above, and why the scan skips the quoted \
+              span rather than bailing out at the quote",
+    },
+    Verdict {
+        yaml: b"a: 1\n \t# c: d\nb: 2\n",
+        loader: false,
+        validator: Validator::Accepts,
+        why: "a tab before a comment is separation; the `: ` in the comment text is \
+              not a value indicator",
     },
     // ---- Rows where the two legitimately disagree. -----------------------------
     Verdict {
         yaml: b"a: 1\n \tb: 2\n",
         loader: false,
-        validator: true,
+        validator: Validator::RejectsTheTab,
         why: "the loader folds the line into the preceding plain scalar before the \
               dispatcher sees it (parser.rs, the `start_indent == 0` continuation \
               arm), yielding {\"a\":\"1 b\"} — a separate defect #173 does not reach",
@@ -131,7 +180,7 @@ const VERDICTS: &[Verdict] = &[
     Verdict {
         yaml: b"a: |\n    x\n  \tb: c\n",
         loader: true,
-        validator: false,
+        validator: Validator::Accepts,
         why: "indent 2 < the block's content indent 4, so the scalar ends and the \
               tab really is indentation; the validator's block-scalar body check \
               measures against the parent indent and skips the line",
@@ -147,7 +196,7 @@ fn loader_and_validator_agree_on_tab_indentation() {
     for v in VERDICTS {
         let text = String::from_utf8_lossy(v.yaml);
         let loader = loader_reports_tab_indentation(v.yaml);
-        let validator = validator_rejects(v.yaml);
+        let validator = validator_verdict(v.yaml);
         if loader != v.loader {
             wrong.push(format!(
                 "  {text:?}: loader should {} — {}",
@@ -161,9 +210,8 @@ fn loader_and_validator_agree_on_tab_indentation() {
         }
         if validator != v.validator {
             wrong.push(format!(
-                "  {text:?}: validator should {} — {}",
-                if v.validator { "reject" } else { "accept" },
-                v.why
+                "  {text:?}: validator {validator:?}, expected {:?} — {}",
+                v.validator, v.why
             ));
         }
     }
@@ -194,6 +242,22 @@ fn a_tab_used_as_separation_still_produces_its_value() {
     assert_eq!(
         to_json(b"a: |\n  x\n  \tb: c\n").unwrap(),
         r#"{"a":"x\n\tb: c\n"}"#
+    );
+
+    // A tab before a comment is separation, and the comment is dropped.
+    assert_eq!(
+        to_json(b"a: 1\n \t# c: d\nb: 2\n").unwrap(),
+        r#"{"a":1,"b":2}"#
+    );
+
+    // A quoted scalar after the tab. Spec-correct is {"a":"x: y"}; the loader instead
+    // reads the line as a mapping, the same continuation-line folding gap that leaves
+    // DK95/00 above with its tab. #173 is about the tab *verdict* — this now loads
+    // instead of erroring, which is the part that changed — so the wrong value is
+    // pinned rather than hidden, and fixing the folding is a deliberate edit here.
+    assert_eq!(
+        to_json(b"a:\n \t\"x: y\"\n").unwrap(),
+        r#"{"a":{"\t\"x":"y\""}}"#
     );
 }
 
