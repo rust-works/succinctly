@@ -21,7 +21,7 @@ use crate::yaml_generators;
 /// Derived from `yaml_generators::ALL_PATTERNS` rather than duplicated, so a
 /// pattern added to the suite is benchmarked by `--patterns all` and appears in
 /// the markdown tables without a second edit (#327).
-fn pattern_names() -> Vec<String> {
+pub fn pattern_names() -> Vec<String> {
     let mut names: Vec<String> = yaml_generators::ALL_PATTERNS
         .iter()
         .map(|(name, _, _)| (*name).to_string())

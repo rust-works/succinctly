@@ -1536,14 +1536,10 @@ fn run_jq_benchmark(args: BenchJqArgs) -> Result<()> {
 
 /// Run yq benchmark
 fn run_yq_benchmark(args: BenchYqArgs) -> Result<()> {
-    // Derived from the single source of truth rather than duplicated, so a
+    // Reuse the benchmark module's own derivation rather than repeating it, so a
     // pattern added to the suite is covered by `--patterns all` without a second
     // edit here (#327).
-    let mut all_patterns: Vec<String> = yaml_generators::ALL_PATTERNS
-        .iter()
-        .map(|(name, _, _)| (*name).to_string())
-        .collect();
-    all_patterns.sort_unstable();
+    let all_patterns = yq_bench::pattern_names();
     let all_sizes = vec!["1kb", "10kb", "100kb", "1mb", "10mb", "100mb"];
 
     let patterns = if args.patterns == "all" {
