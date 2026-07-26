@@ -39,16 +39,23 @@ Required. Must be one of:
 
 ## Scopes
 
-Required. Use scopes defined in `.omni-dev/scopes.yaml`:
+Required. `.omni-dev/scopes.yaml` is authoritative; this list mirrors it and must
+be updated alongside it:
 
-- `ci` - CI/CD pipelines and GitHub Actions workflows
-- `claude` - AI client implementation and integration
-- `cli` - Command-line interface and argument parsing
-- `git` - Git operations and repository analysis
-- `data` - Data structures and serialization
-- `docs` - Documentation and planning
-- `api` - External API integrations
-- `workflows` - GitHub Actions workflow files
+- `bitvec` - Bitvector data structure and rank/select operations
+- `bp` - Balanced parentheses tree navigation
+- `json` - JSON semi-indexing and parsing
+- `yaml` - YAML semi-indexing and parsing
+- `jq` - jq query language parser and evaluator
+- `simd` - SIMD optimizations (x86, AVX2, NEON)
+- `cli` - Command-line interface tool
+- `bench` - Benchmarks and performance testing
+- `test` - Test suite and property tests
+- `docs` - Documentation and optimization notes
+- `ci` - CI/CD pipelines and GitHub Actions
+- `build` - Build configuration and feature flags
+- `scripts` - Developer and repository maintenance shell scripts
+- `core` - Core utilities (broadword, tables, binary ops)
 
 ## Subject Line
 

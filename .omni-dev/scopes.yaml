@@ -47,6 +47,10 @@ scopes:
     description: "Build configuration and feature flags"
     examples: ["build: add mmap-tests feature", "build: update dependencies"]
     file_patterns: ["Cargo.toml", "Cargo.lock", "build.rs"]
+  - name: "scripts"
+    description: "Developer and repository maintenance shell scripts"
+    examples: ["scripts: add merge queue toggle scripts", "scripts: fix yq golden sync"]
+    file_patterns: ["scripts/**"]
   - name: "core"
     description: "Core utilities (broadword, tables, binary ops)"
     examples: ["core: optimize broadword select", "core: add lookup table"]
