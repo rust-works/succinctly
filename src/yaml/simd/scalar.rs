@@ -1,5 +1,11 @@
 //! Scalar kernels shared by every YAML SIMD backend.
 //!
+//! "Scalar" here means *non-vector*, as it does in the `scalar-yaml` feature and
+//! in `mod.rs`'s `find_newline_scalar` / `count_leading_spaces_scalar` — not a
+//! YAML scalar node. For the latter see `crate::yaml::scalar` (not an intra-doc
+//! link: it is a private module), which resolves a plain scalar's type against
+//! the 1.2 core schema and is unrelated to this one despite the shared word.
+//!
 //! These are not "the no-SIMD fallback" — each vector kernel calls them to
 //! finish the sub-chunk remainder its vector loop cannot cover, so they run on
 //! every target. They also stand in as the whole implementation on platforms
