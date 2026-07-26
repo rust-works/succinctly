@@ -6507,6 +6507,11 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Pipe(exprs.to_vec())
     };
 
+    // Deliberately not `eval_owned_expr`: that returns a single `OwnedValue` and
+    // folds a multi-output rest-of-pipe into `OwnedValue::Array`, so `.a[]` after
+    // an owned stage answered `[1,2]` instead of `1` then `2`.
+    // `reduce`/`foreach`/path-tracking still want that single-value collapse, so
+    // only the pipe continuation is widened here.
     eval_owned_input::<W, S>(&rest_expr, &value, optional)
 }
 
@@ -17765,6 +17770,21 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn test_multi_output_preserved_across_owned_pipe() {
+        // Once a pipe stage produces an owned value, the rest of the pipe is
+        // re-evaluated against it. That continuation used to be squeezed through
+        // a single-`OwnedValue` signature, which folded a multi-output rest into
+        // one array -- `.a[]` below answered `[1,2]` instead of `1` then `2`.
+        assert_eq!(outputs(b"null", "{a:[1,2]} | .a[]"), ["1", "2"]);
+        assert_eq!(outputs(b"null", "{a:[1,2]} | .a | .[]"), ["1", "2"]);
+        assert_eq!(outputs(b"null", "{a:[1,2]} | .a[] | . + 1"), ["2", "3"]);
+
+        // Single-output and empty continuations are unaffected.
+        assert_eq!(outputs(b"null", "{a:[1,2]} | .a"), ["[1,2]"]);
+        assert_eq!(outputs(b"null", "{a:[]} | .a[]"), Vec::<String>::new());
     }
 
     #[test]
