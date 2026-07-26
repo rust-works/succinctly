@@ -8313,25 +8313,34 @@ mod tests {
     // Sequence-entry indicator (`- `) classification — #332
     // ========================================================================
 
+    /// Cursor at the first document. The root is always the implicit document
+    /// sequence, so this is the node a `yq` filter of `.` actually sees.
+    #[track_caller]
+    fn first_doc_cursor<'a, W: AsRef<[u64]>>(
+        index: &'a YamlIndex<W>,
+        yaml: &'a [u8],
+    ) -> YamlCursor<'a, W> {
+        let YamlValue::Sequence(docs) = index.root(yaml).value() else {
+            panic!("root is always the document sequence");
+        };
+        let (cursor, _rest) = docs.uncons_cursor().expect("one document");
+        cursor
+    }
+
     /// JSON for the first document, asserting the buffered (`to_json`) and streaming
     /// (`stream_json`, what `yq -o json -I0` takes) emitters agree.
     #[track_caller]
     fn first_doc_json(yaml: &[u8]) -> String {
         let index = YamlIndex::build(yaml).expect("builds");
-        let root = index.root(yaml);
-        let YamlValue::Sequence(elements) = root.value() else {
-            panic!("expected root document sequence");
-        };
-        let (cursor, _rest) = elements.uncons_cursor().expect("one document");
+        let cursor = first_doc_cursor(&index, yaml);
 
         let buffered = cursor.to_json();
         let mut streamed = String::new();
         cursor.stream_json(&mut streamed).expect("streams");
+        let what = String::from_utf8_lossy(yaml);
         assert_eq!(
-            buffered,
-            streamed,
-            "buffered and streaming JSON differ for {}",
-            String::from_utf8_lossy(yaml)
+            buffered, streamed,
+            "buffered and streaming JSON differ for {what}"
         );
         buffered
     }
@@ -8386,6 +8395,19 @@ mod tests {
         assert_eq!(first_doc_json(b"- &a - x\n"), r#"[["x"]]"#);
     }
 
+    /// The empty-key arms of `parse_explicit_flow_mapping_entry`. #332 split what was
+    /// one shared `set_bp_text_end(key_end)` into a call per arm so the nested-container
+    /// arms could opt out; these two keep recording an end equal to the key's own start,
+    /// which decodes as the empty key `""`.
+    #[test]
+    fn test_explicit_flow_key_with_no_key_is_empty() {
+        // `?` then the value indicator — the `Some(b':')` arm
+        assert_eq!(first_doc_json(b"[? : v]\n"), r#"[{"":"v"}]"#);
+        // `?` then a terminator — the `Some(b',' | b']' | b'}')` arm
+        assert_eq!(first_doc_json(b"[? , a]\n"), r#"[{"":null},"a"]"#);
+        assert_eq!(first_doc_json(b"[? ]\n"), r#"[{"":null}]"#);
+    }
+
     /// Ordinary block sequence items still unwrap to their content — the hot path
     /// the discriminator must not disturb.
     #[test]
@@ -8416,11 +8438,7 @@ mod tests {
         ];
         for yaml in inputs {
             let index = YamlIndex::build(yaml).expect("builds");
-            let root = index.root(yaml);
-            let YamlValue::Sequence(docs) = root.value() else {
-                panic!("expected document sequence");
-            };
-            let (doc, _) = docs.uncons_cursor().expect("one document");
+            let doc = first_doc_cursor(&index, yaml);
             // Only sequence documents have elements to compare.
             let YamlValue::Sequence(elements) = doc.value() else {
                 continue;
@@ -8448,22 +8466,15 @@ mod tests {
                 })
                 .collect();
 
+            let what = String::from_utf8_lossy(yaml);
             assert_eq!(
-                via_uncons,
-                via_uncons_cursor,
-                "uncons and uncons_cursor disagree on {}",
-                String::from_utf8_lossy(yaml)
+                via_uncons, via_uncons_cursor,
+                "uncons vs uncons_cursor: {what}"
             );
-            assert_eq!(
-                via_uncons,
-                via_get,
-                "uncons and get disagree on {}",
-                String::from_utf8_lossy(yaml)
-            );
+            assert_eq!(via_uncons, via_get, "uncons vs get: {what}");
             assert!(
                 elements.get(via_uncons.len()).is_none(),
-                "get past the end returned a value for {}",
-                String::from_utf8_lossy(yaml)
+                "get past the end returned a value for {what}"
             );
         }
     }
@@ -8482,14 +8493,15 @@ mod tests {
             let root = index.root(yaml);
             let mut out = String::new();
             root.stream_yaml_document(&mut out, 2).expect("streams");
-            assert_eq!(out, expected, "for {}", String::from_utf8_lossy(yaml));
+            let what = String::from_utf8_lossy(yaml);
+            assert_eq!(out, expected, "for {what}");
 
             // And the emitted YAML must read back as the same value.
+            let round_tripped = first_doc_json(out.as_bytes());
             assert_eq!(
-                first_doc_json(out.as_bytes()),
+                round_tripped,
                 first_doc_json(yaml),
-                "round-trip changed the value of {}",
-                String::from_utf8_lossy(yaml)
+                "round-trip changed {what}"
             );
         }
     }
