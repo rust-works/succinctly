@@ -22,6 +22,7 @@ use super::advance_positions::{build_cumulative_rank, OpenPositions};
 use super::end_positions::EndPositions;
 use super::error::YamlError;
 use super::light::YamlCursor;
+use super::line_break::line_break_len;
 use super::parser::build_semi_index;
 
 /// Index structures for navigating YAML.
@@ -97,30 +98,16 @@ fn build_newline_index(text: &[u8]) -> crate::bits::BitVec {
     let mut i = 0;
 
     while i < text.len() {
-        match text[i] {
-            b'\n' => {
-                // LF: next byte starts a new line
-                let next = i + 1;
-                if next < text.len() {
-                    bits[next / 64] |= 1 << (next % 64);
-                }
-                i += 1;
-            }
-            b'\r' => {
-                // CR: check for CRLF
-                let next = if i + 1 < text.len() && text[i + 1] == b'\n' {
-                    // CRLF: skip both, new line starts after \n
-                    i + 2
-                } else {
-                    // Standalone CR (classic Mac): new line starts after \r
-                    i + 1
-                };
-                if next < text.len() {
-                    bits[next / 64] |= 1 << (next % 64);
-                }
-                i = next;
-            }
-            _ => i += 1,
+        // A new line starts at the byte after the break — one past a lone `\r`
+        // or `\n`, two past a `\r\n`, which is a single break.
+        let break_len = line_break_len(text, i);
+        if break_len == 0 {
+            i += 1;
+            continue;
+        }
+        i += break_len;
+        if i < text.len() {
+            bits[i / 64] |= 1 << (i % 64);
         }
     }
 

@@ -33,6 +33,7 @@ use alloc::{
 use std::collections::BTreeMap;
 
 use super::error::YamlError;
+use super::line_break::{is_line_break, line_break_len};
 use super::simd;
 
 /// Node type in the YAML structure tree.
@@ -365,49 +366,24 @@ impl<'a> Parser<'a> {
     /// Only called on error paths, so we pay the cost only when needed.
     #[inline]
     fn current_line(&self) -> usize {
-        // Count line breaks from start to current position. A CRLF is one
-        // break, so a `\r` only counts when it is not part of one (#324).
+        // Count line breaks from start to current position, by counting the
+        // bytes each break *ends* at: a break of width 1 ends where it starts,
+        // so a CRLF — width 2 at its `\r` — is counted once, at its `\n` (#324).
         //
-        // The lookahead reads `self.input`, not the truncated prefix: when the
-        // cursor sits on the LF of a CRLF, that CR's partner is one byte past
-        // the prefix, and checking the prefix would read it as a lone CR and
-        // report a line too many.
-        let breaks = self.input[..self.pos]
-            .iter()
-            .enumerate()
-            .filter(|&(i, &b)| b == b'\n' || (b == b'\r' && self.input.get(i + 1) != Some(&b'\n')))
+        // `line_break_len` reads `self.input`, not the truncated prefix: when
+        // the cursor sits on the LF of a CRLF, that CR's partner is one byte
+        // past the prefix, and measuring within the prefix would read it as a
+        // lone CR and report a line too many.
+        let breaks = (0..self.pos)
+            .filter(|&i| line_break_len(self.input, i) == 1)
             .count();
         breaks + 1
-    }
-
-    /// Is `b` a YAML line break? Per YAML 1.2 §5.4 that is `\n` or `\r`;
-    /// `\r\n` is the two-byte spelling of a single break (#324).
-    #[inline]
-    fn is_break(b: u8) -> bool {
-        matches!(b, b'\n' | b'\r')
-    }
-
-    /// Width in bytes of the line break at `pos`: 2 for `\r\n`, 1 for a lone
-    /// `\r` or `\n`, 0 if `pos` is not at a break.
-    #[inline]
-    fn break_len_at(&self, pos: usize) -> usize {
-        match self.input.get(pos) {
-            Some(b'\r') => {
-                if self.input.get(pos + 1) == Some(&b'\n') {
-                    2
-                } else {
-                    1
-                }
-            }
-            Some(b'\n') => 1,
-            _ => 0,
-        }
     }
 
     /// Is the current position at a line break?
     #[inline]
     fn at_break(&self) -> bool {
-        self.peek().is_some_and(Self::is_break)
+        self.peek().is_some_and(is_line_break)
     }
 
     /// Does `next` terminate a `-` sequence indicator? That is whitespace, a
@@ -419,11 +395,15 @@ impl<'a> Parser<'a> {
 
     /// Consume the line break at the current position, if any.
     ///
-    /// Dispatches on the byte rather than going through `break_len_at`, so the
-    /// overwhelmingly common LF case costs one bounds-checked load and an
-    /// increment — exactly what the `if peek() == Some(b'\n') { advance() }` it
-    /// replaced cost. Routing it through `advance_by(break_len_at(..))` instead
-    /// doubled the bounds checks on a per-line path.
+    /// The one deliberate restatement of [`line_break_len`]. Dispatching on the
+    /// byte keeps the overwhelmingly common LF case at one bounds-checked load
+    /// and an increment — exactly what the `if peek() == Some(b'\n') { advance() }`
+    /// it replaced cost. Routing it through `advance_by(line_break_len(..))`
+    /// instead doubled the bounds checks on a per-line path.
+    ///
+    /// Because it is a copy, it is pinned to the shared definition by
+    /// `skip_line_break_agrees_with_line_break_len` rather than by the compiler
+    /// (#341). Change one and that test fails.
     #[inline]
     fn skip_line_break(&mut self) {
         match self.input.get(self.pos) {
@@ -581,7 +561,7 @@ impl<'a> Parser<'a> {
     fn current_column(&self) -> usize {
         // Find the start of the current line
         let mut line_start = self.pos;
-        while line_start > 0 && !Self::is_break(self.input[line_start - 1]) {
+        while line_start > 0 && !is_line_break(self.input[line_start - 1]) {
             line_start -= 1;
         }
         self.pos - line_start
@@ -636,7 +616,7 @@ impl<'a> Parser<'a> {
                     break;
                 } else if self.input[i] == b'\\' && quote == b'"' {
                     i += 2; // Skip escape sequence in double-quoted
-                } else if Self::is_break(self.input[i]) {
+                } else if is_line_break(self.input[i]) {
                     return false; // Unclosed quote
                 } else {
                     i += 1;
@@ -709,7 +689,7 @@ impl<'a> Parser<'a> {
     /// callers can consume it with `skip_line_break` (#324).
     #[inline]
     fn skip_to_eol(&mut self) {
-        while self.pos < self.input.len() && !Self::is_break(self.input[self.pos]) {
+        while self.pos < self.input.len() && !is_line_break(self.input[self.pos]) {
             self.pos += 1;
         }
     }
@@ -717,7 +697,7 @@ impl<'a> Parser<'a> {
     /// Skip newline and empty/comment lines.
     fn skip_newlines(&mut self) {
         while let Some(b) = self.peek() {
-            if Self::is_break(b) {
+            if is_line_break(b) {
                 self.skip_line_break();
             } else if b == b'#' {
                 // Comment line
@@ -1055,7 +1035,7 @@ impl<'a> Parser<'a> {
             }
 
             // Look ahead to see if next line is a continuation
-            let mut lookahead = self.pos + self.break_len_at(self.pos); // Skip the line break
+            let mut lookahead = self.pos + line_break_len(self.input, self.pos); // Skip the line break
             let mut next_indent = 0;
 
             // Count indentation on next line (only spaces count as indent in YAML)
@@ -1081,7 +1061,7 @@ impl<'a> Parser<'a> {
                 {
                     check_pos += 1;
                 }
-                if check_pos >= self.input.len() || Self::is_break(self.input[check_pos]) {
+                if check_pos >= self.input.len() || is_line_break(self.input[check_pos]) {
                     // Empty line - skip it and continue
                     self.skip_line_break(); // Skip the current line break
                                             // Skip to end of empty line
@@ -2765,14 +2745,8 @@ impl<'a> Parser<'a> {
                 b':' | b',' | b'}' | b']' => break,
                 b'\n' | b'\r' => {
                     // Multiline key - check if next line continues the key
-                    let mut lookahead = self.pos;
-                    // Skip newline
-                    if lookahead < self.input.len() && self.input[lookahead] == b'\r' {
-                        lookahead += 1;
-                    }
-                    if lookahead < self.input.len() && self.input[lookahead] == b'\n' {
-                        lookahead += 1;
-                    }
+                    // Skip the line break (CRLF counts as the one break it is)
+                    let mut lookahead = self.pos + line_break_len(self.input, self.pos);
                     // Skip leading whitespace on next line
                     while lookahead < self.input.len()
                         && matches!(self.input[lookahead], b' ' | b'\t')
@@ -2895,14 +2869,8 @@ impl<'a> Parser<'a> {
                 }
                 b'\n' | b'\r' => {
                     // Multiline value - check if next line continues the value
-                    let mut lookahead = self.pos;
-                    // Skip newline
-                    if lookahead < self.input.len() && self.input[lookahead] == b'\r' {
-                        lookahead += 1;
-                    }
-                    if lookahead < self.input.len() && self.input[lookahead] == b'\n' {
-                        lookahead += 1;
-                    }
+                    // Skip the line break (CRLF counts as the one break it is)
+                    let mut lookahead = self.pos + line_break_len(self.input, self.pos);
                     // Skip leading whitespace on next line
                     while lookahead < self.input.len()
                         && matches!(self.input[lookahead], b' ' | b'\t')
@@ -2979,14 +2947,8 @@ impl<'a> Parser<'a> {
                 }
                 b'\n' | b'\r' => {
                     // Multiline key - check if next line continues the key
-                    let mut lookahead = self.pos;
-                    // Skip newline
-                    if lookahead < self.input.len() && self.input[lookahead] == b'\r' {
-                        lookahead += 1;
-                    }
-                    if lookahead < self.input.len() && self.input[lookahead] == b'\n' {
-                        lookahead += 1;
-                    }
+                    // Skip the line break (CRLF counts as the one break it is)
+                    let mut lookahead = self.pos + line_break_len(self.input, self.pos);
                     // Skip leading whitespace on next line
                     while lookahead < self.input.len()
                         && matches!(self.input[lookahead], b' ' | b'\t')
@@ -3232,7 +3194,7 @@ impl<'a> Parser<'a> {
                 // Include one trailing line break if there was content — two
                 // bytes wide when that break is a CRLF (#324)
                 if last_content_end > 0 && trailing_newline_start > last_content_end {
-                    last_content_end + self.break_len_at(last_content_end)
+                    last_content_end + line_break_len(self.input, last_content_end)
                 } else {
                     last_content_end
                 }
@@ -4335,32 +4297,35 @@ mod tests {
             "nesting depth exceeds limit of 128 at offset 131"
         );
     }
-    /// The oracle's line-break primitives (#324). `break_len_at` is what tells
-    /// every caller that a CRLF is *one* break two bytes wide; getting it wrong
-    /// leaves a stray `\r` inside the preceding token, which is the whole bug.
+    /// The #106 guard: `skip_line_break` is the one place in the crate that
+    /// restates [`line_break_len`] instead of calling it, for the measured
+    /// reason on its doc comment. A restated predicate diverges silently, so
+    /// pin the two together over every break form and every position — the
+    /// widths must agree byte for byte.
     #[test]
-    fn line_break_primitives_measure_each_form() {
-        let parser = Parser::new(b"a\r\nb\rc\nd");
-        //                        0 1 2 3 4 5 6 7
-        assert_eq!(parser.break_len_at(1), 2, "CRLF at 1");
-        assert_eq!(
-            parser.break_len_at(2),
-            1,
-            "the LF of a CRLF, measured alone"
-        );
-        assert_eq!(parser.break_len_at(4), 1, "lone CR at 4");
-        assert_eq!(parser.break_len_at(6), 1, "LF at 6");
-        assert_eq!(parser.break_len_at(0), 0, "`a` is not a break");
-        assert_eq!(parser.break_len_at(99), 0, "past end of input");
-
-        // A CR at end of input has no LF to pair with.
-        assert_eq!(Parser::new(b"a\r").break_len_at(1), 1);
-        assert_eq!(Parser::new(b"").break_len_at(0), 0);
-
-        assert!(Parser::is_break(b'\n'));
-        assert!(Parser::is_break(b'\r'));
-        assert!(!Parser::is_break(b'\t'));
-        assert!(!Parser::is_break(b' '));
+    fn skip_line_break_agrees_with_line_break_len() {
+        for input in [
+            b"a\r\nb\rc\nd".as_slice(),
+            b"\r\n",
+            b"\n\r",
+            b"\r\r\n",
+            b"\n\n",
+            b"a\r",
+            b"a\n",
+            b"x",
+            b"",
+        ] {
+            for pos in 0..=input.len() {
+                let mut parser = Parser::new(input);
+                parser.pos = pos;
+                parser.skip_line_break();
+                assert_eq!(
+                    parser.pos - pos,
+                    line_break_len(input, pos),
+                    "{input:?} @ {pos}: skip_line_break and line_break_len disagree"
+                );
+            }
+        }
     }
 
     /// `skip_line_break` consumes exactly one break, never half of a CRLF and
