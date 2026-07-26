@@ -175,7 +175,7 @@ const VERDICTS: &[Verdict] = &[
         validator: Validator::RejectsTheTab,
         why: "the loader folds the line into the preceding plain scalar before the \
               dispatcher sees it (parser.rs, the `start_indent == 0` continuation \
-              arm), yielding {\"a\":\"1 b\"} — a separate defect #173 does not reach",
+              arm), yielding {\"a\":\"1 b\"} — that is #371, which #173 does not reach",
     },
     Verdict {
         yaml: b"a: |\n    x\n  \tb: c\n",
@@ -252,9 +252,10 @@ fn a_tab_used_as_separation_still_produces_its_value() {
 
     // A quoted scalar after the tab. Spec-correct is {"a":"x: y"}; the loader instead
     // reads the line as a mapping, the same continuation-line folding gap that leaves
-    // DK95/00 above with its tab. #173 is about the tab *verdict* — this now loads
-    // instead of erroring, which is the part that changed — so the wrong value is
-    // pinned rather than hidden, and fixing the folding is a deliberate edit here.
+    // DK95/00 above with its tab — that is #381. #173 is about the tab *verdict* —
+    // this now loads instead of erroring, which is the part that changed — so the
+    // wrong value is pinned rather than hidden, and fixing #381 is a deliberate edit
+    // to this line and to the DK95/00 one above.
     assert_eq!(
         to_json(b"a:\n \t\"x: y\"\n").unwrap(),
         r#"{"a":{"\t\"x":"y\""}}"#
