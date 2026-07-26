@@ -168,7 +168,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             return YamlValue::Null;
         }
 
-        // Check for sequence item wrapper (non-container node starting with "- ").
+        // Check for sequence item wrapper (non-container node starting with `-`).
         // Sequence items delegate to their first child's value. Uses the
         // already-computed text_pos to avoid redundant lookups.
         if starts_seq_entry(self.text, text_pos) {
@@ -5364,6 +5364,167 @@ mod tests {
                 assert!(!fields.is_empty());
             }
             other => panic!("expected mapping, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // #106 / #337: the seq-item predicate has exactly one definition
+    // -----------------------------------------------------------------------
+
+    /// `starts_seq_entry` accepts a `-` followed by whitespace, a break, or end
+    /// of input — and nothing else.
+    ///
+    /// The narrow copies it replaced accepted only `- ` and `-\t`, which is what
+    /// sent a bare `-` down a second position lookup (#337).
+    #[test]
+    fn seq_item_predicate_accepts_every_item_spelling() {
+        for (text, expected, why) in [
+            (&b"- x"[..], true, "dash space"),
+            (&b"-\tx"[..], true, "dash tab"),
+            (&b"-\n"[..], true, "bare dash, LF — the #337 shape"),
+            (&b"-\r\n"[..], true, "bare dash, CRLF"),
+            (&b"-\r"[..], true, "bare dash, lone CR"),
+            (&b"-"[..], true, "dash at end of input (#106)"),
+            (&b"-5"[..], false, "negative number, not an item"),
+            (&b"---"[..], false, "document marker, not an item"),
+            (&b"-a"[..], false, "plain scalar starting with a dash"),
+            (&b"x"[..], false, "not a dash at all"),
+        ] {
+            assert_eq!(
+                starts_seq_entry(text, 0),
+                expected,
+                "starts_seq_entry({:?}, 0): {why}",
+                core::str::from_utf8(text).unwrap()
+            );
+        }
+
+        // Out of bounds is not an item, however the tail rule reads.
+        assert!(!starts_seq_entry(b"- x", 3));
+        assert!(!starts_seq_entry(b"", 0));
+    }
+
+    /// Documents whose item spellings stress every branch of the predicate:
+    /// empty vs valued, dash-space vs bare dash, LF vs CRLF, a child on the
+    /// following line, a final item with no trailing break, flow elements that
+    /// are not wrappers at all, and a `-5` that only *looks* like an item.
+    const SEQ_ELEMENT_ROUTE_DOCS: &[&[u8]] = &[
+        b"-\n-\n-\n",
+        b"- \n- \n",
+        b"- a\n- b\n",
+        b"-\n- b\n-\n",
+        b"-\r\n-\r\n",
+        b"-\n  a: 1\n-\n  b: 2\n",
+        b"- a\n-",
+        b"- -5\n- -6\n",
+        b"[1, 2, 3]\n",
+        b"- [1, 2]\n- {a: 1}\n",
+        b"-\n- [1]\n- x\n",
+    ];
+
+    /// Every route from a sequence element to its value must agree — `uncons`,
+    /// `uncons_cursor`, `get`, and the cursor-level `value()`.
+    ///
+    /// These were five hand-copied predicates and three had drifted, which cost
+    /// a redundant lookup per element and made whole-document reads quadratic
+    /// (#337). Divergence is silent by nature, so it needs a test that compares
+    /// the call sites against each other rather than against a fixed answer.
+    ///
+    /// Note the cursor assertion is the load-bearing one, and that
+    /// [`test_sequence_element_accessors_agree`] cannot stand in for it: that
+    /// test compares *values*, and values cannot see this divergence, because
+    /// `value()` unwraps wrappers on its own. A route that hands back the
+    /// wrapper instead of the child still *reads* correctly — it just pays for
+    /// the unwrap twice. Comparing `bp_position()` is what pins the routes
+    /// together.
+    ///
+    /// The expectation tracks `starts_inline_seq_entry`, not the wider
+    /// `starts_seq_entry` that `value()` applies: `uncons_cursor` deliberately
+    /// leaves a bare `-` pointed at the wrapper, because `corpus_stats` and
+    /// `is_yaml_cursor_container` read that cursor positionally.
+    #[test]
+    fn every_sequence_element_route_agrees() {
+        for doc in SEQ_ELEMENT_ROUTE_DOCS {
+            let shown = String::from_utf8_lossy(doc).replace('\n', "\\n");
+            let index = YamlIndex::build(doc).unwrap();
+
+            let YamlValue::Sequence(elements) = first_doc(index.root(doc)) else {
+                panic!("expected a sequence for {shown:?}");
+            };
+            let seq_cursor = elements.element_cursor.expect("non-empty sequence");
+
+            let mut rest = elements;
+            let mut raw = Some(seq_cursor);
+            let mut i = 0usize;
+            while let Some((value, next)) = rest.uncons() {
+                let element = raw.expect("raw walk keeps pace with uncons");
+                let (cursor, _) = rest.uncons_cursor().expect("uncons_cursor in range");
+
+                // The node each route should land on, from the shared predicate.
+                let expected_cursor = match element.text_position() {
+                    Some(text_pos)
+                        if !element.is_container() && starts_inline_seq_entry(doc, text_pos) =>
+                    {
+                        element.first_child().unwrap_or(element)
+                    }
+                    _ => element,
+                };
+                assert_eq!(
+                    cursor.bp_position(),
+                    expected_cursor.bp_position(),
+                    "{shown:?} element {i}: uncons_cursor landed on a different node \
+                     than the shared predicate selects"
+                );
+
+                let expected = format!("{value:?}");
+                assert_eq!(
+                    format!("{:?}", elements.get(i).expect("get(i) in range")),
+                    expected,
+                    "{shown:?} element {i}: get disagrees with uncons"
+                );
+                assert_eq!(
+                    format!("{:?}", cursor.value()),
+                    expected,
+                    "{shown:?} element {i}: uncons_cursor().value() disagrees with uncons"
+                );
+
+                raw = element.next_sibling();
+                rest = next;
+                i += 1;
+            }
+            assert!(i > 0, "{shown:?} produced no elements");
+        }
+    }
+
+    /// `YamlIndex::is_seq_item` must classify a node exactly as the shared
+    /// predicate does, for every node in the index — not just the ones a
+    /// particular traversal happens to visit.
+    #[test]
+    fn index_seq_item_flag_matches_shared_predicate() {
+        for doc in SEQ_ELEMENT_ROUTE_DOCS {
+            let shown = String::from_utf8_lossy(doc).replace('\n', "\\n");
+            let index = YamlIndex::build(doc).unwrap();
+            let bp_len = index.bp().len();
+
+            let mut flagged = 0usize;
+            for bp_pos in 0..bp_len {
+                if index.is_container(bp_pos) {
+                    continue;
+                }
+                let Some(text_pos) = index.bp_to_text_pos(bp_pos) else {
+                    continue;
+                };
+                let by_index = index.is_seq_item(doc, bp_pos);
+                assert_eq!(
+                    by_index,
+                    starts_seq_entry(doc, text_pos),
+                    "{shown:?} bp {bp_pos}: is_seq_item disagrees with the shared predicate"
+                );
+                flagged += usize::from(by_index);
+            }
+            assert!(
+                flagged > 0 || doc.starts_with(b"["),
+                "{shown:?}: expected at least one item wrapper"
+            );
         }
     }
 
