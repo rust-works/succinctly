@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use std::string::ToString;
 
 use super::index::YamlIndex;
+use super::line_break::{is_line_break, line_break_len, line_break_len_before};
 use super::scalar::{could_be_null_or_bool, resolve_plain, ResolvedScalar};
 use crate::util::simd::escape::find_json_escape;
 
@@ -43,42 +44,6 @@ impl<W> Clone for YamlCursor<'_, W> {
 }
 
 impl<W> Copy for YamlCursor<'_, W> {}
-
-/// Is `b` a YAML line break? Per YAML 1.2 §5.4 that is `\n` or `\r`; `\r\n` is
-/// the two-byte spelling of a single break.
-///
-/// Scans that look only for `\n` run straight past a lone `\r`, which is how a
-/// classic-Mac document turned every block scalar into the empty string (#324).
-#[inline]
-fn is_line_break(b: u8) -> bool {
-    matches!(b, b'\n' | b'\r')
-}
-
-/// Width in bytes of the line break at `pos`: 2 for `\r\n`, 1 for a lone `\r`
-/// or `\n`, 0 if `pos` is not at a break.
-#[inline]
-fn line_break_len(text: &[u8], pos: usize) -> usize {
-    match text.get(pos) {
-        Some(b'\r') if text.get(pos + 1) == Some(&b'\n') => 2,
-        Some(b'\r' | b'\n') => 1,
-        _ => 0,
-    }
-}
-
-/// Width in bytes of the line break ending immediately *before* `pos`: 2 for
-/// `\r\n`, 1 for a lone `\r` or `\n`, 0 if `pos` is not preceded by one.
-///
-/// The mirror of [`line_break_len`], for backwards scans. Stepping back a fixed
-/// one byte lands in the middle of a CRLF, which leaves the `\r` attached to the
-/// previous line's text (#324).
-#[inline]
-fn line_break_len_before(text: &[u8], pos: usize) -> usize {
-    match pos.checked_sub(1).and_then(|i| text.get(i)) {
-        Some(b'\n') if pos >= 2 && text[pos - 2] == b'\r' => 2,
-        Some(b'\n' | b'\r') => 1,
-        _ => 0,
-    }
-}
 
 impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// Create a new cursor at the given BP position.
@@ -8161,60 +8126,17 @@ mod tests {
     }
 
     // ========================================================================
-    // Line-break helpers and the alternate-parse-path scanners (#324)
+    // The alternate-parse-path scanners (#324)
     //
     // The `#[allow(dead_code)]` STYLE-0005 helpers below are not on the current
     // parse path, so no integration test can reach them. They were still made
     // CR-aware, because a helper that silently keeps LF-only semantics is a
     // trap for whoever re-enables it. These tests pin that behaviour directly
     // so it cannot rot unnoticed.
+    //
+    // The line-break predicates they build on moved to `super::line_break` in
+    // #341 and are tested there.
     // ========================================================================
-
-    #[test]
-    fn line_break_len_measures_each_break_form() {
-        assert_eq!(
-            line_break_len(b"a\r\nb", 1),
-            2,
-            "CRLF is one two-byte break"
-        );
-        assert_eq!(line_break_len(b"a\rb", 1), 1, "lone CR");
-        assert_eq!(line_break_len(b"a\nb", 1), 1, "LF");
-        // A CR at end of input has no LF to pair with.
-        assert_eq!(line_break_len(b"a\r", 1), 1);
-        // Not at a break, and past the end, both measure zero.
-        assert_eq!(line_break_len(b"ab", 0), 0);
-        assert_eq!(line_break_len(b"a\n", 9), 0);
-        assert_eq!(line_break_len(b"", 0), 0);
-    }
-
-    #[test]
-    fn line_break_len_before_measures_backwards() {
-        // b"a\r\nb\rc\nd"
-        //   0 1 2 3 4 5 6 7
-        let text = b"a\r\nb\rc\nd";
-        assert_eq!(line_break_len_before(text, 3), 2, "CRLF ends before `b`");
-        assert_eq!(line_break_len_before(text, 2), 1, "just the CR of a CRLF");
-        assert_eq!(line_break_len_before(text, 5), 1, "lone CR ends before `c`");
-        assert_eq!(line_break_len_before(text, 7), 1, "LF ends before `d`");
-        assert_eq!(line_break_len_before(text, 1), 0, "`a` is not a break");
-        assert_eq!(
-            line_break_len_before(text, 0),
-            0,
-            "nothing before the start"
-        );
-        assert_eq!(line_break_len_before(b"", 0), 0);
-        // A bare LF at index 0 is a one-byte break with no CR in front of it.
-        assert_eq!(line_break_len_before(b"\nx", 1), 1);
-    }
-
-    #[test]
-    fn is_line_break_accepts_both_break_bytes() {
-        assert!(is_line_break(b'\n'));
-        assert!(is_line_break(b'\r'));
-        for b in [b' ', b'\t', b'a', 0x0b, 0x0c] {
-            assert!(!is_line_break(b), "{b:#04x} is not a YAML line break");
-        }
-    }
 
     /// Build an index and hand back the root cursor, for the private scanners
     /// below that need a `YamlCursor` but not a particular node.

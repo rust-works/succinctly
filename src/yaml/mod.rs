@@ -67,6 +67,7 @@ mod end_positions;
 mod error;
 mod index;
 mod light;
+mod line_break;
 mod locate;
 mod parser;
 mod scalar;
