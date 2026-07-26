@@ -574,35 +574,11 @@ impl<'a> Validator<'a> {
     /// is a structural node — a sequence item (`-` + whitespace) or a block
     /// mapping entry (a `: ` value indicator before end of line) — rather than a
     /// plain scalar. Used to decide whether a leading tab is illegal indentation.
+    ///
+    /// Delegates to the module-level definition the loader also consults, so the
+    /// two agree by construction rather than by review (#173).
     fn line_is_structural(&self) -> bool {
-        let mut i = self.offset;
-        while matches!(self.input.get(i), Some(b' ' | b'\t')) {
-            i += 1;
-        }
-        // Sequence item: `-` followed by whitespace or end of line.
-        if self.input.get(i) == Some(&b'-')
-            && matches!(
-                self.input.get(i + 1),
-                None | Some(b' ' | b'\t' | b'\n' | b'\r')
-            )
-        {
-            return true;
-        }
-        // Mapping entry: a `:` value indicator somewhere on the line.
-        while let Some(&b) = self.input.get(i) {
-            match b {
-                b'\n' | b'\r' => return false,
-                b':' if matches!(
-                    self.input.get(i + 1),
-                    None | Some(b' ' | b'\t' | b'\n' | b'\r')
-                ) =>
-                {
-                    return true
-                }
-                _ => i += 1,
-            }
-        }
-        false
+        super::line_is_structural(self.input, self.offset)
     }
 
     /// True if the line begins with a block indicator (`-`/`?`/`:`) whose

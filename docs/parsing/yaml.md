@@ -660,8 +660,8 @@ This separation keeps the index small and fast. A higher-level `YamlValue` type 
 ### 8. Error Handling
 
 > **Superseded.** This section recorded an intent that was never implemented as described.
-> succinctly's default loader is **non-validating**: `YamlIndex::build` rejects only 11 of
-> the YAML Test Suite's 94 invalid documents (11.7%). The four `YamlError` variants that
+> succinctly's default loader is **non-validating**: `YamlIndex::build` rejects only 12 of
+> the YAML Test Suite's 94 invalid documents (12.8%). The four `YamlError` variants that
 > were never constructed — including `InvalidIndentation` — have since been removed (#223).
 > Strict rejection is instead provided by an **opt-in** validator
 > ([`src/yaml/validate.rs`](../../src/yaml/validate.rs), `succinctly yaml validate` /

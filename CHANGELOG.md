@@ -13,8 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass, exposed as `succinctly yaml validate [FILES]...` and `syq --validate`,
   that rejects invalid YAML. It mirrors `json validate` — a separate pass run
   before indexing, so the default non-validating loader path is unchanged and
-  pays nothing. It rejects 59 of the 83 previously-accepted-but-invalid YAML
-  Test Suite cases (reject conformance 11/94 → 70/94) with no false positives on
+  pays nothing. It rejects 58 of the 82 previously-accepted-but-invalid YAML
+  Test Suite cases (reject conformance 12/94 → 70/94) with no false positives on
   the valid corpus; the remaining structurally-deep cases stay on record.
 
 ### Removed
@@ -27,6 +27,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **YAML: a tab after spaces in indentation was folded into the key** (#173):
+  the loader rejected a tab only at column 0 and treated a tab following one or
+  more spaces as start-of-content, so `a:\n \tb: 1` loaded as
+  `{"a":{"\tb":1}}` rather than being refused. YAML forbids a tab in
+  indentation, but a tab is only *indentation* when block structure follows it —
+  before a plain scalar it is separation and legal (`foo:\n \tbar`, and Test
+  Suite case UV7Q, "Legal tab after indentation"). The strict validator already
+  drew that distinction, so the fix promotes its `line_is_structural` predicate
+  to the `yaml` module root and has both consult it, rather than adding a second
+  spelling of the rule. Loader-only reject conformance goes 11/94 → 12/94 (case
+  DK95/06, which the validator already caught); the combined figure stays 70/94.
+  Sharing the predicate also fixed two false positives on the validator side,
+  where the `:` scan read a `:` that was not a value indicator: a tab before a
+  *flow* node is now separation, so `\t{a: 1}` is accepted as `\t{}` already
+  was; and the scan now skips quoted scalars and comments, so `a:\n \t"x: y"`
+  and `a: 1\n \t# c: d` are accepted while `a:\n \t"b": 1` — a quoted *key*, so
+  really indentation — is still refused.
 - **jq `try/catch` discarded the raised error** (#158): the catch handler ran
   against the *original input* rather than the error value, so a handler could
   never see what went wrong — `try error("boom") catch .` gave `null` where jq
