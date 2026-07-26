@@ -76,7 +76,9 @@ pub use neon::build_index_simd;
 /// Build a DSV index using the fastest available SIMD implementation.
 ///
 /// Runtime dispatch order (fastest to slowest):
-/// 1. BMI2 + AVX2: Uses PDEP for quote masking (~10x faster)
+/// 1. BMI2 + AVX2: Uses PDEP for quote masking (~10x faster). Requires *fast*
+///    BMI2 — AMD Zen 1/2 expose the feature but run PDEP in ~18-cycle microcode,
+///    so they take the AVX2 arm instead (#182).
 /// 2. AVX2: Uses prefix_xor for quote masking
 /// 3. SSE2: Fallback for older CPUs
 #[cfg(all(target_arch = "x86_64", any(test, feature = "std")))]
@@ -119,10 +121,17 @@ pub fn build_index_simd(text: &[u8], config: &super::DsvConfig) -> super::DsvInd
 // selection in `mod.rs` is otherwise never exercised end-to-end, because every
 // runner reports the fastest backend and the fallbacks never run (#283).
 
+// `detect_bmi2` deliberately probes *fast* BMI2 rather than bare BMI2. AMD Zen
+// 1/2 report the feature but implement PDEP in microcode at ~18 cycles, so the
+// per-chunk `toggle64` deposit costs more there than the AVX2 prefix-xor chain
+// it is supposed to beat; those CPUs take the AVX2 arm instead (#182).
+// `has_fast_bmi2()` already caches its CPUID probe in an atomic and is used the
+// same way by `util::broadword`.
+
 #[cfg(all(target_arch = "x86_64", feature = "std", not(test)))]
 #[inline]
 fn detect_bmi2() -> bool {
-    is_x86_feature_detected!("bmi2")
+    crate::util::simd::x86::has_fast_bmi2()
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "std", not(test)))]
@@ -134,7 +143,7 @@ fn detect_avx2() -> bool {
 #[cfg(all(target_arch = "x86_64", test))]
 #[inline]
 fn detect_bmi2() -> bool {
-    is_x86_feature_detected!("bmi2") && !test_dispatch::is_disabled(test_dispatch::BMI2)
+    crate::util::simd::x86::has_fast_bmi2() && !test_dispatch::is_disabled(test_dispatch::BMI2)
 }
 
 #[cfg(all(target_arch = "x86_64", test))]
@@ -262,7 +271,10 @@ mod tests {
     fn dispatch_covers_x86_arms() {
         use super::test_dispatch::{mask, AVX2, BMI2};
 
-        let has_bmi2 = std::arch::is_x86_feature_detected!("bmi2");
+        // Matches the dispatcher's own gate: the top arm needs *fast* BMI2, so
+        // on a Zen 1/2 host it is unreachable and this labels the arms honestly
+        // rather than asserting "bmi2 arm" while AVX2 actually ran (#182).
+        let has_bmi2 = crate::util::simd::x86::has_fast_bmi2();
         let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
         let config = DsvConfig::default();
 
