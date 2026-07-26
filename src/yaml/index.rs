@@ -1069,10 +1069,13 @@ mod tests {
     }
 
     #[test]
-    fn test_build_allows_undefined_alias() {
-        // Forward/undefined aliases get no `aliases` entry, so validation
-        // skips them and they keep resolving to null at query time.
-        assert!(YamlIndex::build(b"bad: *undefined").is_ok());
+    fn test_build_rejects_undefined_alias() {
+        // #372: undefined and forward-referencing aliases used to get no
+        // `aliases` entry and resolve to null at query time. An alias must name
+        // a previous anchor, so the miss is now an error — the same treatment
+        // `test_build_rejects_alias_cycle` gives the other unresolvable alias.
+        assert!(YamlIndex::build(b"bad: *undefined").is_err());
+        assert!(YamlIndex::build(b"a: *x\nb: &x 5").is_err());
     }
 
     #[test]

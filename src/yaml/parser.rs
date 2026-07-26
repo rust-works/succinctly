@@ -1702,14 +1702,25 @@ impl<'a> Parser<'a> {
                 }
                 Some(b'*') => {
                     // Alias as key - parse alias name
+                    let alias_start = self.pos;
                     // Skip `*`
                     self.advance();
                     // Parse alias name (same rules as anchor names)
                     let alias_name = self.parse_anchor_name()?;
                     // Record the alias reference
                     // Look up the anchor's BP position
-                    if let Some(&target_bp_pos) = self.anchors.get(&alias_name) {
-                        self.aliases.insert(self.bp_pos - 1, target_bp_pos);
+                    match self.anchors.get(&alias_name) {
+                        Some(&target_bp_pos) => {
+                            self.aliases.insert(self.bp_pos - 1, target_bp_pos);
+                        }
+                        // #372, as in `parse_alias`: a miss here rendered the
+                        // key as the empty string rather than erroring.
+                        None => {
+                            return Err(YamlError::UnknownAnchor {
+                                offset: alias_start,
+                                name: alias_name,
+                            });
+                        }
                     }
                     self.pos
                 }
@@ -3471,6 +3482,9 @@ impl<'a> Parser<'a> {
         self.set_ib();
         self.write_bp_open();
 
+        // Offset of the `*`, so an unresolved alias can point at itself (#372).
+        let alias_start = self.pos;
+
         // Consume `*`
         self.advance();
 
@@ -3480,11 +3494,22 @@ impl<'a> Parser<'a> {
         // Resolve alias to anchor at parse time
         // This ensures we get the anchor definition that was active at this point
         let alias_bp_pos = self.bp_pos - 1;
-        if let Some(&target_bp_pos) = self.anchors.get(&name) {
-            self.aliases.insert(alias_bp_pos, target_bp_pos);
+        match self.anchors.get(&name) {
+            Some(&target_bp_pos) => {
+                self.aliases.insert(alias_bp_pos, target_bp_pos);
+            }
+            // #372: an unresolved alias used to be dropped on the floor, which
+            // left the node with nothing to resolve to and rendered it as
+            // `null`. An alias must name a *previous* anchor (YAML 1.2 §7.1),
+            // so a miss — forward reference or simply undefined — is invalid
+            // input, not a value.
+            None => {
+                return Err(YamlError::UnknownAnchor {
+                    offset: alias_start,
+                    name,
+                });
+            }
         }
-        // Note: If anchor not found, we don't record it.
-        // Forward references (alias before anchor) are not supported.
 
         // Close the alias node
         self.set_bp_text_end(self.pos);

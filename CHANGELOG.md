@@ -80,6 +80,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A `!` *inside* plain scalar content is untouched and remains ordinary text, as
   YAML requires — only a leading `!` is an indicator. Tag *support* is still
   #224; this only makes the two contexts fail the same way.
+- **YAML alias to an unknown anchor silently yielded `null`** (#372): an alias
+  naming an anchor not in scope — a forward reference, or one never defined —
+  was dropped rather than resolved, leaving the node to render as `null`. All
+  six positions an alias can appear in were affected (value, mapping key, flow
+  sequence, flow mapping value, block sequence item, and forward references).
+  YAML 1.2 §7.1 requires an alias to name a *previous* anchor, so this is
+  invalid input rather than a value; it is now refused, as a cyclic alias always
+  has been. Resolvable aliases are unchanged.
+
+  **Breaking**: adds a `YamlError::UnknownAnchor` variant, so exhaustive
+  `match`es on the public `YamlError` gain an arm.
+
 - **jq error-message value previews escaped C1 control characters** (#358):
   a preview built from `OwnedValue::to_json` escapes every
   `char::is_control()`, which includes U+0080–U+009F, so a string containing

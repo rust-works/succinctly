@@ -4938,7 +4938,7 @@ fn stream_yaml_single_quoted<Out: core::fmt::Write>(out: &mut Out, s: &str) -> c
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::yaml::YamlIndex;
+    use crate::yaml::{YamlError, YamlIndex};
 
     /// Helper to get the first document from the root document array.
     /// All YAML documents are wrapped in a virtual root sequence.
@@ -6593,34 +6593,47 @@ mod tests {
     }
 
     #[test]
-    fn test_undefined_alias() {
-        // Alias to undefined anchor - should still parse, but target is None
+    fn test_undefined_alias_is_rejected() {
+        // #372: this used to build successfully and leave the alias with
+        // `target: None`, which rendered as `null` — an invented value for
+        // input YAML 1.2 §7.1 calls invalid. It is now refused at build time,
+        // as a cyclic alias always has been.
         let yaml = b"bad: *undefined";
+        let err = YamlIndex::build(yaml).expect_err("undefined alias should not build");
+        assert!(
+            matches!(&err, YamlError::UnknownAnchor { name, .. } if name == "undefined"),
+            "expected UnknownAnchor naming the anchor, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_defined_alias_still_resolves() {
+        // The other side of #372: a *resolvable* alias must be untouched. This
+        // is the boundary the rejection above must not cross.
+        let yaml = b"good: &a 1\nref: *a";
         let index = YamlIndex::build(yaml).unwrap();
         let root = index.root(yaml);
 
-        if let YamlValue::Mapping(fields) = first_doc(root) {
-            for field in fields {
-                if let YamlValue::String(key) = field.key() {
-                    if key.as_str().unwrap() == "bad" {
-                        if let YamlValue::Alias {
-                            anchor_name,
-                            target,
-                        } = field.value()
-                        {
-                            assert_eq!(anchor_name, "undefined");
-                            // Target should be None because anchor doesn't exist
-                            assert!(target.is_none(), "undefined alias should not resolve");
-                            return;
-                        }
-                        panic!("expected alias for bad");
+        let YamlValue::Mapping(fields) = first_doc(root) else {
+            panic!("expected mapping");
+        };
+        for field in fields {
+            if let YamlValue::String(key) = field.key() {
+                if key.as_str().unwrap() == "ref" {
+                    if let YamlValue::Alias {
+                        anchor_name,
+                        target,
+                    } = field.value()
+                    {
+                        assert_eq!(anchor_name, "a");
+                        assert!(target.is_some(), "defined alias must resolve");
+                        return;
                     }
+                    panic!("expected alias for ref");
                 }
             }
-            panic!("did not find bad field");
-        } else {
-            panic!("expected mapping");
         }
+        panic!("did not find ref field");
     }
 
     #[test]

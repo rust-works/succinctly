@@ -84,6 +84,15 @@ pub enum YamlError {
         name: String,
     },
 
+    /// Alias referencing an anchor that is not in scope, including a forward
+    /// reference (YAML 1.2 §7.1 requires an alias to name a *previous* anchor).
+    UnknownAnchor {
+        /// Byte offset of the alias (`*name`)
+        offset: usize,
+        /// The referenced anchor name
+        name: String,
+    },
+
     /// Tag not supported.
     TagNotSupported {
         /// Byte offset of the `!`
@@ -189,6 +198,9 @@ impl fmt::Display for YamlError {
                     f,
                     "cyclic alias '{name}' at offset {offset} (anchor value contains itself)"
                 )
+            }
+            Self::UnknownAnchor { offset, name } => {
+                write!(f, "unknown anchor '{name}' referenced at offset {offset}")
             }
             Self::TagNotSupported { offset } => {
                 write!(f, "tags (!) not supported at offset {offset}")
