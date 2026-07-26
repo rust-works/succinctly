@@ -10,6 +10,7 @@ use succinctly::jq::escape::{
     write_json_body_yq, write_json_body_yq_ascii,
 };
 use succinctly::jq::OwnedValue;
+use succinctly::yaml::format_float_with_fraction;
 
 /// Exit codes matching jq behavior
 pub mod exit_codes {
@@ -185,13 +186,10 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
             } else {
                 match opts.float_style {
                     FloatStyle::Shortest => f.to_string(),
-                    FloatStyle::PreserveWholeFloat => {
-                        if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
-                            format!("{f:.1}") // Preserve decimal point for whole numbers
-                        } else {
-                            f.to_string()
-                        }
-                    }
+                    // Whole floats keep their decimal point at any magnitude;
+                    // the old `<= i64::MAX` guard silently dropped it above
+                    // that, disagreeing with the YAML writers (issue #169).
+                    FloatStyle::PreserveWholeFloat => format_float_with_fraction(*f),
                 }
             }
         }

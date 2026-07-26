@@ -14,7 +14,9 @@ use succinctly::jq::eval_generic::{eval_with_cursor_using, to_owned, GenericResu
 use succinctly::jq::{self, Builtin, Expr, OwnedValue, QueryResult, YqSemantics};
 use succinctly::json::light::StandardJson;
 use succinctly::json::JsonIndex;
-use succinctly::yaml::{resolve_plain, ResolvedScalar, YamlCursor, YamlIndex, YamlValue};
+use succinctly::yaml::{
+    format_float_with_fraction, resolve_plain, ResolvedScalar, YamlCursor, YamlIndex, YamlValue,
+};
 
 use super::{InputFormat, OutputFormat, YqCommand};
 use crate::output::{self, exit_codes, ColorScheme, ControlEscape, FloatStyle, JsonFormatOpts};
@@ -558,10 +560,8 @@ fn emit_yaml_value(
                 } else {
                     "-.inf".to_string()
                 }
-            } else if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
-                format!("{f:.1}")
             } else {
-                f.to_string()
+                format_float_with_fraction(*f)
             }
         }
         OwnedValue::NumberLiteral(..) => {
