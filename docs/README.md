@@ -109,6 +109,7 @@ Implementation plans for major features (all implemented).
 Specification compliance documentation:
 - [YAML 1.2](compliance/yaml/1.2.md) - type handling, Norway problem, booleans
 - [YAML Known Limitations](compliance/yaml/limitations.md) - YAML Test Suite conformance, unsupported features, why validation is opt-in
+- [jq Known Limitations](compliance/jq/limitations.md) - jq error-message conformance against pinned jq, and the behaviour gaps behind the rest
 
 ---
 
@@ -123,6 +124,7 @@ Specification compliance documentation:
 - **Configure an environment variable** -> [reference/environment-variables.md](reference/environment-variables.md)
 - **Understand YAML 1.2 type handling** -> [compliance/yaml/1.2.md](compliance/yaml/1.2.md)
 - **Know what the YAML parser does not support** -> [compliance/yaml/limitations.md](compliance/yaml/limitations.md)
+- **Know where jq error messages diverge** -> [compliance/jq/limitations.md](compliance/jq/limitations.md)
 - **Understand how JSON indexing works** -> [parsing/json.md](parsing/json.md)
 - **See YAML optimization journey** -> [parsing/yaml.md](parsing/yaml.md)
 - **Learn SIMD techniques** -> [optimizations/simd.md](optimizations/simd.md)

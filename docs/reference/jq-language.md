@@ -275,7 +275,7 @@ See [jq Remaining Work](../plan/jq-remaining.md) for incomplete CLI and module s
 ### Partial Implementation Notes
 
 1. **Variable scoping** - May not perfectly match jq edge cases
-2. **Error messages** - Don't always match jq format exactly
+2. **Error messages** - 96 of the 102 probes in `tests/data/jq-error-probes.tsv` are byte-identical to jq-1.7.1; the rest are behaviour gaps, not wording. See [jq Known Limitations](../compliance/jq/limitations.md)
 3. **Numeric overflow** - Uses wrapping arithmetic
 4. **`$ENV` as bare object** - Only field access works (`$ENV.VAR`)
 5. **Number equality above 2^53** - `1 == 1.0` is `true` as in jq, but a mixed
@@ -293,12 +293,15 @@ See [jq Remaining Work](../plan/jq-remaining.md) for incomplete CLI and module s
 Run against canonical jq to verify:
 
 ```bash
-# Compare output
+# Compare output by hand
 echo '{"a":1}' | jq '.a'
 echo '{"a":1}' | succinctly jq '.a'
 
-# Diff test script
-./scripts/test-jq-compat.sh
+# Or run the pinned-jq oracle suites (both hermetic; jq only needed to resync)
+cargo test --features cli,regex --test jq_golden_tests
+cargo test --features cli,regex --test jq_error_message_tests
+./scripts/sync-jq-golden.sh --check
+./scripts/sync-jq-error-messages.sh --check
 ```
 
 ### Priority Test Cases

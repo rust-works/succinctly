@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **jq error-message conformance corpus** (#356): 102 filter/input probes
+  (`tests/data/jq-error-probes.tsv`) whose messages are captured from the pinned
+  jq by `scripts/sync-jq-error-messages.sh` and asserted against **both**
+  evaluators by `tests/jq_error_message_tests.rs` — the first suite to compare
+  their error text, which had silently drifted. Divergences are recorded in a
+  two-sided manifest, so a new one and a fixed one both break the build. The
+  `jq-drift` CI job re-checks the captured table against the pinned binary, and
+  `docs/compliance/jq/limitations.md` is the jq counterpart to the YAML
+  compliance page the tree already had.
 - **Opt-in strict YAML validation** (#223): a new `succinctly::yaml::validate`
   pass, exposed as `succinctly yaml validate [FILES]...` and `syq --validate`,
   that rejects invalid YAML. It mirrors `json validate` — a separate pass run
@@ -172,6 +181,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty input, so a builder with capacity always gets at least one push), which
   is why it was never hit. The explicit free is gone; `Drop` now owns the
   release.
+- **jq evaluator error messages did not match jq's wording** (#356): `1 | .foo`
+  reported `expected object, got number` where jq says `Cannot index number with
+  string "foo"`, and `"a" | tonumber` said `cannot convert 'a' to number` against
+  jq's `Invalid numeric literal at EOF at line 1, column 1 (while parsing 'a')`.
+  Cosmetic until #158 landed; now that `catch` binds the raised value, a filter
+  can read the text, so `try f catch (if test("Cannot index") then … end)` — a
+  real jq idiom — behaved differently here. 96 of 102 probed messages are now
+  byte-identical to jq-1.7.1 across **both** evaluators, covering indexing,
+  iteration, arithmetic, `keys`/`length`/`sort`/`has`/`test`/`contains`, and
+  `tonumber`/`fromjson`. Root cause was that every message was inlined at its
+  raise site (~300 of them), with no shared definition — which is also how the
+  two evaluators drifted from *each other*: they reported `expected array or
+  object, got number` versus `cannot iterate over number` for the same
+  condition, and had two different `tonumber` messages. `EvalError` moves to a
+  new `src/jq/error.rs` with one named constructor per jq sentence shape, and
+  `tonumber`'s string handling is now a single shared function. Two coupled
+  defects fell out: `.[] = 1` reported `cannot use expression as assignment
+  target` because `set_path` had no iterate arm at all (it now assigns through
+  arrays and objects like jq), and `tonumber` classified `"0x10"` as valid JSON
+  because the internal parser stopped at the first value instead of requiring
+  the whole input. The remaining four probes are behaviour and parser gaps, not
+  wording — `setpath` builds a container on a scalar (#359), and
+  `.[null]`/`.[true]`/`.[{}]` do not parse (#360) — each on record in
+  `tests/data/jq-error-known-divergences.txt`. **API**: `EvalError` gains
+  jq-shaped constructors and `succinctly::jq` re-exports a new `BinOp`;
+  `EvalError::type_error` stays for the sites jq has no counterpart for.
 - **jq `try/catch` discarded the raised error** (#158): the catch handler ran
   against the *original input* rather than the error value, so a handler could
   never see what went wrong — `try error("boom") catch .` gave `null` where jq

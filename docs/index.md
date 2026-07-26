@@ -101,6 +101,7 @@ Key lesson: Micro-benchmark wins often don't translate to end-to-end improvement
 Where the parsers diverge from their specifications, the divergence is measured and recorded
 rather than asserted:
 
+- [compliance/jq/limitations.md](compliance/jq/limitations.md) — jq error-message conformance (102 probes against pinned jq), and the behaviour gaps behind the remaining six
 - [compliance/yaml/limitations.md](compliance/yaml/limitations.md) — YAML Test Suite conformance (402 cases), unsupported features, and why validation is opt-in
 - [compliance/yaml/1.2.md](compliance/yaml/1.2.md) — YAML 1.2 scalar type resolution: the Norway problem, booleans, quoted numbers
 - [guides/cli.md](guides/cli.md) — strict validation for both formats: JSON's RFC 8259 (`json validate`, `sjq --validate`) and YAML's opt-in validator (`yaml validate`, `syq --validate`)
