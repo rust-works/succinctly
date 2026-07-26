@@ -217,6 +217,37 @@ fn jq_error_message_parity() {
     assert!(report.is_empty(), "{report}");
 }
 
+/// The compliance page quotes the corpus size, the pass count and the number
+/// of gaps in prose, and nothing else checks them — they went stale twice
+/// while #356 was being written, once in the same commit that changed the
+/// corpus. Parse them back out and compare against the corpus itself.
+///
+/// Only the summary table carries numbers, so this is the single place to
+/// update when the corpus grows; elsewhere the page and its neighbours are
+/// worded without counts on purpose.
+#[test]
+fn limitations_page_quotes_the_real_numbers() {
+    const PAGE: &str = include_str!("../docs/compliance/jq/limitations.md");
+
+    let total = probes().len();
+    let diverging = known_divergences().len();
+    let matching = total - diverging;
+    // One decimal place, rounded like `{:.1}` — the page shows e.g. `94.0%`.
+    let percent = format!("{:.1}", matching as f64 * 100.0 / total as f64);
+
+    for quote in [
+        format!("over the {total} probes"),
+        format!("**{matching}/{total} = {percent}%**"),
+        format!("| **{diverging}**"),
+    ] {
+        assert!(
+            PAGE.contains(&quote),
+            "docs/compliance/jq/limitations.md is stale: expected it to say {quote:?} \
+             ({matching} of {total} probes match, {diverging} on the divergence manifest)"
+        );
+    }
+}
+
 /// The manifest is hand-maintained; keep it honest about the corpus it names.
 #[test]
 fn known_divergences_reference_real_probes() {

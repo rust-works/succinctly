@@ -24,27 +24,35 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 113 probes in
+Measured against jq-1.7.1 over the 117 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result              | Meaning                                            |
 |----------------------------------------------|---------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **108/113 = 95.6%** | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **112/117 = 95.7%** | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**               | Every probe that errors in both errors identically |
 | **Behaviour / parser gaps**                  | **5**               | succinctly does not raise the error at all         |
 
-The five non-passing probes are enumerated individually, with a category, reason and issue
+These three numbers are asserted, not maintained by hand: `jq_error_message_tests.rs`
+parses them back out of this page and fails if they drift from the corpus (they went stale
+twice while #356 was being written).
+
+The non-passing probes are enumerated individually, with a category, reason and issue
 link, in
 [`tests/data/jq-error-known-divergences.txt`](../../../tests/data/jq-error-known-divergences.txt).
 That file is the machine-readable source of truth; the test asserts it matches reality
 exactly in both directions — a newly diverging probe and a newly matching one both break
 the build — so it cannot silently drift from this page.
 
-Crucially, **none of the five is a wording bug**. In each case succinctly returns a value
+Crucially, **none of them is a wording bug**. In each case succinctly returns a value
 or fails to compile the filter, so there is no message to compare; the wording is already
 correct in `src/jq/error.rs` and will be reached once the underlying bug is fixed.
+
+What the corpus *cannot* see is the mirror image — a filter on which succinctly raises an
+error and jq returns a value — because a probe is only admitted if jq errors on it. Those
+are listed in [Where succinctly errors and jq does not](#where-succinctly-errors-and-jq-does-not).
 
 ## The message vocabulary
 
@@ -147,9 +155,13 @@ approximates to the EOF form:
 | `"  a  "` | `Invalid numeric literal at line 1, column 4 …`        | as above, but with `at EOF` and column 5                             |
 
 Matching these needs a position-reporting JSON parser reporting jq's exact failure
-classes; the hand-rolled `parse_json_string` in `src/jq/eval.rs` does not carry offsets.
+classes; the hand-rolled `parse_complete_json` in `src/jq/eval.rs` does not carry offsets.
 The shapes a filter is likely to branch on (`Invalid numeric literal`, `cannot be parsed
 as a number`) are exact, so this is left as a deliberate approximation.
+
+Both builtins do require the *whole* string to be one JSON value, which is the part that
+matters for the result rather than the message: `"0x10" | fromjson` errors as jq does
+instead of returning `0`, and `"1 2" | fromjson` errors instead of returning `1`.
 
 ## Float literals lose their source spelling
 
@@ -168,7 +180,7 @@ shortest rendering differs from their source spelling.
 
 ## Behaviour and parser gaps
 
-The five probes on record are not wording problems — succinctly never raises the error, so
+The probes on record are not wording problems — succinctly never raises the error, so
 there is nothing to word. Each has its own issue and is listed in
 [`tests/data/jq-error-known-divergences.txt`](../../../tests/data/jq-error-known-divergences.txt).
 
@@ -177,13 +189,54 @@ there is nothing to word. Each has its own issue and is listed in
 | `slice_assign_non_array`, `slice_indices_not_integers`            | A slice is not a path component, so `setpath` leaves the value alone | [#366](https://github.com/rust-works/succinctly/issues/366) |
 | `index_null_key_on_object`, `index_bool_key_on_object`, `index_object_key_on_object` | `.[null]`, `.[true]`, `.[{}]` are rejected by the parser | [#360](https://github.com/rust-works/succinctly/issues/360) |
 
-`setpath_on_number` was a fourth; the other two of #356's six were the `contains`/`inside`
-pair, fixed by [#358](https://github.com/rust-works/succinctly/issues/358) before this page
-existed. [#359](https://github.com/rust-works/succinctly/issues/359) fixed
-`setpath_on_number`: `setpath` now auto-vivifies only `null`, as jq does, and refuses to
-index anything else at any depth. The `setpath_*` probes added alongside it pin the rest of that
+`setpath_on_number` was on this list too. [#359](https://github.com/rust-works/succinctly/issues/359)
+fixed it: `setpath` now auto-vivifies only `null`, as jq does, and refuses to index
+anything else at any depth. The `setpath_*` probes added alongside it pin the rest of that
 surface — wrong-key-type on a real container, out-of-bounds negative and NaN indices, and a
 non-array path argument.
+
+## Where succinctly errors and jq does not
+
+A probe is only admitted to the corpus if jq errors on it, so the corpus is blind to the
+opposite divergence: a filter that jq answers with a value and succinctly refuses. Those
+have to be recorded here.
+
+| Filter          | Input         | jq                          | succinctly                            |
+|-----------------|---------------|-----------------------------|---------------------------------------|
+| `.a = 1`        | `null`        | `{"a":1}`                   | `Cannot index null with string "a"`   |
+| `.a.b = 1`      | `{}`          | `{"a":{"b":1}}`             | `Cannot index null with string "b"`   |
+| `.[5] = 9`      | `[1,2]`       | `[1,2,null,null,null,9]`    | `index 5 out of bounds (length 2)`    |
+| `.[5] \|= 9`    | `[1,2]`       | `[1,2,null,null,null,9]`    | `index 5 out of bounds (length 2)`    |
+| `del(.[5])`     | `[1,2]`       | `[1,2]`                     | `index 5 out of bounds (length 2)`    |
+| `del(.[-5])`    | `[1,2]`       | `[1,2]`                     | `Out of bounds negative array index`  |
+
+Every row is an assignment, update or deletion walking a path *in place*, and every one is
+older than #356 — the rewording changed what these say, not whether they say it. The gap
+they share is auto-vivification: jq grows the container the path asks for (`null` into an
+object, an array up to the index) and treats an unreachable delete as a no-op.
+
+`setpath` is the same operation without the syntax, and after #359 it does follow jq —
+`[1,2] | setpath([5]; 9)` is `[1,2,null,null,null,9]`, and `null | setpath(["a"]; 1)` is
+`{"a":1}`. So the two disagree with each other in-tree today; closing that means teaching
+`set_path`/`update_path`/`delete_at_path` to vivify the way `set_value_at_path` now does.
+
+Where the same walk *does* error in jq, the sentence matches. A still-negative index is
+jq's `Out of bounds negative array index` in `=` and `|=` as well as `setpath`, pinned by
+the probes `assign_negative_index_oob`, `update_negative_index_oob` and
+`assign_negative_index_nested`; `del` raises the same sentence, which is why the last row
+above shows it against a jq that does not raise at all. `index N out of bounds (length M)`
+is succinctly's own wording, kept deliberately for the positive case rather than borrowing
+a jq sentence for something jq never says.
+
+## Refusing an allocation jq does not survive
+
+`setpath` takes its array index from the document, so the array it pads is sized by the
+input: `null | setpath([1e30]; 9)` asks for 9.2e18 elements. jq dies on that filter (it is
+killed on the allocation, with no message to reproduce), and succinctly used to panic with
+`capacity overflow`, which for a library means taking the embedder's process down. It now
+refuses with `Cannot grow array to <n> elements` — succinctly's own wording, since there is
+no jq sentence to copy. Only the impossible is refused; every length that fits in memory
+still pads, so `[1,2] | setpath([5]; 9)` still agrees with jq.
 
 ## A slice is not a path component
 

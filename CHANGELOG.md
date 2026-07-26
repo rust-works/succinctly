@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **jq error-message conformance corpus** (#356): 102 filter/input probes
+- **jq error-message conformance corpus** (#356): a corpus of filter/input probes
   (`tests/data/jq-error-probes.tsv`) whose messages are captured from the pinned
   jq by `scripts/sync-jq-error-messages.sh` and asserted against **both**
   evaluators by `tests/jq_error_message_tests.rs` — the first suite to compare
@@ -187,8 +187,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   jq's `Invalid numeric literal at EOF at line 1, column 1 (while parsing 'a')`.
   Cosmetic until #158 landed; now that `catch` binds the raised value, a filter
   can read the text, so `try f catch (if test("Cannot index") then … end)` — a
-  real jq idiom — behaved differently here. 96 of 102 probed messages are now
-  byte-identical to jq-1.7.1 across **both** evaluators, covering indexing,
+  real jq idiom — behaved differently here. All but seven probed messages are
+  now byte-identical to jq-1.7.1 across **both** evaluators, covering indexing,
   iteration, arithmetic, `keys`/`length`/`sort`/`has`/`test`/`contains`, and
   `tonumber`/`fromjson`. Root cause was that every message was inlined at its
   raise site (~300 of them), with no shared definition — which is also how the
@@ -201,12 +201,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target` because `set_path` had no iterate arm at all (it now assigns through
   arrays and objects like jq), and `tonumber` classified `"0x10"` as valid JSON
   because the internal parser stopped at the first value instead of requiring
-  the whole input. The remaining four probes are behaviour and parser gaps, not
-  wording — `setpath` builds a container on a scalar (#359), and
+  the whole input. The probes that remain are behaviour and parser gaps, not
+  wording — a slice is not a path component (#366), and
   `.[null]`/`.[true]`/`.[{}]` do not parse (#360) — each on record in
   `tests/data/jq-error-known-divergences.txt`. **API**: `EvalError` gains
   jq-shaped constructors and `succinctly::jq` re-exports a new `BinOp`;
   `EvalError::type_error` stays for the sites jq has no counterpart for.
+- **jq `setpath` built a container on a scalar instead of refusing to index it**
+  (#359): `1 | setpath(["a"]; 1)` discarded the input and returned `{"a":1}`
+  where jq reports `Cannot index number with string "a"`. Its siblings (`.a = 1`,
+  `.a |= …`, `del(.a)`, `getpath`) already agreed with jq; only this one
+  auto-vivified. `null` is now the only value vivified — at the root and at every
+  depth — and a real container indexed with the wrong kind of key is refused too
+  (`{} | setpath([0]; 1)`). Three defects fell out of the same walk: a negative
+  index that stays negative after resolution is jq's `Out of bounds negative
+  array index` rather than `(len + idx) as usize` ≈ 1.8e19 nulls; a float index
+  truncates toward zero as jq's does instead of being ignored; and writing to an
+  existing object key keeps the key where jq keeps it, rather than moving it to
+  the end via `IndexMap::shift_remove`. `=` and `|=` now share the negative-index
+  sentence. Assigning through a slice path element remains unimplemented (#366).
+- **jq `tonumber` and `fromjson` panicked on a truncated container** (#359
+  review): `"{" | tonumber` and `"{\"a\":1," | fromjson` indexed one byte past
+  the input while looking for an object key, panicking inside the JSON parser
+  instead of raising a catchable error — a library panic takes the embedder's
+  process with it. `setpath` had the same shape: `null | setpath([1e30]; 9)`
+  asked `Vec::resize` for 9.2e18 elements and died on `capacity overflow`; it now
+  refuses with `Cannot grow array to <n> elements`, while every length that fits
+  in memory still pads as jq does.
+- **jq `fromjson` accepted trailing garbage** (#359 review): it read the first
+  JSON value and dropped the rest, so `"0x10" | fromjson` returned `0` and
+  `"1 2" | fromjson` returned `1` where jq errors on both. It now shares the
+  whole-input parse `tonumber` was given, and `"0x10"` reports jq's sentence
+  verbatim.
 - **jq `try/catch` discarded the raised error** (#158): the catch handler ran
   against the *original input* rather than the error value, so a handler could
   never see what went wrong — `try error("boom") catch .` gave `null` where jq
