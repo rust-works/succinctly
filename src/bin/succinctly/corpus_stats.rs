@@ -370,8 +370,12 @@ fn visit_yaml(
             let mut n = 0u64;
             while let Some((child, rest)) = es.uncons_cursor() {
                 n += 1;
-                if block && has_bare_dash_indicator(bytes, &child) {
-                    counters.bare_dash_items += 1;
+                if block {
+                    if let Some(wrapper) = item_wrapper(index, bytes, &child) {
+                        if has_bare_dash_indicator(bytes, &wrapper) {
+                            counters.bare_dash_items += 1;
+                        }
+                    }
                 }
                 visit_yaml(index, bytes, child, st, counters);
                 es = rest;
@@ -383,26 +387,52 @@ fn visit_yaml(
     }
 }
 
+/// The block-sequence item wrapper for an element, or `None` when the element
+/// is not a block item (a flow element, or a document in the root sequence).
+///
+/// `YamlElements::uncons_cursor` answers "what is this element's *value*": for a
+/// block item with content it hands back the content and leaves the wrapper
+/// behind, and for an empty item (`-` with nothing after it) there is no content
+/// so it hands back the wrapper itself. Classifying how the `-` was *written*
+/// needs the wrapper either way, so recover it here rather than depending on
+/// which of the two cases produced the cursor.
+///
+/// Before #337 this distinction was invisible: a diverged seq-item predicate
+/// made `uncons_cursor` skip unwrapping exactly the bare-dash items, so passing
+/// its result straight to [`has_bare_dash_indicator`] happened to count the
+/// right things for the wrong reason.
+fn item_wrapper<'a>(
+    index: &'a YamlIndex<Vec<u64>>,
+    bytes: &[u8],
+    child: &YamlCursor<'a, Vec<u64>>,
+) -> Option<YamlCursor<'a, Vec<u64>>> {
+    if index.is_seq_item(bytes, child.bp_position()) {
+        // Empty item: uncons_cursor had no content to unwrap to.
+        return Some(*child);
+    }
+    child
+        .parent()
+        .filter(|p| index.is_seq_item(bytes, p.bp_position()))
+}
+
 /// Whether a block-sequence item's `-` indicator sits alone on its own line
 /// (`-\n  key: value`) rather than inline with the content (`- key: value`).
 ///
-/// Derived from the item's own text position rather than a bespoke re-scan of the
-/// document, on the same principle as O4's seq-item wrappers: the text already
-/// encodes it. The index distinguishes the two forms by where it anchors the item
-/// — an inline item's position is its *content* (the `b` of `- b: 2`), while a
-/// bare-dash item has no content on that line so the position is the `-` itself.
-/// So the test is: the position is a `-`, and the rest of that line is blank.
+/// Derived from the item wrapper's own text position rather than a bespoke
+/// re-scan of the document, on the same principle as O4's seq-item wrappers: the
+/// text already encodes it. The index anchors every block item at its `-`, so
+/// what separates the two forms is only what follows on that line — the test is
+/// that nothing but horizontal whitespace does.
 ///
-/// Both halves are load-bearing. Requiring a `-` rejects inline items; requiring
-/// the rest of the line to be blank rejects the two shapes whose *content* also
-/// starts with a dash — a negative number (`- -5`) and a nested inline sequence
-/// (`- - deep`) — which the first check alone would miscount.
+/// That single check is what keeps out the shapes whose *content* also starts
+/// with a dash — a negative number (`- -5`) and a nested inline sequence
+/// (`- - deep`) — which a bare "starts with `-`" test would miscount.
 ///
 /// One deliberate undercount: a comment between the indicator and the content
-/// (`-  # note\n  key: v`) anchors the item at the content, so it reads as inline.
-/// The metric is therefore a lower bound on bare-dash usage.
-fn has_bare_dash_indicator(bytes: &[u8], child: &YamlCursor<'_, Vec<u64>>) -> bool {
-    child.text_position().is_some_and(|start| {
+/// (`-  # note\n  key: v`) leaves the line non-blank, so it reads as inline. The
+/// metric is therefore a lower bound on bare-dash usage.
+fn has_bare_dash_indicator(bytes: &[u8], wrapper: &YamlCursor<'_, Vec<u64>>) -> bool {
+    wrapper.text_position().is_some_and(|start| {
         bytes.get(start) == Some(&b'-')
             // The indicator is bare only if nothing but horizontal whitespace
             // follows it on that line. Running out of input counts: a trailing
