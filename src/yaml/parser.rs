@@ -1574,6 +1574,8 @@ impl<'a> Parser<'a> {
                 self.parse_single_quoted()?;
                 self.pos
             }
+            // Alias as key (`- *a: v`), sharing the block mapping's site.
+            Some(b'*') => self.record_key_alias()?,
             _ => self.parse_unquoted_key()?,
         };
         self.set_bp_text_end(key_end);
@@ -1722,30 +1724,8 @@ impl<'a> Parser<'a> {
                     self.parse_single_quoted()?;
                     self.pos
                 }
-                Some(b'*') => {
-                    // Alias as key - parse alias name
-                    let alias_start = self.pos;
-                    // Skip `*`
-                    self.advance();
-                    // Parse alias name (same rules as anchor names)
-                    let alias_name = self.parse_anchor_name()?;
-                    // Record the alias reference
-                    // Look up the anchor's BP position
-                    match self.anchors.get(&alias_name) {
-                        Some(&target_bp_pos) => {
-                            self.aliases.insert(self.bp_pos - 1, target_bp_pos);
-                        }
-                        // #372, as in `parse_alias`: a miss here rendered the
-                        // key as the empty string rather than erroring.
-                        None => {
-                            return Err(YamlError::UnknownAnchor {
-                                offset: alias_start,
-                                name: alias_name,
-                            });
-                        }
-                    }
-                    self.pos
-                }
+                // Alias as key (`*a: v`), sharing the compact mapping's site.
+                Some(b'*') => self.record_key_alias()?,
                 _ => self.parse_unquoted_key()?,
             }
         };
@@ -3495,6 +3475,40 @@ impl<'a> Parser<'a> {
         self.skip_inline_whitespace();
         self.anchors.insert(name, self.bp_pos - 1);
         Ok(())
+    }
+
+    /// Record an alias used as a mapping key whose BP node is already open, as
+    /// in `*a: v`, and return the key's text end.
+    ///
+    /// The alias *is* the key, so the edge is recorded from `bp_pos - 1` — the
+    /// open already written — exactly as [`Self::record_key_anchor`] binds an
+    /// anchor to it. Callers that have not opened a node yet want
+    /// [`Self::parse_alias`], which opens and closes one of its own.
+    ///
+    /// One definition for both key-alias sites (block and compact mappings):
+    /// they were separate copies, and only one of them resolved the alias at
+    /// all, so `- *a: v` silently produced an empty key (#372).
+    fn record_key_alias(&mut self) -> Result<usize, YamlError> {
+        debug_assert_eq!(self.peek(), Some(b'*'));
+        // Offset of the `*`, so an unresolved alias can point at itself.
+        let alias_start = self.pos;
+        self.advance();
+        // Alias names follow the anchor-name rules.
+        let name = self.parse_anchor_name()?;
+        match self.anchors.get(&name) {
+            Some(&target_bp_pos) => {
+                self.aliases.insert(self.bp_pos - 1, target_bp_pos);
+            }
+            // #372, as in `parse_alias`: a miss here rendered the key as the
+            // empty string rather than erroring.
+            None => {
+                return Err(YamlError::UnknownAnchor {
+                    offset: alias_start,
+                    name,
+                });
+            }
+        }
+        Ok(self.pos)
     }
 
     /// Parse an alias reference (`*name`).
