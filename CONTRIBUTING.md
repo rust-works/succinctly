@@ -265,15 +265,24 @@ VPOPCNTDQ (`SUCCINCTLY_EXPECT_SIMD` intentionally omits it — see the note in
 so **`src/bits/popcount.rs` reports a non-deterministic x86 coverage number**:
 ~93% when the run happens to draw a VPOPCNTDQ-capable host, ~66% when it
 doesn't — a ±~26pp swing driven purely by which CPU the run landed on, not by
-any code change. This is expected, not a regression. The coverage bot
-quarantines it into the "N unchanged file(s) also moved (not attributed to this
-PR)" section, it doesn't count against patch coverage on PRs that leave the
-file untouched, and the
-`fail-under-lines` gate has ~19pp of headroom over the ~74.5% total, so the
-wobble can't trip the build. If you see `popcount.rs` move by ±26pp on an
-otherwise-unrelated PR (e.g. a dependabot bump), that's this — no need to
-re-triage it. Tracked in #302; the kernel's correctness is still validated on
-capable hardware by the two host-gated tests in `popcount.rs`.
+any code change. This is expected, not a regression — and it is now **filtered
+out of the PR comment** rather than merely tolerated: `src/bits/popcount.rs` is
+listed in [`.omni-dev/coverage.yaml`](.omni-dev/coverage.yaml), which
+`omni-dev coverage diff` (>= 0.38.0, pinned in `ci.yml`) reads straight from the
+checkout and applies to *both* the baseline and head reports before diffing, so
+the file can no longer generate a phantom entry. Note the exclusion is symmetric
+and therefore also removes the file from the **`Total:`** the comment reports —
+that number is a couple of points off the raw `cargo llvm-cov` total for this
+reason. It does not weaken any gate: `fail-under-lines` is computed by
+`cargo llvm-cov` itself, independently of `omni-dev`, over the unfiltered set
+(and has ~19pp of headroom over the ~74.5% total regardless).
+
+If you are reading a *pre-filter* PR comment, or `popcount.rs` moves by ±26pp on
+an otherwise-unrelated PR (e.g. a dependabot bump), that's this — no need to
+re-triage it. Tracked in #302 (and omni-dev#1398 for the mechanism); the
+kernel's correctness is still validated on capable hardware by the two
+host-gated tests in `popcount.rs`, which the exclusion does not affect — it
+suppresses *reporting*, not measurement or testing.
 
 ### Unsafe Code
 

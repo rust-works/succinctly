@@ -539,7 +539,12 @@ jobs:
 
       - uses: action-works/omni-dev-coverage-check@v1
         with:
-          version: 0.34.0                               # pin; we're a consumer
+          # Pin; we're a consumer. Must stay >= 0.38.0: that release added the
+          # declarative `.omni-dev/coverage.yaml` ignore-list (omni-dev#1398),
+          # which is how the CPU-conditional `src/bits/popcount.rs` flap (#302)
+          # is silenced. The action does not thread `--ignore-filename-regex`,
+          # so config-file discovery from the checkout is the only route.
+          version: 0.38.0
           use-prebuilt-binary: ${{ matrix.use-prebuilt }}
           test-args: --features cli,simd,regex,serde --workspace
           fail-under-lines: 55   # floor a few pts below local llvm-cov (ARM: 59.58% lines)
