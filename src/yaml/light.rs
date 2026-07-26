@@ -783,17 +783,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 }
 
                 match self.text[after_indent] {
-                    b'\n' => {
-                        // Empty line - continue looking
-                        empty_lines_end = after_indent + 1;
-                    }
-                    b'\r' => {
-                        // Handle CRLF
-                        empty_lines_end = after_indent + 1;
-                        if empty_lines_end < self.text.len() && self.text[empty_lines_end] == b'\n'
-                        {
-                            empty_lines_end += 1;
-                        }
+                    b'\n' | b'\r' => {
+                        // Empty line - continue looking. CRLF is one break.
+                        empty_lines_end = after_indent + line_break_len(self.text, after_indent);
                     }
                     b'\t' => {
                         // Tabs after spaces - check if rest of line is whitespace only
@@ -804,21 +796,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         {
                             check_pos += 1;
                         }
-                        if check_pos >= self.text.len()
-                            || matches!(self.text[check_pos], b'\n' | b'\r')
-                        {
+                        if check_pos >= self.text.len() || is_line_break(self.text[check_pos]) {
                             // Line has only whitespace - treat as empty line, continue looking
-                            empty_lines_end = check_pos;
-                            if check_pos < self.text.len() && self.text[check_pos] == b'\r' {
-                                empty_lines_end += 1;
-                                if empty_lines_end < self.text.len()
-                                    && self.text[empty_lines_end] == b'\n'
-                                {
-                                    empty_lines_end += 1;
-                                }
-                            } else if check_pos < self.text.len() && self.text[check_pos] == b'\n' {
-                                empty_lines_end += 1;
-                            }
+                            empty_lines_end = check_pos + line_break_len(self.text, check_pos);
                             // Continue the loop to check the next line
                         } else if in_flow
                             || line_indent > base_indent
@@ -2000,7 +1980,7 @@ fn scan_ws_run(bytes: &[u8], i: usize) -> (usize, bool) {
     while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
         j += 1;
     }
-    (j, j < bytes.len() && matches!(bytes[j], b'\r' | b'\n'))
+    (j, j < bytes.len() && is_line_break(bytes[j]))
 }
 
 /// Transcode a double-quoted YAML string directly to JSON output.
@@ -2040,20 +2020,9 @@ fn transcode_double_quoted_to_json(
                     b'_' => output.push_str("\\u00a0"), // non-breaking space
                     b'L' => output.push_str("\\u2028"), // line separator
                     b'P' => output.push_str("\\u2029"), // paragraph separator
-                    b'\n' => {
-                        // Escaped line break - skip entirely
-                        i += 1;
-                        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
-                            i += 1;
-                        }
-                        continue;
-                    }
-                    b'\r' => {
-                        // Escaped CRLF
-                        i += 1;
-                        if i < bytes.len() && bytes[i] == b'\n' {
-                            i += 1;
-                        }
+                    b'\n' | b'\r' => {
+                        // Escaped line break - skip entirely, CRLF included
+                        i += line_break_len(bytes, i);
                         while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
                             i += 1;
                         }
@@ -2258,14 +2227,7 @@ fn transcode_single_quoted_to_json(
 /// content and must not be trimmed here.
 fn transcode_fold_line_break_to_json(bytes: &[u8], mut i: usize, output: &mut String) -> usize {
     // Skip the first line break
-    if bytes[i] == b'\r' {
-        i += 1;
-        if i < bytes.len() && bytes[i] == b'\n' {
-            i += 1;
-        }
-    } else if bytes[i] == b'\n' {
-        i += 1;
-    }
+    i += line_break_len(bytes, i);
 
     // Count empty lines
     let mut empty_lines = 0;
@@ -2276,16 +2238,9 @@ fn transcode_fold_line_break_to_json(bytes: &[u8], mut i: usize, output: &mut St
         }
 
         // Check if this is an empty line
-        if i < bytes.len() && (bytes[i] == b'\n' || bytes[i] == b'\r') {
+        if i < bytes.len() && is_line_break(bytes[i]) {
             empty_lines += 1;
-            if bytes[i] == b'\r' {
-                i += 1;
-                if i < bytes.len() && bytes[i] == b'\n' {
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
+            i += line_break_len(bytes, i);
         } else {
             break;
         }
@@ -2675,18 +2630,9 @@ fn stream_transcode_double_quoted_to_json<Out: core::fmt::Write>(
                     b'P' => out
                         .write_str("\\u2029")
                         .map_err(|_| YamlStringError::InvalidUtf8)?,
-                    b'\n' => {
-                        i += 1;
-                        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
-                            i += 1;
-                        }
-                        continue;
-                    }
-                    b'\r' => {
-                        i += 1;
-                        if i < bytes.len() && bytes[i] == b'\n' {
-                            i += 1;
-                        }
+                    b'\n' | b'\r' => {
+                        // Escaped line break - skip entirely, CRLF included
+                        i += line_break_len(bytes, i);
                         while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
                             i += 1;
                         }
@@ -2890,15 +2836,8 @@ fn stream_transcode_fold_line_break<Out: core::fmt::Write>(
 ) -> Result<usize, YamlStringError> {
     let mut newlines = 0;
 
-    while i < bytes.len() && matches!(bytes[i], b'\r' | b'\n') {
-        if bytes[i] == b'\r' {
-            i += 1;
-            if i < bytes.len() && bytes[i] == b'\n' {
-                i += 1;
-            }
-        } else {
-            i += 1;
-        }
+    while i < bytes.len() && is_line_break(bytes[i]) {
+        i += line_break_len(bytes, i);
         newlines += 1;
 
         while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
@@ -3540,32 +3479,24 @@ impl<'a> YamlString<'a> {
                             if end + spaces >= text.len() {
                                 break;
                             }
-                            match text[end + spaces] {
-                                b'\n' => {
-                                    end += spaces + 1;
-                                }
-                                b'\r' => {
-                                    end += spaces + 1;
-                                    if end < text.len() && text[end] == b'\n' {
-                                        end += 1;
-                                    }
-                                }
-                                _ => {
-                                    // Non-empty line at same or lower indent = end of block
-                                    break;
-                                }
+                            let break_len = line_break_len(text, end + spaces);
+                            if break_len == 0 {
+                                // Non-empty line at same or lower indent = end of block
+                                break;
                             }
+                            end += spaces + break_len;
                         }
                         // If no trailing newlines found but we're at EOF, the content
                         // area includes the newline that terminated the indicator line.
                         // Check if there was a newline before content_start.
                         if end == content_start && content_start > 0 {
                             let prev = content_start - 1;
-                            if text[prev] == b'\n'
-                                || (text[prev] == b'\r'
-                                    && (content_start >= text.len()
-                                        || text[content_start] != b'\n'))
-                            {
+                            // A break that both starts at `prev` and *ends* at
+                            // `content_start`, i.e. is exactly one byte wide.
+                            // `line_break_len_before` is the wrong question here:
+                            // it reports 1 from the middle of a CRLF, which would
+                            // split the CR off from its LF.
+                            if line_break_len(text, prev) == 1 {
                                 // The indicator line ended with a newline - include it
                                 // by adjusting content_start back to include that newline
                                 return (prev, content_start);
@@ -3605,42 +3536,25 @@ impl<'a> YamlString<'a> {
                 break;
             }
 
-            match text[pos] {
-                b'\n' => {
-                    // Empty line - include in content area
+            let break_len = line_break_len(text, pos);
+            if break_len > 0 {
+                // Empty line - include in content area
+                pos += break_len;
+            } else {
+                if line_indent < content_indent {
+                    // Dedent - end of block
+                    pos = line_start;
+                    break;
+                }
+
+                // Content line - skip to end
+                while pos < text.len() && !is_line_break(text[pos]) {
                     pos += 1;
                 }
-                b'\r' => {
-                    pos += 1;
-                    if pos < text.len() && text[pos] == b'\n' {
-                        pos += 1;
-                    }
-                }
-                _ => {
-                    if line_indent < content_indent {
-                        // Dedent - end of block
-                        pos = line_start;
-                        break;
-                    }
+                last_content_end = pos;
+                has_content = true;
 
-                    // Content line - skip to end
-                    while pos < text.len() && text[pos] != b'\n' && text[pos] != b'\r' {
-                        pos += 1;
-                    }
-                    last_content_end = pos;
-                    has_content = true;
-
-                    if pos < text.len() {
-                        if text[pos] == b'\r' {
-                            pos += 1;
-                            if pos < text.len() && text[pos] == b'\n' {
-                                pos += 1;
-                            }
-                        } else if text[pos] == b'\n' {
-                            pos += 1;
-                        }
-                    }
-                }
+                pos += line_break_len(text, pos);
             }
         }
 
@@ -3651,16 +3565,7 @@ impl<'a> YamlString<'a> {
                 // Clip: Include exactly one trailing newline if there was content
                 if has_content {
                     // Include one newline after last content
-                    let mut end = last_content_end;
-                    if end < text.len() && text[end] == b'\n' {
-                        end += 1;
-                    } else if end < text.len() && text[end] == b'\r' {
-                        end += 1;
-                        if end < text.len() && text[end] == b'\n' {
-                            end += 1;
-                        }
-                    }
-                    end
+                    last_content_end + line_break_len(text, last_content_end)
                 } else {
                     last_content_end
                 }
@@ -3764,14 +3669,8 @@ impl<'a> YamlString<'a> {
             }
 
             match text[pos] {
-                b'\n' => {
-                    pos += 1;
-                }
-                b'\r' => {
-                    pos += 1;
-                    if pos < text.len() && text[pos] == b'\n' {
-                        pos += 1;
-                    }
+                b'\n' | b'\r' => {
+                    pos += line_break_len(text, pos);
                 }
                 // Note: '#' is NOT treated as a comment here because this function
                 // is used for block scalar content detection, where '#' is content.
@@ -3837,25 +3736,14 @@ fn decode_double_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
                     b'_' => result.push('\u{00A0}'), // non-breaking space
                     b'L' => result.push('\u{2028}'), // line separator
                     b'P' => result.push('\u{2029}'), // paragraph separator
-                    b'\n' => {
-                        // Escaped line break - skip it entirely (no space added)
-                        // Also skip leading whitespace on next line
-                        i += 1;
+                    b'\n' | b'\r' => {
+                        // Escaped line break - skip it entirely (no space added),
+                        // CRLF included. Also skip leading whitespace on next line.
+                        i += line_break_len(bytes, i);
                         while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
                             i += 1;
                         }
                         continue; // Don't increment i again at end of loop
-                    }
-                    b'\r' => {
-                        // Escaped line break (CRLF variant)
-                        i += 1;
-                        if i < bytes.len() && bytes[i] == b'\n' {
-                            i += 1;
-                        }
-                        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
-                            i += 1;
-                        }
-                        continue;
                     }
                     b'x' => {
                         // \xNN - 2 hex digits
@@ -3911,7 +3799,7 @@ fn decode_double_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
                 // line break; escaped whitespace was pushed by the escape
                 // arms and is never trimmed
                 let mut end = i;
-                if i < bytes.len() && matches!(bytes[i], b'\r' | b'\n') {
+                if i < bytes.len() && is_line_break(bytes[i]) {
                     while end > start && matches!(bytes[end - 1], b' ' | b'\t') {
                         end -= 1;
                     }
@@ -3951,7 +3839,7 @@ fn decode_single_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
                 // Regular content
                 let start = i;
                 while i < bytes.len()
-                    && !matches!(bytes[i], b'\n' | b'\r')
+                    && !is_line_break(bytes[i])
                     && !(bytes[i] == b'\'' && i + 1 < bytes.len() && bytes[i + 1] == b'\'')
                 {
                     i += 1;
@@ -3959,7 +3847,7 @@ fn decode_single_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
                 // Trailing literal whitespace folds away before a literal
                 // line break
                 let mut end = i;
-                if i < bytes.len() && matches!(bytes[i], b'\r' | b'\n') {
+                if i < bytes.len() && is_line_break(bytes[i]) {
                     while end > start && matches!(bytes[end - 1], b' ' | b'\t') {
                         end -= 1;
                     }
@@ -3988,14 +3876,7 @@ fn decode_single_quoted(bytes: &[u8]) -> Result<String, YamlStringError> {
 /// trimmed here.
 fn fold_quoted_line_break(bytes: &[u8], mut i: usize, result: &mut String) -> usize {
     // Skip the first line break
-    if bytes[i] == b'\r' {
-        i += 1;
-        if i < bytes.len() && bytes[i] == b'\n' {
-            i += 1;
-        }
-    } else if bytes[i] == b'\n' {
-        i += 1;
-    }
+    i += line_break_len(bytes, i);
 
     // Count empty lines (lines with only whitespace)
     let mut empty_lines = 0;
@@ -4006,17 +3887,9 @@ fn fold_quoted_line_break(bytes: &[u8], mut i: usize, result: &mut String) -> us
         }
 
         // Check if this is an empty line
-        if i < bytes.len() && (bytes[i] == b'\n' || bytes[i] == b'\r') {
+        if i < bytes.len() && is_line_break(bytes[i]) {
             empty_lines += 1;
-            // Skip the line break
-            if bytes[i] == b'\r' {
-                i += 1;
-                if i < bytes.len() && bytes[i] == b'\n' {
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
+            i += line_break_len(bytes, i);
         } else {
             // Non-empty line - we're done counting empty lines
             // i is now positioned after the leading whitespace
@@ -4060,7 +3933,7 @@ fn decode_plain_scalar(bytes: &[u8], base_indent: usize) -> Result<String, YamlS
             _ => {
                 // Regular content - read until end of line
                 let start = i;
-                while i < bytes.len() && !matches!(bytes[i], b'\n' | b'\r') {
+                while i < bytes.len() && !is_line_break(bytes[i]) {
                     i += 1;
                 }
                 // Trim trailing whitespace
@@ -4093,14 +3966,7 @@ fn fold_plain_line_break(
     result: &mut String,
 ) -> usize {
     // Skip the first line break
-    if bytes[i] == b'\r' {
-        i += 1;
-        if i < bytes.len() && bytes[i] == b'\n' {
-            i += 1;
-        }
-    } else if bytes[i] == b'\n' {
-        i += 1;
-    }
+    i += line_break_len(bytes, i);
 
     // Count empty lines (lines with only whitespace)
     let mut empty_lines = 0;
@@ -4113,17 +3979,9 @@ fn fold_plain_line_break(
         let line_indent = i - line_start;
 
         // Check if this is an empty line
-        if i < bytes.len() && (bytes[i] == b'\n' || bytes[i] == b'\r') {
+        if i < bytes.len() && is_line_break(bytes[i]) {
             empty_lines += 1;
-            // Skip the line break
-            if bytes[i] == b'\r' {
-                i += 1;
-                if i < bytes.len() && bytes[i] == b'\n' {
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
+            i += line_break_len(bytes, i);
         } else if i >= bytes.len() {
             // End of content
             break;
@@ -4134,18 +3992,10 @@ fn fold_plain_line_break(
             while check < bytes.len() && matches!(bytes[check], b'\t' | b' ') {
                 check += 1;
             }
-            if check >= bytes.len() || matches!(bytes[check], b'\n' | b'\r') {
+            if check >= bytes.len() || is_line_break(bytes[check]) {
                 // Line is all whitespace - treat as empty line
                 empty_lines += 1;
-                i = check;
-                if i < bytes.len() && bytes[i] == b'\r' {
-                    i += 1;
-                    if i < bytes.len() && bytes[i] == b'\n' {
-                        i += 1;
-                    }
-                } else if i < bytes.len() && bytes[i] == b'\n' {
-                    i += 1;
-                }
+                i = check + line_break_len(bytes, check);
                 // Continue looking for more empty lines
             } else {
                 // Tab followed by content - skip the tabs as indentation
@@ -4258,7 +4108,7 @@ fn decode_block_literal(
 
         // Find end of line
         let line_start = pos;
-        while pos < content.len() && content[pos] != b'\n' && content[pos] != b'\r' {
+        while pos < content.len() && !is_line_break(content[pos]) {
             pos += 1;
         }
 
@@ -4267,18 +4117,12 @@ fn decode_block_literal(
             .map_err(|_| YamlStringError::InvalidUtf8)?;
         result.push_str(line);
 
-        // Handle line ending
-        if pos < content.len() {
-            if content[pos] == b'\r' {
-                pos += 1;
-                result.push('\n');
-                if pos < content.len() && content[pos] == b'\n' {
-                    pos += 1;
-                }
-            } else if content[pos] == b'\n' {
-                pos += 1;
-                result.push('\n');
-            }
+        // Handle line ending. Every break form is rewritten to a single `\n`,
+        // as YAML 1.2 §5.4 requires of the presented content.
+        let break_len = line_break_len(content, pos);
+        pos += break_len;
+        if break_len > 0 {
+            result.push('\n');
         }
     }
 
@@ -4380,9 +4224,8 @@ fn decode_block_folded(
         }
 
         // Check if this is a blank line
-        let is_blank = pos + line_indent >= content.len()
-            || content[pos + line_indent] == b'\n'
-            || content[pos + line_indent] == b'\r';
+        let is_blank =
+            pos + line_indent >= content.len() || is_line_break(content[pos + line_indent]);
 
         if is_blank {
             // Count it only if its break is really there — trailing whitespace
@@ -4391,17 +4234,10 @@ fn decode_block_folded(
             // survives a blank run: it is what distinguishes 1+k newlines
             // from k.
             pos += line_indent;
-            if pos < content.len() {
-                if content[pos] == b'\r' {
-                    pos += 1;
-                    if pos < content.len() && content[pos] == b'\n' {
-                        pos += 1;
-                    }
-                    pending_empty += 1;
-                } else if content[pos] == b'\n' {
-                    pos += 1;
-                    pending_empty += 1;
-                }
+            let break_len = line_break_len(content, pos);
+            pos += break_len;
+            if break_len > 0 {
+                pending_empty += 1;
             }
         } else {
             // Strip the common indent
@@ -4416,7 +4252,7 @@ fn decode_block_folded(
 
             // Find end of line
             let line_start = pos;
-            while pos < content.len() && content[pos] != b'\n' && content[pos] != b'\r' {
+            while pos < content.len() && !is_line_break(content[pos]) {
                 pos += 1;
             }
 
@@ -4451,19 +4287,9 @@ fn decode_block_folded(
             first_line = false;
 
             // Skip line ending, remembering whether there was one
-            last_line_had_break = false;
-            if pos < content.len() {
-                if content[pos] == b'\r' {
-                    pos += 1;
-                    if pos < content.len() && content[pos] == b'\n' {
-                        pos += 1;
-                    }
-                    last_line_had_break = true;
-                } else if content[pos] == b'\n' {
-                    pos += 1;
-                    last_line_had_break = true;
-                }
-            }
+            let break_len = line_break_len(content, pos);
+            pos += break_len;
+            last_line_had_break = break_len > 0;
         }
     }
 
