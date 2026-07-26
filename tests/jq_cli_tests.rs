@@ -1087,6 +1087,43 @@ fn test_optional_suppresses_cannot_index() -> Result<()> {
     Ok(())
 }
 
+/// `?` covers the indexing, not the key expression.
+///
+/// jq's `.[K]?` is `try (E[K])` only over the index step: `.[error("boom")]?`
+/// still raises `boom`, and walking `..` onto a string with `.[.k]?` still fails
+/// on the key lookup. Passing the enclosing `optional` down into the key's
+/// evaluation made succinctly strictly more forgiving than jq — `[.. | .[.k]?]`
+/// returned `[1]` where jq errors.
+#[test]
+fn test_optional_does_not_suppress_key_errors() -> Result<()> {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "[.. | .[.k]?]",
+            r#"{"k":"a","a":1}"#,
+            r#"Cannot index string with string "k""#,
+        ),
+        (".[error(\"boom\")]?", r#"{"a":1}"#, "boom"),
+    ];
+
+    for (filter, input, expected) in cases {
+        let stderr = jq_stderr(filter, input, &[])?;
+        assert!(
+            stderr.contains(expected),
+            "`{filter}` should propagate the key error {expected:?}, got: {stderr}"
+        );
+    }
+
+    // `try` still catches what `?` declines to swallow, so the error is
+    // recoverable — it is raised, not fatal by construction.
+    let (output, _) = run_jq_stdin(
+        r#"[.. | try .[.k] catch "E"]"#,
+        r#"{"k":"a","a":1}"#,
+        &["-c"],
+    )?;
+    assert_eq!(output.trim(), r#"[1,"E","E"]"#);
+    Ok(())
+}
+
 #[test]
 fn test_contains_type_mismatch_errors() -> Result<()> {
     // jq: `1 | contains("a")` is an error, not `false` (#358). This exercises the

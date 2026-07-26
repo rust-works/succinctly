@@ -5989,6 +5989,11 @@ pub(crate) fn index_one_owned(
 ///    `[({"a":1,"b":2},{"a":3,"b":4})[("a","b")]]` is `[1,3,2,4]`.
 /// 3. An empty key stream short-circuits *before* `E` runs:
 ///    `[(error("boom"))[empty]]` is `[]`, not an error.
+///
+/// A trailing `?` covers the indexing, not the key: jq's `.[error("boom")]?`
+/// still raises `boom`, and `{"k":"a","a":1} | [.. | .[.k]?]` still fails on
+/// `Cannot index string with string "k"` when `..` reaches the string `"a"`.
+/// Hence `optional` reaches [`index_one`] but *not* the key evaluation below.
 fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     target: &Expr,
     key: &Expr,
@@ -5996,7 +6001,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // (3) Keys first: an empty key stream must not evaluate the target.
-    let keys = match eval_single::<W, S>(key, value.clone(), optional).materialize_cursor() {
+    let keys = match eval_single::<W, S>(key, value.clone(), false).materialize_cursor() {
         QueryResult::One(v) => vec![to_owned(&v)],
         QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
         QueryResult::Owned(v) => vec![v],

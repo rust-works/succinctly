@@ -817,7 +817,8 @@ fn index_one_generic<V: DocumentValue>(
 /// Evaluate `E[K]` — indexing by a computed key.
 ///
 /// The counterpart of `eval::eval_index_expr`; see that function for why the
-/// key stream is evaluated first and iterated outermost.
+/// key stream is evaluated first and iterated outermost, and why a trailing `?`
+/// does not reach the key.
 fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     target: &Expr,
     key: &Expr,
@@ -826,7 +827,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
     // Keys first: an empty key stream must not evaluate the target at all.
-    let keys = match eval_single::<S, V>(key, value.clone(), optional, cursor) {
+    let keys = match eval_single::<S, V>(key, value.clone(), false, cursor) {
         GenericResult::Error(e) => return GenericResult::Error(e),
         GenericResult::Break(label) => return GenericResult::Break(label),
         GenericResult::None => return GenericResult::None,
