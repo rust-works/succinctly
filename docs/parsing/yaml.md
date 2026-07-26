@@ -5071,6 +5071,183 @@ removed O(1) bit test.
 
 ---
 
+## O5: Positioned Cursor on the Random-Access Path — Accepted ✅
+
+**Issue**: [#337](https://github.com/rust-works/succinctly/issues/337)
+
+### Problem
+
+Reading a document whose sequence items are a bare `-` on its own line was **quadratic**.
+On a Ryzen 9 7950X, 800 KB took 2.5 s against 21 ms for the same size written `- x`; the
+growth was ~3.9× per doubling (the O(n²) signature) against ~1.9× for `- x`. A 10 MB file
+took over 100 s, roughly 100 KB/s against a documented ~110 MiB/s.
+
+Index build and validation were linear — only the **read** path was quadratic, and `.[0]`
+(4 bytes of output) cost the same as `.` (millions), so it was per-element work rather than
+output volume.
+
+### Root cause
+
+Two defects compounding, in the order they fire:
+
+**1. A redundant lookup.** `YamlElements::uncons` looks the same BP open index up twice —
+once via `element_cursor.text_position()` to run the seq-item test, then again inside
+`element_cursor.value()`. The sequential cursor has already advanced `next_open_idx` past
+that index, so the second lookup is classified as a *backwards jump* and dispatched to
+`AdvancePositions::get_random`.
+
+**2. A cursor rewound to zero.** `get_random` computed the right answer, then handed the
+sequential cursor `ib_word_idx: 0, ib_ones_before: 0`. That is *correct* — the invariant
+`ib_ones_before == ones in ib_words[0..ib_word_idx)` holds at word 0 — but pessimal: the
+**next** `get_sequential` must forward-scan IB from the start, O(text_len / 64). One
+backwards jump per element then makes a whole-document read O(n²).
+
+`- x` escaped because its seq-item branch navigates to `first_child()`, a *higher* open
+index, so the second lookup stays on the sequential fast path.
+
+Three independent measurements pinned it before any code changed:
+
+| evidence | result |
+|---|---|
+| `sample` profile, 1.6 MB bare-dash file | 617/623 samples in `get_sequential` via `uncons`; 6 in `get_random` via `value()` — cheap poisoner, expensive victim |
+| `-\n` ×200k (400 KB) vs `- \n` ×200k (600 KB) | **213 ms vs 23 ms** — the slow one is the *smaller* file, and both emit identical output |
+| 50,000 elements at 100 KB vs 4.1 MB of text | 33.6 ms vs 494.8 ms — cost tracks **text length**, i.e. the IB rescan, not element count |
+
+The second row is the whole bug in one line: the only difference is the byte after the
+dash, which is exactly what the diverged seq-item predicates tested.
+
+### Why the predicates had diverged
+
+Five hand-copied copies of "is this a block sequence item", three of which had drifted to
+accept only `- ` and `-\t`:
+
+| site | predicate |
+|---|---|
+| `YamlCursor::value` | `-` + `' '｜'\t'｜'\n'｜'\r'｜EOI` (correct, from #106) |
+| `YamlIndex::is_seq_item` | same, separately inlined |
+| `YamlElements::uncons` | `-` + `' '｜'\t'` only |
+| `YamlElements::uncons_cursor` | same narrow copy |
+| `YamlElements::get` | `-` + `first_child().is_some()`, no whitespace test at all |
+
+#106 recorded exactly this lesson — *duplicated predicates diverge silently* — after the
+same bug class on the same shape.
+
+### Solution
+
+1. **`get_random` leaves a *positioned* cursor** (`seek_cursor` in
+   [src/yaml/advance_positions.rs](../../src/yaml/advance_positions.rs)). `pos` being the
+   `k`-th set bit means exactly `k` ones precede it, so the ones in whole words before it
+   are `k` minus the ones set below it in its own word — O(1), one word read and a popcount,
+   no extra state. This is the load-bearing fix: it makes *any* backwards-jump pattern O(1)
+   amortized rather than O(text_len).
+2. **An O(1) memo for the immediate repeat** (`SequentialCursor::repeats`), the exact
+   pattern `uncons` generates. It needs no new fields — after a successful `get` at `i` the
+   cursor already holds `next_open_idx == i+1`, `adv_cumulative == advance_rank1(i+1)` and
+   `last_ib_arg == adv_cumulative - 1`.
+3. **One seq-item predicate** — `is_seq_item_at` in
+   [src/yaml/light.rs](../../src/yaml/light.rs), with all five sites routed through it.
+4. `SequentialCursor` and `seek_cursor` are now **shared** between `AdvancePositions` and
+   `CompactEndPositions` instead of duplicated. #337 was present in both copies.
+
+### Benchmark Results
+
+Apple M4 Pro (`johns-mac-mini`), release, `yq -o json -I0 '.'`, min of 5, binaries
+interleaved *within* each repetition per
+[the A/B method](../guides/benchmarking.md#ab-benchmarking-method):
+
+| bytes | before | after | speedup | growth before | growth after |
+|---|---|---|---|---|---|
+| 131,072 | 26.1 ms | 5.0 ms | **5.2×** | — | — |
+| 262,144 | 88.2 ms | 7.1 ms | **12.4×** | 3.38× | 1.42× |
+| 524,288 | 329.0 ms | 12.0 ms | **27.3×** | 3.73× | 1.69× |
+| 1,048,576 | 1279.2 ms | 20.8 ms | **61.4×** | 3.89× | 1.73× |
+
+Growth per doubling goes from ~3.9× (quadratic) to ~1.7× (linear), which is why the speedup
+itself grows with input size — the right shape of evidence for an algorithmic fix rather
+than a constant-factor one. **10 MB of bare dashes: 115.6 s → 0.17 s (680×).**
+
+`- x\n` — the shape that was already fast — is the control, and is unchanged (1.00–1.02×
+across 256 KB–2 MB), confirming the win is not bought from the common path.
+
+**The blast radius was wider than the issue reported.** Any element that is not a block
+item with content takes the same double lookup, so three *existing* generated patterns were
+quadratic too (2 MB inputs, same method):
+
+| pattern | query | before | after | delta |
+|---|---|---|---|---|
+| flow | `.` | 610.8 ms | 24.3 ms | **−96.0%** |
+| empty-items | `.` | 536.9 ms | 22.4 ms | **−95.8%** |
+| anchors | `.` | 358.1 ms | 32.0 ms | **−91.1%** |
+| multi-doc | `.[]` | 190.7 ms | 34.1 ms | **−82.1%** |
+
+Flow scalars, aliases and root-level documents all reach `value()` through the non-item
+branch of `uncons`. Every other pattern is neutral: at 16 MB, where process startup is
+negligible, the 26 remaining pattern × query combinations have a median delta of **−0.34%**
+in a −2.1% … +2.1% band.
+
+### Benchmark coverage
+
+Every generator emitted `- ` (dash-space), so this shape had **zero** coverage — the blind
+spot [`docs/guides/benchmarking.md`](../guides/benchmarking.md) rule 7 names: *a benchmark
+cannot measure a shape it does not generate*. A new `empty-items` pattern generates a
+deliberately **half-empty** mix (bare `-`, `- ` with trailing space, comment-only items,
+bare `-` with the value on the next line, nested empty sequences, and ordinary valued
+items), so the wrapper-with-child and wrapper-without-child paths are measured against each
+other rather than one in isolation. `tests/yaml_bench_suite_coverage.rs` gains a
+`Feature::EmptySequenceItem` so the gap cannot silently reopen.
+
+### Trade-offs
+
+**Benefits:**
+- ✅ Quadratic → linear on bare-dash, flow-scalar, alias and multi-document reads
+- ✅ 61× at 1 MB, 680× at 10 MB, and the factor keeps growing with input size
+- ✅ Byte-identical output — 544 before/after comparisons over 17 patterns × 8 queries × 2
+  formats, 0 mismatches; still matches pinned `yq` on the golden fixtures
+- ✅ One seq-item predicate instead of five, and one `SequentialCursor` instead of two
+
+**Costs:**
+- ⚠️ One extra branch in `AdvancePositions::get` / `CompactEndPositions::get` on the
+  backwards-jump arm only — measured neutral (median −0.34% at 16 MB)
+- ⚠️ `uncons_cursor` now unwraps bare-dash items like every other item. `corpus_stats.rs`
+  had been relying on the divergence to recognise them and was rewritten to ask for the
+  wrapper explicitly (`item_wrapper`)
+
+### Key Learnings
+
+1. **A fast path's slow path must leave valid *and useful* state.** `get_random`'s reset was
+   correct by the invariant and still turned O(1) amortized into O(n) per call. Correctness
+   review would never flag it; only the cost model does.
+2. **Cheap poisoner, expensive victim.** The profile put 99% of the time in
+   `get_sequential` and 1% in `get_random` — but `get_random` was the cause. A flat profile
+   names the function that pays, not the one that charges.
+3. **Duplicated predicates diverge silently — and the divergence grows load-bearing.**
+   #106 said this already. By #337 a *third* consumer (`corpus_stats`) had come to depend on
+   the drift, so unifying the predicate was a behaviour change somewhere unrelated.
+4. **Test the property that makes it fast, not the time it takes.** The regression guard
+   asserts the cursor's IB fields point at the last result; a timing assertion would be
+   flaky and a correctness assertion passes on the buggy code, because the old code was
+   correct — just slow.
+5. **A predicate-agreement test must compare what actually differs.** The first version
+   compared element *values* across routes and passed against a deliberately re-broken
+   predicate, because `value()` unwraps wrappers on its own. Comparing `bp_position()`
+   catches it. An agreement test that cannot fail is worse than none.
+
+### Files Modified
+
+- `src/yaml/advance_positions.rs` — `seek_cursor`, `SequentialCursor::repeats`, the repeat
+  arm in `get`; `SequentialCursor` promoted to shared `pub(super)`
+- `src/yaml/end_positions.rs` — same two fixes; local `SequentialCursor` copy deleted in
+  favour of the shared one
+- `src/yaml/light.rs` — `is_seq_item_at` (the one definition) and its four call sites
+- `src/yaml/index.rs` — `is_seq_item` routed through the shared predicate
+- `src/bin/succinctly/corpus_stats.rs` — `item_wrapper` recovers the item node explicitly
+- `src/bin/succinctly/yaml_generators.rs`, `src/bin/succinctly/main.rs` — `empty-items`
+  generator pattern
+- `tests/yaml_bench_suite_coverage.rs`, `tests/yq_cli_tests.rs` — coverage and behaviour
+  regression tests
+
+---
+
 ## See Also
 
 - [YamlIndex wiki page](yaml-index.md) — concept overview, dependencies, and academic references

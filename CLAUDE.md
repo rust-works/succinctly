@@ -449,7 +449,10 @@ For detailed documentation on optimization techniques used in this project, see 
 - Micro-benchmark wins ≠ real-world improvements (threshold tuning: +8-15% regression despite micro-bench suggesting improvement)
 - Eliminating phases beats optimizing them (YAML streaming: removed DOM conversion entirely for 2.3x gain)
 - Derive, don't store, what the text already encodes (seq_items bitvector elimination: −12.5% build peak memory)
-- Duplicated predicates diverge silently — one definition, plus a test that the call sites agree (#106: three copies of one predicate, one of them quadratic)
+- Duplicated predicates diverge silently — one definition, plus a test that the call sites agree (#106: three copies of one predicate, one of them quadratic; #337: five copies, and by then a third consumer depended on the drift)
+- A fast path's slow path must leave state that is *useful*, not merely valid (#337: a correct-but-rewound cursor turned O(1) amortized into O(n) per call — 680x on 10MB)
+- A flat profile names the function that pays, not the one that charges (#337: 99% of samples in the victim, 1% in the poisoner)
+- An agreement test that compares the wrong thing cannot fail — re-break the code and watch it go red (#337: comparing values passed on a deliberately re-diverged predicate; comparing node positions caught it)
 - Check where data physically lives before proposing to tag it (#106: the proposal assumed a `Vec<u32>`; no real file has one)
 - Re-derive a break-even before trusting it (#106: the issue's stated 12.5% dropped a bits-to-bytes conversion; the real gate was 3.125%)
 
@@ -659,6 +662,14 @@ For detailed documentation on optimization techniques used in this project, see 
   - `yaml_bench` build-side clean (< 2% on 38/39 groups, both platforms) except one x86-only `block_scalars` anomaly (12-28%, reproduced twice), investigated and attributed to binary code-layout rather than the new logic: the BP structure for that workload is a fixed 7 words regardless of document size, too small to mechanistically explain the delta, and the same workload is neutral on ARM — filed as #595
   - Also surfaced a pre-existing, unrelated `yaml_bench` bug: the `anchors` group panics with `UnknownAnchor` on unmodified `main` too — filed as #594
   - See [docs/plan/cspoppy.md](docs/plan/cspoppy.md#5a-results-2026-08-03) for full analysis
+- ✅ O5 (Positioned Cursor on the Random-Access Path): **quadratic → linear reads**, issue #337
+  - `AdvancePositions::get_random` rewound the sequential cursor's IB fields to word 0; correct by the invariant, but it forced the *next* `get_sequential` to rescan IB from the start, O(text_len/64). `YamlElements::uncons` looks the same open up twice, so that fired once per element ⇒ O(n²)
+  - Fixes: `seek_cursor` leaves the cursor positioned at the select result (O(1), one popcount); an O(1) memo for the immediate repeat; one shared `is_seq_item_at` replacing five hand-copied predicates (three had drifted to reject `-\n`); `SequentialCursor` shared instead of duplicated across `advance_positions`/`end_positions`, where the bug lived in both copies
+  - **Measured** (Apple M4 Pro, interleaved A/B, min of 5): growth per doubling 3.9× → 1.7×; 1 MB of bare `-` 1279 ms → 21 ms (**61×**), 10 MB **115.6 s → 0.17 s (680×)**; `- x` control unchanged (1.00-1.02×)
+  - **Wider than the issue reported** — flow scalars, aliases and root documents take the same path: flow `-96%`, anchors `-91%`, multi-doc `.[]` `-82%` at 2 MB. All other patterns neutral (median −0.34% over 26 configs at 16 MB)
+  - Outputs byte-identical pre↔post over 544 comparisons (17 patterns × 8 queries × 2 formats)
+  - Key insight: a fast path's slow path must leave state that is not just *valid* but *useful* — and the profile named `get_sequential` (99% of time) while `get_random` (1%) was the cause
+  - See [docs/parsing/yaml.md#o5-positioned-cursor-on-the-random-access-path--accepted-](docs/parsing/yaml.md#o5-positioned-cursor-on-the-random-access-path--accepted-) for full analysis
 
 **UTF-8 validation optimizations:**
 - ⚠️ Broadword (SWAR) UTF-8 accept scan: opt-in only, **not the default** — issue #134
