@@ -245,6 +245,11 @@ fn paths_agree_on_key_and_scalar_constructs() {
         "n: |-\n  123\n",
         // empty block scalars are "" not null
         "strip: >-\n\nclip: >\n\nkeep: |+\n\n",
+        // content-less keep block scalars gain no line break — #344. `explicit` goes
+        // last: a content-less block with an explicit indicator swallows the line after
+        // it, so with `sibling` behind it both paths would agree by losing the same key
+        // and the case could not fail for the reason it exists.
+        "literal: |+\nfolded: >+\nsibling: 1\nexplicit: |2+\n",
         // quoted-string folding: literal trailing whitespace dropped, escaped kept
         "\"folded \nto a space,\t\n \nto a line feed, or \t\\\n \\ \tnon-content\"\n",
         "\"1 trailing\\t\n    tab\"\n",

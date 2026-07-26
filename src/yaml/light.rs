@@ -3420,6 +3420,50 @@ impl<'a> YamlString<'a> {
         text.len()
     }
 
+    /// How far a block scalar's content lines are indented, or `None` when the
+    /// block has no content lines at all.
+    ///
+    /// `content_start` is the first byte after the indicator line's break.
+    ///
+    /// `None` covers two shapes that have to be treated alike: nothing but empty
+    /// lines from here to EOF, and a first line no more indented than the block's
+    /// own key — a sibling, a dedented item, or a comment — which ends the block
+    /// before it starts. Either way everything inside the block is `l-empty`,
+    /// whose leading whitespace is indentation and not content.
+    ///
+    /// One definition on purpose. [`Self::find_block_content_range`] uses it to
+    /// decide where the content ends and the decoders use it to decide what to
+    /// strip; while those were separate copies they disagreed, because the
+    /// decoders' copy dropped the `> base_indent` test and so stripped nothing
+    /// from a block that a comment line had ended (#344).
+    fn block_content_indent(
+        text: &[u8],
+        indicator_pos: usize,
+        content_start: usize,
+        explicit_indent: Option<u8>,
+    ) -> Option<usize> {
+        // The base indent is the mapping key's (for `key: |`) or the line's.
+        // For `- key: |`, the key is at indent 2 (after `- `), not 0.
+        let base_indent = Self::compute_key_indent(text, indicator_pos);
+
+        // Explicit indentation: content is at base_indent + N spaces.
+        if let Some(indent) = explicit_indent {
+            return Some(base_indent + indent as usize);
+        }
+
+        // Auto-detect from the first non-empty line. On a document-start line
+        // (`--- |`) a zero-indented block scalar is valid, so indent 0 counts.
+        match Self::detect_block_indent(text, content_start) {
+            Some(indent)
+                if indent > base_indent
+                    || (Self::is_document_start_line(text, indicator_pos) && indent == 0) =>
+            {
+                Some(indent)
+            }
+            _ => None,
+        }
+    }
+
     /// Find content range for a block scalar.
     /// Returns (content_start, content_end).
     fn find_block_content_range(
@@ -3428,15 +3472,6 @@ impl<'a> YamlString<'a> {
         chomping: ChompingIndicator,
         explicit_indent: Option<u8>,
     ) -> (usize, usize) {
-        // Compute the base indent for block scalar termination.
-        // This is the indent of the mapping key (for `key: |`) or the line indent.
-        // For `- key: |`, the key is at indent 2 (after `- `), not 0.
-        let base_indent = Self::compute_key_indent(text, indicator_pos);
-
-        // Check if we're on a document-start line (--- or %directive)
-        // In this case, content can be at indent 0 (zero-indented block scalar)
-        let on_document_start_line = Self::is_document_start_line(text, indicator_pos);
-
         // Skip indicator and modifiers to find the end of the indicator line
         let mut pos = indicator_pos + 1;
         while pos < text.len() && !is_line_break(text[pos]) {
@@ -3449,23 +3484,16 @@ impl<'a> YamlString<'a> {
 
         let content_start = pos;
 
-        // Determine content indentation:
-        // - If explicit_indent is specified (e.g., >2), use base_indent + explicit_indent
-        // - Otherwise, auto-detect from first non-empty line
-        let content_indent = if let Some(indent) = explicit_indent {
-            // Explicit indentation: content is at base_indent + N spaces
-            base_indent + indent as usize
-        } else {
-            // Auto-detect from first non-empty line
-            // For zero-indented block scalars (after ---), content at indent 0 is valid
-            match Self::detect_block_indent(text, pos) {
-                Some(indent) if indent > base_indent || (on_document_start_line && indent == 0) => {
-                    indent
-                }
-                Some(_) | None => {
-                    // Content is not more indented than indicator line = empty block scalar
-                    // Per YAML spec: for keep chomping on empty block scalar, content is "\n"
-                    // We need to find any trailing newlines starting from content_start
+        let content_indent =
+            match Self::block_content_indent(text, indicator_pos, content_start, explicit_indent) {
+                Some(indent) => indent,
+                None => {
+                    // Content is not more indented than the indicator line, so the block has
+                    // no content lines. All that can remain is `l-keep-empty(n)` — a run of
+                    // empty lines that only keep chomping preserves (YAML 1.2 §8.1.1.2).
+                    // The break that ended the indicator line is *not* one of them: it
+                    // belongs to the header's `s-b-comment`, so a block with no empty lines
+                    // is `""`, not `"\n"` (#344).
                     if chomping == ChompingIndicator::Keep {
                         // Find all trailing newlines/empty lines from content_start
                         let mut end = content_start;
@@ -3475,7 +3503,8 @@ impl<'a> YamlString<'a> {
                             while end + spaces < text.len() && text[end + spaces] == b' ' {
                                 spaces += 1;
                             }
-                            // Check if it's an empty line or EOF
+                            // Spaces running to EOF are not an `l-empty`: that production
+                            // ends in `b-as-line-feed`, and there is no break here to feed.
                             if end + spaces >= text.len() {
                                 break;
                             }
@@ -3486,28 +3515,15 @@ impl<'a> YamlString<'a> {
                             }
                             end += spaces + break_len;
                         }
-                        // If no trailing newlines found but we're at EOF, the content
-                        // area includes the newline that terminated the indicator line.
-                        // Check if there was a newline before content_start.
-                        if end == content_start && content_start > 0 {
-                            let prev = content_start - 1;
-                            // A break that both starts at `prev` and *ends* at
-                            // `content_start`, i.e. is exactly one byte wide.
-                            // `line_break_len_before` is the wrong question here:
-                            // it reports 1 from the middle of a CRLF, which would
-                            // split the CR off from its LF.
-                            if line_break_len(text, prev) == 1 {
-                                // The indicator line ended with a newline - include it
-                                // by adjusting content_start back to include that newline
-                                return (prev, content_start);
-                            }
-                        }
+                        // `end == content_start` means zero empty lines, which under keep
+                        // is `""`. Reaching back past `content_start` to borrow the
+                        // indicator line's own terminator would fabricate a break the
+                        // scalar never had (#344).
                         return (content_start, end);
                     }
                     return (content_start, content_start);
                 }
-            }
-        };
+            };
 
         // Find end of block scalar content
         let mut last_content_end = pos;
@@ -4050,6 +4066,27 @@ fn parse_hex(hex: &[u8]) -> Result<u32, YamlStringError> {
     Ok(value)
 }
 
+/// The indent the decoders use when [`YamlString::block_content_indent`] returns
+/// `None`: strip every line's leading run of spaces, however long.
+///
+/// Both decoders consume this through `line_indent.min(indent)` and a
+/// `line_indent > indent` test, so `usize::MAX` reads as "all of it" and "never
+/// more-indented" respectively — which is only the right answer because `None`
+/// means the range is nothing but `l-empty` lines, whose leading whitespace is
+/// indentation rather than content. That invariant is established over in
+/// `find_block_content_range`, a call away, so assert it here rather than trust
+/// it: were the `None` branch ever to start yielding real content, the bug would
+/// be silently stripped text instead of a failing test.
+fn strip_whole_indent_run(content: &[u8]) -> usize {
+    debug_assert!(
+        content
+            .iter()
+            .all(|&b| b == b' ' || b == b'\n' || b == b'\r'),
+        "block_content_indent returned None over non-blank block scalar content"
+    );
+    usize::MAX
+}
+
 /// Decode a literal block scalar (preserves newlines).
 fn decode_block_literal(
     text: &[u8],
@@ -4061,27 +4098,21 @@ fn decode_block_literal(
         YamlString::find_block_content_range(text, indicator_pos, chomping, explicit_indent);
 
     if content_start >= content_end {
-        // Empty block scalar - but with keep chomping, we should preserve
-        // the implicit final line break (YAML spec section 8.1.1.2).
-        // Even when the block has no content, there's an implicit line break
-        // at the end of the indicator line that keep chomping preserves.
-        if chomping == ChompingIndicator::Keep {
-            return Ok(Cow::Borrowed("\n"));
-        }
+        // No content lines and no empty lines. There is nothing for keep chomping to
+        // keep either: `l-keep-empty(n)` covers the block's own empty lines, not the
+        // break that ended the indicator line (YAML 1.2 §8.1.1.2, #344).
         return Ok(Cow::Borrowed(""));
     }
 
     let content = &text[content_start..content_end];
 
-    // Determine indentation to strip:
-    // - If explicit_indent is specified, use base_indent + explicit_indent
-    // - Otherwise, auto-detect from first non-empty line
-    let base_indent = YamlString::compute_key_indent(text, indicator_pos);
-    let indent = if let Some(ei) = explicit_indent {
-        base_indent + ei as usize
-    } else {
-        YamlString::detect_block_indent(text, content_start).unwrap_or(0)
-    };
+    // No content lines means the range is all `l-empty`, whose leading spaces are
+    // indentation rather than content — strip each line's run whole. Otherwise
+    // `|+` over `   \n` yields `"   \n"` where YAML 1.2 and `yq` give `"\n"`
+    // (yaml-test-suite JEF9/01).
+    let indent =
+        YamlString::block_content_indent(text, indicator_pos, content_start, explicit_indent)
+            .unwrap_or_else(|| strip_whole_indent_run(content));
     if indent == 0 && !content.contains(&b'\r') {
         // No indentation to strip and no line breaks to normalize - borrow as is.
         // Content holding a `\r` must go through the loop below, which rewrites
@@ -4183,25 +4214,18 @@ fn decode_block_folded(
         YamlString::find_block_content_range(text, indicator_pos, chomping, explicit_indent);
 
     if content_start >= content_end {
-        // Empty block scalar - but with keep chomping, we should preserve
-        // the implicit final line break (YAML spec section 8.1.1.2).
-        if chomping == ChompingIndicator::Keep {
-            return Ok(Cow::Borrowed("\n"));
-        }
+        // See `decode_block_literal`: an empty range is `""` under every chomping,
+        // keep included (#344).
         return Ok(Cow::Borrowed(""));
     }
 
     let content = &text[content_start..content_end];
 
-    // Determine indentation to strip:
-    // - If explicit_indent is specified, use base_indent + explicit_indent
-    // - Otherwise, auto-detect from first non-empty line
-    let base_indent = YamlString::compute_key_indent(text, indicator_pos);
-    let indent = if let Some(ei) = explicit_indent {
-        base_indent + ei as usize
-    } else {
-        YamlString::detect_block_indent(text, content_start).unwrap_or(0)
-    };
+    // See `decode_block_literal`: `None` means every line here is `l-empty`, so
+    // strip its leading whitespace whole.
+    let indent =
+        YamlString::block_content_indent(text, indicator_pos, content_start, explicit_indent)
+            .unwrap_or_else(|| strip_whole_indent_run(content));
 
     // Build result by folding newlines
     let mut result = String::with_capacity(content.len());
@@ -5252,6 +5276,67 @@ mod tests {
         }
     }
 
+    /// Issue #344: keep chomping preserves the block's own empty lines, not the
+    /// break that ended the indicator line. That break belongs to the header's
+    /// `s-b-comment` (YAML 1.2 §8.1.1.2), so a block with no content lines *and*
+    /// no empty lines is `""` — the two used to be conflated and every such block
+    /// gained a `"\n"` it never had.
+    ///
+    /// The boundary is one empty line, so both sides of it are pinned here. Note
+    /// `l-empty` ends in `b-as-line-feed`: a blank final line with no break is not
+    /// an empty line, which is why `a: |+\n   ` is `""` while `a: |+\n   \n` is
+    /// `"\n"`. Expected values are mikefarah/yq v4.53.3.
+    #[test]
+    fn test_content_less_keep_block_scalars_have_no_break() {
+        let cases: &[(&[u8], &str)] = &[
+            // Nothing at all after the header, with and without a final break
+            (b"a: |+", "{\"a\":\"\"}"),
+            (b"a: |+\n", "{\"a\":\"\"}"),
+            (b"a: >+", "{\"a\":\"\"}"),
+            (b"a: >+\n", "{\"a\":\"\"}"),
+            // Explicit indentation indicator takes a different path into the
+            // decoders and used to fabricate the same break (2G84/03)
+            (b"a: |2+\n", "{\"a\":\"\"}"),
+            (b"a: >2+\n", "{\"a\":\"\"}"),
+            // The block need not be at EOF: a sibling key or a comment line ends
+            // it just as well
+            (b"a: |+\nb: 2\n", "{\"a\":\"\",\"b\":2}"),
+            (b"a: >+\nb: 2\n", "{\"a\":\"\",\"b\":2}"),
+            (b"a: |+\n# comment\n", "{\"a\":\"\"}"),
+            // As a sequence item rather than a mapping value
+            (b"- |+\n", "[\"\"]"),
+            (b"- >+\n", "[\"\"]"),
+            // Blank final line with no break: not an `l-empty`, so still ""
+            (b"a: |+\n   ", "{\"a\":\"\"}"),
+            // Boundary: one genuine empty line is one `\n`, and its leading
+            // spaces are indentation, not content (JEF9/01)
+            (b"a: |+\n\n", "{\"a\":\"\\n\"}"),
+            (b"a: >+\n\n", "{\"a\":\"\\n\"}"),
+            (b"a: |+\n   \n", "{\"a\":\"\\n\"}"),
+            (b"a: |+\n\n\n", "{\"a\":\"\\n\\n\"}"),
+            (b"a: |+\n  \n  \n", "{\"a\":\"\\n\\n\"}"),
+            // Strip and clip were always right on these shapes — pin them so a
+            // future fix cannot drift them the other way
+            (b"a: |-\n", "{\"a\":\"\"}"),
+            (b"a: |\n", "{\"a\":\"\"}"),
+            (b"a: >-\n", "{\"a\":\"\"}"),
+            (b"a: >\n", "{\"a\":\"\"}"),
+        ];
+
+        for (yaml, expected) in cases {
+            let index = YamlIndex::build(yaml).unwrap();
+            let json = index.root(yaml).to_json_document();
+            let mut streamed = String::new();
+            index
+                .root(yaml)
+                .stream_json_document(&mut streamed)
+                .unwrap();
+            let input = core::str::from_utf8(yaml).unwrap();
+            assert_eq!(json, *expected, "to_json mismatch for {input:?}");
+            assert_eq!(streamed, *expected, "stream_json mismatch for {input:?}");
+        }
+    }
+
     /// Issue #222: quoted-string line folding must drop trailing *literal*
     /// whitespace before a literal line break while preserving *escaped*
     /// whitespace as content, and all three decoders — `as_str` (DOM),
@@ -5893,6 +5978,35 @@ mod tests {
             // A lone CR does terminate the line, so `b-chomped-last` survives
             (b"fold: >+\n  a\r", "a\n"),
             (b"fold: >\r\n  a\r\n\r\n  b", "a\nb"),
+        ]);
+    }
+
+    /// Issue #344, folded side: with no content lines at all, keep chomping has
+    /// only the block's own empty lines to keep. The break that ended the
+    /// indicator line is the header's, not the scalar's, so a block with no
+    /// empty lines is `""` and not `"\n"`.
+    ///
+    /// [`test_block_folded_unterminated_final_line`] already pins the same
+    /// "a run of spaces to EOF is not a line" rule for blocks that *do* have
+    /// content; these are the shapes where it is all the block consists of.
+    /// Expected values are mikefarah/yq v4.53.3.
+    #[test]
+    fn test_block_folded_content_less_keep() {
+        assert_folded(&[
+            (b"fold: >+", ""),
+            (b"fold: >+\n", ""),
+            // Explicit indentation indicator bypasses the empty-block branch
+            (b"fold: >2+\n", ""),
+            // A sibling key or a comment line ends the block just as EOF does
+            (b"fold: >+\nother: 1\n", ""),
+            (b"fold: >+\n# comment\n", ""),
+            // No break, so no `l-empty` — still ""
+            (b"fold: >+\n   ", ""),
+            // Boundary: a real empty line is worth one `\n`, its indentation
+            // stripped
+            (b"fold: >+\n\n", "\n"),
+            (b"fold: >+\n   \n", "\n"),
+            (b"fold: >+\n\n\n", "\n\n"),
         ]);
     }
 

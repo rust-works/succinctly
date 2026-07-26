@@ -1,0 +1,7 @@
+# This file deliberately ends without a trailing line break. A content-less
+# `|+` whose indicator line runs to EOF has no break at all to keep, so it is
+# "" — not the "\n" the decoder used to fabricate (#344). Adding a final
+# newline still yields "", but it exercises a different branch, so the shape is
+# pinned here where an editor cannot quietly "fix" it away.
+before: 1
+no_final_break: |+

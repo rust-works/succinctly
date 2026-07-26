@@ -1,0 +1,27 @@
+# Keep chomping preserves the block's own empty lines, not the break that ended
+# the indicator line — that break belongs to the header's `s-b-comment`, so a
+# block with no content lines and no empty lines is "" and not "\n" (#344).
+literal: |+
+folded: >+
+before_sibling: |+
+sibling: 2
+before_comment: |+
+# a comment line ends the block just as a sibling key does
+seq:
+  - |+
+  - >+
+# The boundary this fix turns on: one genuine empty line is worth one `\n`, and
+# its leading spaces are indentation rather than content.
+one_empty_line: |+
+
+two_empty_lines: |+
+
+
+spaced_empty_line: |+
+   
+# An explicit indentation indicator reaches the decoders by a different path, so
+# it is covered here too — but it has to stay last. A content-less block with an
+# explicit indicator swallows the line that follows it and drops that key; that
+# is a separate indexing defect, unrelated to chomping (it reproduces with `|2`
+# and `|2-` just as well), and not what this case exists to pin.
+explicit_indent: |2+

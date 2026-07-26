@@ -26,7 +26,7 @@ path:
 
 | Dimension                              | Result              | Meaning                                        |
 |----------------------------------------|---------------------|------------------------------------------------|
-| **Load** (valid YAML, output compared) | **214/279 = 76.7%** | Parses and produces the JSON the suite expects |
+| **Load** (valid YAML, output compared) | **215/279 = 77.1%** | Parses and produces the JSON the suite expects |
 | **Reject** (invalid YAML, must fail)   | **70/94 = 74.5%**   | Refused by the loader or the opt-in validator  |
 | **Parse** (valid YAML, no JSON form)   | **27/29 = 93.1%**   | Parses without error                           |
 
@@ -35,7 +35,7 @@ validator enabled (loader OR validator, see below). The *default non-validating
 loader alone* still rejects only 11/94 (11.7%) by design — the opt-in validator
 ([#223](https://github.com/rust-works/succinctly/issues/223)) closes 59 more.
 
-The 91 non-passing cases are enumerated individually, with a category and reason, in
+The 90 non-passing cases are enumerated individually, with a category and reason, in
 [`tests/data/yaml-test-suite-known-failures.txt`](../../../tests/data/yaml-test-suite-known-failures.txt).
 That file is the machine-readable source of truth; the test asserts it matches reality
 exactly, so it cannot silently drift from this page.
@@ -218,13 +218,13 @@ floats render as integers on the streaming path, `1.0` → `1` —
 [#168](https://github.com/rust-works/succinctly/issues/168) /
 [#170](https://github.com/rust-works/succinctly/issues/170)).
 
-## Full accounting of the 65 load failures
+## Full accounting of the 64 load failures
 
 | Category     | Cases | Cause                                                             |
 |--------------|-------|-------------------------------------------------------------------|
 | `tags`       | 31    | Tags not supported (above)                                        |
 | `directives` | 16    | `%YAML` / `%TAG` not recognized (above)                           |
-| `structure`  | 10    | Document end markers; anchors with colons in the name             |
+| `structure`  | 9     | Document end markers; anchors with colons in the name             |
 | `scalars`    | 8     | Zero-indented block scalars; tabs; trailing whitespace            |
 
 `scalars` was 13 until [#329](https://github.com/rust-works/succinctly/issues/329). Folded
@@ -234,7 +234,33 @@ dropped `b-chomped-last` entirely, so `>+` over `a` produced `"a"` rather than `
 Fixing the folding rule in `decode_block_folded` cleared `4Q9F`, `7T8X`, `93WF`, `K527`
 and `TS54`. What remains under `scalars` is unrelated to folding: zero-indented block
 scalars (`DK3J`, `FP8R`), tab handling (`DK95/00`, `K54U`), trailing whitespace
-(`L24T/00`), and explicit indentation indicators (`M5C3`, `2G84/03`).
+(`L24T/00`, `JEF9/02`), explicit indentation indicators (`M5C3`), and the empty stream
+(`AVM7`, filed under `scalars` although it is really a document-level case).
+
+### `JEF9/02`: the one case where we follow `yq` over the suite
+
+[#344](https://github.com/rust-works/succinctly/issues/344) fixed content-less keep-chomped
+block scalars, which used to keep the break that ended the *indicator* line — a break that
+belongs to the header's `s-b-comment`, not to the scalar. That cleared `2G84/03` (`--- |1+`)
+from `scalars` and `JEF9/01` (`- |+` over a spaces-only line) from `structure`, whose blank
+line's indentation had been emitted as content.
+
+It also flipped `JEF9/02` — `- |+` over a spaces-only line with **no terminating break** —
+into a known failure, because the two oracles contradict each other there. `l-empty` ends in
+`b-as-line-feed`, and the suite treats end-of-stream as supplying that break (expecting
+`"\n"`); `yq` v4.53.3 does not (giving `""`). We follow `yq`, which is the compatibility
+target the golden fixtures and the `yq-drift` CI job pin. The net effect on the ledger is one
+case either way.
+
+Three `|+` / `>+` families still diverge from `yq`, none of them specific to content-less
+blocks and all of them predating #344 — an A/B of the fix over 432 block-scalar shapes moved
+45 toward `yq` and none away, leaving these untouched. A block on a document-start line keeps
+a break it should chomp (`--- |+` over a blank line gives `"\n"`, `yq` gives `""`). An
+explicit indentation indicator on the *folded* path does not strip that indent from a
+spaces-only line (`>1+` over `   ` gives `""`, `yq` gives `"  "`). And a content-less block
+with an explicit indicator swallows the line after it, dropping that key outright — `a: |2+`
+over `b: 2` loses `b`, which is why the `empty_block_scalars_keep_contentless` fixture orders
+its `explicit_indent` case last.
 
 The two `parse` failures (`FH7J`, `UKK6/02`) are also tags.
 
