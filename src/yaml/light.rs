@@ -7386,35 +7386,8 @@ mod tests {
             b"a: |+\r\n\r\nb: c\r\n".as_slice(),
             b"a: |+\r\rb: c\r".as_slice(),
         ] {
-            let index = YamlIndex::build(yaml).expect("parses");
-            let root = index.root(yaml);
-            let YamlValue::Mapping(fields) = first_doc(root) else {
-                panic!("expected a mapping for {:?}", String::from_utf8_lossy(yaml));
-            };
-            let got: Vec<(String, String)> = fields
-                .into_iter()
-                .map(|f| {
-                    let YamlValue::String(k) = f.key() else {
-                        panic!("expected a string key");
-                    };
-                    let YamlValue::String(v) = f.value() else {
-                        panic!("expected a string value");
-                    };
-                    (
-                        k.as_str().expect("key decodes").into_owned(),
-                        v.as_str().expect("value decodes").into_owned(),
-                    )
-                })
-                .collect();
-            assert_eq!(
-                got,
-                vec![
-                    ("a".to_string(), "\n".to_string()),
-                    ("b".to_string(), "c".to_string()),
-                ],
-                "input {:?}",
-                String::from_utf8_lossy(yaml)
-            );
+            let input = String::from_utf8_lossy(yaml);
+            assert_eq!(doc_json(yaml), r#"[{"a":"\n","b":"c"}]"#, "input {input:?}");
         }
     }
 
@@ -8072,12 +8045,11 @@ mod tests {
             let (index, text) = cursor_over(yaml);
             let root = index.root(text);
             let end = root.find_plain_scalar_end(3, 0, false);
-            let scanned = &text[3..end];
+            let input = String::from_utf8_lossy(yaml);
+            let scanned = String::from_utf8_lossy(&text[3..end]);
             assert!(
-                scanned.ends_with(b"two"),
-                "input {:?} scanned {:?}",
-                String::from_utf8_lossy(yaml),
-                String::from_utf8_lossy(scanned)
+                scanned.ends_with("two"),
+                "input {input:?} scanned {scanned:?}"
             );
         }
     }
@@ -8096,12 +8068,11 @@ mod tests {
             let (index, text) = cursor_over(yaml);
             let root = index.root(text);
             let end = root.find_plain_scalar_end(3, 0, false);
-            let scanned = &text[3..end];
+            let input = String::from_utf8_lossy(yaml);
+            let scanned = String::from_utf8_lossy(&text[3..end]);
             assert!(
-                scanned.ends_with(b"two"),
-                "input {:?} scanned {:?}",
-                String::from_utf8_lossy(yaml),
-                String::from_utf8_lossy(scanned)
+                scanned.ends_with("two"),
+                "input {input:?} scanned {scanned:?}"
             );
         }
     }

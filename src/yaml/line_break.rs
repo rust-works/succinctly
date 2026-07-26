@@ -164,12 +164,12 @@ mod tests {
 
                 let inside_a_crlf = pos > 0 && line_break_len(text, pos - 1) == 2;
                 if here > 0 && !inside_a_crlf {
+                    let ends_at = pos + here;
                     assert_eq!(
-                        line_break_len_before(text, pos + here),
+                        line_break_len_before(text, ends_at),
                         here,
                         "{text:?} @ {pos}: a break of width {here} starting here \
-                         must be the break of width {here} ending at {}",
-                        pos + here
+                         must be the break of width {here} ending at {ends_at}"
                     );
                 }
             }
