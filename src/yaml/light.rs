@@ -7372,6 +7372,52 @@ mod tests {
         panic!("Could not find value");
     }
 
+    /// A `|+` whose content line never arrives: keep chomping still holds the
+    /// break that ended the indicator line, and the scan for further trailing
+    /// blank lines must stop at the next mapping key rather than swallowing it.
+    /// That stop is the one place the empty-block-scalar scan asks whether it
+    /// is still looking at a break, so it is measured, not assumed (#341).
+    ///
+    /// `yq` reads all three spellings as `{"a": "\n", "b": "c"}`.
+    #[test]
+    fn keep_chomped_empty_block_scalar_stops_at_the_next_key() {
+        for yaml in [
+            b"a: |+\n\nb: c\n".as_slice(),
+            b"a: |+\r\n\r\nb: c\r\n".as_slice(),
+            b"a: |+\r\rb: c\r".as_slice(),
+        ] {
+            let index = YamlIndex::build(yaml).expect("parses");
+            let root = index.root(yaml);
+            let YamlValue::Mapping(fields) = first_doc(root) else {
+                panic!("expected a mapping for {:?}", String::from_utf8_lossy(yaml));
+            };
+            let got: Vec<(String, String)> = fields
+                .into_iter()
+                .map(|f| {
+                    let YamlValue::String(k) = f.key() else {
+                        panic!("expected a string key");
+                    };
+                    let YamlValue::String(v) = f.value() else {
+                        panic!("expected a string value");
+                    };
+                    (
+                        k.as_str().expect("key decodes").into_owned(),
+                        v.as_str().expect("value decodes").into_owned(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    ("a".to_string(), "\n".to_string()),
+                    ("b".to_string(), "c".to_string()),
+                ],
+                "input {:?}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
     #[test]
     fn test_style_folded_block() {
         let yaml = b"key: >\n  line1\n  line2";
@@ -7997,6 +8043,55 @@ mod tests {
             b"a: one\n  two\n".as_slice(),
             b"a: one\r\n  two\r\n".as_slice(),
             b"a: one\r  two\r".as_slice(),
+        ] {
+            let (index, text) = cursor_over(yaml);
+            let root = index.root(text);
+            let end = root.find_plain_scalar_end(3, 0, false);
+            let scanned = &text[3..end];
+            assert!(
+                scanned.ends_with(b"two"),
+                "input {:?} scanned {:?}",
+                String::from_utf8_lossy(yaml),
+                String::from_utf8_lossy(scanned)
+            );
+        }
+    }
+
+    /// A blank line between two content lines does not end a plain scalar —
+    /// the scan steps over it and keeps going. The blank-line arm is where the
+    /// scan measures a break rather than assuming one byte, so a CRLF blank
+    /// line would otherwise leave it standing on the orphaned LF and read that
+    /// as a second blank line (#341).
+    #[test]
+    fn find_plain_scalar_end_steps_over_blank_lines() {
+        for yaml in [
+            b"a: one\n\n  two\nb: 2\n".as_slice(),
+            b"a: one\r\n\r\n  two\r\nb: 2\r\n".as_slice(),
+            b"a: one\r\r  two\rb: 2\r".as_slice(),
+        ] {
+            let (index, text) = cursor_over(yaml);
+            let root = index.root(text);
+            let end = root.find_plain_scalar_end(3, 0, false);
+            let scanned = &text[3..end];
+            assert!(
+                scanned.ends_with(b"two"),
+                "input {:?} scanned {:?}",
+                String::from_utf8_lossy(yaml),
+                String::from_utf8_lossy(scanned)
+            );
+        }
+    }
+
+    /// A line holding only spaces and tabs counts as blank for folding, and the
+    /// scan resumes after *its* break. Reached through the tab arm, which walks
+    /// the whitespace run itself and so must measure the break at wherever that
+    /// run stops rather than at the line's start (#341).
+    #[test]
+    fn find_plain_scalar_end_treats_a_whitespace_only_line_as_blank() {
+        for yaml in [
+            b"a: one\n \t \n  two\nb: 2\n".as_slice(),
+            b"a: one\r\n \t \r\n  two\r\nb: 2\r\n".as_slice(),
+            b"a: one\r \t \r  two\rb: 2\r".as_slice(),
         ] {
             let (index, text) = cursor_over(yaml);
             let root = index.root(text);
