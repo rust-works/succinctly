@@ -27,6 +27,8 @@
 
 use core::fmt;
 
+use super::line_break::{is_line_break, line_break_len};
+
 /// Position information for error reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
@@ -528,10 +530,9 @@ impl<'a> Validator<'a> {
                         } else if c == b'\r' {
                             // A CRLF is a single line break: consume the LF too,
                             // so an unterminated quote resumes this scan exactly
-                            // where the LF-only spelling would (#324).
-                            if self.input.get(i) == Some(&b'\n') {
-                                i += 1;
-                            }
+                            // where the LF-only spelling would (#324). `c` sits
+                            // at `i - 1`, so measure the break from there.
+                            i = (i - 1) + line_break_len(self.input, i - 1);
                             break;
                         }
                     }
@@ -547,7 +548,7 @@ impl<'a> Validator<'a> {
                             }
                             break;
                         }
-                        if c == b'\n' || c == b'\r' {
+                        if is_line_break(c) {
                             break;
                         }
                         i += 1;
@@ -1396,21 +1397,11 @@ impl<'a> Validator<'a> {
 
     /// Consume a line break (`\n`, `\r`, or `\r\n`), resetting the column.
     fn consume_line_break(&mut self) {
-        match self.peek() {
-            Some(b'\r') => {
-                self.offset += 1;
-                if self.peek() == Some(b'\n') {
-                    self.offset += 1;
-                }
-                self.line += 1;
-                self.column = 1;
-            }
-            Some(b'\n') => {
-                self.offset += 1;
-                self.line += 1;
-                self.column = 1;
-            }
-            _ => {}
+        let break_len = line_break_len(self.input, self.offset);
+        if break_len > 0 {
+            self.offset += break_len;
+            self.line += 1;
+            self.column = 1;
         }
     }
 
