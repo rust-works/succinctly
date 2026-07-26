@@ -609,6 +609,34 @@ mod tests {
         }
     }
 
+    /// L0 only engages past one superblock -- `BLOCKS_PER_SUPERBLOCK` (2^23)
+    /// blocks of 512 bits, i.e. a 2^32-bit (512 MiB) bitvector -- so `build`'s L0
+    /// rollover and `rank_at_word`'s L0 lookup are unreachable below that size and
+    /// no test covered the level at all. This is the same size class as #188,
+    /// where a u32 accumulator past 2^32 wrapped. Needs ~700 MB (536 MB of words
+    /// plus a 134 MB directory), hence the huge-tests gate.
+    #[test]
+    #[cfg(feature = "huge-tests")]
+    fn test_rank_crosses_l0_superblock_boundary() {
+        let first_word_past_superblock = BLOCKS_PER_SUPERBLOCK * WORDS_PER_BLOCK;
+        let words = vec![u64::MAX; first_word_past_superblock + WORDS_PER_BLOCK];
+        let dir = RankDirectory::build(&words);
+
+        // Every bit is set, so rank_at_word(w) == w * 64 -- including past 2^32,
+        // where L1 alone (a u32 relative to the L0 base) could not reach.
+        assert!(first_word_past_superblock * 64 > u32::MAX as usize);
+        assert_eq!(
+            dir.rank_at_word(first_word_past_superblock),
+            first_word_past_superblock * 64,
+            "first word of the second superblock"
+        );
+        assert_eq!(
+            dir.rank_at_word(first_word_past_superblock + 1),
+            (first_word_past_superblock + 1) * 64,
+            "L2 offset within the second superblock's first block"
+        );
+    }
+
     // Tests for CacheAlignedL1L2Builder
     mod builder_tests {
         use super::*;

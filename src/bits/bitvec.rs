@@ -876,6 +876,13 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "exceeds capacity")]
+    fn test_len_beyond_word_capacity_panics() {
+        // One word holds 64 bits, so a declared len of 65 is rejected.
+        let _ = BitVec::from_words(vec![0u64], 65);
+    }
+
+    #[test]
     fn test_surplus_words_rank_select_agree() {
         // Every bit set, but only 100 of the 192 declared valid.
         let bv = BitVec::from_words(vec![u64::MAX; 3], 100);
