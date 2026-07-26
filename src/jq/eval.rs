@@ -271,6 +271,20 @@ fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue 
     }
 }
 
+/// jq truthiness of a borrowed value: everything except `null` and `false`.
+///
+/// Equivalent to `to_owned(value).is_truthy()` — [`to_owned`] maps
+/// `StandardJson::Error` to `OwnedValue::Null`, which is falsy — but O(1)
+/// where `to_owned` deep-copies whole arrays and objects to answer a yes/no
+/// question. That matters for the stream operators, which test *every* output
+/// rather than just the first.
+fn json_is_truthy<W>(value: &StandardJson<'_, W>) -> bool {
+    !matches!(
+        value,
+        StandardJson::Null | StandardJson::Bool(false) | StandardJson::Error(_)
+    )
+}
+
 /// Check if an expression contains PathNoArg, Parent, or Key builtins that need path context.
 fn needs_path_context(expr: &Expr) -> bool {
     match expr {
@@ -772,6 +786,87 @@ fn result_to_owned<W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Keep only the truthy outputs of a stream, normalizing the result.
+///
+/// A stream with no surviving output becomes [`QueryResult::None`], and a
+/// single survivor is normalized to `One`/`Owned` so the caller cannot tell a
+/// filtered stream from a value that was single all along. `None`, `Error` and
+/// `Break` pass through untouched — filtering says nothing about them.
+///
+/// Borrowed values stay borrowed: this never calls [`to_owned`], so `//` over a
+/// document-derived stream keeps the zero-copy path.
+fn retain_truthy<W: Clone + AsRef<[u64]>>(result: QueryResult<'_, W>) -> QueryResult<'_, W> {
+    match result.materialize_cursor() {
+        QueryResult::One(v) => {
+            if json_is_truthy(&v) {
+                QueryResult::One(v)
+            } else {
+                QueryResult::None
+            }
+        }
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
+        QueryResult::Owned(v) => {
+            if v.is_truthy() {
+                QueryResult::Owned(v)
+            } else {
+                QueryResult::None
+            }
+        }
+        QueryResult::Many(mut vs) => {
+            vs.retain(json_is_truthy);
+            match vs.len() {
+                0 => QueryResult::None,
+                1 => QueryResult::One(vs.pop().unwrap()),
+                _ => QueryResult::Many(vs),
+            }
+        }
+        QueryResult::ManyOwned(mut vs) => {
+            vs.retain(OwnedValue::is_truthy);
+            match vs.len() {
+                0 => QueryResult::None,
+                1 => QueryResult::Owned(vs.pop().unwrap()),
+                _ => QueryResult::ManyOwned(vs),
+            }
+        }
+        other @ (QueryResult::None | QueryResult::Error(_) | QueryResult::Break(_)) => other,
+    }
+}
+
+/// Append one truthiness bit per output of a stream to `out`.
+///
+/// Returns `Some(control)` when the stream was an `Error` or a `Break`, which
+/// the caller must propagate as its own result; `None` when every output was
+/// consumed. An empty stream contributes no bits, which is how `empty and true`
+/// ends up yielding nothing.
+///
+/// Collecting `bool` rather than `OwnedValue` is deliberate: `and`/`or` only
+/// ever need whether an output was truthy, never the output itself.
+fn push_truthiness<'a, W: Clone + AsRef<[u64]>>(
+    result: QueryResult<'a, W>,
+    out: &mut Vec<bool>,
+) -> Option<QueryResult<'a, W>> {
+    match result.materialize_cursor() {
+        QueryResult::One(v) => out.push(json_is_truthy(&v)),
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
+        QueryResult::Owned(v) => out.push(v.is_truthy()),
+        QueryResult::Many(vs) => out.extend(vs.iter().map(json_is_truthy)),
+        QueryResult::ManyOwned(vs) => out.extend(vs.iter().map(OwnedValue::is_truthy)),
+        QueryResult::None => {}
+        QueryResult::Error(e) => return Some(QueryResult::Error(e)),
+        QueryResult::Break(label) => return Some(QueryResult::Break(label)),
+    }
+    None
+}
+
+/// Turn a stream of booleans into the result of a boolean operator.
+fn bools_to_result<'a, W: Clone + AsRef<[u64]>>(mut bools: Vec<bool>) -> QueryResult<'a, W> {
+    match bools.len() {
+        0 => QueryResult::None,
+        1 => QueryResult::Owned(OwnedValue::Bool(bools.pop().unwrap())),
+        _ => QueryResult::ManyOwned(bools.into_iter().map(OwnedValue::Bool).collect()),
+    }
+}
+
 /// Evaluate arithmetic operations.
 fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     op: ArithOp,
@@ -1162,24 +1257,8 @@ fn eval_and<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate left first
-    let left_val = match result_to_owned(eval_single::<W, S>(left, value.clone(), optional)) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
-
-    // Short-circuit: if left is falsy, return false
-    if !left_val.is_truthy() {
-        return QueryResult::Owned(OwnedValue::Bool(false));
-    }
-
-    // Evaluate right
-    let right_val = match result_to_owned(eval_single::<W, S>(right, value, optional)) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
-
-    QueryResult::Owned(OwnedValue::Bool(right_val.is_truthy()))
+    // `false and _` is false without consulting the right operand.
+    eval_boolean::<W, S>(left, right, value, optional, false)
 }
 
 /// Evaluate boolean OR (short-circuiting).
@@ -1189,24 +1268,57 @@ fn eval_or<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate left first
-    let left_val = match result_to_owned(eval_single::<W, S>(left, value.clone(), optional)) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
+    // `true or _` is true without consulting the right operand.
+    eval_boolean::<W, S>(left, right, value, optional, true)
+}
 
-    // Short-circuit: if left is truthy, return true
-    if left_val.is_truthy() {
-        return QueryResult::Owned(OwnedValue::Bool(true));
+/// Shared body of `and` and `or`, which differ only in which truth value
+/// short-circuits: `false` for `and`, `true` for `or`.
+///
+/// Both are generators, not scalar operators (#160). jq emits one boolean per
+/// (left output, right output) pair, with the left operand as the outer loop:
+/// `(true,false) and (true,false)` yields `true false false` because the second
+/// left output short-circuits. A left output that short-circuits contributes
+/// its boolean without evaluating the right operand at all, which is what makes
+/// `false and error("x")` yield `false` rather than raising.
+///
+/// The right operand is re-evaluated per left output rather than evaluated once
+/// and reused. That matches jq's backtracking, and it costs nothing in the
+/// common case where the left operand is single-output.
+fn eval_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    left: &Expr,
+    right: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    short_circuit: bool,
+) -> QueryResult<'a, W> {
+    let mut left_bools = Vec::new();
+    if let Some(control) = push_truthiness(
+        eval_single::<W, S>(left, value.clone(), optional),
+        &mut left_bools,
+    ) {
+        return control;
     }
 
-    // Evaluate right
-    let right_val = match result_to_owned(eval_single::<W, S>(right, value, optional)) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
+    let mut out = Vec::with_capacity(left_bools.len());
+    for left_bool in left_bools {
+        if left_bool == short_circuit {
+            out.push(short_circuit);
+            continue;
+        }
+        // An error or a break in the right operand is the whole result. Outputs
+        // already accumulated are lost, because `QueryResult` models both as a
+        // property of the stream rather than of an element — the same limit
+        // `eval_comma` has.
+        if let Some(control) = push_truthiness(
+            eval_single::<W, S>(right, value.clone(), optional),
+            &mut out,
+        ) {
+            return control;
+        }
+    }
 
-    QueryResult::Owned(OwnedValue::Bool(right_val.is_truthy()))
+    bools_to_result(out)
 }
 
 /// Evaluate boolean NOT.
@@ -1215,32 +1327,27 @@ fn eval_not<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<
     QueryResult::Owned(OwnedValue::Bool(!owned.is_truthy()))
 }
 
-/// Evaluate alternative operator (//): returns left if truthy, otherwise right.
+/// Evaluate alternative operator (`//`).
+///
+/// `a // b` emits **every** output of `a` that is neither `null` nor `false`,
+/// and only when `a` yields no such output does it evaluate `b` (#160). `b`'s
+/// outputs are emitted unfiltered — `false // (null,7)` is `null, 7` — which is
+/// what makes the left-associative chain `a // b // c` filter `b`'s stream.
 fn eval_alternative<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     left: &Expr,
     right: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate left
-    let left_result = eval_single::<W, S>(left, value.clone(), optional);
-
-    // Check if left produced a truthy result
-    let is_truthy = match &left_result {
-        QueryResult::One(v) => to_owned(v).is_truthy(),
-        QueryResult::OneCursor(_) => unreachable!("eval_single never produces OneCursor"),
-        QueryResult::Owned(v) => v.is_truthy(),
-        QueryResult::Many(vs) => vs.first().is_some_and(|v| to_owned(v).is_truthy()),
-        QueryResult::ManyOwned(vs) => vs.first().is_some_and(super::value::OwnedValue::is_truthy),
-        QueryResult::None => false,
-        QueryResult::Error(_) => false,
-        QueryResult::Break(label) => return QueryResult::Break(label.clone()),
-    };
-
-    if is_truthy {
-        left_result
-    } else {
-        eval_single::<W, S>(right, value, optional)
+    match retain_truthy(eval_single::<W, S>(left, value.clone(), optional)) {
+        // A `break` escapes the operator rather than selecting a branch.
+        QueryResult::Break(label) => QueryResult::Break(label),
+        // No truthy output on the left, so the right side answers. An error on
+        // the left also falls through here, discarding it; jq 1.7.1 instead
+        // propagates left-hand errors, which is a separate divergence from the
+        // multi-output bug this function fixes.
+        QueryResult::None | QueryResult::Error(_) => eval_single::<W, S>(right, value, optional),
+        kept => kept,
     }
 }
 
@@ -13417,6 +13524,23 @@ mod tests {
         }};
     }
 
+    /// Every output of `filter` on `json`, rendered as compact JSON.
+    ///
+    /// Multi-output expectations read better as a `Vec` comparison than as a
+    /// `QueryResult` variant match, and this deliberately does not care whether
+    /// the stream came back borrowed (`Many`) or owned (`ManyOwned`). Use
+    /// `query!` when the variant itself is the thing under test.
+    fn outputs(json: &[u8], filter: &str) -> Vec<String> {
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(filter).unwrap();
+        eval::<Vec<u64>, JqSemantics>(&expr, cursor)
+            .collect_owned()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect()
+    }
+
     #[test]
     fn test_identity() {
         // Identity returns OneCursor for efficient passthrough of unchanged containers
@@ -13960,6 +14084,107 @@ mod tests {
         // Chain alternatives
         query!(br#"{"a": null, "b": null}"#, ".a // .b // 42",
             QueryResult::Owned(OwnedValue::Int(42)) => {}
+        );
+    }
+
+    #[test]
+    fn regression_issue_160_alternative_emits_every_truthy_output() {
+        // `//` is a filter over the whole left stream, not a test of its first
+        // output. Before #160 the truthiness check read `vs.first()` and then
+        // returned the left stream *unfiltered*, so these gave "backup", 3 and
+        // `1 false 2` respectively.
+        assert_eq!(
+            outputs(b"null", r#"(false,1,null,2) // "backup""#),
+            ["1", "2"]
+        );
+        assert_eq!(outputs(b"null", "(null,1) // 3"), ["1"]);
+        assert_eq!(outputs(b"null", "(1,false,2) // 3"), ["1", "2"]);
+    }
+
+    #[test]
+    fn regression_issue_160_alternative_does_not_filter_its_right_side() {
+        // Only the left operand is filtered.
+        assert_eq!(outputs(b"null", "false // (null,7)"), ["null", "7"]);
+
+        // Which is exactly what makes the left-associative chain filter the
+        // middle operand: `((null,false) // (null,5)) // 6` emits `null, 5`
+        // from the inner `//`, and the outer one keeps only the 5.
+        assert_eq!(outputs(b"null", "(null,false) // (null,5) // 6"), ["5"]);
+    }
+
+    #[test]
+    fn regression_issue_160_alternative_keeps_a_borrowed_stream_borrowed() {
+        // Document-derived values must survive the filter without being
+        // promoted to owned, so `//` keeps the zero-copy path.
+        query!(br#"{"a": [1, false, 2]}"#, ".a[] // 9",
+            QueryResult::Many(vs) => {
+                assert_eq!(vs.len(), 2, "expected both truthy elements to survive");
+            }
+        );
+
+        // A single survivor normalizes back to `One`, so callers cannot tell a
+        // filtered stream from a value that was single all along.
+        query!(br#"{"a": [1, false]}"#, ".a[] // 9",
+            QueryResult::One(StandardJson::Number(n)) => {
+                assert_eq!(n.as_i64().unwrap(), 1);
+            }
+        );
+    }
+
+    #[test]
+    fn regression_issue_160_alternative_with_empty_operands() {
+        assert_eq!(outputs(b"null", "empty // 9"), ["9"]);
+
+        // Nothing truthy on the left and nothing at all on the right: no output.
+        query!(b"null", "false // empty", QueryResult::None => {});
+    }
+
+    #[test]
+    fn regression_issue_160_boolean_operators_are_cartesian() {
+        // jq loops the left operand outermost and short-circuits per output, so
+        // the trailing `false` of `(true,false) and _` contributes a single
+        // `false` while the leading `true` fans out over the right operand.
+        assert_eq!(
+            outputs(b"null", "(true,false) and (true,false)"),
+            ["true", "false", "false"]
+        );
+        assert_eq!(
+            outputs(b"null", "(true,false) or (true,false)"),
+            ["true", "true", "false"]
+        );
+        assert_eq!(
+            outputs(b"null", "(false,true) and (1,2)"),
+            ["false", "true", "true"]
+        );
+    }
+
+    #[test]
+    fn regression_issue_160_boolean_short_circuit_skips_the_right_operand() {
+        // A short-circuiting left output must not evaluate the right operand at
+        // all, so the error never surfaces.
+        query!(b"null", r#"false and error("x")"#,
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        query!(b"null", r#"true or error("x")"#,
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    #[test]
+    fn regression_issue_160_boolean_with_empty_operand_yields_nothing() {
+        // These used to be `Error("no value")` / `Error("empty result")`,
+        // because each operand was funnelled through `result_to_owned`.
+        query!(b"null", "empty and true", QueryResult::None => {});
+        query!(b"null", "true and empty", QueryResult::None => {});
+        query!(b"null", "false or empty", QueryResult::None => {});
+    }
+
+    #[test]
+    fn regression_issue_160_boolean_propagates_break() {
+        // `result_to_owned` turned a `Break` into
+        // `Error("break $out not in label")`; it now reaches its label.
+        query!(b"null", "label $out | ((break $out) and true)",
+            QueryResult::None => {}
         );
     }
 
