@@ -183,11 +183,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             // So `end > text_pos` means "this node has an extent of its own". Cold path:
             // only reached when a `- `-prefixed node has no BP child, i.e. for empty
             // sequence items. Every `- x` short-circuits above with zero extra work.
-            if self
-                .index
-                .text_end_pos_by_open_idx(open_idx)
-                .map_or(true, |end| end <= text_pos)
-            {
+            if !self.childless_seq_entry_has_own_extent(open_idx, text_pos) {
                 return YamlValue::Null;
             }
             // Otherwise fall through and decode `- …` as the plain scalar it is.
@@ -313,6 +309,20 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 })
             }
         }
+    }
+
+    /// Does a childless `- `-prefixed node cover text of its own past the indicator?
+    ///
+    /// Split out of [`Self::value`] and marked cold so the discrimination it performs
+    /// (#332) stays off the path every sequence item walks: `value` is recursive and
+    /// sits under `yq`'s whole read path, and inlining this made it 1-2% slower on
+    /// sequence-heavy documents even though the branch itself is never taken there.
+    #[cold]
+    #[inline(never)]
+    fn childless_seq_entry_has_own_extent(&self, open_idx: usize, text_pos: usize) -> bool {
+        self.index
+            .text_end_pos_by_open_idx(open_idx)
+            .is_some_and(|end| end > text_pos)
     }
 
     /// Parse an alias value from text position.
