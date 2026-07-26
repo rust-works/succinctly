@@ -17,9 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   codegen. Interleaved `yaml_bench` versus `c5dab403`, excluding block scalars:
   ARM (M4 Pro) +4.0% → **+0.7%**, x86 (7950X) +11.0% → **+4.7%**, with x86 block
   scalars 31–34% *faster* than the pre-#324 baseline. End-to-end `yq` over 32
-  configurations: +5.0% → **+0.8%** median. CRLF documents are unchanged (+1.1%
-  median, the precheck early-exiting). Output is byte-identical to #324 across
-  244 file × query configurations on both architectures.
+  configurations recovers completely: x86 +5.0% → **+0.8%** median, ARM +2.3% →
+  **−0.2%**. CRLF documents are unchanged (+1.1% x86 / +0.5% ARM, the precheck
+  early-exiting). Output is byte-identical to #324 across 244 file × query
+  configurations on both architectures.
 
   The one shape that regresses is long quoted scalars, +7% to +12%: the parser
   bulk-skips those at ~15 GB/s, so the precheck's second pass over the input is

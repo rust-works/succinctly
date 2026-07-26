@@ -290,18 +290,20 @@ which is a different measurement session and shorter criterion sampling, not a
 change in the code — the point of re-measuring all three arms in one interleaved
 sweep is that only within-sweep comparisons are load-bearing.
 
-CRLF documents are unaffected: the `yaml/crlf` group moves +1.1% median (−0.9% to
-+1.9%) on the 7950X against the #324 parser, which is the precheck early-exiting
-on the first line.
+CRLF documents are unaffected: against the #324 parser the `yaml/crlf` group moves
++1.1% median on the 7950X and +0.5% on the M4 Pro, which is the precheck
+early-exiting on the first line and then doing exactly what #324 did.
 
-End-to-end recovers further, because index build is only part of the pipeline and
-the query side was never regressed. `dev bench yq`, 4 patterns x {1mb, 10mb} x 4
-queries = 32 configurations, same interleaving, 7950X:
+End-to-end recovers completely, because index build is only part of the pipeline
+and the query side was never regressed. `dev bench yq`, 4 patterns x {1mb, 10mb}
+x 4 queries = 32 configurations, same interleaving:
 
-| arm      | median | worst |
-|----------|--------|-------|
-| #324     | +5.0%  | +12.3% (`nested/10mb length`) |
-| **#340** | **+0.8%** | +4.5% (`comprehensive/10mb .[0]`) |
+| Machine           | arm      | median    | worst                             |
+|-------------------|----------|-----------|-----------------------------------|
+| AMD Ryzen 9 7950X | #324     | +5.0%     | +12.3% (`nested/10mb length`)     |
+| AMD Ryzen 9 7950X | **#340** | **+0.8%** | +4.5% (`comprehensive/10mb .[0]`) |
+| Apple M4 Pro      | #324     | +2.3%     | +8.0%                             |
+| Apple M4 Pro      | **#340** | **−0.2%** | +3.0% (`users/10mb .[0]`)         |
 
 Output identity was gated before any of these timings were believed: 244
 (file x query) configurations on both architectures, byte-identical between the

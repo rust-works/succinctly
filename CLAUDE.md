@@ -640,7 +640,7 @@ For detailed documentation on optimization techniques used in this project, see 
 - ✅ O5 (`HAS_CR` Const-Generic Specialization): **recovers most of the #324 CRLF-correctness cost**, issue #340
   - `build_semi_index` SIMD-scans once for `\r`, then parses with `Parser::<false>` (LF-only) or `Parser::<true>` (#324 parser verbatim)
   - Interleaved `yaml_bench` vs `c5dab403`, excl. block scalars: **M4 Pro +4.0% → +0.7%**, **7950X +11.0% → +4.7%**; x86 block scalars 31-34% *faster* than pre-#324
-  - End-to-end `dev bench yq` (32 configs, 7950X): **+5.0% → +0.8%** median; CRLF documents +1.1% (unchanged); binary +52 KB (+0.9%)
+  - End-to-end `dev bench yq` (32 configs) recovers fully: **7950X +5.0% → +0.8%**, **M4 Pro +2.3% → −0.2%** median; CRLF documents +1.1%/+0.5% (unchanged); binary +52 KB (+0.9%)
   - **The gate is one-directional**: `true` is always correct, and the whole-input precheck proves no `\r` arm is reachable under `false`. An un-gated site is a missed optimization, never a bug — so gating can be applied incrementally and measured
   - **Cost the estimate missed**: long quoted scalars regress +7-12%. The parser bulk-skips them at ~15 GB/s, so a second pass over the input is large next to the parse. Reusing the position-finding `define_escape_scanner!` first made it **+42%**; an existence-only scan (OR the chunk compares, reduce once) was needed
   - Key insight: a precheck that enables a fast path is charged to *every* input, including the ones it cannot help — measure it against the workload where the parser is already fastest, not the one it is slowest
