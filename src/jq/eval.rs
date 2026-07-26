@@ -209,8 +209,10 @@ impl EvalError {
         Self::new(format!("index {index} out of bounds (length {len})"))
     }
 
-    /// Create the error `contains`/`inside` raise for operands whose types
-    /// cannot be compared, e.g. `1 | contains("a")` (#358).
+    /// Create the error `contains`/`inside` raise for operands whose kinds
+    /// cannot be compared, e.g. `1 | contains("a")` (#358). The callers decide
+    /// *when* to raise it, by comparing [`jq_kind`] — not `type_name`, which is
+    /// a coarser partition; see that function.
     ///
     /// `left` is the container, `right` the value looked for, so `inside` — which
     /// is `contains` with the operands swapped — passes its *argument* first,
@@ -226,6 +228,32 @@ impl EvalError {
     }
 }
 
+/// A value's kind as jq's `jv_get_kind` reports it, for the operand screens that
+/// compare kinds rather than type names.
+///
+/// This is a *finer* partition than [`OwnedValue::type_name`]: jq's `jv_kind`
+/// enum has separate `JV_KIND_FALSE` and `JV_KIND_TRUE`, and only `jv_kind_name`
+/// collapses the pair back to the one word `boolean`. `f_contains` screens on
+/// `jv_get_kind`, so jq errors on `true | contains(false)` — with a message that
+/// calls *both* operands `boolean` — while `true | contains(true)` is a plain
+/// `true`. Screening on `type_name` instead answers `false` for that pair, which
+/// is exactly the divergence #358 is about (#358 review).
+///
+/// The discriminants are jq's own, `JV_KIND_INVALID` (0) included, so the two
+/// enums can be read side by side. Only equality is ever asked of them.
+fn jq_kind(value: &OwnedValue) -> u8 {
+    match value {
+        OwnedValue::Null => 1,
+        OwnedValue::Bool(false) => 2,
+        OwnedValue::Bool(true) => 3,
+        // jq has one number kind; `1 | contains(1.0)` is a comparison, not an error.
+        OwnedValue::Int(_) | OwnedValue::Float(_) => 4,
+        OwnedValue::String(_) => 5,
+        OwnedValue::Array(_) => 6,
+        OwnedValue::Object(_) => 7,
+    }
+}
+
 /// Render `value` the way jq embeds a value in an error message: its compact
 /// JSON dump, truncated so a huge operand cannot produce a huge message.
 ///
@@ -234,10 +262,20 @@ impl EvalError {
 /// overwrites the last three with `...`. So a 14-byte dump survives whole and a
 /// 15-byte one becomes 11 bytes plus `...`.
 ///
-/// One deliberate deviation: jq's `strncpy` can cut a multi-byte UTF-8 sequence
-/// in half and emit the broken bytes. A Rust `String` cannot hold those, so we
-/// cut at the nearest `char` boundary at or below the limit — the preview is
-/// then up to two bytes shorter than jq's for such values.
+/// Two deviations, both about what gets dumped rather than where it is cut:
+///
+/// 1. jq's `strncpy` can cut a multi-byte UTF-8 sequence in half and emit the
+///    broken bytes. A Rust `String` cannot hold those, so we cut at the nearest
+///    `char` boundary at or below the limit — the preview is then up to two
+///    bytes shorter than jq's for such values.
+/// 2. `OwnedValue::to_json` does not preserve a number's source literal, so a
+///    number reads back canonicalised: jq previews `1e100` as `1E+100` and `1.0`
+///    as `1.0`, where we give `10000000000...` and `1`. This is a property of
+///    materialising into `OwnedValue` — `1e100 | tostring` already differs, and
+///    the streaming identity path, which copies source text, does not — not of
+///    the truncation here. Pinned by `number_previews_are_canonicalised` in
+///    `tests/jq_containment_tests.rs`; fixing it means teaching `OwnedValue` to
+///    carry the literal, which is well beyond #358.
 fn value_preview(value: &OwnedValue) -> String {
     /// `sizeof buf - 1` in jq: the longest dump reproduced verbatim.
     const MAX: usize = 14;
@@ -2687,7 +2725,7 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     let input = to_owned(&value);
-    if input.type_name() != b.type_name() {
+    if jq_kind(&input) != jq_kind(&b) {
         if optional {
             return QueryResult::None;
         }
@@ -2698,10 +2736,10 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Check if `a` contains `b` (recursive containment check)
 ///
-/// Only the *top-level* types have to match; a mismatch nested inside a
+/// Only the *top-level* kinds have to match; a mismatch nested inside a
 /// container is plain `false`, as in jq — `[1,"a"] | contains(["a",2])` is
 /// `false`, not the error [`EvalError::containment_check`] raises. The callers
-/// screen the top level, so this stays a total function.
+/// screen the top level with [`jq_kind`], so this stays a total function.
 fn owned_contains(a: &OwnedValue, b: &OwnedValue) -> bool {
     match (a, b) {
         // String contains string
@@ -2736,7 +2774,7 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     let input = to_owned(&value);
     // inside is the inverse of contains: b contains input
-    if b.type_name() != input.type_name() {
+    if jq_kind(&b) != jq_kind(&input) {
         if optional {
             return QueryResult::None;
         }
@@ -15125,7 +15163,7 @@ mod tests {
         );
     }
 
-    /// jq errors when the two operands' types cannot be compared, rather than
+    /// jq errors when the two operands' kinds cannot be compared, rather than
     /// answering `false` (#358). Only the outermost pair is screened.
     #[test]
     fn test_builtin_contains_type_mismatch() {
@@ -15149,6 +15187,36 @@ mod tests {
         query!(br"[1,2,3]", r"contains([1.0])",
             QueryResult::Owned(OwnedValue::Bool(b)) => {
                 assert!(b);
+            }
+        );
+
+        // `true` and `false` are distinct jq kinds that share the *name*
+        // `boolean`, so a mixed pair errors — with both operands called
+        // `boolean` — while a matched pair is a plain comparison. Screening on
+        // `type_name` would answer `false` for the mixed pair; see `jq_kind`.
+        query!(br"true", r"contains(false)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "boolean (true) and boolean (false) cannot have their containment checked"
+                );
+            }
+        );
+        query!(br"true", r"contains(true)",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+        query!(br"false", r"contains(false)",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        // Nested, the same pair is plain false — the screen is top-level only.
+        query!(br"[false]", r"contains([true])",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
             }
         );
 
@@ -15209,6 +15277,16 @@ mod tests {
         query!(br"[1.0]", r"inside([1,2,3])",
             QueryResult::Owned(OwnedValue::Bool(b)) => {
                 assert!(b);
+            }
+        );
+
+        // The boolean-kind split reaches `inside` too, argument still first.
+        query!(br"true", r"inside(false)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "boolean (false) and boolean (true) cannot have their containment checked"
+                );
             }
         );
     }
