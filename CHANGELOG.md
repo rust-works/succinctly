@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Computed keys in jq index brackets** (#360, closing the index half of
+  #155): `.[e]` accepts any expression, matching jq's `'[' Exp ']'`. `.[$k]`,
+  `.[.k]`, `.[("a","b")]` and `.[1,2]` all work, in value position and in path
+  contexts (`.[$k] = v`, `.[$k] |= f`, `del(.[$k])`, `path(.[$k])`). Previously
+  only a numeric or string literal parsed, so indexing by a variable — ordinary
+  jq — failed to compile with `expected digit`. A key whose *kind* cannot index
+  the container now produces jq's runtime wording from `EvalError::cannot_index`
+  (#356): `Cannot index object with null` and friends, which takes the three
+  `index_*_key_on_object` probes off the error-message divergence manifest.
+  **Breaking**: adds an `Expr::IndexExpr` variant, so exhaustive `match`es on
+  the public `Expr` gain an arm. A constant key still folds to `Expr::Field` /
+  `Expr::Index` at parse time, leaving the existing AST and hot paths unchanged.
+  Not covered: expression-valued slice bounds (`.[$a:$b]`) and jq's
+  indices-of-subarray form (`.[[20]]`) — see
+  [docs/reference/jq-language.md](docs/reference/jq-language.md).
+  Incidentally, the `[range(0; length; 2) as $i | .[$i]]` workaround that doc
+  has long recommended for step slicing now actually parses.
 - **jq error-message conformance corpus** (#356): a corpus of filter/input probes
   (`tests/data/jq-error-probes.tsv`) whose messages are captured from the pinned
   jq by `scripts/sync-jq-error-messages.sh` and asserted against **both**

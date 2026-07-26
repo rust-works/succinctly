@@ -39,6 +39,7 @@ The implementation covers ~95% of jq functionality and is production-ready.
 - [x] `."key"` - Quoted field access (for special characters like kebab-case)
 - [x] `.["key"]` - Bracket notation with string key
 - [x] `.[0]` - Array index (positive and negative)
+- [x] `.[$k]`, `.[.k]`, `.[1,2]` - Bracket notation with a computed key (#360)
 - [x] `.[2:5]`, `.[2:]`, `.[:5]` - Array slicing
 - [x] `.[]` - Array/object iteration
 - [x] `.foo?` - Optional access
@@ -262,6 +263,13 @@ These enable IDE integration and programmatic navigation to specific document po
 ## Known Limitations
 
 **Note:** Array slicing with steps (`.[::2]`) is intentionally not supported - it's Python syntax, not jq. Use `[range(0; length; 2) as $i | .[$i]]` instead.
+
+**Computed keys in brackets** (#360) accept any expression, but two jq behaviours are not reproduced:
+
+- **Slice bounds must be integer literals.** `.[$a:$b]` and `.[(1+1):]` are parse errors; jq accepts them.
+- **An array-valued key errors instead of searching.** jq reads `[10,20,30] | .[[20]]` as an indices-of-subarray search returning `[1]`; here it reports `Cannot index array with array`.
+
+One further divergence is cosmetic: `path(.[1.7])` yields `[1]` where jq keeps the unfloored `[1.7]`.
 
 See [jq Remaining Work](../plan/jq-remaining.md) for incomplete CLI and module system features.
 
