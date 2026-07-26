@@ -136,15 +136,24 @@ Use the helpers instead of hand-rolling the test:
 
 ```rust
 // src/yaml/parser.rs — the oracle
-Self::is_break(b)          // \n or \r
-self.break_len_at(pos)     // 2 for \r\n, 1 for a lone \r or \n, 0 otherwise
+Self::is_break(b)               // \n or \r
+Self::is_ws_or_break(b)         // ' ' | '\t' | break
+Self::is_space_or_break(b)      // ' ' | break  (no tab)
+Self::is_ws_break_or_eoi(next)  // the indicator lookahead: Option<u8>, EOI counts
+Self::is_space_break_or_eoi(next)
+Self::is_flow_key_terminator(next) // the above plus , } ]
+self.break_len_at(pos)          // 2 for \r\n, 1 for a lone \r or \n, 0 otherwise
 self.at_break()
-self.skip_line_break()     // consumes exactly one break, whatever its width
+self.skip_line_break()          // consumes exactly one break, whatever its width
 
 // src/yaml/light.rs — the query side
 is_line_break(b)
 line_break_len(text, pos)
 ```
+
+Going through a helper is not just tidiness — it is what makes the `HAS_CR`
+specialization possible (see below). A hand-rolled `matches!(b, b'\n' | b'\r')`
+is a site the const generic cannot reach.
 
 Two extra traps:
 
@@ -156,6 +165,32 @@ Two extra traps:
 `tests/yaml_crlf_tests.rs` is the guard: it parses the whole YAML Test Suite
 corpus under all three break forms and demands identical output. Run it after any
 change to a line-scanning loop.
+
+### The `HAS_CR` Specialization
+
+`Parser<'a, const HAS_CR: bool>` (#340). `build_semi_index` runs `contains_cr`
+over the input once — a SIMD byte scan — and picks `Parser::<false>` for the
+LF-only documents that are nearly all of them, which compiles every `\r` arm out
+and restores the pre-#324 codegen. `Parser::<true>` is the #324 parser verbatim.
+
+The rule to internalize when editing a line scan:
+
+- **`HAS_CR == true` is always correct.** Only `false` carries an obligation, and
+  the whole-input precheck discharges it: no `\r` in the input means no `\r` arm
+  is reachable, in any context. There is no quoted-string or block-scalar
+  subtlety, because one `\r` anywhere forces the `true` path.
+- **So gating is a performance knob, not a correctness one.** Leaving a new site
+  un-gated is a missed optimization, never a bug. Gate the hot ones; don't
+  contort cold code to reach them.
+- **Match arms cannot be gated.** `b'\n' | b'\r' =>` is a pattern, and a const
+  cannot reach into it. The hot loops use `b if Self::is_break(b) =>` guards
+  instead. Cold sites keep the literal pattern deliberately.
+
+`both_monomorphizations_agree_on_cr_free_input` in `src/yaml/parser.rs` is the
+guard, and it is the only one: `yaml_crlf_tests` and the CRLF reruns in
+`yq_golden_tests` all feed inputs containing a `\r`, which is exactly the set
+that takes the `true` path. If you gate a site whose `\r` arm was doing something
+other than handling a carriage return, that test is what catches it.
 
 ## Test Suite Notes
 
