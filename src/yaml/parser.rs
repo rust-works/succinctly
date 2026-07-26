@@ -178,6 +178,15 @@ struct Parser<'a> {
     /// [`Self::set_bp_text_end`]; release builds carry nothing.
     #[cfg(debug_assertions)]
     wrapper_slots: Vec<bool>,
+
+    /// The end position most recently recorded by [`Self::set_bp_text_end`].
+    ///
+    /// The other half of the same invariant: a wrapper stores no end of its own, so
+    /// under the compact `EndPositions` variant it *inherits* this value, and that is
+    /// what `YamlCursor::value` measures against the wrapper's own text position.
+    /// Asserted in [`Self::write_bp_open_seq_item`].
+    #[cfg(debug_assertions)]
+    last_recorded_end: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -215,6 +224,8 @@ impl<'a> Parser<'a> {
             nesting_depth: 0,
             #[cfg(debug_assertions)]
             wrapper_slots: Vec::with_capacity(estimated_opens),
+            #[cfg(debug_assertions)]
+            last_recorded_end: 0,
         }
     }
 
@@ -298,13 +309,32 @@ impl<'a> Parser<'a> {
     /// Distinct from [`Self::write_bp_open`] only in debug builds, where it records the
     /// slot so [`Self::set_bp_text_end`] can assert no end is ever stored for it — the
     /// invariant `YamlCursor::value` relies on to tell an empty item from a plain scalar
-    /// beginning `- ` (#332).
+    /// beginning `- ` (#332) — and asserts the other half of that invariant here.
     #[inline]
     fn write_bp_open_seq_item(&mut self) {
         self.write_bp_open();
         #[cfg(debug_assertions)]
-        if let Some(last) = self.wrapper_slots.last_mut() {
-            *last = true;
+        {
+            // Storing no end is only half of what the reader needs. Under the compact
+            // `EndPositions` variant the wrapper's slot is zero-filled from the last end
+            // recorded *before* it, and `value()` reads `end <= text_pos` as "no extent
+            // of its own — empty item, null". So that inherited end must never sit past
+            // the `-`. It cannot today: every end is recorded at or before `self.pos`,
+            // and `self.pos` only advances. Assert it because the failure is silent —
+            // an empty `- ` would start reading as the string `"-"` — and because the
+            // wrapper's text position is a parameter of `write_bp_open_at`, not a
+            // constant.
+            let text_pos = self.bp_to_text.last().copied().unwrap_or_default() as usize;
+            debug_assert!(
+                self.last_recorded_end <= text_pos,
+                "sequence-item wrapper at text {text_pos} inherits the end position {} \
+                 of an earlier node; YamlCursor::value reads an end past the wrapper as \
+                 the plain scalar `- …` rather than an empty item (#332)",
+                self.last_recorded_end
+            );
+            if let Some(last) = self.wrapper_slots.last_mut() {
+                *last = true;
+            }
         }
     }
 
@@ -328,6 +358,10 @@ impl<'a> Parser<'a> {
         );
         if let Some(last) = self.bp_to_text_end.last_mut() {
             *last = end_pos as u32;
+        }
+        #[cfg(debug_assertions)]
+        {
+            self.last_recorded_end = end_pos;
         }
     }
 
