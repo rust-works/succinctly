@@ -68,6 +68,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was; and the scan now skips quoted scalars and comments, so `a:\n \t"x: y"`
   and `a: 1\n \t# c: d` are accepted while `a:\n \t"b": 1` — a quoted *key*, so
   really indentation — is still refused.
+- **`BitVec` counted 1-bits that lie past `len`** (#321): `from_words` documents
+  that `len` may be less than `words.len() * 64`, but the constructor masked
+  `words[words.len() - 1]` — the wrong word as soon as `words` is longer than
+  `len` needs — and skipped masking entirely when `len % 64 == 0` or `len == 0`.
+  Surplus 1-bits therefore stayed in the cached `ones_count`, so
+  `BitVec::from_words(vec![u64::MAX, u64::MAX], 64)` reported 128 ones for a
+  64-bit vector, `rank1(i >= len)` returned that inflated count, and
+  `count_zeros()` panicked with "attempt to subtract with overflow" in debug (and
+  wrapped in release). It now clears the tail of the word holding bit `len - 1`
+  and zeroes every word after it. Found while covering `select1`'s
+  "position past `len`" branch, which existed only because of this.
 - **Double free in `RankDirectory`'s cache-aligned builder** (#321):
   `CacheAlignedL1L2Builder::build()` freed its allocation and then returned
   without `mem::forget(self)`, so `Drop` freed the same pointer again — an

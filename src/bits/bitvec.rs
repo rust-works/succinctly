@@ -77,14 +77,18 @@ impl BitVec {
             words.len().saturating_mul(64)
         );
 
-        // Mask out unused bits in the last word
-        if len > 0 {
-            let last_word_bits = len % 64;
-            if last_word_bits > 0 && !words.is_empty() {
-                let last_idx = words.len() - 1;
-                let mask = (1u64 << last_word_bits) - 1;
-                words[last_idx] &= mask;
-            }
+        // Mask out every bit at or past `len`: the tail of the word holding bit
+        // `len - 1`, plus any whole word after it. Masking `words.len() - 1`
+        // instead targeted the wrong word whenever `words` was longer than `len`
+        // needed, so surplus 1-bits stayed in `ones_count` -- inflating
+        // `count_ones()`/`rank1`, and underflowing `count_zeros()`.
+        let used_words = len.div_ceil(64);
+        let tail_bits = len % 64;
+        if tail_bits > 0 {
+            words[used_words - 1] &= (1u64 << tail_bits) - 1;
+        }
+        for word in &mut words[used_words..] {
+            *word = 0;
         }
 
         // Count total ones using the selected popcount implementation
@@ -247,6 +251,9 @@ impl RankSelect for BitVec {
                 // Found the target word
                 let bit_pos = select_in_word(word, remaining as u32) as usize;
                 let result = word_idx * 64 + bit_pos;
+                // Defensive: `with_config` clears every bit at or past `len`, so a
+                // set bit cannot lie outside the vector and this cannot return
+                // None. Kept as a guard, hence unreachable in coverage reports.
                 return if result < self.len {
                     Some(result)
                 } else {
@@ -257,6 +264,7 @@ impl RankSelect for BitVec {
             remaining -= pop;
         }
 
+        // Also defensive: `k < ones_count` guarantees the scan finds the bit.
         None
     }
 }
@@ -764,5 +772,121 @@ mod tests {
                 assert_eq!(bv.rank1(pos), k, "rank1(select1({k})) should be {k}");
             }
         }
+    }
+
+    // ========================================================================
+    // Word-level accessors and Default
+    // ========================================================================
+
+    #[test]
+    fn test_word_accessors() {
+        let words = vec![0b1010_1010u64, u64::MAX, 0];
+        let bv = BitVec::from_words(words.clone(), 192);
+
+        assert_eq!(bv.word_count(), 3);
+        assert_eq!(bv.words(), words.as_slice());
+        for (i, &w) in words.iter().enumerate() {
+            assert_eq!(bv.word(i), w, "word({i})");
+        }
+    }
+
+    #[test]
+    fn test_default_matches_new() {
+        let bv = BitVec::default();
+        assert!(bv.is_empty());
+        assert_eq!(bv.len(), BitVec::new().len());
+        assert_eq!(bv.count_ones(), 0);
+        assert_eq!(bv.select1(0), None);
+    }
+
+    // ========================================================================
+    // Clone
+    // ========================================================================
+
+    /// `BitVec` derives `Clone`, which reaches `RankDirectory`'s hand-written
+    /// `unsafe` clone of its cache-aligned L1/L2 allocation. Exercise it through
+    /// the public API on a bitvector large enough to have a real directory.
+    #[test]
+    fn test_clone_answers_identically_after_source_dropped() {
+        // 2048 bits = 4 blocks, one bit set every 37 positions.
+        let mut words = vec![0u64; 32];
+        for pos in (0..2048).step_by(37) {
+            words[pos / 64] |= 1u64 << (pos % 64);
+        }
+        let bv = BitVec::from_words(words, 2048);
+
+        let expected_ranks: Vec<usize> = (0..=bv.len()).map(|i| bv.rank1(i)).collect();
+        let expected_selects: Vec<Option<usize>> =
+            (0..bv.count_ones()).map(|k| bv.select1(k)).collect();
+        let expected_ones = bv.count_ones();
+
+        let copy = bv.clone();
+        drop(bv);
+
+        assert_eq!(copy.count_ones(), expected_ones);
+        for (i, &want) in expected_ranks.iter().enumerate() {
+            assert_eq!(copy.rank1(i), want, "rank1({i}) after clone");
+        }
+        for (k, &want) in expected_selects.iter().enumerate() {
+            assert_eq!(copy.select1(k), want, "select1({k}) after clone");
+        }
+    }
+
+    #[test]
+    fn test_clone_of_empty() {
+        let copy = BitVec::new().clone();
+        assert!(copy.is_empty());
+        assert_eq!(copy.select1(0), None);
+    }
+
+    // ========================================================================
+    // Surplus words past `len`
+    // ========================================================================
+
+    /// `from_words` documents that `len` may be less than `words.len() * 64`.
+    /// Masking used to be applied to `words[words.len() - 1]`, which is the wrong
+    /// word as soon as `words` is longer than `len` needs: the surplus 1-bits
+    /// stayed in `ones_count`, so `count_ones()` exceeded `len()` and
+    /// `count_zeros()` underflowed.
+    #[test]
+    fn test_surplus_words_are_not_counted() {
+        // Whole surplus word, len a multiple of 64: masking used to be skipped
+        // entirely (len % 64 == 0) and count_ones() reported 128.
+        let bv = BitVec::from_words(vec![u64::MAX, u64::MAX], 64);
+        assert_eq!(bv.len(), 64);
+        assert_eq!(bv.count_ones(), 64);
+        assert_eq!(bv.count_zeros(), 0);
+        assert_eq!(bv.rank1(64), 64);
+        assert_eq!(bv.select1(63), Some(63));
+        assert_eq!(bv.select1(64), None);
+
+        // Partial tail plus a surplus word: the mask used to land on words[2],
+        // leaving words[1] bits 1..63 counted (129 ones for a 65-bit vector).
+        let bv = BitVec::from_words(vec![u64::MAX, u64::MAX, u64::MAX], 65);
+        assert_eq!(bv.count_ones(), 65);
+        assert_eq!(bv.count_zeros(), 0);
+        assert_eq!(bv.select1(64), Some(64));
+        assert_eq!(bv.select1(65), None);
+
+        // len == 0 with words present: masking used to be skipped by `if len > 0`.
+        let bv = BitVec::from_words(vec![u64::MAX], 0);
+        assert_eq!(bv.count_ones(), 0);
+        assert_eq!(bv.count_zeros(), 0);
+        assert_eq!(bv.select1(0), None);
+    }
+
+    #[test]
+    fn test_surplus_words_rank_select_agree() {
+        // Every bit set, but only 100 of the 192 declared valid.
+        let bv = BitVec::from_words(vec![u64::MAX; 3], 100);
+        assert_eq!(bv.count_ones(), 100);
+        for i in 0..=bv.len() {
+            assert_eq!(bv.rank1(i), i, "rank1({i})");
+            assert_eq!(bv.rank0(i), 0, "rank0({i})");
+        }
+        for k in 0..bv.count_ones() {
+            assert_eq!(bv.select1(k), Some(k), "select1({k})");
+        }
+        assert_eq!(bv.select1(bv.count_ones()), None);
     }
 }
