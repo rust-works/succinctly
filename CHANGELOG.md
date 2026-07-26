@@ -27,6 +27,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq `try/catch` discarded the raised error** (#158): the catch handler ran
+  against the *original input* rather than the error value, so a handler could
+  never see what went wrong — `try error("boom") catch .` gave `null` where jq
+  gives `"boom"`, and `catch "c:\(.)"` interpolated the input. `error(v)` also
+  flattened non-string payloads to their JSON text, so `try error({a:1}) catch .`
+  could not yield an object for the handler to index. Root cause was that
+  `EvalError` modelled an error as a bare message string, leaving nothing for
+  `catch` to bind. It now carries the raised value alongside the message;
+  internal errors (type errors and friends) keep raising their message as a
+  string, which is how jq models them. The same commit fixes a coupled defect:
+  bare `error` raised the literal `null` instead of the input value, which only
+  looked correct because `catch` was reading the input anyway — fixing the
+  handler alone would have regressed it. Handlers that fan out (`catch (., .)`)
+  now keep every output instead of collapsing into one array. `succinctly yq`
+  gets the fix too, since its evaluator delegates `try` to this one. Six new
+  pinned-`jq` golden cases cover the family (string, object, `null`, bare,
+  interpolated and multi-output payloads), and the known-failures manifest
+  drops to four entries. **API**: `EvalError` gains a public
+  `value: Option<OwnedValue>` field and a `from_value`/`payload` pair;
+  additive, but downstream struct-literal construction would need updating.
+  Uncaught errors keep the existing `jq: error: <message>` form — jq's
+  `(not a string)` framing and exit code 5 remain a separate divergence.
 - **YAML explicit keys as block sequence items** (#339): `- ? k` followed by
   `  : v` loaded as `["? k","v"]` — the `? ` indicator folded into a plain
   scalar and the `: v` line became a *phantom second element*, so the sequence
