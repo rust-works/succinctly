@@ -20,7 +20,9 @@ use super::expr::Literal;
 /// This is used for values that are constructed during evaluation
 /// (array/object construction, arithmetic results, etc.) rather than
 /// references into the original JSON document.
-#[derive(Debug, Clone, PartialEq)]
+/// Equality is *jq value equality*, not structural equality -- see the
+/// hand-written [`PartialEq`] impl below. In particular `Int(1) == Float(1.0)`.
+#[derive(Debug, Clone)]
 pub enum OwnedValue {
     /// JSON null
     Null,
@@ -214,6 +216,49 @@ impl OwnedValue {
                     .collect();
                 format!("{{{}}}", entries.join(","))
             }
+        }
+    }
+}
+
+/// jq value equality.
+///
+/// This is deliberately **not** `#[derive]`d. Deriving would compare the
+/// representation, so `Int(1)` and `Float(1.0)` -- two spellings of the same
+/// JSON number -- would be unequal, and `1 == 1.0` would evaluate to `false`
+/// (jq says `true`). Since `Vec`/`IndexMap` inherit their `PartialEq` from the
+/// element type, every builtin routed through equality (`==`, `!=`, array `-`,
+/// `contains`, `inside`, `index`, `indices`, `rindex`) picks up this impl.
+///
+/// Semantics, pinned against jq-1.7.1:
+///
+/// - Numbers compare by value across representations: `1 == 1.0`,
+///   `[1] == [1.0]`, `{"a":1} == {"a":1.0}`.
+/// - `Int`/`Int` compares exactly as `i64`, so integers beyond 2^53 keep their
+///   precision: `9007199254740993 == 9007199254740992` is `false`, as in jq 1.7.
+/// - NaN is never equal to itself. This makes the relation partial (hence
+///   `PartialEq` and no `Eq`), and matches jq: `nan == nan` is `false`. It is
+///   also why this cannot be written as `compare_values(..) == Equal` -- the
+///   evaluators' `compare_values` folds incomparable floats to `Equal`.
+/// - `-0.0 == 0` and `-0.0 == 0.0`, as in jq.
+/// - Objects compare order-insensitively (`IndexMap`'s own `PartialEq`), as in jq.
+///
+/// Known divergence: above 2^53 a mixed `Int`/`Float` comparison widens the
+/// integer to `f64`, whereas jq 1.7 retains the decimal literal. So
+/// `9007199254740993 == 9007199254740992.0` is `true` here and `false` in jq.
+/// Every value representable exactly as an `f64` agrees.
+impl PartialEq for OwnedValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Null, Self::Null) => true,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a == b,
+            (Self::Int(a), Self::Float(b)) => (*a as f64) == *b,
+            (Self::Float(a), Self::Int(b)) => *a == (*b as f64),
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::Array(a), Self::Array(b)) => a == b,
+            (Self::Object(a), Self::Object(b)) => a == b,
+            _ => false,
         }
     }
 }
@@ -458,6 +503,97 @@ mod tests {
             OwnedValue::String("s".into())
         );
         assert_eq!(OwnedValue::from("s"), OwnedValue::String("s".into()));
+    }
+
+    #[test]
+    fn test_eq_is_numeric_across_int_and_float() {
+        // The whole point of the hand-written `PartialEq`: `1 == 1.0` (#156).
+        assert_eq!(OwnedValue::Int(1), OwnedValue::Float(1.0));
+        assert_eq!(OwnedValue::Float(1.0), OwnedValue::Int(1));
+        assert_eq!(OwnedValue::Int(-7), OwnedValue::Float(-7.0));
+        assert_ne!(OwnedValue::Int(1), OwnedValue::Float(1.5));
+        assert_ne!(OwnedValue::Float(1.5), OwnedValue::Int(1));
+        // Same-representation comparisons are unchanged.
+        assert_eq!(OwnedValue::Int(2), OwnedValue::Int(2));
+        assert_ne!(OwnedValue::Int(2), OwnedValue::Int(3));
+        assert_eq!(OwnedValue::Float(2.5), OwnedValue::Float(2.5));
+    }
+
+    #[test]
+    fn test_eq_int_int_keeps_i64_precision() {
+        // Widening both sides to f64 would collapse these two; jq 1.7 keeps
+        // integer literal precision here and so do we.
+        assert_ne!(
+            OwnedValue::Int(9_007_199_254_740_993),
+            OwnedValue::Int(9_007_199_254_740_992)
+        );
+    }
+
+    #[test]
+    fn test_eq_nan_is_never_equal() {
+        // Matches jq: `nan == nan` is false. This is why equality cannot be
+        // expressed as `compare_values(..) == Equal`, which folds NaN to Equal.
+        let nan = OwnedValue::Float(f64::NAN);
+        assert_ne!(nan, nan.clone());
+        assert_ne!(nan, OwnedValue::Int(0));
+        // Infinities, by contrast, do compare equal to themselves.
+        assert_eq!(
+            OwnedValue::Float(f64::INFINITY),
+            OwnedValue::Float(f64::INFINITY)
+        );
+        assert_ne!(
+            OwnedValue::Float(f64::INFINITY),
+            OwnedValue::Float(f64::NEG_INFINITY)
+        );
+    }
+
+    #[test]
+    fn test_eq_signed_zero() {
+        // jq: `-0.0 == 0` and `-0.0 == 0.0` are both true.
+        assert_eq!(OwnedValue::Float(-0.0), OwnedValue::Int(0));
+        assert_eq!(OwnedValue::Float(-0.0), OwnedValue::Float(0.0));
+    }
+
+    #[test]
+    fn test_eq_recurses_through_containers() {
+        // `Vec`/`IndexMap` inherit element equality, so containers are numeric-aware too.
+        assert_eq!(
+            OwnedValue::Array(vec![OwnedValue::Int(1)]),
+            OwnedValue::Array(vec![OwnedValue::Float(1.0)])
+        );
+        assert_ne!(
+            OwnedValue::Array(vec![OwnedValue::Int(1)]),
+            OwnedValue::Array(vec![OwnedValue::Float(1.0), OwnedValue::Int(2)])
+        );
+        assert_eq!(
+            OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]),
+            OwnedValue::object_from([("a".to_string(), OwnedValue::Float(1.0))])
+        );
+        // Objects compare order-insensitively, as in jq.
+        assert_eq!(
+            OwnedValue::object_from([
+                ("a".to_string(), OwnedValue::Int(1)),
+                ("b".to_string(), OwnedValue::Int(2)),
+            ]),
+            OwnedValue::object_from([
+                ("b".to_string(), OwnedValue::Float(2.0)),
+                ("a".to_string(), OwnedValue::Int(1)),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_eq_across_types_is_false() {
+        // Numbers are only conflated with each other -- never with other types.
+        assert_ne!(OwnedValue::Int(1), OwnedValue::String("1".into()));
+        assert_ne!(OwnedValue::Int(1), OwnedValue::Bool(true));
+        assert_ne!(OwnedValue::Int(0), OwnedValue::Bool(false));
+        assert_ne!(OwnedValue::Int(0), OwnedValue::Null);
+        assert_ne!(OwnedValue::Float(0.0), OwnedValue::Null);
+        assert_ne!(
+            OwnedValue::Array(vec![]),
+            OwnedValue::Object(IndexMap::new())
+        );
     }
 
     #[test]
