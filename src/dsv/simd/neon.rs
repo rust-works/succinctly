@@ -13,6 +13,7 @@ use super::super::config::DsvConfig;
 use super::super::index::DsvIndex;
 use super::super::index_lightweight::DsvIndexLightweight;
 use crate::json::BitWriter;
+use crate::util::simd::quote_mask::toggle64_from_prefix_xor;
 
 /// Build a DsvIndex using NEON SIMD acceleration.
 ///
@@ -37,8 +38,9 @@ unsafe fn build_index_neon(text: &[u8], config: &DsvConfig) -> DsvIndex {
     let mut markers_writer = BitWriter::with_capacity(num_words);
     let mut newlines_writer = BitWriter::with_capacity(num_words);
 
-    // Track quote state across chunks
-    let mut in_quote = false;
+    // Track quote state across chunks using carry (same convention as the
+    // BMI2/SVE2 deposit backends)
+    let mut qq_carry: u64 = 0;
 
     let delimiter = config.delimiter;
     let quote_char = config.quote_char;
@@ -48,19 +50,19 @@ unsafe fn build_index_neon(text: &[u8], config: &DsvConfig) -> DsvIndex {
 
     // Process 64-byte chunks (4x 16-byte NEON loads)
     while offset + 64 <= text.len() {
-        let (markers_word, newlines_word, new_in_quote) = unsafe {
+        let (markers_word, newlines_word, new_carry) = unsafe {
             process_chunk_64(
                 text.as_ptr().add(offset),
                 delimiter,
                 quote_char,
                 newline,
-                in_quote,
+                qq_carry,
             )
         };
 
         markers_writer.write_bits(markers_word, 64);
         newlines_writer.write_bits(newlines_word, 64);
-        in_quote = new_in_quote;
+        qq_carry = new_carry;
         offset += 64;
     }
 
@@ -73,7 +75,7 @@ unsafe fn build_index_neon(text: &[u8], config: &DsvConfig) -> DsvIndex {
         padded[..remaining].copy_from_slice(&text[offset..]);
 
         let (mut markers_word, mut newlines_word, _) =
-            unsafe { process_chunk_64(padded.as_ptr(), delimiter, quote_char, newline, in_quote) };
+            unsafe { process_chunk_64(padded.as_ptr(), delimiter, quote_char, newline, qq_carry) };
 
         // Mask out the padding bits
         let mask = (1u64 << remaining) - 1;
@@ -91,7 +93,7 @@ unsafe fn build_index_neon(text: &[u8], config: &DsvConfig) -> DsvIndex {
     DsvIndex::new_lightweight(lightweight)
 }
 
-/// Process a 64-byte chunk and return (markers, newlines, new_in_quote).
+/// Process a 64-byte chunk and return (markers, newlines, new_carry).
 ///
 /// The algorithm:
 /// 1. Find all quote, delimiter, and newline positions using SIMD
@@ -104,8 +106,8 @@ unsafe fn process_chunk_64(
     delimiter: u8,
     quote_char: u8,
     newline: u8,
-    in_quote: bool,
-) -> (u64, u64, bool) {
+    qq_carry: u64,
+) -> (u64, u64, u64) {
     // Load 4 x 16-byte chunks
     let chunk0 = vld1q_u8(ptr);
     let chunk1 = vld1q_u8(ptr.add(16));
@@ -144,25 +146,20 @@ unsafe fn process_chunk_64(
     let quote_mask = quote_mask0 | (quote_mask1 << 16) | (quote_mask2 << 32) | (quote_mask3 << 48);
     let nl_mask = nl_mask0 | (nl_mask1 << 16) | (nl_mask2 << 32) | (nl_mask3 << 48);
 
-    // Compute the in-quote mask using prefix XOR (via NEON PMULL)
-    // The prefix XOR of the quote mask tells us which positions are inside quotes.
-    // If in_quote is true, we XOR with all 1s to flip the mask.
-    let quote_xor = prefix_xor_neon(quote_mask);
-    let in_quote_mask = if in_quote { !quote_xor } else { quote_xor };
+    // Compute the outside-quotes mask from the prefix XOR of the quote bitmap,
+    // here via NEON PMULL (shared tail: `crate::util::simd::quote_mask`)
+    let (outside_quotes, new_carry) =
+        toggle64_from_prefix_xor(qq_carry, quote_mask, prefix_xor_neon(quote_mask));
 
     // Delimiters and newlines are valid only outside quotes
-    let valid_delim = delim_mask & !in_quote_mask;
-    let valid_nl = nl_mask & !in_quote_mask;
+    let valid_delim = delim_mask & outside_quotes;
+    let valid_nl = nl_mask & outside_quotes;
 
     // Markers = delimiters OR newlines (both outside quotes)
     let markers = valid_delim | valid_nl;
     let newlines = valid_nl;
 
-    // New in_quote state: count quotes and XOR with current state
-    let quote_count = quote_mask.count_ones();
-    let new_in_quote = (quote_count & 1 == 1) != in_quote;
-
-    (markers, newlines, new_in_quote)
+    (markers, newlines, new_carry)
 }
 
 /// Compare a 16-byte chunk against delimiter, quote, and newline characters.
@@ -244,26 +241,12 @@ unsafe fn prefix_xor_neon(x: u64) -> u64 {
     vgetq_lane_u64::<0>(vreinterpretq_u64_p128(product))
 }
 
-/// Scalar fallback for prefix XOR (used in tests for comparison).
-#[inline]
-#[allow(dead_code)] // STYLE-0005: scalar fallback (NEON path used when detected)
-fn prefix_xor_scalar(x: u64) -> u64 {
-    // Parallel prefix XOR using doubling with left shifts
-    // After step k, each bit i contains XOR of bits max(0, i-2^k+1)..=i
-    // After all steps, each bit i contains XOR of bits 0..=i
-    let mut y = x;
-    y ^= y << 1;
-    y ^= y << 2;
-    y ^= y << 4;
-    y ^= y << 8;
-    y ^= y << 16;
-    y ^= y << 32;
-    y
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::simd::quote_mask::{
+        prefix_xor, tests::quote_mask_patterns, tests::toggle64_bit_serial,
+    };
 
     #[test]
     fn test_prefix_xor_neon() {
@@ -300,28 +283,34 @@ mod tests {
 
     #[test]
     fn test_prefix_xor_neon_matches_scalar() {
-        // Test that NEON PMULL implementation matches scalar implementation
-        let test_patterns = [
-            0u64,
-            1,
-            0b11,
-            0b101,
-            0b1001,
-            0x8000_0000_0000_0000,
-            0xAAAA_AAAA_AAAA_AAAA,
-            0x5555_5555_5555_5555,
-            0xFF00_FF00_FF00_FF00,
-            0x0123_4567_89AB_CDEF,
-            !0u64,
-        ];
-
-        for &pattern in &test_patterns {
-            let scalar_result = prefix_xor_scalar(pattern);
+        // The PMULL kernel must equal the shared scalar `prefix_xor` — the same
+        // function the AVX2/SSE2 backends run in production (#182). Sweeps the
+        // shared pattern set: edge masks including bit 63, every single-bit mask,
+        // and 512 pseudo-random masks.
+        for pattern in quote_mask_patterns() {
+            let scalar_result = prefix_xor(pattern);
             let neon_result = unsafe { prefix_xor_neon(pattern) };
             assert_eq!(
                 neon_result, scalar_result,
                 "Mismatch for pattern {pattern:#018x}: NEON={neon_result:#018x}, scalar={scalar_result:#018x}"
             );
+        }
+    }
+
+    #[test]
+    fn test_neon_chunk_tail_matches_bit_serial_reference() {
+        // The PMULL kernel feeding the shared tail must reproduce the bit-serial
+        // oracle exactly, including the bit-63 chunk-boundary carry (#149/#182).
+        // This is the NEON twin of the BMI2/SVE2 `toggle64` kernel tests.
+        for quote_mask in quote_mask_patterns() {
+            for carry in [0u64, 1] {
+                let quote_xor = unsafe { prefix_xor_neon(quote_mask) };
+                assert_eq!(
+                    toggle64_from_prefix_xor(carry, quote_mask, quote_xor),
+                    toggle64_bit_serial(carry, quote_mask),
+                    "NEON tail mismatch for quote_mask={quote_mask:#x}, carry={carry}"
+                );
+            }
         }
     }
 

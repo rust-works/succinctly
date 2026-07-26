@@ -17,6 +17,7 @@ use super::super::index::DsvIndex;
 use super::super::index_lightweight::DsvIndexLightweight;
 
 use crate::json::BitWriter;
+use crate::util::simd::x86::toggle64_bmi2;
 
 /// Build a DsvIndex using AVX2 + BMI2 acceleration.
 ///
@@ -91,9 +92,6 @@ unsafe fn build_index_bmi2(text: &[u8], config: &DsvConfig) -> DsvIndex {
     let lightweight = DsvIndexLightweight::new(markers_words, newlines_words, text.len());
     DsvIndex::new_lightweight(lightweight)
 }
-/// Alternating bit pattern used by toggle64: 0101...
-const ODDS_MASK: u64 = 0x5555_5555_5555_5555;
-
 /// Process a 64-byte chunk using AVX2 for character matching and BMI2 PDEP for quote masking.
 ///
 /// This is the core algorithm from hw-dsv, ported to Rust.
@@ -151,61 +149,6 @@ unsafe fn process_chunk_64_bmi2(
     let newlines = valid_nl;
 
     (markers, newlines, new_carry)
-}
-
-/// Compute the quote mask using BMI2 PDEP instruction.
-///
-/// This is the critical function from hw-dsv that provides ~50-100x speedup
-/// over iterative approaches. It uses carry propagation to track which
-/// positions are inside vs outside quotes.
-///
-/// # Algorithm
-///
-/// Given a bitmask `w` where each 1-bit marks a quote position:
-/// 1. Use PDEP to scatter an alternating pattern (0101...) to quote positions
-/// 2. Shift and add to create carry propagation
-/// 3. The result has 1-bits where we're outside quotes, 0-bits inside
-///
-/// # Arguments
-/// * `carry` - Carry from previous chunk (0 = outside quotes, 1 = inside quotes)
-/// * `w` - Bitmask of quote positions in this chunk
-///
-/// # Returns
-/// * `(outside_mask, new_carry)` - Mask and carry for next chunk
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[target_feature(enable = "bmi2")]
-unsafe fn toggle64_bmi2(carry: u64, w: u64) -> (u64, u64) {
-    // Extract the carry bit (0 or 1)
-    let c = carry & 0x1;
-
-    // PDEP scatters the alternating pattern to quote positions
-    // If c=0: places 1s at odd quotes (1st, 3rd, 5th...) - these are "enters"
-    // If c=1: places 1s at even quotes (2nd, 4th, 6th...) - shifted by 1
-    let addend = _pdep_u64(ODDS_MASK << c, w);
-
-    // This is the key insight: we use addition with carry propagation
-    // to create a mask that "fills in" between quote pairs.
-    //
-    // The formula: ((addend << 1) | c) + !w
-    //
-    // - addend << 1: shift the deposited bits left by 1
-    // - | c: include the carry from previous chunk
-    // - + !w: add the complement of quote positions
-    //
-    // The addition propagates carries through non-quote regions,
-    // effectively "filling" the regions between matched quote pairs.
-    let comp_w = !w;
-    let shifted = (addend << 1) | c;
-    let result = shifted.wrapping_add(comp_w);
-
-    // Quote state after this chunk = incoming state XOR quote-count parity.
-    // The adder's carry-out cannot be used here: `addend << 1` drops a bit
-    // deposited at position 63, so a quote that opens at bit 63 never
-    // produces an overflow and the carry would be lost (#149).
-    let new_carry = (w.count_ones() as u64 + c) & 1;
-
-    (result, new_carry)
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -376,105 +319,6 @@ mod tests {
             index_scalar.row_count(),
             "Row count mismatch for spanning quote"
         );
-    }
-
-    #[test]
-    fn test_toggle64_basic() {
-        if !has_bmi2() {
-            return;
-        }
-
-        unsafe {
-            // No quotes - everything is outside
-            let (mask, carry) = toggle64_bmi2(0, 0);
-            assert_eq!(carry, 0, "No quotes should not change carry");
-            assert_eq!(mask, !0u64, "No quotes means all outside");
-
-            // Single quote at position 0 - everything after is inside
-            let (_mask, carry) = toggle64_bmi2(0, 1);
-            // After the quote, we're inside, so the mask should have 0s
-            assert_eq!(carry, 1, "Odd quotes should set carry");
-
-            // #149 regression: a quote at bit 63 must still toggle the carry.
-            // The overflow-based carry lost an opener at bit 63 because
-            // `addend << 1` shifts the deposited bit out of the word.
-            let (mask, carry) = toggle64_bmi2(0, 1 << 63);
-            assert_eq!(carry, 1, "Opener at bit 63 must carry into next chunk");
-            assert_eq!(mask, !0u64 >> 1, "Bits 0..63 outside, bit 63 inside");
-            let (_mask, carry) = toggle64_bmi2(1, 1 << 63);
-            assert_eq!(carry, 0, "Closer at bit 63 must clear the carry");
-        }
-    }
-
-    #[test]
-    fn test_toggle64_matches_bit_serial_reference() {
-        if !has_bmi2() {
-            return;
-        }
-
-        // Independent bit-serial oracle: walk the word tracking an inside-quotes
-        // flag, exactly like the scalar DSV parser. A quote bit takes its
-        // post-toggle state — an opening quote reads as inside (0), a closing
-        // quote as outside (1). See the SVE2 twin of this test in
-        // `src/util/simd/sve2.rs` (#149).
-        fn toggle64_reference(carry: u64, quote_mask: u64) -> (u64, u64) {
-            let mut inside = carry & 1 == 1;
-            let mut outside_mask = 0u64;
-            for i in 0..64 {
-                if (quote_mask >> i) & 1 == 1 {
-                    inside = !inside;
-                }
-                if !inside {
-                    outside_mask |= 1 << i;
-                }
-            }
-            (outside_mask, u64::from(inside))
-        }
-
-        // Deterministic PRNG for wide mask coverage without a rand dependency.
-        fn splitmix64(state: &mut u64) -> u64 {
-            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = *state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-
-        let mut patterns = vec![
-            0u64,
-            1,
-            0b11,
-            0b101,
-            0b1001,
-            0x8000_0000_0000_0000,
-            0xC000_0000_0000_0000,
-            0x8000_0000_0000_0001,
-            0xAAAA_AAAA_AAAA_AAAA,
-            0x5555_5555_5555_5555,
-            0xFF00_FF00_FF00_FF00,
-            !0u64,
-        ];
-        patterns.extend((0..64).map(|i| 1u64 << i));
-        let mut state = 0x149u64;
-        patterns.extend((0..512).map(|_| splitmix64(&mut state)));
-
-        for &quote_mask in &patterns {
-            for carry in [0u64, 1] {
-                unsafe {
-                    let (bmi2_mask, bmi2_carry) = toggle64_bmi2(carry, quote_mask);
-                    let (ref_mask, ref_carry) = toggle64_reference(carry, quote_mask);
-
-                    assert_eq!(
-                        bmi2_mask, ref_mask,
-                        "Mask mismatch for quote_mask={quote_mask:#x}, carry={carry}"
-                    );
-                    assert_eq!(
-                        bmi2_carry, ref_carry,
-                        "Carry mismatch for quote_mask={quote_mask:#x}, carry={carry}"
-                    );
-                }
-            }
-        }
     }
 
     #[test]
