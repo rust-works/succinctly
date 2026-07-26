@@ -138,7 +138,8 @@ pub(crate) fn starts_inline_seq_entry(text: &[u8], pos: usize) -> bool {
 /// past the line break is a node whatever follows it, so the scan stops rather than
 /// chasing the closing quote. That is the deliberate difference from
 /// [`validate::Validator::line_kind`], which asks a related question about a whole
-/// block-context line and does follow a quoted scalar across lines.
+/// block-context line and does follow a quoted scalar across lines. Merging the two
+/// scans has to settle that difference first, and is tracked as #382.
 #[inline]
 pub(crate) fn line_is_structural(text: &[u8], from: usize) -> bool {
     let mut i = from;
