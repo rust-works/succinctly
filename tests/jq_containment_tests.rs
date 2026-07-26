@@ -1,10 +1,16 @@
-//! `contains`/`inside` conformance for mismatched operand types (#358).
+//! `contains`/`inside` conformance for mismatched operand kinds (#358).
 //!
-//! jq raises an error when the two operands' types cannot be compared;
-//! succinctly used to answer `false`. The subtlety is *where* the check applies:
-//! only the outermost pair of operands is screened, so a mismatch nested inside
-//! a container stays `false`, and `Int`/`Float` are one type (`number`) and so
-//! never mismatch.
+//! jq raises an error when the two operands' kinds cannot be compared;
+//! succinctly used to answer `false`. Two subtleties decide the shape of the
+//! check:
+//!
+//! 1. Only the outermost pair of operands is screened, so a mismatch nested
+//!    inside a container stays `false`.
+//! 2. The screen is on jq's *kind*, not its type name. `Int`/`Float` are one
+//!    kind (`number`) and so never mismatch — but `true` and `false` are two
+//!    kinds that share the name `boolean`, so `true | contains(false)` errors
+//!    with a message calling both operands `boolean`. See `jq_kind` in
+//!    `src/jq/eval.rs`.
 //!
 //! # Oracle provenance
 //!
@@ -14,6 +20,7 @@
 //! echo 1                | jq -c 'contains("a")'
 //! echo 1                | jq -c 'inside([1])'
 //! echo '[1,"a"]'        | jq -c 'contains(["a",2])'
+//! echo true             | jq -c 'contains(false)'   # distinct kinds, one name
 //! echo '"abcdefghijkl"' | jq -c 'contains(1)'      # 14-byte dump, kept whole
 //! echo '"abcdefghijklm"'| jq -c 'contains(1)'      # 15 bytes, truncated
 //! ```
@@ -29,6 +36,16 @@
 //! no `contains` arm of its own and delegates to the full evaluator. Running
 //! every case through both is what proves the CLI path errors too — see
 //! `tests/jq_evaluator_parity_tests.rs` for the general form of this drift risk.
+//!
+//! # Merging with #356
+//!
+//! #358 says to verify the fix by deleting `contains_number_string` and
+//! `inside_array_number` from `tests/data/jq-error-known-divergences.txt`. That
+//! manifest does not exist yet — it arrives with #356, which also introduces
+//! `src/jq/error.rs` carrying its own `containment_check` and a `dump_truncated`
+//! equivalent to `value_preview` here. Whichever of the two lands second owes
+//! the merge: drop those two manifest lines, and keep one copy of the message
+//! builder and the truncation rather than two that can drift apart.
 
 use succinctly::jq::{eval, eval_generic, parse, JqSemantics, OwnedValue, QueryResult};
 use succinctly::json::JsonIndex;
@@ -92,6 +109,35 @@ const CASES: &[(&[u8], &str, Expect)] = &[
         r"contains(1)",
         Expect::Error("boolean (true) and number (1) cannot have their containment checked"),
     ),
+    // --- the two boolean kinds that share one name ------------------------
+    // jq's `jv_kind` splits `JV_KIND_TRUE` from `JV_KIND_FALSE` and screens on
+    // the kind, so a mixed pair errors even though `jv_kind_name` calls both
+    // `boolean`. A `type_name`-based screen answers `false` here instead.
+    (
+        br"true",
+        r"contains(false)",
+        Expect::Error("boolean (true) and boolean (false) cannot have their containment checked"),
+    ),
+    (
+        br"false",
+        r"contains(true)",
+        Expect::Error("boolean (false) and boolean (true) cannot have their containment checked"),
+    ),
+    (
+        br"true",
+        r"inside(false)",
+        Expect::Error("boolean (false) and boolean (true) cannot have their containment checked"),
+    ),
+    (
+        br"false",
+        r"inside(true)",
+        Expect::Error("boolean (true) and boolean (false) cannot have their containment checked"),
+    ),
+    // A matched pair is a plain comparison, and nested it is plain `false`.
+    (br"true", r"contains(true)", Expect::Values(&["true"])),
+    (br"false", r"contains(false)", Expect::Values(&["true"])),
+    (br"true", r"inside(true)", Expect::Values(&["true"])),
+    (br"[false]", r"contains([true])", Expect::Values(&["false"])),
     (
         br"null",
         r"contains(1)",
@@ -226,6 +272,50 @@ fn optional_suppresses_the_error() {
              the fallback now threads `optional`, so tighten this test"
         );
     }
+}
+
+/// A number in the preview reads back canonicalised, not as its source literal —
+/// a divergence pinned rather than fixed.
+///
+/// `EvalError::containment_check` previews an operand with
+/// `OwnedValue::to_json`, which does not carry the literal the document was
+/// written with, so jq's `number (1E+100)` and `number (1.0)` come back as
+/// `number (10000000000...)` and `number (1)`.
+///
+/// The cause sits in `OwnedValue`, not in the truncation: `1e100 | tostring`
+/// already differs the same way, and the streaming identity path — which copies
+/// source text rather than materialising — does not differ at all
+/// (`echo 1e100 | sjq -c .` prints `1E+100`, matching jq). #358 is what first
+/// routes a materialised dump into an error message and so makes it visible.
+/// Fixing it means teaching `OwnedValue` to carry the literal, which would touch
+/// far more than containment.
+///
+/// The expectations are succinctly's *current* output with jq's beside them.
+/// If a future change makes these match jq, delete the test rather than invert
+/// it — and check `value_preview`'s doc comment in `src/jq/eval.rs`.
+#[test]
+fn number_previews_are_canonicalised() {
+    // jq: number (1E+100) and string ("a") cannot have their containment checked
+    assert_eq!(
+        full_outcome(br"1e100", r#"contains("a")"#),
+        Err(
+            r#"number (10000000000...) and string ("a") cannot have their containment checked"#
+                .to_string()
+        )
+    );
+
+    // jq: number (1.0) and string ("a") cannot have their containment checked
+    assert_eq!(
+        full_outcome(br"1.0", r#"contains("a")"#),
+        Err(r#"number (1) and string ("a") cannot have their containment checked"#.to_string())
+    );
+
+    // Integers that need no canonicalising are unaffected, which is why every
+    // case in `CASES` agrees with jq exactly.
+    assert_eq!(
+        full_outcome(br"42", r#"contains("a")"#),
+        Err(r#"number (42) and string ("a") cannot have their containment checked"#.to_string())
+    );
 }
 
 /// `catch` binds the raised message as a string, so an uncaught error and a
