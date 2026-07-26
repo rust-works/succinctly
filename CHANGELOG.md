@@ -32,6 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- Removed `succinctly::bits::CompactRank` (#321), a two-level rank directory with
+  no remaining callers. **Breaking**: the type is gone from the public API. It
+  was introduced for the YAML index structures and used by them (`ib_rank`,
+  `containers_rank`, `advance_rank`, `has_end_rank`), then replaced with
+  cumulative `Vec<u32>` rank arrays, which is what `YamlIndex` and
+  `AdvancePositions` store today. Its module doc still advertised the YAML use
+  after those call sites were gone. Nothing in the crate regresses in space or
+  speed, because nothing was using it any more; the ~50%-of-bitmap cost of the
+  cumulative arrays that displaced it is unchanged, and whether to close that gap
+  is the open question in #321.
+
 - Removed four never-constructed `YamlError` variants — `InvalidEscape`,
   `InvalidIndentation`, `ExplicitKeyNotSupported`, and `ColonWithoutSpace`
   (#223). **Breaking**: exhaustive `match`es on the public `YamlError` lose four

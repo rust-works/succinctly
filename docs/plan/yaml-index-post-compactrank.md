@@ -1,5 +1,16 @@
 # YamlIndex Post-CompactRank Optimization Plan
 
+> **Status: superseded — historical record (2026-01-27 snapshot).**
+> Its premise no longer holds. The rank indices went back to cumulative
+> `Vec<u32>` arrays in `0156707a`, and `CompactRank` was deleted from the crate in
+> #321 — so Opportunities 1-6, all of which are stated against `CompactRank`, no
+> longer describe the code, and Opportunity 6 (its intra-block popcount cost) is
+> moot. Opportunity 1 was superseded by `EndPositions` (P12) and Opportunity 2 was
+> done in #104; `seq_items` has since been eliminated outright (O4), so the memory
+> layout table is out of date too. Read
+> [../parsing/yaml-succinct.md](../parsing/yaml-succinct.md) for the current
+> layout and [../parsing/yaml.md](../parsing/yaml.md) for what was accepted.
+
 Analysis of optimization opportunities after replacing `Vec<u32>` rank indices
 with `CompactRank` (~3.5% overhead).
 

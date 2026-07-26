@@ -117,15 +117,28 @@ cost 3L/8 = 37.5% of text -- still large, but bitmaps compress well because
 they are sparse, and their rank-select indices should stay under **5% overhead**
 relative to the bitmap they index.
 
-| Representation       | Cost per text byte | 3 structures |
-|----------------------|--------------------|--------------|
-| Position vector      | 4N/L ~ 0.53        | ~160%        |
-| Bitmap               | 1 bit = 0.125      | ~37.5%       |
-| CompactRank (~3.5%)  | ~0.44% of bitmap   | ~1.3%        |
+| Representation               | Cost per text byte | 3 structures |
+|------------------------------|--------------------|--------------|
+| Position vector              | 4N/L ~ 0.53        | ~160%        |
+| Bitmap                       | 1 bit = 0.125      | ~37.5%       |
+| Cumulative rank (`Vec<u32>`) | 4 B/word = 0.0625  | ~18.75%      |
 
-The `CompactRank` two-level directory uses ~3.5% overhead per bitmap
-(L1: one `u32` per 128 words + L2: one `u16` per 8 words), meeting the 5%
-target. This replaced the earlier `Vec<u32>` approach (50% overhead).
+Rank support is a cumulative popcount array holding one `u32` per 64-bit word
+([`build_cumulative_rank`](../../src/yaml/advance_positions.rs)), so each rank
+index costs **50% of the bitmap it indexes** -- 6.25% of the text for the
+text-length bitmaps. That misses the 5% target above by an order of magnitude,
+and it is a deliberate trade rather than an oversight: rank is one array load
+plus one masked popcount, with no hierarchical navigation.
+
+A two-level `CompactRank` directory (L1: one `u32` per 128 words + L2: one `u16`
+per 8 words, ~3.5% of the bitmap) did meet the 5% target and was used by these
+structures briefly (`bc169609`). It was swapped out for the cumulative arrays in
+`0156707a`, which cited cache locality and the single-lookup query for
+sequential streaming access; that commit recorded no measurements, and its
+claimed "~3.5% to ~3.1%" memory figure is wrong in the direction of the trade it
+made. Left with no callers, `CompactRank` was deleted from the crate in #321.
+Whether to close the resulting 10x gap against the 5% target is still open --
+see [ADR-0011](../adrs/adr-0011.md) and issue #321.
 
 The same budget-driven reasoning cut the other way for `seq_items`: since the
 sequence-item property is derivable from the text (`-` + whitespace), storing it
@@ -136,24 +149,27 @@ Measured saving: 19–41 KB retained per MB of input (3–5% of the index) plus 
 
 ## Current derived index structures
 
-Every raw bitmap that needs O(1) rank queries gets a two-level `CompactRank`
-directory at ~3.5% overhead relative to the bitmap it indexes:
+Every raw bitmap that needs O(1) rank queries gets a cumulative popcount array,
+one `u32` per 64-bit word, at ~50% of the bitmap it indexes:
 
-| Bitmap                         | Rank index                         | Overhead |
-|--------------------------------|------------------------------------|----------|
-| `ib`                           | `ib_rank` (in `YamlIndex`)         | ~3.5%    |
-| `ib_words` (in AdvancePos)     | `ib_rank` (in `AdvancePositions`)  | ~3.5%    |
-| `advance_words`                | `advance_rank`                     | ~3.5%    |
-| `containers`                   | `containers_rank`                  | ~3.5%    |
+| Bitmap                     | Rank index                        | Type       | Overhead |
+|----------------------------|-----------------------------------|------------|----------|
+| `ib`                       | `ib_rank` (in `YamlIndex`)        | `Vec<u32>` | ~50%     |
+| `ib_words` (in AdvancePos) | `ib_rank` (in `AdvancePositions`) | `Vec<u32>` | ~50%     |
+| `advance_words`            | `advance_rank`                    | `Vec<u32>` | ~50%     |
+| `containers`               | `containers_rank`                 | `Vec<u32>` | ~50%     |
 
-`CompactRank` uses a two-level hierarchy:
-- **L1**: one `u32` per 128 words (8192 bits) → 0.39% overhead
-- **L2**: one `u16` per 8 words (512 bits) → 3.125% overhead
+Entry `i` holds the popcount of words `[0, i)`, so the array is one longer than
+the word count.
 
-Query: `rank_at_word(words, w) = l1[w/128] + l2[w/8] + popcount(in-block words)`.
+Query: `rank1(pos) = rank[pos / 64] + popcount(words[pos / 64] & ((1 << pos % 64) - 1))`
+-- one load and one masked popcount, regardless of bitmap size
+([`ib_rank1`](../../src/yaml/advance_positions.rs), [`advance_rank1`](../../src/yaml/advance_positions.rs)).
 
-`AdvancePositions.ib_words` additionally has `ib_select_samples` (~2% of the
-bitmap) to support O(1) select queries, needed by the `get()` random access path.
+`AdvancePositions.ib_words` additionally has `ib_select_samples` to support O(1)
+select queries, needed by the `get()` random access path: one `u32` per 256
+1-bits, so its cost scales with density rather than with the bitmap -- ~1.7% of
+the bitmap at the typical N ~ L/7.5.
 
 ## Relationship between YamlIndex and AdvancePositions
 
@@ -165,7 +181,7 @@ bitmap) to support O(1) select queries, needed by the `get()` random access path
       -------             -------                    -------          -------
 
       ib ----------------> ib_rank                   ib_words ------> ib_rank
-      (scalars only)       CompactRank               (all nodes)      CompactRank
+      (scalars only)       Vec<u32> cumulative       (all nodes)      Vec<u32> cumulative
          |                                              |
          `---------------> ib_len ..................... ib_len
                            = text len    duplicate      = text len
@@ -177,8 +193,8 @@ bitmap) to support O(1) select queries, needed by the `get()` random access path
                                                                       total popcount
 
       containers --------> containers_rank
-                           CompactRank               advance_words --> advance_rank
-                                                     (dup markers)    CompactRank
+                           Vec<u32> cumulative       advance_words --> advance_rank
+                                                     (dup markers)    Vec<u32> cumulative
       ty ----------------> ty_len                       |
                                                         `-----------> num_opens
       bp
