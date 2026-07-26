@@ -7665,6 +7665,277 @@ mod tests {
     }
 
     // =========================================================================
+    // Seq-item detection: single predicate across all sites (#106)
+    // =========================================================================
+    // `starts_seq_entry` is the one definition of "this `-` opens a sequence item".
+    // `YamlElements::uncons`/`uncons_cursor`/`get` each used to carry a narrower
+    // copy that rejected `\n`, `\r` and end-of-input. That made dash-newline items
+    // fall through to `value()`, which re-read the same open index — a backwards
+    // jump that reset the `AdvancePositions` sequential cursor and forced the next
+    // read to rescan the IB bitmap from word 0 (O(N*L/64) for the document).
+    //
+    // The three access paths are no longer required to spell the predicate the same
+    // way — `uncons_cursor` deliberately uses the narrower `starts_inline_seq_entry`
+    // (#332) so a bare `-` keeps yielding the wrapper for positional callers. What
+    // must still hold is that they agree on the *value* they ultimately produce,
+    // which is what these tests pin.
+
+    /// Render a value to a compact stable string, so the three `YamlElements`
+    /// access paths can be compared for exact agreement.
+    fn render_value<W: AsRef<[u64]> + core::fmt::Debug>(v: &YamlValue<'_, W>) -> String {
+        match v {
+            YamlValue::Null => "null".to_string(),
+            YamlValue::String(s) => format!("{:?}", &*s.as_str().unwrap()),
+            YamlValue::Mapping(fields) => {
+                let mut parts = Vec::new();
+                let mut it = *fields;
+                while let Some((field, rest)) = it.uncons() {
+                    parts.push(format!(
+                        "{}:{}",
+                        render_value(&field.key()),
+                        render_value(&field.value())
+                    ));
+                    it = rest;
+                }
+                format!("{{{}}}", parts.join(","))
+            }
+            YamlValue::Sequence(elements) => {
+                let mut parts = Vec::new();
+                let mut it = *elements;
+                while let Some((val, rest)) = it.uncons() {
+                    parts.push(render_value(&val));
+                    it = rest;
+                }
+                format!("[{}]", parts.join(","))
+            }
+            YamlValue::Alias { anchor_name, .. } => format!("*{anchor_name}"),
+            YamlValue::Error(e) => format!("ERR({e})"),
+        }
+    }
+
+    /// Render the first document's sequence via each of the three access paths.
+    /// Returns `(uncons, get, uncons_cursor)`.
+    fn render_seq_three_ways(yaml: &[u8]) -> (String, String, String) {
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        let YamlValue::Sequence(elements) = first_doc(root) else {
+            panic!("expected first document to be a sequence");
+        };
+
+        // Path 1: uncons (what Iterator::next delegates to)
+        let via_uncons = render_value(&YamlValue::Sequence(elements));
+
+        // Path 2: get(i)
+        let mut n = 0;
+        let mut probe = elements;
+        while let Some((_, rest)) = probe.uncons() {
+            n += 1;
+            probe = rest;
+        }
+        let via_get = format!(
+            "[{}]",
+            (0..n)
+                .map(|i| render_value(&elements.get(i).expect("get in range")))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        // Path 3: uncons_cursor, resolving each returned cursor to a value
+        let mut parts = Vec::new();
+        let mut it = elements;
+        while let Some((cursor, rest)) = it.uncons_cursor() {
+            parts.push(render_value(&cursor.value()));
+            it = rest;
+        }
+        let via_cursor = format!("[{}]", parts.join(","));
+
+        (via_uncons, via_get, via_cursor)
+    }
+
+    /// The permanent guard: all three access paths must agree. Any future
+    /// divergence between them fails here instead of hiding until a release.
+    /// Returns the agreed rendering.
+    fn assert_seq_paths_agree_on(yaml: &[u8]) -> String {
+        let (a, b, c) = render_seq_three_ways(yaml);
+        assert_eq!(
+            b,
+            a,
+            "get(i) disagrees with uncons for {:?}",
+            String::from_utf8_lossy(yaml)
+        );
+        assert_eq!(
+            c,
+            a,
+            "uncons_cursor disagrees with uncons for {:?}",
+            String::from_utf8_lossy(yaml)
+        );
+        a
+    }
+
+    fn assert_seq_paths_agree(yaml: &[u8], expected: &str) {
+        let actual = assert_seq_paths_agree_on(yaml);
+        assert_eq!(
+            actual,
+            expected,
+            "unexpected value for {:?}",
+            String::from_utf8_lossy(yaml)
+        );
+    }
+
+    #[test]
+    fn test_starts_seq_entry_predicate() {
+        // `-` followed by whitespace, or at end of input, opens a sequence item
+        for t in [&b"-"[..], b"- ", b"-\t", b"-\n", b"-\r"] {
+            assert!(starts_seq_entry(t, 0), "expected seq item for {t:?}");
+        }
+        // `-` followed by anything else is part of a scalar
+        for t in [&b"-1"[..], b"--", b"-x", b"a", b"-#"] {
+            assert!(!starts_seq_entry(t, 0), "expected NOT seq item for {t:?}");
+        }
+        // Out-of-range positions are false, not panics
+        assert!(!starts_seq_entry(b"-", 1));
+        assert!(!starts_seq_entry(b"-", 99));
+        assert!(!starts_seq_entry(b"", 0));
+    }
+
+    #[test]
+    fn test_dash_newline_items_agree_across_paths() {
+        // The shape that used to trigger the backwards-jump pathology: the item
+        // indicator is `-` immediately followed by a newline, content indented below.
+        assert_seq_paths_agree(b"-\n  a: 1\n-\n  a: 2\n", "[{\"a\":\"1\"},{\"a\":\"2\"}]");
+    }
+
+    #[test]
+    fn test_crlf_sequence_items_parse_correctly() {
+        // Was a characterization test for #324, where `\r` was folded into plain
+        // scalars as a trailing space — `a: 1\r\n` yielded the string "1 " rather
+        // than the number 1, and this dash-CRLF item lost its mapping structure
+        // entirely. Now that CRLF is handled, it is a regression test: the item
+        // resolves to a mapping, matching `yq`'s `[{"a":1}]` (the renderer here
+        // stringifies scalars, hence "1").
+        assert_seq_paths_agree(b"-\r\n  a: 1\r\n", "[{\"a\":\"1\"}]");
+        // Bare CRLF items and CRLF scalars, for the same reason.
+        assert_seq_paths_agree(b"- a\r\n- b\r\n", "[\"a\",\"b\"]");
+    }
+
+    #[test]
+    fn test_dash_space_items_agree_across_paths() {
+        // Already handled before unification; pins that it stayed correct.
+        assert_seq_paths_agree(b"- a\n- b\n", "[\"a\",\"b\"]");
+    }
+
+    #[test]
+    fn test_dash_tab_items_agree_across_paths() {
+        // Tab was accepted by the narrow predicate too, so this must not change.
+        assert_seq_paths_agree(b"-\ta\n-\tb\n", "[\"a\",\"b\"]");
+    }
+
+    #[test]
+    fn test_empty_items_are_null_across_paths() {
+        // A trailing bare `-` at end of input is a real empty item -> null.
+        assert_seq_paths_agree(b"- a\n-", "[\"a\",null]");
+        // `- ` with no content is likewise null.
+        assert_seq_paths_agree(b"- \n- b\n", "[null,\"b\"]");
+    }
+
+    #[test]
+    fn test_flow_sequence_of_negative_numbers_across_paths() {
+        // `text[pos] == b'-'` but these are scalars, not item wrappers: the byte
+        // after `-` is a digit. `get()` previously relied on `first_child()` alone
+        // here, with no lookahead at all.
+        assert_seq_paths_agree(b"[-1, -2]\n", "[\"-1\",\"-2\"]");
+    }
+
+    #[test]
+    fn test_nested_block_sequences_across_paths() {
+        assert_seq_paths_agree(b"- - a\n  - b\n", "[[\"a\",\"b\"]]");
+    }
+
+    #[test]
+    fn test_root_documents_are_never_unwrapped() {
+        // The root trap: the virtual root's text position is 0, so for `- a\n- b`
+        // the root's own bytes are `"- "`. Anything that decided "is this a block
+        // sequence?" from the *container's* text would unwrap every document.
+        let yaml = b"- a\n- b\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        assert_eq!(root.text_position(), Some(0));
+        assert_eq!(
+            yaml[0], b'-',
+            "precondition: root text starts at the first `-`"
+        );
+
+        let YamlValue::Sequence(docs) = root.value() else {
+            panic!("root must be the virtual document sequence");
+        };
+        let mut count = 0;
+        let mut it = docs;
+        while let Some((doc, rest)) = it.uncons() {
+            // Each document is itself the sequence, not one of its items.
+            assert_eq!(render_value(&doc), "[\"a\",\"b\"]");
+            count += 1;
+            it = rest;
+        }
+        assert_eq!(count, 1, "expected exactly one document");
+    }
+
+    #[test]
+    fn test_multi_document_sequences_are_not_unwrapped() {
+        let yaml = b"---\n- a\n---\n- b\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        let YamlValue::Sequence(docs) = root.value() else {
+            panic!("root must be the virtual document sequence");
+        };
+        let rendered: Vec<String> = docs.map(|d| render_value(&d)).collect();
+        assert_eq!(rendered, vec!["[\"a\"]".to_string(), "[\"b\"]".to_string()]);
+    }
+
+    #[test]
+    fn test_sequence_as_mapping_value_on_next_line_across_paths() {
+        // Block sequence as a mapping value (parser emits wrappers here too).
+        let yaml = b"k:\n  - a\n  - b\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        assert_eq!(render_value(&first_doc(root)), "{\"k\":[\"a\",\"b\"]}");
+    }
+
+    #[test]
+    fn test_dash_scalar_in_mapping_value_keeps_its_text() {
+        // Characterization, not an endorsement. Per YAML 1.2 `ns-plain-first`, a `-`
+        // before whitespace is always the sequence-entry indicator and never starts a
+        // plain scalar, so `a: -` is invalid: a block sequence cannot begin on the
+        // same line as its parent mapping key. `yq` rejects all of these outright
+        // ("block sequence entries are not allowed in this context"), and
+        // `succinctly yaml validate` rejects them too.
+        //
+        // The parser's mapping-value arm accepts only space/tab after `-`
+        // (parser.rs, `parse_value`), so it emits a plain scalar node whose text is
+        // `-`. The wide reader predicate still classifies that as a wrapper, but a
+        // childless wrapper is now told apart from a plain scalar by whether the
+        // parser recorded an end position for it (#332), so the text survives instead
+        // of collapsing to null. The loader is lenient by design and preserving the
+        // text beats losing it. Locked in so the behaviour is a decision, not an
+        // accident.
+        for yaml in [&b"a: -\n"[..], b"a: -", b"a: -\r\n"] {
+            let index = YamlIndex::build(yaml).unwrap();
+            let root = index.root(yaml);
+            assert_eq!(
+                render_value(&first_doc(root)),
+                "{\"a\":\"-\"}",
+                "unexpected result for {:?}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+        // In flow context the byte after `-` is `}`, so it never looked like a
+        // wrapper in the first place — the same result by a different route.
+        let yaml = b"{a: -}\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+        assert_eq!(render_value(&first_doc(root)), "{\"a\":\"-\"}");
+    }
+
+    // =========================================================================
     // Direct transcoding tests (to_json_document path)
     // =========================================================================
     // These tests verify that the direct YAML→JSON transcoding produces
