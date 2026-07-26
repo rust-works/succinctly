@@ -6636,6 +6636,47 @@ mod tests {
         panic!("did not find ref field");
     }
 
+    /// The boundary #372's rejection must not cross: wherever an anchor is in
+    /// scope, the alias still resolves to its value.
+    ///
+    /// Rejecting a lookup miss is only safe if every anchor a document defines
+    /// is actually *registered*. Two paths recorded no anchor at all, so the
+    /// alias missed and — before the rejection landed — quietly yielded `null`:
+    /// a compact mapping entry inside a block sequence item (`- k: &a 1`) and a
+    /// document-root value (`--- &a 1`). Turning a miss into an error would
+    /// have converted those into a refusal to parse valid YAML, so this asserts
+    /// the resolved output rather than merely that the build succeeds.
+    #[test]
+    fn test_alias_resolves_wherever_the_anchor_is_in_scope() {
+        // (input, expected JSON for the first document)
+        let cases: &[(&[u8], &str)] = &[
+            // Values.
+            (b"a: &x 1\nb: *x", r#"{"a":1,"b":1}"#),
+            (b"a: &x [1,2]\nb: *x", r#"{"a":[1,2],"b":[1,2]}"#),
+            (b"- &x 1\n- *x", r"[1,1]"),
+            (b"a: [&x 1, *x]", r#"{"a":[1,1]}"#),
+            (b"a: {k: &x 1, b: *x}", r#"{"a":{"k":1,"b":1}}"#),
+            // Anchor on a compact mapping entry's value, aliased from a later
+            // entry of the same item, from a later item, and from outside the
+            // sequence. This is the shape a Kubernetes manifest writes.
+            (b"- a: &x 1\n  b: *x", r#"[{"a":1,"b":1}]"#),
+            (b"- a: &x 1\n- b: *x", r#"[{"a":1},{"b":1}]"#),
+            (b"l:\n  - a: &x 1\nr: *x", r#"{"l":[{"a":1}],"r":1}"#),
+            // Keys.
+            (b"&x k: 1\n*x: 2", r#"{"k":1,"k":2}"#),
+            (b"- &x k: 1\n- *x: 2", r#"[{"k":1},{"k":2}]"#),
+            (b"k: &x 1\n? *x\n: v", r#"{"k":1,"1":"v"}"#),
+        ];
+        for (yaml, expected) in cases {
+            assert_eq!(
+                first_doc_json(yaml),
+                *expected,
+                "in: {}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
     #[test]
     fn test_block_nested_sequence() {
         // Block-style nested sequence (value on next line)

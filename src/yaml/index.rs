@@ -1068,14 +1068,64 @@ mod tests {
         assert!(YamlIndex::build(b"a: &x 1\n---\nb: *x").is_ok());
     }
 
+    // ------------------------------------------------------------------------
+    // Unknown-anchor rejection tests (#372)
+    // ------------------------------------------------------------------------
+
+    /// Assert that `yaml` is rejected with `UnknownAnchor` naming
+    /// `expected_name` at the byte offset of `alias_text` within `yaml`.
+    ///
+    /// The offset assertion is what stops a site from reporting a plausible but
+    /// unrelated position: every alias below must point at its own `*`.
+    #[track_caller]
+    fn expect_unknown_anchor(yaml: &str, expected_name: &str, alias_text: &str) {
+        let expected_offset = yaml.find(alias_text).expect("alias text present in input");
+        let Err(err) = YamlIndex::build(yaml.as_bytes()) else {
+            panic!("alias to an unknown anchor must be rejected at build time, in: {yaml:?}");
+        };
+        match err {
+            YamlError::UnknownAnchor { offset, name } => {
+                assert_eq!(name, expected_name, "in: {yaml:?}");
+                assert_eq!(offset, expected_offset, "in: {yaml:?}");
+            }
+            other => panic!("expected UnknownAnchor, got {other:?}, in: {yaml:?}"),
+        }
+    }
+
+    /// Every position an alias can appear in must reject an anchor that is not
+    /// in scope, and name it.
+    ///
+    /// #372: a lookup miss used to be dropped, leaving the node with nothing to
+    /// resolve to — it rendered as `null`, or as an empty string in the three
+    /// key positions. Aliases reach the anchor table through three sites
+    /// (`parse_alias`, `record_key_alias`, and the document-root dispatch), so
+    /// this is table-driven rather than one case per site: a new position that
+    /// forgets to resolve fails here.
     #[test]
-    fn test_build_rejects_undefined_alias() {
-        // #372: undefined and forward-referencing aliases used to get no
-        // `aliases` entry and resolve to null at query time. An alias must name
-        // a previous anchor, so the miss is now an error — the same treatment
-        // `test_build_rejects_alias_cycle` gives the other unresolvable alias.
-        assert!(YamlIndex::build(b"bad: *undefined").is_err());
-        assert!(YamlIndex::build(b"a: *x\nb: &x 5").is_err());
+    fn test_build_rejects_alias_to_unknown_anchor_in_every_position() {
+        // (input, anchor name, the alias text whose offset must be reported)
+        let cases: &[(&str, &str, &str)] = &[
+            // Values.
+            ("bad: *nope", "nope", "*nope"),
+            ("- k: *nope", "nope", "*nope"),
+            ("a: [*nope]", "nope", "*nope"),
+            ("a: {k: *nope}", "nope", "*nope"),
+            ("- *nope", "nope", "*nope"),
+            ("--- *nope", "nope", "*nope"),
+            // Keys.
+            ("*nope: v", "nope", "*nope"),
+            ("- *nope: v", "nope", "*nope"),
+            ("? *nope\n: v", "nope", "*nope"),
+            // A forward reference is a miss like any other: YAML 1.2 §7.1
+            // requires an alias to name a *previous* anchor, so the anchor
+            // below is not in scope at the alias.
+            ("a: *x\nb: &x 5", "x", "*x"),
+            // The anchor exists but was never in scope for this alias.
+            ("a: &x 1\nb: *y", "y", "*y"),
+        ];
+        for (yaml, name, alias_text) in cases {
+            expect_unknown_anchor(yaml, name, alias_text);
+        }
     }
 
     #[test]

@@ -327,6 +327,18 @@ mod tests {
     }
 
     #[test]
+    fn test_unknown_anchor_display() {
+        let err = YamlError::UnknownAnchor {
+            offset: 3,
+            name: "nope".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "unknown anchor 'nope' referenced at offset 3"
+        );
+    }
+
+    #[test]
     fn test_tag_not_supported_display() {
         let err = YamlError::TagNotSupported { offset: 8 };
         assert_eq!(err.to_string(), "tags (!) not supported at offset 8");
