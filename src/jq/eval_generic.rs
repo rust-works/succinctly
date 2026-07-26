@@ -520,6 +520,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     // null since there is no error for `?` to suppress. See #307.
                     None => GenericResult::Owned(OwnedValue::Null),
                 }
+            } else if value.is_null() {
+                // jq returns null for index on null, as the `Expr::Field` arm
+                // above already does for `.foo`. Without this, `null | .[0]`
+                // errored while `null | .[$n]` — the same query, and the same
+                // rule in `index_one_generic` — returned null.
+                GenericResult::Owned(OwnedValue::Null)
             } else if optional {
                 GenericResult::None
             } else {
