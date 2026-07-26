@@ -228,6 +228,17 @@ impl EvalError {
     }
 }
 
+// jq's `jv_kind` discriminants, verbatim from `jv.h`, so the two enums can be
+// read side by side. `JV_KIND_INVALID` (0) has no `OwnedValue` counterpart — an
+// `OwnedValue` is always a valid value — so the numbering starts at 1.
+const JQ_KIND_NULL: u8 = 1;
+const JQ_KIND_FALSE: u8 = 2;
+const JQ_KIND_TRUE: u8 = 3;
+const JQ_KIND_NUMBER: u8 = 4;
+const JQ_KIND_STRING: u8 = 5;
+const JQ_KIND_ARRAY: u8 = 6;
+const JQ_KIND_OBJECT: u8 = 7;
+
 /// A value's kind as jq's `jv_get_kind` reports it, for the operand screens that
 /// compare kinds rather than type names.
 ///
@@ -239,19 +250,40 @@ impl EvalError {
 /// `true`. Screening on `type_name` instead answers `false` for that pair, which
 /// is exactly the divergence #358 is about (#358 review).
 ///
-/// The discriminants are jq's own, `JV_KIND_INVALID` (0) included, so the two
-/// enums can be read side by side. Only equality is ever asked of them.
+/// This is the one definition of "what kind is this value" in the jq module;
+/// [`sort_rank`] is derived from it rather than matched independently. Only
+/// equality is ever asked of the value here — orderings go through `sort_rank`.
 fn jq_kind(value: &OwnedValue) -> u8 {
     match value {
-        OwnedValue::Null => 1,
-        OwnedValue::Bool(false) => 2,
-        OwnedValue::Bool(true) => 3,
+        OwnedValue::Null => JQ_KIND_NULL,
+        OwnedValue::Bool(false) => JQ_KIND_FALSE,
+        OwnedValue::Bool(true) => JQ_KIND_TRUE,
         // jq has one number kind; `1 | contains(1.0)` is a comparison, not an error.
-        OwnedValue::Int(_) | OwnedValue::Float(_) => 4,
-        OwnedValue::String(_) => 5,
-        OwnedValue::Array(_) => 6,
-        OwnedValue::Object(_) => 7,
+        OwnedValue::Int(_) | OwnedValue::Float(_) => JQ_KIND_NUMBER,
+        OwnedValue::String(_) => JQ_KIND_STRING,
+        OwnedValue::Array(_) => JQ_KIND_ARRAY,
+        OwnedValue::Object(_) => JQ_KIND_OBJECT,
     }
+}
+
+/// A value's rank in jq's sort order:
+/// `null < false < true < number < string < array < object`.
+///
+/// This is [`jq_kind`]'s partition with the two boolean kinds merged into the
+/// single `boolean` slot `jv_kind_name` reports — which is what every *ordering*
+/// caller wants (`sort`, `min`, `max`, `unique`, `group_by`, the comparison
+/// operators, `bsearch`). Only `contains`/`inside` need the finer `jq_kind`.
+///
+/// Derived rather than matched so the two cannot drift: before #358 there were
+/// three hand-written copies of this table in the jq module, and a fourth would
+/// have arrived with the containment screen. See the #106 lesson in `CLAUDE.md`
+/// — one definition, plus a test that the call sites agree
+/// (`sort_rank_agrees_with_jq_kind`).
+pub(crate) fn sort_rank(value: &OwnedValue) -> u8 {
+    let kind = jq_kind(value);
+    // Shift off the unused `JV_KIND_INVALID` slot, then close the gap that
+    // merging `false` and `true` into one rank leaves behind.
+    kind - 1 - u8::from(kind >= JQ_KIND_TRUE)
 }
 
 /// Render `value` the way jq embeds a value in an error message: its compact
@@ -1271,19 +1303,8 @@ fn eval_compare<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn compare_values(left: &OwnedValue, right: &OwnedValue) -> core::cmp::Ordering {
     use core::cmp::Ordering;
 
-    fn type_order(v: &OwnedValue) -> u8 {
-        match v {
-            OwnedValue::Null => 0,
-            OwnedValue::Bool(_) => 1,
-            OwnedValue::Int(_) | OwnedValue::Float(_) => 2,
-            OwnedValue::String(_) => 3,
-            OwnedValue::Array(_) => 4,
-            OwnedValue::Object(_) => 5,
-        }
-    }
-
-    let left_type = type_order(left);
-    let right_type = type_order(right);
+    let left_type = sort_rank(left);
+    let right_type = sort_rank(right);
 
     if left_type != right_type {
         return left_type.cmp(&right_type);
@@ -11791,18 +11812,8 @@ fn compare_owned_values(a: &OwnedValue, b: &OwnedValue) -> core::cmp::Ordering {
             x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
         }
         (OwnedValue::String(x), OwnedValue::String(y)) => x.cmp(y),
-        // Different types: use a consistent ordering
-        _ => {
-            let type_order = |v: &OwnedValue| match v {
-                OwnedValue::Null => 0,
-                OwnedValue::Bool(_) => 1,
-                OwnedValue::Int(_) | OwnedValue::Float(_) => 2,
-                OwnedValue::String(_) => 3,
-                OwnedValue::Array(_) => 4,
-                OwnedValue::Object(_) => 5,
-            };
-            type_order(a).cmp(&type_order(b))
-        }
+        // Different types: fall back to jq's cross-type ordering.
+        _ => sort_rank(a).cmp(&sort_rank(b)),
     }
 }
 
@@ -15161,6 +15172,66 @@ mod tests {
                 assert!(!b);
             }
         );
+    }
+
+    /// One representative value per `OwnedValue` variant, in jq's sort order.
+    fn one_of_each_kind() -> Vec<OwnedValue> {
+        vec![
+            OwnedValue::Null,
+            OwnedValue::Bool(false),
+            OwnedValue::Bool(true),
+            OwnedValue::Int(1),
+            OwnedValue::Float(1.5),
+            OwnedValue::String("s".to_string()),
+            OwnedValue::Array(vec![]),
+            OwnedValue::Object(IndexMap::new()),
+        ]
+    }
+
+    /// [`sort_rank`] must stay a faithful coarsening of [`jq_kind`]: the same
+    /// order, with `false`/`true` — and only those — collapsed into one rank.
+    ///
+    /// Deriving `sort_rank` from `jq_kind` makes this true by construction; the
+    /// test exists so that re-expanding either into a hand-written match (there
+    /// were three such copies before #358) fails loudly instead of drifting. See
+    /// the #106 lesson in `CLAUDE.md`: one definition, plus a test that the call
+    /// sites agree.
+    #[test]
+    fn sort_rank_agrees_with_jq_kind() {
+        let values = one_of_each_kind();
+
+        for a in &values {
+            for b in &values {
+                let same_kind = jq_kind(a) == jq_kind(b);
+                let same_rank = sort_rank(a) == sort_rank(b);
+                // Ranks may merge kinds, never split them.
+                if same_kind {
+                    assert!(same_rank, "{a:?} vs {b:?}: same kind, different rank");
+                }
+                // The bool pair is the *only* place a rank merges two kinds.
+                if same_rank && !same_kind {
+                    assert!(
+                        matches!(a, OwnedValue::Bool(_)) && matches!(b, OwnedValue::Bool(_)),
+                        "{a:?} vs {b:?}: ranks merged a pair that is not false/true"
+                    );
+                }
+                // Coarsening preserves order: a merge may turn Less/Greater into
+                // Equal, but wherever the ranks still differ they must differ
+                // the same way the kinds do.
+                if !same_rank {
+                    assert_eq!(
+                        sort_rank(a).cmp(&sort_rank(b)),
+                        jq_kind(a).cmp(&jq_kind(b)),
+                        "{a:?} vs {b:?}: rank order disagrees with kind order",
+                    );
+                }
+            }
+        }
+
+        // jq's documented order: null < false < true < number < string < array
+        // < object, with the two booleans sharing the `boolean` slot.
+        let ranks: Vec<u8> = values.iter().map(sort_rank).collect();
+        assert_eq!(ranks, vec![0, 1, 1, 2, 2, 3, 4, 5]);
     }
 
     /// jq errors when the two operands' kinds cannot be compared, rather than
