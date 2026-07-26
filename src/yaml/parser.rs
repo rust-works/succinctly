@@ -946,6 +946,14 @@ impl<'a> Parser<'a> {
                 // Block sequence item
                 self.parse_sequence_item(0)?;
             }
+            // An anchor or alias that *is* the document (`--- &a 1`, `--- *a`),
+            // as opposed to one prefixing a key (`--- &a k: v`), which the
+            // mapping-entry arm below owns. The plain-scalar arm swallowed
+            // both: the anchor went unregistered and the alias never became an
+            // alias node, so `--- *a` rendered as `null` (#372).
+            Some(b'&' | b'*') if !self.looks_like_mapping_entry() => {
+                self.parse_value(0)?;
+            }
             Some(_) if self.looks_like_mapping_entry() => {
                 // Mapping entry
                 self.parse_mapping_entry(0)?;
@@ -1621,12 +1629,26 @@ impl<'a> Parser<'a> {
             // Inline value
             self.check_unsupported()?;
 
-            // Open value node
-            self.set_ib();
-            self.write_bp_open();
-            let end_pos = self.parse_inline_value(indent)?;
-            self.set_bp_text_end(end_pos);
-            self.write_bp_close();
+            // An anchor or alias prefixes the value here exactly as it does in
+            // `parse_value`, and this path handled neither: `- k: &a 1` never
+            // registered the anchor, so a later `*a` resolved to nothing, and
+            // `- k: *a` never became an alias node at all. Both were swallowed
+            // into the plain scalar below and rendered as `null` (#372).
+            if self.peek() == Some(b'&') {
+                self.parse_anchor()?;
+            }
+
+            if self.peek() == Some(b'*') {
+                // `parse_alias` opens and closes its own node.
+                self.parse_alias()?;
+            } else {
+                // Open value node
+                self.set_ib();
+                self.write_bp_open();
+                let end_pos = self.parse_inline_value(indent)?;
+                self.set_bp_text_end(end_pos);
+                self.write_bp_close();
+            }
         }
 
         // Don't close the mapping here - leave it open so subsequent lines
