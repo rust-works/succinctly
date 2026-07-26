@@ -51,6 +51,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq `contains`/`inside` answered `false` for operands that cannot be
+  compared** (#358): `1 | contains("a")` and `1 | inside([1])` returned `false`
+  where jq raises
+  `number (1) and string ("a") cannot have their containment checked`. Silent —
+  a filter asking "is this string in that string" got a plausible `false` when it
+  had in fact been handed a number. **Behaviour change**: those filters now
+  error, so a query that relied on the `false` will stop producing output.
+  Only the *outermost* pair of operands is screened, matching jq exactly: a
+  mismatch nested inside a container is still `false`
+  (`[1,"a"] | contains(["a",2])`), and integers and floats are one type, so
+  `[1,2,3] | contains([1.0])` stays `true`. The new
+  `EvalError::containment_check` reproduces jq's message including its value
+  preview, which truncates a dump longer than 14 bytes to 11 bytes plus `...`
+  (`string ("abcdefghij...) and number (1) …`); unlike jq's `strncpy` it cuts on
+  a `char` boundary rather than emitting a split UTF-8 sequence. `succinctly yq`
+  gets the fix too, since its evaluator delegates containment to this one.
+  Uncaught, it still exits 0 rather than jq's 5 — that is #355.
 - **jq `//`, `and` and `or` collapsed multi-output operands** (#160): all three
   are generators over their operands' *streams*, but each inspected only the
   first output. `//` decided truthiness from `vs.first()` and then returned the
