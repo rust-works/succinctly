@@ -402,19 +402,48 @@ fn visit_yaml(
 /// (`-  # note\n  key: v`) anchors the item at the content, so it reads as inline.
 /// The metric is therefore a lower bound on bare-dash usage.
 fn has_bare_dash_indicator(bytes: &[u8], child: &YamlCursor<'_, Vec<u64>>) -> bool {
-    child.text_position().is_some_and(|start| {
-        bytes.get(start) == Some(&b'-')
-            // The indicator is bare only if nothing but horizontal whitespace
-            // follows it on that line. Running out of input counts: a trailing
-            // `-` with no newline after it is still alone on its line.
-            && match bytes[start + 1..]
-                .iter()
-                .find(|&&b| !matches!(b, b' ' | b'\t' | b'\r'))
-            {
-                Some(&b) => b == b'\n',
-                None => true,
-            }
-    })
+    let Some(start) = child.text_position() else {
+        return false;
+    };
+
+    // Case 1: the cursor sits on the indicator itself. This is what an item with
+    // no content looks like (`-` with nothing under it), and it is also what a
+    // wrapper node looks like if the caller hands one over un-unwrapped.
+    if bytes.get(start) == Some(&b'-') {
+        // Bare only if nothing but horizontal whitespace follows on that line.
+        // Running out of input counts: a trailing `-` with no newline after it is
+        // still alone on its line.
+        return match bytes[start + 1..]
+            .iter()
+            .find(|&&b| !matches!(b, b' ' | b'\t' | b'\r'))
+        {
+            Some(&b) => b == b'\n',
+            None => true,
+        };
+    }
+
+    // Case 2: the cursor sits on the item's *content*. Walk back to the `-` that
+    // introduced it; the item is bare-dash iff a line break separates them.
+    //
+    // Deriving it this way keeps the metric independent of whether the iterator
+    // yields the item wrapper or its unwrapped content — a distinction that is
+    // not part of this metric's meaning, and which changed under #106.
+    let mut i = start;
+    let mut saw_break = false;
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b' ' | b'\t' => {}
+            b'\n' | b'\r' => saw_break = true,
+            // The introducing `-`; `- - deep` and `- -5` reach here with
+            // `saw_break == false`, so they correctly read as inline.
+            b'-' => return saw_break,
+            // Any other content means this node was not introduced by a `-`
+            // on the way back (e.g. a mapping value), so it is not an item.
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Record a flow collection's byte extent (the P5 metric) when `cur` is a flow
