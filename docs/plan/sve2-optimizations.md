@@ -136,7 +136,8 @@ The only beneficial SVE2 feature is **SVEBITPERM** (BDEP/BEXT instructions), whi
 | File | Operations | Key Techniques |
 |------|------------|----------------|
 | [src/json/simd/neon.rs](../../src/json/simd/neon.rs) | JSON character classification | Nibble lookup tables (`vqtbl1q_u8`), custom `neon_movemask` |
-| [src/yaml/simd/neon.rs](../../src/yaml/simd/neon.rs) | String scanning, indentation counting | Direct comparison, broadword fallbacks |
+| [src/yaml/simd/neon.rs](../../src/yaml/simd/neon.rs) | String scanning, indentation counting, anchors, block scalars | Direct comparison; remainders handled by `simd/scalar.rs` |
+| [src/yaml/simd/broadword.rs](../../src/yaml/simd/broadword.rs) | YAML char classification, newline scanning | SWAR on `u64`; compiled on ARM64 too, since neither has a NEON kernel (#185) |
 | [src/dsv/simd/neon.rs](../../src/dsv/simd/neon.rs) | DSV field detection | Character matching, **PMULL prefix XOR** for quotes |
 | [src/bits/popcount.rs](../../src/bits/popcount.rs) | Population count | `vcntq_u8`, `vaddvq_u16` |
 
