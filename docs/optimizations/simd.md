@@ -835,7 +835,7 @@ RUSTFLAGS="-C target-cpu=native" cargo bench --bench popcount_strategies --featu
 |------------|-------------------------|--------------------------|---------|
 | AVX-512    | `bits/popcount.rs`      | Parallel popcount        | 5–9× / ≈1×‡ |
 | AVX2       | `json/simd/avx2.rs`     | JSON char classification | 1.78x   |
-| AVX2+BMI2  | `dsv/simd/bmi2.rs`      | DSV quote masking        | 10x     |
+| AVX2+BMI2  | `util/simd/x86.rs`      | DSV quote masking        | 10x     |
 | NEON       | `json/simd/neon.rs`     | ARM JSON parsing         | 1.11x   |
 | NEON       | `dsv/simd/neon.rs`      | ARM DSV parsing          | 1.8x    |
 | NEON       | `trees/bp.rs`           | BP L1/L2 index (VMINV)   | 2.8x (L1), 1-3% (L2) |

@@ -33,11 +33,14 @@ Three implementations, selected by CPU features:
 
 | Method          | Platform      | Speedup vs scalar | Technique                |
 |-----------------|---------------|-------------------|--------------------------|
-| `toggle64_bmi2` | x86 BMI2      | **10x**           | PDEP + carry propagation |
+| `toggle64_bmi2` | x86 fast BMI2 | **10x**           | PDEP + carry propagation |
+| `toggle64_sve2` | ARM SVE2      | **10x**           | BDEP + carry propagation |
 | `prefix_xor`    | AVX2/SSE/NEON | baseline          | Parallel prefix XOR      |
 | Scalar          | All           | 1x                | Byte-by-byte loop        |
 
-The BMI2 path uses `PDEP` to scatter quote bits, then a carry-propagation trick to compute the running XOR in a single instruction chain. This is the same technique that makes DSV indexing dramatically faster than JSON or YAML indexing per byte.
+The BMI2 path uses `PDEP` to scatter quote bits, then a carry-propagation trick to compute the running XOR in a single instruction chain. This is the same technique that makes DSV indexing dramatically faster than JSON or YAML indexing per byte. It requires *fast* PDEP: AMD Zen 1/2 expose BMI2 but run PDEP in ~18-cycle microcode, so those CPUs take the AVX2 `prefix_xor` arm instead (#182).
+
+All five backends share one chunk tail in [src/util/simd/quote_mask.rs](../../src/util/simd/quote_mask.rs) — `prefix_xor`, the deposit-and-add formula, and the single definition of the chunk-boundary carry. Each backend contributes only its instruction-specific value (the prefix XOR, or the deposited addend). The carry used to be copied into all five, and the bit-63 bug lived in two of the copies (#149, #182).
 
 ## Performance
 
@@ -61,5 +64,7 @@ DSV indexing throughput (API-level, not end-to-end CLI):
 
 - Implementation: [src/dsv/](../../src/dsv/) (parser.rs, index.rs, index_lightweight.rs, cursor.rs)
 - SIMD: [src/dsv/simd/](../../src/dsv/simd/) (avx2.rs, bmi2.rs, sse2.rs, neon.rs, sve2.rs)
+- Shared quote-mask tail: [src/util/simd/quote_mask.rs](../../src/util/simd/quote_mask.rs)
+- Cross-backend differential tests: [tests/dsv_simd_differential_tests.rs](../../tests/dsv_simd_differential_tests.rs)
 - Parsing doc: [dsv.md](dsv.md)
 - Benchmark: [benchmarks/dsv.md](../benchmarks/dsv.md)

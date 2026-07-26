@@ -189,26 +189,28 @@ fn select_broadword(x: u64, k: u32) -> u32 {
 Used in DSV parsing to compute regions inside quotes:
 
 ```rust
-// src/dsv/simd/bmi2.rs
-fn toggle64_bmi2(carry: u64, w: u64) -> (u64, u64) {
+// src/util/simd/x86.rs — the deposit is the only BMI2-specific step
+unsafe fn toggle64_bmi2(carry: u64, quote_mask: u64) -> (u64, u64) {
     // Scatter alternating 0/1 pattern to quote positions
-    let c = carry & 0x1;
-    let addend = _pdep_u64(0x5555_5555_5555_5555 << c, w);
+    let addend = _pdep_u64(ODDS_MASK << (carry & 1), quote_mask);
+    toggle64_from_deposit(carry, quote_mask, addend)
+}
 
+// src/util/simd/quote_mask.rs — adder tail, shared with the SVE2 BDEP twin (#182)
+fn toggle64_from_deposit(carry: u64, quote_mask: u64, addend: u64) -> (u64, u64) {
     // Use addition with carry propagation to fill between quotes
-    let comp_w = !w;
-    let shifted = (addend << 1) | c;
-    let result = shifted.wrapping_add(comp_w);
+    let c = carry & 1;
+    let result = ((addend << 1) | c).wrapping_add(!quote_mask);
 
     // Carry for the next chunk is quote-count parity, NOT the adder's
     // overflow: `addend << 1` drops an opener deposited at bit 63 (#149).
-    let new_carry = (w.count_ones() as u64 + c) & 1;
-
-    (result, new_carry)
+    (result, next_carry(carry, quote_mask))
 }
 ```
 
-**Result**: 10x faster than prefix_xor, 50-100x faster than scalar.
+**Result**: 10x faster than prefix_xor, 50-100x faster than scalar — where PDEP
+is fast. AMD Zen 1/2 implement it in ~18-cycle microcode, so DSV dispatch gates
+this arm on `has_fast_bmi2()` and falls back to AVX2 prefix_xor there (#182).
 
 ### PEXT for Bit Gathering
 
@@ -271,7 +273,7 @@ fn rotate_left(x: u64, n: u32) -> u64 {
 | POPCNT         | `bits/popcount.rs`           | Rank queries, index building      |
 | CTZ loop       | `util/broadword.rs`          | Select-in-word                    |
 | Bit clearing   | `util/broadword.rs`          | Set bit iteration                 |
-| PDEP toggle    | `dsv/simd/bmi2.rs`           | Quote region masking (10x faster) |
+| PDEP toggle    | `util/simd/x86.rs`           | Quote region masking (10x faster) |
 | Broadword      | `bits/popcount.rs`           | Portable popcount fallback        |
 
 ---

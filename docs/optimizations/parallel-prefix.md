@@ -47,6 +47,7 @@ For operations within a single machine word, use doubling strategy.
 Compute cumulative XOR of all bits in a word:
 
 ```rust
+// src/util/simd/quote_mask.rs — one copy, shared by every DSV backend (#182)
 // After this, bit[i] = XOR of bits 0..=i
 fn prefix_xor(mut y: u64) -> u64 {
     y ^= y << 1;   // XOR adjacent pairs
@@ -70,10 +71,13 @@ After << 2:  [a, a^b, a^b^c, a^b^c^d, b^c^d^e, c^d^e^f, d^e^f^g, e^f^g^h]
 **Application in DSV parsing**: Track whether each position is inside quotes:
 
 ```rust
-// src/dsv/simd/avx2.rs
-fn compute_quote_mask(quote_bits: u64, initial_state: u64) -> u64 {
-    let toggled = prefix_xor(quote_bits);
-    toggled ^ initial_state  // Account for carry from previous chunk
+// src/util/simd/quote_mask.rs — shared tail for the AVX2/SSE2/NEON backends.
+// Each backend supplies only `quote_xor`: AVX2/SSE2 use the shift chain above,
+// NEON uses a single PMULL (carryless multiply by all-ones).
+fn toggle64_from_prefix_xor(carry: u64, quote_mask: u64, quote_xor: u64) -> (u64, u64) {
+    // Broadcast the carry bit to all 64 lanes, then complement: 1 = outside quotes
+    let inside = quote_xor ^ 0u64.wrapping_sub(carry & 1);
+    (!inside, next_carry(carry, quote_mask))
 }
 ```
 
@@ -98,26 +102,34 @@ fn prefix_sum_word(mut x: u64) -> u64 {
 BMI2's PDEP instruction enables efficient carry propagation:
 
 ```rust
-// src/dsv/simd/bmi2.rs
-fn toggle64_bmi2(carry: u64, w: u64) -> (u64, u64) {
+// src/util/simd/x86.rs — the deposit is the only BMI2-specific step. Its SVE2
+// twin (`util/simd/sve2.rs::toggle64_sve2`) swaps PDEP for BDEP and is otherwise
+// the same call.
+unsafe fn toggle64_bmi2(carry: u64, quote_mask: u64) -> (u64, u64) {
     // Scatter alternating pattern to quote positions
-    let c = carry & 0x1;
-    let addend = _pdep_u64(0x5555_5555_5555_5555 << c, w);
+    let addend = _pdep_u64(ODDS_MASK << (carry & 1), quote_mask);
+    toggle64_from_deposit(carry, quote_mask, addend)
+}
 
+// src/util/simd/quote_mask.rs — shared adder tail (#182)
+fn toggle64_from_deposit(carry: u64, quote_mask: u64, addend: u64) -> (u64, u64) {
     // Use addition to propagate carries (fills between quote pairs)
-    let comp_w = !w;
-    let shifted = (addend << 1) | c;
-    let result = shifted.wrapping_add(comp_w);
+    let c = carry & 1;
+    let result = ((addend << 1) | c).wrapping_add(!quote_mask);
 
     // Carry for the next chunk is quote-count parity, NOT the adder's
     // overflow: `addend << 1` drops an opener deposited at bit 63 (#149).
-    let new_carry = (w.count_ones() as u64 + c) & 1;
-
-    (result, new_carry)
+    (result, next_carry(carry, quote_mask))
 }
 ```
 
-**Result**: 10x faster than prefix_xor, 50-100x faster than scalar.
+**Result**: 10x faster than prefix_xor, 50-100x faster than scalar. Gated on
+*fast* BMI2 — AMD Zen 1/2 run PDEP in ~18-cycle microcode and take the AVX2
+prefix-xor arm instead (#182).
+
+Both families share `next_carry`, so the chunk-boundary carry has exactly one
+definition. It previously had five, and the bit-63 bug lived in two of them
+(#149).
 
 ---
 
@@ -254,12 +266,13 @@ fn pfsm_transition(byte: u8) -> [u8; 4] {
 
 ## Usage in Succinctly
 
-| Technique            | Location              | Purpose               | Result        |
-|----------------------|-----------------------|-----------------------|---------------|
-| prefix_xor           | `dsv/simd/avx2.rs`    | Quote state tracking  | Baseline      |
-| PDEP toggle          | `dsv/simd/bmi2.rs`    | Fast quote masking    | 10x faster    |
-| Cumulative index     | `json/light.rs`       | Precomputed prefix    | 627x faster   |
-| PFSM tables          | `json/pfsm_tables.rs` | State parallelization | 33-77% faster |
+| Technique            | Location                   | Purpose               | Result        |
+|----------------------|----------------------------|-----------------------|---------------|
+| prefix_xor           | `util/simd/quote_mask.rs`  | Quote state tracking  | Baseline      |
+| PDEP toggle          | `util/simd/x86.rs`         | Fast quote masking    | 10x faster    |
+| BDEP toggle          | `util/simd/sve2.rs`        | Fast quote masking    | 10x faster    |
+| Cumulative index     | `json/light.rs`            | Precomputed prefix    | 627x faster   |
+| PFSM tables          | `json/pfsm_tables.rs`      | State parallelization | 33-77% faster |
 
 ### Failed Attempts
 
