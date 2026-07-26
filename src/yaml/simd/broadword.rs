@@ -483,6 +483,11 @@ mod tests {
         assert_eq!(find_newline_broadword(&input, 0), Some(9));
     }
 
+    /// Twin of `plain_scalar_terminators_is_exactly_line_break_colon_hash` in
+    /// `yaml::simd::x86`, which pins the same set for the 32-byte classifier the
+    /// live parser path uses. Neither type is compiled on the other's target, so
+    /// the agreement can only be asserted once per arch — but it must be
+    /// asserted on both, or the set drifts exactly as it did before #185.
     #[test]
     fn plain_scalar_terminators_stop_at_structure_but_not_at_spaces() {
         let input = b"value: x";
