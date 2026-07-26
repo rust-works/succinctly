@@ -163,6 +163,35 @@ fn test_object_ordering_parity_162() {
 }
 
 #[test]
+fn test_numeric_equality_parity_156() {
+    // `OwnedValue`'s equality is now numeric-aware (#156), so both evaluators
+    // agree that 1 and 1.0 are the same number -- and agree for the same
+    // reason. Before the fix the generic path already answered `[2,3]` for
+    // `. - [1]`, but only by accident: `eval_on_owned` round-trips the value
+    // through `to_json()` (eval_generic.rs), which renders `Float(1.0)` as `1`
+    // and erased the distinction the full evaluator was still honouring.
+    for (json, filter) in [
+        (b"null".as_slice(), "1 == 1.0"),
+        (b"null", "1 != 1.0"),
+        (b"null", "1 == 1.5"),
+        (b"null", "nan == nan"),
+        (b"null", "[1] == [1.0]"),
+        (b"null", r#"{"a":1} == {"a":1.0}"#),
+        (br"[1.0,2,3]", ". - [1]"),
+        (br"[1,2,3]", "contains([1.0])"),
+        (br"[2,1,3]", "index(1.0)"),
+        (br"[1,2,1.0]", "indices(1)"),
+    ] {
+        assert_parity(json, filter);
+    }
+    // Pin the shared answer against real jq, so parity can't agree on a wrong
+    // one (the failure mode this file's header calls out).
+    assert_eq!(as_strs(&full_outputs(b"null", "1 == 1.0")), ["true"]);
+    assert_eq!(as_strs(&full_outputs(br"[1.0,2,3]", ". - [1]")), ["[2,3]"]);
+    assert_eq!(as_strs(&full_outputs(b"null", "nan == nan")), ["false"]);
+}
+
+#[test]
 fn test_out_of_bounds_index_parity_307() {
     // jq: indexing an array out of bounds (positive or negative) yields `null`.
     // Both evaluators now agree; the generic (CLI) path previously erred -- #307.
