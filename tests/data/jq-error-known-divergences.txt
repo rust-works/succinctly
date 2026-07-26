@@ -19,12 +19,15 @@
 # Seeded from the #356 sweep: 102 of 102 probes diverged at the start; 96 were
 # wording and were fixed there. Two more — `contains`/`inside` on operands whose
 # kinds differ — were behaviour rather than wording, and #358 fixed them before
-# this manifest landed, so they were never listed. The 3 below are not wording
+# this manifest landed, so they were never listed. The 5 below are not wording
 # at all either — succinctly produces a value where jq errors, or cannot parse
 # the filter — so each is a behaviour or parser bug with its own issue. (#356
 # seeded six, two of which #358 had already fixed; #359 fixed
-# `setpath_on_number` and took the rest of `setpath`'s probes with it.)
+# `setpath_on_number`, took the rest of `setpath`'s probes with it, and added
+# the two slice probes it could not fix.)
 
+slice_assign_non_array      slice         a slice is not a path component, so setpath leaves the value alone — #366
+slice_indices_not_integers  slice         a slice is not a path component, so setpath leaves the value alone — #366
 index_null_key_on_object    parser        `.[null]` is rejected by the parser, so no runtime error is reached — #360
 index_bool_key_on_object    parser        `.[true]` is rejected by the parser, so no runtime error is reached — #360
 index_object_key_on_object  parser        `.[{}]` is rejected by the parser, so no runtime error is reached — #360

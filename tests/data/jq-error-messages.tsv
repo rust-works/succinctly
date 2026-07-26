@@ -36,6 +36,8 @@ setpath_negative_index_oob	setpath([-5]; 9)	[1,2]	Out of bounds negative array i
 setpath_negative_index_on_null	setpath([-1]; 9)	null	Out of bounds negative array index
 setpath_nan_index	setpath([nan]; 9)	null	Cannot set array element at NaN index
 setpath_non_array_path	setpath("a"; 1)	1	Path must be specified as an array
+slice_assign_non_array	setpath([{"start":1,"end":2}]; "x")	[1,2,3]	A slice of an array can only be assigned another array
+slice_indices_not_integers	setpath([{"foo":1}]; 9)	[1,2]	Array/string slice indices must be integers
 getpath_on_number	getpath(["a"])	1	Cannot index number with string "a"
 getpath_nested_on_number	getpath(["a","b"])	{"a":1}	Cannot index number with string "b"
 getpath_non_array_path	getpath("a")	{"a":1}	Path must be specified as an array

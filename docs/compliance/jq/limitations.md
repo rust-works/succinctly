@@ -24,25 +24,25 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 111 probes in
+Measured against jq-1.7.1 over the 113 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result              | Meaning                                            |
 |----------------------------------------------|---------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **108/111 = 97.3%** | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **108/113 = 95.6%** | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**               | Every probe that errors in both errors identically |
-| **Behaviour / parser gaps**                  | **3**               | succinctly does not raise the error at all         |
+| **Behaviour / parser gaps**                  | **5**               | succinctly does not raise the error at all         |
 
-The three non-passing probes are enumerated individually, with a category, reason and issue
+The five non-passing probes are enumerated individually, with a category, reason and issue
 link, in
 [`tests/data/jq-error-known-divergences.txt`](../../../tests/data/jq-error-known-divergences.txt).
 That file is the machine-readable source of truth; the test asserts it matches reality
 exactly in both directions — a newly diverging probe and a newly matching one both break
 the build — so it cannot silently drift from this page.
 
-Crucially, **none of the three is a wording bug**. In each case succinctly returns a value
+Crucially, **none of the five is a wording bug**. In each case succinctly returns a value
 or fails to compile the filter, so there is no message to compare; the wording is already
 correct in `src/jq/error.rs` and will be reached once the underlying bug is fixed.
 
@@ -168,12 +168,13 @@ shortest rendering differs from their source spelling.
 
 ## Behaviour and parser gaps
 
-The three probes on record are not wording problems — succinctly never raises the error, so
+The five probes on record are not wording problems — succinctly never raises the error, so
 there is nothing to word. Each has its own issue and is listed in
 [`tests/data/jq-error-known-divergences.txt`](../../../tests/data/jq-error-known-divergences.txt).
 
 | Probe(s)                                                          | Divergence                                                       | Issue |
 |-------------------------------------------------------------------|------------------------------------------------------------------|-------|
+| `slice_assign_non_array`, `slice_indices_not_integers`            | A slice is not a path component, so `setpath` leaves the value alone | [#366](https://github.com/rust-works/succinctly/issues/366) |
 | `index_null_key_on_object`, `index_bool_key_on_object`, `index_object_key_on_object` | `.[null]`, `.[true]`, `.[{}]` are rejected by the parser | [#360](https://github.com/rust-works/succinctly/issues/360) |
 
 `setpath_on_number` was a fourth; the other two of #356's six were the `contains`/`inside`
@@ -184,15 +185,24 @@ index anything else at any depth. The `setpath_*` probes added alongside it pin 
 surface — wrong-key-type on a real container, out-of-bounds negative and NaN indices, and a
 non-array path argument.
 
-## Assigning through a slice is not implemented
+## A slice is not a path component
 
-jq models `.[1:2]` as indexing with `{"start":1,"end":2}`, and `setpath` assigns through
-one: `[1,2,3] | setpath([{"start":1,"end":2}]; ["x"])` is `[1,"x",3]`. succinctly leaves the
-value untouched instead. That is a missing feature rather than a wording divergence, and it
-is deliberately *not* raised as an error — inventing a message jq does not print would be a
-fresh divergence. Only the containers jq would slice get that pass; on a scalar, an object
-path element is refused with jq's `Cannot index <type> with object`
-(probe `setpath_slice_key_on_number`).
+jq models `.[1:2]` as indexing with `{"start":1,"end":2}`, and treats that object as a
+first-class path component: it comes out of `path()`, goes into `getpath`/`setpath`, and
+drives `=`, `|=` and `del()`. succinctly can *read* a slice but does not treat it as a path,
+so `[1,2,3] | setpath([{"start":1,"end":2}]; ["x"])` leaves the value untouched where jq
+gives `[1,"x",3]`. The full divergence table is in
+[#366](https://github.com/rust-works/succinctly/issues/366).
+
+That is a missing feature rather than a wording divergence, and it is deliberately *not*
+raised as an error — inventing a message jq does not print would be a fresh divergence.
+Only the containers jq would slice get that pass; on a scalar, an object path element is
+refused with jq's `Cannot index <type> with object` (probe `setpath_slice_key_on_number`).
+
+The two error sentences the feature owes jq — `A slice of an array can only be assigned
+another array` and `Array/string slice indices must be integers` — are pinned as probes and
+listed in the divergence manifest against #366, so the two-sided check fails the build the
+moment either starts matching.
 
 ## Errors reach the CLI with the right text but the wrong exit code
 

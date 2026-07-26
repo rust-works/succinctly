@@ -59,6 +59,8 @@ setpath_negative_index_oob	setpath([-5]; 9)	[1,2]
 setpath_negative_index_on_null	setpath([-1]; 9)	null
 setpath_nan_index	setpath([nan]; 9)	null
 setpath_non_array_path	setpath("a"; 1)	1
+slice_assign_non_array	setpath([{"start":1,"end":2}]; "x")	[1,2,3]
+slice_indices_not_integers	setpath([{"foo":1}]; 9)	[1,2]
 getpath_on_number	getpath(["a"])	1
 getpath_nested_on_number	getpath(["a","b"])	{"a":1}
 getpath_non_array_path	getpath("a")	{"a":1}
