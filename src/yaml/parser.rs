@@ -2868,6 +2868,13 @@ impl<'a> Parser<'a> {
     /// Stops at `:`, `,`, `}`, `]`, or whitespace before those.
     /// Handles multiline keys (continues across newlines with proper indentation).
     fn parse_flow_unquoted_key(&mut self) -> Result<usize, YamlError> {
+        // #369: reject a tag at the start of a flow key. Both callers land here
+        // with `pos` at the key's first byte — `parse_flow_key` dispatches
+        // anchors, aliases and nested containers first, and
+        // `parse_flow_key_scalar` only peels off the quoted forms — so this one
+        // gate covers the whole plain-key path.
+        self.check_unsupported()?;
+
         let start = self.pos;
 
         while let Some(b) = self.peek() {
@@ -2947,6 +2954,14 @@ impl<'a> Parser<'a> {
 
     /// Parse a scalar value in flow context (string or unquoted).
     fn parse_flow_scalar(&mut self) -> Result<usize, YamlError> {
+        // #369: reject a tag at the start of a flow node, the way block context
+        // always has. Without this the `_` arm below reads `!!str x` as plain
+        // scalar *content*, silently yielding the string "!!str x". `pos` is at
+        // a node start here — anchors, aliases and nested containers are all
+        // dispatched by the caller before this point — so a leading `!` is an
+        // indicator, while a `!` inside content is never seen by this check.
+        self.check_unsupported()?;
+
         let end = match self.peek() {
             Some(b'"') => {
                 self.parse_double_quoted()?;
@@ -2964,6 +2979,11 @@ impl<'a> Parser<'a> {
     /// Parse a flow key (for implicit mapping entries).
     /// Like parse_flow_scalar but also stops at `: ` (colon followed by space/flow indicator).
     fn parse_flow_key_scalar(&mut self) -> Result<usize, YamlError> {
+        // No #369 tag gate here, unlike `parse_flow_scalar`: the two quoted arms
+        // below cannot begin with `!`, and the plain arm is
+        // `parse_flow_unquoted_key`, which gates at this same position. A check
+        // here would reject nothing extra. The path is pinned by a test instead,
+        // so a future change to the plain arm cannot lose the gate silently.
         let end = match self.peek() {
             Some(b'"') => {
                 self.parse_double_quoted()?;
@@ -3058,6 +3078,10 @@ impl<'a> Parser<'a> {
     /// Parse an explicit unquoted key in flow context.
     /// Stops at `: ` (colon followed by whitespace) or flow delimiters, but NOT at bare `:`.
     fn parse_explicit_flow_unquoted_key(&mut self) -> Result<usize, YamlError> {
+        // #369: the `? key : value` form in flow context is a fourth way to
+        // reach a plain scalar at node start.
+        self.check_unsupported()?;
+
         let start = self.pos;
 
         while let Some(b) = self.peek() {

@@ -62,6 +62,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **YAML flow context silently absorbed tags as scalar text** (#369): block
+  context has always rejected `!` via `check_unsupported`, but the flow-context
+  scalar readers fell through to the plain-scalar path, so `a: [!!str x]` yielded
+  the *string* `"!!str x"` rather than an error — silently wrong data instead of
+  a refusal. All four flow positions that reach a scalar reader are now gated
+  (sequence item, mapping value, mapping key, and the explicit `? k : v` form).
+  A `!` *inside* plain scalar content is untouched and remains ordinary text, as
+  YAML requires — only a leading `!` is an indicator. Tag *support* is still
+  #224; this only makes the two contexts fail the same way.
 - **jq error-message value previews escaped C1 control characters** (#358):
   a preview built from `OwnedValue::to_json` escapes every
   `char::is_control()`, which includes U+0080–U+009F, so a string containing

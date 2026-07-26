@@ -1009,6 +1009,191 @@ fn test_yaml_anchored_tag_in_seq_item_is_rejected() -> Result<()> {
 }
 
 #[test]
+fn test_yaml_flow_context_rejects_tags_like_block_context() -> Result<()> {
+    // #369. Block context has always errored on `!` via `check_unsupported`;
+    // flow context fell through to the plain-scalar readers and absorbed the
+    // tag as text, so `a: [!!str x]` yielded the *string* `"!!str x"`. Silently
+    // wrong data is worse than a refusal, which is why this is a bug in its own
+    // right rather than something that waits for tag support (#224).
+    //
+    // Every flow position that reaches a plain-scalar reader. The last two are
+    // the ones no other case covers: an implicit `k: v` entry inside a flow
+    // *sequence* enters through `parse_flow_key_scalar`, and the explicit
+    // `? k : v` form through `parse_explicit_flow_unquoted_key`. Without them,
+    // deleting either gate leaves this test green.
+    for (name, input) in [
+        ("seq item", "a: [!!str x]\n"),
+        ("mapping value", "a: {k: !custom v}\n"),
+        ("mapping key", "a: {!!str k: v}\n"),
+        ("seq item with a plain sibling", "a: [!custom x, plain]\n"),
+        ("implicit entry key in a seq", "a: [!!str k: v]\n"),
+        ("explicit key", "a: [? !!str k : v]\n"),
+    ] {
+        let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", input, &[])?;
+        assert_eq!(exit_code, 1, "{name}: expected clean error exit: {stderr}");
+        assert_eq!(stdout, "", "{name}: nothing should reach stdout");
+        assert!(
+            stderr.contains("tags (!) not supported"),
+            "{name}: stderr should name the tag: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_bang_inside_a_plain_scalar_is_still_content() -> Result<()> {
+    // The boundary the #369 fix must not cross. `!` is an indicator only at the
+    // *start* of a node; inside plain scalar content it is ordinary text, in
+    // both flow and block context. These passed before that fix and must keep
+    // passing after it — if one of them starts erroring, the check moved from
+    // "node begins with a tag" to "node contains a bang".
+    for (name, input, expected) in [
+        ("flow seq", "a: [x!y, a!b]\n", r#"{"a":["x!y","a!b"]}"#),
+        ("block value", "a: hello!world\n", r#"{"a":"hello!world"}"#),
+        ("flow value", "a: {k: v!w}\n", r#"{"a":{"k":"v!w"}}"#),
+    ] {
+        let (stdout, exit_code) = run_yq_stdin(".", input, &["-o", "json", "-I", "0"])?;
+        assert_eq!(exit_code, 0, "{name}: should parse cleanly");
+        assert_eq!(stdout.trim(), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_quoted_flow_key_that_looks_like_a_tag_stays_a_string() -> Result<()> {
+    // The other half of the #369 boundary, and the premise the gate placement
+    // rests on: a quoted node cannot *begin* with `!`, so the quoted arms of the
+    // flow key readers need no tag check and a `!` behind quotes is content.
+    // Those arms had no test of their own — `parse_flow_key`'s single-quoted arm
+    // and both of `parse_explicit_flow_key_scalar`'s were unexecuted lines.
+    for (name, input, expected) in [
+        ("double-quoted key", "a: {\"k\": v}\n", r#"{"a":{"k":"v"}}"#),
+        ("single-quoted key", "a: {'k': v}\n", r#"{"a":{"k":"v"}}"#),
+        (
+            "double-quoted explicit key",
+            "a: [? \"k\" : v]\n",
+            r#"{"a":[{"k":"v"}]}"#,
+        ),
+        (
+            "single-quoted explicit key",
+            "a: [? 'k' : v]\n",
+            r#"{"a":[{"k":"v"}]}"#,
+        ),
+        (
+            "tag text behind quotes",
+            "a: {\"!k\": v}\n",
+            r#"{"a":{"!k":"v"}}"#,
+        ),
+        (
+            "tag text behind quotes, explicit",
+            "a: [? \"!!str k\" : v]\n",
+            r#"{"a":[{"!!str k":"v"}]}"#,
+        ),
+    ] {
+        let (stdout, exit_code) = run_yq_stdin(".", input, &["-o", "json", "-I", "0"])?;
+        assert_eq!(exit_code, 0, "{name}: should parse cleanly");
+        assert_eq!(stdout.trim(), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_flow_key_scalar_shapes() -> Result<()> {
+    // `parse_explicit_flow_unquoted_key` is where the #369 gate for the
+    // `? k : v` form sits, and the gate was the only line in it this change
+    // exercised: its terminator, internal-space, embedded-colon and
+    // continuation-line branches had no test at all. Each expectation below was
+    // taken from yq v4.53.3, so this pins agreement, not just current output.
+    for (name, input, expected) in [
+        (
+            "comma ends the key",
+            "a: [? k, v]\n",
+            r#"{"a":[{"k":null},"v"]}"#,
+        ),
+        (
+            "bracket ends the key",
+            "a: [? k]\n",
+            r#"{"a":[{"k":null}]}"#,
+        ),
+        (
+            "space then comma",
+            "a: [? k , v]\n",
+            r#"{"a":[{"k":null},"v"]}"#,
+        ),
+        (
+            "internal space",
+            "a: [? a b : v]\n",
+            r#"{"a":[{"a b":"v"}]}"#,
+        ),
+        (
+            "internal double space",
+            "a: [? a  b : v]\n",
+            r#"{"a":[{"a  b":"v"}]}"#,
+        ),
+        (
+            "embedded colon",
+            "a: [? a:b : v]\n",
+            r#"{"a":[{"a:b":"v"}]}"#,
+        ),
+        (
+            "space then embedded colon",
+            "a: [? a :b : v]\n",
+            r#"{"a":[{"a :b":"v"}]}"#,
+        ),
+        (
+            "trailing space",
+            "a: [? a b  ]\n",
+            r#"{"a":[{"a b":null}]}"#,
+        ),
+        (
+            "trailing space before a break",
+            "a: [? k \n  ]\n",
+            r#"{"a":[{"k":null}]}"#,
+        ),
+        (
+            "continued on the next line",
+            "a: [? a b\n  c : v]\n",
+            r#"{"a":[{"a b c":"v"}]}"#,
+        ),
+        (
+            "value indicator on the next line",
+            "a: [? k\n  : v]\n",
+            r#"{"a":[{"k":"v"}]}"#,
+        ),
+        (
+            "delimiter on the next line",
+            "a: [? k\n  , x]\n",
+            r#"{"a":[{"k":null},"x"]}"#,
+        ),
+    ] {
+        let (stdout, exit_code) = run_yq_stdin(".", input, &["-o", "json", "-I", "0"])?;
+        assert_eq!(exit_code, 0, "{name}: should parse cleanly");
+        assert_eq!(stdout.trim(), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_flow_key_running_off_the_end_is_rejected() -> Result<()> {
+    // The same reader's EOF exits: the key scan reaches the end of input with
+    // nothing closing the sequence. Both must fail rather than quietly return
+    // the partial key, and `yq` rejects both too.
+    for (name, input) in [
+        ("no closing bracket", "a: [? k "),
+        ("colon then end of input", "a: [? k :"),
+    ] {
+        let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", input, &[])?;
+        assert_eq!(exit_code, 1, "{name}: expected clean error exit: {stderr}");
+        assert_eq!(stdout, "", "{name}: nothing should reach stdout");
+        assert!(
+            stderr.contains("unexpected end of input"),
+            "{name}: stderr should name the truncation: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn test_yaml_anchored_seq_item_is_line_break_agnostic() -> Result<()> {
     // #328 and #324 have to compose: the anchor fix reads the item's value
     // through `at_line_end` and `looks_like_mapping_entry`, and the line-break
