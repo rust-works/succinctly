@@ -284,7 +284,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// — containers, nulls, sequence-item wrappers — the result depends on the storage
     /// variant: `None`, or an *earlier* node's end. Never a later node's, so
     /// `end > bp_to_text_pos(bp_pos)` is a sound test for "this node has an extent of its
-    /// own" (see [`EndPositions::get`](super::end_positions) and #332).
+    /// own" (see the `EndPositions::get` contract in `yaml::end_positions`, and #332).
     #[inline]
     pub fn bp_to_text_end_pos(&self, bp_pos: usize) -> Option<usize> {
         let open_idx = self.bp.rank1(bp_pos);
@@ -436,13 +436,12 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// They are wrapper nodes around the item's content.
     /// Derives this from text (starts with `- `) rather than storing a bitvector.
     ///
-    /// Unlike [`YamlCursor::value`](super::light::YamlCursor::value) this does *not*
-    /// discriminate a childless wrapper from a plain scalar that merely begins `- `
-    /// (see #332). It does not need to: the only caller,
-    /// [`locate::path_to_bp`](super::locate), asks about a node's *ancestors*, and such a
-    /// scalar is always a BP leaf — a flow scalar is opened and closed with nothing pushed
-    /// in between. Adding the end-position lookup here would be unreachable code paid for
-    /// on every ancestor of every backwards walk.
+    /// Unlike [`YamlCursor::value`] this does *not* discriminate a childless wrapper from
+    /// a plain scalar that merely begins `- ` (see #332). It does not need to: the only
+    /// caller, `locate::path_to_bp`, asks about a node's *ancestors*, and such a scalar is
+    /// always a BP leaf — a flow scalar is opened and closed with nothing pushed in
+    /// between. Adding the end-position lookup here would be unreachable code paid for on
+    /// every ancestor of every backwards walk.
     #[inline]
     pub fn is_seq_item(&self, text: &[u8], bp_pos: usize) -> bool {
         // Fast path: containers (mappings/sequences) are never seq_items
