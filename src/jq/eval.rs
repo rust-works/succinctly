@@ -4706,6 +4706,24 @@ fn builtin_fromjsonstream<W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Resolve an array index for a *read*, the way jq resolves one.
+///
+/// Same truncation and negative-index rules as [`resolve_setpath_index`] — a
+/// float truncates toward zero, a negative index counts back from the end —
+/// but a read that lands nowhere is not an error: jq answers `null` for an
+/// index past either end, and for NaN, which reaches no element at all.
+/// `None` is that "no such element".
+fn resolve_read_index(key: &OwnedValue, len: usize) -> Option<usize> {
+    let index = match key {
+        OwnedValue::Int(i) => *i,
+        // `as` saturates, so ±inf lands past the end and reads as `null`.
+        OwnedValue::Float(f) if !f.is_nan() => f.trunc() as i64,
+        _ => return None,
+    };
+    let resolved = if index < 0 { len as i64 + index } else { index };
+    usize::try_from(resolved).ok().filter(|i| *i < len)
+}
+
 /// Builtin: getpath(path) - get value at path
 fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
@@ -4731,13 +4749,9 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             (OwnedValue::Object(obj), OwnedValue::String(key)) => {
                 current = obj.get(key).cloned().unwrap_or(OwnedValue::Null);
             }
-            (OwnedValue::Array(arr), OwnedValue::Int(idx)) => {
-                let index = if *idx < 0 {
-                    (arr.len() as i64 + *idx) as usize
-                } else {
-                    *idx as usize
-                };
-                current = arr.get(index).cloned().unwrap_or(OwnedValue::Null);
+            (OwnedValue::Array(arr), OwnedValue::Int(_) | OwnedValue::Float(_)) => {
+                current = resolve_read_index(&segment, arr.len())
+                    .map_or(OwnedValue::Null, |i| arr[i].clone());
             }
             _ if optional => return QueryResult::None,
             _ => {
@@ -17028,6 +17042,38 @@ mod tests {
                 b"1",
                 r#"try setpath(["a"]; 1) catch ."#,
                 Ok(r#""Cannot index number with string \"a\"""#),
+            ),
+        ]);
+    }
+
+    /// `getpath` resolves an array index exactly as `setpath` does — a float
+    /// truncates toward zero, a negative counts back from the end — but a read
+    /// that lands nowhere is `null` rather than an error, so NaN and either
+    /// end's overrun all answer `null`.
+    ///
+    /// The probe corpus cannot pin any of this: jq answers with a value, and a
+    /// probe is only admitted if jq errors.
+    #[test]
+    fn test_getpath_resolves_numeric_indices_like_setpath() {
+        assert_outcomes(&[
+            (b"[1,2,3]", "getpath([1.5])", Ok("2")),
+            (b"[1,2,3]", "getpath([-0.5])", Ok("1")),
+            (b"[1,2,3]", "getpath([-1.5])", Ok("3")),
+            (b"[1,2,3]", "getpath([-1])", Ok("3")),
+            // Out of range at either end, NaN and ±infinity are all `null`.
+            (b"[1,2,3]", "getpath([5])", Ok("null")),
+            (b"[1,2,3]", "getpath([-5])", Ok("null")),
+            (b"[1,2,3]", "getpath([nan])", Ok("null")),
+            (b"[1,2,3]", "getpath([infinite])", Ok("null")),
+            (b"[1,2,3]", "getpath([-infinite])", Ok("null")),
+            // A miss keeps walking, so the rest of the path reads through null.
+            (br#"[{"a":9}]"#, r#"getpath([1.5,"a"])"#, Ok("null")),
+            (br#"[{"a":9}]"#, r#"getpath([0.5,"a"])"#, Ok("9")),
+            // A non-numeric key is still refused.
+            (
+                b"[1,2,3]",
+                r#"getpath(["a"])"#,
+                Err(r#"Cannot index array with string "a""#),
             ),
         ]);
     }
