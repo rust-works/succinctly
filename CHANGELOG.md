@@ -60,14 +60,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error, so a query that relied on the `false` will stop producing output.
   Only the *outermost* pair of operands is screened, matching jq exactly: a
   mismatch nested inside a container is still `false`
-  (`[1,"a"] | contains(["a",2])`), and integers and floats are one type, so
-  `[1,2,3] | contains([1.0])` stays `true`. The new
+  (`[1,"a"] | contains(["a",2])`). The screen is on jq's *kind*, not its type
+  name, which cuts both ways: integers and floats are one kind, so
+  `[1,2,3] | contains([1.0])` stays `true`, but `true` and `false` are two kinds
+  that share the name `boolean`, so `true | contains(false)` errors with
+  `boolean (true) and boolean (false) cannot have their containment checked`
+  while `true | contains(true)` stays `true`. The new
   `EvalError::containment_check` reproduces jq's message including its value
   preview, which truncates a dump longer than 14 bytes to 11 bytes plus `...`
   (`string ("abcdefghij...) and number (1) …`); unlike jq's `strncpy` it cuts on
   a `char` boundary rather than emitting a split UTF-8 sequence. `succinctly yq`
   gets the fix too, since its evaluator delegates containment to this one.
-  Uncaught, it still exits 0 rather than jq's 5 — that is #355.
+  Two known gaps, both pinned by tests rather than fixed: uncaught, it still
+  exits 0 rather than jq's 5 (#355), and a number in the preview reads back
+  canonicalised rather than as its source literal — jq's `number (1E+100)` is
+  our `number (10000000000...)` — because `OwnedValue` does not carry the
+  literal, a limitation `1e100 | tostring` already shows and the streaming
+  identity path does not share.
 - **jq `//`, `and` and `or` collapsed multi-output operands** (#160): all three
   are generators over their operands' *streams*, but each inspected only the
   first output. `//` decided truthiness from `vs.first()` and then returned the
