@@ -8000,11 +8000,11 @@ mod tests {
         ] {
             let (index, text) = cursor_over(yaml);
             let root = index.root(text);
+            let input = String::from_utf8_lossy(yaml);
             assert_eq!(
                 root.find_plain_scalar_end(3, 0, false),
                 8,
-                "input {:?}",
-                String::from_utf8_lossy(yaml)
+                "input {input:?}"
             );
         }
     }
@@ -8020,12 +8020,11 @@ mod tests {
             let (index, text) = cursor_over(yaml);
             let root = index.root(text);
             let end = root.find_plain_scalar_end(3, 0, false);
-            let scanned = &text[3..end];
+            let input = String::from_utf8_lossy(yaml);
+            let scanned = String::from_utf8_lossy(&text[3..end]);
             assert!(
-                scanned.ends_with(b"two"),
-                "input {:?} scanned {:?}",
-                String::from_utf8_lossy(yaml),
-                String::from_utf8_lossy(scanned)
+                scanned.ends_with("two"),
+                "input {input:?} scanned {scanned:?}"
             );
         }
     }
@@ -8089,12 +8088,8 @@ mod tests {
             let (index, text) = cursor_over(yaml);
             let root = index.root(text);
             let end = root.find_plain_scalar_end(3, 0, false);
-            assert_eq!(
-                &text[3..end],
-                b"at 12:30 sharp",
-                "input {:?}",
-                String::from_utf8_lossy(yaml)
-            );
+            let input = String::from_utf8_lossy(yaml);
+            assert_eq!(&text[3..end], b"at 12:30 sharp", "input {input:?}");
         }
     }
 
