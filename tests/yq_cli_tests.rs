@@ -1956,3 +1956,129 @@ fn test_argjson_invalid_value_errors() -> Result<()> {
     );
     Ok(())
 }
+
+// ============================================================================
+// Sequence-entry indicator in flow context (#332)
+//
+// These inputs are invalid YAML — `-` followed by whitespace is always the
+// sequence-entry indicator, and no block sequence can start inside a flow
+// collection — and real `yq` rejects every one of them. So they cannot be yq
+// goldens: `scripts/sync-yq-golden.sh` has no `expected.out` to capture. The
+// loader is deliberately lenient here (`succinctly yaml validate` is the layer
+// that rejects them); what it must not do is silently discard the content,
+// which is what it did before #332.
+// ============================================================================
+
+#[test]
+fn test_flow_dash_space_scalar_content_is_not_dropped() -> Result<()> {
+    for (yaml, expected) in [
+        ("[- x]\n", r#"["- x"]"#),
+        ("{a: - x}\n", r#"{"a":"- x"}"#),
+        ("[- x, 1]\n", r#"["- x",1]"#),
+        ("[a, - b]\n", r#"["a","- b"]"#),
+        ("{a: [- x]}\n", r#"{"a":["- x"]}"#),
+    ] {
+        let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(output.trim(), expected, "for {yaml:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_flow_dash_without_whitespace_is_still_a_scalar() -> Result<()> {
+    // A `-` not followed by whitespace is a legitimate plain scalar in flow
+    // context and was never affected; pinned so #332's fix cannot regress it.
+    for (yaml, expected) in [
+        ("[-]\n", r#"["-"]"#),
+        ("{a: -}\n", r#"{"a":"-"}"#),
+        ("[-1, -2]\n", "[-1,-2]"),
+    ] {
+        let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(output.trim(), expected, "for {yaml:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_empty_block_sequence_items_remain_null() -> Result<()> {
+    // The other shape that reaches the same branch. These are valid YAML and
+    // must keep reading as null — `yq` agrees.
+    for (yaml, expected) in [
+        ("-\n", "[null]"),
+        ("- # comment\n", "[null]"),
+        ("a:\n  -\n  - y\n", r#"{"a":[null,"y"]}"#),
+    ] {
+        let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(output.trim(), expected, "for {yaml:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_flow_dash_space_scalar_round_trips_through_yaml_output() -> Result<()> {
+    // Default `-o yaml` must quote the scalar: emitted bare under a `- ` marker
+    // it would read back as a nested sequence.
+    let (yaml_out, code) = run_yq_stdin(".", "[- x]\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(yaml_out, "- \"- x\"\n");
+
+    let (json_out, code) = run_yq_stdin(".", &yaml_out, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(json_out.trim(), r#"["- x"]"#);
+    Ok(())
+}
+
+#[test]
+fn test_flow_container_key_does_not_leak_its_closing_bracket() -> Result<()> {
+    // `set_bp_text_end` writes the last slot *pushed*, so recording an end after
+    // parsing a nested `[`/`{` landed it on the innermost node inside that
+    // container and stretched its extent past the closing bracket (#332). One
+    // case per site that used to do it; `at_offset` names the inner node, whose
+    // decoded value carried the stray delimiter before the fix.
+    //
+    // Each `offset` below points at the last element inside the nested container:
+    // the assertion fails with a trailing `]` or `}` if the clobber returns.
+    for (yaml, offset, expected) in [
+        // flow-mapping key via parse_flow_key, sequence — `e` of `[d, e]`, was "e]"
+        ("{[d, e]: f}\n", 5, r#""e""#),
+        // flow-mapping key via parse_flow_key, mapping — the `1` of `{a: 1}`
+        ("{{a: 1}: 2}\n", 5, "1"),
+        // explicit flow key, sequence — `b` of `[a, b]`
+        ("{? [a, b]: 1}\n", 7, r#""b""#),
+        // explicit flow key, mapping — the `1` of `{a: 1}`
+        ("{? {a: 1}: 2}\n", 7, "1"),
+        // explicit flow entry inside a sequence — `b` of `[a, b]`
+        ("[? [a, b] : 1]\n", 7, r#""b""#),
+        // implicit flow-mapping-entry key — `b` of `[a, b]`
+        ("[[a, b]: 1]\n", 5, r#""b""#),
+        // implicit flow-mapping-entry value — `c` of `[b, c]`
+        ("[a: [b, c]]\n", 8, r#""c""#),
+    ] {
+        let (output, code) =
+            run_yq_stdin(&format!("at_offset({offset})"), yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(output.trim(), expected, "for {yaml:?} at offset {offset}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_alias_as_a_flow_mapping_key_keeps_its_own_extent() -> Result<()> {
+    // `parse_alias` opens and closes its own node and records its own end, so the
+    // flow-mapping key site must not record one over the top of it (#332). The
+    // alias resolves to the anchored value, which only works if its extent covers
+    // exactly `*x`.
+    let yaml = "x: &x 1\ny: {*x: 2}\n";
+    let (output, code) = run_yq_stdin("at_offset(13)", yaml, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1");
+
+    // And the document as a whole still reads back correctly.
+    let (whole, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(whole.trim(), r#"{"x":1,"y":{"":2}}"#);
+    Ok(())
+}

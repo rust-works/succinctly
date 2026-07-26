@@ -24,6 +24,7 @@ use super::error::YamlError;
 use super::light::YamlCursor;
 use super::line_break::line_break_len;
 use super::parser::build_semi_index;
+use super::starts_seq_entry;
 
 /// Index structures for navigating YAML.
 ///
@@ -279,7 +280,11 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
 
     /// Get the text end byte offset for a BP position.
     ///
-    /// For scalars, returns the end position. For containers and null values, returns `None`.
+    /// For scalars, returns the end position. For nodes the parser recorded no end for
+    /// — containers, nulls, sequence-item wrappers — the result depends on the storage
+    /// variant: `None`, or an *earlier* node's end. Never a later node's, so
+    /// `end > bp_to_text_pos(bp_pos)` is a sound test for "this node has an extent of its
+    /// own" (see the `EndPositions::get` contract in `yaml::end_positions`, and #332).
     #[inline]
     pub fn bp_to_text_end_pos(&self, bp_pos: usize) -> Option<usize> {
         let open_idx = self.bp.rank1(bp_pos);
@@ -430,6 +435,13 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// Sequence items have BP open/close but no TY entry.
     /// They are wrapper nodes around the item's content.
     /// Derives this from text (starts with `- `) rather than storing a bitvector.
+    ///
+    /// Unlike [`YamlCursor::value`] this does *not* discriminate a childless wrapper from
+    /// a plain scalar that merely begins `- ` (see #332). It does not need to: the only
+    /// caller, `locate::path_to_bp`, asks about a node's *ancestors*, and such a scalar is
+    /// always a BP leaf — a flow scalar is opened and closed with nothing pushed in
+    /// between. Adding the end-position lookup here would be unreachable code paid for on
+    /// every ancestor of every backwards walk.
     #[inline]
     pub fn is_seq_item(&self, text: &[u8], bp_pos: usize) -> bool {
         // Fast path: containers (mappings/sequences) are never seq_items
@@ -442,16 +454,9 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             return false;
         };
 
-        // Check for block sequence indicator `-` followed by whitespace.
-        // Branchless form (see #106): a `-` at end of input is a seq_item, so a
-        // missing next byte is treated as whitespace via `unwrap_or(b' ')`.
-        text_pos < text.len()
-            && text[text_pos] == b'-'
-            && matches!(
-                text.get(text_pos + 1).copied().unwrap_or(b' '),
-                b' ' | b'\t' | b'\n' | b'\r'
-            )
+        starts_seq_entry(text, text_pos)
     }
+
     /// Debug helper to get open position for a given open index.
     #[cfg(test)]
     pub fn debug_open_position_at(&self, open_idx: usize) -> Option<u32> {
