@@ -903,6 +903,97 @@ fn test_builtin_first_on_non_array_errors() -> Result<()> {
     Ok(())
 }
 
+/// Run a filter and return its stderr, for cases whose observable behaviour is
+/// the error message rather than stdout.
+///
+/// The jq golden corpus cannot host these: it compares stdout only and requires
+/// exit 0.
+fn jq_stderr(filter: &str, input: &str, extra_args: &[&str]) -> Result<String> {
+    let mut cmd = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+        ])
+        .args(extra_args)
+        .arg(filter)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(input.as_bytes())?;
+    }
+    let output = cmd.wait_with_output()?;
+    Ok(String::from_utf8(output.stderr)?)
+}
+
+/// Indexing by a key whose *kind* cannot index the container reports jq's
+/// wording verbatim (#360).
+///
+/// The messages are transcribed from jq 1.7.1. Note the string form inserts the
+/// key raw rather than JSON-escaped — `--arg k 'a"b'` really does produce
+/// `Cannot index array with string "a"b"` in jq.
+#[test]
+fn test_cannot_index_error_wording() -> Result<()> {
+    let cases: &[(&str, &str, &[&str], &str)] = &[
+        (".[null]", "{}", &[], "Cannot index object with null"),
+        (".[null]", "[]", &[], "Cannot index array with null"),
+        (".[null]", "null", &[], "Cannot index null with null"),
+        (".[true]", "{}", &[], "Cannot index object with boolean"),
+        (".[{}]", "{}", &[], "Cannot index object with object"),
+        (".[[1]]", "{}", &[], "Cannot index object with array"),
+        (
+            ".[$k]",
+            "[1,2]",
+            &["--arg", "k", "a"],
+            r#"Cannot index array with string "a""#,
+        ),
+        (
+            ".[$k]",
+            r#""s""#,
+            &["--arg", "k", "a"],
+            r#"Cannot index string with string "a""#,
+        ),
+        // The same wording must come out of the path/assignment pre-pass, not
+        // just the value path.
+        (".[null] = 1", "{}", &[], "Cannot index object with null"),
+        ("path(.[null])", "{}", &[], "Cannot index object with null"),
+        ("del(.[null])", "{}", &[], "Cannot index object with null"),
+    ];
+
+    for (filter, input, args, expected) in cases {
+        let stderr = jq_stderr(filter, input, args)?;
+        assert!(
+            stderr.contains(expected),
+            "`{filter}` on `{input}` should report {expected:?}, got: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// `?` suppresses a bad-key error rather than propagating it.
+///
+/// Regression guard for the `eval_generic` fallback: routing an unhandled
+/// expression through `full_eval` restarts with `optional = false`, which
+/// silently dropped the `?` here.
+#[test]
+fn test_optional_suppresses_cannot_index() -> Result<()> {
+    let (output, _) = run_jq_stdin(".[null]?", "{}", &["-c"])?;
+    assert_eq!(output.trim(), "");
+    let stderr = jq_stderr(".[null]?", "{}", &[])?;
+    assert!(
+        !stderr.contains("Cannot index"),
+        "`?` should suppress the error, got: {stderr}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_contains_type_mismatch_errors() -> Result<()> {
     // jq: `1 | contains("a")` is an error, not `false` (#358). This exercises the
