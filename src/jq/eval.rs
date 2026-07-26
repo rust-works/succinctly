@@ -213,12 +213,24 @@ impl EvalError {
 
     /// Create the error `contains`/`inside` raise for operands whose kinds
     /// cannot be compared, e.g. `1 | contains("a")` (#358). The callers decide
-    /// *when* to raise it, by comparing [`jq_kind`] — not `type_name`, which is
+    /// *when* to raise it, by comparing `jq_kind` — not `type_name`, which is
     /// a coarser partition; see that function.
     ///
     /// `left` is the container, `right` the value looked for, so `inside` — which
     /// is `contains` with the operands swapped — passes its *argument* first,
     /// matching jq's `array ([1]) and number (1) …` for `1 | inside([1])`.
+    ///
+    /// # Merge note (#356 / PR #364)
+    ///
+    /// That branch adds `src/jq/error.rs` carrying its own
+    /// `EvalError::containment_check` and a `dump_truncated` equivalent to
+    /// `value_preview`. Two `impl EvalError` blocks defining this name is a
+    /// duplicate-definition *compile* error, not a textual conflict git will
+    /// flag, so whichever of the two lands second owes the merge: keep one copy
+    /// of both helpers, and clear the `contains_number_string` /
+    /// `inside_array_number` entries from
+    /// `tests/data/jq-error-known-divergences.txt` and
+    /// `docs/compliance/jq/limitations.md`, which #358 makes stale.
     pub fn containment_check(left: &OwnedValue, right: &OwnedValue) -> Self {
         Self::new(format!(
             "{} ({}) and {} ({}) cannot have their containment checked",
