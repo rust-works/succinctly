@@ -1680,7 +1680,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::IsValid(expr) => builtin_isvalid::<W, S>(expr, value, optional),
 
         // Phase 10: Path Expressions
-        Builtin::Path(expr) => builtin_path::<W>(expr, value, optional),
+        Builtin::Path(expr) => builtin_path::<W, S>(expr, value, optional),
         Builtin::PathNoArg => {
             // PathNoArg requires path context which is handled in eval_pipe_with_context
             // When called without context, return empty path (root position)
@@ -1787,7 +1787,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
 
         // Phase 11: Path manipulation
-        Builtin::Del(path) => builtin_del::<W>(path, value, optional),
+        Builtin::Del(path) => builtin_del::<W, S>(path, value, optional),
 
         // Phase 12: Additional builtins
         Builtin::Now => builtin_now::<W>(),
@@ -6176,7 +6176,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // First evaluate the value expression
-    let new_value = match eval_single::<W, S>(value_expr, input.clone(), optional)
+    let mut new_value = match eval_single::<W, S>(value_expr, input.clone(), optional)
         .materialize_cursor()
     {
         QueryResult::One(v) => to_owned(&v),
@@ -6205,9 +6205,24 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Convert input to owned for modification
     let mut result = to_owned(&input);
 
-    // Apply the assignment using path
-    if let Err(e) = set_path(&mut result, path_expr, new_value) {
-        return QueryResult::Error(e);
+    // Resolve computed keys against the *original* document, before any write,
+    // then apply every resolved path: `.[("a","b")] = 1` assigns both.
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
+        Ok(paths) => paths,
+        Err(e) => return QueryResult::Error(e),
+    };
+
+    let last = paths.len().saturating_sub(1);
+    for (i, path) in paths.iter().enumerate() {
+        // Only the final application needs to own `new_value`.
+        let value = if i == last {
+            core::mem::replace(&mut new_value, OwnedValue::Null)
+        } else {
+            new_value.clone()
+        };
+        if let Err(e) = set_path(&mut result, path, value) {
+            return QueryResult::Error(e);
+        }
     }
 
     QueryResult::Owned(result)
@@ -6224,9 +6239,17 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Convert input to owned for modification
     let mut result = to_owned(&input);
 
+    // Computed keys resolve against the original document, before any update.
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
+        Ok(paths) => paths,
+        Err(e) => return QueryResult::Error(e),
+    };
+
     // Get current value at path, apply filter, and set back
-    if let Err(e) = update_path::<S>(&mut result, path_expr, filter_expr, optional) {
-        return QueryResult::Error(e);
+    for path in &paths {
+        if let Err(e) = update_path::<S>(&mut result, path, filter_expr, optional) {
+            return QueryResult::Error(e);
+        }
     }
 
     QueryResult::Owned(result)
@@ -6363,6 +6386,13 @@ fn set_path(
             }
             _ => Err(EvalError::cannot_iterate(root)),
         },
+        // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
+        // into a static component before this runs. Explicit rather than left
+        // to the catch-all so a missed install point fails loudly here instead
+        // of being reported as a user error.
+        Expr::IndexExpr { .. } => Err(EvalError::new(
+            "internal error: unresolved computed index in assignment path",
+        )),
         _ => Err(EvalError::new(
             "cannot use expression as assignment target".to_string(),
         )),
@@ -6404,6 +6434,11 @@ fn get_path_mut<'a>(
                         "number",
                     ));
                 }
+            }
+            Expr::IndexExpr { .. } => {
+                return Err(EvalError::new(
+                    "internal error: unresolved computed index in path component",
+                ))
             }
             _ => return Err(EvalError::new("invalid path component")),
         };
@@ -6557,6 +6592,13 @@ fn update_path<S: EvalSemantics>(
             }
         }
         Expr::Optional(inner) => update_path::<S>(root, inner, filter_expr, true),
+        // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
+        // into a static component before this runs. Explicit rather than left
+        // to the catch-all so a missed install point fails loudly here instead
+        // of being reported as a user error.
+        Expr::IndexExpr { .. } => Err(EvalError::new(
+            "internal error: unresolved computed index in update path",
+        )),
         _ => Err(EvalError::new("cannot use expression as update target")),
     }
 }
@@ -6571,6 +6613,270 @@ fn owned_type_name(value: &OwnedValue) -> &'static str {
         OwnedValue::Array(_) => "array",
         OwnedValue::Object(_) => "object",
     }
+}
+
+// =============================================================================
+// Computed keys in path expressions (#360)
+// =============================================================================
+//
+// `set_path`, `get_path_mut`, `update_path`, `delete_at_path`,
+// `eval_with_path_tracking` and `collect_intermediate_with_paths` all understand
+// only *static* path components: `Identity`, `Field`, `Index`, `Iterate`,
+// `Slice`. Rather than teach six walkers about computed keys, the key is
+// resolved to the concrete component it denotes *before* they run, so they keep
+// seeing exactly the shapes they always have.
+//
+// A pre-pass (rather than recursion inside `set_path`) is also what makes
+// multi-key assignment match jq: keys are computed against the *original*
+// document, so `{"a":"x","x":"y"} | .[.a, .x] = 1` yields
+// `{"a":"x","x":1,"y":1}` — the second key is `"y"`, read from the original
+// `.x`, not the `1` the first assignment just wrote.
+
+/// Does this expression contain a computed-key index anywhere in its *path*
+/// structure?
+///
+/// Only the shapes that can appear as a path expression are traversed; a
+/// computed key nested inside, say, an `if` is not a path component and cannot
+/// reach the walkers. Used as a cheap guard so programs without a computed key
+/// skip the pre-pass entirely.
+fn contains_dynamic_index(expr: &Expr) -> bool {
+    match expr {
+        Expr::IndexExpr { .. } => true,
+        Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().any(contains_dynamic_index),
+        Expr::Optional(inner) | Expr::Paren(inner) => contains_dynamic_index(inner),
+        _ => false,
+    }
+}
+
+/// Append `expr` to a path component list, splicing nested pipes and dropping
+/// `Identity`.
+///
+/// `get_path_mut` matches a `&[Expr]` element-wise against
+/// `Identity | Field | Index` and rejects anything else as "invalid path
+/// component", so a nested `Pipe` emitted by the pre-pass would break
+/// assignment with a message that reads like user error.
+fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
+    match expr {
+        Expr::Identity => {}
+        Expr::Pipe(exprs) => {
+            for e in exprs {
+                push_path_components(out, e);
+            }
+        }
+        Expr::Paren(inner) => push_path_components(out, inner),
+        other => out.push(other.clone()),
+    }
+}
+
+/// Evaluate an expression against an owned value, preserving the whole output
+/// stream.
+///
+/// [`eval_owned_expr`] cannot be used for keys: it collapses a multi-output
+/// result into a single `OwnedValue::Array`, which would turn `.[("a","b")]`
+/// into one array-valued key. `QueryResult::collect_owned` is likewise unsafe
+/// on its own because it silently maps `Error` to an empty vec, so both `Error`
+/// and `Break` are intercepted first.
+fn eval_owned_multi<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Result<Vec<OwnedValue>, EvalError> {
+    match eval_owned_input::<Vec<u64>, S>(expr, input, false) {
+        QueryResult::Error(e) => Err(e),
+        QueryResult::Break(label) => Err(EvalError::new(format!("break ${label} not in label"))),
+        other => Ok(other.collect_owned()),
+    }
+}
+
+/// Turn a resolved key value into the static path component it denotes.
+fn key_to_path_component(key: &OwnedValue, container: &OwnedValue) -> Result<Expr, EvalError> {
+    match key {
+        OwnedValue::String(s) => Ok(Expr::Field(s.clone())),
+        OwnedValue::Int(i) => Ok(Expr::Index(*i)),
+        // Truncation toward zero, as in the value path.
+        OwnedValue::Float(f) => Ok(Expr::Index(f.trunc() as i64)),
+        _ => Err(EvalError::cannot_index(owned_type_name(container), key)),
+    }
+}
+
+/// One resolved branch: the static path components reaching it, and the value
+/// found there (needed to resolve any computed key further along the chain).
+type PathBranch = (Vec<Expr>, OwnedValue);
+
+/// Resolve one path node against one value, yielding a branch per output.
+fn resolve_node<S: EvalSemantics>(
+    expr: &Expr,
+    value: &OwnedValue,
+) -> Result<Vec<PathBranch>, EvalError> {
+    match expr {
+        Expr::Pipe(exprs) => resolve_seq::<S>(exprs, value),
+        Expr::Paren(inner) => resolve_node::<S>(inner, value),
+
+        Expr::Comma(exprs) => {
+            let mut out = Vec::new();
+            for e in exprs {
+                out.extend(resolve_node::<S>(e, value)?);
+            }
+            Ok(out)
+        }
+
+        Expr::Optional(inner) => {
+            // A failure under `?` prunes the branch instead of propagating.
+            let Ok(branches) = resolve_node::<S>(inner, value) else {
+                return Ok(Vec::new());
+            };
+            Ok(branches
+                .into_iter()
+                .map(|(components, v)| {
+                    let inner_path = if components.len() == 1 {
+                        components.into_iter().next().expect("len checked")
+                    } else {
+                        Expr::Pipe(components)
+                    };
+                    (vec![Expr::Optional(Box::new(inner_path))], v)
+                })
+                .collect())
+        }
+
+        // `.[]` before a computed key has to be expanded to concrete
+        // components, because each element continues with its own key.
+        // `[path(.xs[] | .[.k])]` is `[["xs",0,"p"],["xs",1,"q"]]` in jq.
+        Expr::Iterate => match value {
+            OwnedValue::Array(items) => Ok(items
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (vec![Expr::Index(i as i64)], v.clone()))
+                .collect()),
+            OwnedValue::Object(map) => Ok(map
+                .iter()
+                .map(|(k, v)| (vec![Expr::Field(k.clone())], v.clone()))
+                .collect()),
+            other => Err(EvalError::type_error(
+                "array or object",
+                owned_type_name(other),
+            )),
+        },
+
+        Expr::IndexExpr { target, key } => {
+            let target_branches = resolve_node::<S>(target, value)?;
+            let keys = eval_owned_multi::<S>(key, value)?;
+
+            // Key outer, target inner — the same order the value path uses, so
+            // `path(.[("a","b")])` emits `["a"]` then `["b"]`.
+            let mut out = Vec::with_capacity(keys.len() * target_branches.len());
+            for k in &keys {
+                for (components, target_value) in &target_branches {
+                    let component = key_to_path_component(k, target_value)?;
+                    let next_value = index_one_owned(target_value, k, false)?
+                        .expect("non-optional index yields a value or errors");
+                    let mut path = components.clone();
+                    path.push(component);
+                    out.push((path, next_value));
+                }
+            }
+            Ok(out)
+        }
+
+        // A static leaf: keep it verbatim and thread its value through.
+        other => {
+            let mut components = Vec::new();
+            push_path_components(&mut components, other);
+            let mut values = eval_owned_multi::<S>(other, value)?;
+            match values.len() {
+                // No output prunes the branch.
+                0 => Ok(Vec::new()),
+                1 => Ok(vec![(components, values.pop().expect("len checked"))]),
+                _ => Err(EvalError::new(
+                    "computed index after a multi-output path component is not supported",
+                )),
+            }
+        }
+    }
+}
+
+/// Resolve a pipe of path nodes, threading the value left to right.
+///
+/// The threading is the whole point: a computed key sees the value reaching
+/// *its* position, which is the document root only when it sits at the top of
+/// the path. `path(.x | .a[.k])` resolves `.k` against `.x`, giving
+/// `["x","a","a"]`.
+fn resolve_seq<S: EvalSemantics>(
+    exprs: &[Expr],
+    value: &OwnedValue,
+) -> Result<Vec<PathBranch>, EvalError> {
+    let mut flat = Vec::new();
+    for e in exprs {
+        push_path_components(&mut flat, e);
+    }
+
+    // Everything after the last computed key is copied verbatim — no need to
+    // evaluate prefixes past the point where the answer stops depending on them.
+    let Some(last_dynamic) = flat.iter().rposition(contains_dynamic_index) else {
+        return Ok(vec![(flat, value.clone())]);
+    };
+
+    let mut branches: Vec<PathBranch> = vec![(Vec::new(), value.clone())];
+    for element in &flat[..=last_dynamic] {
+        let mut next = Vec::new();
+        for (prefix, current) in &branches {
+            for (components, resulting) in resolve_node::<S>(element, current)? {
+                let mut path = prefix.clone();
+                path.extend(components);
+                next.push((path, resulting));
+            }
+        }
+        branches = next;
+    }
+
+    let tail = &flat[last_dynamic + 1..];
+    for (prefix, _) in &mut branches {
+        prefix.extend_from_slice(tail);
+    }
+    Ok(branches)
+}
+
+/// Rewrite every computed key in a path expression into the static component it
+/// denotes for `input`, yielding one fully-static path expression per key.
+///
+/// jq applies *all* of them: `{"a":0,"b":0} | .[("a","b")] = 1` is
+/// `{"a":1,"b":1}`, and `path()` emits one output per resolved path.
+fn resolve_dynamic_indexes<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Result<Vec<Expr>, EvalError> {
+    if !contains_dynamic_index(expr) {
+        return Ok(vec![expr.clone()]);
+    }
+
+    let branches = resolve_node::<S>(expr, input)?;
+    Ok(branches
+        .into_iter()
+        .map(|(components, _)| match components.len() {
+            0 => Expr::Identity,
+            1 => components.into_iter().next().expect("len checked"),
+            _ => Expr::Pipe(components),
+        })
+        .collect())
+}
+
+/// Order resolved paths so deletion does not invalidate later ones.
+///
+/// Deleting `[0]` before `[2]` shifts the array under the second path. jq is
+/// order-insensitive here — both `del(.[(0,2)])` and `del(.[(2,0)])` on
+/// `[10,20,30,40]` give `[20,40]` — so sort by trailing index, descending.
+///
+/// (`builtin_delpaths` has this bug today: `delpaths([[0],[2]])` gives
+/// `[20,30]` where jq gives `[20,40]`, because it sorts only by path length.
+/// Tracked separately; not inherited here.)
+fn sort_paths_for_deletion(paths: &mut [Expr]) {
+    fn trailing_index(expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Index(i) => Some(*i),
+            Expr::Pipe(exprs) => exprs.last().and_then(trailing_index),
+            Expr::Optional(inner) | Expr::Paren(inner) => trailing_index(inner),
+            _ => None,
+        }
+    }
+    paths.sort_by_key(|p| core::cmp::Reverse(trailing_index(p)));
 }
 
 // =============================================================================
@@ -8511,14 +8817,25 @@ fn eval_builtin_owned<S: EvalSemantics>(
 
 /// Builtin: path(expr) - return the path to values selected by expr
 /// This evaluates the expression while tracking the path taken to reach each value.
-fn builtin_path<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     let owned = to_owned(&value);
+
+    // Computed keys must become static components before the tracker runs — it
+    // ignores anything it does not recognise, so an unresolved one would
+    // silently yield no paths at all.
+    let exprs = match resolve_dynamic_indexes::<S>(expr, &owned) {
+        Ok(exprs) => exprs,
+        Err(e) => return QueryResult::Error(e),
+    };
+
     let mut paths = Vec::new();
-    eval_with_path_tracking(expr, &owned, &[], &mut paths, optional);
+    for expr in &exprs {
+        eval_with_path_tracking(expr, &owned, &[], &mut paths, optional);
+    }
 
     if paths.is_empty() {
         if optional {
@@ -8610,6 +8927,12 @@ fn eval_with_path_tracking(
                     paths.push(OwnedValue::Array(new_path));
                 }
             }
+        }
+        // Unreachable: computed keys are resolved to static components before
+        // the tracker runs. The catch-all below emits *no* path rather than an
+        // error, so an unresolved one would silently produce an empty result.
+        Expr::IndexExpr { .. } => {
+            debug_assert!(false, "unresolved computed index reached path tracking");
         }
         // For complex expressions that don't represent simple paths, we can't track
         _ => {
@@ -8755,6 +9078,10 @@ fn collect_intermediate_with_paths(
                     results.push((new_path, item.clone()));
                 }
             }
+        }
+        // Unreachable, for the same reason as in `eval_with_path_tracking`.
+        Expr::IndexExpr { .. } => {
+            debug_assert!(false, "unresolved computed index reached path collection");
         }
         _ => {
             // For non-path expressions, we can't track paths
@@ -9170,7 +9497,7 @@ fn delete_path(value: OwnedValue, path: &[OwnedValue]) -> OwnedValue {
 }
 
 /// Builtin: del(path) - delete a single path
-fn builtin_del<'a, W: Clone + AsRef<[u64]>>(
+fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
@@ -9178,8 +9505,18 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>>(
     // Convert to owned and delete the path
     let mut result = to_owned(&value);
 
-    if let Err(e) = delete_at_path(&mut result, path_expr, optional) {
-        return QueryResult::Error(e);
+    // Computed keys resolve against the original document, then delete
+    // right-to-left so an earlier removal cannot shift a later index.
+    let mut paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
+        Ok(paths) => paths,
+        Err(e) => return QueryResult::Error(e),
+    };
+    sort_paths_for_deletion(&mut paths);
+
+    for path in &paths {
+        if let Err(e) = delete_at_path(&mut result, path, optional) {
+            return QueryResult::Error(e);
+        }
     }
 
     QueryResult::Owned(result)
@@ -9314,6 +9651,13 @@ fn delete_at_path(
             }
         }
         Expr::Optional(inner) => delete_at_path(root, inner, true),
+        // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
+        // into a static component before this runs. Explicit rather than left
+        // to the catch-all so a missed install point fails loudly here instead
+        // of being reported as a user error.
+        Expr::IndexExpr { .. } => Err(EvalError::new(
+            "internal error: unresolved computed index in delete path",
+        )),
         _ => Err(EvalError::new("cannot use expression as delete target")),
     }
 }
