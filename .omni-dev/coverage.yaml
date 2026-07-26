@@ -1,0 +1,45 @@
+# Coverage config for `omni-dev coverage diff` (the sticky PR comment posted by
+# the `Coverage (x86_64)` / `Coverage (ARM64)` jobs in .github/workflows/ci.yml).
+#
+# Requires omni-dev >= 0.38.0 (rust-works/omni-dev#1398). On older versions this
+# file is simply not read, so the pin in ci.yml must stay at or above 0.38.0 for
+# the exclusions below to take effect.
+diff:
+  # Repo-relative path regexes, unanchored (partial match), applied after
+  # --strip-prefix normalisation — same semantics as the
+  # `--ignore-filename-regex` flag, with which this list is set-unioned.
+  #
+  # Only files whose coverage is *inherently non-deterministic across runs*
+  # belong here: a region gated on a runtime CPU-feature check (not a `#[cfg]`)
+  # is compiled into the denominator on every run but executed only on a host
+  # whose CPU has the instruction. When the `main` baseline run and the PR-head
+  # run draw different runner CPUs, the file moves with no source change.
+  # Matching files are dropped from *both* reports before the diff, so they can
+  # no longer produce a phantom entry in the "unchanged file(s) also moved"
+  # note. See CONTRIBUTING.md "SIMD CI coverage" and succinctly#302.
+  ignore-filename-regex:
+    # ~30 lines behind `is_x86_feature_detected!("avx512vpopcntdq")`. The x86
+    # runners are usually Zen 3 (EPYC 7763, no AVX-512) but the fleet is not
+    # CPU-homogeneous, so this file reports ~93% on a capable host and ~66%
+    # otherwise — a ±26pp swing observed on unrelated PRs (#287, #357).
+    # `SUCCINCTLY_EXPECT_SIMD` intentionally omits `avx512vpopcntdq`, so this
+    # cannot be made deterministic by pinning the runner's feature set.
+    - 'src/bits/popcount\.rs'
+
+  # Deliberately NOT excluded, contrary to the illustrative list in
+  # rust-works/omni-dev#1398:
+  #
+  #   src/dsv/simd/**, src/yaml/simd/**, src/json/simd/**
+  #     Their runtime dispatch gates on avx2 / bmi2 / sve2 / sve2-bitperm only —
+  #     every one of which the test legs pin via `SUCCINCTLY_EXPECT_SIMD`, so
+  #     they are deterministic on the runner fleet, not CPU-conditional noise.
+  #
+  #   src/util/simd/x86.rs
+  #     Has an `avx512f` arm (the `has_fast_bmi2` early return), so it flaps by
+  #     the same mechanism — but only by ~1-2 lines in a large file, below the
+  #     threshold that surfaces the "also moved" note. Excluding the whole file
+  #     would hide far more real coverage than noise.
+  #
+  # Keep this list to files with *observed* flap: an entry here removes the file
+  # from the reported total as well, so over-excluding quietly shrinks what the
+  # comment measures.
