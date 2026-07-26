@@ -228,37 +228,33 @@ $ printf '%%YAML 1.2\n--- text\n' | succinctly yq '.'
 
 Tracked in [#225](https://github.com/rust-works/succinctly/issues/225).
 
-### An explicit key and its `: ` on one line
+### A flow collection as a same-line explicit key
 
-`? k: v` — the explicit-key indicator and a value indicator on the *same* line —
-diverges from `yq`, which reads the whole `k: v` as a mapping used as the key and
-so renders the key as `""` (complex keys stringify to `""`, as above):
+`? []: x` — a *flow* collection followed by a value indicator on the same line —
+still diverges from `yq`. The whole `[]: x` is a compact block mapping used as the
+key, so the entry has no value:
 
 ```
-$ printf '? k\n: v\n' | succinctly yq -o=json -I=0 '.'
-{"k":"v"}                            # multi-line: agrees with yq
-$ printf '? k: v\n' | succinctly yq -o=json -I=0 '.'
-{"k":"v"}                            # yq: {"":null}
-$ printf 'm:\n  ? k: v\n' | succinctly yq -o=json -I=0 '.'
-{"m":{"k":null}}                     # yq: {"m":{"":null}}
-$ printf -- '- ? k: v\n' | succinctly yq -o=json -I=0 '.'
-[{"k":null}]                         # yq: [{"":null}]
+$ printf '? []: x\n' | succinctly yq -o=json -I=0 '.'
+{"":"x"}                             # yq: {"":null}
+$ printf '? {a: 1}: v\n' | succinctly yq -o=json -I=0 '.'
+{"":"v"}                             # yq: {"":null}
 ```
 
-`parse_explicit_key` ends the key at the `: ` and returns with the parser
-*mid-line*. The main loop then re-derives that line's indentation from the
-mid-line position and reads it as 0, so `parse_explicit_value` closes the mapping
-it should have been filling — which is why the nested spellings lose the value,
-while at top level the mapping is at indent 0 and survives.
+Both output `""` for the key, so this is a divergence in the *value*, not the key.
 
-The multi-line spelling — the one every real document uses, and the only one the
-YAML Test Suite corpus exercises — is unaffected in all three positions.
+`looks_like_mapping_entry` — the predicate the [#346] fix routes through, shared
+with the `- k: v` sequence-item path — deliberately returns `false` for a leading
+`[` or `{`, so these two spellings keep the pre-[#346] flow-collection handling and
+its mid-line exit. Lifting the restriction means teaching
+`parse_compact_mapping_entry` to accept a flow-collection key, which puts a rarer
+shape's fix on the hot sequence-item path; that trade was not worth taking blind.
 
-Since [#339](https://github.com/rust-works/succinctly/issues/339) the sequence-item
-position shares this wart instead of having one of its own: routing `- ? k`
-through the shared `parse_explicit_key` replaced a *fourth*, different corruption
-(the `? ` folded into a plain scalar) with the behaviour the nested mapping case
-already had. Fixing the mid-line return would fix all of them at once.
+The scalar spellings — `? k: v`, `? "a": v`, `? 'a': v`, and the same shapes in
+mapping-value and sequence-item position — are correct since [#346], as is the
+mirrored value indicator (`? a` / `: b: c`).
+
+[#346]: https://github.com/rust-works/succinctly/issues/346
 
 ## Line breaks — resolved
 

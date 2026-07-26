@@ -475,6 +475,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   additive, but downstream struct-literal construction would need updating.
   Uncaught errors keep the existing `jq: error: <message>` form — jq's
   `(not a string)` framing and exit code 5 remain a separate divergence.
+- **YAML explicit key with its `: ` on the same line** (#346): `? k: v` loaded as
+  the ordinary entry `{"k":"v"}`. Per YAML 1.2 §8.2.2 the node after `? ` is
+  `s-l+block-indented`, which admits a compact block mapping — so the whole
+  `k: v` is a *mapping used as the key*, and the entry has a complex key (which
+  `yq` renders `""`) and no value. The divergence hit every position an explicit
+  key can appear, and inconsistently: `{"k":"v"}` at top level but
+  `{"m":{"k":null}}` as a mapping value and `[{"k":null}]` as a sequence item.
+  Silent in all three — no error, well-formed JSON out. `parse_explicit_key`
+  stopped the key scalar at the `: ` and returned *mid-line*; `count_indent`
+  counts spaces forward from the cursor with no line-start check, so the main
+  loop re-derived that line's indent as `0` and `parse_explicit_value` closed the
+  mapping it should have been filling — which is why only the top-level spelling,
+  whose mapping is already at indent 0, kept its value. The fix routes the key
+  through the same `parse_compact_mapping_entry` the `- k: v` sequence-item path
+  uses rather than a second copy of the decision (#106), and mirrors it on the
+  value indicator, which had the identical defect (`? a` / `: b: c` loaded as
+  `{"a":"b"}`). That pairing is what YAML Test Suite case V9D5 needs. Enabling
+  this required teaching the pending-explicit-key state which mapping *owns* it:
+  a complex key is itself an open container, so the previous "the container being
+  popped is a mapping" test wrote the owner's null into the key and lost the
+  entry entirely. Quoted keys, continuation lines, wide indents and all three
+  YAML 1.2 §5.4 line-break forms are covered, with two new pinned-`yq` golden
+  cases. Flow-collection keys (`? []: x`) remain divergent and are documented in
+  `docs/compliance/yaml/limitations.md`.
 - **YAML explicit keys as block sequence items** (#339): `- ? k` followed by
   `  : v` loaded as `["? k","v"]` — the `? ` indicator folded into a plain
   scalar and the `: v` line became a *phantom second element*, so the sequence
