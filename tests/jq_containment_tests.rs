@@ -182,7 +182,7 @@ const CASES: &[(&[u8], &str, Expect)] = &[
     // does. `OwnedValue::to_json` would escape it — it escapes every
     // `char::is_control()`, which covers C1 — so this case is what pins
     // `value_preview` to the streaming writer instead. See its doc comment; the
-    // over-escaping still affects `tojson`/`@json` and is out of scope for #358.
+    // over-escaping still affects `tojson`/`@json` (#385), out of scope for #358.
     (
         "\"a\u{85}b\"".as_bytes(),
         r"contains(1)",
@@ -248,8 +248,8 @@ fn containment_matches_jq_in_the_generic_evaluator() {
 /// Two gaps therefore sit behind this test, both pre-existing and both invisible
 /// until `contains` started erroring at all:
 ///
-/// 1. the parser cannot express `contains("a")?`;
-/// 2. the generic evaluator drops the flag: its catch-all arm re-enters the full
+/// 1. the parser cannot express `contains("a")?` (#367);
+/// 2. the generic evaluator drops the flag (#386): its catch-all arm re-enters the full
 ///    evaluator with a fresh `optional = false`
 ///    (`src/jq/eval_generic.rs`, the `_ =>` fallback), so an optional-wrapped
 ///    builtin it does not implement itself loses its optionality.
@@ -274,8 +274,8 @@ fn optional_suppresses_the_error() {
             "full evaluator: optional {filter} should yield nothing"
         );
 
-        // Gap 2, pinned: the CLI path still raises. Flip this to the assertions
-        // above once the fallback threads `optional` through.
+        // Gap 2, pinned (#386): the CLI path still raises. Flip this to the
+        // assertions above once the fallback threads `optional` through.
         let generic = eval_generic::eval_with_cursor(&expr, index.root(json));
         assert!(
             generic.is_error(),
@@ -299,7 +299,7 @@ fn optional_suppresses_the_error() {
 /// (`echo 1e100 | sjq -c .` prints `1E+100`, matching jq). #358 is what first
 /// routes a materialised dump into an error message and so makes it visible.
 /// Fixing it means teaching `OwnedValue` to carry the literal, which would touch
-/// far more than containment.
+/// far more than containment; tracked as #387.
 ///
 /// The expectations are succinctly's *current* output with jq's beside them.
 /// If a future change makes these match jq, delete the test rather than invert

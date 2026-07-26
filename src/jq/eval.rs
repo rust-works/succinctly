@@ -319,7 +319,7 @@ pub(crate) fn sort_rank(value: &OwnedValue) -> u8 {
 /// C1 range, so it renders `U+0085` as a six-character backslash-u escape where
 /// jq emits the two raw UTF-8 bytes. (`tojson` and `@json` still go through
 /// `to_json` and still over-escape — a pre-existing divergence wider than #358,
-/// so it is left alone here.)
+/// so it is left alone here and tracked as #385.)
 ///
 /// Two deviations remain, both about what gets dumped rather than where it is cut:
 ///
@@ -334,7 +334,7 @@ pub(crate) fn sort_rank(value: &OwnedValue) -> u8 {
 ///    the streaming identity path, which copies source text, does not — not of
 ///    the truncation here. Pinned by `number_previews_are_canonicalised` in
 ///    `tests/jq_containment_tests.rs`; fixing it means teaching `OwnedValue` to
-///    carry the literal, which is well beyond #358.
+///    carry the literal, which is well beyond #358. Tracked as #387.
 fn value_preview(value: &OwnedValue) -> String {
     /// `sizeof buf - 1` in jq: the longest dump reproduced verbatim.
     const MAX: usize = 14;

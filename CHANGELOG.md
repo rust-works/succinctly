@@ -69,7 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backslash-u escape where jq emits the two raw UTF-8 bytes. Previews now go
   through the streaming JSON writer, which already matched jq here. `tojson` and
   `@json` still over-escape — the same `to_json` path, but a wider behaviour
-  change than #358 should make.
+  change than #358 should make, so it is tracked separately as #385.
 - **jq `contains`/`inside` answered `false` for operands that cannot be
   compared** (#358): `1 | contains("a")` and `1 | inside([1])` returned `false`
   where jq raises
@@ -98,7 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   canonicalised rather than as its source literal — jq's `number (1E+100)` is
   our `number (10000000000...)` — because `OwnedValue` does not carry the
   literal, a limitation `1e100 | tostring` already shows and the streaming
-  identity path does not share.
+  identity path does not share (#387).
 - **jq `//`, `and` and `or` collapsed multi-output operands** (#160): all three
   are generators over their operands' *streams*, but each inspected only the
   first output. `//` decided truthiness from `vs.first()` and then returned the
