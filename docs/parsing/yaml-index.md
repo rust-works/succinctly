@@ -89,7 +89,7 @@ Key lesson: micro-benchmark wins frequently don't translate to end-to-end gains.
 ## Validation
 
 `YamlIndex` performs minimal validation during indexing (structural recognition only) and
-accepts many malformed documents — `YamlIndex::build` rejects 11 of the YAML Test Suite's
+accepts many malformed documents — `YamlIndex::build` rejects 12 of the YAML Test Suite's
 94 invalid inputs. When strict validation is needed, an opt-in pass
 ([`src/yaml/validate.rs`](../../src/yaml/validate.rs), `succinctly yaml validate` /
 `syq --validate`) mirrors `json validate`: a separate pass before indexing that rejects

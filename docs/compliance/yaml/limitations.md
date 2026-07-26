@@ -32,8 +32,8 @@ path:
 
 The **Reject** figure is what the conformance harness rejects with the opt-in
 validator enabled (loader OR validator, see below). The *default non-validating
-loader alone* still rejects only 11/94 (11.7%) by design — the opt-in validator
-([#223](https://github.com/rust-works/succinctly/issues/223)) closes 59 more.
+loader alone* still rejects only 12/94 (12.8%) by design — the opt-in validator
+([#223](https://github.com/rust-works/succinctly/issues/223)) closes 58 more.
 
 The 90 non-passing cases are enumerated individually, with a category and reason, in
 [`tests/data/yaml-test-suite-known-failures.txt`](../../../tests/data/yaml-test-suite-known-failures.txt).
@@ -42,8 +42,8 @@ exactly, so it cannot silently drift from this page.
 
 ## Validation: default loader vs. the opt-in validator
 
-**The default loader is non-validating by design.** `YamlIndex::build` rejects 11 of the
-suite's 94 invalid documents; the other 83 are accepted and produce a value.
+**The default loader is non-validating by design.** `YamlIndex::build` rejects 12 of the
+suite's 94 invalid documents; the other 82 are accepted and produce a value.
 
 This follows from semi-indexing. The index records *structure* — where values start and
 end, and how they nest — not grammar conformance. The parser is a structure recognizer:
@@ -55,25 +55,25 @@ it is 5-10x faster than `yq`.
 **When you need malformed YAML rejected, use the opt-in validator.**
 [`succinctly yaml validate`](../../guides/cli.md) / `syq --validate` runs a separate strict
 pass ([`src/yaml/validate.rs`](../../../src/yaml/validate.rs)) before indexing — mirroring
-`json validate` / `sjq --validate`, so the default path pays nothing. It rejects **59 of
-the 83** documents below with zero false positives on the valid corpus (a guardrail test,
+`json validate` / `sjq --validate`, so the default path pays nothing. It rejects **58 of
+the 82** documents below with zero false positives on the valid corpus (a guardrail test,
 `validator_accepts_all_valid_cases`, enforces that). The conformance harness treats a
 must-fail case as handled if the loader *or* the validator rejects it, which is why the
-Reject figure above is 70/94 rather than 11/94.
+Reject figure above is 70/94 rather than 12/94.
 
 The 24 documents the validator does not yet reject (marked `lax:*` in the manifest) need
 deeper structural analysis — cross-line anchor binding, block-scalar content indentation,
 flow multi-line implicit keys — and are tracked in
 [#223](https://github.com/rust-works/succinctly/issues/223).
 
-The 83 accepted-but-invalid documents (of which the validator now rejects 59) break down as:
+The 82 accepted-but-invalid documents (of which the validator now rejects 58) break down as:
 
 | Category           | Cases | What is not checked                          |
 |--------------------|-------|----------------------------------------------|
 | `lax:mapping`      | 14    | Mapping and implicit-key rules               |
 | `lax:documents`    | 12    | Directive and document-marker placement      |
 | `lax:flow`         | 11    | Flow collection syntax                       |
-| `lax:tabs`         | 9     | Tabs where indentation is expected           |
+| `lax:tabs`         | 8     | Tabs where indentation is expected           |
 | `lax:indentation`  | 7     | Indentation consistency                      |
 | `lax:other`        | 7     | Assorted                                     |
 | `lax:quoting`      | 6     | Quoting and escape sequences                 |
@@ -84,8 +84,8 @@ The 83 accepted-but-invalid documents (of which the validator now rejects 59) br
 The opt-in validation mode now exists ([#223](https://github.com/rust-works/succinctly/issues/223)),
 mirroring the JSON side's `succinctly json validate` / `sjq --validate`. Validation is a
 separate pass run before indexing, so the default path pays nothing for it — see
-[`src/yaml/validate.rs`](../../../src/yaml/validate.rs). The 83 cases above were its
-acceptance criteria; it rejects 59 of them today (each `lax:*` line removed from the
+[`src/yaml/validate.rs`](../../../src/yaml/validate.rs). The 82 cases above were its
+acceptance criteria; it rejects 58 of them today (each `lax:*` line removed from the
 manifest is a case now rejected), with the 24 harder cases still tracked in #223.
 
 ### What "accepted" means: the text is kept, not dropped
