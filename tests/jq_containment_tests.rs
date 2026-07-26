@@ -38,15 +38,15 @@
 //! every case through both is what proves the CLI path errors too — see
 //! `tests/jq_evaluator_parity_tests.rs` for the general form of this drift risk.
 //!
-//! # Merging with #356
+//! # Merged with #356
 //!
-//! #358 says to verify the fix by deleting `contains_number_string` and
-//! `inside_array_number` from `tests/data/jq-error-known-divergences.txt`. That
-//! manifest does not exist yet — it arrives with #356, which also introduces
-//! `src/jq/error.rs` carrying its own `containment_check` and a `dump_truncated`
-//! equivalent to `value_preview` here. Whichever of the two lands second owes
-//! the merge: drop those two manifest lines, and keep one copy of the message
-//! builder and the truncation rather than two that can drift apart.
+//! #356 landed second and paid the merge: `EvalError::containment_check` and the
+//! truncation now exist once, in `src/jq/error.rs`, where `dump_truncated` is
+//! the streaming preview this file's C1 case pins. The kind helpers
+//! (`jq_kind`/`sort_rank`) stay in `src/jq/eval.rs` — they classify values
+//! rather than word messages. `tests/data/jq-error-known-divergences.txt` does
+//! not list the containment rows, because #358 fixed them before that manifest
+//! arrived.
 
 use succinctly::jq::{eval, eval_generic, parse, JqSemantics, OwnedValue, QueryResult};
 use succinctly::json::JsonIndex;
@@ -181,7 +181,7 @@ const CASES: &[(&[u8], &str, Expect)] = &[
     // A C1 control (U+0085, the two bytes C2 85) is passed through raw, as jq
     // does. `OwnedValue::to_json` would escape it — it escapes every
     // `char::is_control()`, which covers C1 — so this case is what pins
-    // `value_preview` to the streaming writer instead. See its doc comment; the
+    // `dump_truncated` to the streaming writer instead. See its doc comment; the
     // over-escaping still affects `tojson`/`@json` (#385), out of scope for #358.
     (
         "\"a\u{85}b\"".as_bytes(),
@@ -303,7 +303,7 @@ fn optional_suppresses_the_error() {
 ///
 /// The expectations are succinctly's *current* output with jq's beside them.
 /// If a future change makes these match jq, delete the test rather than invert
-/// it — and check `value_preview`'s doc comment in `src/jq/eval.rs`.
+/// it — and check `dump_truncated`'s doc comment in `src/jq/error.rs`.
 #[test]
 fn number_previews_are_canonicalised() {
     // jq: number (1E+100) and string ("a") cannot have their containment checked

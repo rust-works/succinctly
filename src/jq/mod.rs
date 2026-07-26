@@ -69,6 +69,7 @@
 //! ```
 
 pub mod document;
+mod error;
 mod eval;
 pub mod eval_generic;
 mod expr;
@@ -77,9 +78,9 @@ mod parser;
 pub mod stream;
 mod value;
 
+pub use error::{BinOp, EvalError};
 pub use eval::{
-    eval, eval_lenient, substitute_vars, EvalError, EvalSemantics, JqSemantics, QueryResult,
-    YqSemantics,
+    eval, eval_lenient, substitute_vars, EvalSemantics, JqSemantics, QueryResult, YqSemantics,
 };
 pub use expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal, MetaValue,

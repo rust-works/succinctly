@@ -15,8 +15,6 @@ use alloc::vec::Vec;
 
 use indexmap::IndexMap;
 
-use super::stream::StreamableValue;
-
 /// Trait for evaluation semantics - determines behavior for edge cases.
 ///
 /// jq and yq (mikefarah/yq) have different behaviors for some operations.
@@ -143,104 +141,13 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
     }
 }
 
-/// Error that occurs during evaluation.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EvalError {
-    pub message: String,
-
-    /// The raw payload of `error(v)`, kept so that `catch` can inspect a
-    /// non-string value: jq binds the *raised value* as the catch handler's
-    /// input, so `try error({a:1}) catch .` must yield `{"a":1}` rather than
-    /// the rendered string `"{\"a\":1}"`.
-    ///
-    /// `None` for errors raised internally by the evaluator (type errors and
-    /// friends). jq models those as string errors, so [`EvalError::payload`]
-    /// falls back to `message` wrapped in [`OwnedValue::String`].
-    pub value: Option<OwnedValue>,
-}
-
-impl EvalError {
-    /// Create a new evaluation error with a message.
-    ///
-    /// The error carries no structured payload, so `catch` sees the message as
-    /// a string. Use [`EvalError::from_value`] for `error(v)`, where jq
-    /// preserves `v` verbatim.
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            value: None,
-        }
-    }
-
-    /// Create an error that raises `value` as its payload, as `error(v)` does.
-    ///
-    /// The message renders `value` the way jq reports it: a string payload is
-    /// used as-is (`error("boom")` reports `boom`, not `"boom"`), anything else
-    /// is serialized as JSON.
-    pub fn from_value(value: OwnedValue) -> Self {
-        let message = match &value {
-            OwnedValue::String(s) => s.clone(),
-            other => other.to_json(),
-        };
-        Self {
-            message,
-            value: Some(value),
-        }
-    }
-
-    /// The value this error raises, as `catch` should see it.
-    ///
-    /// Errors from `error(v)` return `v` unchanged; internal errors return
-    /// their message as a string, matching how jq raises them.
-    pub fn payload(self) -> OwnedValue {
-        self.value.unwrap_or(OwnedValue::String(self.message))
-    }
-
-    /// Create a type error.
-    pub fn type_error(expected: &str, got: &str) -> Self {
-        Self::new(format!("expected {expected}, got {got}"))
-    }
-
-    /// Create a field not found error.
-    pub fn field_not_found(name: &str) -> Self {
-        Self::new(format!("field '{name}' not found"))
-    }
-
-    /// Create an index out of bounds error.
-    pub fn index_out_of_bounds(index: i64, len: usize) -> Self {
-        Self::new(format!("index {index} out of bounds (length {len})"))
-    }
-
-    /// Create the error `contains`/`inside` raise for operands whose kinds
-    /// cannot be compared, e.g. `1 | contains("a")` (#358). The callers decide
-    /// *when* to raise it, by comparing `jq_kind` — not `type_name`, which is
-    /// a coarser partition; see that function.
-    ///
-    /// `left` is the container, `right` the value looked for, so `inside` — which
-    /// is `contains` with the operands swapped — passes its *argument* first,
-    /// matching jq's `array ([1]) and number (1) …` for `1 | inside([1])`.
-    ///
-    /// # Merge note (#356 / PR #364)
-    ///
-    /// That branch adds `src/jq/error.rs` carrying its own
-    /// `EvalError::containment_check` and a `dump_truncated` equivalent to
-    /// `value_preview`. Two `impl EvalError` blocks defining this name is a
-    /// duplicate-definition *compile* error, not a textual conflict git will
-    /// flag, so whichever of the two lands second owes the merge: keep one copy
-    /// of both helpers, and clear the `contains_number_string` /
-    /// `inside_array_number` entries from
-    /// `tests/data/jq-error-known-divergences.txt` and
-    /// `docs/compliance/jq/limitations.md`, which #358 makes stale.
-    pub fn containment_check(left: &OwnedValue, right: &OwnedValue) -> Self {
-        Self::new(format!(
-            "{} ({}) and {} ({}) cannot have their containment checked",
-            left.type_name(),
-            value_preview(left),
-            right.type_name(),
-            value_preview(right),
-        ))
-    }
-}
+// `EvalError` and the jq-compatible wording of its messages live in
+// `super::error` (#356), so both evaluators construct errors from one
+// vocabulary instead of inlining format strings at each raise site.
+//
+// The kind helpers below stay here: they are about values, not messages,
+// and `super::error` renders whatever it is handed.
+pub use super::error::{BinOp, EvalError};
 
 // jq's `jv_kind` discriminants, verbatim from `jv.h`, so the two enums can be
 // read side by side. `JV_KIND_INVALID` (0) has no `OwnedValue` counterpart — an
@@ -298,125 +205,6 @@ pub(crate) fn sort_rank(value: &OwnedValue) -> u8 {
     // Shift off the unused `JV_KIND_INVALID` slot, then close the gap that
     // merging `false` and `true` into one rank leaves behind.
     kind - 1 - u8::from(kind >= JQ_KIND_TRUE)
-}
-
-/// Render `value` the way jq embeds a value in an error message: its compact
-/// JSON dump, truncated so a huge operand cannot produce a huge message.
-///
-/// jq does this with `jv_dump_string_trunc(v, buf, sizeof buf)` over a
-/// `char buf[15]`: dumps up to 14 bytes and, when the dump was longer,
-/// overwrites the last three with `...`. So a 14-byte dump survives whole and a
-/// 15-byte one becomes 11 bytes plus `...`.
-///
-/// Unlike jq — which builds the entire dump with `jv_dump_string` and then
-/// discards all but 14 bytes of it — this streams into a [`PreviewSink`] and
-/// stops as soon as the answer is settled, so previewing a mismatched 100 MB
-/// operand copies 14 bytes rather than the whole document.
-///
-/// It streams via [`StreamableValue::stream_json`] rather than
-/// `OwnedValue::to_json` for a second reason: that is the writer whose escaping
-/// matches jq. `to_json` escapes every `char::is_control()`, which includes the
-/// C1 range, so it renders `U+0085` as a six-character backslash-u escape where
-/// jq emits the two raw UTF-8 bytes. (`tojson` and `@json` still go through
-/// `to_json` and still over-escape — a pre-existing divergence wider than #358,
-/// so it is left alone here and tracked as #385.)
-///
-/// Two deviations remain, both about what gets dumped rather than where it is cut:
-///
-/// 1. jq's `strncpy` can cut a multi-byte UTF-8 sequence in half and emit the
-///    broken bytes. A Rust `String` cannot hold those, so we cut at the nearest
-///    `char` boundary at or below the limit — the preview is then up to three
-///    bytes shorter than jq's for such values.
-/// 2. `OwnedValue` does not preserve a number's source literal, so a number
-///    reads back canonicalised: jq previews `1e100` as `1E+100` and `1.0` as
-///    `1.0`, where we give `10000000000...` and `1`. This is a property of
-///    materialising into `OwnedValue` — `1e100 | tostring` already differs, and
-///    the streaming identity path, which copies source text, does not — not of
-///    the truncation here. Pinned by `number_previews_are_canonicalised` in
-///    `tests/jq_containment_tests.rs`; fixing it means teaching `OwnedValue` to
-///    carry the literal, which is well beyond #358. Tracked as #387.
-fn value_preview(value: &OwnedValue) -> String {
-    /// `sizeof buf - 1` in jq: the longest dump reproduced verbatim.
-    const MAX: usize = 14;
-    /// What is left of the budget once `...` has claimed three bytes.
-    const KEEP: usize = MAX - 3;
-
-    let mut sink = PreviewSink::new(MAX);
-    // The sink stops the writer once the dump is known to exceed `MAX`; writing
-    // into a `String` cannot fail for any other reason, so the returned `Result`
-    // carries nothing `sink.overflowed` has not already recorded.
-    let _ = value.stream_json(&mut sink);
-    if !sink.overflowed {
-        return sink.buf;
-    }
-    sink.truncate_to(KEEP);
-    sink.buf.push_str("...");
-    sink.buf
-}
-
-/// A [`core::fmt::Write`] sink that keeps the first `cap` bytes written to it and
-/// then stops the writer, so [`value_preview`] costs a constant amount of work
-/// however large the offending value is.
-///
-/// Two details carry the bound and the safety:
-///
-/// * It clamps the copy even within a *single* oversized `write_str`. A long
-///   JSON string arrives from the streaming writer as one span, so clamping the
-///   copy — not just refusing later writes — is what actually bounds the work.
-/// * `buf` stays valid UTF-8: an oversized span is cut back to a `char`
-///   boundary. jq's `strncpy` emits the split bytes instead, which is the one
-///   place the preview is allowed to come out shorter than jq's.
-struct PreviewSink {
-    /// The retained prefix; never longer than `cap`, always valid UTF-8.
-    buf: String,
-    /// Byte budget for `buf`.
-    cap: usize,
-    /// Whether anything was dropped — i.e. the dump was longer than `cap`.
-    overflowed: bool,
-}
-
-impl PreviewSink {
-    fn new(cap: usize) -> Self {
-        Self {
-            buf: String::with_capacity(cap),
-            cap,
-            overflowed: false,
-        }
-    }
-
-    /// Cut `buf` back to at most `len` bytes, on a `char` boundary.
-    fn truncate_to(&mut self, len: usize) {
-        let mut cut = len.min(self.buf.len());
-        while cut > 0 && !self.buf.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        self.buf.truncate(cut);
-    }
-}
-
-impl core::fmt::Write for PreviewSink {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let room = self.cap - self.buf.len();
-        if s.len() <= room {
-            self.buf.push_str(s);
-            return Ok(());
-        }
-        // More arrived than fits: take what we can, on a boundary, and stop the
-        // traversal — nothing further can change the preview.
-        let mut cut = room;
-        while cut > 0 && !s.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        self.buf.push_str(&s[..cut]);
-        self.overflowed = true;
-        Err(core::fmt::Error)
-    }
-}
-
-impl core::fmt::Display for EvalError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.message)
-    }
 }
 
 /// Get the type name of a JSON value for error messages.
@@ -533,7 +321,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // jq returns null for field access on null
             StandardJson::Null => QueryResult::One(StandardJson::Null),
             _ if optional => QueryResult::None,
-            _ => QueryResult::Error(EvalError::type_error("object", type_name(&value))),
+            _ => QueryResult::Error(EvalError::cannot_index_with_field(type_name(&value), name)),
         },
 
         Expr::Index(idx) => match value {
@@ -545,7 +333,10 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // jq returns null for index on null
             StandardJson::Null => QueryResult::One(StandardJson::Null),
             _ if optional => QueryResult::None,
-            _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+            _ => QueryResult::Error(EvalError::cannot_index_with_type(
+                type_name(&value),
+                "number",
+            )),
         },
 
         Expr::Slice { start, end } => match value {
@@ -621,7 +412,12 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::Owned(OwnedValue::String(sliced))
             }
             _ if optional => QueryResult::None,
-            _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+            // jq models `.[a:b]` as indexing with `{"start":a,"end":b}`, so a
+            // slice of a non-sliceable value reports an *object* key.
+            _ => QueryResult::Error(EvalError::cannot_index_with_type(
+                type_name(&value),
+                "object",
+            )),
         },
 
         Expr::Iterate => match value {
@@ -634,7 +430,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::Many(results)
             }
             _ if optional => QueryResult::None,
-            _ => QueryResult::Error(EvalError::type_error("array or object", type_name(&value))),
+            _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
         },
 
         Expr::Optional(inner) => eval_single::<W, S>(inner, value, true),
@@ -1140,11 +936,7 @@ fn arith_add<S: EvalSemantics>(
         }
         // null + x = x, x + null = x
         (OwnedValue::Null, other) | (other, OwnedValue::Null) => Ok(other),
-        (a, b) => Err(EvalError::new(format!(
-            "cannot add {} and {}",
-            a.type_name(),
-            b.type_name()
-        ))),
+        (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Add)),
     }
 }
 
@@ -1175,11 +967,7 @@ fn arith_sub<S: EvalSemantics>(
             let result: Vec<_> = a.into_iter().filter(|x| !b.contains(x)).collect();
             Ok(OwnedValue::Array(result))
         }
-        (a, b) => Err(EvalError::new(format!(
-            "cannot subtract {} from {}",
-            b.type_name(),
-            a.type_name()
-        ))),
+        (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Subtract)),
     }
 }
 
@@ -1221,11 +1009,7 @@ fn arith_mul<S: EvalSemantics>(
         }
         // null * x = null
         (OwnedValue::Null, _) | (_, OwnedValue::Null) => Ok(OwnedValue::Null),
-        (a, b) => Err(EvalError::new(format!(
-            "cannot multiply {} and {}",
-            a.type_name(),
-            b.type_name()
-        ))),
+        (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Multiply)),
     }
 }
 
@@ -1260,7 +1044,11 @@ fn arith_div<S: EvalSemantics>(
                     Ok(OwnedValue::Float(a as f64 / b as f64))
                 } else {
                     // jq behavior: error
-                    Err(EvalError::new("division by zero"))
+                    Err(EvalError::divisor_is_zero(
+                        &OwnedValue::Int(a),
+                        &OwnedValue::Int(b),
+                        BinOp::Divide,
+                    ))
                 }
             } else {
                 Ok(OwnedValue::Float(a as f64 / b as f64))
@@ -1268,21 +1056,33 @@ fn arith_div<S: EvalSemantics>(
         }
         (OwnedValue::Int(a), OwnedValue::Float(b)) => {
             if b == 0.0 && !S::DIV_BY_ZERO_IS_INFINITY {
-                Err(EvalError::new("division by zero"))
+                Err(EvalError::divisor_is_zero(
+                    &OwnedValue::Int(a),
+                    &OwnedValue::Float(b),
+                    BinOp::Divide,
+                ))
             } else {
                 Ok(OwnedValue::Float(a as f64 / b))
             }
         }
         (OwnedValue::Float(a), OwnedValue::Int(b)) => {
             if b == 0 && !S::DIV_BY_ZERO_IS_INFINITY {
-                Err(EvalError::new("division by zero"))
+                Err(EvalError::divisor_is_zero(
+                    &OwnedValue::Float(a),
+                    &OwnedValue::Int(b),
+                    BinOp::Divide,
+                ))
             } else {
                 Ok(OwnedValue::Float(a / b as f64))
             }
         }
         (OwnedValue::Float(a), OwnedValue::Float(b)) => {
             if b == 0.0 && !S::DIV_BY_ZERO_IS_INFINITY {
-                Err(EvalError::new("division by zero"))
+                Err(EvalError::divisor_is_zero(
+                    &OwnedValue::Float(a),
+                    &OwnedValue::Float(b),
+                    BinOp::Divide,
+                ))
             } else {
                 Ok(OwnedValue::Float(a / b))
             }
@@ -1295,11 +1095,7 @@ fn arith_div<S: EvalSemantics>(
                 .collect();
             Ok(OwnedValue::Array(parts))
         }
-        (a, b) => Err(EvalError::new(format!(
-            "cannot divide {} by {}",
-            a.type_name(),
-            b.type_name()
-        ))),
+        (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Divide)),
     }
 }
 
@@ -1316,20 +1112,26 @@ fn arith_mod<S: EvalSemantics>(
                     Ok(OwnedValue::Float(f64::NAN))
                 } else {
                     // jq behavior: error
-                    Err(EvalError::new("modulo by zero"))
+                    Err(EvalError::divisor_is_zero(
+                        &OwnedValue::Int(a),
+                        &OwnedValue::Int(b),
+                        BinOp::Modulo,
+                    ))
                 }
             } else {
                 Ok(OwnedValue::Int(a.wrapping_rem(b)))
             }
         }
-        (OwnedValue::Float(a), OwnedValue::Float(b)) => mod_floats::<S>(a, b),
-        (OwnedValue::Int(a), OwnedValue::Float(b)) => mod_floats::<S>(a as f64, b),
-        (OwnedValue::Float(a), OwnedValue::Int(b)) => mod_floats::<S>(a, b as f64),
-        (a, b) => Err(EvalError::new(format!(
-            "cannot compute modulo of {} and {}",
-            a.type_name(),
-            b.type_name()
-        ))),
+        (OwnedValue::Float(a), OwnedValue::Float(b)) => {
+            mod_floats::<S>(a, b, &OwnedValue::Float(a), &OwnedValue::Float(b))
+        }
+        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
+            mod_floats::<S>(a as f64, b, &OwnedValue::Int(a), &OwnedValue::Float(b))
+        }
+        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
+            mod_floats::<S>(a, b as f64, &OwnedValue::Float(a), &OwnedValue::Int(b))
+        }
+        (a, b) => Err(EvalError::binary_op(&a, &b, BinOp::Modulo)),
     }
 }
 
@@ -1338,7 +1140,12 @@ fn arith_mod<S: EvalSemantics>(
 /// jq truncates both operands to integers (`intmax_t`), so `10.5 % 3 == 1` and
 /// `5 % 0.5` errors because the divisor truncates to zero. yq performs float
 /// modulo, returning NaN for a zero divisor.
-fn mod_floats<S: EvalSemantics>(a: f64, b: f64) -> Result<OwnedValue, EvalError> {
+fn mod_floats<S: EvalSemantics>(
+    a: f64,
+    b: f64,
+    left: &OwnedValue,
+    right: &OwnedValue,
+) -> Result<OwnedValue, EvalError> {
     if S::MOD_TRUNCATES_FLOATS {
         if a.is_nan() || b.is_nan() {
             return Ok(OwnedValue::Float(f64::NAN));
@@ -1346,13 +1153,13 @@ fn mod_floats<S: EvalSemantics>(a: f64, b: f64) -> Result<OwnedValue, EvalError>
         // `as` truncates toward zero and saturates, matching jq's intmax_t cast.
         let (ai, bi) = (a as i64, b as i64);
         if bi == 0 {
-            Err(EvalError::new("modulo by zero"))
+            Err(EvalError::divisor_is_zero(left, right, BinOp::Modulo))
         } else {
             // wrapping_rem: i64::MIN % -1 must not panic.
             Ok(OwnedValue::Int(ai.wrapping_rem(bi)))
         }
     } else if b == 0.0 && !S::DIV_BY_ZERO_IS_INFINITY {
-        Err(EvalError::new("modulo by zero"))
+        Err(EvalError::divisor_is_zero(left, right, BinOp::Modulo))
     } else {
         Ok(OwnedValue::Float(a % b))
     }
@@ -2099,10 +1906,7 @@ fn builtin_length<W: Clone + AsRef<[u64]>>(
             }
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new(format!(
-            "{} has no length",
-            type_name(&value)
-        ))),
+        _ => QueryResult::Error(EvalError::has_no_length(&to_owned(&value))),
     }
 }
 
@@ -2120,7 +1924,7 @@ fn builtin_utf8bytelength<W: Clone + AsRef<[u64]>>(
             }
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => QueryResult::Error(EvalError::no_utf8_byte_length(&to_owned(&value))),
     }
 }
 
@@ -2153,7 +1957,7 @@ fn builtin_keys<W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(OwnedValue::Array(arr))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("object or array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::has_no_keys(&to_owned(&value))),
     }
 }
 
@@ -2202,8 +2006,9 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::Bool(in_bounds))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new(
-            "has() requires object+string or array+number",
+        _ => QueryResult::Error(EvalError::cannot_check_has(
+            type_name(&value),
+            key_owned.type_name(),
         )),
     }
 }
@@ -2262,8 +2067,9 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::Bool(in_bounds))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new(
-            "in() requires string/number key and object/array",
+        _ => QueryResult::Error(EvalError::cannot_check_has(
+            obj_owned.type_name(),
+            key_owned.type_name(),
         )),
     }
 }
@@ -2321,7 +2127,7 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::Array(results))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
@@ -2426,7 +2232,7 @@ fn builtin_add<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
@@ -2446,7 +2252,7 @@ fn builtin_any<W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(OwnedValue::Bool(false))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
@@ -2466,7 +2272,7 @@ fn builtin_all<W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(OwnedValue::Bool(true))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
@@ -2486,7 +2292,10 @@ fn builtin_min<W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(min)
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::pair_cannot_be_iterated(
+            &to_owned(&value),
+            &to_owned(&value),
+        )),
     }
 }
 
@@ -2506,7 +2315,10 @@ fn builtin_max<W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(max)
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::pair_cannot_be_iterated(
+            &to_owned(&value),
+            &to_owned(&value),
+        )),
     }
 }
 
@@ -2601,7 +2413,7 @@ fn builtin_ascii_downcase<W: Clone + AsRef<[u64]>>(
             }
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => QueryResult::Error(EvalError::new("explode input must be a string")),
     }
 }
 
@@ -2711,7 +2523,7 @@ fn builtin_startswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => QueryResult::Error(EvalError::new("startswith() requires string inputs")),
     }
 }
 
@@ -2776,7 +2588,7 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => QueryResult::Error(EvalError::new("split input and separator must be strings")),
     }
 }
 
@@ -2816,7 +2628,7 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::String(parts.join(&sep)))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
@@ -2909,7 +2721,10 @@ fn builtin_first<W: Clone + AsRef<[u64]>>(
         },
         // jq: null | first => null
         StandardJson::Null => QueryResult::Owned(OwnedValue::Null),
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_index_with_type(
+            type_name(&value),
+            "number",
+        )),
     }
 }
 
@@ -2930,7 +2745,10 @@ fn builtin_last<W: Clone + AsRef<[u64]>>(
         }
         // jq: null | last => null
         StandardJson::Null => QueryResult::Owned(OwnedValue::Null),
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_index_with_type(
+            type_name(&value),
+            "number",
+        )),
     }
 }
 
@@ -2986,7 +2804,10 @@ fn builtin_reverse<W: Clone + AsRef<[u64]>>(
         }
         // jq: null | reverse => []
         StandardJson::Null => QueryResult::Owned(OwnedValue::Array(Vec::new())),
-        _ => QueryResult::Error(EvalError::type_error("array or string", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_index_with_type(
+            type_name(&value),
+            "number",
+        )),
     }
 }
 
@@ -3003,7 +2824,7 @@ fn builtin_flatten<W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(OwnedValue::Array(flattened))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
@@ -3096,7 +2917,7 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::Array(groups))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
@@ -3118,7 +2939,7 @@ fn builtin_unique<W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(OwnedValue::Array(items))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
@@ -3170,7 +2991,7 @@ fn builtin_sort<W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(OwnedValue::Array(items))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_be_sorted(&to_owned(&value))),
     }
 }
 
@@ -3203,7 +3024,7 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::Array(result))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
@@ -3280,7 +3101,7 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(OwnedValue::Object(result))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
@@ -3359,7 +3180,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::Object(result))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("object", type_name(&value))),
+        _ => QueryResult::Error(EvalError::has_no_keys(&to_owned(&value))),
     }
 }
 
@@ -4001,15 +3822,10 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>>(
         }
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
-                let s = cow.as_ref().trim();
-                if let Ok(i) = s.parse::<i64>() {
-                    QueryResult::Owned(OwnedValue::Int(i))
-                } else if let Ok(f) = s.parse::<f64>() {
-                    QueryResult::Owned(OwnedValue::Float(f))
-                } else if optional {
-                    QueryResult::None
-                } else {
-                    QueryResult::Error(EvalError::new(format!("cannot parse '{s}' as number")))
+                match tonumber_from_str(cow.as_ref()) {
+                    Ok(n) => QueryResult::Owned(n),
+                    Err(_) if optional => QueryResult::None,
+                    Err(e) => QueryResult::Error(e),
                 }
             } else if optional {
                 QueryResult::None
@@ -4018,7 +3834,34 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>>(
             }
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("string or number", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_parse_as_number(&to_owned(&value))),
+    }
+}
+
+/// `tonumber` on a string, shared by both evaluators.
+///
+/// jq implements `tonumber` by handing the string to its JSON parser, which
+/// splits the failures in two: a string that parses as some *other* JSON value
+/// (`"null"`, `"true"`, `"[1]"`) is reported as the string it is, while one
+/// that does not parse at all gets the parser's own diagnostic. We reuse
+/// [`parse_json_string`] to tell the two apart.
+///
+/// Kept in one place because the two evaluators previously had *different*
+/// wording here — "cannot parse 'a' as number" against "cannot convert 'a' to
+/// number" — which is exactly the drift #356 is about.
+pub(super) fn tonumber_from_str(s: &str) -> Result<OwnedValue, EvalError> {
+    // jq's JSON parser skips surrounding whitespace, so `" 1 "` is 1.
+    let trimmed = s.trim();
+    if let Ok(i) = trimmed.parse::<i64>() {
+        Ok(OwnedValue::Int(i))
+    } else if let Ok(f) = trimmed.parse::<f64>() {
+        Ok(OwnedValue::Float(f))
+    } else if parse_complete_json(trimmed).is_ok() {
+        Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
+            s.to_string(),
+        )))
+    } else {
+        Err(EvalError::invalid_numeric_literal(s))
     }
 }
 
@@ -4151,7 +3994,7 @@ fn builtin_fromjson<W: Clone + AsRef<[u64]>>(
                 match parse_json_string(json_str) {
                     Ok(owned) => QueryResult::Owned(owned),
                     Err(_) if optional => QueryResult::None,
-                    Err(e) => QueryResult::Error(EvalError::new(format!("fromjson: {e}"))),
+                    Err(_) => QueryResult::Error(EvalError::invalid_numeric_literal(json_str)),
                 }
             } else if optional {
                 QueryResult::None
@@ -4160,8 +4003,27 @@ fn builtin_fromjson<W: Clone + AsRef<[u64]>>(
             }
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => QueryResult::Error(EvalError::only_strings_can_be_parsed(&to_owned(&value))),
     }
+}
+
+/// Parse a JSON string that must consume all of its input.
+///
+/// [`parse_json_string`] stops at the end of the first value, so `"0x10"`
+/// parses as `0` with `x10` left over. `tonumber` needs the stricter reading
+/// to tell "this is valid JSON but not a number" (`"null"`) from "this is not
+/// valid JSON at all" (`"0x10"`), which jq reports differently.
+fn parse_complete_json(s: &str) -> Result<OwnedValue, String> {
+    let bytes = s.as_bytes();
+    let mut pos = 0;
+    let value = parse_json_value(bytes, &mut pos)?;
+    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
+        pos += 1;
+    }
+    if pos != bytes.len() {
+        return Err("trailing content after JSON value".to_string());
+    }
+    Ok(value)
 }
 
 /// Parse a JSON string into an OwnedValue
@@ -4551,7 +4413,7 @@ fn builtin_explode<W: Clone + AsRef<[u64]>>(
             }
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => QueryResult::Error(EvalError::new("explode input must be a string")),
     }
 }
 
@@ -4581,7 +4443,7 @@ fn builtin_implode<W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(OwnedValue::String(result))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        _ => QueryResult::Error(EvalError::new("implode input must be an array")),
     }
 }
 
@@ -4612,7 +4474,7 @@ fn builtin_test<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     }
 }
 
@@ -4664,7 +4526,9 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::Array(indices))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("string or array", type_name(&value))),
+        // jq's `indices` indexes its input, so a non-indexable one reports
+        // the indexing error for the pattern it was handed.
+        _ => QueryResult::Error(EvalError::cannot_index(type_name(&value), &pattern)),
     }
 }
 
@@ -4823,7 +4687,7 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let path = match result_to_owned(eval_single::<W, S>(path_expr, value.clone(), optional)) {
         Ok(OwnedValue::Array(arr)) => arr,
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("array", "path")),
+        Ok(_) => return QueryResult::Error(EvalError::new("Path must be specified as an array")),
         Err(e) => return QueryResult::Error(e),
     };
 
@@ -4848,11 +4712,7 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             _ if optional => return QueryResult::None,
             _ => {
-                return QueryResult::Error(EvalError::new(format!(
-                    "cannot index {} with {}",
-                    current.type_name(),
-                    segment.type_name()
-                )));
+                return QueryResult::Error(EvalError::cannot_index(current.type_name(), &segment));
             }
         }
     }
@@ -4915,7 +4775,7 @@ fn builtin_test_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
     // Build regex and test for a match
@@ -5294,7 +5154,7 @@ fn builtin_test_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
     // Build regex with flags
@@ -6170,7 +6030,10 @@ fn set_path(
                 map.insert(name.clone(), new_value);
                 Ok(())
             } else {
-                Err(EvalError::type_error("object", owned_type_name(root)))
+                Err(EvalError::cannot_index_with_field(
+                    owned_type_name(root),
+                    name,
+                ))
             }
         }
         Expr::Index(idx) => {
@@ -6184,7 +6047,10 @@ fn set_path(
                     Err(EvalError::index_out_of_bounds(*idx, arr.len()))
                 }
             } else {
-                Err(EvalError::type_error("array", owned_type_name(root)))
+                Err(EvalError::cannot_index_with_type(
+                    owned_type_name(root),
+                    "number",
+                ))
             }
         }
         Expr::Pipe(exprs) if !exprs.is_empty() => {
@@ -6207,6 +6073,21 @@ fn set_path(
                 Err(_) => Ok(()), // Silently succeed for optional
             }
         }
+        Expr::Iterate => match root {
+            OwnedValue::Array(arr) => {
+                for elem in arr.iter_mut() {
+                    *elem = new_value.clone();
+                }
+                Ok(())
+            }
+            OwnedValue::Object(map) => {
+                for (_, elem) in map.iter_mut() {
+                    *elem = new_value.clone();
+                }
+                Ok(())
+            }
+            _ => Err(EvalError::cannot_iterate(root)),
+        },
         _ => Err(EvalError::new(
             "cannot use expression as assignment target".to_string(),
         )),
@@ -6227,7 +6108,10 @@ fn get_path_mut<'a>(
                 if let OwnedValue::Object(map) = current {
                     map.entry(name.clone()).or_insert(OwnedValue::Null)
                 } else {
-                    return Err(EvalError::type_error("object", owned_type_name(current)));
+                    return Err(EvalError::cannot_index_with_field(
+                        owned_type_name(current),
+                        name,
+                    ));
                 }
             }
             Expr::Index(idx) => {
@@ -6240,7 +6124,10 @@ fn get_path_mut<'a>(
                         return Err(EvalError::index_out_of_bounds(*idx, arr.len()));
                     }
                 } else {
-                    return Err(EvalError::type_error("array", owned_type_name(current)));
+                    return Err(EvalError::cannot_index_with_type(
+                        owned_type_name(current),
+                        "number",
+                    ));
                 }
             }
             _ => return Err(EvalError::new("invalid path component")),
@@ -6276,7 +6163,10 @@ fn update_path<S: EvalSemantics>(
             } else if optional {
                 Ok(())
             } else {
-                Err(EvalError::type_error("object", owned_type_name(root)))
+                Err(EvalError::cannot_index_with_field(
+                    owned_type_name(root),
+                    name,
+                ))
             }
         }
         Expr::Index(idx) => {
@@ -6298,7 +6188,10 @@ fn update_path<S: EvalSemantics>(
             } else if optional {
                 Ok(())
             } else {
-                Err(EvalError::type_error("array", owned_type_name(root)))
+                Err(EvalError::cannot_index_with_type(
+                    owned_type_name(root),
+                    "number",
+                ))
             }
         }
         Expr::Iterate => {
@@ -6317,10 +6210,7 @@ fn update_path<S: EvalSemantics>(
                     Ok(())
                 }
                 _ if optional => Ok(()),
-                _ => Err(EvalError::type_error(
-                    "array or object",
-                    owned_type_name(root),
-                )),
+                _ => Err(EvalError::cannot_iterate(root)),
             }
         }
         Expr::Pipe(exprs) if !exprs.is_empty() => {
@@ -6340,7 +6230,10 @@ fn update_path<S: EvalSemantics>(
                         } else if optional {
                             Ok(())
                         } else {
-                            Err(EvalError::type_error("object", owned_type_name(root)))
+                            Err(EvalError::cannot_index_with_field(
+                                owned_type_name(root),
+                                name,
+                            ))
                         }
                     }
                     Expr::Index(idx) => {
@@ -6362,7 +6255,10 @@ fn update_path<S: EvalSemantics>(
                         } else if optional {
                             Ok(())
                         } else {
-                            Err(EvalError::type_error("array", owned_type_name(root)))
+                            Err(EvalError::cannot_index_with_type(
+                                owned_type_name(root),
+                                "number",
+                            ))
                         }
                     }
                     Expr::Iterate => match root {
@@ -6379,10 +6275,7 @@ fn update_path<S: EvalSemantics>(
                             Ok(())
                         }
                         _ if optional => Ok(()),
-                        _ => Err(EvalError::type_error(
-                            "array or object",
-                            owned_type_name(root),
-                        )),
+                        _ => Err(EvalError::cannot_iterate(root)),
                     },
                     _ => update_path::<S>(root, first, filter_expr, optional),
                 }
@@ -7666,10 +7559,10 @@ fn range_arg<W: Clone + AsRef<[u64]>>(result: QueryResult<'_, W>) -> Result<Rang
         QueryResult::One(v) => match to_owned(&v) {
             OwnedValue::Int(i) => Ok(RangeNum::Int(i)),
             OwnedValue::Float(f) => Ok(RangeNum::Float(f)),
-            _ => Err(EvalError::new("range requires numbers")),
+            _ => Err(EvalError::new("Range bounds must be numeric")),
         },
         QueryResult::Error(e) => Err(e),
-        _ => Err(EvalError::new("range requires numbers")),
+        _ => Err(EvalError::new("Range bounds must be numeric")),
     }
 }
 
@@ -8112,7 +8005,10 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             if optional {
                 QueryResult::None
             } else {
-                QueryResult::Error(EvalError::type_error("object", owned_type_name(value)))
+                QueryResult::Error(EvalError::cannot_index_with_field(
+                    owned_type_name(value),
+                    name,
+                ))
             }
         }
         Expr::Index(idx) => {
@@ -8136,14 +8032,14 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             }
             if optional {
                 QueryResult::None
+            } else if let OwnedValue::Array(arr) = value {
+                QueryResult::Error(EvalError::index_out_of_bounds(*idx, arr.len()))
             } else {
-                QueryResult::Error(EvalError::index_out_of_bounds(
-                    *idx,
-                    if let OwnedValue::Array(arr) = value {
-                        arr.len()
-                    } else {
-                        0
-                    },
+                // Indexing a non-array is not an out-of-bounds access; jq
+                // reports it as an indexing type error like `.[0]` does.
+                QueryResult::Error(EvalError::cannot_index_with_type(
+                    owned_type_name(value),
+                    "number",
                 ))
             }
         }
@@ -8190,12 +8086,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     }
                 }
                 _ if optional => return QueryResult::None,
-                _ => {
-                    return QueryResult::Error(EvalError::type_error(
-                        "array or object",
-                        owned_type_name(value),
-                    ))
-                }
+                _ => return QueryResult::Error(EvalError::cannot_iterate(value)),
             }
             if results.is_empty() {
                 QueryResult::None
@@ -8940,7 +8831,10 @@ fn delete_at_path(
             } else if optional {
                 Ok(())
             } else {
-                Err(EvalError::type_error("object", owned_type_name(root)))
+                Err(EvalError::cannot_index_with_field(
+                    owned_type_name(root),
+                    name,
+                ))
             }
         }
         Expr::Index(idx) => {
@@ -8958,7 +8852,10 @@ fn delete_at_path(
             } else if optional {
                 Ok(())
             } else {
-                Err(EvalError::type_error("array", owned_type_name(root)))
+                Err(EvalError::cannot_index_with_type(
+                    owned_type_name(root),
+                    "number",
+                ))
             }
         }
         Expr::Iterate => {
@@ -8973,10 +8870,7 @@ fn delete_at_path(
                     Ok(())
                 }
                 _ if optional => Ok(()),
-                _ => Err(EvalError::type_error(
-                    "array or object",
-                    owned_type_name(root),
-                )),
+                _ => Err(EvalError::cannot_iterate(root)),
             }
         }
         Expr::Pipe(exprs) if !exprs.is_empty() => {
@@ -9000,7 +8894,10 @@ fn delete_at_path(
                         } else if optional {
                             Ok(())
                         } else {
-                            Err(EvalError::type_error("object", owned_type_name(root)))
+                            Err(EvalError::cannot_index_with_field(
+                                owned_type_name(root),
+                                name,
+                            ))
                         }
                     }
                     Expr::Index(idx) => {
@@ -9017,7 +8914,10 @@ fn delete_at_path(
                         } else if optional {
                             Ok(())
                         } else {
-                            Err(EvalError::type_error("array", owned_type_name(root)))
+                            Err(EvalError::cannot_index_with_type(
+                                owned_type_name(root),
+                                "number",
+                            ))
                         }
                     }
                     Expr::Iterate => match root {
@@ -9034,10 +8934,7 @@ fn delete_at_path(
                             Ok(())
                         }
                         _ if optional => Ok(()),
-                        _ => Err(EvalError::type_error(
-                            "array or object",
-                            owned_type_name(root),
-                        )),
+                        _ => Err(EvalError::cannot_iterate(root)),
                     },
                     _ => delete_at_path(root, first, optional),
                 }
@@ -12452,12 +12349,20 @@ fn extract_pattern_bindings(
     match pattern {
         Pattern::Var(name) => Ok(vec![(name.clone(), value.clone())]),
         Pattern::Object(entries) => {
-            let obj = match value {
-                OwnedValue::Object(o) => o,
-                _ => return Err(EvalError::type_error("object", owned_type_name(value))),
-            };
             let mut bindings = Vec::new();
             for entry in entries {
+                // jq destructures by indexing once per key, so a non-object
+                // reports exactly what `.<key>` would — and a pattern with no
+                // keys never indexes, so it cannot fail.
+                let obj = match value {
+                    OwnedValue::Object(o) => o,
+                    _ => {
+                        return Err(EvalError::cannot_index_with_field(
+                            owned_type_name(value),
+                            &entry.key,
+                        ))
+                    }
+                };
                 let field_value = obj.get(&entry.key).cloned().unwrap_or(OwnedValue::Null);
                 let sub_bindings = extract_pattern_bindings(&entry.pattern, &field_value)?;
                 bindings.extend(sub_bindings);
@@ -12465,12 +12370,19 @@ fn extract_pattern_bindings(
             Ok(bindings)
         }
         Pattern::Array(patterns) => {
-            let arr = match value {
-                OwnedValue::Array(a) => a,
-                _ => return Err(EvalError::type_error("array", owned_type_name(value))),
-            };
             let mut bindings = Vec::new();
             for (i, pat) in patterns.iter().enumerate() {
+                // As above: one index per element position, so the error is
+                // the one `.[i]` would raise.
+                let arr = match value {
+                    OwnedValue::Array(a) => a,
+                    _ => {
+                        return Err(EvalError::cannot_index_with_type(
+                            owned_type_name(value),
+                            "number",
+                        ))
+                    }
+                };
                 let elem_value = arr.get(i).cloned().unwrap_or(OwnedValue::Null);
                 let sub_bindings = extract_pattern_bindings(pat, &elem_value)?;
                 bindings.extend(sub_bindings);
@@ -13795,7 +13707,7 @@ mod tests {
         // Accessing .field on non-object is an error (unlike missing field on object)
         query!(br"123", ".field",
             QueryResult::Error(e) => {
-                assert!(e.message.contains("expected object"));
+                assert_eq!(e.message, "Cannot index number with string \"field\"");
             }
         );
 
@@ -15320,42 +15232,6 @@ mod tests {
         // < object, with the two booleans sharing the `boolean` slot.
         let ranks: Vec<u8> = values.iter().map(sort_rank).collect();
         assert_eq!(ranks, vec![0, 1, 1, 2, 2, 3, 4, 5]);
-    }
-
-    /// The preview must cost a bounded amount of work, not a copy of the value.
-    ///
-    /// [`value_preview`] is the reason: jq builds the whole dump and throws all
-    /// but 14 bytes away, which for succinctly would mean serialising a 100 MB
-    /// operand to produce a 14-byte message. The sink is what prevents that, so
-    /// pin the sink directly — a `value_preview` result is short either way and
-    /// would not catch a regression here.
-    #[test]
-    fn preview_sink_copies_at_most_its_cap() {
-        use core::fmt::Write;
-
-        // A single oversized `write_str` is the case that matters: the streaming
-        // writer hands a long JSON string over as one span.
-        let mut sink = PreviewSink::new(14);
-        let huge = "x".repeat(1_000_000);
-        assert!(sink.write_str(&huge).is_err(), "should stop the writer");
-        assert!(sink.overflowed);
-        assert_eq!(sink.buf.len(), 14, "must not copy beyond the cap");
-
-        // An exactly-fitting dump completes without reporting overflow, which is
-        // what lets a 14-byte dump through verbatim.
-        let mut sink = PreviewSink::new(14);
-        assert!(sink.write_str("12345678901234").is_ok());
-        assert!(!sink.overflowed);
-        assert_eq!(sink.buf, "12345678901234");
-        // One more byte tips it over.
-        assert!(sink.write_str("5").is_err());
-        assert!(sink.overflowed);
-
-        // Multi-byte characters are cut back to a boundary, never split.
-        let mut sink = PreviewSink::new(14);
-        let _ = sink.write_str(&"あ".repeat(20)); // 3 bytes each: 12 < 14 < 15
-        assert_eq!(sink.buf, "ああああ", "cut back to a char boundary");
-        assert!(sink.buf.len() <= 14);
     }
 
     /// jq errors when the two operands' kinds cannot be compared, rather than

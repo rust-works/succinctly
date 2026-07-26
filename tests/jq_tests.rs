@@ -126,7 +126,7 @@ fn test_field_missing_returns_null() {
 fn test_field_on_non_object_error() {
     query!(br"[1, 2, 3]", ".foo",
         QueryResult::Error(e) => {
-            assert!(e.message.contains("object"), "expected type error");
+            assert_eq!(e.message, "Cannot index array with string \"foo\"");
         }
     );
 }
@@ -217,7 +217,7 @@ fn test_index_on_null_negative_returns_null() {
 fn test_index_on_non_array_error() {
     query!(br#"{"a": 1}"#, ".[0]",
         QueryResult::Error(e) => {
-            assert!(e.message.contains("array"));
+            assert_eq!(e.message, "Cannot index object with number");
         }
     );
 }
@@ -270,7 +270,7 @@ fn test_iterate_empty_object() {
 fn test_iterate_on_scalar_error() {
     query!(b"42", ".[]",
         QueryResult::Error(e) => {
-            assert!(e.message.contains("array or object"));
+            assert_eq!(e.message, "Cannot iterate over number (42)");
         }
     );
 }

@@ -17,7 +17,8 @@ use indexmap::IndexMap;
 
 use super::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
 use super::eval::{
-    eval as full_eval, sort_rank, EvalError, EvalSemantics, JqSemantics, QueryResult,
+    eval as full_eval, sort_rank, tonumber_from_str, EvalError, EvalSemantics, JqSemantics,
+    QueryResult,
 };
 use super::expr::{Builtin, CompareOp, Expr, Literal};
 use super::value::OwnedValue;
@@ -500,10 +501,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::new(format!(
-                    "expected object, got {}",
-                    value.type_name()
-                )))
+                GenericResult::Error(EvalError::cannot_index_with_field(value.type_name(), name))
             }
         }
 
@@ -525,10 +523,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::new(format!(
-                    "expected array, got {}",
-                    value.type_name()
-                )))
+                GenericResult::Error(EvalError::cannot_index_with_type(
+                    value.type_name(),
+                    "number",
+                ))
             }
         }
 
@@ -555,10 +553,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::new(format!(
-                    "cannot iterate over {}",
-                    value.type_name()
-                )))
+                GenericResult::Error(EvalError::cannot_iterate(&to_owned(&value)))
             }
         }
 
@@ -959,10 +954,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if let Some(f) = value.as_f64() {
                 GenericResult::Owned(OwnedValue::Float(f.abs()))
             } else {
-                GenericResult::Error(EvalError::new(format!(
-                    "{} has no length",
-                    value.type_name()
-                )))
+                GenericResult::Error(EvalError::has_no_length(&to_owned(&value)))
             }
         }
 
@@ -979,10 +971,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     (0..len).map(|i| OwnedValue::Int(i as i64)).collect();
                 GenericResult::Owned(OwnedValue::Array(indices))
             } else {
-                GenericResult::Error(EvalError::new(format!(
-                    "keys requires object or array, got {}",
-                    value.type_name()
-                )))
+                GenericResult::Error(EvalError::has_no_keys(&to_owned(&value)))
             }
         }
 
@@ -998,10 +987,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     (0..len).map(|i| OwnedValue::Int(i as i64)).collect();
                 GenericResult::Owned(OwnedValue::Array(indices))
             } else {
-                GenericResult::Error(EvalError::new(format!(
-                    "keys_unsorted requires object or array, got {}",
-                    value.type_name()
-                )))
+                GenericResult::Error(EvalError::has_no_keys(&to_owned(&value)))
             }
         }
 
@@ -1054,7 +1040,10 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if value.is_null() {
                 GenericResult::Owned(OwnedValue::Null)
             } else {
-                GenericResult::Error(EvalError::type_error("array", value.type_name()))
+                GenericResult::Error(EvalError::cannot_index_with_type(
+                    value.type_name(),
+                    "number",
+                ))
             }
         }
 
@@ -1069,7 +1058,10 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if value.is_null() {
                 GenericResult::Owned(OwnedValue::Null)
             } else {
-                GenericResult::Error(EvalError::type_error("array", value.type_name()))
+                GenericResult::Error(EvalError::cannot_index_with_type(
+                    value.type_name(),
+                    "number",
+                ))
             }
         }
 
@@ -1083,10 +1075,10 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     .collect();
                 GenericResult::Owned(OwnedValue::Array(values))
             } else {
-                GenericResult::Error(EvalError::new(format!(
-                    "reverse requires array, got {}",
-                    value.type_name()
-                )))
+                GenericResult::Error(EvalError::cannot_index_with_type(
+                    value.type_name(),
+                    "number",
+                ))
             }
         }
 
@@ -1111,18 +1103,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if let Some(f) = value.as_f64() {
                 GenericResult::Owned(OwnedValue::Float(f))
             } else if let Some(s) = value.as_str() {
-                if let Ok(i) = s.parse::<i64>() {
-                    GenericResult::Owned(OwnedValue::Int(i))
-                } else if let Ok(f) = s.parse::<f64>() {
-                    GenericResult::Owned(OwnedValue::Float(f))
-                } else {
-                    GenericResult::Error(EvalError::new(format!("cannot convert '{s}' to number")))
+                match tonumber_from_str(s.as_ref()) {
+                    Ok(n) => GenericResult::Owned(n),
+                    Err(e) => GenericResult::Error(e),
                 }
             } else {
-                GenericResult::Error(EvalError::new(format!(
-                    "cannot convert {} to number",
-                    value.type_name()
-                )))
+                GenericResult::Error(EvalError::cannot_parse_as_number(&to_owned(&value)))
             }
         }
 
