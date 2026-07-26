@@ -637,6 +637,14 @@ For detailed documentation on optimization techniques used in this project, see 
   - **16-byte threshold + `#[inline(always)]`**: Both required to prevent regression (threshold alone still caused 3-5% regression)
   - Best for: YAML with long string values (logs, templates, embedded content)
   - See [docs/parsing/yaml.md#o3-simd-escape-scanning-for-json-output--accepted-](docs/parsing/yaml.md#o3-simd-escape-scanning-for-json-output--accepted-) for full analysis
+- ✅ O5 (`HAS_CR` Const-Generic Specialization): **recovers most of the #324 CRLF-correctness cost**, issue #340
+  - `build_semi_index` SIMD-scans once for `\r`, then parses with `Parser::<false>` (LF-only) or `Parser::<true>` (#324 parser verbatim)
+  - Interleaved `yaml_bench` vs `c5dab403`, excl. block scalars: **M4 Pro +4.0% → +0.7%**, **7950X +11.0% → +4.7%**; x86 block scalars 31-34% *faster* than pre-#324
+  - End-to-end `dev bench yq` (32 configs, 7950X): **+5.0% → +0.8%** median; CRLF documents +1.1% (unchanged); binary +52 KB (+0.9%)
+  - **The gate is one-directional**: `true` is always correct, and the whole-input precheck proves no `\r` arm is reachable under `false`. An un-gated site is a missed optimization, never a bug — so gating can be applied incrementally and measured
+  - **Cost the estimate missed**: long quoted scalars regress +7-12%. The parser bulk-skips them at ~15 GB/s, so a second pass over the input is large next to the parse. Reusing the position-finding `define_escape_scanner!` first made it **+42%**; an existence-only scan (OR the chunk compares, reduce once) was needed
+  - Key insight: a precheck that enables a fast path is charged to *every* input, including the ones it cannot help — measure it against the workload where the parser is already fastest, not the one it is slowest
+  - See [docs/parsing/yaml.md#buying-it-back-the-has_cr-specialization](docs/parsing/yaml.md#buying-it-back-the-has_cr-specialization) for full analysis
 - ✅ O4 (seq_items Bitvector Elimination): **−12.5% build peak memory, 2-6% faster builds**, issues #75/#104/#106
   - Removed the stored `seq_items` bitvector; seq-item wrappers are derived from text (`-` + whitespace/EOI)
   - Branchless `matches!` derivation at both detection sites recovers the 7-15% query regression #106 found in the naive form
