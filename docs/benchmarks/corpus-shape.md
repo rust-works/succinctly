@@ -8,35 +8,36 @@ Distributions are derived from the crate's own semi-index (`JsonIndex` / `YamlIn
 
 ## Corpus inventory
 
-| format | workload  | file                     | bytes |
-| ------ | --------- | ------------------------ | ----- |
-| dsv    | gapminder | gapminder-five-year.csv  | 82079 |
-| dsv    | world-gdp | world-gdp-with-codes.csv | 4515  |
-| json   | charts    | bullet-data.json         | 548   |
-| json   | geojson   | us-election.geojson      | 99715 |
-| yaml   | actions   | codeql-analysis.yml      | 925   |
-| yaml   | actions   | prometheus-ci.yml        | 18935 |
-| yaml   | actions   | stale.yml                | 1290  |
-| yaml   | compose   | nginx-flask-mysql.yaml   | 1239  |
-| yaml   | compose   | wordpress.yaml           | 815   |
-| yaml   | k8s       | nginx-deployment.yml     | 836   |
-| yaml   | lint      | sass-lint.yml            | 2055  |
+| format | workload       | file                        | bytes |
+| ------ | -------------- | --------------------------- | ----- |
+| dsv    | gapminder      | gapminder-five-year.csv     | 82079 |
+| dsv    | world-gdp      | world-gdp-with-codes.csv    | 4515  |
+| json   | charts         | bullet-data.json            | 548   |
+| json   | geojson        | us-election.geojson         | 99715 |
+| yaml   | actions        | codeql-analysis.yml         | 925   |
+| yaml   | actions        | prometheus-ci.yml           | 18935 |
+| yaml   | actions        | stale.yml                   | 1290  |
+| yaml   | compose        | nginx-flask-mysql.yaml      | 1239  |
+| yaml   | compose        | wordpress.yaml              | 815   |
+| yaml   | home-assistant | air-quality-conditions.yaml | 9990  |
+| yaml   | k8s            | nginx-deployment.yml        | 836   |
+| yaml   | lint           | sass-lint.yml               | 2055  |
 
 ## YAML
 
-files: 7, total bytes: 26095, anchors: 0, aliases: 0, bare-dash items: 5
+files: 8, total bytes: 36085, anchors: 41, aliases: 86, bare-dash items: 5
 
 | metric               | unit         | n    | min  | p50  | p90  | p99  | max  |
 | -------------------- | ------------ | ---- | ---- | ---- | ---- | ---- | ---- |
-| scalar length        | bytes/scalar | 1052 | 0    | 7    | 38   | 109  | 374  |
-| mapping keys         | keys/mapping | 233  | 0    | 2    | 4    | 9    | 69   |
-| sequence items       | items/seq    | 58   | 1    | 2    | 8    | 12   | 12   |
-| bare-dash seq items  | count/file   | 7    | 0    | 0    | 5    | 5    | 5    |
+| scalar length        | bytes/scalar | 1587 | 0    | 7    | 25   | 89   | 374  |
+| mapping keys         | keys/mapping | 392  | 0    | 2    | 4    | 9    | 69   |
+| sequence items       | items/seq    | 94   | 1    | 2    | 4    | 12   | 12   |
+| bare-dash seq items  | count/file   | 8    | 0    | 0    | 5    | 5    | 5    |
 | flow-collection size | bytes/flow   | 14   | 2    | 11   | 91   | 100  | 100  |
-| nesting depth        | levels/node  | 761  | 2    | 7    | 9    | 11   | 12   |
-| anchors              | count/file   | 7    | 0    | 0    | 0    | 0    | 0    |
-| aliases              | count/file   | 7    | 0    | 0    | 0    | 0    | 0    |
-| escape density       | per KiB/file | 7    | 0.00 | 0.00 | 0.05 | 0.05 | 0.05 |
+| nesting depth        | levels/node  | 1206 | 2    | 6    | 8    | 10   | 12   |
+| anchors              | count/file   | 8    | 0    | 0    | 41   | 41   | 41   |
+| aliases              | count/file   | 8    | 0    | 0    | 86   | 86   | 86   |
+| escape density       | per KiB/file | 8    | 0.00 | 0.00 | 0.05 | 0.05 | 0.05 |
 
 ## JSON
 

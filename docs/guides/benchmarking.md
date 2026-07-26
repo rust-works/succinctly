@@ -493,8 +493,8 @@ is drift-checked in CI so the tooling and report cannot silently rot.
 
 The corpus establishes that a shape **exists** at a given size. It cannot establish
 **how often** it occurs — a handful of files cannot measure a shape present in a
-fraction of a percent of real input, and reading a shape's presence in a seven-file
-corpus as "one file in seven looks like this" inverts the error the corpus exists to
+fraction of a percent of real input, and reading a shape's presence in a corpus this
+small as "one file in eight looks like this" inverts the error the corpus exists to
 prevent. For frequency, scan whole upstream repositories:
 
 ```bash
@@ -505,9 +505,11 @@ prevent. For frequency, scan whole upstream repositories:
 Results are recorded in
 [docs/benchmarks/yaml-shape-survey.md](../benchmarks/yaml-shape-survey.md), which is
 where #326 established that bare-dash sequence items occur in 0.042% of real YAML
-files — and, conversely, that the corpus's `anchors: 0` is a sampling artefact rather
+files — and, conversely, that the corpus's `anchors: 0` was a sampling artefact rather
 than upstream reality, since anchors reach 4–11% of files in the ecosystems that use
-them. That page is date-pinned, not CI-checked: upstream branches move.
+them. #342 acted on that finding by vendoring a Home Assistant config, so the corpus
+now reports 41 anchors and 86 aliases. That page is date-pinned, not CI-checked:
+upstream branches move.
 
 ---
 

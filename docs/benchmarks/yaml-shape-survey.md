@@ -95,8 +95,8 @@ claim.
 
 ## Anchors are the opposite case — a genuine sampling gap
 
-[`NOTICES.md`](../../tests/data/bench-corpus/NOTICES.md) has long flagged that the
-corpus reads `anchors: 0`. The natural reading — that P4's anchor-heavy
+[`NOTICES.md`](../../tests/data/bench-corpus/NOTICES.md) long flagged that the
+corpus read `anchors: 0`. The natural reading — that P4's anchor-heavy
 micro-benchmarks simply over-assumed, and real input has no anchors — is wrong.
 Anchors are an order of magnitude more common than bare dashes, and heavily
 concentrated by ecosystem:
@@ -110,12 +110,23 @@ concentrated by ecosystem:
 | `gitlabhq/gitlabhq`           | 8,354      | 27                 | 0.32%      |
 | Kubernetes/manifests (9 repos)| 18,362     | 5                  | 0.027%     |
 
-So `anchors: 0` in the corpus is a **sampling artefact**, not upstream reality: the
-corpus over-samples Kubernetes and Docker Compose, the two families that genuinely do
+So `anchors: 0` in the corpus was a **sampling artefact**, not upstream reality: the
+corpus over-sampled Kubernetes and Docker Compose, the two families that genuinely do
 not use anchors. In workloads that do — Home Assistant configuration, Salt states,
 Concourse pipelines, GitLab CI — anchors appear in 4–11% of files, which makes them
 roughly 100x more prevalent than the bare-dash shape. Of the two gaps #326 raised,
-this is the one worth closing with a corpus file.
+this was the one worth closing with a corpus file.
+
+#342 closed it, from the densest ecosystem in the table above:
+`yaml/home-assistant/air-quality-conditions.yaml` is `home-assistant/core`'s
+`homeassistant/components/air_quality/conditions.yaml`, a shipped hand-written config
+carrying 41 anchors, 86 aliases, and 6 merge keys (`<<: *name`) in 9,990 B — so the
+corpus now reports `anchors: 41, aliases: 86` rather than zero. As with the bare-dash
+search, the alternates are recorded so the search is not repeated: `saltstack/salt`
+`pkg/common/env-cleanup-rules.yml` (12 anchors, 18 aliases, 12,796 B) parses cleanly and
+would serve as a second ecosystem, but adds no idiom the Home Assistant file lacks;
+every anchor-carrying file in `concourse/concourse` is a `testflight/` or `topgun/`
+fixture, which cannot carry a "real workload" claim.
 
 ## What this means for #106
 
