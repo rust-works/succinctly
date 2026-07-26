@@ -6008,6 +6008,23 @@ fn eval_alternative_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     eval_update::<W, S>(path_expr, &filter, input, optional)
 }
 
+/// The error for an array index a path walk cannot reach.
+///
+/// jq splits these two ways. An index that is *still* negative after being
+/// counted back from the end is `Out of bounds negative array index` —
+/// `[1,2] | .[-5] = 9`, the same sentence `setpath` raises. A positive index
+/// past the end is not an error in jq at all: `[1,2] | .[5] = 9` extends the
+/// array, as `setpath([5]; 9)` does here. Until that gap closes, the positive
+/// case keeps succinctly's own wording rather than borrowing a jq sentence for
+/// a case jq does not raise; see `docs/compliance/jq/limitations.md`.
+fn out_of_range_index(idx: i64, len: usize) -> EvalError {
+    if idx < 0 {
+        EvalError::out_of_bounds_negative_index()
+    } else {
+        EvalError::index_out_of_bounds(idx, len)
+    }
+}
+
 /// Set a value at a path in an owned value.
 fn set_path(
     root: &mut OwnedValue,
@@ -6038,7 +6055,7 @@ fn set_path(
                     arr[actual_idx as usize] = new_value;
                     Ok(())
                 } else {
-                    Err(EvalError::index_out_of_bounds(*idx, arr.len()))
+                    Err(out_of_range_index(*idx, arr.len()))
                 }
             } else {
                 Err(EvalError::cannot_index_with_type(
@@ -6115,7 +6132,7 @@ fn get_path_mut<'a>(
                     if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
                         &mut arr[actual_idx as usize]
                     } else {
-                        return Err(EvalError::index_out_of_bounds(*idx, arr.len()));
+                        return Err(out_of_range_index(*idx, arr.len()));
                     }
                 } else {
                     return Err(EvalError::cannot_index_with_type(
@@ -6177,7 +6194,7 @@ fn update_path<S: EvalSemantics>(
                 } else if optional {
                     Ok(())
                 } else {
-                    Err(EvalError::index_out_of_bounds(*idx, arr.len()))
+                    Err(out_of_range_index(*idx, arr.len()))
                 }
             } else if optional {
                 Ok(())
@@ -6244,7 +6261,7 @@ fn update_path<S: EvalSemantics>(
                             } else if optional {
                                 Ok(())
                             } else {
-                                Err(EvalError::index_out_of_bounds(*idx, arr.len()))
+                                Err(out_of_range_index(*idx, arr.len()))
                             }
                         } else if optional {
                             Ok(())
@@ -8933,7 +8950,7 @@ fn delete_at_path(
                 } else if optional {
                     Ok(())
                 } else {
-                    Err(EvalError::index_out_of_bounds(*idx, arr.len()))
+                    Err(out_of_range_index(*idx, arr.len()))
                 }
             } else if optional {
                 Ok(())
@@ -8995,7 +9012,7 @@ fn delete_at_path(
                             } else if optional {
                                 Ok(())
                             } else {
-                                Err(EvalError::index_out_of_bounds(*idx, arr.len()))
+                                Err(out_of_range_index(*idx, arr.len()))
                             }
                         } else if optional {
                             Ok(())
