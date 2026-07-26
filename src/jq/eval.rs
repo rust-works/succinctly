@@ -208,6 +208,51 @@ impl EvalError {
     pub fn index_out_of_bounds(index: i64, len: usize) -> Self {
         Self::new(format!("index {index} out of bounds (length {len})"))
     }
+
+    /// Create the error `contains`/`inside` raise for operands whose types
+    /// cannot be compared, e.g. `1 | contains("a")` (#358).
+    ///
+    /// `left` is the container, `right` the value looked for, so `inside` — which
+    /// is `contains` with the operands swapped — passes its *argument* first,
+    /// matching jq's `array ([1]) and number (1) …` for `1 | inside([1])`.
+    pub fn containment_check(left: &OwnedValue, right: &OwnedValue) -> Self {
+        Self::new(format!(
+            "{} ({}) and {} ({}) cannot have their containment checked",
+            left.type_name(),
+            value_preview(left),
+            right.type_name(),
+            value_preview(right),
+        ))
+    }
+}
+
+/// Render `value` the way jq embeds a value in an error message: its compact
+/// JSON dump, truncated so a huge operand cannot produce a huge message.
+///
+/// jq does this with `jv_dump_string_trunc(v, buf, sizeof buf)` over a
+/// `char buf[15]`: dumps up to 14 bytes and, when the dump was longer,
+/// overwrites the last three with `...`. So a 14-byte dump survives whole and a
+/// 15-byte one becomes 11 bytes plus `...`.
+///
+/// One deliberate deviation: jq's `strncpy` can cut a multi-byte UTF-8 sequence
+/// in half and emit the broken bytes. A Rust `String` cannot hold those, so we
+/// cut at the nearest `char` boundary at or below the limit — the preview is
+/// then up to two bytes shorter than jq's for such values.
+fn value_preview(value: &OwnedValue) -> String {
+    /// `sizeof buf - 1` in jq: the longest dump reproduced verbatim.
+    const MAX: usize = 14;
+    /// What is left of the budget once `...` has claimed three bytes.
+    const KEEP: usize = MAX - 3;
+
+    let dump = value.to_json();
+    if dump.len() <= MAX {
+        return dump;
+    }
+    let mut cut = KEEP;
+    while cut > 0 && !dump.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}...", &dump[..cut])
 }
 
 impl core::fmt::Display for EvalError {
@@ -2642,10 +2687,21 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     let input = to_owned(&value);
+    if input.type_name() != b.type_name() {
+        if optional {
+            return QueryResult::None;
+        }
+        return QueryResult::Error(EvalError::containment_check(&input, &b));
+    }
     QueryResult::Owned(OwnedValue::Bool(owned_contains(&input, &b)))
 }
 
 /// Check if `a` contains `b` (recursive containment check)
+///
+/// Only the *top-level* types have to match; a mismatch nested inside a
+/// container is plain `false`, as in jq — `[1,"a"] | contains(["a",2])` is
+/// `false`, not the error [`EvalError::containment_check`] raises. The callers
+/// screen the top level, so this stays a total function.
 fn owned_contains(a: &OwnedValue, b: &OwnedValue) -> bool {
     match (a, b) {
         // String contains string
@@ -2680,6 +2736,12 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     let input = to_owned(&value);
     // inside is the inverse of contains: b contains input
+    if b.type_name() != input.type_name() {
+        if optional {
+            return QueryResult::None;
+        }
+        return QueryResult::Error(EvalError::containment_check(&b, &input));
+    }
     QueryResult::Owned(OwnedValue::Bool(owned_contains(&b, &input)))
 }
 
@@ -15049,6 +15111,69 @@ mod tests {
                 assert!(b);
             }
         );
+
+        // Same type, no containment: false, not an error.
+        query!(br"[1]", r"contains([2])",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+        query!(br"1", r"contains(2)",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+    }
+
+    /// jq errors when the two operands' types cannot be compared, rather than
+    /// answering `false` (#358). Only the outermost pair is screened.
+    #[test]
+    fn test_builtin_contains_type_mismatch() {
+        query!(br"1", r#"contains("a")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    r#"number (1) and string ("a") cannot have their containment checked"#
+                );
+            }
+        );
+
+        // A mismatch *inside* a container is still plain false.
+        query!(br#"[1,"a"]"#, r#"contains(["a",2])"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+
+        // Int and Float are both `number`, so this is a comparison, not an error.
+        query!(br"[1,2,3]", r"contains([1.0])",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        // An optional expression suppresses it, like any other error. Built with
+        // `Expr::optional` because the parser does not accept a postfix `?` on a
+        // function call yet — see `tests/jq_containment_tests.rs`.
+        {
+            let json: &[u8] = br"1";
+            let index = JsonIndex::build(json);
+            let expr = parse(r#"contains("a")"#).unwrap().optional();
+            match eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)) {
+                QueryResult::None => {}
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+
+        // Long operands are truncated to jq's 14-byte budget: 11 bytes plus `...`.
+        query!(br#""abcdefghijklm""#, r"contains(1)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    r#"string ("abcdefghij...) and number (1) cannot have their containment checked"#
+                );
+            }
+        );
     }
 
     #[test]
@@ -15061,6 +15186,27 @@ mod tests {
         );
 
         query!(br#"{"a": 1}"#, r#"inside({"a": 1, "b": 2})"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+    }
+
+    /// `inside` reports the container first — it is `contains` with the operands
+    /// swapped, so the *argument* leads the message (#358).
+    #[test]
+    fn test_builtin_inside_type_mismatch() {
+        query!(br"1", r"inside([1])",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "array ([1]) and number (1) cannot have their containment checked"
+                );
+            }
+        );
+
+        // Int/Float is one type, so this stays a comparison.
+        query!(br"[1.0]", r"inside([1,2,3])",
             QueryResult::Owned(OwnedValue::Bool(b)) => {
                 assert!(b);
             }
