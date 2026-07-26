@@ -74,6 +74,11 @@ first_on_number	first	5
 last_on_number	last	5
 reverse_on_number	reverse	5
 indices_on_number	indices(",")	1
+# `indices`/`index`/`rindex` index their input with the pattern, so a
+# non-string pattern on a string input reports that same indexing error.
+indices_number_pattern_on_string	indices(1)	"abc"
+index_null_pattern_on_string	index(null)	"abc"
+rindex_array_pattern_on_string	rindex([1])	"abc"
 
 # ── Cannot iterate over <t> (<value>) ────────────────────────────────────────
 iterate_number	.[]	1
@@ -117,6 +122,10 @@ keys_on_number	keys	1
 keys_on_string	keys	"s"
 keys_unsorted_on_number	keys_unsorted	1
 with_entries_on_number	with_entries(.)	1
+# `to_entries` is defined over `keys_unsorted`, so it borrows `keys`' refusal
+# — and, like `keys`, accepts an array.
+to_entries_on_number	to_entries	1
+to_entries_on_null	to_entries	null
 sort_on_object	sort	{"a":1}
 sort_on_number	sort	1
 test_on_number	test("a")	1
@@ -131,6 +140,9 @@ in_object_on_number	in({})	1
 explode_on_number	explode	1
 implode_on_number	implode	1
 ascii_downcase_on_number	ascii_downcase	1
+# Same jq definition as `ascii_downcase`, so the same sentence — probed
+# because the two had drifted apart here.
+ascii_upcase_on_number	ascii_upcase	1
 split_on_number	split(",")	1
 startswith_on_number	startswith("a")	1
 range_on_string	range(.)	"s"

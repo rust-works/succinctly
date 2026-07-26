@@ -51,6 +51,9 @@ first_on_number	first	5	Cannot index number with number
 last_on_number	last	5	Cannot index number with number
 reverse_on_number	reverse	5	Cannot index number with number
 indices_on_number	indices(",")	1	Cannot index number with string ","
+indices_number_pattern_on_string	indices(1)	"abc"	Cannot index string with number
+index_null_pattern_on_string	index(null)	"abc"	Cannot index string with null
+rindex_array_pattern_on_string	rindex([1])	"abc"	Cannot index string with array
 iterate_number	.[]	1	Cannot iterate over number (1)
 iterate_string	.[]	"str"	Cannot iterate over string ("str")
 iterate_boolean	.[]	true	Cannot iterate over boolean (true)
@@ -88,6 +91,8 @@ keys_on_number	keys	1	number (1) has no keys
 keys_on_string	keys	"s"	string ("s") has no keys
 keys_unsorted_on_number	keys_unsorted	1	number (1) has no keys
 with_entries_on_number	with_entries(.)	1	number (1) has no keys
+to_entries_on_number	to_entries	1	number (1) has no keys
+to_entries_on_null	to_entries	null	null (null) has no keys
 sort_on_object	sort	{"a":1}	object ({"a":1}) cannot be sorted, as it is not an array
 sort_on_number	sort	1	number (1) cannot be sorted, as it is not an array
 test_on_number	test("a")	1	number (1) cannot be matched, as it is not a string
@@ -98,6 +103,7 @@ in_object_on_number	in({})	1	Cannot check whether object has a number key
 explode_on_number	explode	1	explode input must be a string
 implode_on_number	implode	1	implode input must be an array
 ascii_downcase_on_number	ascii_downcase	1	explode input must be a string
+ascii_upcase_on_number	ascii_upcase	1	explode input must be a string
 split_on_number	split(",")	1	split input and separator must be strings
 startswith_on_number	startswith("a")	1	startswith() requires string inputs
 range_on_string	range(.)	"s"	Range bounds must be numeric

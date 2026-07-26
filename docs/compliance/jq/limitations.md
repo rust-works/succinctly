@@ -24,14 +24,14 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 117 probes in
+Measured against jq-1.7.1 over the 123 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result              | Meaning                                            |
 |----------------------------------------------|---------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **112/117 = 95.7%** | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **118/123 = 95.9%** | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**               | Every probe that errors in both errors identically |
 | **Behaviour / parser gaps**                  | **5**               | succinctly does not raise the error at all         |
 
@@ -87,6 +87,18 @@ iterate over number` for the same condition, and `cannot parse 'a' as number` ag
 counterpart for — succinctly extensions (`at_offset`, `@dsv`, `pick`/`omit`, module
 loading) and builtins jq does not define. Anything jq also reports should use a named
 constructor instead.
+
+### One sentence covers a family, so probe the whole family
+
+jq derives many builtins from others (`ascii_upcase` and `ascii_downcase` are both
+`explode | map(…) | implode`; `to_entries` and `keys` both go through `keys_unsorted`;
+`indices`, `index` and `rindex` all index their input with the pattern), so a sentence
+fixed for one member is owed by every member. Fixing only the member a probe named left
+`1 | with_entries(.)` saying `number (1) has no keys` while `1 | to_entries` beside it
+still said `expected object, got number`. The corpus now carries at least one probe per
+member for these families, and the sites that shared wording share a definition —
+`non_string_pattern` in `src/jq/eval.rs` is the single refusal behind all three string
+searches.
 
 ### Value rendering and truncation
 
@@ -251,6 +263,14 @@ That is a missing feature rather than a wording divergence, and it is deliberate
 raised as an error — inventing a message jq does not print would be a fresh divergence.
 Only the containers jq would slice get that pass; on a scalar, an object path element is
 refused with jq's `Cannot index <type> with object` (probe `setpath_slice_key_on_number`).
+
+The same gap reaches `indices`/`index`/`rindex`, which jq also lets take a slice:
+`"abcabc" | indices({"start":1,"end":2})` is `"b"` there, and `indices({})` is `Array/string
+slice indices must be integers`. succinctly refuses both with `Cannot index string with
+object`. Every *other* pattern type reports jq's sentence exactly (probes
+`indices_number_pattern_on_string`, `index_null_pattern_on_string`,
+`rindex_array_pattern_on_string`), so the object case is the only one left, and it closes
+with #366 rather than separately.
 
 The two error sentences the feature owes jq — `A slice of an array can only be assigned
 another array` and `Array/string slice indices must be integers` — are pinned as probes and

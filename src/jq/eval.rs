@@ -2432,7 +2432,9 @@ fn builtin_ascii_upcase<W: Clone + AsRef<[u64]>>(
             }
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        // As `ascii_downcase`: jq defines both as `explode | map(…) | implode`,
+        // so both report `explode`'s refusal.
+        _ => QueryResult::Error(EvalError::new("explode input must be a string")),
     }
 }
 
@@ -3033,11 +3035,28 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 // =============================================================================
 
 /// Builtin: to_entries - {k:v} → [{key:k, value:v}]
+///
+/// jq defines this over `keys_unsorted`, so it accepts everything that has
+/// keys: an array's keys are its indices, and `[1,2] | to_entries` is
+/// `[{"key":0,"value":1},{"key":1,"value":2}]`. Anything with no keys at all
+/// gets `keys`' own refusal.
 fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
+        StandardJson::Array(elements) => {
+            let entries: Vec<OwnedValue> = elements
+                .enumerate()
+                .map(|(i, elem)| {
+                    let mut entry = IndexMap::new();
+                    entry.insert("key".to_string(), OwnedValue::Int(i as i64));
+                    entry.insert("value".to_string(), to_owned(&elem));
+                    OwnedValue::Object(entry)
+                })
+                .collect();
+            QueryResult::Owned(OwnedValue::Array(entries))
+        }
         StandardJson::Object(fields) => {
             let mut entries: Vec<OwnedValue> = Vec::new();
             for field in fields {
@@ -3060,7 +3079,7 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(OwnedValue::Array(entries))
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("object", type_name(&value))),
+        _ => QueryResult::Error(EvalError::has_no_keys(&to_owned(&value))),
     }
 }
 
@@ -4472,6 +4491,22 @@ fn builtin_test<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// The refusal for a non-string pattern handed to `indices`, `index` or
+/// `rindex` on a string input.
+///
+/// jq implements all three by indexing the string with the pattern, so the
+/// message is the indexing one — `"abc" | index(1)` is `Cannot index string
+/// with number` — rather than a complaint that names the argument. One
+/// definition, because the three call sites are identical and had already
+/// drifted into wording (`expected string, got pattern`) that names no type.
+///
+/// An *object* pattern is jq's slice — `"abcabc" | indices({"start":1,"end":2})`
+/// is `"b"` — which succinctly does not implement, so it lands here too with a
+/// sentence jq would not use. That is the same missing feature as #366.
+fn non_string_pattern<W>(value: &StandardJson<'_, W>, pattern: &OwnedValue) -> EvalError {
+    EvalError::cannot_index(type_name(value), pattern)
+}
+
 /// Builtin: indices(s) - find all indices of substring/element s
 fn builtin_indices<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     s_expr: &Expr,
@@ -4490,7 +4525,7 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let pattern_str = match &pattern {
                 OwnedValue::String(p) => p,
                 _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+                _ => return QueryResult::Error(non_string_pattern(&value, &pattern)),
             };
             if let Ok(cow) = s.as_str() {
                 let mut indices = Vec::new();
@@ -4544,7 +4579,7 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let pattern_str = match &pattern {
                 OwnedValue::String(p) => p,
                 _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+                _ => return QueryResult::Error(non_string_pattern(&value, &pattern)),
             };
             if let Ok(cow) = s.as_str() {
                 if let Some(pos) = cow.find(pattern_str.as_str()) {
@@ -4590,7 +4625,7 @@ fn builtin_rindex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let pattern_str = match &pattern {
                 OwnedValue::String(p) => p,
                 _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(EvalError::type_error("string", "pattern")),
+                _ => return QueryResult::Error(non_string_pattern(&value, &pattern)),
             };
             if let Ok(cow) = s.as_str() {
                 if let Some(pos) = cow.rfind(pattern_str.as_str()) {
@@ -16993,6 +17028,70 @@ mod tests {
                 b"1",
                 r#"try setpath(["a"]; 1) catch ."#,
                 Ok(r#""Cannot index number with string \"a\"""#),
+            ),
+        ]);
+    }
+
+    /// jq defines `to_entries` over `keys_unsorted`, so an array's keys are its
+    /// indices and only a value with no keys at all is refused — with `keys`'
+    /// own sentence, which `with_entries` beside it already used.
+    #[test]
+    fn test_to_entries_follows_keys() {
+        assert_outcomes(&[
+            (
+                b"[1,2]",
+                "to_entries",
+                Ok(r#"[{"key":0,"value":1},{"key":1,"value":2}]"#),
+            ),
+            (
+                br#"{"a":1}"#,
+                "to_entries",
+                Ok(r#"[{"key":"a","value":1}]"#),
+            ),
+            (b"[]", "to_entries", Ok("[]")),
+            (b"1", "to_entries", Err("number (1) has no keys")),
+            (b"null", "to_entries", Err("null (null) has no keys")),
+        ]);
+    }
+
+    /// `indices`, `index` and `rindex` all index their string input with the
+    /// pattern, so a non-string pattern reports jq's indexing error rather than
+    /// naming the argument. One helper, three call sites.
+    #[test]
+    fn test_string_search_reports_the_indexing_error() {
+        assert_outcomes(&[
+            (
+                br#""abc""#,
+                "indices(1)",
+                Err("Cannot index string with number"),
+            ),
+            (
+                br#""abc""#,
+                "index(null)",
+                Err("Cannot index string with null"),
+            ),
+            (
+                br#""abc""#,
+                "rindex([1])",
+                Err("Cannot index string with array"),
+            ),
+            // The string cases still work.
+            (br#""abcabc""#, r#"indices("b")"#, Ok("[1,4]")),
+            (br#""abcabc""#, r#"index("b")"#, Ok("1")),
+            (br#""abcabc""#, r#"rindex("b")"#, Ok("4")),
+        ]);
+    }
+
+    /// `ascii_upcase` and `ascii_downcase` are the same jq definition
+    /// (`explode | map(…) | implode`), so they refuse a non-string alike.
+    #[test]
+    fn test_ascii_case_refusals_agree() {
+        assert_outcomes(&[
+            (b"1", "ascii_upcase", Err("explode input must be a string")),
+            (
+                b"1",
+                "ascii_downcase",
+                Err("explode input must be a string"),
             ),
         ]);
     }
