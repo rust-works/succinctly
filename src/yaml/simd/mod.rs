@@ -26,6 +26,10 @@
 //! Use `--features scalar-yaml` to force pure scalar (byte-by-byte) implementations.
 //! This is useful for benchmarking baseline performance without any SIMD or broadword.
 
+// Scalar kernels shared by every backend: each vector loop calls them for its
+// remainder, so they compile everywhere (#185).
+mod scalar;
+
 // NEON module only when not using broadword or scalar fallback
 #[cfg(all(
     target_arch = "aarch64",
@@ -38,17 +42,13 @@ mod neon;
 #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
 mod x86;
 
-// Portable broadword module - compiled when:
-// 1. broadword-yaml feature is enabled on ARM64 (explicit opt-in), OR
-// 2. On non-SIMD platforms (automatic fallback)
-// NOT compiled on x86_64 (uses native SIMD) or ARM64 without broadword-yaml (uses NEON)
-#[cfg(all(
-    not(feature = "scalar-yaml"),
-    any(
-        all(target_arch = "aarch64", feature = "broadword-yaml"),
-        not(any(target_arch = "aarch64", target_arch = "x86_64"))
-    )
-))]
+// Portable broadword module - compiled on every non-x86 target, because it owns
+// the only copy of the SWAR classifier and of `find_newline_broadword`, which
+// ARM64 dispatches to even when NEON supplies the rest. It used to be gated to
+// `broadword-yaml`-on-ARM64 plus exotic arches, with `neon.rs` carrying a second
+// copy for the default ARM64 build; no build compiled both, so the two drifted
+// unchecked until #185 merged them. x86_64 has native SIMD for all of it.
+#[cfg(all(not(feature = "scalar-yaml"), not(target_arch = "x86_64")))]
 mod broadword;
 
 // Re-export platform-specific types for P0 optimizations
@@ -56,23 +56,8 @@ mod broadword;
 pub use x86::YamlCharClass;
 
 // Re-export broadword types when broadword module is compiled
-#[cfg(all(
-    not(feature = "scalar-yaml"),
-    any(
-        all(target_arch = "aarch64", feature = "broadword-yaml"),
-        not(any(target_arch = "aarch64", target_arch = "x86_64"))
-    )
-))]
+#[cfg(all(not(feature = "scalar-yaml"), not(target_arch = "x86_64")))]
 pub use broadword::{YamlCharClass16, YamlCharClassBroadword};
-
-// Re-export NEON types on ARM64 when using NEON (not broadword)
-// Only YamlCharClass16 is used; YamlCharClassBroadword is broadword-specific
-#[cfg(all(
-    target_arch = "aarch64",
-    not(feature = "broadword-yaml"),
-    not(feature = "scalar-yaml")
-))]
-pub use neon::YamlCharClass16;
 
 // ============================================================================
 // Public API - platform-dispatched functions
@@ -237,49 +222,27 @@ pub fn classify_yaml_chars(input: &[u8], offset: usize) -> Option<YamlCharClass>
     x86::classify_yaml_chars(input, offset)
 }
 
-/// Classify 16 bytes of YAML structural characters.
+/// Classify 16 bytes of YAML structural characters using broadword (SWAR).
 ///
-/// On ARM64: Uses NEON or broadword depending on feature flags.
-/// On other platforms: Uses broadword (SWAR).
-/// Returns classification bitmasks for 8 character types at once.
+/// Returns classification bitmasks for nine character types at once.
 ///
-/// Available on ARM64 and non-SIMD platforms.
+/// Available on every non-x86_64 target; x86_64 uses `classify_yaml_chars`
+/// instead, which classifies 32 bytes under AVX2. (Not an intra-doc link: that
+/// function is not compiled on the targets this one exists on.)
 #[inline]
-#[cfg(all(
-    not(feature = "scalar-yaml"),
-    any(target_arch = "aarch64", not(target_arch = "x86_64"))
-))]
+#[cfg(all(not(feature = "scalar-yaml"), not(target_arch = "x86_64")))]
 #[allow(dead_code)] // STYLE-0005: alternate classifier; unused in current path
 pub fn classify_yaml_chars_16(input: &[u8], offset: usize) -> Option<YamlCharClass16> {
-    // ARM64 with NEON (default)
-    #[cfg(all(target_arch = "aarch64", not(feature = "broadword-yaml")))]
-    {
-        neon::classify_yaml_chars_16(input, offset)
-    }
-
-    // Broadword: when feature enabled on ARM64, or on non-SIMD platforms
-    #[cfg(any(
-        all(target_arch = "aarch64", feature = "broadword-yaml"),
-        not(any(target_arch = "aarch64", target_arch = "x86_64"))
-    ))]
-    {
-        broadword::classify_yaml_chars_16(input, offset)
-    }
+    broadword::classify_yaml_chars_16(input, offset)
 }
 
 /// Classify 8 bytes of YAML structural characters using broadword operations.
 ///
 /// Uses pure u64 arithmetic instead of SIMD intrinsics.
 ///
-/// Available on ARM64 (with broadword-yaml feature) and non-SIMD platforms.
+/// Available on every non-x86_64 target.
 #[inline]
-#[cfg(all(
-    not(feature = "scalar-yaml"),
-    any(
-        all(target_arch = "aarch64", feature = "broadword-yaml"),
-        not(any(target_arch = "aarch64", target_arch = "x86_64"))
-    )
-))]
+#[cfg(all(not(feature = "scalar-yaml"), not(target_arch = "x86_64")))]
 #[allow(dead_code)] // STYLE-0005: alternate classifier; unused in current path
 pub fn classify_yaml_chars_8(input: &[u8], offset: usize) -> Option<YamlCharClassBroadword> {
     broadword::classify_yaml_chars_broadword(input, offset)
@@ -308,24 +271,9 @@ pub fn find_newline(input: &[u8], start: usize) -> Option<usize> {
         x86::find_newline_x86(input, start)
     }
 
-    // ARM64 with NEON (default, when not scalar or broadword)
-    #[cfg(all(
-        target_arch = "aarch64",
-        not(feature = "broadword-yaml"),
-        not(feature = "scalar-yaml")
-    ))]
-    {
-        neon::find_newline_broadword(input, start)
-    }
-
-    // Broadword: when feature enabled on ARM64, or on non-SIMD platforms (when not scalar)
-    #[cfg(all(
-        not(feature = "scalar-yaml"),
-        any(
-            all(target_arch = "aarch64", feature = "broadword-yaml"),
-            not(any(target_arch = "aarch64", target_arch = "x86_64"))
-        )
-    ))]
+    // Broadword everywhere else (including ARM64 with NEON: newline scanning has
+    // no NEON kernel, so SWAR is the fast path there too).
+    #[cfg(all(not(feature = "scalar-yaml"), not(target_arch = "x86_64")))]
     {
         broadword::find_newline_broadword(input, start)
     }
@@ -363,7 +311,9 @@ pub fn find_block_scalar_end(input: &[u8], start: usize, min_indent: usize) -> O
         )
     )))]
     {
-        find_block_scalar_end_scalar(input, start, min_indent)
+        Some(scalar::find_block_scalar_end_scalar(
+            input, start, min_indent,
+        ))
     }
 }
 
@@ -406,7 +356,7 @@ pub fn parse_anchor_name(input: &[u8], start: usize) -> usize {
         )
     )))]
     {
-        parse_anchor_name_scalar(input, start)
+        scalar::parse_anchor_name_scalar(input, start)
     }
 }
 
@@ -422,64 +372,6 @@ pub fn parse_anchor_name(input: &[u8], start: usize) -> usize {
 /// `succinctly::yaml::simd::find_json_escape` path keep resolving for existing
 /// consumers (`yaml/light.rs`, the escape benches).
 pub use crate::util::simd::escape::find_json_escape;
-
-/// Scalar fallback for parse_anchor_name
-#[allow(dead_code)] // STYLE-0005: scalar fallback (SIMD path used when detected)
-fn parse_anchor_name_scalar(input: &[u8], start: usize) -> usize {
-    let mut pos = start;
-    while pos < input.len() {
-        let b = input[pos];
-        match b {
-            // Stop at flow indicators, whitespace, and newlines
-            b' ' | b'\t' | b'\n' | b'\r' | b'[' | b']' | b'{' | b'}' | b',' => break,
-            // Colon is allowed in anchor names if not followed by whitespace
-            b':' => {
-                if pos + 1 < input.len() {
-                    let next = input[pos + 1];
-                    if next == b' ' || next == b'\t' || next == b'\n' || next == b'\r' {
-                        break;
-                    }
-                }
-                pos += 1;
-            }
-            _ => pos += 1,
-        }
-    }
-    pos
-}
-
-/// Scalar fallback for find_block_scalar_end
-#[allow(dead_code)] // STYLE-0005: scalar fallback (SIMD path used when detected)
-fn find_block_scalar_end_scalar(input: &[u8], start: usize, min_indent: usize) -> Option<usize> {
-    let mut pos = start;
-
-    while pos < input.len() {
-        if matches!(input[pos], b'\n' | b'\r') {
-            let line_start = pos + 1;
-
-            if line_start >= input.len() {
-                return Some(input.len());
-            }
-
-            // Count leading spaces
-            let mut indent = 0;
-            while line_start + indent < input.len() && input[line_start + indent] == b' ' {
-                indent += 1;
-            }
-
-            // Check if this line has content at insufficient indent
-            if line_start + indent < input.len() {
-                let next_char = input[line_start + indent];
-                if next_char != b'\n' && next_char != b'\r' && indent < min_indent {
-                    return Some(line_start);
-                }
-            }
-        }
-        pos += 1;
-    }
-
-    Some(input.len())
-}
 
 /// Scalar implementation of find_newline.
 #[allow(dead_code)] // STYLE-0005: scalar fallback (SIMD path used when detected)
@@ -720,7 +612,7 @@ mod tests {
         ];
         for (input, min_indent) in cases {
             assert_eq!(
-                find_block_scalar_end_scalar(input, 0, *min_indent),
+                Some(scalar::find_block_scalar_end_scalar(input, 0, *min_indent)),
                 find_block_scalar_end(input, 0, *min_indent),
                 "scalar fallback disagrees with SIMD on {:?}",
                 String::from_utf8_lossy(input)

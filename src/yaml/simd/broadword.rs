@@ -99,11 +99,12 @@ impl YamlCharClassBroadword {
             != 0
     }
 
-    /// Get mask of all value terminators (for unquoted values).
-    /// Terminators: newline, colon, space, hash
+    /// Bytes at which a plain (unquoted) scalar scan must stop and re-examine.
+    ///
+    /// See [`YamlCharClass16::plain_scalar_terminators`].
     #[inline(always)]
-    pub fn value_terminators(&self) -> u8 {
-        self.newlines | self.carriage_returns | self.colons | self.spaces | self.hash
+    pub fn plain_scalar_terminators(&self) -> u8 {
+        self.newlines | self.carriage_returns | self.colons | self.hash
     }
 }
 
@@ -149,10 +150,8 @@ pub fn classify_yaml_chars_broadword(
     })
 }
 
-/// Classify 16 bytes using two broadword operations.
-///
-/// Returns combined u16 masks (low 8 bits from first chunk, high 8 from second).
-/// Returns `None` if fewer than 16 bytes remain.
+/// Classification of a 16-byte chunk: one `u16` mask per character type, with
+/// bit `i` set iff byte `i` of the chunk is that character.
 #[derive(Debug, Clone, Copy, Default)]
 #[allow(dead_code)] // STYLE-0005: broadword fallback classifier; unused when SIMD is active
 pub struct YamlCharClass16 {
@@ -169,14 +168,30 @@ pub struct YamlCharClass16 {
 }
 
 impl YamlCharClass16 {
-    /// Get mask of value terminators.
+    /// Bytes at which a plain (unquoted) scalar scan must stop and re-examine.
+    ///
+    /// The scan may stop early and lose nothing but speed, so this only has to
+    /// be a *superset* of what the parser's byte loop breaks on: `\n`, `\r`
+    /// (YAML 1.2 §5.4 makes a lone CR a line break too — #324), `#`, and `:`.
+    /// The loop re-checks the context-sensitive pair itself — `#` opens a
+    /// comment only after whitespace, `:` ends a key only before whitespace —
+    /// so the mask does not model that.
+    ///
+    /// Notably **not** `spaces`: a plain scalar may contain them (`key: hello
+    /// world`), so stopping at each one only costs a re-entry into the byte
+    /// loop. Until #185 this mask included them and the x86 classifier's did
+    /// not, which meant re-enabling the ARM fast path would have silently
+    /// surrendered most of its skipping to prose-like values.
     #[inline(always)]
-    pub fn value_terminators(&self) -> u16 {
-        self.newlines | self.carriage_returns | self.colons | self.spaces | self.hash
+    pub fn plain_scalar_terminators(&self) -> u16 {
+        self.newlines | self.carriage_returns | self.colons | self.hash
     }
 }
 
 /// Classify 16 bytes at once using two broadword operations.
+///
+/// Returns combined u16 masks (low 8 bits from the first chunk, high 8 from the
+/// second), or `None` if fewer than 16 bytes remain.
 #[inline]
 pub fn classify_yaml_chars_16(input: &[u8], offset: usize) -> Option<YamlCharClass16> {
     if offset + 16 > input.len() {
@@ -212,6 +227,7 @@ pub fn classify_yaml_chars_16(input: &[u8], offset: usize) -> Option<YamlCharCla
 ///
 /// Returns offset from `start` to the found character, or `None` if not found.
 #[inline]
+#[allow(dead_code)] // STYLE-0005: broadword scan kernel; ARM64 dispatches to the NEON one instead
 pub fn find_quote_or_escape_broadword(input: &[u8], start: usize, end: usize) -> Option<usize> {
     if start >= end || start >= input.len() {
         return None;
@@ -247,6 +263,7 @@ pub fn find_quote_or_escape_broadword(input: &[u8], start: usize, end: usize) ->
 ///
 /// Returns offset from `start` to the found character, or `None` if not found.
 #[inline]
+#[allow(dead_code)] // STYLE-0005: broadword scan kernel; ARM64 dispatches to the NEON one instead
 pub fn find_single_quote_broadword(input: &[u8], start: usize, end: usize) -> Option<usize> {
     if start >= end || start >= input.len() {
         return None;
@@ -279,6 +296,7 @@ pub fn find_single_quote_broadword(input: &[u8], start: usize, end: usize) -> Op
 ///
 /// Returns the number of consecutive space characters starting at `start`.
 #[inline]
+#[allow(dead_code)] // STYLE-0005: broadword scan kernel; ARM64 dispatches to the NEON one instead
 pub fn count_leading_spaces_broadword(input: &[u8], start: usize) -> usize {
     if start >= input.len() {
         return 0;
@@ -291,11 +309,9 @@ pub fn count_leading_spaces_broadword(input: &[u8], start: usize) -> usize {
     // Process 8 bytes at a time
     while offset + 8 <= len {
         let chunk = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-        let _non_spaces = has_zero_byte(chunk ^ broadcast_byte(b' '));
 
-        // If non_spaces is 0, all bytes are spaces - invert to check
-        // Actually, has_zero_byte returns high bits set where bytes ARE equal to space
-        // So we need to check if ALL bytes are spaces (all high bits set = 0x8080808080808080)
+        // `find_byte` sets the high bit of every byte that IS a space, so all
+        // eight being spaces means exactly `HI_BYTES`.
         let space_matches = find_byte(chunk, b' ');
         if space_matches != HI_BYTES {
             // Found a non-space - count spaces up to it
@@ -460,12 +476,83 @@ mod tests {
     }
 
     #[test]
-    fn test_broadword_value_terminators() {
+    fn test_broadword_find_newline_in_remainder() {
+        // Newline in bytes after last 8-byte chunk
+        let mut input = vec![b'a'; 10];
+        input[9] = b'\n';
+        assert_eq!(find_newline_broadword(&input, 0), Some(9));
+    }
+
+    /// Twin of `plain_scalar_terminators_is_exactly_line_break_colon_hash` in
+    /// `yaml::simd::x86`, which pins the same set for the 32-byte classifier the
+    /// live parser path uses. Neither type is compiled on the other's target, so
+    /// the agreement can only be asserted once per arch — but it must be
+    /// asserted on both, or the set drifts exactly as it did before #185.
+    #[test]
+    fn plain_scalar_terminators_stop_at_structure_but_not_at_spaces() {
         let input = b"value: x";
         let class = classify_yaml_chars_broadword(input, 0).unwrap();
 
-        let terminators = class.value_terminators();
-        assert!(terminators & (1 << 5) != 0); // colon at 5
-        assert!(terminators & (1 << 6) != 0); // space at 6
+        let terminators = class.plain_scalar_terminators();
+        assert!(terminators & (1 << 5) != 0, "colon at 5 must terminate");
+        assert_eq!(
+            terminators & (1 << 6),
+            0,
+            "space at 6 must NOT terminate: a plain scalar may contain spaces, \
+             and stopping there only costs skip distance (#185)"
+        );
+        // The space is still classified — it is the terminator set that excludes it.
+        assert!(class.spaces & (1 << 6) != 0);
+    }
+
+    /// The broadword classifiers are the ARM64 fast path's eyes, but that path
+    /// is disabled, so nothing on a live route exercises their accessors. They
+    /// still have to agree that a CR terminates a value — a classifier that
+    /// quietly omits it is what let a lone CR swallow a whole document (#324).
+    #[test]
+    fn broadword_classifiers_treat_cr_as_a_value_terminator() {
+        let input = b"abcdefg\rhijklmno";
+        let class = classify_yaml_chars_broadword(input, 0).expect("8 bytes available");
+        assert_eq!(class.carriage_returns, 1 << 7, "CR is at offset 7");
+        assert!(class.has_any());
+        assert!(
+            class.plain_scalar_terminators() & (1 << 7) != 0,
+            "CR must terminate an unquoted value"
+        );
+
+        let class16 = classify_yaml_chars_16(input, 0).expect("16 bytes available");
+        assert_eq!(class16.carriage_returns, 1 << 7);
+        assert!(class16.plain_scalar_terminators() & (1 << 7) != 0);
+
+        // A chunk with no CR reports none, so the mask is not just always set.
+        let plain = b"abcdefghijklmnop";
+        let none = classify_yaml_chars_broadword(plain, 0).expect("8 bytes available");
+        assert_eq!(none.carriage_returns, 0);
+        assert!(!none.has_any(), "no structural bytes in {plain:?}");
+        assert_eq!(none.plain_scalar_terminators(), 0);
+    }
+
+    /// Both widths must agree on the set, or the 8- and 16-byte paths would
+    /// disagree about where a scalar ends. Asserted as an exact channel list so
+    /// adding a channel to one and not the other fails here (#185).
+    #[test]
+    fn both_classifier_widths_agree_on_the_terminator_set() {
+        let input = b"a:b\nc\rd#e f:g\nhi";
+        let c8 = classify_yaml_chars_broadword(input, 0).expect("8 bytes available");
+        let c16 = classify_yaml_chars_16(input, 0).expect("16 bytes available");
+
+        assert_eq!(
+            c8.plain_scalar_terminators(),
+            c8.newlines | c8.carriage_returns | c8.colons | c8.hash
+        );
+        assert_eq!(
+            c16.plain_scalar_terminators(),
+            c16.newlines | c16.carriage_returns | c16.colons | c16.hash
+        );
+        // The 16-byte mask's low half is the 8-byte mask.
+        assert_eq!(
+            c16.plain_scalar_terminators() as u8,
+            c8.plain_scalar_terminators()
+        );
     }
 }

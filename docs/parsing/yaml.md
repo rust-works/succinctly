@@ -1731,6 +1731,7 @@ This is the **first optimization since P2.7 (Block Scalar SIMD)** to show end-to
 **Files Modified:**
 - [`src/yaml/simd/x86.rs`](../../src/yaml/simd/x86.rs) - Added `parse_anchor_name_avx2()`, `parse_anchor_name_scalar()`, `parse_anchor_name()`
 - [`src/yaml/simd/neon.rs`](../../src/yaml/simd/neon.rs) - Added `parse_anchor_name_neon()` for ARM64
+- (Since #185 the shared remainder handler `parse_anchor_name_scalar()` lives once in [`src/yaml/simd/scalar.rs`](../../src/yaml/simd/scalar.rs), not per backend.)
 - [`src/yaml/simd/mod.rs`](../../src/yaml/simd/mod.rs) - Exported `parse_anchor_name()` public API
 - [`src/yaml/parser.rs:3061`](../../src/yaml/parser.rs#L3061) - Replaced scalar loop with SIMD call
 
@@ -2484,7 +2485,7 @@ Following the P3 NEON rejection, we implemented a pure broadword (SWAR) approach
 
 **Key Insight:** The multiplication trick magic constant must be `0x0102040810204080`, not `0x0002040810204081`. The former correctly maps bit positions 0,8,16,24,32,40,48,56 to result bits 0-7.
 
-**Code Location:** [`src/yaml/simd/neon.rs:171-367`](../../src/yaml/simd/neon.rs#L171-L367)
+**Code Location:** [`src/yaml/simd/broadword.rs`](../../src/yaml/simd/broadword.rs) (was `neon.rs:171-367` until #185 merged the two copies)
 
 **Micro-Benchmark Results (Apple M1 Max):**
 
@@ -2535,9 +2536,43 @@ Following the P3 NEON rejection, we implemented a pure broadword (SWAR) approach
 - Reference implementation for other projects
 
 **Code kept at:**
-- Broadword primitives: [`src/yaml/simd/neon.rs:171-220`](../../src/yaml/simd/neon.rs#L171-L220)
-- Classification functions: [`src/yaml/simd/neon.rs:253-367`](../../src/yaml/simd/neon.rs#L253-L367)
-- Parser integration (disabled): [`src/yaml/parser.rs:438-471`](../../src/yaml/parser.rs#L438-L471)
+- Broadword primitives: [`src/yaml/simd/broadword.rs:23-65`](../../src/yaml/simd/broadword.rs#L23-L65)
+- Classification functions: [`src/yaml/simd/broadword.rs:111-230`](../../src/yaml/simd/broadword.rs#L111-L230)
+- Parser integration (disabled): [`src/yaml/parser.rs:585-622`](../../src/yaml/parser.rs#L585-L622)
+
+**Caveat on these numbers — the workload never exercised the skip path (#185)**
+
+The disabled ARM integration asked its classifier for `value_terminators()`,
+which was `newlines | carriage_returns | colons | spaces | hash`. The live x86
+path has never included `spaces`, and the parser's byte loop does not treat a
+space as a terminator either — a plain scalar may contain them (`key: hello
+world`). So on the ARM path a space would abort a 16-byte skip that had no reason
+to stop. #185 unified both paths on `plain_scalar_terminators()` (line break,
+colon, hash; no spaces).
+
+That divergence is **not** what the table above measures, and the reason is worth
+recording, because it is the more useful finding: `yaml_bench` contains no plain
+scalar with an interior space. Every unquoted value it generates is a single
+token — `value{i}`, `leaf`, `item{i}`, `myapp`, `production`, `val{i}` — and the
+only spaces in the corpus sit inside quoted strings or block-scalar content,
+neither of which reaches `skip_unquoted_simd`. On `key0: value0\n` the `\n` at
+offset 6 precedes the next line's space at offset 12, so `trailing_zeros()`
+returns 6 under either mask: on this input the two terminator sets are
+behaviourally identical.
+
+Note the table's shape from the same angle. The only workloads that gained were
+`long_strings/*`, which are *quoted* and never reach the skip path at all, while
+`simple_kv/*` — 6-byte plain values — regressed 6-14%, which the analysis above
+already attributes to 16-byte classification overhead on short values. Nothing in
+the suite is prose-like enough to tell the two terminator sets apart.
+
+So "break-even point >64 bytes" stands as a statement about broadword overhead,
+not about the space-stop. The open follow-up is therefore *not* a re-run: re-running
+`yaml_bench` unchanged would reproduce these numbers, because the generators emit
+no shape that distinguishes the masks. Deciding whether the corrected set makes
+broadword on ARM64 worth re-enabling needs a space-bearing plain-scalar pattern
+added to the suite first — a benchmark cannot measure a shape it does not
+generate.
 
 ---
 

@@ -6,6 +6,8 @@
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+use super::scalar::{find_block_scalar_end_scalar, parse_anchor_name_scalar};
+
 // ============================================================================
 // Dispatch clamp (SUCCINCTLY_SIMD)
 // ============================================================================
@@ -88,6 +90,31 @@ pub struct YamlCharClass {
     /// 32 bytes were scanned — deriving the width from input length alone
     /// skipped structural bytes 16..31 on non-AVX2 CPUs (#193).
     pub width: usize,
+}
+
+impl YamlCharClass {
+    /// Bytes at which a plain (unquoted) scalar scan must stop and re-examine.
+    ///
+    /// The scan may stop early and lose nothing but speed, so this only has to
+    /// be a *superset* of what the parser's byte loop breaks on: `\n`, `\r`
+    /// (YAML 1.2 §5.4 makes a lone CR a line break too — #324), `#`, and `:`.
+    /// The loop re-checks the context-sensitive pair itself — `#` opens a
+    /// comment only after whitespace, `:` ends a key only before whitespace —
+    /// so the mask does not model that.
+    ///
+    /// Notably **not** `spaces`: a plain scalar may contain them (`key: hello
+    /// world`), so stopping at each one only costs a re-entry into the byte
+    /// loop.
+    ///
+    /// Kept verbatim in sync with `YamlCharClass16::plain_scalar_terminators`
+    /// in `yaml::simd::broadword`, which is the same set for the ARM64 variant
+    /// of `skip_unquoted_simd`. (Not an intra-doc link: that module is not
+    /// compiled on x86_64.) The two disagreed until #185 — this one omitted
+    /// `\r` before #324, and the broadword one added `spaces`.
+    #[inline(always)]
+    pub fn plain_scalar_terminators(&self) -> u32 {
+        self.newlines | self.carriage_returns | self.colons | self.hash
+    }
 }
 
 /// Classify YAML structural characters in a 32-byte chunk using AVX2.
@@ -753,37 +780,6 @@ unsafe fn find_block_scalar_end_sse2(input: &[u8], start: usize, min_indent: usi
     find_block_scalar_end_scalar(input, pos, min_indent)
 }
 
-fn find_block_scalar_end_scalar(input: &[u8], start: usize, min_indent: usize) -> usize {
-    let mut pos = start;
-
-    while pos < input.len() {
-        if matches!(input[pos], b'\n' | b'\r') {
-            let line_start = pos + 1;
-
-            if line_start >= input.len() {
-                return input.len();
-            }
-
-            // Count leading spaces
-            let mut indent = 0;
-            while line_start + indent < input.len() && input[line_start + indent] == b' ' {
-                indent += 1;
-            }
-
-            // Check if this line has content at insufficient indent
-            if line_start + indent < input.len() {
-                let next_char = input[line_start + indent];
-                if next_char != b'\n' && next_char != b'\r' && indent < min_indent {
-                    return line_start;
-                }
-            }
-        }
-        pos += 1;
-    }
-
-    input.len()
-}
-
 // ============================================================================
 // Anchor/Alias Name Parsing (P4 Optimization)
 // ============================================================================
@@ -860,30 +856,6 @@ unsafe fn parse_anchor_name_avx2(input: &[u8], start: usize) -> usize {
 
     // Handle remaining bytes with scalar fallback
     parse_anchor_name_scalar(input, pos)
-}
-
-/// Scalar fallback for parsing anchor names.
-fn parse_anchor_name_scalar(input: &[u8], start: usize) -> usize {
-    let mut pos = start;
-    while pos < input.len() {
-        let b = input[pos];
-        match b {
-            // Stop at flow indicators, whitespace, and newlines
-            b' ' | b'\t' | b'\n' | b'\r' | b'[' | b']' | b'{' | b'}' | b',' => break,
-            // Colon is allowed in anchor names if not followed by whitespace
-            b':' => {
-                if pos + 1 < input.len() {
-                    let next = input[pos + 1];
-                    if next == b' ' || next == b'\t' || next == b'\n' || next == b'\r' {
-                        break;
-                    }
-                }
-                pos += 1;
-            }
-            _ => pos += 1,
-        }
-    }
-    pos
 }
 
 /// Public API: Parse anchor/alias name with runtime SIMD dispatch.
@@ -1217,11 +1189,16 @@ mod tests {
         }
     }
 
-    /// All eight mask channels of a `YamlCharClass`, paired with names for
+    /// All nine mask channels of a `YamlCharClass`, paired with names for
     /// assertion messages.
-    fn classify_channels(class: &YamlCharClass) -> [(u32, &'static str); 8] {
+    ///
+    /// `carriage_returns` was missing here until #185, so the channel #324 added
+    /// to the live terminator mask was the one channel the sweep below never
+    /// checked.
+    fn classify_channels(class: &YamlCharClass) -> [(u32, &'static str); 9] {
         [
             (class.newlines, "newlines"),
+            (class.carriage_returns, "carriage_returns"),
             (class.colons, "colons"),
             (class.hyphens, "hyphens"),
             (class.spaces, "spaces"),
@@ -1239,15 +1216,17 @@ mod tests {
     /// terminators after a 16-byte SSE2 classify (#231).
     #[test]
     fn test_classify_kernels_differential_terminator_sweep() {
-        let structural: [(u8, usize); 8] = [
+        // Second field indexes into `classify_channels`; keep the two in step.
+        let structural: [(u8, usize); 9] = [
             (b'\n', 0),
-            (b':', 1),
-            (b'-', 2),
-            (b' ', 3),
-            (b'"', 4),
-            (b'\'', 5),
-            (b'\\', 6),
-            (b'#', 7),
+            (b'\r', 1),
+            (b':', 2),
+            (b'-', 3),
+            (b' ', 4),
+            (b'"', 5),
+            (b'\'', 6),
+            (b'\\', 7),
+            (b'#', 8),
         ];
         let run_avx2 = has_avx2();
 
@@ -1308,5 +1287,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `plain_scalar_terminators` is the mask the *live* `skip_unquoted_simd`
+    /// runs on ([`crate::yaml::parser`]), so it is the copy that matters and the
+    /// one nothing tested before #185. Asserted per byte rather than as an OR of
+    /// the channel fields, which would restate the implementation: a channel
+    /// added to or dropped from the set changes which bytes stop the skip, and
+    /// that is what this pins.
+    ///
+    /// The twin of this test for the broadword widths is
+    /// `plain_scalar_terminators_stop_at_structure_but_not_at_spaces` in
+    /// `yaml::simd::broadword`; the two sets must stay identical because the
+    /// parser's byte loop is shared.
+    #[test]
+    fn plain_scalar_terminators_is_exactly_line_break_colon_hash() {
+        // A terminator must be a superset of what the byte loop breaks on, and
+        // must exclude space — a plain scalar may contain one (`key: hello
+        // world`), so stopping there only shortens the skip.
+        let terminating = *b"\n\r:#";
+        let passing = *b" \t-\"'\\a0";
+
+        for byte in terminating.into_iter().chain(passing) {
+            let mut buf = [b'a'; 48];
+            buf[3] = byte;
+            let class = classify_yaml_chars(&buf, 0).expect("48 bytes available");
+            let stops = class.plain_scalar_terminators() & (1 << 3) != 0;
+
+            assert_eq!(
+                stops,
+                terminating.contains(&byte),
+                "0x{byte:02x} ({:?}) must {} a plain scalar",
+                byte as char,
+                if terminating.contains(&byte) {
+                    "terminate"
+                } else {
+                    "not terminate"
+                }
+            );
+        }
+
+        // An inert chunk sets nothing, so the mask is not simply always hot.
+        let inert = [b'a'; 48];
+        let class = classify_yaml_chars(&inert, 0).expect("48 bytes available");
+        assert_eq!(class.plain_scalar_terminators(), 0);
     }
 }
