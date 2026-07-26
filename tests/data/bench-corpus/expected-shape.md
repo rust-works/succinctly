@@ -8,32 +8,33 @@ Distributions are derived from the crate's own semi-index (`JsonIndex` / `YamlIn
 
 ## Corpus inventory
 
-| format | workload  | file                     | bytes |
-| ------ | --------- | ------------------------ | ----- |
-| dsv    | world-gdp | world-gdp-with-codes.csv | 4515  |
-| json   | charts    | bullet-data.json         | 548   |
-| yaml   | actions   | codeql-analysis.yml      | 925   |
-| yaml   | actions   | stale.yml                | 1290  |
-| yaml   | compose   | nginx-flask-mysql.yaml   | 1239  |
-| yaml   | compose   | wordpress.yaml           | 815   |
-| yaml   | k8s       | nginx-deployment.yml     | 836   |
-| yaml   | lint      | sass-lint.yml            | 2055  |
+| format | workload       | file                        | bytes |
+| ------ | -------------- | --------------------------- | ----- |
+| dsv    | world-gdp      | world-gdp-with-codes.csv    | 4515  |
+| json   | charts         | bullet-data.json            | 548   |
+| yaml   | actions        | codeql-analysis.yml         | 925   |
+| yaml   | actions        | stale.yml                   | 1290  |
+| yaml   | compose        | nginx-flask-mysql.yaml      | 1239  |
+| yaml   | compose        | wordpress.yaml              | 815   |
+| yaml   | home-assistant | air-quality-conditions.yaml | 9990  |
+| yaml   | k8s            | nginx-deployment.yml        | 836   |
+| yaml   | lint           | sass-lint.yml               | 2055  |
 
 ## YAML
 
-files: 6, total bytes: 7160, anchors: 0, aliases: 0, bare-dash items: 5
+files: 7, total bytes: 17150, anchors: 41, aliases: 86, bare-dash items: 5
 
 | metric               | unit         | n   | min  | p50  | p90  | p99  | max  |
 | -------------------- | ------------ | --- | ---- | ---- | ---- | ---- | ---- |
-| scalar length        | bytes/scalar | 410 | 0    | 7    | 21   | 66   | 92   |
-| mapping keys         | keys/mapping | 69  | 0    | 2    | 5    | 69   | 69   |
-| sequence items       | items/seq    | 30  | 1    | 1    | 3    | 4    | 4    |
-| bare-dash seq items  | count/file   | 6   | 0    | 0    | 5    | 5    | 5    |
+| scalar length        | bytes/scalar | 945 | 0    | 7    | 19   | 49   | 92   |
+| mapping keys         | keys/mapping | 228 | 0    | 2    | 3    | 9    | 69   |
+| sequence items       | items/seq    | 66  | 1    | 2    | 3    | 4    | 4    |
+| bare-dash seq items  | count/file   | 7   | 0    | 0    | 5    | 5    | 5    |
 | flow-collection size | bytes/flow   | 4   | 2    | 2    | 100  | 100  | 100  |
-| nesting depth        | levels/node  | 284 | 2    | 5    | 9    | 11   | 12   |
-| anchors              | count/file   | 6   | 0    | 0    | 0    | 0    | 0    |
-| aliases              | count/file   | 6   | 0    | 0    | 0    | 0    | 0    |
-| escape density       | per KiB/file | 6   | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+| nesting depth        | levels/node  | 729 | 2    | 5    | 8    | 11   | 12   |
+| anchors              | count/file   | 7   | 0    | 0    | 41   | 41   | 41   |
+| aliases              | count/file   | 7   | 0    | 0    | 86   | 86   | 86   |
+| escape density       | per KiB/file | 7   | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
 
 ## JSON
 

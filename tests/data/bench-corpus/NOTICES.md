@@ -21,6 +21,7 @@ retains its upstream license below.
 | `yaml/actions/stale.yml`              | [prometheus/prometheus](https://github.com/prometheus/prometheus) `.github/workflows/stale.yml`        | Apache-2.0 |
 | `yaml/k8s/nginx-deployment.yml`       | [kubernetes/examples](https://github.com/kubernetes/examples) `nginx-platform-app/deployment.yml`      | Apache-2.0 |
 | `yaml/lint/sass-lint.yml`             | [istio/istio](https://github.com/istio/istio) `common/config/sass-lint.yml` (bare-dash sequence items: `-` alone on its line) | Apache-2.0 |
+| `yaml/home-assistant/air-quality-conditions.yaml` | [home-assistant/core](https://github.com/home-assistant/core) `homeassistant/components/air_quality/conditions.yaml` (anchors, aliases, and merge keys: `&name`, `*name`, `<<: *name`) | Apache-2.0 |
 | `json/charts/bullet-data.json`        | [plotly/datasets](https://github.com/plotly/datasets) `BulletData.json`                                | MIT        |
 | `dsv/world-gdp/world-gdp-with-codes.csv` | [plotly/datasets](https://github.com/plotly/datasets) `2014_world_gdp_with_codes.csv` (genuine quoting: `"Bahamas, The"`) | MIT |
 
@@ -35,27 +36,44 @@ retains its upstream license below.
 ## What the corpus can and cannot tell you
 
 The corpus establishes **existence** — that a shape occurs in real files, and what
-it looks like at what size. It cannot establish **frequency**: seven files can never
-proportionally represent a shape that appears in a fraction of a percent of real
+it looks like at what size. It cannot establish **frequency**: a corpus this small can
+never proportionally represent a shape that appears in a fraction of a percent of real
 input. `yaml/lint/sass-lint.yml` is the worked example. It was added for #326 so the
 bare-dash sequence item (`-` alone on its line) is sampled at all, but a survey of
 26 upstream repositories (33,575 YAML files) found that shape in 0.042% of them.
-Reading its presence here as "roughly one YAML file in six uses bare dashes" inverts
-the error the corpus exists to prevent. Frequency questions belong to
+Reading its presence here as "roughly one YAML file in seven uses bare dashes" inverts
+the error the corpus exists to prevent.
+
+`yaml/home-assistant/air-quality-conditions.yaml` (#342) is the same story one order of
+magnitude up. It carries 41 anchors and 86 aliases, which is what a genuinely
+anchor-dense file looks like — but anchors appear in only 0.494% of real YAML files,
+and even in Home Assistant, the densest ecosystem surveyed, in 10.98%. The corpus now
+answers "what does anchor-heavy YAML look like, and at what size"; it still does not say
+how often you will meet one. Frequency questions belong to
 [`docs/benchmarks/yaml-shape-survey.md`](../../../docs/benchmarks/yaml-shape-survey.md).
 
 ## Extending the corpus
 
-The 1MB/10MB ladder tiers and anchor/alias-heavy YAML are follow-up curation. The
-anchor gap is the more urgent of the two: the corpus still shows `anchors: 0`, and the
-survey establishes that this is a **sampling artefact**, not upstream reality — the
-corpus over-samples Kubernetes and Compose, the two families that genuinely avoid
-anchors, while ecosystems that use them (Home Assistant, Salt, Concourse, GitLab CI)
-carry anchors in 4–11% of files, roughly 100x the bare-dash rate. To add one: add a
-`manifest.json` entry (`vendored: false`) with a
-commit-pinned `source_url`, `license`, `bytes`, and `sha256`, then run
-`./scripts/sync-bench-corpus.sh` to fetch and verify it. Prefer public-domain or
-permissive (CC0 / MIT / Apache-2.0 / BSD) sources and always record provenance.
+The anchor gap the survey identified is closed (#342): the corpus over-sampled
+Kubernetes and Compose, the two families that genuinely avoid anchors, so its
+`anchors: 0` was a **sampling artefact** rather than upstream reality. Vendoring one
+Home Assistant file — the ecosystem the survey measured at 10.98% — moves the reading to
+41 anchors and 86 aliases. The 1MB/10MB ladder tiers remain outstanding.
+
+To add a file: add a `manifest.json` entry with a commit-pinned `source_url`, `license`,
+`bytes`, and `sha256`, add a row here, then run `./scripts/sync-bench-corpus.sh --check`
+(vendored) or `./scripts/sync-bench-corpus.sh` (fetched) to verify it. Prefer
+public-domain or permissive (CC0 / MIT / Apache-2.0 / BSD) sources and always record
+provenance.
+
+Choose `vendored` by what the file is *for*. A file added to put an input shape on the
+record must be `vendored: true`: only `seed/` reaches
+[`expected-shape.md`](expected-shape.md), the golden CI checks, so a `vendored: false`
+file lands in [`corpus-shape.md`](../../../docs/benchmarks/corpus-shape.md) alone and
+nothing guards it against drifting back out. Reserve `vendored: false` for files that
+exist to fill a large ladder tier, where committing megabytes would be the greater cost.
+Either way, regenerate both reports afterwards — the commands are in
+[`docs/guides/benchmarking.md`](../../../docs/guides/benchmarking.md).
 
 Test-parse any candidate before committing it (`succinctly yq -o json '.' <file>`).
 `ingest_yaml` turns a parse failure into an error that aborts the whole report, and
