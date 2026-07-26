@@ -52,46 +52,9 @@ use core::cell::Cell;
 
 use crate::util::broadword::select_in_word;
 
-use super::advance_positions::{build_cumulative_rank, build_select_samples, SELECT_SAMPLE_RATE};
-
-/// Cursor state for sequential access optimization.
-///
-/// When `get()` is called with consecutively increasing `open_idx` values
-/// (as happens during depth-first streaming), this cursor enables O(1)
-/// amortized access by maintaining incremental rank/select state instead
-/// of recomputing from scratch each time.
-///
-/// Invariants (when `next_open_idx < usize::MAX`):
-/// - `adv_cumulative` = number of 1-bits in `advance[0..next_open_idx)`
-/// - `ib_ones_before` = number of 1-bits in `ib_words[0..ib_word_idx)`
-#[derive(Clone, Copy, Debug)]
-struct SequentialCursor {
-    /// The next expected open_idx for sequential access.
-    next_open_idx: usize,
-    /// advance_rank1(next_open_idx): cumulative 1-bits in advance before this position.
-    adv_cumulative: usize,
-    /// Current word index in IB bitmap for forward scanning.
-    ib_word_idx: usize,
-    /// Number of 1-bits in ib_words[0..ib_word_idx).
-    ib_ones_before: usize,
-    /// Last argument to ib_select1 (for duplicate detection). usize::MAX = uninitialized.
-    last_ib_arg: usize,
-    /// Cached result from last ib_select1 call.
-    last_ib_result: usize,
-}
-
-impl Default for SequentialCursor {
-    fn default() -> Self {
-        Self {
-            next_open_idx: 0,
-            adv_cumulative: 0,
-            ib_word_idx: 0,
-            ib_ones_before: 0,
-            last_ib_arg: usize::MAX,
-            last_ib_result: 0,
-        }
-    }
-}
+use super::advance_positions::{
+    build_cumulative_rank, build_select_samples, SequentialCursor, SELECT_SAMPLE_RATE,
+};
 
 /// End position storage with automatic optimization.
 ///
@@ -323,6 +286,10 @@ impl CompactEndPositions {
             let mut cursor = cursor;
             self.advance_cursor_to(&mut cursor, open_idx);
             self.get_sequential(open_idx, cursor)
+        } else if cursor.repeats(open_idx) {
+            // Re-asking the immediately preceding question: the cursor still holds
+            // the answer, and leaving it untouched keeps the next call sequential.
+            Some(cursor.last_ib_result)
         } else {
             // Backwards jump: full recomputation (rare, only in non-streaming access)
             self.get_random(open_idx)
@@ -917,6 +884,59 @@ mod tests {
                 Some(positions[i] as usize),
                 "random access i={i}"
             );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // #337: this cursor carries the same repeat/backwards-jump fix as
+    // `AdvancePositions`, so it carries the same access-pattern coverage.
+    // ---------------------------------------------------------------------
+
+    /// After the O(1) repeat path and after backwards jumps, `get` must still
+    /// agree with the dense `Vec<u32>` it encodes.
+    #[test]
+    fn interleaved_access_patterns_match_dense_storage() {
+        let positions: Vec<u32> = (1..400).map(|i| i * 37).collect();
+        let text_len = *positions.last().unwrap() as usize + 64;
+        let compact = EndPositions::build(&positions, text_len);
+        let dense = EndPositions::Dense(positions.clone());
+        assert!(
+            matches!(compact, EndPositions::Compact(_)),
+            "fixture must exercise the compact path"
+        );
+
+        let n = positions.len();
+        let mut idx = 0usize;
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for step in 0..4000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            idx = match step % 4 {
+                0 => (idx + 1) % n,                          // sequential
+                1 => idx,                                    // repeat (the #337 pattern)
+                2 => (idx + 1 + (state >> 59) as usize) % n, // forward gap
+                _ => (state >> 33) as usize % n,             // arbitrary jump
+            };
+            assert_eq!(
+                compact.get(idx),
+                dense.get(idx),
+                "step {step}: get({idx}) disagrees with dense storage"
+            );
+        }
+    }
+
+    /// Reading every entry twice — the call pattern `YamlElements::uncons`
+    /// produces — must give the same answers as reading each once.
+    #[test]
+    fn double_read_walk_matches_single_read_walk() {
+        let positions: Vec<u32> = (1..1000).map(|i| i * 500).collect();
+        let text_len = *positions.last().unwrap() as usize + 64;
+        let ep = EndPositions::build(&positions, text_len);
+
+        for (i, &expected) in positions.iter().enumerate() {
+            assert_eq!(ep.get(i), Some(expected as usize), "first read of {i}");
+            assert_eq!(ep.get(i), Some(expected as usize), "second read of {i}");
         }
     }
 }

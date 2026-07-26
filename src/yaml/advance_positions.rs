@@ -145,28 +145,36 @@ impl OpenPositions {
     }
 }
 
-/// Cursor state for sequential access optimization in `AdvancePositions`.
+/// Cursor state for sequential access optimization.
+///
+/// Shared by `AdvancePositions` here and `CompactEndPositions` in
+/// `end_positions`: the two carry the same IB + advance bitmap pair and drive it
+/// with the same three-path dispatch, so they share one cursor rather than two
+/// copies that can drift apart (#337 was a bug present in both copies).
 ///
 /// Invariants (when `next_open_idx < usize::MAX`):
 /// - `adv_cumulative` = number of 1-bits in `advance[0..next_open_idx)`
 /// - `ib_ones_before` = number of 1-bits in `ib_words[0..ib_word_idx)`
 #[derive(Clone, Copy, Debug)]
-struct SequentialCursor {
+pub(super) struct SequentialCursor {
     /// The next expected open_idx for sequential access.
-    next_open_idx: usize,
+    pub(super) next_open_idx: usize,
     /// advance_rank1(next_open_idx): cumulative 1-bits in advance before this position.
-    adv_cumulative: usize,
+    pub(super) adv_cumulative: usize,
     /// Current word index in IB bitmap for forward scanning.
-    ib_word_idx: usize,
+    pub(super) ib_word_idx: usize,
     /// Number of 1-bits in ib_words[0..ib_word_idx).
-    ib_ones_before: usize,
+    pub(super) ib_ones_before: usize,
     /// Last argument to ib_select1 (for duplicate detection). usize::MAX = uninitialized.
-    last_ib_arg: usize,
+    pub(super) last_ib_arg: usize,
     /// Cached result from last ib_select1 call.
-    last_ib_result: usize,
+    pub(super) last_ib_result: usize,
 }
 
 impl Default for SequentialCursor {
+    /// `#[inline]` because `end_positions` constructs this across a module (and
+    /// so potentially codegen-unit) boundary, on the index build path.
+    #[inline]
     fn default() -> Self {
         Self {
             next_open_idx: 0,
@@ -176,6 +184,27 @@ impl Default for SequentialCursor {
             last_ib_arg: usize::MAX,
             last_ib_result: 0,
         }
+    }
+}
+
+impl SequentialCursor {
+    /// Does this cursor already hold the answer for `open_idx`?
+    ///
+    /// True exactly when `open_idx` repeats the immediately preceding query and
+    /// that query resolved to an IB position. `YamlElements::uncons` looks the
+    /// same open up twice — once for the seq-item test, once inside `value()` —
+    /// so this is the hot case on the read path, not a curiosity (#337).
+    ///
+    /// After a successful `get` at index `i` the cursor holds
+    /// `next_open_idx == i + 1`, `adv_cumulative == advance_rank1(i + 1)` and
+    /// `last_ib_arg == adv_cumulative - 1`. A previous call that returned `None`
+    /// cannot match: `advance_count == 0` fails the second test, and a scan that
+    /// ran off the end of IB leaves `last_ib_arg` below `adv_cumulative - 1`.
+    #[inline]
+    pub(super) fn repeats(&self, open_idx: usize) -> bool {
+        open_idx + 1 == self.next_open_idx
+            && self.adv_cumulative > 0
+            && self.adv_cumulative - 1 == self.last_ib_arg
     }
 }
 
@@ -353,6 +382,10 @@ impl AdvancePositions {
             let mut cursor = cursor;
             self.advance_cursor_to(&mut cursor, open_idx);
             self.get_sequential(open_idx, cursor)
+        } else if cursor.repeats(open_idx) {
+            // Re-asking the immediately preceding question: the cursor still holds
+            // the answer, and leaving it untouched keeps the next call sequential.
+            Some(cursor.last_ib_result as u32)
         } else {
             // Backwards jump: full recomputation (rare, only in non-streaming access)
             self.get_random(open_idx)
@@ -482,7 +515,7 @@ impl AdvancePositions {
             last_ib_result: result.map_or(0, |r| r as usize),
         });
 
-        result
+        result.map(|pos| pos as u32)
     }
 
     /// Create a cursor starting at open index 0.
@@ -666,6 +699,24 @@ impl AdvancePositions {
             + self.ib_select_samples.len() * 4
             + self.advance_words.len() * 8
             + self.advance_rank.len() * 4
+    }
+
+    /// `(ib_word_idx, ib_ones_before)` the sequential cursor currently holds.
+    ///
+    /// For asserting the #337 invariant: the IB fields must point *at* the last
+    /// result, because a `get_sequential` that has to rescan IB from word 0 is
+    /// O(text_len/64) rather than O(1).
+    #[cfg(test)]
+    fn cursor_ib_state(&self) -> (usize, usize) {
+        let cursor = self.cursor.get();
+        (cursor.ib_word_idx, cursor.ib_ones_before)
+    }
+
+    /// Reset the sequential cursor, so a test can choose which dispatch path
+    /// the next `get` takes.
+    #[cfg(test)]
+    fn reset_cursor(&self) {
+        self.cursor.set(SequentialCursor::default());
     }
 
     /// Find the last (deepest) open index that starts at the given text position.
@@ -1169,6 +1220,124 @@ mod tests {
         for _ in 0..20_000 {
             let i = rng.random_range(0..positions.len());
             assert_eq!(ap.get(i), Some(positions[i]), "random access i={i}");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // #337: a backwards jump must not leave the cursor rewound to word 0
+    // ---------------------------------------------------------------------
+
+    /// Positions spread far enough apart that a rewound cursor has to cross
+    /// many IB words to catch up — the cost that made reads quadratic.
+    fn wide_positions(n: usize) -> (Vec<u32>, usize) {
+        let stride = 500;
+        ((0..n).map(|i| (i * stride) as u32).collect(), n * stride)
+    }
+
+    /// After a random (backwards) lookup, the cursor's IB fields must point at
+    /// the word holding the result, not back at word 0.
+    ///
+    /// This is the property that makes the fix O(1); asserting it directly is
+    /// stable, where asserting elapsed time would be flaky.
+    #[test]
+    fn random_access_leaves_cursor_at_the_result() {
+        let (positions, text_len) = wide_positions(400);
+        let ap = AdvancePositions::build_unchecked(&positions, text_len);
+
+        for open_idx in [0usize, 1, 7, 63, 64, 199, 256, 399] {
+            ap.reset_cursor();
+            // Seed the cursor past the target so `get` dispatches to get_random.
+            assert_eq!(ap.get(399), Some(positions[399]));
+
+            let pos = ap.get(open_idx).expect("in range") as usize;
+            assert_eq!(pos, positions[open_idx] as usize);
+
+            let (ib_word_idx, ib_ones_before) = ap.cursor_ib_state();
+            assert_eq!(
+                ib_word_idx,
+                pos / 64,
+                "cursor should sit in the result's IB word for open_idx {open_idx}"
+            );
+            assert_eq!(
+                ib_ones_before,
+                ap.ib_rank1(ib_word_idx * 64),
+                "ib_ones_before must count the ones in whole words before ib_word_idx"
+            );
+        }
+    }
+
+    /// The invariant must also hold after the O(1) repeat path, which returns
+    /// without touching the cursor at all.
+    #[test]
+    fn repeating_the_previous_index_is_consistent_and_leaves_cursor_intact() {
+        let (positions, text_len) = wide_positions(200);
+        let ap = AdvancePositions::build_unchecked(&positions, text_len);
+
+        for open_idx in 0..positions.len() {
+            let first = ap.get(open_idx);
+            let state_after_first = ap.cursor_ib_state();
+
+            // `uncons` asks the same question twice; the second must agree...
+            assert_eq!(ap.get(open_idx), first, "repeat of get({open_idx})");
+            assert_eq!(
+                ap.cursor_ib_state(),
+                state_after_first,
+                "repeat of get({open_idx}) must not disturb the cursor"
+            );
+
+            // ...and must not break the sequential walk that follows it.
+            if open_idx + 1 < positions.len() {
+                assert_eq!(ap.get(open_idx + 1), Some(positions[open_idx + 1]));
+                assert_eq!(ap.get(open_idx), Some(positions[open_idx]));
+            }
+        }
+    }
+
+    /// Every dispatch path — sequential, forward gap, repeat, backwards jump —
+    /// must agree with the plain `Vec<u32>` it encodes.
+    #[test]
+    fn interleaved_access_patterns_match_dense_storage() {
+        // Duplicates included: YAML containers share a position with their first
+        // child, so `advance` has 0-bits and `k` stalls across calls.
+        let positions: Vec<u32> = (0..300)
+            .flat_map(|i| [i * 40, i * 40, i * 40 + 17])
+            .collect();
+        let text_len = *positions.last().unwrap() as usize + 64;
+        let ap = AdvancePositions::build_unchecked(&positions, text_len);
+        let n = positions.len();
+
+        // A deterministic mix of forward runs, immediate repeats, long backwards
+        // jumps and gaps, driven by a cheap LCG so the order is reproducible.
+        let mut idx = 0usize;
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for step in 0..4000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            idx = match step % 4 {
+                0 => (idx + 1) % n,                          // sequential
+                1 => idx,                                    // repeat (the #337 pattern)
+                2 => (idx + 1 + (state >> 59) as usize) % n, // forward gap
+                _ => (state >> 33) as usize % n,             // arbitrary jump
+            };
+            assert_eq!(
+                ap.get(idx),
+                Some(positions[idx]),
+                "step {step}: get({idx}) disagrees with dense storage"
+            );
+        }
+    }
+
+    /// A full forward walk must still be correct when every element is read
+    /// twice — the exact call pattern `YamlElements::uncons` produces.
+    #[test]
+    fn double_read_walk_matches_single_read_walk() {
+        let (positions, text_len) = wide_positions(1000);
+        let ap = AdvancePositions::build_unchecked(&positions, text_len);
+
+        for (i, &expected) in positions.iter().enumerate() {
+            assert_eq!(ap.get(i), Some(expected), "first read of {i}");
+            assert_eq!(ap.get(i), Some(expected), "second read of {i}");
         }
     }
 }
