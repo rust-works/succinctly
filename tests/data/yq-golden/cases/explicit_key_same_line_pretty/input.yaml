@@ -1,0 +1,46 @@
+# An explicit key and its `: ` on the same line (#346).
+#
+# `? k: v` makes the whole `k: v` a compact block mapping used as the *key*
+# (YAML 1.2 §8.2.2), so the entry has a complex key - which yq renders `""` -
+# and no value. Every shape here diverged before the fix.
+top_level:
+  ? k: v
+map_value:
+  m:
+    ? k: v
+seq_item:
+  - ? k: v
+value_on_next_line:
+  ? k: v
+  : w
+key_continues:
+  ? k: v
+    j: u
+sibling_entry:
+  ? k: v
+  j: u
+wide_indent:
+  ?   k: v
+      j: u
+  : w
+quoted_key:
+  ? "a": v
+single_quoted_key:
+  ? 'a': v
+value_is_a_mapping:
+  ? a
+  : b: c
+both_are_mappings:
+  ? a: b
+  : c: d
+sequence_key_still_wins:
+  ? - a: b
+  : v
+following_item:
+  - ? k: v
+  - z
+colon_without_space:
+  ? k:v
+multi_line_spelling:
+  ? k
+  : v

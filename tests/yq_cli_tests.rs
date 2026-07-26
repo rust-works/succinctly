@@ -1344,6 +1344,139 @@ fn test_yaml_seq_item_question_mark_without_space_is_a_scalar() -> Result<()> {
 }
 
 // =============================================================================
+// An explicit key and its `: ` on one line (#346) - `? k: v` makes the whole
+// `k: v` a mapping used as the key, so the entry has a complex key (rendered
+// `""`) and no value. Expectations are mikefarah/yq v4.53.3 output.
+// =============================================================================
+
+#[test]
+fn test_yaml_explicit_key_same_line_is_a_complex_key() -> Result<()> {
+    // The headline #346 repro. `parse_explicit_key` used to stop the key scalar
+    // at the `: ` and return mid-line, reading this as the simple entry
+    // {"k":"v"} - a well-formed, wrong document with no error raised.
+    let input = "? k: v\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"":null}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_key_same_line_agrees_across_positions() -> Result<()> {
+    // The three rows from the issue. They diverged three different ways: the
+    // mid-line return left the main loop re-deriving the line's indent as 0, so
+    // top level kept the value while both nested spellings nulled it.
+    for (name, input, expected) in [
+        ("top level", "? k: v\n", r#"{"":null}"#),
+        ("map value", "m:\n  ? k: v\n", r#"{"m":{"":null}}"#),
+        ("seq item", "- ? k: v\n", r#"[{"":null}]"#),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(exit_code, 0, "{name} should parse");
+        assert_eq!(output.trim(), expected, "{name} mismatch");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_key_same_line_takes_its_value_from_the_next_line() -> Result<()> {
+    // The complex key is still an ordinary explicit key: a following `: ` line
+    // at the `?`'s column supplies its value.
+    let input = "? k: v\n: w\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"":"w"}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_key_same_line_ends_at_the_indicators_column() -> Result<()> {
+    // The key mapping sits at the key content's column, so a line there joins the
+    // key, while one back at the `?`'s column ends the key and is a sibling entry.
+    let (output, exit_code) = run_yq_stdin(".", "? k: v\n  j: u\n", &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"":null}"#, "`  j: u` joins the key");
+
+    let (output, exit_code) = run_yq_stdin(".", "? k: v\nj: u\n", &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output.trim(),
+        r#"{"":null,"j":"u"}"#,
+        "`j: u` is a sibling entry"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_value_same_line_is_a_mapping() -> Result<()> {
+    // The value indicator had the identical mid-line defect, so the fix is
+    // mirrored there. Corpus case V9D5 needs both arms at once.
+    let (output, exit_code) = run_yq_stdin(".", "? a\n: b: c\n", &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":{"b":"c"}}"#);
+
+    let input = "- sun: yellow\n- ? earth: blue\n  : moon: white\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output.trim(),
+        r#"[{"sun":"yellow"},{"":{"moon":"white"}}]"#,
+        "V9D5"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_key_same_line_is_navigable() -> Result<()> {
+    // Not just identity: the entry must be a real one-entry mapping, and the
+    // complex key must not leave a `k` field behind for queries to find.
+    let input = "? k: v\n: w\n";
+    let (output, exit_code) = run_yq_stdin("length", input, &["-o=json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "1", "one entry, not two");
+
+    let (output, exit_code) = run_yq_stdin(".k", input, &["-o=json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "null", "`k` is inside the key, not a field");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_key_same_line_is_line_break_agnostic() -> Result<()> {
+    // Composes with #324: all three YAML 1.2 §5.4 break forms give one document.
+    for (name, input) in [
+        ("LF", "? k: v\n: w\n"),
+        ("CRLF", "? k: v\r\n: w\r\n"),
+        ("CR", "? k: v\r: w\r"),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(exit_code, 0, "{name} input should parse");
+        assert_eq!(
+            output.trim(),
+            r#"{"":"w"}"#,
+            "{name} line breaks should give the same document"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_key_colon_without_space_stays_key_text() -> Result<()> {
+    // `:` is only a value indicator when followed by whitespace or EOI, so the
+    // new arm must not claim a key that merely contains a colon.
+    let input = "? k:v\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"k:v":null}"#);
+
+    // ...nor the multi-line spelling, which was always correct.
+    let (output, exit_code) = run_yq_stdin(".", "? k\n: v\n", &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"k":"v"}"#);
+    Ok(())
+}
+
+// =============================================================================
 // Alias cycle rejection (#153) - cyclic anchors must be a clean parse error,
 // not a stack-overflow abort
 // =============================================================================

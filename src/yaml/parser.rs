@@ -2133,12 +2133,40 @@ impl<'a> Parser<'a> {
                 // Block scalar as key
                 self.parse_block_scalar(indent)?;
             }
+            _ if self.looks_like_mapping_entry() => {
+                // `? k: v` — a value indicator on this line means the node after `? `
+                // is a *compact block mapping* that is itself the key (YAML 1.2 §8.2.2:
+                // c-l-block-map-explicit-key -> s-l+block-indented -> ns-l-compact-mapping).
+                // The entry therefore has a complex key and no value, which is why yq
+                // renders it `""` and null (#346).
+                //
+                // Routed through the same `parse_compact_mapping_entry` the `- k: v`
+                // sequence-item path uses rather than a second copy of the decision
+                // (#106). Ordered after the `-`, `[`, `{` and block-scalar arms so
+                // those spellings — whose lines can carry a `: ` that is not this
+                // line's value indicator — keep their handling.
+                //
+                // The key content's own column, not `indent`, is the mapping's indent:
+                // a continuation line joins the key at the key's column (`? k: v` then
+                // `  j: u`), while the `: ` value indicator aligns with the `?`.
+                //
+                // Leaving that mapping open is what keeps the parser off the mid-line
+                // exit this used to take: `parse_unquoted_value_with_indent` stopped at
+                // the `: `, and the main loop then re-derived the line's indent from
+                // mid-line as 0 and closed the mapping it should have been filling.
+                self.parse_compact_mapping_entry(self.current_column())?;
+            }
             Some(b'*') => {
-                // Alias as key (`? *a`). No node is open yet at this point (unlike
-                // the block, compact and flow key sites), so `parse_alias` opening
-                // and closing its own is correct here. Without this arm the alias
-                // fell to the plain-scalar arm below, which produced an empty key
-                // whether or not the anchor existed (#372).
+                // Alias as key (`? *a`). As in the flow-mapping key path,
+                // `parse_alias` opens and closes its own node. Without this arm
+                // the alias fell to the plain-scalar arm below, which produced
+                // an empty key whether or not the anchor existed (#372).
+                //
+                // Below the mapping-entry arm above, so `? *a: v` is read as a
+                // compact mapping whose key is the alias — the same reading
+                // `parse_compact_mapping_entry` already gives `- *a: v`. This
+                // arm is the alias that is the whole key, with its `:` (if any)
+                // on a later line.
                 self.parse_alias()?;
             }
             Some(b'"') => {
@@ -2229,6 +2257,14 @@ impl<'a> Parser<'a> {
             }
             Some(b'|' | b'>') => {
                 self.parse_block_scalar(indent)?;
+            }
+            _ if self.looks_like_mapping_entry() => {
+                // `: b: c` — the mirror of the key-side arm above: the node after `: `
+                // may equally be a compact block mapping starting on the same line, and
+                // stopping the scalar at the inner `: ` left the parser mid-line with
+                // the same consequences (#346). Corpus case V9D5
+                // (`- ? earth: blue` / `  : moon: white`) needs both arms.
+                self.parse_compact_mapping_entry(self.current_column())?;
             }
             Some(b'"') => {
                 self.set_ib();

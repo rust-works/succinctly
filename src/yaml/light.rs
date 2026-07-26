@@ -6566,6 +6566,170 @@ mod tests {
         }
     }
 
+    /// Issue #346: `? ` and a `: ` value indicator on the *same* line. Per YAML 1.2
+    /// §8.2.2 the node after `? ` is `s-l+block-indented`, which admits
+    /// `ns-l-compact-mapping` — so the whole `k: v` is a *mapping used as the key*,
+    /// and the entry has no value. yq renders that key `""` and the value null.
+    ///
+    /// Before the fix `parse_explicit_key` stopped the key scalar at the `: ` and
+    /// returned mid-line. `count_indent` counts spaces forward from `self.pos` with
+    /// no line-start check, so the main loop re-derived that line's indent as 0 and
+    /// `parse_explicit_value` closed the mapping it should have been filling — which
+    /// is why the nested spellings silently lost the value (`{"m":{"k":null}}`) while
+    /// the top-level one survived intact and merely wrong (`{"k":"v"}`).
+    ///
+    /// Every expectation is the output of mikefarah/yq v4.53.3, the same oracle
+    /// `tests/data/yq-golden/cases/explicit_key_same_line_*` is captured from.
+    #[test]
+    fn test_explicit_key_and_value_on_one_line() {
+        let cases: &[(&[u8], &str)] = &[
+            // The three positions from the issue - all were distinct corruptions
+            (b"? k: v\n", "{\"\":null}"),
+            (b"m:\n  ? k: v\n", "{\"m\":{\"\":null}}"),
+            (b"- ? k: v\n", "[{\"\":null}]"),
+            // An explicit value on the following line belongs to the complex key
+            (b"? k: v\n: w\n", "{\"\":\"w\"}"),
+            // A line back at the `?`'s column ends the key and is a sibling entry;
+            // one at the key's own column joins the key mapping instead
+            (b"? k: v\nj: u\n", "{\"\":null,\"j\":\"u\"}"),
+            (b"? k: v\n  j: u\n", "{\"\":null}"),
+            // The key mapping's indent is the key content's column, not the `?`'s
+            (b"?   k: v\n    j: u\n: w\n", "{\"\":\"w\"}"),
+            // Quoted keys reach parse_compact_mapping_entry's own key dispatch
+            (b"? \"a\": v\n", "{\"\":null}"),
+            (b"? 'a': v\n", "{\"\":null}"),
+            // The value indicator has the identical mid-line defect
+            (b"? a\n: b: c\n", "{\"a\":{\"b\":\"c\"}}"),
+            (b"? a: b\n: c: d\n", "{\"\":{\"c\":\"d\"}}"),
+            // YAML Test Suite case V9D5 - needs the key *and* value arms together
+            (
+                b"- sun: yellow\n- ? earth: blue\n  : moon: white\n",
+                "[{\"sun\":\"yellow\"},{\"\":{\"moon\":\"white\"}}]",
+            ),
+            // A sequence key already worked; it must keep winning over the new arm,
+            // whose `: ` scan would otherwise claim this line
+            (b"? - a: b\n: v\n", "{\"\":\"v\"}"),
+            // A following item is a sibling of the mapping, not of its value
+            (b"- ? k: v\n- z\n", "[{\"\":null},\"z\"]"),
+            // Two complex keys in one mapping - yq keeps both `""` entries
+            (b"? k: v\n? a: b\n", "{\"\":null,\"\":null}"),
+            // An empty key inside the compact mapping (corpus M2N8/00 shape)
+            (b"? : x\n", "{\"\":null}"),
+            // #324 composition: the break form cannot change the structure
+            (b"? k: v\r\n: w\r\n", "{\"\":\"w\"}"),
+            (b"? k: v\r: w\r", "{\"\":\"w\"}"),
+            // Negative pins - the new arm must not claim these
+            // `:` without a following space is key text, not a value indicator
+            (b"? k:v\n", "{\"k:v\":null}"),
+            // The multi-line spelling, which was always correct
+            (b"? k\n: v\n", "{\"k\":\"v\"}"),
+            // Flow-collection keys keep their existing (still yq-divergent) handling
+            (b"? []\n: x\n", "{\"\":\"x\"}"),
+        ];
+
+        for (yaml, expected) in cases {
+            let index = YamlIndex::build(yaml).unwrap();
+            let json = index.root(yaml).to_json_document();
+            let mut streamed = String::new();
+            index
+                .root(yaml)
+                .stream_json_document(&mut streamed)
+                .unwrap();
+            let input = core::str::from_utf8(yaml).unwrap();
+            assert_eq!(json, *expected, "to_json mismatch for {input:?}");
+            assert_eq!(streamed, *expected, "stream_json mismatch for {input:?}");
+        }
+    }
+
+    /// Issue #346: the key of `? k: v` must be a real *mapping* node.
+    ///
+    /// `to_json_document` cannot show this — `key_string()` renders both a mapping
+    /// and an empty scalar as `""`, so a parser that emitted an empty scalar key
+    /// would produce byte-identical JSON while carrying a different tree. This walks
+    /// the cursor to prove the BP tree is `map( map( k v ) null )`.
+    #[test]
+    fn test_explicit_key_on_one_line_exposes_a_mapping_key() {
+        let yaml = b"? k: v\n";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        let fields = match first_doc(index.root(yaml)) {
+            YamlValue::Mapping(fields) => fields,
+            other => panic!("expected mapping, got {other:?}"),
+        };
+        let entries: Vec<_> = fields.into_iter().collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "`k: v` is one complex key, not two entries"
+        );
+
+        // The key is the compact mapping `{k: v}`, not the scalar `k`.
+        let key_fields = match entries[0].key_cursor.value() {
+            YamlValue::Mapping(key_fields) => key_fields,
+            other => panic!("expected the key to be a mapping, got {other:?}"),
+        };
+        let key_entries: Vec<_> = key_fields.into_iter().collect();
+        assert_eq!(
+            key_entries.len(),
+            1,
+            "the owner's null must not land inside the key mapping"
+        );
+        assert_eq!(&*key_entries[0].key().as_str().unwrap(), "k");
+        match key_entries[0].value_cursor.value() {
+            YamlValue::String(s) => assert_eq!(&*s.as_str().unwrap(), "v"),
+            other => panic!("expected string value, got {other:?}"),
+        }
+
+        // ...and the entry's own value is null - the owner's null landed on the
+        // owner, not inside the key mapping as a stray third child.
+        assert!(
+            matches!(entries[0].value_cursor.value(), YamlValue::Null),
+            "the complex key has no value"
+        );
+    }
+
+    /// Issue #346: a `: value` line binds to the *entry*, never into the complex key.
+    ///
+    /// `key_string()` flattens any complex key to `""`, so the JSON is `{"":"w"}`
+    /// whatever the tree underneath looks like — only the cursor separates "the key
+    /// is `{k: v}` and the value is `w`" from a key that swallowed one of them.
+    ///
+    /// The discriminating case for the ownership change itself is
+    /// [`test_explicit_key_on_one_line_exposes_a_mapping_key`]: at EOF `end_document`
+    /// drains the stack, and keying the null on "the container being popped is a
+    /// `Mapping`" writes the owner's null into the key mapping, which loses the entry
+    /// entirely (`{}`). This shape survives that bug by luck — the stray child is
+    /// unpaired, so the field iterator drops it — which is exactly why it is pinned
+    /// separately rather than relied on.
+    #[test]
+    fn test_explicit_key_on_one_line_keeps_its_value_out_of_the_key() {
+        let yaml = b"? k: v\n: w\n";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        let fields = match first_doc(index.root(yaml)) {
+            YamlValue::Mapping(fields) => fields,
+            other => panic!("expected mapping, got {other:?}"),
+        };
+        let entries: Vec<_> = fields.into_iter().collect();
+        assert_eq!(entries.len(), 1, "one entry: a complex key and `w`");
+
+        let key_entries: Vec<_> = match entries[0].key_cursor.value() {
+            YamlValue::Mapping(key_fields) => key_fields.into_iter().collect(),
+            other => panic!("expected the key to be a mapping, got {other:?}"),
+        };
+        assert_eq!(
+            key_entries.len(),
+            1,
+            "no null may be written into the key mapping when it is popped"
+        );
+        assert_eq!(&*key_entries[0].key().as_str().unwrap(), "k");
+
+        match entries[0].value_cursor.value() {
+            YamlValue::String(s) => assert_eq!(&*s.as_str().unwrap(), "w"),
+            other => panic!("expected `w` as the value, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_multiple_anchors() {
         let yaml = b"a: &x 1\nb: &y 2\nc: [*x, *y]";
