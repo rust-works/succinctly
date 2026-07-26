@@ -197,10 +197,17 @@ scalar content, so every scan that stops at `\n` must stop at `\r` too.
 | `\r\n` | 2 bytes | Windows — **one** break, so a scan must consume both       |
 | `\r`   | 1 byte  | Classic Mac — a break with no LF to backstop a `\n`-only scan |
 
-**Resolution**: `Parser::{is_break, break_len_at, at_break, skip_line_break}` are
-the single source of truth in the oracle; `light.rs` has the free-function pair
-`is_line_break` / `line_break_len` for the query side. Use them rather than
-testing `b'\n'` by hand.
+**Resolution**: `yaml/line_break.rs` holds the rule in one place —
+`is_line_break` and `line_break_len` — for every consumer of YAML text: the
+oracle, the cursor, the validator and the newline index (#341). Use them rather
+than testing `b'\n'` by hand.
+
+Two wrappers in the oracle look like exceptions and are not.
+`Parser::{is_break, break_len_at}` exist so the `HAS_CR` const generic has
+somewhere to switch (see below); their CR-aware arms call straight through to the
+shared pair, so the rule is still defined once. `Parser::skip_line_break` is the
+one genuine restatement, kept for the measured reason on its doc comment and
+pinned to `line_break_len` by `skip_line_break_agrees_with_line_break_len`.
 
 Two failure modes are worth naming, because [#324](https://github.com/rust-works/succinctly/issues/324)
 hit both:

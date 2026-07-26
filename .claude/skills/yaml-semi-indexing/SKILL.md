@@ -135,25 +135,30 @@ a scan that stops only at `\n` is a bug in two distinct ways (#324):
 Use the helpers instead of hand-rolling the test:
 
 ```rust
-// src/yaml/parser.rs — the oracle
-Self::is_break(b)               // \n or \r
+// src/yaml/line_break.rs — the rule, defined once, for every consumer (#341)
+is_line_break(b)                // \n or \r
+line_break_len(text, pos)       // 2 for \r\n, 1 for a lone \r or \n, 0 otherwise
+
+// src/yaml/parser.rs — the oracle, where the HAS_CR gate lives (#340)
+Self::is_break(b)               // is_line_break, or `== b'\n'` under !HAS_CR
+self.break_len_at(pos)          // line_break_len, or the LF answer under !HAS_CR
 Self::is_ws_or_break(b)         // ' ' | '\t' | break
 Self::is_space_or_break(b)      // ' ' | break  (no tab)
 Self::is_ws_break_or_eoi(next)  // the indicator lookahead: Option<u8>, EOI counts
 Self::is_space_break_or_eoi(next)
 Self::is_flow_key_terminator(next) // the above plus , } ]
-self.break_len_at(pos)          // 2 for \r\n, 1 for a lone \r or \n, 0 otherwise
 self.at_break()
 self.skip_line_break()          // consumes exactly one break, whatever its width
-
-// src/yaml/light.rs — the query side
-is_line_break(b)
-line_break_len(text, pos)
 ```
 
-Going through a helper is not just tidiness — it is what makes the `HAS_CR`
-specialization possible (see below). A hand-rolled `matches!(b, b'\n' | b'\r')`
-is a site the const generic cannot reach.
+Inside the oracle prefer the `Self::`/`self.` forms over the free functions: they
+are the same rule, but they are also where `HAS_CR` switches. Calling
+`is_line_break` directly from a parser hot path silently opts that site out of the
+specialization — correct, just slower. `current_line` does exactly that on
+purpose, being an error path.
+
+Going through a helper at all is not just tidiness. A hand-rolled
+`matches!(b, b'\n' | b'\r')` is a site the const generic cannot reach.
 
 Two extra traps:
 
