@@ -27,7 +27,7 @@
 //!
 //! `YamlIndex::build` performs minimal validation during indexing (structural recognition
 //! only) and accepts many malformed documents. It is a non-validating loader: of the YAML
-//! Test Suite's 94 invalid documents it rejects 11. Do not rely on a parse error to
+//! Test Suite's 94 invalid documents it rejects 12. Do not rely on a parse error to
 //! detect malformed input. See `docs/compliance/yaml/limitations.md`.
 //!
 //! # Example
@@ -113,24 +113,33 @@ pub(crate) fn starts_inline_seq_entry(text: &[u8], pos: usize) -> bool {
 
 /// Is the line at `from` *structural* — a block sequence entry (`- ` …) or a block
 /// mapping entry (a `: ` value indicator before end of line) — rather than a plain
-/// scalar?
+/// scalar or a flow node?
 ///
 /// The one definition of "a leading tab here is illegal indentation". YAML forbids a
 /// tab in indentation, but a tab is only *indentation* when block structure follows:
 /// before a plain scalar it is separation and legal (`DK95/00` `foo:\n \tbar`, `UV7Q`
-/// `x:\n - x\n  \tx`), while before a key or a `-` it is not (`DK95/06`).
-///
-/// It lives at the module root because the strict validator
-/// ([`validate::Validator::scan_line`]) and the loader must classify a line
-/// identically, and #106 and #332 were both a predicate copied to several sites and
-/// then diverging.
+/// `x:\n - x\n  \tx`), while before a key or a `-` it is not (`DK95/06`). The loader
+/// ([`parser::Parser::parse_document_line`]) and the strict validator
+/// ([`validate::Validator::scan_line`]) must classify a line identically, so they share
+/// this one spelling — #106 and #332 were both a predicate copied to several sites and
+/// then diverging. `tests/yaml_tab_indentation_tests.rs` pins the two call sites
+/// against each other (#173).
 ///
 /// Leading spaces and tabs are skipped first, so `from` may point at either.
+///
+/// A flow node is deliberately *not* structural: a root flow node's leading separation
+/// may contain tabs (`Q5MG` `\t{}`, `6CA3` `\t[…]`), and a `:` inside the collection is
+/// flow syntax rather than a block value indicator, so scanning on would misread
+/// `\t{a: 1}` as block structure while `\t{}` reads as a node.
 #[inline]
 pub(crate) fn line_is_structural(text: &[u8], from: usize) -> bool {
     let mut i = from;
     while matches!(text.get(i), Some(b' ' | b'\t')) {
         i += 1;
+    }
+    // A flow node, not block structure — see the doc comment.
+    if matches!(text.get(i), Some(b'{' | b'[')) {
+        return false;
     }
     if starts_seq_entry(text, i) {
         return true;
@@ -178,7 +187,12 @@ mod tests {
             (&b"\ta:b\n"[..], false), // `:` not followed by whitespace is content
             (&b"\t-1\n"[..], false),  // Y79Y/010: `-1` is a scalar, not an entry
             (&b"\tbar"[..], false),   // end of input, no line break
-            (&b"\t{}\n"[..], false),  // Q5MG: a flow node, and no `:` at all
+            // Flow nodes: a root flow node's separation may contain tabs, and a `:`
+            // inside the collection is flow syntax, not a block value indicator.
+            (&b"\t{}\n"[..], false),     // Q5MG
+            (&b"\t{a: 1}\n"[..], false), // same node, now with a `:` inside
+            (&b"\t[\n"[..], false),      // 6CA3
+            (&b"\t[a: 1]\n"[..], false),
             // Nothing at all.
             (&b"\t\n"[..], false),
             (&b"\t"[..], false),

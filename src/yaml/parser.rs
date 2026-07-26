@@ -638,6 +638,30 @@ impl<'a> Parser<'a> {
         Ok(count)
     }
 
+    /// Is the cursor sitting on a tab that is *indentation* rather than separation?
+    ///
+    /// `count_indent` counts spaces only, so after `advance_by(indent)` the cursor
+    /// lands on a tab whenever one follows the leading spaces. YAML forbids a tab in
+    /// indentation, but a tab is only indentation when block structure follows —
+    /// hence [`super::line_is_structural`], shared with the strict validator, rather
+    /// than a bare "is there a tab" (#173).
+    ///
+    /// `line_start` is where this line's leading spaces began. The check matters
+    /// because `parse_document_line` is not always entered at a line start:
+    /// `parse_explicit_key` returns mid-line for `? k: v` (see
+    /// docs/compliance/yaml/limitations.md), and the flow and quoted scanners stop
+    /// just past their closing delimiter, so the main loop can re-derive an "indent"
+    /// from a mid-line cursor. A tab in the middle of a line is never indentation.
+    ///
+    /// Only reachable with `indent >= 1`: `count_indent` already returns
+    /// `Err(TabIndentation)` for a tab at column 0, so `Ok(0)` implies no tab here.
+    #[inline]
+    fn tab_indents_block_structure(&self, line_start: usize) -> bool {
+        self.peek() == Some(b'\t')
+            && (line_start == 0 || is_line_break(self.input[line_start - 1]))
+            && super::line_is_structural(self.input, self.pos)
+    }
+
     /// Get the current column position (0-based).
     /// This counts characters from the start of the current line.
     fn current_column(&self) -> usize {
@@ -3638,7 +3662,19 @@ impl<'a> Parser<'a> {
         };
 
         // Skip to content
+        let line_start = self.pos;
         self.advance_by(indent);
+
+        // A tab *after* the leading spaces is indentation — and so illegal — only when
+        // block structure follows. Before a plain scalar it is separation and legal
+        // (DK95/00 `foo:\n \tbar`, UV7Q `x:\n - x\n  \tx`), which is why the test is
+        // `line_is_structural` and not "is there a tab" (#173).
+        if self.tab_indents_block_structure(line_start) {
+            return Err(YamlError::TabIndentation {
+                line: self.current_line(),
+                offset: self.pos,
+            });
+        }
 
         // close_deeper_indents will handle closing any SequenceItem entries
         // when we return to a lower indent level
@@ -3874,6 +3910,68 @@ mod tests {
         let yaml = b"name:\n\tvalue";
         let result = build_semi_index(yaml);
         assert!(matches!(result, Err(YamlError::TabIndentation { .. })));
+    }
+
+    /// #173: a tab following the leading spaces was treated as start-of-content, so
+    /// this loaded as `{"a":{"\tb":1}}` — the tab folded into the key — instead of
+    /// being rejected as indentation.
+    #[test]
+    fn regression_issue_173_tab_after_spaces_before_a_mapping_key_is_rejected() {
+        let err = build_semi_index(b"a:\n \tb: 1\n").unwrap_err();
+        assert!(
+            matches!(err, YamlError::TabIndentation { line: 2, offset: 4 }),
+            "expected the tab at line 2 offset 4, got {err:?}"
+        );
+    }
+
+    /// DK95/06. The conformance harness already counted this as rejected because the
+    /// opt-in validator caught it; after #173 the default loader catches it too.
+    #[test]
+    fn regression_issue_173_dk95_06_is_rejected_by_the_loader_not_only_the_validator() {
+        let err = build_semi_index(b"foo:\n  a: 1\n  \tb: 2\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                YamlError::TabIndentation {
+                    line: 3,
+                    offset: 14
+                }
+            ),
+            "expected the tab at line 3 offset 14, got {err:?}"
+        );
+    }
+
+    /// A tab before a sequence entry is indentation just as much as one before a
+    /// key. Starting at offset 0 also exercises the `line_start == 0` arm of
+    /// `tab_indents_block_structure`.
+    #[test]
+    fn tab_after_spaces_before_a_sequence_entry_is_rejected() {
+        assert!(matches!(
+            build_semi_index(b"  \t- a\n"),
+            Err(YamlError::TabIndentation { .. })
+        ));
+    }
+
+    /// Q5MG and 6CA3: a root flow node's leading separation may contain tabs. These
+    /// go through `count_indent`'s column-0 arm and its flow recovery, both of which
+    /// #173 left untouched — this pins that.
+    #[test]
+    fn a_flow_node_after_a_leading_tab_is_still_accepted() {
+        assert!(build_semi_index(b"\t{}\n").is_ok());
+        assert!(build_semi_index(b"\t[\n\t]\n").is_ok());
+    }
+
+    /// `parse_document_line` is not always entered at a line start — the flow scanner
+    /// stops just past `]`, leaving the cursor mid-line, and the main loop then
+    /// re-derives an "indent" from there. The tab below is separation in the middle
+    /// of a line, never indentation, so it must not be reported as such.
+    #[test]
+    fn a_mid_line_tab_is_not_reported_as_indentation() {
+        // Two root nodes: malformed either way. What matters is *which* complaint.
+        assert!(!matches!(
+            build_semi_index(b"[1] \tfoo: bar\n"),
+            Err(YamlError::TabIndentation { .. })
+        ));
     }
 
     #[test]
