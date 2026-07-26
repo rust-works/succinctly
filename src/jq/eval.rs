@@ -15,6 +15,8 @@ use alloc::vec::Vec;
 
 use indexmap::IndexMap;
 
+use super::stream::StreamableValue;
+
 /// Trait for evaluation semantics - determines behavior for edge cases.
 ///
 /// jq and yq (mikefarah/yq) have different behaviors for some operations.
@@ -294,15 +296,28 @@ pub(crate) fn sort_rank(value: &OwnedValue) -> u8 {
 /// overwrites the last three with `...`. So a 14-byte dump survives whole and a
 /// 15-byte one becomes 11 bytes plus `...`.
 ///
-/// Two deviations, both about what gets dumped rather than where it is cut:
+/// Unlike jq — which builds the entire dump with `jv_dump_string` and then
+/// discards all but 14 bytes of it — this streams into a [`PreviewSink`] and
+/// stops as soon as the answer is settled, so previewing a mismatched 100 MB
+/// operand copies 14 bytes rather than the whole document.
+///
+/// It streams via [`StreamableValue::stream_json`] rather than
+/// `OwnedValue::to_json` for a second reason: that is the writer whose escaping
+/// matches jq. `to_json` escapes every `char::is_control()`, which includes the
+/// C1 range, so it renders `U+0085` as a six-character backslash-u escape where
+/// jq emits the two raw UTF-8 bytes. (`tojson` and `@json` still go through
+/// `to_json` and still over-escape — a pre-existing divergence wider than #358,
+/// so it is left alone here.)
+///
+/// Two deviations remain, both about what gets dumped rather than where it is cut:
 ///
 /// 1. jq's `strncpy` can cut a multi-byte UTF-8 sequence in half and emit the
 ///    broken bytes. A Rust `String` cannot hold those, so we cut at the nearest
-///    `char` boundary at or below the limit — the preview is then up to two
+///    `char` boundary at or below the limit — the preview is then up to three
 ///    bytes shorter than jq's for such values.
-/// 2. `OwnedValue::to_json` does not preserve a number's source literal, so a
-///    number reads back canonicalised: jq previews `1e100` as `1E+100` and `1.0`
-///    as `1.0`, where we give `10000000000...` and `1`. This is a property of
+/// 2. `OwnedValue` does not preserve a number's source literal, so a number
+///    reads back canonicalised: jq previews `1e100` as `1E+100` and `1.0` as
+///    `1.0`, where we give `10000000000...` and `1`. This is a property of
 ///    materialising into `OwnedValue` — `1e100 | tostring` already differs, and
 ///    the streaming identity path, which copies source text, does not — not of
 ///    the truncation here. Pinned by `number_previews_are_canonicalised` in
@@ -314,15 +329,76 @@ fn value_preview(value: &OwnedValue) -> String {
     /// What is left of the budget once `...` has claimed three bytes.
     const KEEP: usize = MAX - 3;
 
-    let dump = value.to_json();
-    if dump.len() <= MAX {
-        return dump;
+    let mut sink = PreviewSink::new(MAX);
+    // The sink stops the writer once the dump is known to exceed `MAX`; writing
+    // into a `String` cannot fail for any other reason, so the returned `Result`
+    // carries nothing `sink.overflowed` has not already recorded.
+    let _ = value.stream_json(&mut sink);
+    if !sink.overflowed {
+        return sink.buf;
     }
-    let mut cut = KEEP;
-    while cut > 0 && !dump.is_char_boundary(cut) {
-        cut -= 1;
+    sink.truncate_to(KEEP);
+    sink.buf.push_str("...");
+    sink.buf
+}
+
+/// A [`core::fmt::Write`] sink that keeps the first `cap` bytes written to it and
+/// then stops the writer, so [`value_preview`] costs a constant amount of work
+/// however large the offending value is.
+///
+/// Two details carry the bound and the safety:
+///
+/// * It clamps the copy even within a *single* oversized `write_str`. A long
+///   JSON string arrives from the streaming writer as one span, so clamping the
+///   copy — not just refusing later writes — is what actually bounds the work.
+/// * `buf` stays valid UTF-8: an oversized span is cut back to a `char`
+///   boundary. jq's `strncpy` emits the split bytes instead, which is the one
+///   place the preview is allowed to come out shorter than jq's.
+struct PreviewSink {
+    /// The retained prefix; never longer than `cap`, always valid UTF-8.
+    buf: String,
+    /// Byte budget for `buf`.
+    cap: usize,
+    /// Whether anything was dropped — i.e. the dump was longer than `cap`.
+    overflowed: bool,
+}
+
+impl PreviewSink {
+    fn new(cap: usize) -> Self {
+        Self {
+            buf: String::with_capacity(cap),
+            cap,
+            overflowed: false,
+        }
     }
-    format!("{}...", &dump[..cut])
+
+    /// Cut `buf` back to at most `len` bytes, on a `char` boundary.
+    fn truncate_to(&mut self, len: usize) {
+        let mut cut = len.min(self.buf.len());
+        while cut > 0 && !self.buf.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        self.buf.truncate(cut);
+    }
+}
+
+impl core::fmt::Write for PreviewSink {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = self.cap - self.buf.len();
+        if s.len() <= room {
+            self.buf.push_str(s);
+            return Ok(());
+        }
+        // More arrived than fits: take what we can, on a boundary, and stop the
+        // traversal — nothing further can change the preview.
+        let mut cut = room;
+        while cut > 0 && !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        self.buf.push_str(&s[..cut]);
+        self.overflowed = true;
+        Err(core::fmt::Error)
+    }
 }
 
 impl core::fmt::Display for EvalError {
@@ -15232,6 +15308,42 @@ mod tests {
         // < object, with the two booleans sharing the `boolean` slot.
         let ranks: Vec<u8> = values.iter().map(sort_rank).collect();
         assert_eq!(ranks, vec![0, 1, 1, 2, 2, 3, 4, 5]);
+    }
+
+    /// The preview must cost a bounded amount of work, not a copy of the value.
+    ///
+    /// [`value_preview`] is the reason: jq builds the whole dump and throws all
+    /// but 14 bytes away, which for succinctly would mean serialising a 100 MB
+    /// operand to produce a 14-byte message. The sink is what prevents that, so
+    /// pin the sink directly — a `value_preview` result is short either way and
+    /// would not catch a regression here.
+    #[test]
+    fn preview_sink_copies_at_most_its_cap() {
+        use core::fmt::Write;
+
+        // A single oversized `write_str` is the case that matters: the streaming
+        // writer hands a long JSON string over as one span.
+        let mut sink = PreviewSink::new(14);
+        let huge = "x".repeat(1_000_000);
+        assert!(sink.write_str(&huge).is_err(), "should stop the writer");
+        assert!(sink.overflowed);
+        assert_eq!(sink.buf.len(), 14, "must not copy beyond the cap");
+
+        // An exactly-fitting dump completes without reporting overflow, which is
+        // what lets a 14-byte dump through verbatim.
+        let mut sink = PreviewSink::new(14);
+        assert!(sink.write_str("12345678901234").is_ok());
+        assert!(!sink.overflowed);
+        assert_eq!(sink.buf, "12345678901234");
+        // One more byte tips it over.
+        assert!(sink.write_str("5").is_err());
+        assert!(sink.overflowed);
+
+        // Multi-byte characters are cut back to a boundary, never split.
+        let mut sink = PreviewSink::new(14);
+        let _ = sink.write_str(&"あ".repeat(20)); // 3 bytes each: 12 < 14 < 15
+        assert_eq!(sink.buf, "ああああ", "cut back to a char boundary");
+        assert!(sink.buf.len() <= 14);
     }
 
     /// jq errors when the two operands' kinds cannot be compared, rather than
