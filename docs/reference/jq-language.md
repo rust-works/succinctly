@@ -278,6 +278,11 @@ See [jq Remaining Work](../plan/jq-remaining.md) for incomplete CLI and module s
 2. **Error messages** - Don't always match jq format exactly
 3. **Numeric overflow** - Uses wrapping arithmetic
 4. **`$ENV` as bare object** - Only field access works (`$ENV.VAR`)
+5. **Number equality above 2^53** - `1 == 1.0` is `true` as in jq, but a mixed
+   integer/float comparison widens the integer to `f64`, while jq 1.7 retains
+   the decimal literal. They agree on every value representable exactly as an
+   `f64`; beyond that `9007199254740993 == 9007199254740992.0` is `true` here
+   and `false` in jq
 
 ---
 
