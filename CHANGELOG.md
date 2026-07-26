@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Test Suite cases (reject conformance 12/94 → 70/94) with no false positives on
   the valid corpus; the remaining structurally-deep cases stay on record.
 
+### Changed
+
+- **`yaml::simd` terminator accessors renamed and narrowed** (#185):
+  `YamlCharClass16::value_terminators` and
+  `YamlCharClassBroadword::value_terminators` are now
+  `plain_scalar_terminators`, and no longer include the `spaces` channel.
+  **Breaking** for anything naming them through the public `yaml::simd` module.
+  A plain scalar may contain spaces, so a space was never a terminator for the
+  parser's byte loop; the live x86 mask has never included it, and the two
+  disagreed only because they were separate copies. `YamlCharClass` (x86) gains
+  a `plain_scalar_terminators` accessor holding the same set it already used
+  inline.
+
 ### Removed
 
 - Removed four never-constructed `YamlError` variants — `InvalidEscape`,
