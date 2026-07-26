@@ -145,14 +145,53 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvalError {
     pub message: String,
+
+    /// The raw payload of `error(v)`, kept so that `catch` can inspect a
+    /// non-string value: jq binds the *raised value* as the catch handler's
+    /// input, so `try error({a:1}) catch .` must yield `{"a":1}` rather than
+    /// the rendered string `"{\"a\":1}"`.
+    ///
+    /// `None` for errors raised internally by the evaluator (type errors and
+    /// friends). jq models those as string errors, so [`EvalError::payload`]
+    /// falls back to `message` wrapped in [`OwnedValue::String`].
+    pub value: Option<OwnedValue>,
 }
 
 impl EvalError {
     /// Create a new evaluation error with a message.
+    ///
+    /// The error carries no structured payload, so `catch` sees the message as
+    /// a string. Use [`EvalError::from_value`] for `error(v)`, where jq
+    /// preserves `v` verbatim.
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            value: None,
         }
+    }
+
+    /// Create an error that raises `value` as its payload, as `error(v)` does.
+    ///
+    /// The message renders `value` the way jq reports it: a string payload is
+    /// used as-is (`error("boom")` reports `boom`, not `"boom"`), anything else
+    /// is serialized as JSON.
+    pub fn from_value(value: OwnedValue) -> Self {
+        let message = match &value {
+            OwnedValue::String(s) => s.clone(),
+            other => other.to_json(),
+        };
+        Self {
+            message,
+            value: Some(value),
+        }
+    }
+
+    /// The value this error raises, as `catch` should see it.
+    ///
+    /// Errors from `error(v)` return `v` unchanged; internal errors return
+    /// their message as a string, matching how jq raises them.
+    pub fn payload(self) -> OwnedValue {
+        self.value.unwrap_or(OwnedValue::String(self.message))
     }
 
     /// Create a type error.
@@ -1243,12 +1282,14 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the expression
-    let result = eval_single::<W, S>(expr, value.clone(), optional);
+    let result = eval_single::<W, S>(expr, value, optional);
 
     match result {
-        // If error, use catch handler or return nothing
-        QueryResult::Error(_) => match catch {
-            Some(catch_expr) => eval_single::<W, S>(catch_expr, value, optional),
+        // If error, use catch handler or return nothing. jq runs the handler
+        // with the *raised value* as its input, not the original input, so
+        // `try error("boom") catch .` yields "boom".
+        QueryResult::Error(e) => match catch {
+            Some(catch_expr) => eval_owned_input::<W, S>(catch_expr, &e.payload(), optional),
             None => QueryResult::None,
         },
         // Non-error results pass through
@@ -1279,19 +1320,21 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let message = match msg {
+    // The payload is raised verbatim so `catch` can inspect it; `EvalError`
+    // renders the message from it. Bare `error` raises the input value, as jq
+    // does — `{"x":1} | error` reports `{"x":1}`, not `null`.
+    let payload = match msg {
         Some(msg_expr) => {
             let msg_result = eval_single::<W, S>(msg_expr, value, optional);
             match result_to_owned(msg_result) {
-                Ok(OwnedValue::String(s)) => s,
-                Ok(v) => v.to_json(),
+                Ok(v) => v,
                 Err(e) => return QueryResult::Error(e),
             }
         }
-        None => "null".into(),
+        None => to_owned(&value),
     };
 
-    QueryResult::Error(EvalError::new(message))
+    QueryResult::Error(EvalError::from_value(payload))
 }
 
 /// Evaluate a builtin function.
@@ -6857,6 +6900,43 @@ fn eval_owned_expr<S: EvalSemantics>(
         QueryResult::None => Ok(OwnedValue::Null),
         QueryResult::Error(e) => Err(e),
         QueryResult::Break(label) => Err(EvalError::new(format!("break ${label} not in label"))),
+    }
+}
+
+/// Evaluate an expression with an OwnedValue as input, preserving the full
+/// output stream.
+///
+/// [`eval_owned_expr`] collapses a multi-output result into a single array,
+/// which is what `reduce`/`foreach` want but wrong for a filter that is allowed
+/// to fan out: `try error("x") catch (., .)` must emit two values, not one
+/// two-element array. This variant keeps `Many`/`ManyOwned` intact.
+///
+/// The returned result borrows nothing from the temporary document — every
+/// variant it produces is owned — so it is free to satisfy any caller's `'a`
+/// and `W`, the same way [`eval_owned_pipe`] does.
+fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Serialize and reparse to obtain a document the evaluator can index into.
+    // Only reached on the error path, so the round-trip is off the hot path.
+    let json_str = owned_value_to_json_string(input);
+    let json_bytes = json_str.as_bytes();
+
+    use crate::json::JsonIndex;
+    let index = JsonIndex::build(json_bytes);
+    let cursor = index.root(json_bytes);
+
+    match eval_single::<Vec<u64>, S>(expr, cursor.value(), optional).materialize_cursor() {
+        QueryResult::One(v) => QueryResult::Owned(to_owned(&v)),
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
+        QueryResult::Many(vs) => QueryResult::ManyOwned(vs.iter().map(to_owned).collect()),
+        QueryResult::Owned(v) => QueryResult::Owned(v),
+        QueryResult::ManyOwned(vs) => QueryResult::ManyOwned(vs),
+        QueryResult::None => QueryResult::None,
+        QueryResult::Error(e) => QueryResult::Error(e),
+        QueryResult::Break(label) => QueryResult::Break(label),
     }
 }
 
@@ -14032,10 +14112,12 @@ mod tests {
 
     #[test]
     fn test_error_basic() {
-        // error without message
+        // Bare `error` raises the input value, as jq does: `{} | error`
+        // reports `{}`, not `null`.
         query!(br"{}", "error",
             QueryResult::Error(e) => {
-                assert_eq!(e.message, "null");
+                assert_eq!(e.message, "{}");
+                assert_eq!(e.value, Some(OwnedValue::Object(IndexMap::new())));
             }
         );
 
@@ -14043,13 +14125,18 @@ mod tests {
         query!(br"{}", "error(\"something went wrong\")",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "something went wrong");
+                assert_eq!(
+                    e.value,
+                    Some(OwnedValue::String("something went wrong".into()))
+                );
             }
         );
 
-        // error with number message (gets serialized)
+        // error with number message (message is serialized, payload is not)
         query!(br"{}", "error(42)",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "42");
+                assert_eq!(e.value, Some(OwnedValue::Int(42)));
             }
         );
     }
@@ -14074,6 +14161,66 @@ mod tests {
         // try without catch - error is suppressed
         query!(br"{}", "try error(\"oops\")",
             QueryResult::None => {}
+        );
+    }
+
+    /// The catch handler's input is the *raised error value*, not the input the
+    /// `try` was evaluated against — regression test for #158, where the error
+    /// was discarded and `catch` ran on the original input.
+    #[test]
+    fn test_catch_binds_the_error_value() {
+        // String payload: the handler sees "boom", not the input {"x":1}.
+        query!(br#"{"x":1}"#, "try error(\"boom\") catch .",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "boom");
+            }
+        );
+
+        // ...and it is a real input, not just a value that prints right.
+        query!(br#"{"x":1}"#, r#"try error("boom") catch "c:\(.)""#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "c:boom");
+            }
+        );
+
+        // Object payload survives as an object, so the handler can index it.
+        query!(br#"{"x":1}"#, r#"try error({"a":1}) catch .a"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1);
+            }
+        );
+
+        // A null payload is preserved rather than collapsing to the input.
+        query!(br#"{"x":1}"#, "try error(null) catch .",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+
+        // Bare `error` raises the input, so `catch` sees it round-tripped.
+        query!(br#"{"x":1}"#, "try error catch .x",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1);
+            }
+        );
+
+        // Internal (non-`error`) failures raise their message as a string.
+        query!(br"1", "try .foo catch type",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "string");
+            }
+        );
+
+        // A handler that fans out keeps every output instead of collapsing
+        // into a single array.
+        query!(br"{}", "try error(\"x\") catch (., .)",
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(
+                    vs,
+                    vec![
+                        OwnedValue::String("x".into()),
+                        OwnedValue::String("x".into()),
+                    ]
+                );
+            }
         );
     }
 
