@@ -3606,5 +3606,93 @@ fn test_yq_outputs_before_an_error_or_break_survive() -> Result<()> {
     assert_eq!(stdout, "1\n2\n");
     assert_eq!(stderr.trim_end(), "Error: break $out not in label");
     assert_eq!(code, 1);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// #337: empty sequence items (a bare `-` on its own line)
+// ---------------------------------------------------------------------------
+
+/// A bare `-` is a valid, empty sequence item and reads as null — in every
+/// spelling, and mixed freely with items that do have content.
+///
+/// The read path used to treat `-\n` differently from `- \n` (a diverged
+/// seq-item predicate), which cost a redundant position lookup per element and
+/// made whole-document reads quadratic. The two spellings must be
+/// indistinguishable in the output, which is what pins the two code paths
+/// together at the CLI boundary.
+#[test]
+fn test_empty_sequence_items_read_as_null() -> Result<()> {
+    let cases: &[(&str, &str, &str)] = &[
+        ("-\n-\n-\n", "[null,null,null]", "bare dash"),
+        (
+            "- \n- \n- \n",
+            "[null,null,null]",
+            "dash with trailing space",
+        ),
+        ("-\n- \n-\n", "[null,null,null]", "mixed spellings"),
+        (
+            "-\n- a\n-\n",
+            r#"[null,"a",null]"#,
+            "empty and valued mixed",
+        ),
+        ("- a\n-\n- b\n", r#"["a",null,"b"]"#, "empty between valued"),
+        ("-\n- # comment\n", "[null,null]", "comment-only item"),
+        ("- a\n-", r#"["a",null]"#, "bare dash at end of input"),
+        (
+            "-\n  a: 1\n-\n  b: 2\n",
+            r#"[{"a":1},{"b":2}]"#,
+            "value on the line after the dash",
+        ),
+        (
+            "-\n  -\n  - x\n  -\n",
+            r#"[[null,"x",null]]"#,
+            "nested sequence of empty items",
+        ),
+        (
+            "- -5\n- -6\n",
+            "[-5,-6]",
+            "negative numbers are not empty items",
+        ),
+    ];
+
+    for (input, expected, why) in cases {
+        let (output, code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(output.trim(), *expected, "{why}: input {input:?}");
+        assert_eq!(code, 0, "{why}: input {input:?}");
+    }
+
+    Ok(())
+}
+
+/// The two null-item spellings must produce identical output at scale, and
+/// element access must not depend on which one was used.
+#[test]
+fn test_empty_item_spellings_agree_at_scale() -> Result<()> {
+    let bare = "-\n".repeat(500);
+    let spaced = "- \n".repeat(500);
+
+    for filter in [
+        ".",
+        ".[0]",
+        ".[499]",
+        "length",
+        ".[] | select(. == null) | 1",
+    ] {
+        let (from_bare, bare_code) = run_yq_stdin(filter, &bare, &["-o=json", "-I=0"])?;
+        let (from_spaced, spaced_code) = run_yq_stdin(filter, &spaced, &["-o=json", "-I=0"])?;
+
+        assert_eq!(bare_code, 0, "filter {filter:?} on bare dashes");
+        assert_eq!(spaced_code, 0, "filter {filter:?} on spaced dashes");
+        assert_eq!(
+            from_bare, from_spaced,
+            "filter {filter:?} disagrees between `-` and `- ` items"
+        );
+    }
+
+    let (length, _) = run_yq_stdin("length", &bare, &["-o=json", "-I=0"])?;
+    assert_eq!(length.trim(), "500");
+
     Ok(())
 }
