@@ -9,7 +9,7 @@ use succinctly::jq::escape::{
     escape_json_body as run_escaper, write_json_body_jq, write_json_body_jq_ascii,
     write_json_body_yq, write_json_body_yq_ascii,
 };
-use succinctly::jq::OwnedValue;
+use succinctly::jq::{EvalError, OwnedValue, StreamError};
 use succinctly::yaml::format_float_with_fraction;
 
 /// Exit codes matching jq behavior
@@ -18,12 +18,137 @@ pub mod exit_codes {
     // With -e: jq exits 1 when the LAST output was false/null; yq exits 1
     // when NO result was truthy (its "no matches found" failure).
     pub const FALSE_OR_NULL: i32 = 1;
+    /// yq's uniform failure code. Numerically the same as [`FALSE_OR_NULL`] but
+    /// for an unrelated reason: mikefarah/yq exits 1 for *any* failure, where
+    /// jq reserves distinct codes per failure kind (#355).
+    pub const YQ_FAILURE: i32 = 1;
     #[allow(dead_code)] // STYLE-0005: complete jq exit-code set; not all emitted yet
     pub const USAGE_ERROR: i32 = 2; // Usage problem or system error
     pub const COMPILE_ERROR: i32 = 3; // jq program compile error
     pub const NO_OUTPUT: i32 = 4; // With -e, no valid result produced (jq-only; yq folds into 1)
-    #[allow(dead_code)] // STYLE-0005: complete jq exit-code set; not all emitted yet
-    pub const HALT_ERROR: i32 = 5; // halt_error without explicit code
+    /// Uncaught runtime error (and bare `halt_error`). jq exits 5 so that a
+    /// failed filter is distinguishable from a successful one in a pipeline.
+    pub const RUNTIME_ERROR: i32 = 5;
+}
+
+/// Which tool's diagnostic conventions to follow.
+///
+/// The two upstreams disagree, and both are drop-in targets for us:
+///
+/// | | jq 1.7.1 | mikefarah/yq v4 |
+/// |---|---|---|
+/// | text | `jq: error (at <stdin>:1): boom` | `Error: boom` |
+/// | position marker | yes | no |
+/// | `(not a string)` marker | yes | no |
+/// | exit code | 5 | 1 |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagStyle {
+    Jq,
+    Yq,
+}
+
+impl DiagStyle {
+    /// Process exit code for an uncaught evaluation error in this style.
+    pub fn error_exit_code(self) -> i32 {
+        match self {
+            Self::Jq => exit_codes::RUNTIME_ERROR,
+            Self::Yq => exit_codes::YQ_FAILURE,
+        }
+    }
+}
+
+/// Where an input value came from, for jq's `(at <file>:<line>)` marker.
+///
+/// jq reports the line on which the input value *ends*, 1-based, and falls back
+/// to `<stdin>` when reading a pipe and `<unknown>` under `-n` (there is no
+/// input to point at).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputLocation {
+    /// Source file, or `None` for stdin.
+    pub file: Option<String>,
+    /// 1-based line, or `None` when there is no input to point at (`-n`).
+    pub line: Option<usize>,
+}
+
+impl InputLocation {
+    /// A location with no input to point at — jq prints `<unknown>` (e.g. `-n`).
+    pub fn unknown() -> Self {
+        Self {
+            file: None,
+            line: None,
+        }
+    }
+
+    /// A location in `file` (or stdin when `None`) at 1-based `line`.
+    pub fn at(file: Option<&str>, line: usize) -> Self {
+        Self {
+            file: file.map(str::to_string),
+            line: Some(line),
+        }
+    }
+}
+
+impl core::fmt::Display for InputLocation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.line {
+            // Matches `print_validation_error`'s `<stdin>` convention, minus the
+            // column: jq's uncaught-error marker carries a line only.
+            Some(line) => match &self.file {
+                Some(path) => write!(f, "{path}:{line}"),
+                None => write!(f, "<stdin>:{line}"),
+            },
+            None => write!(f, "<unknown>"),
+        }
+    }
+}
+
+/// Collects uncaught evaluation errors from the runners.
+///
+/// Evaluation *continues* after an uncaught error — jq reports the diagnostic
+/// and moves to the next input — so the failure has to be remembered rather
+/// than returned. `hit()` then drives the process exit code (#355).
+///
+/// One definition shared by both runners: the jq and yq paths previously each
+/// carried their own `eprintln!`, which is how the two drifted from upstream
+/// independently.
+#[derive(Debug, Default)]
+pub struct ErrorSink {
+    hit: bool,
+}
+
+impl ErrorSink {
+    /// Report an uncaught evaluation error and mark the run as failed.
+    pub fn report(&mut self, style: DiagStyle, err: &EvalError, at: &InputLocation) {
+        self.emit(style, &err.message, err.payload_is_not_a_string(), at);
+    }
+
+    /// Report an error surfaced by a streaming operation ([`StreamError`]).
+    pub fn report_stream(&mut self, style: DiagStyle, err: &StreamError, at: &InputLocation) {
+        self.emit(style, &err.message, err.not_a_string, at);
+    }
+
+    /// Report a `break` that escaped its label — an uncaught error like any other.
+    pub fn report_break(&mut self, style: DiagStyle, label: &str, at: &InputLocation) {
+        self.emit(style, &format!("break ${label} not in label"), false, at);
+    }
+
+    fn emit(&mut self, style: DiagStyle, message: &str, not_a_string: bool, at: &InputLocation) {
+        match style {
+            DiagStyle::Jq => {
+                let marker = if not_a_string { " (not a string)" } else { "" };
+                eprintln!("jq: error (at {at}){marker}: {message}");
+            }
+            // yq carries neither marker; `Error:` matches the prefix already
+            // used for its "no matches found" failure.
+            DiagStyle::Yq => eprintln!("Error: {message}"),
+        }
+        self.hit = true;
+    }
+
+    /// Whether any uncaught error was reported during the run.
+    pub fn hit(&self) -> bool {
+        self.hit
+    }
 }
 
 /// Print build configuration information (similar to jq --build-configuration)
@@ -541,6 +666,55 @@ mod tests {
 
     /// The jq default spec, spelled out. Parsing this must be a no-op.
     const DEFAULT_SPEC: &str = "1;30:0;39:0;39:0;39:0;32:1;39:1;39:1;34";
+
+    /// The two upstreams disagree on the exit code for an uncaught error, and
+    /// both runners route through this mapping. Pinning it here keeps the jq
+    /// and yq call sites from drifting apart independently (#355).
+    #[test]
+    fn test_error_exit_code_per_style() {
+        assert_eq!(DiagStyle::Jq.error_exit_code(), 5, "jq exits 5");
+        assert_eq!(DiagStyle::Yq.error_exit_code(), 1, "mikefarah/yq exits 1");
+        // Distinct from -e's codes, which describe a *successful* falsy result.
+        assert_ne!(DiagStyle::Jq.error_exit_code(), exit_codes::NO_OUTPUT);
+        assert_ne!(DiagStyle::Jq.error_exit_code(), exit_codes::FALSE_OR_NULL);
+    }
+
+    #[test]
+    fn test_input_location_display() {
+        assert_eq!(InputLocation::at(Some("a.json"), 2).to_string(), "a.json:2");
+        // No file means stdin, matching `print_validation_error`'s convention.
+        assert_eq!(InputLocation::at(None, 1).to_string(), "<stdin>:1");
+        // `-n`: no input to point at.
+        assert_eq!(InputLocation::unknown().to_string(), "<unknown>");
+    }
+
+    /// jq flags a raised payload that is not a string; internal errors, which
+    /// carry no payload, are message-shaped and never flagged.
+    #[test]
+    fn test_not_a_string_marker_tracks_the_payload() {
+        assert!(!EvalError::new("expected object, got number").payload_is_not_a_string());
+        assert!(!EvalError::from_value(OwnedValue::String("boom".into())).payload_is_not_a_string());
+        assert!(EvalError::from_value(OwnedValue::Null).payload_is_not_a_string());
+        assert!(EvalError::from_value(OwnedValue::Int(42)).payload_is_not_a_string());
+        // The rendered message is unchanged by retaining the payload.
+        assert_eq!(
+            EvalError::from_value(OwnedValue::String("boom".into())).message,
+            "boom"
+        );
+        assert_eq!(EvalError::from_value(OwnedValue::Int(42)).message, "42");
+    }
+
+    #[test]
+    fn test_error_sink_starts_clean_and_latches() {
+        let mut sink = ErrorSink::default();
+        assert!(!sink.hit(), "a run with no error must not fail");
+        sink.report(
+            DiagStyle::Jq,
+            &EvalError::new("boom"),
+            &InputLocation::at(None, 1),
+        );
+        assert!(sink.hit(), "an uncaught error must fail the run");
+    }
 
     #[test]
     fn test_jq_colors_valid_sgr() {
