@@ -174,6 +174,14 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo test --verbose --features portable-popcount
 
+      # scalar-yaml switches x86_64 off the `x86` module entirely, so it is a
+      # distinct dispatch set that no other step here builds (#185). Its ARM
+      # counterpart, plus broadword-yaml, run on the test-arm leg —
+      # broadword-yaml is a no-op on x86_64.
+      - name: Run tests (scalar-yaml — no SIMD or broadword)
+        if: needs.gate.outputs.code == 'true'
+        run: cargo test --verbose --features simd,scalar-yaml
+
       - name: Check no_std compatibility
         if: needs.gate.outputs.code == 'true'
         run: cargo check --no-default-features
@@ -256,6 +264,21 @@ jobs:
       - name: Run tests (portable-popcount feature)
         if: needs.gate.outputs.code == 'true'
         run: cargo test --verbose --features portable-popcount
+
+      # The YAML backend selectors are mutually exclusive by cfg, so a build
+      # compiles at most one of neon/broadword/x86 and the compiler never
+      # compares them. Nothing built these two flags until #185, which is how
+      # `neon.rs` came to carry a drifted duplicate of the whole broadword layer
+      # for however long: both copies were syntactically fine, and no leg ever
+      # instantiated the one that had gone stale. These runs exist to make the
+      # unselected backends fail loudly rather than rot quietly.
+      - name: Run tests (broadword-yaml — ARM64 SWAR instead of NEON)
+        if: needs.gate.outputs.code == 'true'
+        run: cargo test --verbose --features simd,broadword-yaml
+
+      - name: Run tests (scalar-yaml — no SIMD or broadword)
+        if: needs.gate.outputs.code == 'true'
+        run: cargo test --verbose --features simd,scalar-yaml
 
   test-macos-arm:
     name: Test (macOS ARM64)
@@ -458,6 +481,21 @@ jobs:
       - name: Run Clippy
         if: needs.gate.outputs.code == 'true'
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # `--all-features` turns on `scalar-yaml`, whose cfgs compile out *every*
+      # YAML SIMD backend — so the step above has never linted `yaml/simd/x86.rs`,
+      # `neon.rs` or `broadword.rs` (verified: a lint planted in x86.rs does not
+      # fire under `--all-features`, and does with the set below). That is the same
+      # blind spot that let the duplicated broadword layer drift, one level up
+      # (#185). This runner is x86_64, so it covers the x86 backend; the ARM
+      # backends are compiled — though not linted — by the test-arm leg.
+      #
+      # `portable-popcount` is kept deliberately: dropping it also un-gates the
+      # AVX-512 popcount path, which carries pre-existing lints that are not this
+      # job's to fix. Linting that path is tracked separately.
+      - name: Run Clippy (YAML SIMD backend selected)
+        if: needs.gate.outputs.code == 'true'
+        run: cargo clippy --all-targets --features std,simd,portable-popcount,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
 
   fmt:
     name: Format
