@@ -50,6 +50,15 @@ assign_field_on_number	.a = 1	1
 update_field_on_number	.a |= . + 1	1
 del_field_on_number	del(.a)	1
 setpath_on_number	setpath(["a"]; 1)	1
+setpath_nested_on_number	setpath(["a","b"]; 2)	{"a":1}
+setpath_on_string	setpath(["a"]; 1)	"str"
+setpath_number_key_on_object	setpath([0]; 1)	{}
+setpath_string_key_on_array	setpath(["a"]; 1)	[]
+setpath_slice_key_on_number	setpath([{"start":1,"end":2}]; ["x"])	1
+setpath_negative_index_oob	setpath([-5]; 9)	[1,2]
+setpath_negative_index_on_null	setpath([-1]; 9)	null
+setpath_nan_index	setpath([nan]; 9)	null
+setpath_non_array_path	setpath("a"; 1)	1
 getpath_on_number	getpath(["a"])	1
 getpath_nested_on_number	getpath(["a","b"])	{"a":1}
 getpath_non_array_path	getpath("a")	{"a":1}

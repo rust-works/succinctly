@@ -27,6 +27,15 @@ assign_field_on_number	.a = 1	1	Cannot index number with string "a"
 update_field_on_number	.a |= . + 1	1	Cannot index number with string "a"
 del_field_on_number	del(.a)	1	Cannot index number with string "a"
 setpath_on_number	setpath(["a"]; 1)	1	Cannot index number with string "a"
+setpath_nested_on_number	setpath(["a","b"]; 2)	{"a":1}	Cannot index number with string "b"
+setpath_on_string	setpath(["a"]; 1)	"str"	Cannot index string with string "a"
+setpath_number_key_on_object	setpath([0]; 1)	{}	Cannot index object with number
+setpath_string_key_on_array	setpath(["a"]; 1)	[]	Cannot index array with string "a"
+setpath_slice_key_on_number	setpath([{"start":1,"end":2}]; ["x"])	1	Cannot index number with object
+setpath_negative_index_oob	setpath([-5]; 9)	[1,2]	Out of bounds negative array index
+setpath_negative_index_on_null	setpath([-1]; 9)	null	Out of bounds negative array index
+setpath_nan_index	setpath([nan]; 9)	null	Cannot set array element at NaN index
+setpath_non_array_path	setpath("a"; 1)	1	Path must be specified as an array
 getpath_on_number	getpath(["a"])	1	Cannot index number with string "a"
 getpath_nested_on_number	getpath(["a","b"])	{"a":1}	Cannot index number with string "b"
 getpath_non_array_path	getpath("a")	{"a":1}	Path must be specified as an array

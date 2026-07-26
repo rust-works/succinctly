@@ -268,6 +268,23 @@ impl EvalError {
         ))
     }
 
+    /// `Path must be specified as an array`.
+    ///
+    /// Raised by the path builtins when their path argument is not an array at
+    /// all — `1 | setpath("a"; 1)`.
+    pub fn path_must_be_array() -> Self {
+        Self::new("Path must be specified as an array")
+    }
+
+    /// `Out of bounds negative array index`.
+    ///
+    /// jq raises this for a negative index that is still negative after being
+    /// resolved against the array's length — `[1,2] | setpath([-5]; 9)`. The
+    /// sentence carries neither the index nor the length.
+    pub fn out_of_bounds_negative_index() -> Self {
+        Self::new("Out of bounds negative array index")
+    }
+
     /// `Cannot iterate over <type> (<value>)`.
     pub fn cannot_iterate(value: &OwnedValue) -> Self {
         Self::new(format!("Cannot iterate over {}", describe(value)))

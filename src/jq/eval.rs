@@ -4687,7 +4687,7 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let path = match result_to_owned(eval_single::<W, S>(path_expr, value.clone(), optional)) {
         Ok(OwnedValue::Array(arr)) => arr,
         Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::new("Path must be specified as an array")),
+        Ok(_) => return QueryResult::Error(EvalError::path_must_be_array()),
         Err(e) => return QueryResult::Error(e),
     };
 
@@ -8648,56 +8648,102 @@ fn builtin_leaf_paths<W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Resolve a `setpath` array index against the array's current length.
+///
+/// jq truncates a float index toward zero — `setpath([1.7]; v)` writes element
+/// 1 and `setpath([-0.5]; v)` writes element 0 — and refuses NaN outright. A
+/// negative index counts back from the end; one that is *still* negative after
+/// that is out of bounds rather than clamped to zero, which is also what keeps
+/// the caller's null padding bounded: `(len + idx) as usize` for
+/// `[1,2] | setpath([-5]; 9)` wraps to ~1.8e19 and pads until memory runs out.
+fn resolve_setpath_index(key: &OwnedValue, len: usize) -> Result<usize, EvalError> {
+    let index = match key {
+        OwnedValue::Int(i) => *i,
+        OwnedValue::Float(f) if f.is_nan() => {
+            return Err(EvalError::new("Cannot set array element at NaN index"))
+        }
+        OwnedValue::Float(f) => f.trunc() as i64,
+        // Not reachable from `set_value_at_path`, which matches the numeric
+        // path elements before calling; stated so the helper stands alone.
+        other => {
+            return Err(EvalError::cannot_index_with_type(
+                "array",
+                other.type_name(),
+            ))
+        }
+    };
+
+    let resolved = if index < 0 { len as i64 + index } else { index };
+    usize::try_from(resolved).map_err(|_| EvalError::out_of_bounds_negative_index())
+}
+
 /// Helper to set a value at a path
-fn set_value_at_path(value: OwnedValue, path: &[OwnedValue], new_val: OwnedValue) -> OwnedValue {
-    if path.is_empty() {
-        return new_val;
-    }
-    match &path[0] {
-        OwnedValue::String(key) => match value {
+///
+/// Follows jq: `null` is the only value auto-vivified into whatever container
+/// the next path element needs. Every other non-container refuses to be
+/// indexed, so `1 | setpath(["a"]; 1)` is an error rather than `{"a":1}`
+/// (#359), and so does a container indexed with the wrong kind of key —
+/// `{} | setpath([0]; 1)`, `[] | setpath(["a"]; 1)`.
+fn set_value_at_path(
+    value: OwnedValue,
+    path: &[OwnedValue],
+    new_val: OwnedValue,
+) -> Result<OwnedValue, EvalError> {
+    let Some(key) = path.first() else {
+        return Ok(new_val);
+    };
+    let rest = &path[1..];
+
+    match key {
+        OwnedValue::String(name) => match value {
             OwnedValue::Object(mut entries) => {
-                if entries.contains_key(key) {
-                    let old = entries.shift_remove(key).unwrap_or(OwnedValue::Null);
-                    let new = set_value_at_path(old, &path[1..], new_val);
-                    entries.insert(key.clone(), new);
+                if let Some(slot) = entries.get_mut(name) {
+                    // Replace through the slot rather than remove-and-reinsert:
+                    // jq leaves an existing key where it was, and `IndexMap`
+                    // would move it to the end after a `shift_remove`.
+                    let old = core::mem::replace(slot, OwnedValue::Null);
+                    *slot = set_value_at_path(old, rest, new_val)?;
                 } else {
-                    let val = set_value_at_path(OwnedValue::Null, &path[1..], new_val);
-                    entries.insert(key.clone(), val);
+                    let val = set_value_at_path(OwnedValue::Null, rest, new_val)?;
+                    entries.insert(name.clone(), val);
                 }
-                OwnedValue::Object(entries)
+                Ok(OwnedValue::Object(entries))
             }
-            _ => {
-                // Create new object
-                let val = set_value_at_path(OwnedValue::Null, &path[1..], new_val);
+            OwnedValue::Null => {
                 let mut entries = IndexMap::new();
-                entries.insert(key.clone(), val);
-                OwnedValue::Object(entries)
+                entries.insert(
+                    name.clone(),
+                    set_value_at_path(OwnedValue::Null, rest, new_val)?,
+                );
+                Ok(OwnedValue::Object(entries))
             }
+            other => Err(EvalError::cannot_index(other.type_name(), key)),
         },
-        OwnedValue::Int(idx) => match value {
-            OwnedValue::Array(mut arr) => {
-                let index = if *idx < 0 {
-                    (arr.len() as i64 + *idx) as usize
-                } else {
-                    *idx as usize
-                };
-                // Extend array if needed
-                while arr.len() <= index {
-                    arr.push(OwnedValue::Null);
-                }
-                let old = arr[index].clone();
-                arr[index] = set_value_at_path(old, &path[1..], new_val);
-                OwnedValue::Array(arr)
+        OwnedValue::Int(_) | OwnedValue::Float(_) => {
+            let mut arr = match value {
+                OwnedValue::Array(arr) => arr,
+                OwnedValue::Null => Vec::new(),
+                other => return Err(EvalError::cannot_index(other.type_name(), key)),
+            };
+            let index = resolve_setpath_index(key, arr.len())?;
+            if index >= arr.len() {
+                arr.resize(index + 1, OwnedValue::Null);
             }
-            _ => {
-                // Create new array
-                let index = if *idx < 0 { 0 } else { *idx as usize };
-                let mut arr = vec![OwnedValue::Null; index + 1];
-                arr[index] = set_value_at_path(OwnedValue::Null, &path[1..], new_val);
-                OwnedValue::Array(arr)
-            }
+            let old = core::mem::replace(&mut arr[index], OwnedValue::Null);
+            arr[index] = set_value_at_path(old, rest, new_val)?;
+            Ok(OwnedValue::Array(arr))
+        }
+        OwnedValue::Object(_) => match value {
+            // An object path element is jq's slice, `{"start":s,"end":e}` —
+            // what `path(.[1:2])` yields. Assigning through one is not
+            // implemented; leave the value untouched rather than raise an
+            // error jq does not. Only the containers jq would slice get that
+            // pass; on anything else the sentence below is jq's.
+            OwnedValue::Array(_) | OwnedValue::Null => Ok(value),
+            other => Err(EvalError::cannot_index(other.type_name(), key)),
         },
-        _ => value,
+        // null, booleans and arrays index nothing, in any container.
+        _ => Err(EvalError::cannot_index(value.type_name(), key)),
     }
 }
 
@@ -8714,12 +8760,12 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::One(v) => to_owned(&v),
         QueryResult::Owned(v) => v,
         QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::new("setpath requires array path")),
+        _ => return QueryResult::Error(EvalError::path_must_be_array()),
     };
 
     let path = match path_owned {
         OwnedValue::Array(p) => p,
-        _ => return QueryResult::Error(EvalError::new("setpath requires array path")),
+        _ => return QueryResult::Error(EvalError::path_must_be_array()),
     };
 
     // Evaluate value expression
@@ -8731,8 +8777,14 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     let owned = to_owned(&value);
-    let result = set_value_at_path(owned, &path, new_val);
-    QueryResult::Owned(result)
+    match set_value_at_path(owned, &path, new_val) {
+        Ok(result) => QueryResult::Owned(result),
+        // An optional context swallows the refusal, as it does for every other
+        // builtin here. Not reachable through `setpath(…)?` yet — the parser
+        // does not take `?` after a call — but the flag is threaded in anyway.
+        Err(_) if optional => QueryResult::None,
+        Err(e) => QueryResult::Error(e),
+    }
 }
 
 /// Helper to delete a path from a value
@@ -16630,6 +16682,214 @@ mod tests {
                 assert_eq!(obj.get("b"), Some(&OwnedValue::Int(2)));
             }
         );
+    }
+
+    /// Run `filter` over `json`, rendering the outcome the way the CLI would:
+    /// `Ok` with the outputs as JSON, `Err` with the raised message.
+    ///
+    /// Every expectation below was read off jq-1.7.1 (the version pinned in
+    /// `tests/data/jq-golden/JQ_VERSION`), not off succinctly.
+    fn outcome(json: &[u8], filter: &str) -> Result<String, String> {
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(filter).unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => Err(e.message),
+            other => Ok(other
+                .collect_owned()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ")),
+        }
+    }
+
+    /// Asserts `filter` over each `input` produces the paired outcome.
+    fn assert_outcomes(cases: &[(&[u8], &str, Result<&str, &str>)]) {
+        for (input, filter, expected) in cases {
+            let want = expected.map(str::to_string).map_err(str::to_string);
+            assert_eq!(
+                outcome(input, filter),
+                want,
+                "{} | {filter}",
+                core::str::from_utf8(input).unwrap()
+            );
+        }
+    }
+
+    /// jq refuses to index a scalar; it does not replace it with a freshly
+    /// built container. `1 | setpath(["a"]; 1)` is an error, not `{"a":1}`
+    /// (#359).
+    #[test]
+    fn test_setpath_refuses_to_index_a_scalar() {
+        assert_outcomes(&[
+            (
+                b"1",
+                r#"setpath(["a"]; 1)"#,
+                Err(r#"Cannot index number with string "a""#),
+            ),
+            (
+                br#""str""#,
+                r#"setpath(["a"]; 1)"#,
+                Err(r#"Cannot index string with string "a""#),
+            ),
+            (
+                b"true",
+                r#"setpath(["a"]; 1)"#,
+                Err(r#"Cannot index boolean with string "a""#),
+            ),
+            (
+                b"1",
+                "setpath([0]; 1)",
+                Err("Cannot index number with number"),
+            ),
+            (
+                br#""s""#,
+                "setpath([0]; 1)",
+                Err("Cannot index string with number"),
+            ),
+        ]);
+    }
+
+    /// The refusal follows the path down, not just at the root: the scalar
+    /// `{"a":1}` reaches at `.a` is as unindexable as a scalar input.
+    #[test]
+    fn test_setpath_refuses_a_scalar_reached_through_the_path() {
+        assert_outcomes(&[
+            (
+                br#"{"a": 1}"#,
+                r#"setpath(["a", "b"]; 2)"#,
+                Err(r#"Cannot index number with string "b""#),
+            ),
+            (
+                br#"{"a": null}"#,
+                r#"setpath(["a", "b"]; 2)"#,
+                Ok(r#"{"a":{"b":2}}"#),
+            ),
+        ]);
+    }
+
+    /// `null` is the one value jq auto-vivifies, and it becomes whichever
+    /// container the path element calls for — at any depth.
+    #[test]
+    fn test_setpath_auto_vivifies_only_null() {
+        assert_outcomes(&[
+            (b"null", r#"setpath(["a"]; 1)"#, Ok(r#"{"a":1}"#)),
+            (b"null", "setpath([0]; 1)", Ok("[1]")),
+            (b"null", r#"setpath(["a", 0]; 1)"#, Ok(r#"{"a":[1]}"#)),
+            (b"null", r#"setpath([0, "a"]; 1)"#, Ok(r#"[{"a":1}]"#)),
+            (b"1", "setpath([]; 2)", Ok("2")),
+        ]);
+    }
+
+    /// A real container indexed with the wrong kind of key is refused too —
+    /// it is not silently replaced by the container the key does fit.
+    #[test]
+    fn test_setpath_refuses_a_container_indexed_with_the_wrong_key() {
+        assert_outcomes(&[
+            (
+                b"{}",
+                "setpath([0]; 1)",
+                Err("Cannot index object with number"),
+            ),
+            (
+                b"[]",
+                r#"setpath(["a"]; 1)"#,
+                Err(r#"Cannot index array with string "a""#),
+            ),
+            (
+                b"null",
+                "setpath([null]; 2)",
+                Err("Cannot index null with null"),
+            ),
+            (
+                b"null",
+                "setpath([true]; 2)",
+                Err("Cannot index null with boolean"),
+            ),
+            (
+                br#"{"a": 1}"#,
+                "setpath([[1]]; 2)",
+                Err("Cannot index object with array"),
+            ),
+            (
+                b"1",
+                r#"setpath([{"start": 1, "end": 2}]; ["x"])"#,
+                Err("Cannot index number with object"),
+            ),
+        ]);
+    }
+
+    /// A negative index counts from the end; one that stays negative is out of
+    /// bounds. Before #359 the out-of-range case computed `(2 + -5) as usize`
+    /// and padded with nulls until memory ran out, so this test also asserts
+    /// termination.
+    #[test]
+    fn test_setpath_negative_index() {
+        assert_outcomes(&[
+            (b"[1,2]", "setpath([-1]; 9)", Ok("[1,9]")),
+            (
+                b"[1,2]",
+                "setpath([-5]; 9)",
+                Err("Out of bounds negative array index"),
+            ),
+            (
+                b"null",
+                "setpath([-1]; 9)",
+                Err("Out of bounds negative array index"),
+            ),
+        ]);
+    }
+
+    /// jq accepts a float index and truncates it toward zero, and refuses NaN.
+    #[test]
+    fn test_setpath_float_index_truncates_toward_zero() {
+        assert_outcomes(&[
+            (b"null", "setpath([1.7]; 9)", Ok("[null,9]")),
+            (b"[1,2,3]", "setpath([1.9]; 9)", Ok("[1,9,3]")),
+            (b"[1,2,3]", "setpath([-0.5]; 9)", Ok("[9,2,3]")),
+            (b"[1,2,3]", "setpath([-1.5]; 9)", Ok("[1,2,9]")),
+            (
+                b"null",
+                "setpath([nan]; 9)",
+                Err("Cannot set array element at NaN index"),
+            ),
+        ]);
+    }
+
+    /// Writing to an existing key leaves it where it was, and an index past
+    /// the end pads with nulls.
+    #[test]
+    fn test_setpath_preserves_key_order_and_pads_arrays() {
+        assert_outcomes(&[
+            (
+                br#"{"a": 1, "b": 2}"#,
+                r#"setpath(["a"]; 9)"#,
+                Ok(r#"{"a":9,"b":2}"#),
+            ),
+            (b"[1,2]", "setpath([5]; 9)", Ok("[1,2,null,null,null,9]")),
+        ]);
+    }
+
+    /// A path argument that is not an array at all gets jq's own sentence, and
+    /// the refusal is catchable like any other raised error.
+    ///
+    /// The `setpath(…)?` form jq also accepts is not covered here: the parser
+    /// does not yet take `?` after a call, which is a separate gap.
+    #[test]
+    fn test_setpath_path_argument_and_catch() {
+        assert_outcomes(&[
+            (
+                b"1",
+                r#"setpath("a"; 1)"#,
+                Err("Path must be specified as an array"),
+            ),
+            (
+                b"1",
+                r#"try setpath(["a"]; 1) catch ."#,
+                Ok(r#""Cannot index number with string \"a\"""#),
+            ),
+        ]);
     }
 
     #[test]
