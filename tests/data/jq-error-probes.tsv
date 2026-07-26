@@ -150,3 +150,4 @@ fromjson_on_number	fromjson	1
 fromjson_on_null	fromjson	null
 fromjson_bad_string	fromjson	"a"
 fromjson_empty_string	fromjson	""
+fromjson_hex_string	fromjson	"0x10"

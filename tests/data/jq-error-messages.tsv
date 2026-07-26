@@ -115,3 +115,4 @@ fromjson_on_number	fromjson	1	number (1) only strings can be parsed
 fromjson_on_null	fromjson	null	null (null) only strings can be parsed
 fromjson_bad_string	fromjson	"a"	Invalid numeric literal at EOF at line 1, column 1 (while parsing 'a')
 fromjson_empty_string	fromjson	""	Expected JSON value (while parsing '')
+fromjson_hex_string	fromjson	"0x10"	Invalid numeric literal at EOF at line 1, column 4 (while parsing '0x10')

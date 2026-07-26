@@ -3844,7 +3844,7 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>>(
 /// splits the failures in two: a string that parses as some *other* JSON value
 /// (`"null"`, `"true"`, `"[1]"`) is reported as the string it is, while one
 /// that does not parse at all gets the parser's own diagnostic. We reuse
-/// [`parse_json_string`] to tell the two apart.
+/// [`parse_complete_json`] to tell the two apart.
 ///
 /// Kept in one place because the two evaluators previously had *different*
 /// wording here — "cannot parse 'a' as number" against "cannot convert 'a' to
@@ -3990,8 +3990,10 @@ fn builtin_fromjson<W: Clone + AsRef<[u64]>>(
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
                 let json_str = cow.as_ref();
-                // Parse the JSON string
-                match parse_json_string(json_str) {
+                // The whole string must be one JSON value: jq rejects `"0x10"`
+                // and `"1 2"` rather than reading the first value and dropping
+                // the rest, which is what the old prefix parse did here.
+                match parse_complete_json(json_str) {
                     Ok(owned) => QueryResult::Owned(owned),
                     Err(_) if optional => QueryResult::None,
                     Err(_) => QueryResult::Error(EvalError::invalid_numeric_literal(json_str)),
@@ -4009,10 +4011,12 @@ fn builtin_fromjson<W: Clone + AsRef<[u64]>>(
 
 /// Parse a JSON string that must consume all of its input.
 ///
-/// [`parse_json_string`] stops at the end of the first value, so `"0x10"`
-/// parses as `0` with `x10` left over. `tonumber` needs the stricter reading
-/// to tell "this is valid JSON but not a number" (`"null"`) from "this is not
-/// valid JSON at all" (`"0x10"`), which jq reports differently.
+/// This is what both `tonumber` and `fromjson` need, because jq parses their
+/// argument with a parser that reports leftovers: the older prefix parse here
+/// stopped at the end of the first value, so `"0x10"` came back as `0` with
+/// `x10` silently dropped and `"1 2"` as `1`. `tonumber` needs it to tell
+/// "this is valid JSON but not a number" (`"null"`) from "this is not valid
+/// JSON at all" (`"0x10"`), which jq words differently.
 fn parse_complete_json(s: &str) -> Result<OwnedValue, String> {
     let bytes = s.as_bytes();
     let mut pos = 0;
@@ -4024,23 +4028,6 @@ fn parse_complete_json(s: &str) -> Result<OwnedValue, String> {
         return Err("trailing content after JSON value".to_string());
     }
     Ok(value)
-}
-
-/// Parse a JSON string into an OwnedValue
-fn parse_json_string(s: &str) -> Result<OwnedValue, String> {
-    let bytes = s.as_bytes();
-    let mut pos = 0;
-
-    // Skip whitespace
-    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
-        pos += 1;
-    }
-
-    if pos >= bytes.len() {
-        return Err("empty input".to_string());
-    }
-
-    parse_json_value(bytes, &mut pos)
 }
 
 /// Parse a JSON value starting at the given position
@@ -16875,6 +16862,27 @@ mod tests {
                 Ok(r#"{"a":9,"b":2}"#),
             ),
             (b"[1,2]", "setpath([5]; 9)", Ok("[1,2,null,null,null,9]")),
+        ]);
+    }
+
+    /// `fromjson` reads one JSON value and requires it to be the whole string,
+    /// as jq's parser does. The prefix parse it used before returned `0` for
+    /// `"0x10"` and `1` for `"1 2"`, silently dropping the rest.
+    #[test]
+    fn test_fromjson_requires_the_whole_string() {
+        assert_outcomes(&[
+            (
+                br#""0x10""#,
+                "fromjson",
+                Err("Invalid numeric literal at EOF at line 1, column 4 (while parsing '0x10')"),
+            ),
+            (
+                br#""1 2""#,
+                "fromjson",
+                Err("Invalid numeric literal at EOF at line 1, column 3 (while parsing '1 2')"),
+            ),
+            (br#"" 42 ""#, "fromjson", Ok("42")),
+            (br#""[1,2]""#, "fromjson", Ok("[1,2]")),
         ]);
     }
 
