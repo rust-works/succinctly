@@ -782,12 +782,21 @@ fn index_one_generic<V: DocumentValue>(
         }
         OwnedValue::Int(_) | OwnedValue::Float(_) => {
             // Truncation is toward zero, matching jq: `.[-1.5]` is the last
-            // element. Out-of-range floats saturate through `as`, yielding null.
-            let idx = numeric_key_to_index(key).expect("key is Int or Float");
+            // element. Out-of-range floats saturate through `as`, yielding null,
+            // and NaN has no index at all — also null.
+            let idx = numeric_key_to_index(key);
             if let Some(elements) = target.as_array() {
-                let len = elements.len();
-                let resolved = if idx < 0 { len as i64 + idx } else { idx };
-                match usize::try_from(resolved).ok().and_then(|i| elements.get(i)) {
+                let resolved = idx.map(|idx| {
+                    if idx < 0 {
+                        elements.len() as i64 + idx
+                    } else {
+                        idx
+                    }
+                });
+                match resolved
+                    .and_then(|r| usize::try_from(r).ok())
+                    .and_then(|i| elements.get(i))
+                {
                     Some(v) => GenericResult::One(v),
                     // Out-of-bounds is null, not an error (#307).
                     None => GenericResult::Owned(OwnedValue::Null),

@@ -1043,6 +1043,33 @@ fn test_cannot_index_wording_is_spelling_independent() -> Result<()> {
     Ok(())
 }
 
+/// A NaN key reads as null but must never *write*.
+///
+/// `f64 as i64` maps NaN to `0`, so the natural implementation silently reads —
+/// and, in an assignment, overwrites — element zero. jq yields null on the read
+/// and errors on the write; both halves are checked here because only the read
+/// half is observable in the golden corpus (`index_nan_key`).
+#[test]
+fn test_nan_key_reads_null_and_rejects_writes() -> Result<()> {
+    let (output, _) = run_jq_stdin("[.[nan]]", "[10,20,30]", &["-c"])?;
+    assert_eq!(output.trim(), "[null]");
+
+    for filter in [".[nan] = 5", ".[nan] |= 5", "path(.[nan])", "del(.[nan])"] {
+        let stderr = jq_stderr(filter, "[10,20,30]", &[])?;
+        assert!(
+            stderr.contains("Cannot set array element at NaN index"),
+            "`{filter}` should refuse a NaN index, got: {stderr}"
+        );
+        let (output, _) = run_jq_stdin(filter, "[10,20,30]", &["-c"])?;
+        assert_eq!(
+            output.trim(),
+            "",
+            "`{filter}` must not emit a mutated document"
+        );
+    }
+    Ok(())
+}
+
 /// `?` suppresses a bad-key error rather than propagating it.
 ///
 /// Regression guard for the `eval_generic` fallback: routing an unhandled

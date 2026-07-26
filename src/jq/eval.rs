@@ -5895,10 +5895,15 @@ fn index_array_by_position<W: Clone + AsRef<[u64]>>(
 /// on `[10,20,30]` is `30` (index -1), not `20`. Out-of-range floats saturate
 /// via `as`, so `.[1e100]` reads as a huge index and yields `null` rather than
 /// wrapping or panicking.
+///
+/// `None` means "numeric, but no index" — NaN only. `f64 as i64` maps NaN to
+/// `0`, which would silently read (and, in an assignment, *write*) element zero;
+/// jq's `.[nan]` is `null`. Callers must treat `None` as out of bounds on a
+/// read, and reject it on a write — see [`key_to_path_component`].
 pub(crate) fn numeric_key_to_index(key: &OwnedValue) -> Option<i64> {
     match key {
         OwnedValue::Int(i) => Some(*i),
-        OwnedValue::Float(f) => Some(f.trunc() as i64),
+        OwnedValue::Float(f) if !f.is_nan() => Some(f.trunc() as i64),
         _ => None,
     }
 }
@@ -5921,8 +5926,12 @@ fn index_one<'a, W: Clone + AsRef<[u64]>>(
             index_object_by_name::<W>(target, s, optional)
         }
         OwnedValue::Int(_) | OwnedValue::Float(_) if indexable_by_number => {
-            let idx = numeric_key_to_index(key).expect("key is Int or Float");
-            index_array_by_position::<W>(target, idx, optional)
+            match numeric_key_to_index(key) {
+                Some(idx) => index_array_by_position::<W>(target, idx, optional),
+                // NaN: a number, so the container check above still applies, but
+                // no element. jq yields null rather than erroring.
+                None => QueryResult::One(StandardJson::Null),
+            }
         }
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index(type_name(&target), key)),
@@ -5946,7 +5955,10 @@ pub(crate) fn index_one_owned(
         }
         (OwnedValue::String(_), OwnedValue::Null) => Ok(Some(OwnedValue::Null)),
         (OwnedValue::Int(_) | OwnedValue::Float(_), OwnedValue::Array(items)) => {
-            let idx = numeric_key_to_index(key).expect("key is Int or Float");
+            // A NaN key has no index, so it reads as out of bounds — null.
+            let Some(idx) = numeric_key_to_index(key) else {
+                return Ok(Some(OwnedValue::Null));
+            };
             let resolved = if idx < 0 {
                 items.len() as i64 + idx
             } else {
@@ -6688,12 +6700,20 @@ fn eval_owned_multi<S: EvalSemantics>(
 }
 
 /// Turn a resolved key value into the static path component it denotes.
+///
+/// NaN is the one numeric key with no component: reading `.[nan]` is null, but
+/// there is no element for a write to land on, so an assignment must fail rather
+/// than pick one. jq's own wording, and its own choice —
+/// `[10,20,30] | .[nan] = 5` is an error there too. (jq's `path(.[nan])` instead
+/// yields `[null]`, a path its own `setpath` then rejects; erroring at the
+/// source is the coherent half of that.)
 fn key_to_path_component(key: &OwnedValue, container: &OwnedValue) -> Result<Expr, EvalError> {
     match key {
         OwnedValue::String(s) => Ok(Expr::Field(s.clone())),
-        OwnedValue::Int(i) => Ok(Expr::Index(*i)),
         // Truncation toward zero, as in the value path.
-        OwnedValue::Float(f) => Ok(Expr::Index(f.trunc() as i64)),
+        OwnedValue::Int(_) | OwnedValue::Float(_) => numeric_key_to_index(key)
+            .map(Expr::Index)
+            .ok_or_else(|| EvalError::new("Cannot set array element at NaN index")),
         _ => Err(EvalError::cannot_index(owned_type_name(container), key)),
     }
 }

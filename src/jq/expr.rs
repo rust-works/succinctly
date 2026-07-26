@@ -45,10 +45,13 @@ pub enum Expr {
     /// [`Expr::Field`] and `.[0]` to [`Expr::Index`], so the hot `.foo.bar[0]`
     /// path and every existing `Field`/`Index` match site are untouched.
     ///
-    /// Two deliberate divergences from jq: an array-valued key errors with
+    /// Three deliberate divergences from jq. An array-valued key errors with
     /// `Cannot index array with array` rather than performing jq's
-    /// indices-of-subarray search (`[10,20,30] | .[[20]]` → `[1]`), and
-    /// `path(.[1.7])` yields `[1]` where jq keeps the unfloored `[1.7]`.
+    /// indices-of-subarray search (`[10,20,30] | .[[20]]` → `[1]`).
+    /// `path(.[1.7])` yields `[1]` where jq keeps the unfloored `[1.7]`. And a
+    /// NaN key, which reads as null in both, has no path component here — jq's
+    /// `path(.[nan])` is `[null]`, a path its own `setpath` then rejects, so
+    /// this errors at the source instead.
     IndexExpr {
         /// The value being indexed — the postfix chain so far.
         target: Box<Self>,
