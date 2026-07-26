@@ -24,14 +24,14 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 123 probes in
+Measured against jq-1.7.1 over the 126 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result              | Meaning                                            |
 |----------------------------------------------|---------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **118/123 = 95.9%** | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **121/126 = 96.0%** | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**               | Every probe that errors in both errors identically |
 | **Behaviour / parser gaps**                  | **5**               | succinctly does not raise the error at all         |
 
@@ -97,8 +97,13 @@ fixed for one member is owed by every member. Fixing only the member a probe nam
 `1 | with_entries(.)` saying `number (1) has no keys` while `1 | to_entries` beside it
 still said `expected object, got number`. The corpus now carries at least one probe per
 member for these families, and the sites that shared wording share a definition —
-`non_string_pattern` in `src/jq/eval.rs` is the single refusal behind all three string
-searches.
+`non_string_pattern` and `unsearchable_input` in `src/jq/eval.rs` are the two refusals
+behind all three string searches.
+
+The families are worth naming, because "fix the site the probe names" caught this twice
+in a row: the first pass fixed the *pattern* half of `indices`/`index`/`rindex` and left
+their *input* half saying `expected string or array, got number`, one arm below. The rule
+that holds is per family, not per raise site.
 
 ### Value rendering and truncation
 

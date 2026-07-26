@@ -4507,6 +4507,31 @@ fn non_string_pattern<W>(value: &StandardJson<'_, W>, pattern: &OwnedValue) -> E
     EvalError::cannot_index(type_name(value), pattern)
 }
 
+/// What `indices`, `index` and `rindex` answer for an input they cannot search.
+///
+/// jq routes a *string* pattern through `_strindices`, which answers `null`
+/// for an input holding no characters to search rather than raising: `null |
+/// index("a")` and `{} | index("a")` are both `null`. Anything else indexes the
+/// input with the pattern, so a scalar — or an object handed a non-string
+/// pattern, `{} | indices(1)` — reports that indexing error.
+///
+/// One definition, because this is the outer half of the same refusal
+/// [`non_string_pattern`] covers, and the three searches had drifted here too.
+fn unsearchable_input<'a, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'a, W>,
+    pattern: &OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
+        StandardJson::Null => QueryResult::Owned(OwnedValue::Null),
+        StandardJson::Object(_) if matches!(pattern, OwnedValue::String(_)) => {
+            QueryResult::Owned(OwnedValue::Null)
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::cannot_index(type_name(value), pattern)),
+    }
+}
+
 /// Builtin: indices(s) - find all indices of substring/element s
 fn builtin_indices<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     s_expr: &Expr,
@@ -4554,10 +4579,7 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             QueryResult::Owned(OwnedValue::Array(indices))
         }
-        _ if optional => QueryResult::None,
-        // jq's `indices` indexes its input, so a non-indexable one reports
-        // the indexing error for the pattern it was handed.
-        _ => QueryResult::Error(EvalError::cannot_index(type_name(&value), &pattern)),
+        _ => unsearchable_input(&value, &pattern, optional),
     }
 }
 
@@ -4602,8 +4624,7 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             QueryResult::Owned(OwnedValue::Null)
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("string or array", type_name(&value))),
+        _ => unsearchable_input(&value, &pattern, optional),
     }
 }
 
@@ -4649,8 +4670,7 @@ fn builtin_rindex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             QueryResult::Owned(OwnedValue::Null)
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("string or array", type_name(&value))),
+        _ => unsearchable_input(&value, &pattern, optional),
     }
 }
 
@@ -17125,6 +17145,39 @@ mod tests {
             (br#""abcabc""#, r#"indices("b")"#, Ok("[1,4]")),
             (br#""abcabc""#, r#"index("b")"#, Ok("1")),
             (br#""abcabc""#, r#"rindex("b")"#, Ok("4")),
+        ]);
+    }
+
+    /// The other half of the same refusal: what the three searches do with an
+    /// input they cannot search. jq's `_strindices` answers `null` where there
+    /// are no characters to search rather than raising, so `null` and an object
+    /// handed a string pattern are values, not errors — and everything else
+    /// reports the indexing error, for all three alike.
+    #[test]
+    fn test_string_search_unsearchable_inputs() {
+        assert_outcomes(&[
+            // jq answers with a value here, so no probe can pin these.
+            (b"null", r#"indices("a")"#, Ok("null")),
+            (b"null", r#"index("a")"#, Ok("null")),
+            (b"null", r#"rindex("a")"#, Ok("null")),
+            (b"{}", r#"indices("a")"#, Ok("null")),
+            (b"{}", r#"index("a")"#, Ok("null")),
+            (b"{}", r#"rindex("a")"#, Ok("null")),
+            // A non-string pattern never reaches `_strindices`, so the object
+            // is indexed with it and refused.
+            (b"{}", "indices(1)", Err("Cannot index object with number")),
+            // Scalars report the indexing error, which `index`/`rindex` used
+            // to word as `expected string or array, got <t>`.
+            (
+                b"1",
+                r#"index("a")"#,
+                Err(r#"Cannot index number with string "a""#),
+            ),
+            (
+                b"true",
+                r#"rindex("a")"#,
+                Err(r#"Cannot index boolean with string "a""#),
+            ),
         ]);
     }
 

@@ -79,6 +79,12 @@ indices_on_number	indices(",")	1
 indices_number_pattern_on_string	indices(1)	"abc"
 index_null_pattern_on_string	index(null)	"abc"
 rindex_array_pattern_on_string	rindex([1])	"abc"
+# … and an input they cannot search reports the same indexing error. `null`
+# and an object with a string pattern are absent on purpose: jq answers those
+# with `null`, so no probe can hold them (unit tests do).
+index_on_number	index("a")	1
+rindex_on_boolean	rindex("a")	true
+indices_number_pattern_on_object	indices(1)	{}
 
 # ── Cannot iterate over <t> (<value>) ────────────────────────────────────────
 iterate_number	.[]	1

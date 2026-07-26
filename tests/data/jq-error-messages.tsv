@@ -54,6 +54,9 @@ indices_on_number	indices(",")	1	Cannot index number with string ","
 indices_number_pattern_on_string	indices(1)	"abc"	Cannot index string with number
 index_null_pattern_on_string	index(null)	"abc"	Cannot index string with null
 rindex_array_pattern_on_string	rindex([1])	"abc"	Cannot index string with array
+index_on_number	index("a")	1	Cannot index number with string "a"
+rindex_on_boolean	rindex("a")	true	Cannot index boolean with string "a"
+indices_number_pattern_on_object	indices(1)	{}	Cannot index object with number
 iterate_number	.[]	1	Cannot iterate over number (1)
 iterate_string	.[]	"str"	Cannot iterate over string ("str")
 iterate_boolean	.[]	true	Cannot iterate over boolean (true)
