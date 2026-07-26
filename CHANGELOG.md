@@ -242,9 +242,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   did not; and `"abc" | indices(1)`, `index(1)`, `rindex(1)` all answered
   `expected string, got pattern` — naming an argument where jq names a type —
   instead of `Cannot index string with number`. The three string searches now
-  share one refusal (`non_string_pattern`) rather than three copies, and the
-  corpus carries a probe per family member so the next member cannot drift
-  alone. `to_entries` also gained jq's array behaviour (`[1,2] | to_entries` is
+  share their refusals (`non_string_pattern` and `unsearchable_input`) rather
+  than keeping three copies each, and the corpus carries a probe per family
+  member so the next member cannot drift alone. Measuring the searches over
+  every input type also turned up behaviour the wording had hidden: jq reaches
+  `_strindices` only for a string pattern and answers `null` where there is
+  nothing to search, so `null | index("a")` and `{} | index("a")` are values,
+  not errors, and all 24 cells of that matrix now match. `to_entries` also gained jq's array behaviour (`[1,2] | to_entries` is
   `[{"key":0,"value":1},{"key":1,"value":2}]`), without which the corrected
   sentence would have claimed an array has no keys where jq answers with a
   value.
