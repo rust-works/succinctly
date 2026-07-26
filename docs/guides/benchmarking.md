@@ -640,6 +640,22 @@ benchmark suite. Every rule below cost a wrong conclusion at least once, during 
 detection work in #106; that investigation's write-up in `docs/parsing/yaml.md` (optimisations
 O5 and O6) carries the full numbers.
 
+`scripts/ab-cli.py` implements rules 1, 2, 4 and 6 for CLI-level A/B work:
+
+```bash
+# what the harness reports for a change that does not exist — run this first, once per machine
+scripts/ab-cli.py --before ./succ-base --control --corpus ~/wrk/bench-scratch/mycorpus
+
+# the real comparison
+scripts/ab-cli.py --before ./succ-base --after ./succ-head --corpus ~/wrk/bench-scratch/mycorpus
+```
+
+Run `--control` before trusting any result. It times the baseline binary against a copy of
+itself, so whatever it reports is noise by construction, and that is the bar a real delta has
+to clear — an idle M4 Pro reads +0.09% median with a per-row range of -1.8%..+1.5%. Without
+that number, #332's +1.1% median across 22 workloads was arguable; with it, the consistent
+sign was decisive, and the fix was restructured before merge.
+
 ### 1. Interleave the two binaries; never run all of A then all of B
 
 Alternate them **within** each repetition, then compare min-of-N and median:
