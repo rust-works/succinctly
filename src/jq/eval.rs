@@ -4103,7 +4103,14 @@ fn parse_json_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String>
 }
 
 /// Parse a JSON string value
+///
+/// The bounds check is not redundant with [`parse_json_value`]'s: an object's
+/// key position is reached from [`parse_json_object`] directly, so `"{"` and
+/// `{"a":1,` arrive here at end of input.
 fn parse_json_string_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+    if *pos >= bytes.len() {
+        return Err("unexpected end of input".to_string());
+    }
     if bytes[*pos] != b'"' {
         return Err("expected '\"'".to_string());
     }
@@ -4205,7 +4212,7 @@ fn parse_json_string_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, 
 
 /// Parse a JSON array
 fn parse_json_array(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
-    if bytes[*pos] != b'[' {
+    if *pos >= bytes.len() || bytes[*pos] != b'[' {
         return Err("expected '['".to_string());
     }
     *pos += 1;
@@ -4251,7 +4258,7 @@ fn parse_json_array(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String>
 
 /// Parse a JSON object
 fn parse_json_object(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
-    if bytes[*pos] != b'{' {
+    if *pos >= bytes.len() || bytes[*pos] != b'{' {
         return Err("expected '{{'".to_string());
     }
     *pos += 1;
@@ -16869,6 +16876,24 @@ mod tests {
             ),
             (b"[1,2]", "setpath([5]; 9)", Ok("[1,2,null,null,null,9]")),
         ]);
+    }
+
+    /// A string that opens a container and stops used to index one byte past
+    /// the input while looking for an object key, panicking inside the JSON
+    /// parser. `fromjson` reached it directly; `tonumber` reaches it too, since
+    /// it asks the same parser whether a non-numeric string is valid JSON.
+    #[test]
+    fn test_conversions_do_not_panic_at_end_of_input() {
+        for input in [br#""{""#.as_slice(), br#""{\"a\":1,""#, br#""[""#] {
+            for filter in ["fromjson", "tonumber"] {
+                let result = outcome(input, filter);
+                assert!(
+                    result.is_err(),
+                    "{} | {filter} should error, got {result:?}",
+                    core::str::from_utf8(input).unwrap()
+                );
+            }
+        }
     }
 
     /// A path argument that is not an array at all gets jq's own sentence, and
