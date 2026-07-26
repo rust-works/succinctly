@@ -8668,7 +8668,47 @@ fn resolve_setpath_index(key: &OwnedValue, len: usize) -> Result<usize, EvalErro
     };
 
     let resolved = if index < 0 { len as i64 + index } else { index };
-    usize::try_from(resolved).map_err(|_| EvalError::out_of_bounds_negative_index())
+    if resolved < 0 {
+        return Err(EvalError::out_of_bounds_negative_index());
+    }
+    // Still fallible on a 32-bit target, where a large positive index does not
+    // fit a `usize`. That is the same refusal as `pad_with_nulls`', not a
+    // negative index, so it must not borrow the sentence above.
+    usize::try_from(resolved).map_err(|_| cannot_grow_array(resolved as u64 + 1))
+}
+
+/// Refusal for an array length that cannot be allocated.
+///
+/// Not a jq sentence: jq does not survive the filters that reach this (it dies
+/// on the allocation), so there is no wording to reproduce — see
+/// `docs/compliance/jq/limitations.md`.
+fn cannot_grow_array(len: u64) -> EvalError {
+    EvalError::new(format!("Cannot grow array to {len} elements"))
+}
+
+/// Pad `arr` with nulls until `index` is a valid element, reporting a failure
+/// the caller can catch.
+///
+/// The length is taken from the document — `setpath([n]; v)` writes element `n`
+/// of an array it grows to fit — so an absurd `n` asks for an absurd
+/// allocation. `Vec::resize` answers that with a `capacity overflow` *panic*,
+/// which for a library means taking the embedder down with it: `null |
+/// setpath([1e30]; 9)` wants 9.2e18 elements. jq has no sentence to reproduce
+/// here because jq does not survive the same filter either (it dies on the
+/// allocation), so this is succinctly's own wording.
+///
+/// Only the impossible is refused: every length that fits in memory still
+/// grows, which is what keeps `[1,2] | setpath([5]; 9)` agreeing with jq.
+fn pad_with_nulls(arr: &mut Vec<OwnedValue>, index: usize) -> Result<(), EvalError> {
+    // `index + 1` is only an overflow on a 32-bit target, where `usize::MAX`
+    // is a reachable index; the refusal is the same either way.
+    let len = index
+        .checked_add(1)
+        .ok_or_else(|| cannot_grow_array(index as u64 + 1))?;
+    arr.try_reserve(len - arr.len())
+        .map_err(|_| cannot_grow_array(len as u64))?;
+    arr.resize(len, OwnedValue::Null);
+    Ok(())
 }
 
 /// Helper to set a value at a path
@@ -8721,7 +8761,7 @@ fn set_value_at_path(
             };
             let index = resolve_setpath_index(key, arr.len())?;
             if index >= arr.len() {
-                arr.resize(index + 1, OwnedValue::Null);
+                pad_with_nulls(&mut arr, index)?;
             }
             let old = core::mem::replace(&mut arr[index], OwnedValue::Null);
             arr[index] = set_value_at_path(old, rest, new_val)?;
@@ -16863,6 +16903,21 @@ mod tests {
             ),
             (b"[1,2]", "setpath([5]; 9)", Ok("[1,2,null,null,null,9]")),
         ]);
+    }
+
+    /// The padding length comes from the document, so an absurd index asks for
+    /// an absurd allocation: `1e30` truncates to `i64::MAX` and `Vec::resize`
+    /// answers that with a `capacity overflow` *panic*, which for a library
+    /// means taking the embedder's process with it. It is a catchable error.
+    ///
+    /// The message is matched by prefix because it names the requested length,
+    /// which differs by word size.
+    #[test]
+    fn test_setpath_refuses_a_length_it_cannot_allocate() {
+        let err = outcome(b"null", "setpath([1e30]; 9)").unwrap_err();
+        assert!(err.starts_with("Cannot grow array to"), "{err}");
+        // Lengths that do fit still pad, so jq's behaviour is untouched.
+        assert_outcomes(&[(b"null", "setpath([3]; 9)", Ok("[null,null,null,9]"))]);
     }
 
     /// `fromjson` reads one JSON value and requires it to be the whole string,
