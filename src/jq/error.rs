@@ -35,6 +35,11 @@ pub struct EvalError {
     /// `None` for errors raised internally by the evaluator (type errors and
     /// friends). jq models those as string errors, so [`EvalError::payload`]
     /// falls back to `message` wrapped in [`OwnedValue::String`].
+    ///
+    /// The CLI reads it for a second purpose: jq appends `(not a string)` to an
+    /// uncaught diagnostic when the raised value is not a string, which only
+    /// the payload can decide — `message` has already lost the distinction
+    /// (#355).
     pub value: Option<OwnedValue>,
 }
 
@@ -204,6 +209,14 @@ impl EvalError {
     /// their message as a string, matching how jq raises them.
     pub fn payload(self) -> OwnedValue {
         self.value.unwrap_or(OwnedValue::String(self.message))
+    }
+
+    /// Whether the raised payload was something other than a string.
+    ///
+    /// Drives jq's `(not a string)` marker on an uncaught error. Internal
+    /// errors (no payload) are message-shaped and therefore never flagged.
+    pub fn payload_is_not_a_string(&self) -> bool {
+        matches!(&self.value, Some(v) if !matches!(v, OwnedValue::String(_)))
     }
 
     /// Create a type error.
