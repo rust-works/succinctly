@@ -4,6 +4,12 @@
 //! (`input.json`), a jq filter (`filter`), CLI arguments (`args`, one per line),
 //! and the expected stdout (`expected.out`).
 //!
+//! A case where jq *fails* additionally holds `expected.status` (its exit code)
+//! and `expected.err` (its stderr), which are then asserted byte-for-byte. Both
+//! are absent for a passing case, which is asserted to exit 0. Without them a
+//! failure has no oracle at all: exit code and diagnostic text are exactly what
+//! diverged in #355, and neither appears on stdout.
+//!
 //! # Golden provenance
 //!
 //! `expected.out` is captured from jqlang/jq — the oracle — at the version
@@ -49,6 +55,12 @@ struct Case {
     filter: String,
     args: Vec<String>,
     expected: String,
+    /// jq's exit code, for cases where it fails. `None` means jq exits 0 and
+    /// stderr is not asserted.
+    expected_status: Option<i32>,
+    /// jq's stderr, asserted byte-for-byte. Present exactly when
+    /// `expected_status` is.
+    expected_err: Option<String>,
 }
 
 /// Load every case directory, failing loudly on an incomplete or empty corpus
@@ -65,9 +77,29 @@ fn cases() -> Vec<Case> {
                 fs::read_to_string(dir.join(file))
                     .unwrap_or_else(|e| panic!("case {name} is missing {file}: {e}"))
             };
+            let opt_read = |file: &str| fs::read_to_string(dir.join(file)).ok();
             let expected = read("expected.out");
+            let expected_status = opt_read("expected.status").map(|s| {
+                s.trim()
+                    .parse::<i32>()
+                    .unwrap_or_else(|e| panic!("case {name} has a bad expected.status: {e}"))
+            });
+            let expected_err = opt_read("expected.err");
+            assert_eq!(
+                expected_status.is_some(),
+                expected_err.is_some(),
+                "case {name}: expected.status and expected.err must be present together \
+                 — rerun ./scripts/sync-jq-golden.sh"
+            );
             assert!(
-                !expected.is_empty(),
+                !matches!(expected_status, Some(0)),
+                "case {name}: expected.status must record a *failing* exit code; \
+                 a passing case omits it — rerun ./scripts/sync-jq-golden.sh"
+            );
+            // A failing case legitimately produces no stdout; a passing one
+            // producing none means the fixture never got captured.
+            assert!(
+                !expected.is_empty() || expected_status.is_some(),
                 "case {name} has an empty expected.out — rerun ./scripts/sync-jq-golden.sh"
             );
             Case {
@@ -75,6 +107,8 @@ fn cases() -> Vec<Case> {
                 filter: read("filter").trim_end_matches('\n').to_string(),
                 args: read("args").lines().map(str::to_string).collect(),
                 expected,
+                expected_status,
+                expected_err,
                 name,
             }
         })
@@ -110,7 +144,8 @@ fn known_failures() -> BTreeMap<String, String> {
 }
 
 /// Run `succinctly jq <args> <filter>` with the case input on stdin and demand
-/// exit code 0 plus stdout byte-equal to the golden.
+/// stdout byte-equal to the golden, plus jq's exit code — 0, or the recorded
+/// failing code and stderr for a case that jq fails.
 fn run_case(case: &Case) -> Result<(), String> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .arg("jq")
@@ -129,12 +164,33 @@ fn run_case(case: &Case) -> Result<(), String> {
         .map_err(|e| format!("write stdin: {e}"))?;
     let output = child.wait_with_output().map_err(|e| format!("wait: {e}"))?;
 
-    if !output.status.success() {
-        return Err(format!(
-            "exit {:?}, stderr: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    match case.expected_status {
+        None => {
+            if !output.status.success() {
+                return Err(format!(
+                    "exit {:?}, stderr: {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+        }
+        Some(want) => {
+            if output.status.code() != Some(want) {
+                return Err(format!(
+                    "exit {:?}, jq exits {want}; stderr: {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            let want_err = case.expected_err.as_deref().unwrap_or_default();
+            if output.stderr != want_err.as_bytes() {
+                return Err(format!(
+                    "stderr differs from jq\n    expected: {:?}\n    actual:   {:?}",
+                    want_err,
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
     }
     if output.stdout != case.expected.as_bytes() {
         return Err(format!(
