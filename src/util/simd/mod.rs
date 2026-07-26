@@ -16,6 +16,12 @@ pub mod x86;
 /// Shared SIMD escape scanning (portable; SIMD kernels are gated internally).
 pub(crate) mod escape;
 
+/// Shared DSV quote-mask tail for every SIMD backend (#182). Gated to the arches
+/// that have a DSV SIMD backend; elsewhere `dsv::simd` falls back to the scalar
+/// parser and nothing here is reachable.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) mod quote_mask;
+
 /// Popcount of a 512-bit (64-byte) block.
 ///
 /// Uses the best available implementation for the current platform.

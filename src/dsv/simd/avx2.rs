@@ -13,6 +13,7 @@ use super::super::config::DsvConfig;
 use super::super::index::DsvIndex;
 use super::super::index_lightweight::DsvIndexLightweight;
 use crate::json::BitWriter;
+use crate::util::simd::quote_mask::{prefix_xor, toggle64_from_prefix_xor};
 
 /// Build a DsvIndex using AVX2 SIMD acceleration.
 #[cfg(target_arch = "x86_64")]
@@ -33,7 +34,9 @@ unsafe fn build_index_avx2(text: &[u8], config: &DsvConfig) -> DsvIndex {
     let mut markers_writer = BitWriter::with_capacity(num_words);
     let mut newlines_writer = BitWriter::with_capacity(num_words);
 
-    let mut in_quote = false;
+    // Track quote state across chunks using carry (same convention as the
+    // BMI2/SVE2 deposit backends)
+    let mut qq_carry: u64 = 0;
 
     let delimiter = config.delimiter as i8;
     let quote_char = config.quote_char as i8;
@@ -43,19 +46,19 @@ unsafe fn build_index_avx2(text: &[u8], config: &DsvConfig) -> DsvIndex {
 
     // Process 64-byte chunks (2x 32-byte AVX2 loads)
     while offset + 64 <= text.len() {
-        let (markers_word, newlines_word, new_in_quote) = unsafe {
+        let (markers_word, newlines_word, new_carry) = unsafe {
             process_chunk_64(
                 text.as_ptr().add(offset),
                 delimiter,
                 quote_char,
                 newline,
-                in_quote,
+                qq_carry,
             )
         };
 
         markers_writer.write_bits(markers_word, 64);
         newlines_writer.write_bits(newlines_word, 64);
-        in_quote = new_in_quote;
+        qq_carry = new_carry;
         offset += 64;
     }
 
@@ -67,7 +70,7 @@ unsafe fn build_index_avx2(text: &[u8], config: &DsvConfig) -> DsvIndex {
         padded[..remaining].copy_from_slice(&text[offset..]);
 
         let (mut markers_word, mut newlines_word, _) =
-            unsafe { process_chunk_64(padded.as_ptr(), delimiter, quote_char, newline, in_quote) };
+            unsafe { process_chunk_64(padded.as_ptr(), delimiter, quote_char, newline, qq_carry) };
 
         let mask = (1u64 << remaining) - 1;
         markers_word &= mask;
@@ -84,7 +87,7 @@ unsafe fn build_index_avx2(text: &[u8], config: &DsvConfig) -> DsvIndex {
     DsvIndex::new_lightweight(lightweight)
 }
 
-/// Process a 64-byte chunk and return (markers, newlines, new_in_quote).
+/// Process a 64-byte chunk and return (markers, newlines, new_carry).
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx2")]
@@ -93,8 +96,8 @@ unsafe fn process_chunk_64(
     delimiter: i8,
     quote_char: i8,
     newline: i8,
-    in_quote: bool,
-) -> (u64, u64, bool) {
+    qq_carry: u64,
+) -> (u64, u64, u64) {
     // Load 2 x 32-byte chunks
     let chunk0 = _mm256_loadu_si256(ptr.cast::<__m256i>());
     let chunk1 = _mm256_loadu_si256(ptr.add(32).cast::<__m256i>());
@@ -127,40 +130,20 @@ unsafe fn process_chunk_64(
     let quote_mask = quote_mask0 | (quote_mask1 << 32);
     let nl_mask = nl_mask0 | (nl_mask1 << 32);
 
-    // Compute the in-quote mask using prefix XOR
-    let quote_xor = prefix_xor(quote_mask);
-    let in_quote_mask = if in_quote { !quote_xor } else { quote_xor };
+    // Compute the outside-quotes mask from the prefix XOR of the quote bitmap
+    // (shared tail: `crate::util::simd::quote_mask`)
+    let (outside_quotes, new_carry) =
+        toggle64_from_prefix_xor(qq_carry, quote_mask, prefix_xor(quote_mask));
 
     // Delimiters and newlines are valid only outside quotes
-    let valid_delim = delim_mask & !in_quote_mask;
-    let valid_nl = nl_mask & !in_quote_mask;
+    let valid_delim = delim_mask & outside_quotes;
+    let valid_nl = nl_mask & outside_quotes;
 
     // Markers = delimiters OR newlines (outside quotes)
     let markers = valid_delim | valid_nl;
     let newlines = valid_nl;
 
-    // New in_quote state
-    let quote_count = quote_mask.count_ones();
-    let new_in_quote = (quote_count & 1 == 1) != in_quote;
-
-    (markers, newlines, new_in_quote)
-}
-
-/// Compute inclusive prefix XOR (cumulative XOR) of a 64-bit mask.
-///
-/// The prefix XOR at position i is the XOR of all bits at positions 0..=i.
-/// This tells us the "parity" of quotes seen so far (including current),
-/// which indicates whether we're inside a quoted field.
-#[inline]
-fn prefix_xor(x: u64) -> u64 {
-    let mut y = x;
-    y ^= y << 1;
-    y ^= y << 2;
-    y ^= y << 4;
-    y ^= y << 8;
-    y ^= y << 16;
-    y ^= y << 32;
-    y
+    (markers, newlines, new_carry)
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]

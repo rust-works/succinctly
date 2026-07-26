@@ -25,6 +25,8 @@
 
 use core::arch::asm;
 
+use super::quote_mask::{toggle64_from_deposit, ODDS_MASK};
+
 /// BDEP (Bit Deposit) - equivalent to x86 BMI2 PDEP.
 ///
 /// Deposits bits from `data` into positions specified by `mask`.
@@ -125,6 +127,10 @@ pub unsafe fn bext_u64(data: u64, mask: u64) -> u64 {
 ///
 /// This is ~10x faster than the prefix_xor software emulation.
 ///
+/// Only the deposit is SVE2-specific: the adder and the chunk-boundary carry are
+/// [`toggle64_from_deposit`], shared with the BMI2 `PDEP` twin
+/// ([`crate::util::simd::x86::toggle64_bmi2`]) so the two cannot drift (#182).
+///
 /// # Arguments
 ///
 /// * `carry` - Carry from previous chunk (0 = outside quotes, 1 = inside quotes)
@@ -140,30 +146,12 @@ pub unsafe fn bext_u64(data: u64, mask: u64) -> u64 {
 #[inline]
 #[target_feature(enable = "sve2-bitperm")]
 pub unsafe fn toggle64_sve2(carry: u64, quote_mask: u64) -> (u64, u64) {
-    /// Alternating bit pattern: 0101...
-    const ODDS_MASK: u64 = 0x5555_5555_5555_5555;
-
-    // Extract the carry bit (0 or 1)
-    let c = carry & 0x1;
-
     // BDEP scatters the alternating pattern to quote positions
     // If c=0: places 1s at odd quotes (1st, 3rd, 5th...) - these are "enters"
     // If c=1: places 1s at even quotes (2nd, 4th, 6th...) - shifted by 1
-    let addend = bdep_u64(ODDS_MASK << c, quote_mask);
+    let addend = bdep_u64(ODDS_MASK << (carry & 1), quote_mask);
 
-    // Addition with carry propagation creates the quote mask
-    // Formula: ((addend << 1) | c) + !quote_mask
-    let comp_w = !quote_mask;
-    let shifted = (addend << 1) | c;
-    let result = shifted.wrapping_add(comp_w);
-
-    // Quote state after this chunk = incoming state XOR quote-count parity.
-    // The adder's carry-out cannot be used here: `addend << 1` drops a bit
-    // deposited at position 63, so a quote that opens at bit 63 never
-    // produces an overflow and the carry would be lost (#149).
-    let new_carry = (quote_mask.count_ones() as u64 + c) & 1;
-
-    (result, new_carry)
+    toggle64_from_deposit(carry, quote_mask, addend)
 }
 
 /// Select the k-th set bit (0-indexed) in a 64-bit word using SVE2 BDEP.
@@ -239,6 +227,7 @@ pub const fn has_sve2_bitperm() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::simd::quote_mask::tests::{quote_mask_patterns, toggle64_bit_serial};
 
     /// Feature guard for the tests below. Routes through the shared skip
     /// helper so every `if !has_sve2() { return; }` prints a visible
@@ -354,70 +343,23 @@ mod tests {
             return;
         }
 
-        // Independent bit-serial oracle: walk the word tracking an inside-quotes
-        // flag, exactly like the scalar DSV parser. Deliberately NOT a scalar
-        // port of the BDEP/adder formula — the previous reference re-implemented
-        // that formula and so inherited its bit-63 carry bug (#149).
+        // Asserts against the shared bit-serial oracle in
+        // `crate::util::simd::quote_mask` — a loop that walks the word toggling
+        // an inside-quotes flag, exactly like the scalar DSV parser, sharing no
+        // algebra with the BDEP/adder formula. The oracle this test used to
+        // carry inline was a scalar port of that same formula, so it inherited
+        // the bit-63 carry bug and stayed green while the code was wrong (#149).
+        // It is now the single oracle for all five backends (#182).
         //
-        // Convention (matches the adder formula): a quote bit takes its
-        // post-toggle state — an opening quote reads as inside (0), a closing
-        // quote as outside (1).
-        fn toggle64_reference(carry: u64, quote_mask: u64) -> (u64, u64) {
-            let mut inside = carry & 1 == 1;
-            let mut outside_mask = 0u64;
-            for i in 0..64 {
-                if (quote_mask >> i) & 1 == 1 {
-                    inside = !inside;
-                }
-                if !inside {
-                    outside_mask |= 1 << i;
-                }
-            }
-            (outside_mask, u64::from(inside))
-        }
-
-        // Deterministic PRNG for wide mask coverage without a rand dependency.
-        fn splitmix64(state: &mut u64) -> u64 {
-            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = *state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-
-        // Fixed edge patterns (bit 63 is the #149 regression), every single-bit
-        // mask, and 512 pseudo-random masks.
-        let mut patterns = vec![
-            0u64,
-            1,
-            0b11,
-            0b101,
-            0b1001,
-            0x8000_0000_0000_0000,
-            0xC000_0000_0000_0000,
-            0x8000_0000_0000_0001,
-            0xAAAA_AAAA_AAAA_AAAA,
-            0x5555_5555_5555_5555,
-            0xFF00_FF00_FF00_FF00,
-            !0u64,
-        ];
-        patterns.extend((0..64).map(|i| 1u64 << i));
-        let mut state = 0x149u64;
-        patterns.extend((0..512).map(|_| splitmix64(&mut state)));
-
-        for &quote_mask in &patterns {
+        // Sweeps the shared pattern set: edge masks including bit 63, every
+        // single-bit mask, and 512 pseudo-random masks.
+        for quote_mask in quote_mask_patterns() {
             for carry in [0u64, 1] {
                 unsafe {
-                    let (sve2_mask, sve2_carry) = toggle64_sve2(carry, quote_mask);
-                    let (ref_mask, ref_carry) = toggle64_reference(carry, quote_mask);
-
                     assert_eq!(
-                        sve2_mask, ref_mask,
-                        "Mask mismatch for quote_mask={quote_mask:#x}, carry={carry}"
-                    );
-                    assert_eq!(
-                        sve2_carry, ref_carry,
-                        "Carry mismatch for quote_mask={quote_mask:#x}, carry={carry}"
+                        toggle64_sve2(carry, quote_mask),
+                        toggle64_bit_serial(carry, quote_mask),
+                        "toggle64_sve2 mismatch for quote_mask={quote_mask:#x}, carry={carry}"
                     );
                 }
             }

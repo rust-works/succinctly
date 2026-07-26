@@ -16,6 +16,47 @@
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+#[cfg(target_arch = "x86_64")]
+use super::quote_mask::{toggle64_from_deposit, ODDS_MASK};
+
+/// Toggle64 using BMI2 PDEP - the x86_64 twin of
+/// [`crate::util::simd::sve2::toggle64_sve2`].
+///
+/// Computes the quote state mask for DSV parsing. Given a bitmask of quote
+/// positions, returns a mask indicating which positions are outside quotes. This
+/// is the critical function from hw-dsv: PDEP scatters an alternating pattern to
+/// the quote positions, then one addition propagates carries through the gaps,
+/// which is ~10x faster than the prefix_xor software emulation.
+///
+/// Only the deposit is BMI2-specific: the adder and the chunk-boundary carry are
+/// [`toggle64_from_deposit`], shared with the SVE2 `BDEP` twin so the two cannot
+/// drift (#182). It lived in `dsv::simd::bmi2` while its SVE2 counterpart lived
+/// here, which is half of why the bit-63 carry bug had to be fixed twice (#149).
+///
+/// # Arguments
+///
+/// * `carry` - Carry from previous chunk (0 = outside quotes, 1 = inside quotes)
+/// * `quote_mask` - Bitmask of quote positions in this chunk
+///
+/// # Returns
+///
+/// * `(outside_mask, new_carry)` - Mask where 1 = outside quotes, and carry for next chunk
+///
+/// # Safety
+///
+/// Requires BMI2. Caller must check `is_x86_feature_detected!("bmi2")`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "bmi2")]
+pub unsafe fn toggle64_bmi2(carry: u64, quote_mask: u64) -> (u64, u64) {
+    // PDEP scatters the alternating pattern to quote positions
+    // If c=0: places 1s at odd quotes (1st, 3rd, 5th...) - these are "enters"
+    // If c=1: places 1s at even quotes (2nd, 4th, 6th...) - shifted by 1
+    let addend = _pdep_u64(ODDS_MASK << (carry & 1), quote_mask);
+
+    toggle64_from_deposit(carry, quote_mask, addend)
+}
+
 /// Popcount of 64 bytes (512 bits) using POPCNT instruction.
 ///
 /// # Safety
@@ -211,6 +252,7 @@ fn detect_fast_bmi2() -> bool {
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
+    use crate::util::simd::quote_mask::tests::{quote_mask_patterns, toggle64_bit_serial};
 
     /// Detection guard for POPCNT; emits a visible `SKIPPED` line when
     /// unavailable so a fully-skipped run doesn't read as green (#193).
@@ -424,6 +466,65 @@ mod tests {
                     assert_eq!(
                         pdep_result, ctz_result,
                         "Mismatch for word={word:#x}, k={k}"
+                    );
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // BMI2 toggle64 (DSV quote mask) tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_toggle64_basic() {
+        if !has_bmi2() {
+            return;
+        }
+
+        unsafe {
+            // No quotes - everything is outside
+            let (mask, carry) = toggle64_bmi2(0, 0);
+            assert_eq!(carry, 0, "No quotes should not change carry");
+            assert_eq!(mask, !0u64, "No quotes means all outside");
+
+            // Single quote at position 0 - everything after is inside
+            let (_mask, carry) = toggle64_bmi2(0, 1);
+            // After the quote, we're inside, so the mask should have 0s
+            assert_eq!(carry, 1, "Odd quotes should set carry");
+
+            // #149 regression: a quote at bit 63 must still toggle the carry.
+            // The overflow-based carry lost an opener at bit 63 because
+            // `addend << 1` shifts the deposited bit out of the word.
+            let (mask, carry) = toggle64_bmi2(0, 1 << 63);
+            assert_eq!(carry, 1, "Opener at bit 63 must carry into next chunk");
+            assert_eq!(mask, !0u64 >> 1, "Bits 0..63 outside, bit 63 inside");
+            let (_mask, carry) = toggle64_bmi2(1, 1 << 63);
+            assert_eq!(carry, 0, "Closer at bit 63 must clear the carry");
+        }
+    }
+
+    #[test]
+    fn test_toggle64_matches_bit_serial_reference() {
+        if !has_bmi2() {
+            return;
+        }
+
+        // Asserts against the shared bit-serial oracle in
+        // `crate::util::simd::quote_mask` — a loop that walks the word toggling
+        // an inside-quotes flag, exactly like the scalar DSV parser, sharing no
+        // algebra with the PDEP/adder formula. See the SVE2 twin of this test in
+        // `src/util/simd/sve2.rs` (#149, #182).
+        //
+        // Sweeps the shared pattern set: edge masks including bit 63, every
+        // single-bit mask, and 512 pseudo-random masks.
+        for quote_mask in quote_mask_patterns() {
+            for carry in [0u64, 1] {
+                unsafe {
+                    assert_eq!(
+                        toggle64_bmi2(carry, quote_mask),
+                        toggle64_bit_serial(carry, quote_mask),
+                        "toggle64_bmi2 mismatch for quote_mask={quote_mask:#x}, carry={carry}"
                     );
                 }
             }
