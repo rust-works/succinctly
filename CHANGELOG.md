@@ -233,6 +233,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"1 2" | fromjson` returned `1` where jq errors on both. It now shares the
   whole-input parse `tonumber` was given, and `"0x10"` reports jq's sentence
   verbatim.
+- **jq builtins derived from the same definition worded their errors
+  differently** (#359 review): jq builds many builtins out of others, so one
+  sentence is owed by a whole family — but the #356 sweep fixed only the member
+  each probe named. `1 | with_entries(.)` said `number (1) has no keys` while
+  `1 | to_entries` beside it still said `expected object, got number`;
+  `ascii_downcase` reported `explode input must be a string` and `ascii_upcase`
+  did not; and `"abc" | indices(1)`, `index(1)`, `rindex(1)` all answered
+  `expected string, got pattern` — naming an argument where jq names a type —
+  instead of `Cannot index string with number`. The three string searches now
+  share one refusal (`non_string_pattern`) rather than three copies, and the
+  corpus carries a probe per family member so the next member cannot drift
+  alone. `to_entries` also gained jq's array behaviour (`[1,2] | to_entries` is
+  `[{"key":0,"value":1},{"key":1,"value":2}]`), without which the corrected
+  sentence would have claimed an array has no keys where jq answers with a
+  value.
+- **jq `getpath` rejected a float array index that jq accepts** (#359 review):
+  `[1,2,3] | getpath([1.5])` errored with `Cannot index array with number`
+  where jq gives `2`. #359 taught `setpath` jq's index resolution — truncate
+  toward zero, count a negative back from the end — but left the read path
+  behind, so the two disagreed in-tree about the same path element. Reads now
+  resolve identically, differing only where jq differs: an index that reaches
+  no element is `null` rather than an error, which covers NaN, ±infinity and
+  an overrun at either end.
 - **jq `try/catch` discarded the raised error** (#158): the catch handler ran
   against the *original input* rather than the error value, so a handler could
   never see what went wrong — `try error("boom") catch .` gave `null` where jq
