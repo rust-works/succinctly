@@ -57,10 +57,6 @@ fn assert_parity(json: &[u8], filter: &str) {
 /// Assert the two evaluators currently DISAGREE, pinning both observed outputs.
 /// When the referenced fix aligns them, the `assert_ne!` fails, forcing whoever
 /// lands the fix to convert this into `assert_parity`.
-///
-/// Currently unused -- the last pinned divergence (#307) is now parity -- but
-/// retained as scaffolding for the next divergence this file needs to pin.
-#[allow(dead_code)]
 fn assert_divergence(json: &[u8], filter: &str, full_expected: &[&str], generic_expected: &[&str]) {
     let full = full_outputs(json, filter);
     let generic = generic_outputs(json, filter);
@@ -189,6 +185,54 @@ fn test_numeric_equality_parity_156() {
     assert_eq!(as_strs(&full_outputs(b"null", "1 == 1.0")), ["true"]);
     assert_eq!(as_strs(&full_outputs(br"[1.0,2,3]", ". - [1]")), ["[2,3]"]);
     assert_eq!(as_strs(&full_outputs(b"null", "nan == nan")), ["false"]);
+}
+
+#[test]
+fn test_stream_operator_parity_160() {
+    // `//`, `and` and `or` are generators over their operands' streams, not
+    // scalar operators over the first output of each (#160). The generic (CLI)
+    // evaluator delegates all three back into the full evaluator, so the fix
+    // has to land in both at once -- this pins that it did.
+    //
+    // Every expectation is pinned against real jq-1.7.1 first, so parity cannot
+    // lock in an agreed-upon wrong answer (this file's header failure mode).
+    for (filter, expected) in [
+        (r#"(false,1,null,2) // "backup""#, ["1", "2"].as_slice()),
+        ("false // (null,7)", &["null", "7"]),
+        ("(null,false) // (null,5) // 6", &["5"]),
+        ("empty // 9", &["9"]),
+        ("(true,false) and (true,false)", &["true", "false", "false"]),
+        ("(true,false) or (true,false)", &["true", "true", "false"]),
+        ("(false,true) and (1,2)", &["false", "true", "true"]),
+        (r#"false and error("x")"#, &["false"]),
+        (r#"true or error("x")"#, &["true"]),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(b"null", filter)),
+            expected,
+            "full evaluator disagrees with jq for `{filter}`"
+        );
+        assert_parity(b"null", filter);
+    }
+}
+
+#[test]
+fn test_multi_output_condition_in_select_parity_160() {
+    // `and`/`or` can now hand `select` a multi-output condition, where the two
+    // evaluators disagree: `builtin_select` (eval.rs) tests the first output,
+    // while eval_generic's `Builtin::Select` treats any multi-output condition
+    // as truthy outright. jq fans the condition out instead, emitting the input
+    // once per truthy output -- so both are wrong, in different ways.
+    //
+    // That drift predates #160; #160 only widened what can reach it. Pinned
+    // here rather than fixed, because fixing `select` is the separate
+    // follow-up. jq's answer for the filter below is no output at all, which
+    // is what the full evaluator happens to give.
+    assert_eq!(
+        as_strs(&full_outputs(b"1", "[(false,false) and true]")),
+        ["[false,false]"]
+    );
+    assert_divergence(b"1", "select((false,false) and true)", &[], &["1"]);
 }
 
 #[test]
