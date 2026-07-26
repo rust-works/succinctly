@@ -2094,6 +2094,13 @@ impl<'a> Parser<'a> {
                 // Block scalar as key
                 self.parse_block_scalar(indent)?;
             }
+            Some(b'*') => {
+                // Alias as key (`? *a`). As in the flow-mapping key path,
+                // `parse_alias` opens and closes its own node. Without this arm
+                // the alias fell to the plain-scalar arm below, which produced
+                // an empty key whether or not the anchor existed (#372).
+                self.parse_alias()?;
+            }
             Some(b'"') => {
                 // Double-quoted key
                 self.write_bp_open();
