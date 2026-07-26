@@ -8369,6 +8369,27 @@ mod tests {
         assert_eq!(first_doc_json(b"key: - a\n"), r#"{"key":"- a"}"#);
     }
 
+    /// A same-line block mapping value that is a bare sequence-entry indicator, with
+    /// no content after it. The parser records an extent covering the `-` alone
+    /// (trailing spaces are trimmed), so this decodes as the string `"-"` — where
+    /// before #332 it was `null`, the same silent loss as `a: - x`.
+    ///
+    /// Pinned apart from the `- x` shapes because it is the one #325 is expected to
+    /// flip: once the parser emits a real sequence for a same-line `- ` value, this
+    /// becomes the empty item `{"a":[null]}`. `yq` rejects the input either way
+    /// (`block sequence entries are not allowed in this context`).
+    #[test]
+    fn test_bare_dash_as_same_line_mapping_value_keeps_the_dash() {
+        assert_eq!(first_doc_json(b"a: - \n"), r#"{"a":"-"}"#);
+        assert_eq!(first_doc_json(b"a: -\n"), r#"{"a":"-"}"#);
+        assert_eq!(first_doc_json(b"a: -  \n"), r#"{"a":"-"}"#);
+        assert_eq!(first_doc_json(b"a: -\t\n"), r#"{"a":"-"}"#);
+        // The same `- ` on the *next* line is a real block sequence whose one item is
+        // empty: a childless wrapper, which stays null. That is the discriminator's
+        // other side, and it is why the parser must never record an end for a wrapper.
+        assert_eq!(first_doc_json(b"a:\n  - \n"), r#"{"a":[null]}"#);
+    }
+
     /// A `-` *not* followed by whitespace is an ordinary plain scalar in flow
     /// context and must keep decoding as one.
     #[test]
