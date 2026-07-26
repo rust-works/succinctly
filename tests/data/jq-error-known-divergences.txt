@@ -1,0 +1,29 @@
+# Known divergences of succinctly's evaluator error wording from the pinned jq.
+#
+# Consumed by tests/jq_error_message_tests.rs. One line per diverging probe:
+#
+#   <probe>           <category>        <reason — #issue>
+#
+# <probe> is an id from tests/data/jq-error-probes.tsv. Columns are
+# whitespace-separated; `#` lines and blank lines are ignored.
+#
+# The check is two-sided: a probe diverging without a line here fails the
+# build, and a line here for a probe that now matches also fails the build — so
+# every fix is forced to shrink this file, and no divergence can hide. The
+# captured messages in tests/data/jq-error-messages.tsv always hold the correct
+# (pinned jq) wording; only this manifest records where succinctly disagrees.
+#
+# Every entry must also have a section in docs/compliance/jq/limitations.md.
+# See tests/data/jq-golden-known-failures.txt for the sibling manifest.
+#
+# Seeded from the #356 sweep: 102 of 102 probes diverged at the start; 96 were
+# wording and were fixed here. Two more — `contains`/`inside` on operands whose
+# kinds differ — were behaviour rather than wording, and #358 fixed them before
+# this manifest landed, so they are not listed. The 4 below are not wording at
+# all either — succinctly produces a value where jq errors, or cannot parse the
+# filter — so each is a behaviour or parser bug with its own issue.
+
+setpath_on_number           assignment    builds a container on a scalar instead of refusing to index it — #359
+index_null_key_on_object    parser        `.[null]` is rejected by the parser, so no runtime error is reached — #360
+index_bool_key_on_object    parser        `.[true]` is rejected by the parser, so no runtime error is reached — #360
+index_object_key_on_object  parser        `.[{}]` is rejected by the parser, so no runtime error is reached — #360
