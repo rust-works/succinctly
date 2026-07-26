@@ -23,6 +23,7 @@
 //! echo true             | jq -c 'contains(false)'   # distinct kinds, one name
 //! echo '"abcdefghijkl"' | jq -c 'contains(1)'      # 14-byte dump, kept whole
 //! echo '"abcdefghijklm"'| jq -c 'contains(1)'      # 15 bytes, truncated
+//! printf '"a\302\205b"' | jq -c 'contains(1)'      # C1 control, passed through raw
 //! ```
 //!
 //! These are hand-transcribed rather than generated, so the suite is hermetic —
@@ -176,6 +177,16 @@ const CASES: &[(&[u8], &str, Expect)] = &[
         Expect::Error(
             r#"object ({"aaa":1,"b...) and number (1) cannot have their containment checked"#,
         ),
+    ),
+    // A C1 control (U+0085, the two bytes C2 85) is passed through raw, as jq
+    // does. `OwnedValue::to_json` would escape it — it escapes every
+    // `char::is_control()`, which covers C1 — so this case is what pins
+    // `value_preview` to the streaming writer instead. See its doc comment; the
+    // over-escaping still affects `tojson`/`@json` and is out of scope for #358.
+    (
+        "\"a\u{85}b\"".as_bytes(),
+        r"contains(1)",
+        Expect::Error("string (\"a\u{85}b\") and number (1) cannot have their containment checked"),
     ),
     // (`?` suppression is covered by `optional_suppresses_the_error` below —
     //  the surface syntax `contains("a")?` does not parse yet.)
