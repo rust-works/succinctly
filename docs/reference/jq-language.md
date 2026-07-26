@@ -271,7 +271,7 @@ These enable IDE integration and programmatic navigation to specific document po
 
 Two further divergences are confined to path contexts. `path(.[1.7])` yields `[1]` where jq keeps the unfloored `[1.7]`. A NaN key reads as `null` in both (`[10,20,30] | .[nan]` → `null`), but has no path component here: `path(.[nan])` and `del(.[nan])` report `Cannot set array element at NaN index`, jq's own wording for the assignment case, where jq instead yields the path `[null]` that its own `setpath` rejects (and, for `del`, hangs).
 
-**Indexing by a variable bound from a generator does not work yet.** `.[$k]` itself is fine, but `keys[] as $k | .[$k]` — the most common way to reach it — binds `$k` to the whole array rather than each element. This is a defect in `as`-binding over a multi-output expression, not in the bracket syntax: `[keys[] as $k | $k]` already returns `[["a","b"]]` instead of `["a","b"]`. Explicit bindings (`--arg k a`, `. as $x | $x[…]`, `def f($k): .[$k]`) are unaffected.
+**Indexing by a variable bound from a generator does not work yet** (#397). `.[$k]` itself is fine, but `keys[] as $k | .[$k]` — the most common way to reach it — binds `$k` to the whole array rather than each element. The bracket syntax is not at fault, and neither is `as`: iterating a *computed* value collapses the stream into a single array before the binding ever happens, so `[keys[]]` is already `[["a","b"]]` rather than `["a","b"]`. Explicit bindings (`--arg k a`, `. as $x | $x[…]`, `def f($k): .[$k]`) and iteration of a value navigated out of the document (`.[]`) are unaffected.
 
 See [jq Remaining Work](../plan/jq-remaining.md) for incomplete CLI and module system features.
 

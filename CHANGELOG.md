@@ -23,8 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Expr::Index` at parse time, leaving the existing AST and hot paths unchanged.
   Not covered: expression-valued slice bounds (`.[$a:$b]`), jq's
   indices-of-subarray form (`.[[20]]`), and — through a pre-existing defect in
-  `as`-binding over a generator, not in the brackets — `keys[] as $k | .[$k]`.
-  See [docs/reference/jq-language.md](docs/reference/jq-language.md).
+  iterating a computed value, not in the brackets — `keys[] as $k | .[$k]`
+  (#397). See [docs/reference/jq-language.md](docs/reference/jq-language.md).
   Incidentally, the `[range(0; length; 2) as $i | .[$i]]` workaround that doc
   has long recommended for step slicing now actually parses.
 - **jq error-message conformance corpus** (#356): a corpus of filter/input probes

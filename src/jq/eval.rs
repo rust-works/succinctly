@@ -6899,7 +6899,8 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
 ///
 /// (`builtin_delpaths` has both bugs today: `delpaths([[0],[2]])` gives
 /// `[20,30]` where jq gives `[20,40]`, because it sorts only by path length.
-/// Tracked separately; not inherited here.)
+/// It works on runtime path arrays rather than path expressions, so it cannot
+/// call this directly, but the rule is the same one — #398.)
 fn prepare_paths_for_deletion(paths: &mut Vec<Expr>) {
     // Quadratic, but `paths` is one entry per resolved key — a handful, not a
     // document-sized list — and `Expr` is neither `Hash` nor `Ord`. Skipped
