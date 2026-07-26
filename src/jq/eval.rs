@@ -6878,15 +6878,42 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         .collect())
 }
 
-/// Order resolved paths so deletion does not invalidate later ones.
+/// Prepare resolved paths for deletion: drop duplicates, then order so deleting
+/// one cannot invalidate the next.
 ///
-/// Deleting `[0]` before `[2]` shifts the array under the second path. jq is
-/// order-insensitive here — both `del(.[(0,2)])` and `del(.[(2,0)])` on
+/// Both halves are needed, and for the same reason — a deletion shifts the
+/// array under every path to its right.
+///
+/// *Duplicates*: `del(.[(0,0)])` names element 0 twice, and deleting twice takes
+/// element 1 with it — `[1,2,3]` would give `[3]` where jq gives `[2,3]`. jq's
+/// `delpaths` dedupes, so a repeated key deletes once.
+///
+/// *Order*: deleting `[0]` before `[2]` shifts the array under the second path.
+/// jq is order-insensitive here — both `del(.[(0,2)])` and `del(.[(2,0)])` on
 /// `[10,20,30,40]` give `[20,40]` — so sort by trailing index, descending.
 ///
-/// (`builtin_delpaths` has this bug today: `delpaths([[0],[2]])` gives
+/// (`builtin_delpaths` has both bugs today: `delpaths([[0],[2]])` gives
 /// `[20,30]` where jq gives `[20,40]`, because it sorts only by path length.
 /// Tracked separately; not inherited here.)
+fn prepare_paths_for_deletion(paths: &mut Vec<Expr>) {
+    // Quadratic, but `paths` is one entry per resolved key — a handful, not a
+    // document-sized list — and `Expr` is neither `Hash` nor `Ord`. Skipped
+    // outright for the overwhelmingly common single-path `del(.foo)`, which is
+    // every `del` that has no computed key at all.
+    if paths.len() > 1 {
+        let mut kept: Vec<Expr> = Vec::with_capacity(paths.len());
+        for path in paths.drain(..) {
+            if !kept.contains(&path) {
+                kept.push(path);
+            }
+        }
+        *paths = kept;
+    }
+    sort_paths_for_deletion(paths);
+}
+
+/// Order resolved paths so deletion does not invalidate later ones. See
+/// [`prepare_paths_for_deletion`], the only caller.
 fn sort_paths_for_deletion(paths: &mut [Expr]) {
     fn trailing_index(expr: &Expr) -> Option<i64> {
         match expr {
@@ -9531,7 +9558,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(paths) => paths,
         Err(e) => return QueryResult::Error(e),
     };
-    sort_paths_for_deletion(&mut paths);
+    prepare_paths_for_deletion(&mut paths);
 
     for path in &paths {
         if let Err(e) = delete_at_path(&mut result, path, optional) {
