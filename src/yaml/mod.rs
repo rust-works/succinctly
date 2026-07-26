@@ -111,6 +111,43 @@ pub(crate) fn starts_inline_seq_entry(text: &[u8], pos: usize) -> bool {
     text.get(pos) == Some(&b'-') && matches!(text.get(pos + 1), Some(b' ' | b'\t'))
 }
 
+/// Is the line at `from` *structural* — a block sequence entry (`- ` …) or a block
+/// mapping entry (a `: ` value indicator before end of line) — rather than a plain
+/// scalar?
+///
+/// The one definition of "a leading tab here is illegal indentation". YAML forbids a
+/// tab in indentation, but a tab is only *indentation* when block structure follows:
+/// before a plain scalar it is separation and legal (`DK95/00` `foo:\n \tbar`, `UV7Q`
+/// `x:\n - x\n  \tx`), while before a key or a `-` it is not (`DK95/06`).
+///
+/// It lives at the module root because the strict validator
+/// ([`validate::Validator::scan_line`]) and the loader must classify a line
+/// identically, and #106 and #332 were both a predicate copied to several sites and
+/// then diverging.
+///
+/// Leading spaces and tabs are skipped first, so `from` may point at either.
+#[inline]
+pub(crate) fn line_is_structural(text: &[u8], from: usize) -> bool {
+    let mut i = from;
+    while matches!(text.get(i), Some(b' ' | b'\t')) {
+        i += 1;
+    }
+    if starts_seq_entry(text, i) {
+        return true;
+    }
+    // A block mapping entry: a `:` value indicator somewhere on this line.
+    while let Some(&b) = text.get(i) {
+        match b {
+            b'\n' | b'\r' => return false,
+            b':' if matches!(text.get(i + 1), None | Some(b' ' | b'\t' | b'\n' | b'\r')) => {
+                return true
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 pub use error::YamlError;
 pub use index::YamlIndex;
 pub use light::{
@@ -119,3 +156,52 @@ pub use light::{
 };
 pub use locate::{locate_offset, locate_offset_detailed, LocateResult};
 pub use scalar::{resolve_plain, ResolvedScalar};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the classification that decides whether a leading tab is illegal
+    /// indentation. Each row names the YAML Test Suite case it stands for, so the
+    /// rule cannot be widened without someone re-deciding a named case (#173).
+    #[test]
+    fn line_is_structural_classifies_block_structure_only() {
+        for (text, want) in [
+            // Block structure: the tab before it is indentation, and illegal.
+            (&b"\tb: 2\n"[..], true),
+            (&b"\t- a\n"[..], true),
+            (&b"\tkey:\n"[..], true), // `:` at end of line is still an indicator
+            (&b"  \tb: 2\n"[..], true), // leading spaces are skipped
+            // Plain scalars: the tab is separation, and legal.
+            (&b"\tbar\n"[..], false), // DK95/00 `foo:\n \tbar`
+            (&b"\tx\n"[..], false),   // UV7Q `x:\n - x\n  \tx`
+            (&b"\ta:b\n"[..], false), // `:` not followed by whitespace is content
+            (&b"\t-1\n"[..], false),  // Y79Y/010: `-1` is a scalar, not an entry
+            (&b"\tbar"[..], false),   // end of input, no line break
+            (&b"\t{}\n"[..], false),  // Q5MG: a flow node, and no `:` at all
+            // Nothing at all.
+            (&b"\t\n"[..], false),
+            (&b"\t"[..], false),
+        ] {
+            assert_eq!(
+                line_is_structural(text, 0),
+                want,
+                "line_is_structural({text:?})"
+            );
+        }
+    }
+
+    /// `from` may point at either a space or a tab, and the scan starts there —
+    /// the loader passes the position of the tab, the validator the position of
+    /// the first non-space.
+    #[test]
+    fn line_is_structural_starts_scanning_at_the_given_offset() {
+        let text = b"a: 1\n  \tb foo\n";
+        assert!(line_is_structural(text, 0)); // line 1: `a: 1`
+                                              // Line 2 is a plain scalar, so every offset within it agrees — and the scan
+                                              // must stop at the line break rather than running on into line 1's `:`.
+        assert!(!line_is_structural(text, 5)); // start of line 2's indentation
+        assert!(!line_is_structural(text, 7)); // the tab itself
+        assert!(!line_is_structural(text, 8)); // the content
+    }
+}
