@@ -631,7 +631,7 @@ combined with SIMD prefix sums for dramatic speedup.
 
 ### Low Confidence: Anchor Terminator Nibble Tables
 
-**Current State** ([src/yaml/simd/neon.rs](../../src/yaml/simd/neon.rs#L422-L498)):
+**Current State** (`parse_anchor_name_neon`, [src/yaml/simd/neon.rs](../../src/yaml/simd/neon.rs#L225-L248)):
 ```rust
 // 10 separate CMEQ comparisons + 9 ORR operations
 let is_space = vceqq_u8(chunk, space);

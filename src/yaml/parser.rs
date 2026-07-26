@@ -549,11 +549,13 @@ impl<'a> Parser<'a> {
     fn skip_unquoted_simd(&self, _value_start: usize) -> Option<usize> {
         // Use classify_yaml_chars to scan 32 bytes at once
         if let Some(class) = super::simd::classify_yaml_chars(self.input, self.pos) {
-            // Check for any potential terminators: line break, colon, or hash.
-            // `\r` counts: it is a YAML 1.2 §5.4 line break, and without it the
-            // classifier skips straight over a lone CR and swallows the rest of
-            // the document into one scalar (#324).
-            let terminators = class.newlines | class.carriage_returns | class.colons | class.hash;
+            // Line break, colon, or hash — see `plain_scalar_terminators`, which
+            // both this and the ARM variant below share so the two cannot drift
+            // on what ends a scalar (#185). `\r` counts: it is a YAML 1.2 §5.4
+            // line break, and without it the classifier skips straight over a
+            // lone CR and swallows the rest of the document into one scalar
+            // (#324).
+            let terminators = class.plain_scalar_terminators();
 
             if terminators == 0 {
                 // No structural characters in the classified chunk — skip
@@ -593,8 +595,11 @@ impl<'a> Parser<'a> {
     fn skip_unquoted_simd(&self, _value_start: usize) -> Option<usize> {
         // Use broadword classify to scan 16 bytes at once (two 8-byte chunks)
         if let Some(class) = super::simd::classify_yaml_chars_16(self.input, self.pos) {
-            // Check for any potential terminators: newline, colon, or hash
-            let terminators = class.value_terminators();
+            // The same set the live x86 path uses: line break (LF or CR), colon,
+            // hash. This called a `value_terminators()` that also included
+            // spaces until #185, so re-enabling this path would have stopped the
+            // skip at every space for no reason.
+            let terminators = class.plain_scalar_terminators();
 
             if terminators == 0 {
                 // No structural characters in this 16-byte chunk - safe to skip all
