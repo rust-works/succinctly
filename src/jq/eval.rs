@@ -15347,7 +15347,14 @@ mod tests {
     }
 
     /// jq errors when the two operands' kinds cannot be compared, rather than
-    /// answering `false` (#358). Only the outermost pair is screened.
+    /// answering `false` (#358).
+    ///
+    /// This covers the *shape* of the result — which `QueryResult` variant each
+    /// outcome lands on — for one case of each. The exhaustive oracle matrix
+    /// (nesting, `Int`/`Float`, both truncation boundaries, `?` suppression, and
+    /// every case run through the generic evaluator too) lives in
+    /// `tests/jq_containment_tests.rs`; add new cases there rather than here, so
+    /// there is one place to re-check when jq's behaviour is re-probed.
     #[test]
     fn test_builtin_contains_type_mismatch() {
         query!(br"1", r#"contains("a")"#,
@@ -15356,20 +15363,6 @@ mod tests {
                     e.message,
                     r#"number (1) and string ("a") cannot have their containment checked"#
                 );
-            }
-        );
-
-        // A mismatch *inside* a container is still plain false.
-        query!(br#"[1,"a"]"#, r#"contains(["a",2])"#,
-            QueryResult::Owned(OwnedValue::Bool(b)) => {
-                assert!(!b);
-            }
-        );
-
-        // Int and Float are both `number`, so this is a comparison, not an error.
-        query!(br"[1,2,3]", r"contains([1.0])",
-            QueryResult::Owned(OwnedValue::Bool(b)) => {
-                assert!(b);
             }
         );
 
@@ -15390,39 +15383,12 @@ mod tests {
                 assert!(b);
             }
         );
-        query!(br"false", r"contains(false)",
-            QueryResult::Owned(OwnedValue::Bool(b)) => {
-                assert!(b);
-            }
-        );
 
-        // Nested, the same pair is plain false — the screen is top-level only.
-        query!(br"[false]", r"contains([true])",
+        // A mismatch *inside* a container is still plain false: the screen is
+        // top-level only, so `owned_contains` stays total.
+        query!(br#"[1,"a"]"#, r#"contains(["a",2])"#,
             QueryResult::Owned(OwnedValue::Bool(b)) => {
                 assert!(!b);
-            }
-        );
-
-        // An optional expression suppresses it, like any other error. Built with
-        // `Expr::optional` because the parser does not accept a postfix `?` on a
-        // function call yet — see `tests/jq_containment_tests.rs`.
-        {
-            let json: &[u8] = br"1";
-            let index = JsonIndex::build(json);
-            let expr = parse(r#"contains("a")"#).unwrap().optional();
-            match eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)) {
-                QueryResult::None => {}
-                other => panic!("unexpected result: {other:?}"),
-            }
-        }
-
-        // Long operands are truncated to jq's 14-byte budget: 11 bytes plus `...`.
-        query!(br#""abcdefghijklm""#, r"contains(1)",
-            QueryResult::Error(e) => {
-                assert_eq!(
-                    e.message,
-                    r#"string ("abcdefghij...) and number (1) cannot have their containment checked"#
-                );
             }
         );
     }
@@ -15444,7 +15410,8 @@ mod tests {
     }
 
     /// `inside` reports the container first — it is `contains` with the operands
-    /// swapped, so the *argument* leads the message (#358).
+    /// swapped, so the *argument* leads the message (#358). Wider coverage is in
+    /// `tests/jq_containment_tests.rs`; see `test_builtin_contains_type_mismatch`.
     #[test]
     fn test_builtin_inside_type_mismatch() {
         query!(br"1", r"inside([1])",
@@ -15453,13 +15420,6 @@ mod tests {
                     e.message,
                     "array ([1]) and number (1) cannot have their containment checked"
                 );
-            }
-        );
-
-        // Int/Float is one type, so this stays a comparison.
-        query!(br"[1.0]", r"inside([1,2,3])",
-            QueryResult::Owned(OwnedValue::Bool(b)) => {
-                assert!(b);
             }
         );
 
