@@ -342,7 +342,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             Err(_) => return YamlValue::Error("invalid UTF-8 in anchor name"),
         };
 
-        // Try to resolve the alias to its target
+        // Resolve the alias to its target. For an index from `YamlIndex::build`
+        // this is always `Some`: an alias naming an anchor that is not in scope
+        // fails the build (#372), so no alias node reaches here unresolved.
+        // `resolve_alias` stays fallible because it is public and takes an
+        // arbitrary BP position, which need not be an alias at all.
         let target = self.index.resolve_alias(self.bp_pos, self.text);
 
         YamlValue::Alias {
@@ -4532,8 +4536,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
                 }
             }
             YamlValue::Alias { target, .. } => {
-                // Resolve alias and check target
-                target.map_or(true, |t| t.value().is_null()) // Unresolved alias treated as null
+                // An alias is null exactly when its target is. The `None` arm is
+                // unreachable for an index from `YamlIndex::build`, which since
+                // #372 refuses an alias it cannot resolve; it is kept, rather
+                // than unwrapped, so a hand-built index cannot panic here.
+                target.map_or(true, |t| t.value().is_null())
             }
             _ => false,
         }
