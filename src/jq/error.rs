@@ -19,7 +19,7 @@ use alloc::format;
 #[cfg(not(test))]
 use alloc::string::String;
 
-use super::stream::StreamableValue;
+use super::stream::stream_owned_value_json_jq;
 use super::value::OwnedValue;
 
 /// Error that occurs during evaluation.
@@ -53,12 +53,13 @@ const DUMP_KEEP: usize = 11;
 /// mismatched 100 MB operand copies 14 bytes rather than the whole document
 /// (#358).
 ///
-/// It streams via [`StreamableValue::stream_json`] rather than
-/// `OwnedValue::to_json` for a second reason: that is the writer whose escaping
-/// matches jq. `to_json` escapes every `char::is_control()`, which includes the
-/// C1 range, so it renders `U+0085` as a six-character backslash-u escape where
-/// jq emits the two raw UTF-8 bytes. (`tojson` and `@json` still go through
-/// `to_json` and still over-escape — a pre-existing divergence, tracked as #385.)
+/// It streams via [`stream_owned_value_json_jq`] — the jq-convention writer from
+/// [`super::escape`] — rather than the `StreamableValue` impl, which escapes the
+/// way `yq` does. The two differ at `\b`, `\f` and DEL, which a jq error message
+/// has to render jq's way. (#358 used the `StreamableValue` impl here because it
+/// was the only writer that left C1 raw; #385 fixed the C1 handling everywhere
+/// and split the two conventions apart, so the correct writer is now available
+/// by name.)
 ///
 /// Two deviations remain, both about what gets dumped rather than where it is cut:
 ///
@@ -79,7 +80,7 @@ fn dump_truncated(value: &OwnedValue) -> String {
     // The sink stops the writer once the dump is known to exceed the budget;
     // writing into a `String` cannot fail for any other reason, so the returned
     // `Result` carries nothing `sink.overflowed` has not already recorded.
-    let _ = value.stream_json(&mut sink);
+    let _ = stream_owned_value_json_jq(value, &mut sink);
     if !sink.overflowed {
         return sink.buf;
     }

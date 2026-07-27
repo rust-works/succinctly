@@ -20,8 +20,8 @@
 //! | `.[]` (iterate) | M2 streaming | ~2.5x input |
 //! | `length`, complex | OwnedValue | 5-8x input |
 
+use super::escape::{write_json_body_jq, write_json_body_yq};
 use super::value::OwnedValue;
-use crate::util::simd::escape::find_json_escape;
 
 /// A value that can be streamed directly to output without intermediate allocation.
 ///
@@ -85,10 +85,38 @@ impl StreamableValue for OwnedValue {
     }
 }
 
-/// Stream an OwnedValue as JSON without intermediate string allocation.
+/// Stream an OwnedValue as JSON, escaping strings the way `yq` does.
+///
+/// This is what [`StreamableValue::stream_json`] runs, and so what `syq -o json`
+/// emits. For the `jq` convention — which #385 established is a genuinely
+/// different one, not a stricter one — see [`stream_owned_value_json_jq`].
 fn stream_owned_value_json<W: core::fmt::Write>(
     value: &OwnedValue,
     out: &mut W,
+) -> core::fmt::Result {
+    stream_owned_value_json_with(value, out, write_json_body_yq)
+}
+
+/// Stream an OwnedValue as JSON, escaping strings the way `jq` does.
+///
+/// Used for the values `jq` embeds in its error messages, which have to read
+/// back exactly as jq renders them (`src/jq/error.rs`). The difference from the
+/// `yq` convention that [`StreamableValue::stream_json`] emits is three code
+/// points wide — `\b`, `\f` and DEL — and is documented in
+/// [`write_json_body_jq`].
+pub fn stream_owned_value_json_jq<W: core::fmt::Write>(
+    value: &OwnedValue,
+    out: &mut W,
+) -> core::fmt::Result {
+    stream_owned_value_json_with(value, out, write_json_body_jq)
+}
+
+/// Stream an OwnedValue as JSON without intermediate string allocation, using
+/// `escape` for every string body — the one place the two conventions differ.
+fn stream_owned_value_json_with<W: core::fmt::Write>(
+    value: &OwnedValue,
+    out: &mut W,
+    escape: fn(&mut W, &str) -> core::fmt::Result,
 ) -> core::fmt::Result {
     match value {
         OwnedValue::Null => out.write_str("null"),
@@ -103,14 +131,14 @@ fn stream_owned_value_json<W: core::fmt::Write>(
                 write!(out, "{f}")
             }
         }
-        OwnedValue::String(s) => stream_json_string(out, s),
+        OwnedValue::String(s) => stream_json_string(out, s, escape),
         OwnedValue::Array(arr) => {
             out.write_char('[')?;
             for (i, elem) in arr.iter().enumerate() {
                 if i > 0 {
                     out.write_char(',')?;
                 }
-                stream_owned_value_json(elem, out)?;
+                stream_owned_value_json_with(elem, out, escape)?;
             }
             out.write_char(']')
         }
@@ -120,61 +148,23 @@ fn stream_owned_value_json<W: core::fmt::Write>(
                 if i > 0 {
                     out.write_char(',')?;
                 }
-                stream_json_string(out, key)?;
+                stream_json_string(out, key, escape)?;
                 out.write_char(':')?;
-                stream_owned_value_json(value, out)?;
+                stream_owned_value_json_with(value, out, escape)?;
             }
             out.write_char('}')
         }
     }
 }
 
-/// Stream a string as JSON with proper escaping.
-///
-/// Uses SIMD-accelerated escape detection (O3 optimization from issue #81) to
-/// find characters that need escaping in 16-32 byte chunks, then copies safe
-/// spans directly to output.
-fn stream_json_string<W: core::fmt::Write>(out: &mut W, s: &str) -> core::fmt::Result {
+/// Stream a quoted JSON string, escaping its body with `escape`.
+fn stream_json_string<W: core::fmt::Write>(
+    out: &mut W,
+    s: &str,
+    escape: fn(&mut W, &str) -> core::fmt::Result,
+) -> core::fmt::Result {
     out.write_char('"')?;
-
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        // SIMD-accelerated scan for next escapable character (", \, or < 0x20)
-        // Returns index of first match, or len if no escapes needed
-        let escape_pos = find_json_escape(bytes, i);
-
-        // Copy the safe span directly (no escaping needed)
-        if i < escape_pos {
-            out.write_str(&s[i..escape_pos])?;
-        }
-
-        i = escape_pos;
-
-        // Handle escape sequence if needed
-        if i < len {
-            let b = bytes[i];
-            match b {
-                b'"' => out.write_str("\\\"")?,
-                b'\\' => out.write_str("\\\\")?,
-                b'\n' => out.write_str("\\n")?,
-                b'\r' => out.write_str("\\r")?,
-                b'\t' => out.write_str("\\t")?,
-                b if b < 0x20 => {
-                    // Control character - escape as \u00XX
-                    out.write_str("\\u00")?;
-                    const HEX: &[u8; 16] = b"0123456789abcdef";
-                    out.write_char(HEX[(b >> 4) as usize] as char)?;
-                    out.write_char(HEX[(b & 0xf) as usize] as char)?;
-                }
-                _ => out.write_char(b as char)?,
-            }
-            i += 1;
-        }
-    }
-
+    escape(out, s)?;
     out.write_char('"')
 }
 
