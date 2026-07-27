@@ -6669,6 +6669,12 @@ mod tests {
             (b"- a: &x 1\n  b: *x", r#"[{"a":1,"b":1}]"#),
             (b"- a: &x 1\n- b: *x", r#"[{"a":1},{"b":1}]"#),
             (b"l:\n  - a: &x 1\nr: *x", r#"{"l":[{"a":1}],"r":1}"#),
+            // An anchor on a document-root value, the other path that recorded
+            // nothing. Its node is on the `---` line here, so the anchor has
+            // something to name — unlike `--- &x` alone, which names the
+            // following document's placeholder and is rejected instead
+            // (`test_build_rejects_alias_to_unknown_anchor_in_every_position`).
+            (b"--- &x [1]", r"[1]"),
             // Keys.
             (b"&x k: 1\n*x: 2", r#"{"k":1,"k":2}"#),
             (b"- &x k: 1\n- *x: 2", r#"[{"k":1},{"k":2}]"#),
@@ -6682,6 +6688,19 @@ mod tests {
                 String::from_utf8_lossy(yaml)
             );
         }
+    }
+
+    /// An alias *is* a document (`--- *x`), the one alias position whose result
+    /// the first-document helper above cannot see.
+    ///
+    /// Anchors carry across documents here, and `yq` v4.53.3 agrees, so the
+    /// second document is the anchored value rather than `null` as it was
+    /// before #372 routed this position through `parse_value`.
+    #[test]
+    fn test_alias_as_a_whole_document_resolves() {
+        let yaml = b"a: &x 1\n--- *x";
+        let index = YamlIndex::build(yaml).expect("builds");
+        assert_eq!(index.root(yaml).to_json(), r#"[{"a":1},1]"#);
     }
 
     #[test]

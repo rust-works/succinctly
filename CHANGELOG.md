@@ -101,6 +101,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now instead of producing an empty key. Aliases that already resolved are
   unchanged.
 
+  One document-root form is deliberately *not* given an anchor: `&x` alone on
+  the `---` line, with the node on a following line. What follows starts at
+  indent 0, which this parser reads as a separate document, so the only node
+  here for the anchor to name is an empty placeholder — and binding it there
+  would make a later `*x` resolve to that placeholder and render as `null`,
+  reintroducing the very miss this change removes. The anchor is consumed
+  without being recorded, so the alias is the error it should be. `yq` reports
+  `unknown anchor 'x'` for the block-mapping form of this input too; for the
+  block-sequence form it reads a plain scalar instead, so rejecting is a
+  deliberate divergence over inventing `null`. The pre-existing bug that splits
+  `--- &x` and its node into two documents is untouched.
+
   No YAML Test Suite manifest movement: no case in the suite contains an alias
   to an anchor that is not in scope, so none could flip. The three `lax:anchors`
   entries that remain (4JVG, CXX2, GT5M) are anchor *placement* and

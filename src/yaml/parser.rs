@@ -952,6 +952,20 @@ impl<'a> Parser<'a> {
             // both: the anchor went unregistered and the alias never became an
             // alias node, so `--- *a` rendered as `null` (#372).
             Some(b'&' | b'*') if !self.looks_like_mapping_entry() => {
+                // `&a` with nothing after it on the line has no node here to
+                // name: whatever follows starts at indent 0, which this parser
+                // reads as a *separate* document, so the node `parse_value`
+                // opens below is the empty placeholder. Binding the anchor to
+                // that placeholder made a later `*a` resolve to it and render
+                // as `null` — the silent miss this issue removes everywhere
+                // else, and the one `yq` reports as `unknown anchor` for this
+                // same input. Consuming the name without recording it lets that
+                // alias be the error it should be (#372).
+                if self.peek() == Some(b'&') && self.anchor_ends_the_line() {
+                    self.advance();
+                    self.parse_anchor_name()?;
+                    self.skip_inline_whitespace();
+                }
                 self.parse_value(0)?;
             }
             Some(_) if self.looks_like_mapping_entry() => {
@@ -3442,6 +3456,23 @@ impl<'a> Parser<'a> {
             .to_string();
 
         Ok(name)
+    }
+
+    /// Whether the `&name` at the cursor is the last content on its line, so
+    /// the node it would name is not on this line.
+    ///
+    /// Pure lookahead: the cursor is restored before returning. A malformed
+    /// name reads as `false` so that [`Self::parse_anchor`] reports it, at the
+    /// offset it always did, rather than this scan reporting it early.
+    fn anchor_ends_the_line(&mut self) -> bool {
+        debug_assert_eq!(self.peek(), Some(b'&'));
+        let saved = self.pos;
+        self.advance();
+        let named = self.parse_anchor_name().is_ok();
+        self.skip_inline_whitespace();
+        let ends_line = named && self.at_line_end();
+        self.pos = saved;
+        ends_line
     }
 
     /// Parse an anchor definition (`&name`).

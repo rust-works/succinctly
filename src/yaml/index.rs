@@ -1122,6 +1122,17 @@ mod tests {
             ("a: *x\nb: &x 5", "x", "*x"),
             // The anchor exists but was never in scope for this alias.
             ("a: &x 1\nb: *y", "y", "*y"),
+            // An anchor alone on the `---` line names nothing: what follows
+            // starts at indent 0 and becomes a separate document, so the node
+            // the anchor would bind to is the empty placeholder. Recording it
+            // there made this alias resolve to that placeholder and render as
+            // `null` — the very miss this test exists to rule out. `yq` reports
+            // `unknown anchor 'x'` here too.
+            ("--- &x\na: 1\nb: *x", "x", "*x"),
+            // Same shape with a sequence. `yq` reads this one as the plain
+            // scalar `1 - *x` rather than erroring, so rejecting is a
+            // deliberate divergence: the alternative is the silent `null`.
+            ("--- &x\n- 1\n- *x", "x", "*x"),
         ];
         for (yaml, name, alias_text) in cases {
             expect_unknown_anchor(yaml, name, alias_text);
