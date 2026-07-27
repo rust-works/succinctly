@@ -24,16 +24,16 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 143 probes in
+Measured against jq-1.7.1 over the 165 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result              | Meaning                                            |
 |----------------------------------------------|---------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **141/143 = 98.6%** | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **162/165 = 98.2%** | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**               | Every probe that errors in both errors identically |
-| **Behaviour / parser gaps**                  | **2**               | succinctly does not raise the error at all         |
+| **Behaviour / parser gaps**                  | **3**               | succinctly does not raise the error at all         |
 
 These three numbers are asserted, not maintained by hand: `jq_error_message_tests.rs`
 parses them back out of this page and fails if they drift from the corpus (they went stale
@@ -82,7 +82,19 @@ iterate over number` for the same condition, and `cannot parse 'a' as number` ag
 | `<v> only strings have UTF-8 byte length`                | `no_utf8_byte_length`                         |
 | `Cannot check whether <t> has a <key-type> key`          | `cannot_check_has`                            |
 | `Cannot use <t> (<v>) as object key`                     | `cannot_use_as_object_key`                    |
+| `Cannot delete fields from <t>`                          | `cannot_delete_fields_from`                   |
+| `Cannot delete <key-type> field of object`               | `cannot_delete_object_field`                  |
+| `Cannot delete <key-type> element of array`              | `cannot_delete_array_element`                 |
+| `Path must be specified as an array`                     | `path_must_be_array`                          |
+| `Paths must be specified as an array`                    | `paths_must_be_array`                         |
+| `Path must be specified as array, not <key-type>`        | `path_element_must_be_array`                  |
 | `Invalid numeric literal at EOF at line 1, column <n> …` | `invalid_numeric_literal`                     |
+
+The last three are one sentence apiece for the same complaint, and jq's choice between them
+says which argument was wrong: the path argument of `getpath`/`setpath`, the *list* argument
+of `delpaths`, or one element of that list. The wording differences are jq's — the plural in
+one, the missing "an" before `array` in another — so the three have three constructors and
+must not be merged.
 
 `EvalError::type_error` ("expected X, got Y") survives for the raise sites jq has no
 counterpart for — succinctly extensions (`at_offset`, `@dsv`, `pick`/`omit`, module
@@ -251,7 +263,7 @@ there is nothing to word. Each has its own issue and is listed in
 
 | Probe(s)                                                          | Divergence                                                       | Issue |
 |-------------------------------------------------------------------|------------------------------------------------------------------|-------|
-| `slice_assign_non_array`, `slice_indices_not_integers`            | A slice is not a path component, so `setpath` leaves the value alone | [#366](https://github.com/rust-works/succinctly/issues/366) |
+| `slice_assign_non_array`, `slice_indices_not_integers`, `delpaths_slice_indices_not_integers` | A slice is not a path component, so `setpath`/`delpaths` leave the value alone | [#366](https://github.com/rust-works/succinctly/issues/366) |
 
 `index_null_key_on_object`, `index_bool_key_on_object` and `index_object_key_on_object`
 were on this list too, as parser gaps: `.[null]`, `.[true]` and `.[{}]` did not parse, so
@@ -264,6 +276,44 @@ fixed it: `setpath` now auto-vivifies only `null`, as jq does, and refuses to in
 anything else at any depth. The `setpath_*` probes added alongside it pin the rest of that
 surface — wrong-key-type on a real container, out-of-bounds negative and NaN indices, and a
 non-array path argument.
+
+[#395](https://github.com/rust-works/succinctly/issues/395) did the same for `delpaths`,
+which walked its paths through an infallible `delete_path` and so handed the input back
+untouched wherever it could not walk — `1 | delpaths([["a"]])` returned `1` while
+`1 | del(.a)`, the same operation through `delete_at_path`, refused. Twenty-one `delpaths_*`
+probes now pin that surface; the twenty-second is the slice gap above.
+
+Seven of those twenty-one pin *which* refusal is raised, a question a builtin taking a list
+of paths has and `setpath` does not. Three things decide it, and all three are jq's:
+
+- **The paths are ordered before any is walked**, so `[1,2] | delpaths([["a"],[true]])` and
+  the same two paths written the other way round both report the boolean — the one that
+  sorts first.
+- **Only a path's last element deletes; the rest are walked**, and the two are worded
+  differently. `{} | delpaths([[true]])` is `Cannot delete boolean field of object`, while
+  the same bad key one step from the end — `{} | delpaths([[true,0]])` — is `Cannot index
+  object with boolean`, the sentence `.[true]` and `getpath([true])` print.
+- **Every walk at a level happens before any deletion at it**, so a bad walk is reported
+  even when a bad deletion sorts ahead of it: `[] | delpaths([[null],[true,"a"]])` is
+  `Cannot index array with boolean`, not the refusal `[null]` would have raised.
+
+None of that is a wording choice made here; it falls out of walking the paths as one set the
+way jq does, which is also what makes `[1,2,3] | delpaths([[0],[1]])` come out as jq's `[3]`
+rather than `[2]`, and what lets `{"a":{"b":1}} | delpaths([["a"],["a","b","c"]])` be `{}`
+rather than a refusal to index the number below a key that is already gone. Those value cases
+cannot be probes — jq answers them — so they are pinned as `delpaths_*` golden fixtures.
+
+One more asymmetry is pinned there rather than here, because jq answers it: deleting at an
+array index decides which end to count from *before* truncating, and walking through one
+decides after. `[1,2,3] | delpaths([[-0.5]])` deletes nothing, because `-0.5` counts from the
+end and truncates to one past it, while `getpath([-0.5])` and `delpaths([[-0.5,0]])` both
+read element 0. `-0.0` is not negative under IEEE comparison, so it counts from the front:
+`[1,2] | delpaths([[-0.0]])` is `[2]`.
+
+One case has no jq behaviour to copy at all: `[1,2] | delpaths([[nan]])` does not
+terminate in jq. succinctly resolves a NaN index to no element and leaves the array alone,
+which is a decision rather than a match. It has to be an explicit one — `f64::trunc` of NaN
+is NaN and `as i64` saturates that to `0`, so falling through would delete the first element.
 
 ## Where succinctly errors and jq does not
 
@@ -279,6 +329,8 @@ have to be recorded here.
 | `.[5] \|= 9`    | `[1,2]`       | `[1,2,null,null,null,9]`    | `index 5 out of bounds (length 2)`    |
 | `del(.[5])`     | `[1,2]`       | `[1,2]`                     | `index 5 out of bounds (length 2)`    |
 | `del(.[-5])`    | `[1,2]`       | `[1,2]`                     | `Out of bounds negative array index`  |
+| `del(.a)`       | `null`        | `null`                      | `Cannot index null with string "a"`   |
+| `del(.[0])`     | `null`        | `null`                      | `Cannot index null with number`       |
 
 Every row is an assignment, update or deletion walking a path *in place*, and every one is
 older than #356 — the rewording changed what these say, not whether they say it. The gap
@@ -320,6 +372,11 @@ means generating a stream, not renaming an error. The sentence stays succinctly'
 `{"a":1}`. So the two disagree with each other in-tree today; closing that means teaching
 `set_path`/`update_path`/`delete_at_path` to vivify the way `set_value_at_path` now does.
 
+`delpaths` joined that side with #395: `null | delpaths([["a"]])` is `null`, as jq has it,
+while the two `del` rows above still refuse. The two spellings of one operation therefore
+still disagree in-tree — the direction of the disagreement has flipped, not closed, and it
+closes when `delete_at_path` treats `null` the way `delete_path` now does.
+
 Where the same walk *does* error in jq, the sentence matches. A still-negative index is
 jq's `Out of bounds negative array index` in `=` and `|=` as well as `setpath`, pinned by
 the probes `assign_negative_index_oob`, `update_negative_index_oob` and
@@ -351,6 +408,11 @@ That is a missing feature rather than a wording divergence, and it is deliberate
 raised as an error — inventing a message jq does not print would be a fresh divergence.
 Only the containers jq would slice get that pass; on a scalar, an object path element is
 refused with jq's `Cannot index <type> with object` (probe `setpath_slice_key_on_number`).
+
+`delpaths` was given the same pass in #395: an object path element against an *array* is left
+alone, because that is where jq would delete a range. Against an object, where jq has no
+slice to take, it is refused with jq's `Cannot delete object field of object` (probe
+`delpaths_slice_key_on_object`), so only the one case that owes a feature stays silent.
 
 The same gap reaches `indices`/`index`/`rindex`, which jq also lets take a slice:
 `"abcabc" | indices({"start":1,"end":2})` is `"b"` there, and `indices({})` is `Array/string

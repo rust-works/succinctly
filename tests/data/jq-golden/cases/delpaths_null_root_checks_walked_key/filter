@@ -1,0 +1,1 @@
+try delpaths([[true,0]]) catch .

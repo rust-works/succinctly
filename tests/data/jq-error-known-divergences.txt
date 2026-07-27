@@ -23,8 +23,10 @@
 # succinctly produces a value where jq errors, or cannot parse the filter — so
 # each is a behaviour or parser bug with its own issue. (#359 fixed
 # `setpath_on_number`, took the rest of `setpath`'s probes with it, and added
-# the two slice probes it could not fix. #360 took the three `index_*_key_on_*`
-# parser entries, which now reach the runtime error jq raises.)
+# the two slice probes it could not fix. #395 did the same for `delpaths`,
+# adding a fifteenth probe and a third slice line. #360 took the three
+# `index_*_key_on_*` parser entries, which now reach the runtime error jq
+# raises.)
 #
 # This file cannot record the mirror image — a filter jq answers with a value
 # and succinctly refuses — because a probe is only admitted if jq errors on it.
@@ -33,3 +35,4 @@
 
 slice_assign_non_array      slice         a slice is not a path component, so setpath leaves the value alone — #366
 slice_indices_not_integers  slice         a slice is not a path component, so setpath leaves the value alone — #366
+delpaths_slice_indices_not_integers  slice  a slice is not a path component, so delpaths leaves the value alone — #366

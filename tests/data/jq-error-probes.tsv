@@ -64,6 +64,28 @@ update_negative_index_oob	.[-5] |= 9	[1,2]
 assign_negative_index_nested	.a[-5] = 9	{"a":[1,2]}
 slice_assign_non_array	setpath([{"start":1,"end":2}]; "x")	[1,2,3]
 slice_indices_not_integers	setpath([{"foo":1}]; 9)	[1,2]
+delpaths_on_number	delpaths([["a"]])	1
+delpaths_on_string	delpaths([[0]])	"str"
+delpaths_on_boolean	delpaths([["a"]])	true
+delpaths_nested_on_number	delpaths([["a","b"]])	{"a":1}
+delpaths_number_key_on_object	delpaths([[0]])	{"a":1}
+delpaths_null_key_on_object	delpaths([[null]])	{"a":1}
+delpaths_array_key_on_object	delpaths([[["a"]]])	{"a":1}
+delpaths_slice_key_on_object	delpaths([[{"start":0,"end":2}]])	{"a":1}
+delpaths_string_key_on_array	delpaths([["a"]])	[1,2]
+delpaths_array_key_on_array	delpaths([[["a"]]])	[1,2]
+delpaths_non_array_paths	delpaths(1)	{"a":1}
+delpaths_string_path_element	delpaths(["a"])	{"a":1}
+delpaths_number_path_element	delpaths([1])	{"a":1}
+delpaths_path_element_checked_first	delpaths(["a"])	1
+delpaths_refusal_follows_path_order	delpaths([["a"],[true]])	[1,2]
+delpaths_refusal_order_independent	delpaths([[true],["a"]])	[1,2]
+delpaths_walked_key_on_object	delpaths([[true,0]])	{}
+delpaths_walked_key_on_array	delpaths([[null,0]])	[1,2]
+delpaths_walked_key_on_number	delpaths([["a","b"]])	1
+delpaths_walk_before_delete	delpaths([[null],[true,"a"]])	[]
+delpaths_null_root_walked_key	delpaths([[true,0]])	null
+delpaths_slice_indices_not_integers	delpaths([[{"foo":1}]])	[1,2]
 getpath_on_number	getpath(["a"])	1
 getpath_nested_on_number	getpath(["a","b"])	{"a":1}
 getpath_non_array_path	getpath("a")	{"a":1}

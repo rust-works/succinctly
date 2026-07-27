@@ -289,3 +289,23 @@ fn test_parity_delpaths_398() {
         r#"delpaths([["a","x"],["b"]])"#,
     );
 }
+
+#[test]
+fn test_parity_delpaths_refusals_395() {
+    // The refusals #395 added have to reach the CLI with jq's sentence intact.
+    // `catch` turns each one into a value, which is the only way an error shows
+    // up in `collect_owned` at all -- without it both evaluators would report
+    // the empty output and the comparison would pass while saying nothing.
+    for (json, filter) in [
+        (b"1".as_slice(), r#"try delpaths([["a"]]) catch ."#),
+        (b"[1,2]", r#"try delpaths([["a"]]) catch ."#),
+        (br#"{"a":1}"#, "try delpaths([[0]]) catch ."),
+        (br#"{"a":1}"#, r#"try delpaths([["a","b"]]) catch ."#),
+        (br#"{"a":1}"#, r#"try delpaths(["a"]) catch ."#),
+        (br#"{"a":1}"#, "try delpaths(1) catch ."),
+        (b"{}", "try delpaths([[true,0]]) catch ."),
+        (b"null", "try delpaths([[true,0]]) catch ."),
+    ] {
+        assert_parity(json, filter);
+    }
+}

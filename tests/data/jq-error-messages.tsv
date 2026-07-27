@@ -41,6 +41,28 @@ update_negative_index_oob	.[-5] |= 9	[1,2]	Out of bounds negative array index
 assign_negative_index_nested	.a[-5] = 9	{"a":[1,2]}	Out of bounds negative array index
 slice_assign_non_array	setpath([{"start":1,"end":2}]; "x")	[1,2,3]	A slice of an array can only be assigned another array
 slice_indices_not_integers	setpath([{"foo":1}]; 9)	[1,2]	Array/string slice indices must be integers
+delpaths_on_number	delpaths([["a"]])	1	Cannot delete fields from number
+delpaths_on_string	delpaths([[0]])	"str"	Cannot delete fields from string
+delpaths_on_boolean	delpaths([["a"]])	true	Cannot delete fields from boolean
+delpaths_nested_on_number	delpaths([["a","b"]])	{"a":1}	Cannot delete fields from number
+delpaths_number_key_on_object	delpaths([[0]])	{"a":1}	Cannot delete number field of object
+delpaths_null_key_on_object	delpaths([[null]])	{"a":1}	Cannot delete null field of object
+delpaths_array_key_on_object	delpaths([[["a"]]])	{"a":1}	Cannot delete array field of object
+delpaths_slice_key_on_object	delpaths([[{"start":0,"end":2}]])	{"a":1}	Cannot delete object field of object
+delpaths_string_key_on_array	delpaths([["a"]])	[1,2]	Cannot delete string element of array
+delpaths_array_key_on_array	delpaths([[["a"]]])	[1,2]	Cannot delete array element of array
+delpaths_non_array_paths	delpaths(1)	{"a":1}	Paths must be specified as an array
+delpaths_string_path_element	delpaths(["a"])	{"a":1}	Path must be specified as array, not string
+delpaths_number_path_element	delpaths([1])	{"a":1}	Path must be specified as array, not number
+delpaths_path_element_checked_first	delpaths(["a"])	1	Path must be specified as array, not string
+delpaths_refusal_follows_path_order	delpaths([["a"],[true]])	[1,2]	Cannot delete boolean element of array
+delpaths_refusal_order_independent	delpaths([[true],["a"]])	[1,2]	Cannot delete boolean element of array
+delpaths_walked_key_on_object	delpaths([[true,0]])	{}	Cannot index object with boolean
+delpaths_walked_key_on_array	delpaths([[null,0]])	[1,2]	Cannot index array with null
+delpaths_walked_key_on_number	delpaths([["a","b"]])	1	Cannot index number with string "a"
+delpaths_walk_before_delete	delpaths([[null],[true,"a"]])	[]	Cannot index array with boolean
+delpaths_null_root_walked_key	delpaths([[true,0]])	null	Cannot index null with boolean
+delpaths_slice_indices_not_integers	delpaths([[{"foo":1}]])	[1,2]	Array/string slice indices must be integers
 getpath_on_number	getpath(["a"])	1	Cannot index number with string "a"
 getpath_nested_on_number	getpath(["a","b"])	{"a":1}	Cannot index number with string "b"
 getpath_non_array_path	getpath("a")	{"a":1}	Path must be specified as an array

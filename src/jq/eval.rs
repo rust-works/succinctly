@@ -18468,6 +18468,9 @@ mod tests {
             (b"[10,20,30,40]", "delpaths([[0],[2]])", Ok("[20,40]")),
             (b"[10,20,30,40]", "delpaths([[2],[0]])", Ok("[20,40]")),
             (b"[10,20,30,40]", "delpaths([[0],[0]])", Ok("[20,30,40]")),
+            // Equality is jq value equality, which is why `[0]` and `[0.0]` are
+            // one path and not two.
+            (b"[10,20,30,40]", "delpaths([[0],[0.0]])", Ok("[20,30,40]")),
             (
                 b"[10,20,30,40]",
                 "delpaths([[0],[0],[0]])",
@@ -18487,7 +18490,9 @@ mod tests {
     }
 
     /// The empty path names the document itself. It sorts before every other
-    /// array, so it wins wherever the caller wrote it.
+    /// array, so it wins wherever the caller wrote it — including over a path
+    /// that could not have been walked. An empty *list* deletes nothing and
+    /// refuses nothing.
     #[test]
     fn test_delpaths_empty_path_deletes_the_document() {
         assert_outcomes(&[
@@ -18495,14 +18500,22 @@ mod tests {
             (b"[10,20,30,40]", "delpaths([[]])", Ok("null")),
             (b"[10,20,30,40]", "delpaths([[],[0]])", Ok("null")),
             (b"[10,20,30,40]", "delpaths([[0],[]])", Ok("null")),
+            (b"1", r#"delpaths([[],["a"]])"#, Ok("null")),
+            (br#"{"a": 1}"#, r#"delpaths([[],["a"]])"#, Ok("null")),
+            // No paths at all: no walk, so no refusal even on a scalar.
+            (b"1", "delpaths([])", Ok("1")),
+            (br#""str""#, "delpaths([])", Ok(r#""str""#)),
         ]);
     }
 
     /// A path that ends at one level takes its whole subtree, and the longer
-    /// paths under it are never walked. This is why `delpaths([[0,1]])` on
+    /// paths under it are never walked — so they never get to complain about
+    /// what they would have run into. This is why `delpaths([[0,1]])` on
     /// `[10,20,30,40]` is `Cannot delete fields from number` in jq while
-    /// `delpaths([[0],[0,1]])` is a value — the number is gone before anything
-    /// tries to index it. A per-path loop would refuse both (#415).
+    /// `delpaths([[0],[0,1]])` is a value: the number is gone before anything
+    /// tries to index it. A per-path loop cannot do this — it either walks the
+    /// deeper path before the key is gone (error) or after (a no-op that still
+    /// had to walk), and jq does neither (#395, #415).
     #[test]
     fn test_delpaths_shorter_path_shadows_its_extensions() {
         assert_outcomes(&[
@@ -18514,6 +18527,20 @@ mod tests {
                 br#"{"a":{"x":1,"y":2},"b":3}"#,
                 r#"delpaths([["a"],["a","x"]])"#,
                 Ok(r#"{"b":3}"#),
+            ),
+            // The shadowed paths include ones that would have refused: a key of
+            // the wrong kind, and a walk into a number.
+            (b"[[1,2]]", r#"delpaths([[0],[0,5],[0,"x"]])"#, Ok("[]")),
+            (br#"{"a": 1}"#, r#"delpaths([["a"],["a","b"]])"#, Ok("{}")),
+            (
+                br#"{"a": {"b": 1}}"#,
+                r#"delpaths([["a"],["a","b","c"]])"#,
+                Ok("{}"),
+            ),
+            (
+                br#"{"a": {"b": {"c": 1}}}"#,
+                r#"delpaths([["a","b"],["a","b","c"]])"#,
+                Ok(r#"{"a":{}}"#),
             ),
         ]);
     }
@@ -18574,6 +18601,27 @@ mod tests {
                 "delpaths([[0,-1],[0,-2]])",
                 Ok("[[1],[4,5,6]]"),
             ),
+            // Adjacent positive indices are the plainest form of the same rule:
+            // a sequential walk returns `[2]` here, and jq returns `[3]`.
+            (b"[1,2,3]", "delpaths([[0],[1]])", Ok("[3]")),
+            (b"[1,2,3,4,5]", "delpaths([[0],[1],[2]])", Ok("[4,5]")),
+            (b"[1,2,3,4]", "delpaths([[0],[2],[1]])", Ok("[4]")),
+            // One level down, and across two containers at once.
+            (
+                br#"{"a": [1,2,3]}"#,
+                r#"delpaths([["a",0],["a",1]])"#,
+                Ok(r#"{"a":[3]}"#),
+            ),
+            (
+                br#"{"a": [1,2,3], "b": [4,5,6]}"#,
+                r#"delpaths([["a",0],["a",2],["b",1]])"#,
+                Ok(r#"{"a":[2],"b":[4,6]}"#),
+            ),
+            (
+                b"[[1,2],[3,4]]",
+                "delpaths([[0,1],[1,0],[0,0]])",
+                Ok("[[],[4]]"),
+            ),
         ]);
     }
 
@@ -18584,6 +18632,10 @@ mod tests {
         assert_outcomes(&[
             (br#"{"a":1}"#, r#"delpaths([["b","c"]])"#, Ok(r#"{"a":1}"#)),
             (b"null", r#"delpaths([["a"]])"#, Ok("null")),
+            (b"null", "delpaths([[0]])", Ok("null")),
+            (b"{}", r#"delpaths([["a", "b"]])"#, Ok("{}")),
+            (b"[1,2]", "delpaths([[5]])", Ok("[1,2]")),
+            (b"[1,2]", "delpaths([[-5]])", Ok("[1,2]")),
             (b"[1,2]", r#"delpaths([[5,"a"]])"#, Ok("[1,2]")),
             (
                 br#"{"a":null}"#,
@@ -18598,9 +18650,45 @@ mod tests {
         ]);
     }
 
-    /// A key of the wrong kind for its container is a refusal, not a key that
-    /// names nothing — and which sentence it gets depends on where in the path
-    /// it sits, because only the last element deletes (#395, #415).
+    /// A value with no fields cannot be deleted from. This walk used to be
+    /// infallible and handed the input straight back, so `delpaths` accepted
+    /// what `del` — the same operation through `delete_at_path` — refused
+    /// (#395, #415).
+    #[test]
+    fn test_delpaths_refuses_a_value_with_no_fields() {
+        assert_outcomes(&[
+            (
+                b"1",
+                r#"delpaths([["a"]])"#,
+                Err("Cannot delete fields from number"),
+            ),
+            (
+                br#""str""#,
+                "delpaths([[0]])",
+                Err("Cannot delete fields from string"),
+            ),
+            (
+                b"true",
+                r#"delpaths([["a"]])"#,
+                Err("Cannot delete fields from boolean"),
+            ),
+            // Reached through the path, not just at the root.
+            (
+                br#"{"a": 1}"#,
+                r#"delpaths([["a", "b"]])"#,
+                Err("Cannot delete fields from number"),
+            ),
+            (
+                b"[1,2]",
+                r#"delpaths([[0, "x"]])"#,
+                Err("Cannot delete fields from number"),
+            ),
+        ]);
+    }
+
+    /// A real container refuses the wrong kind of key, and jq words the two
+    /// containers differently — the message names which one it was. This is a
+    /// refusal, not a key that names nothing (#395, #415).
     #[test]
     fn test_delpaths_refuses_the_wrong_kind_of_key() {
         assert_outcomes(&[
@@ -18610,10 +18698,235 @@ mod tests {
                 Err("Cannot delete number field of object"),
             ),
             (
+                br#"{"a": 1}"#,
+                "delpaths([[null]])",
+                Err("Cannot delete null field of object"),
+            ),
+            (
+                br#"{"a": 1}"#,
+                r#"delpaths([[["a"]]])"#,
+                Err("Cannot delete array field of object"),
+            ),
+            (
+                b"[1,2]",
+                r#"delpaths([["a"]])"#,
+                Err("Cannot delete string element of array"),
+            ),
+            (
+                b"[1,2]",
+                "delpaths([[true]])",
+                Err("Cannot delete boolean element of array"),
+            ),
+            (
                 br#"{"a":{"x":1}}"#,
                 r#"delpaths([[0,"x"]])"#,
                 Err("Cannot index object with number"),
             ),
+        ]);
+    }
+
+    /// Only a path's last element deletes; the elements before it are walked,
+    /// and jq words a bad key differently in the two positions. The same key one
+    /// step further from the end stops being a deletion and becomes an index.
+    #[test]
+    fn test_delpaths_words_a_walked_key_as_an_index() {
+        assert_outcomes(&[
+            // Last element: the deleting sentence.
+            (
+                b"{}",
+                "delpaths([[true]])",
+                Err("Cannot delete boolean field of object"),
+            ),
+            (
+                b"[1,2]",
+                "delpaths([[null]])",
+                Err("Cannot delete null element of array"),
+            ),
+            (
+                b"1",
+                r#"delpaths([["a"]])"#,
+                Err("Cannot delete fields from number"),
+            ),
+            // Not the last element: the indexing sentence, the one `.[true]`
+            // and `getpath([true])` also print. Note the key's text appears for
+            // a string and not for anything else — jq's rule, not ours.
+            (
+                b"{}",
+                "delpaths([[true,0]])",
+                Err("Cannot index object with boolean"),
+            ),
+            (
+                b"[1,2]",
+                "delpaths([[null,0]])",
+                Err("Cannot index array with null"),
+            ),
+            (
+                b"1",
+                r#"delpaths([["a","b"]])"#,
+                Err(r#"Cannot index number with string "a""#),
+            ),
+            (
+                b"1",
+                "delpaths([[0,1]])",
+                Err("Cannot index number with number"),
+            ),
+            (
+                br#""s""#,
+                "delpaths([[true,1]])",
+                Err("Cannot index string with boolean"),
+            ),
+            // The switch happens at the last element, not at the first failure:
+            // here `"a"` walks fine and the refusal is one step deeper.
+            (
+                br#"{"a": 1}"#,
+                r#"delpaths([["a","b","c"]])"#,
+                Err(r#"Cannot index number with string "b""#),
+            ),
+            (
+                br#"{"a": 1}"#,
+                r#"delpaths([["a","b"]])"#,
+                Err("Cannot delete fields from number"),
+            ),
+        ]);
+    }
+
+    /// When more than one path is bad, jq reports the one that sorts first, not
+    /// the one written first — the paths are ordered before any of them is
+    /// walked, so the answer does not depend on how they were spelled. jq's
+    /// value order puts `null` before `true` before a string.
+    #[test]
+    fn test_delpaths_refuses_the_first_path_in_order() {
+        assert_outcomes(&[
+            (
+                b"[1,2]",
+                r#"delpaths([["a"],[true]])"#,
+                Err("Cannot delete boolean element of array"),
+            ),
+            (
+                b"[1,2]",
+                r#"delpaths([[true],["a"]])"#,
+                Err("Cannot delete boolean element of array"),
+            ),
+            (
+                b"[1,2]",
+                r#"delpaths([[null],[true],["a"]])"#,
+                Err("Cannot delete null element of array"),
+            ),
+            (
+                b"[1,2]",
+                r#"delpaths([["a"],[true],[null]])"#,
+                Err("Cannot delete null element of array"),
+            ),
+            (
+                br#"{"a": 1}"#,
+                "delpaths([[0],[null]])",
+                Err("Cannot delete null field of object"),
+            ),
+            // A good path does not rescue a bad one, in either order.
+            (
+                b"[1,2]",
+                r#"delpaths([[0],["a"]])"#,
+                Err("Cannot delete string element of array"),
+            ),
+            (
+                br#"{"a": 1, "z": 2}"#,
+                r#"delpaths([["z"],[0]])"#,
+                Err("Cannot delete number field of object"),
+            ),
+        ]);
+    }
+
+    /// A level walks through the keys it is keeping before it deletes the keys
+    /// it is dropping, so a bad walk is reported even when a bad deletion sorts
+    /// ahead of it. This is not a tie-break: it is what deleting a level's keys
+    /// together, after descending, does on its own.
+    #[test]
+    fn test_delpaths_walks_before_it_deletes() {
+        assert_outcomes(&[
+            // `[null]` sorts first and would refuse, but `[true,"a"]` is walked
+            // first because it is walked at all.
+            (
+                b"[]",
+                r#"delpaths([[null],[true,"a"]])"#,
+                Err("Cannot index array with boolean"),
+            ),
+            (
+                b"true",
+                r#"delpaths([["a",1],[5]])"#,
+                Err(r#"Cannot index boolean with string "a""#),
+            ),
+            (
+                br#""s""#,
+                r#"delpaths([[null],["a","a","b"],[2,0]])"#,
+                Err("Cannot index string with number"),
+            ),
+            // With no walk to do, the deletions speak, smallest first.
+            (
+                b"[1,2]",
+                r#"delpaths([["a"],[true],[null]])"#,
+                Err("Cannot delete null element of array"),
+            ),
+        ]);
+    }
+
+    /// Which end an index counts from is settled by the key before it is
+    /// truncated, and only when deleting. A float in `(-1, 0)` truncates to `0`
+    /// but still counts from the end, so it lands one past it and deletes
+    /// nothing — while the same key merely walked reads element 0.
+    #[test]
+    fn test_delpaths_float_index_counts_from_the_end_before_truncating() {
+        assert_outcomes(&[
+            (b"[1,2,3]", "delpaths([[-0.5]])", Ok("[1,2,3]")),
+            (b"[1,2,3]", "delpaths([[-0.9]])", Ok("[1,2,3]")),
+            (b"[1,2,3,4,5]", "delpaths([[-0.5]])", Ok("[1,2,3,4,5]")),
+            // `-0.0` is not negative under IEEE comparison, so it counts from
+            // the front like `0` does.
+            (b"[1,2]", "delpaths([[-0.0]])", Ok("[2]")),
+            (b"[1,2,3]", "delpaths([[0.5]])", Ok("[2,3]")),
+            (b"[1,2,3]", "delpaths([[1.9]])", Ok("[1,3]")),
+            (b"[1,2,3]", "delpaths([[-1.5]])", Ok("[1,2]")),
+            // Walked, not deleted: `-0.5` is element 0, so the delete below it
+            // reaches the first element.
+            (b"[[1,2],[3,4]]", "delpaths([[-0.5,0]])", Ok("[[2],[3,4]]")),
+            (
+                br#"["s"]"#,
+                "delpaths([[-0.5,null]])",
+                Err("Cannot delete fields from string"),
+            ),
+        ]);
+    }
+
+    /// null absorbs deletions at any depth, but the *document* checks the keys
+    /// it is asked to walk through — and only the document. jq refuses
+    /// `null | delpaths([[true,0]])` and answers the same key one level down.
+    #[test]
+    fn test_delpaths_null_checks_walked_keys_only_at_the_root() {
+        assert_outcomes(&[
+            (
+                b"null",
+                "delpaths([[true,0]])",
+                Err("Cannot index null with boolean"),
+            ),
+            (
+                b"null",
+                "delpaths([[null,0]])",
+                Err("Cannot index null with null"),
+            ),
+            // A key that can index null walks fine, and what it reaches absorbs
+            // everything below without checking.
+            (b"null", r#"delpaths([["a",true,0]])"#, Ok("null")),
+            (b"null", r#"delpaths([["a","b",true,0]])"#, Ok("null")),
+            (b"null", "delpaths([[0,true,0]])", Ok("null")),
+            // A null reached through a real container is never checked either.
+            (
+                br#"{"a": null}"#,
+                r#"delpaths([["a",true,0]])"#,
+                Ok(r#"{"a":null}"#),
+            ),
+            (b"[null]", "delpaths([[0,true,0]])", Ok("[null]")),
+            // A deleting key is not checked even at the root.
+            (b"null", "delpaths([[true]])", Ok("null")),
+            (b"null", r#"delpaths([[0],["a"]])"#, Ok("null")),
         ]);
     }
 
@@ -18659,6 +18972,16 @@ mod tests {
             (
                 b"[1,2]",
                 "delpaths(null)",
+                Err("Paths must be specified as an array"),
+            ),
+            (
+                br#"{"a": 1}"#,
+                "delpaths(1)",
+                Err("Paths must be specified as an array"),
+            ),
+            (
+                br#"{"a": 1}"#,
+                r#"delpaths("a")"#,
                 Err("Paths must be specified as an array"),
             ),
             (
