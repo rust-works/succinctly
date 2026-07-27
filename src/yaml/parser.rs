@@ -2751,9 +2751,8 @@ impl<'a> Parser<'a> {
             // Parse key
             self.set_ib();
             self.write_bp_open();
-            // A complex key (nested flow container) or an alias opened its own BP nodes
-            // and carries its own end; recording one here would clobber the innermost of
-            // them (#332).
+            // A complex key (a nested flow container) opened its own BP nodes and carries
+            // its own end; recording one here would clobber the innermost of them (#332).
             if !self.parse_flow_key()? {
                 self.set_bp_text_end(self.pos);
             }
@@ -2828,8 +2827,8 @@ impl<'a> Parser<'a> {
     /// Parse a key in flow context.
     /// Keys can be scalars, flow sequences, or flow mappings (complex keys).
     ///
-    /// Returns `true` when the key opened BP nodes of its own — a nested flow container,
-    /// or an alias. The caller must **not** record an end position in that case — see
+    /// Returns `true` when the key opened BP nodes of its own — a nested flow container.
+    /// The caller must **not** record an end position in that case — see
     /// [`Self::set_bp_text_end`].
     fn parse_flow_key(&mut self) -> Result<bool, YamlError> {
         // Check for anchor on key. The caller already opened the key's BP node,
@@ -2889,11 +2888,16 @@ impl<'a> Parser<'a> {
                 self.parse_flow_mapping()?;
                 return Ok(true);
             }
+            // Alias as key (`{*a: v}`), sharing the block and compact mappings'
+            // site. The caller already opened the key's BP node, so the edge
+            // binds to that node; `parse_alias` here opened a *second* one, which
+            // took the edge and left the key with no extent, so a resolving alias
+            // still rendered as `""` while a miss went through `parse_alias`'s
+            // lookup and errored — the one key position that stayed inconsistent
+            // after #372 (#405). Returning `false` lets the caller record the
+            // end, which is the `self.pos` the helper returns.
             Some(b'*') => {
-                // Alias as key — `parse_alias` opens and closes its own node, and
-                // records its own end
-                self.parse_alias()?;
-                return Ok(true);
+                self.record_key_alias()?;
             }
             _ => {
                 self.parse_flow_unquoted_key()?;
@@ -3527,9 +3531,15 @@ impl<'a> Parser<'a> {
     /// anchor to it. Callers that have not opened a node yet want
     /// [`Self::parse_alias`], which opens and closes one of its own.
     ///
-    /// One definition for both key-alias sites (block and compact mappings):
-    /// they were separate copies, and only one of them resolved the alias at
-    /// all, so `- *a: v` silently produced an empty key (#372).
+    /// The end returned is the byte after the name, with no whitespace skipped
+    /// — unlike [`Self::record_key_anchor`], where the key text *follows* the
+    /// indicator — so a key written `*a : v` has an extent of exactly `*a`.
+    ///
+    /// One definition for all three key-alias sites (block, compact and flow
+    /// mappings), as [`Self::record_key_anchor`] already was for the three
+    /// key-*anchor* sites: they were separate copies, only one of which
+    /// resolved the alias at all, so `- *a: v` silently produced an empty key
+    /// (#372) and `{*a: v}` bound the edge to a node below the key (#405).
     fn record_key_alias(&mut self) -> Result<usize, YamlError> {
         debug_assert_eq!(self.peek(), Some(b'*'));
         // Offset of the `*`, so an unresolved alias can point at itself.

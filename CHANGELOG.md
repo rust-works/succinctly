@@ -91,6 +91,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **YAML alias used as a flow-mapping key rendered as the empty string** (#405):
+  `{&x k: 1, *x: 2}` loaded as `{"k":1,"":2}` where `yq` gives `{"k":1,"k":2}`,
+  and likewise for a flow mapping nested in a block one or in a sequence. The
+  alias resolved — the key node it resolved *onto* was the wrong one. The
+  flow-mapping key site opens the key's BP node before reading the key, so the
+  alias must be recorded against that node; it instead called `parse_alias`,
+  which opens and closes a node of its own, so the alias edge bound to a node
+  *below* the key and the key itself was left with no extent. It now shares
+  `record_key_alias` with the block, compact and explicit key sites, as the
+  key-*anchor* sites already shared `record_key_anchor`. This was the one key
+  position #372 left inconsistent with itself: a miss went through
+  `parse_alias`'s lookup and errored, while a hit silently rendered `""`.
+  Unaffected: an alias key resolving to a sequence or mapping still stringifies
+  as `""`, which is the complex-key rule and matches `yq`.
+
 - **`tojson`, `@json` and `sjq`'s printer escaped C1 control characters** (#385):
   the escaping branched on `char::is_control()`, which is true for the C1 range
   U+0080–U+009F as well as C0. JSON only requires escaping below U+0020 and jq
@@ -224,7 +239,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now refused at build time, as a cyclic alias always has been. Every position
   an alias can appear in is covered: values (block, flow sequence, flow mapping,
   block sequence item, compact mapping entry, document root) and keys (block,
-  compact, explicit `?`).
+  compact, flow, explicit `?`).
 
   Two of those positions did not resolve aliases *at all*, so rejecting a
   lookup miss would have turned valid YAML into a parse failure. A compact

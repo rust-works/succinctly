@@ -2252,19 +2252,71 @@ fn test_flow_container_key_does_not_leak_its_closing_bracket() -> Result<()> {
 
 #[test]
 fn test_alias_as_a_flow_mapping_key_keeps_its_own_extent() -> Result<()> {
-    // `parse_alias` opens and closes its own node and records its own end, so the
-    // flow-mapping key site must not record one over the top of it (#332). The
-    // alias resolves to the anchored value, which only works if its extent covers
-    // exactly `*x`.
+    // The flow-mapping key site records the key's end itself, so the alias node
+    // *is* the key node and its extent must cover exactly `*x` for the alias to
+    // resolve. It used to reach this through `parse_alias`, which opened a second
+    // node inside the already-open key and carried the end on that one — which is
+    // why the site had to skip recording an end at all (#332), and why the key
+    // itself had none and rendered as `""` (#405).
     let yaml = "x: &x 1\ny: {*x: 2}\n";
     let (output, code) = run_yq_stdin("at_offset(13)", yaml, &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "1");
 
-    // And the document as a whole still reads back correctly.
+    // And the document as a whole still reads back correctly. `yq` v4.53.3 agrees.
     let (whole, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
-    assert_eq!(whole.trim(), r#"{"x":1,"y":{"":2}}"#);
+    assert_eq!(whole.trim(), r#"{"x":1,"y":{"1":2}}"#);
+    Ok(())
+}
+
+#[test]
+fn test_alias_as_a_flow_mapping_key_resolves() -> Result<()> {
+    // #405. An alias used as a flow-mapping key resolved internally but rendered
+    // as the empty string: the caller had already opened the key's BP node, and
+    // `parse_alias` opened another one inside it and bound the alias edge to
+    // *that*, so the key node itself had neither an extent nor an edge. The three
+    // other key positions already went through `record_key_alias`; this one now
+    // does too.
+    //
+    // Every expectation is `yq` v4.53.3's output for the same input, on the
+    // streaming path (`-I 0`). The pretty path is deliberately not asserted here:
+    // its DOM collapses duplicate mapping keys (#174), which resolution makes
+    // reachable from more inputs but does not cause.
+    for (yaml, expected) in [
+        // Alias to an anchored key, and to an anchored value — different targets.
+        ("{&x k: 1, *x: 2}\n", r#"{"k":1,"k":2}"#),
+        ("{k: &x 1, *x: 2}\n", r#"{"k":1,"1":2}"#),
+        // Flow mapping nested in a block mapping, and two sibling flow mappings
+        // inside a flow sequence: the anchor and the alias in separate entries.
+        ("a: {&x k: 1, *x: 2}\n", r#"{"a":{"k":1,"k":2}}"#),
+        ("[{&x k: 1}, {*x: 2}]\n", r#"[{"k":1},{"k":2}]"#),
+        // A space before the `:` must not widen the key's extent past the name.
+        ("{&x k: 1, *x : 2}\n", r#"{"k":1,"k":2}"#),
+        // Alias key whose value is an implicit null.
+        ("{&x k: 1, *x}\n", r#"{"k":1,"k":null}"#),
+        // An alias key resolving to a *complex* (sequence or mapping) node still
+        // stringifies as `""`, which is what it did before this fix and what `yq`
+        // does — the empty key here is the complex-key rule, not the bug.
+        ("{&x [1,2]: 3, *x: 4}\n", r#"{"":3,"":4}"#),
+        ("{a: &x {p: 1}, *x: 2}\n", r#"{"a":{"p":1},"":2}"#),
+    ] {
+        let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(output.trim(), expected, "for {yaml:?}");
+    }
+
+    // An anchor and an alias to it on the *same* node: the alias edge now lands on
+    // the node the anchor names, so this is a cycle by the `target == alias` arm of
+    // `validate_alias_acyclicity` rather than by its ancestor arm. It must stay an
+    // error — resolving it would be unbounded materialization.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", "{&x *x: 1}\n", &["-o=json"])?;
+    assert_eq!(code, 1, "expected clean error exit, stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("cyclic alias 'x'"),
+        "stderr should name the cycle: {stderr}"
+    );
     Ok(())
 }
 

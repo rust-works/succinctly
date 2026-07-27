@@ -1096,7 +1096,7 @@ mod tests {
     /// in scope, and name it.
     ///
     /// #372: a lookup miss used to be dropped, leaving the node with nothing to
-    /// resolve to — it rendered as `null`, or as an empty string in the three
+    /// resolve to — it rendered as `null`, or as an empty string in the four
     /// key positions. Aliases reach the anchor table through three sites
     /// (`parse_alias`, `record_key_alias`, and the document-root dispatch), so
     /// this is table-driven rather than one case per site: a new position that
@@ -1116,6 +1116,11 @@ mod tests {
             ("*nope: v", "nope", "*nope"),
             ("- *nope: v", "nope", "*nope"),
             ("? *nope\n: v", "nope", "*nope"),
+            // The flow-mapping key reached this rejection through
+            // `parse_alias` before #405 routed it through `record_key_alias`
+            // like the other three, so the offset it reports is the helper's
+            // rather than `parse_alias`'s. Both are the `*`, and this pins that.
+            ("{*nope: v}", "nope", "*nope"),
             // A forward reference is a miss like any other: YAML 1.2 §7.1
             // requires an alias to name a *previous* anchor, so the anchor
             // below is not in scope at the alias.

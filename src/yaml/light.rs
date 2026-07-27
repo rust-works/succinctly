@@ -6685,6 +6685,28 @@ mod tests {
             (b"&x k: 1\n*x: 2", r#"{"k":1,"k":2}"#),
             (b"- &x k: 1\n- *x: 2", r#"[{"k":1},{"k":2}]"#),
             (b"k: &x 1\n? *x\n: v", r#"{"k":1,"1":"v"}"#),
+            // Flow-mapping keys (#405), the position #372 left inconsistent
+            // with itself: a miss went through `parse_alias`'s lookup and
+            // errored, while a hit bound the edge to the node `parse_alias`
+            // opened *below* the already-open key, so the key kept no extent of
+            // its own and rendered as `""`. Aliasing an anchored key and an
+            // anchored value are separate targets, hence both.
+            (b"{&x k: 1, *x: 2}", r#"{"k":1,"k":2}"#),
+            (b"{k: &x 1, *x: 2}", r#"{"k":1,"1":2}"#),
+            (b"a: {&x k: 1, *x: 2}", r#"{"a":{"k":1,"k":2}}"#),
+            (b"[{&x k: 1}, {*x: 2}]", r#"[{"k":1},{"k":2}]"#),
+            // Space before the `:`. The key's extent must be exactly `*x`: the
+            // helper returns the byte after the name and skips no whitespace,
+            // so a stray space cannot land inside the alias name the reader
+            // scans back out of the text.
+            (b"{&x k: 1, *x : 2}", r#"{"k":1,"k":2}"#),
+            // Alias key with an implicit null value, which is the one flow
+            // shape where the caller records the key's end and then writes an
+            // empty value node.
+            (b"{&x k: 1, *x}", r#"{"k":1,"k":null}"#),
+            // Two aliases to one anchor: resolution is per-node, so the second
+            // must not depend on the first having consumed the edge.
+            (b"{&x k: 1, *x: 2, *x: 3}", r#"{"k":1,"k":2,"k":3}"#),
         ];
         for (yaml, expected) in cases {
             assert_eq!(
