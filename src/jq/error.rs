@@ -297,6 +297,29 @@ impl EvalError {
         Self::new("Out of bounds negative array index")
     }
 
+    /// `Cannot delete fields from <type>`.
+    ///
+    /// Raised when a delete walks onto something with no fields at all —
+    /// `1 | delpaths([["a"]])`, `{"a":1} | delpaths([["a","b"]])`. `null` is not
+    /// one of these: jq deletes from it as a no-op.
+    pub fn cannot_delete_fields_from(container_type: &str) -> Self {
+        Self::new(format!("Cannot delete fields from {container_type}"))
+    }
+
+    /// `Cannot delete <key type> field of object`.
+    ///
+    /// An object can only be indexed by a string — `{"a":1} | delpaths([[0]])`.
+    pub fn cannot_delete_object_field(key_type: &str) -> Self {
+        Self::new(format!("Cannot delete {key_type} field of object"))
+    }
+
+    /// `Cannot delete <key type> element of array`.
+    ///
+    /// An array can only be indexed by a number — `[1,2] | delpaths([["a"]])`.
+    pub fn cannot_delete_array_element(key_type: &str) -> Self {
+        Self::new(format!("Cannot delete {key_type} element of array"))
+    }
+
     /// `Cannot iterate over <type> (<value>)`.
     pub fn cannot_iterate(value: &OwnedValue) -> Self {
         Self::new(format!("Cannot iterate over {}", describe(value)))
