@@ -12604,26 +12604,6 @@ fn builtin_transpose<W: Clone + AsRef<[u64]>>(
     QueryResult::Owned(OwnedValue::Array(result))
 }
 
-/// Helper to compare OwnedValue for binary search
-fn compare_owned_values(a: &OwnedValue, b: &OwnedValue) -> core::cmp::Ordering {
-    use core::cmp::Ordering;
-    match (a, b) {
-        (OwnedValue::Null, OwnedValue::Null) => Ordering::Equal,
-        (OwnedValue::Bool(x), OwnedValue::Bool(y)) => x.cmp(y),
-        (OwnedValue::Int(x), OwnedValue::Int(y)) => x.cmp(y),
-        (OwnedValue::Float(x), OwnedValue::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-        (OwnedValue::Int(x), OwnedValue::Float(y)) => {
-            (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
-        }
-        (OwnedValue::Float(x), OwnedValue::Int(y)) => {
-            x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
-        }
-        (OwnedValue::String(x), OwnedValue::String(y)) => x.cmp(y),
-        // Different types: fall back to jq's cross-type ordering.
-        _ => sort_rank(a).cmp(&sort_rank(b)),
-    }
-}
-
 /// Builtin: bsearch(x) - binary search for x in sorted array
 fn builtin_bsearch<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     x_expr: &Expr,
@@ -12647,16 +12627,45 @@ fn builtin_bsearch<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Collect array elements
     let elements: Vec<OwnedValue> = elements_iter.map(|v| to_owned(&v)).collect();
 
-    // Binary search
-    match elements.binary_search_by(|probe| compare_owned_values(probe, &x)) {
-        Ok(idx) => QueryResult::Owned(OwnedValue::Int(idx as i64)),
-        Err(idx) => {
-            // jq returns an object with "index" field when not found
-            let mut obj = IndexMap::new();
-            obj.insert("index".to_string(), OwnedValue::Int(idx as i64));
-            QueryResult::Owned(OwnedValue::Object(obj))
+    // jq's search from `builtin.jq`: an inclusive `hi` and a
+    // `floor((lo + hi) / 2)` midpoint, so the probe sequence — and with it which
+    // of several equal elements gets reported — is jq's.
+    //
+    // The absent case reaches jq's answer by a shorter route. `builtin.jq`
+    // re-probes after its loop and returns `-2 - start` or `-1 - start`
+    // depending on that probe; each of its three exit paths reduces to
+    // `-1 - (count of elements below the target)`, and `hi` has settled one
+    // below that count, so `-2 - hi` is the same number without the re-probe.
+    //
+    // `Vec::binary_search_by` is not a substitute. It documents that "any one of
+    // the matches could be returned", and it does in fact land elsewhere than jq
+    // among equal elements: on rustc 1.97.0 `[1,1] | bsearch(1)` is 0 in jq and
+    // 1 there, `[1,1,1]` is 1 in jq and 2 there, `[1,1,1,1]` is 1 in jq and 3
+    // there. Depending on an explicitly unspecified choice would let a std
+    // change silently break oracle parity.
+    //
+    // The two arms jq special-cases before its loop need no special case here:
+    // an empty array leaves `hi` at -1 and yields -1, and a one-element array
+    // reduces to a single probe.
+    let mut lo: i64 = 0;
+    let mut hi: i64 = elements.len() as i64 - 1;
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        // `compare_values` is the one comparator for jq's total order — the same
+        // one `sort` uses, so the two cannot disagree about a pair. The private
+        // copy that used to live here lacked `(Array, Array)` and
+        // `(Object, Object)` arms, so every pair of containers compared Equal
+        // and `bsearch` reported absent values as found (#384).
+        match compare_values(&elements[mid as usize], &x) {
+            core::cmp::Ordering::Equal => return QueryResult::Owned(OwnedValue::Int(mid)),
+            core::cmp::Ordering::Less => lo = mid + 1,
+            core::cmp::Ordering::Greater => hi = mid - 1,
         }
     }
+
+    // Absent: jq returns the negated insertion point, not an object. `hi` has
+    // settled one below the insertion point, so `-2 - hi` is `-1 - insertion`.
+    QueryResult::Owned(OwnedValue::Int(-2 - hi))
 }
 
 // Object functions
@@ -17342,20 +17351,60 @@ mod tests {
         );
     }
 
+    /// Every expectation here is jq-1.7.1's own output for the same input.
+    ///
+    /// The absent cases carry the weight: before #384 they returned
+    /// `{"index": n}` instead of jq's negative insertion point, and the
+    /// container cases returned a *found* index for a value that is not
+    /// present, because `bsearch` used a comparator with no `(Array, Array)`
+    /// or `(Object, Object)` arm.
     #[test]
     fn test_bsearch() {
-        // Found case - returns index
-        query!(br"[1, 2, 3, 4, 5]", "bsearch(3)",
-            QueryResult::Owned(OwnedValue::Int(idx)) => {
-                assert_eq!(idx, 2);
-            }
+        macro_rules! bsearch_is {
+            ($input:expr, $filter:expr, $expected:expr) => {
+                query!($input, $filter,
+                    QueryResult::Owned(OwnedValue::Int(idx)) => {
+                        assert_eq!(idx, $expected, "{} | {}", stringify!($input), $filter);
+                    }
+                );
+            };
+        }
+
+        // Scalars, present and absent.
+        bsearch_is!(br"[1, 2, 3, 4, 5]", "bsearch(3)", 2);
+        bsearch_is!(br"[1, 2, 4, 5]", "bsearch(3)", -3);
+        bsearch_is!(br"[1, 2, 3]", "bsearch(5)", -4);
+        bsearch_is!(br"[1, 3, 5]", "bsearch(2)", -2);
+        bsearch_is!(br#"["a", "b"]"#, r#"bsearch("c")"#, -3);
+
+        // Containers: the comparator must recurse into contents, not stop at
+        // the type rank (which is equal for any two arrays).
+        bsearch_is!(br"[[1], [2], [3]]", "bsearch([2])", 1);
+        bsearch_is!(br"[[1], [2], [3]]", "bsearch([9])", -4);
+        bsearch_is!(br#"[{"a": 1}, {"a": 2}]"#, r#"bsearch({"a": 2})"#, 1);
+        bsearch_is!(br#"[{"a": 1}, {"a": 3}]"#, r#"bsearch({"a": 2})"#, -2);
+
+        // Degenerate lengths jq special-cases before its loop; the uniform
+        // loop must reach the same answers.
+        bsearch_is!(br"[]", "bsearch(1)", -1);
+        bsearch_is!(br"[5]", "bsearch(5)", 0);
+        bsearch_is!(br"[5]", "bsearch(9)", -2);
+        bsearch_is!(br"[5]", "bsearch(1)", -1);
+
+        // Which of several equal elements is chosen is jq's midpoint
+        // convention, not an arbitrary one — see the note in `builtin_bsearch`.
+        bsearch_is!(br"[1, 1]", "bsearch(1)", 0);
+        bsearch_is!(br"[1, 1, 1]", "bsearch(1)", 1);
+        bsearch_is!(br"[1, 1, 1, 1]", "bsearch(1)", 1);
+        bsearch_is!(br"[0, 1, 1, 1, 2]", "bsearch(1)", 2);
+
+        // Cross-type ordering still applies within a mixed sorted array.
+        bsearch_is!(
+            br#"[null, true, 1, "a", [1], {"a": 1}]"#,
+            r#"bsearch("a")"#,
+            3
         );
-        // Not found case - returns object with index
-        query!(br"[1, 2, 4, 5]", "bsearch(3)",
-            QueryResult::Owned(OwnedValue::Object(obj)) => {
-                assert_eq!(obj.get("index"), Some(&OwnedValue::Int(2)));
-            }
-        );
+        bsearch_is!(br#"[null, true, 1, "a", [1], {"a": 1}]"#, "bsearch(2)", -4);
     }
 
     #[test]
