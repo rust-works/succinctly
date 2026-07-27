@@ -947,6 +947,73 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
+    // Anchor at the end of a compact mapping entry's line (#406)
+    // ------------------------------------------------------------------------
+
+    /// Issue #406: the anchor on a compact mapping entry whose value is on the
+    /// next line names that value's collection.
+    ///
+    /// The sibling of `test_anchored_sequence_item_targets_its_collection` for
+    /// the one block-context site that decided where the value was *before*
+    /// consuming the anchor. It targeted an open bit even when it was wrong —
+    /// the open of the collapsed plain scalar — so the corpus invariant above
+    /// could not see this; only the node's *kind* distinguishes the two.
+    #[test]
+    fn test_compact_entry_trailing_anchor_targets_its_collection() {
+        for (yaml, kind_is_seq) in [
+            (&b"- k: &a\n    b: 1\n"[..], false),
+            (&b"- k: &a\n    - 1\n"[..], true),
+            // A block sequence may sit at the entry's own indent.
+            (&b"- k: &a\n  - 1\n"[..], true),
+            (&b"- k: &a\n    [1, 2]\n"[..], true),
+        ] {
+            let index = YamlIndex::build(yaml).expect("must parse");
+            let target = index.get_anchor_bp_pos("a").expect("anchor a recorded");
+            assert!(
+                index.bp.is_open(target),
+                "anchor must target an open bit for {:?}",
+                core::str::from_utf8(yaml).unwrap()
+            );
+            assert!(
+                index.is_container(target),
+                "anchor must target the collection, not a collapsed scalar, for {:?}",
+                core::str::from_utf8(yaml).unwrap()
+            );
+            assert_eq!(
+                index.is_sequence_at_bp(target),
+                kind_is_seq,
+                "anchor must target the collection itself for {:?}",
+                core::str::from_utf8(yaml).unwrap()
+            );
+        }
+    }
+
+    /// The other side of #406: with no value on the following lines the entry
+    /// is null, and the anchor names the explicit empty node the null arms emit
+    /// rather than dangling on a sibling's open or a close bit.
+    #[test]
+    fn test_compact_entry_trailing_anchor_on_null_targets_an_empty_node() {
+        for yaml in [
+            &b"- k: &a\n"[..],
+            &b"- k: &a\n- b\n"[..],
+            &b"- k: &a\n  j: 2\n"[..],
+        ] {
+            let index = YamlIndex::build(yaml).expect("must parse");
+            let target = index.get_anchor_bp_pos("a").expect("anchor a recorded");
+            assert!(
+                index.bp.is_open(target),
+                "anchor must target an open bit for {:?}",
+                core::str::from_utf8(yaml).unwrap()
+            );
+            assert!(
+                !index.is_container(target),
+                "a null entry's anchor must not name a container for {:?}",
+                core::str::from_utf8(yaml).unwrap()
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------------
     // Open-position storage selection (#327)
     // ------------------------------------------------------------------------
 
