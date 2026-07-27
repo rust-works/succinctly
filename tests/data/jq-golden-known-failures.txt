@@ -18,8 +18,8 @@
 # Six mapped to enumerated jq issues; two were surfaced by this capture itself
 # and filed fresh — format_csv (#306) and index_oob_null (#307) — exactly the
 # systematic bug-surfacing #300 anticipated. collect_map_pipe, index_oob_null
-# (#307), format_csv (#306), int_float_eq (#156), try_catch_error (#158) and
-# alt_multi_output (#160) have since been fixed and dropped, leaving 2.
+# (#307), format_csv (#306), int_float_eq (#156), try_catch_error (#158),
+# alt_multi_output (#160) and comma_in_index (#155, via #360) have since been
+# fixed and dropped, leaving 1.
 
 assign_rhs_root    assignment    compound-assign RHS evaluated against the sub-value, not the root — #159
-comma_in_index     parser        comma generator rejected inside index brackets — #155

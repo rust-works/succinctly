@@ -903,6 +903,227 @@ fn test_builtin_first_on_non_array_errors() -> Result<()> {
     Ok(())
 }
 
+/// Run a filter and return its stderr, for cases whose observable behaviour is
+/// the error message rather than stdout.
+///
+/// The jq golden corpus cannot host these: it compares stdout only and requires
+/// exit 0.
+fn jq_stderr(filter: &str, input: &str, extra_args: &[&str]) -> Result<String> {
+    let mut cmd = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+        ])
+        .args(extra_args)
+        .arg(filter)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(input.as_bytes())?;
+    }
+    let output = cmd.wait_with_output()?;
+    Ok(String::from_utf8(output.stderr)?)
+}
+
+/// Indexing by a key whose *kind* cannot index the container reports jq's
+/// wording verbatim (#360).
+///
+/// The messages are transcribed from jq 1.7.1. Note the string form inserts the
+/// key raw rather than JSON-escaped — `--arg k 'a"b'` really does produce
+/// `Cannot index array with string "a"b"` in jq.
+#[test]
+fn test_cannot_index_error_wording() -> Result<()> {
+    let cases: &[(&str, &str, &[&str], &str)] = &[
+        (".[null]", "{}", &[], "Cannot index object with null"),
+        (".[null]", "[]", &[], "Cannot index array with null"),
+        (".[null]", "null", &[], "Cannot index null with null"),
+        (".[true]", "{}", &[], "Cannot index object with boolean"),
+        (".[{}]", "{}", &[], "Cannot index object with object"),
+        (".[[1]]", "{}", &[], "Cannot index object with array"),
+        (
+            ".[$k]",
+            "[1,2]",
+            &["--arg", "k", "a"],
+            r#"Cannot index array with string "a""#,
+        ),
+        (
+            ".[$k]",
+            r#""s""#,
+            &["--arg", "k", "a"],
+            r#"Cannot index string with string "a""#,
+        ),
+        // The same wording must come out of the path/assignment pre-pass, not
+        // just the value path.
+        (".[null] = 1", "{}", &[], "Cannot index object with null"),
+        ("path(.[null])", "{}", &[], "Cannot index object with null"),
+        ("del(.[null])", "{}", &[], "Cannot index object with null"),
+    ];
+
+    for (filter, input, args, expected) in cases {
+        let stderr = jq_stderr(filter, input, args)?;
+        assert!(
+            stderr.contains(expected),
+            "`{filter}` on `{input}` should report {expected:?}, got: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// A *literal* key reports the same thing a computed one does.
+///
+/// The pair in each row is the same query written two ways. They travel
+/// different routes to get there — a constant key folds to
+/// `Expr::Field`/`Expr::Index` at parse time (#360), a computed one stays an
+/// `Expr::IndexExpr` and dispatches on the key's kind at run time — and each
+/// route raises its error from its own site, so nothing but a test holds them to
+/// one wording. A message that changes with the spelling of the key is worse
+/// than either message alone.
+///
+/// Nothing else covers the pairing: the #356 error corpus probes each spelling
+/// against jq independently, which catches a drift from jq but not a drift
+/// between the two spellings if both were to move together.
+#[test]
+fn test_cannot_index_wording_is_spelling_independent() -> Result<()> {
+    // (literal filter, computed filter, extra args, input, expected message)
+    let cases: &[(&str, &str, &[&str], &str, &str)] = &[
+        (
+            ".[0]",
+            ".[$n]",
+            &["--argjson", "n", "0"],
+            r#"{"a":1}"#,
+            "Cannot index object with number",
+        ),
+        (
+            r#".["x"]"#,
+            ".[$k]",
+            &["--arg", "k", "x"],
+            "[1,2]",
+            r#"Cannot index array with string "x""#,
+        ),
+        (
+            ".x",
+            ".[$k]",
+            &["--arg", "k", "x"],
+            "[1,2]",
+            r#"Cannot index array with string "x""#,
+        ),
+        (
+            ".a",
+            ".[$k]",
+            &["--arg", "k", "a"],
+            "123",
+            r#"Cannot index number with string "a""#,
+        ),
+        (
+            ".[0]",
+            ".[$n]",
+            &["--argjson", "n", "0"],
+            r#""s""#,
+            "Cannot index string with number",
+        ),
+    ];
+
+    for (literal, computed, args, input, expected) in cases {
+        for filter in [literal, computed] {
+            let stderr = jq_stderr(filter, input, args)?;
+            assert!(
+                stderr.contains(expected),
+                "`{filter}` on `{input}` should report {expected:?}, got: {stderr}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A NaN key reads as null but must never *write*.
+///
+/// `f64 as i64` maps NaN to `0`, so the natural implementation silently reads —
+/// and, in an assignment, overwrites — element zero. jq yields null on the read
+/// and errors on the write; both halves are checked here because only the read
+/// half is observable in the golden corpus (`index_nan_key`).
+#[test]
+fn test_nan_key_reads_null_and_rejects_writes() -> Result<()> {
+    let (output, _) = run_jq_stdin("[.[nan]]", "[10,20,30]", &["-c"])?;
+    assert_eq!(output.trim(), "[null]");
+
+    for filter in [".[nan] = 5", ".[nan] |= 5", "path(.[nan])", "del(.[nan])"] {
+        let stderr = jq_stderr(filter, "[10,20,30]", &[])?;
+        assert!(
+            stderr.contains("Cannot set array element at NaN index"),
+            "`{filter}` should refuse a NaN index, got: {stderr}"
+        );
+        let (output, _) = run_jq_stdin(filter, "[10,20,30]", &["-c"])?;
+        assert_eq!(
+            output.trim(),
+            "",
+            "`{filter}` must not emit a mutated document"
+        );
+    }
+    Ok(())
+}
+
+/// `?` suppresses a bad-key error rather than propagating it.
+///
+/// Regression guard for the `eval_generic` fallback: routing an unhandled
+/// expression through `full_eval` restarts with `optional = false`, which
+/// silently dropped the `?` here.
+#[test]
+fn test_optional_suppresses_cannot_index() -> Result<()> {
+    let (output, _) = run_jq_stdin(".[null]?", "{}", &["-c"])?;
+    assert_eq!(output.trim(), "");
+    let stderr = jq_stderr(".[null]?", "{}", &[])?;
+    assert!(
+        !stderr.contains("Cannot index"),
+        "`?` should suppress the error, got: {stderr}"
+    );
+    Ok(())
+}
+
+/// `?` covers the indexing, not the key expression.
+///
+/// jq's `.[K]?` is `try (E[K])` only over the index step: `.[error("boom")]?`
+/// still raises `boom`, and walking `..` onto a string with `.[.k]?` still fails
+/// on the key lookup. Passing the enclosing `optional` down into the key's
+/// evaluation made succinctly strictly more forgiving than jq — `[.. | .[.k]?]`
+/// returned `[1]` where jq errors.
+#[test]
+fn test_optional_does_not_suppress_key_errors() -> Result<()> {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "[.. | .[.k]?]",
+            r#"{"k":"a","a":1}"#,
+            r#"Cannot index string with string "k""#,
+        ),
+        (".[error(\"boom\")]?", r#"{"a":1}"#, "boom"),
+    ];
+
+    for (filter, input, expected) in cases {
+        let stderr = jq_stderr(filter, input, &[])?;
+        assert!(
+            stderr.contains(expected),
+            "`{filter}` should propagate the key error {expected:?}, got: {stderr}"
+        );
+    }
+
+    // `try` still catches what `?` declines to swallow, so the error is
+    // recoverable — it is raised, not fatal by construction.
+    let (output, _) = run_jq_stdin(
+        r#"[.. | try .[.k] catch "E"]"#,
+        r#"{"k":"a","a":1}"#,
+        &["-c"],
+    )?;
+    assert_eq!(output.trim(), r#"[1,"E","E"]"#);
+    Ok(())
+}
+
 #[test]
 fn test_contains_type_mismatch_errors() -> Result<()> {
     // jq: `1 | contains("a")` is an error, not `false` (#358). This exercises the

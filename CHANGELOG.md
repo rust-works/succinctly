@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Computed keys in jq index brackets** (#360, closing the index half of
+  #155): `.[e]` accepts any expression, matching jq's `'[' Exp ']'`. `.[$k]`,
+  `.[.k]`, `.[("a","b")]` and `.[1,2]` all work, in value position and in path
+  contexts (`.[$k] = v`, `.[$k] |= f`, `del(.[$k])`, `path(.[$k])`). Previously
+  only a numeric or string literal parsed, so indexing by a variable — ordinary
+  jq — failed to compile with `expected digit`. A key whose *kind* cannot index
+  the container now produces jq's runtime wording from `EvalError::cannot_index`
+  (#356): `Cannot index object with null` and friends, which takes the three
+  `index_*_key_on_object` probes off the error-message divergence manifest.
+  **Breaking**: adds an `Expr::IndexExpr` variant, so exhaustive `match`es on
+  the public `Expr` gain an arm. A constant key still folds to `Expr::Field` /
+  `Expr::Index` at parse time, leaving the existing AST and hot paths unchanged.
+  Not covered: expression-valued slice bounds (`.[$a:$b]` — though both bounds
+  now accept the same *literal* spellings, so `.[(1):3]` and `.[1:(3)]` agree),
+  jq's indices-of-subarray form (`.[[20]]`), a computed key after a multi-output
+  path component (`path(.. | .[.k])`, #412), and — through a pre-existing defect
+  in iterating a computed value, not in the brackets — `keys[] as $k | .[$k]`
+  (#397). See [docs/reference/jq-language.md](docs/reference/jq-language.md).
+  Incidentally, the `[range(0; length; 2) as $i | .[$i]]` workaround that doc
+  has long recommended for step slicing now actually parses.
 - **jq error-message conformance corpus** (#356): a corpus of filter/input probes
   (`tests/data/jq-error-probes.tsv`) whose messages are captured from the pinned
   jq by `scripts/sync-jq-error-messages.sh` and asserted against **both**
@@ -70,6 +90,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface.
 
 ### Fixed
+
+- **jq: a repeated key no longer deletes twice** (#360). `[1,2,3] | del(.[(0,0)])`
+  removed elements 0 and 1, yielding `[3]`; resolved paths are now deduplicated
+  before deletion, as jq's `delpaths` does, giving `[2,3]`.
+
+- **jq: a NaN index no longer reads or writes element 0** (#360). `f64 as i64`
+  maps NaN to `0`, so `[10,20,30] | .[nan]` returned `10` and `.[nan] = 5`
+  silently overwrote the first element. Reads now yield `null` as jq does, and
+  writes (`= v`, `|= f`, `del`, `path`) report `Cannot set array element at NaN
+  index`.
+
+- **jq: `?` no longer suppresses errors raised by a computed key, or by the
+  expression being indexed** (#360). The enclosing optional flag was passed into
+  both halves of `E[K]`, where jq's `gen_index_opt` makes one opcode optional and
+  compiles both halves normally. So `{"k":"a","a":1} | [.. | .[.k]?]` returned
+  `[1]` where jq fails with `Cannot index string with string "k"`, and
+  `"str" | .a[length]?` returned nothing where jq fails with `Cannot index string
+  with string "a"` — the latter making `?` mean two different things depending on
+  whether the key folded to a constant, since `"str" | .a[0]?` raised all along.
+  `?` now covers the indexing only, matching jq; `try`/`catch` still catches the
+  error.
 
 - **YAML flow context silently absorbed tags as scalar text** (#369): block
   context has always rejected `!` via `check_unsupported`, but the flow-context

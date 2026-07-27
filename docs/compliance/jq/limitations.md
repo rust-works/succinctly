@@ -31,9 +31,9 @@ Measured against jq-1.7.1 over the 126 probes in
 
 | Dimension                                    | Result              | Meaning                                            |
 |----------------------------------------------|---------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **121/126 = 96.0%** | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **124/126 = 98.4%** | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**               | Every probe that errors in both errors identically |
-| **Behaviour / parser gaps**                  | **5**               | succinctly does not raise the error at all         |
+| **Behaviour / parser gaps**                  | **2**               | succinctly does not raise the error at all         |
 
 These three numbers are asserted, not maintained by hand: `jq_error_message_tests.rs`
 parses them back out of this page and fails if they drift from the corpus (they went stale
@@ -204,7 +204,12 @@ there is nothing to word. Each has its own issue and is listed in
 | Probe(s)                                                          | Divergence                                                       | Issue |
 |-------------------------------------------------------------------|------------------------------------------------------------------|-------|
 | `slice_assign_non_array`, `slice_indices_not_integers`            | A slice is not a path component, so `setpath` leaves the value alone | [#366](https://github.com/rust-works/succinctly/issues/366) |
-| `index_null_key_on_object`, `index_bool_key_on_object`, `index_object_key_on_object` | `.[null]`, `.[true]`, `.[{}]` are rejected by the parser | [#360](https://github.com/rust-works/succinctly/issues/360) |
+
+`index_null_key_on_object`, `index_bool_key_on_object` and `index_object_key_on_object`
+were on this list too, as parser gaps: `.[null]`, `.[true]` and `.[{}]` did not parse, so
+no runtime error was reached. [#360](https://github.com/rust-works/succinctly/issues/360)
+made index brackets take an arbitrary expression, and all three now raise jq's
+`Cannot index object with <type>`.
 
 `setpath_on_number` was on this list too. [#359](https://github.com/rust-works/succinctly/issues/359)
 fixed it: `setpath` now auto-vivifies only `null`, as jq does, and refuses to index

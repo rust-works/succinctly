@@ -384,6 +384,12 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             body: Box::new(rewrite_namespaced_calls(*body)),
         },
         Expr::Break(name) => Expr::Break(name),
+        // Both halves hold sub-expressions, so a namespaced call can appear in
+        // either — `.[ns::f]` as much as `(ns::f)[0]`.
+        Expr::IndexExpr { target, key } => Expr::IndexExpr {
+            target: Box::new(rewrite_namespaced_calls(*target)),
+            key: Box::new(rewrite_namespaced_calls(*key)),
+        },
         // Expressions that don't contain sub-expressions - return as-is
         Expr::Identity
         | Expr::Field(_)
