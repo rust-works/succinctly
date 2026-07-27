@@ -38,6 +38,6 @@ These plans are kept for:
 When implementing similar features:
 1. Review relevant plan for design patterns
 2. Note any lessons learned sections
-3. Check archive for rejected approaches
+3. Check Archived Plans for superseded analyses and rejected approaches
 
 If the codebase diverges from a plan, the plan should be updated or archived.
