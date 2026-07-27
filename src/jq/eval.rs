@@ -6822,6 +6822,35 @@ fn resolve_node<S: EvalSemantics>(
 ///
 /// The threading is the whole point: a computed key sees the value reaching
 /// *its* position, which is the document root only when it sits at the top of
+/// Thread a value through a run of static path components, without expanding
+/// them.
+///
+/// The components stay verbatim in the resolved path; only the value carried
+/// alongside them is computed. That value is what a computed key further along
+/// the chain is checked against, so skipping the walk does not produce a wrong
+/// *path* — components come from the key, never from the container — but it
+/// does produce a spurious `Cannot index <wrong type> with <key>`. `.a.b[.k]`
+/// with a numeric `.k` looked the key up in the document root, an object, and
+/// failed where jq assigns.
+///
+/// A component with no single output stops the walk at null: null accepts every
+/// key kind that can index anything at all, so a later key still resolves
+/// instead of erroring against a container it never actually saw.
+fn value_after_components<S: EvalSemantics>(
+    components: &[Expr],
+    value: &OwnedValue,
+) -> Result<OwnedValue, EvalError> {
+    let mut current = value.clone();
+    for component in components {
+        let mut values = eval_owned_multi::<S>(component, &current)?;
+        match values.len() {
+            1 => current = values.pop().expect("len checked"),
+            _ => return Ok(OwnedValue::Null),
+        }
+    }
+    Ok(current)
+}
+
 /// the path. `path(.x | .a[.k])` resolves `.k` against `.x`, giving
 /// `["x","a","a"]`.
 fn resolve_seq<S: EvalSemantics>(
@@ -6833,10 +6862,13 @@ fn resolve_seq<S: EvalSemantics>(
         push_path_components(&mut flat, e);
     }
 
-    // Everything after the last computed key is copied verbatim — no need to
-    // evaluate prefixes past the point where the answer stops depending on them.
+    // Everything after the last computed key keeps its components verbatim —
+    // resolving them would expand `.[]` into one path per element for no gain.
+    // The *value* still has to be threaded through them, because an enclosing
+    // `IndexExpr` indexes it: in `.a[.k].b[.j]`, `.j` applies to `.a[.k].b`.
     let Some(last_dynamic) = flat.iter().rposition(contains_dynamic_index) else {
-        return Ok(vec![(flat, value.clone())]);
+        let end = value_after_components::<S>(&flat, value)?;
+        return Ok(vec![(flat, end)]);
     };
 
     let mut branches: Vec<PathBranch> = vec![(Vec::new(), value.clone())];
@@ -6853,7 +6885,9 @@ fn resolve_seq<S: EvalSemantics>(
     }
 
     let tail = &flat[last_dynamic + 1..];
-    for (prefix, _) in &mut branches {
+    for (prefix, current) in &mut branches {
+        let end = value_after_components::<S>(tail, current)?;
+        *current = end;
         prefix.extend_from_slice(tail);
     }
     Ok(branches)

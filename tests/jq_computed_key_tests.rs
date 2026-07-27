@@ -419,6 +419,63 @@ fn test_path_expression_shapes_around_a_computed_key() {
     );
 }
 
+/// A computed key is checked against the container it will actually index, not
+/// against the value the chain started from.
+///
+/// The resolver keeps the static components of a path verbatim and threads a
+/// value alongside them; when it skipped that threading, `.a.b[.k]` checked a
+/// numeric key against the document *root* — an object — and reported `Cannot
+/// index object with number` for a filter jq assigns without complaint.
+///
+/// A string key hides this: looking one up in the wrong object yields null
+/// rather than an error, so every case here uses a numeric key into an array,
+/// which is the combination that fails loudly.
+#[test]
+fn test_computed_key_sees_the_container_it_indexes() {
+    // One static component ahead of the key, in each path context.
+    let doc = r#"{"a":{"b":[10,20]},"k":1}"#;
+    check(
+        doc,
+        ".a.b[.k] = 99",
+        Outcome::values(&[r#"{"a":{"b":[10,99]},"k":1}"#]),
+    );
+    check(
+        doc,
+        ".a.b[.k] |= .+1",
+        Outcome::values(&[r#"{"a":{"b":[10,21]},"k":1}"#]),
+    );
+    check(
+        doc,
+        "del(.a.b[.k])",
+        Outcome::values(&[r#"{"a":{"b":[10]},"k":1}"#]),
+    );
+    check(
+        doc,
+        "[path(.a.b[.k])]",
+        Outcome::values(&[r#"[["a","b",1]]"#]),
+    );
+
+    // The components *after* the last computed key are kept verbatim rather
+    // than resolved, so they are the second place the value has to be threaded:
+    // here `.j` applies to `.a[.k].b`, not to `.a[.k]`.
+    check(
+        r#"{"a":{"x":{"b":[10,20]}},"k":"x","j":1}"#,
+        ".a[.k].b[.j] = 99",
+        Outcome::values(&[r#"{"a":{"x":{"b":[10,99]}},"k":"x","j":1}"#]),
+    );
+
+    // A decoy at the root under the same name the key resolves to. If the
+    // container is taken from the root, the second key indexes the string
+    // "decoy" and errors; the plain version above passes either way, because
+    // looking "x" up in a root that lacks it yields null, which accepts any
+    // key kind.
+    check(
+        r#"{"a":{"b":{"x":[10,20]}},"x":"decoy","k":"x","j":1}"#,
+        ".a.b[.k][.j] = 99",
+        Outcome::values(&[r#"{"a":{"b":{"x":[10,99]}},"x":"decoy","k":"x","j":1}"#]),
+    );
+}
+
 #[test]
 fn test_unsupported_path_prefixes_report_rather_than_misfire() {
     // Iterating a scalar. jq says `Cannot iterate over number (1)`; the wording
