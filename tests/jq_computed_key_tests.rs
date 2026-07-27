@@ -212,6 +212,12 @@ fn test_empty_key_stream_short_circuits() {
     check("null", r#"(error("boom"))[empty]"#, Outcome::values(&[]));
     // A key expression that iterates an empty array is empty the same way.
     check(r#"{"ks":[]}"#, ".[.ks[]]", Outcome::values(&[]));
+    // "Empty" has two spellings inside the evaluators — a `None` result and a
+    // present-but-zero-length one — and only the second reaches the explicit
+    // length check. An inner computed index that prunes every key produces the
+    // second: `1` is indexable by neither `"p"` nor `"q"`, so `?` prunes both
+    // and hands the outer bracket a stream that exists and is empty.
+    check(r#"{"x":1}"#, r#".[.x[("p","q")]?]"#, Outcome::values(&[]));
 }
 
 #[test]
@@ -461,6 +467,50 @@ fn test_path_expression_shapes_around_a_computed_key() {
         r#"{"a":1}"#,
         r#"(empty | .[("x","y")]) = 9"#,
         Outcome::values(&[r#"{"a":1}"#]),
+    );
+}
+
+/// Components *after* the last computed key stay verbatim, including ones that
+/// fan out.
+///
+/// The resolver stops expanding once no computed key remains to its right, so
+/// `.[.k].b[]` resolves `.k` and then copies `.b` and `[]` through untouched —
+/// one path with an `Iterate` in it, not one path per element. It still has to
+/// thread a *value* through that tail, in case an enclosing key indexes it, and
+/// a fanning-out component has no single value to thread: the walk stops at
+/// null there rather than picking an arbitrary element.
+///
+/// Both directions matter. `[]` over two elements is the many-valued case; `[]`
+/// over an empty array is the no-valued one, and reaches the same stop.
+#[test]
+fn test_components_after_the_last_computed_key_may_fan_out() {
+    check(
+        r#"{"k":"a","a":{"b":[1,2]}}"#,
+        ".[.k].b[] = 9",
+        Outcome::values(&[r#"{"k":"a","a":{"b":[9,9]}}"#]),
+    );
+    check(
+        r#"{"k":"a","a":{"b":[1,2]}}"#,
+        ".[.k].b[] |= .*10",
+        Outcome::values(&[r#"{"k":"a","a":{"b":[10,20]}}"#]),
+    );
+    check(
+        r#"{"k":"a","a":{"b":[1,2]}}"#,
+        "del(.[.k].b[])",
+        Outcome::values(&[r#"{"k":"a","a":{"b":[]}}"#]),
+    );
+    // One `Iterate` component, expanded by the tracker rather than the
+    // resolver — which is why it is still two paths.
+    check(
+        r#"{"k":"a","a":{"b":[1,2]}}"#,
+        "[path(.[.k].b[])]",
+        Outcome::values(&[r#"[["a","b",0],["a","b",1]]"#]),
+    );
+    // Nothing to iterate: same stop, no write, no error.
+    check(
+        r#"{"k":"a","a":{"b":[]}}"#,
+        ".[.k].b[] = 9",
+        Outcome::values(&[r#"{"k":"a","a":{"b":[]}}"#]),
     );
 }
 
