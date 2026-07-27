@@ -74,6 +74,36 @@ impl core::fmt::Display for ParseError {
     }
 }
 
+/// The contents of an index bracket, before a target is attached.
+///
+/// A constant key (`[0]`, `["k"]`, `[1:3]`, `[]`) is a complete chain element on
+/// its own. A computed key is not: `E[K]` evaluates `K` against the input to the
+/// *whole* postfix chain, so it needs `E` as an explicit target rather than a
+/// preceding position in a flat [`Expr::Pipe`]. Only the caller knows the chain,
+/// hence this two-state return. See [`Expr::IndexExpr`].
+enum Bracket {
+    /// `[]`, `["k"]`, `[0]`, `[1:3]` — carries any `?` wrapper itself.
+    Static(Expr),
+    /// `[expr]` with a computed key; the caller supplies the target.
+    Dynamic { key: Expr, optional: bool },
+}
+
+/// Attach a parsed bracket to the postfix chain built so far.
+///
+/// A dynamic key captures the chain as its `target`, because the key is
+/// evaluated against the chain's *input* — `.a[.k]` reads `.k` from the chain
+/// input, not from `.a`.
+fn push_bracket(chain: &mut Vec<Expr>, bracket: Bracket) {
+    match bracket {
+        Bracket::Static(expr) => chain.push(expr),
+        Bracket::Dynamic { key, optional } => {
+            let target = Expr::pipe(core::mem::take(chain));
+            let node = Expr::index_by(target, key);
+            chain.push(if optional { node.optional() } else { node });
+        }
+    }
+}
+
 /// Parser state.
 struct Parser<'a> {
     input: &'a str,
@@ -590,24 +620,22 @@ impl<'a> Parser<'a> {
         Ok(result)
     }
 
-    /// Parse a bracket expression: `[0]`, `[]`, `[1:3]`, `["key"]`, etc.
+    /// Parse a bracket expression: `[0]`, `[]`, `[1:3]`, `["key"]`, `[$k]`, etc.
     /// This is for indexing, NOT array construction.
-    fn parse_index_bracket(&mut self) -> Result<Expr, ParseError> {
+    ///
+    /// Bracket contents parse at comma precedence, matching jq's `'[' Exp ']'`,
+    /// so `.[1,2]` is a two-output generator. A key that folds to a constant
+    /// becomes [`Expr::Field`] or [`Expr::Index`] (see [`Self::fold_index_key`])
+    /// and stays a self-contained chain element; anything else is returned as
+    /// [`Bracket::Dynamic`] for the caller to attach a target to.
+    fn parse_index_bracket(&mut self) -> Result<Bracket, ParseError> {
         self.expect('[')?;
         self.skip_ws();
 
         // Empty brackets = iterate
         if self.peek() == Some(']') {
             self.next();
-            return Ok(Expr::Iterate);
-        }
-
-        // Check for string key: `["key"]`
-        if self.peek() == Some('"') {
-            let key = self.parse_string_literal()?;
-            self.skip_ws();
-            self.expect(']')?;
-            return Ok(Expr::Field(key));
+            return Ok(Bracket::Static(Expr::Iterate));
         }
 
         // Check for slice starting with ':'
@@ -618,53 +646,65 @@ impl<'a> Parser<'a> {
             if self.peek() == Some(']') {
                 // `[:]` - full slice, returns the whole array as a single value
                 self.next();
-                return Ok(Expr::Slice {
+                return Ok(Bracket::Static(Expr::Slice {
                     start: None,
                     end: None,
-                });
+                }));
             }
 
             // `[:n]` - slice from start to n
             let end = self.parse_integer()?;
             self.skip_ws();
             self.expect(']')?;
-            return Ok(Expr::Slice {
+            return Ok(Bracket::Static(Expr::Slice {
                 start: None,
                 end: Some(end),
-            });
+            }));
         }
 
-        // Parse first number
-        let first = self.parse_integer()?;
+        // Parse the bracket contents as a full expression. `:` can never be
+        // consumed by an expression here — object construction needs `{`, and a
+        // namespaced call needs `::` — so it reliably marks a slice.
+        let key_start = self.pos;
+        let key = self.parse_comma_expr()?;
         self.skip_ws();
 
         match self.peek() {
             Some(']') => {
-                // `[n]` - simple index
                 self.next();
-                Ok(Expr::Index(first))
+                Ok(match Self::fold_index_key(&key) {
+                    Some(folded) => Bracket::Static(folded),
+                    None => Bracket::Dynamic {
+                        key,
+                        optional: false,
+                    },
+                })
             }
             Some(':') => {
-                // `[n:]` or `[n:m]` - slice
+                // `[n:]` or `[n:m]` - slice. Bounds stay integer literals;
+                // expression-valued bounds (`.[$a:$b]`) are not supported yet.
+                let first = Self::fold_int_literal(&key).ok_or_else(|| {
+                    ParseError::new("slice bounds must be integer literals", key_start)
+                })?;
                 self.next();
                 self.skip_ws();
 
                 if self.peek() == Some(']') {
                     // `[n:]` - slice from n to end
                     self.next();
-                    Ok(Expr::Slice {
+                    Ok(Bracket::Static(Expr::Slice {
                         start: Some(first),
                         end: None,
-                    })
+                    }))
                 } else {
                     // `[n:m]` - slice from n to m
                     let second = self.parse_integer()?;
                     self.skip_ws();
                     self.expect(']')?;
-                    Ok(Expr::Slice {
+                    Ok(Bracket::Static(Expr::Slice {
                         start: Some(first),
                         end: Some(second),
-                    })
+                    }))
                 }
             }
             Some(c) => Err(ParseError::new(
@@ -678,15 +718,52 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Fold a constant bracket key into the static chain element it denotes.
+    ///
+    /// This is what keeps `.foo.bar[0]` on exactly the AST it has always had:
+    /// only a genuinely computed key becomes an [`Expr::IndexExpr`]. `null`,
+    /// `true` and `{}` deliberately do *not* fold — they must reach the
+    /// evaluator so the error is jq's runtime `Cannot index …`, not a parse
+    /// error (issue #360).
+    fn fold_index_key(key: &Expr) -> Option<Expr> {
+        match key {
+            Expr::Paren(inner) => Self::fold_index_key(inner),
+            Expr::Literal(Literal::String(s)) => Some(Expr::Field(s.clone())),
+            Expr::Literal(Literal::Int(i)) => Some(Expr::Index(*i)),
+            // `.[1.0]` is an integer index; `.[1.7]` is not, and must go through
+            // the evaluator to truncate the way jq does.
+            Expr::Literal(Literal::Float(f))
+                if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 =>
+            {
+                Some(Expr::Index(*f as i64))
+            }
+            _ => None,
+        }
+    }
+
+    /// Fold a slice bound to an integer literal, seeing through parens.
+    fn fold_int_literal(key: &Expr) -> Option<i64> {
+        match Self::fold_index_key(key) {
+            Some(Expr::Index(i)) => Some(i),
+            _ => None,
+        }
+    }
+
     /// Parse an index bracket and check for optional marker.
-    fn parse_index_bracket_with_optional(&mut self) -> Result<Expr, ParseError> {
-        let expr = self.parse_index_bracket()?;
+    fn parse_index_bracket_with_optional(&mut self) -> Result<Bracket, ParseError> {
+        let bracket = self.parse_index_bracket()?;
         self.skip_ws();
         if self.peek() == Some('?') {
             self.next();
-            Ok(Expr::Optional(expr.into()))
+            Ok(match bracket {
+                Bracket::Static(expr) => Bracket::Static(Expr::Optional(expr.into())),
+                Bracket::Dynamic { key, .. } => Bracket::Dynamic {
+                    key,
+                    optional: true,
+                },
+            })
         } else {
-            Ok(expr)
+            Ok(bracket)
         }
     }
 
@@ -861,9 +938,18 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::RecursiveDescent);
                 }
 
-                // Check for `.[...]` (index/iterate)
+                // Check for `.[...]` (index/iterate). A leading bracket indexes
+                // the identity, so a dynamic key gets `.` as its target.
                 if self.peek() == Some('[') {
-                    let first = self.parse_index_bracket_with_optional()?;
+                    let bracket = self.parse_index_bracket_with_optional()?;
+                    let mut chain = vec![Expr::Identity];
+                    push_bracket(&mut chain, bracket);
+                    let first = match chain.len() {
+                        // A static bracket leaves `[Identity, elem]`; the
+                        // Identity is redundant as a chain head.
+                        2 => chain.pop().unwrap(),
+                        _ => Expr::pipe(chain),
+                    };
                     return self.parse_postfix(first);
                 }
 
@@ -3108,7 +3194,8 @@ impl<'a> Parser<'a> {
 
                     // Check for bracket after dot
                     if self.peek() == Some('[') {
-                        chain.push(self.parse_index_bracket_with_optional()?);
+                        let bracket = self.parse_index_bracket_with_optional()?;
+                        push_bracket(&mut chain, bracket);
                     } else if self.peek() == Some('"') {
                         // Quoted field access `."key"`
                         let name = self.parse_string_literal()?;
@@ -3138,7 +3225,8 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Some('[') => {
-                    chain.push(self.parse_index_bracket_with_optional()?);
+                    let bracket = self.parse_index_bracket_with_optional()?;
+                    push_bracket(&mut chain, bracket);
                 }
                 _ => break,
             }
@@ -4256,7 +4344,8 @@ mod tests {
         assert!(parse("").is_err());
         // Note: "foo" now parses as FuncCall{name:"foo", args:[]} - valid syntax for user functions
         assert!(parse(".[").is_err()); // unclosed bracket
-        assert!(parse(".[abc]").is_err()); // invalid index
+        assert!(parse(".[1 2]").is_err()); // missing ']' after the key
+        assert!(parse(".[$a:$b]").is_err()); // slice bounds must be integer literals
         assert!(parse(".123").is_err()); // field starting with number
         assert!(parse("{").is_err()); // unclosed brace
         assert!(parse("[").is_err()); // unclosed bracket
@@ -4641,6 +4730,88 @@ mod tests {
                 Expr::Field("my-key".into()),
                 Expr::Field("bar".into()),
             ])
+        );
+    }
+
+    /// A constant key must still fold to the static chain element it always
+    /// produced, so the hot `.foo.bar[0]` path and every `Field`/`Index` match
+    /// site are untouched by #360.
+    #[test]
+    fn test_index_key_constant_folding() {
+        assert_eq!(parse(".[0]").unwrap(), Expr::Index(0));
+        assert_eq!(parse(".[-1]").unwrap(), Expr::Index(-1));
+        assert_eq!(parse(".[1.0]").unwrap(), Expr::Index(1));
+        assert_eq!(parse(".[\"a\"]").unwrap(), Expr::Field("a".into()));
+        // Parenthesised constants fold too — `.[("a")]` is `.a`.
+        assert_eq!(parse(".[(\"a\")]").unwrap(), Expr::Field("a".into()));
+        assert_eq!(parse(".[ \"a\" ]").unwrap(), Expr::Field("a".into()));
+
+        // A fractional index cannot be a static component (jq truncates it at
+        // evaluation), so it stays dynamic.
+        assert!(matches!(parse(".[1.7]").unwrap(), Expr::IndexExpr { .. }));
+        // `null`/`true`/`{}` must reach the evaluator to produce jq's runtime
+        // `Cannot index …`, so they must not fold into a parse error.
+        for src in [".[null]", ".[true]", ".[{}]"] {
+            assert!(
+                matches!(parse(src).unwrap(), Expr::IndexExpr { .. }),
+                "{src} should parse as a computed index"
+            );
+        }
+    }
+
+    /// The nesting shape is what encodes jq's key scoping: every key in a
+    /// postfix chain is evaluated against the chain's input, which a flat
+    /// `Pipe` cannot express (it is also what an explicit `|` lowers to).
+    #[test]
+    fn test_dynamic_index_shapes() {
+        assert_eq!(
+            parse(".[$k]").unwrap(),
+            Expr::index_by(Expr::Identity, Expr::Var("k".into()))
+        );
+
+        // `.a[.k]`: the key hangs off the node, not off `.a`.
+        assert_eq!(
+            parse(".a[.k]").unwrap(),
+            Expr::index_by(Expr::Field("a".into()), Expr::Field("k".into()))
+        );
+
+        // `.[.k][.k]` nests, so both keys see the same input.
+        assert_eq!(
+            parse(".[.k][.k]").unwrap(),
+            Expr::index_by(
+                Expr::index_by(Expr::Identity, Expr::Field("k".into())),
+                Expr::Field("k".into())
+            )
+        );
+
+        // `.a[.k].b[.j]`: the second target is the whole chain so far.
+        assert_eq!(
+            parse(".a[.k].b[.j]").unwrap(),
+            Expr::index_by(
+                Expr::Pipe(vec![
+                    Expr::index_by(Expr::Field("a".into()), Expr::Field("k".into())),
+                    Expr::Field("b".into()),
+                ]),
+                Expr::Field("j".into())
+            )
+        );
+
+        // Bracket contents parse at comma precedence (#155).
+        assert_eq!(
+            parse(".[1,2]").unwrap(),
+            Expr::index_by(
+                Expr::Identity,
+                Expr::Comma(vec![
+                    Expr::Literal(Literal::Int(1)),
+                    Expr::Literal(Literal::Int(2)),
+                ])
+            )
+        );
+
+        // `?` wraps the whole node, not the key.
+        assert_eq!(
+            parse(".[$k]?").unwrap(),
+            Expr::index_by(Expr::Identity, Expr::Var("k".into())).optional()
         );
     }
 

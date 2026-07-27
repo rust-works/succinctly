@@ -13,6 +13,7 @@
 //! | `.[-1]` | Access last element of an array |
 //! | `.[]` | Iterate all elements of array/object |
 //! | `.[2:5]` | Slice array from index 2 to 5 |
+//! | `.[$k]`, `.[.k]`, `.[1,2]` | Index by a computed key (string key selects a field, number an element) |
 //! | `.foo.bar` | Chained field access |
 //! | `.foo[0].bar` | Mixed field and index access |
 //! | `.foo?` | Optional access (null if missing) |

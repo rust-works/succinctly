@@ -1115,6 +1115,8 @@ fn contains_split_doc(expr: &Expr) -> bool {
             _ => false,
         },
         // Terminal expressions that cannot contain split_doc
+        // Both halves hold sub-expressions, so `split_doc` can hide in either.
+        Expr::IndexExpr { target, key } => contains_split_doc(target) || contains_split_doc(key),
         Expr::Identity
         | Expr::Field(_)
         | Expr::Index(_)

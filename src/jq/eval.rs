@@ -287,6 +287,7 @@ fn needs_path_context(expr: &Expr) -> bool {
         Expr::Paren(inner) => needs_path_context(inner),
         Expr::Optional(inner) => needs_path_context(inner),
         Expr::Comma(exprs) => exprs.iter().any(needs_path_context),
+        Expr::IndexExpr { target, key } => needs_path_context(target) || needs_path_context(key),
         Expr::If {
             cond,
             then_branch,
@@ -312,32 +313,11 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match expr {
         Expr::Identity => QueryResult::One(value),
 
-        Expr::Field(name) => match value {
-            StandardJson::Object(fields) => match find_field::<W>(fields, name) {
-                Some(v) => QueryResult::One(v),
-                // jq returns null for missing fields on objects (not an error)
-                None => QueryResult::One(StandardJson::Null),
-            },
-            // jq returns null for field access on null
-            StandardJson::Null => QueryResult::One(StandardJson::Null),
-            _ if optional => QueryResult::None,
-            _ => QueryResult::Error(EvalError::cannot_index_with_field(type_name(&value), name)),
-        },
+        Expr::Field(name) => index_object_by_name::<W>(value, name, optional),
 
-        Expr::Index(idx) => match value {
-            StandardJson::Array(elements) => match get_element_at_index::<W>(elements, *idx) {
-                Some(v) => QueryResult::One(v),
-                // jq returns null for out-of-bounds array access (not an error)
-                None => QueryResult::One(StandardJson::Null),
-            },
-            // jq returns null for index on null
-            StandardJson::Null => QueryResult::One(StandardJson::Null),
-            _ if optional => QueryResult::None,
-            _ => QueryResult::Error(EvalError::cannot_index_with_type(
-                type_name(&value),
-                "number",
-            )),
-        },
+        Expr::Index(idx) => index_array_by_position::<W>(value, *idx, optional),
+
+        Expr::IndexExpr { target, key } => eval_index_expr::<W, S>(target, key, value, optional),
 
         Expr::Slice { start, end } => match value {
             StandardJson::Array(elements) => {
@@ -5860,6 +5840,221 @@ fn find_field<'a, W: Clone + AsRef<[u64]>>(
     fields.find(name)
 }
 
+/// Look a string key up in an object — the shared body of `.foo`, `.["foo"]`
+/// and the string-key case of `.[$k]`.
+///
+/// Shared so a computed key cannot drift from a literal one; in particular the
+/// null-input passthrough below is reached *only* for a valid key kind, which is
+/// what makes `null | .["a"]` yield `null` while `null | .[null]` errors.
+#[inline]
+fn index_object_by_name<'a, W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'a, W>,
+    name: &str,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
+        StandardJson::Object(fields) => match find_field::<W>(fields, name) {
+            Some(v) => QueryResult::One(v),
+            // jq returns null for missing fields on objects (not an error)
+            None => QueryResult::One(StandardJson::Null),
+        },
+        // jq returns null for field access on null
+        StandardJson::Null => QueryResult::One(StandardJson::Null),
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::cannot_index_with_field(type_name(&value), name)),
+    }
+}
+
+/// Index an array by position — the shared body of `.[0]` and the numeric-key
+/// case of `.[$k]`. See [`index_object_by_name`] for why this is shared.
+#[inline]
+fn index_array_by_position<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
+    idx: i64,
+    optional: bool,
+) -> QueryResult<'_, W> {
+    match value {
+        StandardJson::Array(elements) => match get_element_at_index::<W>(elements, idx) {
+            Some(v) => QueryResult::One(v),
+            // jq returns null for out-of-bounds array access (not an error)
+            None => QueryResult::One(StandardJson::Null),
+        },
+        // jq returns null for index on null
+        StandardJson::Null => QueryResult::One(StandardJson::Null),
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::cannot_index_with_type(
+            type_name(&value),
+            "number",
+        )),
+    }
+}
+
+/// Truncate a numeric key to an array index the way jq does.
+///
+/// Truncation is toward zero, not floor: measured against jq 1.7.1, `.[-1.5]`
+/// on `[10,20,30]` is `30` (index -1), not `20`. Out-of-range floats saturate
+/// via `as`, so `.[1e100]` reads as a huge index and yields `null` rather than
+/// wrapping or panicking.
+pub(crate) fn numeric_key_to_index(key: &OwnedValue) -> Option<i64> {
+    match key {
+        OwnedValue::Int(i) => Some(*i),
+        OwnedValue::Float(f) => Some(f.trunc() as i64),
+        _ => None,
+    }
+}
+
+/// Apply one resolved key to one target value.
+///
+/// The key kind is dispatched *before* the container is inspected, so the error
+/// is jq's `Cannot index <container> with <key>` rather than the generic
+/// `expected object, got …` that the static arms produce.
+fn index_one<'a, W: Clone + AsRef<[u64]>>(
+    target: StandardJson<'a, W>,
+    key: &OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let indexable_by_string = matches!(target, StandardJson::Object(_) | StandardJson::Null);
+    let indexable_by_number = matches!(target, StandardJson::Array(_) | StandardJson::Null);
+
+    match key {
+        OwnedValue::String(s) if indexable_by_string => {
+            index_object_by_name::<W>(target, s, optional)
+        }
+        OwnedValue::Int(_) | OwnedValue::Float(_) if indexable_by_number => {
+            let idx = numeric_key_to_index(key).expect("key is Int or Float");
+            index_array_by_position::<W>(target, idx, optional)
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::cannot_index(type_name(&target), key)),
+    }
+}
+
+/// [`index_one`] for a target that is already an owned value, as when the
+/// indexed expression computed rather than navigated (`(.a|tostring)[$k]`).
+///
+/// Mirrors the borrowed path's rules exactly: missing key and out-of-bounds
+/// index both yield null, null input passes through for a valid key kind, and
+/// an invalid key kind errors even on null.
+pub(crate) fn index_one_owned(
+    target: &OwnedValue,
+    key: &OwnedValue,
+    optional: bool,
+) -> Result<Option<OwnedValue>, EvalError> {
+    match (key, target) {
+        (OwnedValue::String(s), OwnedValue::Object(map)) => {
+            Ok(Some(map.get(s).cloned().unwrap_or(OwnedValue::Null)))
+        }
+        (OwnedValue::String(_), OwnedValue::Null) => Ok(Some(OwnedValue::Null)),
+        (OwnedValue::Int(_) | OwnedValue::Float(_), OwnedValue::Array(items)) => {
+            let idx = numeric_key_to_index(key).expect("key is Int or Float");
+            let resolved = if idx < 0 {
+                items.len() as i64 + idx
+            } else {
+                idx
+            };
+            let element = usize::try_from(resolved)
+                .ok()
+                .and_then(|i| items.get(i))
+                .cloned()
+                .unwrap_or(OwnedValue::Null);
+            Ok(Some(element))
+        }
+        (OwnedValue::Int(_) | OwnedValue::Float(_), OwnedValue::Null) => Ok(Some(OwnedValue::Null)),
+        _ if optional => Ok(None),
+        _ => Err(EvalError::cannot_index(owned_type_name(target), key)),
+    }
+}
+
+/// Evaluate `E[K]` — indexing by a computed key.
+///
+/// jq compiles this as `K as $k | E | .[$k]`, and three consequences of that
+/// desugaring are load-bearing (each measured against jq 1.7.1):
+///
+/// 1. `K` is evaluated against *this node's* input, not against `E`'s output —
+///    which is why [`Expr::IndexExpr`] carries its own target instead of being
+///    a flat chain element.
+/// 2. The key stream is outer and the target stream inner:
+///    `[({"a":1,"b":2},{"a":3,"b":4})[("a","b")]]` is `[1,3,2,4]`.
+/// 3. An empty key stream short-circuits *before* `E` runs:
+///    `[(error("boom"))[empty]]` is `[]`, not an error.
+fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    target: &Expr,
+    key: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // (3) Keys first: an empty key stream must not evaluate the target.
+    let keys = match eval_single::<W, S>(key, value.clone(), optional).materialize_cursor() {
+        QueryResult::One(v) => vec![to_owned(&v)],
+        QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
+        QueryResult::Owned(v) => vec![v],
+        QueryResult::ManyOwned(vs) => vs,
+        QueryResult::None => return QueryResult::None,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
+    };
+    if keys.is_empty() {
+        return QueryResult::None;
+    }
+
+    let targets = eval_single::<W, S>(target, value, optional).materialize_cursor();
+
+    // Borrowed and owned targets are kept apart so the common (borrowed) case
+    // never materializes the document.
+    enum Targets<'a, W> {
+        Borrowed(Vec<StandardJson<'a, W>>),
+        Owned(Vec<OwnedValue>),
+    }
+    let targets = match targets {
+        QueryResult::One(v) => Targets::Borrowed(vec![v]),
+        QueryResult::Many(vs) => Targets::Borrowed(vs),
+        QueryResult::Owned(v) => Targets::Owned(vec![v]),
+        QueryResult::ManyOwned(vs) => Targets::Owned(vs),
+        QueryResult::None => return QueryResult::None,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
+    };
+
+    // (2) Key outer, target inner.
+    match targets {
+        Targets::Borrowed(ts) => {
+            let mut out: Vec<StandardJson<'a, W>> = Vec::with_capacity(keys.len() * ts.len());
+            for k in &keys {
+                for t in &ts {
+                    match index_one::<W>(t.clone(), k, optional) {
+                        QueryResult::One(v) => out.push(v),
+                        QueryResult::None => {}
+                        QueryResult::Error(e) => return QueryResult::Error(e),
+                        _ => unreachable!("index_one yields only One/None/Error"),
+                    }
+                }
+            }
+            match out.len() {
+                1 => QueryResult::One(out.pop().expect("len checked")),
+                _ => QueryResult::Many(out),
+            }
+        }
+        Targets::Owned(ts) => {
+            let mut out: Vec<OwnedValue> = Vec::with_capacity(keys.len() * ts.len());
+            for k in &keys {
+                for t in &ts {
+                    match index_one_owned(t, k, optional) {
+                        Ok(Some(v)) => out.push(v),
+                        Ok(None) => {}
+                        Err(e) => return QueryResult::Error(e),
+                    }
+                }
+            }
+            match out.len() {
+                1 => QueryResult::Owned(out.pop().expect("len checked")),
+                _ => QueryResult::ManyOwned(out),
+            }
+        }
+    }
+}
+
 /// Get element at index (supports negative indexing).
 ///
 /// Uses `get_fast` for O(n) BP operations + O(log n) IB select,
@@ -6429,6 +6624,12 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
             end: *end,
         },
         Expr::Iterate => Expr::Iterate,
+        // Must recurse into `key`: variables are resolved by substitution, so
+        // skipping it would leave `$k` in `.[$k]` unbound at eval time.
+        Expr::IndexExpr { target, key } => Expr::IndexExpr {
+            target: Box::new(substitute_var(target, var_name, replacement)),
+            key: Box::new(substitute_var(key, var_name, replacement)),
+        },
         Expr::RecursiveDescent => Expr::RecursiveDescent,
         Expr::Optional(e) => Expr::Optional(Box::new(substitute_var(e, var_name, replacement))),
         Expr::Pipe(exprs) => Expr::Pipe(
@@ -12619,6 +12820,10 @@ fn expand_func_calls(expr: &Expr, func_name: &str, params: &[String], body: &Exp
             end: *end,
         },
         Expr::Iterate => Expr::Iterate,
+        Expr::IndexExpr { target, key } => Expr::IndexExpr {
+            target: Box::new(expand_func_calls(target, func_name, params, body)),
+            key: Box::new(expand_func_calls(key, func_name, params, body)),
+        },
         Expr::RecursiveDescent => Expr::RecursiveDescent,
         Expr::Optional(e) => {
             Expr::Optional(Box::new(expand_func_calls(e, func_name, params, body)))
@@ -12870,6 +13075,10 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
             end: *end,
         },
         Expr::Iterate => Expr::Iterate,
+        Expr::IndexExpr { target, key } => Expr::IndexExpr {
+            target: Box::new(substitute_func_param(target, param, arg)),
+            key: Box::new(substitute_func_param(key, param, arg)),
+        },
         Expr::RecursiveDescent => Expr::RecursiveDescent,
         Expr::Optional(e) => Expr::Optional(Box::new(substitute_func_param(e, param, arg))),
         Expr::Pipe(exprs) => Expr::Pipe(

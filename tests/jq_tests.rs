@@ -580,7 +580,12 @@ fn test_parse_unclosed_bracket_error() {
 
 #[test]
 fn test_parse_invalid_index_error() {
-    assert!(parse(".[abc]").is_err());
+    // Since #360 the brackets take an arbitrary expression, so `.[abc]` parses
+    // (`abc` is a function call) and fails at evaluation instead — the same
+    // place jq reports an unknown function. What must still fail to *parse* is
+    // a bracket that is not a well-formed expression at all.
+    assert!(parse(".[1 2]").is_err());
+    assert!(parse(".[").is_err());
 }
 
 #[test]

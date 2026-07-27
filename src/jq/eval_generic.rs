@@ -17,8 +17,8 @@ use indexmap::IndexMap;
 
 use super::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
 use super::eval::{
-    eval as full_eval, sort_rank, tonumber_from_str, EvalError, EvalSemantics, JqSemantics,
-    QueryResult,
+    eval as full_eval, index_one_owned as index_owned_by_key, numeric_key_to_index, sort_rank,
+    tonumber_from_str, EvalError, EvalSemantics, JqSemantics, QueryResult,
 };
 use super::expr::{Builtin, CompareOp, Expr, Literal};
 use super::value::OwnedValue;
@@ -530,6 +530,14 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
+        // Handled natively rather than through the `_` fallback below, for two
+        // reasons: the fallback re-enters `full_eval`, which restarts with
+        // `optional = false` and so loses the `?` in `.[$k]?`; and it
+        // serialises and re-indexes the whole document per evaluation.
+        Expr::IndexExpr { target, key } => {
+            eval_index_expr::<S, V>(target, key, value, optional, cursor)
+        }
+
         Expr::Iterate => {
             if let Some(elements) = value.as_array() {
                 let values = elements.collect_values();
@@ -736,6 +744,150 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 QueryResult::ManyOwned(vs) => GenericResult::ManyOwned(vs),
                 QueryResult::Break(label) => GenericResult::Break(label),
             }
+        }
+    }
+}
+
+/// Apply one resolved key to one target value.
+///
+/// Mirrors `eval::index_one`: the key *kind* is checked before the container,
+/// so the error is jq's `Cannot index <container> with <key>`, and the
+/// null-input passthrough is reached only for a valid key kind (`null | .["a"]`
+/// is `null`, `null | .[null]` errors).
+fn index_one_generic<V: DocumentValue>(
+    target: V,
+    key: &OwnedValue,
+    optional: bool,
+) -> GenericResult<V> {
+    match key {
+        OwnedValue::String(s) => {
+            if let Some(fields) = target.as_object() {
+                match fields.find(s) {
+                    Some(v) => GenericResult::One(v),
+                    None => GenericResult::Owned(OwnedValue::Null),
+                }
+            } else if target.is_null() {
+                GenericResult::Owned(OwnedValue::Null)
+            } else if optional {
+                GenericResult::None
+            } else {
+                GenericResult::Error(EvalError::cannot_index(target.type_name(), key))
+            }
+        }
+        OwnedValue::Int(_) | OwnedValue::Float(_) => {
+            // Truncation is toward zero, matching jq: `.[-1.5]` is the last
+            // element. Out-of-range floats saturate through `as`, yielding null.
+            let idx = numeric_key_to_index(key).expect("key is Int or Float");
+            if let Some(elements) = target.as_array() {
+                let len = elements.len();
+                let resolved = if idx < 0 { len as i64 + idx } else { idx };
+                match usize::try_from(resolved).ok().and_then(|i| elements.get(i)) {
+                    Some(v) => GenericResult::One(v),
+                    // Out-of-bounds is null, not an error (#307).
+                    None => GenericResult::Owned(OwnedValue::Null),
+                }
+            } else if target.is_null() {
+                GenericResult::Owned(OwnedValue::Null)
+            } else if optional {
+                GenericResult::None
+            } else {
+                GenericResult::Error(EvalError::cannot_index(target.type_name(), key))
+            }
+        }
+        _ if optional => GenericResult::None,
+        _ => GenericResult::Error(EvalError::cannot_index(target.type_name(), key)),
+    }
+}
+
+/// Evaluate `E[K]` — indexing by a computed key.
+///
+/// The counterpart of `eval::eval_index_expr`; see that function for why the
+/// key stream is evaluated first and iterated outermost.
+fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
+    target: &Expr,
+    key: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
+    // Keys first: an empty key stream must not evaluate the target at all.
+    let keys = match eval_single::<S, V>(key, value.clone(), optional, cursor) {
+        GenericResult::Error(e) => return GenericResult::Error(e),
+        GenericResult::Break(label) => return GenericResult::Break(label),
+        GenericResult::None => return GenericResult::None,
+        other => other.collect_owned(),
+    };
+    if keys.is_empty() {
+        return GenericResult::None;
+    }
+
+    let targets = match eval_single::<S, V>(target, value, optional, cursor) {
+        GenericResult::Error(e) => return GenericResult::Error(e),
+        GenericResult::Break(label) => return GenericResult::Break(label),
+        GenericResult::None => return GenericResult::None,
+        GenericResult::One(v) => vec![v],
+        GenericResult::Many(vs) => vs,
+        GenericResult::OneCursor(c) => vec![c.value()],
+        // An owned target (a computed, non-navigational left side) has no
+        // borrowed representation here; round-trip it through the shared
+        // owned-value path by re-entering with the materialized document.
+        owned @ (GenericResult::Owned(_) | GenericResult::ManyOwned(_)) => {
+            let targets = owned.collect_owned();
+            let mut out = Vec::with_capacity(keys.len() * targets.len());
+            for k in &keys {
+                for t in &targets {
+                    match index_owned_by_key(t, k, optional) {
+                        Ok(Some(v)) => out.push(v),
+                        Ok(None) => {}
+                        Err(e) => return GenericResult::Error(e),
+                    }
+                }
+            }
+            return match out.len() {
+                1 => GenericResult::Owned(out.pop().expect("len checked")),
+                _ => GenericResult::ManyOwned(out),
+            };
+        }
+    };
+
+    // Key outer, target inner.
+    let mut borrowed: Vec<V> = Vec::new();
+    let mut owned: Vec<OwnedValue> = Vec::new();
+    let mut any_owned = false;
+    for k in &keys {
+        for t in &targets {
+            match index_one_generic::<V>(t.clone(), k, optional) {
+                GenericResult::One(v) => {
+                    if any_owned {
+                        owned.push(to_owned(&v));
+                    } else {
+                        borrowed.push(v);
+                    }
+                }
+                GenericResult::Owned(v) => {
+                    if !any_owned {
+                        any_owned = true;
+                        owned = borrowed.iter().map(to_owned).collect();
+                        borrowed.clear();
+                    }
+                    owned.push(v);
+                }
+                GenericResult::None => {}
+                GenericResult::Error(e) => return GenericResult::Error(e),
+                _ => unreachable!("index_one_generic yields One/Owned/None/Error"),
+            }
+        }
+    }
+
+    if any_owned {
+        match owned.len() {
+            1 => GenericResult::Owned(owned.pop().expect("len checked")),
+            _ => GenericResult::ManyOwned(owned),
+        }
+    } else {
+        match borrowed.len() {
+            1 => GenericResult::One(borrowed.pop().expect("len checked")),
+            _ => GenericResult::Many(borrowed),
         }
     }
 }

@@ -32,6 +32,30 @@ pub enum Expr {
     /// Iterate all elements: `.[]`
     Iterate,
 
+    /// Index by a computed key: `.[$k]`, `.[.k]`, `.[1,2]`, `E[K]`.
+    ///
+    /// jq compiles `E[K]` as `K as $k | E | .[$k]`, so `K` is evaluated against
+    /// the input to the *whole* postfix chain, not against the value at `E`. On
+    /// `{"k":"x","a":{"k":"y","x":"HIT-x","y":"HIT-y"}}`, `.a[.k]` is `"HIT-x"`
+    /// (the root's `.k`) while `.a | .[.k]` is `"HIT-y"`. [`Expr::Pipe`] cannot
+    /// express that difference — both lower to the same flat chain — so this
+    /// variant carries its own `target` and nests instead of flattening.
+    ///
+    /// Constant keys never reach here: the parser folds `.["a"]` to
+    /// [`Expr::Field`] and `.[0]` to [`Expr::Index`], so the hot `.foo.bar[0]`
+    /// path and every existing `Field`/`Index` match site are untouched.
+    ///
+    /// Two deliberate divergences from jq: an array-valued key errors with
+    /// `Cannot index array with array` rather than performing jq's
+    /// indices-of-subarray search (`[10,20,30] | .[[20]]` → `[1]`), and
+    /// `path(.[1.7])` yields `[1]` where jq keeps the unfloored `[1.7]`.
+    IndexExpr {
+        /// The value being indexed — the postfix chain so far.
+        target: Box<Self>,
+        /// The key expression, evaluated against this node's own input.
+        key: Box<Self>,
+    },
+
     /// Optional access: `.foo?` - returns null instead of error if missing
     Optional(Box<Self>),
 
@@ -1014,6 +1038,14 @@ impl Expr {
     /// Create an iterate expression.
     pub fn iterate() -> Self {
         Self::Iterate
+    }
+
+    /// Create a computed-key index expression: `target[key]`.
+    pub fn index_by(target: Self, key: Self) -> Self {
+        Self::IndexExpr {
+            target: Box::new(target),
+            key: Box::new(key),
+        }
     }
 
     /// Create a slice expression.
