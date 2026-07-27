@@ -20274,4 +20274,93 @@ mod tests {
             });
         }
     }
+
+    // ========== #360: the unresolved-computed-key guards ==========
+
+    /// Every path walker refuses an unresolved [`Expr::IndexExpr`], loudly.
+    ///
+    /// [`resolve_dynamic_indexes`] rewrites each computed key into the static
+    /// component it denotes before any of these six run, so none of these arms
+    /// can fire through the public API — which is exactly why they need a test
+    /// of their own. They exist so that a *new* path context wired up without
+    /// that pre-pass fails where the mistake is, instead of blaming the user's
+    /// filter through the `_` catch-alls ("invalid path component", "cannot use
+    /// expression as …") or, in the two trackers, silently emitting no path at
+    /// all. Nothing else pins that promise: the wording *is* the signal that an
+    /// install point has gone missing.
+    mod computed_key_guards {
+        use super::*;
+
+        /// `.[$k]` left unresolved — what each walker below is handed.
+        fn unresolved() -> Expr {
+            Expr::index_by(Expr::Identity, Expr::Var("k".to_string()))
+        }
+
+        #[test]
+        fn test_set_path_refuses_an_unresolved_key() {
+            let mut root = OwnedValue::Null;
+            let err = set_path(&mut root, &unresolved(), OwnedValue::Int(1)).unwrap_err();
+            assert_eq!(
+                err.message,
+                "internal error: unresolved computed index in assignment path"
+            );
+        }
+
+        #[test]
+        fn test_get_path_mut_refuses_an_unresolved_key() {
+            let mut root = OwnedValue::Null;
+            let err = get_path_mut(&mut root, &[unresolved()]).unwrap_err();
+            assert_eq!(
+                err.message,
+                "internal error: unresolved computed index in path component"
+            );
+        }
+
+        #[test]
+        fn test_update_path_refuses_an_unresolved_key() {
+            let mut root = OwnedValue::Null;
+            let err = update_path::<JqSemantics>(&mut root, &unresolved(), &Expr::Identity, false)
+                .unwrap_err();
+            assert_eq!(
+                err.message,
+                "internal error: unresolved computed index in update path"
+            );
+        }
+
+        #[test]
+        fn test_delete_at_path_refuses_an_unresolved_key() {
+            let mut root = OwnedValue::Null;
+            let err = delete_at_path(&mut root, &unresolved(), false).unwrap_err();
+            assert_eq!(
+                err.message,
+                "internal error: unresolved computed index in delete path"
+            );
+        }
+
+        // The two path trackers have no error channel — they simply emit no
+        // path — so their guard is a `debug_assert!`, which only fires in a
+        // build that has them enabled.
+
+        #[test]
+        #[cfg(debug_assertions)]
+        #[should_panic(expected = "unresolved computed index reached path tracking")]
+        fn test_path_tracking_refuses_an_unresolved_key() {
+            let mut paths = Vec::new();
+            eval_with_path_tracking(&unresolved(), &OwnedValue::Null, &[], &mut paths, false);
+        }
+
+        #[test]
+        #[cfg(debug_assertions)]
+        #[should_panic(expected = "unresolved computed index reached path collection")]
+        fn test_path_collection_refuses_an_unresolved_key() {
+            let mut results = Vec::new();
+            collect_intermediate_with_paths(
+                &unresolved(),
+                &OwnedValue::Null,
+                &[],
+                &mut results,
+                false,
+            );
+        }
+    }
 }
