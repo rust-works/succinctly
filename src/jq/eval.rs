@@ -6810,18 +6810,18 @@ fn resolve_node<S: EvalSemantics>(
                 // No output prunes the branch.
                 0 => Ok(Vec::new()),
                 1 => Ok(vec![(components, values.pop().expect("len checked"))]),
+                // `..` and friends fan out to many values, each of which would
+                // need its own key resolved against it. jq handles this; we do
+                // not yet (#412), so say so in the user's terms rather than in
+                // the resolver's.
                 _ => Err(EvalError::new(
-                    "computed index after a multi-output path component is not supported",
+                    "Cannot use a computed index after a multi-output path component",
                 )),
             }
         }
     }
 }
 
-/// Resolve a pipe of path nodes, threading the value left to right.
-///
-/// The threading is the whole point: a computed key sees the value reaching
-/// *its* position, which is the document root only when it sits at the top of
 /// Thread a value through a run of static path components, without expanding
 /// them.
 ///
@@ -6851,6 +6851,10 @@ fn value_after_components<S: EvalSemantics>(
     Ok(current)
 }
 
+/// Resolve a pipe of path nodes, threading the value left to right.
+///
+/// The threading is the whole point: a computed key sees the value reaching
+/// *its* position, which is the document root only when it sits at the top of
 /// the path. `path(.x | .a[.k])` resolves `.k` against `.x`, giving
 /// `["x","a","a"]`.
 fn resolve_seq<S: EvalSemantics>(
@@ -6930,6 +6934,14 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
 /// *Order*: deleting `[0]` before `[2]` shifts the array under the second path.
 /// jq is order-insensitive here — both `del(.[(0,2)])` and `del(.[(2,0)])` on
 /// `[10,20,30,40]` give `[20,40]` — so sort by trailing index, descending.
+///
+/// Sorting on the *trailing* index is only sound while every path here has the
+/// same depth, which holds because one `del` argument is one chain: its keys
+/// fan out at a single position, so they differ only in that component.
+/// `del(.a, .b)` — which would break the assumption, since `[1]` sorts before
+/// `[2,0]` yet deleting it shifts the array `[2,0]` reaches into — does not
+/// parse at all today. Widen this to a full lexicographic descending sort
+/// before that changes.
 ///
 /// (`builtin_delpaths` has both bugs today: `delpaths([[0],[2]])` gives
 /// `[20,30]` where jq gives `[20,40]`, because it sorts only by path length.

@@ -266,10 +266,10 @@ These enable IDE integration and programmatic navigation to specific document po
 
 **Computed keys in brackets** (#360) accept any expression, but two jq behaviours are not reproduced:
 
-- **Slice bounds must be integer literals.** `.[$a:$b]` and `.[(1+1):]` are parse errors; jq accepts them.
+- **Slice bounds must fold to an integer literal.** Both bounds accept the same spellings — `.[1:3]`, `.[(1):3]`, `.[1:(3)]`, `.[1.0:3]` — but nothing that has to be evaluated: `.[$a:$b]` and `.[(1+1):]` are parse errors, where jq accepts them.
 - **An array-valued key errors instead of searching.** jq reads `[10,20,30] | .[[20]]` as an indices-of-subarray search returning `[1]`; here it reports `Cannot index array with array`.
 
-Two further divergences are confined to path contexts. `path(.[1.7])` yields `[1]` where jq keeps the unfloored `[1.7]`. A NaN key reads as `null` in both (`[10,20,30] | .[nan]` → `null`), but has no path component here: `path(.[nan])` and `del(.[nan])` report `Cannot set array element at NaN index`, jq's own wording for the assignment case, where jq instead yields the path `[null]` that its own `setpath` rejects (and, for `del`, hangs).
+Three further divergences are confined to path contexts. `path(.[1.7])` yields `[1]` where jq keeps the unfloored `[1.7]`. A NaN key reads as `null` in both (`[10,20,30] | .[nan]` → `null`), but has no path component here: `path(.[nan])` and `del(.[nan])` report `Cannot set array element at NaN index`, jq's own wording for the assignment case, where jq instead yields the path `[null]` that its own `setpath` rejects (and, for `del`, hangs). And a computed key **after a multi-output path component** — `path(.. | .[.k])`, as against `path(.[] | .[.k])`, which does work — reports `Cannot use a computed index after a multi-output path component` (#412): each of the many values needs its own key resolved against it, which the resolver does for `.[]` but not in general.
 
 **Indexing by a variable bound from a generator does not work yet** (#397). `.[$k]` itself is fine, but `keys[] as $k | .[$k]` — the most common way to reach it — binds `$k` to the whole array rather than each element. The bracket syntax is not at fault, and neither is `as`: iterating a *computed* value collapses the stream into a single array before the binding ever happens, so `[keys[]]` is already `[["a","b"]]` rather than `["a","b"]`. Explicit bindings (`--arg k a`, `. as $x | $x[…]`, `def f($k): .[$k]`) and iteration of a value navigated out of the document (`.[]`) are unaffected.
 

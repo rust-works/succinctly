@@ -492,7 +492,7 @@ fn test_unsupported_path_prefixes_report_rather_than_misfire() {
     check(
         r#"{"a":1}"#,
         r#"(.. | .[("x","y")]) = 9"#,
-        Outcome::error("computed index after a multi-output path component is not supported"),
+        Outcome::error("Cannot use a computed index after a multi-output path component"),
     );
     // `. = 5` replaces the root, so the sibling branch then indexes a number,
     // and reports it as jq does.

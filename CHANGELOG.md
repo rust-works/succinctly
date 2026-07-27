@@ -21,9 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Breaking**: adds an `Expr::IndexExpr` variant, so exhaustive `match`es on
   the public `Expr` gain an arm. A constant key still folds to `Expr::Field` /
   `Expr::Index` at parse time, leaving the existing AST and hot paths unchanged.
-  Not covered: expression-valued slice bounds (`.[$a:$b]`), jq's
-  indices-of-subarray form (`.[[20]]`), and — through a pre-existing defect in
-  iterating a computed value, not in the brackets — `keys[] as $k | .[$k]`
+  Not covered: expression-valued slice bounds (`.[$a:$b]` — though both bounds
+  now accept the same *literal* spellings, so `.[(1):3]` and `.[1:(3)]` agree),
+  jq's indices-of-subarray form (`.[[20]]`), a computed key after a multi-output
+  path component (`path(.. | .[.k])`, #412), and — through a pre-existing defect
+  in iterating a computed value, not in the brackets — `keys[] as $k | .[$k]`
   (#397). See [docs/reference/jq-language.md](docs/reference/jq-language.md).
   Incidentally, the `[range(0; length; 2) as $i | .[$i]]` workaround that doc
   has long recommended for step slicing now actually parses.
