@@ -16,10 +16,26 @@ const MAX_CARGO_RETRIES: u32 = 3;
 
 /// Helper to run jq command with input from stdin
 fn run_jq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(String, i32)> {
+    let (stdout, _, code) = run_jq_stdin_streams(filter, input, extra_args)?;
+    Ok((stdout, code))
+}
+
+/// Helper to run jq command with input from stdin, keeping stderr.
+///
+/// Most tests only care about stdout and the exit code; use this when the
+/// absence of a diagnostic is itself the thing under test. `--quiet` keeps
+/// cargo's own progress lines ("Compiling", "Blocking waiting for file lock")
+/// off stderr, so what remains is the binary's.
+fn run_jq_stdin_streams(
+    filter: &str,
+    input: &str,
+    extra_args: &[&str],
+) -> Result<(String, String, i32)> {
     for attempt in 0..MAX_CARGO_RETRIES {
         let mut cmd = Command::new("cargo")
             .args([
                 "run",
+                "--quiet",
                 "--features",
                 "cli",
                 "--bin",
@@ -48,7 +64,8 @@ fn run_jq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(Strin
         }
 
         let stdout = String::from_utf8(output.stdout)?;
-        return Ok((stdout, exit_code));
+        let stderr = String::from_utf8(output.stderr)?;
+        return Ok((stdout, stderr, exit_code));
     }
     unreachable!()
 }
@@ -1814,6 +1831,39 @@ fn test_import_with_namespace() -> Result<()> {
 
     // Should output 10 (5 * 2)
     assert_eq!(stdout.trim(), "10", "mymath::double should multiply by 2");
+    Ok(())
+}
+
+// =============================================================================
+// Stream operators: `//`, `and`, `or` (#160)
+// =============================================================================
+
+#[test]
+fn test_stream_operators_emit_every_output() -> Result<()> {
+    // Exact stdout including trailing newlines — the output *count* is the
+    // point, so `.trim()` would hide the bug (#160).
+    for (filter, expected) in [
+        (r#"(false,1,null,2) // "backup""#, "1\n2\n"),
+        ("false // (null,7)", "null\n7\n"),
+        ("(true,false) and (true,false)", "true\nfalse\nfalse\n"),
+        ("(true,false) or (true,false)", "true\ntrue\nfalse\n"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, "null", &["-c"])?;
+        assert_eq!(code, 0, "`{filter}` should succeed");
+        assert_eq!(stdout, expected, "wrong output stream for `{filter}`");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_boolean_with_empty_operand_is_silent() -> Result<()> {
+    // An empty operand used to reach `result_to_owned`, which reported it as
+    // `Error("no value")` and printed a diagnostic. jq emits nothing at all,
+    // quietly. The goldens compare stdout only, so stderr is asserted here.
+    let (stdout, stderr, code) = run_jq_stdin_streams("empty and true", "null", &["-c"])?;
+    assert_eq!(stdout, "", "expected no output");
+    assert_eq!(stderr, "", "expected no diagnostic on stderr");
+    assert_eq!(code, 0, "expected success");
     Ok(())
 }
 

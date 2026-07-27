@@ -51,6 +51,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq `//`, `and` and `or` collapsed multi-output operands** (#160): all three
+  are generators over their operands' *streams*, but each inspected only the
+  first output. `//` decided truthiness from `vs.first()` and then returned the
+  left stream unfiltered, so `(null,1) // 3` gave `3` where jq gives `1`, and
+  `(1,false,2) // 3` gave `1 false 2` where jq gives `1 2`. `and`/`or` funnelled
+  each operand through `result_to_owned`, keeping the first output and turning
+  an empty stream into `Error("empty result")` — so `(true,false) and true` gave
+  one boolean where jq gives two, and `empty and true` printed a spurious
+  `jq: error: no value` where jq is silent. `//` now emits every non-`null`,
+  non-`false` output of its left side and evaluates the right only when there
+  are none; the right side's outputs are still emitted unfiltered, which is what
+  makes the left-associative chain `a // b // c` filter `b`'s stream. `and`/`or`
+  fan out over both operands with the left as the outer loop, still
+  short-circuiting per left output so `false and error("x")` yields `false`
+  without raising. A `break` in either operand now reaches its label instead of
+  becoming `Error("break $l not in label")`. Filtering keeps document-derived
+  values borrowed, so the zero-copy path survives. `succinctly yq` gets the fix
+  too, since its evaluator delegates all three operators to this one. Ten new
+  pinned-`jq` golden cases cover the family, and the known-failures manifest
+  drops to two entries. **Not fixed**: `QueryResult` still models an error as a
+  property of the whole stream rather than of one output, so `(1,error("x")) // 2`
+  yields `2` where jq yields `1`, and a mid-stream error in `and`/`or` discards
+  the outputs already computed; `//` still suppresses left-hand errors, which
+  jq 1.7.1 propagates; and `if`/`select` still collapse a multi-output condition
+  to its first output (sibling of #354).
 - **YAML: a tab after spaces in indentation was folded into the key** (#173):
   the loader rejected a tab only at column 0 and treated a tab following one or
   more spaces as start-of-content, so `a:\n \tb: 1` loaded as
