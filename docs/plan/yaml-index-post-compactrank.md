@@ -72,8 +72,8 @@ For typical YAML with N ≈ L/7.5:
 | **`bp_to_text_end`**     | **4N ≈ 0.53L**   | **~53%**  |
 | Total                    |                  | ~125%     |
 
-**`bp_to_text_end` is now the single largest structure** — roughly 40% of the
-entire index.
+**`bp_to_text_end` was, in 2026-01, the single largest structure** — roughly
+40% of the entire index.
 
 ---
 
@@ -91,7 +91,7 @@ meaningful end positions.
 In typical YAML, containers + sequence items make up 30-50% of BP opens,
 meaning 30-50% of entries are wasted zeros.
 
-### Current usage
+### Usage (2026-01-27)
 
 ```
 index.rs:294    bp_to_text_end_pos(bp_pos)  →  self.bp_to_text_end.get(open_idx)
@@ -237,10 +237,10 @@ now costs 2 lookups + up to 7 popcounts (vs the old single array lookup with
 
 For a 1MB file with ~16K IB words:
 
-| Method              | Binary search steps | Cost per step                | Total cost              |
-|---------------------|---------------------|------------------------------|-------------------------|
-| Old (`Vec<u32>`)    | ~14                 | 1 array read                 | 14 reads                |
-| Current (CompactRank) | ~14               | 2 reads + up to 7 popcounts  | 28 reads + 98 popcounts |
+| Method                  | Binary search steps | Cost per step               | Total cost              |
+|-------------------------|---------------------|-----------------------------|-------------------------|
+| Old (`Vec<u32>`)        | ~14                 | 1 array read                | 14 reads                |
+| 2026-01 (CompactRank)   | ~14                 | 2 reads + up to 7 popcounts | 28 reads + 98 popcounts |
 
 `AdvancePositions` already solves this with `ib_select_samples` (one sample
 per 256 ones), reducing select to a linear scan over ~256 ones instead of
@@ -459,12 +459,12 @@ The two optimizations are complementary:
 - **yq-memory-optimization** reduces runtime memory (DOM → streaming)
 - **This plan** reduces index memory (bp_to_text_end compression)
 
-Together, the goal is total memory ≈ 1.1-1.5× input size (currently ~1.25×
-for index alone, plus runtime overhead).
+Together, the goal is total memory ≈ 1.1-1.5× input size (~1.25× for index
+alone as of 2026-01, plus runtime overhead).
 
 ## Changelog
 
-| Date       | Change                                                    |
-|------------|-----------------------------------------------------------|
-| 2026-01-27 | Initial analysis post-CompactRank migration               |
-| 2026-07-27 | Retired as historical record; dated layout heading (#368) |
+| Date       | Change                                                            |
+|------------|-------------------------------------------------------------------|
+| 2026-01-27 | Initial analysis post-CompactRank migration                       |
+| 2026-07-27 | Retired; dated currency claims, marked CompactRank tables (#368)  |
