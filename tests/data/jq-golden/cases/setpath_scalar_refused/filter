@@ -1,0 +1,1 @@
+try setpath(["a"]; 1) catch .

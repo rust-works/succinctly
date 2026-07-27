@@ -647,6 +647,13 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: ./scripts/sync-jq-golden.sh --check
 
+      # Same idea for the error-message table (#356): the captured wording in
+      # tests/data/jq-error-messages.tsv is oracle output too, and
+      # tests/jq_error_message_tests.rs asserts both evaluators reproduce it.
+      - name: Verify error messages against pinned jq
+        if: needs.gate.outputs.code == 'true'
+        run: ./scripts/sync-jq-error-messages.sh --check
+
   # Drift detector for the real-workload corpus shape statistics (#301). Runs
   # entirely offline over the committed seed (tests/data/bench-corpus/seed/): it
   # (1) verifies each vendored seed file's sha256 against the manifest, then

@@ -1,0 +1,174 @@
+# Probe corpus for jq evaluator error-message parity (#356).
+#
+# Each row is a filter/input pair on which the pinned jq REPORTS AN ERROR.
+# ./scripts/sync-jq-error-messages.sh runs jq over every row and records the
+# message it prints into tests/data/jq-error-messages.tsv, which
+# tests/jq_error_message_tests.rs then asserts both succinctly evaluators
+# reproduce verbatim.
+#
+# Columns are TAB-separated:
+#
+#   <id>	<filter>	<input-json>
+#
+# `#` lines and blank lines are ignored. <id> must be unique and is the key
+# used by tests/data/jq-error-known-divergences.txt.
+#
+# A row on which jq does NOT error is a hard error in the sync script: this
+# corpus only describes error wording, so a probe that stopped erroring is
+# either a bad probe or a jq behaviour change that needs a human look.
+#
+# Group order follows the message taxonomy in
+# docs/compliance/jq/limitations.md.
+
+# ── Cannot index <t> with string "<k>" ───────────────────────────────────────
+index_field_number	.foo	1
+index_field_string	.foo	"str"
+index_field_boolean	.foo	true
+index_field_array	.foo	[1,2]
+index_bracket_on_number	.["a"]	1
+index_bracket_on_array	.["a"]	[1,2]
+index_field_nested	.a.b	{"a":1}
+index_field_empty_key	.[""]	1
+index_field_quoted_key	.["a\"b"]	1
+index_field_unicode_key	.["héllo"]	1
+index_field_long_key	.["aaaaaaaaaaaaaaaaaaaa"]	1
+
+# ── Cannot index <t> with <key-type> ─────────────────────────────────────────
+index_num_on_number	.[0]	1
+index_num_on_string	.[0]	"str"
+index_num_on_boolean	.[0]	true
+index_num_on_object	.[0]	{"a":1}
+index_null_key_on_object	.[null]	{"a":1}
+index_bool_key_on_object	.[true]	{"a":1}
+index_object_key_on_object	.[{}]	{"a":1}
+slice_on_number	.[1:2]	1
+slice_on_boolean	.[1:2]	true
+slice_on_object	.[1:2]	{"a":1}
+
+# ── Indexing reached through paths, assignment, deletion, destructuring ──────
+assign_field_on_number	.a = 1	1
+update_field_on_number	.a |= . + 1	1
+del_field_on_number	del(.a)	1
+setpath_on_number	setpath(["a"]; 1)	1
+setpath_nested_on_number	setpath(["a","b"]; 2)	{"a":1}
+setpath_on_string	setpath(["a"]; 1)	"str"
+setpath_number_key_on_object	setpath([0]; 1)	{}
+setpath_string_key_on_array	setpath(["a"]; 1)	[]
+setpath_slice_key_on_number	setpath([{"start":1,"end":2}]; ["x"])	1
+setpath_negative_index_oob	setpath([-5]; 9)	[1,2]
+setpath_negative_index_on_null	setpath([-1]; 9)	null
+setpath_nan_index	setpath([nan]; 9)	null
+setpath_non_array_path	setpath("a"; 1)	1
+assign_negative_index_oob	.[-5] = 9	[1,2]
+update_negative_index_oob	.[-5] |= 9	[1,2]
+assign_negative_index_nested	.a[-5] = 9	{"a":[1,2]}
+slice_assign_non_array	setpath([{"start":1,"end":2}]; "x")	[1,2,3]
+slice_indices_not_integers	setpath([{"foo":1}]; 9)	[1,2]
+getpath_on_number	getpath(["a"])	1
+getpath_nested_on_number	getpath(["a","b"])	{"a":1}
+getpath_non_array_path	getpath("a")	{"a":1}
+destructure_array_on_number	. as [$a] | $a	5
+destructure_object_on_number	. as {a:$a} | $a	5
+destructure_array_on_object	. as [$a] | $a	{"a":1}
+first_on_number	first	5
+last_on_number	last	5
+reverse_on_number	reverse	5
+indices_on_number	indices(",")	1
+# `indices`/`index`/`rindex` index their input with the pattern, so a
+# non-string pattern on a string input reports that same indexing error.
+indices_number_pattern_on_string	indices(1)	"abc"
+index_null_pattern_on_string	index(null)	"abc"
+rindex_array_pattern_on_string	rindex([1])	"abc"
+# … and an input they cannot search reports the same indexing error. `null`
+# and an object with a string pattern are absent on purpose: jq answers those
+# with `null`, so no probe can hold them (unit tests do).
+index_on_number	index("a")	1
+rindex_on_boolean	rindex("a")	true
+indices_number_pattern_on_object	indices(1)	{}
+
+# ── Cannot iterate over <t> (<value>) ────────────────────────────────────────
+iterate_number	.[]	1
+iterate_string	.[]	"str"
+iterate_boolean	.[]	true
+iterate_null	.[]	null
+iterate_string_truncated	.[]	"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+iterate_string_at_limit	.[]	"abcdefghijkl"
+iterate_string_over_limit	.[]	"abcdefghijklm"
+iterate_assign_on_number	.[] = 1	5
+map_on_number	map(.)	5
+add_on_string	add	"s"
+any_on_number	any	1
+all_on_number	all	1
+flatten_on_number	flatten	1
+unique_on_number	unique	1
+sort_by_on_number	sort_by(.)	1
+group_by_on_number	group_by(.)	1
+from_entries_on_number	from_entries	1
+join_on_number	join(",")	1
+
+# ── <a> and <b> cannot be <verb> ─────────────────────────────────────────────
+add_number_string	. + "a"	1
+add_array_object	. + {}	[1]
+add_truncated_operand	. + "a"	{"aaaaaaaa":1,"bbbbbbbb":2}
+subtract_number_string	. - "a"	1
+subtract_object_number	. - 1	{"a":1}
+divide_number_string	. / "a"	1
+modulo_number_string	. % "a"	1
+divide_by_zero	. / 0	1
+modulo_by_zero	. % 0	1
+min_on_number	min	1
+max_on_number	max	1
+contains_number_string	contains("a")	1
+inside_array_number	inside([1])	1
+
+# ── <v> has no keys / has no length / cannot be sorted / matched ─────────────
+length_on_boolean	length	true
+utf8bytelength_on_number	utf8bytelength	1
+keys_on_number	keys	1
+keys_on_string	keys	"s"
+keys_unsorted_on_number	keys_unsorted	1
+with_entries_on_number	with_entries(.)	1
+# `to_entries` is defined over `keys_unsorted`, so it borrows `keys`' refusal
+# — and, like `keys`, accepts an array.
+to_entries_on_number	to_entries	1
+to_entries_on_null	to_entries	null
+sort_on_object	sort	{"a":1}
+sort_on_number	sort	1
+test_on_number	test("a")	1
+
+# ── Cannot check whether <t> has a <k> key ───────────────────────────────────
+has_string_on_number	has("a")	1
+has_string_on_array	has("a")	[1]
+has_number_on_object	has(1)	{"a":1}
+in_object_on_number	in({})	1
+
+# ── Fixed-sentence builtin errors ────────────────────────────────────────────
+explode_on_number	explode	1
+implode_on_number	implode	1
+ascii_downcase_on_number	ascii_downcase	1
+# Same jq definition as `ascii_downcase`, so the same sentence — probed
+# because the two had drifted apart here.
+ascii_upcase_on_number	ascii_upcase	1
+split_on_number	split(",")	1
+startswith_on_number	startswith("a")	1
+range_on_string	range(.)	"s"
+
+# ── Conversion: tonumber / fromjson ──────────────────────────────────────────
+tonumber_bad_string	tonumber	"a"
+tonumber_empty_string	tonumber	""
+tonumber_long_string	tonumber	"abcdefghijklmnopqrstuvwxyz"
+tonumber_hex_string	tonumber	"0x10"
+tonumber_trailing_garbage	tonumber	"12abc"
+tonumber_double_sign	tonumber	"--1"
+tonumber_null_literal	tonumber	"null"
+tonumber_true_literal	tonumber	"true"
+tonumber_on_null	tonumber	null
+tonumber_on_boolean	tonumber	true
+tonumber_on_array	tonumber	[]
+tonumber_on_object	tonumber	{}
+tonumber_on_object_truncated	tonumber	{"aaaaaaaa":1,"bbbbbbbb":2}
+fromjson_on_number	fromjson	1
+fromjson_on_null	fromjson	null
+fromjson_bad_string	fromjson	"a"
+fromjson_empty_string	fromjson	""
+fromjson_hex_string	fromjson	"0x10"

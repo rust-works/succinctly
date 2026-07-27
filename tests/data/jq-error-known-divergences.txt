@@ -1,0 +1,37 @@
+# Known divergences of succinctly's evaluator error wording from the pinned jq.
+#
+# Consumed by tests/jq_error_message_tests.rs. One line per diverging probe:
+#
+#   <probe>           <category>        <reason — #issue>
+#
+# <probe> is an id from tests/data/jq-error-probes.tsv. Columns are
+# whitespace-separated; `#` lines and blank lines are ignored.
+#
+# The check is two-sided: a probe diverging without a line here fails the
+# build, and a line here for a probe that now matches also fails the build — so
+# every fix is forced to shrink this file, and no divergence can hide. The
+# captured messages in tests/data/jq-error-messages.tsv always hold the correct
+# (pinned jq) wording; only this manifest records where succinctly disagrees.
+#
+# Every entry must also have a section in docs/compliance/jq/limitations.md.
+# See tests/data/jq-golden-known-failures.txt for the sibling manifest.
+#
+# Seeded from the #356 sweep: 102 of 102 probes diverged at the start; 96 were
+# wording and were fixed there. Six were not, and two of those — `contains` and
+# `inside` on operands whose kinds differ — were fixed by #358 before this file
+# landed, so they never reached it. What remains below is not wording either —
+# succinctly produces a value where jq errors, or cannot parse the filter — so
+# each is a behaviour or parser bug with its own issue. (#359 fixed
+# `setpath_on_number`, took the rest of `setpath`'s probes with it, and added
+# the two slice probes it could not fix.)
+#
+# This file cannot record the mirror image — a filter jq answers with a value
+# and succinctly refuses — because a probe is only admitted if jq errors on it.
+# Those live in prose, under "Where succinctly errors and jq does not" in
+# docs/compliance/jq/limitations.md.
+
+slice_assign_non_array      slice         a slice is not a path component, so setpath leaves the value alone — #366
+slice_indices_not_integers  slice         a slice is not a path component, so setpath leaves the value alone — #366
+index_null_key_on_object    parser        `.[null]` is rejected by the parser, so no runtime error is reached — #360
+index_bool_key_on_object    parser        `.[true]` is rejected by the parser, so no runtime error is reached — #360
+index_object_key_on_object  parser        `.[{}]` is rejected by the parser, so no runtime error is reached — #360

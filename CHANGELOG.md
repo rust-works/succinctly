@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **jq error-message conformance corpus** (#356): a corpus of filter/input probes
+  (`tests/data/jq-error-probes.tsv`) whose messages are captured from the pinned
+  jq by `scripts/sync-jq-error-messages.sh` and asserted against **both**
+  evaluators by `tests/jq_error_message_tests.rs` — the first suite to compare
+  their error text, which had silently drifted. Divergences are recorded in a
+  two-sided manifest, so a new one and a fixed one both break the build. The
+  `jq-drift` CI job re-checks the captured table against the pinned binary, and
+  `docs/compliance/jq/limitations.md` is the jq counterpart to the YAML
+  compliance page the tree already had.
 - **Opt-in strict YAML validation** (#223): a new `succinctly::yaml::validate`
   pass, exposed as `succinctly yaml validate [FILES]...` and `syq --validate`,
   that rejects invalid YAML. It mirrors `json validate` — a separate pass run
@@ -172,6 +181,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty input, so a builder with capacity always gets at least one push), which
   is why it was never hit. The explicit free is gone; `Drop` now owns the
   release.
+- **jq evaluator error messages did not match jq's wording** (#356): `1 | .foo`
+  reported `expected object, got number` where jq says `Cannot index number with
+  string "foo"`, and `"a" | tonumber` said `cannot convert 'a' to number` against
+  jq's `Invalid numeric literal at EOF at line 1, column 1 (while parsing 'a')`.
+  Cosmetic until #158 landed; now that `catch` binds the raised value, a filter
+  can read the text, so `try f catch (if test("Cannot index") then … end)` — a
+  real jq idiom — behaved differently here. All but seven probed messages are
+  now byte-identical to jq-1.7.1 across **both** evaluators, covering indexing,
+  iteration, arithmetic, `keys`/`length`/`sort`/`has`/`test`/`contains`, and
+  `tonumber`/`fromjson`. Root cause was that every message was inlined at its
+  raise site (~300 of them), with no shared definition — which is also how the
+  two evaluators drifted from *each other*: they reported `expected array or
+  object, got number` versus `cannot iterate over number` for the same
+  condition, and had two different `tonumber` messages. `EvalError` moves to a
+  new `src/jq/error.rs` with one named constructor per jq sentence shape, and
+  `tonumber`'s string handling is now a single shared function. Two coupled
+  defects fell out: `.[] = 1` reported `cannot use expression as assignment
+  target` because `set_path` had no iterate arm at all (it now assigns through
+  arrays and objects like jq), and `tonumber` classified `"0x10"` as valid JSON
+  because the internal parser stopped at the first value instead of requiring
+  the whole input. The probes that remain are behaviour and parser gaps, not
+  wording — a slice is not a path component (#366), and
+  `.[null]`/`.[true]`/`.[{}]` do not parse (#360) — each on record in
+  `tests/data/jq-error-known-divergences.txt`. **API**: `EvalError` gains
+  jq-shaped constructors and `succinctly::jq` re-exports a new `BinOp`;
+  `EvalError::type_error` stays for the sites jq has no counterpart for.
+- **jq `setpath` built a container on a scalar instead of refusing to index it**
+  (#359): `1 | setpath(["a"]; 1)` discarded the input and returned `{"a":1}`
+  where jq reports `Cannot index number with string "a"`. Its siblings (`.a = 1`,
+  `.a |= …`, `del(.a)`, `getpath`) already agreed with jq; only this one
+  auto-vivified. `null` is now the only value vivified — at the root and at every
+  depth — and a real container indexed with the wrong kind of key is refused too
+  (`{} | setpath([0]; 1)`). Three defects fell out of the same walk: a negative
+  index that stays negative after resolution is jq's `Out of bounds negative
+  array index` rather than `(len + idx) as usize` ≈ 1.8e19 nulls; a float index
+  truncates toward zero as jq's does instead of being ignored; and writing to an
+  existing object key keeps the key where jq keeps it, rather than moving it to
+  the end via `IndexMap::shift_remove`. `=` and `|=` now share the negative-index
+  sentence. Assigning through a slice path element remains unimplemented (#366).
+- **jq `tonumber` and `fromjson` panicked on a truncated container** (#359
+  review): `"{" | tonumber` and `"{\"a\":1," | fromjson` indexed one byte past
+  the input while looking for an object key, panicking inside the JSON parser
+  instead of raising a catchable error — a library panic takes the embedder's
+  process with it. `setpath` had the same shape: `null | setpath([1e30]; 9)`
+  asked `Vec::resize` for 9.2e18 elements and died on `capacity overflow`; it now
+  refuses with `Cannot grow array to <n> elements`, while every length that fits
+  in memory still pads as jq does.
+- **jq `fromjson` accepted trailing garbage** (#359 review): it read the first
+  JSON value and dropped the rest, so `"0x10" | fromjson` returned `0` and
+  `"1 2" | fromjson` returned `1` where jq errors on both. It now shares the
+  whole-input parse `tonumber` was given, and `"0x10"` reports jq's sentence
+  verbatim.
+- **jq builtins derived from the same definition worded their errors
+  differently** (#359 review): jq builds many builtins out of others, so one
+  sentence is owed by a whole family — but the #356 sweep fixed only the member
+  each probe named. `1 | with_entries(.)` said `number (1) has no keys` while
+  `1 | to_entries` beside it still said `expected object, got number`;
+  `ascii_downcase` reported `explode input must be a string` and `ascii_upcase`
+  did not; and `"abc" | indices(1)`, `index(1)`, `rindex(1)` all answered
+  `expected string, got pattern` — naming an argument where jq names a type —
+  instead of `Cannot index string with number`. The three string searches now
+  share their refusals (`non_string_pattern` and `unsearchable_input`) rather
+  than keeping three copies each, and the corpus carries a probe per family
+  member so the next member cannot drift alone. Measuring the searches over
+  every input type also turned up behaviour the wording had hidden: jq reaches
+  `_strindices` only for a string pattern and answers `null` where there is
+  nothing to search, so `null | index("a")` and `{} | index("a")` are values,
+  not errors, and all 24 cells of that matrix now match. `to_entries` also gained jq's array behaviour (`[1,2] | to_entries` is
+  `[{"key":0,"value":1},{"key":1,"value":2}]`), without which the corrected
+  sentence would have claimed an array has no keys where jq answers with a
+  value.
+- **jq `getpath` rejected a float array index that jq accepts** (#359 review):
+  `[1,2,3] | getpath([1.5])` errored with `Cannot index array with number`
+  where jq gives `2`. #359 taught `setpath` jq's index resolution — truncate
+  toward zero, count a negative back from the end — but left the read path
+  behind, so the two disagreed in-tree about the same path element. Reads now
+  resolve identically, differing only where jq differs: an index that reaches
+  no element is `null` rather than an error, which covers NaN, ±infinity and
+  an overrun at either end.
 - **jq `try/catch` discarded the raised error** (#158): the catch handler ran
   against the *original input* rather than the error value, so a handler could
   never see what went wrong — `try error("boom") catch .` gave `null` where jq

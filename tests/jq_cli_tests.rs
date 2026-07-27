@@ -893,9 +893,12 @@ fn test_builtin_first_on_non_array_errors() -> Result<()> {
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
     assert_eq!(stdout.trim(), "");
+    // jq defines `first` as `.[0]`, so it reports an indexing error (#356);
+    // the exact wording is pinned against jq-1.7.1 in
+    // tests/data/jq-error-messages.tsv.
     assert!(
-        stderr.contains("expected array, got number"),
-        "Should report a type error for `5 | first`: {stderr}"
+        stderr.contains("Cannot index number with number"),
+        "Should report jq's indexing error for `5 | first`: {stderr}"
     );
     Ok(())
 }
