@@ -11991,6 +11991,30 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         _ => return QueryResult::Error(EvalError::new("delpaths requires array of paths")),
     };
 
+    // Everything the walk cannot use goes before the sort, so what remains is
+    // both a list of paths and a set `compare_values` totally orders.
+    //
+    // A non-array entry is jq's `Path must be specified as array, not <kind>`
+    // (#415). Until that lands it deletes nothing — but it has to be dropped
+    // rather than reaching the walk, where the empty path deletes the whole
+    // document and a non-array must not be mistaken for one.
+    //
+    // A NaN component is dropped with the path around it, because it names no
+    // element at any depth — `resolve_read_index` refuses it, as jq's `jv_get`
+    // does. Leaving it in would do more than waste a walk: `compare_values`
+    // answers `Equal` for NaN against *every* number, so the path would head a
+    // run that swallowed its numeric siblings and cancelled their deletions,
+    // and the comparator would not be transitive, which `sort_by` is entitled
+    // to panic on. jq cannot arbitrate — 1.7.1 loops forever on
+    // `delpaths([[nan]])` — so this is pinned by unit test rather than by a
+    // golden (#415).
+    paths.retain(|path| match path {
+        OwnedValue::Array(components) => !components
+            .iter()
+            .any(|key| matches!(key, OwnedValue::Float(f) if f.is_nan())),
+        _ => false,
+    });
+
     // jq sorts the whole path list in its total value order — arrays compare
     // lexicographically — before deleting anything, so the order the caller
     // wrote them in is immaterial: `delpaths([[0],[2]])` and
@@ -12006,10 +12030,7 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `[[1],[1.0]]` being the pair.
     paths.sort_by(compare_values);
 
-    // A non-array entry is jq's `Path must be specified as array, not <kind>`
-    // (#415). Until that lands it deletes nothing — but it has to be dropped
-    // here rather than reaching the walk, where the empty path deletes the
-    // whole document and a non-array must not be mistaken for one.
+    // Every survivor of the `retain` is an array, so this only re-borrows.
     let paths: Vec<&[OwnedValue]> = paths
         .iter()
         .filter_map(|path| match path {
@@ -18426,6 +18447,43 @@ mod tests {
                 r#"delpaths([["a","zz"],["a","x"]])"#,
                 Ok(r#"{"a":{},"b":2}"#),
             ),
+            // A key of the wrong kind for its container names nothing either.
+            // jq refuses both — `Cannot delete number field of object`, and
+            // `Cannot index object with number` for the nested one (#415) — so
+            // neither can be a golden case.
+            (br#"{"a":1}"#, "delpaths([[0]])", Ok(r#"{"a":1}"#)),
+            (
+                br#"{"a":{"x":1}}"#,
+                r#"delpaths([[0,"x"]])"#,
+                Ok(r#"{"a":{"x":1}}"#),
+            ),
+        ]);
+    }
+
+    /// A NaN component names no element, so its path is dropped — and dropped
+    /// *whole*, before the sort, because `compare_values` answers `Equal` for
+    /// NaN against every number. Left in, `[nan]` headed a run that swallowed
+    /// its numeric siblings and cancelled their deletions, so
+    /// `delpaths([[nan],[0]])` deleted nothing at all.
+    ///
+    /// jq cannot arbitrate: 1.7.1 loops forever on `delpaths([[nan]])`, which
+    /// is why this is a unit test and not a golden case (#415). What it pins is
+    /// that a path succinctly cannot use costs only itself.
+    #[test]
+    fn test_delpaths_nan_path_does_not_cancel_its_siblings() {
+        assert_outcomes(&[
+            (b"[10,20,30,40]", "delpaths([[nan]])", Ok("[10,20,30,40]")),
+            (b"[10,20,30,40]", "delpaths([[nan],[0]])", Ok("[20,30,40]")),
+            (b"[10,20,30,40]", "delpaths([[0],[nan]])", Ok("[20,30,40]")),
+            (b"[10,20,30,40]", "delpaths([[0],[nan],[2]])", Ok("[20,40]")),
+            (
+                b"[[1,2],[3,4]]",
+                "delpaths([[0,nan],[0,1]])",
+                Ok("[[1],[3,4]]"),
+            ),
+            // A bare NaN is not a path at all, and goes the same way as any
+            // other non-array entry rather than sorting among the paths.
+            (b"[10,20,30,40]", "delpaths([nan,[0]])", Ok("[20,30,40]")),
         ]);
     }
 
