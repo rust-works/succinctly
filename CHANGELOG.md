@@ -91,6 +91,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`tojson`, `@json` and `sjq`'s printer escaped C1 control characters** (#385):
+  the escaping branched on `char::is_control()`, which is true for the C1 range
+  U+0080–U+009F as well as C0. JSON only requires escaping below U+0020 and jq
+  escapes nothing else there, so a string holding U+0085 (NEL) round-tripped
+  through jq as its two raw UTF-8 bytes and through succinctly as a
+  six-character backslash-u escape. `tojson` additionally emitted the long forms
+  where jq emits `\b` and `\f`, and `JqValue`'s object keys escaped only `"` and
+  `\`, so a control character in a key produced invalid JSON.
+
+  The predicate is now `< 0x20 || == 0x7f`. Not `is_control()`, and not the bare
+  `< 0x20` the issue proposed — jq escapes DEL, which succinctly had right only
+  by accident of `is_control()` covering it, and which a naive narrowing to C0
+  would have broken in the other direction.
+
+  Behind it, the five hand-written JSON string writers are now two, in
+  `succinctly::jq::escape`: one per convention, because jq and mikefarah/yq
+  genuinely disagree at `0x08`, `0x0c` and `0x7f`. A differential test pins that
+  disagreement set exactly — asserting only that the two agree would pass if
+  both broke the same way. Six oracle-captured cases under
+  `tests/data/jq-golden/cases/escape_controls_*` cover the corpus end to end.
+  yq's output is unaffected; see the #106 lesson in `CLAUDE.md` on predicates
+  that diverge silently.
+
 - **jq: `delpaths` no longer lets one deletion shift the array under the next**
   (#398). It deleted left to right, sorting only by path length, so two paths of
   equal length kept the caller's order and the first deletion moved the element

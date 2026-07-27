@@ -3846,6 +3846,10 @@ fn yaml_quote_string(s: &str) -> String {
                 '\n' => result.push_str("\\n"),
                 '\r' => result.push_str("\\r"),
                 '\t' => result.push_str("\\t"),
+                // YAML's `\xNN`, not JSON's `\u00xx` — so this is deliberately
+                // not one of the writers #385 unified in `super::escape`, and
+                // `is_control()` is the right predicate here: YAML has an 8-bit
+                // escape and `Cc` (C0, DEL, C1) is exactly what it covers.
                 c if c.is_control() => {
                     result.push_str(&format!("\\x{:02x}", c as u32));
                 }
@@ -7858,7 +7862,7 @@ fn eval_owned_expr<S: EvalSemantics>(
     // Create a synthetic JSON from the owned value
     // For simplicity, we'll serialize and reparse
     // This is inefficient but correct
-    let json_str = owned_value_to_json_string(input);
+    let json_str = input.to_json();
     let json_bytes = json_str.as_bytes();
 
     // We need to create a temporary index and cursor
@@ -7908,7 +7912,7 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Serialize and reparse to obtain a document the evaluator can index into.
     // Only reached on the error path, so the round-trip is off the hot path.
-    let json_str = owned_value_to_json_string(input);
+    let json_str = input.to_json();
     let json_bytes = json_str.as_bytes();
 
     use crate::json::JsonIndex;
@@ -7924,67 +7928,6 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
-    }
-}
-
-/// Convert an OwnedValue to a JSON string.
-fn owned_value_to_json_string(value: &OwnedValue) -> String {
-    match value {
-        OwnedValue::Null => "null".into(),
-        OwnedValue::Bool(true) => "true".into(),
-        OwnedValue::Bool(false) => "false".into(),
-        OwnedValue::Int(i) => format!("{i}"),
-        OwnedValue::Float(f) => {
-            if f.is_nan() || f.is_infinite() {
-                "null".into() // JSON doesn't have NaN or Infinity
-            } else {
-                format!("{f}")
-            }
-        }
-        OwnedValue::String(s) => {
-            // Escape the string for JSON
-            let mut result = String::with_capacity(s.len() + 2);
-            result.push('"');
-            for c in s.chars() {
-                match c {
-                    '"' => result.push_str("\\\""),
-                    '\\' => result.push_str("\\\\"),
-                    '\n' => result.push_str("\\n"),
-                    '\r' => result.push_str("\\r"),
-                    '\t' => result.push_str("\\t"),
-                    c if c.is_control() => {
-                        result.push_str(&format!("\\u{:04x}", c as u32));
-                    }
-                    c => result.push(c),
-                }
-            }
-            result.push('"');
-            result
-        }
-        OwnedValue::Array(arr) => {
-            let mut result = String::from("[");
-            for (i, v) in arr.iter().enumerate() {
-                if i > 0 {
-                    result.push(',');
-                }
-                result.push_str(&owned_value_to_json_string(v));
-            }
-            result.push(']');
-            result
-        }
-        OwnedValue::Object(obj) => {
-            let mut result = String::from("{");
-            for (i, (k, v)) in obj.iter().enumerate() {
-                if i > 0 {
-                    result.push(',');
-                }
-                result.push_str(&owned_value_to_json_string(&OwnedValue::String(k.clone())));
-                result.push(':');
-                result.push_str(&owned_value_to_json_string(v));
-            }
-            result.push('}');
-            result
-        }
     }
 }
 

@@ -23,6 +23,7 @@ use std::borrow::Cow;
 
 use crate::json::light::{JsonCursor, StandardJson};
 
+use super::escape::write_json_body_jq;
 use super::expr::Literal;
 use super::value::OwnedValue;
 
@@ -463,17 +464,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             }
             JqValue::String(s) => {
                 out.write_char('"')?;
-                for c in s.chars() {
-                    match c {
-                        '"' => out.write_str("\\\"")?,
-                        '\\' => out.write_str("\\\\")?,
-                        '\n' => out.write_str("\\n")?,
-                        '\r' => out.write_str("\\r")?,
-                        '\t' => out.write_str("\\t")?,
-                        c if c.is_control() => write!(out, "\\u{:04x}", c as u32)?,
-                        c => out.write_char(c)?,
-                    }
-                }
+                write_json_body_jq(out, s)?;
                 out.write_char('"')
             }
             JqValue::Array(arr) => {
@@ -492,15 +483,12 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                     if i > 0 {
                         out.write_char(',')?;
                     }
-                    // Write key
+                    // Write key. This used to escape only `"` and `\`, which
+                    // let a control character in a key through raw and so
+                    // emitted invalid JSON; keys take the same convention as
+                    // values.
                     out.write_char('"')?;
-                    for c in k.chars() {
-                        match c {
-                            '"' => out.write_str("\\\"")?,
-                            '\\' => out.write_str("\\\\")?,
-                            c => out.write_char(c)?,
-                        }
-                    }
+                    write_json_body_jq(out, k)?;
                     out.write_str("\":")?;
                     v.write_json(out)?;
                 }

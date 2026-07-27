@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 
 use indexmap::IndexMap;
 
+use super::escape::{escape_json_body, write_json_body_jq};
 use super::expr::Literal;
 
 /// An owned JSON value.
@@ -204,7 +205,7 @@ impl OwnedValue {
                     format!("{f}")
                 }
             }
-            Self::String(s) => format!("\"{}\"", escape_json_string(s)),
+            Self::String(s) => format!("\"{}\"", escape_json_body(write_json_body_jq, s)),
             Self::Array(arr) => {
                 let elements: Vec<String> = arr.iter().map(Self::to_json).collect();
                 format!("[{}]", elements.join(","))
@@ -212,7 +213,13 @@ impl OwnedValue {
             Self::Object(obj) => {
                 let entries: Vec<String> = obj
                     .iter()
-                    .map(|(k, v)| format!("\"{}\":{}", escape_json_string(k), v.to_json()))
+                    .map(|(k, v)| {
+                        format!(
+                            "\"{}\":{}",
+                            escape_json_body(write_json_body_jq, k),
+                            v.to_json()
+                        )
+                    })
                     .collect();
                 format!("{{{}}}", entries.join(","))
             }
@@ -261,25 +268,6 @@ impl PartialEq for OwnedValue {
             _ => false,
         }
     }
-}
-
-/// Escape a string for JSON output.
-fn escape_json_string(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            c if c.is_control() => {
-                result.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => result.push(c),
-        }
-    }
-    result
 }
 
 impl From<Literal> for OwnedValue {
@@ -396,6 +384,55 @@ mod tests {
             OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]).to_json(),
             "[1,2]"
         );
+    }
+
+    /// `to_json` is what `tojson`, `@json`, `tostring` and string interpolation
+    /// all render through, so its escaping has to be jq's. Pinned against
+    /// jq-1.7.1 (#385):
+    ///
+    /// ```console
+    /// $ printf '"a\\u0001b\\u007fc\\u0085d\\u0008e\\u000cf"' | jq -r tojson | od -An -c
+    ///     "   a   \   u   0   0   0   1   b   \   u   0   0   7   f   c
+    ///   302 205   d   \   b   e   \   f   f   "  \n
+    /// ```
+    #[test]
+    fn test_to_json_string_escaping_matches_jq() {
+        let json = |s: &str| OwnedValue::String(s.into()).to_json();
+
+        // Backspace and form feed take jq's short forms, not the long
+        // \u0008/\u000c that yq uses.
+        assert_eq!(json("\u{8}\u{c}"), "\"\\b\\f\"");
+        // Other C0 controls, and DEL, take the long form.
+        assert_eq!(json("\u{1}\u{1f}"), "\"\\u0001\\u001f\"");
+        assert_eq!(json("\u{7f}"), "\"\\u007f\"");
+        // C1 controls are emitted raw: `char::is_control()` covers them but
+        // JSON does not require escaping them and jq does not escape them.
+        assert_eq!(json("a\u{85}b"), "\"a\u{85}b\"");
+        assert_eq!(json("\u{80}\u{9f}"), "\"\u{80}\u{9f}\"");
+        // Non-ASCII is untouched, above and below the BMP.
+        assert_eq!(json("café 😀"), "\"café 😀\"");
+        // Object keys take the same treatment as values.
+        let mut obj = IndexMap::new();
+        obj.insert("k\u{85}\u{8}".to_string(), OwnedValue::Int(1));
+        assert_eq!(OwnedValue::Object(obj).to_json(), "{\"k\u{85}\\b\":1}");
+    }
+
+    /// Whatever `to_json` emits has to parse back to the value it came from —
+    /// the escaping change must not make a control character round-trip badly.
+    #[test]
+    fn test_to_json_round_trips_through_a_parser() {
+        for cp in (0u32..=0xFF).chain([0x2028, 0x1F600]) {
+            let c = char::from_u32(cp).unwrap();
+            let value = OwnedValue::String(String::from(c));
+            let json = value.to_json();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("U+{cp:04X}: {json:?}: {e}"));
+            assert_eq!(
+                parsed.as_str(),
+                Some(String::from(c).as_str()),
+                "U+{cp:04X}"
+            );
+        }
     }
 
     #[test]
