@@ -68,6 +68,14 @@ pub mod trees;
 /// Internal utilities (not part of public API).
 pub(crate) mod util;
 
+/// Scan-length instrumentation for the `select` word-scan loops (#40).
+///
+/// Diagnostic tooling, not a data structure: the counters it collects are only
+/// populated in builds with the non-default `select-stats` feature. See the
+/// module docs for why the measurement exists.
+#[cfg(any(feature = "std", test))]
+pub use util::select_stats;
+
 /// Binary serialization utilities.
 pub mod binary;
 

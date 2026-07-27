@@ -247,6 +247,13 @@ impl RankSelect for BitVec {
         // ones_count` guarantees the scan finds it, so this `?` is unreachable.
         let (word_idx, rem) = scan_select(&self.words, start_word, remaining)?;
 
+        // #40: words popcounted by this scan, including the crossing word.
+        #[cfg(feature = "select-stats")]
+        crate::util::select_stats::record(
+            crate::util::select_stats::Site::BitVec,
+            word_idx - start_word + 1,
+        );
+
         let bit_pos = select_in_word(self.words[word_idx], rem as u32) as usize;
         let result = word_idx * 64 + bit_pos;
         // Defensive: `with_config` clears every bit at or past `len`, so a set

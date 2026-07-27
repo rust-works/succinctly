@@ -412,6 +412,11 @@ impl AdvancePositions {
             let result = wi * 64 + bit_pos;
 
             // #40: words popcounted by this scan, including the crossing word.
+            #[cfg(feature = "select-stats")]
+            crate::util::select_stats::record(
+                crate::util::select_stats::Site::YamlAdvance,
+                wi - start_wi + 1,
+            );
 
             // `rem` is the target's rank *within* word `wi`, so `k - rem` is
             // the number of ones before that word — the cursor's invariant.

@@ -60,6 +60,12 @@ broadword-yaml = []
 # Useful for benchmarking baseline scalar performance.
 scalar-yaml = []
 
+# Record how many words each `select` word-scan traverses (#40 measurement).
+# Adds a counter to five hot-ish scan loops, so it must never be on for timing
+# runs -- it exists to decide whether those scans are long enough for a SIMD
+# kernel to pay for itself. See `succinctly dev select-stats`.
+select-stats = ["std"]
+
 # Unified benchmark runner (succinctly bench list/run)
 bench-runner = ["cli", "dep:chrono"]
 

@@ -348,6 +348,8 @@ impl EliasFano {
             let ones = masked.count_ones() as usize;
             if ones > remaining {
                 // #40: a single-word scan.
+                #[cfg(feature = "select-stats")]
+                crate::util::select_stats::record(crate::util::select_stats::Site::EliasFano, 1);
 
                 return start_word * 64 + select_in_word(masked, remaining as u32) as usize;
             }
@@ -357,6 +359,11 @@ impl EliasFano {
                 .expect("select1: not enough 1-bits");
 
             // #40: words popcounted, counting the masked start word.
+            #[cfg(feature = "select-stats")]
+            crate::util::select_stats::record(
+                crate::util::select_stats::Site::EliasFano,
+                word_idx - start_word + 1,
+            );
 
             let bit_pos = select_in_word(self.high_bits[word_idx], rem as u32) as usize;
             return word_idx * 64 + bit_pos;
@@ -367,6 +374,11 @@ impl EliasFano {
             .expect("select1: not enough 1-bits");
 
         // #40: words popcounted by this scan, including the crossing word.
+        #[cfg(feature = "select-stats")]
+        crate::util::select_stats::record(
+            crate::util::select_stats::Site::EliasFano,
+            word_idx - start_word + 1,
+        );
 
         word_idx * 64 + select_in_word(self.high_bits[word_idx], rem as u32) as usize
     }

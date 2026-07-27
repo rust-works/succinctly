@@ -112,6 +112,11 @@ impl SelectSupport for WithSelect {
         let (word_idx, rem) = scan_select(words, start_word, remaining)?;
 
         // #40: words popcounted by this scan, including the crossing word.
+        #[cfg(feature = "select-stats")]
+        crate::util::select_stats::record(
+            crate::util::select_stats::Site::BpWithSelect,
+            word_idx - start_word + 1,
+        );
 
         let bit_pos = select_in_word(words[word_idx], rem as u32) as usize;
         let result = word_idx * 64 + bit_pos;

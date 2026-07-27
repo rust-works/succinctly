@@ -600,6 +600,11 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         let k32 = k as u32;
         let n = words.len();
 
+        // #40: count `ib_rank` probes so this path's cost can be compared with
+        // the word-scan sites. Starts at 1 for the `hint_rank` probe below.
+        #[cfg(feature = "select-stats")]
+        let mut probes = 1usize;
+
         // Clamp hint to valid range
         let hint = hint.min(n.saturating_sub(1));
 
@@ -614,6 +619,10 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             let mut prev = hint;
 
             loop {
+                #[cfg(feature = "select-stats")]
+                {
+                    probes += 1;
+                }
                 let next = (hint + bound).min(n);
                 if next >= n || self.ib_rank[next + 1] > k32 {
                     lo = prev;
@@ -629,6 +638,10 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             let mut prev = hint;
 
             loop {
+                #[cfg(feature = "select-stats")]
+                {
+                    probes += 1;
+                }
                 let next = hint.saturating_sub(bound);
                 if next == 0 || self.ib_rank[next + 1] <= k32 {
                     lo = next;
@@ -644,6 +657,10 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         let mut lo = lo;
         let mut hi = hi;
         while lo < hi {
+            #[cfg(feature = "select-stats")]
+            {
+                probes += 1;
+            }
             let mid = lo + (hi - lo) / 2;
             if self.ib_rank[mid + 1] <= k32 {
                 lo = mid + 1;
@@ -651,6 +668,12 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
                 hi = mid;
             }
         }
+
+        #[cfg(feature = "select-stats")]
+        crate::util::select_stats::record(
+            crate::util::select_stats::Site::YamlIbSelectFrom,
+            probes,
+        );
 
         if lo >= n {
             return None;

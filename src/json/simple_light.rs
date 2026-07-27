@@ -308,6 +308,11 @@ impl<W: AsRef<[u64]>> SimpleJsonIndex<W> {
         let (word_idx, rem) = crate::bits::scan_select(words, 0, k)?;
 
         // #40: words popcounted by this scan, including the crossing word.
+        #[cfg(feature = "select-stats")]
+        crate::util::select_stats::record(
+            crate::util::select_stats::Site::SimpleJson,
+            word_idx + 1,
+        );
 
         let bit_pos = select_in_word(words[word_idx], rem as u32) as usize;
         let result = word_idx * 64 + bit_pos;
