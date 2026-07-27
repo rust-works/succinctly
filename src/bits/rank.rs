@@ -238,15 +238,10 @@ impl CacheAlignedL1L2Builder {
     /// space is reclaimed.
     fn build(self) -> CacheAlignedL1L2 {
         if self.len == 0 {
-            // Nothing was pushed, deallocate if we allocated
-            if self.capacity > 0 {
-                let layout =
-                    Layout::from_size_align(self.capacity * 16, CACHE_LINE_SIZE).expect("layout");
-                // Safety: ptr was allocated with this layout
-                unsafe {
-                    alloc::alloc::dealloc(self.ptr.as_ptr().cast::<u8>(), layout);
-                }
-            }
+            // Nothing was pushed, so there is nothing to transfer. Fall out of
+            // scope and let `Drop` release the allocation -- unlike the two paths
+            // below, this one must *not* free it here, because it does not
+            // `mem::forget(self)` afterwards and `Drop` would free it again.
             return CacheAlignedL1L2::empty();
         }
 
@@ -563,6 +558,85 @@ mod tests {
         assert_eq!(dir.rank_at_word(7), 64 * 7); // 448
     }
 
+    /// `CacheAlignedL1L2` hand-rolls `Clone` because a derived one would copy the
+    /// pointer and double-free. `RankDirectory` and `BitVec` both derive `Clone`
+    /// on top of it, so `BitVec::clone()` runs this `unsafe` body -- and no test
+    /// executed it until now.
+    #[test]
+    fn test_aligned_clone_is_deep_and_stays_aligned() {
+        let values: Vec<u128> = (0..12).map(|i| i * 7 + 1).collect();
+        let original = CacheAlignedL1L2::from_vec(values.clone());
+        let copy = original.clone();
+
+        assert_eq!(copy.as_slice(), values.as_slice());
+        assert_ne!(
+            copy.ptr.as_ptr(),
+            original.ptr.as_ptr(),
+            "clone must own its allocation, not alias the original"
+        );
+        assert_eq!(
+            copy.ptr.as_ptr() as usize % CACHE_LINE_SIZE,
+            0,
+            "clone must preserve cache-line alignment"
+        );
+
+        // Dropping the source must leave the clone intact.
+        drop(original);
+        assert_eq!(copy.as_slice(), values.as_slice());
+    }
+
+    #[test]
+    fn test_aligned_clone_of_empty() {
+        let copy = CacheAlignedL1L2::empty().clone();
+        assert!(copy.is_empty());
+        assert_eq!(copy.as_slice(), &[] as &[u128]);
+    }
+
+    #[test]
+    fn test_directory_clone_answers_ranks_after_source_dropped() {
+        // 24 words = 3 blocks, so l1_l2 holds real entries for the clone to copy.
+        let words: Vec<u64> = (0..24u64).map(|i| 0x0F0F_0F0F_0F0F_0F0Fu64 ^ i).collect();
+        let dir = RankDirectory::build(&words);
+        let expected: Vec<usize> = (0..words.len())
+            .map(|w| words[..w].iter().map(|x| x.count_ones() as usize).sum())
+            .collect();
+
+        let copy = dir.clone();
+        drop(dir);
+
+        for (w, &want) in expected.iter().enumerate() {
+            assert_eq!(copy.rank_at_word(w), want, "rank_at_word({w}) after clone");
+        }
+    }
+
+    /// L0 only engages past one superblock -- `BLOCKS_PER_SUPERBLOCK` (2^23)
+    /// blocks of 512 bits, i.e. a 2^32-bit (512 MiB) bitvector -- so `build`'s L0
+    /// rollover and `rank_at_word`'s L0 lookup are unreachable below that size and
+    /// no test covered the level at all. This is the same size class as #188,
+    /// where a u32 accumulator past 2^32 wrapped. Needs ~700 MB (536 MB of words
+    /// plus a 134 MB directory), hence the huge-tests gate.
+    #[test]
+    #[cfg(feature = "huge-tests")]
+    fn test_rank_crosses_l0_superblock_boundary() {
+        let first_word_past_superblock = BLOCKS_PER_SUPERBLOCK * WORDS_PER_BLOCK;
+        let words = vec![u64::MAX; first_word_past_superblock + WORDS_PER_BLOCK];
+        let dir = RankDirectory::build(&words);
+
+        // Every bit is set, so rank_at_word(w) == w * 64 -- including past 2^32,
+        // where L1 alone (a u32 relative to the L0 base) could not reach.
+        assert!(first_word_past_superblock * 64 > u32::MAX as usize);
+        assert_eq!(
+            dir.rank_at_word(first_word_past_superblock),
+            first_word_past_superblock * 64,
+            "first word of the second superblock"
+        );
+        assert_eq!(
+            dir.rank_at_word(first_word_past_superblock + 1),
+            (first_word_past_superblock + 1) * 64,
+            "L2 offset within the second superblock's first block"
+        );
+    }
+
     // Tests for CacheAlignedL1L2Builder
     mod builder_tests {
         use super::*;
@@ -652,6 +726,17 @@ mod tests {
             builder.push(1);
             let result = builder.build();
             assert_eq!(result.as_slice(), &[u128::MAX, u128::MAX / 2, 1]);
+        }
+
+        #[test]
+        fn test_builder_capacity_but_nothing_pushed() {
+            // `build()` has to free the allocation it made for `capacity` when
+            // nothing was ever pushed; `test_builder_empty` uses capacity 0 and
+            // so skips that dealloc arm.
+            let builder = CacheAlignedL1L2::builder(4);
+            let result = builder.build();
+            assert!(result.is_empty());
+            assert_eq!(result.as_slice(), &[] as &[u128]);
         }
 
         #[test]

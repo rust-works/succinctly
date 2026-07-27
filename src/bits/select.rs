@@ -236,6 +236,29 @@ mod tests {
         assert_eq!(idx.jump_to(15), (0, 15));
     }
 
+    #[test]
+    fn test_jump_to_past_the_last_sample() {
+        // 4 words x 4 ones at sample rate 4 gives samples for ones 0, 4, 8, 12.
+        let words = vec![0b1111u64; 4];
+        let idx = SelectIndex::build(&words, 16, 4);
+        assert_eq!(idx.samples.len(), 4);
+
+        // k == total_ones and beyond both land past the last sample, so `jump_to`
+        // falls back to it: scanning from there just runs off the end, which is
+        // how `BitVec::select1` yields None. It must never point past the k-th one.
+        assert_eq!(idx.jump_to(16), (3, 4));
+        assert_eq!(idx.jump_to(100), (3, 88));
+    }
+
+    #[test]
+    fn test_sample_rate_accessor_reports_the_rate_built_with() {
+        let words = vec![0b1111u64; 4];
+        assert_eq!(SelectIndex::build(&words, 16, 4).sample_rate(), 4);
+        // `build` clamps 0 to 1 to avoid a divide-by-zero in `jump_to`.
+        assert_eq!(SelectIndex::build(&words, 16, 0).sample_rate(), 1);
+        assert_eq!(SelectIndex::empty().sample_rate(), DEFAULT_SAMPLE_RATE);
+    }
+
     /// Regression test for #188: `cumulative_before` was u32 and wrapped past
     /// 2^32 set bits. Needs ~800 MB RAM (512 MB of all-ones words plus the
     /// sample array), hence the huge-tests gate.

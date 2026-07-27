@@ -32,6 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- Removed `succinctly::bits::CompactRank` (#321), a two-level rank directory with
+  no remaining callers. **Breaking**: the type is gone from the public API. It
+  was introduced for the YAML index structures and used by them (`ib_rank`,
+  `containers_rank`, `advance_rank`, `has_end_rank`), then replaced with
+  cumulative `Vec<u32>` rank arrays, which is what `YamlIndex` and
+  `AdvancePositions` store today. Its module doc still advertised the YAML use
+  after those call sites were gone. Nothing in the crate regresses in space or
+  speed, because nothing was using it any more; the ~50%-of-bitmap cost of the
+  cumulative arrays that displaced it is unchanged, and whether to close that gap
+  is the open question in #321.
+
 - Removed four never-constructed `YamlError` variants — `InvalidEscape`,
   `InvalidIndentation`, `ExplicitKeyNotSupported`, and `ColonWithoutSpace`
   (#223). **Breaking**: exhaustive `match`es on the public `YamlError` lose four
@@ -57,6 +68,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was; and the scan now skips quoted scalars and comments, so `a:\n \t"x: y"`
   and `a: 1\n \t# c: d` are accepted while `a:\n \t"b": 1` — a quoted *key*, so
   really indentation — is still refused.
+- **`BitVec` counted 1-bits that lie past `len`** (#321): `from_words` documents
+  that `len` may be less than `words.len() * 64`, but the constructor masked
+  `words[words.len() - 1]` — the wrong word as soon as `words` is longer than
+  `len` needs — and skipped masking entirely when `len % 64 == 0` or `len == 0`.
+  Surplus 1-bits therefore stayed in the cached `ones_count`, so
+  `BitVec::from_words(vec![u64::MAX, u64::MAX], 64)` reported 128 ones for a
+  64-bit vector, `rank1(i >= len)` returned that inflated count, and
+  `count_zeros()` panicked with "attempt to subtract with overflow" in debug (and
+  wrapped in release). It now clears the tail of the word holding bit `len - 1`
+  and zeroes every word after it. Found while covering `select1`'s
+  "position past `len`" branch, which existed only because of this.
+- **Double free in `RankDirectory`'s cache-aligned builder** (#321):
+  `CacheAlignedL1L2Builder::build()` freed its allocation and then returned
+  without `mem::forget(self)`, so `Drop` freed the same pointer again — an
+  immediate abort. Only the "capacity allocated but nothing pushed" path did
+  this; the two paths that transfer ownership always forgot `self`. That path is
+  unreachable from any public API today (`RankDirectory::build` returns early for
+  empty input, so a builder with capacity always gets at least one push), which
+  is why it was never hit. The explicit free is gone; `Drop` now owns the
+  release.
 - **jq `try/catch` discarded the raised error** (#158): the catch handler ran
   against the *original input* rather than the error value, so a handler could
   never see what went wrong — `try error("boom") catch .` gave `null` where jq
