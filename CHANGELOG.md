@@ -21,9 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Breaking**: adds an `Expr::IndexExpr` variant, so exhaustive `match`es on
   the public `Expr` gain an arm. A constant key still folds to `Expr::Field` /
   `Expr::Index` at parse time, leaving the existing AST and hot paths unchanged.
-  Not covered: expression-valued slice bounds (`.[$a:$b]`) and jq's
-  indices-of-subarray form (`.[[20]]`) — see
-  [docs/reference/jq-language.md](docs/reference/jq-language.md).
+  Not covered: expression-valued slice bounds (`.[$a:$b]`), jq's
+  indices-of-subarray form (`.[[20]]`), and — through a pre-existing defect in
+  `as`-binding over a generator, not in the brackets — `keys[] as $k | .[$k]`.
+  See [docs/reference/jq-language.md](docs/reference/jq-language.md).
   Incidentally, the `[range(0; length; 2) as $i | .[$i]]` workaround that doc
   has long recommended for step slicing now actually parses.
 - **jq error-message conformance corpus** (#356): a corpus of filter/input probes
@@ -87,6 +88,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface.
 
 ### Fixed
+
+- **jq: a repeated key no longer deletes twice** (#360). `[1,2,3] | del(.[(0,0)])`
+  removed elements 0 and 1, yielding `[3]`; resolved paths are now deduplicated
+  before deletion, as jq's `delpaths` does, giving `[2,3]`.
+
+- **jq: a NaN index no longer reads or writes element 0** (#360). `f64 as i64`
+  maps NaN to `0`, so `[10,20,30] | .[nan]` returned `10` and `.[nan] = 5`
+  silently overwrote the first element. Reads now yield `null` as jq does, and
+  writes (`= v`, `|= f`, `del`, `path`) report `Cannot set array element at NaN
+  index`.
+
+- **jq: `?` no longer suppresses errors raised by a computed key** (#360). The
+  enclosing optional flag was passed into the key's own evaluation, so
+  `{"k":"a","a":1} | [.. | .[.k]?]` returned `[1]` where jq fails with `Cannot
+  index string with string "k"`. `?` now covers the indexing only, matching jq;
+  `try`/`catch` still catches the error.
 
 - **YAML flow context silently absorbed tags as scalar text** (#369): block
   context has always rejected `!` via `check_unsupported`, but the flow-context

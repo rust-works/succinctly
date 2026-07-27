@@ -269,7 +269,9 @@ These enable IDE integration and programmatic navigation to specific document po
 - **Slice bounds must be integer literals.** `.[$a:$b]` and `.[(1+1):]` are parse errors; jq accepts them.
 - **An array-valued key errors instead of searching.** jq reads `[10,20,30] | .[[20]]` as an indices-of-subarray search returning `[1]`; here it reports `Cannot index array with array`.
 
-One further divergence is cosmetic: `path(.[1.7])` yields `[1]` where jq keeps the unfloored `[1.7]`.
+Two further divergences are confined to path contexts. `path(.[1.7])` yields `[1]` where jq keeps the unfloored `[1.7]`. A NaN key reads as `null` in both (`[10,20,30] | .[nan]` → `null`), but has no path component here: `path(.[nan])` and `del(.[nan])` report `Cannot set array element at NaN index`, jq's own wording for the assignment case, where jq instead yields the path `[null]` that its own `setpath` rejects (and, for `del`, hangs).
+
+**Indexing by a variable bound from a generator does not work yet.** `.[$k]` itself is fine, but `keys[] as $k | .[$k]` — the most common way to reach it — binds `$k` to the whole array rather than each element. This is a defect in `as`-binding over a multi-output expression, not in the bracket syntax: `[keys[] as $k | $k]` already returns `[["a","b"]]` instead of `["a","b"]`. Explicit bindings (`--arg k a`, `. as $x | $x[…]`, `def f($k): .[$k]`) are unaffected.
 
 See [jq Remaining Work](../plan/jq-remaining.md) for incomplete CLI and module system features.
 
