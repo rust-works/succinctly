@@ -4,6 +4,8 @@
 
 #[cfg(not(test))]
 use alloc::boxed::Box;
+// `BTreeSet`, not `HashSet`: this crate is `no_std`, and `alloc` has no hasher.
+use alloc::collections::BTreeSet;
 #[cfg(not(test))]
 use alloc::format;
 #[cfg(not(test))]
@@ -9705,14 +9707,21 @@ fn delete_keys(value: OwnedValue, keys: &[&OwnedValue]) -> OwnedValue {
     }
     match value {
         OwnedValue::Object(mut entries) => {
-            for key in keys {
-                // A non-string key is jq's `Cannot delete <kind> field of
-                // object` (#415). `shift_remove`, not `swap_remove`: the
-                // surviving keys keep their order.
-                if let OwnedValue::String(name) = key {
-                    entries.shift_remove(name);
-                }
-            }
+            // A non-string key is jq's `Cannot delete <kind> field of object`
+            // (#415); here it names no field, so it drops out of the set.
+            let doomed: BTreeSet<&str> = keys
+                .iter()
+                .filter_map(|key| match key {
+                    OwnedValue::String(name) => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            // One order-preserving `retain`, for the reason the array arm below
+            // takes the same shape: `shift_remove` per key shifts the tail every
+            // time, so deleting half of a 60k-key object cost 4.4s against jq's
+            // 0.02s. `retain` is `shift_remove`'s equal for a single key and
+            // linear for any number of them.
+            entries.retain(|name, _| !doomed.contains(name.as_str()));
             OwnedValue::Object(entries)
         }
         OwnedValue::Array(mut arr) => {
