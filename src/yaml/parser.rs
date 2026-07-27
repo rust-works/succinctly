@@ -161,8 +161,14 @@ struct Parser<'a> {
     in_document: bool,
 
     // Explicit key tracking
-    /// Whether we have a pending explicit key that needs a value (null if not followed by `:`)
-    pending_explicit_key: bool,
+    /// Depth (`indent_stack.len()`) of the mapping holding an explicit key that
+    /// still needs a value, or `None`. The key gets a null value if no `: ` follows.
+    ///
+    /// A depth rather than a bool because a complex key can itself be an open
+    /// container: `? k: v` makes the whole `k: v` the key, so the mapping on top of
+    /// the stack is the *key*, and the owner — the mapping the null belongs to — is
+    /// the one below it.
+    pending_explicit_key: Option<usize>,
 
     /// Current depth of recursively-parsed constructs, capped at
     /// [`MAX_NESTING_DEPTH`] to bound call-stack growth
@@ -220,7 +226,7 @@ impl<'a> Parser<'a> {
             anchors: BTreeMap::new(),
             aliases: BTreeMap::new(),
             in_document: false,
-            pending_explicit_key: false,
+            pending_explicit_key: None,
             nesting_depth: 0,
             #[cfg(debug_assertions)]
             wrapper_slots: Vec::with_capacity(estimated_opens),
@@ -379,13 +385,22 @@ impl<'a> Parser<'a> {
 
     /// Close a pending explicit key by adding a null value node.
     /// Call this when a new key or end of mapping is encountered without an explicit value.
+    ///
+    /// The null goes to the mapping that *owns* the key, which is only the mapping on
+    /// top of the stack when the depths match. A complex key can itself be an open
+    /// container — `? k: v` leaves the key mapping above its owner — and writing the
+    /// owner's null into that key would give the key a stray third child and consume
+    /// the pending state before the real `: value` line arrives.
+    ///
+    /// Every caller funnels through here rather than repeating the ownership test at
+    /// the call site: three copies of one predicate is how #106 happened.
     fn close_pending_explicit_key(&mut self) {
-        if self.pending_explicit_key {
+        if self.pending_explicit_key == Some(self.indent_stack.len()) {
             // Add a null value node (empty open/close pair)
             // Use input.len() as the text position to indicate "no text" / null value
             self.write_bp_open_at(self.input.len());
             self.write_bp_close();
-            self.pending_explicit_key = false;
+            self.pending_explicit_key = None;
         }
     }
 
@@ -1001,10 +1016,9 @@ impl<'a> Parser<'a> {
         // Close any remaining open containers within the document
         // The virtual root is at indent_stack[0], so close everything above it
         while self.indent_stack.len() > 1 {
-            // If we're closing a mapping that has a pending explicit key, close it first
-            if self.current_type == Some(NodeType::Mapping) {
-                self.close_pending_explicit_key();
-            }
+            // If we're closing the mapping that owns a pending explicit key, give the
+            // key its null first. `close_pending_explicit_key` owns that test.
+            self.close_pending_explicit_key();
             self.indent_stack.pop();
             self.pop_type();
             self.write_bp_close();
@@ -1348,10 +1362,11 @@ impl<'a> Parser<'a> {
             // Containers at the same level should stay open so new entries
             // can be added to them.
             if current_indent > new_indent {
-                // If we're closing a mapping that has a pending explicit key, close it first
-                if self.current_type == Some(NodeType::Mapping) {
-                    self.close_pending_explicit_key();
-                }
+                // If we're closing the mapping that owns a pending explicit key, give
+                // the key its null first. `close_pending_explicit_key` owns that test —
+                // testing `current_type == Mapping` here would fire on a complex key
+                // that is itself a mapping (`? k: v`), which is not the owner.
+                self.close_pending_explicit_key();
                 self.indent_stack.pop();
                 self.pop_type();
                 self.write_bp_close();
@@ -1990,6 +2005,12 @@ impl<'a> Parser<'a> {
             self.push_type(NodeType::Mapping);
         }
 
+        // The mapping that owns this key, recorded now while it is unambiguously the
+        // top of the stack: parsing the key may push containers of its own (a
+        // sequence, or the compact mapping of `? k: v`) that must not receive the
+        // owner's null value.
+        let owner_depth = self.indent_stack.len();
+
         // Skip `?`
         self.advance();
 
@@ -2018,7 +2039,7 @@ impl<'a> Parser<'a> {
                 self.set_ib();
                 self.write_bp_open();
                 self.write_bp_close();
-                self.pending_explicit_key = true;
+                self.pending_explicit_key = Some(owner_depth);
                 return Ok(());
             }
 
@@ -2048,7 +2069,7 @@ impl<'a> Parser<'a> {
                     self.write_bp_close();
                     // Restore position for main loop to process `: value`
                     self.pos = saved_pos;
-                    self.pending_explicit_key = true;
+                    self.pending_explicit_key = Some(owner_depth);
                     return Ok(());
                 }
                 // Other content at same/lower indent - empty key (null) with implicit null value
@@ -2059,7 +2080,7 @@ impl<'a> Parser<'a> {
                 self.write_bp_close();
                 // Restore position for main loop to process next content
                 self.pos = saved_pos;
-                self.pending_explicit_key = true;
+                self.pending_explicit_key = Some(owner_depth);
                 return Ok(());
             }
 
@@ -2112,12 +2133,40 @@ impl<'a> Parser<'a> {
                 // Block scalar as key
                 self.parse_block_scalar(indent)?;
             }
+            _ if self.looks_like_mapping_entry() => {
+                // `? k: v` — a value indicator on this line means the node after `? `
+                // is a *compact block mapping* that is itself the key (YAML 1.2 §8.2.2:
+                // c-l-block-map-explicit-key -> s-l+block-indented -> ns-l-compact-mapping).
+                // The entry therefore has a complex key and no value, which is why yq
+                // renders it `""` and null (#346).
+                //
+                // Routed through the same `parse_compact_mapping_entry` the `- k: v`
+                // sequence-item path uses rather than a second copy of the decision
+                // (#106). Ordered after the `-`, `[`, `{` and block-scalar arms so
+                // those spellings — whose lines can carry a `: ` that is not this
+                // line's value indicator — keep their handling.
+                //
+                // The key content's own column, not `indent`, is the mapping's indent:
+                // a continuation line joins the key at the key's column (`? k: v` then
+                // `  j: u`), while the `: ` value indicator aligns with the `?`.
+                //
+                // Leaving that mapping open is what keeps the parser off the mid-line
+                // exit this used to take: `parse_unquoted_value_with_indent` stopped at
+                // the `: `, and the main loop then re-derived the line's indent from
+                // mid-line as 0 and closed the mapping it should have been filling.
+                self.parse_compact_mapping_entry(self.current_column())?;
+            }
             Some(b'*') => {
-                // Alias as key (`? *a`). No node is open yet at this point (unlike
-                // the block, compact and flow key sites), so `parse_alias` opening
-                // and closing its own is correct here. Without this arm the alias
-                // fell to the plain-scalar arm below, which produced an empty key
-                // whether or not the anchor existed (#372).
+                // Alias as key (`? *a`). As in the flow-mapping key path,
+                // `parse_alias` opens and closes its own node. Without this arm
+                // the alias fell to the plain-scalar arm below, which produced
+                // an empty key whether or not the anchor existed (#372).
+                //
+                // Below the mapping-entry arm above, so `? *a: v` is read as a
+                // compact mapping whose key is the alias — the same reading
+                // `parse_compact_mapping_entry` already gives `- *a: v`. This
+                // arm is the alias that is the whole key, with its `:` (if any)
+                // on a later line.
                 self.parse_alias()?;
             }
             Some(b'"') => {
@@ -2144,7 +2193,7 @@ impl<'a> Parser<'a> {
         }
 
         // Mark that we have an explicit key waiting for a value
-        self.pending_explicit_key = true;
+        self.pending_explicit_key = Some(owner_depth);
 
         Ok(())
     }
@@ -2155,7 +2204,7 @@ impl<'a> Parser<'a> {
         self.close_deeper_indents(indent + 1);
 
         // This value is for the pending explicit key
-        self.pending_explicit_key = false;
+        self.pending_explicit_key = None;
 
         // Skip `:`
         self.advance();
@@ -2208,6 +2257,14 @@ impl<'a> Parser<'a> {
             }
             Some(b'|' | b'>') => {
                 self.parse_block_scalar(indent)?;
+            }
+            _ if self.looks_like_mapping_entry() => {
+                // `: b: c` — the mirror of the key-side arm above: the node after `: `
+                // may equally be a compact block mapping starting on the same line, and
+                // stopping the scalar at the inner `: ` left the parser mid-line with
+                // the same consequences (#346). Corpus case V9D5
+                // (`- ? earth: blue` / `  : moon: white`) needs both arms.
+                self.parse_compact_mapping_entry(self.current_column())?;
             }
             Some(b'"') => {
                 self.set_ib();

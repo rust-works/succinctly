@@ -970,6 +970,9 @@ mod tests {
             &b"? a\n? b\nc: 1\n"[..],
             &b"? a\nc: 1\n"[..],
             &b"? a\n? b\n"[..],
+            // #346: a same-line complex key is valueless too, so it reaches the
+            // same fallback once another entry follows its null sentinel
+            &b"? k: v\nj: u\n"[..],
         ] {
             let index = YamlIndex::build(yaml).expect("valueless explicit keys must parse");
             assert!(
@@ -993,6 +996,11 @@ mod tests {
             // Block-scalar and sequence keys
             &b"? |\n  block key\n: v\n"[..],
             &b"outer:\n  ? - a\n  : b\n"[..],
+            // #346: a same-line complex key with nothing after it - the null
+            // sentinel sorts last, so the opens stay monotonic
+            &b"? k: v\n"[..],
+            // ...and one that does take a value stays monotonic throughout
+            &b"? k: v\n: w\n"[..],
         ] {
             let index = YamlIndex::build(yaml).expect("must parse");
             assert!(

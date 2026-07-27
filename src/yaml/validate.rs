@@ -1513,6 +1513,34 @@ mod tests {
         assert!(validate(b"? k\n: - ? e\n    : v\n").is_ok());
     }
 
+    /// Issue #346: the same-line spelling `? k: v`, in which the whole `k: v` is
+    /// a compact block mapping used as the key, must pass the validator too.
+    ///
+    /// Same reason as [`accepts_explicit_keys_as_sequence_items`]: the validator
+    /// has its own `LineKind` classifier and does not inherit the parser fix, so
+    /// `syq --validate` could reject documents `syq` now reads correctly.
+    #[test]
+    fn accepts_an_explicit_key_and_its_value_indicator_on_one_line() {
+        assert!(validate(b"? k: v\n").is_ok());
+        assert!(validate(b"m:\n  ? k: v\n").is_ok());
+        assert!(validate(b"- ? k: v\n").is_ok());
+        assert!(validate(b"? k: v\n: w\n").is_ok());
+        assert!(validate(b"? k: v\n  j: u\n").is_ok());
+        assert!(validate(b"? k: v\nj: u\n").is_ok());
+        assert!(validate(b"?   k: v\n    j: u\n: w\n").is_ok());
+        assert!(validate(b"? \"a\": v\n").is_ok());
+        assert!(validate(b"? 'a': v\n").is_ok());
+        assert!(validate(b"? : x\n").is_ok());
+        // The value indicator carries the same spelling
+        assert!(validate(b"? a\n: b: c\n").is_ok());
+        assert!(validate(b"? a: b\n: c: d\n").is_ok());
+        // YAML Test Suite case V9D5 - needs the key and value arms together
+        assert!(validate(b"- sun: yellow\n- ? earth: blue\n  : moon: white\n").is_ok());
+        assert!(validate(b"? - a: b\n: v\n").is_ok());
+        assert!(validate(b"- ? k: v\n- z\n").is_ok());
+        assert!(validate(b"? k: v\r\n: w\r\n").is_ok());
+    }
+
     #[test]
     fn accepts_multiline_and_folded_scalars() {
         assert!(validate(b"a\nb\n c\nd\n\ne\n").is_ok()); // 9YRD plain multiline
