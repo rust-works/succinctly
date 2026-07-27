@@ -2267,3 +2267,28 @@ fn test_alias_as_a_flow_mapping_key_keeps_its_own_extent() -> Result<()> {
     assert_eq!(whole.trim(), r#"{"x":1,"y":{"":2}}"#);
     Ok(())
 }
+
+#[test]
+fn test_computed_key_in_index_brackets() -> Result<()> {
+    // The yq runner walks the parsed program to decide whether it can stream,
+    // and that walk has to descend into both halves of a computed index (#360).
+    // A key it fails to look inside would be scanned as an opaque leaf, so a
+    // `split_doc` hiding there would pick the wrong output path.
+    let yaml = "a: 1\nb: 2\nk: a\n";
+
+    // Key outer, target inner — one output per key, in key order.
+    let (output, code) = run_yq_stdin(r#".[("a","b")]"#, yaml, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "1\n2\n");
+
+    // A key read out of the document itself.
+    let (output, code) = run_yq_stdin(".[.k]", yaml, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "1\n");
+
+    // A missing key is null, not an error, exactly as `.missing` is.
+    let (output, code) = run_yq_stdin(r#".[("nope")]"#, yaml, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "null\n");
+    Ok(())
+}

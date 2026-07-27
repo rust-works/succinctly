@@ -4815,6 +4815,27 @@ mod tests {
         );
     }
 
+    /// `.a.[k]` — jq's older spelling, where a dot precedes the bracket — takes
+    /// a separate branch of the postfix loop from `.a[k]`. Both have to attach
+    /// the bracket to the chain the same way, or a computed key written with
+    /// the dot would silently read its key from `.a` instead of from the input.
+    #[test]
+    fn test_dot_before_bracket_matches_the_bare_bracket() {
+        for (dotted, bare) in [
+            (".a.[0]", ".a[0]"),
+            (r#".a.["k"]"#, r#".a["k"]"#),
+            (".a.[.k]", ".a[.k]"),
+            (".a.[$k]?", ".a[$k]?"),
+            (".a.[]", ".a[]"),
+        ] {
+            assert_eq!(
+                parse(dotted).unwrap(),
+                parse(bare).unwrap(),
+                "`{dotted}` should parse identically to `{bare}`"
+            );
+        }
+    }
+
     #[test]
     fn test_bracket_string_notation() {
         // Basic bracket string notation
