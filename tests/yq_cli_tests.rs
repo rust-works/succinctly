@@ -1366,6 +1366,62 @@ fn test_yaml_explicit_flow_mapping_key_drops_the_indicator() -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// An anchor at the end of a compact mapping entry's line (#406) - `- k: &a`
+// puts the value on the *next* line, not this one. Expectations are
+// mikefarah/yq v4.53.3 output.
+// =============================================================================
+
+#[test]
+fn test_yaml_compact_entry_trailing_anchor_keeps_the_nested_value() -> Result<()> {
+    // The headline #406 repros. `parse_compact_mapping_entry` asked
+    // `at_line_end` before anything consumed the `&a`, so the entry took the
+    // inline path and `parse_inline_value`'s multi-line plain-scalar rule ate
+    // the block below: the mapping form came out as {"k":"b"} and the sequence
+    // form as {"k":null}. Adding the anchor is the only difference from the
+    // shapes above them, which were always right.
+    for (name, input, expected) in [
+        (
+            "mapping, no anchor",
+            "- k:\n    b: 1\n",
+            r#"[{"k":{"b":1}}]"#,
+        ),
+        ("mapping", "- k: &a\n    b: 1\n", r#"[{"k":{"b":1}}]"#),
+        ("sequence, no anchor", "- k:\n    - 1\n", r#"[{"k":[1]}]"#),
+        ("sequence", "- k: &a\n    - 1\n", r#"[{"k":[1]}]"#),
+        // A block sequence may sit at its parent key's own indent.
+        (
+            "sequence at entry indent",
+            "- k: &a\n  - 1\n",
+            r#"[{"k":[1]}]"#,
+        ),
+        // The entry keeps its siblings: the nested mapping must close so `j`
+        // lands beside `k`, not inside it.
+        (
+            "sibling entry after the nested block",
+            "- k: &a\n    b: 1\n  j: 2\n",
+            r#"[{"k":{"b":1},"j":2}]"#,
+        ),
+        // `at_line_end` is also true at a comment, so the anchor is still last.
+        (
+            "anchor then comment",
+            "- k: &a # note\n    b: 1\n",
+            r#"[{"k":{"b":1}}]"#,
+        ),
+        // A flow collection on the next line went the same way — `"[1, 2]"`.
+        (
+            "flow collection below",
+            "- k: &a\n    [1, 2]\n",
+            r#"[{"k":[1,2]}]"#,
+        ),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(exit_code, 0, "{name}: should parse cleanly");
+        assert_eq!(output.trim(), expected, "{name}");
+    }
+    Ok(())
+}
+
 #[test]
 fn test_yaml_explicit_flow_key_agrees_across_positions() -> Result<()> {
     // The fix is "one definition of `? key`, shared by both flow containers",
@@ -1402,6 +1458,127 @@ fn test_yaml_explicit_flow_key_agrees_across_positions() -> Result<()> {
             "{name}: the two call sites disagree"
         );
         assert_eq!(in_mapping.trim(), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_compact_entry_trailing_anchor_null_values_are_unchanged() -> Result<()> {
+    // The other side of the same decision: when no value follows, the entry is
+    // null and the anchor names an explicit empty node rather than dangling on
+    // whatever BP bit comes next. These already passed and pin the boundary —
+    // if one of them starts returning a collection, the fix has widened from
+    // "the value is on the next line" to "the next line is the value".
+    for (name, input, expected) in [
+        ("EOF", "- k: &a\n", r#"[{"k":null}]"#),
+        ("lower indent", "- k: &a\n- b\n", r#"[{"k":null},"b"]"#),
+        (
+            "same indent, not a sequence",
+            "- k: &a\n  j: 2\n",
+            r#"[{"k":null,"j":2}]"#,
+        ),
+        (
+            "alias to the null anchor",
+            "- k: &a\n  j: 2\n- *a\n",
+            r#"[{"k":null,"j":2},null]"#,
+        ),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(exit_code, 0, "{name}: should parse cleanly");
+        assert_eq!(output.trim(), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_compact_entry_anchor_names_the_nested_collection() -> Result<()> {
+    // Identity output alone cannot tell "the anchor names the nested mapping"
+    // from "the anchor names a scalar that happens to render the same", so
+    // resolve it. Before the fix the alias propagated the collapsed scalar —
+    // `[{"k":"b"},{"c":"b"}]` for the third case, self-consistent and wrong.
+    for (name, input, expected) in [
+        (
+            "alias as a sequence item",
+            "- k: &a\n    b: 1\n- *a\n",
+            r#"[{"k":{"b":1}},{"b":1}]"#,
+        ),
+        (
+            "alias as a block mapping value",
+            "seq:\n  - k: &a\n      b: 1\nref: *a\n",
+            r#"{"seq":[{"k":{"b":1}}],"ref":{"b":1}}"#,
+        ),
+        (
+            "alias as another compact entry's value",
+            "- k: &a\n    b: 1\n- c: *a\n",
+            r#"[{"k":{"b":1}},{"c":{"b":1}}]"#,
+        ),
+        (
+            "anchored sequence",
+            "- k: &a\n    - 1\n- *a\n",
+            r#"[{"k":[1]},[1]]"#,
+        ),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(exit_code, 0, "{name}: should parse cleanly");
+        assert_eq!(output.trim(), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_every_block_value_site_consumes_a_trailing_anchor() -> Result<()> {
+    // The bug was that one of the four block-context value sites decided where
+    // the value was *before* consuming the anchor, and the other three did not.
+    // One input shape — `&a` last on its line, the value indented below, an
+    // alias to it — through all four. Pinning them together is what stops the
+    // outlier coming back: a copy that regresses fails here even if its own
+    // section's tests are deleted.
+    for (name, input, expected) in [
+        (
+            "block mapping value (parse_mapping_entry)",
+            "k: &a\n  b: 1\nc: *a\n",
+            r#"{"k":{"b":1},"c":{"b":1}}"#,
+        ),
+        (
+            "compact mapping value (parse_compact_mapping_entry)",
+            "- k: &a\n    b: 1\n- *a\n",
+            r#"[{"k":{"b":1}},{"b":1}]"#,
+        ),
+        (
+            "sequence item (parse_sequence_item_inner)",
+            "- &a\n  b: 1\n- *a\n",
+            r#"[{"b":1},{"b":1}]"#,
+        ),
+        (
+            "explicit value (parse_explicit_value)",
+            "? k\n: &a\n  b: 1\nz: *a\n",
+            r#"{"k":{"b":1},"z":{"b":1}}"#,
+        ),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(exit_code, 0, "{name}: should parse cleanly");
+        assert_eq!(output.trim(), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_compact_entry_trailing_anchor_is_line_break_agnostic() -> Result<()> {
+    // `at_line_end` is now consulted twice per entry rather than once, and it
+    // is one of the predicates #324 taught to stop at `\r`. All three break
+    // forms are the same document per YAML 1.2 §5.4.
+    for (name, input) in [
+        ("LF", "- k: &a\n    b: 1\n- *a\n"),
+        ("CRLF", "- k: &a\r\n    b: 1\r\n- *a\r\n"),
+        ("CR", "- k: &a\r    b: 1\r- *a\r"),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(exit_code, 0, "{name} input should parse");
+        assert_eq!(
+            output.trim(),
+            r#"[{"k":{"b":1}},{"b":1}]"#,
+            "{name} line breaks should give the same document"
+        );
     }
     Ok(())
 }

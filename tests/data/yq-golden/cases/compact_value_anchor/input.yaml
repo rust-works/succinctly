@@ -1,0 +1,42 @@
+# An anchor at the end of a compact mapping entry's line (#406). The compact
+# counterpart to anchored_seq_item_compact: there the anchor is on the `- `,
+# here it is on the entry's value, where it names something on the NEXT line.
+nested_mapping:
+  - k: &nm
+      b: 1
+  - *nm
+nested_sequence:
+  - k: &ns
+      - 1
+  - *ns
+sequence_at_entry_indent:
+  - k: &si
+    - 1
+  - *si
+flow_below:
+  - k: &fb
+      [1, 2]
+  - *fb
+trailing_comment:
+  - k: &tc # note: a colon in a comment
+      b: 1
+  - *tc
+sibling_after_nested:
+  - k: &sa
+      b: 1
+    j: 2
+  - *sa
+inline_value:
+  - k: &iv v
+  - *iv
+null_at_lower_indent:
+  - k: &nl
+  - *nl
+null_at_same_indent:
+  - k: &ni
+    j: 2
+  - *ni
+alias_in_compact_value:
+  - k: &ac
+      b: 1
+  - c: *ac
