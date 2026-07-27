@@ -21,6 +21,12 @@ These plans are kept for:
 | [m2-benchmark-improvements.md](m2-benchmark-improvements.md)     | Proposed    | `yq_bench.rs`                     | Benchmark M2 streaming path    |
 | [simd-features.md](simd-features.md)                             | Current     | `src/yaml/simd/`                  | YAML SIMD feature flag matrix  |
 
+## Archived Plans
+
+| Plan                                                             | Status   | Module              | Description                             |
+|------------------------------------------------------------------|----------|---------------------|-----------------------------------------|
+| [yaml-index-post-compactrank.md](yaml-index-post-compactrank.md) | Archived | `src/yaml/index.rs` | Index analysis from the CompactRank era |
+
 ## Plan Status Legend
 
 - **Implemented**: Feature exists in codebase, plan reflects final design
