@@ -5990,10 +5990,16 @@ pub(crate) fn index_one_owned(
 /// 3. An empty key stream short-circuits *before* `E` runs:
 ///    `[(error("boom"))[empty]]` is `[]`, not an error.
 ///
-/// A trailing `?` covers the indexing, not the key: jq's `.[error("boom")]?`
-/// still raises `boom`, and `{"k":"a","a":1} | [.. | .[.k]?]` still fails on
-/// `Cannot index string with string "k"` when `..` reaches the string `"a"`.
-/// Hence `optional` reaches [`index_one`] but *not* the key evaluation below.
+/// A trailing `?` covers the indexing, and *only* the indexing — jq's
+/// `gen_index_opt(obj, key)` puts one opcode in its opt form and compiles both
+/// halves normally. So neither the key nor the target is evaluated optionally:
+/// `.[error("boom")]?` still raises `boom`, `{"k":"a","a":1} | [.. | .[.k]?]`
+/// still fails on `Cannot index string with string "k"` when `..` reaches the
+/// string `"a"`, and `"str" | .a[length]?` still fails on `Cannot index string
+/// with string "a"` — which the folded spelling `"str" | .a[0]?` has always
+/// done, so passing `optional` down here would make `?` mean two different
+/// things depending on whether the key happened to be a constant. `optional`
+/// reaches [`index_one`] and nothing else.
 fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     target: &Expr,
     key: &Expr,
@@ -6015,7 +6021,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::None;
     }
 
-    let targets = eval_single::<W, S>(target, value, optional).materialize_cursor();
+    let targets = eval_single::<W, S>(target, value, false).materialize_cursor();
 
     // Borrowed and owned targets are kept apart so the common (borrowed) case
     // never materializes the document.

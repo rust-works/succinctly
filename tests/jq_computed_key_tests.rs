@@ -158,6 +158,51 @@ fn test_optional_suppresses_the_indexing_error_only() {
     check("null", r#".[error("boom")]"#, Outcome::error("boom"));
 }
 
+/// `?` does not cover the *target* either — jq's `gen_index_opt(obj, key)`
+/// makes one opcode optional and compiles both halves normally.
+///
+/// The folded spelling `"str" | .a[0]?` has always raised here, because `.a`
+/// and `[0]` are separate chain elements and only the second is wrapped. When
+/// the computed-key path passed its `optional` down into the target as well,
+/// `"str" | .a[1+1]?` — the same query, differing only in whether the key
+/// happens to fold to a constant — silently returned nothing instead. Every
+/// case below is written in both spellings for exactly that reason.
+///
+/// A `Paren` target hides this: `(.a)[…]` resets the flag on the way down, so
+/// `(error("boom"))[…]?` raised even while the bare-field form did not.
+#[test]
+fn test_optional_does_not_reach_the_target() {
+    for filter in [".a[0]?", ".a[1+1]?", ".a[length]?"] {
+        check(
+            r#""str""#,
+            filter,
+            Outcome::error(r#"Cannot index string with string "a""#),
+        );
+    }
+
+    // Deeper in the chain, where the failing element is not the chain head.
+    for filter in [".a.b[0]?", ".a.b[1+1]?", ".a.b[length]?"] {
+        check(
+            r#"{"a":"s"}"#,
+            filter,
+            Outcome::error(r#"Cannot index string with string "b""#),
+        );
+    }
+
+    // A target that raises outright rather than by being unindexable. This is
+    // the parenthesised spelling that kept working throughout, and is here as
+    // the contrast that made the bare-field bug invisible.
+    check(
+        "null",
+        r#"(error("boom"))[("a","b")]?"#,
+        Outcome::error("boom"),
+    );
+
+    // What `?` *does* still suppress, so the fix is not simply "`?` no longer
+    // does anything": the indexing itself, once the target has been produced.
+    check(r#"{"a":"s"}"#, ".a[length]?", Outcome::values(&[]));
+}
+
 #[test]
 fn test_empty_key_stream_short_circuits() {
     // An empty key stream must not evaluate the target at all — jq compiles

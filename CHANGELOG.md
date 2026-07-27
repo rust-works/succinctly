@@ -101,11 +101,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes (`= v`, `|= f`, `del`, `path`) report `Cannot set array element at NaN
   index`.
 
-- **jq: `?` no longer suppresses errors raised by a computed key** (#360). The
-  enclosing optional flag was passed into the key's own evaluation, so
-  `{"k":"a","a":1} | [.. | .[.k]?]` returned `[1]` where jq fails with `Cannot
-  index string with string "k"`. `?` now covers the indexing only, matching jq;
-  `try`/`catch` still catches the error.
+- **jq: `?` no longer suppresses errors raised by a computed key, or by the
+  expression being indexed** (#360). The enclosing optional flag was passed into
+  both halves of `E[K]`, where jq's `gen_index_opt` makes one opcode optional and
+  compiles both halves normally. So `{"k":"a","a":1} | [.. | .[.k]?]` returned
+  `[1]` where jq fails with `Cannot index string with string "k"`, and
+  `"str" | .a[length]?` returned nothing where jq fails with `Cannot index string
+  with string "a"` — the latter making `?` mean two different things depending on
+  whether the key folded to a constant, since `"str" | .a[0]?` raised all along.
+  `?` now covers the indexing only, matching jq; `try`/`catch` still catches the
+  error.
 
 - **YAML flow context silently absorbed tags as scalar text** (#369): block
   context has always rejected `!` via `check_unsupported`, but the flow-context

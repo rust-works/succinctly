@@ -818,7 +818,7 @@ fn index_one_generic<V: DocumentValue>(
 ///
 /// The counterpart of `eval::eval_index_expr`; see that function for why the
 /// key stream is evaluated first and iterated outermost, and why a trailing `?`
-/// does not reach the key.
+/// reaches neither the key nor the target.
 fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     target: &Expr,
     key: &Expr,
@@ -837,7 +837,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         return GenericResult::None;
     }
 
-    let targets = match eval_single::<S, V>(target, value, optional, cursor) {
+    let targets = match eval_single::<S, V>(target, value, false, cursor) {
         GenericResult::Error(e) => return GenericResult::Error(e),
         GenericResult::Break(label) => return GenericResult::Break(label),
         GenericResult::None => return GenericResult::None,
