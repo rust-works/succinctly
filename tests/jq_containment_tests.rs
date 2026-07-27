@@ -24,6 +24,8 @@
 //! echo '"abcdefghijkl"' | jq -c 'contains(1)'      # 14-byte dump, kept whole
 //! echo '"abcdefghijklm"'| jq -c 'contains(1)'      # 15 bytes, truncated
 //! printf '"a\302\205b"' | jq -c 'contains(1)'      # C1 control, passed through raw
+//! printf '"x\010y"'      | jq -c 'contains(1)'      # backspace, jq's short form
+//! printf '"x\177y"'      | jq -c 'contains(1)'      # DEL, escaped as \u007f
 //! ```
 //!
 //! These are hand-transcribed rather than generated, so the suite is hermetic —
@@ -178,15 +180,34 @@ const CASES: &[(&[u8], &str, Expect)] = &[
             r#"object ({"aaa":1,"b...) and number (1) cannot have their containment checked"#,
         ),
     ),
-    // A C1 control (U+0085, the two bytes C2 85) is passed through raw, as jq
-    // does. `OwnedValue::to_json` would escape it — it escapes every
-    // `char::is_control()`, which covers C1 — so this case is what pins
-    // `dump_truncated` to the streaming writer instead. See its doc comment; the
-    // over-escaping still affects `tojson`/`@json` (#385), out of scope for #358.
+    // The preview escapes exactly as jq does — #385 made that one writer
+    // (`write_json_body_jq`) rather than three near-copies, so these three cases
+    // pin all of `dump_truncated`'s escaping, not just the C1 row #358 needed.
+    //
+    // A C1 control (U+0085, the two bytes C2 85) is passed through raw. This is
+    // the row that used to fail: `char::is_control()` is true for C1, so every
+    // writer branching on it escaped a character jq leaves alone.
     (
         "\"a\u{85}b\"".as_bytes(),
         r"contains(1)",
         Expect::Error("string (\"a\u{85}b\") and number (1) cannot have their containment checked"),
+    ),
+    // Backspace takes jq's short form. yq writes it as the long \u0008, and
+    // #358 previewed through yq's writer, so this row is what keeps the preview
+    // on the jq one.
+    (
+        b"\"x\x08y\"",
+        r"contains(1)",
+        Expect::Error(r#"string ("x\by") and number (1) cannot have their containment checked"#),
+    ),
+    // DEL is escaped, though it is not below 0x20 — which is why the predicate
+    // is `< 0x20 || == 0x7f` and not the bare `< 0x20` #385 first proposed.
+    (
+        b"\"x\x7fy\"",
+        r"contains(1)",
+        Expect::Error(
+            r#"string ("x\u007fy") and number (1) cannot have their containment checked"#,
+        ),
     ),
     // (`?` suppression is covered by `optional_suppresses_the_error` below —
     //  the surface syntax `contains("a")?` does not parse yet.)

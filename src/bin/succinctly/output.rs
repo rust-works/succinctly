@@ -3,6 +3,12 @@
 //! Exit codes, JSON string escaping, JSON pretty-printing, ANSI colorization
 //! (including `JQ_COLORS` support), and build-configuration diagnostics.
 
+// Aliased: this module already has an `escape_json_body` of its own, which
+// picks *which* convention to use; the library's runs a chosen writer.
+use succinctly::jq::escape::{
+    escape_json_body as run_escaper, write_json_body_jq, write_json_body_jq_ascii,
+    write_json_body_yq, write_json_body_yq_ascii,
+};
 use succinctly::jq::OwnedValue;
 
 /// Exit codes matching jq behavior
@@ -67,67 +73,23 @@ pub fn print_build_configuration(tool: &str) {
     }
 }
 
-/// Escape special characters in a JSON string.
+/// Escape a JSON string body using jq's convention.
 ///
-/// Returns the escaped body without surrounding quotes; callers add them.
+/// Returns the escaped body without surrounding quotes; callers add them. The
+/// escaping itself lives in `succinctly::jq::escape`, the one place either
+/// convention is defined — see `write_json_body_jq` for the full table.
 pub fn escape_json_string(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\x08' => result.push_str("\\b"), // backspace
-            '\x0C' => result.push_str("\\f"), // form feed
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            c if c.is_control() => {
-                result.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => result.push(c),
-        }
-    }
-    result
+    run_escaper(write_json_body_jq, s)
 }
 
-/// Escape special characters in a JSON string, also escaping non-ASCII as \uXXXX.
+/// [`escape_json_string`], also escaping non-ASCII as \uXXXX — jq's `-a` mode.
 ///
 /// Returns the escaped body without surrounding quotes; callers add them.
 pub fn escape_json_string_ascii(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\x08' => result.push_str("\\b"), // backspace
-            '\x0C' => result.push_str("\\f"), // form feed
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            c if c.is_control() => {
-                result.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c if !c.is_ascii() => {
-                // Escape non-ASCII characters as \uXXXX
-                // For characters outside BMP, use surrogate pairs
-                let code = c as u32;
-                if code <= 0xFFFF {
-                    result.push_str(&format!("\\u{code:04x}"));
-                } else {
-                    // Surrogate pair for characters above U+FFFF
-                    let adjusted = code - 0x10000;
-                    let high = 0xD800 + (adjusted >> 10);
-                    let low = 0xDC00 + (adjusted & 0x3FF);
-                    result.push_str(&format!("\\u{high:04x}\\u{low:04x}"));
-                }
-            }
-            c => result.push(c),
-        }
-    }
-    result
+    run_escaper(write_json_body_jq_ascii, s)
 }
 
-/// Escape special characters in a JSON string using yq's control-char rules.
+/// Escape a JSON string body using yq's control-char rules.
 ///
 /// Matches `mikefarah/yq`: only `"`, `\`, and C0 controls (`< 0x20`) are
 /// escaped — with `\t`/`\n`/`\r` short forms and `\u00xx` for the rest. Unlike
@@ -135,21 +97,7 @@ pub fn escape_json_string_ascii(s: &str) -> String {
 /// `\u0008`/`\u000c` (not `\b`/`\f`), and DEL (`0x7f`) plus the C1 controls
 /// (`0x80..=0x9f`) are emitted raw. Returns the body without surrounding quotes.
 pub fn escape_json_string_yq(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                result.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => result.push(c),
-        }
-    }
-    result
+    run_escaper(write_json_body_yq, s)
 }
 
 /// yq-style escaping (see [`escape_json_string_yq`]) that also escapes
@@ -157,42 +105,15 @@ pub fn escape_json_string_yq(s: &str) -> String {
 ///
 /// Returns the escaped body without surrounding quotes; callers add them.
 pub fn escape_json_string_ascii_yq(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                result.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c if !c.is_ascii() => {
-                // Escape non-ASCII characters as \uXXXX
-                // For characters outside BMP, use surrogate pairs
-                let code = c as u32;
-                if code <= 0xFFFF {
-                    result.push_str(&format!("\\u{code:04x}"));
-                } else {
-                    // Surrogate pair for characters above U+FFFF
-                    let adjusted = code - 0x10000;
-                    let high = 0xD800 + (adjusted >> 10);
-                    let low = 0xDC00 + (adjusted & 0x3FF);
-                    result.push_str(&format!("\\u{high:04x}\\u{low:04x}"));
-                }
-            }
-            c => result.push(c),
-        }
-    }
-    result
+    run_escaper(write_json_body_yq_ascii, s)
 }
 
 /// Which tool's control-character escaping convention [`format_json`] uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlEscape {
-    /// jq style: `\b`/`\f` short escapes, DEL and C1 controls escaped as
-    /// `\u00xx`. See [`escape_json_string`].
+    /// jq style: `\b`/`\f` short escapes and DEL escaped as `\u00xx`; the C1
+    /// controls are left raw, as jq leaves them (#385). See
+    /// [`escape_json_string`].
     Jq,
     /// yq style: backspace/form-feed as `\u0008`/`\u000c`, DEL and C1 controls
     /// left raw. See [`escape_json_string_yq`].
@@ -753,10 +674,17 @@ mod tests {
         assert_eq!(escape_json_string("a\\b"), "a\\\\b");
         assert_eq!(escape_json_string("\x08\x0C"), "\\b\\f");
         assert_eq!(escape_json_string("\r\t"), "\\r\\t");
-        // Other controls fall back to \uXXXX, including C1 controls.
+        // Other C0 controls fall back to \uXXXX, and so does DEL.
         assert_eq!(escape_json_string("\x01"), "\\u0001");
         assert_eq!(escape_json_string("\u{7f}"), "\\u007f");
-        assert_eq!(escape_json_string("\u{85}"), "\\u0085");
+        // C1 controls (U+0080..=U+009F) do NOT: jq emits them raw, and only
+        // `char::is_control()` — which this used to branch on — calls them
+        // controls. Pinned against jq-1.7.1 (#385):
+        //
+        //     $ printf '"\302\205"' | jq -r tojson | od -An -c
+        //         "  302 205   "  \n
+        assert_eq!(escape_json_string("\u{85}"), "\u{85}");
+        assert_eq!(escape_json_string("\u{80}\u{9f}"), "\u{80}\u{9f}");
         // Non-ASCII passes through unescaped.
         assert_eq!(escape_json_string("café"), "café");
     }
