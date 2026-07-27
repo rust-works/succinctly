@@ -17,8 +17,11 @@ YAML uses more components than JSON due to its richer structure:
 - **Balanced Parentheses (BP)**: Encodes tree structure for navigation
 - **Type Bits (TY)**: Distinguishes mappings (0) from sequences (1)
 - **Sequence item wrappers**: derived from text, not stored. A non-container node whose
-  byte is `-` followed by whitespace or end-of-input. See `is_seq_item_at` in `src/yaml/index.rs`
-  (the single definition -- O4 removed the `seq_items` bitvector, O6 consolidated five call sites)
+  byte is `-` followed by whitespace or end-of-input. See `starts_seq_entry` in `src/yaml/mod.rs`
+  (the single definition -- O4 removed the `seq_items` bitvector, #332 and O6 consolidated the
+  five call sites onto it). Never re-spell this predicate at a call site: a narrower copy in
+  `uncons_cursor` made `-\n` items re-read their own open index, which `AdvancePositions` treats
+  as a backwards jump, resetting the sequential IB cursor and going quadratic
 
 ### Key Insight: Sequence Items vs Containers
 

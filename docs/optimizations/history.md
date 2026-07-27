@@ -709,7 +709,10 @@ methods rejected `\n`, `\r` and end-of-input, so a `-\n` item fell through to `v
 re-read the same open index. That backwards jump resets the `AdvancePositions` IB scan cursor to word
 0, making the next read rescan from the start: O(N·L/64) per document.
 
-**Technique**: extract `is_seq_item_at` as the single definition; route all five sites through it.
+**Technique**: one definition, every site routed through it. #332 landed most of this on `main`
+independently — it named the predicate `starts_seq_entry` and routed `uncons`/`get` through
+`value()` — but deliberately kept `uncons_cursor` on a narrower `starts_inline_seq_entry`, which
+preserved the `-\n` fall-through intact. Widening that last site is what removes the pathology.
 
 **Measured**: interleaved A/B (binaries alternate within each rep, so thermal drift cannot bias
 one), min of 15, both machines verified idle first.
@@ -740,7 +743,8 @@ comparable), because the pathology is a cache-thrashing IB rescan.
 merely-redundant read becomes a complexity change. The shape was invisible because every generator
 emitted `- ` (dash-space), justified by a stale comment claiming the parser required it.
 
-**Files**: `src/yaml/index.rs`, `src/yaml/light.rs`, `src/bin/succinctly/yaml_generators.rs`
+**Files**: `src/yaml/mod.rs`, `src/yaml/light.rs`, `src/bin/succinctly/corpus_stats.rs`,
+`src/bin/succinctly/yaml_generators.rs`
 
 ### ✅ ~~Medium Priority: Popcount Loop Unrolling~~ — DEPLOYED
 

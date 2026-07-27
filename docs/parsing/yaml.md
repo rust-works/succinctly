@@ -5197,6 +5197,17 @@ branchless form; the three `YamlElements` methods (`uncons`, `uncons_cursor`, `g
 carried a narrower copy accepting only space and tab — rejecting `\n`, `\r` and end-of-input.
 `get` had no lookahead at all.
 
+> **Attribution.** That is the pre-[#332](https://github.com/rust-works/succinctly/issues/332)
+> state. #332 landed independently on `main` while this work was in flight and did most of the
+> consolidation: it named the predicate `starts_seq_entry` in `src/yaml/mod.rs`, routed `uncons`
+> and `get` through `value()`, and added its own accessor-agreement test. What it did **not**
+> remove is the pathology below — it gave `uncons_cursor` a *deliberately narrower*
+> `starts_inline_seq_entry` (space and tab only), preserving the `-\n` fall-through exactly.
+> So the single-definition half of O6 is #332's; the part this branch contributes is widening
+> `uncons_cursor` to the shared predicate and retiring the narrow one. The measurements below
+> were taken against the pre-#332 baseline; the pathology and its magnitude re-measured the same
+> way afterwards (see *Re-measured post-#332*).
+
 ### The Pathology
 
 The divergence was not cosmetic. On an item whose `-` indicator is followed by a newline,
@@ -5218,8 +5229,9 @@ corpus contains zero bare-dash items. The shape simply had no benchmark.
 
 ### Results
 
-Extract `is_seq_item_at(text, text_pos)` as the single definition; route all five sites through
-it.
+Give the predicate one definition and route every site through it. As landed, that definition is
+`starts_seq_entry` in `src/yaml/mod.rs` (#332's name for it); the final divergent site is
+`YamlElements::uncons_cursor`, widened here from `starts_inline_seq_entry`.
 
 Method: interleaved A/B — the two binaries alternate within each repetition so thermal drift
 cannot bias one of them — reporting min of 15. Both machines were verified idle first. Sizes at
@@ -5270,6 +5282,33 @@ measured only on Apple Silicon would have understated this by 2.7x.
 byte-identical before/after on 48 configurations per machine (12 inputs × 4 queries), 0
 differences, and every one still matches system `yq`.
 
+### Re-measured post-#332
+
+The tables above compare against the pre-#332 baseline. Because #332 landed the consolidation's
+naming but kept `uncons_cursor` narrow, the pathology survived it unchanged, and the remaining
+one-line widening was re-measured against `main` at `f308cbac` — same interleaved A/B method,
+min of 7. This run was taken on an **Apple M4 Max laptop under load**, not on the designated
+benchmark machines, so the absolute times are inflated and only the scaling curve and the
+control are load-independent:
+
+| shape          | narrow (`main`) | wide (fix) | speedup   |
+| -------------- | --------------- | ---------- | --------- |
+| bare-dash 1MB  | 99.7 ms         | 43.4 ms    | **2.29x** |
+| bare-dash 2MB  | 306.9 ms        | 84.0 ms    | **3.66x** |
+| bare-dash 4MB  | 1043.6 ms       | 161.7 ms   | **6.45x** |
+| dash-space 1MB | 45.7 ms         | 46.3 ms    | 0.99x     |
+| dash-space 2MB | 86.3 ms         | 87.2 ms    | 0.99x     |
+| dash-space 4MB | 171.2 ms        | 170.3 ms   | 1.01x     |
+
+The narrow column roughly triples per doubling while the wide column doubles, and the fixed
+times land on the dash-space control — which never takes the divergent path and is flat at
+0.99–1.01x. Output byte-identical narrow-vs-wide on 40 configurations (5 shapes × 4 queries ×
+JSON and YAML output); valid inputs still match system `yq` v4.53.3.
+
+**Not yet re-run on `johns-mac-mini` or `terminus`.** The 6.12x/16.37x figures above remain the
+authoritative cross-architecture numbers, and the Zen 4 point — that a memory-bound pathology
+costs ~3x more there than on Apple Silicon — is unmeasured for this final form.
+
 ### Rejected Sub-Optimisation: Hoisting Wrapper-Ness Per Sequence
 
 Since `YamlElements` re-derives wrapper status per element, caching it once per sequence looked
@@ -5292,9 +5331,13 @@ forms. Pinned by `wrapper_emission_is_context_dependent` in `seq_item_stats.rs`.
 
 ### Files Modified
 
-- `src/yaml/index.rs` — added `is_seq_item_at`; `is_seq_item` reduced to a wrapper
-- `src/yaml/light.rs` — `value()` and all three `YamlElements` methods route through it; tests
-  for cross-path agreement
+- `src/yaml/mod.rs` — `starts_seq_entry` is the single definition (#332); the now-callerless
+  `starts_inline_seq_entry` removed
+- `src/yaml/light.rs` — `uncons_cursor` widened to `starts_seq_entry`, so all three
+  `YamlElements` methods reach it through one path; tests for cross-path agreement on bare-dash,
+  CRLF, trailing-`-` and root/multi-document shapes
+- `src/bin/succinctly/corpus_stats.rs` — bare-dash counting derived from text rather than from
+  cursor identity, which is what frees `uncons_cursor` to widen
 - `src/bin/succinctly/yaml_generators.rs` — `seqwrap` pattern with bare-dash items
 
 ---
