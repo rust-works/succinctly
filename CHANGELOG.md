@@ -99,8 +99,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alias must be recorded against that node; it instead called `parse_alias`,
   which opens and closes a node of its own, so the alias edge bound to a node
   *below* the key and the key itself was left with no extent. It now shares
-  `record_key_alias` with the block, compact and explicit key sites, as the
-  key-*anchor* sites already shared `record_key_anchor`. This was the one key
+  `record_key_alias` with the block and compact key sites — all three
+  key-alias sites now share one definition, as the three key-*anchor* sites
+  already shared `record_key_anchor`. This was the one key
   position #372 left inconsistent with itself: a miss went through
   `parse_alias`'s lookup and errored, while a hit silently rendered `""`.
   Unaffected: an alias key resolving to a sequence or mapping still stringifies

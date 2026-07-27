@@ -6695,10 +6695,10 @@ mod tests {
             (b"{k: &x 1, *x: 2}", r#"{"k":1,"1":2}"#),
             (b"a: {&x k: 1, *x: 2}", r#"{"a":{"k":1,"k":2}}"#),
             (b"[{&x k: 1}, {*x: 2}]", r#"[{"k":1},{"k":2}]"#),
-            // Space before the `:`. The key's extent must be exactly `*x`: the
-            // helper returns the byte after the name and skips no whitespace,
-            // so a stray space cannot land inside the alias name the reader
-            // scans back out of the text.
+            // Space before the `:`. Resolution is by BP position, not by
+            // re-reading the alias name from text, so this isn't pinning name
+            // lookup — it's a regression check that a stray space before the
+            // colon still parses and resolves.
             (b"{&x k: 1, *x : 2}", r#"{"k":1,"k":2}"#),
             // Alias key with an implicit null value, which is the one flow
             // shape where the caller records the key's end and then writes an
