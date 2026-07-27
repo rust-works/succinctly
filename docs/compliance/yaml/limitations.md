@@ -109,15 +109,80 @@ and `{"key":null}` — the content was silently discarded, which is a worse fail
 either erroring or keeping the text. A `-` *not* followed by whitespace is an ordinary flow
 plain scalar and always was: `[-]` is `["-"]`, `[-1]` is `[-1]`.
 
-### One exception: cyclic aliases are rejected
+### Two exceptions: an alias with no usable target is rejected
 
-An alias that would make an anchored value contain itself (`a: &x {self: *x}`) is
-rejected at index build with `YamlError::AliasCycle` ("anchor value contains itself").
-This is the one structural check the non-validating loader performs, because a cyclic
-document cannot be materialized at all — before
-[#153](https://github.com/rust-works/succinctly/issues/153) it aborted the process with
-a stack overflow. YAML 1.2's representation graph technically permits cycles, but `yq`
-rejects the same input at decode time, so rejecting is also the compatible behavior.
+Two alias forms are refused at index build. They are the same failure underneath — an
+alias with nothing to resolve to:
+
+- **Cyclic.** An alias that would make an anchored value contain itself
+  (`a: &x {self: *x}`) fails with `YamlError::AliasCycle` ("anchor value contains itself").
+  A cyclic document cannot be materialized at all; before
+  [#153](https://github.com/rust-works/succinctly/issues/153) it aborted the process with a
+  stack overflow. YAML 1.2's representation graph technically permits cycles, but `yq`
+  rejects the same input at decode time, so rejecting is also the compatible behavior.
+- **Unknown.** An alias naming an anchor that is not in scope — never defined, or defined
+  *later* — fails with `YamlError::UnknownAnchor` since
+  [#372](https://github.com/rust-works/succinctly/issues/372). YAML 1.2 §7.1 requires an
+  alias to name a *previous* anchor, so a miss is invalid input rather than a value, and
+  `yq` reports `unknown anchor 'x' referenced` for the same input.
+
+```
+$ printf 'a: &x {self: *x}\n' | succinctly yq '.'
+Error: YAML parse error: cyclic alias 'x' at offset 13 (anchor value contains itself)
+$ printf 'a: *x\nb: &x 5\n' | succinctly yq '.'
+Error: YAML parse error: unknown anchor 'x' referenced at offset 3
+$ printf 'b: &x 5\na: *x\n' | succinctly yq -o json -I0 '.'
+{"b":5,"a":5}             # a resolvable alias is unaffected
+```
+
+Until #372 the second silently yielded `null` — or `""` where the alias was a key — the
+same silent-wrong-data mode as the `- ` case above.
+
+These two are the loader's only checks on *document structure*, and neither is grammar
+conformance: both are cases where there is no value to produce at all, not cases where the
+input breaks a rule the index could otherwise ignore. Rejecting the rest of what the suite
+calls invalid is the validator's job.
+
+Neither costs this page's conformance numbers anything: no case in the corpus contains an
+alias to an out-of-scope anchor, so the 12/94 loader figure, the 82 accepted-but-invalid
+documents and the `lax:anchors` row are unmoved by #372.
+
+### The other ways `YamlIndex::build` fails
+
+Structure aside, `build` still refuses input it has no reading for at all. None of these is
+a conformance check either — they are an absent feature, bytes it cannot tokenize, and the
+index's own ceilings:
+
+| Rejected                                        | Example      | `YamlError`           |
+|-------------------------------------------------|--------------|-----------------------|
+| A tag in node position (absent feature, below)  | `a: !!str 1` | `TagNotSupported`     |
+| A tab where block structure expects indentation | `\ta: 1`     | `TabIndentation`      |
+| A quote with no close before end of input       | `a: "x`      | `UnclosedQuote`       |
+| Input ending inside a flow collection or escape | `a: {k: 1`   | `UnexpectedEof`       |
+| A flow item not followed by `,` or its closer   | `a: [[1] 2]` | `UnexpectedCharacter` |
+| A key run that ends before its `:`              | `b #c: d`    | `KeyWithoutValue`     |
+| `&` or `*` with an empty name                   | `a: &`       | `InvalidAnchorName`   |
+| Non-UTF-8 bytes in an anchor name               | —            | `InvalidUtf8`         |
+| Nesting past 128 levels                         | 129 × `[`    | `NestingTooDeep`      |
+| Empty input                                     | —            | `EmptyInput`          |
+| Input of `u32::MAX` bytes or more               | ≥ 4 GiB      | `InputTooLarge`       |
+
+The last is a property of the index rather than of YAML — text positions are stored as
+`u32`, see [Input Size Limits](../../reference/limits.md).
+
+The flow row is the closest the loader comes to grammar checking, and it marks where the
+line actually falls. `[[1] 2]` fails because a `]` cannot be followed by a bare `2`; the
+same missing comma in `[1 2]` does not, because a plain scalar absorbs it:
+
+```
+$ printf 'a: [[1] 2]\n' | succinctly yq '.'
+Error: YAML parse error: unexpected character '2' at offset 8: expected ',' or ']' in flow sequence
+$ printf 'a: [1 2]\n' | succinctly yq -o json -I0 '.'
+{"a":["1 2"]}             # same missing comma, absorbed
+```
+
+The loader stops where it cannot continue, not where a rule is broken — which is why the
+11 `lax:flow` cases above survive it.
 
 ## Unsupported features
 
