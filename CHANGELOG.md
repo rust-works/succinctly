@@ -80,6 +80,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A `!` *inside* plain scalar content is untouched and remains ordinary text, as
   YAML requires — only a leading `!` is an indicator. Tag *support* is still
   #224; this only makes the two contexts fail the same way.
+- **YAML alias to an unknown anchor silently yielded `null`** (#372): an alias
+  naming an anchor not in scope — a forward reference, or one never defined —
+  was dropped rather than resolved, leaving the node to render as `null`, or as
+  an empty string where the alias was a key. YAML 1.2 §7.1 requires an alias to
+  name a *previous* anchor, so this is invalid input rather than a value; it is
+  now refused at build time, as a cyclic alias always has been. Every position
+  an alias can appear in is covered: values (block, flow sequence, flow mapping,
+  block sequence item, compact mapping entry, document root) and keys (block,
+  compact, explicit `?`).
+
+  Two of those positions did not resolve aliases *at all*, so rejecting a
+  lookup miss would have turned valid YAML into a parse failure. A compact
+  mapping entry inside a block sequence item never registered an anchor on its
+  value, and neither did a document-root value, so `- name: &n web` followed by
+  `image: *n` — the shape a Kubernetes manifest writes — resolved to `null`
+  before and would have become a hard error. Both now go through the same
+  anchor/alias handling as every other value, so those aliases resolve properly
+  rather than merely failing loudly. `? *a` as an explicit key likewise resolves
+  now instead of producing an empty key. Aliases that already resolved are
+  unchanged.
+
+  One document-root form is deliberately *not* given an anchor: `&x` alone on
+  the `---` line, with the node on a following line. What follows starts at
+  indent 0, which this parser reads as a separate document, so the only node
+  here for the anchor to name is an empty placeholder — and binding it there
+  would make a later `*x` resolve to that placeholder and render as `null`,
+  reintroducing the very miss this change removes. The anchor is consumed
+  without being recorded, so the alias is the error it should be. `yq` reports
+  `unknown anchor 'x'` for the block-mapping form of this input too; for the
+  block-sequence form it reads a plain scalar instead, so rejecting is a
+  deliberate divergence over inventing `null`. The pre-existing bug that splits
+  `--- &x` and its node into two documents is untouched.
+
+  No YAML Test Suite manifest movement: no case in the suite contains an alias
+  to an anchor that is not in scope, so none could flip. The three `lax:anchors`
+  entries that remain (4JVG, CXX2, GT5M) are anchor *placement* and
+  *duplication* rules, which this does not touch.
+
+  **Breaking**: adds a `YamlError::UnknownAnchor` variant, so exhaustive
+  `match`es on the public `YamlError` gain an arm.
+
 - **jq error-message value previews escaped C1 control characters** (#358):
   a preview built from `OwnedValue::to_json` escapes every
   `char::is_control()`, which includes U+0080–U+009F, so a string containing

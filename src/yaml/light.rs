@@ -342,7 +342,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             Err(_) => return YamlValue::Error("invalid UTF-8 in anchor name"),
         };
 
-        // Try to resolve the alias to its target
+        // Resolve the alias to its target. For an index from `YamlIndex::build`
+        // this is always `Some`: an alias naming an anchor that is not in scope
+        // fails the build (#372), so no alias node reaches here unresolved.
+        // `resolve_alias` stays fallible because it is public and takes an
+        // arbitrary BP position, which need not be an alias at all.
         let target = self.index.resolve_alias(self.bp_pos, self.text);
 
         YamlValue::Alias {
@@ -4532,8 +4536,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
                 }
             }
             YamlValue::Alias { target, .. } => {
-                // Resolve alias and check target
-                target.map_or(true, |t| t.value().is_null()) // Unresolved alias treated as null
+                // An alias is null exactly when its target is. The `None` arm is
+                // unreachable for an index from `YamlIndex::build`, which since
+                // #372 refuses an alias it cannot resolve; it is kept, rather
+                // than unwrapped, so a hand-built index cannot panic here.
+                target.map_or(true, |t| t.value().is_null())
             }
             _ => false,
         }
@@ -4938,7 +4945,7 @@ fn stream_yaml_single_quoted<Out: core::fmt::Write>(out: &mut Out, s: &str) -> c
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::yaml::YamlIndex;
+    use crate::yaml::{YamlError, YamlIndex};
 
     /// Helper to get the first document from the root document array.
     /// All YAML documents are wrapped in a virtual root sequence.
@@ -6593,34 +6600,107 @@ mod tests {
     }
 
     #[test]
-    fn test_undefined_alias() {
-        // Alias to undefined anchor - should still parse, but target is None
+    fn test_undefined_alias_is_rejected() {
+        // #372: this used to build successfully and leave the alias with
+        // `target: None`, which rendered as `null` — an invented value for
+        // input YAML 1.2 §7.1 calls invalid. It is now refused at build time,
+        // as a cyclic alias always has been.
         let yaml = b"bad: *undefined";
+        let err = YamlIndex::build(yaml).expect_err("undefined alias should not build");
+        assert!(
+            matches!(&err, YamlError::UnknownAnchor { name, .. } if name == "undefined"),
+            "expected UnknownAnchor naming the anchor, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_defined_alias_still_resolves() {
+        // The other side of #372: a *resolvable* alias must be untouched. This
+        // is the boundary the rejection above must not cross.
+        let yaml = b"good: &a 1\nref: *a";
         let index = YamlIndex::build(yaml).unwrap();
         let root = index.root(yaml);
 
-        if let YamlValue::Mapping(fields) = first_doc(root) {
-            for field in fields {
-                if let YamlValue::String(key) = field.key() {
-                    if key.as_str().unwrap() == "bad" {
-                        if let YamlValue::Alias {
-                            anchor_name,
-                            target,
-                        } = field.value()
-                        {
-                            assert_eq!(anchor_name, "undefined");
-                            // Target should be None because anchor doesn't exist
-                            assert!(target.is_none(), "undefined alias should not resolve");
-                            return;
-                        }
-                        panic!("expected alias for bad");
+        let YamlValue::Mapping(fields) = first_doc(root) else {
+            panic!("expected mapping");
+        };
+        for field in fields {
+            if let YamlValue::String(key) = field.key() {
+                if key.as_str().unwrap() == "ref" {
+                    if let YamlValue::Alias {
+                        anchor_name,
+                        target,
+                    } = field.value()
+                    {
+                        assert_eq!(anchor_name, "a");
+                        assert!(target.is_some(), "defined alias must resolve");
+                        return;
                     }
+                    panic!("expected alias for ref");
                 }
             }
-            panic!("did not find bad field");
-        } else {
-            panic!("expected mapping");
         }
+        panic!("did not find ref field");
+    }
+
+    /// The boundary #372's rejection must not cross: wherever an anchor is in
+    /// scope, the alias still resolves to its value.
+    ///
+    /// Rejecting a lookup miss is only safe if every anchor a document defines
+    /// is actually *registered*. Two paths recorded no anchor at all, so the
+    /// alias missed and — before the rejection landed — quietly yielded `null`:
+    /// a compact mapping entry inside a block sequence item (`- k: &a 1`) and a
+    /// document-root value (`--- &a 1`). Turning a miss into an error would
+    /// have converted those into a refusal to parse valid YAML, so this asserts
+    /// the resolved output rather than merely that the build succeeds.
+    #[test]
+    fn test_alias_resolves_wherever_the_anchor_is_in_scope() {
+        // (input, expected JSON for the first document)
+        let cases: &[(&[u8], &str)] = &[
+            // Values.
+            (b"a: &x 1\nb: *x", r#"{"a":1,"b":1}"#),
+            (b"a: &x [1,2]\nb: *x", r#"{"a":[1,2],"b":[1,2]}"#),
+            (b"- &x 1\n- *x", r"[1,1]"),
+            (b"a: [&x 1, *x]", r#"{"a":[1,1]}"#),
+            (b"a: {k: &x 1, b: *x}", r#"{"a":{"k":1,"b":1}}"#),
+            // Anchor on a compact mapping entry's value, aliased from a later
+            // entry of the same item, from a later item, and from outside the
+            // sequence. This is the shape a Kubernetes manifest writes.
+            (b"- a: &x 1\n  b: *x", r#"[{"a":1,"b":1}]"#),
+            (b"- a: &x 1\n- b: *x", r#"[{"a":1},{"b":1}]"#),
+            (b"l:\n  - a: &x 1\nr: *x", r#"{"l":[{"a":1}],"r":1}"#),
+            // An anchor on a document-root value, the other path that recorded
+            // nothing. Its node is on the `---` line here, so the anchor has
+            // something to name — unlike `--- &x` alone, which names the
+            // following document's placeholder and is rejected instead
+            // (`test_build_rejects_alias_to_unknown_anchor_in_every_position`).
+            (b"--- &x [1]", r"[1]"),
+            // Keys.
+            (b"&x k: 1\n*x: 2", r#"{"k":1,"k":2}"#),
+            (b"- &x k: 1\n- *x: 2", r#"[{"k":1},{"k":2}]"#),
+            (b"k: &x 1\n? *x\n: v", r#"{"k":1,"1":"v"}"#),
+        ];
+        for (yaml, expected) in cases {
+            assert_eq!(
+                first_doc_json(yaml),
+                *expected,
+                "in: {}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
+    /// An alias *is* a document (`--- *x`), the one alias position whose result
+    /// the first-document helper above cannot see.
+    ///
+    /// Anchors carry across documents here, and `yq` v4.53.3 agrees, so the
+    /// second document is the anchored value rather than `null` as it was
+    /// before #372 routed this position through `parse_value`.
+    #[test]
+    fn test_alias_as_a_whole_document_resolves() {
+        let yaml = b"a: &x 1\n--- *x";
+        let index = YamlIndex::build(yaml).expect("builds");
+        assert_eq!(index.root(yaml).to_json(), r#"[{"a":1},1]"#);
     }
 
     #[test]

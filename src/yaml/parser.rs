@@ -946,6 +946,28 @@ impl<'a> Parser<'a> {
                 // Block sequence item
                 self.parse_sequence_item(0)?;
             }
+            // An anchor or alias that *is* the document (`--- &a 1`, `--- *a`),
+            // as opposed to one prefixing a key (`--- &a k: v`), which the
+            // mapping-entry arm below owns. The plain-scalar arm swallowed
+            // both: the anchor went unregistered and the alias never became an
+            // alias node, so `--- *a` rendered as `null` (#372).
+            Some(b'&' | b'*') if !self.looks_like_mapping_entry() => {
+                // `&a` with nothing after it on the line has no node here to
+                // name: whatever follows starts at indent 0, which this parser
+                // reads as a *separate* document, so the node `parse_value`
+                // opens below is the empty placeholder. Binding the anchor to
+                // that placeholder made a later `*a` resolve to it and render
+                // as `null` — the silent miss this issue removes everywhere
+                // else, and the one `yq` reports as `unknown anchor` for this
+                // same input. Consuming the name without recording it lets that
+                // alias be the error it should be (#372).
+                if self.peek() == Some(b'&') && self.anchor_ends_the_line() {
+                    self.advance();
+                    self.parse_anchor_name()?;
+                    self.skip_inline_whitespace();
+                }
+                self.parse_value(0)?;
+            }
             Some(_) if self.looks_like_mapping_entry() => {
                 // Mapping entry
                 self.parse_mapping_entry(0)?;
@@ -1566,6 +1588,8 @@ impl<'a> Parser<'a> {
                 self.parse_single_quoted()?;
                 self.pos
             }
+            // Alias as key (`- *a: v`), sharing the block mapping's site.
+            Some(b'*') => self.record_key_alias()?,
             _ => self.parse_unquoted_key()?,
         };
         self.set_bp_text_end(key_end);
@@ -1621,12 +1645,26 @@ impl<'a> Parser<'a> {
             // Inline value
             self.check_unsupported()?;
 
-            // Open value node
-            self.set_ib();
-            self.write_bp_open();
-            let end_pos = self.parse_inline_value(indent)?;
-            self.set_bp_text_end(end_pos);
-            self.write_bp_close();
+            // An anchor or alias prefixes the value here exactly as it does in
+            // `parse_value`, and this path handled neither: `- k: &a 1` never
+            // registered the anchor, so a later `*a` resolved to nothing, and
+            // `- k: *a` never became an alias node at all. Both were swallowed
+            // into the plain scalar below and rendered as `null` (#372).
+            if self.peek() == Some(b'&') {
+                self.parse_anchor()?;
+            }
+
+            if self.peek() == Some(b'*') {
+                // `parse_alias` opens and closes its own node.
+                self.parse_alias()?;
+            } else {
+                // Open value node
+                self.set_ib();
+                self.write_bp_open();
+                let end_pos = self.parse_inline_value(indent)?;
+                self.set_bp_text_end(end_pos);
+                self.write_bp_close();
+            }
         }
 
         // Don't close the mapping here - leave it open so subsequent lines
@@ -1700,19 +1738,8 @@ impl<'a> Parser<'a> {
                     self.parse_single_quoted()?;
                     self.pos
                 }
-                Some(b'*') => {
-                    // Alias as key - parse alias name
-                    // Skip `*`
-                    self.advance();
-                    // Parse alias name (same rules as anchor names)
-                    let alias_name = self.parse_anchor_name()?;
-                    // Record the alias reference
-                    // Look up the anchor's BP position
-                    if let Some(&target_bp_pos) = self.anchors.get(&alias_name) {
-                        self.aliases.insert(self.bp_pos - 1, target_bp_pos);
-                    }
-                    self.pos
-                }
+                // Alias as key (`*a: v`), sharing the compact mapping's site.
+                Some(b'*') => self.record_key_alias()?,
                 _ => self.parse_unquoted_key()?,
             }
         };
@@ -2080,6 +2107,13 @@ impl<'a> Parser<'a> {
             Some(b'|' | b'>') => {
                 // Block scalar as key
                 self.parse_block_scalar(indent)?;
+            }
+            Some(b'*') => {
+                // Alias as key (`? *a`). As in the flow-mapping key path,
+                // `parse_alias` opens and closes its own node. Without this arm
+                // the alias fell to the plain-scalar arm below, which produced
+                // an empty key whether or not the anchor existed (#372).
+                self.parse_alias()?;
             }
             Some(b'"') => {
                 // Double-quoted key
@@ -3424,6 +3458,23 @@ impl<'a> Parser<'a> {
         Ok(name)
     }
 
+    /// Whether the `&name` at the cursor is the last content on its line, so
+    /// the node it would name is not on this line.
+    ///
+    /// Pure lookahead: the cursor is restored before returning. A malformed
+    /// name reads as `false` so that [`Self::parse_anchor`] reports it, at the
+    /// offset it always did, rather than this scan reporting it early.
+    fn anchor_ends_the_line(&mut self) -> bool {
+        debug_assert_eq!(self.peek(), Some(b'&'));
+        let saved = self.pos;
+        self.advance();
+        let named = self.parse_anchor_name().is_ok();
+        self.skip_inline_whitespace();
+        let ends_line = named && self.at_line_end();
+        self.pos = saved;
+        ends_line
+    }
+
     /// Parse an anchor definition (`&name`).
     /// Records the anchor and returns, expecting the value to follow.
     fn parse_anchor(&mut self) -> Result<String, YamlError> {
@@ -3464,12 +3515,49 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Record an alias used as a mapping key whose BP node is already open, as
+    /// in `*a: v`, and return the key's text end.
+    ///
+    /// The alias *is* the key, so the edge is recorded from `bp_pos - 1` — the
+    /// open already written — exactly as [`Self::record_key_anchor`] binds an
+    /// anchor to it. Callers that have not opened a node yet want
+    /// [`Self::parse_alias`], which opens and closes one of its own.
+    ///
+    /// One definition for both key-alias sites (block and compact mappings):
+    /// they were separate copies, and only one of them resolved the alias at
+    /// all, so `- *a: v` silently produced an empty key (#372).
+    fn record_key_alias(&mut self) -> Result<usize, YamlError> {
+        debug_assert_eq!(self.peek(), Some(b'*'));
+        // Offset of the `*`, so an unresolved alias can point at itself.
+        let alias_start = self.pos;
+        self.advance();
+        // Alias names follow the anchor-name rules.
+        let name = self.parse_anchor_name()?;
+        match self.anchors.get(&name) {
+            Some(&target_bp_pos) => {
+                self.aliases.insert(self.bp_pos - 1, target_bp_pos);
+            }
+            // #372, as in `parse_alias`: a miss here rendered the key as the
+            // empty string rather than erroring.
+            None => {
+                return Err(YamlError::UnknownAnchor {
+                    offset: alias_start,
+                    name,
+                });
+            }
+        }
+        Ok(self.pos)
+    }
+
     /// Parse an alias reference (`*name`).
     /// Creates a leaf node in the BP tree pointing to the aliased value.
     fn parse_alias(&mut self) -> Result<(), YamlError> {
         // Mark alias position
         self.set_ib();
         self.write_bp_open();
+
+        // Offset of the `*`, so an unresolved alias can point at itself (#372).
+        let alias_start = self.pos;
 
         // Consume `*`
         self.advance();
@@ -3480,11 +3568,22 @@ impl<'a> Parser<'a> {
         // Resolve alias to anchor at parse time
         // This ensures we get the anchor definition that was active at this point
         let alias_bp_pos = self.bp_pos - 1;
-        if let Some(&target_bp_pos) = self.anchors.get(&name) {
-            self.aliases.insert(alias_bp_pos, target_bp_pos);
+        match self.anchors.get(&name) {
+            Some(&target_bp_pos) => {
+                self.aliases.insert(alias_bp_pos, target_bp_pos);
+            }
+            // #372: an unresolved alias used to be dropped on the floor, which
+            // left the node with nothing to resolve to and rendered it as
+            // `null`. An alias must name a *previous* anchor (YAML 1.2 §7.1),
+            // so a miss — forward reference or simply undefined — is invalid
+            // input, not a value.
+            None => {
+                return Err(YamlError::UnknownAnchor {
+                    offset: alias_start,
+                    name,
+                });
+            }
         }
-        // Note: If anchor not found, we don't record it.
-        // Forward references (alias before anchor) are not supported.
 
         // Close the alias node
         self.set_bp_text_end(self.pos);
