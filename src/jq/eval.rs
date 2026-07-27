@@ -4,6 +4,8 @@
 
 #[cfg(not(test))]
 use alloc::boxed::Box;
+// `BTreeSet`, not `HashSet`: this crate is `no_std`, and `alloc` has no hasher.
+use alloc::collections::BTreeSet;
 #[cfg(not(test))]
 use alloc::format;
 #[cfg(not(test))]
@@ -7025,10 +7027,18 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
 /// parse at all today. Widen this to a full lexicographic descending sort
 /// before that changes.
 ///
-/// (`builtin_delpaths` has both bugs today: `delpaths([[0],[2]])` gives
-/// `[20,30]` where jq gives `[20,40]`, because it sorts only by path length.
-/// It works on runtime path arrays rather than path expressions, so it cannot
-/// call this directly, but the rule is the same one — #398.)
+/// Still divergent: a *negative* trailing index. Sorting descending puts `-1`
+/// before `-2`, but `-1` names the later element only until something is
+/// removed, so `[10,20,30,40] | del(.[(-1,-2)])` gives `[10,30]` where jq gives
+/// `[10,20]`. No descending order fixes this, because the two indices are
+/// counted from opposite ends of the array: jq resolves every index against the
+/// length the array had *before* any deletion and removes them in one pass,
+/// which is what [`delete_keys`] does. Routing `del` through that is #424.
+///
+/// (`builtin_delpaths` had both bugs above and was fixed in #398 — it works on
+/// runtime path arrays rather than path expressions, so it cannot call this,
+/// but [`delete_paths_sorted`] is the same rule stated over values, and is the
+/// reference for #424.)
 fn prepare_paths_for_deletion(paths: &mut Vec<Expr>) {
     // Quadratic, but `paths` is one entry per resolved key — a handful, not a
     // document-sized list — and `Expr` is neither `Hash` nor `Ord`. Skipped
@@ -9616,64 +9626,137 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Helper to delete a path from a value
-fn delete_path(value: OwnedValue, path: &[OwnedValue]) -> OwnedValue {
-    if path.is_empty() {
-        return OwnedValue::Null;
-    }
-    if path.len() == 1 {
-        match &path[0] {
-            OwnedValue::String(key) => match value {
-                OwnedValue::Object(mut entries) => {
-                    entries.shift_remove(key);
-                    return OwnedValue::Object(entries);
-                }
-                other => return other,
-            },
-            OwnedValue::Int(idx) => match value {
-                OwnedValue::Array(mut arr) => {
-                    let index = if *idx < 0 {
-                        (arr.len() as i64 + *idx) as usize
-                    } else {
-                        *idx as usize
-                    };
-                    if index < arr.len() {
-                        arr.remove(index);
-                    }
-                    return OwnedValue::Array(arr);
-                }
-                other => return other,
-            },
-            _ => return value,
+/// Delete every path in `paths` from `value`, the way jq's `delpaths_sorted`
+/// does (jq's `src/jv_aux.c`).
+///
+/// `paths` is sorted ascending in jq's total value order, and every path is
+/// longer than `start`. Paths sharing the component at `start` form one run.
+/// If the run's first — hence, the list being sorted, its shortest — path ends
+/// here, the whole subtree goes and the longer paths under it are never
+/// walked: `[10,20,30,40] | delpaths([[0],[0,1]])` is `[20,30,40]`, not an
+/// attempt to index into the number it just deleted. `delpaths([[0,1]])` on
+/// its own *is* an error in jq for exactly that reason (#415).
+///
+/// Every key that ends at one level is collected and removed in a single pass,
+/// which is the part a per-path loop cannot reproduce: the deletions there are
+/// simultaneous, so each index resolves against the length the array had
+/// *before* any sibling was removed. `delpaths([[-1],[-2]])` is `[10,20]`, not
+/// the `[10,30]` that deleting one at a time gives (#398).
+fn delete_paths_sorted(mut value: OwnedValue, paths: &[&[OwnedValue]], start: usize) -> OwnedValue {
+    debug_assert!(
+        paths.iter().all(|p| p.len() > start),
+        "every path in a run is longer than the depth it is grouped at"
+    );
+    let mut del_keys: Vec<&OwnedValue> = Vec::new();
+    let mut i = 0;
+    while i < paths.len() {
+        let key = &paths[i][start];
+        let mut j = i + 1;
+        while j < paths.len() && compare_values(&paths[j][start], key) == core::cmp::Ordering::Equal
+        {
+            j += 1;
         }
+        // The run's first path is its shortest — a prefix sorts before its own
+        // extensions — so this decides the whole run, and a repeated path
+        // contributes one key rather than one deletion per mention.
+        if paths[i].len() == start + 1 {
+            del_keys.push(key);
+        } else {
+            value = delete_paths_under(value, key, &paths[i..j], start + 1);
+        }
+        i = j;
     }
-    match &path[0] {
-        OwnedValue::String(key) => match value {
-            OwnedValue::Object(mut entries) => {
-                if let Some(v) = entries.shift_remove(key) {
-                    let updated = delete_path(v, &path[1..]);
-                    entries.insert(key.clone(), updated);
+    delete_keys(value, &del_keys)
+}
+
+/// Recurse into the child of `value` under `key`. A key that names nothing is
+/// a no-op, as it is in jq — `{"a":1} | delpaths([["b","c"]])` is `{"a":1}`.
+fn delete_paths_under(
+    value: OwnedValue,
+    key: &OwnedValue,
+    paths: &[&[OwnedValue]],
+    start: usize,
+) -> OwnedValue {
+    match value {
+        OwnedValue::Object(mut entries) => {
+            // A non-string key is jq's `Cannot index object with <kind>`
+            // (#415); until then it names no child, so nothing happens.
+            if let OwnedValue::String(name) = key {
+                if let Some(slot) = entries.get_mut(name) {
+                    // Replace through the slot rather than remove-and-reinsert:
+                    // jq leaves an existing key where it was, and `IndexMap`
+                    // would move it to the end after a `shift_remove`.
+                    let old = core::mem::replace(slot, OwnedValue::Null);
+                    *slot = delete_paths_sorted(old, paths, start);
                 }
-                OwnedValue::Object(entries)
             }
-            other => other,
-        },
-        OwnedValue::Int(idx) => match value {
-            OwnedValue::Array(mut arr) => {
-                let index = if *idx < 0 {
-                    (arr.len() as i64 + *idx) as usize
-                } else {
-                    *idx as usize
-                };
-                if index < arr.len() {
-                    let old = arr[index].clone();
-                    arr[index] = delete_path(old, &path[1..]);
-                }
-                OwnedValue::Array(arr)
+            OwnedValue::Object(entries)
+        }
+        OwnedValue::Array(mut arr) => {
+            if let Some(index) = resolve_read_index(key, arr.len()) {
+                let old = core::mem::replace(&mut arr[index], OwnedValue::Null);
+                arr[index] = delete_paths_sorted(old, paths, start);
             }
-            other => other,
-        },
-        _ => value,
+            OwnedValue::Array(arr)
+        }
+        // jq reads the child with `jv_get`: a `null` is skipped, and a scalar
+        // is `Cannot index <type> with …`. Only the skip is implemented (#415).
+        other => other,
+    }
+}
+
+/// jq's `jv_dels`: remove every key in `keys` from one container in a single
+/// pass. Keys naming nothing are ignored, and every array index resolves
+/// against the length the array had on entry, so one deletion cannot shift the
+/// array under its siblings.
+fn delete_keys(value: OwnedValue, keys: &[&OwnedValue]) -> OwnedValue {
+    if keys.is_empty() {
+        return value;
+    }
+    match value {
+        OwnedValue::Object(mut entries) => {
+            // A non-string key is jq's `Cannot delete <kind> field of object`
+            // (#415); here it names no field, so it drops out of the set.
+            let doomed: BTreeSet<&str> = keys
+                .iter()
+                .filter_map(|key| match key {
+                    OwnedValue::String(name) => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            // One order-preserving `retain`, for the reason the array arm below
+            // takes the same shape: `shift_remove` per key shifts the tail every
+            // time, so deleting half of a 60k-key object cost 4.4s against jq's
+            // 0.02s. `retain` is `shift_remove`'s equal for a single key and
+            // linear for any number of them.
+            entries.retain(|name, _| !doomed.contains(name.as_str()));
+            OwnedValue::Object(entries)
+        }
+        OwnedValue::Array(mut arr) => {
+            // A key that is not a number is jq's `Cannot delete <kind> element
+            // of array` (#415). `resolve_read_index` is `getpath`'s resolver:
+            // a float truncates toward zero, a negative counts back from the
+            // end, and anything that reaches no element is dropped.
+            let mut indices: Vec<usize> = keys
+                .iter()
+                .filter_map(|key| resolve_read_index(key, arr.len()))
+                .collect();
+            indices.sort_unstable();
+            indices.dedup();
+            // One `retain` pass with a cursor into the ascending index list. A
+            // `Vec::remove` per key would be quadratic, and `delpaths` is
+            // precisely how a filter deletes many elements at once.
+            let (mut index, mut cursor) = (0usize, 0usize);
+            arr.retain(|_| {
+                let doomed = cursor < indices.len() && indices[cursor] == index;
+                cursor += usize::from(doomed);
+                index += 1;
+                !doomed
+            });
+            OwnedValue::Array(arr)
+        }
+        // jq: `Cannot delete fields from <type>` (#415).
+        other => other,
     }
 }
 
@@ -11919,26 +12002,68 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         _ => return QueryResult::Error(EvalError::new("delpaths requires array of paths")),
     };
 
-    let paths = match paths_owned {
+    let mut paths = match paths_owned {
         OwnedValue::Array(p) => p,
+        // jq's wording here is `Paths must be specified as an array` (#415).
         _ => return QueryResult::Error(EvalError::new("delpaths requires array of paths")),
     };
 
-    let mut result = to_owned(&value);
-    // Sort paths by length descending to delete deeper paths first
-    let mut sorted_paths: Vec<Vec<OwnedValue>> = paths
-        .into_iter()
-        .filter_map(|p| match p {
-            OwnedValue::Array(arr) => Some(arr),
+    // Everything the walk cannot use goes before the sort, so what remains is
+    // both a list of paths and a set `compare_values` totally orders.
+    //
+    // A non-array entry is jq's `Path must be specified as array, not <kind>`
+    // (#415). Until that lands it deletes nothing — but it has to be dropped
+    // rather than reaching the walk, where the empty path deletes the whole
+    // document and a non-array must not be mistaken for one.
+    //
+    // A NaN component is dropped with the path around it, because it names no
+    // element at any depth — `resolve_read_index` refuses it, as jq's `jv_get`
+    // does. Leaving it in would do more than waste a walk: `compare_values`
+    // answers `Equal` for NaN against *every* number, so the path would head a
+    // run that swallowed its numeric siblings and cancelled their deletions,
+    // and the comparator would not be transitive, which `sort_by` is entitled
+    // to panic on. jq cannot arbitrate — 1.7.1 loops forever on
+    // `delpaths([[nan]])` — so this is pinned by unit test rather than by a
+    // golden (#415).
+    paths.retain(|path| match path {
+        OwnedValue::Array(components) => !components
+            .iter()
+            .any(|key| matches!(key, OwnedValue::Float(f) if f.is_nan())),
+        _ => false,
+    });
+
+    // jq sorts the whole path list in its total value order — arrays compare
+    // lexicographically — before deleting anything, so the order the caller
+    // wrote them in is immaterial: `delpaths([[0],[2]])` and
+    // `delpaths([[2],[0]])` are both `[20,40]` on `[10,20,30,40]`. Deleting
+    // left to right instead let an earlier deletion shift the array under a
+    // later path (#398).
+    //
+    // `compare_values` *is* that ordering, already shared with `sort` and
+    // `unique`, so the paths stay wrapped as `OwnedValue::Array` through the
+    // sort and it applies unchanged, rather than a second lexicographic
+    // comparator growing here to drift from it. The sort has to be stable, as
+    // jq's is: two paths can compare equal and still name different keys,
+    // `[[1],[1.0]]` being the pair.
+    paths.sort_by(compare_values);
+
+    // Every survivor of the `retain` is an array, so this only re-borrows.
+    let paths: Vec<&[OwnedValue]> = paths
+        .iter()
+        .filter_map(|path| match path {
+            OwnedValue::Array(components) => Some(components.as_slice()),
             _ => None,
         })
         .collect();
-    sorted_paths.sort_by_key(|b| core::cmp::Reverse(b.len()));
 
-    for path in sorted_paths {
-        result = delete_path(result, &path);
+    // The empty path names the document itself, and sorts before every other
+    // array, so only the first entry needs checking: `delpaths([[],[0]])` and
+    // `delpaths([[0],[]])` are both `null`.
+    match paths.first() {
+        None => QueryResult::Owned(to_owned(&value)),
+        Some([]) => QueryResult::Owned(OwnedValue::Null),
+        Some(_) => QueryResult::Owned(delete_paths_sorted(to_owned(&value), &paths, 0)),
     }
-    QueryResult::Owned(result)
 }
 
 // Phase 10: Math Functions
@@ -18200,6 +18325,204 @@ mod tests {
                 assert_eq!(obj.get("b"), None);
             }
         );
+    }
+
+    /// jq sorts the path list before deleting anything, so the order the caller
+    /// wrote the paths in cannot change the answer, and a repeated path deletes
+    /// once. Deleting left to right instead let `[0]` shift the array under
+    /// `[2]`, taking `30` rather than the `40` that path named (#398).
+    #[test]
+    fn test_delpaths_is_order_independent() {
+        assert_outcomes(&[
+            (b"[10,20,30,40]", "delpaths([[0],[2]])", Ok("[20,40]")),
+            (b"[10,20,30,40]", "delpaths([[2],[0]])", Ok("[20,40]")),
+            (b"[10,20,30,40]", "delpaths([[0],[0]])", Ok("[20,30,40]")),
+            (
+                b"[10,20,30,40]",
+                "delpaths([[0],[0],[0]])",
+                Ok("[20,30,40]"),
+            ),
+            (
+                br#"{"a":1,"b":2,"c":3}"#,
+                r#"delpaths([["a"],["c"]])"#,
+                Ok(r#"{"b":2}"#),
+            ),
+            (
+                br#"{"a":1,"b":2,"c":3}"#,
+                r#"delpaths([["c"],["a"]])"#,
+                Ok(r#"{"b":2}"#),
+            ),
+        ]);
+    }
+
+    /// The empty path names the document itself. It sorts before every other
+    /// array, so it wins wherever the caller wrote it.
+    #[test]
+    fn test_delpaths_empty_path_deletes_the_document() {
+        assert_outcomes(&[
+            (b"[10,20,30,40]", "delpaths([])", Ok("[10,20,30,40]")),
+            (b"[10,20,30,40]", "delpaths([[]])", Ok("null")),
+            (b"[10,20,30,40]", "delpaths([[],[0]])", Ok("null")),
+            (b"[10,20,30,40]", "delpaths([[0],[]])", Ok("null")),
+        ]);
+    }
+
+    /// A path that ends at one level takes its whole subtree, and the longer
+    /// paths under it are never walked. This is why `delpaths([[0,1]])` on
+    /// `[10,20,30,40]` is `Cannot delete fields from number` in jq while
+    /// `delpaths([[0],[0,1]])` is a value — the number is gone before anything
+    /// tries to index it. A per-path loop would refuse both (#415).
+    #[test]
+    fn test_delpaths_shorter_path_shadows_its_extensions() {
+        assert_outcomes(&[
+            (b"[10,20,30,40]", "delpaths([[0],[0,1]])", Ok("[20,30,40]")),
+            (b"[[1,2],[3,4]]", "delpaths([[0],[0,1]])", Ok("[[3,4]]")),
+            (b"[[1,2],[3,4]]", "delpaths([[0,1],[0]])", Ok("[[3,4]]")),
+            (b"[[1,2],[3,4]]", "delpaths([[0,1],[1,0]])", Ok("[[1],[4]]")),
+            (
+                br#"{"a":{"x":1,"y":2},"b":3}"#,
+                r#"delpaths([["a"],["a","x"]])"#,
+                Ok(r#"{"b":3}"#),
+            ),
+        ]);
+    }
+
+    /// Deleting inside an object leaves the enclosing key where it was. The
+    /// walk replaces through the slot; a `shift_remove` and reinsert would move
+    /// the key to the end of the `IndexMap`, which is only visible when another
+    /// key follows the one whose child was edited.
+    #[test]
+    fn test_delpaths_preserves_nested_key_order() {
+        assert_outcomes(&[
+            (
+                br#"{"a":{"x":1},"b":2}"#,
+                r#"delpaths([["a","x"]])"#,
+                Ok(r#"{"a":{},"b":2}"#),
+            ),
+            (
+                br#"{"a":{"x":1,"y":2},"b":3,"c":4}"#,
+                r#"delpaths([["a","x"],["b"]])"#,
+                Ok(r#"{"a":{"y":2},"c":4}"#),
+            ),
+            (
+                br#"{"a":{"x":1,"y":2},"b":3,"c":4}"#,
+                r#"delpaths([["b"],["a","x"]])"#,
+                Ok(r#"{"a":{"y":2},"c":4}"#),
+            ),
+            (
+                br#"{"a":[{"x":1,"y":2},{"z":3}],"b":9}"#,
+                r#"delpaths([["a",0,"x"],["a",1],["b"]])"#,
+                Ok(r#"{"a":[{"y":2}]}"#),
+            ),
+        ]);
+    }
+
+    /// Every key that ends at one level is removed in a single pass, so each
+    /// index resolves against the length the array had before any sibling went.
+    /// Deleting one at a time makes `[[-1],[-2]]` yield `[10,30]`, because the
+    /// second index counts back from an array that has already lost an element
+    /// (#398). Indices go through `resolve_read_index`, so a float truncates
+    /// toward zero and `1` and `1.0` name the same element.
+    #[test]
+    fn test_delpaths_resolves_indices_against_the_undeleted_array() {
+        assert_outcomes(&[
+            (b"[10,20,30,40]", "delpaths([[-1],[-2]])", Ok("[10,20]")),
+            (b"[10,20,30,40]", "delpaths([[-1],[-3]])", Ok("[10,30]")),
+            (b"[10,20,30,40]", "delpaths([[-1],[-4]])", Ok("[20,30]")),
+            (b"[10,20,30,40]", "delpaths([[-2],[-4]])", Ok("[20,40]")),
+            // `[3]` and `[-1]` are distinct values, so they are two groups —
+            // but they resolve to one index, and deleting it twice is a no-op.
+            (b"[10,20,30,40]", "delpaths([[3],[-1]])", Ok("[10,20,30]")),
+            (b"[10,20,30,40]", "delpaths([[0],[-4]])", Ok("[20,30,40]")),
+            (b"[10,20,30,40]", "delpaths([[-9]])", Ok("[10,20,30,40]")),
+            (b"[10,20,30,40]", "delpaths([[1.7]])", Ok("[10,30,40]")),
+            (b"[10,20,30,40]", "delpaths([[1],[1.0]])", Ok("[10,30,40]")),
+            (b"[10,20,30,40]", "delpaths([[1.0],[1]])", Ok("[10,30,40]")),
+            (
+                br"[[1,2,3],[4,5,6]]",
+                "delpaths([[0,-1],[0,-2]])",
+                Ok("[[1],[4,5,6]]"),
+            ),
+        ]);
+    }
+
+    /// A path that reaches no element deletes nothing, and does not disturb the
+    /// paths beside it.
+    #[test]
+    fn test_delpaths_ignores_keys_that_name_nothing() {
+        assert_outcomes(&[
+            (br#"{"a":1}"#, r#"delpaths([["b","c"]])"#, Ok(r#"{"a":1}"#)),
+            (b"null", r#"delpaths([["a"]])"#, Ok("null")),
+            (b"[1,2]", r#"delpaths([[5,"a"]])"#, Ok("[1,2]")),
+            (
+                br#"{"a":null}"#,
+                r#"delpaths([["a","b"]])"#,
+                Ok(r#"{"a":null}"#),
+            ),
+            (
+                br#"{"a":{"x":1},"b":2}"#,
+                r#"delpaths([["a","zz"],["a","x"]])"#,
+                Ok(r#"{"a":{},"b":2}"#),
+            ),
+            // A key of the wrong kind for its container names nothing either.
+            // jq refuses both — `Cannot delete number field of object`, and
+            // `Cannot index object with number` for the nested one (#415) — so
+            // neither can be a golden case.
+            (br#"{"a":1}"#, "delpaths([[0]])", Ok(r#"{"a":1}"#)),
+            (
+                br#"{"a":{"x":1}}"#,
+                r#"delpaths([[0,"x"]])"#,
+                Ok(r#"{"a":{"x":1}}"#),
+            ),
+        ]);
+    }
+
+    /// A NaN component names no element, so its path is dropped — and dropped
+    /// *whole*, before the sort, because `compare_values` answers `Equal` for
+    /// NaN against every number. Left in, `[nan]` headed a run that swallowed
+    /// its numeric siblings and cancelled their deletions, so
+    /// `delpaths([[nan],[0]])` deleted nothing at all.
+    ///
+    /// jq cannot arbitrate: 1.7.1 loops forever on `delpaths([[nan]])`, which
+    /// is why this is a unit test and not a golden case (#415). What it pins is
+    /// that a path succinctly cannot use costs only itself.
+    #[test]
+    fn test_delpaths_nan_path_does_not_cancel_its_siblings() {
+        assert_outcomes(&[
+            (b"[10,20,30,40]", "delpaths([[nan]])", Ok("[10,20,30,40]")),
+            (b"[10,20,30,40]", "delpaths([[nan],[0]])", Ok("[20,30,40]")),
+            (b"[10,20,30,40]", "delpaths([[0],[nan]])", Ok("[20,30,40]")),
+            (b"[10,20,30,40]", "delpaths([[0],[nan],[2]])", Ok("[20,40]")),
+            (
+                b"[[1,2],[3,4]]",
+                "delpaths([[0,nan],[0,1]])",
+                Ok("[[1],[3,4]]"),
+            ),
+            // A bare NaN is not a path at all, and goes the same way as any
+            // other non-array entry rather than sorting among the paths.
+            (b"[10,20,30,40]", "delpaths([nan,[0]])", Ok("[20,30,40]")),
+        ]);
+    }
+
+    /// A path list entry that is not an array is dropped. jq refuses it —
+    /// `Path must be specified as array, not number` — so this has no golden
+    /// case; both sides return a value only because succinctly does not raise
+    /// it yet (#415).
+    ///
+    /// What must hold either way is that the entry is never mistaken for the
+    /// empty path, which would delete the whole document.
+    #[test]
+    fn test_delpaths_drops_entries_that_are_not_paths() {
+        assert_outcomes(&[
+            (b"[1,2]", "delpaths([0])", Ok("[1,2]")),
+            (b"[1,2]", r#"delpaths(["a"])"#, Ok("[1,2]")),
+            (b"[1,2]", "delpaths([null])", Ok("[1,2]")),
+            (
+                b"[1,2]",
+                "delpaths(null)",
+                Err("delpaths requires array of paths"),
+            ),
+        ]);
     }
 
     #[test]
