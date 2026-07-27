@@ -5132,6 +5132,13 @@ accept only `- ` and `-\t`:
 #106 recorded exactly this lesson — *duplicated predicates diverge silently* — after the
 same bug class on the same shape.
 
+The consolidation itself landed with #332, not here: [src/yaml/mod.rs](../../src/yaml/mod.rs)
+now holds `starts_seq_entry` as the one definition, shared with the parser and the
+validator, alongside a deliberately narrower `starts_inline_seq_entry`. `uncons` and `get`
+are gone as call sites entirely — they delegate to `uncons_cursor` and `value()` — so three
+of the five copies were removed rather than rerouted. What #337 adds is the cursor fix
+below, and the tests that make a re-divergence fail.
+
 ### Solution
 
 1. **`get_random` leaves a *positioned* cursor** (`seek_cursor` in
@@ -5144,8 +5151,10 @@ same bug class on the same shape.
    pattern `uncons` generates. It needs no new fields — after a successful `get` at `i` the
    cursor already holds `next_open_idx == i+1`, `adv_cumulative == advance_rank1(i+1)` and
    `last_ib_arg == adv_cumulative - 1`.
-3. **One seq-item predicate** — `is_seq_item_at` in
-   [src/yaml/light.rs](../../src/yaml/light.rs), with all five sites routed through it.
+3. **Tests that pin the call sites to the shared predicate** — the consolidation is #332's
+   (`starts_seq_entry`), but nothing made a re-divergence fail. `every_sequence_element_route_agrees`
+   compares `bp_position()` across `uncons`, `uncons_cursor`, `get` and `value()`; widening
+   `uncons_cursor` back to the general predicate fails it.
 4. `SequentialCursor` and `seek_cursor` are now **shared** between `AdvancePositions` and
    `CompactEndPositions` instead of duplicated. #337 was present in both copies.
 
@@ -5203,7 +5212,8 @@ other rather than one in isolation. `tests/yaml_bench_suite_coverage.rs` gains a
 - ✅ 61× at 1 MB, 680× at 10 MB, and the factor keeps growing with input size
 - ✅ Byte-identical output — 544 before/after comparisons over 17 patterns × 8 queries × 2
   formats, 0 mismatches; still matches pinned `yq` on the golden fixtures
-- ✅ One seq-item predicate instead of five, and one `SequentialCursor` instead of two
+- ✅ One `SequentialCursor` instead of two, and #332's one seq-item predicate now held in
+  place by a test that fails when a call site drifts off it
 
 **Costs:**
 - ⚠️ One extra branch in `AdvancePositions::get` / `CompactEndPositions::get` on the
@@ -5238,8 +5248,8 @@ other rather than one in isolation. `tests/yaml_bench_suite_coverage.rs` gains a
   arm in `get`; `SequentialCursor` promoted to shared `pub(super)`
 - `src/yaml/end_positions.rs` — same two fixes; local `SequentialCursor` copy deleted in
   favour of the shared one
-- `src/yaml/light.rs` — `is_seq_item_at` (the one definition) and its four call sites
-- `src/yaml/index.rs` — `is_seq_item` routed through the shared predicate
+- `src/yaml/light.rs` — the agreement tests pinning the element routes and
+  `YamlIndex::is_seq_item` to #332's `starts_seq_entry` / `starts_inline_seq_entry`
 - `src/bin/succinctly/corpus_stats.rs` — `item_wrapper` recovers the item node explicitly
 - `src/bin/succinctly/yaml_generators.rs`, `src/bin/succinctly/main.rs` — `empty-items`
   generator pattern
