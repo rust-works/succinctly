@@ -24,14 +24,14 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 126 probes in
+Measured against jq-1.7.1 over the 143 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result              | Meaning                                            |
 |----------------------------------------------|---------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **124/126 = 98.4%** | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **141/143 = 98.6%** | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**               | Every probe that errors in both errors identically |
 | **Behaviour / parser gaps**                  | **2**               | succinctly does not raise the error at all         |
 
@@ -81,6 +81,7 @@ iterate over number` for the same condition, and `cannot parse 'a' as number` ag
 | `<v> only strings can be parsed`                         | `only_strings_can_be_parsed`                  |
 | `<v> only strings have UTF-8 byte length`                | `no_utf8_byte_length`                         |
 | `Cannot check whether <t> has a <key-type> key`          | `cannot_check_has`                            |
+| `Cannot use <t> (<v>) as object key`                     | `cannot_use_as_object_key`                    |
 | `Invalid numeric literal at EOF at line 1, column <n> …` | `invalid_numeric_literal`                     |
 
 `EvalError::type_error` ("expected X, got Y") survives for the raise sites jq has no
@@ -104,6 +105,53 @@ The families are worth naming, because "fix the site the probe names" caught thi
 in a row: the first pass fixed the *pattern* half of `indices`/`index`/`rindex` and left
 their *input* half saying `expected string or array, got number`, one arm below. The rule
 that holds is per family, not per raise site.
+
+Sometimes jq's own source names the family outright. `strings` on the pinned binary yields:
+
+```jq
+def from_entries: map({(.key // .Key // .name // .Name): (if has("value") then .value else .Value end)}) | add | .//={};
+def with_entries(f): to_entries | map(f) | from_entries;
+```
+
+So `from_entries` *is* object construction, and `with_entries` *is* `from_entries` — one
+raise site in jq behind `{(0):1}`, `[{"key":0}] | from_entries` and
+`{"a":1} | with_entries(.key = 0)` alike, which is why all three share
+`cannot_use_as_object_key`. Succinctly had it as three: two hand-written copies of the
+entry lookup (`from_entries` and `with_entries` reimplemented it separately, and neither
+called the other) plus `key must be a string` in `eval_object_construction`. Both copies
+*dropped* the entry rather than refusing it, so the caller got a smaller object with no
+indication anything was lost — #391. The lookup now has one definition,
+`entries_to_object` in `src/jq/eval.rs`, and `with_entries` is composed from
+`builtin_to_entries` and it rather than restating either.
+
+That composition is also what fixed `[1,2] | with_entries(.)`. jq reaches
+`Cannot use number (0) as object key` because `to_entries` accepts an array — its keys are
+the indices — and hands those number keys to `from_entries`. Succinctly's `with_entries`
+matched only an object, so it reported `array ([1,2]) has no keys` from a type check jq
+has not got. Deriving the builtin from the two it is defined over is what makes the right
+sentence arrive without anyone choosing it.
+
+The same source line pins the *alias* semantics, and its two halves disagree on purpose:
+the key is a `//` chain (`key`, `Key`, `name`, `Name` — an alias holding `null` or `false`
+is passed over in favour of a later one), while the value is a presence test (`value`, then
+`Value` — an explicit `"value": null` beats a `"Value"` beside it). Succinctly had accepted
+`k` and `v`, which jq does not, and neither `Key`/`Name`/`Value`, which it does. Correcting
+the chain was a precondition for raising the error rather than a tidy-up beside it:
+refusing a non-string key while still reading the wrong aliases would have failed
+`[{"Key":"a","value":1}]` and `[{"key":null,"name":"a","value":1}]`, both of which jq
+answers. The chain is pinned by golden cases (`from_entries_key_aliases`,
+`from_entries_alias_falls_through_null`, `from_entries_value_aliases`) rather than probes,
+because it is value behaviour and no probe can hold a filter jq does not error on.
+
+"Passed over in favour of a later one" is exact, and *not* the same as falling through: the
+chain's **last** alias has nothing later to be preferred, so `a // b` yields `b` whatever
+`b` is. A falsy `.Name` is therefore the key, and `[{"Name":false}] | from_entries` is
+`Cannot use boolean (false) as object key` — not the `null (null)` a uniform fall-through
+would produce. Reading the tail as falling through too is the easy mistake, and the case
+that hides it is a tail that is merely *absent*, which really is `null`; the probe pair
+`from_entries_falsy_tail_key` / `from_entries_absent_tail_key` exists to separate them, with
+`from_entries_alias_falsy_tail` pinning the same case end-to-end through the CLI. This half
+of the chain *can* be probed, unlike the rest of it, precisely because jq errors here.
 
 ### Value rendering and truncation
 
@@ -236,6 +284,36 @@ Every row is an assignment, update or deletion walking a path *in place*, and ev
 older than #356 — the rewording changed what these say, not whether they say it. The gap
 they share is auto-vivification: jq grows the container the path asks for (`null` into an
 object, an array up to the index) and treats an unreachable delete as a no-op.
+
+One row is not a path walk, and it is here because #391 read jq's definition of
+`from_entries` and took only half of it:
+
+| Filter         | Input                         | jq        | succinctly                       |
+|----------------|-------------------------------|-----------|----------------------------------|
+| `from_entries` | `{"x":{"key":"a","value":1}}` | `{"a":1}` | `Cannot iterate over object (…)` |
+
+`map(f)` is `[.[] | f]`, and `.[]` over an object iterates its *values*, so jq's
+`from_entries` accepts an object of entries as readily as an array of them. Succinctly's
+matches an array alone. The refusal predates #391 — what #391 changed is that the rest of
+the builtin is now derived from that same definition, which is what makes this half stand
+out. Tracked as [#422](https://github.com/rust-works/succinctly/issues/422), together with
+the other `map`-derived builtins that may share the shape.
+
+An object key that yields something other than exactly one value is a second, unrelated
+group — it is the key half of
+[#354](https://github.com/rust-works/succinctly/issues/354):
+
+| Filter        | Input       | jq                       | succinctly             |
+|---------------|-------------|--------------------------|------------------------|
+| `{(empty):1}` | `0`         | *(no output)*            | `key must be a string` |
+| `{(.[]):1}`   | `["a","b"]` | `{"a":1}` then `{"b":1}` | `key must be a string` |
+
+jq's object construction takes the cartesian product over each key's outputs, so a key
+producing nothing produces no object and a key producing two produces two. Succinctly
+evaluates the key to a single value and refuses anything else, with wording of its own —
+the one sentence left in `eval_object_construction`, because reaching jq's answer here
+means generating a stream, not renaming an error. The sentence stays succinctly's until
+#354 is built.
 
 `setpath` is the same operation without the syntax, and after #359 it does follow jq —
 `[1,2] | setpath([5]; 9)` is `[1,2,null,null,null,9]`, and `null | setpath(["a"]; 1)` is

@@ -75,6 +75,23 @@ sort_by_on_number	sort_by(.)	1	Cannot iterate over number (1)
 group_by_on_number	group_by(.)	1	Cannot iterate over number (1)
 from_entries_on_number	from_entries	1	Cannot iterate over number (1)
 join_on_number	join(",")	1	Cannot iterate over number (1)
+from_entries_number_key	from_entries	[{"key":0,"value":1}]	Cannot use number (0) as object key
+from_entries_boolean_key	from_entries	[{"key":true,"value":1}]	Cannot use boolean (true) as object key
+from_entries_array_key	from_entries	[{"key":[1],"value":1}]	Cannot use array ([1]) as object key
+from_entries_object_key	from_entries	[{"key":{},"value":1}]	Cannot use object ({}) as object key
+from_entries_truncated_key	from_entries	[{"key":12345678901234567}]	Cannot use number (12345678901...) as object key
+from_entries_missing_key	from_entries	[{"value":1}]	Cannot use null (null) as object key
+from_entries_null_entry	from_entries	[null]	Cannot use null (null) as object key
+from_entries_falsy_tail_key	from_entries	[{"Name":false,"value":1}]	Cannot use boolean (false) as object key
+from_entries_absent_tail_key	from_entries	[{"key":false,"value":1}]	Cannot use null (null) as object key
+from_entries_string_entry	from_entries	["a"]	Cannot index string with string "key"
+from_entries_number_entry	from_entries	[1]	Cannot index number with string "key"
+from_entries_array_entry	from_entries	[[0,1]]	Cannot index array with string "key"
+with_entries_on_array	with_entries(.)	[1,2]	Cannot use number (0) as object key
+with_entries_sets_number_key	with_entries(.key=0)	{"a":1}	Cannot use number (0) as object key
+object_construct_number_key	{(.):1}	0	Cannot use number (0) as object key
+object_construct_null_key	{(.):1}	null	Cannot use null (null) as object key
+object_construct_array_key	{(.):1}	[1]	Cannot use array ([1]) as object key
 add_number_string	. + "a"	1	number (1) and string ("a") cannot be added
 add_array_object	. + {}	[1]	array ([1]) and object ({}) cannot be added
 add_truncated_operand	. + "a"	{"aaaaaaaa":1,"bbbbbbbb":2}	object ({"aaaaaaaa"...) and string ("a") cannot be added

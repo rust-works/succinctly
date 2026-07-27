@@ -106,6 +106,39 @@ group_by_on_number	group_by(.)	1
 from_entries_on_number	from_entries	1
 join_on_number	join(",")	1
 
+# ── Cannot use <t> (<v>) as object key ───────────────────────────────────────
+# jq defines `from_entries` as object construction over the entries —
+# `map({(.key // .Key // .name // .Name): …})` — so a non-string key is refused
+# where it would be inserted, and `with_entries` and `{(f):v}` inherit the same
+# sentence. Before #391 every entry below was silently dropped instead.
+from_entries_number_key	from_entries	[{"key":0,"value":1}]
+from_entries_boolean_key	from_entries	[{"key":true,"value":1}]
+from_entries_array_key	from_entries	[{"key":[1],"value":1}]
+from_entries_object_key	from_entries	[{"key":{},"value":1}]
+from_entries_truncated_key	from_entries	[{"key":12345678901234567}]
+# No key alias at all, and an entry that is `null`, both leave the key `null`.
+from_entries_missing_key	from_entries	[{"value":1}]
+from_entries_null_entry	from_entries	[null]
+# The chain's *last* alias has nothing to be skipped in favour of, so a falsy
+# `Name` is the key — `a // b` yields `b` whatever `b` is. The pair below is
+# what separates that from a tail that is merely absent.
+from_entries_falsy_tail_key	from_entries	[{"Name":false,"value":1}]
+from_entries_absent_tail_key	from_entries	[{"key":false,"value":1}]
+# A non-object entry is indexed with "key" all the same, so it reports the
+# indexing error rather than this section's sentence.
+from_entries_string_entry	from_entries	["a"]
+from_entries_number_entry	from_entries	[1]
+from_entries_array_entry	from_entries	[[0,1]]
+# `with_entries` is `to_entries | map(f) | from_entries`, so an array input
+# reaches `from_entries` with its indices as keys — and a filter that writes a
+# non-string key lands there too.
+with_entries_on_array	with_entries(.)	[1,2]
+with_entries_sets_number_key	with_entries(.key=0)	{"a":1}
+# The construction `from_entries` is defined over, reached directly.
+object_construct_number_key	{(.):1}	0
+object_construct_null_key	{(.):1}	null
+object_construct_array_key	{(.):1}	[1]
+
 # ── <a> and <b> cannot be <verb> ─────────────────────────────────────────────
 add_number_string	. + "a"	1
 add_array_object	. + {}	[1]
