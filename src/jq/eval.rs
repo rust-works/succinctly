@@ -1353,11 +1353,12 @@ fn eval_alternative<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match retain_truthy(eval_single::<W, S>(left, value.clone(), optional)) {
         // A `break` escapes the operator rather than selecting a branch.
         QueryResult::Break(label) => QueryResult::Break(label),
-        // No truthy output on the left, so the right side answers. An error on
-        // the left also falls through here, discarding it; jq 1.7.1 instead
-        // propagates left-hand errors, which is a separate divergence from the
-        // multi-output bug this function fixes.
-        QueryResult::None | QueryResult::Error(_) => eval_single::<W, S>(right, value, optional),
+        // No truthy output on the left, so the right side answers.
+        QueryResult::None => eval_single::<W, S>(right, value, optional),
+        // An error on the left propagates, matching jq 1.7.1: `//` only
+        // substitutes for falsy/absent output, not for a raised error. Use
+        // `?` on the left (e.g. `.a? // 3`) to suppress the error instead.
+        error @ QueryResult::Error(_) => error,
         kept => kept,
     }
 }
@@ -15178,6 +15179,29 @@ mod tests {
         // Chain alternatives
         query!(br#"{"a": null, "b": null}"#, ".a // .b // 42",
             QueryResult::Owned(OwnedValue::Int(42)) => {}
+        );
+    }
+
+    #[test]
+    fn regression_issue_377_alternative_propagates_left_hand_errors() {
+        // jq 1.7.1 raises a left-hand error rather than treating it as falsy;
+        // `//` only substitutes for false/null/absent output.
+        query!(br"null", r#"error("x") // 3"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+        query!(br"1", ".a // 3",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index number with string \"a\"");
+            }
+        );
+
+        // A `?` on the erroring operand still suppresses the error and falls
+        // through to the right side, since `.a?` never produces `Error` in
+        // the first place.
+        query!(br"1", ".a? // 3",
+            QueryResult::Owned(OwnedValue::Int(3)) => {}
         );
     }
 
