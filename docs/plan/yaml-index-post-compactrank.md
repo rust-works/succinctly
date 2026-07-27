@@ -18,11 +18,15 @@ with `CompactRank` (~3.5% overhead).
 
 The CompactRank migration replaced four `Vec<u32>` cumulative rank indices (50%
 overhead each) with two-level `CompactRank` structures (~3.5% overhead). This
-reduced memory usage by 20-52% in CLI benchmarks — uncited, and from the same
-era as `0156707a`'s memory claim, which
-[../parsing/yaml-succinct.md](../parsing/yaml-succinct.md) shows to be wrong in
-the direction of the trade it made. Do not quote it forward. This document
-identifies the remaining optimization opportunities.
+reduced memory usage by 20-52% in CLI benchmarks. This document identifies the
+remaining optimization opportunities.
+
+> **Note (2026-07)**: the 20-52% figure is uncited — it appears nowhere else in
+> the repo, and `bc169609` (the migration commit) does not claim it. It also
+> dates from the same week as `0156707a`, whose own "~3.5% to ~3.1%" memory
+> claim is wrong in the direction of the trade it made; see
+> [yaml-succinct.md § Design constraint](../parsing/yaml-succinct.md#design-constraint-bitmaps-not-position-vectors).
+> Do not quote the 20-52% forward without re-measuring.
 
 ## YamlIndex Memory Layout (2026-01-27)
 
