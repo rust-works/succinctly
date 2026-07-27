@@ -977,6 +977,72 @@ fn test_cannot_index_error_wording() -> Result<()> {
     Ok(())
 }
 
+/// A *literal* key reports the same thing a computed one does.
+///
+/// The pair in each row is the same query written two ways. They travel
+/// different routes to get there — a constant key folds to
+/// `Expr::Field`/`Expr::Index` at parse time (#360), a computed one stays an
+/// `Expr::IndexExpr` and dispatches on the key's kind at run time — and each
+/// route raises its error from its own site, so nothing but a test holds them to
+/// one wording. A message that changes with the spelling of the key is worse
+/// than either message alone.
+///
+/// Nothing else covers the pairing: the #356 error corpus probes each spelling
+/// against jq independently, which catches a drift from jq but not a drift
+/// between the two spellings if both were to move together.
+#[test]
+fn test_cannot_index_wording_is_spelling_independent() -> Result<()> {
+    // (literal filter, computed filter, extra args, input, expected message)
+    let cases: &[(&str, &str, &[&str], &str, &str)] = &[
+        (
+            ".[0]",
+            ".[$n]",
+            &["--argjson", "n", "0"],
+            r#"{"a":1}"#,
+            "Cannot index object with number",
+        ),
+        (
+            r#".["x"]"#,
+            ".[$k]",
+            &["--arg", "k", "x"],
+            "[1,2]",
+            r#"Cannot index array with string "x""#,
+        ),
+        (
+            ".x",
+            ".[$k]",
+            &["--arg", "k", "x"],
+            "[1,2]",
+            r#"Cannot index array with string "x""#,
+        ),
+        (
+            ".a",
+            ".[$k]",
+            &["--arg", "k", "a"],
+            "123",
+            r#"Cannot index number with string "a""#,
+        ),
+        (
+            ".[0]",
+            ".[$n]",
+            &["--argjson", "n", "0"],
+            r#""s""#,
+            "Cannot index string with number",
+        ),
+    ];
+
+    for (literal, computed, args, input, expected) in cases {
+        for filter in [literal, computed] {
+            let stderr = jq_stderr(filter, input, args)?;
+            assert!(
+                stderr.contains(expected),
+                "`{filter}` on `{input}` should report {expected:?}, got: {stderr}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `?` suppresses a bad-key error rather than propagating it.
 ///
 /// Regression guard for the `eval_generic` fallback: routing an unhandled

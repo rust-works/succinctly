@@ -124,6 +124,9 @@ fn test_field_missing_returns_null() {
 
 #[test]
 fn test_field_on_non_object_error() {
+    // The message names the *container* and the key, as jq's does, and is the
+    // same error `.[$k]` raises for a string key — a literal key folds to
+    // `Expr::Field` (#360) but must not pick up its own wording.
     query!(br"[1, 2, 3]", ".foo",
         QueryResult::Error(e) => {
             assert_eq!(e.message, "Cannot index array with string \"foo\"");
@@ -215,6 +218,9 @@ fn test_index_on_null_negative_returns_null() {
 
 #[test]
 fn test_index_on_non_array_error() {
+    // As in `test_field_on_non_object_error`: jq's wording, naming the
+    // container, identical to what `.[$n]` reports for the same input.
+    // `Expr::Index` is the folded form of a constant numeric key (#360).
     query!(br#"{"a": 1}"#, ".[0]",
         QueryResult::Error(e) => {
             assert_eq!(e.message, "Cannot index object with number");
