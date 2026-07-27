@@ -26,7 +26,7 @@ path:
 
 | Dimension                              | Result              | Meaning                                        |
 |----------------------------------------|---------------------|------------------------------------------------|
-| **Load** (valid YAML, output compared) | **215/279 = 77.1%** | Parses and produces the JSON the suite expects |
+| **Load** (valid YAML, output compared) | **216/279 = 77.4%** | Parses and produces the JSON the suite expects |
 | **Reject** (invalid YAML, must fail)   | **70/94 = 74.5%**   | Refused by the loader or the opt-in validator  |
 | **Parse** (valid YAML, no JSON form)   | **27/29 = 93.1%**   | Parses without error                           |
 
@@ -35,7 +35,7 @@ validator enabled (loader OR validator, see below). The *default non-validating
 loader alone* still rejects only 12/94 (12.8%) by design — the opt-in validator
 ([#223](https://github.com/rust-works/succinctly/issues/223)) closes 58 more.
 
-The 90 non-passing cases are enumerated individually, with a category and reason, in
+The 89 non-passing cases are enumerated individually, with a category and reason, in
 [`tests/data/yaml-test-suite-known-failures.txt`](../../../tests/data/yaml-test-suite-known-failures.txt).
 That file is the machine-readable source of truth; the test asserts it matches reality
 exactly, so it cannot silently drift from this page.
@@ -313,24 +313,27 @@ floats render as integers on the streaming path, `1.0` → `1` —
 [#168](https://github.com/rust-works/succinctly/issues/168) /
 [#170](https://github.com/rust-works/succinctly/issues/170)).
 
-## Full accounting of the 64 load failures
+## Full accounting of the 63 load failures
 
 | Category     | Cases | Cause                                                             |
 |--------------|-------|-------------------------------------------------------------------|
 | `tags`       | 31    | Tags not supported (above)                                        |
 | `directives` | 16    | `%YAML` / `%TAG` not recognized (above)                           |
 | `structure`  | 9     | Document end markers; anchors with colons in the name             |
-| `scalars`    | 8     | Zero-indented block scalars; tabs; trailing whitespace            |
+| `scalars`    | 7     | Zero-indented block scalars; tabs; trailing whitespace            |
 
 `scalars` was 13 until [#329](https://github.com/rust-works/succinctly/issues/329). Folded
 (`>`) block scalars mis-counted the newlines a blank line is worth — a blank line yielded
 N+1 where YAML 1.2 §8.1.3 and `yq` give N — and folded blocks with keep chomping (`>+`)
 dropped `b-chomped-last` entirely, so `>+` over `a` produced `"a"` rather than `"a\n"`.
 Fixing the folding rule in `decode_block_folded` cleared `4Q9F`, `7T8X`, `93WF`, `K527`
-and `TS54`. What remains under `scalars` is unrelated to folding: zero-indented block
-scalars (`DK3J`, `FP8R`), tab handling (`DK95/00`, `K54U`), trailing whitespace
-(`L24T/00`, `JEF9/02`), explicit indentation indicators (`M5C3`), and the empty stream
-(`AVM7`, filed under `scalars` although it is really a document-level case).
+and `TS54`. `DK95/00` (a tab used as separation before a plain scalar, retained as
+content instead of stripped) was fixed by
+[#381](https://github.com/rust-works/succinctly/issues/381). What remains under
+`scalars` is unrelated to folding: zero-indented block scalars (`DK3J`, `FP8R`), tab
+handling (`K54U`), trailing whitespace (`L24T/00`, `JEF9/02`), explicit indentation
+indicators (`M5C3`), and the empty stream (`AVM7`, filed under `scalars` although it
+is really a document-level case).
 
 ### `JEF9/02`: the one case where we follow `yq` over the suite
 
