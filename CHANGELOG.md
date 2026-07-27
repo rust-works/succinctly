@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **One definition of "what kind is this value" in the jq module** (#358): the
+  `null < false < true < number < string < array < object` table behind `sort`,
+  `min`, `max`, `unique`, `group_by`, the comparison operators and `bsearch` had
+  been hand-written in three places (twice in `src/jq/eval.rs`, once in
+  `src/jq/eval_generic.rs`), and the containment screen below would have made a
+  fourth. There is now a single `jq_kind` mirroring jq's `jv_kind`, with
+  `sort_rank` *derived* from it by merging the two boolean kinds, plus a test
+  that the coarsening stays faithful. No behaviour change — the old copies
+  already agreed — but see the #106 lesson in `CLAUDE.md` on predicates that
+  diverge silently.
+
 - **`yaml::simd` terminator accessors renamed and narrowed** (#185):
   `YamlCharClass16::value_terminators` and
   `YamlCharClassBroadword::value_terminators` are now
@@ -51,6 +62,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq error-message value previews escaped C1 control characters** (#358):
+  a preview built from `OwnedValue::to_json` escapes every
+  `char::is_control()`, which includes U+0080–U+009F, so a string containing
+  U+0085 previewed with a six-character
+  backslash-u escape where jq emits the two raw UTF-8 bytes. Previews now go
+  through the streaming JSON writer, which already matched jq here. `tojson` and
+  `@json` still over-escape — the same `to_json` path, but a wider behaviour
+  change than #358 should make, so it is tracked separately as #385.
+- **jq `contains`/`inside` answered `false` for operands that cannot be
+  compared** (#358): `1 | contains("a")` and `1 | inside([1])` returned `false`
+  where jq raises
+  `number (1) and string ("a") cannot have their containment checked`. Silent —
+  a filter asking "is this string in that string" got a plausible `false` when it
+  had in fact been handed a number. **Behaviour change**: those filters now
+  error, so a query that relied on the `false` will stop producing output.
+  Only the *outermost* pair of operands is screened, matching jq exactly: a
+  mismatch nested inside a container is still `false`
+  (`[1,"a"] | contains(["a",2])`). The screen is on jq's *kind*, not its type
+  name, which cuts both ways: integers and floats are one kind, so
+  `[1,2,3] | contains([1.0])` stays `true`, but `true` and `false` are two kinds
+  that share the name `boolean`, so `true | contains(false)` errors with
+  `boolean (true) and boolean (false) cannot have their containment checked`
+  while `true | contains(true)` stays `true`. The new
+  `EvalError::containment_check` reproduces jq's message including its value
+  preview, which truncates a dump longer than 14 bytes to 11 bytes plus `...`
+  (`string ("abcdefghij...) and number (1) …`); unlike jq's `strncpy` it cuts on
+  a `char` boundary rather than emitting a split UTF-8 sequence. Unlike jq it
+  also stops serialising once the answer is settled, so previewing a mismatched
+  100 MB operand copies 14 bytes instead of dumping the whole document.
+  `succinctly yq` gets the fix too, since its evaluator delegates containment to
+  this one.
+  Two known gaps, both pinned by tests rather than fixed: uncaught, it still
+  exits 0 rather than jq's 5 (#355), and a number in the preview reads back
+  canonicalised rather than as its source literal — jq's `number (1E+100)` is
+  our `number (10000000000...)` — because `OwnedValue` does not carry the
+  literal, a limitation `1e100 | tostring` already shows and the streaming
+  identity path does not share (#387).
 - **jq `//`, `and` and `or` collapsed multi-output operands** (#160): all three
   are generators over their operands' *streams*, but each inspected only the
   first output. `//` decided truthiness from `vs.first()` and then returned the

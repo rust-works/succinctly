@@ -901,6 +901,44 @@ fn test_builtin_first_on_non_array_errors() -> Result<()> {
 }
 
 #[test]
+fn test_contains_type_mismatch_errors() -> Result<()> {
+    // jq: `1 | contains("a")` is an error, not `false` (#358). This exercises the
+    // CLI's generic evaluator, which reaches the check by delegating to the full
+    // one. Like `first` above, the exit status is not asserted: runtime eval
+    // errors still exit 0 rather than jq's 5 (#355).
+    let mut cmd = Command::new("cargo")
+        .args([
+            "run",
+            "--features",
+            "cli",
+            "--bin",
+            "succinctly",
+            "--",
+            "jq",
+            "-c",
+            r#"contains("a")"#,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(b"1")?;
+    }
+    let output = cmd.wait_with_output()?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(stdout.trim(), "", "no `false` on stdout: {stdout}");
+    assert!(
+        stderr.contains(r#"number (1) and string ("a") cannot have their containment checked"#),
+        "Should report jq's containment error: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_builtin_keys() -> Result<()> {
     let (output, code) = run_jq_stdin("keys", r#"{"z":1,"a":2}"#, &["-c"])?;
     assert_eq!(code, 0);

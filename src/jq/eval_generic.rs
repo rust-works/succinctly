@@ -16,7 +16,9 @@ use alloc::vec::Vec;
 use indexmap::IndexMap;
 
 use super::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
-use super::eval::{eval as full_eval, EvalError, EvalSemantics, JqSemantics, QueryResult};
+use super::eval::{
+    eval as full_eval, sort_rank, EvalError, EvalSemantics, JqSemantics, QueryResult,
+};
 use super::expr::{Builtin, CompareOp, Expr, Literal};
 use super::value::OwnedValue;
 use crate::json::JsonIndex;
@@ -109,19 +111,8 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(
 fn compare_values(left: &OwnedValue, right: &OwnedValue) -> Option<core::cmp::Ordering> {
     use core::cmp::Ordering;
 
-    fn type_order(v: &OwnedValue) -> u8 {
-        match v {
-            OwnedValue::Null => 0,
-            OwnedValue::Bool(_) => 1,
-            OwnedValue::Int(_) | OwnedValue::Float(_) => 2,
-            OwnedValue::String(_) => 3,
-            OwnedValue::Array(_) => 4,
-            OwnedValue::Object(_) => 5,
-        }
-    }
-
-    let left_type = type_order(left);
-    let right_type = type_order(right);
+    let left_type = sort_rank(left);
+    let right_type = sort_rank(right);
 
     if left_type != right_type {
         return Some(left_type.cmp(&right_type));

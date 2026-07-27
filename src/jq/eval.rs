@@ -15,6 +15,8 @@ use alloc::vec::Vec;
 
 use indexmap::IndexMap;
 
+use super::stream::StreamableValue;
+
 /// Trait for evaluation semantics - determines behavior for edge cases.
 ///
 /// jq and yq (mikefarah/yq) have different behaviors for some operations.
@@ -207,6 +209,207 @@ impl EvalError {
     /// Create an index out of bounds error.
     pub fn index_out_of_bounds(index: i64, len: usize) -> Self {
         Self::new(format!("index {index} out of bounds (length {len})"))
+    }
+
+    /// Create the error `contains`/`inside` raise for operands whose kinds
+    /// cannot be compared, e.g. `1 | contains("a")` (#358). The callers decide
+    /// *when* to raise it, by comparing `jq_kind` — not `type_name`, which is
+    /// a coarser partition; see that function.
+    ///
+    /// `left` is the container, `right` the value looked for, so `inside` — which
+    /// is `contains` with the operands swapped — passes its *argument* first,
+    /// matching jq's `array ([1]) and number (1) …` for `1 | inside([1])`.
+    ///
+    /// # Merge note (#356 / PR #364)
+    ///
+    /// That branch adds `src/jq/error.rs` carrying its own
+    /// `EvalError::containment_check` and a `dump_truncated` equivalent to
+    /// `value_preview`. Two `impl EvalError` blocks defining this name is a
+    /// duplicate-definition *compile* error, not a textual conflict git will
+    /// flag, so whichever of the two lands second owes the merge: keep one copy
+    /// of both helpers, and clear the `contains_number_string` /
+    /// `inside_array_number` entries from
+    /// `tests/data/jq-error-known-divergences.txt` and
+    /// `docs/compliance/jq/limitations.md`, which #358 makes stale.
+    pub fn containment_check(left: &OwnedValue, right: &OwnedValue) -> Self {
+        Self::new(format!(
+            "{} ({}) and {} ({}) cannot have their containment checked",
+            left.type_name(),
+            value_preview(left),
+            right.type_name(),
+            value_preview(right),
+        ))
+    }
+}
+
+// jq's `jv_kind` discriminants, verbatim from `jv.h`, so the two enums can be
+// read side by side. `JV_KIND_INVALID` (0) has no `OwnedValue` counterpart — an
+// `OwnedValue` is always a valid value — so the numbering starts at 1.
+const JQ_KIND_NULL: u8 = 1;
+const JQ_KIND_FALSE: u8 = 2;
+const JQ_KIND_TRUE: u8 = 3;
+const JQ_KIND_NUMBER: u8 = 4;
+const JQ_KIND_STRING: u8 = 5;
+const JQ_KIND_ARRAY: u8 = 6;
+const JQ_KIND_OBJECT: u8 = 7;
+
+/// A value's kind as jq's `jv_get_kind` reports it, for the operand screens that
+/// compare kinds rather than type names.
+///
+/// This is a *finer* partition than [`OwnedValue::type_name`]: jq's `jv_kind`
+/// enum has separate `JV_KIND_FALSE` and `JV_KIND_TRUE`, and only `jv_kind_name`
+/// collapses the pair back to the one word `boolean`. `f_contains` screens on
+/// `jv_get_kind`, so jq errors on `true | contains(false)` — with a message that
+/// calls *both* operands `boolean` — while `true | contains(true)` is a plain
+/// `true`. Screening on `type_name` instead answers `false` for that pair, which
+/// is exactly the divergence #358 is about (#358 review).
+///
+/// This is the one definition of "what kind is this value" in the jq module;
+/// [`sort_rank`] is derived from it rather than matched independently. Only
+/// equality is ever asked of the value here — orderings go through `sort_rank`.
+fn jq_kind(value: &OwnedValue) -> u8 {
+    match value {
+        OwnedValue::Null => JQ_KIND_NULL,
+        OwnedValue::Bool(false) => JQ_KIND_FALSE,
+        OwnedValue::Bool(true) => JQ_KIND_TRUE,
+        // jq has one number kind; `1 | contains(1.0)` is a comparison, not an error.
+        OwnedValue::Int(_) | OwnedValue::Float(_) => JQ_KIND_NUMBER,
+        OwnedValue::String(_) => JQ_KIND_STRING,
+        OwnedValue::Array(_) => JQ_KIND_ARRAY,
+        OwnedValue::Object(_) => JQ_KIND_OBJECT,
+    }
+}
+
+/// A value's rank in jq's sort order:
+/// `null < false < true < number < string < array < object`.
+///
+/// This is [`jq_kind`]'s partition with the two boolean kinds merged into the
+/// single `boolean` slot `jv_kind_name` reports — which is what every *ordering*
+/// caller wants (`sort`, `min`, `max`, `unique`, `group_by`, the comparison
+/// operators, `bsearch`). Only `contains`/`inside` need the finer `jq_kind`.
+///
+/// Derived rather than matched so the two cannot drift: before #358 there were
+/// three hand-written copies of this table in the jq module, and a fourth would
+/// have arrived with the containment screen. See the #106 lesson in `CLAUDE.md`
+/// — one definition, plus a test that the call sites agree
+/// (`sort_rank_agrees_with_jq_kind`).
+pub(crate) fn sort_rank(value: &OwnedValue) -> u8 {
+    let kind = jq_kind(value);
+    // Shift off the unused `JV_KIND_INVALID` slot, then close the gap that
+    // merging `false` and `true` into one rank leaves behind.
+    kind - 1 - u8::from(kind >= JQ_KIND_TRUE)
+}
+
+/// Render `value` the way jq embeds a value in an error message: its compact
+/// JSON dump, truncated so a huge operand cannot produce a huge message.
+///
+/// jq does this with `jv_dump_string_trunc(v, buf, sizeof buf)` over a
+/// `char buf[15]`: dumps up to 14 bytes and, when the dump was longer,
+/// overwrites the last three with `...`. So a 14-byte dump survives whole and a
+/// 15-byte one becomes 11 bytes plus `...`.
+///
+/// Unlike jq — which builds the entire dump with `jv_dump_string` and then
+/// discards all but 14 bytes of it — this streams into a [`PreviewSink`] and
+/// stops as soon as the answer is settled, so previewing a mismatched 100 MB
+/// operand copies 14 bytes rather than the whole document.
+///
+/// It streams via [`StreamableValue::stream_json`] rather than
+/// `OwnedValue::to_json` for a second reason: that is the writer whose escaping
+/// matches jq. `to_json` escapes every `char::is_control()`, which includes the
+/// C1 range, so it renders `U+0085` as a six-character backslash-u escape where
+/// jq emits the two raw UTF-8 bytes. (`tojson` and `@json` still go through
+/// `to_json` and still over-escape — a pre-existing divergence wider than #358,
+/// so it is left alone here and tracked as #385.)
+///
+/// Two deviations remain, both about what gets dumped rather than where it is cut:
+///
+/// 1. jq's `strncpy` can cut a multi-byte UTF-8 sequence in half and emit the
+///    broken bytes. A Rust `String` cannot hold those, so we cut at the nearest
+///    `char` boundary at or below the limit — the preview is then up to three
+///    bytes shorter than jq's for such values.
+/// 2. `OwnedValue` does not preserve a number's source literal, so a number
+///    reads back canonicalised: jq previews `1e100` as `1E+100` and `1.0` as
+///    `1.0`, where we give `10000000000...` and `1`. This is a property of
+///    materialising into `OwnedValue` — `1e100 | tostring` already differs, and
+///    the streaming identity path, which copies source text, does not — not of
+///    the truncation here. Pinned by `number_previews_are_canonicalised` in
+///    `tests/jq_containment_tests.rs`; fixing it means teaching `OwnedValue` to
+///    carry the literal, which is well beyond #358. Tracked as #387.
+fn value_preview(value: &OwnedValue) -> String {
+    /// `sizeof buf - 1` in jq: the longest dump reproduced verbatim.
+    const MAX: usize = 14;
+    /// What is left of the budget once `...` has claimed three bytes.
+    const KEEP: usize = MAX - 3;
+
+    let mut sink = PreviewSink::new(MAX);
+    // The sink stops the writer once the dump is known to exceed `MAX`; writing
+    // into a `String` cannot fail for any other reason, so the returned `Result`
+    // carries nothing `sink.overflowed` has not already recorded.
+    let _ = value.stream_json(&mut sink);
+    if !sink.overflowed {
+        return sink.buf;
+    }
+    sink.truncate_to(KEEP);
+    sink.buf.push_str("...");
+    sink.buf
+}
+
+/// A [`core::fmt::Write`] sink that keeps the first `cap` bytes written to it and
+/// then stops the writer, so [`value_preview`] costs a constant amount of work
+/// however large the offending value is.
+///
+/// Two details carry the bound and the safety:
+///
+/// * It clamps the copy even within a *single* oversized `write_str`. A long
+///   JSON string arrives from the streaming writer as one span, so clamping the
+///   copy — not just refusing later writes — is what actually bounds the work.
+/// * `buf` stays valid UTF-8: an oversized span is cut back to a `char`
+///   boundary. jq's `strncpy` emits the split bytes instead, which is the one
+///   place the preview is allowed to come out shorter than jq's.
+struct PreviewSink {
+    /// The retained prefix; never longer than `cap`, always valid UTF-8.
+    buf: String,
+    /// Byte budget for `buf`.
+    cap: usize,
+    /// Whether anything was dropped — i.e. the dump was longer than `cap`.
+    overflowed: bool,
+}
+
+impl PreviewSink {
+    fn new(cap: usize) -> Self {
+        Self {
+            buf: String::with_capacity(cap),
+            cap,
+            overflowed: false,
+        }
+    }
+
+    /// Cut `buf` back to at most `len` bytes, on a `char` boundary.
+    fn truncate_to(&mut self, len: usize) {
+        let mut cut = len.min(self.buf.len());
+        while cut > 0 && !self.buf.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        self.buf.truncate(cut);
+    }
+}
+
+impl core::fmt::Write for PreviewSink {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let room = self.cap - self.buf.len();
+        if s.len() <= room {
+            self.buf.push_str(s);
+            return Ok(());
+        }
+        // More arrived than fits: take what we can, on a boundary, and stop the
+        // traversal — nothing further can change the preview.
+        let mut cut = room;
+        while cut > 0 && !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        self.buf.push_str(&s[..cut]);
+        self.overflowed = true;
+        Err(core::fmt::Error)
     }
 }
 
@@ -1188,19 +1391,8 @@ fn eval_compare<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn compare_values(left: &OwnedValue, right: &OwnedValue) -> core::cmp::Ordering {
     use core::cmp::Ordering;
 
-    fn type_order(v: &OwnedValue) -> u8 {
-        match v {
-            OwnedValue::Null => 0,
-            OwnedValue::Bool(_) => 1,
-            OwnedValue::Int(_) | OwnedValue::Float(_) => 2,
-            OwnedValue::String(_) => 3,
-            OwnedValue::Array(_) => 4,
-            OwnedValue::Object(_) => 5,
-        }
-    }
-
-    let left_type = type_order(left);
-    let right_type = type_order(right);
+    let left_type = sort_rank(left);
+    let right_type = sort_rank(right);
 
     if left_type != right_type {
         return left_type.cmp(&right_type);
@@ -2642,10 +2834,21 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     let input = to_owned(&value);
+    if jq_kind(&input) != jq_kind(&b) {
+        if optional {
+            return QueryResult::None;
+        }
+        return QueryResult::Error(EvalError::containment_check(&input, &b));
+    }
     QueryResult::Owned(OwnedValue::Bool(owned_contains(&input, &b)))
 }
 
 /// Check if `a` contains `b` (recursive containment check)
+///
+/// Only the *top-level* kinds have to match; a mismatch nested inside a
+/// container is plain `false`, as in jq — `[1,"a"] | contains(["a",2])` is
+/// `false`, not the error [`EvalError::containment_check`] raises. The callers
+/// screen the top level with [`jq_kind`], so this stays a total function.
 fn owned_contains(a: &OwnedValue, b: &OwnedValue) -> bool {
     match (a, b) {
         // String contains string
@@ -2680,6 +2883,12 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     let input = to_owned(&value);
     // inside is the inverse of contains: b contains input
+    if jq_kind(&b) != jq_kind(&input) {
+        if optional {
+            return QueryResult::None;
+        }
+        return QueryResult::Error(EvalError::containment_check(&b, &input));
+    }
     QueryResult::Owned(OwnedValue::Bool(owned_contains(&b, &input)))
 }
 
@@ -11691,18 +11900,8 @@ fn compare_owned_values(a: &OwnedValue, b: &OwnedValue) -> core::cmp::Ordering {
             x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
         }
         (OwnedValue::String(x), OwnedValue::String(y)) => x.cmp(y),
-        // Different types: use a consistent ordering
-        _ => {
-            let type_order = |v: &OwnedValue| match v {
-                OwnedValue::Null => 0,
-                OwnedValue::Bool(_) => 1,
-                OwnedValue::Int(_) | OwnedValue::Float(_) => 2,
-                OwnedValue::String(_) => 3,
-                OwnedValue::Array(_) => 4,
-                OwnedValue::Object(_) => 5,
-            };
-            type_order(a).cmp(&type_order(b))
-        }
+        // Different types: fall back to jq's cross-type ordering.
+        _ => sort_rank(a).cmp(&sort_rank(b)),
     }
 }
 
@@ -15049,6 +15248,161 @@ mod tests {
                 assert!(b);
             }
         );
+
+        // Same type, no containment: false, not an error.
+        query!(br"[1]", r"contains([2])",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+        query!(br"1", r"contains(2)",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
+    }
+
+    /// One representative value per `OwnedValue` variant, in jq's sort order.
+    fn one_of_each_kind() -> Vec<OwnedValue> {
+        vec![
+            OwnedValue::Null,
+            OwnedValue::Bool(false),
+            OwnedValue::Bool(true),
+            OwnedValue::Int(1),
+            OwnedValue::Float(1.5),
+            OwnedValue::String("s".to_string()),
+            OwnedValue::Array(vec![]),
+            OwnedValue::Object(IndexMap::new()),
+        ]
+    }
+
+    /// [`sort_rank`] must stay a faithful coarsening of [`jq_kind`]: the same
+    /// order, with `false`/`true` — and only those — collapsed into one rank.
+    ///
+    /// Deriving `sort_rank` from `jq_kind` makes this true by construction; the
+    /// test exists so that re-expanding either into a hand-written match (there
+    /// were three such copies before #358) fails loudly instead of drifting. See
+    /// the #106 lesson in `CLAUDE.md`: one definition, plus a test that the call
+    /// sites agree.
+    #[test]
+    fn sort_rank_agrees_with_jq_kind() {
+        let values = one_of_each_kind();
+
+        for a in &values {
+            for b in &values {
+                let same_kind = jq_kind(a) == jq_kind(b);
+                let same_rank = sort_rank(a) == sort_rank(b);
+                // Ranks may merge kinds, never split them.
+                if same_kind {
+                    assert!(same_rank, "{a:?} vs {b:?}: same kind, different rank");
+                }
+                // The bool pair is the *only* place a rank merges two kinds.
+                if same_rank && !same_kind {
+                    assert!(
+                        matches!(a, OwnedValue::Bool(_)) && matches!(b, OwnedValue::Bool(_)),
+                        "{a:?} vs {b:?}: ranks merged a pair that is not false/true"
+                    );
+                }
+                // Coarsening preserves order: a merge may turn Less/Greater into
+                // Equal, but wherever the ranks still differ they must differ
+                // the same way the kinds do.
+                if !same_rank {
+                    assert_eq!(
+                        sort_rank(a).cmp(&sort_rank(b)),
+                        jq_kind(a).cmp(&jq_kind(b)),
+                        "{a:?} vs {b:?}: rank order disagrees with kind order",
+                    );
+                }
+            }
+        }
+
+        // jq's documented order: null < false < true < number < string < array
+        // < object, with the two booleans sharing the `boolean` slot.
+        let ranks: Vec<u8> = values.iter().map(sort_rank).collect();
+        assert_eq!(ranks, vec![0, 1, 1, 2, 2, 3, 4, 5]);
+    }
+
+    /// The preview must cost a bounded amount of work, not a copy of the value.
+    ///
+    /// [`value_preview`] is the reason: jq builds the whole dump and throws all
+    /// but 14 bytes away, which for succinctly would mean serialising a 100 MB
+    /// operand to produce a 14-byte message. The sink is what prevents that, so
+    /// pin the sink directly — a `value_preview` result is short either way and
+    /// would not catch a regression here.
+    #[test]
+    fn preview_sink_copies_at_most_its_cap() {
+        use core::fmt::Write;
+
+        // A single oversized `write_str` is the case that matters: the streaming
+        // writer hands a long JSON string over as one span.
+        let mut sink = PreviewSink::new(14);
+        let huge = "x".repeat(1_000_000);
+        assert!(sink.write_str(&huge).is_err(), "should stop the writer");
+        assert!(sink.overflowed);
+        assert_eq!(sink.buf.len(), 14, "must not copy beyond the cap");
+
+        // An exactly-fitting dump completes without reporting overflow, which is
+        // what lets a 14-byte dump through verbatim.
+        let mut sink = PreviewSink::new(14);
+        assert!(sink.write_str("12345678901234").is_ok());
+        assert!(!sink.overflowed);
+        assert_eq!(sink.buf, "12345678901234");
+        // One more byte tips it over.
+        assert!(sink.write_str("5").is_err());
+        assert!(sink.overflowed);
+
+        // Multi-byte characters are cut back to a boundary, never split.
+        let mut sink = PreviewSink::new(14);
+        let _ = sink.write_str(&"あ".repeat(20)); // 3 bytes each: 12 < 14 < 15
+        assert_eq!(sink.buf, "ああああ", "cut back to a char boundary");
+        assert!(sink.buf.len() <= 14);
+    }
+
+    /// jq errors when the two operands' kinds cannot be compared, rather than
+    /// answering `false` (#358).
+    ///
+    /// This covers the *shape* of the result — which `QueryResult` variant each
+    /// outcome lands on — for one case of each. The exhaustive oracle matrix
+    /// (nesting, `Int`/`Float`, both truncation boundaries, `?` suppression, and
+    /// every case run through the generic evaluator too) lives in
+    /// `tests/jq_containment_tests.rs`; add new cases there rather than here, so
+    /// there is one place to re-check when jq's behaviour is re-probed.
+    #[test]
+    fn test_builtin_contains_type_mismatch() {
+        query!(br"1", r#"contains("a")"#,
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    r#"number (1) and string ("a") cannot have their containment checked"#
+                );
+            }
+        );
+
+        // `true` and `false` are distinct jq kinds that share the *name*
+        // `boolean`, so a mixed pair errors — with both operands called
+        // `boolean` — while a matched pair is a plain comparison. Screening on
+        // `type_name` would answer `false` for the mixed pair; see `jq_kind`.
+        query!(br"true", r"contains(false)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "boolean (true) and boolean (false) cannot have their containment checked"
+                );
+            }
+        );
+        query!(br"true", r"contains(true)",
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b);
+            }
+        );
+
+        // A mismatch *inside* a container is still plain false: the screen is
+        // top-level only, so `owned_contains` stays total.
+        query!(br#"[1,"a"]"#, r#"contains(["a",2])"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b);
+            }
+        );
     }
 
     #[test]
@@ -15063,6 +15417,31 @@ mod tests {
         query!(br#"{"a": 1}"#, r#"inside({"a": 1, "b": 2})"#,
             QueryResult::Owned(OwnedValue::Bool(b)) => {
                 assert!(b);
+            }
+        );
+    }
+
+    /// `inside` reports the container first — it is `contains` with the operands
+    /// swapped, so the *argument* leads the message (#358). Wider coverage is in
+    /// `tests/jq_containment_tests.rs`; see `test_builtin_contains_type_mismatch`.
+    #[test]
+    fn test_builtin_inside_type_mismatch() {
+        query!(br"1", r"inside([1])",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "array ([1]) and number (1) cannot have their containment checked"
+                );
+            }
+        );
+
+        // The boolean-kind split reaches `inside` too, argument still first.
+        query!(br"true", r"inside(false)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "boolean (false) and boolean (true) cannot have their containment checked"
+                );
             }
         );
     }
