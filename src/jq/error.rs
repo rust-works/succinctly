@@ -288,6 +288,27 @@ impl EvalError {
         Self::new("Path must be specified as an array")
     }
 
+    /// `Paths must be specified as an array`.
+    ///
+    /// `delpaths` takes a list of paths rather than one path, and jq words its
+    /// refusal in the plural — `{"a":1} | delpaths(1)`. Deliberately *not*
+    /// folded into [`EvalError::path_must_be_array`]: jq has three
+    /// near-identical sentences here, and which one it prints says which
+    /// argument was wrong.
+    pub fn paths_must_be_array() -> Self {
+        Self::new("Paths must be specified as an array")
+    }
+
+    /// `Path must be specified as array, not <key type>`.
+    ///
+    /// The third of the trio: `delpaths` checks each *element* of its list, and
+    /// names the offending kind — `{"a":1} | delpaths(["a"])`, a plausible typo
+    /// for `delpaths([["a"]])`. Note the missing "an" before `array`, which is
+    /// jq's wording and not a slip.
+    pub fn path_element_must_be_array(key_type: &str) -> Self {
+        Self::new(format!("Path must be specified as array, not {key_type}"))
+    }
+
     /// `Out of bounds negative array index`.
     ///
     /// jq raises this for a negative index that is still negative after being

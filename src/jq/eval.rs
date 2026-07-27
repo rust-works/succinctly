@@ -12112,23 +12112,31 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::One(v) => to_owned(&v),
         QueryResult::Owned(v) => v,
         QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::new("delpaths requires array of paths")),
+        _ => return QueryResult::Error(EvalError::paths_must_be_array()),
     };
 
     let paths = match paths_owned {
         OwnedValue::Array(p) => p,
-        // jq's wording here is `Paths must be specified as an array` (#415).
-        _ => return QueryResult::Error(EvalError::new("delpaths requires array of paths")),
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::paths_must_be_array()),
     };
 
-    // Everything the walk cannot use goes before the sort, so what remains is
-    // both a list of paths and a set `compare_paths` totally orders.
-    //
-    // A non-array entry is jq's `Path must be specified as array, not <kind>`
-    // (#415). Until that lands it deletes nothing — but it has to be dropped
-    // rather than reaching the walk, where the empty path deletes the whole
-    // document and a non-array must not be mistaken for one.
-    //
+    // Every element must be a path before anything is deleted. jq checks the
+    // shape first, so `1 | delpaths(["a"])` reports the malformed path and not
+    // the scalar it would then have failed to walk. Until #395 a non-array
+    // element was quietly filtered out, so `delpaths(["a"])` — a plausible typo
+    // for `delpaths([["a"]])` — deleted nothing and said nothing.
+    let mut sorted_paths: Vec<Vec<OwnedValue>> = Vec::with_capacity(paths.len());
+    for path in paths {
+        match path {
+            OwnedValue::Array(components) => sorted_paths.push(components),
+            _ if optional => return QueryResult::None,
+            other => {
+                return QueryResult::Error(EvalError::path_element_must_be_array(other.type_name()))
+            }
+        }
+    }
+
     // A NaN component is dropped with the path around it, because it names no
     // element at any depth — neither index resolver accepts it, as jq's `jv_get`
     // does not. Leaving it in would do more than waste a walk: `compare_values`
@@ -12139,18 +12147,11 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `delpaths([[nan]])` — so this is pinned by unit test rather than by a
     // golden. It also means a NaN path never refuses: dropped before the walk,
     // it cannot reach the container that would have named it (#415).
-    let mut sorted_paths: Vec<Vec<OwnedValue>> = paths
-        .into_iter()
-        .filter_map(|path| match path {
-            OwnedValue::Array(components) => Some(components),
-            _ => None,
-        })
-        .filter(|components| {
-            !components
-                .iter()
-                .any(|key| matches!(key, OwnedValue::Float(f) if f.is_nan()))
-        })
-        .collect();
+    sorted_paths.retain(|components| {
+        !components
+            .iter()
+            .any(|key| matches!(key, OwnedValue::Float(f) if f.is_nan()))
+    });
 
     // jq sorts the whole path list in its total value order — arrays compare
     // lexicographically — before deleting anything, so the order the caller
@@ -18637,29 +18638,55 @@ mod tests {
                 "delpaths([[0,nan],[0,1]])",
                 Ok("[[1],[3,4]]"),
             ),
-            // A bare NaN is not a path at all, and goes the same way as any
-            // other non-array entry rather than sorting among the paths.
-            (b"[10,20,30,40]", "delpaths([nan,[0]])", Ok("[20,30,40]")),
+            // A bare NaN is not a path at all, so it is refused as a malformed
+            // path element rather than sorting among the paths — the shape
+            // check runs before anything NaN could disturb.
+            (
+                b"[10,20,30,40]",
+                "delpaths([nan,[0]])",
+                Err("Path must be specified as array, not number"),
+            ),
         ]);
     }
 
-    /// A path list entry that is not an array is dropped. jq refuses it —
-    /// `Path must be specified as array, not number` — so this has no golden
-    /// case; both sides return a value only because succinctly does not raise
-    /// it yet (#415).
-    ///
-    /// What must hold either way is that the entry is never mistaken for the
-    /// empty path, which would delete the whole document.
+    /// jq has three near-identical sentences for a malformed path argument, and
+    /// which one it prints says which argument was wrong. A non-array *element*
+    /// used to be filtered out silently, so `delpaths(["a"])` — the typo for
+    /// `delpaths([["a"]])` — deleted nothing and reported nothing (#395).
     #[test]
-    fn test_delpaths_drops_entries_that_are_not_paths() {
+    fn test_delpaths_refuses_a_malformed_path_argument() {
         assert_outcomes(&[
-            (b"[1,2]", "delpaths([0])", Ok("[1,2]")),
-            (b"[1,2]", r#"delpaths(["a"])"#, Ok("[1,2]")),
-            (b"[1,2]", "delpaths([null])", Ok("[1,2]")),
             (
                 b"[1,2]",
                 "delpaths(null)",
-                Err("delpaths requires array of paths"),
+                Err("Paths must be specified as an array"),
+            ),
+            (
+                b"[1,2]",
+                "delpaths([0])",
+                Err("Path must be specified as array, not number"),
+            ),
+            (
+                b"[1,2]",
+                r#"delpaths(["a"])"#,
+                Err("Path must be specified as array, not string"),
+            ),
+            (
+                b"[1,2]",
+                "delpaths([null])",
+                Err("Path must be specified as array, not null"),
+            ),
+            // Every element is checked before anything is deleted, so a bad
+            // element is reported even when the walk would have failed first.
+            (
+                b"1",
+                r#"delpaths(["a"])"#,
+                Err("Path must be specified as array, not string"),
+            ),
+            (
+                br#"{"a": 1}"#,
+                r#"delpaths([["a"], 1])"#,
+                Err("Path must be specified as array, not number"),
             ),
         ]);
     }
