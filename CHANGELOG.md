@@ -133,9 +133,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Seven cases captured from jq 1.7.1 pin the behaviour, and both evaluators are
   checked for agreement. Deleting many array elements is also **~50x faster**
   (30k of 60k: 1.03s → 0.02s) and many object keys **~90x** (30k of 60k: 4.4s →
-  0.05s), both having been quadratic. Still divergent, as before: `delpaths`
-  silently no-ops where jq raises (#415), and `del()` with negative computed
-  indexes has the bug this fixes (#424).
+  0.05s), both having been quadratic. Still divergent, as before: `del()` with
+  negative computed indexes has the bug this fixes (#424). The no-ops where jq
+  raises, left open as #415, are the entry below.
+
+- **jq `delpaths` returned the input where jq refuses, and skipped malformed
+  paths** (#395, #415): `1 | delpaths([["a"]])` printed `1` where jq reports
+  `Cannot delete fields from number`, and `delpaths(["a"])` — a plausible typo
+  for `delpaths([["a"]])` — deleted nothing and reported nothing where jq
+  reports `Path must be specified as array, not string`. `del(.a)` on the same
+  input already refused, because it walks `delete_at_path`; the `delpaths` walk
+  was infallible and handed the value back wherever it could not proceed, so the
+  two spellings of one operation disagreed in-tree. The walk now returns
+  `Result` and matches the container before the key, which is what keeps jq's
+  three refusals apart: `Cannot delete fields from <t>` for a value with no
+  fields, `Cannot delete <t> field of object` and `Cannot delete <t> element of
+  array` for a real container indexed with the wrong kind of key.
+
+  Which refusal a bad key gets is decided by where it sits, and that is jq's
+  rule rather than a choice made here. Only a path's *last* element deletes:
+  `{} | delpaths([[true]])` is `Cannot delete boolean field of object`, but the
+  same key one step from the end — `{} | delpaths([[true,0]])` — is `Cannot
+  index object with boolean`, the sentence `.[true]` and `getpath([true])` also
+  print. Each level walks the keys it is keeping before deleting the keys it is
+  dropping, so a bad walk is reported even when a bad deletion sorts ahead of it
+  (`[] | delpaths([[null],[true,"a"]])` names the boolean), and a refusal names
+  the path that sorts first rather than the one written first, so
+  `[1,2] | delpaths([["a"],[true]])` reports the boolean either way round.
+
+  Two index rules came with it. Which end an array index counts from is settled
+  *before* truncation when deleting and after when walking, so
+  `[1,2,3] | delpaths([[-0.5]])` deletes nothing while `getpath([-0.5])` and
+  `delpaths([[-0.5,0]])` both read element 0, and `-0.0` counts from the front
+  (`[1,2] | delpaths([[-0.0]])` is `[2]`). And `null` absorbs deletions at every
+  depth, but the *document* checks the keys it is asked to walk through, so
+  `null | delpaths([[true,0]])` refuses while `{"a":null} |
+  delpaths([["a",true,0]])` does not. A missing key, an out-of-range index in
+  either direction, the empty path and the empty list are unchanged, and #398's
+  single-pass deletions are kept — every index still resolves against the length
+  the container had on entry, and both containers still drop their doomed keys
+  in one order-preserving `retain`. The malformed-argument sentences are jq's
+  too: `Paths must be specified as an array` for the list, and the per-element
+  check runs before any deletion, so `1 | delpaths(["a"])` reports the path
+  rather than the scalar it would then have failed to walk. Deleting through a
+  slice path element remains unimplemented (#366). **API**: `EvalError` gains
+  `cannot_delete_fields_from`, `cannot_delete_object_field`,
+  `cannot_delete_array_element`, `paths_must_be_array` and
+  `path_element_must_be_array`.
 
 - **`bsearch` reported absent containers as found, and returned an object when
   absent** (#384): two defects in the same twenty lines of `src/jq/eval.rs`.
