@@ -18,10 +18,13 @@ with `CompactRank` (~3.5% overhead).
 
 The CompactRank migration replaced four `Vec<u32>` cumulative rank indices (50%
 overhead each) with two-level `CompactRank` structures (~3.5% overhead). This
-reduced memory usage by 20-52% in CLI benchmarks. This document identifies the
-remaining optimization opportunities.
+reduced memory usage by 20-52% in CLI benchmarks — uncited, and from the same
+era as `0156707a`'s memory claim, which
+[../parsing/yaml-succinct.md](../parsing/yaml-succinct.md) shows to be wrong in
+the direction of the trade it made. Do not quote it forward. This document
+identifies the remaining optimization opportunities.
 
-## Current YamlIndex Memory Layout
+## YamlIndex Memory Layout (2026-01-27)
 
 | Structure             | Type                     | Size                | Notes                                |
 |-----------------------|--------------------------|---------------------|--------------------------------------|
@@ -451,3 +454,4 @@ for index alone, plus runtime overhead).
 | Date       | Change                                                    |
 |------------|-----------------------------------------------------------|
 | 2026-01-27 | Initial analysis post-CompactRank migration               |
+| 2026-07-27 | Retired as historical record; dated layout heading (#368) |
