@@ -91,6 +91,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: `delpaths` no longer lets one deletion shift the array under the next**
+  (#398). It deleted left to right, sorting only by path length, so two paths of
+  equal length kept the caller's order and the first deletion moved the element
+  the second named: `[10,20,30,40] | delpaths([[0],[2]])` gave `[20,30]` where
+  jq gives `[20,40]` — the wrong element, silently — while the same two paths
+  written the other way round happened to come out right. jq's ordering rule is
+  now implemented properly: the path list is sorted in jq's total value order,
+  the paths are grouped by shared prefix, and every key that ends at one level
+  is removed in a single pass, so each index resolves against the length the
+  container had before any sibling went. That last part is what a per-path loop
+  cannot reproduce, and it is why `delpaths([[-1],[-2]])` is `[10,20]` rather
+  than the `[10,30]` deleting one at a time gives. Duplicates collapse (a
+  repeated path deletes once), a shorter path shadows its own extensions
+  (`delpaths([[0],[0,1]])` takes the subtree without trying to index into it),
+  the empty path deletes the document wherever it appears in the list, and a
+  key whose child is edited keeps its position rather than moving to the end.
+  Seven cases captured from jq 1.7.1 pin the behaviour, and both evaluators are
+  checked for agreement. Deleting many array elements is also **~50x faster**
+  (30k of 60k: 1.03s → 0.02s) and many object keys **~90x** (30k of 60k: 4.4s →
+  0.05s), both having been quadratic. Still divergent, as before: `delpaths`
+  silently no-ops where jq raises (#415), and `del()` with negative computed
+  indexes has the bug this fixes (#424).
+
 - **`bsearch` reported absent containers as found, and returned an object when
   absent** (#384): two defects in the same twenty lines of `src/jq/eval.rs`.
   `bsearch` had its own comparator with arms for null, bool, numbers and string

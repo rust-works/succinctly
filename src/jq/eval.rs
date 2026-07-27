@@ -7027,10 +7027,18 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
 /// parse at all today. Widen this to a full lexicographic descending sort
 /// before that changes.
 ///
-/// (`builtin_delpaths` has both bugs today: `delpaths([[0],[2]])` gives
-/// `[20,30]` where jq gives `[20,40]`, because it sorts only by path length.
-/// It works on runtime path arrays rather than path expressions, so it cannot
-/// call this directly, but the rule is the same one — #398.)
+/// Still divergent: a *negative* trailing index. Sorting descending puts `-1`
+/// before `-2`, but `-1` names the later element only until something is
+/// removed, so `[10,20,30,40] | del(.[(-1,-2)])` gives `[10,30]` where jq gives
+/// `[10,20]`. No descending order fixes this, because the two indices are
+/// counted from opposite ends of the array: jq resolves every index against the
+/// length the array had *before* any deletion and removes them in one pass,
+/// which is what [`delete_keys`] does. Routing `del` through that is #424.
+///
+/// (`builtin_delpaths` had both bugs above and was fixed in #398 — it works on
+/// runtime path arrays rather than path expressions, so it cannot call this,
+/// but [`delete_paths_sorted`] is the same rule stated over values, and is the
+/// reference for #424.)
 fn prepare_paths_for_deletion(paths: &mut Vec<Expr>) {
     // Quadratic, but `paths` is one entry per resolved key — a handful, not a
     // document-sized list — and `Expr` is neither `Hash` nor `Ord`. Skipped
