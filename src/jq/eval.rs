@@ -647,7 +647,8 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// nothing there.
 ///
 /// Succinctly's parser does not yet accept `?` on anything but a path
-/// expression, so today the flag arrives only from within.
+/// expression, so today the flag arrives only from within; the branch is
+/// covered directly by `test_optional_suppresses_the_object_key_refusal`.
 fn refuse_object_key<'a, W: Clone + AsRef<[u64]>>(
     key: &OwnedValue,
     optional: bool,
@@ -687,7 +688,9 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
                     // A single non-string key is jq's `Cannot use <t> (<v>) as
-                    // object key`.
+                    // object key` — the same sentence `from_entries` raises,
+                    // because jq *defines* `from_entries` as object
+                    // construction over the entries (#391).
                     QueryResult::One(v) => return refuse_object_key(&to_owned(&v), optional),
                     QueryResult::Owned(v) => return refuse_object_key(&v, optional),
                     // A key expression yielding no value, or more than one, is
@@ -3090,6 +3093,89 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// The key aliases `from_entries` reads, in the order jq's `//` chain tries
+/// them. `k`/`K` are *not* among them — jq 1.7.1 does not accept those.
+const ENTRY_KEY_ALIASES: [&str; 4] = ["key", "Key", "name", "Name"];
+
+/// The key and value jq takes from one `from_entries` entry:
+/// `{(.key // .Key // .name // .Name): (if has("value") then .value else .Value end)}`.
+///
+/// The key chain is the alternative operator, not a presence test, so an alias
+/// holding `null` or `false` is passed over in favour of a later one — but a
+/// `0` is not, which is how a number key reaches the refusal in
+/// [`entries_to_object`] rather than being quietly skipped.
+///
+/// The *last* alias does not fall through, because there is nothing left to
+/// fall through to: `a // b` yields `b` whatever `b` is once `a` has nothing
+/// truthy, so a `false` in `.Name` is the chain's value and is refused as a
+/// boolean. Reading it as null instead is what made
+/// `[{"Name":false}] | from_entries` report the wrong kind.
+///
+/// The value half is `if has("value") then .value else .Value end` — presence,
+/// not truthiness, and so deliberately unlike the key half. An explicit
+/// `"value": null` beats a `"Value"` beside it, which a `//` chain would get
+/// wrong. Reading either half the other way changes the answer silently, which
+/// is why they are one function: the asymmetry is the thing to keep.
+///
+/// A non-object entry is indexed all the same: jq's `.key` on a scalar is the
+/// indexing error, and on `null` it is `null` — refused as a key by
+/// [`entries_to_object`] before the value it returns beside it is ever used,
+/// which is how `[null] | from_entries` reports the key and not a failure to
+/// look up `value`.
+fn entry_key_and_value(entry: &OwnedValue) -> Result<(OwnedValue, OwnedValue), EvalError> {
+    let obj = match entry {
+        OwnedValue::Object(obj) => obj,
+        OwnedValue::Null => return Ok((OwnedValue::Null, OwnedValue::Null)),
+        other => return Err(EvalError::cannot_index_with_field(other.type_name(), "key")),
+    };
+
+    // Irrefutable on a fixed-size array, so the tail is derived from the chain
+    // rather than named twice.
+    let [earlier @ .., tail] = &ENTRY_KEY_ALIASES;
+
+    let key = earlier
+        .iter()
+        .find_map(|alias| obj.get(*alias).filter(|v| v.is_truthy()))
+        .or_else(|| obj.get(*tail))
+        .cloned()
+        .unwrap_or(OwnedValue::Null);
+
+    let value = obj
+        .get("value")
+        .or_else(|| obj.get("Value"))
+        .cloned()
+        .unwrap_or(OwnedValue::Null);
+
+    Ok((key, value))
+}
+
+/// jq's `from_entries` over entries already materialised as [`OwnedValue`]s.
+///
+/// One definition, because `from_entries` and `with_entries` are one
+/// definition in jq (`def with_entries(f): to_entries | map(f) |
+/// from_entries;`) and had drifted here as two hand-written copies of the same
+/// filter — the second of which is what silently dropped every entry it could
+/// not use (#391).
+///
+/// The key is refused before the value beside it is used, as jq's `{(K):(V)}`
+/// evaluates it: `[null] | from_entries` reports the key refusal, not a failure
+/// to look up `value`. Re-inserting a key keeps its original position and
+/// replaces its value, which is what jq's `add` over the mapped singletons
+/// does.
+fn entries_to_object<I: IntoIterator<Item = OwnedValue>>(
+    entries: I,
+) -> Result<IndexMap<String, OwnedValue>, EvalError> {
+    let mut result = IndexMap::new();
+    for entry in entries {
+        let (key, value) = entry_key_and_value(&entry)?;
+        let OwnedValue::String(k) = key else {
+            return Err(EvalError::cannot_use_as_object_key(&key));
+        };
+        result.insert(k, value);
+    }
+    Ok(result)
+}
+
 /// Builtin: from_entries - [{key:k, value:v}] → {k:v}
 fn builtin_from_entries<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
@@ -3097,34 +3183,15 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
-            let mut result = IndexMap::new();
-
-            for elem in elements {
-                // Each element should be an object with "key"/"name" and "value" fields
-                if let StandardJson::Object(fields) = elem {
-                    let owned = to_owned(&StandardJson::Object(fields));
-                    if let OwnedValue::Object(obj) = owned {
-                        // Try "key" first, then "name", then "k"
-                        let key = obj
-                            .get("key")
-                            .or_else(|| obj.get("name"))
-                            .or_else(|| obj.get("k"));
-
-                        // Try "value" first, then "v"
-                        let val = obj
-                            .get("value")
-                            .or_else(|| obj.get("v"))
-                            .cloned()
-                            .unwrap_or(OwnedValue::Null);
-
-                        if let Some(OwnedValue::String(k)) = key {
-                            result.insert(k.clone(), val);
-                        }
-                    }
-                }
+            match entries_to_object(elements.map(|elem| to_owned(&elem))) {
+                Ok(result) => QueryResult::Owned(OwnedValue::Object(result)),
+                // The `?` suffix swallows the refusal outright in jq, as the
+                // arm below already does for a non-array input. See
+                // `refuse_object_key` on why the flag is not yet reachable
+                // from succinctly's own syntax.
+                Err(_) if optional => QueryResult::None,
+                Err(e) => QueryResult::Error(e),
             }
-
-            QueryResult::Owned(OwnedValue::Object(result))
         }
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
@@ -3132,81 +3199,63 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: with_entries(f) - to_entries | map(f) | from_entries
+///
+/// Composed out of the two builtins jq composes it from, rather than
+/// reimplementing either. That is what lets an *array* input through: jq's
+/// `to_entries` accepts one (its keys are the indices), so `[1,2] |
+/// with_entries(.)` reaches `from_entries` with number keys and inherits its
+/// refusal — where the previous object-only shape reported `array ([1,2]) has
+/// no keys` from a type check jq does not have (#391).
 fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match value {
-        StandardJson::Object(fields) => {
-            // Convert to entries
-            let mut entries: Vec<OwnedValue> = Vec::new();
-            for field in fields {
-                let key = if let StandardJson::String(k) = field.key() {
-                    if let Ok(cow) = k.as_str() {
-                        cow.into_owned()
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                };
-                let val = to_owned(&field.value());
-
-                let mut entry = IndexMap::new();
-                entry.insert("key".to_string(), OwnedValue::String(key));
-                entry.insert("value".to_string(), val);
-                entries.push(OwnedValue::Object(entry));
-            }
-
-            // Apply f to each entry
-            let mut transformed: Vec<OwnedValue> = Vec::new();
-            for entry in entries {
-                let entry_json = owned_to_json_bytes(&entry);
-                let index = crate::json::JsonIndex::build(&entry_json);
-                let cursor = index.root(&entry_json);
-
-                match eval_single::<Vec<u64>, S>(f, cursor.value(), optional).materialize_cursor() {
-                    QueryResult::One(v) => transformed.push(to_owned(&v)),
-                    QueryResult::OneCursor(_) => unreachable!(),
-                    QueryResult::Owned(v) => transformed.push(v),
-                    QueryResult::Many(vs) => {
-                        for v in vs {
-                            transformed.push(to_owned(&v));
-                        }
-                    }
-                    QueryResult::ManyOwned(vs) => transformed.extend(vs),
-                    QueryResult::None => {}
-                    QueryResult::Error(e) => return QueryResult::Error(e),
-                    QueryResult::Break(label) => return QueryResult::Break(label),
-                }
-            }
-
-            // Convert back from entries
-            let mut result = IndexMap::new();
-            for entry in transformed {
-                if let OwnedValue::Object(obj) = entry {
-                    let key = obj
-                        .get("key")
-                        .or_else(|| obj.get("name"))
-                        .or_else(|| obj.get("k"));
-
-                    let val = obj
-                        .get("value")
-                        .or_else(|| obj.get("v"))
-                        .cloned()
-                        .unwrap_or(OwnedValue::Null);
-
-                    if let Some(OwnedValue::String(k)) = key {
-                        result.insert(k.clone(), val);
-                    }
-                }
-            }
-
-            QueryResult::Owned(OwnedValue::Object(result))
+    // `to_entries` owns the input-shape check, so a value with no keys at all
+    // reports its sentence and nothing else needs to know the shape.
+    let entries = match builtin_to_entries::<W>(value, optional) {
+        QueryResult::Owned(OwnedValue::Array(entries)) => entries,
+        QueryResult::None => return QueryResult::None,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
+        // `to_entries` yields an owned array on every success path today, so
+        // this is dead — but it is *its* invariant, not one visible here, so a
+        // change over there should degrade rather than abort a caller.
+        _ => {
+            return QueryResult::Error(EvalError::new(
+                "to_entries did not yield an array of entries",
+            ))
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::has_no_keys(&to_owned(&value))),
+    };
+
+    // map(f)
+    let mut transformed: Vec<OwnedValue> = Vec::new();
+    for entry in entries {
+        let entry_json = owned_to_json_bytes(&entry);
+        let index = crate::json::JsonIndex::build(&entry_json);
+        let cursor = index.root(&entry_json);
+
+        match eval_single::<Vec<u64>, S>(f, cursor.value(), optional).materialize_cursor() {
+            QueryResult::One(v) => transformed.push(to_owned(&v)),
+            QueryResult::OneCursor(_) => unreachable!(),
+            QueryResult::Owned(v) => transformed.push(v),
+            QueryResult::Many(vs) => {
+                for v in vs {
+                    transformed.push(to_owned(&v));
+                }
+            }
+            QueryResult::ManyOwned(vs) => transformed.extend(vs),
+            QueryResult::None => {}
+            QueryResult::Error(e) => return QueryResult::Error(e),
+            QueryResult::Break(label) => return QueryResult::Break(label),
+        }
+    }
+
+    // from_entries
+    match entries_to_object(transformed) {
+        Ok(result) => QueryResult::Owned(OwnedValue::Object(result)),
+        Err(_) if optional => QueryResult::None,
+        Err(e) => QueryResult::Error(e),
     }
 }
 
@@ -17854,10 +17903,201 @@ mod tests {
         ]);
     }
 
-    /// A non-string object key is jq's `Cannot use <t> (<v>) as object key`,
-    /// the sentence every raise site that builds an object owes — this one used
-    /// to say `key must be a string`, which is succinctly's own wording for a
-    /// condition jq has a sentence for.
+    /// `from_entries` refuses an entry it cannot use; it does not drop it.
+    ///
+    /// Dropping is what #391 was: `[{"key":0,"value":1}] | from_entries` came
+    /// back `{}`, so the caller got a smaller object with nothing to say it had
+    /// lost an entry. Every case here answered `{}` before the fix.
+    #[test]
+    fn test_from_entries_refuses_a_key_it_cannot_use() {
+        assert_outcomes(&[
+            (
+                br#"[{"key":0,"value":1}]"#,
+                "from_entries",
+                Err("Cannot use number (0) as object key"),
+            ),
+            (
+                br#"[{"key":true,"value":1}]"#,
+                "from_entries",
+                Err("Cannot use boolean (true) as object key"),
+            ),
+            (
+                br#"[{"key":[1],"value":1}]"#,
+                "from_entries",
+                Err("Cannot use array ([1]) as object key"),
+            ),
+            // No key alias at all leaves the key `null`, which is refused too —
+            // jq names the value it got, not the absence.
+            (
+                br#"[{"value":1}]"#,
+                "from_entries",
+                Err("Cannot use null (null) as object key"),
+            ),
+            (
+                b"[null]",
+                "from_entries",
+                Err("Cannot use null (null) as object key"),
+            ),
+            // A non-object entry is indexed with "key" all the same, so it
+            // reports the indexing error rather than the key refusal.
+            (
+                br#"["a"]"#,
+                "from_entries",
+                Err(r#"Cannot index string with string "key""#),
+            ),
+            (
+                b"[[0,1]]",
+                "from_entries",
+                Err(r#"Cannot index array with string "key""#),
+            ),
+            // The refusal fires at the first bad entry, not after collecting
+            // the good ones.
+            (
+                br#"[{"key":"a","value":1},{"key":0,"value":2}]"#,
+                "from_entries",
+                Err("Cannot use number (0) as object key"),
+            ),
+            // `try` swallows it outright, as jq does.
+            (br#"[{"key":0,"value":1}]"#, "try from_entries", Ok("")),
+            (br#"["a"]"#, "try from_entries", Ok("")),
+            (
+                br#"[{"key":0,"value":1}]"#,
+                r#"try from_entries catch "E""#,
+                Ok(r#""E""#),
+            ),
+        ]);
+    }
+
+    /// The `optional` flag suppresses the refusal, which is what jq's `?`
+    /// suffix does — `[{"key":0}] | from_entries?` prints nothing.
+    ///
+    /// Driven through the builtins directly because succinctly's parser does
+    /// not yet accept `?` after anything but a path expression: `from_entries?`
+    /// and `{(.):1}?` are both compile errors today, a gap of their own. The
+    /// flag still has to mean the right thing when it arrives.
+    #[test]
+    fn test_optional_suppresses_the_object_key_refusal() {
+        let json = br#"[{"key":0,"value":1}]"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        assert!(matches!(
+            builtin_from_entries::<Vec<u64>>(cursor.value(), true),
+            QueryResult::None
+        ));
+
+        let f = parse(".").unwrap();
+        assert!(matches!(
+            builtin_with_entries::<Vec<u64>, JqSemantics>(&f, cursor.value(), true),
+            QueryResult::None
+        ));
+
+        let json = b"0";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("{(.):1}").unwrap();
+        assert!(matches!(
+            eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), true),
+            QueryResult::None
+        ));
+    }
+
+    /// jq's key aliases are `.key // .Key // .name // .Name` and its value
+    /// aliases are `if has("value") then .value else .Value end`.
+    ///
+    /// The two halves disagree on purpose, and both halves matter: the key
+    /// chain is the *alternative* operator, so an alias holding `null` or
+    /// `false` falls through — while the value lookup is *presence*, so an
+    /// explicit `"value": null` beats a `"Value"` beside it. Reading either
+    /// half the other way changes the answer, silently.
+    #[test]
+    fn test_from_entries_alias_chain_follows_jq() {
+        assert_outcomes(&[
+            (
+                br#"[{"key":"a","value":1},{"Key":"b","value":2},{"name":"c","value":3},{"Name":"d","value":4}]"#,
+                "from_entries",
+                Ok(r#"{"a":1,"b":2,"c":3,"d":4}"#),
+            ),
+            // `//`, not presence: a null or false alias is skipped.
+            (
+                br#"[{"key":null,"Key":false,"name":"n","value":1}]"#,
+                "from_entries",
+                Ok(r#"{"n":1}"#),
+            ),
+            // The *last* alias has nothing to be skipped in favour of, so its
+            // falsy value is the chain's: `a // b` yields `b` whatever `b` is.
+            // Letting the tail fall through too reported `null (null)` here.
+            (
+                br#"[{"Name":false,"value":1}]"#,
+                "from_entries",
+                Err("Cannot use boolean (false) as object key"),
+            ),
+            (
+                br#"[{"key":false,"Key":false,"name":false,"Name":false}]"#,
+                "from_entries",
+                Err("Cannot use boolean (false) as object key"),
+            ),
+            // …and an absent tail really is null, which is the case that made
+            // the wrong reading look right.
+            (
+                br#"[{"key":false,"value":1}]"#,
+                "from_entries",
+                Err("Cannot use null (null) as object key"),
+            ),
+            // Presence, not `//`: an explicit null value wins over `Value`.
+            (
+                br#"[{"key":"a","value":null,"Value":2},{"key":"b","Value":3}]"#,
+                "from_entries",
+                Ok(r#"{"a":null,"b":3}"#),
+            ),
+            // Earlier alias wins when several are present.
+            (
+                br#"[{"key":"a","Key":"b","name":"c","Name":"d","value":1}]"#,
+                "from_entries",
+                Ok(r#"{"a":1}"#),
+            ),
+            // A repeated key keeps its position and takes the later value,
+            // which is what jq's `add` over the mapped singletons does.
+            (
+                br#"[{"key":"a","value":1},{"key":"b","value":2},{"key":"a","value":3}]"#,
+                "from_entries",
+                Ok(r#"{"a":3,"b":2}"#),
+            ),
+            (b"[]", "from_entries", Ok("{}")),
+        ]);
+    }
+
+    /// `with_entries(f)` is `to_entries | map(f) | from_entries`, so it inherits
+    /// both ends: `to_entries` accepts an array (its keys are the indices) and
+    /// `from_entries` then refuses those number keys. Before #391 the object-only
+    /// shape reported `array ([1,2]) has no keys` from a type check jq has not
+    /// got, and a filter that wrote a non-string key dropped the entry.
+    #[test]
+    fn test_with_entries_composes_to_entries_and_from_entries() {
+        assert_outcomes(&[
+            (
+                b"[1,2]",
+                "with_entries(.)",
+                Err("Cannot use number (0) as object key"),
+            ),
+            (
+                br#"{"a":1}"#,
+                "with_entries(.key = 0)",
+                Err("Cannot use number (0) as object key"),
+            ),
+            // A value with no keys at all is still `to_entries`' refusal.
+            (b"1", "with_entries(.)", Err("number (1) has no keys")),
+            (
+                br#"{"a":1,"b":2}"#,
+                "with_entries(.value += 10)",
+                Ok(r#"{"a":11,"b":12}"#),
+            ),
+        ]);
+    }
+
+    /// jq *defines* `from_entries` as object construction over the entries, so
+    /// `{(0):1}` owes the same sentence — the family rule in
+    /// `docs/compliance/jq/limitations.md` applied to a family jq's own source
+    /// spells out. It used to say `key must be a string`.
     #[test]
     fn test_object_construction_refuses_a_non_string_key() {
         assert_outcomes(&[

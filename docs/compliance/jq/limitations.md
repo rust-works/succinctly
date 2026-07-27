@@ -24,14 +24,14 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 129 probes in
+Measured against jq-1.7.1 over the 143 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result              | Meaning                                            |
 |----------------------------------------------|---------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **127/129 = 98.4%** | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **141/143 = 98.6%** | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**               | Every probe that errors in both errors identically |
 | **Behaviour / parser gaps**                  | **2**               | succinctly does not raise the error at all         |
 
@@ -105,6 +105,53 @@ The families are worth naming, because "fix the site the probe names" caught thi
 in a row: the first pass fixed the *pattern* half of `indices`/`index`/`rindex` and left
 their *input* half saying `expected string or array, got number`, one arm below. The rule
 that holds is per family, not per raise site.
+
+Sometimes jq's own source names the family outright. `strings` on the pinned binary yields:
+
+```jq
+def from_entries: map({(.key // .Key // .name // .Name): (if has("value") then .value else .Value end)}) | add | .//={};
+def with_entries(f): to_entries | map(f) | from_entries;
+```
+
+So `from_entries` *is* object construction, and `with_entries` *is* `from_entries` — one
+raise site in jq behind `{(0):1}`, `[{"key":0}] | from_entries` and
+`{"a":1} | with_entries(.key = 0)` alike, which is why all three share
+`cannot_use_as_object_key`. Succinctly had it as three: two hand-written copies of the
+entry lookup (`from_entries` and `with_entries` reimplemented it separately, and neither
+called the other) plus `key must be a string` in `eval_object_construction`. Both copies
+*dropped* the entry rather than refusing it, so the caller got a smaller object with no
+indication anything was lost — #391. The lookup now has one definition,
+`entries_to_object` in `src/jq/eval.rs`, and `with_entries` is composed from
+`builtin_to_entries` and it rather than restating either.
+
+That composition is also what fixed `[1,2] | with_entries(.)`. jq reaches
+`Cannot use number (0) as object key` because `to_entries` accepts an array — its keys are
+the indices — and hands those number keys to `from_entries`. Succinctly's `with_entries`
+matched only an object, so it reported `array ([1,2]) has no keys` from a type check jq
+has not got. Deriving the builtin from the two it is defined over is what makes the right
+sentence arrive without anyone choosing it.
+
+The same source line pins the *alias* semantics, and its two halves disagree on purpose:
+the key is a `//` chain (`key`, `Key`, `name`, `Name` — an alias holding `null` or `false`
+is passed over in favour of a later one), while the value is a presence test (`value`, then
+`Value` — an explicit `"value": null` beats a `"Value"` beside it). Succinctly had accepted
+`k` and `v`, which jq does not, and neither `Key`/`Name`/`Value`, which it does. Correcting
+the chain was a precondition for raising the error rather than a tidy-up beside it:
+refusing a non-string key while still reading the wrong aliases would have failed
+`[{"Key":"a","value":1}]` and `[{"key":null,"name":"a","value":1}]`, both of which jq
+answers. The chain is pinned by golden cases (`from_entries_key_aliases`,
+`from_entries_alias_falls_through_null`, `from_entries_value_aliases`) rather than probes,
+because it is value behaviour and no probe can hold a filter jq does not error on.
+
+"Passed over in favour of a later one" is exact, and *not* the same as falling through: the
+chain's **last** alias has nothing later to be preferred, so `a // b` yields `b` whatever
+`b` is. A falsy `.Name` is therefore the key, and `[{"Name":false}] | from_entries` is
+`Cannot use boolean (false) as object key` — not the `null (null)` a uniform fall-through
+would produce. Reading the tail as falling through too is the easy mistake, and the case
+that hides it is a tail that is merely *absent*, which really is `null`; the probe pair
+`from_entries_falsy_tail_key` / `from_entries_absent_tail_key` exists to separate them, with
+`from_entries_alias_falsy_tail` pinning the same case end-to-end through the CLI. This half
+of the chain *can* be probed, unlike the rest of it, precisely because jq errors here.
 
 ### Value rendering and truncation
 
