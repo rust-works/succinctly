@@ -24,14 +24,14 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 126 probes in
+Measured against jq-1.7.1 over the 129 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result              | Meaning                                            |
 |----------------------------------------------|---------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **124/126 = 98.4%** | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **127/129 = 98.4%** | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**               | Every probe that errors in both errors identically |
 | **Behaviour / parser gaps**                  | **2**               | succinctly does not raise the error at all         |
 
@@ -81,6 +81,7 @@ iterate over number` for the same condition, and `cannot parse 'a' as number` ag
 | `<v> only strings can be parsed`                         | `only_strings_can_be_parsed`                  |
 | `<v> only strings have UTF-8 byte length`                | `no_utf8_byte_length`                         |
 | `Cannot check whether <t> has a <key-type> key`          | `cannot_check_has`                            |
+| `Cannot use <t> (<v>) as object key`                     | `cannot_use_as_object_key`                    |
 | `Invalid numeric literal at EOF at line 1, column <n> …` | `invalid_numeric_literal`                     |
 
 `EvalError::type_error` ("expected X, got Y") survives for the raise sites jq has no
@@ -236,6 +237,22 @@ Every row is an assignment, update or deletion walking a path *in place*, and ev
 older than #356 — the rewording changed what these say, not whether they say it. The gap
 they share is auto-vivification: jq grows the container the path asks for (`null` into an
 object, an array up to the index) and treats an unreachable delete as a no-op.
+
+An object key that yields something other than exactly one value is a second, unrelated
+group — it is the key half of
+[#354](https://github.com/rust-works/succinctly/issues/354):
+
+| Filter        | Input       | jq                       | succinctly             |
+|---------------|-------------|--------------------------|------------------------|
+| `{(empty):1}` | `0`         | *(no output)*            | `key must be a string` |
+| `{(.[]):1}`   | `["a","b"]` | `{"a":1}` then `{"b":1}` | `key must be a string` |
+
+jq's object construction takes the cartesian product over each key's outputs, so a key
+producing nothing produces no object and a key producing two produces two. Succinctly
+evaluates the key to a single value and refuses anything else, with wording of its own —
+the one sentence left in `eval_object_construction`, because reaching jq's answer here
+means generating a stream, not renaming an error. The sentence stays succinctly's until
+#354 is built.
 
 `setpath` is the same operation without the syntax, and after #359 it does follow jq —
 `[1,2] | setpath([5]; 9)` is `[1,2,null,null,null,9]`, and `null | setpath(["a"]; 1)` is

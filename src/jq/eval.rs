@@ -642,6 +642,23 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     QueryResult::Owned(OwnedValue::Array(items))
 }
 
+/// jq's refusal of a non-string object key — or nothing at all under the
+/// `optional` flag, which is what jq's `?` suffix sets: `0 | {(.):1}?` prints
+/// nothing there.
+///
+/// Succinctly's parser does not yet accept `?` on anything but a path
+/// expression, so today the flag arrives only from within.
+fn refuse_object_key<'a, W: Clone + AsRef<[u64]>>(
+    key: &OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    if optional {
+        QueryResult::None
+    } else {
+        QueryResult::Error(EvalError::cannot_use_as_object_key(key))
+    }
+}
+
 /// Evaluate object construction.
 fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     entries: &[super::expr::ObjectEntry],
@@ -655,18 +672,28 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let key_str = match &entry.key {
             ObjectKey::Literal(s) => s.clone(),
             ObjectKey::Expr(key_expr) => {
-                let key_result = eval_single::<W, S>(key_expr, value.clone(), optional);
+                let key_result =
+                    eval_single::<W, S>(key_expr, value.clone(), optional).materialize_cursor();
                 match key_result {
-                    QueryResult::One(StandardJson::String(s)) => {
-                        if let Ok(cow) = s.as_str() {
-                            cow.into_owned()
-                        } else {
-                            return QueryResult::Error(EvalError::new("key must be a string"));
+                    QueryResult::One(StandardJson::String(s)) => match s.as_str() {
+                        Ok(cow) => cow.into_owned(),
+                        // Not a condition jq has — its strings are always
+                        // valid UTF-8 — so this keeps succinctly's wording.
+                        Err(_) => {
+                            return QueryResult::Error(EvalError::new("key must be a string"))
                         }
-                    }
+                    },
                     QueryResult::Owned(OwnedValue::String(s)) => s,
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
+                    // A single non-string key is jq's `Cannot use <t> (<v>) as
+                    // object key`.
+                    QueryResult::One(v) => return refuse_object_key(&to_owned(&v), optional),
+                    QueryResult::Owned(v) => return refuse_object_key(&v, optional),
+                    // A key expression yielding no value, or more than one, is
+                    // a separate behavioural gap — jq gives `empty` and a
+                    // cartesian product respectively. See
+                    // docs/compliance/jq/limitations.md.
                     _ => {
                         return QueryResult::Error(EvalError::new("key must be a string"));
                     }
@@ -17824,6 +17851,29 @@ mod tests {
             (b"[]", "to_entries", Ok("[]")),
             (b"1", "to_entries", Err("number (1) has no keys")),
             (b"null", "to_entries", Err("null (null) has no keys")),
+        ]);
+    }
+
+    /// A non-string object key is jq's `Cannot use <t> (<v>) as object key`,
+    /// the sentence every raise site that builds an object owes — this one used
+    /// to say `key must be a string`, which is succinctly's own wording for a
+    /// condition jq has a sentence for.
+    #[test]
+    fn test_object_construction_refuses_a_non_string_key() {
+        assert_outcomes(&[
+            (b"0", "{(.):1}", Err("Cannot use number (0) as object key")),
+            (
+                b"null",
+                "{(.):1}",
+                Err("Cannot use null (null) as object key"),
+            ),
+            (
+                b"[1]",
+                "{(.):1}",
+                Err("Cannot use array ([1]) as object key"),
+            ),
+            (br#""s""#, "{(.):1}", Ok(r#"{"s":1}"#)),
+            (b"0", r#"try {(.):1} catch "E""#, Ok(r#""E""#)),
         ]);
     }
 

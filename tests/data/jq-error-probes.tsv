@@ -106,6 +106,13 @@ group_by_on_number	group_by(.)	1
 from_entries_on_number	from_entries	1
 join_on_number	join(",")	1
 
+# ── Cannot use <t> (<v>) as object key ───────────────────────────────────────
+# jq builds an object key from an arbitrary expression and refuses a non-string
+# one where it would be inserted.
+object_construct_number_key	{(.):1}	0
+object_construct_null_key	{(.):1}	null
+object_construct_array_key	{(.):1}	[1]
+
 # ── <a> and <b> cannot be <verb> ─────────────────────────────────────────────
 add_number_string	. + "a"	1
 add_array_object	. + {}	[1]

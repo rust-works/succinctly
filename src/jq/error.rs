@@ -268,6 +268,17 @@ impl EvalError {
         ))
     }
 
+    /// `Cannot use <type> (<v>) as object key`.
+    ///
+    /// jq builds an object key from an arbitrary expression and refuses a
+    /// non-string one where it would be inserted, so `{(0):1}` and
+    /// `[{"key":0}] | from_entries` report the same sentence — jq *defines*
+    /// `from_entries` as `map({(.key // .Key // .name // .Name): …})`, so the
+    /// two are one raise site in jq and one constructor here (#391).
+    pub fn cannot_use_as_object_key(key: &OwnedValue) -> Self {
+        Self::new(format!("Cannot use {} as object key", describe(key)))
+    }
+
     /// `Path must be specified as an array`.
     ///
     /// Raised by the path builtins when their path argument is not an array at
@@ -490,6 +501,25 @@ mod tests {
         assert_eq!(
             EvalError::cannot_index("number", &s(key)).message,
             format!("Cannot index number with string \"{key}\"")
+        );
+    }
+
+    /// The object-key refusal names the kind and previews the value, and the
+    /// preview is truncated like every other — a long key is what jq reports
+    /// as `number (12345678901...)`, not in full.
+    #[test]
+    fn object_key_message_names_the_kind_and_truncates_the_preview() {
+        assert_eq!(
+            EvalError::cannot_use_as_object_key(&OwnedValue::Int(0)).message,
+            "Cannot use number (0) as object key"
+        );
+        assert_eq!(
+            EvalError::cannot_use_as_object_key(&OwnedValue::Null).message,
+            "Cannot use null (null) as object key"
+        );
+        assert_eq!(
+            EvalError::cannot_use_as_object_key(&OwnedValue::Int(12345678901234567)).message,
+            "Cannot use number (12345678901...) as object key"
         );
     }
 
