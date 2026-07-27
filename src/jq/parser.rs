@@ -370,39 +370,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse an integer (for array indices).
-    fn parse_integer(&mut self) -> Result<i64, ParseError> {
-        let start = self.pos;
-
-        // Optional negative sign
-        if self.peek() == Some('-') {
-            self.next();
-        }
-
-        // Must have at least one digit
-        match self.peek() {
-            Some(c) if c.is_ascii_digit() => {
-                self.next();
-            }
-            _ => {
-                return Err(ParseError::new("expected digit", self.pos));
-            }
-        }
-
-        // Consume remaining digits
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() {
-                self.next();
-            } else {
-                break;
-            }
-        }
-
-        self.input[start..self.pos]
-            .parse()
-            .map_err(|_| ParseError::new("invalid number", start))
-    }
-
     /// Parse a string literal or string interpolation.
     /// Returns either a simple string literal or a StringInterpolation expression.
     fn parse_string_or_interpolation(&mut self) -> Result<Expr, ParseError> {
@@ -653,7 +620,7 @@ impl<'a> Parser<'a> {
             }
 
             // `[:n]` - slice from start to n
-            let end = self.parse_integer()?;
+            let end = self.parse_slice_bound()?;
             self.skip_ws();
             self.expect(']')?;
             return Ok(Bracket::Static(Expr::Slice {
@@ -681,11 +648,11 @@ impl<'a> Parser<'a> {
                 })
             }
             Some(':') => {
-                // `[n:]` or `[n:m]` - slice. Bounds stay integer literals;
-                // expression-valued bounds (`.[$a:$b]`) are not supported yet.
-                let first = Self::fold_int_literal(&key).ok_or_else(|| {
-                    ParseError::new("slice bounds must be integer literals", key_start)
-                })?;
+                // `[n:]` or `[n:m]` - slice. Bounds must still fold to an
+                // integer literal; expression-valued bounds (`.[$a:$b]`) are
+                // not supported yet.
+                let first = Self::fold_int_literal(&key)
+                    .ok_or_else(|| Self::slice_bound_error(key_start))?;
                 self.next();
                 self.skip_ws();
 
@@ -698,7 +665,7 @@ impl<'a> Parser<'a> {
                     }))
                 } else {
                     // `[n:m]` - slice from n to m
-                    let second = self.parse_integer()?;
+                    let second = self.parse_slice_bound()?;
                     self.skip_ws();
                     self.expect(']')?;
                     Ok(Bracket::Static(Expr::Slice {
@@ -747,6 +714,22 @@ impl<'a> Parser<'a> {
             Some(Expr::Index(i)) => Some(i),
             _ => None,
         }
+    }
+
+    /// The error both slice bounds report when they do not fold.
+    fn slice_bound_error(pos: usize) -> ParseError {
+        ParseError::new("slice bounds must be integer literals", pos)
+    }
+
+    /// Parse one slice bound.
+    ///
+    /// Both bounds go through here so they accept the same spellings. Parsing
+    /// only the *first* as an expression would let `.[(1):3]` compile while
+    /// `.[1:(3)]` did not — an asymmetry with no grammar behind it.
+    fn parse_slice_bound(&mut self) -> Result<i64, ParseError> {
+        let start = self.pos;
+        let bound = self.parse_comma_expr()?;
+        Self::fold_int_literal(&bound).ok_or_else(|| Self::slice_bound_error(start))
     }
 
     /// Parse an index bracket and check for optional marker.
@@ -4755,6 +4738,45 @@ mod tests {
             assert!(
                 matches!(parse(src).unwrap(), Expr::IndexExpr { .. }),
                 "{src} should parse as a computed index"
+            );
+        }
+    }
+
+    /// Both slice bounds accept the same spellings.
+    ///
+    /// Parsing only the first bound as an expression let `.[(1):3]` compile
+    /// while `.[1:(3)]` did not — an asymmetry with no grammar behind it, and
+    /// invisible unless a test writes the same constant on both sides.
+    #[test]
+    fn test_slice_bounds_accept_the_same_spellings() {
+        let expected = Expr::Slice {
+            start: Some(1),
+            end: Some(3),
+        };
+        for src in [".[1:3]", ".[(1):3]", ".[1:(3)]", ".[1.0:3]", ".[1:3.0]"] {
+            assert_eq!(parse(src).unwrap(), expected, "`{src}`");
+        }
+
+        // Open bounds too, including the negative that only the `[:n]` branch
+        // ever sees.
+        for (src, expected) in [
+            (".[:-2]", (None, Some(-2))),
+            (".[:(-2)]", (None, Some(-2))),
+            (".[-2:]", (Some(-2), None)),
+        ] {
+            let (start, end) = expected;
+            assert_eq!(parse(src).unwrap(), Expr::Slice { start, end }, "`{src}`");
+        }
+
+        // A bound that does not fold is still rejected, on either side, and
+        // says why rather than complaining about a digit.
+        for src in [".[$a:1]", ".[1:$b]", ".[:$b]"] {
+            let err = parse(src).unwrap_err();
+            assert!(
+                err.message
+                    .contains("slice bounds must be integer literals"),
+                "`{src}` gave: {}",
+                err.message
             );
         }
     }
