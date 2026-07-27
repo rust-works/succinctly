@@ -133,10 +133,22 @@ $ echo 'a: !!str 1' | succinctly yq '.'
 Error: YAML parse error: tags (!) not supported at offset 3
 ```
 
-In flow context they are silently absorbed into the scalar instead, so `[!!str a]` yields
-the string `"!!str a"` — silently wrong data rather than an error. Tracked in
-[#224](https://github.com/rust-works/succinctly/issues/224), which covers both tag support
-and that inconsistency.
+Flow context rejects them the same way, in every position — sequence item, mapping value,
+mapping key, and the explicit `? k : v` form
+([#369](https://github.com/rust-works/succinctly/issues/369); before that fix flow context
+absorbed the tag into the scalar, so `[!!str a]` yielded the string `"!!str a"`):
+
+```
+$ echo 'a: [!!str x]' | succinctly yq '.'
+Error: YAML parse error: tags (!) not supported at offset 4
+```
+
+A `!` *inside* plain scalar content is not an indicator and remains ordinary text in both
+contexts — `[x!y]` is `["x!y"]`, `a: hello!world` is `"hello!world"`. Only a `!` starting a
+node is a tag.
+
+Tag *support* is tracked in [#224](https://github.com/rust-works/succinctly/issues/224);
+these 33 cases stay failures until it lands.
 
 ### Directives — 16 cases (all load)
 
