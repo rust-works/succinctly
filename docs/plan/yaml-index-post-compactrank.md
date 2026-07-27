@@ -30,6 +30,11 @@ remaining optimization opportunities.
 
 ## YamlIndex Memory Layout (2026-01-27)
 
+> **Superseded**: the `CompactRank` rows below hold only for the
+> `bc169609..0156707a` window. Both rank indices are cumulative `Vec<u32>` at
+> ~50% of the bitmap they index, not ~3.5% — see
+> [yaml-succinct.md § Current derived index structures](../parsing/yaml-succinct.md#current-derived-index-structures).
+
 | Structure             | Type                     | Size                | Notes                                |
 |-----------------------|--------------------------|---------------------|--------------------------------------|
 | `ib`                  | bitmap                   | L/8 bytes           | 1 bit/text byte                      |
@@ -53,6 +58,10 @@ Where L = text length, B = BP length (~2N), N = BP opens, T = container count.
 > [parsing/yaml.md O4](../parsing/yaml.md#o4-seq_items-bitvector-elimination--accepted-).
 
 For typical YAML with N ≈ L/7.5:
+
+> **Superseded**: at ~50% of each indexed bitmap rather than ~3.5%, the rank
+> row below is more than an order of magnitude larger than shown, and the
+> ~125% total is understated to match.
 
 | Component                | Cost             | % of text |
 |--------------------------|------------------|-----------|
