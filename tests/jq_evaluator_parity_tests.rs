@@ -245,3 +245,21 @@ fn test_out_of_bounds_index_parity_307() {
     // The `?` variant also yields null (no error for `?` to suppress).
     assert_parity(br"[1,2,3]", ".[10]?");
 }
+
+#[test]
+fn test_bsearch_parity_384() {
+    // `bsearch` lives only in the full evaluator; the generic (CLI) path
+    // reaches it through the fallback that re-renders the input as JSON and
+    // hands it to `full_eval`. These pin that the round trip preserves the
+    // answer -- including the negative insertion point, which the fallback
+    // would have to carry back as a number rather than the object `bsearch`
+    // returned before #384.
+    for filter in ["bsearch(3)", "bsearch(5)", "bsearch(0)"] {
+        assert_parity(br"[1,2,3,4]", filter);
+    }
+    // Containers exercise the recursive comparator across the round trip.
+    assert_parity(br"[[1],[2],[3]]", "bsearch([2])");
+    assert_parity(br"[[1],[2],[3]]", "bsearch([9])");
+    assert_parity(br#"[{"a":1},{"a":3}]"#, r#"bsearch({"a":2})"#);
+    assert_parity(br"[]", "bsearch(1)");
+}
