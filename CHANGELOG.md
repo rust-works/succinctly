@@ -112,6 +112,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `?` now covers the indexing only, matching jq; `try`/`catch` still catches the
   error.
 
+- **A tab between a plain YAML key and its `:` was folded into the key** (#370):
+  `a\t: 1` loaded as `{"a\t":1}`, so a `.a` lookup missed a key the document
+  plainly spells `a`. YAML puts that white space outside the key —
+  `ns-s-implicit-yaml-key ::= ns-yaml-key(c) s-separate-in-line?`, and
+  `s-white` is a space *or a tab* — but the key's trailing trim was the one
+  place in the parser that listed only the space. Every sibling trim (the value
+  path, and all three flow-context sites) already included the tab. A tab
+  *inside* a plain scalar is unaffected and stays content, as
+  `nb-ns-plain-in-line` requires: `a\tb: 1` is still the key `a\tb`.
+
+  The same omission had a second home. A scalar's extent is derived twice by
+  copies that never consult each other: the parser's, stored in the index and
+  reported by `yq`, and `find_scalar_end`'s, re-derived from the text and
+  reported by `yq-locate` and `at_offset`. Fixing only the parser would have
+  left `syq` printing `a` while `syq-locate` still reported the byte range
+  `a\t`. The cursor copy also dropped the tab from its *terminator* set, which
+  broke a document with no trailing tab at all: `a:\t1` is legal YAML whose key
+  located as a range running to end of input. Both are now spelled the way
+  `parse_unquoted_key` spells them. See the #106 lesson in `CLAUDE.md` on
+  predicates that diverge silently — this is the third copy of that story.
+
+  No fixture moved: neither the YAML Test Suite corpus nor
+  `tests/data/yq-golden/` contains a tab adjacent to a colon, which is why the
+  shape survived this long. `tests/yaml_tab_separation_tests.rs` covers it now,
+  pinned by output and by located byte range, and is the separation half of the
+  split `tests/yaml_tab_indentation_tests.rs` (#173) draws — there a tab before
+  block structure is illegal indentation, here a tab before an indicator on the
+  same line is legal separation.
+
 - **YAML flow context silently absorbed tags as scalar text** (#369): block
   context has always rejected `!` via `check_unsupported`, but the flow-context
   scalar readers fell through to the plain-scalar path, so `a: [!!str x]` yielded

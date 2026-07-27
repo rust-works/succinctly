@@ -1325,9 +1325,13 @@ impl<'a> Parser<'a> {
 
         // Trim trailing whitespace. `\r` goes with it for the same reason as in
         // `parse_unquoted_value_with_indent_impl`: it is a line break, so it is
-        // never part of the key (#324).
+        // never part of the key (#324). A tab goes with it because the white
+        // space between a key and its `:` is `s-separate-in-line`, which
+        // `ns-s-implicit-yaml-key` leaves outside the key — the same reason a
+        // trailing space is trimmed, and this set is why `a\t: 1` used to load
+        // as {"a\t":1} (#370).
         let mut end = self.pos;
-        while end > start && matches!(self.input[end - 1], b' ' | b'\r') {
+        while end > start && matches!(self.input[end - 1], b' ' | b'\t' | b'\r') {
             end -= 1;
         }
 
