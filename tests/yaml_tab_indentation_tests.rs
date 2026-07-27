@@ -227,12 +227,10 @@ fn a_tab_used_as_separation_still_produces_its_value() {
     // UV7Q. This is the spec-correct output; the suite agrees.
     assert_eq!(to_json(b"x:\n - x\n  \tx\n").unwrap(), r#"{"x":["x x"]}"#);
 
-    // DK95/00. The suite wants {"foo":"bar"} — the leading tab should be stripped as
-    // separation. Retaining it is a known scalar-folding gap, on record in
-    // tests/data/yaml-test-suite-known-failures.txt as `DK95/00 scalars`. Pinned as
-    // it is so that fixing the folding is a deliberate change to this line, not a
-    // silent one.
-    assert_eq!(to_json(b"foo:\n \tbar\n").unwrap(), r#"{"foo":"\tbar"}"#);
+    // DK95/00. The leading tab is separation and is stripped, matching the suite
+    // (#381). Previously a known scalar-folding gap, on record in
+    // tests/data/yaml-test-suite-known-failures.txt as `DK95/00 scalars`.
+    assert_eq!(to_json(b"foo:\n \tbar\n").unwrap(), r#"{"foo":"bar"}"#);
 
     // Q5MG and 6CA3, both spec-correct.
     assert_eq!(to_json(b"\t{}\n").unwrap(), "{}");
@@ -250,16 +248,10 @@ fn a_tab_used_as_separation_still_produces_its_value() {
         r#"{"a":1,"b":2}"#
     );
 
-    // A quoted scalar after the tab. Spec-correct is {"a":"x: y"}; the loader instead
-    // reads the line as a mapping, the same continuation-line folding gap that leaves
-    // DK95/00 above with its tab — that is #381. #173 is about the tab *verdict* —
-    // this now loads instead of erroring, which is the part that changed — so the
-    // wrong value is pinned rather than hidden, and fixing #381 is a deliberate edit
-    // to this line and to the DK95/00 one above.
-    assert_eq!(
-        to_json(b"a:\n \t\"x: y\"\n").unwrap(),
-        r#"{"a":{"\t\"x":"y\""}}"#
-    );
+    // A quoted scalar after the tab. The tab is stripped as separation, so the
+    // opening quote is the node's first byte and it reads as the quoted scalar
+    // it is, rather than as a mapping (#381).
+    assert_eq!(to_json(b"a:\n \t\"x: y\"\n").unwrap(), r#"{"a":"x: y"}"#);
 }
 
 /// `parse_document_line` is not always entered at a line start — `parse_explicit_key`
