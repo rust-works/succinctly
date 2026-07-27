@@ -118,12 +118,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values borrowed, so the zero-copy path survives. `succinctly yq` gets the fix
   too, since its evaluator delegates all three operators to this one. Ten new
   pinned-`jq` golden cases cover the family, and the known-failures manifest
-  drops to two entries. **Not fixed**: `QueryResult` still models an error as a
-  property of the whole stream rather than of one output, so `(1,error("x")) // 2`
-  yields `2` where jq yields `1`, and a mid-stream error in `and`/`or` discards
-  the outputs already computed; `//` still suppresses left-hand errors, which
-  jq 1.7.1 propagates; and `if`/`select` still collapse a multi-output condition
-  to its first output (sibling of #354).
+  drops to two entries. **Not fixed**: `QueryResult` still models an error or a
+  `break` as a property of the whole stream rather than of one output, so
+  `(1,error("x")) // 2` yields `2` where jq yields `1`, and a mid-stream error
+  or `break` in `and`/`or` discards the outputs already computed —
+  `label $out | ((true,true) and (1, break $out))` yields nothing where jq
+  yields `true` (#400); `//` still suppresses left-hand errors, which jq 1.7.1
+  propagates (#377); and `if`/`select` still collapse a multi-output condition
+  to its first output (#378, sibling of #354).
 - **YAML: a tab after spaces in indentation was folded into the key** (#173):
   the loader rejected a tab only at column 0 and treated a tab following one or
   more spaces as start-of-content, so `a:\n \tb: 1` loaded as

@@ -1898,9 +1898,19 @@ fn test_boolean_with_empty_operand_is_silent() -> Result<()> {
     // An empty operand used to reach `result_to_owned`, which reported it as
     // `Error("no value")` and printed a diagnostic. jq emits nothing at all,
     // quietly. The goldens compare stdout only, so stderr is asserted here.
+    //
+    // Matching on the absence of a diagnostic rather than on a byte-empty
+    // stderr keeps the test independent of whatever else may reach that stream:
+    // `--quiet` silences cargo's own progress lines, but not a rustc warning
+    // from the build it triggers. Requiring stderr to be empty would couple this
+    // assertion to the whole workspace compiling warning-free, which is not what
+    // it is testing.
     let (stdout, stderr, code) = run_jq_stdin_streams("empty and true", "null", &["-c"])?;
     assert_eq!(stdout, "", "expected no output");
-    assert_eq!(stderr, "", "expected no diagnostic on stderr");
+    assert!(
+        !stderr.contains("jq: error"),
+        "expected no diagnostic on stderr, got: {stderr}"
+    );
     assert_eq!(code, 0, "expected success");
     Ok(())
 }
