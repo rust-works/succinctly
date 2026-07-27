@@ -116,10 +116,11 @@ alias with nothing to resolve to:
 
 - **Cyclic.** An alias that would make an anchored value contain itself
   (`a: &x {self: *x}`) fails with `YamlError::AliasCycle` ("anchor value contains itself").
-  A cyclic document cannot be materialized at all; before
+  A cyclic document has no finite tree form; before
   [#153](https://github.com/rust-works/succinctly/issues/153) it aborted the process with a
-  stack overflow. YAML 1.2's representation graph technically permits cycles, but `yq`
-  rejects the same input at decode time, so rejecting is also the compatible behavior.
+  stack overflow. YAML 1.2's representation graph technically permits cycles. Unlike the
+  unknown-anchor case this is a deliberate divergence from `yq`, which accepts the input
+  and emits a depth-limited expansion (`{"a":{"self":{"self":{}}}}`) rather than an error.
 - **Unknown.** An alias naming an anchor that is not in scope — never defined, or defined
   *later* — fails with `YamlError::UnknownAnchor` since
   [#372](https://github.com/rust-works/succinctly/issues/372). YAML 1.2 §7.1 requires an

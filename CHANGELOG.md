@@ -515,8 +515,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `yq -R -s` now yields the entire input as a single string instead of an array of per-line strings, matching jq and `jq -R -s` (#271)
 - YAML alias cycles (`a: &anchor {self: *anchor}`) are rejected at index build with the
   new `YamlError::AliasCycle` variant instead of aborting with a stack overflow when the
-  value is materialized (#153). Matches `yq`, which fails at decode time on the same
-  input. Note: exhaustive `match`es on `YamlError` need a new arm.
+  value is materialized (#153). A deliberate divergence from `yq`, which accepts the same
+  input and emits a depth-limited expansion. Note: exhaustive `match`es on `YamlError`
+  need a new arm.
 - **BalancedParens L2 excess overflow** (#188): the per-L2-block excess
   counters were `i16` and overflowed at nesting depth > 32,767 (debug panic /
   silent wrap in release). Widened to `i32` across the scalar, NEON, and
