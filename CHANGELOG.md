@@ -91,6 +91,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`bsearch` reported absent containers as found, and returned an object when
+  absent** (#384): two defects in the same twenty lines of `src/jq/eval.rs`.
+  `bsearch` had its own comparator with arms for null, bool, numbers and string
+  and none for `(Array, Array)` or `(Object, Object)`, so two containers fell
+  through to the cross-type rank comparison and compared *equal* — binary search
+  over containers returned whichever midpoint it landed on and claimed a match
+  for a value that is not present, which a caller could not even detect by
+  testing for the not-found marker. That comparator is gone; `bsearch` now uses
+  `compare_values`, the one `sort` already uses, so the two cannot disagree
+  about a pair (the #106 lesson in `CLAUDE.md`). Separately, the absent case
+  returned `{"index": n}` where jq returns the negative insertion point
+  `-1 - n`, so jq's idiomatic `if . < 0 then … end` raised a type error instead
+  of taking the branch. The search itself is now jq's own loop from
+  `builtin.jq` rather than `Vec::binary_search_by`, whose choice among equal
+  elements is documented as unspecified and differs from jq's; succinctly now
+  matches the oracle on duplicates too. Both evaluators are covered — the CLI
+  reaches `bsearch` through the generic evaluator's fallback — and seven new
+  pinned-jq golden cases exercise containers, absence, duplicates and the empty
+  array.
+
 - **jq: a repeated key no longer deletes twice** (#360). `[1,2,3] | del(.[(0,0)])`
   removed elements 0 and 1, yielding `[3]`; resolved paths are now deduplicated
   before deletion, as jq's `delpaths` does, giving `[2,3]`.
