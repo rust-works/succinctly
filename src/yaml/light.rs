@@ -720,12 +720,16 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // Flow context delimiters
                 b',' | b']' | b'}' => break,
                 b':' => {
-                    // Colon followed by space, newline, or EOF ends the scalar
+                    // Colon followed by white space, a line break, or EOF ends
+                    // the scalar. The tab is not optional: this is the same
+                    // terminator set `parse_unquoted_key` uses, and dropping it
+                    // here made `a:\t1` — legal YAML — report a byte range that
+                    // ran to end of input (#370).
                     if end + 1 >= self.text.len() {
                         // Colon at EOF - this is a key separator
                         break;
                     }
-                    if matches!(self.text[end + 1], b' ' | b'\n' | b'\r') {
+                    if matches!(self.text[end + 1], b' ' | b'\t' | b'\n' | b'\r') {
                         break;
                     }
                     end += 1;
@@ -733,8 +737,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 _ => end += 1,
             }
         }
-        // Trim trailing whitespace
-        while end > start && matches!(self.text[end - 1], b' ' | b'\r') {
+        // Trim trailing white space, tab included: this re-derives the extent
+        // the parser already trimmed, so the two must agree on what separation
+        // is, or `yq-locate` reports `a\t` for a key `yq` prints as `a` (#370).
+        while end > start && matches!(self.text[end - 1], b' ' | b'\t' | b'\r') {
             end -= 1;
         }
         end
