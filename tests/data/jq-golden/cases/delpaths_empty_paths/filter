@@ -1,0 +1,1 @@
+delpaths([]), delpaths([[]]), delpaths([[],[0]]), delpaths([[0],[]])

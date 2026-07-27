@@ -1,0 +1,1 @@
+delpaths([[-1]]), delpaths([[-9]]), delpaths([[0],[-4]]), delpaths([[-4],[0]])

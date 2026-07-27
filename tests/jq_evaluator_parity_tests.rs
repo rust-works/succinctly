@@ -263,3 +263,29 @@ fn test_bsearch_parity_384() {
     assert_parity(br#"[{"a":1},{"a":3}]"#, r#"bsearch({"a":2})"#);
     assert_parity(br"[]", "bsearch(1)");
 }
+
+#[test]
+fn test_parity_delpaths_398() {
+    // `delpaths` sorts its path list and deletes by grouped prefix, so the
+    // caller's order is immaterial and a repeat deletes once -- #398. Only
+    // `src/jq/eval.rs` implements it; `eval_generic` has no `DelPaths` arm and
+    // round-trips through JSON to the full evaluator, so most of these confirm
+    // that fallback rather than a second implementation.
+    for filter in [
+        "delpaths([[0],[2]])",
+        "delpaths([[2],[0]])",
+        "delpaths([[0],[0]])",
+        "delpaths([[-1],[-2]])",
+        "delpaths([[3],[-1]])",
+        "delpaths([[0],[0,1]])",
+        "delpaths([[]])",
+    ] {
+        assert_parity(br"[10,20,30,40]", filter);
+    }
+    // Not a tautology: the round trip is where object key order could be lost,
+    // and this is the case that would show it.
+    assert_parity(
+        br#"{"a":{"x":1,"y":2},"b":3,"c":4}"#,
+        r#"delpaths([["a","x"],["b"]])"#,
+    );
+}
