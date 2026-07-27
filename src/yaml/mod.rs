@@ -98,22 +98,6 @@ pub(crate) fn starts_seq_entry(text: &[u8], pos: usize) -> bool {
     text.get(pos) == Some(&b'-') && is_seq_indicator_next(text.get(pos + 1).copied())
 }
 
-/// Is the sequence-entry indicator at `pos` followed by content on the *same* line?
-///
-/// Deliberately narrower than [`starts_seq_entry`]: a bare `-` — line break or end of
-/// input after it — is excluded. `YamlElements::uncons_cursor` uses this so that a bare
-/// `-` keeps yielding the wrapper node rather than its child, because callers that use the
-/// returned cursor *positionally* depend on it: `corpus_stats` counts bare-dash items by
-/// the cursor's text position, and `is_yaml_cursor_container` decides block-vs-inline YAML
-/// layout from it.
-///
-/// Value decoding is unaffected either way — `value()` applies the wider
-/// [`starts_seq_entry`] and unwraps a bare-`-` wrapper itself.
-#[inline]
-pub(crate) fn starts_inline_seq_entry(text: &[u8], pos: usize) -> bool {
-    text.get(pos) == Some(&b'-') && matches!(text.get(pos + 1), Some(b' ' | b'\t'))
-}
-
 /// Is the line at `from` *structural* — a block sequence entry (`- ` …) or a block
 /// mapping entry (a `: ` value indicator before end of line) — rather than a plain
 /// scalar or a flow node?

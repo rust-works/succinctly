@@ -25,7 +25,7 @@ use std::string::ToString;
 use super::index::YamlIndex;
 use super::line_break::{is_line_break, line_break_len, line_break_len_before};
 use super::scalar::{could_be_null_or_bool, resolve_plain, ResolvedScalar};
-use super::{starts_inline_seq_entry, starts_seq_entry};
+use super::starts_seq_entry;
 use crate::util::simd::escape::find_json_escape;
 
 // ============================================================================
@@ -3551,9 +3551,23 @@ impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
         // YAML layout — see the content rather than the wrapper. For flow sequences,
         // virtual root sequences, and document containers the element IS the value.
         //
-        // Deliberately `starts_inline_seq_entry`, not the wider `starts_seq_entry` that
-        // `value()` uses: a bare `-` stays pointed at the wrapper, which is what
-        // `corpus_stats`'s bare-dash counting reads. Value decoding is the same either way.
+        // Deliberately the wide `starts_seq_entry` — the same predicate `value()` uses —
+        // and not the narrower `starts_inline_seq_entry`, which accepts only space and tab.
+        //
+        // The narrow spelling is a performance trap, not just a semantic choice (#106). On
+        // an item whose `-` is followed by a line break, it fails here, so the wrapper
+        // cursor is returned unchanged and `uncons` then calls `value()` on it — which
+        // re-reads the open index this function just read. `AdvancePositions::get` treats a
+        // repeat of the previous index as a *backwards* jump (after reading `k` the cursor
+        // sits at `k + 1`), takes `get_random`, and resets the sequential IB scan state to
+        // word 0. The next read then rescans the bitmap from the start: O(N*L/64) for a
+        // document of N such items, which measured quadratic on bare-dash input.
+        //
+        // Widening it is safe because no caller depends on getting the wrapper back: the
+        // one that used to, `corpus_stats`'s bare-dash counting, now derives that from the
+        // text independently, and `is_yaml_cursor_container` wants the content anyway.
+        // Value decoding is unchanged either way — `value()` unwraps a bare-`-` wrapper
+        // itself, so output is byte-identical.
         //
         // A childless wrapper is returned as-is: `value()` decides whether it is an empty
         // sequence item (null) or a plain scalar that merely begins `- ` (#332).
@@ -3561,7 +3575,7 @@ impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
             Some((element_cursor, rest))
         } else if element_cursor
             .text_position()
-            .is_some_and(|text_pos| starts_inline_seq_entry(element_cursor.text, text_pos))
+            .is_some_and(|text_pos| starts_seq_entry(element_cursor.text, text_pos))
         {
             Some((element_cursor.first_child().unwrap_or(element_cursor), rest))
         } else {
@@ -7674,11 +7688,10 @@ mod tests {
     // jump that reset the `AdvancePositions` sequential cursor and forced the next
     // read to rescan the IB bitmap from word 0 (O(N*L/64) for the document).
     //
-    // The three access paths are no longer required to spell the predicate the same
-    // way — `uncons_cursor` deliberately uses the narrower `starts_inline_seq_entry`
-    // (#332) so a bare `-` keeps yielding the wrapper for positional callers. What
-    // must still hold is that they agree on the *value* they ultimately produce,
-    // which is what these tests pin.
+    // All three now route through `uncons_cursor`, which applies that one predicate.
+    // What these tests pin is that they agree on the *value* they ultimately produce,
+    // so a future re-divergence fails on the agreement assertion rather than on one
+    // path's expected value.
 
     /// Render a value to a compact stable string, so the three `YamlElements`
     /// access paths can be compared for exact agreement.
