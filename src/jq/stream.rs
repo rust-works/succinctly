@@ -20,6 +20,8 @@
 //! | `.[]` (iterate) | M2 streaming | ~2.5x input |
 //! | `length`, complex | OwnedValue | 5-8x input |
 
+use alloc::string::{String, ToString};
+
 use super::escape::{write_json_body_jq, write_json_body_yq};
 use super::value::{format_number_jq_compat, NumberRepr, OwnedValue};
 use crate::yaml::format_float_with_fraction;
