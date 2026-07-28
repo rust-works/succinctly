@@ -139,6 +139,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to a single entry via the owned-value conversion in `to_owned` — a
   separate, still-open gap, not fixed here.)
 
+- **The strict YAML validator accepted an alias to an unknown anchor** (#404):
+  `succinctly yaml validate` passed `a: *nope`, which `yq` rejects with
+  `unknown anchor 'nope' referenced`. Since #372 taught the default loader the
+  same rule, the *opt-in strict* mode had become the laxer of the two — `syq`
+  refused the document while `yaml validate`, documented as the yq-conformance
+  gate, gave it a clean exit 0, so a CI check built on the validator stayed
+  green on input `yq` refuses. The validator now tracks the anchor names a
+  document defines and rejects an alias naming one that is not in scope, in
+  every position an alias can occupy (value, sequence item, implicit key,
+  explicit key, and both flow collections — the flow ones had no anchor/alias
+  handling at all), with a new `YamlValidationErrorKind::UnknownAnchor`.
+
+  Rejecting a `*` first requires knowing it *starts a node* rather than sitting
+  inside a scalar: `a: rm *.tmp` and `a: text` continued by `  *notanalias` are
+  strings, and `yq` loads both. The scanner now tracks where a node can begin —
+  after a `:`/`-`/`?` indicator, after `[`/`{`/`,`/`:` in flow, and at the start
+  of a line that is not the continuation of an open plain scalar — and checks
+  only there. Anchor *registration* stays deliberately permissive, because an
+  extra name can only make the check accept more, never reject valid input: a
+  `&foo` that is really scalar content still satisfies a later `*foo`, as does
+  an anchor the loader declines to record (`&x` alone on a `---` line, #372).
+  Anchor scope is not reset at a document boundary, since `yq` and the loader
+  both resolve an alias against an earlier document's anchor.
+
+  Names now take their extent from `simd::parse_anchor_name`, the definition the
+  loader scans with, rather than the validator's own — which stopped only at
+  whitespace, read `*nope: v`'s name as `nope:`, and so would have rejected the
+  valid `&a: 1` / `b: *a`. See the #106 note in `CLAUDE.md` on predicates that
+  diverge silently.
+
+  The validator remains `no_std`, but now allocates on the success path for a
+  document that defines anchors, whose names it must remember.
+
+  No YAML Test Suite manifest movement, for the reason #372 gives: no case in
+  the suite contains an alias to an anchor that is not in scope.
+
 - **jq's regex builtins and `endswith` kept the pre-#356 wording after #356
   fixed their siblings** (#393): `test("a")` and `startswith("a")` were
   probed and now report jq's sentences, but `match`, `capture`, `scan`,
