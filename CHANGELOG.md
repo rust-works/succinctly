@@ -91,6 +91,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`//` discarded a left-hand error instead of propagating it** (#377):
+  `eval_alternative` treated a left-hand `Error` the same as `None` and fell
+  through to the right side, so `error("x") // 3` and `.a // 3` (on a
+  non-object) silently produced `3` instead of raising, where jq 1.7.1
+  raises. Split out of #160, which deliberately left this arm unchanged to
+  keep that fix scoped to the multi-output bug. `//` now propagates a
+  left-hand error; `.a? // 3` is unaffected since `?` already resolves to
+  `None` before reaching the operator. **Not fixed**: the whole-stream error
+  model means `(1, error("x")) // 2` still yields `2` where jq yields `1` —
+  `QueryResult::Error` is a property of the stream, not of one output, so
+  partial-then-error is unrepresentable; a faithful fix is the same larger
+  change `eval_comma` needs for #400.
+
 - **YAML alias used as a flow-mapping key rendered as the empty string** (#405):
   `{&x k: 1, *x: 2}` loaded as `{"k":1,"":2}` where `yq` gives `{"k":1,"k":2}`,
   and likewise for a flow mapping nested in a block one or in a sequence. The
@@ -334,9 +347,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(1,error("x")) // 2` yields `2` where jq yields `1`, and a mid-stream error
   or `break` in `and`/`or` discards the outputs already computed —
   `label $out | ((true,true) and (1, break $out))` yields nothing where jq
-  yields `true` (#400); `//` still suppresses left-hand errors, which jq 1.7.1
-  propagates (#377); and `if`/`select` still collapse a multi-output condition
-  to its first output (#378, sibling of #354).
+  yields `true` (#400); and `if`/`select` still collapse a multi-output condition
+  to its first output (#378, sibling of #354). `//` also suppressed left-hand
+  errors rather than propagating them; fixed separately below (#377).
 - **YAML: a tab after spaces in indentation was folded into the key** (#173):
   the loader rejected a tab only at column 0 and treated a tab following one or
   more spaces as start-of-content, so `a:\n \tb: 1` loaded as
