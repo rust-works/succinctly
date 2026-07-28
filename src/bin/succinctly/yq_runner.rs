@@ -564,6 +564,19 @@ fn emit_yaml_value(
                 f.to_string()
             }
         }
+        OwnedValue::NumberLiteral(..) => {
+            if value.as_f64().is_some_and(f64::is_nan) {
+                ".nan".to_string()
+            } else if value.as_f64().is_some_and(f64::is_infinite) {
+                if value.as_f64() > Some(0.0) {
+                    ".inf".to_string()
+                } else {
+                    "-.inf".to_string()
+                }
+            } else {
+                value.number_str().expect("numeric variant").into_owned()
+            }
+        }
         OwnedValue::String(s) => yaml_quote_string(s),
         OwnedValue::Array(arr) => {
             if arr.is_empty() {

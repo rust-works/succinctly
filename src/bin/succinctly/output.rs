@@ -195,6 +195,16 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                 }
             }
         }
+        OwnedValue::NumberLiteral(..) => {
+            if value
+                .as_f64()
+                .is_some_and(|f| f.is_nan() || f.is_infinite())
+            {
+                "null".to_string() // JSON doesn't support NaN or Infinity
+            } else {
+                value.number_str().expect("numeric variant").into_owned()
+            }
+        }
         OwnedValue::String(s) => {
             format!("\"{}\"", escape_json_body(s, opts))
         }
