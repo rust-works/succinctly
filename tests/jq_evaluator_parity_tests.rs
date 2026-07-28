@@ -262,6 +262,9 @@ fn test_bsearch_parity_384() {
     assert_parity(br"[[1],[2],[3]]", "bsearch([9])");
     assert_parity(br#"[{"a":1},{"a":3}]"#, r#"bsearch({"a":2})"#);
     assert_parity(br"[]", "bsearch(1)");
+    // `null | length == 0` in jq, so `null` answers "not found" like `[]`
+    // rather than erroring (#420); the round trip must preserve that too.
+    assert_parity(br"null", "bsearch(1)");
 }
 
 #[test]

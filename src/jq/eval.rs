@@ -12933,18 +12933,25 @@ fn builtin_bsearch<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let elements_iter = match value.clone() {
-        StandardJson::Array(a) => a,
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::new("bsearch requires array")),
-    };
-
-    // Evaluate search value
-    let x = match eval_single::<W, S>(x_expr, value, optional) {
+    // jq's `bsearch($target)` desugars to `target as $target | if length == 0
+    // then -1 ...`, which evaluates `target` before ever looking at the input's
+    // shape — a `target`-side error (or `empty`) wins over the checks below.
+    let x = match eval_single::<W, S>(x_expr, value.clone(), optional) {
         QueryResult::One(v) => to_owned(&v),
         QueryResult::Owned(v) => v,
         QueryResult::Error(e) => return QueryResult::Error(e),
         _ => return QueryResult::None,
+    };
+
+    let elements_iter = match value {
+        StandardJson::Array(a) => a,
+        // `null | length` is `0` in jq, so `null` takes the same `length == 0`
+        // branch as `[]` and answers "not found" rather than erroring (#420).
+        // It is the only non-array for which this applies: every other
+        // non-array's `length` itself errors in jq, matching the guard below.
+        StandardJson::Null => return QueryResult::Owned(OwnedValue::Int(-1)),
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::new("bsearch requires array")),
     };
 
     // Collect array elements
@@ -17784,6 +17791,36 @@ mod tests {
             3
         );
         bsearch_is!(br#"[null, true, 1, "a", [1], {"a": 1}]"#, "bsearch(2)", -4);
+
+        // `null | length == 0` in jq, so `null` takes the empty-array branch
+        // and answers "not found" instead of erroring (#420).
+        bsearch_is!(br"null", "bsearch(1)", -1);
+    }
+
+    /// Every other non-array still errors, because jq's own `length` errors
+    /// on them too — `null` (#420) is the only exception.
+    #[test]
+    fn test_bsearch_non_array_errors() {
+        query!(br"5", "bsearch(1)",
+            QueryResult::Error(e) => {
+                assert!(e.to_string().contains("bsearch requires array"));
+            }
+        );
+        query!(br#""abc""#, "bsearch(1)",
+            QueryResult::Error(e) => {
+                assert!(e.to_string().contains("bsearch requires array"));
+            }
+        );
+        query!(br#"{"a": 1}"#, "bsearch(1)",
+            QueryResult::Error(e) => {
+                assert!(e.to_string().contains("bsearch requires array"));
+            }
+        );
+        query!(br"false", "bsearch(1)",
+            QueryResult::Error(e) => {
+                assert!(e.to_string().contains("bsearch requires array"));
+            }
+        );
     }
 
     #[test]
