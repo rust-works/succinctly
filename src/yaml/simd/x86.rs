@@ -1431,7 +1431,7 @@ mod tests {
         // A colon followed by a flow indicator: the colon rule only checks for
         // whitespace, so the colon is content and the flow indicator (not the
         // colon) is the terminator.
-        for term in [b',', b']', b'}'] {
+        for term in *b",]}" {
             let mut buf = vec![b'a', b':'];
             buf.push(term);
             buf.extend(std::iter::repeat_n(b'a', 61));
