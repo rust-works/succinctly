@@ -58,6 +58,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Test Suite cases (reject conformance 12/94 → 70/94) with no false positives on
   the valid corpus; the remaining structurally-deep cases stay on record.
 
+### Performance
+
+- **SIMD-accelerated JSON string validation** (#123): `validate_string` skipped
+  one byte at a time through `validate_utf8_char`, capping the strict validator
+  at 0.5-1.8 GiB/s. It now skips runs of printable ASCII wholesale via a new
+  `find_json_string_stop` scanner (32B AVX2 / 16B SSE2 / 16B NEON, same
+  machinery as `find_json_escape`), hands whole non-ASCII runs to
+  `text::utf8::validate_utf8` in bulk, and ports that validator's SIMD kernel to
+  NEON (previously AVX2-only, leaving aarch64 scalar). Handing every run
+  straight to the scanner regressed short-string patterns hard (`users` +343%,
+  `unicode` +198%) even as long strings improved 5-15x, so a
+  `SCALAR_PROBE_BYTES`-wide scalar probe gates entry to the vector path, and the
+  scanner call is kept out of the recursive-descent core's inlining (`arrays`
+  +8.8%, `pathological` +12.2% before that split). Net, on 1 MB inputs: `nested`
+  -93.4%/-97.3%, `strings` -75.3%/-79.4%, `unicode` -38.8%/-30.6% (Apple M5
+  Max / AMD Ryzen 9 7950X); every pattern in the corpus is neutral or faster.
+  Error kinds and positions are unchanged. See
+  [docs/benchmarks/json-validate.md](docs/benchmarks/json-validate.md) and
+  [docs/optimizations/simd.md](docs/optimizations/simd.md) for the full
+  measurement trail, including the codegen-unit and laptop-noise traps hit
+  along the way.
+
 ### Changed
 
 - **One definition of "what kind is this value" in the jq module** (#358): the
