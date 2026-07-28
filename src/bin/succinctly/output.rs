@@ -791,6 +791,24 @@ mod tests {
     }
 
     #[test]
+    fn test_format_json_non_finite_number_literal_is_null() {
+        // A `NumberLiteral` whose source text overflows f64 to infinity
+        // (`1e400`) must be treated the same as a plain non-finite Float.
+        let opts = JsonFormatOpts {
+            indent: "",
+            sort_keys: false,
+            ascii: false,
+            float_style: FloatStyle::Shortest,
+            control_escape: ControlEscape::Jq,
+        };
+        let overflowed = OwnedValue::NumberLiteral(
+            succinctly::jq::NumberRepr::Float(f64::INFINITY),
+            "1e400".into(),
+        );
+        assert_eq!(format_json(&overflowed, &opts), "null");
+    }
+
+    #[test]
     fn test_format_json_empty_containers() {
         let pretty = JsonFormatOpts {
             indent: "  ",
