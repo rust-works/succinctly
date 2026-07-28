@@ -2377,6 +2377,30 @@ impl<'a> Parser<'a> {
             self.consume_keyword("fromjsonstream");
             return Ok(Some(Builtin::FromJsonStream));
         }
+        if self.matches_keyword("tostream") {
+            self.consume_keyword("tostream");
+            return Ok(Some(Builtin::ToStream));
+        }
+        if self.matches_keyword("fromstream") {
+            self.consume_keyword("fromstream");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let f = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::FromStream(Box::new(f))));
+        }
+        if self.matches_keyword("truncate_stream") {
+            self.consume_keyword("truncate_stream");
+            self.skip_ws();
+            self.expect('(')?;
+            self.skip_ws();
+            let f = self.parse_pipe_expr()?;
+            self.skip_ws();
+            self.expect(')')?;
+            return Ok(Some(Builtin::TruncateStream(Box::new(f))));
+        }
         if self.matches_keyword("getpath") {
             self.consume_keyword("getpath");
             self.skip_ws();

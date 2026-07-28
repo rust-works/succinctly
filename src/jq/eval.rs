@@ -1649,6 +1649,9 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Rindex(s) => builtin_rindex::<W, S>(s, value, optional),
         Builtin::ToJsonStream => builtin_tojsonstream::<W>(value, optional),
         Builtin::FromJsonStream => builtin_fromjsonstream::<W>(value, optional),
+        Builtin::ToStream => builtin_tostream::<W>(value, optional),
+        Builtin::FromStream(f) => builtin_fromstream::<W, S>(f, value, optional),
+        Builtin::TruncateStream(f) => builtin_truncate_stream::<W, S>(f, value, optional),
         Builtin::GetPath(path) => builtin_getpath::<W, S>(path, value, optional),
 
         // Phase 16: Regex Functions
@@ -5909,10 +5912,7 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Pipe(exprs.to_vec())
     };
 
-    match eval_owned_expr::<S>(&rest_expr, &value, optional) {
-        Ok(v) => QueryResult::Owned(v),
-        Err(e) => QueryResult::Error(e),
-    }
+    eval_owned_input::<W, S>(&rest_expr, &value, optional)
 }
 
 /// Find a field in an object by name.
@@ -7508,6 +7508,13 @@ fn substitute_var_in_builtin(
         Builtin::Rindex(e) => Builtin::Rindex(Box::new(substitute_var(e, var_name, replacement))),
         Builtin::ToJsonStream => Builtin::ToJsonStream,
         Builtin::FromJsonStream => Builtin::FromJsonStream,
+        Builtin::ToStream => Builtin::ToStream,
+        Builtin::FromStream(e) => {
+            Builtin::FromStream(Box::new(substitute_var(e, var_name, replacement)))
+        }
+        Builtin::TruncateStream(e) => {
+            Builtin::TruncateStream(Box::new(substitute_var(e, var_name, replacement)))
+        }
         Builtin::GetPath(e) => Builtin::GetPath(Box::new(substitute_var(e, var_name, replacement))),
         // Phase 16: Regex Functions
         Builtin::TestFlags(re, flags) => Builtin::TestFlags(
@@ -9244,6 +9251,174 @@ fn collect_paths(value: &OwnedValue, current_path: &[OwnedValue], paths: &mut Ve
             }
         }
         _ => {}
+    }
+}
+
+/// Helper to collect `tostream`-style events: `[path, value]` for every leaf
+/// (scalar, or an empty array/object), plus a closing `[path]` marker after
+/// every *non-empty* container, whose path is the container's own path with
+/// its last key/index appended (jq's own convention — verified against
+/// jq-1.7.1, see `test_tostream_*` below).
+fn collect_tostream_events(value: &OwnedValue, path: &[OwnedValue], events: &mut Vec<OwnedValue>) {
+    match value {
+        OwnedValue::Object(entries) if !entries.is_empty() => {
+            let mut last_path = path.to_vec();
+            for (key, val) in entries {
+                let mut child_path = path.to_vec();
+                child_path.push(OwnedValue::String(key.clone()));
+                collect_tostream_events(val, &child_path, events);
+                last_path = child_path;
+            }
+            events.push(OwnedValue::Array(vec![OwnedValue::Array(last_path)]));
+        }
+        OwnedValue::Array(arr) if !arr.is_empty() => {
+            let mut last_path = path.to_vec();
+            for (i, val) in arr.iter().enumerate() {
+                let mut child_path = path.to_vec();
+                child_path.push(OwnedValue::Int(i as i64));
+                collect_tostream_events(val, &child_path, events);
+                last_path = child_path;
+            }
+            events.push(OwnedValue::Array(vec![OwnedValue::Array(last_path)]));
+        }
+        leaf => {
+            events.push(OwnedValue::Array(vec![
+                OwnedValue::Array(path.to_vec()),
+                leaf.clone(),
+            ]));
+        }
+    }
+}
+
+/// Builtin: tostream - jq-compatible stream of `[path,value]` / `[path]` events
+fn builtin_tostream<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
+    _optional: bool,
+) -> QueryResult<'_, W> {
+    let owned = to_owned(&value);
+    let mut events = Vec::new();
+    collect_tostream_events(&owned, &[], &mut events);
+    // Always non-empty: every value (including an empty container or a
+    // top-level scalar) produces at least one leaf event.
+    if events.len() == 1 {
+        QueryResult::Owned(events.pop().unwrap())
+    } else {
+        QueryResult::ManyOwned(events)
+    }
+}
+
+/// Builtin: fromstream(f) - reconstruct values from a stream of tostream-style events
+///
+/// Mirrors jq's own `builtin.jq` definition: an accumulator `x` built up via
+/// `setpath`, and a completion flag `e` that is recomputed from each event's
+/// path length, reset to the initial state whenever the previous event
+/// completed a value.
+fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    f: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let events = match eval_single::<W, S>(f, value, optional) {
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
+        result => result.collect_owned(),
+    };
+
+    let mut outputs = Vec::new();
+    let mut x = OwnedValue::Null;
+    let mut e = false;
+
+    for event in events {
+        if e {
+            x = OwnedValue::Null;
+        }
+        let OwnedValue::Array(parts) = &event else {
+            return QueryResult::Error(EvalError::new("Invalid streaming format"));
+        };
+        match parts.as_slice() {
+            [OwnedValue::Array(path), leaf_value] => {
+                e = path.is_empty();
+                x = match set_value_at_path(x, path, leaf_value.clone()) {
+                    Ok(v) => v,
+                    Err(err) => return QueryResult::Error(err),
+                };
+            }
+            [OwnedValue::Array(path)] => {
+                e = path.len() == 1;
+            }
+            _ => return QueryResult::Error(EvalError::new("Invalid streaming format")),
+        }
+        if e {
+            outputs.push(x.clone());
+        }
+    }
+
+    match outputs.len() {
+        0 => QueryResult::None,
+        1 => QueryResult::Owned(outputs.pop().unwrap()),
+        _ => QueryResult::ManyOwned(outputs),
+    }
+}
+
+/// Builtin: truncate_stream(stream) - drop the leading `.` path components
+/// from `stream`'s events.
+///
+/// jq's real signature takes a single filter argument: the depth comes from
+/// `.` (the value piped into `truncate_stream` itself), not a second
+/// argument, and `stream` is evaluated against that same `.` — matching
+/// jq-1.7.1's `def truncate_stream(stream): . as $n | stream | ...`.
+///
+/// jq's own definition compares the path length against `$n` with the
+/// generic `>` operator, not a numeric type check, so a non-numeric `.` at
+/// the call site (e.g. `null | truncate_stream(...)`) does not error — every
+/// event's length sorts above `null` in jq's ordering, so every event is
+/// kept unmodified. [`compare_values`] reuses that same ordering here.
+fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    stream_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let depth = to_owned(&value);
+
+    let events = match eval_single::<W, S>(stream_expr, value, optional) {
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
+        result => result.collect_owned(),
+    };
+
+    let mut outputs = Vec::new();
+    for event in events {
+        let OwnedValue::Array(mut parts) = event else {
+            return QueryResult::Error(EvalError::new("Invalid streaming format"));
+        };
+        let Some(OwnedValue::Array(path)) = parts.first() else {
+            return QueryResult::Error(EvalError::new("Invalid path in streaming format"));
+        };
+        let path_len = OwnedValue::Int(path.len() as i64);
+        if compare_values(&path_len, &depth) == core::cmp::Ordering::Greater {
+            // Reachable non-number depths here are only null/bool (jq order:
+            // null < bool < number < ...), never string/array/object, since
+            // a number never sorts above those. Both null and bool slice as
+            // offset 0 — null matches jq's own `.[null:]` semantics; a
+            // boolean depth is what real jq refuses with "Array/string slice
+            // indices must be integers", which succinctly does not reproduce
+            // here (out of scope: `truncate_stream` is always called with an
+            // integer depth in practice).
+            let offset = match &depth {
+                OwnedValue::Int(i) => (*i).max(0) as usize,
+                OwnedValue::Float(f) => f.max(0.0) as usize,
+                _ => 0,
+            };
+            let truncated = path[offset.min(path.len())..].to_vec();
+            parts[0] = OwnedValue::Array(truncated);
+            outputs.push(OwnedValue::Array(parts));
+        }
+    }
+
+    match outputs.len() {
+        0 => QueryResult::None,
+        1 => QueryResult::Owned(outputs.pop().unwrap()),
+        _ => QueryResult::ManyOwned(outputs),
     }
 }
 
@@ -11605,6 +11780,9 @@ fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
         "rindex/1",
         "tojsonstream/0",
         "fromjsonstream/0",
+        "tostream/0",
+        "fromstream/1",
+        "truncate_stream/1",
         // Path operations (arity 0-2)
         "path/1",
         "paths/0",
@@ -14064,6 +14242,13 @@ fn expand_func_calls_in_builtin(
         }
         Builtin::ToJsonStream => Builtin::ToJsonStream,
         Builtin::FromJsonStream => Builtin::FromJsonStream,
+        Builtin::ToStream => Builtin::ToStream,
+        Builtin::FromStream(e) => {
+            Builtin::FromStream(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
+        Builtin::TruncateStream(e) => {
+            Builtin::TruncateStream(Box::new(expand_func_calls(e, func_name, params, body)))
+        }
         Builtin::GetPath(e) => {
             Builtin::GetPath(Box::new(expand_func_calls(e, func_name, params, body)))
         }
@@ -14381,6 +14566,13 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
         Builtin::Rindex(e) => Builtin::Rindex(Box::new(substitute_func_param(e, param, arg))),
         Builtin::ToJsonStream => Builtin::ToJsonStream,
         Builtin::FromJsonStream => Builtin::FromJsonStream,
+        Builtin::ToStream => Builtin::ToStream,
+        Builtin::FromStream(e) => {
+            Builtin::FromStream(Box::new(substitute_func_param(e, param, arg)))
+        }
+        Builtin::TruncateStream(e) => {
+            Builtin::TruncateStream(Box::new(substitute_func_param(e, param, arg)))
+        }
         Builtin::GetPath(e) => Builtin::GetPath(Box::new(substitute_func_param(e, param, arg))),
         // Phase 16: Regex Functions
         Builtin::TestFlags(re, flags) => Builtin::TestFlags(
@@ -17093,6 +17285,25 @@ mod tests {
     }
 
     #[test]
+    fn test_variable_binding_preserves_streaming_through_a_multi_output_filter() {
+        // A pipe stage after `as` binds a value is still a pipe: piping a
+        // bound variable into a multi-output filter must keep streaming N
+        // separate top-level outputs, the same as piping the document
+        // itself would. `$doc | paths` used to collapse into one array
+        // (`eval_owned_pipe` collapsed through `eval_owned_expr`, which is
+        // correct for `reduce`/`foreach` but not for a plain pipe
+        // continuation) where `paths` alone streams correctly.
+        assert_eq!(
+            outputs(br#"{"a":{"b":1}}"#, ". as $doc | $doc | paths"),
+            outputs(br#"{"a":{"b":1}}"#, "paths")
+        );
+        assert_eq!(
+            outputs(br#"{"a":{"b":1}}"#, ". as $doc | $doc | paths"),
+            [r#"["a"]"#, r#"["a","b"]"#]
+        );
+    }
+
+    #[test]
     fn test_reduce() {
         // Sum array elements
         query!(br"[1, 2, 3, 4, 5]", r"reduce .[] as $x (0; . + $x)",
@@ -18801,6 +19012,145 @@ mod tests {
             QueryResult::Owned(OwnedValue::Array(_)) => {
                 // Stub returns input as-is
             }
+        );
+    }
+
+    // The following tostream/fromstream/truncate_stream expectations are all
+    // verified against jq-1.7.1 (#396) — not derived from this codebase's own
+    // output.
+
+    #[test]
+    fn test_tostream_object() {
+        assert_eq!(
+            outputs(br#"{"a":1,"b":[2,3]}"#, "tostream"),
+            [
+                r#"[["a"],1]"#,
+                r#"[["b",0],2]"#,
+                r#"[["b",1],3]"#,
+                r#"[["b",1]]"#,
+                r#"[["b"]]"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_tostream_nested() {
+        assert_eq!(
+            outputs(br#"{"a":{"b":1,"c":2}}"#, "tostream"),
+            [
+                r#"[["a","b"],1]"#,
+                r#"[["a","c"],2]"#,
+                r#"[["a","c"]]"#,
+                r#"[["a"]]"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_tostream_empty_containers_are_leaves() {
+        assert_eq!(
+            outputs(br#"{"a":[],"b":{},"c":1}"#, "tostream"),
+            [
+                r#"[["a"],[]]"#,
+                r#"[["b"],{}]"#,
+                r#"[["c"],1]"#,
+                r#"[["c"]]"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_tostream_top_level_scalar() {
+        assert_eq!(outputs(b"1", "tostream"), [r"[[],1]"]);
+    }
+
+    #[test]
+    fn test_tostream_top_level_empty_array() {
+        assert_eq!(outputs(b"[]", "tostream"), [r"[[],[]]"]);
+    }
+
+    #[test]
+    fn test_tostream_top_level_empty_object() {
+        assert_eq!(outputs(b"{}", "tostream"), [r"[[],{}]"]);
+    }
+
+    #[test]
+    fn test_fromstream_roundtrip_object() {
+        assert_eq!(
+            outputs(br#"{"a":1,"b":[2,3]}"#, "fromstream(tostream)"),
+            [r#"{"a":1,"b":[2,3]}"#]
+        );
+    }
+
+    #[test]
+    fn test_fromstream_roundtrip_array() {
+        assert_eq!(outputs(b"[10,20]", "fromstream(tostream)"), ["[10,20]"]);
+    }
+
+    #[test]
+    fn test_fromstream_roundtrip_scalar() {
+        assert_eq!(outputs(b"1", "fromstream(tostream)"), ["1"]);
+    }
+
+    #[test]
+    fn test_fromstream_multiple_values() {
+        // Exercises the state-reset-on-completion path with two independent
+        // top-level values in one event stream, not just a single round trip.
+        assert_eq!(
+            outputs(
+                br#"[[["a"],1],[["a"]],[["b"],2],[["b"]]]"#,
+                "fromstream(.[])"
+            ),
+            [r#"{"a":1}"#, r#"{"b":2}"#]
+        );
+    }
+
+    #[test]
+    fn test_truncate_stream_depth1() {
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":1,"c":2}}"#,
+                ". as $doc | 1 | truncate_stream($doc|tostream)"
+            ),
+            [r#"[["b"],1]"#, r#"[["c"],2]"#, r#"[["c"]]"#]
+        );
+    }
+
+    #[test]
+    fn test_truncate_stream_depth0_is_identity() {
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":1,"c":2}}"#,
+                ". as $doc | 0 | truncate_stream($doc|tostream)"
+            ),
+            outputs(br#"{"a":{"b":1,"c":2}}"#, "tostream")
+        );
+    }
+
+    #[test]
+    fn test_truncate_stream_then_fromstream() {
+        // The documented idiom for pulling one sub-object out of a stream.
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":1,"c":2},"d":9}"#,
+                ". as $doc | 1 | fromstream(truncate_stream($doc|tostream))"
+            ),
+            [r#"{"b":1,"c":2}"#]
+        );
+    }
+
+    #[test]
+    fn test_truncate_stream_null_depth_keeps_everything() {
+        // jq's own definition compares path length against `$n` with the
+        // generic `>` operator, not a type check: every length sorts above
+        // `null` in jq's ordering, so a null depth keeps every event
+        // unmodified rather than erroring on a non-numeric depth.
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":1,"c":2}}"#,
+                "null | truncate_stream(([[[\"a\",\"b\"],1],[[\"a\",\"c\"],2]])|.[])"
+            ),
+            [r#"[["a","b"],1]"#, r#"[["a","c"],2]"#]
         );
     }
 
