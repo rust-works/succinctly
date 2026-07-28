@@ -127,6 +127,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key regardless of how the duplicate arose (compact output is correct),
   tracked in the known-failures manifest rather than blocking this fix.
 
+- **YAML duplicate mapping keys resolved `.key` to the first occurrence
+  instead of the last** (#174): `a: 1\na: 2` gave `.a == 1`; both `yq`
+  (mikefarah, which reads the last entry for a path lookup while otherwise
+  passing duplicate keys through unmerged) and YAML 1.2 want the last.
+  The parser already indexed both keys — iteration (`.[]`) and `keys` both
+  see both entries — only `YamlFields::find`, the name-based lookup behind
+  `.key` field access (used by both the JSON-shaped and generic/cursor
+  evaluators), returned on the first match instead of keeping the last one
+  seen. (`to_entries` and JSON/`-o=json` output still collapse duplicate keys
+  to a single entry via the owned-value conversion in `to_owned` — a
+  separate, still-open gap, not fixed here.)
+
 - **`yq-locate` reported a short byte range for a plain scalar containing `#`**
   (#411): `a#b: 1` loads as `{"a#b":1}` — YAML's `ns-plain-char` admits a `#`
   that is not preceded by white space — but `syq-locate --offset 0` reported
