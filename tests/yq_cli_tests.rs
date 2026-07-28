@@ -1344,6 +1344,45 @@ fn test_yaml_seq_item_question_mark_without_space_is_a_scalar() -> Result<()> {
 }
 
 // =============================================================================
+// A non-scalar explicit key at ordinary mapping level (#172) - `? - a\n  - b\n:
+// value` used to lose the whole entry (`{}`). Fixed as a side effect of #325
+// (key-side parsing, via the same route as the #339 sequence-item fix) and
+// #429/#346 (the mid-line-return fix that let the value survive in nested
+// positions). Expectations are mikefarah/yq v4.53.3 output.
+// =============================================================================
+
+#[test]
+fn test_yaml_explicit_non_scalar_key_headline_repro() -> Result<()> {
+    // The original #172 repro: `{}` before the fix, both key and value lost.
+    let input = "? - a\n  - b\n: value\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"":"value"}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_non_scalar_key_keeps_its_siblings() -> Result<()> {
+    // Entries before and after the explicit entry are unaffected.
+    let input = "x: 1\n? - a\n  - b\n: value\ny: 2\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"x":1,"":"value","y":2}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_non_scalar_key_two_entries_in_one_mapping() -> Result<()> {
+    // Two non-scalar-keyed entries in one mapping - yq keeps both `""` entries,
+    // same as the #346 same-line case's two-complex-keys pin.
+    let input = "? - a\n: v1\n? - b\n: v2\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"":"v1","":"v2"}"#);
+    Ok(())
+}
+
+// =============================================================================
 // An explicit key and its `: ` on one line (#346) - `? k: v` makes the whole
 // `k: v` a mapping used as the key, so the entry has a complex key (rendered
 // `""`) and no value. Expectations are mikefarah/yq v4.53.3 output.
