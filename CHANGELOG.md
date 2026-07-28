@@ -103,6 +103,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **YAML explicit non-scalar keys silently dropped the entry** (#172,
+  resolved by drift): `? - a\n  - b\n: value` used to load as `{}`, losing
+  both the key and the value, silently — no error, well-formed JSON out. Not
+  fixed by a dedicated change: #325's rewrite of `parse_explicit_key` to
+  delegate the key side to `parse_sequence_item` fixed the key parsing, and
+  #429 (closing #346)'s fix for `parse_explicit_key`'s mid-line return fixed
+  the value surviving in nested positions — together they resolved every
+  shape discussed on the issue. Re-verified against `yq` v4.53.3 across nine
+  shapes (block-sequence, flow-sequence and flow-mapping keys; with and
+  without a value; at top level, as a sibling of other entries, and two in
+  one mapping), all matching byte-for-byte; `yq` has no way to render a
+  non-scalar key, so both sides collapse it to `""` and the divergence is
+  now only in that (expected) rendering, not in whether the value survives.
+  New regression coverage locks this in:
+  `test_explicit_non_scalar_key_at_mapping_level` in `src/yaml/light.rs`,
+  three `tests/yq_cli_tests.rs` cases, and a new
+  `explicit_key_non_scalar_{compact,pretty}` golden pair. One shape stays a
+  known, unrelated divergence — a *same-line* flow collection key (`? []: x`)
+  — documented in `docs/compliance/yaml/limitations.md`. Building the new
+  golden pair's two-duplicate-keys case also surfaced a distinct bug, filed
+  separately as #442: pretty-printed JSON silently drops a duplicate mapping
+  key regardless of how the duplicate arose (compact output is correct),
+  tracked in the known-failures manifest rather than blocking this fix.
+
 - **`yq-locate` reported a short byte range for a plain scalar containing `#`**
   (#411): `a#b: 1` loads as `{"a#b":1}` — YAML's `ns-plain-char` admits a `#`
   that is not preceded by white space — but `syq-locate --offset 0` reported
