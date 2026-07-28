@@ -16416,9 +16416,10 @@ mod tests {
             }
         );
 
-        // jq's ltrimstr is total: non-string input passes through unchanged (#394)
+        // jq's ltrimstr is total: non-string input passes through unchanged (#394).
+        // A document-sourced number materializes as NumberLiteral, not Int (#387).
         query!(b"1", r#"ltrimstr("a")"#,
-            QueryResult::Owned(OwnedValue::Int(n)) => {
+            QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => {
                 assert_eq!(n, 1);
             }
         );
@@ -16446,9 +16447,10 @@ mod tests {
             }
         );
 
-        // jq's rtrimstr is total: non-string input passes through unchanged (#394)
+        // jq's rtrimstr is total: non-string input passes through unchanged (#394).
+        // A document-sourced number materializes as NumberLiteral, not Int (#387).
         query!(b"1", r#"rtrimstr("a")"#,
-            QueryResult::Owned(OwnedValue::Int(n)) => {
+            QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => {
                 assert_eq!(n, 1);
             }
         );
