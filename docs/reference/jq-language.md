@@ -197,6 +197,11 @@ The implementation covers ~95% of jq functionality and is production-ready.
 - [x] `isvalid(expr)`
 - [x] `modulemeta(name)` (stub)
 - [x] `tojsonstream` / `fromjsonstream`
+- [x] `tostream` / `fromstream(f)` / `truncate_stream(f)` — jq's standard streaming
+  builtins (#396). Distinct from `tojsonstream`/`fromjsonstream` above, which predate
+  these and use a different (non-standard) event shape; both pairs are kept for
+  compatibility. `truncate_stream(f)` takes a single argument, not `depth; f` — the
+  depth comes from `.`, matching jq's own `def truncate_stream(stream): . as $n | stream | ...`.
 - [x] `map(f)` / `map_values(f)`
 
 ### Date/Time Functions

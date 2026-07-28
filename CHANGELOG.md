@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **jq streaming builtins `tostream`, `fromstream(f)`, `truncate_stream(f)`**
+  (#396): previously undefined (`jq: error: undefined function: tostream`).
+  `tostream` walks a value emitting jq's `[path,value]` leaf events (including
+  empty containers, which jq treats as leaves) and `[path]` closing markers
+  after each non-empty container; `fromstream(f)` reconstructs values from
+  such a stream; `truncate_stream(f)` drops the leading `.` path components —
+  note it takes a single filter argument, not `depth; f`, since the depth
+  comes from `.` itself, matching jq's own
+  `def truncate_stream(stream): . as $n | stream | ...`. The existing
+  `tojsonstream`/`fromjsonstream` (different, non-standard event shape) are
+  unchanged and kept alongside these for compatibility.
+
 - **Computed keys in jq index brackets** (#360, closing the index half of
   #155): `.[e]` accepts any expression, matching jq's `'[' Exp ']'`. `.[$k]`,
   `.[.k]`, `.[("a","b")]` and `.[1,2]` all work, in value position and in path
@@ -108,6 +120,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one tab immediately before a `#`, and it sits in value position (already
   handled correctly) rather than in a key — no fixture moved.
   `tests/yaml_tab_comment_tests.rs` covers the key-side guard now.
+
+- **A pipe continuing after a freshly-computed value collapsed multi-output
+  results into one array** (found while implementing #396): `eval_owned_pipe`
+  — reached whenever the left side of `|` is a computed value rather than one
+  navigated straight out of the document (an `as` binding, arithmetic, object
+  or array construction, and so on) — called `eval_owned_expr`, whose own doc
+  comment says it intentionally collapses multi-output into a single array
+  (correct for `reduce`/`foreach`, wrong here). `. as $doc | $doc | paths` on
+  `{"a":{"b":1}}` produced `[["a"],["a","b"]]` instead of streaming `["a"]`
+  and `["a","b"]` separately — reproducible with any multi-output filter
+  (`paths`, `range`, `.[]`, and the new `tostream`), not just the new
+  builtins. Fixed by switching to `eval_owned_input`, a sibling helper already
+  written for exactly this (its doc comment: `eval_owned_expr` "is wrong for a
+  filter that is allowed to fan out"); the caller's `match` already had a live
+  `ManyOwned` arm anticipating it. No test regressions across the full suite.
 
 - **`//` discarded a left-hand error instead of propagating it** (#377):
   `eval_alternative` treated a left-hand `Error` the same as `None` and fell
