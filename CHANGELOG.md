@@ -103,6 +103,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`yq-locate` reported a short byte range for a plain scalar containing `#`**
+  (#411): `a#b: 1` loads as `{"a#b":1}` — YAML's `ns-plain-char` admits a `#`
+  that is not preceded by white space — but `syq-locate --offset 0` reported
+  the byte range `[0, 1]`, covering only `a`. `find_scalar_end`, the cursor's
+  re-derivation of a scalar's extent used by `yq-locate` and `at_offset`,
+  broke on every `#` unconditionally; the parser's own derivation
+  (`parse_unquoted_key` / `parse_unquoted_value_*`), which `yq` reads from,
+  already had the white-space guard right. Same fourth copy of the #106
+  story as #370 (a tab) and #381 (a continuation-line tab) — a second
+  "where does this scalar end" that drifted from the first, this time
+  triggered by `#` rather than a tab. Affects values as well as keys (`k:
+  a#b`). `find_scalar_end` now shares the guard its dead sibling
+  `find_plain_scalar_end` already had.
+
 - **A tab before `#` did not start a comment in a plain YAML key** (#410):
   `a\t# c: d` loaded as `{"a\t# c":"d"}`, folding the comment text into the
   key, where `a # c: d` (a space in the same position) already raised

@@ -716,7 +716,16 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         while end < self.text.len() {
             match self.text[end] {
                 // Block context delimiters
-                b'\n' | b'\r' | b'#' => break,
+                b'\n' | b'\r' => break,
+                b'#' => {
+                    // # preceded by white space is a comment; otherwise it's
+                    // part of the scalar (ns-plain-char admits a `#` that is
+                    // not preceded by white space, e.g. `a#b`).
+                    if end > start && matches!(self.text[end - 1], b' ' | b'\t') {
+                        break;
+                    }
+                    end += 1;
+                }
                 // Flow context delimiters
                 b',' | b']' | b'}' => break,
                 b':' => {
