@@ -5909,10 +5909,7 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Pipe(exprs.to_vec())
     };
 
-    match eval_owned_expr::<S>(&rest_expr, &value, optional) {
-        Ok(v) => QueryResult::Owned(v),
-        Err(e) => QueryResult::Error(e),
-    }
+    eval_owned_input::<W, S>(&rest_expr, &value, optional)
 }
 
 /// Find a field in an object by name.
@@ -17089,6 +17086,25 @@ mod tests {
                 assert_eq!(obj.get("name"), Some(&OwnedValue::String("Alice".to_string())));
                 assert_eq!(obj.get("greeting"), Some(&OwnedValue::String("Hello".to_string())));
             }
+        );
+    }
+
+    #[test]
+    fn test_variable_binding_preserves_streaming_through_a_multi_output_filter() {
+        // A pipe stage after `as` binds a value is still a pipe: piping a
+        // bound variable into a multi-output filter must keep streaming N
+        // separate top-level outputs, the same as piping the document
+        // itself would. `$doc | paths` used to collapse into one array
+        // (`eval_owned_pipe` collapsed through `eval_owned_expr`, which is
+        // correct for `reduce`/`foreach` but not for a plain pipe
+        // continuation) where `paths` alone streams correctly.
+        assert_eq!(
+            outputs(br#"{"a":{"b":1}}"#, ". as $doc | $doc | paths"),
+            outputs(br#"{"a":{"b":1}}"#, "paths")
+        );
+        assert_eq!(
+            outputs(br#"{"a":{"b":1}}"#, ". as $doc | $doc | paths"),
+            [r#"["a"]"#, r#"["a","b"]"#]
         );
     }
 
