@@ -5,6 +5,8 @@
 //! JSON and YAML without intermediate conversion.
 
 #[cfg(not(test))]
+use alloc::boxed::Box;
+#[cfg(not(test))]
 use alloc::format;
 #[cfg(not(test))]
 use alloc::string::{String, ToString};
