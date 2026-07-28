@@ -264,20 +264,13 @@ fn containment_matches_jq_in_the_generic_evaluator() {
 /// character '?'"), where jq accepts all three. That is a parser gap unrelated to
 /// containment; going through the builder still exercises the evaluators' real
 /// `Expr::Optional` path, so this starts covering the surface syntax the moment
-/// the parser catches up.
+/// the parser catches up (#367).
 ///
-/// Two gaps therefore sit behind this test, both pre-existing and both invisible
-/// until `contains` started erroring at all:
-///
-/// 1. the parser cannot express `contains("a")?` (#367);
-/// 2. the generic evaluator drops the flag (#386): its catch-all arm re-enters the full
-///    evaluator with a fresh `optional = false`
-///    (`src/jq/eval_generic.rs`, the `_ =>` fallback), so an optional-wrapped
-///    builtin it does not implement itself loses its optionality.
-///
-/// Gap 2 is pinned below rather than fixed, so the divergence is on record and a
-/// fix is forced to update this test — the convention
-/// `tests/jq_evaluator_parity_tests.rs` uses for evaluator drift.
+/// Both evaluators agree here: the generic evaluator's fallback to the full
+/// evaluator for builtins it doesn't implement itself now threads `optional`
+/// through (`src/jq/eval_generic.rs`, `eval_on_owned`/`eval_on_many_owned`), so
+/// an optional-wrapped builtin it delegates is suppressed the same way as the
+/// full evaluator (#386, previously pinned as open drift here).
 #[test]
 fn optional_suppresses_the_error() {
     for filter in [r#"contains("a")"#, r"inside([1])"] {
@@ -295,13 +288,14 @@ fn optional_suppresses_the_error() {
             "full evaluator: optional {filter} should yield nothing"
         );
 
-        // Gap 2, pinned (#386): the CLI path still raises. Flip this to the
-        // assertions above once the fallback threads `optional` through.
         let generic = eval_generic::eval_with_cursor(&expr, index.root(json));
         assert!(
-            generic.is_error(),
-            "generic evaluator: optional {filter} unexpectedly suppressed — \
-             the fallback now threads `optional`, so tighten this test"
+            !generic.is_error(),
+            "generic evaluator: optional {filter} should be suppressed"
+        );
+        assert!(
+            generic.collect_owned().is_empty(),
+            "generic evaluator: optional {filter} should yield nothing"
         );
     }
 }
