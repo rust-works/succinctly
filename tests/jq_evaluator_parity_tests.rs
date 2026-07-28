@@ -380,3 +380,44 @@ fn test_optional_pipe_fallback_no_longer_raises_386() {
         "generic evaluator: optional pipe should be suppressed, not raise"
     );
 }
+
+#[test]
+fn test_parity_number_literal_preservation_387() {
+    // `tostring`/`tojson`/`@json`/string interpolation on a document number
+    // used to lose the source literal and re-render Rust's own `f64::Display`
+    // (`1e100` -> a 101-digit integer). `tostring` is implemented directly in
+    // both evaluators (`eval.rs::builtin_tostring`,
+    // `eval_generic.rs::Builtin::ToString`), so this is exactly the kind of
+    // two-implementation drift this file exists to catch (#387).
+    //
+    // Every expectation is pinned against jq-1.7.1 first, so parity can't lock
+    // in an agreed-upon wrong answer.
+    for (json, filter, expected) in [
+        (b"1e100".as_slice(), "tostring", "1E+100"),
+        (b"1.0", "tostring", "1.0"),
+        (b"-0.0", "tostring", "-0.0"),
+        (b"1e-7", "tostring", "1E-7"),
+        (b"1e100", "tojson", "1E+100"),
+        (b"1.0", "tojson", "1.0"),
+        (b"1e100", r#""\(.)""#, "1E+100"),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(json, filter)),
+            [format!("\"{expected}\"")],
+            "full evaluator disagrees with jq for `{filter}` on `{}`",
+            String::from_utf8_lossy(json)
+        );
+        assert_parity(json, filter);
+    }
+
+    // A computed number (post-arithmetic) is a fresh value, not a passthrough,
+    // so it drops the literal and both evaluators still agree with each other
+    // -- this only pins parity, not a specific jq-matching spelling (that gap
+    // is pre-existing and unrelated to #387; see CLAUDE.md's own notes).
+    assert_parity(b"1e100", "(. + 0) | tostring");
+
+    // The streaming identity path was already correct before #387 and must
+    // stay that way -- `-0.0` in particular is the case the original report
+    // used to show identity was fine while `tostring` was not.
+    assert_parity(b"-0.0", ".");
+}
