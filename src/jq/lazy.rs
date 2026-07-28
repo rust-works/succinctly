@@ -263,6 +263,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
         match self {
             JqValue::Int(n) => Some(*n),
             JqValue::Float(f) if (*f - (*f as i64 as f64)).abs() < f64::EPSILON => Some(*f as i64),
+            JqValue::NumberLiteral(literal) => OwnedValue::from_number_literal(literal).as_i64(),
             JqValue::RawNumber(bytes) => core::str::from_utf8(bytes)
                 .ok()
                 .and_then(|s| s.parse().ok()),
@@ -279,6 +280,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
         match self {
             JqValue::Int(n) => Some(*n as f64),
             JqValue::Float(f) => Some(*f),
+            JqValue::NumberLiteral(literal) => OwnedValue::from_number_literal(literal).as_f64(),
             JqValue::RawNumber(bytes) => core::str::from_utf8(bytes)
                 .ok()
                 .and_then(|s| s.parse().ok()),
@@ -817,6 +819,30 @@ mod tests {
         // consistent with how it treats `RawNumber`/`Cursor`.
         let via_write: JqValue<'_, Vec<u64>> = JqValue::from_owned(owned);
         assert_eq!(via_write.to_json_string(), "1e100");
+    }
+
+    #[test]
+    fn test_jqvalue_number_literal_as_i64_and_as_f64() {
+        // Builtins like skip(n; ...)/nth(n; ...)/parent(n) read a numeric
+        // argument through as_i64()/as_f64() (or an equivalent match on
+        // Int/Float); a NumberLiteral-typed argument (the common case once a
+        // document number flows through) must resolve the same as a plain
+        // Int/Float, not silently read as "not a number".
+        let int_lit: JqValue<'_, Vec<u64>> =
+            JqValue::from_owned(OwnedValue::from_number_literal("2"));
+        assert_eq!(int_lit.as_i64(), Some(2));
+        assert_eq!(int_lit.as_f64(), Some(2.0));
+
+        let float_lit: JqValue<'_, Vec<u64>> =
+            JqValue::from_owned(OwnedValue::from_number_literal("1.5"));
+        assert_eq!(float_lit.as_i64(), None);
+        assert_eq!(float_lit.as_f64(), Some(1.5));
+
+        // An integral-valued Float repr (e.g. from "2.0") still converts to
+        // i64, same as JqValue::Float's own integral-value branch above.
+        let integral_float_lit: JqValue<'_, Vec<u64>> =
+            JqValue::from_owned(OwnedValue::from_number_literal("2.0"));
+        assert_eq!(integral_float_lit.as_i64(), Some(2));
     }
 
     #[test]

@@ -4045,8 +4045,9 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
             }
         }
-        QueryResult::Owned(OwnedValue::Int(i)) => i as usize,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as usize,
+        QueryResult::Owned(
+            ref owned @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)),
+        ) => owned.as_f64().unwrap_or(0.0) as usize,
         QueryResult::Error(e) => return QueryResult::Error(e),
         _ => return QueryResult::Error(EvalError::type_error("number", "null")),
     };
@@ -8736,8 +8737,10 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
     if let Expr::Builtin(Builtin::ParentN(n_expr)) = first {
         // Evaluate n
         let n = match eval_owned_expr::<S>(n_expr, value, optional) {
-            Ok(OwnedValue::Int(i)) => i as usize,
-            Ok(OwnedValue::Float(f)) => f as usize,
+            Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) => i as usize,
+            Ok(OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => {
+                f as usize
+            }
             Ok(_) if optional => return QueryResult::None,
             Ok(_) => return QueryResult::Error(EvalError::type_error("number", "other")),
             Err(_) if optional => return QueryResult::None,
@@ -12144,8 +12147,9 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
             }
         }
-        QueryResult::Owned(OwnedValue::Int(i)) => i as usize,
-        QueryResult::Owned(OwnedValue::Float(f)) => f as usize,
+        QueryResult::Owned(
+            ref owned @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)),
+        ) => owned.as_f64().unwrap_or(0.0) as usize,
         QueryResult::Error(e) => return QueryResult::Error(e),
         _ => return QueryResult::Error(EvalError::type_error("number", "null")),
     };
@@ -20484,6 +20488,38 @@ mod tests {
             QueryResult::Owned(v) => {
                 assert_eq!(v, OwnedValue::Int(20));
             }
+        );
+    }
+
+    #[test]
+    fn test_nth_stream_number_literal_n_387() {
+        // A bare `.n` field access stays a lazy StandardJson::Number cursor
+        // (QueryResult::One), which already worked fine -- it never goes
+        // through to_owned()'s NumberLiteral conversion. getpath(["n"])
+        // forces materialization through to_owned(), so `n` arrives as
+        // QueryResult::Owned(OwnedValue::NumberLiteral(..)), which is the
+        // arm that was actually broken. The n-arm match in
+        // builtin_nth_stream must treat that the same as a plain Int/Float,
+        // not fall through to a "expected number, got null" error.
+        assert_eq!(
+            outputs(
+                br#"{"n":2,"arr":[10,20,30,40,50]}"#,
+                r#"nth(getpath(["n"]); .arr[])"#
+            ),
+            ["30"]
+        );
+    }
+
+    #[test]
+    fn test_skip_number_literal_n_387() {
+        // See test_nth_stream_number_literal_n_387 for why getpath (not a
+        // bare `.n`) is required to reach the previously-broken arm.
+        assert_eq!(
+            outputs(
+                br#"{"n":2,"arr":[10,20,30,40,50]}"#,
+                r#"[skip(getpath(["n"]); .arr[])]"#
+            ),
+            ["[30,40,50]"]
         );
     }
 
