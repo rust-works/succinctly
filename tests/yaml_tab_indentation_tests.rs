@@ -252,6 +252,11 @@ fn a_tab_used_as_separation_still_produces_its_value() {
     // opening quote is the node's first byte and it reads as the quoted scalar
     // it is, rather than as a mapping (#381).
     assert_eq!(to_json(b"a:\n \t\"x: y\"\n").unwrap(), r#"{"a":"x: y"}"#);
+
+    // The single-quoted form of the row above — a separate dispatch arm
+    // (`parse_single_quoted`), so it needs its own pinned value rather than
+    // relying on the double-quoted case to stand in for it.
+    assert_eq!(to_json(b"a:\n \t'x: y'\n").unwrap(), r#"{"a":"x: y"}"#);
 }
 
 /// `parse_document_line` is not always entered at a line start — `parse_explicit_key`
