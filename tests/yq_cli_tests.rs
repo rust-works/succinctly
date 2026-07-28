@@ -1776,6 +1776,19 @@ fn test_yaml_explicit_non_scalar_key_two_entries_in_one_mapping() -> Result<()> 
     Ok(())
 }
 
+#[test]
+fn test_yaml_anchored_first_item_of_explicit_key_sequence_binds() -> Result<()> {
+    // `? - &a 1` anchors the sequence's first item inline, not the `?` key as a
+    // whole. This is the one call site that reaches `parse_value` with the
+    // anchor still at the cursor (every other caller strips it first), so it's
+    // the sole remaining coverage for that branch.
+    let input = "? - &a 1\n: b\nc: *a\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"":"b","c":1}"#);
+    Ok(())
+}
+
 // =============================================================================
 // An explicit key and its `: ` on one line (#346) - `? k: v` makes the whole
 // `k: v` a mapping used as the key, so the entry has a complex key (rendered
