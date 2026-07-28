@@ -528,6 +528,18 @@ fn test_yaml_output_format() -> Result<()> {
 }
 
 #[test]
+fn test_duplicate_mapping_key_is_last_wins() -> Result<()> {
+    // YAML 1.2 / yq: a mapping with a duplicate key resolves `.key` to the
+    // *last* occurrence, not the first (issue #174).
+    let yaml = "a: 1\na: 2\n";
+    let (output, code) = run_yq_stdin(".a", yaml, &[])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "2");
+    Ok(())
+}
+
+#[test]
 fn test_compact_json_output() -> Result<()> {
     let yaml = r"
 a: 1
