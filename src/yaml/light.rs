@@ -3080,17 +3080,21 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
     }
 
     /// Find a field by name.
+    ///
+    /// YAML permits duplicate mapping keys; per YAML 1.2 and to match `yq`,
+    /// the last matching entry wins (see issue #174).
     pub fn find(&self, name: &str) -> Option<YamlValue<'a, W>> {
         let mut fields = *self;
+        let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
             if let YamlValue::String(key) = field.key() {
                 if key.as_str().ok()? == name {
-                    return Some(field.value());
+                    result = Some(field.value());
                 }
             }
             fields = rest;
         }
-        None
+        result
     }
 }
 
@@ -5055,6 +5059,25 @@ mod tests {
             if let Some(YamlValue::String(s)) = fields.find("name") {
                 assert_eq!(&*s.as_str().unwrap(), "Alice");
             }
+        }
+    }
+
+    #[test]
+    fn test_duplicate_mapping_key_find_is_last_wins() {
+        // YAML 1.2 / yq: `.a` on a mapping with a duplicate key resolves to
+        // the *last* occurrence, not the first (issue #174).
+        let yaml = b"a: 1\na: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let root = index.root(yaml);
+
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            if let Some(YamlValue::String(s)) = fields.find("a") {
+                assert_eq!(&*s.as_str().unwrap(), "2");
+            } else {
+                panic!("expected string scalar \"2\"");
+            }
+        } else {
+            panic!("expected mapping");
         }
     }
 
