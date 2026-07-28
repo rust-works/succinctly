@@ -69,7 +69,7 @@ use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey,
     Pattern, StringPart,
 };
-use super::value::OwnedValue;
+use super::value::{format_number_jq_compat, NumberRepr, OwnedValue};
 
 /// Result of evaluating a jq expression.
 #[derive(Debug)]
@@ -182,7 +182,7 @@ fn jq_kind(value: &OwnedValue) -> u8 {
         OwnedValue::Bool(false) => JQ_KIND_FALSE,
         OwnedValue::Bool(true) => JQ_KIND_TRUE,
         // jq has one number kind; `1 | contains(1.0)` is a comparison, not an error.
-        OwnedValue::Int(_) | OwnedValue::Float(_) => JQ_KIND_NUMBER,
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => JQ_KIND_NUMBER,
         OwnedValue::String(_) => JQ_KIND_STRING,
         OwnedValue::Array(_) => JQ_KIND_ARRAY,
         OwnedValue::Object(_) => JQ_KIND_OBJECT,
@@ -227,16 +227,11 @@ fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue 
     match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
-        StandardJson::Number(n) => {
-            if let Ok(i) = n.as_i64() {
-                OwnedValue::Int(i)
-            } else if let Ok(f) = n.as_f64() {
-                OwnedValue::Float(f)
-            } else {
-                // Fallback - shouldn't happen for valid JSON
-                OwnedValue::Float(0.0)
-            }
-        }
+        StandardJson::Number(n) => match core::str::from_utf8(n.raw_bytes()) {
+            Ok(s) => OwnedValue::from_number_literal(s),
+            // Fallback - shouldn't happen for valid JSON
+            Err(_) => OwnedValue::Float(0.0),
+        },
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
                 OwnedValue::String(cow.into_owned())
@@ -914,6 +909,10 @@ fn arith_add<S: EvalSemantics>(
     left: OwnedValue,
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
+    // A `NumberLiteral` operand degrades to plain `Int`/`Float` the moment it
+    // computes with something -- jq gives computed numbers canonical
+    // formatting, only values that reach output untouched keep their literal.
+    let (left, right) = (left.into_plain_number(), right.into_plain_number());
     match (left, right) {
         // Number addition - jq converts to float on overflow, yq wraps
         (OwnedValue::Int(a), OwnedValue::Int(b)) => {
@@ -957,6 +956,7 @@ fn arith_sub<S: EvalSemantics>(
     left: OwnedValue,
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
+    let (left, right) = (left.into_plain_number(), right.into_plain_number());
     match (left, right) {
         // jq converts to float on overflow, yq wraps
         (OwnedValue::Int(a), OwnedValue::Int(b)) => {
@@ -988,6 +988,7 @@ fn arith_mul<S: EvalSemantics>(
     left: OwnedValue,
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
+    let (left, right) = (left.into_plain_number(), right.into_plain_number());
     match (left, right) {
         // jq converts to float on overflow, yq wraps
         (OwnedValue::Int(a), OwnedValue::Int(b)) => {
@@ -1048,6 +1049,7 @@ fn arith_div<S: EvalSemantics>(
     left: OwnedValue,
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
+    let (left, right) = (left.into_plain_number(), right.into_plain_number());
     match (left, right) {
         (OwnedValue::Int(a), OwnedValue::Int(b)) => {
             if b == 0 {
@@ -1116,6 +1118,7 @@ fn arith_mod<S: EvalSemantics>(
     left: OwnedValue,
     right: OwnedValue,
 ) -> Result<OwnedValue, EvalError> {
+    let (left, right) = (left.into_plain_number(), right.into_plain_number());
     match (left, right) {
         (OwnedValue::Int(a), OwnedValue::Int(b)) => {
             if b == 0 {
@@ -1227,6 +1230,20 @@ fn compare_values(left: &OwnedValue, right: &OwnedValue) -> core::cmp::Ordering 
         }
         (OwnedValue::Float(a), OwnedValue::Int(b)) => {
             a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
+        }
+        // A `NumberLiteral` operand compares by its parsed value, exactly
+        // like `Int`/`Float` -- ordering never looks at the source text. Try
+        // exact `i64` first (matches the `(Int,Int)` arm's precision above
+        // 2^53), fall back to the same `f64` widening the mixed `Int`/`Float`
+        // arms above use.
+        (OwnedValue::NumberLiteral(..), _) | (_, OwnedValue::NumberLiteral(..)) => {
+            match (left.as_i64(), right.as_i64()) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                _ => match (left.as_f64(), right.as_f64()) {
+                    (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+                    _ => Ordering::Equal,
+                },
+            }
         }
         (OwnedValue::String(a), OwnedValue::String(b)) => a.cmp(b),
         (OwnedValue::Array(a), OwnedValue::Array(b)) => {
@@ -2067,7 +2084,10 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::Bool(found))
         }
         // jq returns false for negative indices, yq returns true if in range
-        (OwnedValue::Int(idx), OwnedValue::Array(elements)) => {
+        (
+            OwnedValue::Int(idx) | OwnedValue::NumberLiteral(NumberRepr::Int(idx), _),
+            OwnedValue::Array(elements),
+        ) => {
             let len = elements.len() as i64;
             let in_bounds = if S::NEGATIVE_INDEX_IN_HAS {
                 // yq behavior: negative indices are valid if abs(idx) <= len
@@ -3325,8 +3345,9 @@ fn owned_to_string(value: &OwnedValue) -> String {
         OwnedValue::Null => "null".to_string(),
         OwnedValue::Bool(true) => "true".to_string(),
         OwnedValue::Bool(false) => "false".to_string(),
-        OwnedValue::Int(n) => format!("{n}"),
-        OwnedValue::Float(f) => format!("{f}"),
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+            value.number_str().expect("numeric variant").into_owned()
+        }
         OwnedValue::String(s) => s.clone(), // Don't quote strings in interpolation
         OwnedValue::Array(_) | OwnedValue::Object(_) => value.to_json(),
     }
@@ -3377,8 +3398,9 @@ fn format_uri(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> 
     // jq converts non-strings to strings first (e.g., 42 | @uri => "42")
     let s = match value {
         OwnedValue::String(s) => s.clone(),
-        OwnedValue::Int(n) => n.to_string(),
-        OwnedValue::Float(f) => f.to_string(),
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+            value.number_str().expect("numeric variant").into_owned()
+        }
         OwnedValue::Bool(b) => {
             if *b {
                 "true".to_string()
@@ -3596,8 +3618,9 @@ fn format_html(value: &OwnedValue, _optional: bool) -> Result<String, EvalError>
     // jq converts non-strings to strings first (e.g., 42 | @html => "42")
     let s = match value {
         OwnedValue::String(s) => s.clone(),
-        OwnedValue::Int(n) => n.to_string(),
-        OwnedValue::Float(f) => f.to_string(),
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+            value.number_str().expect("numeric variant").into_owned()
+        }
         OwnedValue::Bool(b) => {
             if *b {
                 "true".to_string()
@@ -3636,8 +3659,9 @@ fn shell_quote_value(value: &OwnedValue) -> String {
             }
         }
         // Numbers, bools, null are NOT quoted in jq
-        OwnedValue::Int(n) => n.to_string(),
-        OwnedValue::Float(f) => f.to_string(),
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+            value.number_str().expect("numeric variant").into_owned()
+        }
         OwnedValue::Bool(b) => {
             if *b {
                 "true".to_string()
@@ -3668,8 +3692,9 @@ fn format_sh(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
             Ok(parts.join(" "))
         }
         // Numbers, bools, null are converted to strings
-        OwnedValue::Int(n) => Ok(n.to_string()),
-        OwnedValue::Float(f) => Ok(f.to_string()),
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+            Ok(value.number_str().expect("numeric variant").into_owned())
+        }
         OwnedValue::Bool(b) => Ok(if *b {
             "true".to_string()
         } else {
@@ -3756,6 +3781,15 @@ fn props_value_to_string(value: &OwnedValue) -> String {
                 format!("{f}")
             }
         }
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => ".nan".to_string(),
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_infinite() => {
+            if *f > 0.0 {
+                ".inf".to_string()
+            } else {
+                "-.inf".to_string()
+            }
+        }
+        OwnedValue::NumberLiteral(_, literal) => format_number_jq_compat(literal.as_bytes()),
         OwnedValue::String(s) => {
             // Replace newlines with spaces, as yq does
             s.replace(['\n', '\r'], " ")
@@ -3786,6 +3820,15 @@ fn owned_to_yaml(value: &OwnedValue) -> String {
                 format!("{f}")
             }
         }
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => ".nan".to_string(),
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_infinite() => {
+            if *f > 0.0 {
+                ".inf".to_string()
+            } else {
+                "-.inf".to_string()
+            }
+        }
+        OwnedValue::NumberLiteral(_, literal) => format_number_jq_compat(literal.as_bytes()),
         OwnedValue::String(s) => yaml_quote_string(s),
         OwnedValue::Array(arr) => {
             let items: Vec<String> = arr.iter().map(owned_to_yaml).collect();
@@ -3886,6 +3929,7 @@ fn builtin_tostring<W: Clone + AsRef<[u64]>>(
         OwnedValue::Bool(false) => "false".to_string(),
         OwnedValue::Int(n) => format!("{n}"),
         OwnedValue::Float(f) => format!("{f}"),
+        OwnedValue::NumberLiteral(_, literal) => format_number_jq_compat(literal.as_bytes()),
         OwnedValue::Array(_) | OwnedValue::Object(_) => owned.to_json(),
     };
     QueryResult::Owned(OwnedValue::String(s))
@@ -3898,14 +3942,12 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Number(n) => {
-            // Already a number, return as-is
-            if let Ok(i) = n.as_i64() {
-                QueryResult::Owned(OwnedValue::Int(i))
-            } else if let Ok(f) = n.as_f64() {
-                QueryResult::Owned(OwnedValue::Float(f))
-            } else {
-                QueryResult::Owned(OwnedValue::Int(0))
-            }
+            // Already a number, return as-is -- this is a passthrough, not a
+            // computation, so (like `.`) it keeps the source literal.
+            QueryResult::Owned(match core::str::from_utf8(n.raw_bytes()) {
+                Ok(s) => OwnedValue::from_number_literal(s),
+                Err(_) => OwnedValue::Int(0),
+            })
         }
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
@@ -4802,12 +4844,9 @@ fn builtin_fromjsonstream<W: Clone + AsRef<[u64]>>(
 /// index past either end, and for NaN, which reaches no element at all.
 /// `None` is that "no such element".
 fn resolve_read_index(key: &OwnedValue, len: usize) -> Option<usize> {
-    let index = match key {
-        OwnedValue::Int(i) => *i,
-        // `as` saturates, so ±inf lands past the end and reads as `null`.
-        OwnedValue::Float(f) if !f.is_nan() => f.trunc() as i64,
-        _ => return None,
-    };
+    // `as` saturates, so ±inf lands past the end and reads as `null`; NaN
+    // returns `None` here same as it does from `numeric_key_to_index`.
+    let index = numeric_key_to_index(key)?;
     let resolved = if index < 0 { len as i64 + index } else { index };
     usize::try_from(resolved).ok().filter(|i| *i < len)
 }
@@ -5989,6 +6028,8 @@ pub(crate) fn numeric_key_to_index(key: &OwnedValue) -> Option<i64> {
     match key {
         OwnedValue::Int(i) => Some(*i),
         OwnedValue::Float(f) if !f.is_nan() => Some(f.trunc() as i64),
+        OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => Some(*i),
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if !f.is_nan() => Some(f.trunc() as i64),
         _ => None,
     }
 }
@@ -6010,7 +6051,9 @@ fn index_one<'a, W: Clone + AsRef<[u64]>>(
         OwnedValue::String(s) if indexable_by_string => {
             index_object_by_name::<W>(target, s, optional)
         }
-        OwnedValue::Int(_) | OwnedValue::Float(_) if indexable_by_number => {
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+            if indexable_by_number =>
+        {
             match numeric_key_to_index(key) {
                 Some(idx) => index_array_by_position::<W>(target, idx, optional),
                 // NaN: a number, so the container check above still applies, but
@@ -6039,7 +6082,10 @@ pub(crate) fn index_one_owned(
             Ok(Some(map.get(s).cloned().unwrap_or(OwnedValue::Null)))
         }
         (OwnedValue::String(_), OwnedValue::Null) => Ok(Some(OwnedValue::Null)),
-        (OwnedValue::Int(_) | OwnedValue::Float(_), OwnedValue::Array(items)) => {
+        (
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
+            OwnedValue::Array(items),
+        ) => {
             // A NaN key has no index, so it reads as out of bounds — null.
             let Some(idx) = numeric_key_to_index(key) else {
                 return Ok(Some(OwnedValue::Null));
@@ -6056,7 +6102,10 @@ pub(crate) fn index_one_owned(
                 .unwrap_or(OwnedValue::Null);
             Ok(Some(element))
         }
-        (OwnedValue::Int(_) | OwnedValue::Float(_), OwnedValue::Null) => Ok(Some(OwnedValue::Null)),
+        (
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
+            OwnedValue::Null,
+        ) => Ok(Some(OwnedValue::Null)),
         _ if optional => Ok(None),
         _ => Err(EvalError::cannot_index(owned_type_name(target), key)),
     }
@@ -6716,7 +6765,7 @@ fn owned_type_name(value: &OwnedValue) -> &'static str {
     match value {
         OwnedValue::Null => "null",
         OwnedValue::Bool(_) => "boolean",
-        OwnedValue::Int(_) | OwnedValue::Float(_) => "number",
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => "number",
         OwnedValue::String(_) => "string",
         OwnedValue::Array(_) => "array",
         OwnedValue::Object(_) => "object",
@@ -6807,9 +6856,11 @@ fn key_to_path_component(key: &OwnedValue, container: &OwnedValue) -> Result<Exp
     match key {
         OwnedValue::String(s) => Ok(Expr::Field(s.clone())),
         // Truncation toward zero, as in the value path.
-        OwnedValue::Int(_) | OwnedValue::Float(_) => numeric_key_to_index(key)
-            .map(Expr::Index)
-            .ok_or_else(|| EvalError::new("Cannot set array element at NaN index")),
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+            numeric_key_to_index(key)
+                .map(Expr::Index)
+                .ok_or_else(|| EvalError::new("Cannot set array element at NaN index"))
+        }
         _ => Err(EvalError::cannot_index(owned_type_name(container), key)),
     }
 }
@@ -7746,6 +7797,11 @@ fn owned_to_expr(value: &OwnedValue) -> Expr {
         OwnedValue::Bool(b) => Expr::Literal(Literal::Bool(*b)),
         OwnedValue::Int(i) => Expr::Literal(Literal::Int(*i)),
         OwnedValue::Float(f) => Expr::Literal(Literal::Float(*f)),
+        // A filter `Literal` has no source-text slot (out of scope -- see
+        // #387's plan), so a document-sourced literal degrades to its plain
+        // parsed form here, same as it does after arithmetic.
+        OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => Expr::Literal(Literal::Int(*i)),
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => Expr::Literal(Literal::Float(*f)),
         OwnedValue::String(s) => Expr::Literal(Literal::String(s.clone())),
         OwnedValue::Array(arr) => {
             // Build array construction expression with all elements
@@ -8287,9 +8343,17 @@ fn range_arg<W: Clone + AsRef<[u64]>>(result: QueryResult<'_, W>) -> Result<Rang
     match result {
         QueryResult::Owned(OwnedValue::Int(i)) => Ok(RangeNum::Int(i)),
         QueryResult::Owned(OwnedValue::Float(f)) => Ok(RangeNum::Float(f)),
+        QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) => {
+            Ok(RangeNum::Int(i))
+        }
+        QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => {
+            Ok(RangeNum::Float(f))
+        }
         QueryResult::One(v) => match to_owned(&v) {
             OwnedValue::Int(i) => Ok(RangeNum::Int(i)),
             OwnedValue::Float(f) => Ok(RangeNum::Float(f)),
+            OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => Ok(RangeNum::Int(i)),
+            OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => Ok(RangeNum::Float(f)),
             _ => Err(EvalError::new("Range bounds must be numeric")),
         },
         QueryResult::Error(e) => Err(e),
@@ -9583,6 +9647,11 @@ fn resolve_setpath_index(key: &OwnedValue, len: usize) -> Result<usize, EvalErro
             return Err(EvalError::new("Cannot set array element at NaN index"))
         }
         OwnedValue::Float(f) => f.trunc() as i64,
+        OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => *i,
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => {
+            return Err(EvalError::new("Cannot set array element at NaN index"))
+        }
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => f.trunc() as i64,
         // Not reachable from `set_value_at_path`, which matches the numeric
         // path elements before calling; stated so the helper stands alone.
         other => {
@@ -9679,7 +9748,7 @@ fn set_value_at_path(
             }
             other => Err(EvalError::cannot_index(other.type_name(), key)),
         },
-        OwnedValue::Int(_) | OwnedValue::Float(_) => {
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
             let mut arr = match value {
                 OwnedValue::Array(arr) => arr,
                 OwnedValue::Null => Vec::new(),
@@ -10307,6 +10376,8 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
         match arr.get(idx) {
             Some(OwnedValue::Int(n)) => Ok(*n),
             Some(OwnedValue::Float(f)) => Ok(*f as i64),
+            Some(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => Ok(*n),
+            Some(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => Ok(*f as i64),
             _ => Err(EvalError::new(format!(
                 "mktime: element {idx} must be a number"
             ))),
@@ -10394,6 +10465,8 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         match arr.get(idx) {
             Some(OwnedValue::Int(n)) => *n,
             Some(OwnedValue::Float(f)) => *f as i64,
+            Some(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => *n,
+            Some(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => *f as i64,
             _ => 0,
         }
     };
@@ -13078,6 +13151,8 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let idx = match key {
                     OwnedValue::Int(i) => *i,
                     OwnedValue::Float(f) => *f as i64,
+                    OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => *i,
+                    OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => *f as i64,
                     _ => continue, // Skip non-numeric indices
                 };
 
@@ -13171,6 +13246,8 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     let idx = match k {
                         OwnedValue::Int(i) => *i,
                         OwnedValue::Float(f) => *f as i64,
+                        OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => *i,
+                        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => *f as i64,
                         _ => return None,
                     };
                     // Handle negative indices
@@ -15729,8 +15806,8 @@ mod tests {
 
         // Object payload survives as an object, so the handler can index it.
         query!(br#"{"x":1}"#, r#"try error({"a":1}) catch .a"#,
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 1);
+            QueryResult::Owned(v) => {
+                assert_eq!(v, OwnedValue::Int(1));
             }
         );
 
@@ -15741,8 +15818,8 @@ mod tests {
 
         // Bare `error` raises the input, so `catch` sees it round-tripped.
         query!(br#"{"x":1}"#, "try error catch .x",
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 1);
+            QueryResult::Owned(v) => {
+                assert_eq!(v, OwnedValue::Int(1));
             }
         );
 
@@ -16098,7 +16175,7 @@ mod tests {
     #[test]
     fn test_builtin_min() {
         query!(br"[3, 1, 2]", "min",
-            QueryResult::Owned(OwnedValue::Int(1)) => {}
+            QueryResult::Owned(v) => assert_eq!(v, OwnedValue::Int(1))
         );
         query!(br#"["c", "a", "b"]"#, "min",
             QueryResult::Owned(OwnedValue::String(s)) if s == "a" => {}
@@ -16111,7 +16188,7 @@ mod tests {
     #[test]
     fn test_builtin_max() {
         query!(br"[3, 1, 2]", "max",
-            QueryResult::Owned(OwnedValue::Int(3)) => {}
+            QueryResult::Owned(v) => assert_eq!(v, OwnedValue::Int(3))
         );
         query!(br#"["c", "a", "b"]"#, "max",
             QueryResult::Owned(OwnedValue::String(s)) if s == "c" => {}
@@ -16574,8 +16651,8 @@ mod tests {
     #[test]
     fn test_builtin_last() {
         query!(br"[1, 2, 3]", "last",
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 3);
+            QueryResult::Owned(v) => {
+                assert_eq!(v, OwnedValue::Int(3));
             }
         );
     }
@@ -17078,8 +17155,8 @@ mod tests {
 
         // Already a number
         query!(br"42", "tonumber",
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 42);
+            QueryResult::Owned(v) => {
+                assert_eq!(v, OwnedValue::Int(42));
             }
         );
     }
@@ -17160,34 +17237,34 @@ mod tests {
     #[test]
     fn test_builtin_getpath() {
         query!(br#"{"a": {"b": 42}}"#, r#"getpath(["a", "b"])"#,
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 42);
+            QueryResult::Owned(v) => {
+                assert_eq!(v, OwnedValue::Int(42));
             }
         );
 
         query!(br"[1, 2, 3]", r"getpath([1])",
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 2);
+            QueryResult::Owned(v) => {
+                assert_eq!(v, OwnedValue::Int(2));
             }
         );
 
         // Negative index support
         query!(br"[1, 2, 3]", r"getpath([-1])",
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 3);
+            QueryResult::Owned(v) => {
+                assert_eq!(v, OwnedValue::Int(3));
             }
         );
 
         query!(br"[1, 2, 3]", r"getpath([-2])",
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 2);
+            QueryResult::Owned(v) => {
+                assert_eq!(v, OwnedValue::Int(2));
             }
         );
 
         // Nested with negative index
         query!(br#"{"a": [10, 20, 30]}"#, r#"getpath(["a", -1])"#,
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 30);
+            QueryResult::Owned(v) => {
+                assert_eq!(v, OwnedValue::Int(30));
             }
         );
     }
@@ -18773,8 +18850,8 @@ mod tests {
     #[test]
     fn test_debug() {
         // debug just passes through the value
-        query!(b"42", "debug", QueryResult::Owned(OwnedValue::Int(n)) => {
-            assert_eq!(n, 42);
+        query!(b"42", "debug", QueryResult::Owned(v) => {
+            assert_eq!(v, OwnedValue::Int(42));
         });
     }
 
@@ -19225,8 +19302,8 @@ mod tests {
     fn test_getpath() {
         // getpath returns Owned Int, not One StandardJson
         query!(br#"{"a": {"b": 42}}"#, r#"getpath(["a", "b"])"#,
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 42);
+            QueryResult::Owned(v) => {
+                assert_eq!(v, OwnedValue::Int(42));
             }
         );
         // Non-existent path returns null
@@ -19238,8 +19315,8 @@ mod tests {
     #[test]
     fn test_debug_msg() {
         // debug(msg) passes through value unchanged
-        query!(b"42", r#"debug("test message")"#, QueryResult::Owned(OwnedValue::Int(n)) => {
-            assert_eq!(n, 42);
+        query!(b"42", r#"debug("test message")"#, QueryResult::Owned(v) => {
+            assert_eq!(v, OwnedValue::Int(42));
         });
     }
 
@@ -20186,8 +20263,8 @@ mod tests {
     fn test_loc_line_number() {
         // $__loc__ should report line 1 for single-line filter
         query!(b"null", "$__loc__.line",
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 1);
+            QueryResult::Owned(v) => {
+                assert_eq!(v, OwnedValue::Int(1));
             }
         );
     }
@@ -20211,10 +20288,14 @@ mod tests {
         let cursor = index.root(json);
         let expr = crate::jq::parse(filter).unwrap();
         match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 2, "expected line 2 for $__loc__ on second line");
+            QueryResult::Owned(v) => {
+                assert_eq!(
+                    v,
+                    OwnedValue::Int(2),
+                    "expected line 2 for $__loc__ on second line"
+                );
             }
-            other => panic!("expected Int, got {other:?}"),
+            other => panic!("expected Owned, got {other:?}"),
         }
     }
 
@@ -20228,10 +20309,14 @@ mod tests {
         let cursor = index.root(json);
         let expr = crate::jq::parse(filter).unwrap();
         match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 3, "expected line 3 for $__loc__ on third line");
+            QueryResult::Owned(v) => {
+                assert_eq!(
+                    v,
+                    OwnedValue::Int(3),
+                    "expected line 3 for $__loc__ on third line"
+                );
             }
-            other => panic!("expected Int, got {other:?}"),
+            other => panic!("expected Owned, got {other:?}"),
         }
     }
 
@@ -20244,10 +20329,14 @@ mod tests {
         let cursor = index.root(json);
         let expr = crate::jq::parse(filter).unwrap();
         match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 1, "expected line 1 for $__loc__ in function on line 1");
+            QueryResult::Owned(v) => {
+                assert_eq!(
+                    v,
+                    OwnedValue::Int(1),
+                    "expected line 1 for $__loc__ in function on line 1"
+                );
             }
-            other => panic!("expected Int, got {other:?}"),
+            other => panic!("expected Owned, got {other:?}"),
         }
     }
 
@@ -20325,8 +20414,8 @@ mod tests {
         // last (no arg) - get last element of array
         // Note: last collects all elements to find the last, so returns Owned
         query!(b"[1, 2, 3]", "last",
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 3);
+            QueryResult::Owned(v) => {
+                assert_eq!(v, OwnedValue::Int(3));
             }
         );
     }
@@ -20335,8 +20424,8 @@ mod tests {
     fn test_nth_stream() {
         // nth(1; .[]) - get second element (0-indexed)
         query!(b"[10, 20, 30]", "nth(1; .[])",
-            QueryResult::Owned(OwnedValue::Int(n)) => {
-                assert_eq!(n, 20);
+            QueryResult::Owned(v) => {
+                assert_eq!(v, OwnedValue::Int(20));
             }
         );
     }

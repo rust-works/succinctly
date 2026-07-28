@@ -5,16 +5,193 @@
 //! references into the original JSON bytes.
 
 #[cfg(not(test))]
+use alloc::borrow::Cow;
+#[cfg(not(test))]
+use alloc::boxed::Box;
+#[cfg(not(test))]
 use alloc::format;
 #[cfg(not(test))]
 use alloc::string::{String, ToString};
 #[cfg(not(test))]
 use alloc::vec::Vec;
+#[cfg(test)]
+use std::borrow::Cow;
 
 use indexmap::IndexMap;
 
 use super::escape::{escape_json_body, write_json_body_jq};
 use super::expr::Literal;
+
+/// The parsed value backing a [`OwnedValue::NumberLiteral`], kept separate
+/// from the source text so arithmetic/comparison can read it without
+/// touching the `Box<str>`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NumberRepr {
+    Int(i64),
+    Float(f64),
+}
+
+/// Format a raw JSON number string the way jq itself would print it.
+///
+/// This is jq's number formatting, not a verbatim echo of `raw`: jq always
+/// renders a number through its own canonical algorithm, so `jq -c .` on
+/// `1e100` prints `1E+100`, not the `1e100` the document actually contains.
+/// `OwnedValue::NumberLiteral` keeps the raw text so this can be derived
+/// on demand (Rust's own `f64`/`i64` `Display` can't reproduce it -- that
+/// mismatch is issue #387).
+///
+/// - Integers: output as-is
+/// - Floats with trailing zeros: preserve them (`0.10` -> `0.10`)
+/// - Scientific notation: normalize mantissa (`12e2` -> `1.2E+3`), uppercase E, explicit +
+/// - `e0`/`e-0`: eliminate the exponent entirely (`5.5e0` -> `5.5`)
+/// - Negative exponents >= -5: convert to decimal (`1e-3` -> `0.001`)
+/// - Negative exponents < -5: keep scientific (`1e-10` -> `1E-10`)
+/// - Negative zero: preserved as `-0`
+///
+/// Shared by the CLI's `--jq-compat` output formatter
+/// (`src/bin/succinctly/jq_runner.rs`) and every library-level path that
+/// renders a `NumberLiteral` (`to_json`, `tostring`, `@json`, string
+/// interpolation, error-message previews) -- a single definition so the two
+/// cannot drift, per the #106 lesson in `CLAUDE.md`.
+pub fn format_number_jq_compat(raw: &[u8]) -> String {
+    let s = match core::str::from_utf8(raw) {
+        Ok(s) => s,
+        Err(_) => return String::from_utf8_lossy(raw).into_owned(),
+    };
+
+    // Check if it contains exponent notation
+    let has_exp = s.contains('e') || s.contains('E');
+    let has_dot = s.contains('.');
+
+    if !has_exp && !has_dot {
+        // Plain integer - output as-is
+        return s.to_string();
+    }
+
+    if !has_exp {
+        // Plain decimal without exponent - preserve as-is (keeps trailing zeros)
+        return s.to_string();
+    }
+
+    // Has exponent - need to reformat according to jq rules
+    // Parse the full number to get the actual value
+    let value: f64 = match s.parse() {
+        Ok(v) => v,
+        Err(_) => return s.to_string(),
+    };
+
+    // Parse exponent to check for e0/e-0
+    let exp: i32 = if let Some(pos) = s.find(['e', 'E']) {
+        s[pos + 1..].parse().unwrap_or(0)
+    } else {
+        0
+    };
+
+    // For e0 or e-0, jq eliminates the exponent
+    if exp == 0 {
+        // Check if result is integer
+        if value.fract() == 0.0 && value.abs() < 1e15 {
+            return format!("{}", value as i64);
+        }
+        // Format as plain decimal
+        return format!("{value}");
+    }
+
+    // For negative exponents >= -5, jq converts to decimal
+    if (-5..0).contains(&exp) {
+        // Convert to decimal: 1e-3 → 0.001
+        // Use smart rounding to avoid floating point noise
+        return format_decimal_jq(value);
+    }
+
+    // For other cases, use normalized scientific notation
+    // jq normalizes mantissa to have one digit before decimal point
+    if value == 0.0 {
+        return "0".to_string();
+    }
+
+    let abs_value = value.abs();
+    let log10 = libm::log10(abs_value).floor() as i32;
+    let normalized_mantissa = abs_value / libm::pow(10.0, log10 as f64);
+    let new_exp = log10;
+
+    // Format mantissa with appropriate precision
+    // Round to avoid floating point noise (e.g., 9.199999999999999 → 9.2)
+    let mantissa_str = format_mantissa_jq(normalized_mantissa);
+
+    let sign = if value < 0.0 { "-" } else { "" };
+    let exp_sign = if new_exp >= 0 { "+" } else { "" };
+    format!("{sign}{mantissa_str}E{exp_sign}{new_exp}")
+}
+
+/// Format a mantissa value for jq-compatible output.
+/// Handles floating point precision issues by rounding appropriately.
+fn format_mantissa_jq(value: f64) -> String {
+    // Check if it's essentially an integer
+    if (value.round() - value).abs() < 1e-10 {
+        return format!("{}", value.round() as i64);
+    }
+
+    // Try different precisions and pick the shortest that rounds back correctly
+    for precision in 1..=15 {
+        let formatted = format!("{value:.precision$}");
+        if let Ok(parsed) = formatted.parse::<f64>() {
+            if (parsed - value).abs() < 1e-14 {
+                // Trim trailing zeros
+                let trimmed = formatted.trim_end_matches('0');
+                if trimmed.ends_with('.') {
+                    return format!("{trimmed}0");
+                }
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    // Fallback: full precision
+    let formatted = format!("{value:.15}");
+    let trimmed = formatted.trim_end_matches('0');
+    if trimmed.ends_with('.') {
+        format!("{trimmed}0")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Format a decimal value for jq-compatible output.
+/// Uses smart rounding to avoid floating point noise.
+fn format_decimal_jq(value: f64) -> String {
+    let sign = if value < 0.0 { "-" } else { "" };
+    let abs_value = value.abs();
+
+    // Check if it's essentially an integer
+    if (abs_value.round() - abs_value).abs() < 1e-10 {
+        return format!("{}", value.round() as i64);
+    }
+
+    // Try different precisions and pick the shortest that rounds back correctly
+    for precision in 1..=15 {
+        let formatted = format!("{abs_value:.precision$}");
+        if let Ok(parsed) = formatted.parse::<f64>() {
+            if (parsed - abs_value).abs() < 1e-14 {
+                // Trim trailing zeros
+                let trimmed = formatted.trim_end_matches('0');
+                if trimmed.ends_with('.') {
+                    return format!("{sign}{trimmed}0");
+                }
+                return format!("{sign}{trimmed}");
+            }
+        }
+    }
+
+    // Fallback: full precision
+    let formatted = format!("{abs_value:.15}");
+    let trimmed = formatted.trim_end_matches('0');
+    if trimmed.ends_with('.') {
+        format!("{sign}{trimmed}0")
+    } else {
+        format!("{sign}{trimmed}")
+    }
+}
 
 /// An owned JSON value.
 ///
@@ -33,6 +210,21 @@ pub enum OwnedValue {
     Int(i64),
     /// JSON floating-point number
     Float(f64),
+    /// A number materialized straight from a document token, carrying jq's
+    /// exact source spelling (e.g. `1e100`, `1.0`, `-0.0`) alongside its
+    /// parsed value.
+    ///
+    /// Produced only by `to_owned`-style conversions out of a document
+    /// cursor; every other constructor keeps using [`Int`](Self::Int)/
+    /// [`Float`](Self::Float) directly. Arithmetic, comparison, and math
+    /// builtins treat this exactly like `Int`/`Float` for computation --
+    /// only formatting (`to_json`, `tostring`, `@json`, string
+    /// interpolation, error-message previews) prefers the literal. The
+    /// moment a value passes through an operation that produces a *new*
+    /// number, the result collapses to plain `Int`/`Float` (see
+    /// [`into_plain_number`](Self::into_plain_number)) -- matching jq, where
+    /// only values that reach output untouched keep their original spelling.
+    NumberLiteral(NumberRepr, Box<str>),
     /// JSON string
     String(String),
     /// JSON array
@@ -60,6 +252,66 @@ impl OwnedValue {
     /// Create a float value.
     pub fn float(f: f64) -> Self {
         Self::Float(f)
+    }
+
+    /// Create a number that carries its document source text.
+    ///
+    /// Parses `literal` the same way every document-materializing conversion
+    /// decides between the two representations: try `i64` first, fall back
+    /// to `f64`. Falls back to plain [`Float`](Self::Float) `0.0` if
+    /// `literal` parses as neither (should not happen for a valid document
+    /// number token).
+    pub(crate) fn from_number_literal(literal: &str) -> Self {
+        Self::from_number_literal_boxed(literal.into())
+    }
+
+    /// Like [`from_number_literal`](Self::from_number_literal), but takes an
+    /// already-owned `Box<str>` (e.g. from `JqValue::NumberLiteral`) instead
+    /// of allocating a fresh one.
+    pub(crate) fn from_number_literal_boxed(literal: Box<str>) -> Self {
+        let repr = if let Ok(i) = literal.parse::<i64>() {
+            NumberRepr::Int(i)
+        } else if let Ok(f) = literal.parse::<f64>() {
+            NumberRepr::Float(f)
+        } else {
+            return Self::Float(0.0);
+        };
+        Self::NumberLiteral(repr, literal)
+    }
+
+    /// Collapse a [`NumberLiteral`](Self::NumberLiteral) into a plain
+    /// `Int`/`Float`, dropping the source text. A no-op for every other
+    /// variant.
+    ///
+    /// Every operation that *computes* with a number rather than passing it
+    /// through untouched should normalize its operands through this first --
+    /// arithmetic calls it at the top of each operator function so a
+    /// literal-carrying operand degrades before the value/value match runs.
+    pub(crate) fn into_plain_number(self) -> Self {
+        match self {
+            Self::NumberLiteral(NumberRepr::Int(n), _) => Self::Int(n),
+            Self::NumberLiteral(NumberRepr::Float(f), _) => Self::Float(f),
+            other => other,
+        }
+    }
+
+    /// The exact text this number should render as: the source literal when
+    /// present, otherwise the parsed value's own `Display` formatting.
+    /// `None` for non-numbers.
+    ///
+    /// Deliberately does not special-case NaN/Infinity -- callers that need
+    /// JSON's "null" substitution (`to_json`, the error-preview streamer)
+    /// check that themselves before falling back to this, e.g. via
+    /// `self.as_f64().is_some_and(f64::is_nan)`.
+    pub fn number_str(&self) -> Option<Cow<'_, str>> {
+        match self {
+            Self::Int(n) => Some(Cow::Owned(n.to_string())),
+            Self::Float(f) => Some(Cow::Owned(f.to_string())),
+            Self::NumberLiteral(_, literal) => {
+                Some(Cow::Owned(format_number_jq_compat(literal.as_bytes())))
+            }
+            _ => None,
+        }
     }
 
     /// Create a string value.
@@ -102,7 +354,7 @@ impl OwnedValue {
         match self {
             Self::Null => "null",
             Self::Bool(_) => "boolean",
-            Self::Int(_) | Self::Float(_) => "number",
+            Self::Int(_) | Self::Float(_) | Self::NumberLiteral(..) => "number",
             Self::String(_) => "string",
             Self::Array(_) => "array",
             Self::Object(_) => "object",
@@ -122,6 +374,12 @@ impl OwnedValue {
         match self {
             Self::Int(n) => Some(*n),
             Self::Float(f) if (*f - (*f as i64 as f64)).abs() < f64::EPSILON => Some(*f as i64),
+            Self::NumberLiteral(NumberRepr::Int(n), _) => Some(*n),
+            Self::NumberLiteral(NumberRepr::Float(f), _)
+                if (*f - (*f as i64 as f64)).abs() < f64::EPSILON =>
+            {
+                Some(*f as i64)
+            }
             _ => None,
         }
     }
@@ -131,6 +389,8 @@ impl OwnedValue {
         match self {
             Self::Int(n) => Some(*n as f64),
             Self::Float(f) => Some(*f),
+            Self::NumberLiteral(NumberRepr::Int(n), _) => Some(*n as f64),
+            Self::NumberLiteral(NumberRepr::Float(f), _) => Some(*f),
             _ => None,
         }
     }
@@ -205,6 +465,10 @@ impl OwnedValue {
                     format!("{f}")
                 }
             }
+            Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
+                "null".into() // JSON doesn't support NaN or Infinity
+            }
+            Self::NumberLiteral(_, literal) => format_number_jq_compat(literal.as_bytes()),
             Self::String(s) => format!("\"{}\"", escape_json_body(write_json_body_jq, s)),
             Self::Array(arr) => {
                 let elements: Vec<String> = arr.iter().map(Self::to_json).collect();
@@ -253,6 +517,19 @@ impl OwnedValue {
 /// integer to `f64`, whereas jq 1.7 retains the decimal literal. So
 /// `9007199254740993 == 9007199254740992.0` is `true` here and `false` in jq.
 /// Every value representable exactly as an `f64` agrees.
+///
+/// `NumberLiteral` compares purely on its parsed [`NumberRepr`], never on the
+/// source text -- two spellings of the same number (`1.0` and `1e0`) are
+/// equal, matching every other numeric comparison here.
+fn numeric_repr_eq(a: NumberRepr, b: NumberRepr) -> bool {
+    match (a, b) {
+        (NumberRepr::Int(a), NumberRepr::Int(b)) => a == b,
+        (NumberRepr::Float(a), NumberRepr::Float(b)) => a == b,
+        (NumberRepr::Int(a), NumberRepr::Float(b)) => (a as f64) == b,
+        (NumberRepr::Float(a), NumberRepr::Int(b)) => a == (b as f64),
+    }
+}
+
 impl PartialEq for OwnedValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -262,6 +539,13 @@ impl PartialEq for OwnedValue {
             (Self::Float(a), Self::Float(b)) => a == b,
             (Self::Int(a), Self::Float(b)) => (*a as f64) == *b,
             (Self::Float(a), Self::Int(b)) => *a == (*b as f64),
+            (Self::NumberLiteral(a, _), Self::NumberLiteral(b, _)) => numeric_repr_eq(*a, *b),
+            (Self::NumberLiteral(a, _), Self::Int(b))
+            | (Self::Int(b), Self::NumberLiteral(a, _)) => numeric_repr_eq(*a, NumberRepr::Int(*b)),
+            (Self::NumberLiteral(a, _), Self::Float(b))
+            | (Self::Float(b), Self::NumberLiteral(a, _)) => {
+                numeric_repr_eq(*a, NumberRepr::Float(*b))
+            }
             (Self::String(a), Self::String(b)) => a == b,
             (Self::Array(a), Self::Array(b)) => a == b,
             (Self::Object(a), Self::Object(b)) => a == b,
@@ -644,5 +928,115 @@ mod tests {
                 OwnedValue::Int(3)
             ])
         );
+    }
+
+    // =========================================================================
+    // NumberLiteral (#387: tostring/tojson lose a number's source literal)
+    // =========================================================================
+
+    #[test]
+    fn test_from_number_literal_picks_int_or_float() {
+        assert_eq!(
+            OwnedValue::from_number_literal("42"),
+            OwnedValue::NumberLiteral(NumberRepr::Int(42), "42".into())
+        );
+        assert_eq!(
+            OwnedValue::from_number_literal("1.0"),
+            OwnedValue::NumberLiteral(NumberRepr::Float(1.0), "1.0".into())
+        );
+        assert_eq!(
+            OwnedValue::from_number_literal("1e100"),
+            OwnedValue::NumberLiteral(NumberRepr::Float(1e100), "1e100".into())
+        );
+    }
+
+    #[test]
+    fn test_number_literal_eq_matches_plain_int_and_float() {
+        // A NumberLiteral is numerically equal to the plain variant it parses
+        // to, and to the other representation of the same number -- equality
+        // never looks at the source text (#387).
+        assert_eq!(OwnedValue::from_number_literal("42"), OwnedValue::Int(42));
+        assert_eq!(OwnedValue::Int(42), OwnedValue::from_number_literal("42"));
+        assert_eq!(
+            OwnedValue::from_number_literal("1.0"),
+            OwnedValue::Float(1.0)
+        );
+        assert_eq!(OwnedValue::from_number_literal("1.0"), OwnedValue::Int(1));
+        assert_eq!(
+            OwnedValue::from_number_literal("1e0"),
+            OwnedValue::from_number_literal("1")
+        );
+        assert_ne!(OwnedValue::from_number_literal("1.5"), OwnedValue::Int(1));
+    }
+
+    #[test]
+    fn test_number_literal_type_name_and_conversions() {
+        let lit = OwnedValue::from_number_literal("1e100");
+        assert_eq!(lit.type_name(), "number");
+        assert_eq!(lit.as_f64(), Some(1e100));
+        assert_eq!(lit.as_i64(), None); // not integral
+
+        let int_lit = OwnedValue::from_number_literal("42");
+        assert_eq!(int_lit.as_i64(), Some(42));
+        assert_eq!(int_lit.as_f64(), Some(42.0));
+    }
+
+    #[test]
+    fn test_number_literal_to_json_preserves_source_spelling() {
+        // Preserved verbatim where jq's own canonical formatting agrees with
+        // the source text...
+        assert_eq!(OwnedValue::from_number_literal("42").to_json(), "42");
+        assert_eq!(OwnedValue::from_number_literal("1.0").to_json(), "1.0");
+        assert_eq!(OwnedValue::from_number_literal("-0.0").to_json(), "-0.0");
+        // ...and reformatted into jq's canonical spelling where it doesn't --
+        // this is the exact repro from #387, pinned against jq-1.7.1.
+        assert_eq!(OwnedValue::from_number_literal("1e100").to_json(), "1E+100");
+        assert_eq!(OwnedValue::from_number_literal("1e-7").to_json(), "1E-7");
+    }
+
+    #[test]
+    fn test_number_literal_number_str_matches_to_json() {
+        let lit = OwnedValue::from_number_literal("1e100");
+        assert_eq!(lit.number_str().as_deref(), Some("1E+100"));
+        assert_eq!(OwnedValue::Null.number_str(), None);
+    }
+
+    #[test]
+    fn test_into_plain_number_drops_the_literal() {
+        // Once a value is treated as a fresh computed number (what every
+        // arithmetic operator does before matching), the literal is gone and
+        // formatting falls back to plain Int/Float Display -- matching jq,
+        // where only untouched values keep their original spelling.
+        assert_eq!(
+            OwnedValue::from_number_literal("1e100").into_plain_number(),
+            OwnedValue::Float(1e100)
+        );
+        assert_eq!(
+            OwnedValue::from_number_literal("42").into_plain_number(),
+            OwnedValue::Int(42)
+        );
+        // No-op for every other variant.
+        assert_eq!(
+            OwnedValue::Bool(true).into_plain_number(),
+            OwnedValue::Bool(true)
+        );
+        assert_eq!(
+            OwnedValue::String("x".into()).into_plain_number(),
+            OwnedValue::String("x".into())
+        );
+    }
+
+    #[test]
+    fn test_format_number_jq_compat_matches_jq_1_7_1() {
+        // Pinned against jq-1.7.1 -- the exact cases from #387's repro.
+        assert_eq!(format_number_jq_compat(b"1e100"), "1E+100");
+        assert_eq!(format_number_jq_compat(b"1.0"), "1.0");
+        assert_eq!(format_number_jq_compat(b"-0.0"), "-0.0");
+        assert_eq!(format_number_jq_compat(b"1e-7"), "1E-7");
+        assert_eq!(format_number_jq_compat(b"42"), "42");
+        // e0/e-0 drop the exponent entirely.
+        assert_eq!(format_number_jq_compat(b"5.5e0"), "5.5");
+        // Negative exponents within [-5, -1] expand to decimal.
+        assert_eq!(format_number_jq_compat(b"1e-3"), "0.001");
     }
 }

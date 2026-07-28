@@ -56,6 +56,8 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
         OwnedValue::Null
     } else if let Some(b) = value.as_bool() {
         OwnedValue::Bool(b)
+    } else if let Some(literal) = value.number_literal() {
+        OwnedValue::from_number_literal(&literal)
     } else if let Some(i) = value.as_i64() {
         OwnedValue::Int(i)
     } else if let Some(f) = value.as_f64() {
@@ -76,15 +78,10 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(
     match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
-        StandardJson::Number(n) => {
-            if let Ok(i) = n.as_i64() {
-                OwnedValue::Int(i)
-            } else if let Ok(f) = n.as_f64() {
-                OwnedValue::Float(f)
-            } else {
-                OwnedValue::Null
-            }
-        }
+        StandardJson::Number(n) => match core::str::from_utf8(n.raw_bytes()) {
+            Ok(s) => OwnedValue::from_number_literal(s),
+            Err(_) => OwnedValue::Null,
+        },
         StandardJson::String(s) => {
             OwnedValue::String(s.as_str().map(|c| c.to_string()).unwrap_or_default())
         }
@@ -128,6 +125,20 @@ fn compare_values(left: &OwnedValue, right: &OwnedValue) -> Option<core::cmp::Or
         (OwnedValue::Float(a), OwnedValue::Float(b)) => a.partial_cmp(b),
         (OwnedValue::Int(a), OwnedValue::Float(b)) => (*a as f64).partial_cmp(b),
         (OwnedValue::Float(a), OwnedValue::Int(b)) => a.partial_cmp(&(*b as f64)),
+        // A `NumberLiteral` operand compares by its parsed value, exactly
+        // like `Int`/`Float` -- ordering never looks at the source text. Try
+        // exact `i64` first (matches the `(Int,Int)` arm's precision above
+        // 2^53), fall back to the same `f64` widening the mixed `Int`/`Float`
+        // arms above use.
+        (OwnedValue::NumberLiteral(..), _) | (_, OwnedValue::NumberLiteral(..)) => {
+            match (left.as_i64(), right.as_i64()) {
+                (Some(a), Some(b)) => Some(a.cmp(&b)),
+                _ => match (left.as_f64(), right.as_f64()) {
+                    (Some(a), Some(b)) => a.partial_cmp(&b),
+                    _ => None,
+                },
+            }
+        }
         (OwnedValue::String(a), OwnedValue::String(b)) => Some(a.cmp(b)),
         // Arrays: compare element-wise, then by length
         (OwnedValue::Array(a), OwnedValue::Array(b)) => {
@@ -792,7 +803,7 @@ fn index_one_generic<V: DocumentValue>(
                 GenericResult::Error(EvalError::cannot_index(target.type_name(), key))
             }
         }
-        OwnedValue::Int(_) | OwnedValue::Float(_) => {
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
             // Truncation is toward zero, matching jq: `.[-1.5]` is the last
             // element. Out-of-range floats saturate through `as`, yielding null,
             // and NaN has no index at all — also null.
@@ -1269,8 +1280,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             let s = match &owned {
                 OwnedValue::Null => "null".to_string(),
                 OwnedValue::Bool(b) => b.to_string(),
-                OwnedValue::Int(i) => i.to_string(),
-                OwnedValue::Float(f) => f.to_string(),
+                OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+                    owned.number_str().expect("numeric variant").into_owned()
+                }
                 OwnedValue::String(s) => s.clone(),
                 OwnedValue::Array(_) | OwnedValue::Object(_) => owned.to_json(),
             };
@@ -1278,7 +1290,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         }
 
         Builtin::ToNumber => {
-            if let Some(i) = value.as_i64() {
+            // Already a number: a passthrough, not a computation, so (like
+            // `.`) it keeps the source literal.
+            if let Some(literal) = value.number_literal() {
+                GenericResult::Owned(OwnedValue::from_number_literal(&literal))
+            } else if let Some(i) = value.as_i64() {
                 GenericResult::Owned(OwnedValue::Int(i))
             } else if let Some(f) = value.as_f64() {
                 GenericResult::Owned(OwnedValue::Float(f))
@@ -1906,7 +1922,7 @@ mod tests {
         let expr = crate::jq::parse("at_offset(27)").unwrap();
         let result = eval_with_cursor(&expr, cursor);
         let owned = result.into_owned().unwrap();
-        assert!(matches!(owned, OwnedValue::Int(30)));
+        assert_eq!(owned, OwnedValue::Int(30));
     }
 
     #[test]

@@ -61,20 +61,12 @@ const DUMP_KEEP: usize = 11;
 /// and split the two conventions apart, so the correct writer is now available
 /// by name.)
 ///
-/// Two deviations remain, both about what gets dumped rather than where it is cut:
-///
-/// 1. jq cuts at a byte offset and can therefore split a multi-byte character,
-///    emitting invalid UTF-8; a Rust `String` cannot hold that, so we snap back
-///    to the nearest character boundary. The two agree except when a multi-byte
-///    character straddles byte `DUMP_KEEP` of the dump — see
-///    `docs/compliance/jq/limitations.md`.
-/// 2. `OwnedValue` does not preserve a number's source literal, so a number
-///    reads back canonicalised: jq previews `1e100` as `1E+100` and `1.0` as
-///    `1.0`, where we give `10000000000...` and `1`. This is a property of
-///    materialising into `OwnedValue` — `1e100 | tostring` already differs, and
-///    the streaming identity path, which copies source text, does not — not of
-///    the truncation here. Pinned by `number_previews_are_canonicalised` in
-///    `tests/jq_containment_tests.rs`. Tracked as #387.
+/// One deviation remains, about where the dump is cut rather than what gets
+/// dumped: jq cuts at a byte offset and can therefore split a multi-byte
+/// character, emitting invalid UTF-8; a Rust `String` cannot hold that, so we
+/// snap back to the nearest character boundary. The two agree except when a
+/// multi-byte character straddles byte `DUMP_KEEP` of the dump — see
+/// `docs/compliance/jq/limitations.md`.
 fn dump_truncated(value: &OwnedValue) -> String {
     let mut sink = PreviewSink::new(DUMP_BUDGET);
     // The sink stops the writer once the dump is known to exceed the budget;

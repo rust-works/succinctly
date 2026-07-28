@@ -135,6 +135,19 @@ pub trait DocumentValue: Sized + Clone {
     /// Try to get as an f64.
     fn as_f64(&self) -> Option<f64>;
 
+    /// The exact source text of this value if it's a number, so a
+    /// materializing conversion (`to_owned`) can preserve jq's formatting
+    /// (`1e100`, `1.0`, `-0.0`) instead of re-rendering the parsed value —
+    /// see issue #387.
+    ///
+    /// Defaults to `None`: only JSON overrides this today. YAML numbers are
+    /// resolved plain scalars (hex/octal/underscore forms `yq` may or may not
+    /// echo back verbatim), which is a separate judgment call this default
+    /// deliberately leaves alone.
+    fn number_literal(&self) -> Option<Cow<'_, str>> {
+        None
+    }
+
     /// Try to get as a string.
     fn as_str(&self) -> Option<Cow<'_, str>>;
 

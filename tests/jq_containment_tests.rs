@@ -300,40 +300,26 @@ fn optional_suppresses_the_error() {
     }
 }
 
-/// A number in the preview reads back canonicalised, not as its source literal —
-/// a divergence pinned rather than fixed.
-///
-/// `EvalError::containment_check` previews an operand with
-/// `OwnedValue::to_json`, which does not carry the literal the document was
-/// written with, so jq's `number (1E+100)` and `number (1.0)` come back as
-/// `number (10000000000...)` and `number (1)`.
-///
-/// The cause sits in `OwnedValue`, not in the truncation: `1e100 | tostring`
-/// already differs the same way, and the streaming identity path — which copies
-/// source text rather than materialising — does not differ at all
-/// (`echo 1e100 | sjq -c .` prints `1E+100`, matching jq). #358 is what first
-/// routes a materialised dump into an error message and so makes it visible.
-/// Fixing it means teaching `OwnedValue` to carry the literal, which would touch
-/// far more than containment; tracked as #387.
-///
-/// The expectations are succinctly's *current* output with jq's beside them.
-/// If a future change makes these match jq, delete the test rather than invert
-/// it — and check `dump_truncated`'s doc comment in `src/jq/error.rs`.
+/// A number in the containment-check preview now reads back exactly as jq
+/// prints it, because `OwnedValue::NumberLiteral` (#387) carries the source
+/// literal through `EvalError::containment_check`'s `OwnedValue::to_json`
+/// preview. Was pinned as `number_previews_are_canonicalised`, documenting the
+/// opposite (canonicalised) output; see `dump_truncated`'s doc comment in
+/// `src/jq/error.rs` for the sibling fix in the truncated-dump preview.
 #[test]
-fn number_previews_are_canonicalised() {
+fn number_previews_match_jq() {
     // jq: number (1E+100) and string ("a") cannot have their containment checked
     assert_eq!(
         full_outcome(br"1e100", r#"contains("a")"#),
         Err(
-            r#"number (10000000000...) and string ("a") cannot have their containment checked"#
-                .to_string()
+            r#"number (1E+100) and string ("a") cannot have their containment checked"#.to_string()
         )
     );
 
     // jq: number (1.0) and string ("a") cannot have their containment checked
     assert_eq!(
         full_outcome(br"1.0", r#"contains("a")"#),
-        Err(r#"number (1) and string ("a") cannot have their containment checked"#.to_string())
+        Err(r#"number (1.0) and string ("a") cannot have their containment checked"#.to_string())
     );
 
     // Integers that need no canonicalising are unaffected, which is why every
