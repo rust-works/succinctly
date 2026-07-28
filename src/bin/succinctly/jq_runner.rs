@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
 use succinctly::jq::eval_generic::{eval_with_cursor, to_owned as generic_to_owned, GenericResult};
-use succinctly::jq::{self, Expr, JqValue, OwnedValue, Program};
+use succinctly::jq::{self, format_number_jq_compat, Expr, JqValue, OwnedValue, Program};
 use succinctly::json::light::{JsonCursor, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
 use succinctly::json::JsonIndex;
@@ -1687,6 +1687,9 @@ where
         JqValue::RawNumber(bytes) => {
             out.write_all(formatter.format_raw_number(bytes).as_bytes())?;
         }
+        JqValue::NumberLiteral(literal) => {
+            out.write_all(formatter.format_raw_number(literal.as_bytes()).as_bytes())?;
+        }
         JqValue::Cursor(c) => {
             use succinctly::json::light::StandardJson;
             match c.value() {
@@ -1917,160 +1920,6 @@ where
         }
     }
     Ok(())
-}
-
-// =============================================================================
-// Number formatting helpers
-// =============================================================================
-
-/// Format a raw JSON number string according to jq's formatting rules.
-///
-/// jq's number formatting:
-/// - Integers: output as-is
-/// - Floats with trailing zeros: preserve them (0.10 → 0.10)
-/// - Scientific notation: normalize mantissa (12e2 → 1.2E+3), uppercase E, explicit +
-/// - e0 or e-0: eliminate exponent entirely (5.5e0 → 5.5)
-/// - Negative exponents >= -5: convert to decimal (1e-3 → 0.001)
-/// - Negative exponents < -5: keep scientific (1e-10 → 1E-10)
-/// - Negative zero: preserve as -0
-fn format_number_jq_compat(raw: &[u8]) -> String {
-    let s = match core::str::from_utf8(raw) {
-        Ok(s) => s,
-        Err(_) => return String::from_utf8_lossy(raw).into_owned(),
-    };
-
-    // Check if it contains exponent notation
-    let has_exp = s.contains('e') || s.contains('E');
-    let has_dot = s.contains('.');
-
-    if !has_exp && !has_dot {
-        // Plain integer - output as-is
-        return s.to_string();
-    }
-
-    if !has_exp {
-        // Plain decimal without exponent - preserve as-is (keeps trailing zeros)
-        return s.to_string();
-    }
-
-    // Has exponent - need to reformat according to jq rules
-    // Parse the full number to get the actual value
-    let value: f64 = match s.parse() {
-        Ok(v) => v,
-        Err(_) => return s.to_string(),
-    };
-
-    // Parse exponent to check for e0/e-0
-    let exp: i32 = if let Some(pos) = s.find(['e', 'E']) {
-        s[pos + 1..].parse().unwrap_or(0)
-    } else {
-        0
-    };
-
-    // For e0 or e-0, jq eliminates the exponent
-    if exp == 0 {
-        // Check if result is integer
-        if value.fract() == 0.0 && value.abs() < 1e15 {
-            return format!("{}", value as i64);
-        }
-        // Format as plain decimal
-        return format!("{value}");
-    }
-
-    // For negative exponents >= -5, jq converts to decimal
-    if (-5..0).contains(&exp) {
-        // Convert to decimal: 1e-3 → 0.001
-        // Use smart rounding to avoid floating point noise
-        return format_decimal_jq(value);
-    }
-
-    // For other cases, use normalized scientific notation
-    // jq normalizes mantissa to have one digit before decimal point
-    if value == 0.0 {
-        return "0".to_string();
-    }
-
-    let abs_value = value.abs();
-    let log10 = abs_value.log10().floor() as i32;
-    let normalized_mantissa = abs_value / 10f64.powi(log10);
-    let new_exp = log10;
-
-    // Format mantissa with appropriate precision
-    // Round to avoid floating point noise (e.g., 9.199999999999999 → 9.2)
-    let mantissa_str = format_mantissa_jq(normalized_mantissa);
-
-    let sign = if value < 0.0 { "-" } else { "" };
-    let exp_sign = if new_exp >= 0 { "+" } else { "" };
-    format!("{sign}{mantissa_str}E{exp_sign}{new_exp}")
-}
-
-/// Format a mantissa value for jq-compatible output.
-/// Handles floating point precision issues by rounding appropriately.
-fn format_mantissa_jq(value: f64) -> String {
-    // Check if it's essentially an integer
-    if (value.round() - value).abs() < 1e-10 {
-        return format!("{}", value.round() as i64);
-    }
-
-    // Try different precisions and pick the shortest that rounds back correctly
-    for precision in 1..=15 {
-        let formatted = format!("{value:.precision$}");
-        if let Ok(parsed) = formatted.parse::<f64>() {
-            if (parsed - value).abs() < 1e-14 {
-                // Trim trailing zeros
-                let trimmed = formatted.trim_end_matches('0');
-                if trimmed.ends_with('.') {
-                    return format!("{trimmed}0");
-                }
-                return trimmed.to_string();
-            }
-        }
-    }
-
-    // Fallback: full precision
-    let formatted = format!("{value:.15}");
-    let trimmed = formatted.trim_end_matches('0');
-    if trimmed.ends_with('.') {
-        format!("{trimmed}0")
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// Format a decimal value for jq-compatible output.
-/// Uses smart rounding to avoid floating point noise.
-fn format_decimal_jq(value: f64) -> String {
-    let sign = if value < 0.0 { "-" } else { "" };
-    let abs_value = value.abs();
-
-    // Check if it's essentially an integer
-    if (abs_value.round() - abs_value).abs() < 1e-10 {
-        return format!("{}", value.round() as i64);
-    }
-
-    // Try different precisions and pick the shortest that rounds back correctly
-    for precision in 1..=15 {
-        let formatted = format!("{abs_value:.precision$}");
-        if let Ok(parsed) = formatted.parse::<f64>() {
-            if (parsed - abs_value).abs() < 1e-14 {
-                // Trim trailing zeros
-                let trimmed = formatted.trim_end_matches('0');
-                if trimmed.ends_with('.') {
-                    return format!("{sign}{trimmed}0");
-                }
-                return format!("{sign}{trimmed}");
-            }
-        }
-    }
-
-    // Fallback: full precision
-    let formatted = format!("{abs_value:.15}");
-    let trimmed = formatted.trim_end_matches('0');
-    if trimmed.ends_with('.') {
-        format!("{sign}{trimmed}0")
-    } else {
-        format!("{sign}{trimmed}")
-    }
 }
 
 /// Format a value as JSON.

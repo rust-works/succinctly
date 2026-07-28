@@ -564,6 +564,19 @@ fn emit_yaml_value(
                 f.to_string()
             }
         }
+        OwnedValue::NumberLiteral(..) => {
+            if value.as_f64().is_some_and(f64::is_nan) {
+                ".nan".to_string()
+            } else if value.as_f64().is_some_and(f64::is_infinite) {
+                if value.as_f64() > Some(0.0) {
+                    ".inf".to_string()
+                } else {
+                    "-.inf".to_string()
+                }
+            } else {
+                value.number_str().expect("numeric variant").into_owned()
+            }
+        }
         OwnedValue::String(s) => yaml_quote_string(s),
         OwnedValue::Array(arr) => {
             if arr.is_empty() {
@@ -1709,6 +1722,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use succinctly::jq::NumberRepr;
 
     #[test]
     fn test_yaml_to_owned_value_string() {
@@ -1748,6 +1762,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_emit_yaml_value_number_literal_nan_and_infinite() {
+        // A `NumberLiteral` that parses to a non-finite float (NaN or +/-
+        // infinity -- reachable from a document number that overflows f64,
+        // e.g. `1e400`) must render the same YAML sentinels as a plain
+        // non-finite Float, not fall through to `number_str`.
+        let config = OutputConfig {
+            output_format: OutputFormat::Yaml,
+            compact: true,
+            raw_output: false,
+            join_output: false,
+            nul_output: false,
+            ascii_output: false,
+            sort_keys: false,
+            no_doc: false,
+            indent_str: String::new(),
+            use_color: false,
+        };
+
+        let nan = OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into());
+        assert_eq!(emit_yaml_value(&nan, &config, 0, false), ".nan");
+
+        let pos_inf = OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1e400".into());
+        assert_eq!(emit_yaml_value(&pos_inf, &config, 0, false), ".inf");
+
+        let neg_inf =
+            OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-1e400".into());
+        assert_eq!(emit_yaml_value(&neg_inf, &config, 0, false), "-.inf");
     }
 
     #[test]

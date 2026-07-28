@@ -384,8 +384,8 @@ fn test_slice_piped_to_length() {
 #[test]
 fn test_slice_piped_to_index() {
     query!(br"[0, 1, 2, 3, 4]", ".[1:4] | .[0]",
-        QueryResult::Owned(OwnedValue::Int(n)) => {
-            assert_eq!(n, 1);
+        QueryResult::Owned(v) => {
+            assert_eq!(v, OwnedValue::Int(1));
         }
     );
 }

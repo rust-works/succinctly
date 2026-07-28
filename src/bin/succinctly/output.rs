@@ -195,6 +195,16 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                 }
             }
         }
+        OwnedValue::NumberLiteral(..) => {
+            if value
+                .as_f64()
+                .is_some_and(|f| f.is_nan() || f.is_infinite())
+            {
+                "null".to_string() // JSON doesn't support NaN or Infinity
+            } else {
+                value.number_str().expect("numeric variant").into_owned()
+            }
+        }
         OwnedValue::String(s) => {
             format!("\"{}\"", escape_json_body(s, opts))
         }
@@ -778,6 +788,24 @@ mod tests {
             format_json(&OwnedValue::Float(f64::INFINITY), &opts),
             "null"
         );
+    }
+
+    #[test]
+    fn test_format_json_non_finite_number_literal_is_null() {
+        // A `NumberLiteral` whose source text overflows f64 to infinity
+        // (`1e400`) must be treated the same as a plain non-finite Float.
+        let opts = JsonFormatOpts {
+            indent: "",
+            sort_keys: false,
+            ascii: false,
+            float_style: FloatStyle::Shortest,
+            control_escape: ControlEscape::Jq,
+        };
+        let overflowed = OwnedValue::NumberLiteral(
+            succinctly::jq::NumberRepr::Float(f64::INFINITY),
+            "1e400".into(),
+        );
+        assert_eq!(format_json(&overflowed, &opts), "null");
     }
 
     #[test]

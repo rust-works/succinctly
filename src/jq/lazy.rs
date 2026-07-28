@@ -13,6 +13,8 @@
 #[cfg(not(test))]
 use alloc::borrow::Cow;
 #[cfg(not(test))]
+use alloc::boxed::Box;
+#[cfg(not(test))]
 use alloc::string::{String, ToString};
 #[cfg(not(test))]
 use alloc::vec::Vec;
@@ -63,6 +65,12 @@ pub enum JqValue<'a, W = Vec<u64>> {
     /// but hasn't been parsed yet. When output, the original bytes are written
     /// directly, preserving formatting like `4e4` instead of `40000`.
     RawNumber(&'a [u8]),
+
+    /// An owned, materialized counterpart to `RawNumber`: a number that has
+    /// been through `OwnedValue` (array/object construction, `as` binding,
+    /// `sort`, ...) but reached here untouched by arithmetic, so it still
+    /// carries its document source text. See `OwnedValue::NumberLiteral`.
+    NumberLiteral(Box<str>),
 
     /// JSON string (materialized).
     String(String),
@@ -163,6 +171,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             OwnedValue::Bool(b) => JqValue::Bool(b),
             OwnedValue::Int(n) => JqValue::Int(n),
             OwnedValue::Float(f) => JqValue::Float(f),
+            OwnedValue::NumberLiteral(_, literal) => JqValue::NumberLiteral(literal),
             OwnedValue::String(s) => JqValue::String(s),
             OwnedValue::Array(arr) => {
                 JqValue::Array(arr.into_iter().map(JqValue::from_owned).collect())
@@ -223,7 +232,10 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             },
             JqValue::Null => "null",
             JqValue::Bool(_) => "boolean",
-            JqValue::Int(_) | JqValue::Float(_) | JqValue::RawNumber(_) => "number",
+            JqValue::Int(_)
+            | JqValue::Float(_)
+            | JqValue::RawNumber(_)
+            | JqValue::NumberLiteral(_) => "number",
             JqValue::String(_) => "string",
             JqValue::Array(_) => "array",
             JqValue::Object(_) => "object",
@@ -251,6 +263,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
         match self {
             JqValue::Int(n) => Some(*n),
             JqValue::Float(f) if (*f - (*f as i64 as f64)).abs() < f64::EPSILON => Some(*f as i64),
+            JqValue::NumberLiteral(literal) => OwnedValue::from_number_literal(literal).as_i64(),
             JqValue::RawNumber(bytes) => core::str::from_utf8(bytes)
                 .ok()
                 .and_then(|s| s.parse().ok()),
@@ -267,6 +280,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
         match self {
             JqValue::Int(n) => Some(*n as f64),
             JqValue::Float(f) => Some(*f),
+            JqValue::NumberLiteral(literal) => OwnedValue::from_number_literal(literal).as_f64(),
             JqValue::RawNumber(bytes) => core::str::from_utf8(bytes)
                 .ok()
                 .and_then(|s| s.parse().ok()),
@@ -354,18 +368,9 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::Bool(b) => OwnedValue::Bool(*b),
             JqValue::Int(n) => OwnedValue::Int(*n),
             JqValue::Float(f) => OwnedValue::Float(*f),
-            JqValue::RawNumber(bytes) => {
-                // Parse the raw number bytes
-                if let Ok(s) = core::str::from_utf8(bytes) {
-                    if let Ok(i) = s.parse::<i64>() {
-                        return OwnedValue::Int(i);
-                    }
-                    if let Ok(f) = s.parse::<f64>() {
-                        return OwnedValue::Float(f);
-                    }
-                }
-                OwnedValue::Float(0.0)
-            }
+            JqValue::RawNumber(bytes) => core::str::from_utf8(bytes)
+                .map_or(OwnedValue::Float(0.0), OwnedValue::from_number_literal),
+            JqValue::NumberLiteral(literal) => OwnedValue::from_number_literal(literal),
             JqValue::String(s) => OwnedValue::String(s.clone()),
             JqValue::Array(arr) => {
                 OwnedValue::Array(arr.iter().map(JqValue::materialize).collect())
@@ -388,18 +393,9 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::Bool(b) => OwnedValue::Bool(b),
             JqValue::Int(n) => OwnedValue::Int(n),
             JqValue::Float(f) => OwnedValue::Float(f),
-            JqValue::RawNumber(bytes) => {
-                // Parse the raw number bytes
-                if let Ok(s) = core::str::from_utf8(bytes) {
-                    if let Ok(i) = s.parse::<i64>() {
-                        return OwnedValue::Int(i);
-                    }
-                    if let Ok(f) = s.parse::<f64>() {
-                        return OwnedValue::Float(f);
-                    }
-                }
-                OwnedValue::Float(0.0)
-            }
+            JqValue::RawNumber(bytes) => core::str::from_utf8(bytes)
+                .map_or(OwnedValue::Float(0.0), OwnedValue::from_number_literal),
+            JqValue::NumberLiteral(literal) => OwnedValue::from_number_literal_boxed(literal),
             JqValue::String(s) => OwnedValue::String(s),
             JqValue::Array(arr) => {
                 OwnedValue::Array(arr.into_iter().map(JqValue::into_owned).collect())
@@ -462,6 +458,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                 let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
                 out.write_str(s)
             }
+            JqValue::NumberLiteral(literal) => out.write_str(literal),
             JqValue::String(s) => {
                 out.write_char('"')?;
                 write_json_body_jq(out, s)?;
@@ -514,15 +511,10 @@ fn cursor_to_owned<W: Clone + AsRef<[u64]>>(cursor: &JsonCursor<'_, W>) -> Owned
     match cursor.value() {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(b),
-        StandardJson::Number(n) => {
-            if let Ok(i) = n.as_i64() {
-                OwnedValue::Int(i)
-            } else if let Ok(f) = n.as_f64() {
-                OwnedValue::Float(f)
-            } else {
-                OwnedValue::Float(0.0)
-            }
-        }
+        StandardJson::Number(n) => match core::str::from_utf8(n.raw_bytes()) {
+            Ok(s) => OwnedValue::from_number_literal(s),
+            Err(_) => OwnedValue::Float(0.0),
+        },
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
                 OwnedValue::String(cow.into_owned())
@@ -801,5 +793,89 @@ mod tests {
     fn test_jqvalue_float_json() {
         let f: JqValue<'_, Vec<u64>> = JqValue::Float(2.5);
         assert_eq!(f.to_json_string(), "2.5");
+    }
+
+    #[test]
+    fn test_jqvalue_number_literal_materialize_into_owned_and_write() {
+        // `JqValue::NumberLiteral` is `OwnedValue::NumberLiteral`'s lazy-side
+        // counterpart (built by `from_owned`, e.g. by the CLI's output
+        // formatter).
+        let owned = OwnedValue::from_number_literal("1e100");
+
+        // `materialize`/`into_owned` round-trip through `OwnedValue`, whose
+        // own `to_json` reformats through jq's canonical algorithm (see
+        // `format_number_jq_compat`) -- so both give jq's spelling.
+        let via_materialize: JqValue<'_, Vec<u64>> = JqValue::from_owned(owned.clone());
+        assert!(matches!(via_materialize, JqValue::NumberLiteral(_)));
+        assert_eq!(via_materialize.materialize().to_json(), "1E+100");
+
+        let via_into_owned: JqValue<'_, Vec<u64>> = JqValue::from_owned(owned.clone());
+        assert_eq!(via_into_owned.into_owned().to_json(), "1E+100");
+
+        // `write_json`/`to_json_string`, by contrast, is this module's
+        // documented format-*preserving* serializer (see the module doc and
+        // `test_write_json_preserves_cursor_format`'s `4e4` case) -- it
+        // writes the source literal verbatim rather than jq's reformatting,
+        // consistent with how it treats `RawNumber`/`Cursor`.
+        let via_write: JqValue<'_, Vec<u64>> = JqValue::from_owned(owned);
+        assert_eq!(via_write.to_json_string(), "1e100");
+    }
+
+    #[test]
+    fn test_jqvalue_number_literal_as_i64_and_as_f64() {
+        // Builtins like skip(n; ...)/nth(n; ...)/parent(n) read a numeric
+        // argument through as_i64()/as_f64() (or an equivalent match on
+        // Int/Float); a NumberLiteral-typed argument (the common case once a
+        // document number flows through) must resolve the same as a plain
+        // Int/Float, not silently read as "not a number".
+        let int_lit: JqValue<'_, Vec<u64>> =
+            JqValue::from_owned(OwnedValue::from_number_literal("2"));
+        assert_eq!(int_lit.as_i64(), Some(2));
+        assert_eq!(int_lit.as_f64(), Some(2.0));
+
+        let float_lit: JqValue<'_, Vec<u64>> =
+            JqValue::from_owned(OwnedValue::from_number_literal("1.5"));
+        assert_eq!(float_lit.as_i64(), None);
+        assert_eq!(float_lit.as_f64(), Some(1.5));
+
+        // An integral-valued Float repr (e.g. from "2.0") still converts to
+        // i64, same as JqValue::Float's own integral-value branch above.
+        let integral_float_lit: JqValue<'_, Vec<u64>> =
+            JqValue::from_owned(OwnedValue::from_number_literal("2.0"));
+        assert_eq!(integral_float_lit.as_i64(), Some(2));
+    }
+
+    #[test]
+    fn test_jqvalue_raw_number_into_owned() {
+        let raw: JqValue<'_, Vec<u64>> = JqValue::RawNumber(b"4e4");
+        assert_eq!(raw.into_owned().to_json(), "4E+4");
+    }
+
+    #[test]
+    fn test_jqvalue_raw_number_materialize() {
+        let raw: JqValue<'_, Vec<u64>> = JqValue::RawNumber(b"4e4");
+        assert_eq!(raw.materialize().to_json(), "4E+4");
+    }
+
+    #[test]
+    fn test_jqvalue_cursor_number_materialize_and_into_owned() {
+        use crate::json::JsonIndex;
+
+        // Materializing/consuming a cursor over a number (as opposed to
+        // reading its raw bytes, which takes a separate fast path in
+        // `write_json`) goes through `cursor_to_owned`, which must also
+        // preserve the source literal rather than round-tripping through
+        // `f64`.
+        let json = br"1e100";
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let materialize_val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
+        assert_eq!(materialize_val.materialize().to_json(), "1E+100");
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let into_owned_val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
+        assert_eq!(into_owned_val.into_owned().to_json(), "1E+100");
     }
 }

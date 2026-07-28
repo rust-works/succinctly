@@ -23,7 +23,7 @@ use super::eval::{
     tonumber_from_str, EvalError, EvalSemantics, JqSemantics, QueryResult,
 };
 use super::expr::{Builtin, CompareOp, Expr, Literal};
-use super::value::OwnedValue;
+use super::value::{numeric_repr_cmp, OwnedValue};
 use crate::json::JsonIndex;
 
 /// Convert a DocumentValue to an OwnedValue.
@@ -56,6 +56,8 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> OwnedValue {
         OwnedValue::Null
     } else if let Some(b) = value.as_bool() {
         OwnedValue::Bool(b)
+    } else if let Some(literal) = value.number_literal() {
+        OwnedValue::from_number_literal(&literal)
     } else if let Some(i) = value.as_i64() {
         OwnedValue::Int(i)
     } else if let Some(f) = value.as_f64() {
@@ -76,15 +78,10 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(
     match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
-        StandardJson::Number(n) => {
-            if let Ok(i) = n.as_i64() {
-                OwnedValue::Int(i)
-            } else if let Ok(f) = n.as_f64() {
-                OwnedValue::Float(f)
-            } else {
-                OwnedValue::Null
-            }
-        }
+        StandardJson::Number(n) => match core::str::from_utf8(n.raw_bytes()) {
+            Ok(s) => OwnedValue::from_number_literal(s),
+            Err(_) => OwnedValue::Null,
+        },
         StandardJson::String(s) => {
             OwnedValue::String(s.as_str().map(|c| c.to_string()).unwrap_or_default())
         }
@@ -128,6 +125,17 @@ fn compare_values(left: &OwnedValue, right: &OwnedValue) -> Option<core::cmp::Or
         (OwnedValue::Float(a), OwnedValue::Float(b)) => a.partial_cmp(b),
         (OwnedValue::Int(a), OwnedValue::Float(b)) => (*a as f64).partial_cmp(b),
         (OwnedValue::Float(a), OwnedValue::Int(b)) => a.partial_cmp(&(*b as f64)),
+        // A `NumberLiteral` operand compares by its parsed value, exactly
+        // like `Int`/`Float` -- ordering never looks at the source text.
+        // `numeric_repr_cmp` dispatches on the same `(Int,Int)`/`(Float,Float)`/
+        // mixed pairing `==` uses (`numeric_repr_eq`), so ordering can't
+        // disagree with equality about the same pair (see its doc comment).
+        (OwnedValue::NumberLiteral(..), _) | (_, OwnedValue::NumberLiteral(..)) => {
+            match (left.number_repr(), right.number_repr()) {
+                (Some(a), Some(b)) => Some(numeric_repr_cmp(a, b)),
+                _ => None,
+            }
+        }
         (OwnedValue::String(a), OwnedValue::String(b)) => Some(a.cmp(b)),
         // Arrays: compare element-wise, then by length
         (OwnedValue::Array(a), OwnedValue::Array(b)) => {
@@ -792,7 +800,7 @@ fn index_one_generic<V: DocumentValue>(
                 GenericResult::Error(EvalError::cannot_index(target.type_name(), key))
             }
         }
-        OwnedValue::Int(_) | OwnedValue::Float(_) => {
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
             // Truncation is toward zero, matching jq: `.[-1.5]` is the last
             // element. Out-of-range floats saturate through `as`, yielding null,
             // and NaN has no index at all — also null.
@@ -1269,8 +1277,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             let s = match &owned {
                 OwnedValue::Null => "null".to_string(),
                 OwnedValue::Bool(b) => b.to_string(),
-                OwnedValue::Int(i) => i.to_string(),
-                OwnedValue::Float(f) => f.to_string(),
+                OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+                    owned.number_str().expect("numeric variant").into_owned()
+                }
                 OwnedValue::String(s) => s.clone(),
                 OwnedValue::Array(_) | OwnedValue::Object(_) => owned.to_json(),
             };
@@ -1278,7 +1287,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         }
 
         Builtin::ToNumber => {
-            if let Some(i) = value.as_i64() {
+            // Already a number: a passthrough, not a computation, so (like
+            // `.`) it keeps the source literal.
+            if let Some(literal) = value.number_literal() {
+                GenericResult::Owned(OwnedValue::from_number_literal(&literal))
+            } else if let Some(i) = value.as_i64() {
                 GenericResult::Owned(OwnedValue::Int(i))
             } else if let Some(f) = value.as_f64() {
                 GenericResult::Owned(OwnedValue::Float(f))
@@ -1297,7 +1310,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // Evaluate the offset expression
             let offset_result = eval_single::<S, _>(offset_expr, value.clone(), false, cursor);
             let offset = match offset_result {
-                GenericResult::Owned(OwnedValue::Int(i)) if i >= 0 => i as usize,
+                GenericResult::Owned(v) => match v.as_i64() {
+                    Some(i) if i >= 0 => i as usize,
+                    _ => {
+                        return GenericResult::Error(EvalError::new(
+                            "at_offset requires a non-negative integer".to_string(),
+                        ))
+                    }
+                },
                 GenericResult::One(v) => match v.as_i64() {
                     Some(i) if i >= 0 => i as usize,
                     _ => {
@@ -1337,7 +1357,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // Evaluate the line expression
             let line_result = eval_single::<S, _>(line_expr, value.clone(), false, cursor);
             let line = match line_result {
-                GenericResult::Owned(OwnedValue::Int(i)) if i > 0 => i as usize,
+                GenericResult::Owned(v) => match v.as_i64() {
+                    Some(i) if i > 0 => i as usize,
+                    _ => {
+                        return GenericResult::Error(EvalError::new(
+                            "at_position requires positive integers for line".to_string(),
+                        ))
+                    }
+                },
                 GenericResult::One(v) => match v.as_i64() {
                     Some(i) if i > 0 => i as usize,
                     _ => {
@@ -1356,7 +1383,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // Evaluate the column expression
             let col_result = eval_single::<S, _>(col_expr, value.clone(), false, cursor);
             let col = match col_result {
-                GenericResult::Owned(OwnedValue::Int(i)) if i > 0 => i as usize,
+                GenericResult::Owned(v) => match v.as_i64() {
+                    Some(i) if i > 0 => i as usize,
+                    _ => {
+                        return GenericResult::Error(EvalError::new(
+                            "at_position requires positive integers for column".to_string(),
+                        ))
+                    }
+                },
                 GenericResult::One(v) => match v.as_i64() {
                     Some(i) if i > 0 => i as usize,
                     _ => {
@@ -1906,7 +1940,7 @@ mod tests {
         let expr = crate::jq::parse("at_offset(27)").unwrap();
         let result = eval_with_cursor(&expr, cursor);
         let owned = result.into_owned().unwrap();
-        assert!(matches!(owned, OwnedValue::Int(30)));
+        assert_eq!(owned, OwnedValue::Int(30));
     }
 
     #[test]
@@ -1930,6 +1964,33 @@ mod tests {
         let result = eval_with_cursor(&expr, cursor);
         let owned = result.into_owned().unwrap();
         assert!(matches!(owned, OwnedValue::String(ref s) if s == "name"));
+    }
+
+    #[test]
+    fn test_at_offset_and_at_position_accept_a_document_sourced_argument() {
+        // #387 wraps a materialized document number in `OwnedValue::NumberLiteral`
+        // instead of plain `Int`, so `getpath` (which returns `Owned`, not a lazy
+        // cursor) now hands `AtOffset`/`AtPosition` a `NumberLiteral` -- unhandled
+        // here previously, it fell to the `_` arm and errored "requires a
+        // non-negative integer" even though the value was a perfectly good 0.
+        let json = br#"{"n": 2, "l": 1, "c": 1}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+
+        let via_getpath = crate::jq::parse(r#"at_offset(getpath(["n"]))"#).unwrap();
+        let via_literal = crate::jq::parse("at_offset(2)").unwrap();
+        assert_eq!(
+            eval_with_cursor(&via_getpath, cursor).into_owned().unwrap(),
+            eval_with_cursor(&via_literal, cursor).into_owned().unwrap(),
+        );
+
+        let via_getpath =
+            crate::jq::parse(r#"at_position(getpath(["l"]); getpath(["c"]))"#).unwrap();
+        let via_literal = crate::jq::parse("at_position(1; 1)").unwrap();
+        assert_eq!(
+            eval_with_cursor(&via_getpath, cursor).into_owned().unwrap(),
+            eval_with_cursor(&via_literal, cursor).into_owned().unwrap(),
+        );
     }
 
     #[test]
