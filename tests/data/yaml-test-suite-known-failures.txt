@@ -74,7 +74,6 @@ EW3V      lax:mapping       mapping/key rules not validated — #223
 F2C7      tags              tags (!) not supported — #224
 FH7J      tags              tags (!) not supported — #224
 FP8R      scalars           scalar content/folding differs from spec
-FTA2      structure         document/block structure differs from spec
 G9HC      lax:indentation   indentation not validated — #223
 GT5M      lax:anchors       anchor/alias rules not validated — #223
 HMQ5      tags              tags (!) not supported — #224

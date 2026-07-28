@@ -1123,6 +1123,25 @@ mod tests {
         expect_alias_cycle("ok: 1\n---\na: &x\n  b: *x", "x", "*x");
     }
 
+    /// An anchor alone on the `---` line names the document's root node, which
+    /// starts on the *next* line, so an alias to it from inside that node is a
+    /// cycle like any other.
+    ///
+    /// These two were `UnknownAnchor` cases until #407. The `---` line had its
+    /// own dispatch, which opened an empty node for the anchor to bind to and
+    /// left the real root as a second document; #372 kept the anchor
+    /// unrecorded rather than let an alias resolve to that placeholder and
+    /// render as `null`. With the dispatch shared the anchor binds properly,
+    /// and both now behave exactly as their `---`-less equivalents already did.
+    /// (`yq` v4.53.3 still reports `unknown anchor 'x'` for the first and reads
+    /// the second as the plain scalar `1 - *x`; it also renders the mapping
+    /// form as `{"":1}`, so it is not the oracle for this shape.)
+    #[test]
+    fn test_build_rejects_cycle_through_anchor_alone_on_the_document_start_line() {
+        expect_alias_cycle("--- &x\na: 1\nb: *x", "x", "*x");
+        expect_alias_cycle("--- &x\n- 1\n- *x", "x", "*x");
+    }
+
     #[test]
     fn test_build_allows_sibling_alias() {
         assert!(YamlIndex::build(b"a: &x 1\nb: *x").is_ok());
@@ -1172,10 +1191,10 @@ mod tests {
     ///
     /// #372: a lookup miss used to be dropped, leaving the node with nothing to
     /// resolve to — it rendered as `null`, or as an empty string in the four
-    /// key positions. Aliases reach the anchor table through three sites
-    /// (`parse_alias`, `record_key_alias`, and the document-root dispatch), so
-    /// this is table-driven rather than one case per site: a new position that
-    /// forgets to resolve fails here.
+    /// key positions. Aliases reach the anchor table through two sites
+    /// (`parse_alias` and `record_key_alias`), so this is table-driven rather
+    /// than one case per site: a new position that forgets to resolve fails
+    /// here.
     #[test]
     fn test_build_rejects_alias_to_unknown_anchor_in_every_position() {
         // (input, anchor name, the alias text whose offset must be reported)
@@ -1202,17 +1221,6 @@ mod tests {
             ("a: *x\nb: &x 5", "x", "*x"),
             // The anchor exists but was never in scope for this alias.
             ("a: &x 1\nb: *y", "y", "*y"),
-            // An anchor alone on the `---` line names nothing: what follows
-            // starts at indent 0 and becomes a separate document, so the node
-            // the anchor would bind to is the empty placeholder. Recording it
-            // there made this alias resolve to that placeholder and render as
-            // `null` — the very miss this test exists to rule out. `yq` reports
-            // `unknown anchor 'x'` here too.
-            ("--- &x\na: 1\nb: *x", "x", "*x"),
-            // Same shape with a sequence. `yq` reads this one as the plain
-            // scalar `1 - *x` rather than erroring, so rejecting is a
-            // deliberate divergence: the alternative is the silent `null`.
-            ("--- &x\n- 1\n- *x", "x", "*x"),
         ];
         for (yaml, name, alias_text) in cases {
             expect_unknown_anchor(yaml, name, alias_text);
