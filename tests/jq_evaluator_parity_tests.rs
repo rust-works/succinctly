@@ -9,7 +9,7 @@
 //! the fix is forced to update them and no NEW drift slips in silently.
 
 use succinctly::jq::eval_generic;
-use succinctly::jq::{eval, parse, JqSemantics, QueryResult};
+use succinctly::jq::{eval, parse, Expr, JqSemantics, QueryResult};
 use succinctly::json::JsonIndex;
 
 /// Outputs of the full evaluator (`src/jq/eval.rs`).
@@ -287,5 +287,93 @@ fn test_parity_delpaths_398() {
     assert_parity(
         br#"{"a":{"x":1,"y":2},"b":3,"c":4}"#,
         r#"delpaths([["a","x"],["b"]])"#,
+    );
+}
+
+/// Assert both evaluators produce identical, non-error, empty output for an
+/// optional-wrapped `expr` -- the shared assertion `?` collapses to once the
+/// error it would have raised is suppressed.
+fn assert_optional_parity_suppressed(json: &[u8], expr: &Expr) {
+    let index = JsonIndex::build(json);
+
+    let full: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(expr, index.root(json));
+    assert!(
+        !full.is_error(),
+        "full evaluator: {expr:?} should be suppressed"
+    );
+    assert!(
+        full.collect_owned().is_empty(),
+        "full evaluator: {expr:?} should yield nothing"
+    );
+
+    let generic = eval_generic::eval_with_cursor(expr, index.root(json));
+    assert!(
+        !generic.is_error(),
+        "generic evaluator: {expr:?} should be suppressed"
+    );
+    assert!(
+        generic.collect_owned().is_empty(),
+        "generic evaluator: {expr:?} should yield nothing"
+    );
+}
+
+#[test]
+fn test_optional_builtin_fallback_parity_386() {
+    // `eval_generic`'s builtin dispatch handles a handful of builtins itself
+    // and sends the rest to the full evaluator via `eval_on_owned`. That
+    // fallback used to rebuild a bare `Expr::Builtin`, dropping the `optional`
+    // flag it was called with -- so `builtin?` raised through the CLI path
+    // even though the full evaluator suppressed it (#386). `bsearch` and
+    // `contains` both live only in the full evaluator, so both reach this
+    // fallback (`src/jq/eval_generic.rs`, `eval_builtin`'s `_ =>` arm).
+    //
+    // `?` can't be parsed after a call (#367), so the expression is built
+    // with `Expr::optional` rather than parsed -- same as
+    // `jq_containment_tests.rs::optional_suppresses_the_error`.
+    for (json, filter) in [(b"1".as_slice(), r#"contains("a")"#), (b"1", "bsearch(9)")] {
+        let expr = parse(filter).expect("parse failed").optional();
+        assert_optional_parity_suppressed(json, &expr);
+    }
+}
+
+#[test]
+fn test_optional_pipe_fallback_no_longer_raises_386() {
+    // A second, related fallback site: once a pipe stage has round-tripped
+    // through `eval_on_owned` and produced an owned intermediate value,
+    // continuing the pipe from that owned value used the same JSON round trip
+    // (`src/jq/eval_generic.rs`, the `GenericResult::Owned`/`ManyOwned` arms
+    // of `Expr::Pipe`) and dropped `optional` the same way (#386).
+    //
+    // `contains(["a"])` on `["ab"]` succeeds (true), round-tripping through
+    // the fallback into an owned boolean. Piping that boolean into
+    // `contains("x")` errors (containment is undefined for booleans) -- before
+    // the fix that error escaped even though the whole pipe is wrapped
+    // optional; now it's suppressed.
+    //
+    // This does NOT use `assert_optional_parity_suppressed`: the full
+    // evaluator's own owned-pipe continuation (`eval_owned_expr` in
+    // `src/jq/eval.rs`) collapses a suppressed `None` into `null` rather than
+    // "no output" -- a pre-existing, unrelated quirk that exists to give
+    // `reduce`/`foreach` a single value per step. So `full` yields `null` here
+    // while `generic` yields nothing; both are correctly non-error, which is
+    // all #386 is about, so only that is asserted.
+    let expr = Expr::Pipe(vec![
+        parse(r#"contains(["a"])"#).expect("parse failed"),
+        parse(r#"contains("x")"#).expect("parse failed"),
+    ])
+    .optional();
+    let json: &[u8] = br#"["ab"]"#;
+    let index = JsonIndex::build(json);
+
+    let full: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+    assert!(
+        !full.is_error(),
+        "full evaluator: optional pipe should be suppressed, not raise"
+    );
+
+    let generic = eval_generic::eval_with_cursor(&expr, index.root(json));
+    assert!(
+        !generic.is_error(),
+        "generic evaluator: optional pipe should be suppressed, not raise"
     );
 }

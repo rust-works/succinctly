@@ -5,6 +5,8 @@
 //! JSON and YAML without intermediate conversion.
 
 #[cfg(not(test))]
+use alloc::boxed::Box;
+#[cfg(not(test))]
 use alloc::format;
 #[cfg(not(test))]
 use alloc::string::{String, ToString};
@@ -167,11 +169,20 @@ fn compare_values(left: &OwnedValue, right: &OwnedValue) -> Option<core::cmp::Or
 fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     owned: OwnedValue,
+    optional: bool,
 ) -> GenericResult<V> {
     let json_str = owned.to_json();
     let json_bytes = json_str.as_bytes();
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
+
+    let wrapped;
+    let expr = if optional {
+        wrapped = Expr::Optional(Box::new(expr.clone()));
+        &wrapped
+    } else {
+        expr
+    };
 
     match full_eval::<Vec<u64>, S>(expr, cursor) {
         QueryResult::One(v) => GenericResult::Owned(standard_json_to_owned(&v)),
@@ -191,10 +202,11 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
 fn eval_on_many_owned<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     owned_values: Vec<OwnedValue>,
+    optional: bool,
 ) -> GenericResult<V> {
     let mut results = Vec::new();
     for owned in owned_values {
-        match eval_on_owned::<S, V>(expr, owned) {
+        match eval_on_owned::<S, V>(expr, owned, optional) {
             GenericResult::One(_) => unreachable!("eval_on_owned never returns One"),
             GenericResult::OneCursor(_) => unreachable!("eval_on_owned never returns OneCursor"),
             GenericResult::Many(_) => unreachable!("eval_on_owned never returns Many"),
@@ -612,11 +624,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     GenericResult::Error(e) => return GenericResult::Error(e),
                     GenericResult::Owned(o) => {
                         // Continue piping from owned value via JSON round-trip
-                        eval_on_owned::<S, _>(expr, o)
+                        eval_on_owned::<S, _>(expr, o, optional)
                     }
                     GenericResult::ManyOwned(os) => {
                         // Continue piping from owned values via JSON round-trip
-                        eval_on_many_owned::<S, _>(expr, os)
+                        eval_on_many_owned::<S, _>(expr, os, optional)
                     }
                     GenericResult::Break(label) => return GenericResult::Break(label),
                 };
@@ -1385,7 +1397,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // For other builtins, fall back to full evaluator via JSON
         _ => {
             let owned = to_owned(&value);
-            eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned)
+            eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
         }
     }
 }
