@@ -91,6 +91,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A tab before `#` did not start a comment in a plain YAML key** (#410):
+  `a\t# c: d` loaded as `{"a\t# c":"d"}`, folding the comment text into the
+  key, where `a # c: d` (a space in the same position) already raised
+  `KeyWithoutValue`. `s-b-comment` requires `s-separate-in-line` before the
+  `#`, and `s-white` is a space *or a tab* — but `parse_unquoted_key`'s
+  comment guard tested only for a preceding space. The same omission #370
+  fixed for this function's trailing trim, thirty lines away; the value-side
+  equivalents were already tab-aware. A `#` *not* preceded by whitespace is
+  unaffected and stays key content, as before: `a#b: value` is still the key
+  `a#b`.
+
+  Unlike #370, this turns a previously-accepted document into an error, so
+  the fix was checked against the same corpora #370's CHANGELOG entry names:
+  the 402-case YAML Test Suite and `tests/data/yq-golden/` contain exactly
+  one tab immediately before a `#`, and it sits in value position (already
+  handled correctly) rather than in a key — no fixture moved.
+  `tests/yaml_tab_comment_tests.rs` covers the key-side guard now.
+
 - **`//` discarded a left-hand error instead of propagating it** (#377):
   `eval_alternative` treated a left-hand `Error` the same as `None` and fell
   through to the right side, so `error("x") // 3` and `.a // 3` (on a

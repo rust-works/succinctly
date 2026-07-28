@@ -1330,9 +1330,11 @@ impl<'a> Parser<'a> {
                     });
                 }
                 b'#' => {
-                    // # is only a comment if preceded by whitespace
-                    // Otherwise it's part of the key (e.g., "a#b: value")
-                    if self.pos > start && self.input[self.pos - 1] == b' ' {
+                    // # starts a comment only after s-separate-in-line, and
+                    // s-white is a space *or* a tab — the same set #370 fixed
+                    // for the trailing trim below (#410). Otherwise it's part
+                    // of the key (e.g., "a#b: value").
+                    if self.pos > start && matches!(self.input[self.pos - 1], b' ' | b'\t') {
                         return Err(YamlError::KeyWithoutValue {
                             offset: start,
                             line: self.current_line(),
@@ -4187,6 +4189,18 @@ mod tests {
                 }
             ),
             "expected the tab at line 3 offset 14, got {err:?}"
+        );
+    }
+
+    /// #410: the comment guard in `parse_unquoted_key` tested only for a preceding
+    /// space, so `a\t# c: d` loaded the comment text into the key as `{"a\t# c":"d"}`
+    /// instead of erroring the same way `a # c: d` already did.
+    #[test]
+    fn regression_issue_410_tab_before_hash_starts_a_comment_in_a_key() {
+        let err = build_semi_index(b"a\t# c: d\n").unwrap_err();
+        assert!(
+            matches!(err, YamlError::KeyWithoutValue { line: 1, offset: 0 }),
+            "expected key-without-value at line 1 offset 0, got {err:?}"
         );
     }
 
