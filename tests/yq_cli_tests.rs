@@ -2527,3 +2527,34 @@ fn test_compact_and_pretty_agree_on_whole_floats() -> Result<()> {
     assert_eq!(compact.trim(), pretty.replace([' ', '\n'], ""));
     Ok(())
 }
+
+/// Non-identity navigation (`.field`, `.[0]`, `.[]`, chained) takes the M2
+/// streaming fast path in compact mode, a different writer
+/// (`stream_owned_value_json_with` in `src/jq/stream.rs`) than the `.`
+/// identity path fixed first. It must agree with `.` and with real `yq`
+/// v4.53.3 rather than collapsing whole floats back to integers.
+#[test]
+fn test_navigation_queries_keep_whole_float_decimal_point() -> Result<()> {
+    for (filter, yaml, want) in [
+        (".x", "x: 1.0\n", "1.0"),
+        (".x[0]", "x: [1.0, 2.0]\n", "1.0"),
+        (".x[]", "x: [1.0, 2.0]\n", "1.0\n2.0"),
+        (".x.y[1]", "x:\n  y: [1.0, 2.0]\n", "2.0"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "exit code for {filter:?}");
+        assert_eq!(out.trim(), want, "for {filter:?} over {yaml:?}");
+    }
+    Ok(())
+}
+
+/// The same navigation queries must also agree in compact YAML output
+/// (`-o=yaml -I=0`), which streams through a sibling writer
+/// (`stream_owned_value_yaml`) that had the identical bug.
+#[test]
+fn test_navigation_queries_keep_whole_float_decimal_point_yaml() -> Result<()> {
+    let (out, code) = run_yq_stdin(".x", "x: 1.0\n", &["-o=yaml", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "1.0");
+    Ok(())
+}
