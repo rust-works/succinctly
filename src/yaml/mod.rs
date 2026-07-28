@@ -213,8 +213,8 @@ fn quoted_scalar_end(text: &[u8], pos: usize) -> Option<usize> {
 pub use error::YamlError;
 pub use index::YamlIndex;
 pub use light::{
-    ChompingIndicator, YamlCursor, YamlElements, YamlField, YamlFields, YamlNumber, YamlString,
-    YamlValue,
+    format_float_with_fraction, ChompingIndicator, YamlCursor, YamlElements, YamlField, YamlFields,
+    YamlNumber, YamlString, YamlValue,
 };
 pub use locate::{locate_offset, locate_offset_detailed, LocateResult};
 pub use scalar::{resolve_plain, ResolvedScalar};

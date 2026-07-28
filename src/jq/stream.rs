@@ -20,8 +20,11 @@
 //! | `.[]` (iterate) | M2 streaming | ~2.5x input |
 //! | `length`, complex | OwnedValue | 5-8x input |
 
+use alloc::string::{String, ToString};
+
 use super::escape::{write_json_body_jq, write_json_body_yq};
 use super::value::{format_number_jq_compat, NumberRepr, OwnedValue};
+use crate::yaml::format_float_with_fraction;
 
 /// A value that can be streamed directly to output without intermediate allocation.
 ///
@@ -90,11 +93,17 @@ impl StreamableValue for OwnedValue {
 /// This is what [`StreamableValue::stream_json`] runs, and so what `syq -o json`
 /// emits. For the `jq` convention — which #385 established is a genuinely
 /// different one, not a stricter one — see [`stream_owned_value_json_jq`].
+///
+/// Whole floats keep their decimal point here (`format_float_with_fraction`):
+/// this is the M2 fast path for non-identity navigation queries (`.field`,
+/// `.[0]`, `.[]`) in compact mode, and it must agree with the identity
+/// streaming path and the OwnedValue/DOM pretty-printer, both of which
+/// preserve `1.0` rather than collapsing it to `1` (issue #169).
 fn stream_owned_value_json<W: core::fmt::Write>(
     value: &OwnedValue,
     out: &mut W,
 ) -> core::fmt::Result {
-    stream_owned_value_json_with(value, out, write_json_body_yq)
+    stream_owned_value_json_with(value, out, write_json_body_yq, format_float_with_fraction)
 }
 
 /// Stream an OwnedValue as JSON, escaping strings the way `jq` does.
@@ -104,19 +113,27 @@ fn stream_owned_value_json<W: core::fmt::Write>(
 /// `yq` convention that [`StreamableValue::stream_json`] emits is three code
 /// points wide — `\b`, `\f` and DEL — and is documented in
 /// [`write_json_body_jq`].
+///
+/// Floats here stay plain `Display` output (no whole-float repair): unlike
+/// `yq`, jq only shows a decimal point when the value is an unmodified
+/// literal echoed from the source (handled upstream, before this function
+/// ever sees an `OwnedValue`) — a *computed* whole float like `1.0 + 2.0`
+/// prints as `3`, not `3.0`, in real jq.
 pub fn stream_owned_value_json_jq<W: core::fmt::Write>(
     value: &OwnedValue,
     out: &mut W,
 ) -> core::fmt::Result {
-    stream_owned_value_json_with(value, out, write_json_body_jq)
+    stream_owned_value_json_with(value, out, write_json_body_jq, |f| f.to_string())
 }
 
 /// Stream an OwnedValue as JSON without intermediate string allocation, using
-/// `escape` for every string body — the one place the two conventions differ.
+/// `escape` for every string body and `float_fmt` for every float — the two
+/// places the `yq`/jq-error conventions differ.
 fn stream_owned_value_json_with<W: core::fmt::Write>(
     value: &OwnedValue,
     out: &mut W,
     escape: fn(&mut W, &str) -> core::fmt::Result,
+    float_fmt: fn(f64) -> String,
 ) -> core::fmt::Result {
     match value {
         OwnedValue::Null => out.write_str("null"),
@@ -128,7 +145,7 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
                 // JSON doesn't support NaN or Infinity
                 out.write_str("null")
             } else {
-                write!(out, "{f}")
+                out.write_str(&float_fmt(*f))
             }
         }
         OwnedValue::NumberLiteral(repr, literal) => {
@@ -145,7 +162,7 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
                 if i > 0 {
                     out.write_char(',')?;
                 }
-                stream_owned_value_json_with(elem, out, escape)?;
+                stream_owned_value_json_with(elem, out, escape, float_fmt)?;
             }
             out.write_char(']')
         }
@@ -157,7 +174,7 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
                 }
                 stream_json_string(out, key, escape)?;
                 out.write_char(':')?;
-                stream_owned_value_json_with(value, out, escape)?;
+                stream_owned_value_json_with(value, out, escape, float_fmt)?;
             }
             out.write_char('}')
         }
@@ -204,7 +221,10 @@ fn stream_owned_value_yaml<W: core::fmt::Write>(
                     out.write_str("-.inf")
                 }
             } else {
-                write!(out, "{f}")
+                // Not `write!(out, "{f}")`: that drops the `.0` from a whole
+                // float, diverging from the identity streaming path and the
+                // DOM pretty-printer (issue #169).
+                out.write_str(&format_float_with_fraction(*f))
             }
         }
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => out.write_str(".nan"),
@@ -518,6 +538,46 @@ mod tests {
         let mut buf = String::new();
         OwnedValue::Float(3.125).stream_json(&mut buf).unwrap();
         assert_eq!(buf, "3.125");
+    }
+
+    /// The `yq` JSON convention (what the M2 fast path for `.field`/`.[0]`/
+    /// `.[]` streams through) must keep a whole float's decimal point,
+    /// matching the identity path and the DOM pretty-printer (issue #169).
+    #[test]
+    fn test_stream_json_whole_float_keeps_decimal_point() {
+        let mut buf = String::new();
+        OwnedValue::Float(1.0).stream_json(&mut buf).unwrap();
+        assert_eq!(buf, "1.0");
+
+        buf.clear();
+        OwnedValue::Float(-0.0).stream_json(&mut buf).unwrap();
+        assert_eq!(buf, "-0.0");
+
+        buf.clear();
+        OwnedValue::Array(vec![OwnedValue::Float(1.0), OwnedValue::Float(2.5)])
+            .stream_json(&mut buf)
+            .unwrap();
+        assert_eq!(buf, "[1.0,2.5]");
+    }
+
+    /// The `yq` YAML convention must agree with the JSON one.
+    #[test]
+    fn test_stream_yaml_whole_float_keeps_decimal_point() {
+        let mut buf = String::new();
+        OwnedValue::Float(1.0).stream_yaml(&mut buf, 0).unwrap();
+        assert_eq!(buf, "1.0");
+    }
+
+    /// The `jq` error convention is a distinct writer (`stream_owned_value_json_jq`,
+    /// used only for embedding values in `jq`'s own error messages) and must NOT
+    /// gain whole-float repair: real jq shows a decimal point only when echoing an
+    /// unmodified source literal (handled upstream, before `OwnedValue` exists),
+    /// not for computed values — `1.0 + 2.0` prints as `3`, not `3.0`.
+    #[test]
+    fn test_stream_json_jq_convention_keeps_shortest_float() {
+        let mut buf = String::new();
+        stream_owned_value_json_jq(&OwnedValue::Float(3.0), &mut buf).unwrap();
+        assert_eq!(buf, "3");
     }
 
     #[test]

@@ -2393,18 +2393,29 @@ fn write_i64(output: &mut String, mut n: i64) {
     output.push_str(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
 }
 
+/// Formats a finite `f64`, always keeping a fractional part.
+///
+/// A scalar that [`resolve_plain`] typed as `!!float` must not be emitted as an
+/// integer: `1.0` is a float, and printing it as `1` changes its type on a
+/// round trip (issue #169). Rust's `Display` for `f64` drops the `.0` from
+/// whole values and never uses exponent notation, so the absence of a `.` is
+/// the only case needing repair.
+///
+/// Shared with the streaming writer and the `yq` CLI's printers so every
+/// emitter renders a float the same way.
+#[must_use]
+pub fn format_float_with_fraction(f: f64) -> String {
+    let mut buf = f.to_string();
+    if !buf.as_bytes().contains(&b'.') {
+        buf.push_str(".0");
+    }
+    buf
+}
+
 /// Fast f64 to string formatting.
-/// For simple cases, writes directly; falls back to to_string() for edge cases.
 #[inline]
 fn write_f64(output: &mut String, f: f64) {
-    // Check for integer-like floats (no fractional part)
-    if f.fract() == 0.0 && f.abs() < 9007199254740992.0 {
-        // Can represent exactly as i64
-        write_i64(output, f as i64);
-    } else {
-        // Fall back to standard formatting for non-integer floats
-        output.push_str(&f.to_string());
-    }
+    output.push_str(&format_float_with_fraction(f));
 }
 
 /// Fast YAML scalar to JSON conversion.
@@ -2955,7 +2966,8 @@ fn stream_yaml_scalar_as_json<Out: core::fmt::Write>(
         ResolvedScalar::Bool(true) => out.write_str("true"),
         ResolvedScalar::Bool(false) => out.write_str("false"),
         ResolvedScalar::Int(n) => write!(out, "{n}"),
-        ResolvedScalar::Float(f) if f.is_finite() => write!(out, "{f}"),
+        // Not `write!(out, "{f}")`: that drops the `.0` from a whole float.
+        ResolvedScalar::Float(f) if f.is_finite() => out.write_str(&format_float_with_fraction(f)),
         // JSON cannot represent the `.inf`/`.nan` family.
         ResolvedScalar::Float(_) => out.write_str("null"),
         ResolvedScalar::Str => stream_json_string(out, str_val),

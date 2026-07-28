@@ -254,11 +254,11 @@ fn test_i0_block_folded_stays_string() -> Result<()> {
 
 #[test]
 fn test_i0_float_one_point_zero() -> Result<()> {
-    // yq preserves `1.0` as a float -> {"x":1.0}. succinctly currently collapses
-    // it to the integer {"x":1} -- bug #168/#170.
+    // #169 (fixed): a scalar the core-schema resolver typed as `!!float` is
+    // emitted with its decimal point, so `1.0` no longer collapses to `1`.
     let (out, code) = run_yq_stdin(".", "x: 1.0\n", &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), r#"{"x":1}"#);
+    assert_eq!(out.trim(), r#"{"x":1.0}"#);
     Ok(())
 }
 
@@ -2475,5 +2475,86 @@ fn test_computed_key_in_index_brackets() -> Result<()> {
     let (output, code) = run_yq_stdin(r#".[("nope")]"#, yaml, &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
     assert_eq!(output, "null\n");
+    Ok(())
+}
+
+// =============================================================================
+// Whole-float representation — #169
+// =============================================================================
+
+/// A scalar resolved as `!!float` must never print as an integer, whatever
+/// spelling it had in the source. Each expectation was measured against
+/// `yq` v4.53.3 with `yq -o=json -I=0`.
+#[test]
+fn test_whole_floats_keep_their_decimal_point() -> Result<()> {
+    for (scalar, want) in [
+        ("1.0", "1.0"),
+        ("2.0", "2.0"),
+        ("0.0", "0.0"),
+        ("-0.0", "-0.0"),
+        ("1.", "1.0"),
+        ("-5.0", "-5.0"),
+        // Above i64::MAX, where the old guard gave up and dropped the `.0`.
+        ("12345678901234567890123", "12345678901234568000000.0"),
+        // Genuine integers stay integers.
+        ("42", "42"),
+        ("-5", "-5"),
+        ("0x2A", "42"),
+    ] {
+        let yaml = format!("x: {scalar}\n");
+        let (out, code) = run_yq_stdin(".", &yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "exit code for {scalar:?}");
+        assert_eq!(out.trim(), format!("{{\"x\":{want}}}"), "for {scalar:?}");
+    }
+    Ok(())
+}
+
+/// The compact and pretty printers must agree on float representation; before
+/// the fix the compact path collapsed `1.0` while the pretty path did not.
+#[test]
+fn test_compact_and_pretty_agree_on_whole_floats() -> Result<()> {
+    let yaml = "a: 1.0\nb: 0.0\nc: -0.0\nd: 2.5\ne: 42\n";
+
+    let (compact, compact_code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+    let (pretty, pretty_code) = run_yq_stdin(".", yaml, &["-o=json"])?;
+
+    assert_eq!(compact_code, 0);
+    assert_eq!(pretty_code, 0);
+    assert_eq!(
+        compact.trim(),
+        r#"{"a":1.0,"b":0.0,"c":-0.0,"d":2.5,"e":42}"#
+    );
+    assert_eq!(compact.trim(), pretty.replace([' ', '\n'], ""));
+    Ok(())
+}
+
+/// Non-identity navigation (`.field`, `.[0]`, `.[]`, chained) takes the M2
+/// streaming fast path in compact mode, a different writer
+/// (`stream_owned_value_json_with` in `src/jq/stream.rs`) than the `.`
+/// identity path fixed first. It must agree with `.` and with real `yq`
+/// v4.53.3 rather than collapsing whole floats back to integers.
+#[test]
+fn test_navigation_queries_keep_whole_float_decimal_point() -> Result<()> {
+    for (filter, yaml, want) in [
+        (".x", "x: 1.0\n", "1.0"),
+        (".x[0]", "x: [1.0, 2.0]\n", "1.0"),
+        (".x[]", "x: [1.0, 2.0]\n", "1.0\n2.0"),
+        (".x.y[1]", "x:\n  y: [1.0, 2.0]\n", "2.0"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "exit code for {filter:?}");
+        assert_eq!(out.trim(), want, "for {filter:?} over {yaml:?}");
+    }
+    Ok(())
+}
+
+/// The same navigation queries must also agree in compact YAML output
+/// (`-o=yaml -I=0`), which streams through a sibling writer
+/// (`stream_owned_value_yaml`) that had the identical bug.
+#[test]
+fn test_navigation_queries_keep_whole_float_decimal_point_yaml() -> Result<()> {
+    let (out, code) = run_yq_stdin(".x", "x: 1.0\n", &["-o=yaml", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "1.0");
     Ok(())
 }
