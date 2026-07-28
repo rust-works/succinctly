@@ -2545,24 +2545,18 @@ impl<'a> Parser<'a> {
             && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
     }
 
-    /// Parse an explicit mapping entry in flow context: `? key : value`
-    /// Creates a single-pair mapping as the sequence element.
-    fn parse_explicit_flow_mapping_entry(&mut self) -> Result<(), YamlError> {
-        // Open implicit mapping
-        self.set_ib();
-        self.write_bp_open();
-        self.write_ty(false); // 0 = mapping
-
-        // Skip `?`
-        self.advance();
-        self.skip_flow_whitespace();
-
-        // Parse key - can be scalar, quoted, flow mapping, or flow sequence
-        self.set_ib();
-        self.write_bp_open();
+    /// Parse the key node of an explicit flow entry, with the `? ` indicator already
+    /// consumed and the key's BP node already open.
+    ///
+    /// Records the key's own text end. Nested flow containers open and end BP nodes of
+    /// their own, so none is recorded for them — doing so would clobber the innermost
+    /// of them (#332).
+    ///
+    /// One definition for the flow-sequence and flow-mapping sites. They were separate
+    /// and diverged: the mapping one planted the interest bit on the `?` *before*
+    /// consuming it, folding the indicator and its space into the key text (#402).
+    fn parse_explicit_flow_key_node(&mut self) -> Result<(), YamlError> {
         match self.peek() {
-            // Nested flow containers open their own BP nodes and need no end of their
-            // own; recording one here would clobber the innermost of them (#332).
             Some(b'{') => {
                 self.parse_flow_mapping()?;
             }
@@ -2583,6 +2577,25 @@ impl<'a> Parser<'a> {
                 self.set_bp_text_end(key_end);
             }
         }
+        Ok(())
+    }
+
+    /// Parse an explicit mapping entry in flow context: `? key : value`
+    /// Creates a single-pair mapping as the sequence element.
+    fn parse_explicit_flow_mapping_entry(&mut self) -> Result<(), YamlError> {
+        // Open implicit mapping
+        self.set_ib();
+        self.write_bp_open();
+        self.write_ty(false); // 0 = mapping
+
+        // Skip `?`
+        self.advance();
+        self.skip_flow_whitespace();
+
+        // Parse key - can be scalar, quoted, flow mapping, or flow sequence
+        self.set_ib();
+        self.write_bp_open();
+        self.parse_explicit_flow_key_node()?;
         self.write_bp_close();
 
         // Skip whitespace before possible colon
@@ -2852,12 +2865,25 @@ impl<'a> Parser<'a> {
             }
             first = false;
 
+            // `? ` is a node marker, not key text: consume it *before* the interest bit
+            // is planted, or the indicator and the space after it land inside the key's
+            // span. The flow-sequence path has always done it in this order (#402).
+            let explicit = self.looks_like_explicit_flow_key();
+            if explicit {
+                self.advance();
+                self.skip_flow_whitespace();
+            }
+
             // Parse key
             self.set_ib();
             self.write_bp_open();
-            // A complex key (a nested flow container) opened its own BP nodes and carries
-            // its own end; recording one here would clobber the innermost of them (#332).
-            if !self.parse_flow_key()? {
+            if explicit {
+                // Records its own end, or none at all for a nested flow container.
+                self.parse_explicit_flow_key_node()?;
+            } else if !self.parse_flow_key()? {
+                // A complex key (a nested flow container) opened its own BP nodes and
+                // carries its own end; recording one here would clobber the innermost of
+                // them (#332).
                 self.set_bp_text_end(self.pos);
             }
             self.write_bp_close();
@@ -2928,8 +2954,12 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// Parse a key in flow context.
+    /// Parse an *implicit* key in flow context.
     /// Keys can be scalars, flow sequences, or flow mappings (complex keys).
+    ///
+    /// The explicit `? key` form is not handled here: its indicator has to be consumed
+    /// before the caller plants the key's interest bit, so the caller dispatches it to
+    /// [`Self::parse_explicit_flow_key_node`] instead (#402).
     ///
     /// Returns `true` when the key opened BP nodes of its own — a nested flow container.
     /// The caller must **not** record an end position in that case — see
@@ -2942,37 +2972,6 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(b'&') {
             self.record_key_anchor()?;
             self.skip_flow_whitespace();
-        }
-
-        // Check for explicit key indicator
-        if self.looks_like_explicit_flow_key() {
-            // Skip `?`
-            self.advance();
-            self.skip_flow_whitespace();
-            // Parse the actual key
-            match self.peek() {
-                Some(b'"') => {
-                    self.parse_double_quoted()?;
-                }
-                Some(b'\'') => {
-                    self.parse_single_quoted()?;
-                }
-                Some(b'[') => {
-                    self.parse_flow_sequence()?;
-                    return Ok(true);
-                }
-                Some(b'{') => {
-                    self.parse_flow_mapping()?;
-                    return Ok(true);
-                }
-                Some(b':' | b',' | b'}') => {
-                    // Empty key (null) - don't consume anything
-                }
-                _ => {
-                    self.parse_explicit_flow_unquoted_key()?;
-                }
-            }
-            return Ok(false);
         }
 
         match self.peek() {
@@ -3223,6 +3222,15 @@ impl<'a> Parser<'a> {
 
     /// Parse an explicit unquoted key in flow context.
     /// Stops at `: ` (colon followed by whitespace) or flow delimiters, but NOT at bare `:`.
+    ///
+    /// A `:` ends the key only when a blank, a line break or end-of-input follows it.
+    /// `:` before a flow indicator (`,`, `}`, `]`) is ordinary key content and the scan
+    /// stops at the indicator instead, so `[? k :, x]` keys on `k :`. That is `yq`'s
+    /// rule, and it is a **deliberate divergence from YAML 1.2 §7.3.3**, under which the
+    /// colon would be the value indicator and the key just `k` — see spec example 7.3
+    /// (corpus case FRK4), which `yq` rejects outright. Chosen for `yq` agreement in
+    /// #402; `test_yaml_flow_explicit_key_colon_before_a_flow_indicator_is_content` is
+    /// the only guard, since FRK4 is a parses-only corpus case.
     fn parse_explicit_flow_unquoted_key(&mut self) -> Result<usize, YamlError> {
         // #369: the `? key : value` form in flow context is a fourth way to
         // reach a plain scalar at node start.
@@ -3234,12 +3242,11 @@ impl<'a> Parser<'a> {
             match b {
                 b',' | b'}' | b']' => break,
                 b':' => {
-                    // Only stop at `: ` or `:\n` or `:` at end
+                    // Only stop at `: ` or `:\n` or `:` at end. A flow indicator after
+                    // the colon does *not* stop the key (#402) — `,`/`}`/`]` end it on
+                    // their own arm, one byte later, with the colon kept.
                     let next = self.peek_at(1);
-                    if matches!(
-                        next,
-                        Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b'}' | b']') | None
-                    ) {
+                    if matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
                         break;
                     }
                     // Colon not followed by space - include it in the key
@@ -3270,14 +3277,9 @@ impl<'a> Parser<'a> {
                         // Explicit value indicator - stop key here
                         break;
                     }
-                    // Check for single `:` followed by flow delimiter
-                    if lookahead < self.input.len()
-                        && self.input[lookahead] == b':'
-                        && (lookahead + 1 >= self.input.len()
-                            || matches!(self.input[lookahead + 1], b',' | b'}' | b']'))
-                    {
-                        break;
-                    }
+                    // A `:` before a flow indicator on the next line is *not* a value
+                    // indicator — the key continues onto that line and keeps the colon,
+                    // so `[? k\n  :, x]` keys on `k :` (#402).
                     // Continue parsing on next line
                     self.advance(); // Skip newline char(s)
                     if self.peek() == Some(b'\n') {
@@ -3299,16 +3301,15 @@ impl<'a> Parser<'a> {
                     if lookahead < self.input.len() {
                         match self.input[lookahead] {
                             b':' => {
-                                // Check if colon is followed by space/end
+                                // Check if colon is followed by space/end. A flow
+                                // indicator after it keeps the key going (#402).
                                 let after_colon = if lookahead + 1 < self.input.len() {
                                     Some(self.input[lookahead + 1])
                                 } else {
                                     None
                                 };
-                                if matches!(
-                                    after_colon,
-                                    Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b'}' | b']') | None
-                                ) {
+                                if matches!(after_colon, Some(b' ' | b'\t' | b'\n' | b'\r') | None)
+                                {
                                     // Whitespace before `: ` - stop here
                                     break;
                                 }
@@ -3319,12 +3320,13 @@ impl<'a> Parser<'a> {
                                 // Whitespace before delimiter - stop here
                                 break;
                             }
-                            b'\n' | b'\r' => {
-                                // Newline - check next line
-                                break;
-                            }
                             _ => {
-                                // Continue with the key
+                                // Continue with the key. A line break lands here too:
+                                // walking the blanks hands the decision to the `\n`/`\r`
+                                // arm, which is the one that knows whether the next line
+                                // continues the key. Stopping here instead made a space
+                                // before the break abort the parse — `[? k \n  x : v]`
+                                // errored while `[? k\n  x : v]` was fine (#402).
                                 self.advance();
                             }
                         }
