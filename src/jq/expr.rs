@@ -625,6 +625,12 @@ pub enum Builtin {
     ToJsonStream,
     /// `fromjsonstream` - convert from JSON stream format
     FromJsonStream,
+    /// `tostream` - jq-compatible stream of `[path,value]` / `[path]` events
+    ToStream,
+    /// `fromstream(f)` - reconstruct values from a stream of events produced by `f`
+    FromStream(Box<Expr>),
+    /// `truncate_stream(f)` - drop the leading `.` path components from `f`'s stream events
+    TruncateStream(Box<Expr>),
     /// `getpath(path)` - get value at path
     GetPath(Box<Expr>),
 
