@@ -9477,11 +9477,7 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // indices must be integers", which succinctly does not reproduce
             // here (out of scope: `truncate_stream` is always called with an
             // integer depth in practice).
-            let offset = match &depth {
-                OwnedValue::Int(i) => (*i).max(0) as usize,
-                OwnedValue::Float(f) => f.max(0.0) as usize,
-                _ => 0,
-            };
+            let offset = depth.as_f64().map_or(0, |f| f.max(0.0) as usize);
             let truncated = path[offset.min(path.len())..].to_vec();
             parts[0] = OwnedValue::Array(truncated);
             outputs.push(OwnedValue::Array(parts));
