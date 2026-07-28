@@ -395,6 +395,23 @@ impl OwnedValue {
         }
     }
 
+    /// The parsed [`NumberRepr`] behind `Int`, `Float`, or `NumberLiteral`;
+    /// `None` for every other variant.
+    ///
+    /// Lets a caller (e.g. the evaluators' `compare_values`) dispatch on
+    /// exactly the same `(Int, Int)` / `(Float, Float)` / mixed pairing that
+    /// [`numeric_repr_eq`] uses for `==`, regardless of which of the three
+    /// variants either operand happens to be -- so ordering can't disagree
+    /// with equality about the same pair of numbers.
+    pub(crate) fn number_repr(&self) -> Option<NumberRepr> {
+        match self {
+            Self::Int(n) => Some(NumberRepr::Int(*n)),
+            Self::Float(f) => Some(NumberRepr::Float(*f)),
+            Self::NumberLiteral(repr, _) => Some(*repr),
+            _ => None,
+        }
+    }
+
     /// Convert to a string reference, if possible.
     pub fn as_str(&self) -> Option<&str> {
         match self {
@@ -521,12 +538,41 @@ impl OwnedValue {
 /// `NumberLiteral` compares purely on its parsed [`NumberRepr`], never on the
 /// source text -- two spellings of the same number (`1.0` and `1e0`) are
 /// equal, matching every other numeric comparison here.
-fn numeric_repr_eq(a: NumberRepr, b: NumberRepr) -> bool {
+pub(crate) fn numeric_repr_eq(a: NumberRepr, b: NumberRepr) -> bool {
     match (a, b) {
         (NumberRepr::Int(a), NumberRepr::Int(b)) => a == b,
         (NumberRepr::Float(a), NumberRepr::Float(b)) => a == b,
         (NumberRepr::Int(a), NumberRepr::Float(b)) => (a as f64) == b,
         (NumberRepr::Float(a), NumberRepr::Int(b)) => a == (b as f64),
+    }
+}
+
+/// Order two parsed number representations with the exact same per-pair
+/// dispatch [`numeric_repr_eq`] uses for equality -- exact `i64` comparison
+/// when both are `Int` (so integers beyond 2^53 keep precision, matching the
+/// evaluators' plain `(Int, Int)` ordering arm), exact `f64` comparison when
+/// both are `Float`, and `f64`-widening for a mixed pair (the same
+/// precision-losing widen the mixed `Int`/`Float` ordering arms use).
+///
+/// This exists so a `NumberLiteral` operand orders consistently with how it
+/// compares equal: before this, `compare_values` tried exact `i64` first for
+/// *any* `NumberLiteral` pair while `==` always widened mixed pairs to `f64`,
+/// so `9007199254740993 == 9007199254740992.0` could be `true` while
+/// `9007199254740993 > 9007199254740992.0` was also `true` -- sort and
+/// `unique`/`group_by` disagreeing with `==` about the same two numbers.
+pub(crate) fn numeric_repr_cmp(a: NumberRepr, b: NumberRepr) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    match (a, b) {
+        (NumberRepr::Int(a), NumberRepr::Int(b)) => a.cmp(&b),
+        (NumberRepr::Float(a), NumberRepr::Float(b)) => {
+            a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+        }
+        (NumberRepr::Int(a), NumberRepr::Float(b)) => {
+            (a as f64).partial_cmp(&b).unwrap_or(Ordering::Equal)
+        }
+        (NumberRepr::Float(a), NumberRepr::Int(b)) => {
+            a.partial_cmp(&(b as f64)).unwrap_or(Ordering::Equal)
+        }
     }
 }
 
@@ -967,6 +1013,51 @@ mod tests {
             OwnedValue::from_number_literal("1")
         );
         assert_ne!(OwnedValue::from_number_literal("1.5"), OwnedValue::Int(1));
+    }
+
+    #[test]
+    fn test_number_repr_agrees_with_partial_eq_across_variants() {
+        // `number_repr` must return the same `NumberRepr` regardless of which
+        // of the three numeric variants a value happens to be in, and
+        // `numeric_repr_cmp` must call two values `Equal` exactly when
+        // `numeric_repr_eq` calls them equal -- otherwise ordering-based
+        // consumers (`sort`, `group_by`, `unique`) can disagree with `==`
+        // about the very same pair (#387: this actually happened for a
+        // `NumberLiteral` operand above 2^53, before `compare_values` was
+        // rewritten to share this exact dispatch with equality).
+        let pairs = [
+            (OwnedValue::Int(42), OwnedValue::from_number_literal("42")),
+            (
+                OwnedValue::Float(1.5),
+                OwnedValue::from_number_literal("1.5"),
+            ),
+            (
+                OwnedValue::from_number_literal("1.0"),
+                OwnedValue::from_number_literal("1e0"),
+            ),
+            // The precision-boundary case #387 regressed: a `NumberLiteral`
+            // `Int` above 2^53 against a `Float` that collapses to the same
+            // `f64` value on widening.
+            (
+                OwnedValue::from_number_literal("9007199254740993"),
+                OwnedValue::Float(9007199254740992.0),
+            ),
+        ];
+        for (a, b) in pairs {
+            let are_eq = a == b;
+            let ra = a.number_repr().expect("numeric operand");
+            let rb = b.number_repr().expect("numeric operand");
+            assert_eq!(
+                numeric_repr_eq(ra, rb),
+                are_eq,
+                "numeric_repr_eq disagrees with OwnedValue::eq for {a:?} vs {b:?}"
+            );
+            assert_eq!(
+                numeric_repr_cmp(ra, rb) == core::cmp::Ordering::Equal,
+                are_eq,
+                "numeric_repr_cmp disagrees with OwnedValue::eq for {a:?} vs {b:?}"
+            );
+        }
     }
 
     #[test]

@@ -69,7 +69,7 @@ use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey,
     Pattern, StringPart,
 };
-use super::value::{format_number_jq_compat, NumberRepr, OwnedValue};
+use super::value::{format_number_jq_compat, numeric_repr_cmp, NumberRepr, OwnedValue};
 
 /// Result of evaluating a jq expression.
 #[derive(Debug)]
@@ -1232,17 +1232,14 @@ fn compare_values(left: &OwnedValue, right: &OwnedValue) -> core::cmp::Ordering 
             a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
         }
         // A `NumberLiteral` operand compares by its parsed value, exactly
-        // like `Int`/`Float` -- ordering never looks at the source text. Try
-        // exact `i64` first (matches the `(Int,Int)` arm's precision above
-        // 2^53), fall back to the same `f64` widening the mixed `Int`/`Float`
-        // arms above use.
+        // like `Int`/`Float` -- ordering never looks at the source text.
+        // `numeric_repr_cmp` dispatches on the same `(Int,Int)`/`(Float,Float)`/
+        // mixed pairing `==` uses (`numeric_repr_eq`), so ordering can't
+        // disagree with equality about the same pair (see its doc comment).
         (OwnedValue::NumberLiteral(..), _) | (_, OwnedValue::NumberLiteral(..)) => {
-            match (left.as_i64(), right.as_i64()) {
-                (Some(a), Some(b)) => a.cmp(&b),
-                _ => match (left.as_f64(), right.as_f64()) {
-                    (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
-                    _ => Ordering::Equal,
-                },
+            match (left.number_repr(), right.number_repr()) {
+                (Some(a), Some(b)) => numeric_repr_cmp(a, b),
+                _ => Ordering::Equal,
             }
         }
         (OwnedValue::String(a), OwnedValue::String(b)) => a.cmp(b),
