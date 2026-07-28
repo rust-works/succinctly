@@ -2464,7 +2464,8 @@ fn builtin_ltrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let prefix_result = eval_single::<W, S>(prefix_expr, value.clone(), optional);
     let prefix = match result_to_owned(prefix_result) {
         Ok(OwnedValue::String(s)) => s,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
+        // jq's ltrimstr is total: a non-string argument leaves input unchanged.
+        Ok(_) => return QueryResult::Owned(to_owned(&value)),
         Err(e) => return QueryResult::Error(e),
     };
 
@@ -2481,8 +2482,8 @@ fn builtin_ltrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::Owned(OwnedValue::String(String::new()))
             }
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        // jq's ltrimstr is total: a non-string input passes through unchanged.
+        _ => QueryResult::Owned(to_owned(&value)),
     }
 }
 
@@ -2496,7 +2497,8 @@ fn builtin_rtrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let suffix_result = eval_single::<W, S>(suffix_expr, value.clone(), optional);
     let suffix = match result_to_owned(suffix_result) {
         Ok(OwnedValue::String(s)) => s,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("string", "non-string")),
+        // jq's rtrimstr is total: a non-string argument leaves input unchanged.
+        Ok(_) => return QueryResult::Owned(to_owned(&value)),
         Err(e) => return QueryResult::Error(e),
     };
 
@@ -2513,8 +2515,8 @@ fn builtin_rtrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::Owned(OwnedValue::String(String::new()))
             }
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        // jq's rtrimstr is total: a non-string input passes through unchanged.
+        _ => QueryResult::Owned(to_owned(&value)),
     }
 }
 
@@ -16268,6 +16270,20 @@ mod tests {
                 assert_eq!(s, "hello world");
             }
         );
+
+        // jq's ltrimstr is total: non-string argument leaves input unchanged (#394)
+        query!(br#""abc""#, "ltrimstr(1)",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "abc");
+            }
+        );
+
+        // jq's ltrimstr is total: non-string input passes through unchanged (#394)
+        query!(b"1", r#"ltrimstr("a")"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1);
+            }
+        );
     }
 
     #[test]
@@ -16282,6 +16298,20 @@ mod tests {
         query!(br#""hello world""#, r#"rtrimstr("goodbye")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "hello world");
+            }
+        );
+
+        // jq's rtrimstr is total: non-string argument leaves input unchanged (#394)
+        query!(br#""abc""#, "rtrimstr(null)",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "abc");
+            }
+        );
+
+        // jq's rtrimstr is total: non-string input passes through unchanged (#394)
+        query!(b"1", r#"rtrimstr("a")"#,
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1);
             }
         );
     }
