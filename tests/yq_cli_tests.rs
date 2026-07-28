@@ -1671,6 +1671,22 @@ fn test_yaml_flow_explicit_key_colon_before_a_flow_indicator_is_content() -> Res
     Ok(())
 }
 
+#[test]
+fn test_yaml_explicit_flow_key_comment_requires_preceding_whitespace() -> Result<()> {
+    // #437: `parse_explicit_flow_unquoted_key` has the same shape as
+    // `parse_flow_unquoted_key` and was missing the same `#` arm — a comment
+    // inside a `? key : value` flow key folded into the key text instead of
+    // erroring.
+    let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", "{? a # b : c}\n", &[])?;
+    assert_eq!(exit_code, 1, "expected clean error exit: {stderr}");
+    assert_eq!(stdout, "", "nothing should reach stdout");
+    assert!(
+        stderr.contains("key without value"),
+        "stderr should name the missing value: {stderr}"
+    );
+    Ok(())
+}
+
 // =============================================================================
 // Explicit keys as sequence items (#339) - `- ? k` / `  : v` is a mapping, not
 // a plain scalar. Expectations are mikefarah/yq v4.53.3 output.
