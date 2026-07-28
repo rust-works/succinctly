@@ -362,6 +362,42 @@ its `explicit_indent` case last.
 
 The two `parse` failures (`FH7J`, `UKK6/02`) are also tags.
 
+### `FRK4`: a divergence the ledger cannot see
+
+`JEF9/02` above is the one case where following `yq` moves a case *across* the ledger.
+[#402](https://github.com/rust-works/succinctly/issues/402) added a second place where we
+follow `yq` over the spec, and this one does not move the ledger at all — which is why it is
+recorded here.
+
+In an explicit **flow** key, a `:` ends the key only when a blank, a line break or end of
+input follows it. Before a flow indicator it is ordinary key content, and the scan stops at
+the indicator instead:
+
+```
+$ printf 'a: [? k :, x]\n' | succinctly yq -o=json -I=0 '.'
+{"a":[{"k :":null},"x"]}             # agrees with yq
+```
+
+YAML 1.2 §7.3.3 says the opposite — `ns-plain-char` excludes a `:` followed by a
+`c-flow-indicator`, so the colon is the value indicator and the key is just `k`. The visible
+cost is spec example 7.3, corpus case `FRK4`:
+
+```
+$ printf '{\n  ? foo :,\n  : bar,\n}\n' | succinctly yq -o=json -I=0 '.'
+{"foo :":null,"":"bar"}              # spec: key is `foo`; yq: rejects the document
+```
+
+`yq` rejects `FRK4` outright, so there is no `yq` answer to agree with there — only the rule
+it applies everywhere else. `FRK4` is a *parses-only* corpus case (`json: null`), so it still
+passes and the known-failures manifest cannot notice the change:
+`test_yaml_flow_explicit_key_colon_before_a_flow_indicator_is_content` in
+`tests/yq_cli_tests.rs` is the only guard.
+
+The same change made `? ` a node marker in flow mappings rather than key text — `{? k : v}`
+used to key on `? k` — and stopped a space before a line break from aborting the key scan, so
+`[? k \n  x : v]` now reads the same as `[? k\n  x : v]`. Both of those are plain bug fixes
+that move toward `yq` *and* the spec together.
+
 ## Why not wrap an existing parser?
 
 Issue [#49](https://github.com/rust-works/succinctly/issues/49) raised the option of using

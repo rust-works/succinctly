@@ -1180,6 +1180,34 @@ fn test_yaml_explicit_flow_key_scalar_shapes() -> Result<()> {
             "a: [? k\n  , x]\n",
             r#"{"a":[{"k":null},"x"]}"#,
         ),
+        // #402. A `:` ends the key only before a blank, a break or end of input.
+        // Before a flow indicator it is content, and the scan stops at the
+        // indicator one byte later — so the colon stays in the key.
+        (
+            "colon then comma",
+            "a: [? k :, x]\n",
+            r#"{"a":[{"k :":null},"x"]}"#,
+        ),
+        (
+            "colon then bracket",
+            "a: [? k :]\n",
+            r#"{"a":[{"k :":null}]}"#,
+        ),
+        (
+            "unspaced colon then bracket",
+            "a: [? k:]\n",
+            r#"{"a":[{"k:":null}]}"#,
+        ),
+        (
+            "colon then comma on the next line",
+            "a: [? k\n  :, x]\n",
+            r#"{"a":[{"k :":null},"x"]}"#,
+        ),
+        (
+            "colon then bracket on the next line",
+            "a: [? k\n  :]\n",
+            r#"{"a":[{"k :":null}]}"#,
+        ),
         // #402. A space before the break used to abort the parse outright
         // ("unexpected character 'x'") while the same input without it parsed.
         // Folding drops the trailing space, so both give the one key.
@@ -1352,6 +1380,7 @@ fn test_yaml_explicit_flow_key_agrees_across_positions() -> Result<()> {
         ("double-quoted", "\"k\" : v", r#"{"k":"v"}"#),
         ("single-quoted", "'k' : v", r#"{"k":"v"}"#),
         ("embedded colon", "a:b : v", r#"{"a:b":"v"}"#),
+        ("trailing colon", "k :", r#"{"k :":null}"#),
         ("continued line", "k \n  x : v", r#"{"k x":"v"}"#),
     ] {
         let (in_mapping, code) = run_yq_stdin(
@@ -1402,6 +1431,31 @@ fn test_yaml_flow_question_mark_without_a_space_is_content() -> Result<()> {
         assert_eq!(exit_code, 0, "{name}: should parse cleanly");
         assert_eq!(stdout.trim(), expected, "{name}");
     }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_flow_explicit_key_colon_before_a_flow_indicator_is_content() -> Result<()> {
+    // A deliberate divergence from YAML 1.2, pinned here because nothing else
+    // can catch it moving.
+    //
+    // In an explicit flow key, `:` ends the key only before a blank, a break or
+    // end of input; before a flow indicator it is content. That is yq's rule
+    // (see `test_yaml_explicit_flow_key_scalar_shapes`), and it contradicts
+    // §7.3.3, under which `:` before `,`/`}`/`]` is the value indicator.
+    //
+    // The visible cost is spec example 7.3, YAML Test Suite case FRK4, whose
+    // first key the spec reads as `foo` and we now read as `foo :`. yq rejects
+    // that document outright, so there is no yq answer to agree with. FRK4 is a
+    // parses-only corpus case (`json: null`), so `yaml_test_suite`'s manifest
+    // will not notice the change — this assertion is the only guard. #402.
+    let (stdout, exit_code) = run_yq_stdin(
+        ".",
+        "{\n  ? foo :,\n  : bar,\n}\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(exit_code, 0, "FRK4 must still parse");
+    assert_eq!(stdout.trim(), r#"{"foo :":null,"":"bar"}"#);
     Ok(())
 }
 

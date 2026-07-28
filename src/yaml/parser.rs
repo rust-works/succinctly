@@ -3222,6 +3222,15 @@ impl<'a> Parser<'a> {
 
     /// Parse an explicit unquoted key in flow context.
     /// Stops at `: ` (colon followed by whitespace) or flow delimiters, but NOT at bare `:`.
+    ///
+    /// A `:` ends the key only when a blank, a line break or end-of-input follows it.
+    /// `:` before a flow indicator (`,`, `}`, `]`) is ordinary key content and the scan
+    /// stops at the indicator instead, so `[? k :, x]` keys on `k :`. That is `yq`'s
+    /// rule, and it is a **deliberate divergence from YAML 1.2 §7.3.3**, under which the
+    /// colon would be the value indicator and the key just `k` — see spec example 7.3
+    /// (corpus case FRK4), which `yq` rejects outright. Chosen for `yq` agreement in
+    /// #402; `test_yaml_flow_explicit_key_colon_before_a_flow_indicator_is_content` is
+    /// the only guard, since FRK4 is a parses-only corpus case.
     fn parse_explicit_flow_unquoted_key(&mut self) -> Result<usize, YamlError> {
         // #369: the `? key : value` form in flow context is a fourth way to
         // reach a plain scalar at node start.
@@ -3233,12 +3242,11 @@ impl<'a> Parser<'a> {
             match b {
                 b',' | b'}' | b']' => break,
                 b':' => {
-                    // Only stop at `: ` or `:\n` or `:` at end
+                    // Only stop at `: ` or `:\n` or `:` at end. A flow indicator after
+                    // the colon does *not* stop the key (#402) — `,`/`}`/`]` end it on
+                    // their own arm, one byte later, with the colon kept.
                     let next = self.peek_at(1);
-                    if matches!(
-                        next,
-                        Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b'}' | b']') | None
-                    ) {
+                    if matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
                         break;
                     }
                     // Colon not followed by space - include it in the key
@@ -3269,14 +3277,9 @@ impl<'a> Parser<'a> {
                         // Explicit value indicator - stop key here
                         break;
                     }
-                    // Check for single `:` followed by flow delimiter
-                    if lookahead < self.input.len()
-                        && self.input[lookahead] == b':'
-                        && (lookahead + 1 >= self.input.len()
-                            || matches!(self.input[lookahead + 1], b',' | b'}' | b']'))
-                    {
-                        break;
-                    }
+                    // A `:` before a flow indicator on the next line is *not* a value
+                    // indicator — the key continues onto that line and keeps the colon,
+                    // so `[? k\n  :, x]` keys on `k :` (#402).
                     // Continue parsing on next line
                     self.advance(); // Skip newline char(s)
                     if self.peek() == Some(b'\n') {
@@ -3298,16 +3301,15 @@ impl<'a> Parser<'a> {
                     if lookahead < self.input.len() {
                         match self.input[lookahead] {
                             b':' => {
-                                // Check if colon is followed by space/end
+                                // Check if colon is followed by space/end. A flow
+                                // indicator after it keeps the key going (#402).
                                 let after_colon = if lookahead + 1 < self.input.len() {
                                     Some(self.input[lookahead + 1])
                                 } else {
                                     None
                                 };
-                                if matches!(
-                                    after_colon,
-                                    Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b'}' | b']') | None
-                                ) {
+                                if matches!(after_colon, Some(b' ' | b'\t' | b'\n' | b'\r') | None)
+                                {
                                     // Whitespace before `: ` - stop here
                                     break;
                                 }
