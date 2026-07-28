@@ -80,12 +80,10 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
         Err(_) => return s.to_string(),
     };
 
-    // Parse exponent to check for e0/e-0
-    let exp: i32 = if let Some(pos) = s.find(['e', 'E']) {
-        s[pos + 1..].parse().unwrap_or(0)
-    } else {
-        0
-    };
+    // Parse exponent to check for e0/e-0. `has_exp` above guarantees `e`/`E`
+    // is present, so the position is always found.
+    let exp_pos = s.find(['e', 'E']).expect("has_exp guarantees e/E present");
+    let exp: i32 = s[exp_pos + 1..].parse().unwrap_or(0);
 
     // For e0 or e-0, jq eliminates the exponent
     if exp == 0 {
@@ -222,8 +220,8 @@ pub enum OwnedValue {
     /// interpolation, error-message previews) prefers the literal. The
     /// moment a value passes through an operation that produces a *new*
     /// number, the result collapses to plain `Int`/`Float` (see
-    /// [`into_plain_number`](Self::into_plain_number)) -- matching jq, where
-    /// only values that reach output untouched keep their original spelling.
+    /// `into_plain_number`) -- matching jq, where only values that reach
+    /// output untouched keep their original spelling.
     NumberLiteral(NumberRepr, Box<str>),
     /// JSON string
     String(String),
