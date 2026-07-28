@@ -1,0 +1,1 @@
+. as $doc | 1 | fromstream(truncate_stream($doc|tostream))
