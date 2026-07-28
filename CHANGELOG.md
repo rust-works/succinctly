@@ -402,6 +402,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Breaking**: adds a `YamlError::UnknownAnchor` variant, so exhaustive
   `match`es on the public `YamlError` gain an arm.
 
+- **An anchor at the end of a compact mapping entry's line swallowed the nested
+  value** (#406): `- k: &a` followed by an indented block read that block as one
+  folded plain scalar, so `- k: &a` / `    b: 1` came out as `[{"k":"b"}]` and
+  the sequence form `- k: &a` / `    - 1` as `[{"k":null}]` — well-formed but
+  wrong documents, with no error raised. The same entry without the anchor was
+  always right. `parse_compact_mapping_entry` asked whether the value was on
+  this line *before* anything consumed the `&a`, so the answer was always "yes"
+  and `parse_inline_value`'s multi-line plain-scalar rule ran on what was
+  effectively an empty remainder. It now consumes the anchor first and then
+  decides, which is the order every other block-context value site already used
+  — `parse_mapping_entry`, `parse_sequence_item_inner` and
+  `parse_explicit_value` — and a test pins all four against one input shape so
+  the outlier cannot come back. A flow collection on the following line
+  (`- k: &a` / `    [1, 2]`, previously the string `"[1, 2]"`) is fixed by the
+  same change, and aliases now propagate the nested collection rather than the
+  collapsed scalar. A block scalar whose `|` or `>` sits at the *same* indent as
+  the key (legal in YAML, unlike a plain scalar or flow collection there) is a
+  separate, pre-existing bug that this does not address: `next_indent ==
+  indent` only treats a `-` as "the value continues here", so `|`/`>` there is
+  still misread as null on both the anchored and non-anchored forms, where yq
+  gives `""`. A block scalar indented deeper than the key — the shape `#406`
+  is actually about — is unaffected by that gap and now agrees with yq for
+  every chomping/indicator variant.
+
+  No YAML Test Suite manifest movement: no case in the suite has this shape.
+
 - **jq error-message value previews escaped C1 control characters** (#358):
   a preview built from `OwnedValue::to_json` escapes every
   `char::is_control()`, which includes U+0080–U+009F, so a string containing

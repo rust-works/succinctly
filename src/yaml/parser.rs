@@ -1656,6 +1656,28 @@ impl<'a> Parser<'a> {
         // Skip space after colon
         self.skip_inline_whitespace();
 
+        // An anchor prefixes the value rather than being it, so it has to be
+        // consumed *before* asking where the value is: with `&a` last on the
+        // line the value is on the *next* line. Deciding first sent `- k: &a` /
+        // `    b: 1` down the inline path, where `parse_inline_value`'s
+        // multi-line plain-scalar rule read the nested block as one folded
+        // scalar — `{"k":"b"}` for that input, and `{"k":null}` for the
+        // sequence form (#406).
+        //
+        // Every other block-context value site already orders the two this way
+        // — `parse_mapping_entry`, `parse_sequence_item_inner`,
+        // `parse_explicit_value` — which is why the block form `k: &a` /
+        // `  b: 1` was always right. This was the last one that did not.
+        //
+        // `- k: &a 1` also never registered the anchor before this, so a later
+        // `*a` resolved to nothing (#372).
+        if !self.at_line_end() {
+            self.check_unsupported()?;
+            if self.peek() == Some(b'&') {
+                self.parse_anchor()?;
+            }
+        }
+
         // Parse value
         if self.at_line_end() {
             // Value is on next line or implicit null
@@ -1687,21 +1709,21 @@ impl<'a> Parser<'a> {
                 }
                 // Otherwise, value is a nested structure - main loop will handle it
             }
+            // An anchor consumed above needs a node to name, and both arms
+            // provide one: the null arms emit that empty node unconditionally,
+            // and in the nested-structure arm the next BP write is the
+            // container's own open (`close_deeper_indents` closes only
+            // *strictly* deeper containers, so it cannot slip a close in
+            // first). Hence no `following_value_is_null` call here, unlike
+            // `parse_sequence_item_inner` and `parse_explicit_value` where the
+            // placeholder is conditional. `test_every_anchor_targets_an_open_bit`
+            // is the whole-corpus guard on that.
         } else {
-            // Inline value
-            self.check_unsupported()?;
-
-            // An anchor or alias prefixes the value here exactly as it does in
-            // `parse_value`, and this path handled neither: `- k: &a 1` never
-            // registered the anchor, so a later `*a` resolved to nothing, and
-            // `- k: *a` never became an alias node at all. Both were swallowed
-            // into the plain scalar below and rendered as `null` (#372).
-            if self.peek() == Some(b'&') {
-                self.parse_anchor()?;
-            }
-
+            // Inline value (`check_unsupported` ran above)
             if self.peek() == Some(b'*') {
-                // `parse_alias` opens and closes its own node.
+                // `parse_alias` opens and closes its own node. `- k: *a` never
+                // became an alias node at all before #372, and was swallowed
+                // into the plain scalar below.
                 self.parse_alias()?;
             } else {
                 // Open value node
