@@ -1180,6 +1180,29 @@ fn test_yaml_explicit_flow_key_scalar_shapes() -> Result<()> {
             "a: [? k\n  , x]\n",
             r#"{"a":[{"k":null},"x"]}"#,
         ),
+        // #402. A space before the break used to abort the parse outright
+        // ("unexpected character 'x'") while the same input without it parsed.
+        // Folding drops the trailing space, so both give the one key.
+        (
+            "space before a continued line",
+            "a: [? k \n  x : v]\n",
+            r#"{"a":[{"k x":"v"}]}"#,
+        ),
+        (
+            "tab before a continued line",
+            "a: [? k\t\n  x : v]\n",
+            r#"{"a":[{"k x":"v"}]}"#,
+        ),
+        (
+            "space before a continued line, no value",
+            "a: [? k \n  x]\n",
+            r#"{"a":[{"k x":null}]}"#,
+        ),
+        (
+            "space before a continued line, in a mapping",
+            "a: {? k \n  x : v}\n",
+            r#"{"a":{"k x":"v"}}"#,
+        ),
     ] {
         let (stdout, exit_code) = run_yq_stdin(".", input, &["-o", "json", "-I", "0"])?;
         assert_eq!(exit_code, 0, "{name}: should parse cleanly");
@@ -1329,6 +1352,7 @@ fn test_yaml_explicit_flow_key_agrees_across_positions() -> Result<()> {
         ("double-quoted", "\"k\" : v", r#"{"k":"v"}"#),
         ("single-quoted", "'k' : v", r#"{"k":"v"}"#),
         ("embedded colon", "a:b : v", r#"{"a:b":"v"}"#),
+        ("continued line", "k \n  x : v", r#"{"k x":"v"}"#),
     ] {
         let (in_mapping, code) = run_yq_stdin(
             ".a",

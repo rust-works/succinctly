@@ -3318,12 +3318,13 @@ impl<'a> Parser<'a> {
                                 // Whitespace before delimiter - stop here
                                 break;
                             }
-                            b'\n' | b'\r' => {
-                                // Newline - check next line
-                                break;
-                            }
                             _ => {
-                                // Continue with the key
+                                // Continue with the key. A line break lands here too:
+                                // walking the blanks hands the decision to the `\n`/`\r`
+                                // arm, which is the one that knows whether the next line
+                                // continues the key. Stopping here instead made a space
+                                // before the break abort the parse — `[? k \n  x : v]`
+                                // errored while `[? k\n  x : v]` was fine (#402).
                                 self.advance();
                             }
                         }
