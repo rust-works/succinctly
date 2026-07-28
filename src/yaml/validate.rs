@@ -1623,6 +1623,36 @@ mod tests {
         assert!(validate(b"---\nseq:\n &anchor\n- a\n- b\n").is_ok()); // SKE5
     }
 
+    /// Issue #404: the unknown-anchor rejection must not take valid input with
+    /// it. Two ways it could: a `*` that is plain-scalar content rather than an
+    /// alias, and an anchor whose definition the scanner fails to register.
+    /// Every case here loads under `yq` v4.53.3 (the goldens' pinned version).
+    #[test]
+    fn accepts_resolvable_aliases_and_stars_in_scalars() {
+        // A `*` inside a scalar is content: `{"a":"text *star"}`.
+        assert!(validate(b"a: text *star\n").is_ok());
+        assert!(validate(b"a: rm *.tmp\n").is_ok());
+        assert!(validate(b"a: what? *star\n").is_ok());
+        // ... including on the continuation line of a multi-line plain scalar,
+        // where the `*` opens the line: `{"a":"text *notanalias"}`.
+        assert!(validate(b"a: text\n  *notanalias\n").is_ok());
+        assert!(validate(b"a:\n  text\n  *notanalias\n").is_ok());
+        assert!(validate(b"root\n*notanalias\n").is_ok()); // "root *notanalias"
+        assert!(validate(b"a: text &amp more\n").is_ok());
+        // An anchor defined before the alias, in each position defining one.
+        assert!(validate(b"a: &x 1\nb: *x\n").is_ok());
+        assert!(validate(b"- &x 1\n- *x\n").is_ok());
+        assert!(validate(b"a: [&x 1, *x]\n").is_ok());
+        assert!(validate(b"a: {k: &x 1, j: *x}\n").is_ok());
+        assert!(validate(b"? &x k\n: *x\n").is_ok());
+        // The name ends at a `: ` value indicator, as the loader's scan does —
+        // registering `a:` here would reject the alias below.
+        assert!(validate(b"&a: 1\nb: *a\n").is_ok());
+        // Anchors carry across documents for `yq` and for the loader, so an
+        // alias to an earlier document's anchor is not an unresolved one.
+        assert!(validate(b"a: &x 1\n---\nb: *x\n").is_ok());
+    }
+
     /// Issue #328: every shape the loader now handles must also pass the
     /// validator, or `syq --validate` would reject documents `syq` reads fine.
     ///
@@ -1879,6 +1909,51 @@ mod tests {
         )); // SY6V
     }
 
+    /// Issue #404: an alias naming an anchor that is not in scope. `yq` v4.53.3
+    /// rejects every case below with `unknown anchor 'nope' referenced`, and
+    /// `yaml validate` is documented as the yq-conformance gate, so accepting
+    /// them left a CI check green on input `yq` refuses.
+    ///
+    /// Table-driven over the positions an alias can occupy — a value, a
+    /// sequence item, an explicit key, an implicit key, and both flow
+    /// collections — because they reach the check through different scanners
+    /// (`scan_content_tokens` and `scan_flow`), and a position added later that
+    /// forgets to check fails here. The position is asserted too: reporting
+    /// some other plausible offset would still pass a kind-only assertion.
+    #[test]
+    fn rejects_alias_to_unknown_anchor() {
+        for input in [
+            &b"a: *nope\n"[..],
+            b"- *nope\n",
+            b"? *nope\n: v\n",
+            b"*nope: v\n",
+            b"a: [*nope]\n",
+            b"a: {k: *nope}\n",
+            b"[*nope]\n",
+            b"a: &x 1\nb: [1, *nope]\n",
+        ] {
+            let err = validate(input).unwrap_err();
+            let shown = String::from_utf8_lossy(input);
+            assert!(
+                matches!(&err.kind, UnknownAnchor { name } if name == "nope"),
+                "{shown:?}: {:?}",
+                err.kind
+            );
+            assert_eq!(
+                input.get(err.position.offset),
+                Some(&b'*'),
+                "{shown:?}: error should point at the alias sigil, not {:?}",
+                err.position
+            );
+        }
+        // A forward reference: the anchor exists, but not yet. YAML 1.2 §7.1
+        // requires an alias to name a *previous* anchor.
+        assert!(matches!(
+            kind(b"a: *x\nb: &x 5\n"),
+            UnknownAnchor { name } if name == "x"
+        ));
+    }
+
     #[test]
     fn rejects_document_and_directive_errors() {
         assert!(matches!(
@@ -1954,6 +2029,9 @@ mod tests {
             TabInIndentation,
             AnchorOnAlias,
             MisplacedAnchor,
+            UnknownAnchor {
+                name: "nope".into(),
+            },
             ContentAfterDocumentEnd,
             MisplacedDirective,
             InvalidDirective,
