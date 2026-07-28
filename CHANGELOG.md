@@ -139,6 +139,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to a single entry via the owned-value conversion in `to_owned` — a
   separate, still-open gap, not fixed here.)
 
+- **jq's regex builtins and `endswith` kept the pre-#356 wording after #356
+  fixed their siblings** (#393): `test("a")` and `startswith("a")` were
+  probed and now report jq's sentences, but `match`, `capture`, `scan`,
+  `splits`, `sub` and `gsub` — the rest of the family that shares `test`'s
+  "input is not a string" refusal — still said `expected string, got number`
+  instead of `number (1) cannot be matched, as it is not a string`, and
+  `endswith` still said it for the identical condition `startswith` had
+  already been fixed to word as `endswith() requires string inputs`. On the
+  argument side, `startswith(1)`, `endswith(1)`, `split(1)` and `test(1)`
+  (plus `match(1)`/`capture(1)`, the same bug at the same sites) put an
+  argument's *role* — `got non-string`, `got pattern` — where
+  `EvalError::type_error`'s second slot means a type name, reading as types
+  that do not exist; jq's actual wording for the pattern argument
+  (`number not a string or array`) is a third shape entirely, now carried by
+  a new `EvalError::not_string_or_array` constructor. All of these route
+  through the named constructors #356 introduced rather than the generic
+  `type_error` fallback, and the probe corpus gained one entry per sibling
+  (156 probes, up from 143) so a family member fixed in isolation cannot
+  drift again — see "One sentence covers a family, so probe the whole
+  family" in `docs/compliance/jq/limitations.md`.
+
 - **`yq-locate` reported a short byte range for a plain scalar containing `#`**
   (#411): `a#b: 1` loads as `{"a#b":1}` — YAML's `ns-plain-char` admits a `#`
   that is not preceded by white space — but `syq-locate --offset 0` reported

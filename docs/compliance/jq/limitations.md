@@ -24,14 +24,14 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 143 probes in
+Measured against jq-1.7.1 over the 156 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result              | Meaning                                            |
 |----------------------------------------------|---------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **141/143 = 98.6%** | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **154/156 = 98.7%** | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**               | Every probe that errors in both errors identically |
 | **Behaviour / parser gaps**                  | **2**               | succinctly does not raise the error at all         |
 
@@ -77,6 +77,7 @@ iterate over number` for the same condition, and `cannot parse 'a' as number` ag
 | `<v> has no keys` / `has no length`                      | `has_no_keys`, `has_no_length`                |
 | `<v> cannot be sorted, as it is not an array`            | `cannot_be_sorted`                            |
 | `<v> cannot be matched, as it is not a string`           | `cannot_be_matched`                           |
+| `<t> not a string or array`                              | `not_string_or_array`                         |
 | `<v> cannot be parsed as a number`                       | `cannot_parse_as_number`                      |
 | `<v> only strings can be parsed`                         | `only_strings_can_be_parsed`                  |
 | `<v> only strings have UTF-8 byte length`                | `no_utf8_byte_length`                         |

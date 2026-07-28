@@ -116,6 +116,15 @@ to_entries_on_null	to_entries	null	null (null) has no keys
 sort_on_object	sort	{"a":1}	object ({"a":1}) cannot be sorted, as it is not an array
 sort_on_number	sort	1	number (1) cannot be sorted, as it is not an array
 test_on_number	test("a")	1	number (1) cannot be matched, as it is not a string
+match_on_number	match("a")	1	number (1) cannot be matched, as it is not a string
+capture_on_number	capture("(?<x>a)")	1	number (1) cannot be matched, as it is not a string
+scan_on_number	scan("a")	1	number (1) cannot be matched, as it is not a string
+splits_on_number	splits(",")	1	number (1) cannot be matched, as it is not a string
+sub_on_number	sub("a";"b")	1	number (1) cannot be matched, as it is not a string
+gsub_on_number	gsub("a";"b")	1	number (1) cannot be matched, as it is not a string
+test_arg_non_string	test(1)	"abc"	number not a string or array
+match_arg_non_string	match(1)	"abc"	number not a string or array
+capture_arg_non_string	capture(1)	"abc"	number not a string or array
 has_string_on_number	has("a")	1	Cannot check whether number has a string key
 has_string_on_array	has("a")	[1]	Cannot check whether array has a string key
 has_number_on_object	has(1)	{"a":1}	Cannot check whether object has a number key
@@ -126,6 +135,10 @@ ascii_downcase_on_number	ascii_downcase	1	explode input must be a string
 ascii_upcase_on_number	ascii_upcase	1	explode input must be a string
 split_on_number	split(",")	1	split input and separator must be strings
 startswith_on_number	startswith("a")	1	startswith() requires string inputs
+endswith_on_number	endswith("a")	1	endswith() requires string inputs
+startswith_arg_non_string	startswith(1)	"abc"	startswith() requires string inputs
+endswith_arg_non_string	endswith(1)	"abc"	endswith() requires string inputs
+split_arg_non_string	split(1)	"abc"	split input and separator must be strings
 range_on_string	range(.)	"s"	Range bounds must be numeric
 tonumber_bad_string	tonumber	"a"	Invalid numeric literal at EOF at line 1, column 1 (while parsing 'a')
 tonumber_empty_string	tonumber	""	Expected JSON value (while parsing '')
