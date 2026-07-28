@@ -68,7 +68,6 @@ CUP7      tags              tags (!) not supported — #224
 CXX2      lax:anchors       anchor/alias rules not validated — #223
 DK3J      scalars           scalar content/folding differs from spec
 DK4H      lax:mapping       mapping/key rules not validated — #223
-DK95/00   scalars           scalar content/folding differs from spec
 DK95/07   directives        %YAML/%TAG directive not recognized — #225
 EHF6      tags              tags (!) not supported — #224
 EW3V      lax:mapping       mapping/key rules not validated — #223

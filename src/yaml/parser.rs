@@ -682,6 +682,31 @@ impl<'a> Parser<'a> {
             && super::line_is_structural(self.input, self.pos)
     }
 
+    /// Skip `s-separate-in-line` whitespace still sitting on the cursor after
+    /// the leading indent has already been consumed by `advance_by`.
+    ///
+    /// `count_indent` only counts spaces, so a tab immediately after them is
+    /// left on the cursor. When that tab is legal separation (not indenting
+    /// block structure — see `tab_indents_block_structure`, which this reuses
+    /// so the two never disagree), it is not part of the following node and
+    /// must be skipped before a caller dispatches on `self.peek()` or records
+    /// a node's start position. Otherwise the tab becomes the node's first
+    /// byte: a plain scalar picks up a leading `\t` (`DK95/00`), and a quoted
+    /// node is pushed off its opening quote and misread as a mapping (#381).
+    ///
+    /// A tab that *does* indent block structure is left in place for
+    /// `tab_indents_block_structure`'s caller to reject.
+    #[inline]
+    fn skip_separation_whitespace(&mut self, line_start: usize) {
+        loop {
+            match self.peek() {
+                Some(b' ') => self.advance(),
+                Some(b'\t') if !self.tab_indents_block_structure(line_start) => self.advance(),
+                _ => break,
+            }
+        }
+    }
+
     /// Get the current column position (0-based).
     /// This counts characters from the start of the current line.
     fn current_column(&self) -> usize {
@@ -1254,7 +1279,7 @@ impl<'a> Parser<'a> {
                 && !sequence_indicator_is_block_structure
                 && !(next_char == b':'
                     && lookahead + 1 < self.input.len()
-                    && matches!(self.input[lookahead + 1], b' ' | b'\n' | b'\r'))
+                    && matches!(self.input[lookahead + 1], b' ' | b'\t' | b'\n' | b'\r'))
             {
                 // Continue to next line
                 self.skip_line_break();
@@ -1836,6 +1861,11 @@ impl<'a> Parser<'a> {
 
             // Re-advance to content position for the remaining checks
             self.advance_by(next_indent);
+            // A tab left over from `advance_by` (which only accounts for
+            // spaces) is legal separation here, not content - skip it so the
+            // dispatch below, and any node it opens, land on the node's real
+            // first byte (#381).
+            self.skip_separation_whitespace(saved_pos);
 
             // Check if this is a nested structure or a plain scalar value
             match self.peek() {
@@ -1873,10 +1903,24 @@ impl<'a> Parser<'a> {
                         self.pos = saved_pos;
                         return Ok(());
                     }
-                    // Plain scalar value - parse it here with key's indent as base
+                    // Scalar value - parse it here with key's indent as base.
+                    // Quoted nodes need their own reader: the unquoted scanner
+                    // stops at the first `: ` it sees, including one inside
+                    // the quotes, stranding the cursor mid-string and
+                    // corrupting whatever follows on the document.
                     self.set_ib();
                     self.write_bp_open();
-                    let end_pos = self.parse_unquoted_value_with_indent(indent);
+                    let end_pos = match self.peek() {
+                        Some(b'"') => {
+                            self.parse_double_quoted()?;
+                            self.pos
+                        }
+                        Some(b'\'') => {
+                            self.parse_single_quoted()?;
+                            self.pos
+                        }
+                        _ => self.parse_unquoted_value_with_indent(indent),
+                    };
                     self.set_bp_text_end(end_pos);
                     self.write_bp_close();
                     return Ok(());
@@ -3875,6 +3919,11 @@ impl<'a> Parser<'a> {
                 offset: self.pos,
             });
         }
+
+        // The tab above was ruled out as (illegal) indentation, so it's
+        // separation - skip it, and any more of it, so the dispatch below
+        // lands on the line's real first byte instead of the tab (#381).
+        self.skip_separation_whitespace(line_start);
 
         // close_deeper_indents will handle closing any SequenceItem entries
         // when we return to a lower indent level
