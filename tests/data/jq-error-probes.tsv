@@ -175,6 +175,12 @@ splits_on_number	splits(",")	1
 sub_on_number	sub("a";"b")	1
 gsub_on_number	gsub("a";"b")	1
 
+# `<t> not a string or array` — test/match/capture's pattern argument, a
+# distinct jq wording from `cannot be matched` above.
+test_arg_non_string	test(1)	"abc"
+match_arg_non_string	match(1)	"abc"
+capture_arg_non_string	capture(1)	"abc"
+
 # ── Cannot check whether <t> has a <k> key ───────────────────────────────────
 has_string_on_number	has("a")	1
 has_string_on_array	has("a")	[1]
@@ -191,6 +197,10 @@ ascii_upcase_on_number	ascii_upcase	1
 split_on_number	split(",")	1
 startswith_on_number	startswith("a")	1
 endswith_on_number	endswith("a")	1
+
+startswith_arg_non_string	startswith(1)	"abc"
+endswith_arg_non_string	endswith(1)	"abc"
+split_arg_non_string	split(1)	"abc"
 range_on_string	range(.)	"s"
 
 # ── Conversion: tonumber / fromjson ──────────────────────────────────────────

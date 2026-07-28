@@ -352,6 +352,16 @@ impl EvalError {
         Self::subject(value, "cannot be matched, as it is not a string")
     }
 
+    /// `<type> not a string or array`.
+    ///
+    /// jq's wording when test/match/capture's *pattern* argument is neither a
+    /// string nor an array: no value preview, no parens — just the bare type
+    /// name. Confirmed live against jq-1.7.1: `test(12345)` → `number not a
+    /// string or array`, `test({"a":1})` → `object not a string or array`.
+    pub fn not_string_or_array(type_name: &str) -> Self {
+        Self::new(format!("{type_name} not a string or array"))
+    }
+
     /// `<v> cannot be parsed as a number`.
     pub fn cannot_parse_as_number(value: &OwnedValue) -> Self {
         Self::subject(value, "cannot be parsed as a number")

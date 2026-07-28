@@ -29,20 +29,22 @@ const TABLE: &str = include_str!("data/jq-error-messages.tsv");
 const KNOWN_DIVERGENCES: &str = include_str!("data/jq-error-known-divergences.txt");
 
 /// Probes whose jq message depends on an optional feature being compiled in.
-/// Without `regex`, `test("a")` fails with "regex feature not enabled" before
-/// it can reach the type check the probe is about. `match`/`capture`/`scan`/
-/// `splits`/`sub`/`gsub` don't exist at all without `regex`.
+/// Without `regex`, `match`/`capture`/`scan`/`splits`/`sub`/`gsub` fail with
+/// "regex feature not enabled" before they can reach the type check the probe
+/// is about. `test` has a non-regex substring-match fallback that reproduces
+/// jq's wording on both build configs, so it needs no entry here.
 #[cfg(feature = "regex")]
 const FEATURE_GATED: &[&str] = &[];
 #[cfg(not(feature = "regex"))]
 const FEATURE_GATED: &[&str] = &[
-    "test_on_number",
     "match_on_number",
     "capture_on_number",
     "scan_on_number",
     "splits_on_number",
     "sub_on_number",
     "gsub_on_number",
+    "match_arg_non_string",
+    "capture_arg_non_string",
 ];
 
 struct Probe {
