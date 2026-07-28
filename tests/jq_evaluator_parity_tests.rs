@@ -477,3 +477,71 @@ fn test_parity_number_literal_ordering_agrees_with_equality_387() {
     assert_eq!(as_strs(&full_outputs(json, ".[0] > .[1]")), ["false"]);
     assert_eq!(as_strs(&full_outputs(json, ".[0] < .[1]")), ["false"]);
 }
+
+#[test]
+fn test_parity_number_literal_reaches_more_numeric_arg_builtins_387() {
+    // A second batch of builtins that, like
+    // `test_parity_number_literal_reaches_numeric_arg_builtins_387`, match a
+    // numeric *argument* (not the primary input) against `OwnedValue::Int`/
+    // `Float` and needed a `NumberLiteral` arm added alongside: in()'s
+    // negative-index check, range()'s bounds, setpath's index (reached via
+    // `[]=`), mktime/strftime's broken-down-time array elements,
+    // combinations(n), pick/omit's index lists, tonumber's already-numeric
+    // passthrough, and @sh's numeric formatting.
+    //
+    // Every argument below is deliberately sourced by *direct* indexing
+    // (`.field`, `.[idx]`) rather than through `as $var`/`reduce` binding:
+    // variable binding round-trips a value through `owned_to_expr`, whose own
+    // doc comment says a bound `NumberLiteral` "degrades to its plain parsed
+    // form" (`Expr::Literal` has no source-text slot) -- so a `$var`-sourced
+    // argument would exercise the already-covered plain Int/Float arm
+    // instead of the new one. Every expectation is pinned against jq-1.7.1
+    // (or, for the yq-only pick/omit, against this crate's own hermetic
+    // yq-golden fixtures) first.
+    for (json, filter, expected) in [
+        // `in()` (not `has()` -- a separate, near-duplicate implementation)
+        // shares `has()`'s "jq: negative indices are never in range" rule.
+        // Both key representations are needed: llvm-cov instruments each side
+        // of the `OwnedValue::Int(idx) | OwnedValue::NumberLiteral(..)`
+        // or-pattern as its own region, so a `NumberLiteral`-only key (the
+        // #387-added arm) leaves the pre-existing plain-`Int` arm looking
+        // uncovered on the same source line.
+        (br"null".as_slice(), "(-1) | in([1,2,3])", "false"),
+        (br"[1,2,3,-1]", ".[3] | in([1,2,3,-1])", "false"),
+        (br#"{"a":0,"b":3}"#, "[range(.a; .b)]", "[0,1,2]"),
+        // `setpath(path; value)` -- not the `[]=` assignment operator, which
+        // resolves indices through a separate `resolve_dynamic_indexes` path
+        // that doesn't share this match -- with both an Int- and
+        // Float-repr'd `NumberLiteral` index.
+        (br"[10,20,30,1]", "setpath([.[-1]]; 99)", "[10,99,30,1]"),
+        (br"[10,20,30,1.7]", "setpath([.[-1]]; 99)", "[10,99,30,1.7]"),
+        (br"[2020.0,0,1,0,0,0]", "mktime", "1577836800"),
+        (br"[1,2,3,2]", "[combinations(.[-1])] | length", "16"),
+        // Both an Int- and a Float-repr'd `NumberLiteral` index.
+        (br"[10,20,30,1]", "pick([.[-1]])", "[20]"),
+        (br"[10,20,30,1]", "omit([.[-1]])", "[10,30,1]"),
+        (br"[10,20,30,1.0]", "pick([.[-1]])", "[20]"),
+        (br"[10,20,30,1.0]", "omit([.[-1]])", "[10,30,1.0]"),
+        (br"1e100", "tonumber", "1E+100"),
+        (br"1e2", "@sh", "\"1E+2\""),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(json, filter)),
+            [expected],
+            "full evaluator disagrees with jq for `{filter}` on `{}`",
+            String::from_utf8_lossy(json)
+        );
+        assert_parity(json, filter);
+    }
+
+    // strftime returns a raw (unquoted) string, so it's checked separately
+    // from the `to_json`-per-output loop above.
+    assert_eq!(
+        as_strs(&full_outputs(
+            br"[2020.0,0,1,0,0,0]",
+            r#"strftime("%Y-%m-%d")"#
+        )),
+        ["\"2020-01-01\""]
+    );
+    assert_parity(br"[2020.0,0,1,0,0,0]", r#"strftime("%Y-%m-%d")"#);
+}
