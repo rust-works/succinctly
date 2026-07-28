@@ -62,6 +62,7 @@ jobs:
             --exclude '^https://doi\.org/'
             --exclude '^https://no-color\.org/'
             --exclude '^https://www\.reddit\.com/'
+            --exclude '^https://vigna\.di\.unimi\.it/'
             '**/*.md'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -96,6 +97,7 @@ jobs:
             --exclude '^https://doi\.org/'
             --exclude '^https://no-color\.org/'
             --exclude '^https://www\.reddit\.com/'
+            --exclude '^https://vigna\.di\.unimi\.it/'
             '**/*.md'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
