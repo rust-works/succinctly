@@ -521,6 +521,54 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_json_number_literal() {
+        let mut buf = String::new();
+        OwnedValue::NumberLiteral(NumberRepr::Float(1.2e3), "1.2e3".into())
+            .stream_json(&mut buf)
+            .unwrap();
+        assert_eq!(buf, "1.2E+3");
+    }
+
+    #[test]
+    fn test_stream_json_number_literal_nan_and_infinite() {
+        // A `NumberLiteral` whose source text overflows/underflows to a
+        // non-finite float (e.g. `1e400`) must render as `null` like a plain
+        // non-finite Float does, not fall through to `format_number_jq_compat`.
+        let mut buf = String::new();
+        OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into())
+            .stream_json(&mut buf)
+            .unwrap();
+        assert_eq!(buf, "null");
+
+        buf.clear();
+        OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1e400".into())
+            .stream_json(&mut buf)
+            .unwrap();
+        assert_eq!(buf, "null");
+    }
+
+    #[test]
+    fn test_stream_yaml_number_literal_nan_and_infinite() {
+        let mut buf = String::new();
+        OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into())
+            .stream_yaml(&mut buf, 0)
+            .unwrap();
+        assert_eq!(buf, ".nan");
+
+        buf.clear();
+        OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1e400".into())
+            .stream_yaml(&mut buf, 0)
+            .unwrap();
+        assert_eq!(buf, ".inf");
+
+        buf.clear();
+        OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-1e400".into())
+            .stream_yaml(&mut buf, 0)
+            .unwrap();
+        assert_eq!(buf, "-.inf");
+    }
+
+    #[test]
     fn test_stream_string() {
         let mut buf = String::new();
         OwnedValue::String("hello".to_string())

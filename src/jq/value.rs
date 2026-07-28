@@ -1059,6 +1059,15 @@ mod tests {
     }
 
     #[test]
+    fn test_number_repr_is_none_for_non_numeric_variants() {
+        assert_eq!(OwnedValue::Null.number_repr(), None);
+        assert_eq!(OwnedValue::Bool(true).number_repr(), None);
+        assert_eq!(OwnedValue::String("x".into()).number_repr(), None);
+        assert_eq!(OwnedValue::array().number_repr(), None);
+        assert_eq!(OwnedValue::object().number_repr(), None);
+    }
+
+    #[test]
     fn test_number_literal_type_name_and_conversions() {
         let lit = OwnedValue::from_number_literal("1e100");
         assert_eq!(lit.type_name(), "number");
@@ -1068,6 +1077,11 @@ mod tests {
         let int_lit = OwnedValue::from_number_literal("42");
         assert_eq!(int_lit.as_i64(), Some(42));
         assert_eq!(int_lit.as_f64(), Some(42.0));
+
+        // A NumberLiteral backed by an integral Float representation also
+        // converts to i64, just like plain OwnedValue::Float does.
+        let float_int_lit = OwnedValue::from_number_literal("2.0");
+        assert_eq!(float_int_lit.as_i64(), Some(2));
     }
 
     #[test]
@@ -1084,10 +1098,39 @@ mod tests {
     }
 
     #[test]
+    fn test_number_literal_to_json_overflow_to_infinity_is_null() {
+        // "1e400" overflows f64 to infinity during parsing even though the
+        // source text is a normal-looking (if extreme) JSON number token.
+        // JSON has no Infinity, so, like plain Float, this renders as null.
+        let lit = OwnedValue::from_number_literal("1e400");
+        assert!(matches!(
+            lit,
+            OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_infinite()
+        ));
+        assert_eq!(lit.to_json(), "null");
+    }
+
+    #[test]
     fn test_number_literal_number_str_matches_to_json() {
         let lit = OwnedValue::from_number_literal("1e100");
         assert_eq!(lit.number_str().as_deref(), Some("1E+100"));
         assert_eq!(OwnedValue::Null.number_str(), None);
+
+        // Plain Int/Float variants (not just NumberLiteral) also produce a
+        // number_str, via Display rather than format_number_jq_compat.
+        assert_eq!(OwnedValue::Int(7).number_str().as_deref(), Some("7"));
+        assert_eq!(OwnedValue::Float(2.5).number_str().as_deref(), Some("2.5"));
+    }
+
+    #[test]
+    fn test_from_number_literal_boxed_falls_back_to_zero_for_unparseable_text() {
+        // `from_number_literal_boxed` only ever receives valid document number
+        // tokens in practice, but it's defensive: neither an i64 nor f64 parse
+        // succeeding falls back to a plain zero rather than panicking.
+        assert_eq!(
+            OwnedValue::from_number_literal("not-a-number"),
+            OwnedValue::Float(0.0)
+        );
     }
 
     #[test]
@@ -1127,5 +1170,52 @@ mod tests {
         assert_eq!(format_number_jq_compat(b"5.5e0"), "5.5");
         // Negative exponents within [-5, -1] expand to decimal.
         assert_eq!(format_number_jq_compat(b"1e-3"), "0.001");
+    }
+
+    #[test]
+    fn test_format_number_jq_compat_invalid_utf8_falls_back_to_lossy() {
+        // Not a real document number (the parser only ever hands this valid
+        // UTF-8), but the function is `pub` and takes raw bytes, so it must
+        // not panic on garbage.
+        let raw = &[0xFF, 0xFE][..];
+        assert_eq!(
+            format_number_jq_compat(raw),
+            String::from_utf8_lossy(raw).into_owned()
+        );
+    }
+
+    #[test]
+    fn test_format_number_jq_compat_unparseable_exponent_falls_back_to_raw() {
+        // "1e" contains 'e' but has no exponent digits, so it fails the f64
+        // parse and falls back to echoing the input unchanged.
+        assert_eq!(format_number_jq_compat(b"1e"), "1e");
+    }
+
+    #[test]
+    fn test_format_number_jq_compat_e0_integer_drops_exponent() {
+        // e0 eliminates the exponent; when the result is a whole number it
+        // takes the integer-formatting branch rather than float Display.
+        assert_eq!(format_number_jq_compat(b"5e0"), "5");
+    }
+
+    #[test]
+    fn test_format_number_jq_compat_zero_with_positive_exponent() {
+        assert_eq!(format_number_jq_compat(b"0e10"), "0");
+    }
+
+    #[test]
+    fn test_format_number_jq_compat_non_integer_mantissa() {
+        // Docstring example: `12e2` -> `1.2E+3`. Exercises the mantissa's
+        // shortest-round-tripping-precision loop (the integer fast path
+        // covers only whole-number mantissas like `1`).
+        assert_eq!(format_number_jq_compat(b"12e2"), "1.2E+3");
+    }
+
+    #[test]
+    fn test_format_number_jq_compat_negative_exponent_integer_decimal() {
+        // Negative exponent that still resolves to a whole number takes
+        // format_decimal_jq's integer fast path rather than its precision loop.
+        assert_eq!(format_number_jq_compat(b"100e-2"), "1");
+        assert_eq!(format_number_jq_compat(b"-100e-2"), "-1");
     }
 }

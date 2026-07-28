@@ -14929,6 +14929,53 @@ mod tests {
     }
 
     #[test]
+    fn test_numeric_key_to_index_number_literal_387() {
+        assert_eq!(
+            numeric_key_to_index(&OwnedValue::from_number_literal("2")),
+            Some(2)
+        );
+        // Truncates toward zero, same as plain Float.
+        assert_eq!(
+            numeric_key_to_index(&OwnedValue::from_number_literal("1.7")),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_substitute_vars_number_literal_degrades_to_plain_literal_387() {
+        // `substitute_vars` (the `--arg`/`--argjson`-style public API) inlines
+        // each variable's value into the AST via `owned_to_expr`. Unlike a
+        // document-sourced value flowing through a builtin argument,
+        // `Expr::Literal` has no source-text slot (#387's documented scope
+        // boundary -- see `owned_to_expr`'s doc comment), so a `NumberLiteral`
+        // substituted in degrades to its plain parsed value: the substituted
+        // filter's own re-evaluation loses jq's canonical spelling and falls
+        // back to Rust's `f64`/`i64` Display, same as any other computed
+        // (non-passthrough) number.
+        let expr = parse("$n").unwrap();
+
+        let int_lit = OwnedValue::from_number_literal("42");
+        let substituted = substitute_vars(&expr, [("n", &int_lit)]);
+        assert_eq!(substituted, Expr::Literal(Literal::Int(42)));
+
+        let float_lit = OwnedValue::from_number_literal("1e100");
+        let substituted = substitute_vars(&expr, [("n", &float_lit)]);
+        assert_eq!(substituted, Expr::Literal(Literal::Float(1e100)));
+
+        let index = JsonIndex::build(b"null");
+        let cursor = index.root(b"null");
+        assert_eq!(
+            eval::<Vec<u64>, JqSemantics>(&substituted, cursor)
+                .collect_owned()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>(),
+            // Not jq's "1E+100" -- see the doc comment above.
+            ["1e100".parse::<f64>().unwrap().to_string()]
+        );
+    }
+
+    #[test]
     fn test_identity() {
         // Identity returns OneCursor for efficient passthrough of unchanged containers
         query!(br#"{"foo": 1}"#, ".", QueryResult::OneCursor(_) => {});

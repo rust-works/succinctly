@@ -792,4 +792,64 @@ mod tests {
         let f: JqValue<'_, Vec<u64>> = JqValue::Float(2.5);
         assert_eq!(f.to_json_string(), "2.5");
     }
+
+    #[test]
+    fn test_jqvalue_number_literal_materialize_into_owned_and_write() {
+        // `JqValue::NumberLiteral` is `OwnedValue::NumberLiteral`'s lazy-side
+        // counterpart (built by `from_owned`, e.g. by the CLI's output
+        // formatter).
+        let owned = OwnedValue::from_number_literal("1e100");
+
+        // `materialize`/`into_owned` round-trip through `OwnedValue`, whose
+        // own `to_json` reformats through jq's canonical algorithm (see
+        // `format_number_jq_compat`) -- so both give jq's spelling.
+        let via_materialize: JqValue<'_, Vec<u64>> = JqValue::from_owned(owned.clone());
+        assert!(matches!(via_materialize, JqValue::NumberLiteral(_)));
+        assert_eq!(via_materialize.materialize().to_json(), "1E+100");
+
+        let via_into_owned: JqValue<'_, Vec<u64>> = JqValue::from_owned(owned.clone());
+        assert_eq!(via_into_owned.into_owned().to_json(), "1E+100");
+
+        // `write_json`/`to_json_string`, by contrast, is this module's
+        // documented format-*preserving* serializer (see the module doc and
+        // `test_write_json_preserves_cursor_format`'s `4e4` case) -- it
+        // writes the source literal verbatim rather than jq's reformatting,
+        // consistent with how it treats `RawNumber`/`Cursor`.
+        let via_write: JqValue<'_, Vec<u64>> = JqValue::from_owned(owned);
+        assert_eq!(via_write.to_json_string(), "1e100");
+    }
+
+    #[test]
+    fn test_jqvalue_raw_number_into_owned() {
+        let raw: JqValue<'_, Vec<u64>> = JqValue::RawNumber(b"4e4");
+        assert_eq!(raw.into_owned().to_json(), "4E+4");
+    }
+
+    #[test]
+    fn test_jqvalue_raw_number_materialize() {
+        let raw: JqValue<'_, Vec<u64>> = JqValue::RawNumber(b"4e4");
+        assert_eq!(raw.materialize().to_json(), "4E+4");
+    }
+
+    #[test]
+    fn test_jqvalue_cursor_number_materialize_and_into_owned() {
+        use crate::json::JsonIndex;
+
+        // Materializing/consuming a cursor over a number (as opposed to
+        // reading its raw bytes, which takes a separate fast path in
+        // `write_json`) goes through `cursor_to_owned`, which must also
+        // preserve the source literal rather than round-tripping through
+        // `f64`.
+        let json = br"1e100";
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let materialize_val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
+        assert_eq!(materialize_val.materialize().to_json(), "1E+100");
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let into_owned_val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
+        assert_eq!(into_owned_val.into_owned().to_json(), "1E+100");
+    }
 }
