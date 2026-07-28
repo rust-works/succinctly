@@ -190,6 +190,7 @@ ascii_downcase_on_number	ascii_downcase	1
 ascii_upcase_on_number	ascii_upcase	1
 split_on_number	split(",")	1
 startswith_on_number	startswith("a")	1
+endswith_on_number	endswith("a")	1
 range_on_string	range(.)	"s"
 
 # ── Conversion: tonumber / fromjson ──────────────────────────────────────────

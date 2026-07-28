@@ -132,6 +132,7 @@ ascii_downcase_on_number	ascii_downcase	1	explode input must be a string
 ascii_upcase_on_number	ascii_upcase	1	explode input must be a string
 split_on_number	split(",")	1	split input and separator must be strings
 startswith_on_number	startswith("a")	1	startswith() requires string inputs
+endswith_on_number	endswith("a")	1	endswith() requires string inputs
 range_on_string	range(.)	"s"	Range bounds must be numeric
 tonumber_bad_string	tonumber	"a"	Invalid numeric literal at EOF at line 1, column 1 (while parsing 'a')
 tonumber_empty_string	tonumber	""	Expected JSON value (while parsing '')

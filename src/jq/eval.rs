@@ -2590,7 +2590,7 @@ fn builtin_endswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => QueryResult::Error(EvalError::new("endswith() requires string inputs")),
     }
 }
 
