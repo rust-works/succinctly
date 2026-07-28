@@ -1040,6 +1040,9 @@ fn test_yaml_flow_context_rejects_tags_like_block_context() -> Result<()> {
         ("seq item with a plain sibling", "a: [!custom x, plain]\n"),
         ("implicit entry key in a seq", "a: [!!str k: v]\n"),
         ("explicit key", "a: [? !!str k : v]\n"),
+        // #402 routed the flow *mapping*'s explicit key through the same reader.
+        // Without this the gate could be dropped from that path unnoticed.
+        ("explicit key in a mapping", "a: {? !!str k : v}\n"),
     ] {
         let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", input, &[])?;
         assert_eq!(exit_code, 1, "{name}: expected clean error exit: {stderr}");
@@ -1251,6 +1254,130 @@ fn test_yaml_anchor_on_null_explicit_value_resolves_to_null() -> Result<()> {
     let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
     assert_eq!(exit_code, 0);
     assert_eq!(output.trim(), r#"{"e":null,"z":null}"#);
+    Ok(())
+}
+
+// =============================================================================
+// Explicit keys in flow mappings (#402) - `{? k : v}` keys on `k`, not on `? k`.
+// Expectations are mikefarah/yq v4.53.3 output.
+// =============================================================================
+
+#[test]
+fn test_yaml_explicit_flow_mapping_key_drops_the_indicator() -> Result<()> {
+    // `? ` is a node marker, not key text. The flow *sequence* path consumed it
+    // before marking the key's start; the flow *mapping* path planted the
+    // interest bit on the `?` first, so the indicator and the space after it
+    // ended up inside the key string — `{"? k":"v"}`. Silently wrong data, the
+    // same failure mode as #339 (block context) and #369 (flow tags).
+    for (name, input, expected) in [
+        ("plain key", "a: {? k : v}\n", r#"{"a":{"k":"v"}}"#),
+        ("no value", "a: {? k}\n", r#"{"a":{"k":null}}"#),
+        // The quoted arms: every input that reached them exhibited the bug, so
+        // they were the last uncovered lines of the explicit branch.
+        (
+            "double-quoted key",
+            "a: {? \"k\" : v}\n",
+            r#"{"a":{"k":"v"}}"#,
+        ),
+        (
+            "single-quoted key",
+            "a: {? 'k' : v}\n",
+            r#"{"a":{"k":"v"}}"#,
+        ),
+        ("embedded colon", "a: {? a:b : v}\n", r#"{"a":{"a:b":"v"}}"#),
+        ("empty key", "a: {? : v}\n", r#"{"a":{"":"v"}}"#),
+        (
+            "empty key, no value",
+            "a: {? , b: 1}\n",
+            r#"{"a":{"":null,"b":1}}"#,
+        ),
+        ("empty key at the brace", "a: {? }\n", r#"{"a":{"":null}}"#),
+        (
+            "two explicit entries",
+            "a: {? k : v, ? j : w}\n",
+            r#"{"a":{"k":"v","j":"w"}}"#,
+        ),
+        (
+            "after an implicit entry",
+            "a: {x: 1, ? k : v}\n",
+            r#"{"a":{"x":1,"k":"v"}}"#,
+        ),
+        // The anchor is stripped when the key is read, as in the sequence form.
+        ("anchored key", "a: {? &n k : v}\n", r#"{"a":{"k":"v"}}"#),
+        // Complex keys open their own BP nodes; yq renders them as "" in JSON.
+        ("sequence key", "a: {? [1,2] : v}\n", r#"{"a":{"":"v"}}"#),
+        ("mapping key", "a: {? {x: 1} : v}\n", r#"{"a":{"":"v"}}"#),
+    ] {
+        let (stdout, exit_code) = run_yq_stdin(".", input, &["-o", "json", "-I", "0"])?;
+        assert_eq!(exit_code, 0, "{name}: should parse cleanly");
+        assert_eq!(stdout.trim(), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_flow_key_agrees_across_positions() -> Result<()> {
+    // The fix is "one definition of `? key`, shared by both flow containers",
+    // so the two call sites must agree. They diverged before precisely because
+    // there were two copies of the dispatch — only the sequence one was right.
+    //
+    // Comparing the entries themselves rather than whole documents: `.a` in a
+    // mapping and `.a[0]` in a sequence are the same single-pair mapping.
+    for (name, shape, expected) in [
+        ("plain", "k : v", r#"{"k":"v"}"#),
+        ("no value", "k", r#"{"k":null}"#),
+        ("double-quoted", "\"k\" : v", r#"{"k":"v"}"#),
+        ("single-quoted", "'k' : v", r#"{"k":"v"}"#),
+        ("embedded colon", "a:b : v", r#"{"a:b":"v"}"#),
+    ] {
+        let (in_mapping, code) = run_yq_stdin(
+            ".a",
+            &format!("a: {{? {shape}}}\n"),
+            &["-o", "json", "-I", "0"],
+        )?;
+        assert_eq!(code, 0, "{name}: mapping form should parse");
+        let (in_sequence, code) = run_yq_stdin(
+            ".a[0]",
+            &format!("a: [? {shape}]\n"),
+            &["-o", "json", "-I", "0"],
+        )?;
+        assert_eq!(code, 0, "{name}: sequence form should parse");
+
+        assert_eq!(
+            in_mapping.trim(),
+            in_sequence.trim(),
+            "{name}: the two call sites disagree"
+        );
+        assert_eq!(in_mapping.trim(), expected, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_flow_question_mark_without_a_space_is_content() -> Result<()> {
+    // The boundary the fix must not cross. `?` is an indicator only when
+    // whitespace or end-of-input follows it; otherwise it starts no node and is
+    // ordinary scalar text. If one of these starts losing the `?`, the check
+    // moved from "node begins with an explicit-key indicator" to "node contains
+    // a `?`".
+    //
+    // The first two are yq v4.53.3 output. The third is not: yq rejects a `?`
+    // inside a flow plain scalar, while the YAML Test Suite says it is content
+    // (JR7V, "Question marks in scalars"), and that corpus case passes. It is
+    // pinned here against the suite, not against yq.
+    for (name, input, expected) in [
+        ("unspaced key", "a: {?k : v}\n", r#"{"a":{"?k":"v"}}"#),
+        ("bare question mark", "a: {?}\n", r#"{"a":{"?":null}}"#),
+        (
+            "inside a plain scalar",
+            "a: [b ? c]\n",
+            r#"{"a":["b ? c"]}"#,
+        ),
+    ] {
+        let (stdout, exit_code) = run_yq_stdin(".", input, &["-o", "json", "-I", "0"])?;
+        assert_eq!(exit_code, 0, "{name}: should parse cleanly");
+        assert_eq!(stdout.trim(), expected, "{name}");
+    }
     Ok(())
 }
 
