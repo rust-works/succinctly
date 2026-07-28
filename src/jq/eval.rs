@@ -4988,7 +4988,7 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
     // Build regex
@@ -5087,7 +5087,7 @@ fn builtin_capture<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
     // Build regex
@@ -5135,7 +5135,7 @@ fn builtin_scan<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
     // Build regex
@@ -5177,7 +5177,7 @@ fn builtin_splits<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
     // Build regex
@@ -5232,7 +5232,7 @@ fn builtin_sub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
     // Build regex
@@ -5283,7 +5283,7 @@ fn builtin_gsub<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
     // Build regex
@@ -5406,7 +5406,7 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
     // Build regex
@@ -5490,7 +5490,7 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
     // Build regex
@@ -5565,7 +5565,7 @@ fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
     // Build regex
@@ -5626,7 +5626,7 @@ fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
     // Build regex
@@ -5697,7 +5697,7 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
     // Build regex
@@ -5759,7 +5759,7 @@ fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("string", type_name(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
     // Build regex

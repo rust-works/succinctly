@@ -116,6 +116,12 @@ to_entries_on_null	to_entries	null	null (null) has no keys
 sort_on_object	sort	{"a":1}	object ({"a":1}) cannot be sorted, as it is not an array
 sort_on_number	sort	1	number (1) cannot be sorted, as it is not an array
 test_on_number	test("a")	1	number (1) cannot be matched, as it is not a string
+match_on_number	match("a")	1	number (1) cannot be matched, as it is not a string
+capture_on_number	capture("(?<x>a)")	1	number (1) cannot be matched, as it is not a string
+scan_on_number	scan("a")	1	number (1) cannot be matched, as it is not a string
+splits_on_number	splits(",")	1	number (1) cannot be matched, as it is not a string
+sub_on_number	sub("a";"b")	1	number (1) cannot be matched, as it is not a string
+gsub_on_number	gsub("a";"b")	1	number (1) cannot be matched, as it is not a string
 has_string_on_number	has("a")	1	Cannot check whether number has a string key
 has_string_on_array	has("a")	[1]	Cannot check whether array has a string key
 has_number_on_object	has(1)	{"a":1}	Cannot check whether object has a number key

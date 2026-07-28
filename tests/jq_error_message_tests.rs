@@ -30,11 +30,20 @@ const KNOWN_DIVERGENCES: &str = include_str!("data/jq-error-known-divergences.tx
 
 /// Probes whose jq message depends on an optional feature being compiled in.
 /// Without `regex`, `test("a")` fails with "regex feature not enabled" before
-/// it can reach the type check the probe is about.
+/// it can reach the type check the probe is about. `match`/`capture`/`scan`/
+/// `splits`/`sub`/`gsub` don't exist at all without `regex`.
 #[cfg(feature = "regex")]
 const FEATURE_GATED: &[&str] = &[];
 #[cfg(not(feature = "regex"))]
-const FEATURE_GATED: &[&str] = &["test_on_number"];
+const FEATURE_GATED: &[&str] = &[
+    "test_on_number",
+    "match_on_number",
+    "capture_on_number",
+    "scan_on_number",
+    "splits_on_number",
+    "sub_on_number",
+    "gsub_on_number",
+];
 
 struct Probe {
     id: String,
