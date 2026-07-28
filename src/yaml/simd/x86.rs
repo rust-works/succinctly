@@ -789,7 +789,12 @@ unsafe fn find_block_scalar_end_sse2(input: &[u8], start: usize, min_indent: usi
 /// Searches for YAML anchor name terminators:
 /// - Whitespace: space, tab, newline, CR
 /// - Flow indicators: [ ] { } ,
-/// - Colons followed by whitespace
+/// - Colons followed by whitespace (a bare `:` is a legal name character,
+///   mirroring [`super::neon::parse_anchor_name_neon`] and
+///   [`parse_anchor_name_scalar`] — see #404's follow-up fix: this function
+///   used to treat every `:` as an unconditional terminator, which shrank an
+///   anchor name like `:@*!$"<foo>` to empty and made an alias to it read as
+///   unresolved).
 ///
 /// Returns the position of the first terminator, or end of input.
 #[target_feature(enable = "avx2")]
@@ -830,7 +835,9 @@ unsafe fn parse_anchor_name_avx2(input: &[u8], start: usize) -> usize {
         let is_comma = _mm256_cmpeq_epi8(chunk, comma);
         let is_colon = _mm256_cmpeq_epi8(chunk, colon);
 
-        // Combine all terminator checks
+        // Whitespace and flow indicators are unconditional terminators. A
+        // colon is only a terminator when the byte after it is whitespace, so
+        // it cannot be decided from this chunk alone — resolve it below.
         let ws = _mm256_or_si256(is_space, is_tab);
         let ws = _mm256_or_si256(ws, is_newline);
         let ws = _mm256_or_si256(ws, is_cr);
@@ -840,15 +847,34 @@ unsafe fn parse_anchor_name_avx2(input: &[u8], start: usize) -> usize {
         let flow = _mm256_or_si256(flow, is_rbrace);
         let flow = _mm256_or_si256(flow, is_comma);
 
-        let terminators = _mm256_or_si256(ws, flow);
-        let terminators = _mm256_or_si256(terminators, is_colon);
+        let definite = _mm256_or_si256(ws, flow);
 
-        let mask = _mm256_movemask_epi8(terminators);
+        let definite_mask = _mm256_movemask_epi8(definite) as u32;
+        let colon_mask = _mm256_movemask_epi8(is_colon) as u32;
+        let combined_mask = definite_mask | colon_mask;
 
-        if mask != 0 {
-            // Found terminator - find first position
-            let offset = mask.trailing_zeros() as usize;
-            return pos + offset;
+        if combined_mask != 0 {
+            let first_pos = combined_mask.trailing_zeros() as usize;
+
+            // A definite terminator at or before the first colon candidate
+            // wins outright — it needs no lookahead.
+            if (definite_mask >> first_pos) & 1 != 0 {
+                return pos + first_pos;
+            }
+
+            // The first candidate is a colon: it terminates only if the very
+            // next byte is whitespace.
+            let colon_pos = pos + first_pos;
+            if colon_pos + 1 < end {
+                if let b' ' | b'\t' | b'\n' | b'\r' = input[colon_pos + 1] {
+                    return colon_pos;
+                }
+            }
+
+            // Not a terminator — the colon is a name character. Hand the rest
+            // of the scan to the scalar version rather than re-deriving the
+            // same colon-lookahead rule in SIMD for every subsequent byte.
+            return parse_anchor_name_scalar(input, colon_pos + 1);
         }
 
         pos += 32;
@@ -1331,5 +1357,109 @@ mod tests {
         let inert = [b'a'; 48];
         let class = classify_yaml_chars(&inert, 0).expect("48 bytes available");
         assert_eq!(class.plain_scalar_terminators(), 0);
+    }
+
+    // ========================================================================
+    // parse_anchor_name AVX2/scalar differential tests (#404 follow-up)
+    // ========================================================================
+
+    /// The AVX2 kernel used to treat every `:` as an unconditional terminator
+    /// (missing the "only when followed by whitespace" rule the doc comment
+    /// itself described), shrinking a name like `:@*!$"<foo>` to empty. Confirmed
+    /// against the YAML Test Suite's W5VH case ("Allowed characters in alias"),
+    /// which the strict validator's alias-scope check (#404) turned into a
+    /// spurious `unknown anchor` rejection on x86_64 only — `parse_anchor_name`
+    /// is shared with the loader (`src/yaml/parser.rs`), so this also risked
+    /// silently breaking real anchor resolution on x86_64 hardware, just never
+    /// observed because typical anchor names don't contain a bare `:`.
+    ///
+    /// Differential against [`parse_anchor_name_scalar`] — the reference both
+    /// this kernel and [`super::neon::parse_anchor_name_neon`] are meant to
+    /// match — over every placement class the colon rule must distinguish:
+    /// colon-then-whitespace (terminates before the colon), colon-then-name-char
+    /// (colon is content, scan continues), a colon run before whitespace, and
+    /// colon-then-flow-indicator (the colon rule only checks for whitespace, so
+    /// the flow indicator terminates and the colon stays in the name). Buffers
+    /// are 64 bytes so every case is reached through the 32-byte AVX2 loop
+    /// rather than its scalar tail, including a colon placed as the last byte of
+    /// the first chunk so the next-byte lookahead crosses the chunk boundary.
+    #[test]
+    fn test_parse_anchor_name_avx2_matches_scalar_around_colons() {
+        if !has_avx2() {
+            return;
+        }
+
+        let case = |input: &[u8], start: usize| {
+            let scalar = parse_anchor_name_scalar(input, start);
+            let avx2 = unsafe { parse_anchor_name_avx2(input, start) };
+            assert_eq!(
+                avx2,
+                scalar,
+                "AVX2/scalar mismatch for {:?} from {start}",
+                String::from_utf8_lossy(input)
+            );
+            avx2
+        };
+
+        // The exact W5VH name, embedded so the colon lands inside the first
+        // 32-byte AVX2 chunk: `:@*!$"<foo>` followed by `: ` (colon-space,
+        // terminates before the colon) then filler.
+        let mut buf = b":@*!$\"<foo>: ".to_vec();
+        buf.extend(std::iter::repeat_n(b'a', 64 - buf.len()));
+        assert_eq!(case(&buf, 0), 11, "name must stop before the `: ` pair");
+
+        // A colon immediately followed by whitespace at the very start.
+        let mut buf = b": ".to_vec();
+        buf.extend(std::iter::repeat_n(b'a', 62));
+        assert_eq!(
+            case(&buf, 0),
+            0,
+            "empty name: `:` is followed by whitespace"
+        );
+
+        // A colon followed by a non-whitespace name character: content, not a
+        // terminator; the scan continues to the real terminator (a space).
+        let mut buf = b"a:b c".to_vec();
+        buf.extend(std::iter::repeat_n(b'a', 59));
+        assert_eq!(case(&buf, 0), 3, "`a:b` is all name; stops at the space");
+
+        // A run of colons before the whitespace that actually terminates.
+        let mut buf = b"foo::: bar".to_vec();
+        buf.extend(std::iter::repeat_n(b'a', 54));
+        assert_eq!(case(&buf, 0), 5, "stops at the colon adjacent to the space");
+
+        // A colon followed by a flow indicator: the colon rule only checks for
+        // whitespace, so the colon is content and the flow indicator (not the
+        // colon) is the terminator.
+        for term in [b',', b']', b'}'] {
+            let mut buf = vec![b'a', b':'];
+            buf.push(term);
+            buf.extend(std::iter::repeat_n(b'a', 61));
+            assert_eq!(
+                case(&buf, 0),
+                2,
+                "colon before {:?} is content; {:?} terminates",
+                term as char,
+                term as char
+            );
+        }
+
+        // A colon as the last byte of the first 32-byte chunk, with the
+        // terminating whitespace as the first byte of the next chunk — the
+        // next-byte check must read across the chunk boundary correctly.
+        let mut buf = vec![b'a'; 31];
+        buf.push(b':');
+        buf.push(b' ');
+        buf.extend(std::iter::repeat_n(b'a', 32));
+        assert_eq!(case(&buf, 0), 31, "boundary-crossing colon-space");
+
+        // The same shape, but the colon is not followed by whitespace across
+        // the boundary: it stays content and scanning continues past it.
+        let mut buf = vec![b'a'; 31];
+        buf.push(b':');
+        buf.push(b'b');
+        buf.push(b' ');
+        buf.extend(std::iter::repeat_n(b'a', 31));
+        assert_eq!(case(&buf, 0), 33, "boundary-crossing colon-then-name-char");
     }
 }
