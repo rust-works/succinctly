@@ -1,0 +1,26 @@
+# A non-scalar explicit key at ordinary mapping level (#172)
+block_seq_key:
+  ? - a
+    - b
+  : value
+no_value:
+  ? - a
+    - b
+siblings:
+  x: 1
+  ? - a
+    - b
+  : value
+  y: 2
+two_entries:
+  ? - a
+  : v1
+  ? - b
+  : v2
+flow_map_key:
+  ? {a: 1}
+  : value
+key_on_next_line:
+  ?
+    a: 1
+  : value

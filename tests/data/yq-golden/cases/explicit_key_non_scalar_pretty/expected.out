@@ -1,0 +1,23 @@
+{
+  "block_seq_key": {
+    "": "value"
+  },
+  "no_value": {
+    "": null
+  },
+  "siblings": {
+    "x": 1,
+    "": "value",
+    "y": 2
+  },
+  "two_entries": {
+    "": "v1",
+    "": "v2"
+  },
+  "flow_map_key": {
+    "": "value"
+  },
+  "key_on_next_line": {
+    "": "value"
+  }
+}

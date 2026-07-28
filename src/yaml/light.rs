@@ -6662,6 +6662,55 @@ mod tests {
         }
     }
 
+    /// Issue #172: a non-scalar (sequence/flow-mapping) explicit key at
+    /// *ordinary mapping level* — not the sequence-item position #339 covers.
+    ///
+    /// The original repro (`? - a\n  - b\n: value`) lost the whole entry
+    /// (`{}`). That was fixed as a side effect of two unrelated changes: #325
+    /// rewrote `parse_explicit_key` to delegate the key side to
+    /// `parse_sequence_item`, so the sequence/flow-collection key parses
+    /// correctly instead of corrupting the BP tree; #429 (closing #346) fixed
+    /// `parse_explicit_key`'s mid-line return, which had been making the main
+    /// loop misread the following line's indentation and, in nested
+    /// positions, drop the value along with the key. yq has no way to render
+    /// a non-scalar key, so it collapses to `""` on both sides — these cases
+    /// pin that the *value* now survives everywhere, not that the key
+    /// renders meaningfully.
+    ///
+    /// Every expectation is the output of mikefarah/yq v4.53.3.
+    #[test]
+    fn test_explicit_non_scalar_key_at_mapping_level() {
+        let cases: &[(&[u8], &str)] = &[
+            // The headline #172 repro, and its no-value twin
+            (b"? - a\n  - b\n: value\n", "{\"\":\"value\"}"),
+            (b"? - a\n  - b\n", "{\"\":null}"),
+            // Sibling entries around the explicit entry are unaffected
+            (
+                b"x: 1\n? - a\n  - b\n: value\ny: 2\n",
+                "{\"x\":1,\"\":\"value\",\"y\":2}",
+            ),
+            // Two non-scalar-keyed entries in one mapping - yq keeps both `""`
+            (b"? - a\n: v1\n? - b\n: v2\n", "{\"\":\"v1\",\"\":\"v2\"}"),
+            // A flow mapping as the key, key and value on separate lines
+            (b"? {a: 1}\n: value\n", "{\"\":\"value\"}"),
+            // Key content (itself a block mapping) indented on the line after `?`
+            (b"?\n  a: 1\n: value\n", "{\"\":\"value\"}"),
+        ];
+
+        for (yaml, expected) in cases {
+            let index = YamlIndex::build(yaml).unwrap();
+            let json = index.root(yaml).to_json_document();
+            let mut streamed = String::new();
+            index
+                .root(yaml)
+                .stream_json_document(&mut streamed)
+                .unwrap();
+            let input = core::str::from_utf8(yaml).unwrap();
+            assert_eq!(json, *expected, "to_json mismatch for {input:?}");
+            assert_eq!(streamed, *expected, "stream_json mismatch for {input:?}");
+        }
+    }
+
     /// Issue #346: the key of `? k: v` must be a real *mapping* node.
     ///
     /// `to_json_document` cannot show this — `key_string()` renders both a mapping
