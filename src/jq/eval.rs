@@ -2023,7 +2023,10 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::Bool(found))
         }
         // Array has index - jq returns false for negative, yq returns true if in range
-        (StandardJson::Array(elements), OwnedValue::Int(idx)) => {
+        (
+            StandardJson::Array(elements),
+            OwnedValue::Int(idx) | OwnedValue::NumberLiteral(NumberRepr::Int(idx), _),
+        ) => {
             let len = (*elements).count() as i64;
             let in_bounds = if S::NEGATIVE_INDEX_IN_HAS {
                 // yq behavior: negative indices are valid if abs(idx) <= len
@@ -2806,7 +2809,7 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Get the index
     let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match result_to_owned(n_result) {
-        Ok(OwnedValue::Int(i)) => i,
+        Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) => i,
         Ok(_) => return QueryResult::Error(EvalError::type_error("number", "non-number")),
         Err(e) => return QueryResult::Error(e),
     };
@@ -2895,8 +2898,10 @@ fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Get the depth
     let depth_result = eval_single::<W, S>(depth_expr, value.clone(), optional);
     let depth = match result_to_owned(depth_result) {
-        Ok(OwnedValue::Int(d)) if d >= 0 => d as usize,
-        Ok(OwnedValue::Int(_)) => {
+        Ok(OwnedValue::Int(d) | OwnedValue::NumberLiteral(NumberRepr::Int(d), _)) if d >= 0 => {
+            d as usize
+        }
+        Ok(OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)) => {
             return QueryResult::Error(EvalError::new("depth must be non-negative"));
         }
         Ok(_) => return QueryResult::Error(EvalError::type_error("number", "non-number")),
@@ -4876,7 +4881,10 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             (OwnedValue::Object(obj), OwnedValue::String(key)) => {
                 current = obj.get(key).cloned().unwrap_or(OwnedValue::Null);
             }
-            (OwnedValue::Array(arr), OwnedValue::Int(_) | OwnedValue::Float(_)) => {
+            (
+                OwnedValue::Array(arr),
+                OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
+            ) => {
                 current = resolve_read_index(&segment, arr.len())
                     .map_or(OwnedValue::Null, |i| arr[i].clone());
             }
@@ -8070,7 +8078,9 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Evaluate n
     let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match result_to_owned(n_result) {
-        Ok(OwnedValue::Int(i)) if i >= 0 => i as usize,
+        Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) if i >= 0 => {
+            i as usize
+        }
         Ok(_) => {
             return QueryResult::Error(EvalError::new("limit requires non-negative integer"));
         }
@@ -11689,9 +11699,13 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Get n
     let n = match result_to_owned(eval_single::<W, S>(n_expr, value.clone(), optional)) {
-        Ok(OwnedValue::Int(i)) if i >= 0 => i as usize,
-        Ok(OwnedValue::Int(_)) if optional => return QueryResult::None,
-        Ok(OwnedValue::Int(_)) => {
+        Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) if i >= 0 => {
+            i as usize
+        }
+        Ok(OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)) if optional => {
+            return QueryResult::None
+        }
+        Ok(OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)) => {
             return QueryResult::Error(EvalError::new("combinations(n): n must be non-negative"))
         }
         Ok(_) if optional => return QueryResult::None,
@@ -12481,6 +12495,9 @@ fn get_number_from_result<W: Clone + AsRef<[u64]>>(
     match result {
         QueryResult::Owned(OwnedValue::Int(n)) => Ok(n as f64),
         QueryResult::Owned(OwnedValue::Float(n)) => Ok(n),
+        QueryResult::Owned(v @ OwnedValue::NumberLiteral(..)) => v
+            .as_f64()
+            .ok_or_else(|| NumberError::Error(EvalError::new("invalid number"))),
         QueryResult::One(StandardJson::Number(n)) => n
             .as_f64()
             .map_err(|_| NumberError::Error(EvalError::new("invalid number"))),

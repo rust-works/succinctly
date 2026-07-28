@@ -1313,7 +1313,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // Evaluate the offset expression
             let offset_result = eval_single::<S, _>(offset_expr, value.clone(), false, cursor);
             let offset = match offset_result {
-                GenericResult::Owned(OwnedValue::Int(i)) if i >= 0 => i as usize,
+                GenericResult::Owned(v) => match v.as_i64() {
+                    Some(i) if i >= 0 => i as usize,
+                    _ => {
+                        return GenericResult::Error(EvalError::new(
+                            "at_offset requires a non-negative integer".to_string(),
+                        ))
+                    }
+                },
                 GenericResult::One(v) => match v.as_i64() {
                     Some(i) if i >= 0 => i as usize,
                     _ => {
@@ -1353,7 +1360,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // Evaluate the line expression
             let line_result = eval_single::<S, _>(line_expr, value.clone(), false, cursor);
             let line = match line_result {
-                GenericResult::Owned(OwnedValue::Int(i)) if i > 0 => i as usize,
+                GenericResult::Owned(v) => match v.as_i64() {
+                    Some(i) if i > 0 => i as usize,
+                    _ => {
+                        return GenericResult::Error(EvalError::new(
+                            "at_position requires positive integers for line".to_string(),
+                        ))
+                    }
+                },
                 GenericResult::One(v) => match v.as_i64() {
                     Some(i) if i > 0 => i as usize,
                     _ => {
@@ -1372,7 +1386,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // Evaluate the column expression
             let col_result = eval_single::<S, _>(col_expr, value.clone(), false, cursor);
             let col = match col_result {
-                GenericResult::Owned(OwnedValue::Int(i)) if i > 0 => i as usize,
+                GenericResult::Owned(v) => match v.as_i64() {
+                    Some(i) if i > 0 => i as usize,
+                    _ => {
+                        return GenericResult::Error(EvalError::new(
+                            "at_position requires positive integers for column".to_string(),
+                        ))
+                    }
+                },
                 GenericResult::One(v) => match v.as_i64() {
                     Some(i) if i > 0 => i as usize,
                     _ => {
@@ -1946,6 +1967,33 @@ mod tests {
         let result = eval_with_cursor(&expr, cursor);
         let owned = result.into_owned().unwrap();
         assert!(matches!(owned, OwnedValue::String(ref s) if s == "name"));
+    }
+
+    #[test]
+    fn test_at_offset_and_at_position_accept_a_document_sourced_argument() {
+        // #387 wraps a materialized document number in `OwnedValue::NumberLiteral`
+        // instead of plain `Int`, so `getpath` (which returns `Owned`, not a lazy
+        // cursor) now hands `AtOffset`/`AtPosition` a `NumberLiteral` -- unhandled
+        // here previously, it fell to the `_` arm and errored "requires a
+        // non-negative integer" even though the value was a perfectly good 0.
+        let json = br#"{"n": 2, "l": 1, "c": 1}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+
+        let via_getpath = crate::jq::parse(r#"at_offset(getpath(["n"]))"#).unwrap();
+        let via_literal = crate::jq::parse("at_offset(2)").unwrap();
+        assert_eq!(
+            eval_with_cursor(&via_getpath, cursor).into_owned().unwrap(),
+            eval_with_cursor(&via_literal, cursor).into_owned().unwrap(),
+        );
+
+        let via_getpath =
+            crate::jq::parse(r#"at_position(getpath(["l"]); getpath(["c"]))"#).unwrap();
+        let via_literal = crate::jq::parse("at_position(1; 1)").unwrap();
+        assert_eq!(
+            eval_with_cursor(&via_getpath, cursor).into_owned().unwrap(),
+            eval_with_cursor(&via_literal, cursor).into_owned().unwrap(),
+        );
     }
 
     #[test]

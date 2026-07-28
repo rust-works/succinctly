@@ -421,3 +421,36 @@ fn test_parity_number_literal_preservation_387() {
     // used to show identity was fine while `tostring` was not.
     assert_parity(b"-0.0", ".");
 }
+
+#[test]
+fn test_parity_number_literal_reaches_numeric_arg_builtins_387() {
+    // #387 made every document number materialize as `OwnedValue::NumberLiteral`
+    // instead of plain `Int`/`Float`. A handful of builtins in `eval.rs` matched
+    // their numeric *argument* against `OwnedValue::Int(_)` only (not the new
+    // variant), so a document-sourced argument -- a field, an array element, a
+    // bound variable -- fell through to their "not a number" error arm even
+    // though the value plainly was one. A filter literal (`limit(2; ...)`)
+    // never hit this, which is why it went unnoticed: only indirection through
+    // data did. Every expectation here is pinned against jq-1.7.1 first.
+    for (json, filter, expected) in [
+        (br#"{"n":2}"#.as_slice(), "[limit(.n; range(10))]", "[0,1]"),
+        (br"[10,20,30,1]", "nth(.[3])", "20"),
+        (br"[1,[9,[2,3]]]", "flatten(.[0])", "[1,9,[2,3]]"),
+        (br"[1,2,3]", "has(.[0])", "true"),
+        (br"[99,1]", "getpath([.[1]])", "1"),
+        (br"[1,2]", "[combinations(.[0])]|length", "2"),
+        (
+            br#"{"y":1,"x":1}"#,
+            ". as $o | atan2($o.y; $o.x)",
+            "0.7853981633974483",
+        ),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(json, filter)),
+            [expected],
+            "full evaluator disagrees with jq for `{filter}` on `{}`",
+            String::from_utf8_lossy(json)
+        );
+        assert_parity(json, filter);
+    }
+}
