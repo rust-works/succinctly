@@ -9934,10 +9934,14 @@ fn delete_paths_under(
             other => Err(EvalError::cannot_index("object", other)),
         },
         OwnedValue::Array(mut arr) => match key {
-            // An object-shaped key is jq's slice descriptor; navigating
-            // through one for delete is not implemented (matches
-            // `set_value_at_path`'s same exclusion for assignment), so it is
-            // left a no-op.
+            // An object-shaped key is jq's slice descriptor
+            // (`path(.[a:b])` produces `{"start":a,"end":b}`). jq performs the
+            // slice delete for a valid one and raises `Array/string slice
+            // indices must be integers` for a malformed one; neither is
+            // implemented here, nor in `set_value_at_path`'s matching
+            // exclusion for assignment, so this silently no-ops instead of
+            // either — a real divergence from jq, tracked in #469, not a
+            // deliberate match for it.
             OwnedValue::Object(_) => Ok(OwnedValue::Array(arr)),
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
                 if let Some(index) = resolve_read_index(key, arr.len()) {
@@ -9992,10 +9996,11 @@ fn delete_keys(value: OwnedValue, keys: &[&OwnedValue]) -> Result<OwnedValue, Ev
         OwnedValue::Array(mut arr) => {
             // A key that is not a number is jq's `Cannot delete <kind> element
             // of array`. An object-shaped key is jq's slice descriptor
-            // (`.[a:b]`); deleting through one is not implemented, matching
-            // `set_value_at_path`'s same exclusion, so it is left a no-op
-            // rather than raising a sentence for slice-delete we do not
-            // support either. `resolve_read_index` is `getpath`'s resolver: a
+            // (`.[a:b]`); jq performs the slice delete for a valid one and
+            // raises for a malformed one, neither of which is implemented
+            // here (nor in `set_value_at_path`'s matching exclusion), so this
+            // silently no-ops instead — a real divergence from jq, tracked in
+            // #469. `resolve_read_index` is `getpath`'s resolver: a
             // float truncates toward zero, a negative counts back from the
             // end, and anything that reaches no element (out of range, or
             // NaN) is dropped rather than raised.
@@ -19130,8 +19135,10 @@ mod tests {
             ),
             (b"null", r#"delpaths([["a"]])"#, Ok("null")),
             // Contrast: an object-shaped ("slice") key against an array is a
-            // deliberately preserved no-op, matching `set_value_at_path`'s
-            // same exclusion for assignment.
+            // no-op today, not a match for jq — jq performs the slice delete
+            // for a valid descriptor and raises for a malformed one like this
+            // empty `{}`. Pinned as a known gap, tracked in #469, not as
+            // correct behavior.
             (b"[1,2,3]", "delpaths([[{}]])", Ok("[1,2,3]")),
         ]);
     }
