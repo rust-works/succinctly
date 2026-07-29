@@ -103,6 +103,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An anchor or alias on the key of a flow-sequence's implicit single-pair
+  mapping was a parse error or bound to the wrong node** (#409, found while
+  fixing #405 — that issue was the same key position in a flow *mapping*,
+  `{*a: v}`): `[&x k: 1, *x: 2]` errored `unexpected character ':': expected
+  ',' or ']' in flow sequence` instead of `yq`'s `[{"k":1},{"k":2}]`, and
+  `[&x k: 1, *x]` — an anchor on such a key, aliased from a later plain item —
+  resolved the alias to the mapping `{"k":1}` instead of the key text `"k"`.
+  Two independent bugs in `parse_flow_sequence_inner`'s per-item dispatch,
+  neither in the key handling #405 consolidated:
+
+  The dispatch consumed a leading `&`/`*` *before* asking whether the item was
+  a `key: value` pair, so an alias key's `*` was read as a standalone aliased
+  *value* by `parse_alias`, which `continue`d with the cursor left on `:` —
+  reordering alone would not have fixed it, since `looks_like_flow_mapping_entry`
+  skipped a leading quote or container when scanning ahead for the `:` but not
+  a leading `&name`/`*name`, so it answered `false` for both shapes. And an
+  anchor's bare `parse_anchor()` call records the anchor against whatever BP
+  node opens *next* — here the implicit mapping *wrapper*
+  `parse_implicit_flow_mapping_entry` was about to open, not the key inside
+  it. This is exactly the shape `record_key_anchor`/`record_key_alias` exist
+  for (corpus case CN3R: `&flowseq [a: b, &c c: d, ...]` exercises the anchor
+  half already, but never aliases `&c`, so the wrong binding was invisible on
+  JSON-output-only assertion — corpus-latent, and confirmed unaffected by this
+  fix); `parse_implicit_flow_mapping_entry` was the one key site that read
+  straight from `parse_flow_key_scalar` instead.
+
+  `looks_like_flow_mapping_entry` now skips a leading `&name`/`*name` (reusing
+  `simd::parse_anchor_name`, the same scanner the real anchor/alias parse
+  uses, rather than a second hand-rolled terminator set — see the #106 lesson
+  in `CLAUDE.md`) before scanning for the `:`, so the pair check runs before
+  the sequence loop's anchor/alias consumption rather than after. And
+  `parse_implicit_flow_mapping_entry`'s key now shares `parse_flow_key` with
+  the flow-mapping key site wholesale, rather than adding a fourth direct
+  call to `record_key_anchor`/`record_key_alias` alongside it — one definition
+  for both implicit-key sites, gaining the anchor/alias handling for free.
+  `parse_flow_key_scalar`, now unreachable, is removed. Unaffected: `[a: 1, b:
+  2]` and `[&x a, *x]`, the two shapes the issue calls out as already correct.
+
 - **A comma-generator was rejected inside call arguments** (#155, closing the
   call-argument half — #360 already closed the index-bracket half): builtin
   calls like `sort_by(.a,.b)`, `first(1,2,3)`, `[limit(2;1,2,3,4)]`, and
