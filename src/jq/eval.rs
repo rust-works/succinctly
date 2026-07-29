@@ -6332,6 +6332,30 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 // Assignment Operators Implementation
 // =============================================================================
 
+/// Evaluate an expression once against `value`, reducing its output stream to
+/// a single owned value: `One`/`Owned` pass through, `None` becomes `Null`,
+/// and a multi-valued stream keeps only its first element (also `Null` if
+/// empty). Used for the right-hand side of assignment operators, all of which
+/// jq evaluates as a single value rather than once per updated path.
+/// `Err` carries a `QueryResult` the caller should return immediately
+/// (an error or an in-flight `break`).
+fn eval_rhs_once<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> Result<OwnedValue, QueryResult<'a, W>> {
+    match eval_single::<W, S>(expr, value, optional).materialize_cursor() {
+        QueryResult::One(v) => Ok(to_owned(&v)),
+        QueryResult::Owned(v) => Ok(v),
+        QueryResult::None => Ok(OwnedValue::Null),
+        QueryResult::Error(e) => Err(QueryResult::Error(e)),
+        QueryResult::Many(vs) => Ok(vs.first().map_or(OwnedValue::Null, to_owned)),
+        QueryResult::ManyOwned(vs) => Ok(vs.into_iter().next().unwrap_or(OwnedValue::Null)),
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
+        QueryResult::Break(label) => Err(QueryResult::Break(label)),
+    }
+}
+
 /// Evaluate simple assignment: `.path = value`
 /// Sets the value at path and returns the modified input.
 fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
@@ -6341,30 +6365,9 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // First evaluate the value expression
-    let mut new_value = match eval_single::<W, S>(value_expr, input.clone(), optional)
-        .materialize_cursor()
-    {
-        QueryResult::One(v) => to_owned(&v),
-        QueryResult::Owned(v) => v,
-        QueryResult::None => OwnedValue::Null,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        QueryResult::Many(vs) => {
-            // If value produces multiple results, use the first one
-            if let Some(v) = vs.first() {
-                to_owned(v)
-            } else {
-                OwnedValue::Null
-            }
-        }
-        QueryResult::ManyOwned(vs) => {
-            if let Some(v) = vs.into_iter().next() {
-                v
-            } else {
-                OwnedValue::Null
-            }
-        }
-        QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
-        QueryResult::Break(label) => return QueryResult::Break(label),
+    let mut new_value = match eval_rhs_once::<W, S>(value_expr, input.clone(), optional) {
+        Ok(v) => v,
+        Err(early_return) => return early_return,
     };
 
     // Convert input to owned for modification
@@ -6437,10 +6440,22 @@ fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         AssignOp::Mod => ArithOp::Mod,
     };
 
+    // jq evaluates the RHS of `a op= b` once against the original input `.`,
+    // not against the sub-value at `a` (confirmed against real jq: `(.a,.b)
+    // += .a` on `{"a":1,"b":2}` yields `{"a":2,"b":3}`, so `.b`'s `+=` sees
+    // the pristine `.a`, not the value `.a` was just updated to). Evaluate it
+    // up front and splice in the resulting value rather than the raw
+    // expression, so `update_path`'s per-path `Identity` no longer resolves
+    // `.` inside it to the sub-value being replaced.
+    let rhs_value = match eval_rhs_once::<W, S>(value_expr, input.clone(), optional) {
+        Ok(v) => v,
+        Err(early_return) => return early_return,
+    };
+
     let filter = Expr::Arithmetic {
         op: arith_op,
         left: Box::new(Expr::Identity),
-        right: value_expr.clone().into(),
+        right: Box::new(owned_to_expr(&rhs_value)),
     };
 
     eval_update::<W, S>(path_expr, &filter, input, optional)
@@ -6454,8 +6469,18 @@ fn eval_alternative_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // Same root-vs-sub-value fix as eval_compound_assign: evaluate `value_expr`
+    // once against the original input before splicing it into the filter.
+    let rhs_value = match eval_rhs_once::<W, S>(value_expr, input.clone(), optional) {
+        Ok(v) => v,
+        Err(early_return) => return early_return,
+    };
+
     // Convert to update: .path //= value  becomes  .path |= . // value
-    let filter = Expr::Alternative(Box::new(Expr::Identity), Box::new(value_expr.clone()));
+    let filter = Expr::Alternative(
+        Box::new(Expr::Identity),
+        Box::new(owned_to_expr(&rhs_value)),
+    );
 
     eval_update::<W, S>(path_expr, &filter, input, optional)
 }
@@ -19869,6 +19894,51 @@ mod tests {
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 let a = obj.get("a").unwrap();
                 assert_eq!(*a, OwnedValue::String("existing".to_string()));
+            }
+        );
+    }
+
+    #[test]
+    fn test_compound_assign_references_root() {
+        // Regression test for #159: the RHS of `.a += .b` must be evaluated
+        // against the root, not against the sub-value at `.a`.
+        query!(br#"{"a": 1, "b": 2}"#, r".a += .b",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(*obj.get("a").unwrap(), OwnedValue::Int(3));
+                assert_eq!(*obj.get("b").unwrap(), OwnedValue::Int(2));
+            }
+        );
+    }
+
+    #[test]
+    fn test_alternative_assign_references_root() {
+        // Regression test for #159: the RHS of `.a //= .b` must be evaluated
+        // against the root, not against the sub-value at `.a`.
+        query!(br#"{"a": null, "b": 5}"#, r".a //= .b",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(*obj.get("a").unwrap(), OwnedValue::Int(5));
+                assert_eq!(*obj.get("b").unwrap(), OwnedValue::Int(5));
+            }
+        );
+    }
+
+    #[test]
+    fn test_compound_assign_multi_path_freezes_rhs() {
+        // Regression test for #159: the RHS is evaluated once against the
+        // pristine root before any path is updated, then reused for every
+        // element `.a[]` resolves to -- not re-evaluated per element against
+        // the already-updated root. Confirmed against real jq (jq-1.7.1):
+        // `{"a":[1,2,3]} | .a[] += .a[0]` yields `{"a":[2,3,4]}` (every
+        // element gets the original `.a[0]` == 1 added), not `[2,4,6]` (which
+        // is what re-reading a progressively-updated `.a[0]` would produce).
+        query!(br#"{"a": [1, 2, 3]}"#, r".a[] += .a[0]",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                let arr = obj.get("a").unwrap();
+                assert_eq!(*arr, OwnedValue::Array(vec![
+                    OwnedValue::Int(2),
+                    OwnedValue::Int(3),
+                    OwnedValue::Int(4),
+                ]));
             }
         );
     }
