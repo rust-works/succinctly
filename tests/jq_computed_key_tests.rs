@@ -667,6 +667,80 @@ fn test_del_with_negative_computed_indexes_resolves_against_original_length() {
     );
 }
 
+/// Grouped deletion (added above for #424) assumed every sibling path
+/// reaching the same depth shared the exact same shape — all `Field`, all
+/// `Index`, or all `Iterate` — and dispatched once on the first path's shape
+/// alone. That assumption breaks against `null`: `null` accepts a string
+/// key, a numeric key, or `.[]` without erroring (`null | .a`, `null | .[0]`,
+/// and `null | .[]` are all `null`), so `.[("a",0)]` resolved against a null
+/// target yields one `Field("a")` path and one `Index(0)` path at the same
+/// position. That used to panic (`unreachable!()`) instead of erroring or
+/// succeeding. It now raises the same error the existing single-path
+/// `del(.a)` on `null` already raises — a separate, pre-existing divergence
+/// from jq's silent no-op that this fix does not attempt to close.
+#[test]
+fn test_del_computed_index_against_null_does_not_panic() {
+    check(
+        "null",
+        r#"del(.[("a",0)])"#,
+        Outcome::error(r#"Cannot index null with string "a""#),
+    );
+    // Same shape mismatch, opposite generation order — still no panic, and
+    // still order-independent (fields are always resolved before indices).
+    check(
+        "null",
+        r#"del(.[(0,"a")])"#,
+        Outcome::error(r#"Cannot index null with string "a""#),
+    );
+    // Nested under a field rather than at the top of the path.
+    check(
+        r#"{"x":null}"#,
+        r#"del(.x[("a",0)])"#,
+        Outcome::error(r#"Cannot index null with string "a""#),
+    );
+}
+
+/// The same array index can be named by more than one sibling path in one
+/// `del(...)` argument, each with its own `?`: `del(.[(0,5)].a, .[5]?.a)`
+/// names index 5 once without `?` (via the computed key `(0,5)`) and once
+/// with it. Grouping by index used to keep only whichever occurrence's
+/// `optional` flag was pushed first, so whether the shared, out-of-range
+/// index 5 raised depended on which side of the comma `.[5]?` was written
+/// on. One optional occurrence has to cover every other occurrence of the
+/// same index, regardless of order.
+#[test]
+fn test_del_merges_optional_across_duplicate_indexes_order_independently() {
+    check(
+        r#"[{"a":1},{"a":2}]"#,
+        r"del(.[(0,5)].a, .[5]?.a)",
+        Outcome::values(&[r#"[{},{"a":2}]"#]),
+    );
+    check(
+        r#"[{"a":1},{"a":2}]"#,
+        r"del(.[5]?.a, .[(0,5)].a)",
+        Outcome::values(&[r#"[{},{"a":2}]"#]),
+    );
+}
+
+/// A non-object (or non-array) container fails every sibling path
+/// identically, so an optional sibling must not mask a non-optional one's
+/// error just because it happens to resolve first. `.a?` on `null` succeeds
+/// silently, but `.[("b","c")]` (no `?`) reaching the same `null` still has
+/// to raise — whichever order they're written in.
+#[test]
+fn test_del_container_type_error_is_not_masked_by_an_earlier_optional_sibling() {
+    check(
+        "null",
+        r#"del(.a?, .[("b","c")])"#,
+        Outcome::error(r#"Cannot index null with string "b""#),
+    );
+    check(
+        "null",
+        r#"del(.[("b","c")], .a?)"#,
+        Outcome::error(r#"Cannot index null with string "b""#),
+    );
+}
+
 #[test]
 fn test_del_and_path_report_a_bad_computed_key() {
     check(

@@ -10095,13 +10095,17 @@ fn flatten_delete_path(expr: &Expr, optional: bool, out: &mut Vec<DeleteStep>) {
 /// are known.
 ///
 /// Every path here comes from one `del` argument's single expression tree, so
-/// whichever branch a computed key took, the shape that follows is identical
-/// — only the concrete `Field`/`Index` values differ. That is what lets every
-/// path be exactly as long as its siblings, and agree, at any shared depth, on
-/// being a `Field`, an `Index`, or an `Iterate` — never a mix — without
-/// needing `delpaths`' total-value-order sort to discover it.
+/// whichever branch a computed key took, the shape that follows is *usually*
+/// identical — only the concrete `Field`/`Index` values differ — which is
+/// what lets every path be exactly as long as its siblings. It is not always
+/// identical in *kind*, though: `null` accepts a string key, a numeric key,
+/// or `.[]` without erroring (`null | .a`, `null | .[0]`, and `null | .[]`
+/// are all `null`), so `.[("a",0)]` resolved against a null target yields one
+/// `Field("a")` path and one `Index(0)` path at the same position. Partition
+/// by actual shape below rather than trusting `paths[0]` to speak for the
+/// rest, which used to panic on exactly that input.
 fn delete_expr_paths_at(
-    value: OwnedValue,
+    mut value: OwnedValue,
     paths: &[&[DeleteStep]],
     start: usize,
 ) -> Result<OwnedValue, EvalError> {
@@ -10119,15 +10123,38 @@ fn delete_expr_paths_at(
         );
         return Ok(OwnedValue::Null);
     }
-    match &paths[0][start].component {
-        Expr::Field(_) => delete_expr_object_paths(value, paths, start),
-        Expr::Index(_) => delete_expr_array_paths(value, paths, start),
-        Expr::Iterate => delete_expr_iterate_paths(value, paths, start),
-        // `flatten_delete_path` only ever leaves Field/Index/Iterate
-        // components behind; anything else is a path shape `del` has never
-        // supported (e.g. `Slice`), matching `delete_at_path`'s catch-all.
-        _ => Err(EvalError::new("cannot use expression as delete target")),
+
+    let mut fields: Vec<&[DeleteStep]> = Vec::new();
+    let mut indices: Vec<&[DeleteStep]> = Vec::new();
+    let mut iterates: Vec<&[DeleteStep]> = Vec::new();
+    for &path in paths {
+        match &path[start].component {
+            Expr::Field(_) => fields.push(path),
+            Expr::Index(_) => indices.push(path),
+            Expr::Iterate => iterates.push(path),
+            // `flatten_delete_path` only ever leaves Field/Index/Iterate
+            // components behind; anything else is a path shape `del` has
+            // never supported (e.g. `Slice`), matching `delete_at_path`'s
+            // catch-all.
+            _ => return Err(EvalError::new("cannot use expression as delete target")),
+        }
     }
+
+    // `value` can only be one concrete type at a time, so at most one of
+    // these three actually mutates it — the others see a container of the
+    // wrong shape and take that branch's optional-vs-error path (see
+    // `delete_expr_object_paths`/`delete_expr_array_paths`). All three can
+    // be non-empty only when `value` is `null`, per the doc comment above.
+    if !fields.is_empty() {
+        value = delete_expr_object_paths(value, &fields, start)?;
+    }
+    if !indices.is_empty() {
+        value = delete_expr_array_paths(value, &indices, start)?;
+    }
+    if !iterates.is_empty() {
+        value = delete_expr_iterate_paths(value, &iterates, start)?;
+    }
+    Ok(value)
 }
 
 /// [`delete_expr_paths_at`]'s `Field` case: group by field name, delete the
@@ -10165,16 +10192,24 @@ fn delete_expr_object_paths(
     }
 
     if !matches!(value, OwnedValue::Object(_)) {
-        return if paths[0][start].optional {
-            Ok(value)
-        } else {
-            let Expr::Field(name) = &paths[0][start].component else {
-                unreachable!("dispatched on Field above")
-            };
-            Err(EvalError::cannot_index_with_field(
-                owned_type_name(&value),
-                name,
-            ))
+        // A non-object container fails every path here identically, so this
+        // is not a per-key merge like the groups below: any single
+        // non-optional path among the siblings has to raise, regardless of
+        // where in the list it sits. Checking only `paths[0]` here used to
+        // let an optional sibling that happened to sort first (e.g. `.a?` in
+        // `del(.a?, .[("b","c")])` against `null`) silently swallow a
+        // non-optional one's error.
+        return match paths.iter().find(|p| !p[start].optional) {
+            None => Ok(value),
+            Some(required) => {
+                let Expr::Field(name) = &required[start].component else {
+                    unreachable!("dispatched on Field above")
+                };
+                Err(EvalError::cannot_index_with_field(
+                    owned_type_name(&value),
+                    name,
+                ))
+            }
         };
     }
 
@@ -10185,7 +10220,11 @@ fn delete_expr_object_paths(
                     let old = core::mem::replace(slot, OwnedValue::Null);
                     *slot = delete_expr_paths_at(old, group, start + 1)?;
                 }
-                None if group[0][start].optional => {}
+                // Requiring *every* sibling naming this field to be optional
+                // would be too strict: one occurrence marking it optional is
+                // enough to cover the others, the same merge the
+                // terminal-index case below uses.
+                None if group.iter().any(|p| p[start].optional) => {}
                 None => return Err(EvalError::field_not_found(name)),
             }
         }
@@ -10220,8 +10259,14 @@ fn delete_expr_array_paths(
         };
         let idx = *idx;
         if path.len() == start + 1 {
-            if !terminal.iter().any(|(i, _)| *i == idx) {
-                terminal.push((idx, path[start].optional));
+            // One occurrence of `idx` marking it optional is enough to cover
+            // every other occurrence — merge rather than keep only whichever
+            // one was pushed first, which used to make the outcome depend on
+            // argument order (`del(.[(0,5)], .[5]?)` errored or not
+            // depending on which side `.[5]?` was written on).
+            match terminal.iter_mut().find(|(i, _)| *i == idx) {
+                Some(entry) => entry.1 |= path[start].optional,
+                None => terminal.push((idx, path[start].optional)),
             }
             continue;
         }
@@ -10239,7 +10284,10 @@ fn delete_expr_array_paths(
     }
 
     if !matches!(value, OwnedValue::Array(_)) {
-        return if paths[0][start].optional {
+        // Same reasoning as the object case above: a non-array container
+        // fails every path here identically, so a single non-optional path
+        // among the siblings has to raise even when others are optional.
+        return if paths.iter().all(|p| p[start].optional) {
             Ok(value)
         } else {
             Err(EvalError::cannot_index_with_type(
@@ -10257,7 +10305,7 @@ fn delete_expr_array_paths(
                 let slot = &mut arr[actual as usize];
                 let old = core::mem::replace(slot, OwnedValue::Null);
                 *slot = delete_expr_paths_at(old, group, start + 1)?;
-            } else if !group[0][start].optional {
+            } else if !group.iter().any(|p| p[start].optional) {
                 return Err(out_of_range_index(*idx, arr.len()));
             }
         }
