@@ -7,6 +7,8 @@
 //! requested.
 
 #[cfg(not(test))]
+use alloc::vec;
+#[cfg(not(test))]
 use alloc::{
     borrow::Cow, collections::BTreeMap, rc::Rc, string::String, string::ToString, vec::Vec,
 };
@@ -3078,8 +3080,8 @@ impl<W> Clone for FieldsInner<'_, W> {
     }
 }
 
-/// Immutable "list" of YAML mapping fields. See [`FieldsInner`] for the two
-/// representations this wraps.
+/// Immutable "list" of YAML mapping fields. See `FieldsInner` (private) for
+/// the two representations this wraps.
 #[derive(Debug)]
 pub struct YamlFields<'a, W = Vec<u64>> {
     inner: FieldsInner<'a, W>,
