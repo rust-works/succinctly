@@ -26,12 +26,12 @@ files: 7, total bytes: 17150, anchors: 41, aliases: 86, bare-dash items: 5
 
 | metric               | unit         | n   | min  | p50  | p90  | p99  | max  |
 | -------------------- | ------------ | --- | ---- | ---- | ---- | ---- | ---- |
-| scalar length        | bytes/scalar | 945 | 0    | 7    | 19   | 49   | 92   |
-| mapping keys         | keys/mapping | 228 | 0    | 2    | 3    | 9    | 69   |
+| scalar length        | bytes/scalar | 957 | 0    | 7    | 19   | 49   | 92   |
+| mapping keys         | keys/mapping | 234 | 0    | 2    | 3    | 9    | 69   |
 | sequence items       | items/seq    | 66  | 1    | 2    | 3    | 4    | 4    |
 | bare-dash seq items  | count/file   | 7   | 0    | 0    | 5    | 5    | 5    |
 | flow-collection size | bytes/flow   | 4   | 2    | 2    | 100  | 100  | 100  |
-| nesting depth        | levels/node  | 729 | 2    | 5    | 8    | 11   | 12   |
+| nesting depth        | levels/node  | 741 | 2    | 5    | 8    | 11   | 12   |
 | anchors              | count/file   | 7   | 0    | 0    | 41   | 41   | 41   |
 | aliases              | count/file   | 7   | 0    | 0    | 86   | 86   | 86   |
 | escape density       | per KiB/file | 7   | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |

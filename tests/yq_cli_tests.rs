@@ -912,7 +912,6 @@ fn test_split_doc_identity_passthrough() -> Result<()> {
 // =============================================================================
 
 #[test]
-#[ignore] // TODO: Fix - merge keys should be expanded
 fn test_yaml_merge_key_expansion() -> Result<()> {
     // yq: merge key << should be expanded
     let input = "default: &default\n  a: 1\nitem:\n  <<: *default\n  b: 2";
@@ -932,7 +931,6 @@ fn test_yaml_merge_key_expansion() -> Result<()> {
 }
 
 #[test]
-#[ignore] // TODO: Fix - merge keys should be expanded
 fn test_yaml_merge_key_override() -> Result<()> {
     // When item has same key as anchor, item's value takes precedence
     let input = "default: &default\n  a: 1\n  b: original\nitem:\n  <<: *default\n  b: override";
