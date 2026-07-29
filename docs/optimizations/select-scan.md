@@ -2,7 +2,7 @@
 
 [Home](../../) > [Docs](../) > [Optimizations](./) > Select scan
 
-Investigation of [#40](https://github.com/newhoggy/succinctly/issues/40): should the
+Investigation of [#40](https://github.com/rust-works/succinctly/issues/40): should the
 word scan inside `select` be vectorised?
 
 **Outcome: the SIMD kernel is not justified — but finding that out uncovered an
