@@ -16297,6 +16297,19 @@ mod tests {
                 assert_eq!(arr[0], OwnedValue::Int(2));
             }
         );
+
+        // map(f) is [.[] | f], and .[] over an object iterates its values,
+        // so jq accepts an object of entries as readily as an array (#422).
+        query!(br#"{"a": 1, "b": 2}"#, "map(. + 1)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(2), OwnedValue::Int(3)]);
+            }
+        );
+        query!(br"{}", "map(. + 1)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty());
+            }
+        );
     }
 
     #[test]
@@ -16342,6 +16355,16 @@ mod tests {
         query!(br"[]", "add",
             QueryResult::Owned(OwnedValue::Null) => {}
         );
+
+        // add is [.[] | .] folded with +, and .[] over an object iterates
+        // its values, so jq accepts an object here as readily as an array
+        // (#422).
+        query!(br#"{"a": 1, "b": 2, "c": 3}"#, "add",
+            QueryResult::Owned(OwnedValue::Int(6)) => {}
+        );
+        query!(br"{}", "add",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
     }
 
     #[test]
@@ -16358,6 +16381,16 @@ mod tests {
         query!(br"[1, 0]", "any",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}  // numbers are truthy
         );
+
+        // any is [.[] | .] with an early-exit truthiness check, and .[] over
+        // an object iterates its values, so jq accepts an object here as
+        // readily as an array (#422).
+        query!(br#"{"a": false, "b": true}"#, "any",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"{}", "any",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
     }
 
     #[test]
@@ -16370,6 +16403,14 @@ mod tests {
         );
         query!(br"[1, 2, 3]", "all",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}  // numbers are truthy
+        );
+
+        // Same shape as `any` — see #422.
+        query!(br#"{"a": true, "b": false}"#, "all",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        query!(br"{}", "all",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
     }
 
@@ -16652,6 +16693,20 @@ mod tests {
                 assert_eq!(s, "a-c");
             }
         );
+
+        // join(s) is [.[] | tostring] joined by s, and .[] over an object
+        // iterates its values, so jq accepts an object here as readily as
+        // an array (#422).
+        query!(br#"{"a": "x", "b": "y"}"#, r#"join(",")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "x,y");
+            }
+        );
+        query!(br"{}", r#"join(",")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "");
+            }
+        );
     }
 
     #[test]
@@ -16904,6 +16959,28 @@ mod tests {
                 assert_eq!(arr[2], OwnedValue::Array(vec![OwnedValue::Int(3)]));
             }
         );
+
+        // flatten is defined over [.[]], and .[] over an object iterates
+        // its values, so jq accepts an object here as readily as an array
+        // (#422). Same one-level depth as the array case above.
+        query!(br#"{"a": [1, 2], "b": [3, [4]]}"#, "flatten",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::Int(1),
+                        OwnedValue::Int(2),
+                        OwnedValue::Int(3),
+                        OwnedValue::Array(vec![OwnedValue::Int(4)]),
+                    ]
+                );
+            }
+        );
+        query!(br"{}", "flatten",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty());
+            }
+        );
     }
 
     #[test]
@@ -17035,6 +17112,20 @@ mod tests {
         query!(br#"[{"name": "x", "value": 10}]"#, "from_entries",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.get("x"), Some(&OwnedValue::Int(10)));
+            }
+        );
+
+        // from_entries is map({...}) | add | .//={}, and .[] over an object
+        // iterates its values, so jq accepts an object of entries as
+        // readily as an array of them (#422).
+        query!(br#"{"x": {"key": "a", "value": 1}}"#, "from_entries",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("a"), Some(&OwnedValue::Int(1)));
+            }
+        );
+        query!(br"{}", "from_entries",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert!(obj.is_empty());
             }
         );
     }
