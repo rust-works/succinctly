@@ -7260,6 +7260,18 @@ mod tests {
             // Two aliases to one anchor: resolution is per-node, so the second
             // must not depend on the first having consumed the edge.
             (b"{&x k: 1, *x: 2, *x: 3}", r#"{"k":1,"k":2,"k":3}"#),
+            // Flow-*sequence* implicit-mapping-entry keys (#409), a separate
+            // bug from #405 above: the sequence loop consumed a leading `&`
+            // or `*` before ever checking whether the item was a pair, so a
+            // miss errored `expected ',' or ']'` instead of naming the
+            // unknown anchor, and a hit either failed the same way (alias) or
+            // bound to the mapping wrapper instead of the key (anchor).
+            (b"[&x k: 1, *x: 2]", r#"[{"k":1},{"k":2}]"#),
+            // Anchor on the key, aliased by a later plain (non-pair) item.
+            (b"[&x k: 1, *x]", r#"[{"k":1},"k"]"#),
+            // Anchored value in a block mapping, aliased as a flow-sequence
+            // implicit-entry key nested in that mapping's value.
+            (b"{a: &x 1, b: [*x: 2]}", r#"{"a":1,"b":[{"1":2}]}"#),
         ];
         for (yaml, expected) in cases {
             assert_eq!(

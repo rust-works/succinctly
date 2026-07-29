@@ -1028,9 +1028,10 @@ fn test_yaml_flow_context_rejects_tags_like_block_context() -> Result<()> {
     //
     // Every flow position that reaches a plain-scalar reader. The last two are
     // the ones no other case covers: an implicit `k: v` entry inside a flow
-    // *sequence* enters through `parse_flow_key_scalar`, and the explicit
-    // `? k : v` form through `parse_explicit_flow_unquoted_key`. Without them,
-    // deleting either gate leaves this test green.
+    // *sequence* enters through `parse_flow_key` (shared with the flow-mapping
+    // key site since #409), and the explicit `? k : v` form through
+    // `parse_explicit_flow_unquoted_key`. Without them, deleting either gate
+    // leaves this test green.
     for (name, input) in [
         ("seq item", "a: [!!str x]\n"),
         ("mapping value", "a: {k: !custom v}\n"),
@@ -1291,6 +1292,21 @@ fn test_yaml_anchor_on_flow_mapping_key_binds_to_key() -> Result<()> {
     let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
     assert_eq!(exit_code, 0);
     assert_eq!(output.trim(), r#"{"a":{"e":"f"},"b":"e"}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_anchor_on_flow_sequence_key_binds_to_key() -> Result<()> {
+    // The flow-*sequence* counterpart of the test above (#409): an implicit
+    // single-pair-mapping entry inside `[...]` also opens the key's BP node
+    // before the anchor is read, so a bare `parse_anchor` here bound the
+    // anchor to the mapping *wrapper* `parse_implicit_flow_mapping_entry` was
+    // about to open, not the key `k` inside it — invisible on `&flowseq [...,
+    // &c c: d, ...]` (corpus case CN3R) since that case never aliases `&c`.
+    let input = "[&x k: 1, *x: 2]\n";
+    let (output, exit_code) = run_yq_stdin("at_offset(11)", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#""k""#);
     Ok(())
 }
 
@@ -2962,6 +2978,48 @@ fn test_alias_as_a_flow_mapping_key_resolves() -> Result<()> {
     // `validate_alias_acyclicity` rather than by its ancestor arm. It must stay an
     // error — resolving it would be unbounded materialization.
     let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", "{&x *x: 1}\n", &["-o=json"])?;
+    assert_eq!(code, 1, "expected clean error exit, stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("cyclic alias 'x'"),
+        "stderr should name the cycle: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_alias_as_a_flow_sequence_key_resolves() -> Result<()> {
+    // #409, the flow-*sequence* counterpart of #405 above. An implicit
+    // single-pair-mapping entry inside `[...]` never reached the pair check
+    // at all for an alias key: the sequence loop consumed a leading `*` as a
+    // *standalone* item and `continue`d, so `*x: 2` left the cursor on `:`
+    // and errored `expected ',' or ']'`. An anchor on such a key parsed
+    // without erroring but bound to the mapping wrapper instead of the key,
+    // the same wrong-node shape #405 fixed for the flow-mapping key.
+    //
+    // Every expectation is `yq` v4.53.3's output for the same input, on the
+    // streaming path (`-I 0`), taken directly from the issue's repro table.
+    for (yaml, expected) in [
+        // Alias to an anchored key.
+        ("[&x k: 1, *x: 2]\n", r#"[{"k":1},{"k":2}]"#),
+        // Alias to an anchored value, nested inside a block mapping.
+        ("{a: &x 1, b: [*x: 2]}\n", r#"{"a":1,"b":[{"1":2}]}"#),
+        // Anchor on the key, aliased by a later *plain* (non-pair) item.
+        ("[&x k: 1, *x]\n", r#"[{"k":1},"k"]"#),
+        // Unaffected baselines the issue calls out: no anchor/alias at all,
+        // and a plain aliased scalar item (not a key) - both must still work.
+        ("[a: 1, b: 2]\n", r#"[{"a":1},{"b":2}]"#),
+        ("[&x a, *x]\n", r#"["a","a"]"#),
+    ] {
+        let (output, code) = run_yq_stdin(".", yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "for {yaml:?}");
+        assert_eq!(output.trim(), expected, "for {yaml:?}");
+    }
+
+    // An anchor and an alias to it on the same key: must still be rejected as
+    // a cycle, the same as the flow-mapping key position above - this call
+    // path must not have quietly dropped `record_key_alias`'s cycle check.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", "[&x *x: 1]\n", &["-o=json"])?;
     assert_eq!(code, 1, "expected clean error exit, stderr: {stderr}");
     assert_eq!(stdout, "");
     assert!(
