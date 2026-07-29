@@ -103,6 +103,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A tab that indented a sequence-item continuation line was folded into a
+  plain scalar instead of rejected** (#432, also fixing #371): three related
+  gaps in `parse_unquoted_value_with_indent_impl` and `parse_mapping_entry`
+  in `src/yaml/parser.rs`, all downstream of the `tab_indents_block_structure`
+  check introduced by #173/#381 not reaching every site that dispatches on a
+  continuation line. `a:\n \t- x\n` loaded as `{"a":"\t- x"}` — a key's
+  "value is on the next line" arm left the tab on the cursor when it indented
+  block structure, so the `Some(b'-')` sequence check silently missed it and
+  fell through to a plain scalar. `- a\n \t- b\n` loaded as `["a - b"]`
+  because the plain-scalar continuation scan only compared indentation by
+  counting *spaces*, so a tab that itself indented a sibling sequence item
+  read as "more indented, keep going" and folded the second item into the
+  first's scalar; the same gap made `a: 1\n \tb: 2\n` silently drop `: 2`
+  (#371) since a mapping value at indent 0 hit the same scan gated on
+  `start_indent == 0` rather than the narrower `is_doc_root` the function
+  already computed. All three now raise `TabIndentation`, matching the
+  opt-in validator, which already rejected all three shapes. New coverage:
+  three rows in the `VERDICTS` table in `tests/yaml_tab_indentation_tests.rs`
+  (plus the pre-existing #371 row moved from the "loader and validator
+  legitimately disagree" section into "both must reject" now that they
+  agree); `yaml_test_suite_conformance` and `yq_golden_conformance` re-run
+  clean.
+
 - **YAML explicit non-scalar keys silently dropped the entry** (#172,
   resolved by drift): `? - a\n  - b\n: value` used to load as `{}`, losing
   both the key and the value, silently — no error, well-formed JSON out. Not
