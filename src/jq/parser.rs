@@ -2913,21 +2913,8 @@ impl<'a> Parser<'a> {
         }
 
         // Phase 13: Iteration control
-        // limit(n; expr) - output at most n values from expr
-        if self.matches_keyword("limit") {
-            self.consume_keyword("limit");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let n = self.parse_pipe_expr()?;
-            self.skip_ws();
-            self.expect(';')?;
-            self.skip_ws();
-            let expr = self.parse_pipe_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Limit(Box::new(n), Box::new(expr))));
-        }
+        // Note: limit is handled in parse_primary (parse_limit_expr) before
+        // try_parse_builtin, producing Expr::Limit rather than Builtin::Limit.
 
         // skip(n; expr) - skip first n outputs from expr
         if self.matches_keyword("skip") {
@@ -2949,40 +2936,10 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Skip(Box::new(n), Box::new(expr))));
         }
 
-        // first(expr) or first - output only the first value
-        // first without args is already handled by Phase 5 Builtin::First
-        // first(expr) uses stream version
-        if self.matches_keyword("first") {
-            self.consume_keyword("first");
-            self.skip_ws();
-            if self.peek() == Some('(') {
-                self.next();
-                self.skip_ws();
-                let expr = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(')')?;
-                return Ok(Some(Builtin::FirstStream(Box::new(expr))));
-            }
-            // No-arg first is already handled by Phase 5 Builtin::First
-            return Ok(Some(Builtin::First));
-        }
-
-        // last(expr) or last - output only the last value
-        // last without args is already handled by Phase 5 Builtin::Last
-        if self.matches_keyword("last") {
-            self.consume_keyword("last");
-            self.skip_ws();
-            if self.peek() == Some('(') {
-                self.next();
-                self.skip_ws();
-                let expr = self.parse_pipe_expr()?;
-                self.skip_ws();
-                self.expect(')')?;
-                return Ok(Some(Builtin::LastStream(Box::new(expr))));
-            }
-            // No-arg last is already handled by Phase 5 Builtin::Last
-            return Ok(Some(Builtin::Last));
-        }
+        // Note: first(expr)/first, last(expr)/last are handled in
+        // parse_primary (parse_first_expr/parse_last_expr) before
+        // try_parse_builtin, producing Expr::FirstExpr/Expr::LastExpr rather
+        // than Builtin::FirstStream/Builtin::LastStream.
 
         // nth(n; expr) or nth(n) - output only the nth value (0-indexed)
         // nth(n) without second arg is already handled by Phase 5 Builtin::Nth
