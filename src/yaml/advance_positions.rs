@@ -107,25 +107,23 @@ impl OpenPositions {
     /// Find the last (deepest) open index that starts at the given text position.
     ///
     /// Returns `None` if no node starts at this position.
+    ///
+    /// Positions are recorded in DFS pre-order, so among the opens sharing a
+    /// text position the deepest is the last — hence "last".
     pub fn find_last_open_at_text_pos(&self, text_pos: usize) -> Option<usize> {
         match self {
             Self::Compact(ap) => ap.find_last_open_at_text_pos(text_pos),
             Self::Dense(v) => {
-                // Binary search for non-compact storage
-                let text_pos_u32 = text_pos as u32;
-                let search_result = v.binary_search(&text_pos_u32);
-
-                match search_result {
-                    Ok(idx) => {
-                        // Found a match, scan right to find the last one
-                        let mut last = idx;
-                        while last + 1 < v.len() && v[last + 1] == text_pos_u32 {
-                            last += 1;
-                        }
-                        Some(last)
-                    }
-                    Err(_) => None,
-                }
+                // A reverse linear scan, NOT a binary search: `Dense` is
+                // selected precisely when positions are non-monotonic, so the
+                // vector is unsorted by construction and `binary_search` would
+                // silently miss matches. This path is reached only for
+                // documents containing a valueless explicit key (`? a` with no
+                // `: value`), and only from `yq-locate` / the jq `at_offset`
+                // and `at_position` builtins, so the linear cost is confined
+                // to a rare query on a rare document shape.
+                let text_pos_u32 = u32::try_from(text_pos).ok()?;
+                v.iter().rposition(|&p| p == text_pos_u32)
             }
         }
     }
@@ -1204,5 +1202,32 @@ mod tests {
                 "null sentinel at text_len={text_len} must be recoverable"
             );
         }
+    }
+
+    /// `Dense` is selected precisely when positions are non-monotonic, so it
+    /// is unsorted by construction and reverse lookup must not binary-search
+    /// it. Mirrors what the parser emits for `? a\nb: 1\n`, where the
+    /// valueless explicit key records a null at `input.len()` before the
+    /// following entry records smaller positions.
+    #[test]
+    fn test_dense_reverse_lookup_on_unsorted_positions() {
+        let positions = vec![0, 0, 2, 9, 4, 7];
+        let op = OpenPositions::build(&positions, 10);
+        assert!(
+            !op.is_compact(),
+            "non-monotonic input must fall back to Dense"
+        );
+
+        // Every recorded position must be reachable, including the ones that
+        // sit after the out-of-order sentinel.
+        assert_eq!(op.find_last_open_at_text_pos(0), Some(1));
+        assert_eq!(op.find_last_open_at_text_pos(2), Some(2));
+        assert_eq!(op.find_last_open_at_text_pos(9), Some(3));
+        assert_eq!(op.find_last_open_at_text_pos(4), Some(4));
+        assert_eq!(op.find_last_open_at_text_pos(7), Some(5));
+
+        // Positions no node starts at still report nothing.
+        assert_eq!(op.find_last_open_at_text_pos(1), None);
+        assert_eq!(op.find_last_open_at_text_pos(8), None);
     }
 }

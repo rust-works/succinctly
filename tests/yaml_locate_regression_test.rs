@@ -219,3 +219,32 @@ fn the_located_byte_range_still_stops_at_a_flow_indicator_in_flow_context() {
     let (start, end) = found.byte_range;
     assert_eq!(&yaml[start..end], b"a", "the first flow sequence element");
 }
+
+/// Reverse lookup on a document containing a valueless explicit key (#56).
+///
+/// A `? key` with no `: value` makes the parser record a null-value node at
+/// `input.len()`, which puts `bp_to_text` out of text order and forces the
+/// `Dense` fallback. That vector is unsorted by construction, so the reverse
+/// text→BP lookup used to binary-search it and silently fail: every node
+/// recorded *after* the out-of-order sentinel became unreachable, and
+/// `yq-locate` reported nothing for those offsets.
+#[test]
+fn test_locate_offset_with_valueless_explicit_key() {
+    let yaml = b"? a\nb: 1\n";
+    //           0123 4567 8
+
+    let index = YamlIndex::build(yaml).unwrap();
+
+    // `b` and `1` are recorded after the null sentinel at input.len().
+    // Before the fix both of these returned None.
+    assert_eq!(
+        locate_offset(&index, yaml, 4),
+        Some(".[0].b".to_string()),
+        "offset 4 ('b') must resolve despite the preceding out-of-order sentinel"
+    );
+    assert_eq!(
+        locate_offset(&index, yaml, 7),
+        Some(".[0].b".to_string()),
+        "offset 7 ('1') must resolve despite the preceding out-of-order sentinel"
+    );
+}
