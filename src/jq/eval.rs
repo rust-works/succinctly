@@ -18305,6 +18305,11 @@ mod tests {
         );
         bsearch_is!(br#"[null, true, 1, "a", [1], {"a": 1}]"#, "bsearch(2)", -4);
 
+        // NaN never compares Equal to anything, including itself (#421), so
+        // it is reported absent rather than falsely "found" by the old
+        // fold-to-Equal bug.
+        bsearch_is!(br"[1, 2, 3]", "bsearch(nan)", -1);
+
         // `null | length == 0` in jq, so `null` takes the empty-array branch
         // and answers "not found" instead of erroring (#420).
         bsearch_is!(br"null", "bsearch(1)", -1);
@@ -18334,6 +18339,53 @@ mod tests {
                 assert!(e.to_string().contains("bsearch requires array"));
             }
         );
+    }
+
+    /// `compare_values` orders NaN as `Less` than every number, including
+    /// another NaN (#421) -- a genuine violation of the strict weak ordering
+    /// `[T]::sort_by` assumes. Rust's stable sort only reaches the internal
+    /// consistency check that can panic on such a violation
+    /// (`core::slice::sort::shared::smallsort`'s bidirectional merge) for
+    /// slices longer than 20 elements; shorter slices use a plain insertion
+    /// sort that cannot panic regardless of comparator validity.
+    ///
+    /// This is a canary for that threshold, not a jq-parity check: it only
+    /// pins that `sort`/`sort_by`/`unique`/`unique_by`/`group_by` complete
+    /// without panicking on an array past that threshold holding several
+    /// NaNs -- not what order they land in (genuinely unspecified once two or
+    /// more NaNs share a slice this large; jq's own qsort-based sort makes no
+    /// promise here either).
+    ///
+    /// `sort`/`sort_by` don't dedup, so their length is pinned exactly.
+    /// `unique`/`unique_by`/`group_by` do dedup/group by `compare_values`
+    /// equality, and a separate, pre-existing defect (a freshly-constructed
+    /// array materializes through JSON text, which has no NaN literal, so
+    /// two or more NaN elements collapse to real, mutually-`Equal` `Null`s
+    /// before `compare_values` ever runs -- see #421's "Separate defect"
+    /// section) makes their post-dedup length unpredictable here. That
+    /// defect is out of scope for this fix; this test only needs "did not
+    /// panic", so it doesn't assert a specific count for those three.
+    #[test]
+    fn test_sort_many_nans_does_not_panic_421() {
+        for filter in [
+            "[range(30), nan, nan, nan] | sort | length",
+            "[range(30), nan, nan, nan] | sort_by(.) | length",
+        ] {
+            query!(b"null", filter,
+                QueryResult::Owned(OwnedValue::Int(n)) => {
+                    assert_eq!(n, 33, "{filter}");
+                }
+            );
+        }
+        for filter in [
+            "[range(30), nan, nan, nan] | unique | length",
+            "[range(30), nan, nan, nan] | unique_by(.) | length",
+            "[range(30), nan, nan, nan] | group_by(.) | length",
+        ] {
+            query!(b"null", filter,
+                QueryResult::Owned(OwnedValue::Int(_)) => {}
+            );
+        }
     }
 
     #[test]
