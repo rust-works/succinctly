@@ -1,24 +1,29 @@
 #![allow(unsafe_code)] // runtime SIMD feature dispatch for escape scanning
-//! Shared SIMD escape scanning.
+//! Shared SIMD byte scanning.
 //!
-//! Finds the next byte in a string that a text format would need to *escape* —
-//! the hot inner loop of streaming-output transcoders. Historically this lived in
-//! `yaml/simd/` while `jq/stream.rs` consumed it, making jq depend on yaml
-//! internals (#125). It now lives here as a neutral, shared utility that any
-//! consumer (jq streaming, jq/yq output escaping in #91, jq format functions in
-//! #124) can use without a cross-module dependency.
+//! Finds the next byte in a buffer matching a predicate. The original consumer —
+//! and the reason for the module's name — is "the next byte a text format would
+//! need to *escape*", the hot inner loop of streaming-output transcoders.
+//! Historically this lived in `yaml/simd/` while `jq/stream.rs` consumed it,
+//! making jq depend on yaml internals (#125). It now lives here as a neutral,
+//! shared utility that any consumer (jq streaming, jq/yq output escaping in #91,
+//! jq format functions in #124) can use without a cross-module dependency.
 //!
 //! ## The predicate seam
 //!
 //! The scanning machinery — the 16/32-byte SIMD chunk loop, the movemask +
 //! `trailing_zeros` position extraction, and the scalar remainder — is identical
-//! across escape predicates; only the *set of bytes considered special* differs
+//! across predicates; only the *set of bytes considered special* differs
 //! (JSON escapes `"` / `\` / `< 0x20`; a future `@html` scanner would want
 //! `<` / `>` / `&` / `'` / `"`, etc.). [`define_escape_scanner!`] captures the
 //! machinery once and takes the predicate as a parameter: a scalar `|b| ...`
 //! expression plus three per-backend mask helpers (NEON / AVX2 / SSE2). Adding a
 //! new scanner (#124) is a new macro invocation, not another refactor of this
-//! file. Only [`find_json_escape`] is instantiated today.
+//! file.
+//!
+//! Two are instantiated: [`find_json_escape`] and [`contains_cr`]. The second is
+//! not an escape predicate at all — it is the #340 `has_cr` precheck — which is
+//! the point of the seam: the predicate is the parameter, the machinery is not.
 //!
 //! ## Dispatch
 //!
@@ -403,6 +408,69 @@ pub fn find_json_escape(bytes: &[u8], start: usize) -> usize {
     json_escape::find(bytes, start)
 }
 
+// ---- Carriage-return predicate ---------------------------------------------
+//
+// Not an escape predicate: this is the `has_cr` precheck the YAML oracle uses to
+// pick its `HAS_CR` monomorphization (#340). A single byte compare, so the mask
+// helpers below are one intrinsic each.
+
+/// NEON match mask for `\r`.
+#[cfg(all(
+    target_arch = "aarch64",
+    not(feature = "broadword-yaml"),
+    not(feature = "scalar-yaml")
+))]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn cr_neon_mask(chunk: uint8x16_t) -> uint8x16_t {
+    vceqq_u8(chunk, vdupq_n_u8(b'\r'))
+}
+
+/// AVX2 match mask for `\r`.
+#[cfg(all(
+    target_arch = "x86_64",
+    not(feature = "scalar-yaml"),
+    any(test, feature = "std")
+))]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn cr_avx2_mask(chunk: __m256i) -> __m256i {
+    _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'\r' as i8))
+}
+
+/// SSE2 match mask for `\r`.
+#[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
+#[inline]
+#[target_feature(enable = "sse2")]
+unsafe fn cr_sse2_mask(chunk: __m128i) -> __m128i {
+    _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\r' as i8))
+}
+
+define_escape_scanner! {
+    /// Carriage-return scanner (the #340 `has_cr` precheck).
+    mod cr_scan;
+    scalar: |b| b == b'\r';
+    neon_mask: cr_neon_mask;
+    avx2_mask: cr_avx2_mask;
+    sse2_mask: cr_sse2_mask;
+}
+
+/// Does `input` contain a carriage return anywhere?
+///
+/// The YAML oracle calls this once per document to choose between its two
+/// `HAS_CR` monomorphizations (#340). A `false` answer means every `\r` arm in
+/// the parser is provably dead for this input, so the LF-only specialization can
+/// drop them and keep the pre-#324 codegen.
+///
+/// SIMD is load-bearing here rather than decorative: `YamlIndex::build` runs at
+/// ~250-400 MiB/s, so a byte-at-a-time precheck would cost several percent of the
+/// build it is meant to speed up, while a 16-32 byte/iteration scan costs a
+/// fraction of one.
+#[inline]
+pub fn contains_cr(input: &[u8]) -> bool {
+    cr_scan::find(input, 0) < input.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,6 +820,128 @@ mod tests {
         fn neon_returns_len_when_start_past_end() {
             // The kernel's own `start >= len` guard, not reached through find().
             assert_eq!(super::super::json_escape::neon(b"abc", 9), 3);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // The `has_cr` precheck (#340).
+    //
+    // Both directions of a wrong answer matter, and only one of them is loud.
+    // Under-reporting (`false` when a `\r` is present) sends a CRLF document down
+    // the LF-only parser and silently corrupts it — `tests/yaml_crlf_tests.rs` and
+    // the CRLF/CR reruns in `tests/yq_golden_tests.rs` catch that. Over-reporting
+    // (`true` for a CR-free document) is *correct* and merely gives up the whole
+    // optimization, so nothing else in the suite would notice; that is what these
+    // exact-agreement tests are for.
+    // ------------------------------------------------------------------------
+    mod cr_precheck {
+        use super::super::contains_cr;
+
+        /// Independent reference, deliberately not `cr_scan::scalar`.
+        fn reference(bytes: &[u8]) -> bool {
+            bytes.contains(&b'\r')
+        }
+
+        #[test]
+        fn agrees_with_reference_on_shapes() {
+            let cases: Vec<Vec<u8>> = vec![
+                b"".to_vec(),
+                b"\r".to_vec(),
+                b"\n".to_vec(),
+                b"a: 1\n".to_vec(),
+                b"a: 1\r\n".to_vec(),
+                b"a: 1\rb: 2".to_vec(),
+                b"no breaks at all".to_vec(),
+                vec![b'a'; 1000],
+                // 0x0A and 0x0D differ in one bit; a mask built for the wrong
+                // constant would still "find line breaks" and read as working.
+                b"lots\nof\nline\nfeeds\nbut\nno\ncarriage\nreturns\n".to_vec(),
+            ];
+            for input in &cases {
+                assert_eq!(
+                    reference(input),
+                    contains_cr(input),
+                    "mismatch for {input:?}"
+                );
+            }
+        }
+
+        /// A `\r` anywhere must be seen, whichever kernel path covers that offset.
+        ///
+        /// Lengths straddle the 16-byte (NEON/SSE2), 32-byte (AVX2) and 48-byte
+        /// (AVX2 + SSE2 tail) boundaries, so each length exercises a different mix
+        /// of vector loop and scalar remainder — a `\r` living only in the tail is
+        /// exactly what a chunk-loop-only scan would miss.
+        #[test]
+        fn finds_a_cr_at_every_offset_and_length() {
+            for len in [0usize, 1, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64, 65, 129] {
+                let clean = vec![b'a'; len];
+                assert!(!contains_cr(&clean), "false positive at len {len}");
+                for pos in 0..len {
+                    let mut input = clean.clone();
+                    input[pos] = b'\r';
+                    assert!(contains_cr(&input), "missed CR at {pos} of {len}");
+                }
+            }
+        }
+
+        /// No other byte may be mistaken for `\r` — in particular not `\n`.
+        #[test]
+        fn no_other_byte_reports_as_cr() {
+            for byte in 0u8..=255 {
+                for pos in [0usize, 15, 16, 31, 32, 40] {
+                    let mut input = vec![b'a'; 48];
+                    input[pos] = byte;
+                    assert_eq!(
+                        byte == b'\r',
+                        contains_cr(&input),
+                        "byte {byte:#04x} at {pos}"
+                    );
+                }
+            }
+        }
+
+        /// The scalar fallback is the only path in a `scalar-yaml` build and the
+        /// short-input path everywhere else; check it directly on every target.
+        #[test]
+        fn scalar_fallback_matches_reference() {
+            for len in [0usize, 1, 5, 16, 33] {
+                let clean = vec![b'z'; len];
+                assert_eq!(super::super::cr_scan::scalar(&clean, 0), len);
+                for pos in 0..len {
+                    let mut input = clean.clone();
+                    input[pos] = b'\r';
+                    assert_eq!(super::super::cr_scan::scalar(&input, 0), pos);
+                }
+            }
+        }
+
+        /// Both x86 tiers, since `find` only ever picks one of them on a given
+        /// runner and the SSE2 baseline would otherwise go untested on AVX2
+        /// hardware (#193).
+        #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
+        #[test]
+        fn both_x86_tiers_agree() {
+            let has_avx2 =
+                crate::util::simd::note_simd_skip_unless(is_x86_feature_detected!("avx2"), "avx2");
+            for len in [16usize, 32, 48, 64] {
+                for pos in 0..len {
+                    let mut input = vec![b'a'; len];
+                    input[pos] = b'\r';
+                    assert_eq!(
+                        super::super::cr_scan::dispatch(&input, 0, false),
+                        pos,
+                        "SSE2 missed CR at {pos} of {len}"
+                    );
+                    if has_avx2 {
+                        assert_eq!(
+                            super::super::cr_scan::dispatch(&input, 0, true),
+                            pos,
+                            "AVX2 missed CR at {pos} of {len}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
