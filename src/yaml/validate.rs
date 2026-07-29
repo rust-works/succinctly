@@ -31,7 +31,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::line_break::{is_line_break, line_break_len};
+use super::line_break::line_break_len;
 
 /// Position information for error reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -534,10 +534,18 @@ impl<'a> Validator<'a> {
     }
 
     /// Classify a block-context line (from the cursor, after leading indent) as
-    /// a sequence entry, a mapping entry, or a plain/quoted scalar. Quoted
-    /// regions are skipped so a `:` inside a quoted key is not miscounted.
+    /// a sequence entry, a mapping entry, or a plain/quoted scalar. A quoted
+    /// region is skipped via the shared [`super::quoted_span_end`] so a `:`
+    /// inside one is not miscounted — and, because a value may legally follow
+    /// on a later line, a quoted key or scalar that spans lines is followed to
+    /// its true close rather than stopping there, unlike
+    /// [`super::line_is_structural`]'s narrower question (#382). A `"`/`'`/`#`
+    /// glued to preceding content is ordinary text, gated by
+    /// [`super::after_separation`] — the same rule `line_is_structural` uses,
+    /// which `line_kind`'s quote arms were missing until #382.
     fn line_kind(&self) -> LineKind {
         let mut i = self.offset;
+        let content_start = i;
         let first = self.input.get(i).copied();
         // Sequence entry `-` / explicit key `?` / explicit value `:`.
         if matches!(first, Some(b'-'))
@@ -560,44 +568,14 @@ impl<'a> Validator<'a> {
         while let Some(&b) = self.input.get(i) {
             match b {
                 b'\n' | b'\r' => break,
-                b'"' => {
-                    i += 1;
-                    while let Some(&c) = self.input.get(i) {
-                        i += 1;
-                        if c == b'\\' {
-                            i += 1;
-                        } else if c == b'"' || c == b'\n' {
-                            break;
-                        } else if c == b'\r' {
-                            // A CRLF is a single line break: consume the LF too,
-                            // so an unterminated quote resumes this scan exactly
-                            // where the LF-only spelling would (#324). `c` sits
-                            // at `i - 1`, so measure the break from there.
-                            i = (i - 1) + line_break_len(self.input, i - 1);
-                            break;
-                        }
+                b'"' | b'\'' if super::after_separation(self.input, content_start, i) => {
+                    match super::quoted_span_end(self.input, i) {
+                        super::QuotedSpanEnd::ClosedSameLine(end)
+                        | super::QuotedSpanEnd::ClosedAcrossLines(end) => i = end,
+                        super::QuotedSpanEnd::Unterminated => break,
                     }
                 }
-                b'\'' => {
-                    i += 1;
-                    while let Some(&c) = self.input.get(i) {
-                        if c == b'\'' {
-                            i += 1;
-                            if self.input.get(i) == Some(&b'\'') {
-                                i += 1;
-                                continue;
-                            }
-                            break;
-                        }
-                        if is_line_break(c) {
-                            break;
-                        }
-                        i += 1;
-                    }
-                }
-                b'#' if i > self.offset && matches!(self.input.get(i - 1), Some(b' ' | b'\t')) => {
-                    break
-                }
+                b'#' if super::after_separation(self.input, content_start, i) => break,
                 b':' if matches!(
                     self.input.get(i + 1),
                     None | Some(b' ' | b'\t' | b'\n' | b'\r')
@@ -1885,6 +1863,29 @@ mod tests {
             kind(b"word1  # comment\nword2\n"),
             TrailingContent
         )); // BS4K
+
+        // #382: line_kind used to scan straight through this quoted scalar's
+        // own line break (absorbed inside what it wrongly treated as a fresh
+        // reopened quote on line 2), landing on line 3's `c:` and reporting
+        // Map for line 1 — silently accepting an incompatible second root.
+        assert!(matches!(
+            kind(b"\"line one\n line two\"\nc: d\n"),
+            TrailingContent
+        ));
+        assert!(matches!(
+            kind(b"'line one\n line two'\nc: d\n"),
+            TrailingContent
+        ));
+    }
+
+    /// #382: `line_kind`'s quote arms used to trigger on *any* `"`/`'` byte,
+    /// unlike `line_is_structural`'s `after_separation` gating — so a quote
+    /// glued to preceding scalar content was misread as opening a span,
+    /// swallowing the line's real `:` and wrongly rejecting the entry after it.
+    #[test]
+    fn accepts_a_glued_quote_before_the_real_value_indicator() {
+        assert!(validate(b"foo'bar: baz\nqux: quux\n").is_ok());
+        assert!(validate(b"foo\"bar: baz\nqux: quux\n").is_ok());
     }
 
     #[test]
@@ -2058,5 +2059,149 @@ mod tests {
             },
         };
         assert!(err.to_string().contains("line 1"));
+    }
+
+    // ========================================================================
+    // line_is_structural vs. line_kind agreement (#382): both skip a quoted
+    // span via the shared quoted_span_end/after_separation, but ask different
+    // questions of a fresh line — pin every named point of agreement and every
+    // deliberate divergence, not a flat invariant (see
+    // tests/yaml_tab_indentation_tests.rs for why a table, not an assertion).
+    // ========================================================================
+
+    /// `line_kind` classifies from `self.offset`; this positions a validator
+    /// there directly, without driving `scan_line`'s whole state machine.
+    fn line_kind_at(text: &[u8], offset: usize) -> LineKind {
+        let mut v = Validator::new(text);
+        v.offset = offset;
+        v.line_kind()
+    }
+
+    struct QuoteScanAgreement {
+        yaml: &'static [u8],
+        structural: bool,
+        kind: LineKind,
+        why: &'static str,
+    }
+
+    const QUOTE_SCAN_AGREEMENT: &[QuoteScanAgreement] = &[
+        // ---- Agree: ordinary one-line shapes. ------------------------------
+        QuoteScanAgreement {
+            yaml: b"a: 1\n",
+            structural: true,
+            kind: LineKind::Map,
+            why: "plain one-line entry",
+        },
+        QuoteScanAgreement {
+            yaml: b"- a\n",
+            structural: true,
+            kind: LineKind::Seq,
+            why: "plain sequence entry",
+        },
+        QuoteScanAgreement {
+            yaml: b"a\n",
+            structural: false,
+            kind: LineKind::Scalar,
+            why: "plain scalar, no indicator",
+        },
+        QuoteScanAgreement {
+            yaml: b"\"b\": 1\n",
+            structural: true,
+            kind: LineKind::Map,
+            why: "quoted key",
+        },
+        QuoteScanAgreement {
+            yaml: b"'b': 1\n",
+            structural: true,
+            kind: LineKind::Map,
+            why: "single-quoted key",
+        },
+        QuoteScanAgreement {
+            yaml: b"\"x: y\"\n",
+            structural: false,
+            kind: LineKind::Scalar,
+            why: "`:` inside a quoted scalar is content, not a key",
+        },
+        QuoteScanAgreement {
+            yaml: b"foo\"bar: baz\n",
+            structural: true,
+            kind: LineKind::Map,
+            why: "a quote glued to content is not a delimiter (#382 gating fix)",
+        },
+        QuoteScanAgreement {
+            yaml: b"foo'bar: baz\n",
+            structural: true,
+            kind: LineKind::Map,
+            why: "single-quoted analogue of the row above",
+        },
+        // ---- Agree, now that #382 fixed the cross-line fold. ---------------
+        QuoteScanAgreement {
+            yaml: b"\"a\n b\": v\n",
+            structural: false,
+            kind: LineKind::Map,
+            why: "multi-line quoted key: a node to line_is_structural (stops \
+                  at the break) but a Map to line_kind, which now correctly \
+                  follows the close (#382)",
+        },
+        QuoteScanAgreement {
+            yaml: b"'a\n b': v\n",
+            structural: false,
+            kind: LineKind::Map,
+            why: "single-quoted analogue",
+        },
+        QuoteScanAgreement {
+            yaml: b"\"a\n b\"\n",
+            structural: false,
+            kind: LineKind::Scalar,
+            why: "multi-line quoted scalar with no following `:`",
+        },
+        QuoteScanAgreement {
+            yaml: b"\"ab",
+            structural: false,
+            kind: LineKind::Scalar,
+            why: "unterminated quote, no close anywhere in the input: both \
+                  scans give up and treat the line as a non-structural \
+                  scalar rather than hunting past end of input",
+        },
+        // ---- Named, legitimate divergences (#382 leaves these alone). ------
+        QuoteScanAgreement {
+            yaml: b"{a: 1}\n",
+            structural: false,
+            kind: LineKind::Map,
+            why: "flow mapping: not structural to line_is_structural (a tab \
+                  before it is legal separation, Q5MG/6CA3), but line_kind \
+                  has no flow-node early return and reports Map",
+        },
+        QuoteScanAgreement {
+            yaml: b"? k\n",
+            structural: false,
+            kind: LineKind::Map,
+            why: "leading `?`: line_kind recognizes it directly; \
+                  line_is_structural only recognizes `-`, so a leading `?` \
+                  falls through to its `:` scan and finds none here",
+        },
+    ];
+
+    #[test]
+    fn line_is_structural_and_line_kind_agree_except_where_named() {
+        let mut wrong = Vec::new();
+        for row in QUOTE_SCAN_AGREEMENT {
+            let text = String::from_utf8_lossy(row.yaml);
+            let structural = crate::yaml::line_is_structural(row.yaml, 0);
+            let actual_kind = line_kind_at(row.yaml, 0);
+            if structural != row.structural {
+                wrong.push(format!(
+                    "  {text:?}: line_is_structural = {structural}, expected {} — {}",
+                    row.structural, row.why
+                ));
+            }
+            if actual_kind != row.kind {
+                wrong.push(format!(
+                    "  {text:?}: line_kind = {actual_kind:?}, expected {:?} — {}",
+                    row.kind, row.why
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "verdicts changed:\n{}", wrong.join("\n"));
     }
 }

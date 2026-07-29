@@ -134,12 +134,15 @@ pub(crate) fn starts_inline_seq_entry(text: &[u8], pos: usize) -> bool {
 ///
 /// The `:` must be a *value indicator*, so the scan skips what cannot hold one: a
 /// quoted scalar (`\t"x: y"` is a node, `\t"b": 1` is a key) and a comment
-/// (`\t# c: d`). Both quoted-scalar forms are single-line here — a scalar that runs
-/// past the line break is a node whatever follows it, so the scan stops rather than
-/// chasing the closing quote. That is the deliberate difference from
+/// (`\t# c: d`). Both quoted-scalar forms use [`quoted_span_end`] to find the true
+/// close, however many lines it takes — but a scalar that runs past the line break
+/// is a node whatever follows it, so *this* scan stops there rather than resuming
+/// after the close. That is the deliberate difference from
 /// [`validate::Validator::line_kind`], which asks a related question about a whole
-/// block-context line and does follow a quoted scalar across lines. Merging the two
-/// scans has to settle that difference first, and is tracked as #382.
+/// block-context line: a value on a later line does not change whether *this* line
+/// opened a node, so it resumes scanning after the close instead. The two used to
+/// hand-roll independent quote scans (#382); now they share `quoted_span_end` and
+/// differ only in what each does with its answer.
 #[inline]
 pub(crate) fn line_is_structural(text: &[u8], from: usize) -> bool {
     let mut i = from;
@@ -157,19 +160,22 @@ pub(crate) fn line_is_structural(text: &[u8], from: usize) -> bool {
     // content or after separation. Mid-scalar they are ordinary content, and the
     // `:` after them is a real indicator (`foo#bar: baz`, `foo"bar: baz`).
     let content_start = i;
-    let after_separation =
-        |i: usize| i == content_start || matches!(text.get(i - 1), Some(b' ' | b'\t'));
     // A block mapping entry: a `:` value indicator somewhere on this line.
     while let Some(&b) = text.get(i) {
         match b {
             b'\n' | b'\r' => return false,
             // Everything past a comment is comment text, so no indicator follows.
-            b'#' if after_separation(i) => return false,
-            b'"' | b'\'' if after_separation(i) => match quoted_scalar_end(text, i) {
-                Some(end) => i = end,
-                // Runs past the line break: a multi-line scalar, hence a node.
-                None => return false,
-            },
+            b'#' if after_separation(text, content_start, i) => return false,
+            b'"' | b'\'' if after_separation(text, content_start, i) => {
+                match quoted_span_end(text, i) {
+                    QuotedSpanEnd::ClosedSameLine(end) => i = end,
+                    // Crosses the line break (or never closes): a multi-line
+                    // scalar, hence a node whatever follows it.
+                    QuotedSpanEnd::ClosedAcrossLines(_) | QuotedSpanEnd::Unterminated => {
+                        return false
+                    }
+                }
+            }
             b':' if matches!(text.get(i + 1), None | Some(b' ' | b'\t' | b'\n' | b'\r')) => {
                 return true
             }
@@ -179,21 +185,50 @@ pub(crate) fn line_is_structural(text: &[u8], from: usize) -> bool {
     false
 }
 
-/// The offset just past the closing quote of the quoted scalar opening at `pos`, or
-/// `None` if it does not close before the end of the line (or of the input).
+/// Is the `"`, `'` or `#` byte at `i` a real delimiter — at `content_start` or right
+/// after a space/tab — rather than glued to preceding scalar content (`foo"bar`,
+/// `foo#bar`)? Mid-scalar, these bytes are ordinary content and a `:` after them is a
+/// real value indicator.
 ///
-/// Single-line by construction — see [`line_is_structural`], its only caller, for why
-/// a scalar that spans lines is answered with `None` rather than followed.
-fn quoted_scalar_end(text: &[u8], pos: usize) -> Option<usize> {
+/// Shared by [`line_is_structural`] and [`validate::Validator::line_kind`] — #382
+/// found `line_kind`'s quote arms missing this gating (its comment arm already had
+/// its own copy of the same rule).
+#[inline]
+pub(crate) fn after_separation(text: &[u8], content_start: usize, i: usize) -> bool {
+    i == content_start || matches!(text.get(i - 1), Some(b' ' | b'\t'))
+}
+
+/// Where the quoted scalar opening at `pos` (on its `"`/`'` byte) truly closes,
+/// following it across as many raw line breaks as it takes — the flow-scalar
+/// line-folding rule shared by both quote kinds.
+///
+/// This only locates the close; it does not validate escape sequences or
+/// continuation-line indentation (see
+/// [`validate::Validator::scan_double_quoted`]/[`validate::Validator::scan_single_quoted`]
+/// for that, on the separate content-validation pass — this function does not
+/// replace them and is not used by them).
+///
+/// [`line_is_structural`] and [`validate::Validator::line_kind`] used to hand-roll
+/// three independent versions of this scan between them (one single-line-only, two
+/// more inline and line-break-blind); this is the one definition, shared (#382).
+pub(crate) fn quoted_span_end(text: &[u8], pos: usize) -> QuotedSpanEnd {
     let quote = text[pos];
     let mut i = pos + 1;
+    let mut crossed_line = false;
     while let Some(&c) = text.get(i) {
         match c {
-            b'\n' | b'\r' => return None,
+            b'\n' | b'\r' => {
+                i += line_break::line_break_len(text, i);
+                crossed_line = true;
+            }
             // Inside `"…"`, `\` escapes the next byte — and a `\` before the line
-            // break continues the scalar onto the next line, which is also a `None`.
+            // break is a line continuation: it still folds the scalar onward.
             b'\\' if quote == b'"' => match text.get(i + 1) {
-                None | Some(b'\n' | b'\r') => return None,
+                None => return QuotedSpanEnd::Unterminated,
+                Some(b'\n' | b'\r') => {
+                    i += 1 + line_break::line_break_len(text, i + 1);
+                    crossed_line = true;
+                }
                 Some(_) => i += 2,
             },
             // Inside `'…'`, `''` is an escaped quote rather than the close.
@@ -201,13 +236,32 @@ fn quoted_scalar_end(text: &[u8], pos: usize) -> Option<usize> {
                 if quote == b'\'' && text.get(i + 1) == Some(&b'\'') {
                     i += 2;
                 } else {
-                    return Some(i + 1);
+                    let end = i + 1;
+                    return if crossed_line {
+                        QuotedSpanEnd::ClosedAcrossLines(end)
+                    } else {
+                        QuotedSpanEnd::ClosedSameLine(end)
+                    };
                 }
             }
             _ => i += 1,
         }
     }
-    None
+    QuotedSpanEnd::Unterminated
+}
+
+/// The result of [`quoted_span_end`]: where a quoted scalar closes, and whether it
+/// crossed a raw line break to get there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuotedSpanEnd {
+    /// Closed on the same physical line it opened on; the offset just past the
+    /// closing quote.
+    ClosedSameLine(usize),
+    /// Closed after crossing at least one raw line break; the offset just past the
+    /// closing quote.
+    ClosedAcrossLines(usize),
+    /// No closing quote before the end of input.
+    Unterminated,
 }
 
 pub use error::YamlError;
@@ -288,20 +342,23 @@ mod tests {
         assert!(!line_is_structural(text, 8)); // the content
     }
 
-    /// `quoted_scalar_end` stops at the line break rather than chasing the closing
-    /// quote onto the next line. `line_is_structural` reads that `None` as "a node",
-    /// which is the answer it wants for a multi-line scalar however the scalar ends.
+    /// `quoted_span_end` follows a quoted scalar across as many raw line breaks as
+    /// it takes to find its true close. `line_is_structural` only wants same-line
+    /// closes and treats both `ClosedAcrossLines` and `Unterminated` as "a node";
+    /// `line_kind` (validate.rs) uses the full cross-line answer.
     #[test]
-    fn quoted_scalar_end_is_single_line() {
-        assert_eq!(quoted_scalar_end(b"\"ab\" rest", 0), Some(4));
-        assert_eq!(quoted_scalar_end(b"'ab' rest", 0), Some(4));
-        assert_eq!(quoted_scalar_end(b"\"a\\\"b\" rest", 0), Some(6)); // `\"` inside
-        assert_eq!(quoted_scalar_end(b"'a''b' rest", 0), Some(6)); // `''` inside
-        assert_eq!(quoted_scalar_end(b"\"ab\nc\"", 0), None); // crosses a break
-        assert_eq!(quoted_scalar_end(b"'ab\nc'", 0), None);
-        assert_eq!(quoted_scalar_end(b"\"ab\r\nc\"", 0), None); // CRLF too
-        assert_eq!(quoted_scalar_end(b"\"ab\\\nc\"", 0), None); // escaped break
-        assert_eq!(quoted_scalar_end(b"\"ab", 0), None); // end of input
-        assert_eq!(quoted_scalar_end(b"\"ab\\", 0), None); // trailing `\`
+    fn quoted_span_end_follows_a_scalar_across_lines() {
+        use QuotedSpanEnd::*;
+        assert_eq!(quoted_span_end(b"\"ab\" rest", 0), ClosedSameLine(4));
+        assert_eq!(quoted_span_end(b"'ab' rest", 0), ClosedSameLine(4));
+        assert_eq!(quoted_span_end(b"\"a\\\"b\" rest", 0), ClosedSameLine(6)); // `\"` inside
+        assert_eq!(quoted_span_end(b"'a''b' rest", 0), ClosedSameLine(6)); // `''` inside
+        assert_eq!(quoted_span_end(b"\"ab\nc\"", 0), ClosedAcrossLines(6)); // crosses a break
+        assert_eq!(quoted_span_end(b"'ab\nc'", 0), ClosedAcrossLines(6));
+        assert_eq!(quoted_span_end(b"\"ab\r\nc\"", 0), ClosedAcrossLines(7)); // CRLF counted as width 2
+        assert_eq!(quoted_span_end(b"\"ab\\\nc\"", 0), ClosedAcrossLines(7)); // escaped break still folds
+        assert_eq!(quoted_span_end(b"\"ab", 0), Unterminated); // end of input
+        assert_eq!(quoted_span_end(b"\"ab\\", 0), Unterminated); // trailing `\`
+        assert_eq!(quoted_span_end(b"\"ab\nc", 0), Unterminated); // crosses a line, never closes
     }
 }
