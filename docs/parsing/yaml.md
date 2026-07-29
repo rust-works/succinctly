@@ -2540,7 +2540,7 @@ Following the P3 NEON rejection, we implemented a pure broadword (SWAR) approach
 - Classification functions: [`src/yaml/simd/broadword.rs:111-230`](../../src/yaml/simd/broadword.rs#L111-L230)
 - Parser integration (disabled): [`src/yaml/parser.rs:585-622`](../../src/yaml/parser.rs#L585-L622)
 
-**Caveat on these numbers — the workload never exercised the skip path (#185)**
+**Caveat that motivated the re-measurement (#185)**
 
 The disabled ARM integration asked its classifier for `value_terminators()`,
 which was `newlines | carriage_returns | colons | spaces | hash`. The live x86
@@ -2550,29 +2550,52 @@ world`). So on the ARM path a space would abort a 16-byte skip that had no reaso
 to stop. #185 unified both paths on `plain_scalar_terminators()` (line break,
 colon, hash; no spaces).
 
-That divergence is **not** what the table above measures, and the reason is worth
-recording, because it is the more useful finding: `yaml_bench` contains no plain
-scalar with an interior space. Every unquoted value it generates is a single
-token — `value{i}`, `leaf`, `item{i}`, `myapp`, `production`, `val{i}` — and the
-only spaces in the corpus sit inside quoted strings or block-scalar content,
-neither of which reaches `skip_unquoted_simd`. On `key0: value0\n` the `\n` at
-offset 6 precedes the next line's space at offset 12, so `trailing_zeros()`
-returns 6 under either mask: on this input the two terminator sets are
-behaviourally identical.
+That divergence was **not** what the table above measured: every generator in
+`yaml_bench` emitted single-token unquoted values (`value{i}`, `leaf`,
+`item{i}`, `myapp`...), so the old and corrected masks behaved identically on
+every fixture — a benchmark cannot measure a shape it does not generate (#106).
+#383 added `generate_prose_kv`/`bench_prose_scalars` (`yaml/prose_scalars`),
+prose-like values with interior spaces at 16/64/256/1024 bytes, specifically to
+tell the two masks apart.
 
-Note the table's shape from the same angle. The only workloads that gained were
-`long_strings/*`, which are *quoted* and never reach the skip path at all, while
-`simple_kv/*` — 6-byte plain values — regressed 6-14%, which the analysis above
-already attributes to 16-byte classification overhead on short values. Nothing in
-the suite is prose-like enough to tell the two terminator sets apart.
+**Re-measurement (Apple M4 Pro, 2026-07-29)** — corrected terminator set,
+`skip_unquoted_simd` temporarily re-enabled on aarch64:
 
-So "break-even point >64 bytes" stands as a statement about broadword overhead,
-not about the space-stop. The open follow-up is therefore *not* a re-run: re-running
-`yaml_bench` unchanged would reproduce these numbers, because the generators emit
-no shape that distinguishes the masks. Deciding whether the corrected set makes
-broadword on ARM64 worth re-enabling needs a space-bearing plain-scalar pattern
-added to the suite first — a benchmark cannot measure a shape it does not
-generate.
+| Benchmark              | Disabled (old behavior) | Re-enabled (corrected mask) | Change          |
+|-------------------------|-------------------------|------------------------------|-----------------|
+| prose_scalars/16b       | 4.97 µs                 | 4.87 µs                      | -2% (noise)     |
+| prose_scalars/64b       | 7.54 µs                 | 5.96 µs                      | **-21%** ✅     |
+| prose_scalars/256b      | 19.10 µs                | 11.16 µs                     | **-41%** ✅     |
+| prose_scalars/1024b     | 62.8 µs                 | 32.0 µs                      | **-49%** ✅     |
+| simple_kv/10            | 827 ns                  | 879 ns                       | **+6%** ❌      |
+| simple_kv/100           | 3.96 µs                 | 4.34 µs                      | **+10%** ❌     |
+| simple_kv/1000          | 35.1 µs                 | 38.9 µs                      | **+11%** ❌     |
+| simple_kv/10000         | 365 µs                  | 392 µs                       | **+7%** ❌      |
+| sequences/10..10000     | —                       | —                             | **+5 to +12%** ❌ |
+| large/1kb..1mb          | 1.82 ms – 2.88 µs       | 1.91 ms – 3.15 µs             | **+5 to +9%** ❌ |
+
+Growth-with-size on `prose_scalars` (neutral at 16B, up to -49% at 1024B) is the
+signature of the space-stop actually mattering, not noise — confirmed with an
+interleaved A/B (3 alternating pairs, `docs/guides/benchmarking.md` rule 1),
+each pair stable within ~2%. The `simple_kv`/`sequences`/`large` regression was
+checked both orderings (rule 1) to rule out thermal drift: reversing which
+binary ran first left the disabled build faster by the same ~5-10% either way,
+so this is a real cost, not an artifact.
+
+**Conclusion: the corrected terminator set does change the picture, but not
+enough to flip the decision.** The 21-49% win is real and grows with scalar
+length, confirming the space-stop was costing exactly what #185 predicted.
+But it is confined to prose-like values ≥64 bytes, while ordinary YAML —
+`simple_kv`, `sequences`, short k8s-style values, all short single-token
+scalars — regressed 5-12% from the 16-byte classification overhead the
+original P4 analysis identified (see above). Typical YAML is short-token
+dominated (see `docs/benchmarks/corpus-shape.md`), so this path stays
+**disabled by default**: a niche win on long prose scalars does not justify a
+broad regression on the common shape. `skip_unquoted_simd` and its call sites
+remain in the source (`#[allow(dead_code)]`) for the next reconsideration —
+e.g. if a length-gated activation (only engage above some scalar-length
+threshold) is ever worth exploring, since the crossover between "regresses"
+and "wins big" appears to sit between 16 and 64 bytes.
 
 ---
 
