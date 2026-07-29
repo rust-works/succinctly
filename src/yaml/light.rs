@@ -7,10 +7,18 @@
 //! requested.
 
 #[cfg(not(test))]
-use alloc::{borrow::Cow, string::String, string::ToString, vec::Vec};
+use alloc::vec;
+#[cfg(not(test))]
+use alloc::{
+    borrow::Cow, collections::BTreeMap, rc::Rc, string::String, string::ToString, vec::Vec,
+};
 
 #[cfg(test)]
 use std::borrow::Cow;
+#[cfg(test)]
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::rc::Rc;
 #[cfg(test)]
 use std::string::ToString;
 
@@ -3044,57 +3052,138 @@ pub enum YamlValue<'a, W = Vec<u64>> {
 // ============================================================================
 
 /// Immutable "list" of YAML mapping fields.
+///
+/// The common case (`Direct`) walks the mapping's direct BP children lazily,
+/// with no allocation. When the mapping contains a merge key (`<<`), fields
+/// are resolved once into an ordered, deduplicated `Merged` list per YAML's
+/// merge-key semantics (see [`resolve_merge_keys`]) and shared via `Rc` so
+/// cloning during iteration stays O(1) rather than re-copying the list at
+/// every step.
 #[derive(Debug)]
-pub struct YamlFields<'a, W = Vec<u64>> {
-    /// Cursor pointing to the current field key, or None if exhausted
-    key_cursor: Option<YamlCursor<'a, W>>,
+enum FieldsInner<'a, W> {
+    Direct(Option<YamlCursor<'a, W>>),
+    Merged {
+        entries: Rc<Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)>>,
+        index: usize,
+    },
 }
 
-impl<W> Clone for YamlFields<'_, W> {
+impl<W> Clone for FieldsInner<'_, W> {
     fn clone(&self) -> Self {
-        *self
+        match self {
+            FieldsInner::Direct(c) => FieldsInner::Direct(*c),
+            FieldsInner::Merged { entries, index } => FieldsInner::Merged {
+                entries: entries.clone(),
+                index: *index,
+            },
+        }
     }
 }
 
-impl<W> Copy for YamlFields<'_, W> {}
+/// Immutable "list" of YAML mapping fields. See `FieldsInner` (private) for
+/// the two representations this wraps.
+#[derive(Debug)]
+pub struct YamlFields<'a, W = Vec<u64>> {
+    inner: FieldsInner<'a, W>,
+}
+
+// Manual, unconditional (no `W: Clone` bound) impl: `#[derive(Clone)]` would
+// require `W: Clone`, which isn't in scope in the generic `W: AsRef<[u64]>`
+// contexts this type is used in — and method resolution would then silently
+// fall back to the blanket `impl Clone for &T`, cloning the *reference*
+// rather than the value (a real Rust footgun caught by a type mismatch at
+// the first `self.clone()` call site that reassigned the result).
+impl<W> Clone for YamlFields<'_, W> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
 
 impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
     /// Create a new YamlFields from a mapping cursor.
     pub fn from_mapping_cursor(mapping_cursor: YamlCursor<'a, W>) -> Self {
+        let key_cursor = mapping_cursor.first_child();
+        match resolve_merge_keys(key_cursor) {
+            Some(entries) => Self {
+                inner: FieldsInner::Merged {
+                    entries: Rc::new(entries),
+                    index: 0,
+                },
+            },
+            None => Self {
+                inner: FieldsInner::Direct(key_cursor),
+            },
+        }
+    }
+
+    /// Raw (merge-unaware) cons-list over a mapping's direct children.
+    ///
+    /// Used internally by [`resolve_merge_keys`] to walk a mapping's own
+    /// fields, and to enumerate a merge source's own fields (which are
+    /// copied verbatim, not recursively re-resolved — see that function's
+    /// doc comment).
+    fn raw(first_key: Option<YamlCursor<'a, W>>) -> Self {
         Self {
-            key_cursor: mapping_cursor.first_child(),
+            inner: FieldsInner::Direct(first_key),
         }
     }
 
     /// Check if there are no more fields.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.key_cursor.is_none()
+        match &self.inner {
+            FieldsInner::Direct(c) => c.is_none(),
+            FieldsInner::Merged { entries, index } => *index >= entries.len(),
+        }
     }
 
     /// Get the first field and the remaining fields.
     pub fn uncons(&self) -> Option<(YamlField<'a, W>, Self)> {
-        let key_cursor = self.key_cursor?;
-        let value_cursor = key_cursor.next_sibling()?;
+        match &self.inner {
+            FieldsInner::Direct(key_cursor) => {
+                let key_cursor = (*key_cursor)?;
+                let value_cursor = key_cursor.next_sibling()?;
 
-        let rest = YamlFields {
-            key_cursor: value_cursor.next_sibling(),
-        };
+                let rest = Self {
+                    inner: FieldsInner::Direct(value_cursor.next_sibling()),
+                };
 
-        let field = YamlField {
-            key_cursor,
-            value_cursor,
-        };
+                let field = YamlField {
+                    key_cursor,
+                    value_cursor,
+                };
 
-        Some((field, rest))
+                Some((field, rest))
+            }
+            FieldsInner::Merged { entries, index } => {
+                let &(key_cursor, value_cursor) = entries.get(*index)?;
+
+                let rest = Self {
+                    inner: FieldsInner::Merged {
+                        entries: entries.clone(),
+                        index: index + 1,
+                    },
+                };
+
+                let field = YamlField {
+                    key_cursor,
+                    value_cursor,
+                };
+
+                Some((field, rest))
+            }
+        }
     }
 
     /// Find a field by name.
     ///
     /// YAML permits duplicate mapping keys; per YAML 1.2 and to match `yq`,
-    /// the last matching entry wins (see issue #174).
+    /// the last matching entry wins (see issue #174). A `Merged` list is
+    /// already deduplicated, so this loop is a no-op scan for it.
     pub fn find(&self, name: &str) -> Option<YamlValue<'a, W>> {
-        let mut fields = *self;
+        let mut fields = self.clone();
         let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
             if let YamlValue::String(key) = field.key() {
@@ -3115,6 +3204,203 @@ impl<'a, W: AsRef<[u64]>> Iterator for YamlFields<'a, W> {
         let (field, rest) = self.uncons()?;
         *self = rest;
         Some(field)
+    }
+}
+
+/// Resolve YAML merge keys (`<<`) into an ordered, deduplicated field list.
+///
+/// Returns `None` when the mapping has no merge key at all, so the common
+/// case stays a single forward pass with no `Vec`/`BTreeMap` allocation
+/// beyond the small `seen` buffer described below. Otherwise resolves per
+/// mikefarah/yq v4.53.3's actual (non-spec-compliant, but oracle-pinned —
+/// see `docs/parsing/yaml.md`) behavior, verified empirically against that
+/// binary:
+///
+/// - Fields are combined with "insert or update" semantics: a new key is
+///   appended at the end; a key that already exists has its *value*
+///   overwritten in place, keeping its original position. This single rule,
+///   applied to the mapping's own keys in document order and interleaved
+///   with each `<<`'s expansion at the point it occurs, reproduces both
+///   "own key after `<<` wins" and "merge after own key wins" — yq applies
+///   whichever writes last, textually, without `<<` getting special
+///   priority (issue #171).
+/// - `<<: [a, b, ...]` merges multiple sources. Per the merge-key spec, an
+///   earlier-listed source must win value conflicts against a later one, so
+///   the list is folded in *reverse*: applying `b` then `a` with the same
+///   insert-or-update rule makes `a`'s value win while `b`'s unique keys
+///   still claim the earlier positions (empirically confirmed: position
+///   comes from whichever source is folded first, value from whichever is
+///   folded last).
+/// - A merge source's own fields are taken verbatim: a `<<` key nested
+///   inside a source is copied as an ordinary key, not expanded recursively.
+///   yq does not recurse into a merged-in mapping's own merge key.
+/// - An invalid merge value (null, scalar, an alias that doesn't resolve to
+///   a mapping, or a non-mapping sequence element) contributes nothing
+///   rather than erroring, matching yq's silent-skip behavior.
+///
+/// # Why this decodes each key exactly once
+///
+/// A `YamlCursor::value()` call is not a free re-read: for a non-container
+/// node it consults `AdvancePositions`/`CompactEndPositions`
+/// (`src/yaml/advance_positions.rs`, `src/yaml/end_positions.rs`), each of
+/// which keeps a single *document-wide* sequential cursor optimized for
+/// monotonically increasing access (amortized O(1)). A first version of this
+/// function scanned the mapping once with `.any()` to check for a merge key,
+/// then — merge key or not — walked it again from the start to build the
+/// result. Decoding the same key a second time is a backward jump against
+/// that shared cursor, which falls back to `get_random`; that fallback
+/// resets the incremental IB-scan state to the very start of the document's
+/// index instead of to the resumed position, so the *next* sequential call
+/// has to rescan from position zero to catch back up — O(current document
+/// position), paid on every mapping regardless of whether it had a merge
+/// key. Over N sibling mappings (an array of flat records — one of the most
+/// common real-world YAML/JSON shapes) that turns an O(N) document walk into
+/// O(N²) (#171 review).
+///
+/// So: walk forward exactly once, buffering each already-decoded
+/// `YamlValue` (not just the cursor) in `seen` as we go. If a later field
+/// turns out to be a merge key, `seen`'s entries are folded into the
+/// deduplicated result using the value already in hand — never re-derived
+/// via a second `.value()` call on an earlier cursor. If no merge key is
+/// ever found, `seen` is simply dropped and `None` is returned; the
+/// `Vec`/`BTreeMap` used for deduplication are allocated only once a merge
+/// key is confirmed to exist.
+fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
+    first_key: Option<YamlCursor<'a, W>>,
+) -> Option<Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)>> {
+    let mut fields = YamlFields::raw(first_key);
+    let mut seen: Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>, YamlValue<'a, W>)> = Vec::new();
+
+    loop {
+        let (field, rest) = fields.uncons()?;
+        let key_value = field.key_cursor.value();
+
+        if is_merge_key_value(&key_value) {
+            let mut entries: Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)> =
+                Vec::with_capacity(seen.len() + 1);
+            let mut positions: BTreeMap<String, usize> = BTreeMap::new();
+
+            for (key, value, key_value) in seen {
+                upsert_field(&mut entries, &mut positions, key, value, &key_value);
+            }
+            merge_field_into(&mut entries, &mut positions, field.value_cursor);
+
+            fields = rest;
+            while let Some((field, rest)) = fields.uncons() {
+                let key_value = field.key_cursor.value();
+                if is_merge_key_value(&key_value) {
+                    merge_field_into(&mut entries, &mut positions, field.value_cursor);
+                } else {
+                    upsert_field(
+                        &mut entries,
+                        &mut positions,
+                        field.key_cursor,
+                        field.value_cursor,
+                        &key_value,
+                    );
+                }
+                fields = rest;
+            }
+
+            return Some(entries);
+        }
+
+        seen.push((field.key_cursor, field.value_cursor, key_value));
+        fields = rest;
+    }
+}
+
+/// Expand one `<<` field's merge sources into `entries`/`positions`.
+///
+/// Reverse the source list so an earlier-listed source (higher merge-spec
+/// priority) is applied last and wins value conflicts, while a later-listed
+/// source's unique keys still claim the earlier positions (see
+/// `resolve_merge_keys`'s doc comment).
+fn merge_field_into<'a, W: AsRef<[u64]>>(
+    entries: &mut Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)>,
+    positions: &mut BTreeMap<String, usize>,
+    value_cursor: YamlCursor<'a, W>,
+) {
+    for source in merge_sources(value_cursor).into_iter().rev() {
+        for source_field in YamlFields::raw(source.first_child()) {
+            let key_value = source_field.key_cursor.value();
+            upsert_field(
+                entries,
+                positions,
+                source_field.key_cursor,
+                source_field.value_cursor,
+                &key_value,
+            );
+        }
+    }
+}
+
+/// Insert a field by name, or overwrite an existing entry's value in place.
+///
+/// `key_value` is the key's already-decoded value, passed in rather than
+/// re-derived from `key` — see `resolve_merge_keys`'s doc comment for why a
+/// second `YamlCursor::value()` call on an already-visited key is expensive.
+fn upsert_field<'a, W: AsRef<[u64]>>(
+    entries: &mut Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)>,
+    positions: &mut BTreeMap<String, usize>,
+    key: YamlCursor<'a, W>,
+    value: YamlCursor<'a, W>,
+    key_value: &YamlValue<'a, W>,
+) {
+    let name = key_value.key_string().into_owned();
+    match positions.get(&name) {
+        Some(&pos) => entries[pos] = (key, value),
+        None => {
+            positions.insert(name, entries.len());
+            entries.push((key, value));
+        }
+    }
+}
+
+/// Is this key's already-decoded value YAML's merge key?
+///
+/// Empirically, mikefarah/yq treats a key whose *decoded* content is `<<` as
+/// a merge key even when quoted (`"<<"`), so this compares decoded string
+/// content rather than requiring an unquoted plain scalar.
+fn is_merge_key_value<W: AsRef<[u64]>>(key_value: &YamlValue<'_, W>) -> bool {
+    matches!(key_value, YamlValue::String(s) if matches!(s.as_str(), Ok(ref v) if v == "<<"))
+}
+
+/// Resolve a `<<` value to the ordered list of mapping sources it names.
+///
+/// Handles a direct inline mapping, an alias to a mapping, or a sequence
+/// mixing either (each element resolved the same way). Anything else
+/// (null, scalar, an alias to a non-mapping, or a non-mapping sequence
+/// element) yields no sources — merging from it is a silent no-op, matching
+/// yq rather than erroring.
+fn merge_sources<W: AsRef<[u64]>>(value_cursor: YamlCursor<'_, W>) -> Vec<YamlCursor<'_, W>> {
+    fn as_mapping<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> bool {
+        matches!(cursor.value(), YamlValue::Mapping(_))
+    }
+
+    match value_cursor.value() {
+        YamlValue::Mapping(_) => vec![value_cursor],
+        YamlValue::Alias {
+            target: Some(target),
+            ..
+        } if as_mapping(target) => vec![target],
+        YamlValue::Sequence(elements) => {
+            let mut sources = Vec::new();
+            let mut rest = elements;
+            while let Some((cursor, tail)) = rest.uncons_cursor() {
+                match cursor.value() {
+                    YamlValue::Mapping(_) => sources.push(cursor),
+                    YamlValue::Alias {
+                        target: Some(target),
+                        ..
+                    } if as_mapping(target) => sources.push(target),
+                    _ => {}
+                }
+                rest = tail;
+            }
+            sources
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -4660,7 +4946,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
 
     fn as_object(&self) -> Option<Self::Fields> {
         match self {
-            YamlValue::Mapping(fields) => Some(*fields),
+            YamlValue::Mapping(fields) => Some(fields.clone()),
             YamlValue::Alias { target, .. } => target.and_then(|t| t.value().as_object()),
             _ => None,
         }
@@ -6609,7 +6895,7 @@ mod tests {
         assert_eq!(items.len(), 1, "the `: v` line must not add an element");
 
         let fields = match &items[0] {
-            YamlValue::Mapping(fields) => *fields,
+            YamlValue::Mapping(fields) => fields.clone(),
             other => panic!("expected mapping, got {other:?}"),
         };
         let field = fields.into_iter().next().expect("one field");
@@ -8917,5 +9203,176 @@ mod tests {
         let mut out = String::new();
         write_yaml_value_as_json(&mut out, value);
         out
+    }
+
+    // ========================================================================
+    // Merge keys (`<<: *anchor`) — issue #171
+    //
+    // Expected outputs below were captured directly from mikefarah/yq v4.53.3
+    // (the pinned golden oracle, `tests/data/yq-golden/YQ_VERSION`) run
+    // without `--yaml-fix-merge-anchor-to-spec`, since that's the default
+    // (unflagged) invocation `succinctly yq` is meant to match. That flag's
+    // absence is exactly why "own key wins" isn't a fixed rule below — see
+    // `resolve_merge_keys`'s doc comment for the actual rule.
+    // ========================================================================
+
+    #[test]
+    fn test_merge_key_basic_expansion() {
+        let yaml = b"default: &default\n  a: 1\nitem:\n  <<: *default\n  b: 2\n";
+        assert_eq!(
+            first_doc_json(yaml),
+            r#"{"default":{"a":1},"item":{"a":1,"b":2}}"#
+        );
+    }
+
+    #[test]
+    fn test_merge_key_own_field_after_wins() {
+        let yaml =
+            b"default: &default\n  a: 1\n  b: original\nitem:\n  <<: *default\n  b: override\n";
+        let index = YamlIndex::build(yaml).expect("builds");
+        let YamlValue::Mapping(root) = first_doc(index.root(yaml)) else {
+            panic!("root document must be a mapping");
+        };
+        let Some(YamlValue::Mapping(item)) = root.find("item") else {
+            panic!("item must be a mapping");
+        };
+        assert_eq!(
+            item.find("b").and_then(|v| v.as_str().map(Cow::into_owned)),
+            Some("override".to_string())
+        );
+    }
+
+    #[test]
+    fn test_merge_key_own_field_before_loses_to_merge() {
+        // Empirically surprising but matches yq's default (non-spec) behavior:
+        // a merge key always overwrites in the order it's textually applied,
+        // with no special priority for the mapping's own keys.
+        let yaml =
+            b"default: &default\n  a: 1\n  b: original\nitem:\n  b: own_first\n  <<: *default\n";
+        assert_eq!(
+            first_doc_json(yaml),
+            r#"{"default":{"a":1,"b":"original"},"item":{"b":"original","a":1}}"#
+        );
+    }
+
+    #[test]
+    fn test_merge_key_multiple_sources_earlier_wins_value() {
+        // `<<: [*a1, *a2]`: a1 is listed first so it must win the "common"
+        // conflict, but a2's unique key still claims the earlier position.
+        let yaml = b"a1: &a1\n  common: from_a1\n  x: 1\na2: &a2\n  common: from_a2\n  y: 2\nitem:\n  <<: [*a1, *a2]\n  z: 3\n";
+        assert_eq!(
+            first_doc_json(yaml),
+            r#"{"a1":{"common":"from_a1","x":1},"a2":{"common":"from_a2","y":2},"item":{"common":"from_a1","y":2,"x":1,"z":3}}"#
+        );
+    }
+
+    #[test]
+    fn test_merge_key_duplicate_keys_last_wins() {
+        // Two separate `<<:` entries (not a list): the later one wins on
+        // conflict, same as ordinary duplicate mapping keys (#174).
+        let yaml = b"a1: &a1\n  common: from_a1\n  x: 1\na2: &a2\n  common: from_a2\n  y: 2\nitem:\n  <<: *a1\n  <<: *a2\n  z: 3\n";
+        assert_eq!(
+            first_doc_json(yaml),
+            r#"{"a1":{"common":"from_a1","x":1},"a2":{"common":"from_a2","y":2},"item":{"common":"from_a2","x":1,"y":2,"z":3}}"#
+        );
+    }
+
+    #[test]
+    fn test_merge_key_quoted_still_merges() {
+        // yq merges even a quoted "<<" key — not spec-compliant (only a
+        // plain unquoted scalar resolves to the merge type) but that's the
+        // pinned oracle's actual behavior.
+        let yaml = b"default: &default\n  a: 1\nitem:\n  \"<<\": *default\n  b: 2\n";
+        assert_eq!(
+            first_doc_json(yaml),
+            r#"{"default":{"a":1},"item":{"a":1,"b":2}}"#
+        );
+    }
+
+    #[test]
+    fn test_merge_key_inline_mapping_value() {
+        let yaml = b"item:\n  <<: {a: 1, b: 2}\n  c: 3\n";
+        assert_eq!(first_doc_json(yaml), r#"{"item":{"a":1,"b":2,"c":3}}"#);
+    }
+
+    #[test]
+    fn test_merge_key_invalid_value_is_silently_ignored() {
+        for yaml in [
+            &b"item:\n  <<:\n  b: 2\n"[..],   // null merge value
+            &b"item:\n  <<: 5\n  b: 2\n"[..], // scalar merge value
+        ] {
+            assert_eq!(
+                first_doc_json(yaml),
+                r#"{"item":{"b":2}}"#,
+                "for {:?}",
+                String::from_utf8_lossy(yaml)
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_key_source_own_merge_key_not_recursively_expanded() {
+        // `mid` merges `base` but is itself merged verbatim into `item`: its
+        // own literal (unexpanded) "<<" key is copied over, not recursively
+        // resolved — matches `yq '.item'` queried directly (merge is one
+        // level deep only).
+        //
+        // Known divergence: real yq's *whole-document* render (`yq -o json
+        // '.'`) instead shows `item` fully resolved to `{"x":1,"y":2,"z":3}`
+        // with no literal `<<` — an artifact of yq mutating the shared,
+        // anchor-backed node in place the first time it visits `mid` during
+        // top-to-bottom traversal, so a later alias copy inherits the
+        // already-resolved form. That's traversal-order-dependent state
+        // succinctly's semi-index deliberately doesn't replicate: every
+        // lookup here is a pure, local read with no cross-node mutation, so
+        // `.item` gives the same answer whether queried alone or as part of
+        // `.`.
+        let yaml =
+            b"base: &base\n  x: 1\nmid: &mid\n  <<: *base\n  y: 2\nitem:\n  <<: *mid\n  z: 3\n";
+        let index = YamlIndex::build(yaml).expect("builds");
+        let YamlValue::Mapping(root) = first_doc(index.root(yaml)) else {
+            panic!("root document must be a mapping");
+        };
+
+        let Some(item_value) = root.find("item") else {
+            panic!("item not found");
+        };
+        assert_eq!(
+            write_yaml_value_as_json_string(item_value),
+            r#"{"<<":{"x":1},"y":2,"z":3}"#
+        );
+
+        // `mid` resolves its *own* merge key fine when read directly.
+        let Some(mid_value) = root.find("mid") else {
+            panic!("mid not found");
+        };
+        assert_eq!(
+            write_yaml_value_as_json_string(mid_value),
+            r#"{"x":1,"y":2}"#
+        );
+    }
+
+    #[test]
+    fn test_merge_key_inside_sequence_item() {
+        let yaml = b"default: &default\n  a: 1\nitems:\n  - <<: *default\n    b: 2\n";
+        assert_eq!(
+            first_doc_json(yaml),
+            r#"{"default":{"a":1},"items":[{"a":1,"b":2}]}"#
+        );
+    }
+
+    #[test]
+    fn test_merge_key_keys_builtin_reflects_merge() {
+        let yaml = b"default: &default\n  a: 1\nitem:\n  <<: *default\n  b: 2\n";
+        let index = YamlIndex::build(yaml).expect("builds");
+        let YamlValue::Mapping(root) = first_doc(index.root(yaml)) else {
+            panic!("root document must be a mapping");
+        };
+        let Some(YamlValue::Mapping(item)) = root.find("item") else {
+            panic!("item must be a mapping");
+        };
+        assert_eq!(item.keys(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(item.len(), 2);
+        assert!(!item.is_empty());
     }
 }

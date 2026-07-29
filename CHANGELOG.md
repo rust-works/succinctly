@@ -157,6 +157,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[2,4,6]` — and that `//=` is not specially lazy (`.a //= error("x")` still
   raises when `.a` is already truthy), both now covered by new tests
   alongside the two reported repros.
+- **`yq -o json '.'` over a document with many small mapping records —
+  arrays of flat objects, the `users` benchmark pattern — went from O(n) to
+  O(n²)** (found reviewing the merge-key fix below): a 5MB `users` document
+  went from ~150ms to ~1.15s (7.7x, and the gap grew with size — 30MB went
+  from ~1s to 31.5s). The regression was not in the merge-key code itself
+  but in `AdvancePositions`/`CompactEndPositions` (`src/yaml/
+  advance_positions.rs`, `src/yaml/end_positions.rs`): both keep a single
+  document-wide sequential cursor optimized for monotonically increasing
+  access, and their `get_random` backward-jump fallback reset its
+  incremental IB-scan state to word zero instead of the position it had
+  just found — so the *next* forward access had to rescan the whole
+  document's index from the start to catch up. `resolve_merge_keys`
+  (checking a mapping's fields for `<<`, then walking them again to build
+  the result) triggered exactly that backward jump on every mapping,
+  merge key or not, turning an O(n) document walk into O(n²). Fixed
+  `get_random` to seed the resumed cursor from the position its own
+  `ib_select1` scan already found instead of discarding it (a first
+  attempt at this got the word-boundary arithmetic wrong when the match
+  fell inside the select sample's own word — caught by an A/B
+  output-identity diff against `main`, not by any existing test, since
+  every existing test in both files is far smaller than
+  `SELECT_SAMPLE_RATE` (256) and so never exercised that path), and
+  separately restructured `resolve_merge_keys` to decode each key once in
+  a single forward pass rather than scanning twice. Verified via
+  interleaved A/B benchmark against `main` (output-identical throughout):
+  100KB–30MB now within ~10-15% of `main` at every size instead of a
+  growing multiple. New regression coverage:
+  `test_get_random_then_sequential_resumes_correctly` and
+  `test_get_random_access_pattern_matches_reference` in both
+  `advance_positions.rs` and `end_positions.rs`, using non-arithmetic
+  position gaps so select samples don't accidentally land on word
+  boundaries (`SELECT_SAMPLE_RATE` is itself a multiple of 64).
+- **YAML merge keys (`<<: *anchor`) were indexed as a literal `"<<"` key
+  instead of merging the referenced mapping's fields** (#171): `d: &d {x: 1}` /
+  `m:` / `  <<: *d` / `  y: 2` produced `{"<<":{"x":1},"y":2}` instead of the
+  expected `{"x":1,"y":2}`. Resolution happens at query time in
+  `YamlFields::from_mapping_cursor` (`src/yaml/light.rs`) rather than during
+  parsing or index construction, so every consumer — field access, `.[]`
+  iteration, `keys`/`to_entries`, and the direct YAML→JSON/YAML streaming
+  paths — gets it through the one shared `uncons`/`find` primitive, with no
+  new index format and no cost for the common merge-free mapping. Semantics
+  were verified empirically against the pinned `yq` v4.53.3 oracle rather
+  than the written spec, since that binary's default (non-`--yaml-fix-merge-
+  anchor-to-spec`) behavior is what `succinctly yq` must match: a later key
+  (real or merged) overwrites an earlier same-named one's *value* in place,
+  keeping the earlier key's position; `<<: [a, b, ...]` folds its sources in
+  reverse so an earlier-listed source still wins value conflicts per the
+  merge-key spec while a later one's unique keys claim the earlier positions;
+  a merge source's own fields are copied verbatim rather than recursively
+  re-resolved (yq does not expand a merged-in mapping's own `<<`); and an
+  invalid merge value (null, a scalar, a non-mapping alias target, or a
+  non-mapping sequence element) contributes nothing rather than erroring.
+  Unignores the two merge-key tests already written for this in
+  `tests/yq_cli_tests.rs`, adds a dedicated `tests/data/yq-golden/cases/
+  merge_key` fixture, and extends the `anchors` benchmark pattern so the
+  end-to-end suite no longer has a blind spot here (previously in
+  `OUT_OF_SCOPE` in `tests/yaml_bench_suite_coverage.rs`). **Breaking**: the
+  public `YamlFields` type is no longer `Copy` (only `Clone`) — a
+  merge-resolved mapping's field list is shared via `Rc` rather than being a
+  bare cursor, and `DocumentFields`'s trait bound relaxed from `Copy + Clone`
+  to `Clone` to match. Not covered: `yq-locate`'s reverse position lookup
+  (`src/yaml/locate.rs`) still walks the raw BP structure and does not know
+  about merge keys, and a merge source that is itself merged verbatim into
+  a *second* mapping can show yq's own traversal-order-dependent quirk where
+  querying the whole document resolves it but querying that path alone does
+  not (`resolve_merge_keys`'s doc comment has the details); succinctly always
+  gives the latter (pure, local, no cross-node mutation) answer.
 
 - **A tab that indented a sequence-item continuation line was folded into a
   plain scalar instead of rejected** (#432, also fixing #371): three related

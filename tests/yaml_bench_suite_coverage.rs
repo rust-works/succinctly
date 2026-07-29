@@ -85,6 +85,7 @@ const REQUIRED: &[Feature] = &[
     Feature::FoldedBlockScalar,
     Feature::ExplicitKey,
     Feature::MultiDocument,
+    Feature::MergeKey,
 ];
 
 /// Constructs deliberately kept out of the suite, with the reason. Generating
@@ -94,21 +95,18 @@ const REQUIRED: &[Feature] = &[
 /// When one is fixed, delete its row here and give it a pattern: this test
 /// turns the fix into a required edit rather than leaving the coverage gap in
 /// place.
-const OUT_OF_SCOPE: &[(Feature, &str)] = &[
-    (
-        Feature::MergeKey,
-        "parsed as an ordinary key, so output is {\"<<\": {...}} where yq splices (#171)",
-    ),
-    (
-        Feature::Tag,
-        "rejected outright in block context (documented non-support in src/yaml/mod.rs)",
-    ),
-];
+const OUT_OF_SCOPE: &[(Feature, &str)] = &[(
+    Feature::Tag,
+    "rejected outright in block context (documented non-support in src/yaml/mod.rs)",
+)];
 
 /// The feature each pattern added by #327 exists to carry.
 const HEADLINE: &[(&str, &[Feature])] = &[
     ("flow", &[Feature::FlowMapping, Feature::FlowSequence]),
-    ("anchors", &[Feature::Anchor, Feature::Alias]),
+    (
+        "anchors",
+        &[Feature::Anchor, Feature::Alias, Feature::MergeKey],
+    ),
     (
         "block-scalars",
         &[Feature::LiteralBlockScalar, Feature::FoldedBlockScalar],
@@ -190,11 +188,6 @@ fn walk(cur: YamlCursor<'_, Vec<u64>>, found: &mut BTreeSet<Feature>) {
                 found.insert(Feature::FlowMapping);
             }
             for field in fields {
-                if let YamlValue::String(key) = field.key() {
-                    if key.raw_bytes() == b"<<" {
-                        found.insert(Feature::MergeKey);
-                    }
-                }
                 walk(field.value_cursor(), found);
             }
         }
@@ -252,14 +245,20 @@ fn features_of(pattern: &str, bytes: &[u8]) -> BTreeSet<Feature> {
         _ => walk(root, &mut found),
     }
 
-    // Two constructs the index does not distinguish: an explicit key is an
-    // ordinary key once indexed, and a tag would have failed the build above.
+    // Three constructs the index does not distinguish after the fact: an
+    // explicit key is an ordinary key once indexed, a tag would have failed
+    // the build above, and a merge key (#171) is resolved away into ordinary
+    // fields by `YamlFields` — a successfully merged mapping has no literal
+    // "<<" left for a tree walk to find.
     let text = String::from_utf8_lossy(bytes);
     if text.starts_with("? ") || text.contains("\n? ") {
         found.insert(Feature::ExplicitKey);
     }
     if text.contains("!!") {
         found.insert(Feature::Tag);
+    }
+    if text.contains("<<:") {
+        found.insert(Feature::MergeKey);
     }
 
     found

@@ -12,6 +12,8 @@
 //! - Block scalars: literal (`|`) and folded (`>`)
 //! - Chomping modifiers: strip (`-`), keep (`+`), clip (default)
 //! - Anchors (`&name`) and aliases (`*name`)
+//! - Merge keys (`<<: *anchor`), including multiple sources (`<<: [*a, *b]`),
+//!   resolved at query time in `YamlFields` (issue #171)
 //! - Explicit keys (`?` / `:`)
 //! - Multi-document streams (`---` / `...`), wrapped in an implicit root sequence
 //! - Comments (ignored in block context)
@@ -21,7 +23,6 @@
 //! - Tags (`!!str`, `!custom`, verbatim `!<...>`) — rejected in block context, absorbed
 //!   as scalar text in flow context
 //! - `%YAML` / `%TAG` directives — parsed as plain scalars
-//! - Merge keys (`<<`) — parsed as an ordinary key
 //!
 //! # Validation
 //!

@@ -219,8 +219,13 @@ pub trait DocumentValue: Sized + Clone {
 }
 
 /// Iterator-like access to object fields.
+///
+/// Only `Clone`, not `Copy`: YAML fields backing a merge-resolved mapping
+/// (`<<: *anchor`) hold an `Rc`-shared entry list rather than a bare cursor,
+/// so cloning is O(1) but not a bitwise copy (see `YamlFields` in
+/// `src/yaml/light.rs`).
 #[allow(clippy::type_complexity)] // STYLE-0004: uncons returns the cons-list contract (field, rest); the nested tuple is intentional
-pub trait DocumentFields: Sized + Copy + Clone {
+pub trait DocumentFields: Sized + Clone {
     /// The value type for keys and values.
     type Value: DocumentValue;
 
@@ -240,7 +245,7 @@ pub trait DocumentFields: Sized + Copy + Clone {
     /// Count the number of fields.
     fn len(&self) -> usize {
         let mut count = 0;
-        let mut fields = *self;
+        let mut fields = self.clone();
         while let Some((_, rest)) = fields.uncons() {
             count += 1;
             fields = rest;
@@ -251,7 +256,7 @@ pub trait DocumentFields: Sized + Copy + Clone {
     /// Collect all field names.
     fn keys(&self) -> Vec<String> {
         let mut keys = Vec::new();
-        let mut fields = *self;
+        let mut fields = self.clone();
         while let Some((field, rest)) = fields.uncons() {
             if let Some(key) = field.key_str() {
                 keys.push(key.into_owned());

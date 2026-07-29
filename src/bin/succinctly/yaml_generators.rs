@@ -15,7 +15,7 @@
 //! | feature                        | pattern         |
 //! |--------------------------------|-----------------|
 //! | flow mapping / sequence        | `flow`          |
-//! | anchors and aliases            | `anchors`       |
+//! | anchors, aliases, merge keys `<<:` | `anchors`   |
 //! | block scalars `\|` `>` + chomping | `block-scalars` |
 //! | explicit keys `? ` / `: `      | `explicit-keys` |
 //! | multi-document `---` / `...`   | `multi-doc`     |
@@ -26,8 +26,6 @@
 //! test asserts they are **not** generated. Fixing any of them should flip that
 //! assertion, not pass silently:
 //!
-//! - **Merge keys `<<:`** — parsed as an ordinary key, so `succinctly yq` emits
-//!   `{"<<": {…}}` where yq splices the target mapping (#171).
 //! - **Tags (`!!str`, `!custom`)** — rejected outright in block context; a
 //!   documented non-support in `src/yaml/mod.rs`.
 //!
@@ -615,6 +613,10 @@ fn generate_flow(target_size: usize, seed: Option<u64>) -> String {
 /// is a block mapping, a block sequence or a flow collection. That last family
 /// is what makes the anchor pattern exercise `parse_sequence_item_inner`'s
 /// dispatch rather than only the mapping-value path.
+///
+/// Each group also emits a merge key (`<<: *anchor`, #171): a mapping that
+/// merges the group's `retry` anchor and adds one field of its own, so the
+/// suite exercises merge-key resolution end-to-end alongside plain aliasing.
 fn generate_anchors(target_size: usize, seed: Option<u64>) -> String {
     let mut rng = seed.map(ChaCha8Rng::seed_from_u64);
     let mut yaml = String::with_capacity(target_size);
@@ -668,6 +670,10 @@ fn generate_anchors(target_size: usize, seed: Option<u64>) -> String {
             yaml.push_str(&format!("    - *m{group}\n"));
             yaml.push_str(&format!("    - *q{group}\n"));
             yaml.push_str(&format!("    - *f{group}\n"));
+            // Merge key (#171): merges `retry` and adds its own field.
+            yaml.push_str("  merged:\n");
+            yaml.push_str(&format!("    <<: *{}\n", short(group)));
+            yaml.push_str("    override: true\n");
         }
 
         let replicas = rng.as_mut().map_or(1 + count % 5, |r| r.random_range(1..6));

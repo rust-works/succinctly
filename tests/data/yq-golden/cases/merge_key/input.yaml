@@ -1,0 +1,15 @@
+default: &default
+  a: 1
+  b: original
+item:
+  <<: *default
+  b: override
+a1: &a1
+  common: from_a1
+  x: 1
+a2: &a2
+  common: from_a2
+  y: 2
+multi:
+  <<: [*a1, *a2]
+  z: 3
