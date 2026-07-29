@@ -2155,6 +2155,14 @@ mod tests {
             kind: LineKind::Scalar,
             why: "multi-line quoted scalar with no following `:`",
         },
+        QuoteScanAgreement {
+            yaml: b"\"ab",
+            structural: false,
+            kind: LineKind::Scalar,
+            why: "unterminated quote, no close anywhere in the input: both \
+                  scans give up and treat the line as a non-structural \
+                  scalar rather than hunting past end of input",
+        },
         // ---- Named, legitimate divergences (#382 leaves these alone). ------
         QuoteScanAgreement {
             yaml: b"{a: 1}\n",
