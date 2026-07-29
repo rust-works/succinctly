@@ -1124,6 +1124,47 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
+        // Handled natively rather than through the `_` fallback below: the
+        // fallback materializes the whole value via `to_owned()` first,
+        // which merges duplicate YAML mapping keys into one `IndexMap`
+        // entry before this builtin ever runs (#443). Building one entry
+        // object per field directly off the field cursor -- like `Keys`/
+        // `Iterate` above -- means no user key is ever put into a shared
+        // map, so duplicates can't collapse.
+        Builtin::ToEntries => {
+            if let Some(elements) = value.as_array() {
+                let entries: Vec<OwnedValue> = elements
+                    .collect_values()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, elem)| {
+                        let mut entry = IndexMap::new();
+                        entry.insert("key".to_string(), OwnedValue::Int(i as i64));
+                        entry.insert("value".to_string(), to_owned(&elem));
+                        OwnedValue::Object(entry)
+                    })
+                    .collect();
+                GenericResult::Owned(OwnedValue::Array(entries))
+            } else if let Some(fields) = value.as_object() {
+                let mut entries: Vec<OwnedValue> = Vec::new();
+                let mut f = fields;
+                while let Some((field, rest)) = f.uncons() {
+                    if let Some(key) = field.key_str() {
+                        let mut entry = IndexMap::new();
+                        entry.insert("key".to_string(), OwnedValue::String(key.into_owned()));
+                        entry.insert("value".to_string(), to_owned(&field.value));
+                        entries.push(OwnedValue::Object(entry));
+                    }
+                    f = rest;
+                }
+                GenericResult::Owned(OwnedValue::Array(entries))
+            } else if optional {
+                GenericResult::None
+            } else {
+                GenericResult::Error(EvalError::has_no_keys(&to_owned(&value)))
+            }
+        }
+
         Builtin::IsNull => GenericResult::Owned(OwnedValue::Bool(value.is_null())),
 
         Builtin::IsBoolean => GenericResult::Owned(OwnedValue::Bool(value.is_bool())),
