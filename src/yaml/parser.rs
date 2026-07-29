@@ -1242,10 +1242,16 @@ impl<'a> Parser<'a> {
                     }
                     continue;
                 }
-                // Tab followed by content - for document root scalars (start_indent == 0),
-                // this is a continuation per YAML spec example 7.12 "Plain Lines".
-                // The tabs become part of the folded content (converted to space).
-                if start_indent == 0 && next_char == b'\t' {
+                // Tab followed by content - for document root scalars, this is
+                // a continuation per YAML spec example 7.12 "Plain Lines". The
+                // tabs become part of the folded content (converted to space).
+                //
+                // Gated on `is_doc_root`, not `start_indent == 0`: a mapping
+                // value or sequence item at indent 0 also has `start_indent ==
+                // 0` but is not the document root, so a tab there indents
+                // whatever structure follows and must not be folded into
+                // content (#371, #432).
+                if is_doc_root && next_char == b'\t' {
                     // Continue to next line - this is a valid continuation
                     self.skip_line_break();
                     // Skip leading whitespace (tabs are content, but we're at the scalar's level)
@@ -1253,6 +1259,20 @@ impl<'a> Parser<'a> {
                         self.advance();
                     }
                     continue;
+                }
+                // Reaching here means `next_char == b'\t'` and `is_doc_root` is
+                // false (the two branches above already `continue`d for every
+                // other combination). This scan works off local `lookahead`/
+                // `next_indent` variables rather than the cursor, so it can't
+                // reuse `tab_indents_block_structure` directly - `line_is_structural`
+                // is the shared primitive underneath both. Without this check the
+                // generic "more indented, so continue" rule below only compares
+                // space-counts and can't see the tab, so it folds whatever
+                // structure follows (a sequence item, mapping entry, ...) into
+                // the scalar instead of stopping so the per-line dispatcher can
+                // reject the tab as indentation (#371, #432).
+                if super::line_is_structural(self.input, lookahead) {
+                    break;
                 }
             }
 
@@ -1885,6 +1905,18 @@ impl<'a> Parser<'a> {
 
             // Re-advance to content position for the remaining checks
             self.advance_by(next_indent);
+            // A tab here indents whatever block structure follows (most often
+            // a sequence item) - reject it before the dispatch below, which
+            // otherwise misses it: the `Some(b'-')` arm doesn't match while
+            // the tab is still on the cursor, so it fell through to the
+            // plain-scalar arm and folded the dash and all into a string
+            // instead of raising this error (#432).
+            if self.tab_indents_block_structure(saved_pos) {
+                return Err(YamlError::TabIndentation {
+                    line: self.current_line(),
+                    offset: self.pos,
+                });
+            }
             // A tab left over from `advance_by` (which only accounts for
             // spaces) is legal separation here, not content - skip it so the
             // dispatch below, and any node it opens, land on the node's real

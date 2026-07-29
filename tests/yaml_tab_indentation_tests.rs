@@ -16,8 +16,8 @@
 //! # Why an agreement *table* and not an invariant
 //!
 //! The obvious assertion — "the loader rejects a tab shape only if the validator
-//! does" — is false, in both directions, for reasons that have nothing to do with
-//! tabs (see the two `Verdict` rows that disagree). Writing it as an invariant would
+//! does" — is false, for reasons that have nothing to do with tabs (see the
+//! `Verdict` row that disagrees). Writing it as an invariant would
 //! mean either a red build or quietly weakening it until it asserted nothing.
 //! Stating both verdicts per row instead makes each divergence a reviewed fact with
 //! a reason attached, which is what CLAUDE.md's #106 lesson asks for: one definition
@@ -108,6 +108,47 @@ const VERDICTS: &[Verdict] = &[
         validator: Validator::RejectsTheTab,
         why: "a tab before a sequence entry is indentation too",
     },
+    Verdict {
+        yaml: b"a: 1\n \tb: 2\n",
+        loader: true,
+        validator: Validator::RejectsTheTab,
+        why: "#371 fixed: the loader used to fold this line into the preceding \
+              plain scalar before the dispatcher saw it (parser.rs, the \
+              `start_indent == 0` continuation arm — a mapping value or sequence \
+              item at indent 0 also has `start_indent == 0` but is not the \
+              document root), yielding {\"a\":\"1 b\"} and silently dropping the \
+              `: 2`. Gating on `is_doc_root` instead makes the loader stop the \
+              scalar and defer to the per-line dispatcher, which already raises \
+              this error (also fixes the sequence-item analogue, #432)",
+    },
+    Verdict {
+        yaml: b"a:\n \t- x\n",
+        loader: true,
+        validator: Validator::RejectsTheTab,
+        why: "#432 repro 1 fixed: a key's \"value is on the next line\" arm left \
+              the tab on the cursor when it indented block structure, so the \
+              `Some(b'-')` sequence-continuation check didn't match it and the \
+              dash fell through to the plain-scalar arm, yielding \
+              {\"a\":\"\\t- x\"} instead of this error",
+    },
+    Verdict {
+        yaml: b"a:\n \t- x\n \t- y\n",
+        loader: true,
+        validator: Validator::RejectsTheTab,
+        why: "#432 repro 2, the same gap as the row above with a second \
+              tab-indented item following - both used to fold into one scalar, \
+              {\"a\":\"\\t- x - y\"}",
+    },
+    Verdict {
+        yaml: b"- a\n \t- b\n",
+        loader: true,
+        validator: Validator::RejectsTheTab,
+        why: "#432 repro 3 fixed: a plain scalar's continuation-line scan only \
+              compared indent by counting spaces, so a tab that itself indented \
+              a sibling sequence item read as \"more indented, so continue\" and \
+              folded the second item into the first's scalar, yielding \
+              [\"a - b\"] instead of this error",
+    },
     // ---- A tab that is separation. Both must accept. ---------------------------
     Verdict {
         yaml: b"foo:\n \tbar\n",
@@ -169,14 +210,6 @@ const VERDICTS: &[Verdict] = &[
               not a value indicator",
     },
     // ---- Rows where the two legitimately disagree. -----------------------------
-    Verdict {
-        yaml: b"a: 1\n \tb: 2\n",
-        loader: false,
-        validator: Validator::RejectsTheTab,
-        why: "the loader folds the line into the preceding plain scalar before the \
-              dispatcher sees it (parser.rs, the `start_indent == 0` continuation \
-              arm), yielding {\"a\":\"1 b\"} — that is #371, which #173 does not reach",
-    },
     Verdict {
         yaml: b"a: |\n    x\n  \tb: c\n",
         loader: true,
