@@ -150,6 +150,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behavior change dressed as a refactor. Conformance figures are unaffected
   (216/279 · 70/94 · 27/29 unchanged); both bugs were corpus-latent.
 
+- **Project-wide audit of YAML `s-white`/unconditional-terminator predicates**
+  (#434), the exhaustive search #173/#370/#410/#411 each asked for reactively.
+  Six more instances of the same shape, all in `src/yaml/`:
+  - `find_scalar_end` (`light.rs`), the cursor's re-derivation of a scalar's
+    extent used by `at_offset`/`syq-locate`, broke unconditionally on `,`/`]`/`}`
+    with no flow-context check at all, despite its own comment calling them
+    "flow context delimiters" — its dead sibling `find_plain_scalar_end`
+    already gated the same arm on `if in_flow`. Any block-context scalar
+    containing a literal comma, `]`, or `}` (`note: hello, world`) printed
+    correctly via `syq` but located a truncated range via `syq-locate`/
+    `at_offset` — the highest-impact finding, since this trigger is far more
+    common in real YAML than any tab-adjacency case.
+  - `parse_unquoted_value_with_indent_impl`'s colon-terminator check had no
+    `None` arm, so a colon as the last byte of a document (no trailing
+    newline) was absorbed into the value instead of ending it, while
+    `find_scalar_end` already stopped there — eval and locate disagreed on
+    the same node, the #370 shape reached via absolute EOF instead of a tab.
+  - `is_document_start`/`is_document_end` required the marker to be followed
+    by `Some(b' ' | b'\n' | b'\r') | None`, missing the tab the strict
+    validator's `doc_marker_char` already accepted — confirmed against the
+    YAML Test Suite's K54U case (`---\tscalar`), previously a known failure,
+    now passing.
+  - Four sites choosing whether `?`/`:` at line start were explicit-key/value
+    indicators matched the same terminator set missing a tab, while the `-`
+    (sequence indicator) check a few lines away in each of those functions,
+    and the canonical shared `is_seq_indicator_next` (fixed for #332
+    specifically to stop this drift), already included it. `?\tkey\n:\tvalue\n`
+    loaded as two unrelated top-level documents instead of one mapping entry.
+  - `is_sequence_at_same_indent` (deciding whether a same-indent block
+    sequence is an anchored mapping key's value) was missing the tab its own
+    doc comment claims parity with `parse_compact_mapping_entry` on — that
+    sibling already had it. `key: &a\n-\tx\n-\ty\n` resolved to `{"key":null}`
+    instead of `{"key":["x","y"]}`, dangling the anchor.
+  - `parse_explicit_key`'s inline dispatch on a `-` starting an explicit key's
+    value (`? - a\n  - b\n: value`, a non-scalar key, #172) hand-rolled the
+    same 3-way match missing the tab instead of calling the canonical
+    `is_seq_indicator_next` every sibling `-` check in the file already uses
+    (#332) — caught in review of this same PR, after the rest of the audit
+    above had already landed. `? -\ta\n  -\tb\n: value\n` fell through to
+    being parsed as a plain scalar key `-\ta`, losing the second sequence item
+    and the value entirely (`{"-\ta":["b"]}` instead of `{"":"value"}`).
+
+  A seventh candidate — `skip_newlines` not skipping a tab-led blank/comment
+  line — was implemented and then reverted: it silently turned the YAML Test
+  Suite's Y79Y/000 (`foo: |\n\t\nbar: 1\n`, `fail: true`) from a correctly
+  rejected document into `{"foo":"","bar":1}`, the opposite compatibility risk
+  this issue itself warns about. `src/json/` was audited in full and found
+  clean — RFC 8259's whitespace set is applied consistently, and the one
+  byte-for-byte duplicated predicate found there (`needs_json_yaml_quoting` /
+  `needs_yaml_quoting`) is currently correct in both copies because a
+  companion control-character scan independently catches tabs.
+
 - **YAML explicit non-scalar keys silently dropped the entry** (#172,
   resolved by drift): `? - a\n  - b\n: value` used to load as `{}`, losing
   both the key and the value, silently — no error, well-formed JSON out. Not

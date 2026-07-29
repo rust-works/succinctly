@@ -9,6 +9,16 @@
 
 use succinctly::yaml::{locate_offset, locate_offset_detailed, YamlIndex};
 
+/// Renders a byte string with any non-ASCII-printable bytes visible in
+/// assertion output.
+struct Text<'a>(&'a [u8]);
+
+impl core::fmt::Debug for Text<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}", String::from_utf8_lossy(self.0))
+    }
+}
+
 #[test]
 fn test_locate_offset_simple_mapping() {
     // The exact example from the bug report (issue #26)
@@ -162,4 +172,50 @@ fn test_locate_offset_block_sequence() {
         locate_offset(&index, yaml, 48), // '2'
         Some(".[0].top[0][1]".to_string()),
     );
+}
+
+/// A block-context plain scalar containing `,`, `]`, or `}` is not truncated
+/// by locate (#434). YAML's `ns-plain-char` reserves these bytes as flow
+/// indicators only inside a flow collection - in block context they are
+/// ordinary scalar content (e.g. `note: hello, world`), and `syq` already
+/// printed the value in full. `find_scalar_end` (`YamlCursor::raw_bytes`'s
+/// re-derivation of a scalar's extent from text, used by `at_offset` and
+/// `syq-locate`) broke on these bytes unconditionally regardless of context,
+/// despite its own comment calling them "flow context delimiters" - the same
+/// eval/locate divergence shape as #370, just reached through a flow
+/// indicator instead of a missing tab.
+#[test]
+fn the_located_byte_range_is_not_truncated_by_a_flow_indicator_in_block_context() {
+    // (document, offset to locate, the bytes the reported range must cover)
+    for (yaml, offset, expected) in [
+        (&b"note: hello, world\n"[..], 6, &b"hello, world"[..]),
+        (b"item: use a[0] here\n", 6, b"use a[0] here"),
+        (b"note: use {key} here\n", 6, b"use {key} here"),
+    ] {
+        let index = YamlIndex::build(yaml).expect("parses");
+        let found = locate_offset_detailed(&index, yaml, offset)
+            .unwrap_or_else(|| panic!("offset {offset} of {:?} located nothing", Text(yaml)));
+        let (start, end) = found.byte_range;
+        assert_eq!(
+            &yaml[start..end],
+            expected,
+            "offset {offset} of {:?}: range {:?} covers {:?}",
+            Text(yaml),
+            found.byte_range,
+            Text(&yaml[start..end])
+        );
+    }
+}
+
+/// The flow-context control: inside an actual flow collection, `,` and `]`
+/// still correctly terminate the element they follow - the fix must not make
+/// `find_scalar_end` blind to flow indicators altogether, only context-aware.
+#[test]
+fn the_located_byte_range_still_stops_at_a_flow_indicator_in_flow_context() {
+    let yaml = b"[a, b]\n";
+    let index = YamlIndex::build(yaml).expect("parses");
+    let found = locate_offset_detailed(&index, yaml, 1)
+        .unwrap_or_else(|| panic!("offset 1 of {:?} located nothing", Text(yaml)));
+    let (start, end) = found.byte_range;
+    assert_eq!(&yaml[start..end], b"a", "the first flow sequence element");
 }

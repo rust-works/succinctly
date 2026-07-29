@@ -908,8 +908,12 @@ impl<'a> Parser<'a> {
         if slice != b"---" {
             return false;
         }
-        // Must be followed by space, line break, or EOF
-        matches!(self.peek_at(3), Some(b' ' | b'\n' | b'\r') | None)
+        // Must be followed by white space (space or tab), a line break, or EOF.
+        // The tab is not optional: `doc_marker_char` (validate.rs), the strict
+        // validator's copy of this same check, already includes it, and
+        // dropping it here meant `---\tfoo` was silently parsed as content
+        // instead of a document boundary (#434).
+        matches!(self.peek_at(3), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
     }
 
     /// Check if we're at a document end marker (`...`).
@@ -921,8 +925,9 @@ impl<'a> Parser<'a> {
         if slice != b"..." {
             return false;
         }
-        // Must be followed by space, line break, or EOF
-        matches!(self.peek_at(3), Some(b' ' | b'\n' | b'\r') | None)
+        // Must be followed by white space (space or tab), a line break, or EOF.
+        // See `is_document_start` for why the tab isn't optional (#434).
+        matches!(self.peek_at(3), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
     }
 
     /// Skip past a document marker (`---` or `...`).
@@ -932,8 +937,10 @@ impl<'a> Parser<'a> {
         self.advance();
         self.advance();
         self.advance();
-        // Skip trailing space after marker if present
-        if self.peek() == Some(b' ') {
+        // Skip trailing separation white space after the marker, if present -
+        // both space and tab, matching `parse_inline_document_value`'s own
+        // leading-whitespace skip right after this call (#434).
+        while matches!(self.peek(), Some(b' ' | b'\t')) {
             self.advance();
         }
     }
@@ -960,9 +967,9 @@ impl<'a> Parser<'a> {
     /// split one document into two.
     ///
     /// The indent is 0 rather than one re-derived from the cursor:
-    /// [`Self::skip_document_marker`] consumes only a single trailing space, so
-    /// `count_indent` would read `---···&x` as indent 3, when the node is at
-    /// document root either way.
+    /// [`Self::skip_document_marker`] consumes a run of trailing spaces and
+    /// tabs, so `count_indent` would read `---···&x` as indent 3 (or worse
+    /// with a tab in the run), when the node is at document root either way.
     fn parse_inline_document_value(&mut self) -> Result<(), YamlError> {
         // Skip leading whitespace
         self.skip_inline_whitespace();
@@ -1124,9 +1131,16 @@ impl<'a> Parser<'a> {
                         self.advance();
                     }
                     b':' => {
-                        // Colon followed by whitespace ends the value (could be a key)
-                        // But in value context, colons in URLs etc. are allowed
-                        if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                        // Colon followed by whitespace, a line break, or EOF ends
+                        // the value (could be a key). In value context, colons in
+                        // URLs etc. are allowed. The `| None` arm matters: without
+                        // it, a colon as the last byte of the document (no trailing
+                        // newline) was absorbed as content instead of terminating
+                        // the value, while `find_scalar_end` (the locate-path copy
+                        // of this same boundary) already stopped there - eval and
+                        // locate disagreed on the same node (#434, same shape as
+                        // #370).
+                        if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
                             break;
                         }
                         self.advance();
@@ -1257,8 +1271,8 @@ impl<'a> Parser<'a> {
                 && next_char != b'#'
                 && !sequence_indicator_is_block_structure
                 && !(next_char == b':'
-                    && lookahead + 1 < self.input.len()
-                    && matches!(self.input[lookahead + 1], b' ' | b'\t' | b'\n' | b'\r'))
+                    && (lookahead + 1 >= self.input.len()
+                        || matches!(self.input[lookahead + 1], b' ' | b'\t' | b'\n' | b'\r')))
             {
                 // Continue to next line
                 self.skip_line_break();
@@ -1517,7 +1531,11 @@ impl<'a> Parser<'a> {
             // Don't close the outer item - it will be closed when we return
             // to a lower indent level.
         } else if self.peek() == Some(b'?')
-            && matches!(self.peek_at(1), Some(b' ' | b'\n' | b'\r') | None)
+            // Tab included: the sibling `-` check just above uses the same
+            // 4-way terminator set; this one dropped the tab, so `?\tkey`
+            // fell through to being parsed as a plain scalar instead of an
+            // explicit key (#434).
+            && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
         {
             // Explicit key as the item's value: `- ? k` / `  : v` (#339).
             //
@@ -1891,7 +1909,11 @@ impl<'a> Parser<'a> {
                     self.pos = saved_pos;
                     return Ok(());
                 }
-                Some(b'?') if matches!(self.peek_at(1), Some(b' ' | b'\n' | b'\r') | None) => {
+                // Tab included: the sibling `-` check just above uses the
+                // same 4-way terminator set (#434).
+                Some(b'?')
+                    if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) =>
+                {
                     // Explicit key - will be handled by main loop
                     self.pos = saved_pos;
                     return Ok(());
@@ -1982,7 +2004,7 @@ impl<'a> Parser<'a> {
                     // Skip past indent spaces to check what follows (SIMD accelerated)
                     self.skip_spaces_simd();
                     matches!(self.peek(), Some(b'-'))
-                        && matches!(self.peek_at(1), Some(b' ' | b'\n' | b'\r') | None)
+                        && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
                 };
                 // Restore position after checking
                 self.pos = pos_before_check;
@@ -1992,7 +2014,10 @@ impl<'a> Parser<'a> {
                 // lower indent belongs to an outer container, and treating it
                 // as this key's value left the key's anchor dangling
                 // (`m:\n  b: &b\n- x`). Same test as
-                // `parse_compact_mapping_entry`, which had it right.
+                // `parse_compact_mapping_entry`, which had it right - though
+                // it wasn't quite: that version already included the tab in
+                // its terminator set and this one didn't, so `-\tx` at the
+                // key's indent still dangled the anchor (#434).
                 if next_indent < indent || (next_indent == indent && !is_sequence_at_same_indent) {
                     // Next line is at same or lower indent and not a sequence - value is null
                     // Create explicit null node for anchor to point to
@@ -2153,7 +2178,12 @@ impl<'a> Parser<'a> {
 
         // Parse the key value inline
         match self.peek() {
-            Some(b'-') if matches!(self.peek_at(1), Some(b' ' | b'\n' | b'\r') | None) => {
+            // Tab included: this is the same terminator set `is_seq_indicator_next`
+            // canonicalizes (#332) and every sibling `-` check in this file already
+            // uses it, but this site still hand-rolled a 3-way match missing the
+            // tab, so `? -\ta\n  -\tb\n: value` fell through to being parsed as a
+            // plain scalar key `-\ta` instead of a sequence key (#434).
+            Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
                 // Sequence as key - open key node and let sequence parsing continue
                 // The key will be a sequence
                 self.write_bp_open();
@@ -3987,11 +4017,16 @@ impl<'a> Parser<'a> {
             Some(b'-') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
                 self.parse_sequence_item(indent)?;
             }
-            Some(b'?') if matches!(self.peek_at(1), Some(b' ' | b'\n' | b'\r') | None) => {
+            // Tab included in both arms below: the sibling `-` arm just above
+            // uses the same 4-way terminator set, and `?`/`:` dropping the
+            // tab meant `?\tkey` / `:\tvalue` fell through to
+            // `looks_like_mapping_entry()` instead of being recognized here
+            // (#434).
+            Some(b'?') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
                 // Explicit key indicator
                 self.parse_explicit_key(indent)?;
             }
-            Some(b':') if matches!(self.peek_at(1), Some(b' ' | b'\n' | b'\r') | None) => {
+            Some(b':') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
                 // Explicit value indicator (value for previous explicit key)
                 self.parse_explicit_value(indent)?;
             }
