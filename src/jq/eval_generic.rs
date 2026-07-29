@@ -1601,6 +1601,37 @@ mod tests {
     }
 
     #[test]
+    fn test_yaml_generic_to_entries_duplicate_keys() {
+        // Duplicate YAML mapping keys must survive `to_entries` unmerged,
+        // matching real `yq` -- not collapse to the last occurrence via the
+        // `to_owned()` fallback's `IndexMap` (#443).
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: 1\na: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+
+        let mapping_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = mapping_cursor.value();
+
+        let result = eval(&Expr::Builtin(Builtin::ToEntries), value);
+        let owned = result.into_owned().unwrap();
+
+        let expected_entry = |v: i64| {
+            let mut entry = IndexMap::new();
+            entry.insert("key".to_string(), OwnedValue::String("a".to_string()));
+            entry.insert("value".to_string(), OwnedValue::Int(v));
+            OwnedValue::Object(entry)
+        };
+        assert_eq!(
+            owned,
+            OwnedValue::Array(vec![expected_entry(1), expected_entry(2)])
+        );
+    }
+
+    #[test]
     fn test_yaml_generic_array() {
         use crate::yaml::YamlIndex;
 
