@@ -2485,6 +2485,34 @@ impl<'a> Parser<'a> {
     fn looks_like_flow_mapping_entry(&self) -> bool {
         let mut i = self.pos;
 
+        // Skip a leading anchor or alias: an aliased key IS the key (`*x: v`,
+        // #409) and an anchored key just prefixes it (`&x k: v`, corpus case
+        // CN3R) - what determines whether this item is a pair is what
+        // follows the name, not the indicator. Uses the same scanner the
+        // real anchor/alias parse uses, so this can't drift from what will
+        // actually be consumed (#106).
+        if i < self.input.len() && (self.input[i] == b'&' || self.input[i] == b'*') {
+            let is_alias = self.input[i] == b'*';
+            let name_start = i + 1;
+            let name_end = simd::parse_anchor_name(self.input, name_start);
+            if name_end == name_start {
+                // Empty name - not a valid anchor/alias; let the real parse
+                // report it.
+                return false;
+            }
+            i = name_end;
+            while i < self.input.len() && matches!(self.input[i], b' ' | b'\t') {
+                i += 1;
+            }
+            if is_alias {
+                // The alias name is the whole key; nothing else to scan.
+                return i < self.input.len() && self.input[i] == b':';
+            }
+            // An anchor prefixes the actual key, which still needs to be
+            // scanned below - it may be quoted, a container, or a plain
+            // scalar.
+        }
+
         // Skip quoted string if present
         if i < self.input.len() && (self.input[i] == b'"' || self.input[i] == b'\'') {
             let quote = self.input[i];
@@ -2695,21 +2723,18 @@ impl<'a> Parser<'a> {
         self.write_bp_open();
         self.write_ty(false); // 0 = mapping
 
-        // Parse key - can be scalar, quoted, flow mapping, or flow sequence
+        // Parse key - shares `parse_flow_key` with the flow-mapping key site,
+        // so an anchor or alias prefixing this key (`[&x k: 1, *x: 2]`,
+        // #409) binds via `record_key_anchor` / `record_key_alias` to this
+        // already-open key node, rather than `parse_anchor`/`parse_alias`'s
+        // "next node opened" semantics binding to the wrong node.
         self.set_ib();
         self.write_bp_open();
-        match self.peek() {
-            // Nested flow containers need no end of their own (#332)
-            Some(b'{') => {
-                self.parse_flow_mapping()?;
-            }
-            Some(b'[') => {
-                self.parse_flow_sequence()?;
-            }
-            _ => {
-                let key_end = self.parse_flow_key_scalar()?;
-                self.set_bp_text_end(key_end);
-            }
+        if !self.parse_flow_key()? {
+            // A complex key (a nested flow container) opened its own BP nodes
+            // and carries its own end; recording one here would clobber the
+            // innermost of them (#332).
+            self.set_bp_text_end(self.pos);
         }
         self.write_bp_close();
 
@@ -2807,41 +2832,40 @@ impl<'a> Parser<'a> {
             }
             first = false;
 
-            // Check for anchor first - it prefixes the actual value
-            if self.peek() == Some(b'&') {
-                self.parse_anchor()?;
-            }
-
-            // Check for alias - this IS the value
-            if self.peek() == Some(b'*') {
-                self.parse_alias()?;
-                self.skip_flow_whitespace();
-                continue;
-            }
-
             // Check for explicit key `? key : value` in flow context
             if self.looks_like_explicit_flow_key() {
                 self.parse_explicit_flow_mapping_entry()?;
             } else if self.looks_like_flow_mapping_entry() {
-                // Check for implicit mapping entry (handles all key types including { and [)
-                // This is an implicit single-pair mapping: [ key : value ]
+                // Handles all key forms, including a leading anchor or alias
+                // (`[&x k: 1, *x: 2]`, #409), { and [, quoted, and plain scalar
+                // keys. This is an implicit single-pair mapping: [ key : value ]
                 self.parse_implicit_flow_mapping_entry()?;
             } else {
-                // Parse flow value (item) - containers handle their own BP
-                match self.peek() {
-                    Some(b'[') => {
-                        self.parse_flow_sequence()?;
-                    }
-                    Some(b'{') => {
-                        self.parse_flow_mapping()?;
-                    }
-                    _ => {
-                        // Plain scalar value - wrap in BP
-                        self.set_ib();
-                        self.write_bp_open();
-                        let end = self.parse_flow_scalar()?;
-                        self.set_bp_text_end(end);
-                        self.write_bp_close();
+                // Not a key:value pair - an anchor or alias here prefixes a
+                // standalone value instead (`[&x a, *x]`), so it's consumed
+                // only now that the pair check has ruled that out.
+                if self.peek() == Some(b'&') {
+                    self.parse_anchor()?;
+                }
+                if self.peek() == Some(b'*') {
+                    self.parse_alias()?;
+                } else {
+                    // Parse flow value (item) - containers handle their own BP
+                    match self.peek() {
+                        Some(b'[') => {
+                            self.parse_flow_sequence()?;
+                        }
+                        Some(b'{') => {
+                            self.parse_flow_mapping()?;
+                        }
+                        _ => {
+                            // Plain scalar value - wrap in BP
+                            self.set_ib();
+                            self.write_bp_open();
+                            let end = self.parse_flow_scalar()?;
+                            self.set_bp_text_end(end);
+                            self.write_bp_close();
+                        }
                     }
                 }
             }
@@ -3000,6 +3024,11 @@ impl<'a> Parser<'a> {
     /// Parse an *implicit* key in flow context.
     /// Keys can be scalars, flow sequences, or flow mappings (complex keys).
     ///
+    /// Shared by both implicit-key sites: a flow mapping's own entries
+    /// (`{k: v}`) and a flow sequence's implicit single-pair-mapping entry
+    /// (`[k: v]`, since #409 — it used to hand-roll a narrower version of
+    /// this match with no anchor/alias arms).
+    ///
     /// The explicit `? key` form is not handled here: its indicator has to be consumed
     /// before the caller plants the key's interest bit, so the caller dispatches it to
     /// [`Self::parse_explicit_flow_key_node`] instead (#402).
@@ -3034,9 +3063,10 @@ impl<'a> Parser<'a> {
                 self.parse_flow_mapping()?;
                 return Ok(true);
             }
-            // Alias as key (`{*a: v}`), sharing the block and compact mappings'
-            // site. The caller already opened the key's BP node, so the edge
-            // binds to that node; `parse_alias` here opened a *second* one, which
+            // Alias as key (`{*a: v}`, and via this same function `[*a: v]`
+            // since #409), sharing the block and compact mappings' site. The
+            // caller already opened the key's BP node, so the edge binds to
+            // that node; `parse_alias` here opened a *second* one, which
             // took the edge and left the key with no extent, so a resolving alias
             // still rendered as `""` while a miss went through `parse_alias`'s
             // lookup and errored — the one key position that stayed inconsistent
@@ -3056,11 +3086,12 @@ impl<'a> Parser<'a> {
     /// Stops at `:`, `,`, `}`, `]`, or whitespace before those.
     /// Handles multiline keys (continues across newlines with proper indentation).
     fn parse_flow_unquoted_key(&mut self) -> Result<usize, YamlError> {
-        // #369: reject a tag at the start of a flow key. Both callers land here
-        // with `pos` at the key's first byte — `parse_flow_key` dispatches
-        // anchors, aliases and nested containers first, and
-        // `parse_flow_key_scalar` only peels off the quoted forms — so this one
-        // gate covers the whole plain-key path.
+        // #369: reject a tag at the start of a flow key. `parse_flow_key` is
+        // the only caller, from two call sites (the flow-mapping key and,
+        // since #409, the flow-sequence implicit-entry key); it dispatches
+        // anchors, aliases and nested containers first and lands here with
+        // `pos` at the key's first byte, so this one gate covers the whole
+        // plain-key path from both sites.
         self.check_unsupported()?;
 
         let start = self.pos;
@@ -3176,31 +3207,6 @@ impl<'a> Parser<'a> {
                 self.pos
             }
             _ => self.parse_flow_unquoted_value(),
-        };
-        Ok(end)
-    }
-
-    /// Parse a flow key (for implicit mapping entries).
-    /// Like parse_flow_scalar but also stops at `: ` (colon followed by space/flow indicator).
-    fn parse_flow_key_scalar(&mut self) -> Result<usize, YamlError> {
-        // No #369 tag gate here, unlike `parse_flow_scalar`: the two quoted arms
-        // below cannot begin with `!`, and the plain arm is
-        // `parse_flow_unquoted_key`, which gates at this same position. A check
-        // here would reject nothing extra. The path is pinned by a test instead,
-        // so a future change to the plain arm cannot lose the gate silently.
-        let end = match self.peek() {
-            Some(b'"') => {
-                self.parse_double_quoted()?;
-                self.pos
-            }
-            Some(b'\'') => {
-                self.parse_single_quoted()?;
-                self.pos
-            }
-            _ => {
-                // Use existing parse_flow_unquoted_key which stops at `:`
-                self.parse_flow_unquoted_key()?
-            }
         };
         Ok(end)
     }

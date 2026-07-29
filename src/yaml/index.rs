@@ -1215,6 +1215,12 @@ mod tests {
             // like the other three, so the offset it reports is the helper's
             // rather than `parse_alias`'s. Both are the `*`, and this pins that.
             ("{*nope: v}", "nope", "*nope"),
+            // The flow-*sequence* implicit single-pair-mapping key didn't
+            // reach this rejection at all before #409: the sequence loop
+            // consumed a leading `*` as a standalone item before the pair
+            // check ever ran, so `[*nope: v]` errored `expected ',' or ']'`
+            // rather than naming the unknown anchor.
+            ("[*nope: v]", "nope", "*nope"),
             // A forward reference is a miss like any other: YAML 1.2 §7.1
             // requires an alias to name a *previous* anchor, so the anchor
             // below is not in scope at the alias.
