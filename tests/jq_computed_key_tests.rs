@@ -617,14 +617,54 @@ fn test_del_resolves_and_orders_computed_keys() {
         r#"del(.[("a","b")]?)"#,
         Outcome::values(&["{}"]),
     );
-    // Deleting repeated indexes deletes once, and right-to-left, so an earlier
-    // removal cannot shift a later one.
+    // Deleting repeated indexes deletes once, and every index is removed
+    // simultaneously, so an earlier removal cannot shift a later one.
     check(
         "[10,20,30,40]",
         "del(.[(0,2)])",
         Outcome::values(&["[20,40]"]),
     );
     check("[1,2,3]", "del(.[(0,0)])", Outcome::values(&["[2,3]"]));
+}
+
+/// #424: a negative computed index has to resolve against the length the
+/// array had *before* any deletion here, not the length after an earlier
+/// sibling was already removed.
+///
+/// `del(.[(-1,-2)])` on `[10,20,30,40]` used to delete `-1` (`40`) first,
+/// shortening the array to length 3, so `-2` then counted back from *that*
+/// and took `20` instead of `30` — giving `[10,30]` where jq gives `[10,20]`.
+/// Reversing the argument order didn't help, because `-1` and `-2` are
+/// counted from the opposite end to a non-negative index, so no ordering of
+/// one-at-a-time deletions is correct; every index has to be resolved
+/// against the same, original length and removed in one pass.
+#[test]
+fn test_del_with_negative_computed_indexes_resolves_against_original_length() {
+    check(
+        "[10,20,30,40]",
+        "del(.[(-1,-2)])",
+        Outcome::values(&["[10,20]"]),
+    );
+    // Order-insensitive, same as the non-negative case above.
+    check(
+        "[10,20,30,40]",
+        "del(.[(-2,-1)])",
+        Outcome::values(&["[10,20]"]),
+    );
+    // A mixed sign pair that isn't order-insensitive by coincidence.
+    check(
+        "[10,20,30,40]",
+        "del(.[(1,-1)])",
+        Outcome::values(&["[10,30]"]),
+    );
+    // Two independent computed-index positions in one chain: each inner
+    // array gets its own simultaneous removal, resolved against its own
+    // (not the outer array's) length.
+    check(
+        "[[10,20,30],[40,50,60,70]]",
+        "del(.[(0,1)][(-1,-2)])",
+        Outcome::values(&["[[10],[40,50]]"]),
+    );
 }
 
 #[test]
