@@ -238,7 +238,7 @@ pub unsafe fn block_popcount_avx2(block: &[u64]) -> usize {
             0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
         );
         let low_mask = _mm256_set1_epi8(0x0F);
-        let ptr = block.as_ptr() as *const __m256i;
+        let ptr = block.as_ptr().cast::<__m256i>();
 
         let mut acc = _mm256_setzero_si256();
         for i in 0..2 {
@@ -254,7 +254,7 @@ pub unsafe fn block_popcount_avx2(block: &[u64]) -> usize {
         // Sum bytes within each 64-bit lane, then across lanes.
         let sums = _mm256_sad_epu8(acc, _mm256_setzero_si256());
         let mut lanes = [0u64; 4];
-        _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, sums);
+        _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), sums);
         (lanes[0] + lanes[1] + lanes[2] + lanes[3]) as usize
     }
 }
