@@ -3120,10 +3120,10 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
 
     /// Raw (merge-unaware) cons-list over a mapping's direct children.
     ///
-    /// Used internally by [`resolve_merge_keys`] both to detect whether a
-    /// mapping needs merge resolution at all, and to enumerate a merge
-    /// source's own fields (which are copied verbatim, not recursively
-    /// re-resolved — see that function's doc comment).
+    /// Used internally by [`resolve_merge_keys`] to walk a mapping's own
+    /// fields, and to enumerate a merge source's own fields (which are
+    /// copied verbatim, not recursively re-resolved — see that function's
+    /// doc comment).
     fn raw(first_key: Option<YamlCursor<'a, W>>) -> Self {
         Self {
             inner: FieldsInner::Direct(first_key),
@@ -3210,7 +3210,8 @@ impl<'a, W: AsRef<[u64]>> Iterator for YamlFields<'a, W> {
 /// Resolve YAML merge keys (`<<`) into an ordered, deduplicated field list.
 ///
 /// Returns `None` when the mapping has no merge key at all, so the common
-/// case stays a zero-allocation cursor walk. Otherwise resolves per
+/// case stays a single forward pass with no `Vec`/`BTreeMap` allocation
+/// beyond the small `seen` buffer described below. Otherwise resolves per
 /// mikefarah/yq v4.53.3's actual (non-spec-compliant, but oracle-pinned —
 /// see `docs/parsing/yaml.md`) behavior, verified empirically against that
 /// binary:
@@ -3236,53 +3237,117 @@ impl<'a, W: AsRef<[u64]>> Iterator for YamlFields<'a, W> {
 /// - An invalid merge value (null, scalar, an alias that doesn't resolve to
 ///   a mapping, or a non-mapping sequence element) contributes nothing
 ///   rather than erroring, matching yq's silent-skip behavior.
+///
+/// # Why this decodes each key exactly once
+///
+/// A `YamlCursor::value()` call is not a free re-read: for a non-container
+/// node it consults `AdvancePositions`/`CompactEndPositions`
+/// (`src/yaml/advance_positions.rs`, `src/yaml/end_positions.rs`), each of
+/// which keeps a single *document-wide* sequential cursor optimized for
+/// monotonically increasing access (amortized O(1)). A first version of this
+/// function scanned the mapping once with `.any()` to check for a merge key,
+/// then — merge key or not — walked it again from the start to build the
+/// result. Decoding the same key a second time is a backward jump against
+/// that shared cursor, which falls back to `get_random`; that fallback
+/// resets the incremental IB-scan state to the very start of the document's
+/// index instead of to the resumed position, so the *next* sequential call
+/// has to rescan from position zero to catch back up — O(current document
+/// position), paid on every mapping regardless of whether it had a merge
+/// key. Over N sibling mappings (an array of flat records — one of the most
+/// common real-world YAML/JSON shapes) that turns an O(N) document walk into
+/// O(N²) (#171 review).
+///
+/// So: walk forward exactly once, buffering each already-decoded
+/// `YamlValue` (not just the cursor) in `seen` as we go. If a later field
+/// turns out to be a merge key, `seen`'s entries are folded into the
+/// deduplicated result using the value already in hand — never re-derived
+/// via a second `.value()` call on an earlier cursor. If no merge key is
+/// ever found, `seen` is simply dropped and `None` is returned; the
+/// `Vec`/`BTreeMap` used for deduplication are allocated only once a merge
+/// key is confirmed to exist.
 fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
     first_key: Option<YamlCursor<'a, W>>,
 ) -> Option<Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)>> {
-    if !YamlFields::raw(first_key).any(|field| is_merge_key(&field.key_cursor)) {
-        return None;
-    }
+    let mut fields = YamlFields::raw(first_key);
+    let mut seen: Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>, YamlValue<'a, W>)> = Vec::new();
 
-    let mut entries: Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)> = Vec::new();
-    let mut positions: BTreeMap<String, usize> = BTreeMap::new();
+    loop {
+        let (field, rest) = fields.uncons()?;
+        let key_value = field.key_cursor.value();
 
-    for field in YamlFields::raw(first_key) {
-        if is_merge_key(&field.key_cursor) {
-            // Reverse so an earlier-listed source (higher merge-spec
-            // priority) is applied last and wins value conflicts, while a
-            // later-listed source's unique keys still claim the earlier
-            // positions (see doc comment above).
-            for source in merge_sources(field.value_cursor).into_iter().rev() {
-                for source_field in YamlFields::raw(source.first_child()) {
+        if is_merge_key_value(&key_value) {
+            let mut entries: Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)> =
+                Vec::with_capacity(seen.len() + 1);
+            let mut positions: BTreeMap<String, usize> = BTreeMap::new();
+
+            for (key, value, key_value) in seen {
+                upsert_field(&mut entries, &mut positions, key, value, &key_value);
+            }
+            merge_field_into(&mut entries, &mut positions, field.value_cursor);
+
+            fields = rest;
+            while let Some((field, rest)) = fields.uncons() {
+                let key_value = field.key_cursor.value();
+                if is_merge_key_value(&key_value) {
+                    merge_field_into(&mut entries, &mut positions, field.value_cursor);
+                } else {
                     upsert_field(
                         &mut entries,
                         &mut positions,
-                        source_field.key_cursor,
-                        source_field.value_cursor,
+                        field.key_cursor,
+                        field.value_cursor,
+                        &key_value,
                     );
                 }
+                fields = rest;
             }
-        } else {
+
+            return Some(entries);
+        }
+
+        seen.push((field.key_cursor, field.value_cursor, key_value));
+        fields = rest;
+    }
+}
+
+/// Expand one `<<` field's merge sources into `entries`/`positions`.
+///
+/// Reverse the source list so an earlier-listed source (higher merge-spec
+/// priority) is applied last and wins value conflicts, while a later-listed
+/// source's unique keys still claim the earlier positions (see
+/// `resolve_merge_keys`'s doc comment).
+fn merge_field_into<'a, W: AsRef<[u64]>>(
+    entries: &mut Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)>,
+    positions: &mut BTreeMap<String, usize>,
+    value_cursor: YamlCursor<'a, W>,
+) {
+    for source in merge_sources(value_cursor).into_iter().rev() {
+        for source_field in YamlFields::raw(source.first_child()) {
+            let key_value = source_field.key_cursor.value();
             upsert_field(
-                &mut entries,
-                &mut positions,
-                field.key_cursor,
-                field.value_cursor,
+                entries,
+                positions,
+                source_field.key_cursor,
+                source_field.value_cursor,
+                &key_value,
             );
         }
     }
-
-    Some(entries)
 }
 
 /// Insert a field by name, or overwrite an existing entry's value in place.
+///
+/// `key_value` is the key's already-decoded value, passed in rather than
+/// re-derived from `key` — see `resolve_merge_keys`'s doc comment for why a
+/// second `YamlCursor::value()` call on an already-visited key is expensive.
 fn upsert_field<'a, W: AsRef<[u64]>>(
     entries: &mut Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)>,
     positions: &mut BTreeMap<String, usize>,
     key: YamlCursor<'a, W>,
     value: YamlCursor<'a, W>,
+    key_value: &YamlValue<'a, W>,
 ) {
-    let name = key.value().key_string().into_owned();
+    let name = key_value.key_string().into_owned();
     match positions.get(&name) {
         Some(&pos) => entries[pos] = (key, value),
         None => {
@@ -3292,16 +3357,13 @@ fn upsert_field<'a, W: AsRef<[u64]>>(
     }
 }
 
-/// Is this key node YAML's merge key?
+/// Is this key's already-decoded value YAML's merge key?
 ///
 /// Empirically, mikefarah/yq treats a key whose *decoded* content is `<<` as
 /// a merge key even when quoted (`"<<"`), so this compares decoded string
 /// content rather than requiring an unquoted plain scalar.
-fn is_merge_key<W: AsRef<[u64]>>(key_cursor: &YamlCursor<'_, W>) -> bool {
-    match key_cursor.value() {
-        YamlValue::String(s) => matches!(s.as_str(), Ok(ref v) if v == "<<"),
-        _ => false,
-    }
+fn is_merge_key_value<W: AsRef<[u64]>>(key_value: &YamlValue<'_, W>) -> bool {
+    matches!(key_value, YamlValue::String(s) if matches!(s.as_str(), Ok(ref v) if v == "<<"))
 }
 
 /// Resolve a `<<` value to the ordered list of mapping sources it names.
