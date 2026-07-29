@@ -444,20 +444,34 @@ impl AdvancePositions {
 
         let advance_count = self.advance_rank1(open_idx + 1);
 
-        let result = if advance_count == 0 {
-            None
+        let (result, ib_word_idx, ib_ones_before, last_ib_arg) = if advance_count == 0 {
+            (None, 0, 0, usize::MAX)
         } else {
-            self.ib_select1(advance_count - 1).map(|pos| pos as u32)
+            let k = advance_count - 1;
+            match self.ib_select1_with_state(k) {
+                Some((pos, word_idx, ones_before)) => (Some(pos as u32), word_idx, ones_before, k),
+                None => (None, 0, 0, usize::MAX),
+            }
         };
 
-        // Set up cursor for subsequent sequential access starting at open_idx + 1
+        // Set up cursor for subsequent sequential access starting at open_idx + 1,
+        // resuming IB scanning from exactly where this lookup left off (the
+        // word/ones-before pair `ib_select1_with_state` already computed)
+        // rather than resetting to word 0. A reset here forces the *next*
+        // `get_sequential` call to rescan the IB bitmap from the very start of
+        // the document to catch back up — O(current document position) instead
+        // of the O(1) amortized cost `get_sequential` is documented to have.
+        // That cost is paid once per backward jump, so a caller that
+        // repeatedly decodes-then-rewinds (e.g. a per-mapping merge-key check
+        // followed by the mapping's real field walk) turns an O(n) document
+        // walk into O(n^2) — see `resolve_merge_keys` in `src/yaml/light.rs`.
         self.cursor.set(SequentialCursor {
             next_open_idx: open_idx + 1,
             adv_cumulative: advance_count,
-            ib_word_idx: 0,
-            ib_ones_before: 0,
-            last_ib_arg: usize::MAX,
-            last_ib_result: 0,
+            ib_word_idx,
+            ib_ones_before,
+            last_ib_arg,
+            last_ib_result: result.map_or(0, |r| r as usize),
         });
 
         result
@@ -580,37 +594,58 @@ impl AdvancePositions {
     /// Select the k-th 1-bit in IB (0-indexed).
     #[inline]
     fn ib_select1(&self, k: usize) -> Option<usize> {
+        self.ib_select1_with_state(k).map(|(pos, _, _)| pos)
+    }
+
+    /// Select the k-th 1-bit in IB (0-indexed), also returning the resulting
+    /// word index and the ones-count before that word (word-boundary-aligned,
+    /// matching the `SequentialCursor` invariant) — the state a caller needs
+    /// to resume forward scanning from here instead of from word 0. See
+    /// `get_random`'s doc comment for why that matters.
+    #[inline]
+    fn ib_select1_with_state(&self, k: usize) -> Option<(usize, usize, usize)> {
         if k >= self.ib_ones {
             return None;
         }
 
         // Use select samples to find starting word
         let sample_idx = k / SELECT_SAMPLE_RATE;
-        let (start_word, mut remaining) = if sample_idx < self.ib_select_samples.len() {
+        let has_sample = sample_idx < self.ib_select_samples.len();
+
+        let (start_word, mut remaining, mut ones_before) = if has_sample {
             let sample_pos = self.ib_select_samples[sample_idx] as usize;
             let skip_ones = sample_idx * SELECT_SAMPLE_RATE;
-            (sample_pos / 64, k - skip_ones)
+            let word_idx = sample_pos / 64;
+            let bit_offset = sample_pos % 64;
+            // `skip_ones` counts ones up to the sample *bit*, not the word
+            // boundary — recover the word-boundary-aligned count by
+            // subtracting the ones already seen earlier in this same word.
+            let prefix_ones =
+                (self.ib_words[word_idx] & ((1u64 << bit_offset) - 1)).count_ones() as usize;
+            (word_idx, k - skip_ones, skip_ones - prefix_ones)
         } else {
-            (0, k)
+            (0, k, 0)
         };
 
         // Scan from sample position
         for word_idx in start_word..self.ib_words.len() {
-            let word = if word_idx == start_word && sample_idx < self.ib_select_samples.len() {
+            let full_word = self.ib_words[word_idx];
+            let word = if word_idx == start_word && has_sample {
                 // Mask off bits before sample position
                 let sample_pos = self.ib_select_samples[sample_idx] as usize;
                 let bit_offset = sample_pos % 64;
-                self.ib_words[word_idx] & !((1u64 << bit_offset) - 1)
+                full_word & !((1u64 << bit_offset) - 1)
             } else {
-                self.ib_words[word_idx]
+                full_word
             };
 
             let ones = word.count_ones() as usize;
             if ones > remaining {
                 let bit_pos = select_in_word(word, remaining as u32) as usize;
-                return Some(word_idx * 64 + bit_pos);
+                return Some((word_idx * 64 + bit_pos, word_idx, ones_before));
             }
             remaining -= ones;
+            ones_before += full_word.count_ones() as usize;
         }
 
         None
@@ -1064,5 +1099,68 @@ mod tests {
         // All opens are at position 5 → should return last (4)
         assert_eq!(ap.find_last_open_at_text_pos(5), Some(4));
         assert_eq!(ap.find_last_open_at_text_pos(0), None);
+    }
+
+    /// Monotonically non-decreasing positions with irregular (non-arithmetic)
+    /// gaps. A plain `i * constant` sequence can accidentally make every
+    /// `SELECT_SAMPLE_RATE`-th select sample land exactly on a 64-bit word
+    /// boundary (e.g. any multiple of 256, since 256 is itself a multiple of
+    /// 64) — which would silently stop a test from ever exercising
+    /// `get_random`'s within-word case, the one an earlier (broken) version
+    /// of the #171-review fix got wrong. Irregular gaps avoid that trap.
+    fn irregular_positions(n: usize, seed: u64) -> Vec<u32> {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let mut pos = 0u32;
+        (0..n)
+            .map(|_| {
+                pos += rng.random_range(1..=6);
+                pos
+            })
+            .collect()
+    }
+
+    /// A backward jump (`get_random`) must leave the cursor correctly seeded
+    /// for the *next* sequential call, not just for the jump itself.
+    #[test]
+    fn test_get_random_then_sequential_resumes_correctly() {
+        let positions = irregular_positions(2000, 1);
+        let ap = AdvancePositions::build_unchecked(&positions, 20_000);
+
+        // Forward pass (like a merge-key prescan), then rewind to the start
+        // and walk forward again (the real field walk) — the exact
+        // decode-then-restart shape that triggered the bug.
+        for (i, &pos) in positions.iter().enumerate() {
+            assert_eq!(ap.get(i), Some(pos), "forward pass 1, i={i}");
+        }
+        for (i, &pos) in positions.iter().enumerate() {
+            assert_eq!(ap.get(i), Some(pos), "forward pass 2, i={i}");
+        }
+
+        // Every (backward jump, then resume sequentially to the end) pair,
+        // for a spread of jump targets — exercises `get_random` landing both
+        // inside and outside a sample's own word.
+        for &jump_to in &[0, 1, 63, 64, 65, 255, 256, 257, 511, 1000, 1999] {
+            for (i, &pos) in positions.iter().enumerate().skip(jump_to) {
+                assert_eq!(ap.get(i), Some(pos), "after jump to {jump_to}, i={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_random_access_pattern_matches_reference() {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        let positions = irregular_positions(3000, 2);
+        let ap = AdvancePositions::build_unchecked(&positions, 20_000);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(171);
+        for _ in 0..20_000 {
+            let i = rng.random_range(0..positions.len());
+            assert_eq!(ap.get(i), Some(positions[i]), "random access i={i}");
+        }
     }
 }
