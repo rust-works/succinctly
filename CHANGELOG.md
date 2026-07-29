@@ -103,6 +103,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq compound/alternative assignment (`+= -= *= /= %= //=`) evaluated the
+  right-hand side against the sub-value at the path instead of the document
+  root** (#159): `eval_compound_assign`/`eval_alternative_assign` in
+  `src/jq/eval.rs` built a filter embedding the *unevaluated* RHS expression
+  and handed it to `update_path`, whose `Identity` leaf supplies the sub-value
+  already navigated to `path` as `.` — so `.a += .b` resolved `.b` against
+  `.a`'s value, not the root. `{"a":1,"b":2} | .a += .b` raised `expected
+  object, got number` instead of `{"a":3,"b":2}`; `{"a":null,"b":5} | .a //=
+  .b` returned `.a` unchanged instead of `5`. A literal RHS (`.a += 5`) masked
+  the bug since a literal doesn't reference `.`. Fixed by evaluating the RHS
+  once against the original input up front (new `eval_rhs_once` helper,
+  shared with `eval_assign`, which already worked this way) and splicing the
+  resulting value into the filter via the existing `owned_to_expr` (also used
+  by `eval_as`/`eval_reduce`/`eval_foreach`), so `update_path`'s per-path `.`
+  no longer resolves into it. Confirmed against real jq (jq-1.7.1) that the
+  RHS is evaluated exactly once against the pristine root even when the path
+  expression touches multiple elements — `{"a":[1,2,3]} | .a[] += .a[0]`
+  yields `{"a":[2,3,4]}` (every element gets the original `.a[0]`), not
+  `[2,4,6]` — and that `//=` is not specially lazy (`.a //= error("x")` still
+  raises when `.a` is already truthy), both now covered by new tests
+  alongside the two reported repros.
+
 - **A tab that indented a sequence-item continuation line was folded into a
   plain scalar instead of rejected** (#432, also fixing #371): three related
   gaps in `parse_unquoted_value_with_indent_impl` and `parse_mapping_entry`
