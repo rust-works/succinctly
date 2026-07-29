@@ -103,6 +103,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The strict YAML validator accepted a flow-collection anchor immediately
+  followed by an alias** (#452): `[&a *a]` and `{k: &a *a}` passed
+  `succinctly yaml validate`, which `yq` rejects — an anchor property cannot
+  decorate an alias node. Block context already rejected the same shape on
+  one line (`&a *b`, `AnchorOnAlias`, SR86/SU74) via `scan_anchor`, but
+  `scan_flow`'s `&` arm (shared by `[...]` and `{...}`) had no equivalent
+  check: it recorded the anchor and read a following `*alias` as an ordinary
+  reference, which also passed the unrelated #404 unknown-anchor check since
+  the anchor had just been registered into scope. The placement check is now
+  `check_after_anchor`, shared by both call sites — block's `scan_anchor`
+  (after its same-line `skip_spaces_and_tabs`) and flow's `&` arm (after
+  `skip_flow_ws`, which — unlike block — also crosses line breaks and
+  comments, so `[&a\n*a]` is rejected too).
+
 - **Two `compare_values` comparators (and a private `numeric_repr_cmp`) disagreed
   with jq about NaN, and with each other** (#421): jq treats NaN as strictly
   less than every number, including another NaN — `nan < 1`, `nan < nan`, and
