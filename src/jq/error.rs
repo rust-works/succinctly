@@ -280,6 +280,50 @@ impl EvalError {
         Self::new("Path must be specified as an array")
     }
 
+    /// `Paths must be specified as an array`.
+    ///
+    /// `delpaths`'s own whole-argument shape refusal — `delpaths(1)`,
+    /// `delpaths(null)`. Spelled with the plural noun, distinct from
+    /// [`Self::path_must_be_array`], which is `setpath`/`getpath`'s sentence
+    /// for the same shape of mistake.
+    pub fn paths_must_be_array() -> Self {
+        Self::new("Paths must be specified as an array")
+    }
+
+    /// `Path must be specified as array, not <type>`.
+    ///
+    /// `delpaths(paths)` raises this for one entry of `paths` that is not
+    /// itself an array — `delpaths([0])`, `delpaths(["a"])`. Checked over the
+    /// whole list before any deletion runs, so a bad entry anywhere refuses
+    /// the call rather than deleting the entries that sort ahead of it.
+    pub fn path_must_be_array_not(type_name: &str) -> Self {
+        Self::new(format!("Path must be specified as array, not {type_name}"))
+    }
+
+    /// `Cannot delete fields from <type>`.
+    ///
+    /// `delpaths`/`del` reached a scalar (other than `null`) as the container
+    /// to delete a key from — `1 | delpaths([[0]])`.
+    pub fn cannot_delete_fields_from(type_name: &str) -> Self {
+        Self::new(format!("Cannot delete fields from {type_name}"))
+    }
+
+    /// `Cannot delete <type> field of object`.
+    ///
+    /// `delpaths`/`del` named an object field to delete with a non-string key
+    /// — `{"a":1} | delpaths([[0]])`.
+    pub fn cannot_delete_field_of_object(key_type: &str) -> Self {
+        Self::new(format!("Cannot delete {key_type} field of object"))
+    }
+
+    /// `Cannot delete <type> element of array`.
+    ///
+    /// `delpaths`/`del` named an array element to delete with a non-number
+    /// key — `[1,2] | delpaths([["a"]])`.
+    pub fn cannot_delete_element_of_array(key_type: &str) -> Self {
+        Self::new(format!("Cannot delete {key_type} element of array"))
+    }
+
     /// `Out of bounds negative array index`.
     ///
     /// jq raises this for a negative index that is still negative after being

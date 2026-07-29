@@ -174,6 +174,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new `jq_golden_tests` cases (`comma_in_call_args`, `comma_in_limit_arg`,
   `comma_in_user_func_call`).
 
+- **`delpaths` silently accepted inputs jq refuses** (#395, closing #415):
+  `delpaths` deleted what it could and dropped the rest instead of raising.
+  `1 | delpaths([["a"]])` returned `1` unchanged instead of `Cannot delete
+  fields from number`; `{"a":1} | delpaths([[0]])` returned `{"a":1}` instead
+  of `Cannot delete number field of object`; `[1,2] | delpaths([0])` — a
+  plausible typo for `delpaths([[0]])` — returned `[1,2]` instead of `Path
+  must be specified as array, not number`. `delete_keys` and
+  `delete_paths_under` (`src/jq/eval.rs`) now return `Result<OwnedValue,
+  EvalError>` and raise jq's own sentences — `Cannot delete <type> field of
+  object`, `Cannot delete <type> element of array`, `Cannot delete fields
+  from <type>`, and `Cannot index <type> with <key>` for a scalar reached
+  mid-path — and `builtin_delpaths` validates every entry's shape as a
+  pre-pass before any deletion runs, so `delpaths([[0],"a"])` refuses outright
+  rather than deleting `[0]` first the way a per-path loop would. Four new
+  error constructors on `EvalError` (`src/jq/error.rs`) carry the exact
+  wording, confirmed against jq-1.7.1. `null` stays a no-op, as jq treats it.
+  Not fixed here: `delpaths`/`setpath` still silently no-op on an
+  object-shaped ("slice") path component against an array instead of
+  performing the slice edit or raising, tracked as #469.
+
 - **jq compound/alternative assignment (`+= -= *= /= %= //=`) evaluated the
   right-hand side against the sub-value at the path instead of the document
   root** (#159): `eval_compound_assign`/`eval_alternative_assign` in
@@ -598,8 +618,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Seven cases captured from jq 1.7.1 pin the behaviour, and both evaluators are
   checked for agreement. Deleting many array elements is also **~50x faster**
   (30k of 60k: 1.03s → 0.02s) and many object keys **~90x** (30k of 60k: 4.4s →
-  0.05s), both having been quadratic. Still divergent, as before: `delpaths`
-  silently no-ops where jq raises (#415), and `del()` with negative computed
+  0.05s), both having been quadratic. `delpaths` silently no-opping where jq
+  raises was fixed separately (#415, #395), and `del()` with negative computed
   indexes has the bug this fixes (#424).
 
 - **`bsearch` reported absent containers as found, and returned an object when
