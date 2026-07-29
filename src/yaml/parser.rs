@@ -908,8 +908,12 @@ impl<'a> Parser<'a> {
         if slice != b"---" {
             return false;
         }
-        // Must be followed by space, line break, or EOF
-        matches!(self.peek_at(3), Some(b' ' | b'\n' | b'\r') | None)
+        // Must be followed by white space (space or tab), a line break, or EOF.
+        // The tab is not optional: `doc_marker_char` (validate.rs), the strict
+        // validator's copy of this same check, already includes it, and
+        // dropping it here meant `---\tfoo` was silently parsed as content
+        // instead of a document boundary (#434).
+        matches!(self.peek_at(3), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
     }
 
     /// Check if we're at a document end marker (`...`).
@@ -921,8 +925,9 @@ impl<'a> Parser<'a> {
         if slice != b"..." {
             return false;
         }
-        // Must be followed by space, line break, or EOF
-        matches!(self.peek_at(3), Some(b' ' | b'\n' | b'\r') | None)
+        // Must be followed by white space (space or tab), a line break, or EOF.
+        // See `is_document_start` for why the tab isn't optional (#434).
+        matches!(self.peek_at(3), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
     }
 
     /// Skip past a document marker (`---` or `...`).
@@ -932,8 +937,10 @@ impl<'a> Parser<'a> {
         self.advance();
         self.advance();
         self.advance();
-        // Skip trailing space after marker if present
-        if self.peek() == Some(b' ') {
+        // Skip trailing separation white space after the marker, if present -
+        // both space and tab, matching `parse_inline_document_value`'s own
+        // leading-whitespace skip right after this call (#434).
+        while matches!(self.peek(), Some(b' ' | b'\t')) {
             self.advance();
         }
     }
@@ -960,9 +967,9 @@ impl<'a> Parser<'a> {
     /// split one document into two.
     ///
     /// The indent is 0 rather than one re-derived from the cursor:
-    /// [`Self::skip_document_marker`] consumes only a single trailing space, so
-    /// `count_indent` would read `---···&x` as indent 3, when the node is at
-    /// document root either way.
+    /// [`Self::skip_document_marker`] consumes a run of trailing spaces and
+    /// tabs, so `count_indent` would read `---···&x` as indent 3 (or worse
+    /// with a tab in the run), when the node is at document root either way.
     fn parse_inline_document_value(&mut self) -> Result<(), YamlError> {
         // Skip leading whitespace
         self.skip_inline_whitespace();

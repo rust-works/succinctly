@@ -80,7 +80,6 @@ HMQ5      tags              tags (!) not supported — #224
 HU3P      lax:mapping       mapping/key rules not validated — #223
 J7PZ      tags              tag shorthand emitted as scalar text — #224
 JEF9/02   scalars           blank final line with no break — follows yq, which gives "" — #344
-K54U      scalars           scalar content/folding differs from spec
 KS4U      lax:flow          flow syntax not validated — #223
 L24T/00   scalars           scalar content/folding differs from spec
 L94M      tags              tag shorthand emitted as scalar text — #224
