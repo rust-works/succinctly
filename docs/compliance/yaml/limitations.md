@@ -26,7 +26,7 @@ path:
 
 | Dimension                              | Result              | Meaning                                        |
 |----------------------------------------|---------------------|------------------------------------------------|
-| **Load** (valid YAML, output compared) | **216/279 = 77.4%** | Parses and produces the JSON the suite expects |
+| **Load** (valid YAML, output compared) | **217/279 = 77.8%** | Parses and produces the JSON the suite expects |
 | **Reject** (invalid YAML, must fail)   | **70/94 = 74.5%**   | Refused by the loader or the opt-in validator  |
 | **Parse** (valid YAML, no JSON form)   | **27/29 = 93.1%**   | Parses without error                           |
 
@@ -35,7 +35,7 @@ validator enabled (loader OR validator, see below). The *default non-validating
 loader alone* still rejects only 12/94 (12.8%) by design — the opt-in validator
 ([#223](https://github.com/rust-works/succinctly/issues/223)) closes 58 more.
 
-The 89 non-passing cases are enumerated individually, with a category and reason, in
+The 88 non-passing cases are enumerated individually, with a category and reason, in
 [`tests/data/yaml-test-suite-known-failures.txt`](../../../tests/data/yaml-test-suite-known-failures.txt).
 That file is the machine-readable source of truth; the test asserts it matches reality
 exactly, so it cannot silently drift from this page.
@@ -190,7 +190,7 @@ The loader stops where it cannot continue, not where a rule is broken — which 
 
 ## Unsupported features
 
-These are absent rather than wrong, and account for 47 of the 77 load failures.
+These are absent rather than wrong, and account for 47 of the 62 load failures.
 
 ### Tags — 33 cases (31 load, 2 parse)
 
@@ -316,14 +316,21 @@ floats render as integers on the streaming path, `1.0` → `1` —
 [#168](https://github.com/rust-works/succinctly/issues/168) /
 [#170](https://github.com/rust-works/succinctly/issues/170)).
 
-## Full accounting of the 63 load failures
+## Full accounting of the 62 load failures
 
 | Category     | Cases | Cause                                                             |
 |--------------|-------|-------------------------------------------------------------------|
 | `tags`       | 31    | Tags not supported (above)                                        |
 | `directives` | 16    | `%YAML` / `%TAG` not recognized (above)                           |
-| `structure`  | 9     | Document end markers; anchors with colons in the name             |
+| `structure`  | 8     | Document end markers; anchors with colons in the name             |
 | `scalars`    | 7     | Zero-indented block scalars; tabs; trailing whitespace            |
+
+`structure` was 9 until [#407](https://github.com/rust-works/succinctly/issues/407). The
+content of a `---` line went through a hand-rolled partial copy of the block-context
+dispatch, which opened an empty node for an anchor whose node was on the next line — and a
+node at document root *is* a document, so `--- &x` split one document into two and left the
+node unanchored. Sharing the one dispatch cleared `FTA2` (`--- &sequence` over a block
+sequence) and, off the suite, `--- &x {a: 1}`, `--- ? a` and `--- "a": 1`.
 
 `scalars` was 13 until [#329](https://github.com/rust-works/succinctly/issues/329). Folded
 (`>`) block scalars mis-counted the newlines a blank line is worth — a blank line yielded

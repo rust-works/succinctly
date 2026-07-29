@@ -466,17 +466,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now instead of producing an empty key. Aliases that already resolved are
   unchanged.
 
-  One document-root form is deliberately *not* given an anchor: `&x` alone on
-  the `---` line, with the node on a following line. What follows starts at
-  indent 0, which this parser reads as a separate document, so the only node
-  here for the anchor to name is an empty placeholder — and binding it there
-  would make a later `*x` resolve to that placeholder and render as `null`,
-  reintroducing the very miss this change removes. The anchor is consumed
-  without being recorded, so the alias is the error it should be. `yq` reports
-  `unknown anchor 'x'` for the block-mapping form of this input too; for the
-  block-sequence form it reads a plain scalar instead, so rejecting is a
-  deliberate divergence over inventing `null`. The pre-existing bug that splits
-  `--- &x` and its node into two documents is untouched.
+  One document-root form was left deliberately anchorless while the underlying
+  document split remained: `&x` alone on the `---` line, with its node on a
+  following line. The anchor was consumed without being recorded, so a later
+  `*x` was the error it should be rather than a silent `null`. #407 below
+  removed the split, and the anchor now binds to the node it names.
 
   No YAML Test Suite manifest movement: no case in the suite contains an alias
   to an anchor that is not in scope, so none could flip. The three `lax:anchors`
@@ -485,6 +479,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **Breaking**: adds a `YamlError::UnknownAnchor` variant, so exhaustive
   `match`es on the public `YamlError` gain an arm.
+- **YAML `--- &x` with its node on the next line split one document into two**
+  (#407): an anchor alone on the `---` line yielded `null` followed by the real
+  document, and the node the anchor should have named went unanchored —
+  `printf -- '--- &x\na: 1\n' | syq -o json -I0 .` printed `null` and
+  `{"a":1}`. Per YAML 1.2 the `&x` property attaches to the document's root
+  node, so that is one document, `{"a":1}`, with `x` bound to it. The same
+  input without `---` was always correct.
+
+  The cause was two dispatchers for one grammar: the content of a `---` line
+  went through a hand-rolled partial copy of the block-context dispatch in
+  `parse_document_line`. The copy opened an empty node for the anchor to name,
+  and a node at document root *is* a document. The copy is gone; both entry
+  points now share one `parse_block_node`, and a new differential
+  (`tests/yaml_document_start_line_tests.rs`) asserts that `--- X` and a bare
+  `X` parse identically — the test the missing definition never had.
+
+  Five more shapes were diverging the same way and are fixed with it:
+  `--- &x` over a block sequence (suite case `FTA2`, which moves out of the
+  known-failures manifest), the indented `--- &x` over `  a: 1`,
+  `--- &x {a: 1}` (which read the `:` *inside* the flow mapping and gave
+  `{"":"1}"}`), `--- ? a` (which gave the literal `"? a"`), and `--- "a": 1`
+  (which gave `"a"` and `1`).
+
+  Two consequent behaviour changes, both matching the `---`-less form exactly:
+  `--- &x\na: 1\nb: *x` and `--- &x\n- 1\n- *x` now report a *cyclic* alias
+  rather than an unknown one, because the anchor binds; and
+  `--- &x\na: 1\n---\nb: *x` resolves the alias across the document break.
+  A tag on the `---` line is still not rejected the way a bare one is — that
+  asymmetry is #224's, and is now noted at the one place it lives.
 
 - **An anchor at the end of a compact mapping entry's line swallowed the nested
   value** (#406): `- k: &a` followed by an indented block read that block as one

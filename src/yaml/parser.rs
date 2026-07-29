@@ -951,79 +951,38 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse content after a document marker on the same line (e.g., `--- >` or `--- value`).
+    ///
+    /// The content of a `---` line is an ordinary block-context node that
+    /// happens to start mid-line, so it goes through the same
+    /// [`Self::parse_block_node`] every other line does. It had its own partial
+    /// copy of that dispatch until #407, and the two had drifted apart in six
+    /// shapes — most visibly `--- &x` with its node on the next line, which
+    /// split one document into two.
+    ///
+    /// The indent is 0 rather than one re-derived from the cursor:
+    /// [`Self::skip_document_marker`] consumes only a single trailing space, so
+    /// `count_indent` would read `---···&x` as indent 3, when the node is at
+    /// document root either way.
     fn parse_inline_document_value(&mut self) -> Result<(), YamlError> {
         // Skip leading whitespace
-        while self.peek() == Some(b' ') || self.peek() == Some(b'\t') {
-            self.advance();
+        self.skip_inline_whitespace();
+
+        // The one arm that is genuinely the `---` line's own. `parse_block_node`
+        // has no `|`/`>` arm: at document root a block scalar falls to its
+        // plain-scalar arm, and `YamlCursor::value` re-reads the header from
+        // the node's text (`parse_block_header`) when the value is
+        // materialized. Calling `parse_block_scalar` directly keeps `--- |` on
+        // the path it has always taken.
+        //
+        // A tag is the other asymmetry, and deliberately left alone here:
+        // `check_unsupported` runs in `parse_document_line` but not on this
+        // path, so `--- !!str x` indexes as a scalar where a bare `!!str x` is
+        // rejected. That is #224's to settle, not this dispatch's.
+        if matches!(self.peek(), Some(b'|' | b'>')) {
+            return self.parse_block_scalar(0);
         }
 
-        match self.peek() {
-            Some(b'|' | b'>') => {
-                // Block scalar
-                self.parse_block_scalar(0)?;
-            }
-            Some(b'"') => {
-                // Quoted string
-                self.set_ib();
-                self.write_bp_open();
-                self.parse_double_quoted()?;
-                self.set_bp_text_end(self.pos);
-                self.write_bp_close();
-            }
-            Some(b'\'') => {
-                // Single-quoted string
-                self.set_ib();
-                self.write_bp_open();
-                self.parse_single_quoted()?;
-                self.set_bp_text_end(self.pos);
-                self.write_bp_close();
-            }
-            Some(b'[' | b'{') => {
-                // Flow collection
-                self.parse_value(0)?;
-            }
-            Some(b'-') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
-                // Block sequence item
-                self.parse_sequence_item(0)?;
-            }
-            // An anchor or alias that *is* the document (`--- &a 1`, `--- *a`),
-            // as opposed to one prefixing a key (`--- &a k: v`), which the
-            // mapping-entry arm below owns. The plain-scalar arm swallowed
-            // both: the anchor went unregistered and the alias never became an
-            // alias node, so `--- *a` rendered as `null` (#372).
-            Some(b'&' | b'*') if !self.looks_like_mapping_entry() => {
-                // `&a` with nothing after it on the line has no node here to
-                // name: whatever follows starts at indent 0, which this parser
-                // reads as a *separate* document, so the node `parse_value`
-                // opens below is the empty placeholder. Binding the anchor to
-                // that placeholder made a later `*a` resolve to it and render
-                // as `null` — the silent miss this issue removes everywhere
-                // else, and the one `yq` reports as `unknown anchor` for this
-                // same input. Consuming the name without recording it lets that
-                // alias be the error it should be (#372).
-                if self.peek() == Some(b'&') && self.anchor_ends_the_line() {
-                    self.advance();
-                    self.parse_anchor_name()?;
-                    self.skip_inline_whitespace();
-                }
-                self.parse_value(0)?;
-            }
-            Some(_) if self.looks_like_mapping_entry() => {
-                // Mapping entry
-                self.parse_mapping_entry(0)?;
-            }
-            Some(_) => {
-                // Plain scalar at document root
-                self.set_ib();
-                self.write_bp_open();
-                let end = self.parse_unquoted_value_doc_root(0);
-                self.set_bp_text_end(end);
-                self.write_bp_close();
-            }
-            None => {}
-        }
-
-        Ok(())
+        self.parse_block_node(0)
     }
 
     /// Start a new document within the virtual root sequence.
@@ -3626,23 +3585,6 @@ impl<'a> Parser<'a> {
         Ok(name)
     }
 
-    /// Whether the `&name` at the cursor is the last content on its line, so
-    /// the node it would name is not on this line.
-    ///
-    /// Pure lookahead: the cursor is restored before returning. A malformed
-    /// name reads as `false` so that [`Self::parse_anchor`] reports it, at the
-    /// offset it always did, rather than this scan reporting it early.
-    fn anchor_ends_the_line(&mut self) -> bool {
-        debug_assert_eq!(self.peek(), Some(b'&'));
-        let saved = self.pos;
-        self.advance();
-        let named = self.parse_anchor_name().is_ok();
-        self.skip_inline_whitespace();
-        let ends_line = named && self.at_line_end();
-        self.pos = saved;
-        ends_line
-    }
-
     /// Parse an anchor definition (`&name`).
     /// Records the anchor and returns, expecting the value to follow.
     fn parse_anchor(&mut self) -> Result<String, YamlError> {
@@ -3983,6 +3925,30 @@ impl<'a> Parser<'a> {
         // lands on the line's real first byte instead of the tab (#381).
         self.skip_separation_whitespace(line_start);
 
+        self.parse_block_node(indent)?;
+
+        // Move to next line if we haven't already
+        self.skip_line_break();
+
+        Ok(())
+    }
+
+    /// Dispatch the block-context node that begins at the cursor, treating
+    /// `indent` as its indentation level.
+    ///
+    /// One definition for both ways into block context: an ordinary document
+    /// line ([`Self::parse_document_line`], which derives `indent` from the
+    /// line's leading spaces) and the content of a `---` line
+    /// ([`Self::parse_inline_document_value`], always at document root, so
+    /// `indent` is 0).
+    ///
+    /// The `---` line used to carry its own copy of this match, missing arms
+    /// and ordering the ones it did have differently, so six shapes parsed one
+    /// way on a bare line and another after `---`. `--- &x` with its node on
+    /// the next line was the worst of them: the copy opened an empty node for
+    /// the anchor to name, and a node at document root *is* a document, so one
+    /// document became two (#407).
+    fn parse_block_node(&mut self, indent: usize) -> Result<(), YamlError> {
         // close_deeper_indents will handle closing any SequenceItem entries
         // when we return to a lower indent level
 
@@ -4126,9 +4092,6 @@ impl<'a> Parser<'a> {
             }
             None => {}
         }
-
-        // Move to next line if we haven't already
-        self.skip_line_break();
 
         Ok(())
     }

@@ -411,9 +411,9 @@ mod issue_324 {
         assert_json(b"a: [1, 2]\rb: {c: 3}\r", r#"{"a":[1,2],"b":{"c":3}}"#);
     }
 
-    /// `--- - a` puts a sequence item on the document-marker line, which is its
-    /// own dispatch arm in `parse_inline_document_value` and reaches none of
-    /// the tests above.
+    /// `--- - a` puts a sequence item on the document-marker line, which enters
+    /// the parser through `parse_inline_document_value` — a mid-line cursor at
+    /// document root — and reaches none of the tests above.
     #[test]
     fn sequence_item_on_the_document_marker_line() {
         assert_json(b"--- - a\n- b\n", r#"["a","b"]"#);
