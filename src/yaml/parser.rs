@@ -486,15 +486,34 @@ impl<'a> Parser<'a> {
         self.peek().is_some_and(is_line_break)
     }
 
-    /// Does `next` terminate a `-` sequence indicator? That is whitespace, a
-    /// line break, or end of input.
-    ///
-    /// Delegates to the module-level definition the reader also uses, so the terminator
-    /// set has one spelling (#332). Kept as an associated fn because the guard it appears
-    /// in must stay on one line for `llvm-cov` to see it (#324).
+    /// Is `b` whitespace or a line break?
     #[inline]
-    fn is_seq_indicator_next(next: Option<u8>) -> bool {
-        super::is_seq_indicator_next(next)
+    fn is_ws_or_break(b: u8) -> bool {
+        matches!(b, b' ' | b'\t') || is_line_break(b)
+    }
+
+    /// Does `next` terminate an indicator character — whitespace, a line break,
+    /// or end of input?
+    ///
+    /// This is the lookahead that separates a *structural* `-`/`?`/`:` from the
+    /// first byte of a plain scalar. It had seventeen inline `matches!` copies
+    /// before #340; one definition means the `HAS_CR` gate has a single place to
+    /// live and the copies cannot drift apart (#106). It also keeps the test off
+    /// its own source line, which a multi-line `matches!` in a match guard turns
+    /// into a coverage region that never reports as executed.
+    ///
+    /// This is the parser's spelling of the terminator set [`super::is_seq_indicator_next`]
+    /// gives the *reader* (#332). It cannot simply call it: the whole point of #340 is that
+    /// the `\r` arm here becomes compile-time gated, and the reader — which indexes into
+    /// text rather than scanning it under a `HAS_CR` specialization — has no such gate. The
+    /// two are therefore pinned by `is_ws_break_or_eoi_agrees_with_is_seq_indicator_next`
+    /// rather than by the compiler; change one acceptance set and that test fails.
+    #[inline]
+    fn is_ws_break_or_eoi(next: Option<u8>) -> bool {
+        match next {
+            Some(b) => Self::is_ws_or_break(b),
+            None => true,
+        }
     }
 
     /// Consume the line break at the current position, if any.
@@ -730,9 +749,9 @@ impl<'a> Parser<'a> {
         let mut i = self.pos;
         while i < self.input.len() {
             match self.input[i] {
-                b'\n' | b'\r' => return true,
                 b'#' => return true, // Comment starts
                 b' ' => i += 1,
+                b if is_line_break(b) => return true,
                 _ => return false,
             }
         }
@@ -749,7 +768,7 @@ impl<'a> Parser<'a> {
             // Empty key: `:` at start followed by whitespace/newline/EOF
             Some(b':') => {
                 let next = self.peek_at(1);
-                if matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
+                if Self::is_ws_break_or_eoi(next) {
                     return true;
                 }
                 // Colon not followed by whitespace - continue checking
@@ -791,7 +810,7 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                return matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None);
+                return Self::is_ws_break_or_eoi(next);
             }
             return false;
         }
@@ -799,7 +818,6 @@ impl<'a> Parser<'a> {
         // Scan for `: ` pattern in unquoted key
         while i < self.input.len() {
             match self.input[i] {
-                b'\n' | b'\r' => return false, // Line ended without finding `: `
                 b':' => {
                     // Check what follows the colon
                     let next = if i + 1 < self.input.len() {
@@ -807,11 +825,13 @@ impl<'a> Parser<'a> {
                     } else {
                         None
                     };
-                    match next {
-                        Some(b' ' | b'\t' | b'\n' | b'\r') | None => return true,
-                        _ => i += 1, // Colon not followed by whitespace, continue
+                    if Self::is_ws_break_or_eoi(next) {
+                        return true;
                     }
+                    i += 1; // Colon not followed by whitespace, continue
                 }
+                // Line ended without finding `: `
+                b if is_line_break(b) => return false,
                 // Note: " and ' in the middle of a key are allowed (e.g., bla"keks: foo)
                 // Continue scanning past them.
                 _ => i += 1,
@@ -920,7 +940,7 @@ impl<'a> Parser<'a> {
         // validator's copy of this same check, already includes it, and
         // dropping it here meant `---\tfoo` was silently parsed as content
         // instead of a document boundary (#434).
-        matches!(self.peek_at(3), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
+        Self::is_ws_break_or_eoi(self.peek_at(3))
     }
 
     /// Check if we're at a document end marker (`...`).
@@ -934,7 +954,7 @@ impl<'a> Parser<'a> {
         }
         // Must be followed by white space (space or tab), a line break, or EOF.
         // See `is_document_start` for why the tab isn't optional (#434).
-        matches!(self.peek_at(3), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
+        Self::is_ws_break_or_eoi(self.peek_at(3))
     }
 
     /// Skip past a document marker (`---` or `...`).
@@ -1199,7 +1219,6 @@ impl<'a> Parser<'a> {
             // Use inline scalar loop for common case, SIMD for long runs
             while let Some(b) = self.peek() {
                 match b {
-                    b'\n' | b'\r' => break,
                     b'#' => {
                         // # is only a comment if preceded by whitespace (space or tab)
                         if self.pos > start && matches!(self.input[self.pos - 1], b' ' | b'\t') {
@@ -1210,18 +1229,19 @@ impl<'a> Parser<'a> {
                     b':' => {
                         // Colon followed by whitespace, a line break, or EOF ends
                         // the value (could be a key). In value context, colons in
-                        // URLs etc. are allowed. The `| None` arm matters: without
+                        // URLs etc. are allowed. The EOF case matters: without
                         // it, a colon as the last byte of the document (no trailing
                         // newline) was absorbed as content instead of terminating
                         // the value, while `find_scalar_end` (the locate-path copy
                         // of this same boundary) already stopped there - eval and
                         // locate disagreed on the same node (#434, same shape as
                         // #370).
-                        if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
+                        if Self::is_ws_break_or_eoi(self.peek_at(1)) {
                             break;
                         }
                         self.advance();
                     }
+                    b if is_line_break(b) => break,
                     _ => {
                         // SIMD/broadword fast-path: skip long runs of regular characters
                         // Only use SIMD if we have enough remaining bytes to justify overhead
@@ -1276,7 +1296,7 @@ impl<'a> Parser<'a> {
 
             // If empty line (just whitespace then newline), skip it and continue
             // This includes lines with only spaces, tabs, or a mix
-            if matches!(next_char, b'\n' | b'\r' | b'\t') {
+            if is_line_break(next_char) || next_char == b'\t' {
                 // Check if rest of line is whitespace
                 let mut check_pos = lookahead;
                 while check_pos < self.input.len() && matches!(self.input[check_pos], b' ' | b'\t')
@@ -1374,8 +1394,7 @@ impl<'a> Parser<'a> {
                 && !sequence_indicator_is_block_structure
                 && !is_document_marker
                 && !(next_char == b':'
-                    && (lookahead + 1 >= self.input.len()
-                        || matches!(self.input[lookahead + 1], b' ' | b'\t' | b'\n' | b'\r')))
+                    && Self::is_ws_break_or_eoi(self.input.get(lookahead + 1).copied()))
             {
                 // Continue to next line
                 self.skip_line_break();
@@ -1411,19 +1430,12 @@ impl<'a> Parser<'a> {
             match b {
                 b':' => {
                     // Check for colon + whitespace or colon + line break
-                    if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
+                    if Self::is_ws_break_or_eoi(self.peek_at(1)) {
                         break;
                     }
                     // Colon not followed by whitespace is part of the key
                     // (e.g., "key::" or URLs like "http://example.com")
                     self.advance();
-                }
-                b'\n' | b'\r' => {
-                    // Key without colon
-                    return Err(YamlError::KeyWithoutValue {
-                        offset: start,
-                        line: self.current_line(),
-                    });
                 }
                 b'#' => {
                     // # starts a comment only after s-separate-in-line, and
@@ -1437,6 +1449,13 @@ impl<'a> Parser<'a> {
                         });
                     }
                     self.advance();
+                }
+                b if is_line_break(b) => {
+                    // Key without colon
+                    return Err(YamlError::KeyWithoutValue {
+                        offset: start,
+                        line: self.current_line(),
+                    });
                 }
                 _ => {
                     // SIMD/broadword fast-path: skip long runs of regular characters
@@ -1695,9 +1714,7 @@ impl<'a> Parser<'a> {
         }
 
         // Check for nested sequence: `- - item` (sequence item containing a sequence)
-        if self.peek() == Some(b'-')
-            && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
-        {
+        if self.peek() == Some(b'-') && Self::is_ws_break_or_eoi(self.peek_at(1)) {
             // Nested sequence - the item value is another sequence.
             // Use the actual column position of the nested `-` as the indent.
             // This ensures that subsequent items at the same column (like `- d` after `- c`)
@@ -1869,8 +1886,8 @@ impl<'a> Parser<'a> {
                 // Check if next content is a sequence indicator
                 let saved_pos = self.pos;
                 self.advance_by(next_indent);
-                let is_sequence_indicator = matches!(self.peek(), Some(b'-'))
-                    && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None);
+                let is_sequence_indicator =
+                    matches!(self.peek(), Some(b'-')) && Self::is_ws_break_or_eoi(self.peek_at(1));
                 self.pos = saved_pos;
 
                 if next_indent < indent || (next_indent == indent && !is_sequence_indicator) {
@@ -1979,7 +1996,7 @@ impl<'a> Parser<'a> {
         let key_end = if self.peek() == Some(b':') {
             // Empty key - check that it's followed by proper terminator
             let next = self.peek_at(1);
-            if matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
+            if Self::is_ws_break_or_eoi(next) {
                 // Empty key case - key length is 0, don't advance yet
                 self.pos
             } else {
@@ -2053,8 +2070,8 @@ impl<'a> Parser<'a> {
             let saved_pos = self.pos;
             self.advance_by(next_indent);
             let next_char = self.peek();
-            let is_sequence_indicator = matches!(next_char, Some(b'-'))
-                && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None);
+            let is_sequence_indicator =
+                matches!(next_char, Some(b'-')) && Self::is_ws_break_or_eoi(self.peek_at(1));
             self.pos = saved_pos;
 
             if next_indent < indent {
@@ -2096,18 +2113,14 @@ impl<'a> Parser<'a> {
 
             // Check if this is a nested structure or a plain scalar value
             match self.peek() {
-                Some(b'-')
-                    if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) =>
-                {
+                Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                     // Sequence - will be handled by main loop
                     self.pos = saved_pos;
                     return Ok(());
                 }
                 // Tab included: the sibling `-` check just above uses the
                 // same 4-way terminator set (#434).
-                Some(b'?')
-                    if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) =>
-                {
+                Some(b'?') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                     // Explicit key - will be handled by main loop
                     self.pos = saved_pos;
                     return Ok(());
@@ -2197,8 +2210,7 @@ impl<'a> Parser<'a> {
                 let is_sequence_at_same_indent = {
                     // Skip past indent spaces to check what follows (SIMD accelerated)
                     self.skip_spaces_simd();
-                    matches!(self.peek(), Some(b'-'))
-                        && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
+                    matches!(self.peek(), Some(b'-')) && Self::is_ws_break_or_eoi(self.peek_at(1))
                 };
                 // Restore position after checking
                 self.pos = pos_before_check;
@@ -2358,9 +2370,8 @@ impl<'a> Parser<'a> {
                 // Next content is at same or lower indent
                 if next_char == Some(b':')
                     && (next_indent == indent)
-                    && matches!(
+                    && Self::is_ws_break_or_eoi(
                         self.input.get(saved_pos + next_indent + 1).copied(),
-                        Some(b' ' | b'\t' | b'\n' | b'\r') | None
                     )
                 {
                     // `: value` at same indent - empty key (null), value follows
@@ -2396,12 +2407,13 @@ impl<'a> Parser<'a> {
 
         // Parse the key value inline
         match self.peek() {
-            // Tab included: this is the same terminator set `is_seq_indicator_next`
-            // canonicalizes (#332) and every sibling `-` check in this file already
-            // uses it, but this site still hand-rolled a 3-way match missing the
-            // tab, so `? -\ta\n  -\tb\n: value` fell through to being parsed as a
-            // plain scalar key `-\ta` instead of a sequence key (#434).
-            Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
+            // Tab included: every sibling `-` check in this file uses the same
+            // 4-way terminator set (kept in sync with `super::is_seq_indicator_next`
+            // by `is_ws_break_or_eoi_agrees_with_is_seq_indicator_next`), but this
+            // site still hand-rolled a 3-way match missing the tab, so
+            // `? -\ta\n  -\tb\n: value` fell through to being parsed as a plain
+            // scalar key `-\ta` instead of a sequence key (#434).
+            Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                 // Sequence as key - open key node and let sequence parsing continue
                 // The key will be a sequence
                 self.write_bp_open();
@@ -2547,7 +2559,7 @@ impl<'a> Parser<'a> {
 
         // Parse the value
         match self.peek() {
-            Some(b'-') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
+            Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                 // Sequence as value. Routed through the shared sequence-item
                 // parser rather than an inlined copy of its dispatch, so anchor
                 // handling (#328) and every future fix land here too — this was
@@ -2851,8 +2863,7 @@ impl<'a> Parser<'a> {
 
     /// Check if we're looking at an explicit key indicator `?` in flow context
     fn looks_like_explicit_flow_key(&self) -> bool {
-        self.peek() == Some(b'?')
-            && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
+        self.peek() == Some(b'?') && Self::is_ws_break_or_eoi(self.peek_at(1))
     }
 
     /// Parse the key node of an explicit flow entry, with the `? ` indicator already
@@ -3563,8 +3574,7 @@ impl<'a> Parser<'a> {
                     // Only stop at `: ` or `:\n` or `:` at end. A flow indicator after
                     // the colon does *not* stop the key (#402) — `,`/`}`/`]` end it on
                     // their own arm, one byte later, with the colon kept.
-                    let next = self.peek_at(1);
-                    if matches!(next, Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
+                    if Self::is_ws_break_or_eoi(self.peek_at(1)) {
                         break;
                     }
                     // Colon not followed by space - include it in the key
@@ -3590,7 +3600,7 @@ impl<'a> Parser<'a> {
                     // Check for `: ` on next line (explicit value indicator)
                     if lookahead + 1 < self.input.len()
                         && self.input[lookahead] == b':'
-                        && matches!(self.input[lookahead + 1], b' ' | b'\t' | b'\n' | b'\r')
+                        && Self::is_ws_or_break(self.input[lookahead + 1])
                     {
                         // Explicit value indicator - stop key here
                         break;
@@ -3626,8 +3636,7 @@ impl<'a> Parser<'a> {
                                 } else {
                                     None
                                 };
-                                if matches!(after_colon, Some(b' ' | b'\t' | b'\n' | b'\r') | None)
-                                {
+                                if Self::is_ws_break_or_eoi(after_colon) {
                                     // Whitespace before `: ` - stop here
                                     break;
                                 }
@@ -4277,7 +4286,7 @@ impl<'a> Parser<'a> {
 
         // Check what kind of content this is
         match self.peek() {
-            Some(b'-') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
+            Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                 self.parse_sequence_item(indent)?;
             }
             // Tab included in both arms below: the sibling `-` arm just above
@@ -4285,11 +4294,11 @@ impl<'a> Parser<'a> {
             // tab meant `?\tkey` / `:\tvalue` fell through to
             // `looks_like_mapping_entry()` instead of being recognized here
             // (#434).
-            Some(b'?') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
+            Some(b'?') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                 // Explicit key indicator
                 self.parse_explicit_key(indent)?;
             }
-            Some(b':') if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) => {
+            Some(b':') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                 // Explicit value indicator (value for previous explicit key)
                 self.parse_explicit_value(indent)?;
             }
@@ -4335,7 +4344,7 @@ impl<'a> Parser<'a> {
                         // `matches!` across lines gives the opening line its own
                         // coverage region that never reports as executed, even
                         // though the arm body does.
-                        Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
+                        Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                             // Anchor before block sequence on same line
                             self.parse_sequence_item(indent)?;
                         }
@@ -5257,6 +5266,23 @@ mod tests {
             "nesting depth exceeds limit of 128 at offset 131"
         );
     }
+    /// The other #106 guard: [`Parser::is_ws_break_or_eoi`] is the parser's
+    /// spelling of the terminator set [`super::super::is_seq_indicator_next`]
+    /// gives the reader (#332), and the two are pinned by this test rather than
+    /// by the compiler — see the doc comment for why the parser cannot just call
+    /// it. Exhaustive over every byte plus end of input, so a divergence in the
+    /// acceptance set cannot hide in an untested byte.
+    #[test]
+    fn is_ws_break_or_eoi_agrees_with_is_seq_indicator_next() {
+        for next in (0..=u8::MAX).map(Some).chain(core::iter::once(None)) {
+            assert_eq!(
+                Parser::is_ws_break_or_eoi(next),
+                crate::yaml::is_seq_indicator_next(next),
+                "{next:?}: parser and reader disagree on the indicator terminator set"
+            );
+        }
+    }
+
     /// The #106 guard: `skip_line_break` is the one place in the crate that
     /// restates [`line_break_len`] instead of calling it, for the measured
     /// reason on its doc comment. A restated predicate diverges silently, so
