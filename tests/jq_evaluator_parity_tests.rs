@@ -265,6 +265,99 @@ fn test_bsearch_parity_384() {
     // `null | length == 0` in jq, so `null` answers "not found" like `[]`
     // rather than erroring (#420); the round trip must preserve that too.
     assert_parity(br"null", "bsearch(1)");
+    // A NaN needle is never found in a NaN-free sorted haystack -- NaN
+    // orders as less than every number, so `compare_values` never answers
+    // `Equal` for it (#421).
+    assert_parity(br"[1,2,3]", "bsearch(nan)");
+}
+
+#[test]
+fn test_nan_ordering_parity_421() {
+    // jq treats NaN as strictly less than every number, including another
+    // NaN. `f64::partial_cmp` returns `None` for any NaN comparison, and
+    // both evaluators used to paper over that in incompatible, both-wrong
+    // ways: the full evaluator folded it to `Equal` (NaN compared equal to
+    // everything); the generic (CLI) evaluator's `<`/`<=`/`>`/`>=` fast path
+    // folded the resulting `None` to `false` (NaN compared less than
+    // nothing). Every expected value below is pinned against jq-1.7.1-apple.
+    for (filter, expected) in [
+        ("nan < 1", "true"),
+        ("nan > 1", "false"),
+        ("nan <= 1", "true"),
+        ("nan >= 1", "false"),
+        ("1 < nan", "false"),
+        ("1 > nan", "true"),
+        ("nan < nan", "true"),
+        ("nan <= nan", "true"),
+        ("nan >= nan", "false"),
+        ("nan > nan", "false"),
+        ("nan == nan", "false"),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(b"null", filter)),
+            [expected],
+            "full evaluator disagrees with jq for `{filter}`"
+        );
+        assert_parity(b"null", filter);
+    }
+}
+
+#[test]
+fn test_nan_container_ordering_parity_421() {
+    // NaN's ordering rule reaches every container builtin that sorts.
+    // `sort`/`unique`/`group_by` have no dedicated fast path in the generic
+    // (CLI) evaluator -- like `bsearch` (#384), they fall through its JSON
+    // round-trip fallback into the full evaluator, so `assert_parity` here
+    // pins that round trip rather than a second implementation. Every
+    // expected value is pinned against jq-1.7.1-apple.
+    for (filter, expected) in [
+        ("[3,nan,1] | sort", "[null,1,3]"),
+        ("[1,nan] | min", "null"),
+        ("[nan,1] | min", "null"),
+        ("[1,nan] | max", "1"),
+        ("[nan,1] | max", "1"),
+        // A single NaN in the array needs no dedup/grouping decision against
+        // another NaN, so this one is unaffected by the separate defect below.
+        ("[nan,1,2] | group_by(.)", "[[null],[1],[2]]"),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(b"null", filter)),
+            [expected],
+            "full evaluator disagrees with jq for `{filter}`"
+        );
+        assert_parity(b"null", filter);
+    }
+}
+
+#[test]
+fn test_nan_container_ordering_known_divergence_421() {
+    // jq keeps NaN a real NaN internally and only turns it into `null` at
+    // print time, so `[nan,nan] | unique` keeps both (jq: `[null,null]`).
+    // Here, a freshly-constructed array is materialized through JSON text on
+    // its way to `unique`/`group_by` (JSON has no NaN literal), which turns
+    // each NaN into a genuine `Null` *before* `compare_values` ever runs --
+    // and two real `Null`s legitimately compare `Equal`, so they collapse.
+    //
+    // This is the separate, pre-existing defect #421 calls out ("nan does
+    // not survive as a number") -- not a comparator bug, and out of scope for
+    // this fix. Pinning the current (wrong, but internally consistent
+    // between both evaluators) answer here so a fix for that defect has a
+    // failing test to flip, rather than silently dropping coverage.
+    for (filter, current_answer) in [
+        ("[nan,nan] | unique", "[null]"),
+        ("[nan,1,nan] | unique", "[null,1]"),
+        ("[nan,nan,1] | group_by(.)", "[[null,null],[1]]"),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(b"null", filter)),
+            [current_answer],
+            "full evaluator answer changed for `{filter}` -- if this now matches jq \
+             (`[null,null]` / `[null,null,1]` / `[[null],[null],[1]]` respectively), \
+             the separate NaN-materialization defect is fixed: update this test's \
+             expectation and move the case into test_nan_container_ordering_parity_421"
+        );
+        assert_parity(b"null", filter);
+    }
 }
 
 #[test]

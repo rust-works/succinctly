@@ -523,8 +523,11 @@ impl OwnedValue {
 ///   precision: `9007199254740993 == 9007199254740992` is `false`, as in jq 1.7.
 /// - NaN is never equal to itself. This makes the relation partial (hence
 ///   `PartialEq` and no `Eq`), and matches jq: `nan == nan` is `false`. It is
-///   also why this cannot be written as `compare_values(..) == Equal` -- the
-///   evaluators' `compare_values` folds incomparable floats to `Equal`.
+///   also why this cannot be written as `compare_values(..) == Equal` -- since
+///   #421, `compare_values` orders NaN as strictly `Less` than every number,
+///   including another NaN, so `<` can match jq; reusing that for `==` would
+///   make `nan == nan` true exactly when two NaNs compare `Less`, which is
+///   what `<` needs, not what `==` needs.
 /// - `-0.0 == 0` and `-0.0 == 0.0`, as in jq.
 /// - Objects compare order-insensitively (`IndexMap`'s own `PartialEq`), as in jq.
 ///
@@ -545,6 +548,40 @@ pub(crate) fn numeric_repr_eq(a: NumberRepr, b: NumberRepr) -> bool {
     }
 }
 
+/// Order two `f64`s the way jq's own comparator does: NaN sorts strictly
+/// below every other float, including another NaN (#421).
+///
+/// `f64::partial_cmp` returns `None` whenever either operand is NaN, which is
+/// why every caller here used to fall back to `Ordering::Equal` -- silently
+/// treating NaN as equal to any number instead of ordered against it. Real jq
+/// (verified against jq-1.7.1) instead treats NaN as smaller than anything,
+/// even itself:
+///
+/// ```text
+/// nan <  1    -> true      nan >  1    -> false
+/// nan <= 1    -> true      nan >= 1    -> false
+/// 1   <  nan  -> false     1   >  nan  -> true
+/// nan <  nan  -> true      nan <= nan  -> true
+/// nan >= nan  -> false     nan == nan  -> false  (a separate, hand-written `PartialEq`)
+/// ```
+///
+/// Deliberately **not** a strict weak ordering: `cmp_f64(NaN, NaN)` answers
+/// `Less` regardless of which argument is which, so both directions between
+/// the same two NaNs report `Less` -- a genuine antisymmetry violation. This
+/// matches jq's own comparator exactly (its C `qsort`-based sort has the
+/// identical property); see [`super::eval::compare_values`]'s doc comment for
+/// how narrow the practical fallout of that is.
+pub(crate) fn cmp_f64(a: f64, b: f64) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    if a.is_nan() {
+        Ordering::Less
+    } else if b.is_nan() {
+        Ordering::Greater
+    } else {
+        a.partial_cmp(&b).expect("neither operand is NaN")
+    }
+}
+
 /// Order two parsed number representations with the exact same per-pair
 /// dispatch [`numeric_repr_eq`] uses for equality -- exact `i64` comparison
 /// when both are `Int` (so integers beyond 2^53 keep precision, matching the
@@ -558,19 +595,14 @@ pub(crate) fn numeric_repr_eq(a: NumberRepr, b: NumberRepr) -> bool {
 /// so `9007199254740993 == 9007199254740992.0` could be `true` while
 /// `9007199254740993 > 9007199254740992.0` was also `true` -- sort and
 /// `unique`/`group_by` disagreeing with `==` about the same two numbers.
+///
+/// The NaN rule (#421) is centralized in [`cmp_f64`], not repeated here.
 pub(crate) fn numeric_repr_cmp(a: NumberRepr, b: NumberRepr) -> core::cmp::Ordering {
-    use core::cmp::Ordering;
     match (a, b) {
         (NumberRepr::Int(a), NumberRepr::Int(b)) => a.cmp(&b),
-        (NumberRepr::Float(a), NumberRepr::Float(b)) => {
-            a.partial_cmp(&b).unwrap_or(Ordering::Equal)
-        }
-        (NumberRepr::Int(a), NumberRepr::Float(b)) => {
-            (a as f64).partial_cmp(&b).unwrap_or(Ordering::Equal)
-        }
-        (NumberRepr::Float(a), NumberRepr::Int(b)) => {
-            a.partial_cmp(&(b as f64)).unwrap_or(Ordering::Equal)
-        }
+        (NumberRepr::Float(a), NumberRepr::Float(b)) => cmp_f64(a, b),
+        (NumberRepr::Int(a), NumberRepr::Float(b)) => cmp_f64(a as f64, b),
+        (NumberRepr::Float(a), NumberRepr::Int(b)) => cmp_f64(a, b as f64),
     }
 }
 
@@ -897,7 +929,9 @@ mod tests {
     #[test]
     fn test_eq_nan_is_never_equal() {
         // Matches jq: `nan == nan` is false. This is why equality cannot be
-        // expressed as `compare_values(..) == Equal`, which folds NaN to Equal.
+        // expressed as `compare_values(..) == Equal` -- `compare_values` orders
+        // NaN as strictly `Less` than every number, including another NaN
+        // (#421), not `Equal`.
         let nan = OwnedValue::Float(f64::NAN);
         assert_ne!(nan, nan.clone());
         assert_ne!(nan, OwnedValue::Int(0));

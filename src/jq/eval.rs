@@ -69,7 +69,7 @@ use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey,
     Pattern, StringPart,
 };
-use super::value::{format_number_jq_compat, numeric_repr_cmp, NumberRepr, OwnedValue};
+use super::value::{cmp_f64, format_number_jq_compat, numeric_repr_cmp, NumberRepr, OwnedValue};
 
 /// Result of evaluating a jq expression.
 #[derive(Debug)]
@@ -1210,7 +1210,31 @@ fn eval_compare<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Compare two values using jq ordering: null < bool < number < string < array < object.
-fn compare_values(left: &OwnedValue, right: &OwnedValue) -> core::cmp::Ordering {
+///
+/// The one definition of this ordering in the jq module -- shared with the
+/// generic (CLI) evaluator, which imports this rather than keeping its own
+/// copy (#421, following the #358/#384 precedent: one definition, plus a test
+/// that call sites agree).
+///
+/// NaN orders as strictly less than every other number, including another
+/// NaN -- see [`cmp_f64`](super::value::cmp_f64)'s doc comment for the full
+/// truth table. That makes this comparator *not* a strict weak ordering
+/// whenever two NaNs are compared against each other, which
+/// `sort`/`sort_by`/`unique`/`unique_by`/`group_by` feed straight into
+/// `[T]::sort_by`. In practice the risk is narrow: `[T]::sort_by` only
+/// reaches the internal check that can panic on such a comparator
+/// (`core::slice::sort::shared::smallsort`'s bidirectional-merge consistency
+/// check) for slices longer than 20 elements --
+/// `MAX_LEN_ALWAYS_INSERTION_SORT` in the current standard library, an
+/// implementation detail, not a stable contract. Anything at or below that
+/// length uses plain insertion sort, which cannot panic regardless of
+/// comparator validity, and stress-testing (1,510 randomized/adversarial
+/// trials up to length 5000 and 90% NaN density) found no panics at any size.
+/// `min`/`max`/`min_by`/`max_by` never sort (`Iterator::min_by`/`max_by` fold
+/// left-to-right) and `unique`'s/`unique_by`'s `dedup_by` only compares
+/// adjacent elements, so neither has any panic surface at all. See
+/// `test_sort_many_nans_does_not_panic_421`.
+pub(crate) fn compare_values(left: &OwnedValue, right: &OwnedValue) -> core::cmp::Ordering {
     use core::cmp::Ordering;
 
     let left_type = sort_rank(left);
@@ -1224,13 +1248,9 @@ fn compare_values(left: &OwnedValue, right: &OwnedValue) -> core::cmp::Ordering 
         (OwnedValue::Null, OwnedValue::Null) => Ordering::Equal,
         (OwnedValue::Bool(a), OwnedValue::Bool(b)) => a.cmp(b),
         (OwnedValue::Int(a), OwnedValue::Int(b)) => a.cmp(b),
-        (OwnedValue::Float(a), OwnedValue::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
-            (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)
-        }
-        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
-            a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
-        }
+        (OwnedValue::Float(a), OwnedValue::Float(b)) => cmp_f64(*a, *b),
+        (OwnedValue::Int(a), OwnedValue::Float(b)) => cmp_f64(*a as f64, *b),
+        (OwnedValue::Float(a), OwnedValue::Int(b)) => cmp_f64(*a, *b as f64),
         // A `NumberLiteral` operand compares by its parsed value, exactly
         // like `Int`/`Float` -- ordering never looks at the source text.
         // `numeric_repr_cmp` dispatches on the same `(Int,Int)`/`(Float,Float)`/
@@ -12361,13 +12381,15 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // A NaN component is dropped with the path around it, because it names no
     // element at any depth — `resolve_read_index` refuses it, as jq's `jv_get`
-    // does. Leaving it in would do more than waste a walk: `compare_values`
-    // answers `Equal` for NaN against *every* number, so the path would head a
-    // run that swallowed its numeric siblings and cancelled their deletions,
-    // and the comparator would not be transitive, which `sort_by` is entitled
-    // to panic on. jq cannot arbitrate — 1.7.1 loops forever on
-    // `delpaths([[nan]])` — so this is pinned by unit test rather than by a
-    // golden.
+    // does. Leaving it in would do more than waste a walk: since #421,
+    // `compare_values` orders NaN as strictly less than every number,
+    // including another NaN, so two NaN-headed paths would compare `Less`
+    // than *each other* simultaneously — a comparator property `sort_by` is
+    // entitled to panic on (`core::slice::sort`'s bidirectional-merge
+    // consistency check). Filtering NaN out here keeps this particular
+    // `sort_by` call entirely NaN-free, so it never risks that regardless.
+    // jq cannot arbitrate either — 1.7.1 loops forever on `delpaths([[nan]])`
+    // — so this is pinned by unit test rather than by a golden.
     paths.retain(|path| match path {
         OwnedValue::Array(components) => !components
             .iter()
@@ -18283,6 +18305,11 @@ mod tests {
         );
         bsearch_is!(br#"[null, true, 1, "a", [1], {"a": 1}]"#, "bsearch(2)", -4);
 
+        // NaN never compares Equal to anything, including itself (#421), so
+        // it is reported absent rather than falsely "found" by the old
+        // fold-to-Equal bug.
+        bsearch_is!(br"[1, 2, 3]", "bsearch(nan)", -1);
+
         // `null | length == 0` in jq, so `null` takes the empty-array branch
         // and answers "not found" instead of erroring (#420).
         bsearch_is!(br"null", "bsearch(1)", -1);
@@ -18312,6 +18339,53 @@ mod tests {
                 assert!(e.to_string().contains("bsearch requires array"));
             }
         );
+    }
+
+    /// `compare_values` orders NaN as `Less` than every number, including
+    /// another NaN (#421) -- a genuine violation of the strict weak ordering
+    /// `[T]::sort_by` assumes. Rust's stable sort only reaches the internal
+    /// consistency check that can panic on such a violation
+    /// (`core::slice::sort::shared::smallsort`'s bidirectional merge) for
+    /// slices longer than 20 elements; shorter slices use a plain insertion
+    /// sort that cannot panic regardless of comparator validity.
+    ///
+    /// This is a canary for that threshold, not a jq-parity check: it only
+    /// pins that `sort`/`sort_by`/`unique`/`unique_by`/`group_by` complete
+    /// without panicking on an array past that threshold holding several
+    /// NaNs -- not what order they land in (genuinely unspecified once two or
+    /// more NaNs share a slice this large; jq's own qsort-based sort makes no
+    /// promise here either).
+    ///
+    /// `sort`/`sort_by` don't dedup, so their length is pinned exactly.
+    /// `unique`/`unique_by`/`group_by` do dedup/group by `compare_values`
+    /// equality, and a separate, pre-existing defect (a freshly-constructed
+    /// array materializes through JSON text, which has no NaN literal, so
+    /// two or more NaN elements collapse to real, mutually-`Equal` `Null`s
+    /// before `compare_values` ever runs -- see #421's "Separate defect"
+    /// section) makes their post-dedup length unpredictable here. That
+    /// defect is out of scope for this fix; this test only needs "did not
+    /// panic", so it doesn't assert a specific count for those three.
+    #[test]
+    fn test_sort_many_nans_does_not_panic_421() {
+        for filter in [
+            "[range(30), nan, nan, nan] | sort | length",
+            "[range(30), nan, nan, nan] | sort_by(.) | length",
+        ] {
+            query!(b"null", filter,
+                QueryResult::Owned(OwnedValue::Int(n)) => {
+                    assert_eq!(n, 33, "{filter}");
+                }
+            );
+        }
+        for filter in [
+            "[range(30), nan, nan, nan] | unique | length",
+            "[range(30), nan, nan, nan] | unique_by(.) | length",
+            "[range(30), nan, nan, nan] | group_by(.) | length",
+        ] {
+            query!(b"null", filter,
+                QueryResult::Owned(OwnedValue::Int(_)) => {}
+            );
+        }
     }
 
     #[test]
@@ -19285,14 +19359,16 @@ mod tests {
     }
 
     /// A NaN component names no element, so its path is dropped — and dropped
-    /// *whole*, before the sort, because `compare_values` answers `Equal` for
-    /// NaN against every number. Left in, `[nan]` headed a run that swallowed
-    /// its numeric siblings and cancelled their deletions, so
-    /// `delpaths([[nan],[0]])` deleted nothing at all.
+    /// *whole*, before the sort, because (since #421) `compare_values` orders
+    /// NaN as strictly less than every number, including another NaN. Left
+    /// in, two NaN-headed paths would each compare `Less` than the other — a
+    /// property `sort_by` is entitled to panic on — instead of the pre-#421
+    /// failure mode this test used to describe (NaN comparing `Equal` to
+    /// every sibling and cancelling their deletions).
     ///
-    /// jq cannot arbitrate: 1.7.1 loops forever on `delpaths([[nan]])`, which
-    /// is why this is a unit test and not a golden case. What it pins is that
-    /// a path succinctly cannot use costs only itself.
+    /// jq cannot arbitrate either: 1.7.1 loops forever on `delpaths([[nan]])`,
+    /// which is why this is a unit test and not a golden case. What it pins is
+    /// that a path succinctly cannot use costs only itself.
     #[test]
     fn test_delpaths_nan_path_does_not_cancel_its_siblings() {
         assert_outcomes(&[

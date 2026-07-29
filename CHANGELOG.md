@@ -103,6 +103,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two `compare_values` comparators (and a private `numeric_repr_cmp`) disagreed
+  with jq about NaN, and with each other** (#421): jq treats NaN as strictly
+  less than every number, including another NaN — `nan < 1`, `nan < nan`, and
+  `nan <= nan` are all `true` in jq-1.7.1, while `nan >= nan` is `false`.
+  `f64::partial_cmp` returns `None` for any NaN comparison, and the two
+  evaluators papered over that differently: the full evaluator
+  (`src/jq/eval.rs`) folded `None` to `Ordering::Equal`, so NaN compared equal
+  to every number and `[1,2,3] | bsearch(nan)` falsely reported it "found"; the
+  generic (CLI) evaluator (`src/jq/eval_generic.rs`) folded the resulting
+  `Option::None` to `false` in its `<`/`<=`/`>`/`>=` fast path, so NaN compared
+  less than nothing. A new `cmp_f64` (`src/jq/value.rs`) centralizes jq's rule;
+  `eval_generic.rs`'s own `compare_values` is gone, importing the full
+  evaluator's instead, so the two can no longer drift (#358/#384 precedent).
+  `sort`/`min`/`max` now order NaN as jq does and `bsearch` now correctly
+  reports a NaN needle absent. Not fixed here: a separate, pre-existing defect
+  where a freshly-constructed array materializes through JSON text (which has
+  no NaN literal) on its way into `unique`/`group_by`, silently turning NaN
+  into a real `Null` before the comparator runs — so `[nan,nan] | unique` still
+  doesn't match jq's `[null,null]`. That's a different mechanism (tracked
+  separately) and left as a documented known divergence
+  (`test_nan_container_ordering_known_divergence_421`).
+
 - **`from_entries` and six other `map`-derived builtins refused an object of
   entries that jq accepts** (#422): jq defines `from_entries` as
   `map({...}) | add | .//={}`, and `map(f)` is `[.[] | f]` — `.[]` over an
