@@ -17648,6 +17648,20 @@ mod tests {
         );
     }
 
+    /// `limit`'s `expr` argument now accepts a top-level comma-generator
+    /// (#155): `[limit(2;1,2,3,4)]` == `[1,2]`, matching real jq. The
+    /// generator here is finite, so the existing eager
+    /// evaluate-then-`take(n)` implementation already produces the correct
+    /// answer without needing true short-circuiting.
+    #[test]
+    fn test_limit_comma_generator_argument() {
+        query!(br"null", r"[limit(2;1,2,3,4)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+    }
+
     #[test]
     fn test_first_last_expr() {
         // first(expr) - returns a reference to first element
@@ -17662,6 +17676,34 @@ mod tests {
             QueryResult::One(StandardJson::Number(n)) => {
                 assert_eq!(n.as_i64().unwrap(), 3);
             }
+        );
+    }
+
+    /// `first`/`last`'s argument now accepts a top-level comma-generator
+    /// (#155): `first(1,2,3)` == `1`, `last(1,2,3)` == `3`.
+    #[test]
+    fn test_first_last_expr_comma_generator_argument() {
+        query!(br"null", r"first(1,2,3)",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1);
+            }
+        );
+
+        query!(br"null", r"last(1,2,3)",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 3);
+            }
+        );
+    }
+
+    /// A single-parameter user-defined function called with a
+    /// comma-generator argument (#155): `def f(x): x; f(1,2)` fans out to
+    /// two outputs, matching real jq's call-by-name substitution semantics.
+    #[test]
+    fn test_user_function_call_with_comma_generator_argument() {
+        assert_eq!(
+            outputs(b"null", "def f(x): x; f(1,2)"),
+            vec!["1".to_string(), "2".to_string()]
         );
     }
 
