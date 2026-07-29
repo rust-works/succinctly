@@ -1927,6 +1927,38 @@ mod tests {
             kind(b"&anchor - sequence entry\n"),
             MisplacedAnchor
         )); // SY6V
+
+        // #452: `scan_flow`'s `&` arm (shared by `[...]` and `{...}`) had no
+        // placement check — it recorded the anchor and read a following
+        // `*alias` as an ordinary reference, which also passed the unrelated
+        // #404 unknown-anchor check since the anchor was just registered into
+        // scope.
+        assert!(matches!(kind(b"[&a *a]\n"), AnchorOnAlias));
+        assert!(matches!(kind(b"{k: &a *a}\n"), AnchorOnAlias));
+    }
+
+    /// #452: unlike block's `scan_anchor`, which skips only same-line
+    /// spaces/tabs before this check, flow's equivalent runs after
+    /// `skip_flow_ws`, which also crosses line breaks and comments — so an
+    /// anchor and alias split across either still decorate the same node and
+    /// must still be rejected, with the error still pointing at the `*`.
+    #[test]
+    fn rejects_anchor_on_alias_across_flow_separation() {
+        for input in [&b"[&a\n*a]\n"[..], b"[&a # note\n*a]\n"] {
+            let err = validate(input).unwrap_err();
+            let shown = String::from_utf8_lossy(input);
+            assert!(
+                matches!(err.kind, AnchorOnAlias),
+                "{shown:?}: {:?}",
+                err.kind
+            );
+            assert_eq!(
+                input.get(err.position.offset),
+                Some(&b'*'),
+                "{shown:?}: error should point at the alias sigil, not {:?}",
+                err.position
+            );
+        }
     }
 
     /// Issue #404: an alias naming an anchor that is not in scope. `yq` v4.53.3
