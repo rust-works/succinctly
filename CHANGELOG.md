@@ -126,6 +126,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agree); `yaml_test_suite_conformance` and `yq_golden_conformance` re-run
   clean.
 
+- **YAML validator misclassified lines around a multi-line quoted scalar,
+  in one direction silently accepting an invalid document and in the other
+  wrongly rejecting a valid one** (#382): `Validator::line_kind`'s `"` arm
+  advanced past a raw line break without noticing it had left the quote
+  open, so a later `"` was misread as *opening* a fresh span instead of
+  *closing* the real one — `"line one\n line two"\nc: d\n` (a quoted scalar
+  root followed by an incompatible `c: d` mapping, which must be rejected as
+  a second root node) was silently accepted. Fixing that cross-line
+  tracking exposed a second bug that had to land in the same change: neither
+  quote arm gated on whether the quote was glued to preceding content the
+  way `line_is_structural`'s `after_separation` check already did, so
+  `foo'bar: baz\nqux: quux\n` — an ordinary plain-scalar key containing a
+  literal `'`, followed by an ordinary second entry — was wrongly rejected
+  (an ungated quote-open would otherwise hunt arbitrarily far into later
+  content for a partner once it correctly stopped bailing at the first line
+  break). Both quote kinds now fold across lines to their true close via one
+  shared `quoted_span_end` in `src/yaml/mod.rs`, replacing what had become
+  three independent hand-rolled scans (`line_is_structural`'s single-line
+  `quoted_scalar_end`, and `line_kind`'s two inline, mutually-asymmetric `"`
+  and `'` arms) — the duplicated-predicate shape #106/#332 already flagged,
+  left standing by #375 (closing #173) since a naive merge would have been a
+  behavior change dressed as a refactor. Conformance figures are unaffected
+  (216/279 · 70/94 · 27/29 unchanged); both bugs were corpus-latent.
+
 - **YAML explicit non-scalar keys silently dropped the entry** (#172,
   resolved by drift): `? - a\n  - b\n: value` used to load as `{}`, losing
   both the key and the value, silently — no error, well-formed JSON out. Not
