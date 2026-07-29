@@ -2371,14 +2371,16 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return QueryResult::Owned(OwnedValue::Null);
             }
 
-            // Compute keys for each item
+            // Compute keys for each item. jq keys by `[f]` — the array of
+            // *all* outputs of the key filter, not just its first output
+            // (#155).
             let mut keyed: Vec<(OwnedValue, StandardJson<'a, W>)> = Vec::new();
             for item in items {
-                match eval_single::<W, S>(f, item.clone(), optional) {
-                    QueryResult::One(v) => keyed.push((to_owned(&v), item)),
+                match eval_array_construction::<W, S>(f, item.clone(), optional) {
                     QueryResult::Owned(v) => keyed.push((v, item)),
                     QueryResult::Error(e) => return QueryResult::Error(e),
-                    _ => keyed.push((OwnedValue::Null, item)),
+                    QueryResult::Break(label) => return QueryResult::Break(label),
+                    _ => unreachable!("eval_array_construction only returns Owned/Error/Break"),
                 }
             }
 
@@ -2407,14 +2409,16 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return QueryResult::Owned(OwnedValue::Null);
             }
 
-            // Compute keys for each item
+            // Compute keys for each item. jq keys by `[f]` — the array of
+            // *all* outputs of the key filter, not just its first output
+            // (#155).
             let mut keyed: Vec<(OwnedValue, StandardJson<'a, W>)> = Vec::new();
             for item in items {
-                match eval_single::<W, S>(f, item.clone(), optional) {
-                    QueryResult::One(v) => keyed.push((to_owned(&v), item)),
+                match eval_array_construction::<W, S>(f, item.clone(), optional) {
                     QueryResult::Owned(v) => keyed.push((v, item)),
                     QueryResult::Error(e) => return QueryResult::Error(e),
-                    _ => keyed.push((OwnedValue::Null, item)),
+                    QueryResult::Break(label) => return QueryResult::Break(label),
+                    _ => unreachable!("eval_array_construction only returns Owned/Error/Break"),
                 }
             }
 
@@ -2923,11 +2927,14 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Compute keys for each item
             let mut keyed: Vec<(OwnedValue, OwnedValue)> = Vec::new();
             for item in items {
-                let key = match eval_single::<W, S>(f, item.clone(), optional) {
-                    QueryResult::One(v) => to_owned(&v),
+                // jq keys by `[f]` — the array of *all* outputs of the key
+                // filter — not just its first output, so `sort_by(.a,.b)`
+                // is a genuine multi-key sort (#155).
+                let key = match eval_array_construction::<W, S>(f, item.clone(), optional) {
                     QueryResult::Owned(v) => v,
                     QueryResult::Error(e) => return QueryResult::Error(e),
-                    _ => OwnedValue::Null,
+                    QueryResult::Break(label) => return QueryResult::Break(label),
+                    _ => unreachable!("eval_array_construction only returns Owned/Error/Break"),
                 };
                 keyed.push((key, to_owned(&item)));
             }
@@ -3000,11 +3007,14 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Compute keys for each item
             let mut keyed: Vec<(OwnedValue, OwnedValue)> = Vec::new();
             for item in items {
-                let key = match eval_single::<W, S>(f, item.clone(), optional) {
-                    QueryResult::One(v) => to_owned(&v),
+                // jq keys by `[f]` — the array of *all* outputs of the key
+                // filter — not just its first output, so `sort_by(.a,.b)`
+                // is a genuine multi-key sort (#155).
+                let key = match eval_array_construction::<W, S>(f, item.clone(), optional) {
                     QueryResult::Owned(v) => v,
                     QueryResult::Error(e) => return QueryResult::Error(e),
-                    _ => OwnedValue::Null,
+                    QueryResult::Break(label) => return QueryResult::Break(label),
+                    _ => unreachable!("eval_array_construction only returns Owned/Error/Break"),
                 };
                 keyed.push((key, to_owned(&item)));
             }
@@ -3052,11 +3062,14 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Compute keys for each item
             let mut keyed: Vec<(OwnedValue, OwnedValue)> = Vec::new();
             for item in items {
-                let key = match eval_single::<W, S>(f, item.clone(), optional) {
-                    QueryResult::One(v) => to_owned(&v),
+                // jq keys by `[f]` — the array of *all* outputs of the key
+                // filter — not just its first output, so `sort_by(.a,.b)`
+                // is a genuine multi-key sort (#155).
+                let key = match eval_array_construction::<W, S>(f, item.clone(), optional) {
                     QueryResult::Owned(v) => v,
                     QueryResult::Error(e) => return QueryResult::Error(e),
-                    _ => OwnedValue::Null,
+                    QueryResult::Break(label) => return QueryResult::Break(label),
+                    _ => unreachable!("eval_array_construction only returns Owned/Error/Break"),
                 };
                 keyed.push((key, to_owned(&item)));
             }
@@ -16843,6 +16856,54 @@ mod tests {
         );
     }
 
+    /// `sort_by`/`group_by`/`unique_by`/`min_by`/`max_by` key on `[f]` — the
+    /// array of *all* outputs of the key filter, not just its first output
+    /// (#155). A comma-generator key filter (`sort_by(.a,.b)`) now reaches
+    /// this code because the parser accepts a top-level comma in call
+    /// arguments; verify the eval side actually does a multi-key sort
+    /// instead of silently keying everything on `null`.
+    #[test]
+    fn test_by_builtins_multi_key_comma_generator() {
+        let data = br#"[{"a":2,"b":1},{"a":1,"b":2},{"a":1,"b":1}]"#;
+
+        assert_eq!(
+            outputs(data, "[sort_by(.a,.b)[] | [.a,.b]]"),
+            vec![r"[[1,1],[1,2],[2,1]]".to_string()]
+        );
+
+        query!(data, "min_by(.a,.b)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("a"), Some(&OwnedValue::Int(1)));
+                assert_eq!(obj.get("b"), Some(&OwnedValue::Int(1)));
+            }
+        );
+
+        query!(data, "max_by(.a,.b)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("a"), Some(&OwnedValue::Int(2)));
+                assert_eq!(obj.get("b"), Some(&OwnedValue::Int(1)));
+            }
+        );
+
+        // group_by(.tags[]) — a plain (non-comma) generator key filter also
+        // exercises the same "collect all outputs" fix.
+        let tagged = br#"[{"a":2,"tags":["x"]},{"a":1,"tags":["x","y"]}]"#;
+        query!(tagged, "group_by(.tags[])",
+            QueryResult::Owned(OwnedValue::Array(groups)) => {
+                assert_eq!(groups.len(), 2);
+            }
+        );
+
+        // unique_by(.a,.b) — distinct (a,b) pairs are not deduplicated
+        // against each other even when .a alone repeats.
+        let pairs = br#"[{"a":1,"b":2},{"a":1,"b":3},{"a":1,"b":2}]"#;
+        query!(pairs, "unique_by(.a,.b)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+            }
+        );
+    }
+
     // ==========================================================================
     // Phase 5: Object Functions Tests
     // ==========================================================================
@@ -17587,6 +17648,20 @@ mod tests {
         );
     }
 
+    /// `limit`'s `expr` argument now accepts a top-level comma-generator
+    /// (#155): `[limit(2;1,2,3,4)]` == `[1,2]`, matching real jq. The
+    /// generator here is finite, so the existing eager
+    /// evaluate-then-`take(n)` implementation already produces the correct
+    /// answer without needing true short-circuiting.
+    #[test]
+    fn test_limit_comma_generator_argument() {
+        query!(br"null", r"[limit(2;1,2,3,4)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+    }
+
     #[test]
     fn test_first_last_expr() {
         // first(expr) - returns a reference to first element
@@ -17601,6 +17676,34 @@ mod tests {
             QueryResult::One(StandardJson::Number(n)) => {
                 assert_eq!(n.as_i64().unwrap(), 3);
             }
+        );
+    }
+
+    /// `first`/`last`'s argument now accepts a top-level comma-generator
+    /// (#155): `first(1,2,3)` == `1`, `last(1,2,3)` == `3`.
+    #[test]
+    fn test_first_last_expr_comma_generator_argument() {
+        query!(br"null", r"first(1,2,3)",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 1);
+            }
+        );
+
+        query!(br"null", r"last(1,2,3)",
+            QueryResult::Owned(OwnedValue::Int(n)) => {
+                assert_eq!(n, 3);
+            }
+        );
+    }
+
+    /// A single-parameter user-defined function called with a
+    /// comma-generator argument (#155): `def f(x): x; f(1,2)` fans out to
+    /// two outputs, matching real jq's call-by-name substitution semantics.
+    #[test]
+    fn test_user_function_call_with_comma_generator_argument() {
+        assert_eq!(
+            outputs(b"null", "def f(x): x; f(1,2)"),
+            vec!["1".to_string(), "2".to_string()]
         );
     }
 

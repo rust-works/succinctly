@@ -103,6 +103,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A comma-generator was rejected inside call arguments** (#155, closing the
+  call-argument half — #360 already closed the index-bracket half): builtin
+  calls like `sort_by(.a,.b)`, `first(1,2,3)`, `[limit(2;1,2,3,4)]`, and
+  user-defined calls like `def f(x): x; f(1,2)` failed to parse with
+  `expected ';' or ')' in function arguments`. Every call-argument slot in
+  `src/jq/parser.rs` — `parse_func_call_or_error`, `parse_namespaced_call`,
+  and the ~35 builtins in `try_parse_builtin` — parsed each argument with
+  `parse_pipe_expr` (no top-level comma) instead of `parse_comma_expr` (full
+  expression, comma included), unlike `parse_index_bracket`, which already
+  received this fix for #360. Deliberate exception: the `n` (count) argument
+  of `limit`/`skip`/`nth` stays restricted to non-comma, since this codebase
+  doesn't implement real jq's `$n` per-output-fanout parameter convention for
+  those three — accepting a comma there would parse but silently take only
+  the first output, which is worse than today's clean parse error. Fixing
+  the parser alone would have introduced a silent regression: `sort_by`,
+  `group_by`, `unique_by`, `min_by`, and `max_by` (`src/jq/eval.rs`) computed
+  their key by evaluating the key filter once and defaulting anything but a
+  single output to `null`, so `sort_by(.a,.b)` would have newly parsed but
+  silently sorted everything as equal. All five now key by `[f]` — the array
+  of *all* outputs of the key filter, reusing `eval_array_construction` —
+  matching jq's actual semantics, so `sort_by(.a,.b)` is a genuine multi-key
+  sort. `limit`/`first`/`last`/`nth`'s eagerness (they evaluate their
+  generator argument to completion before truncating) is unchanged: it
+  already produces correct output for the finite generators in scope here,
+  and true short-circuiting for infinite generators is a separate,
+  significantly larger change tracked for a follow-up. New coverage:
+  `test_comma_in_call_arguments` (parser), `test_by_builtins_multi_key_comma_generator`,
+  `test_limit_comma_generator_argument`,
+  `test_first_last_expr_comma_generator_argument`,
+  `test_user_function_call_with_comma_generator_argument` (eval), and three
+  new `jq_golden_tests` cases (`comma_in_call_args`, `comma_in_limit_arg`,
+  `comma_in_user_func_call`).
+
 - **jq compound/alternative assignment (`+= -= *= /= %= //=`) evaluated the
   right-hand side against the sub-value at the path instead of the document
   root** (#159): `eval_compound_assign`/`eval_alternative_assign` in
