@@ -196,6 +196,33 @@ fn generate_k8s_like(resources: usize) -> Vec<u8> {
     yaml
 }
 
+/// Generate plain (unquoted) scalars containing interior spaces — prose-like
+/// values such as `key0: the quick brown fox jumps\n`. Every other generator
+/// in this file emits single-token values, so a mask that stops at a space
+/// and one that doesn't behave identically on them; this is the shape needed
+/// to tell the two apart (#185, #383).
+fn generate_prose_kv(pairs: usize, target_value_len: usize) -> Vec<u8> {
+    const WORDS: &[&str] = &[
+        "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "config", "service",
+        "cluster", "region", "primary", "replica", "enabled", "timeout", "retries", "endpoint",
+        "version", "status",
+    ];
+    let mut yaml = Vec::with_capacity(pairs * (target_value_len + 12));
+    let mut word_idx = 0usize;
+    for i in 0..pairs {
+        let mut value = String::with_capacity(target_value_len + 8);
+        while value.len() < target_value_len {
+            if !value.is_empty() {
+                value.push(' ');
+            }
+            value.push_str(WORDS[word_idx % WORDS.len()]);
+            word_idx += 1;
+        }
+        yaml.extend_from_slice(format!("key{i}: {value}\n").as_bytes());
+    }
+    yaml
+}
+
 // ============================================================================
 // Benchmark Groups
 // ============================================================================
@@ -414,6 +441,31 @@ fn bench_anchors(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark space-bearing plain scalars, bracketing the ~64-byte break-even
+/// point the earlier (uninformative) P4 broadword measurement found, so the
+/// corrected terminator set can actually be told apart from the old one
+/// (#383).
+fn bench_prose_scalars(c: &mut Criterion) {
+    let mut group = c.benchmark_group("yaml/prose_scalars");
+
+    for &value_len in &[16, 64, 256, 1024] {
+        let yaml = generate_prose_kv(100, value_len);
+        group.throughput(Throughput::Bytes(yaml.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{value_len}b")),
+            &yaml,
+            |b, yaml| {
+                b.iter(|| {
+                    let index = YamlIndex::build(black_box(yaml)).unwrap();
+                    black_box(index)
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_simple_kv,
@@ -424,5 +476,6 @@ criterion_group!(
     bench_large_files,
     bench_block_scalars,
     bench_anchors,
+    bench_prose_scalars,
 );
 criterion_main!(benches);
