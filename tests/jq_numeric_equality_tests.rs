@@ -72,7 +72,8 @@ fn test_eq_is_numeric_not_cross_type() {
 #[test]
 fn test_eq_nan_is_never_equal() {
     // jq: `nan == nan` is false. Equality is therefore NOT
-    // `compare_values(..) == Equal`, which folds incomparable floats to Equal.
+    // `compare_values(..) == Equal` -- `compare_values` orders NaN as
+    // strictly `Less` than every number, including another NaN (#421).
     assert_eq!(one(b"1", "nan == nan"), "false");
     assert_eq!(one(b"1", "nan != nan"), "true");
     // Infinities, by contrast, do compare equal to themselves.

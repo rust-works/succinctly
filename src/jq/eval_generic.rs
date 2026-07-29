@@ -19,11 +19,11 @@ use indexmap::IndexMap;
 
 use super::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
 use super::eval::{
-    eval as full_eval, index_one_owned as index_owned_by_key, numeric_key_to_index, sort_rank,
+    compare_values, eval as full_eval, index_one_owned as index_owned_by_key, numeric_key_to_index,
     tonumber_from_str, EvalError, EvalSemantics, JqSemantics, QueryResult,
 };
 use super::expr::{Builtin, CompareOp, Expr, Literal};
-use super::value::{numeric_repr_cmp, OwnedValue};
+use super::value::OwnedValue;
 use crate::json::JsonIndex;
 
 /// Convert a DocumentValue to an OwnedValue.
@@ -101,72 +101,6 @@ fn standard_json_to_owned<W: Clone + AsRef<[u64]>>(
                 .collect(),
         ),
         StandardJson::Error(_) => OwnedValue::Null,
-    }
-}
-
-/// Compare two OwnedValues for ordering.
-///
-/// Uses jq ordering: null < bool < number < string < array < object.
-/// Returns Some(Ordering) if values are comparable, None if not (for mixed incompatible types).
-fn compare_values(left: &OwnedValue, right: &OwnedValue) -> Option<core::cmp::Ordering> {
-    use core::cmp::Ordering;
-
-    let left_type = sort_rank(left);
-    let right_type = sort_rank(right);
-
-    if left_type != right_type {
-        return Some(left_type.cmp(&right_type));
-    }
-
-    match (left, right) {
-        (OwnedValue::Null, OwnedValue::Null) => Some(Ordering::Equal),
-        (OwnedValue::Bool(a), OwnedValue::Bool(b)) => Some(a.cmp(b)),
-        (OwnedValue::Int(a), OwnedValue::Int(b)) => Some(a.cmp(b)),
-        (OwnedValue::Float(a), OwnedValue::Float(b)) => a.partial_cmp(b),
-        (OwnedValue::Int(a), OwnedValue::Float(b)) => (*a as f64).partial_cmp(b),
-        (OwnedValue::Float(a), OwnedValue::Int(b)) => a.partial_cmp(&(*b as f64)),
-        // A `NumberLiteral` operand compares by its parsed value, exactly
-        // like `Int`/`Float` -- ordering never looks at the source text.
-        // `numeric_repr_cmp` dispatches on the same `(Int,Int)`/`(Float,Float)`/
-        // mixed pairing `==` uses (`numeric_repr_eq`), so ordering can't
-        // disagree with equality about the same pair (see its doc comment).
-        (OwnedValue::NumberLiteral(..), _) | (_, OwnedValue::NumberLiteral(..)) => {
-            match (left.number_repr(), right.number_repr()) {
-                (Some(a), Some(b)) => Some(numeric_repr_cmp(a, b)),
-                _ => None,
-            }
-        }
-        (OwnedValue::String(a), OwnedValue::String(b)) => Some(a.cmp(b)),
-        // Arrays: compare element-wise, then by length
-        (OwnedValue::Array(a), OwnedValue::Array(b)) => {
-            for (ai, bi) in a.iter().zip(b.iter()) {
-                match compare_values(ai, bi) {
-                    Some(Ordering::Equal) => continue,
-                    other => return other,
-                }
-            }
-            Some(a.len().cmp(&b.len()))
-        }
-        // Objects: jq compares the sorted key arrays first, then values in
-        // sorted-key order.
-        (OwnedValue::Object(a), OwnedValue::Object(b)) => {
-            let mut a_keys: Vec<&String> = a.keys().collect();
-            let mut b_keys: Vec<&String> = b.keys().collect();
-            a_keys.sort();
-            b_keys.sort();
-            match a_keys.cmp(&b_keys) {
-                Ordering::Equal => {}
-                other => return Some(other),
-            }
-            for k in a_keys {
-                match compare_values(&a[k], &b[k]) {
-                    Some(Ordering::Equal) => continue,
-                    other => return other,
-                }
-            }
-            Some(Ordering::Equal)
-        }
-        _ => None,
     }
 }
 
@@ -725,18 +659,18 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 CompareOp::Eq => left_owned == right_owned,
                 CompareOp::Ne => left_owned != right_owned,
                 CompareOp::Lt => {
-                    compare_values(&left_owned, &right_owned) == Some(core::cmp::Ordering::Less)
+                    compare_values(&left_owned, &right_owned) == core::cmp::Ordering::Less
                 }
                 CompareOp::Le => matches!(
                     compare_values(&left_owned, &right_owned),
-                    Some(core::cmp::Ordering::Less | core::cmp::Ordering::Equal)
+                    core::cmp::Ordering::Less | core::cmp::Ordering::Equal
                 ),
                 CompareOp::Gt => {
-                    compare_values(&left_owned, &right_owned) == Some(core::cmp::Ordering::Greater)
+                    compare_values(&left_owned, &right_owned) == core::cmp::Ordering::Greater
                 }
                 CompareOp::Ge => matches!(
                     compare_values(&left_owned, &right_owned),
-                    Some(core::cmp::Ordering::Greater | core::cmp::Ordering::Equal)
+                    core::cmp::Ordering::Greater | core::cmp::Ordering::Equal
                 ),
             };
 
