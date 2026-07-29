@@ -2004,7 +2004,7 @@ impl<'a> Parser<'a> {
                     // Skip past indent spaces to check what follows (SIMD accelerated)
                     self.skip_spaces_simd();
                     matches!(self.peek(), Some(b'-'))
-                        && matches!(self.peek_at(1), Some(b' ' | b'\n' | b'\r') | None)
+                        && matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None)
                 };
                 // Restore position after checking
                 self.pos = pos_before_check;
@@ -2014,7 +2014,10 @@ impl<'a> Parser<'a> {
                 // lower indent belongs to an outer container, and treating it
                 // as this key's value left the key's anchor dangling
                 // (`m:\n  b: &b\n- x`). Same test as
-                // `parse_compact_mapping_entry`, which had it right.
+                // `parse_compact_mapping_entry`, which had it right - though
+                // it wasn't quite: that version already included the tab in
+                // its terminator set and this one didn't, so `-\tx` at the
+                // key's indent still dangled the anchor (#434).
                 if next_indent < indent || (next_indent == indent && !is_sequence_at_same_indent) {
                     // Next line is at same or lower indent and not a sequence - value is null
                     // Create explicit null node for anchor to point to
