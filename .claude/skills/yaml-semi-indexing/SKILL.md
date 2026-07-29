@@ -143,9 +143,7 @@ line_break_len(text, pos)       // 2 for \r\n, 1 for a lone \r or \n, 0 otherwis
 Self::is_break(b)               // is_line_break, or `== b'\n'` under !HAS_CR
 self.break_len_at(pos)          // line_break_len, or the LF answer under !HAS_CR
 Self::is_ws_or_break(b)         // ' ' | '\t' | break
-Self::is_space_or_break(b)      // ' ' | break  (no tab)
 Self::is_ws_break_or_eoi(next)  // the indicator lookahead: Option<u8>, EOI counts
-Self::is_space_break_or_eoi(next)
 Self::is_flow_key_terminator(next) // the above plus , } ]
 self.at_break()
 self.skip_line_break()          // consumes exactly one break, whatever its width
