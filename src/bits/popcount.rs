@@ -215,6 +215,13 @@ unsafe fn popcount_64bytes_neon(ptr: *const u8) -> u32 {
 ))]
 #[inline]
 #[target_feature(enable = "avx512f,avx512vpopcntdq")]
+// `_mm512_loadu_si512`/`_mm512_popcnt_epi64`/`_mm512_reduce_add_epi64` stabilized in
+// Rust 1.89, above the crate's declared MSRV (1.73.0). This fn is only reachable
+// behind the opt-in `simd` feature + x86_64 + a runtime
+// `is_x86_feature_detected!("avx512vpopcntdq")` check, and CI always builds with
+// latest stable, so the crate-wide MSRV floor (which covers the rest of the library)
+// doesn't need to move for this one opt-in kernel.
+#[allow(clippy::incompatible_msrv)]
 unsafe fn popcount_words_avx512vpopcntdq(words: &[u64]) -> usize {
     use core::arch::x86_64::*;
 
@@ -228,7 +235,7 @@ unsafe fn popcount_words_avx512vpopcntdq(words: &[u64]) -> usize {
     // Process 8 u64 words (512 bits) at a time
     while offset + 8 <= words.len() {
         unsafe {
-            let ptr = words.as_ptr().add(offset) as *const __m512i;
+            let ptr = words.as_ptr().add(offset).cast::<__m512i>();
             let v = _mm512_loadu_si512(ptr);
 
             // _mm512_popcnt_epi64: Count bits in each of 8 u64 lanes in parallel
@@ -433,8 +440,7 @@ mod tests {
 
             assert_eq!(
                 avx512_result, expected,
-                "AVX-512 VPOPCNTDQ mismatch for {} words",
-                len
+                "AVX-512 VPOPCNTDQ mismatch for {len} words"
             );
         }
     }

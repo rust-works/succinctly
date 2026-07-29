@@ -204,6 +204,8 @@ jobs:
       - name: Install Rust
         if: needs.gate.outputs.code == 'true'
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Cache cargo
         if: needs.gate.outputs.code == 'true'
@@ -279,6 +281,26 @@ jobs:
       - name: Run tests (scalar-yaml — no SIMD or broadword)
         if: needs.gate.outputs.code == 'true'
         run: cargo test --verbose --features simd,scalar-yaml
+
+      # No clippy job runs on aarch64, so every target_arch="aarch64"-gated kernel —
+      # yaml/simd/neon.rs, yaml/simd/broadword.rs, the NEON popcount path in
+      # src/bits/popcount.rs, plus the DSV/JSON/util NEON+SVE2 kernels — has only ever
+      # been built and tested here, never linted (#388, the ARM half of the same
+      # blind spot fixed for x86_64 in the `clippy` job above). Three invocations are
+      # needed because the YAML backend selectors are cfg-exclusive (see the `Run
+      # tests (broadword-yaml...)` comment above): one build only ever selects one of
+      # neon/broadword/scalar.
+      - name: Run Clippy (--all-features — scalar-yaml + NEON/SVE2 kernels)
+        if: needs.gate.outputs.code == 'true'
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run Clippy (simd feature — NEON YAML backend selected)
+        if: needs.gate.outputs.code == 'true'
+        run: cargo clippy --all-targets --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
+
+      - name: Run Clippy (broadword-yaml — ARM64 SWAR backend selected)
+        if: needs.gate.outputs.code == 'true'
+        run: cargo clippy --all-targets --features std,simd,broadword-yaml,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
 
   test-macos-arm:
     name: Test (macOS ARM64)
@@ -488,14 +510,17 @@ jobs:
       # fire under `--all-features`, and does with the set below). That is the same
       # blind spot that let the duplicated broadword layer drift, one level up
       # (#185). This runner is x86_64, so it covers the x86 backend; the ARM
-      # backends are compiled — though not linted — by the test-arm leg.
+      # backends are linted by the test-arm leg below.
       #
-      # `portable-popcount` is kept deliberately: dropping it also un-gates the
-      # AVX-512 popcount path, which carries pre-existing lints that are not this
-      # job's to fix. Linting that path is tracked separately.
-      - name: Run Clippy (YAML SIMD backend selected)
+      # `portable-popcount` is dropped (unlike the x86 backend step's earlier form):
+      # `simd` + `portable-popcount` together also un-gate the AVX-512 popcount path
+      # (src/bits/popcount.rs) the same way `scalar-yaml` un-gates the YAML backends,
+      # so this step now covers both blind spots at once (#388).
+      # `popcount_words_portable`, gated *by* `portable-popcount`, stays covered by
+      # the `--all-features` step above.
+      - name: Run Clippy (YAML SIMD + AVX-512 popcount backend selected)
         if: needs.gate.outputs.code == 'true'
-        run: cargo clippy --all-targets --features std,simd,portable-popcount,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
+        run: cargo clippy --all-targets --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
 
   fmt:
     name: Format
