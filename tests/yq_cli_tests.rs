@@ -539,6 +539,48 @@ fn test_duplicate_mapping_key_is_last_wins() -> Result<()> {
     Ok(())
 }
 
+/// Field-lookup semantics (`.a` above, last-wins) are distinct from
+/// output/serialization semantics: on identity pass-through, real yq keeps
+/// *both* duplicate keys, in every output mode. Before #442, succinctly's
+/// pretty (indented) output silently dropped the earlier occurrence via an
+/// `IndexMap`-backed DOM, while compact (`-I0`) streamed straight from the
+/// cursor and kept both. The M2 fast path now covers pretty output too, so
+/// all four combinations agree with real yq.
+#[test]
+fn test_duplicate_mapping_key_survives_json_output() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (pretty, code) = run_yq_stdin(".", yaml, &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty, "{\n  \"a\": 1,\n  \"a\": 2\n}\n");
+
+    let (compact, code) = run_yq_stdin(".", yaml, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(compact, "{\"a\":1,\"a\":2}\n");
+
+    Ok(())
+}
+
+/// Same as [`test_duplicate_mapping_key_survives_json_output`], but for the
+/// default YAML output format — plain `yq '.'` with no flags shares the
+/// same materialize-into-`OwnedValue::Object` code path as `-o json`, so it
+/// had the identical pre-#442 bug (undocumented by the issue's own repro,
+/// which only showed `-o json`).
+#[test]
+fn test_duplicate_mapping_key_survives_yaml_output() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (pretty, code) = run_yq_stdin(".", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty, "a: 1\na: 2\n");
+
+    let (compact, code) = run_yq_stdin(".", yaml, &["-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(compact, "a: 1\na: 2\n");
+
+    Ok(())
+}
+
 #[test]
 fn test_compact_json_output() -> Result<()> {
     let yaml = r"
@@ -2445,7 +2487,12 @@ fn test_from_file_with_multiple_input_files() -> Result<()> {
     )?;
 
     assert_eq!(code, 0);
-    assert_eq!(output, "---\n1\n---\n2\n");
+    // No leading `---` before the first file's result, matching real yq —
+    // the separator only appears *between* documents (#442 routed this
+    // non-compact multi-file case through the M2 fast path's
+    // `emit_yaml_doc_separator`, which corrects a pre-existing divergence
+    // from the DOM/slow path that had emitted a spurious leading `---`).
+    assert_eq!(output, "1\n---\n2\n");
     Ok(())
 }
 
@@ -2947,9 +2994,11 @@ fn test_alias_as_a_flow_mapping_key_resolves() -> Result<()> {
     // does too.
     //
     // Every expectation is `yq` v4.53.3's output for the same input, on the
-    // streaming path (`-I 0`). The pretty path is deliberately not asserted here:
-    // its DOM collapses duplicate mapping keys (#174), which resolution makes
-    // reachable from more inputs but does not cause.
+    // streaming path (`-I 0`). Before #442, the pretty path wasn't asserted
+    // here: its DOM collapsed duplicate mapping keys, which resolution makes
+    // reachable from more inputs but does not cause. #442 fixed pretty output
+    // for identity/navigation queries, so a couple of representative cases
+    // are now spot-checked in pretty mode too, below.
     for (yaml, expected) in [
         // Alias to an anchored key, and to an anchored value — different targets.
         ("{&x k: 1, *x: 2}\n", r#"{"k":1,"k":2}"#),
@@ -2972,6 +3021,16 @@ fn test_alias_as_a_flow_mapping_key_resolves() -> Result<()> {
         assert_eq!(code, 0, "for {yaml:?}");
         assert_eq!(output.trim(), expected, "for {yaml:?}");
     }
+
+    // Pretty-mode spot check (#442): a duplicate-`k`-key case and a
+    // duplicate-empty-string-key case, matching real yq's pretty output.
+    let (output, code) = run_yq_stdin(".", "{&x k: 1, *x: 2}\n", &["-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "{\n  \"k\": 1,\n  \"k\": 2\n}\n");
+
+    let (output, code) = run_yq_stdin(".", "{&x [1,2]: 3, *x: 4}\n", &["-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "{\n  \"\": 3,\n  \"\": 4\n}\n");
 
     // An anchor and an alias to it on the *same* node: the alias edge now lands on
     // the node the anchor names, so this is a cycle by the `target == alias` arm of

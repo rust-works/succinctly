@@ -1,18 +1,25 @@
 //! Cross-path consistency: `yq -o=json` must equal `yq -o=json -I=0` in value.
 //!
-//! `succinctly yq` has two YAML→JSON conversions. Compact output (`-I 0`) takes
-//! the streaming fast path (`YamlCursor::stream_json`); any other indent
-//! materializes an `OwnedValue` and pretty-prints. An indent flag must not
-//! change data, so for every input the two paths must agree on the JSON
-//! *values* they produce (issue #222).
+//! `succinctly yq` has two YAML→JSON conversions, both taking the streaming
+//! M2 fast path (`YamlCursor::stream_json`) directly from the cursor for the
+//! identity query this harness runs — compact (`-I 0`) and pretty differ only
+//! in whitespace, not in whether duplicate keys survive (issue #442). Older
+//! query shapes that fall back to materializing an `OwnedValue` still collapse
+//! duplicate keys via its `IndexMap`, but identity does not. An indent flag
+//! must not change data, so for every input the two paths must agree on the
+//! JSON *values* they produce (issue #222).
 //!
 //! This harness runs every case in the vendored YAML Test Suite corpus through
 //! both paths and compares. Comparison is on parsed, key-sorted JSON values,
-//! not bytes: the paths legitimately differ in whitespace, and objects with
-//! duplicate `""` keys (multiple complex keys in one mapping) collapse
-//! last-wins identically on both sides once parsed. If either path errors, they
-//! must both error; if either emits output that is not valid JSON, that counts
-//! as a divergence.
+//! not bytes: the paths legitimately differ in whitespace. Objects with
+//! duplicate `""` keys (multiple complex keys in one mapping) would collapse
+//! last-wins identically on both sides once parsed even if the comparator
+//! were byte-exact, since the comparator's own JSON parser dedupes on parse —
+//! this harness's parsed-value comparison can't distinguish "both paths kept
+//! both keys" from "both paths dropped one," so it isn't a substitute for the
+//! byte-level assertions in `tests/yq_cli_tests.rs` and
+//! `tests/yq_golden_tests.rs`. If either path errors, they must both error; if
+//! either emits output that is not valid JSON, that counts as a divergence.
 //!
 //! Cases that still diverge — for reasons tracked by *other* issues, not the
 //! key/fold/block-scalar drift #222 fixed — are listed in
