@@ -1131,9 +1131,16 @@ impl<'a> Parser<'a> {
                         self.advance();
                     }
                     b':' => {
-                        // Colon followed by whitespace ends the value (could be a key)
-                        // But in value context, colons in URLs etc. are allowed
-                        if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                        // Colon followed by whitespace, a line break, or EOF ends
+                        // the value (could be a key). In value context, colons in
+                        // URLs etc. are allowed. The `| None` arm matters: without
+                        // it, a colon as the last byte of the document (no trailing
+                        // newline) was absorbed as content instead of terminating
+                        // the value, while `find_scalar_end` (the locate-path copy
+                        // of this same boundary) already stopped there - eval and
+                        // locate disagreed on the same node (#434, same shape as
+                        // #370).
+                        if matches!(self.peek_at(1), Some(b' ' | b'\t' | b'\n' | b'\r') | None) {
                             break;
                         }
                         self.advance();
@@ -1264,8 +1271,8 @@ impl<'a> Parser<'a> {
                 && next_char != b'#'
                 && !sequence_indicator_is_block_structure
                 && !(next_char == b':'
-                    && lookahead + 1 < self.input.len()
-                    && matches!(self.input[lookahead + 1], b' ' | b'\t' | b'\n' | b'\r'))
+                    && (lookahead + 1 >= self.input.len()
+                        || matches!(self.input[lookahead + 1], b' ' | b'\t' | b'\n' | b'\r')))
             {
                 // Continue to next line
                 self.skip_line_break();
