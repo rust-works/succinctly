@@ -327,6 +327,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not (`resolve_merge_keys`'s doc comment has the details); succinctly always
   gives the latter (pure, local, no cross-node mutation) answer.
 
+- **`del()` with multiple negative computed indexes deleted the wrong
+  element** (#424): `sort_paths_for_deletion` in `src/jq/eval.rs` ordered
+  resolved paths by trailing index descending and deleted them one at a
+  time, which is only sound while every index counts from the same end of
+  the array. `[10,20,30,40] | del(.[(-1,-2)])` deleted `-1` (`40`) first,
+  shortening the array to length 3, so `-2` then counted back from *that*
+  and took `20` instead of `30` — `[10,30]` where jq gives `[10,20]`.
+  Reversing the argument order didn't help, since `-1` and `-2` count from
+  the opposite end to a non-negative index, so no ordering of one-at-a-time
+  deletions is correct. The same defect reached nested, independent computed
+  indexes too (`.[(0,1)][(-1,-2)]`) — not called out in the issue, but
+  sharing the identical cause. Fixed by grouping resolved paths that share a
+  container and deleting each container's keys simultaneously, resolving
+  every index against the length its container had before any sibling here
+  was removed — reusing `delete_keys`, the same primitive `delpaths` was
+  fixed with in #398, while keeping `del`'s own type/bounds error checks.
+  New coverage: four cases (reported, reversed, mixed-sign, and nested) in
+  `test_del_with_negative_computed_indexes_resolves_against_original_length`
+  in `tests/jq_computed_key_tests.rs`.
+
 - **A tab that indented a sequence-item continuation line was folded into a
   plain scalar instead of rejected** (#432, also fixing #371): three related
   gaps in `parse_unquoted_value_with_indent_impl` and `parse_mapping_entry`
