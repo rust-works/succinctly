@@ -7,8 +7,10 @@
 //! *before* indexing, that rejects invalid YAML. The default indexing path does
 //! not link it and is structurally incapable of regressing because of it.
 //!
-//! Like the JSON validator this is a plain scalar scanner — `no_std`, with no
-//! allocation on the success path. It is **not** a full YAML grammar checker:
+//! Like the JSON validator this is a plain scalar scanner — `no_std`, and it
+//! allocates on the success path only for a document that defines anchors,
+//! whose names it must remember to resolve later aliases (#404). It is **not**
+//! a full YAML grammar checker:
 //! it walks the document permissively and rejects only the specific classes of
 //! malformed input enumerated in issue #223 (the YAML Test Suite's `lax:*`
 //! cases). Everything it does not recognize as invalid, it accepts — the same
@@ -25,6 +27,8 @@
 //! assert!(validate(b"a: b: c\n").is_err()); // nested mapping key
 //! ```
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt;
 
 use super::line_break::{is_line_break, line_break_len};
@@ -105,6 +109,19 @@ pub enum YamlValidationErrorKind {
     AnchorOnAlias,
     /// An anchor was placed where it cannot bind to a following node.
     MisplacedAnchor,
+    /// An alias named an anchor that is not in scope (`a: *nope`), including a
+    /// forward reference — YAML 1.2 §7.1 requires an alias to name a *previous*
+    /// anchor, and `yq` rejects every such alias with
+    /// `unknown anchor 'nope' referenced`.
+    ///
+    /// The lenient loader rejects this too ([`YamlError::UnknownAnchor`], #372);
+    /// without this kind the *strict* validator was the laxer of the two (#404).
+    ///
+    /// [`YamlError::UnknownAnchor`]: super::YamlError::UnknownAnchor
+    UnknownAnchor {
+        /// The referenced anchor name.
+        name: String,
+    },
 
     // --- Documents / directives ---
     /// Non-comment content followed a `...` document-end marker on its line.
@@ -178,6 +195,7 @@ impl fmt::Display for YamlValidationErrorKind {
             }
             Self::AnchorOnAlias => write!(f, "anchor immediately followed by an alias"),
             Self::MisplacedAnchor => write!(f, "misplaced anchor"),
+            Self::UnknownAnchor { name } => write!(f, "unknown anchor '{name}' referenced"),
             Self::ContentAfterDocumentEnd => {
                 write!(f, "content after document-end marker '...'")
             }
@@ -283,6 +301,25 @@ pub struct Validator<'a> {
     /// A root plain scalar was closed by a trailing comment; any further content
     /// in the same document is a second root node (BS4K, EB22).
     root_scalar_done: bool,
+    /// Byte spans of the anchor names defined so far, so an alias can be checked
+    /// against them (#404). Empty — and unallocated — until the first anchor.
+    ///
+    /// Deliberately *not* cleared at a document boundary: `yq` resolves an alias
+    /// against an anchor defined in an earlier document of the same stream
+    /// (`a: &x 1\n---\nb: *x` loads), and the loader's anchor table is not
+    /// cleared either, so clearing here would reject input both accept.
+    anchors: Vec<(usize, usize)>,
+    /// True while the cursor sits where a node may begin, so a `*` there is an
+    /// alias rather than plain-scalar content (`a: text *star` is the string
+    /// `text *star`). Only meaningful during [`Self::scan_content_tokens`].
+    at_node_start: bool,
+    /// The previous content line ended inside plain-scalar content, so a
+    /// following scalar line at or past its indentation continues that scalar
+    /// rather than starting a node.
+    prev_line_open_plain: bool,
+    /// Indentation of the previous content line, paired with
+    /// [`Self::prev_line_open_plain`].
+    prev_line_indent: usize,
 }
 
 impl<'a> Validator<'a> {
@@ -304,6 +341,10 @@ impl<'a> Validator<'a> {
             frame_len: 0,
             line_had_comment: false,
             root_scalar_done: false,
+            anchors: Vec::new(),
+            at_node_start: true,
+            prev_line_open_plain: false,
+            prev_line_indent: 0,
         }
     }
 
@@ -732,6 +773,8 @@ impl<'a> Validator<'a> {
             self.root_kind = None;
             self.root_scalar_done = false;
             self.frame_len = 0;
+            // A marker closes any open plain scalar; the next line starts a node.
+            self.prev_line_open_plain = false;
             Ok(())
         } else {
             // `---` document start; a document root node may follow on this line.
@@ -744,13 +787,43 @@ impl<'a> Validator<'a> {
             self.root_kind = None;
             self.root_scalar_done = false;
             self.frame_len = 0;
+            self.prev_line_open_plain = false;
             self.scan_content_line()
         }
     }
 
     /// Scan the significant content of a line (after leading indent), consuming
     /// scalars, flow collections, and comments to the line break.
+    ///
+    /// Wraps [`Self::scan_content_tokens`] with the cross-line bookkeeping that
+    /// tells a node from the continuation of the previous line's plain scalar
+    /// (#404), so both call sites — a plain line and `--- x` — get it.
     fn scan_content_line(&mut self) -> Result<(), YamlValidationError> {
+        self.at_node_start = !self.continues_plain_scalar();
+        let result = self.scan_content_tokens();
+        // A line that ended inside plain content may be continued by the next;
+        // a trailing comment closes the scalar, so it cannot be.
+        self.prev_line_open_plain = !self.at_node_start && !self.line_had_comment;
+        self.prev_line_indent = self.line_indent;
+        result
+    }
+
+    /// True if this line continues the previous line's plain scalar rather than
+    /// starting a node, so a leading `*` is scalar content — `a: text\n  *x` is
+    /// the string `text *x`, and `root\n*x` is `root *x`.
+    ///
+    /// A continuation is a scalar line at or past the open scalar's
+    /// indentation. A `-`/`?`/`:` indicator or a `: ` value indicator makes the
+    /// line a node instead ([`Self::line_kind`] reports those as `Seq`/`Map`),
+    /// which is what keeps an alias key (`*nope: v`) checked.
+    fn continues_plain_scalar(&self) -> bool {
+        self.prev_line_open_plain
+            && self.line_indent >= self.prev_line_indent
+            && self.line_kind() == LineKind::Scalar
+    }
+
+    /// Walk one content line's tokens. See [`Self::scan_content_line`].
+    fn scan_content_tokens(&mut self) -> Result<(), YamlValidationError> {
         // A tab used as indentation between block indicators (Y79Y/004-009).
         if self.tab_between_indicators() {
             return Err(self.error(YamlValidationErrorKind::TabInIndentation));
@@ -773,16 +846,24 @@ impl<'a> Validator<'a> {
                     self.consume_line_break();
                     return Ok(());
                 }
+                // An anchor is a property, not a node: whatever follows it still
+                // begins one, so `at_node_start` carries through.
                 Some(b'&') if self.at_quote_start() => {
                     suppress_nested = true;
                     self.scan_anchor()?;
                 }
                 Some(b'*') if self.at_quote_start() => {
                     suppress_nested = true;
-                    self.scan_anchor_name();
+                    self.scan_alias(self.at_node_start)?;
+                    self.at_node_start = false;
                 }
                 Some(b'?') => {
                     suppress_nested = true;
+                    // An explicit key indicator opens a node. A `?` inside a
+                    // scalar does not, even when a space follows it — the
+                    // `*star` in `a: what? *star` is content.
+                    self.at_node_start = self.at_node_start
+                        && matches!(self.peek_at(1), None | Some(b' ' | b'\t' | b'\n' | b'\r'));
                     self.advance();
                 }
                 Some(b'"') if self.at_quote_start() => {
@@ -795,6 +876,7 @@ impl<'a> Validator<'a> {
                     };
                     let multiline = self.scan_double_quoted(min)?;
                     self.check_after_block_quoted(multiline)?;
+                    self.at_node_start = false;
                 }
                 Some(b'\'') if self.at_quote_start() => {
                     let min = if seen_value_indicator {
@@ -804,6 +886,7 @@ impl<'a> Validator<'a> {
                     };
                     let multiline = self.scan_single_quoted(min)?;
                     self.check_after_block_quoted(multiline)?;
+                    self.at_node_start = false;
                 }
                 Some(b':') if self.is_value_indicator() => {
                     if seen_value_indicator && !suppress_nested {
@@ -825,10 +908,13 @@ impl<'a> Validator<'a> {
                     {
                         return Err(self.error(YamlValidationErrorKind::TrailingContent));
                     }
+                    // The entry's value node follows the indicator.
+                    self.at_node_start = true;
                 }
                 Some(b'[' | b'{') if self.at_quote_start() => {
                     self.scan_flow()?;
                     self.check_after_top_level_flow()?;
+                    self.at_node_start = false;
                 }
                 Some(b'|' | b'>') if self.at_block_scalar_header() => {
                     self.scan_block_scalar_header()?;
@@ -840,8 +926,22 @@ impl<'a> Validator<'a> {
                     self.skip_to_line_end();
                     return Ok(());
                 }
+                // Separation between tokens: whatever the cursor was expecting,
+                // it still is.
+                Some(b' ' | b'\t') => {
+                    self.advance();
+                }
+                // A block sequence indicator; the item's node follows it.
+                Some(b'-')
+                    if self.at_node_start
+                        && matches!(self.peek_at(1), None | Some(b' ' | b'\t' | b'\n' | b'\r')) =>
+                {
+                    self.advance();
+                }
+                // Plain scalar content, so no node begins at the next byte.
                 Some(_) => {
                     self.advance();
+                    self.at_node_start = false;
                 }
             }
         }
@@ -1035,6 +1135,18 @@ impl<'a> Validator<'a> {
                     self.scan_flow()?;
                     expect_item = false;
                 }
+                // Every arm here is reached at a node start — after `[`, `{`,
+                // `,` or `:` — so a `*` is an alias, not scalar content (#404).
+                // An anchor is a property: its node still follows, so
+                // `expect_item` is left alone.
+                Some(b'&') => {
+                    let name = self.scan_anchor_name();
+                    self.record_anchor(name);
+                }
+                Some(b'*') => {
+                    self.scan_alias(true)?;
+                    expect_item = false;
+                }
                 Some(b'"') => {
                     self.scan_double_quoted(0)?;
                     expect_item = false;
@@ -1161,7 +1273,8 @@ impl<'a> Validator<'a> {
     /// not be immediately followed by an alias (`&a *b`, SR86/SU74) nor by a
     /// block sequence indicator on the same line (`&a - x`, SY6V).
     fn scan_anchor(&mut self) -> Result<(), YamlValidationError> {
-        self.scan_anchor_name(); // consumes `&`/`*` and the name
+        let name = self.scan_anchor_name(); // consumes `&` and the name
+        self.record_anchor(name);
         self.skip_spaces_and_tabs();
         match self.peek() {
             Some(b'*') => Err(self.error(YamlValidationErrorKind::AnchorOnAlias)),
@@ -1172,16 +1285,60 @@ impl<'a> Validator<'a> {
         }
     }
 
-    /// Consume an anchor or alias token: the `&`/`*` sigil and its name (any
-    /// non-whitespace, non-flow-indicator bytes; `:` is a legal name character).
-    fn scan_anchor_name(&mut self) {
+    /// Consume an anchor or alias token — the `&`/`*` sigil and its name — and
+    /// return the name's byte span, excluding the sigil.
+    ///
+    /// The extent is [`super::simd::parse_anchor_name`], the definition the
+    /// loader scans names with, rather than a second copy here: an alias is
+    /// resolved against the names the loader recorded, so a name it reads as
+    /// `a` must not be read as `a:` here (`&a: 1\nb: *a` loads under `yq`).
+    /// See the #106 note in `CLAUDE.md` on predicates that diverge silently.
+    ///
+    /// A name holds no line break, so the column advances by its length.
+    fn scan_anchor_name(&mut self) -> (usize, usize) {
         self.advance(); // `&` or `*`
-        while !matches!(
-            self.peek(),
-            None | Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b'[' | b']' | b'{' | b'}')
-        ) {
-            self.advance();
+        let start = self.offset;
+        let end = super::simd::parse_anchor_name(self.input, start);
+        self.column += end - start;
+        self.offset = end;
+        (start, end)
+    }
+
+    /// Record an anchor name as in scope for later aliases (#404).
+    ///
+    /// Registration is deliberately permissive — every `&name` the scanner
+    /// reaches is recorded, whether or not it truly binds a node. An extra name
+    /// can only make [`Self::scan_alias`] accept more, never reject valid input.
+    fn record_anchor(&mut self, (start, end): (usize, usize)) {
+        if end > start {
+            self.anchors.push((start, end));
         }
+    }
+
+    /// True if `input[start..end]` names an anchor already defined.
+    fn anchor_in_scope(&self, start: usize, end: usize) -> bool {
+        let name = &self.input[start..end];
+        self.anchors.iter().any(|&(s, e)| &self.input[s..e] == name)
+    }
+
+    /// Consume an alias token (`*name`), positioned on the `*`, and — when
+    /// `checked` — reject a name no anchor has defined (#404).
+    ///
+    /// The lookup happens *before* consuming so the error points at the `*`, as
+    /// the loader's `UnknownAnchor` offset does. `checked` is false where the
+    /// `*` may be plain-scalar content instead of a node (see
+    /// [`Self::at_node_start`]); an empty name is left to the loader.
+    fn scan_alias(&mut self, checked: bool) -> Result<(), YamlValidationError> {
+        if checked {
+            let start = self.offset + 1;
+            let end = super::simd::parse_anchor_name(self.input, start);
+            if end > start && !self.anchor_in_scope(start, end) {
+                let name = String::from_utf8_lossy(&self.input[start..end]).into_owned();
+                return Err(self.error(YamlValidationErrorKind::UnknownAnchor { name }));
+            }
+        }
+        self.scan_anchor_name();
+        Ok(())
     }
 
     /// Scan a double-quoted scalar, validating escape sequences. May span lines.
@@ -1466,6 +1623,36 @@ mod tests {
         assert!(validate(b"---\nseq:\n &anchor\n- a\n- b\n").is_ok()); // SKE5
     }
 
+    /// Issue #404: the unknown-anchor rejection must not take valid input with
+    /// it. Two ways it could: a `*` that is plain-scalar content rather than an
+    /// alias, and an anchor whose definition the scanner fails to register.
+    /// Every case here loads under `yq` v4.53.3 (the goldens' pinned version).
+    #[test]
+    fn accepts_resolvable_aliases_and_stars_in_scalars() {
+        // A `*` inside a scalar is content: `{"a":"text *star"}`.
+        assert!(validate(b"a: text *star\n").is_ok());
+        assert!(validate(b"a: rm *.tmp\n").is_ok());
+        assert!(validate(b"a: what? *star\n").is_ok());
+        // ... including on the continuation line of a multi-line plain scalar,
+        // where the `*` opens the line: `{"a":"text *notanalias"}`.
+        assert!(validate(b"a: text\n  *notanalias\n").is_ok());
+        assert!(validate(b"a:\n  text\n  *notanalias\n").is_ok());
+        assert!(validate(b"root\n*notanalias\n").is_ok()); // "root *notanalias"
+        assert!(validate(b"a: text &amp more\n").is_ok());
+        // An anchor defined before the alias, in each position defining one.
+        assert!(validate(b"a: &x 1\nb: *x\n").is_ok());
+        assert!(validate(b"- &x 1\n- *x\n").is_ok());
+        assert!(validate(b"a: [&x 1, *x]\n").is_ok());
+        assert!(validate(b"a: {k: &x 1, j: *x}\n").is_ok());
+        assert!(validate(b"? &x k\n: *x\n").is_ok());
+        // The name ends at a `: ` value indicator, as the loader's scan does —
+        // registering `a:` here would reject the alias below.
+        assert!(validate(b"&a: 1\nb: *a\n").is_ok());
+        // Anchors carry across documents for `yq` and for the loader, so an
+        // alias to an earlier document's anchor is not an unresolved one.
+        assert!(validate(b"a: &x 1\n---\nb: *x\n").is_ok());
+    }
+
     /// Issue #328: every shape the loader now handles must also pass the
     /// validator, or `syq --validate` would reject documents `syq` reads fine.
     ///
@@ -1722,6 +1909,51 @@ mod tests {
         )); // SY6V
     }
 
+    /// Issue #404: an alias naming an anchor that is not in scope. `yq` v4.53.3
+    /// rejects every case below with `unknown anchor 'nope' referenced`, and
+    /// `yaml validate` is documented as the yq-conformance gate, so accepting
+    /// them left a CI check green on input `yq` refuses.
+    ///
+    /// Table-driven over the positions an alias can occupy — a value, a
+    /// sequence item, an explicit key, an implicit key, and both flow
+    /// collections — because they reach the check through different scanners
+    /// (`scan_content_tokens` and `scan_flow`), and a position added later that
+    /// forgets to check fails here. The position is asserted too: reporting
+    /// some other plausible offset would still pass a kind-only assertion.
+    #[test]
+    fn rejects_alias_to_unknown_anchor() {
+        for input in [
+            &b"a: *nope\n"[..],
+            b"- *nope\n",
+            b"? *nope\n: v\n",
+            b"*nope: v\n",
+            b"a: [*nope]\n",
+            b"a: {k: *nope}\n",
+            b"[*nope]\n",
+            b"a: &x 1\nb: [1, *nope]\n",
+        ] {
+            let err = validate(input).unwrap_err();
+            let shown = String::from_utf8_lossy(input);
+            assert!(
+                matches!(&err.kind, UnknownAnchor { name } if name == "nope"),
+                "{shown:?}: {:?}",
+                err.kind
+            );
+            assert_eq!(
+                input.get(err.position.offset),
+                Some(&b'*'),
+                "{shown:?}: error should point at the alias sigil, not {:?}",
+                err.position
+            );
+        }
+        // A forward reference: the anchor exists, but not yet. YAML 1.2 §7.1
+        // requires an alias to name a *previous* anchor.
+        assert!(matches!(
+            kind(b"a: *x\nb: &x 5\n"),
+            UnknownAnchor { name } if name == "x"
+        ));
+    }
+
     #[test]
     fn rejects_document_and_directive_errors() {
         assert!(matches!(
@@ -1797,6 +2029,9 @@ mod tests {
             TabInIndentation,
             AnchorOnAlias,
             MisplacedAnchor,
+            UnknownAnchor {
+                name: "nope".into(),
+            },
             ContentAfterDocumentEnd,
             MisplacedDirective,
             InvalidDirective,

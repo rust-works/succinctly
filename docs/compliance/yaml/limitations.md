@@ -125,7 +125,10 @@ alias with nothing to resolve to:
   *later* — fails with `YamlError::UnknownAnchor` since
   [#372](https://github.com/rust-works/succinctly/issues/372). YAML 1.2 §7.1 requires an
   alias to name a *previous* anchor, so a miss is invalid input rather than a value, and
-  `yq` reports `unknown anchor 'x' referenced` for the same input.
+  `yq` reports `unknown anchor 'x' referenced` for the same input. The strict validator
+  enforces this too ([#404](https://github.com/rust-works/succinctly/issues/404)); it did
+  not at first, which briefly made the opt-in strict mode *laxer* than the default one for
+  this input.
 
 ```
 $ printf 'a: &x {self: *x}\n' | succinctly yq '.'

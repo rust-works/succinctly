@@ -139,6 +139,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to a single entry via the owned-value conversion in `to_owned` — a
   separate, still-open gap, not fixed here.)
 
+- **The strict YAML validator accepted an alias to an unknown anchor** (#404):
+  `succinctly yaml validate` passed `a: *nope`, which `yq` rejects with
+  `unknown anchor 'nope' referenced`. Since #372 taught the default loader the
+  same rule, the *opt-in strict* mode had become the laxer of the two — `syq`
+  refused the document while `yaml validate`, documented as the yq-conformance
+  gate, gave it a clean exit 0, so a CI check built on the validator stayed
+  green on input `yq` refuses. The validator now tracks the anchor names a
+  document defines and rejects an alias naming one that is not in scope, in
+  every position an alias can occupy (value, sequence item, implicit key,
+  explicit key, and both flow collections — the flow ones had no anchor/alias
+  handling at all), with a new `YamlValidationErrorKind::UnknownAnchor`.
+
+  Rejecting a `*` first requires knowing it *starts a node* rather than sitting
+  inside a scalar: `a: rm *.tmp` and `a: text` continued by `  *notanalias` are
+  strings, and `yq` loads both. The scanner now tracks where a node can begin —
+  after a `:`/`-`/`?` indicator, after `[`/`{`/`,`/`:` in flow, and at the start
+  of a line that is not the continuation of an open plain scalar — and checks
+  only there. Anchor *registration* stays deliberately permissive, because an
+  extra name can only make the check accept more, never reject valid input: a
+  `&foo` that is really scalar content still satisfies a later `*foo`, as does
+  an anchor the loader declines to record (`&x` alone on a `---` line, #372).
+  Anchor scope is not reset at a document boundary, since `yq` and the loader
+  both resolve an alias against an earlier document's anchor.
+
+  Names now take their extent from `simd::parse_anchor_name`, the definition the
+  loader scans with, rather than the validator's own — which stopped only at
+  whitespace, read `*nope: v`'s name as `nope:`, and so would have rejected the
+  valid `&a: 1` / `b: *a`. See the #106 note in `CLAUDE.md` on predicates that
+  diverge silently.
+
+  The validator remains `no_std`, but now allocates on the success path for a
+  document that defines anchors, whose names it must remember.
+
+  No YAML Test Suite manifest movement, for the reason #372 gives: no case in
+  the suite contains an alias to an anchor that is not in scope.
+
+- **The AVX2 anchor-name scanner treated every `:` as a terminator, truncating
+  names on x86_64** (#453, found while fixing #404's CI): `parse_anchor_name_avx2`
+  (`src/yaml/simd/x86.rs`) is the AVX2 kernel behind `simd::parse_anchor_name`,
+  the function both the loader and, since #404, the strict validator use to
+  compute anchor/alias name extents. It stopped at *every* `:`, unlike the
+  scalar reference and the NEON kernel, which correctly stop only at a `:`
+  followed by whitespace (a bare `:` is a legal anchor-name character). On
+  x86_64 with AVX2, this silently truncated a name of at least ~32 bytes
+  remaining in the buffer that contains such a colon — e.g. the YAML Test
+  Suite's `W5VH` case (`&:@*!$"<foo>: scalar a` / `*:@*!$"<foo>:`) computed an
+  *empty* anchor name instead of its real 11 bytes. This is a pre-existing bug
+  in the already-shipped "P4 Anchor/Alias SIMD" optimization, not something
+  #404 introduced; it went unnoticed because nothing previously compared a
+  registered anchor name against later text by content, which is exactly what
+  #404's new `anchor_in_scope` check does, surfacing the truncation as a false
+  `unknown anchor` rejection on x86_64 only. `parse_anchor_name_avx2` now
+  mirrors the NEON kernel: SIMD flags only whitespace/flow-indicators as
+  definite terminators, and a candidate colon is resolved by checking the
+  actual next byte, falling back to the scalar scanner for the remainder when
+  the colon turns out to be a name character. New differential test
+  `test_parse_anchor_name_avx2_matches_scalar_around_colons` in
+  `src/yaml/simd/x86.rs` pins colon-then-whitespace, colon-then-name-char, a
+  colon run, colon-before-flow-indicator, and a colon crossing a 32-byte chunk
+  boundary against the scalar reference.
+
 - **jq's regex builtins and `endswith` kept the pre-#356 wording after #356
   fixed their siblings** (#393): `test("a")` and `startswith("a")` were
   probed and now report jq's sentences, but `match`, `capture`, `scan`,
