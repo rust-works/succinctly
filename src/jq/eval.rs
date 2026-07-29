@@ -19034,6 +19034,108 @@ mod tests {
         ]);
     }
 
+    /// A key of the wrong *kind* for its container names nothing valid at all
+    /// — jq refuses it rather than treating it as absent.
+    #[test]
+    fn test_delpaths_rejects_wrong_type_keys() {
+        assert_outcomes(&[
+            // Terminal: object field named by a non-string key.
+            (
+                br#"{"a":1}"#,
+                "delpaths([[0]])",
+                Err("Cannot delete number field of object"),
+            ),
+            (
+                br#"{"a":1}"#,
+                "delpaths([[null]])",
+                Err("Cannot delete null field of object"),
+            ),
+            (
+                br#"{"a":1}"#,
+                "delpaths([[true]])",
+                Err("Cannot delete boolean field of object"),
+            ),
+            (
+                br#"{"a":1}"#,
+                "delpaths([[[1]]])",
+                Err("Cannot delete array field of object"),
+            ),
+            (
+                br#"{"a":1}"#,
+                "delpaths([[{}]])",
+                Err("Cannot delete object field of object"),
+            ),
+            // Terminal: array element named by a non-number key.
+            (
+                b"[1,2]",
+                r#"delpaths([["a"]])"#,
+                Err("Cannot delete string element of array"),
+            ),
+            (
+                b"[1,2]",
+                "delpaths([[true]])",
+                Err("Cannot delete boolean element of array"),
+            ),
+            (
+                b"[1,2]",
+                "delpaths([[null]])",
+                Err("Cannot delete null element of array"),
+            ),
+            (
+                b"[1,2]",
+                "delpaths([[[1]]])",
+                Err("Cannot delete array element of array"),
+            ),
+            // Mid-path: non-string key navigating into an object.
+            (
+                br#"{"a":{"x":1}}"#,
+                r#"delpaths([[0,"x"]])"#,
+                Err("Cannot index object with number"),
+            ),
+            // Mid-path: wrong-type key navigating into an array.
+            (
+                b"[[1,2,3]]",
+                r#"delpaths([[0,"x",1]])"#,
+                Err(r#"Cannot index array with string "x""#),
+            ),
+            // Mid-path: a scalar reached with path left over.
+            (
+                br#"{"a":1}"#,
+                r#"delpaths([["a","b","c"]])"#,
+                Err(r#"Cannot index number with string "b""#),
+            ),
+            (
+                br#"{"a":"hi"}"#,
+                r#"delpaths([["a","b","c"]])"#,
+                Err(r#"Cannot index string with string "b""#),
+            ),
+            // Terminal: a scalar reached with no key left to apply.
+            (
+                b"1",
+                "delpaths([[0]])",
+                Err("Cannot delete fields from number"),
+            ),
+            (
+                b"1",
+                r#"delpaths([["a"]])"#,
+                Err("Cannot delete fields from number"),
+            ),
+            // Contrast: `null` stays a no-op at both mid-path and terminal
+            // position — it has no fields to begin with, so there is nothing
+            // to refuse.
+            (
+                br#"{"a":null}"#,
+                r#"delpaths([["a","b"]])"#,
+                Ok(r#"{"a":null}"#),
+            ),
+            (b"null", r#"delpaths([["a"]])"#, Ok("null")),
+            // Contrast: an object-shaped ("slice") key against an array is a
+            // deliberately preserved no-op, matching `set_value_at_path`'s
+            // same exclusion for assignment.
+            (b"[1,2,3]", "delpaths([[{}]])", Ok("[1,2,3]")),
+        ]);
+    }
+
     /// A NaN component names no element, so its path is dropped — and dropped
     /// *whole*, before the sort, because `compare_values` answers `Equal` for
     /// NaN against every number. Left in, `[nan]` headed a run that swallowed
