@@ -286,20 +286,6 @@ older than #356 — the rewording changed what these say, not whether they say i
 they share is auto-vivification: jq grows the container the path asks for (`null` into an
 object, an array up to the index) and treats an unreachable delete as a no-op.
 
-One row is not a path walk, and it is here because #391 read jq's definition of
-`from_entries` and took only half of it:
-
-| Filter         | Input                         | jq        | succinctly                       |
-|----------------|-------------------------------|-----------|----------------------------------|
-| `from_entries` | `{"x":{"key":"a","value":1}}` | `{"a":1}` | `Cannot iterate over object (…)` |
-
-`map(f)` is `[.[] | f]`, and `.[]` over an object iterates its *values*, so jq's
-`from_entries` accepts an object of entries as readily as an array of them. Succinctly's
-matches an array alone. The refusal predates #391 — what #391 changed is that the rest of
-the builtin is now derived from that same definition, which is what makes this half stand
-out. Tracked as [#422](https://github.com/rust-works/succinctly/issues/422), together with
-the other `map`-derived builtins that may share the shape.
-
 An object key that yields something other than exactly one value is a second, unrelated
 group — it is the key half of
 [#354](https://github.com/rust-works/succinctly/issues/354):

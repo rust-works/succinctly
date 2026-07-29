@@ -2139,28 +2139,41 @@ fn builtin_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: map(f)
+/// Applies `f` to each element and materializes the results into a flat
+/// array — the shared body of `map(f)`, over either an array's elements or
+/// an object's values.
+fn map_over<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    f: &Expr,
+    elements: impl Iterator<Item = StandardJson<'a, W>>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let mut results = Vec::new();
+    for elem in elements {
+        match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
+            QueryResult::One(v) => results.push(to_owned(&v)),
+            QueryResult::OneCursor(_) => unreachable!(),
+            QueryResult::Owned(v) => results.push(v),
+            QueryResult::Many(vs) => results.extend(vs.iter().map(to_owned)),
+            QueryResult::ManyOwned(vs) => results.extend(vs),
+            QueryResult::None => {}
+            QueryResult::Error(e) => return QueryResult::Error(e),
+            QueryResult::Break(label) => return QueryResult::Break(label),
+        }
+    }
+    QueryResult::Owned(OwnedValue::Array(results))
+}
+
 fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // map(f) is equivalent to [.[] | f]
+    // map(f) is [.[] | f], and .[] over an object iterates its values, so jq
+    // accepts an object here as readily as an array (#422).
     match value {
-        StandardJson::Array(elements) => {
-            let mut results = Vec::new();
-            for elem in elements {
-                match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
-                    QueryResult::One(v) => results.push(to_owned(&v)),
-                    QueryResult::OneCursor(_) => unreachable!(),
-                    QueryResult::Owned(v) => results.push(v),
-                    QueryResult::Many(vs) => results.extend(vs.iter().map(to_owned)),
-                    QueryResult::ManyOwned(vs) => results.extend(vs),
-                    QueryResult::None => {}
-                    QueryResult::Error(e) => return QueryResult::Error(e),
-                    QueryResult::Break(label) => return QueryResult::Break(label),
-                }
-            }
-            QueryResult::Owned(OwnedValue::Array(results))
+        StandardJson::Array(elements) => map_over::<W, S>(f, elements, optional),
+        StandardJson::Object(fields) => {
+            map_over::<W, S>(f, fields.map(|fld| fld.value()), optional)
         }
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
@@ -2250,63 +2263,82 @@ fn builtin_add<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match value {
-        StandardJson::Array(elements) => {
-            let items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
-            if items.is_empty() {
-                return QueryResult::Owned(OwnedValue::Null);
-            }
+    // add is [.[] | .] folded with +, and .[] over an object iterates its
+    // values, so jq accepts an object here as readily as an array (#422).
+    let items: Vec<OwnedValue> = match value {
+        StandardJson::Array(elements) => elements.map(|e| to_owned(&e)).collect(),
+        StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+    };
+    if items.is_empty() {
+        return QueryResult::Owned(OwnedValue::Null);
+    }
 
-            // Fold the items using addition
-            let mut acc = items.into_iter();
-            let first = acc.next().unwrap();
-            let result = acc.try_fold(first, arith_add::<S>);
+    // Fold the items using addition
+    let mut acc = items.into_iter();
+    let first = acc.next().unwrap();
+    let result = acc.try_fold(first, arith_add::<S>);
 
-            match result {
-                Ok(v) => QueryResult::Owned(v),
-                Err(e) => QueryResult::Error(e),
-            }
-        }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+    match result {
+        Ok(v) => QueryResult::Owned(v),
+        Err(e) => QueryResult::Error(e),
     }
 }
 
+/// Short-circuiting fold shared by `any`/`all`: returns `target_truthy` as
+/// soon as an element's truthiness matches it, instead of walking the rest
+/// of the container. `any` looks for a truthy element (`target_truthy =
+/// true`); `all` looks for a falsy one (`target_truthy = false`).
+fn any_all_over<'a, W: Clone + AsRef<[u64]> + 'a>(
+    elements: impl Iterator<Item = StandardJson<'a, W>>,
+    target_truthy: bool,
+) -> bool {
+    for elem in elements {
+        if to_owned(&elem).is_truthy() == target_truthy {
+            return target_truthy;
+        }
+    }
+    !target_truthy
+}
+
 /// Builtin: any
+///
+/// any is [.[] | .] with an early-exit truthiness check, and .[] over an
+/// object iterates its values, so jq accepts an object here as readily as
+/// an array (#422).
 fn builtin_any<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
-            for elem in elements {
-                let owned = to_owned(&elem);
-                if owned.is_truthy() {
-                    return QueryResult::Owned(OwnedValue::Bool(true));
-                }
-            }
-            QueryResult::Owned(OwnedValue::Bool(false))
+            QueryResult::Owned(OwnedValue::Bool(any_all_over(elements, true)))
         }
+        StandardJson::Object(fields) => QueryResult::Owned(OwnedValue::Bool(any_all_over(
+            fields.map(|f| f.value()),
+            true,
+        ))),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
 }
 
 /// Builtin: all
+///
+/// Same shape as `any` — see #422.
 fn builtin_all<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
-            for elem in elements {
-                let owned = to_owned(&elem);
-                if !owned.is_truthy() {
-                    return QueryResult::Owned(OwnedValue::Bool(false));
-                }
-            }
-            QueryResult::Owned(OwnedValue::Bool(true))
+            QueryResult::Owned(OwnedValue::Bool(any_all_over(elements, false)))
         }
+        StandardJson::Object(fields) => QueryResult::Owned(OwnedValue::Bool(any_all_over(
+            fields.map(|f| f.value()),
+            false,
+        ))),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
@@ -2638,7 +2670,35 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Stringifies each element for `join`: strings pass through, nulls are
+/// skipped, everything else is rendered as JSON.
+fn join_parts<'a, W: Clone + AsRef<[u64]> + 'a>(
+    elements: impl Iterator<Item = StandardJson<'a, W>>,
+) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for elem in elements {
+        match &elem {
+            StandardJson::String(s) => {
+                if let Ok(cow) = s.as_str() {
+                    parts.push(cow.into_owned());
+                }
+            }
+            StandardJson::Null => {
+                // Skip nulls in join
+            }
+            _ => {
+                // For non-strings, convert to string representation
+                parts.push(to_owned(&elem).to_json());
+            }
+        }
+    }
+    parts
+}
+
 /// Builtin: join(s) - join array elements with separator
+///
+/// join(s) is [.[] | tostring] joined by s, and .[] over an object iterates
+/// its values, so jq accepts an object here as readily as an array (#422).
 fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sep_expr: &Expr,
     value: StandardJson<'a, W>,
@@ -2654,25 +2714,11 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     match value {
         StandardJson::Array(elements) => {
-            let mut parts: Vec<String> = Vec::new();
-            for elem in elements {
-                match &elem {
-                    StandardJson::String(s) => {
-                        if let Ok(cow) = s.as_str() {
-                            parts.push(cow.into_owned());
-                        }
-                    }
-                    StandardJson::Null => {
-                        // Skip nulls in join
-                    }
-                    _ => {
-                        // For non-strings, convert to string representation
-                        parts.push(to_owned(&elem).to_json());
-                    }
-                }
-            }
-            QueryResult::Owned(OwnedValue::String(parts.join(&sep)))
+            QueryResult::Owned(OwnedValue::String(join_parts(elements).join(&sep)))
         }
+        StandardJson::Object(fields) => QueryResult::Owned(OwnedValue::String(
+            join_parts(fields.map(|f| f.value())).join(&sep),
+        )),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
@@ -2858,20 +2904,22 @@ fn builtin_reverse<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: flatten - flatten nested arrays (1 level)
+///
+/// flatten is defined over [.[]], and .[] over an object iterates its
+/// values, so jq accepts an object here as readily as an array (#422).
 fn builtin_flatten<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
     depth: usize,
 ) -> QueryResult<'_, W> {
-    match value {
-        StandardJson::Array(elements) => {
-            let items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
-            let flattened = flatten_owned(items, depth);
-            QueryResult::Owned(OwnedValue::Array(flattened))
-        }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
-    }
+    let items: Vec<OwnedValue> = match value {
+        StandardJson::Array(elements) => elements.map(|e| to_owned(&e)).collect(),
+        StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+    };
+    let flattened = flatten_owned(items, depth);
+    QueryResult::Owned(OwnedValue::Array(flattened))
 }
 
 /// Flatten owned values to a specific depth
@@ -3226,20 +3274,22 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match value {
-        StandardJson::Array(elements) => {
-            match entries_to_object(elements.map(|elem| to_owned(&elem))) {
-                Ok(result) => QueryResult::Owned(OwnedValue::Object(result)),
-                // The `?` suffix swallows the refusal outright in jq, as the
-                // arm below already does for a non-array input. See
-                // `refuse_object_key` on why the flag is not yet reachable
-                // from succinctly's own syntax.
-                Err(_) if optional => QueryResult::None,
-                Err(e) => QueryResult::Error(e),
-            }
-        }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+    // map(f) is [.[] | f], and .[] over an object iterates its values, so jq
+    // accepts an object of entries as readily as an array of them (#422).
+    let entries: Vec<OwnedValue> = match value {
+        StandardJson::Array(elements) => elements.map(|elem| to_owned(&elem)).collect(),
+        StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+    };
+    match entries_to_object(entries) {
+        Ok(result) => QueryResult::Owned(OwnedValue::Object(result)),
+        // The `?` suffix swallows the refusal outright in jq, as the arm
+        // above already does for a non-array/non-object input. See
+        // `refuse_object_key` on why the flag is not yet reachable from
+        // succinctly's own syntax.
+        Err(_) if optional => QueryResult::None,
+        Err(e) => QueryResult::Error(e),
     }
 }
 
@@ -16247,6 +16297,19 @@ mod tests {
                 assert_eq!(arr[0], OwnedValue::Int(2));
             }
         );
+
+        // map(f) is [.[] | f], and .[] over an object iterates its values,
+        // so jq accepts an object of entries as readily as an array (#422).
+        query!(br#"{"a": 1, "b": 2}"#, "map(. + 1)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(2), OwnedValue::Int(3)]);
+            }
+        );
+        query!(br"{}", "map(. + 1)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty());
+            }
+        );
     }
 
     #[test]
@@ -16292,6 +16355,16 @@ mod tests {
         query!(br"[]", "add",
             QueryResult::Owned(OwnedValue::Null) => {}
         );
+
+        // add is [.[] | .] folded with +, and .[] over an object iterates
+        // its values, so jq accepts an object here as readily as an array
+        // (#422).
+        query!(br#"{"a": 1, "b": 2, "c": 3}"#, "add",
+            QueryResult::Owned(OwnedValue::Int(6)) => {}
+        );
+        query!(br"{}", "add",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
     }
 
     #[test]
@@ -16308,6 +16381,16 @@ mod tests {
         query!(br"[1, 0]", "any",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}  // numbers are truthy
         );
+
+        // any is [.[] | .] with an early-exit truthiness check, and .[] over
+        // an object iterates its values, so jq accepts an object here as
+        // readily as an array (#422).
+        query!(br#"{"a": false, "b": true}"#, "any",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"{}", "any",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
     }
 
     #[test]
@@ -16320,6 +16403,14 @@ mod tests {
         );
         query!(br"[1, 2, 3]", "all",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}  // numbers are truthy
+        );
+
+        // Same shape as `any` — see #422.
+        query!(br#"{"a": true, "b": false}"#, "all",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        query!(br"{}", "all",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
     }
 
@@ -16602,6 +16693,20 @@ mod tests {
                 assert_eq!(s, "a-c");
             }
         );
+
+        // join(s) is [.[] | tostring] joined by s, and .[] over an object
+        // iterates its values, so jq accepts an object here as readily as
+        // an array (#422).
+        query!(br#"{"a": "x", "b": "y"}"#, r#"join(",")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "x,y");
+            }
+        );
+        query!(br"{}", r#"join(",")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "");
+            }
+        );
     }
 
     #[test]
@@ -16854,6 +16959,28 @@ mod tests {
                 assert_eq!(arr[2], OwnedValue::Array(vec![OwnedValue::Int(3)]));
             }
         );
+
+        // flatten is defined over [.[]], and .[] over an object iterates
+        // its values, so jq accepts an object here as readily as an array
+        // (#422). Same one-level depth as the array case above.
+        query!(br#"{"a": [1, 2], "b": [3, [4]]}"#, "flatten",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::Int(1),
+                        OwnedValue::Int(2),
+                        OwnedValue::Int(3),
+                        OwnedValue::Array(vec![OwnedValue::Int(4)]),
+                    ]
+                );
+            }
+        );
+        query!(br"{}", "flatten",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty());
+            }
+        );
     }
 
     #[test]
@@ -16985,6 +17112,20 @@ mod tests {
         query!(br#"[{"name": "x", "value": 10}]"#, "from_entries",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.get("x"), Some(&OwnedValue::Int(10)));
+            }
+        );
+
+        // from_entries is map({...}) | add | .//={}, and .[] over an object
+        // iterates its values, so jq accepts an object of entries as
+        // readily as an array of them (#422).
+        query!(br#"{"x": {"key": "a", "value": 1}}"#, "from_entries",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("a"), Some(&OwnedValue::Int(1)));
+            }
+        );
+        query!(br"{}", "from_entries",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert!(obj.is_empty());
             }
         );
     }

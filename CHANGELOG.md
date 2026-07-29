@@ -103,6 +103,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`from_entries` and six other `map`-derived builtins refused an object of
+  entries that jq accepts** (#422): jq defines `from_entries` as
+  `map({...}) | add | .//={}`, and `map(f)` is `[.[] | f]` — `.[]` over an
+  object iterates its *values*, so jq accepts
+  `{"x":{"key":"a","value":1}} | from_entries` (`{"a":1}`) as readily as the
+  array form. `from_entries`, `add`, `any`, `all`, `join`, `flatten` and `map`
+  (`src/jq/eval.rs`) each matched `StandardJson::Array` alone and routed an
+  object straight to `Cannot iterate over object (…)`; the refusal predates
+  #391, but #391 derived the rest of `from_entries` from that same `map(f)`
+  definition, which is what made this one half stand out. All seven now also
+  match `StandardJson::Object`, iterating its values via the idiom
+  `Expr::Iterate` already uses for `.[]`; `any`/`all`/`join`/`map` keep their
+  short-circuiting/streaming behaviour via small helpers generic over either
+  element source, rather than collecting eagerly first. Left unchanged: `min`,
+  `max`, `min_by`, `max_by`, `unique`, `unique_by`, `group_by` — verified live
+  against jq-1.7.1 that jq itself refuses an object for all of these, so
+  matching jq there means leaving them exactly as they were (they do have a
+  separate, pre-existing error-wording gap on that refusal, left for a
+  follow-up issue). New coverage: an object and an empty-object case in each
+  builtin's existing unit test, plus seven golden fixtures under
+  `tests/data/jq-golden/cases/`.
+
 - **An anchor or alias on the key of a flow-sequence's implicit single-pair
   mapping was a parse error or bound to the wrong node** (#409, found while
   fixing #405 — that issue was the same key position in a flow *mapping*,
