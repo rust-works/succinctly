@@ -619,7 +619,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
 
     /// Check if a position is inside a flow context (inside `[]` or `{}`).
     /// Returns true if there's an unmatched `[` or `{` before the position.
-    #[allow(dead_code)] // STYLE-0005: alternate parse-path helper; unused in current path
+    ///
+    /// No longer dead code as of #434: `find_scalar_end` (a live path) calls
+    /// this directly, in addition to the still-unused `find_plain_scalar_end`.
     fn is_in_flow_context(&self, pos: usize) -> bool {
         // Find start of line containing pos
         let mut line_start = pos;
@@ -712,6 +714,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
 
     /// Find the end of a single-line unquoted scalar (stops at a line break).
     fn find_scalar_end(&self, start: usize) -> usize {
+        // ns-plain-char only reserves `,`/`]`/`}` inside a flow collection; in
+        // block context they're ordinary scalar content (e.g. `note: a, b`).
+        // Breaking on them unconditionally made this function (used only by
+        // `at_offset`/`yq-locate`) truncate any block-context scalar
+        // containing one of these bytes, while `syq`/`yq` printed the value
+        // in full — an eval/locate divergence in the #370 shape, just
+        // reached via flow-indicator bytes instead of a missing tab (#434).
+        let in_flow = self.is_in_flow_context(start);
         let mut end = start;
         while end < self.text.len() {
             match self.text[end] {
@@ -726,8 +736,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     }
                     end += 1;
                 }
-                // Flow context delimiters
-                b',' | b']' | b'}' => break,
+                // Flow context delimiters - only terminate in flow context
+                b',' | b']' | b'}' if in_flow => break,
                 b':' => {
                     // Colon followed by white space, a line break, or EOF ends
                     // the scalar. The tab is not optional: this is the same
