@@ -1611,6 +1611,41 @@ fn test_yaml_flow_question_mark_without_a_space_is_content() -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// `#` as a comment start in flow-mapping keys (#437). `parse_flow_unquoted_key`
+// had no `#` arm at all, so a comment folded into the key text instead of
+// erroring — unlike the block-key path (#410) and the flow-*value* path, both
+// of which already treat a whitespace-preceded `#` as a comment.
+// =============================================================================
+
+#[test]
+fn test_yaml_flow_key_comment_requires_preceding_whitespace() -> Result<()> {
+    for (name, input) in [
+        ("space before hash, implicit key", "{a # b: c}\n"),
+        ("tab before hash, implicit key", "{a\t# b: c}\n"),
+    ] {
+        let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", input, &[])?;
+        assert_eq!(exit_code, 1, "{name}: expected clean error exit: {stderr}");
+        assert_eq!(stdout, "", "{name}: nothing should reach stdout");
+        assert!(
+            stderr.contains("key without value"),
+            "{name}: stderr should name the missing value: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn hash_without_preceding_space_is_flow_key_content() -> Result<()> {
+    // The boundary the #437 fix must not cross: `#` not preceded by a space or
+    // tab is ordinary key content, exactly as it already is in block context
+    // (`a#b: value`).
+    let (stdout, exit_code) = run_yq_stdin(".", "{a#b: c}\n", &["-o", "json", "-I", "0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(stdout.trim(), r#"{"a#b":"c"}"#);
+    Ok(())
+}
+
 #[test]
 fn test_yaml_flow_explicit_key_colon_before_a_flow_indicator_is_content() -> Result<()> {
     // A deliberate divergence from YAML 1.2, pinned here because nothing else
@@ -1633,6 +1668,22 @@ fn test_yaml_flow_explicit_key_colon_before_a_flow_indicator_is_content() -> Res
     )?;
     assert_eq!(exit_code, 0, "FRK4 must still parse");
     assert_eq!(stdout.trim(), r#"{"foo :":null,"":"bar"}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_explicit_flow_key_comment_requires_preceding_whitespace() -> Result<()> {
+    // #437: `parse_explicit_flow_unquoted_key` has the same shape as
+    // `parse_flow_unquoted_key` and was missing the same `#` arm — a comment
+    // inside a `? key : value` flow key folded into the key text instead of
+    // erroring.
+    let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", "{? a # b : c}\n", &[])?;
+    assert_eq!(exit_code, 1, "expected clean error exit: {stderr}");
+    assert_eq!(stdout, "", "nothing should reach stdout");
+    assert!(
+        stderr.contains("key without value"),
+        "stderr should name the missing value: {stderr}"
+    );
     Ok(())
 }
 

@@ -3038,6 +3038,22 @@ impl<'a> Parser<'a> {
         while let Some(b) = self.peek() {
             match b {
                 b':' | b',' | b'}' | b']' => break,
+                b'#' => {
+                    // # starts a comment only after s-separate-in-line (space or
+                    // tab), same rule as the block-key and flow-value arms
+                    // (#410, `parse_flow_unquoted_value`). A comment here means
+                    // the key never reached its `:`, so this errors the same way
+                    // the block-key path does rather than folding the comment
+                    // text into the key (#437). Otherwise `#` is ordinary key
+                    // content (e.g. `a#b: value`).
+                    if self.pos > start && matches!(self.input[self.pos - 1], b' ' | b'\t') {
+                        return Err(YamlError::KeyWithoutValue {
+                            offset: start,
+                            line: self.current_line(),
+                        });
+                    }
+                    self.advance();
+                }
                 b'\n' | b'\r' => {
                     // Multiline key - check if next line continues the key
                     // Skip the line break (CRLF counts as the one break it is)
@@ -3254,6 +3270,20 @@ impl<'a> Parser<'a> {
         while let Some(b) = self.peek() {
             match b {
                 b',' | b'}' | b']' => break,
+                b'#' => {
+                    // Same rule as `parse_flow_unquoted_key` (#437): a `#`
+                    // preceded by a space or tab starts a comment, so the key
+                    // never reached its value and this errors instead of
+                    // folding the comment text into the key. Otherwise `#` is
+                    // ordinary key content.
+                    if self.pos > start && matches!(self.input[self.pos - 1], b' ' | b'\t') {
+                        return Err(YamlError::KeyWithoutValue {
+                            offset: start,
+                            line: self.current_line(),
+                        });
+                    }
+                    self.advance();
+                }
                 b':' => {
                     // Only stop at `: ` or `:\n` or `:` at end. A flow indicator after
                     // the colon does *not* stop the key (#402) — `,`/`}`/`]` end it on
@@ -4220,6 +4250,53 @@ mod tests {
         assert!(
             matches!(err, YamlError::KeyWithoutValue { line: 1, offset: 0 }),
             "expected key-without-value at line 1 offset 0, got {err:?}"
+        );
+    }
+
+    /// #437: `parse_flow_unquoted_key` had no `#` arm at all, so a comment inside
+    /// a flow-mapping key folded into the key text instead of erroring, unlike
+    /// its block-key (#410) and flow-value siblings which both treat a
+    /// whitespace-preceded `#` as a comment.
+    #[test]
+    fn regression_issue_437_space_before_hash_starts_a_comment_in_a_flow_key() {
+        let err = build_semi_index(b"{a # b: c}\n").unwrap_err();
+        assert!(
+            matches!(err, YamlError::KeyWithoutValue { line: 1, offset: 1 }),
+            "expected key-without-value at line 1 offset 1, got {err:?}"
+        );
+    }
+
+    /// #437: same gap, tab variant.
+    #[test]
+    fn regression_issue_437_tab_before_hash_starts_a_comment_in_a_flow_key() {
+        let err = build_semi_index(b"{a\t# b: c}\n").unwrap_err();
+        assert!(
+            matches!(err, YamlError::KeyWithoutValue { line: 1, offset: 1 }),
+            "expected key-without-value at line 1 offset 1, got {err:?}"
+        );
+    }
+
+    /// #437: a `#` not preceded by whitespace stays ordinary key content, in flow
+    /// context exactly as it already does in block context (`a#b: value`).
+    /// Content is pinned via the CLI in
+    /// `hash_without_preceding_space_is_flow_key_content` (tests/yq_cli_tests.rs).
+    #[test]
+    fn hash_without_preceding_space_in_a_flow_key_still_parses() {
+        let result = build_semi_index(b"{a#b: c}\n");
+        assert!(
+            result.is_ok(),
+            "expected a#b to parse as key content: {result:?}"
+        );
+    }
+
+    /// #437: the explicit `? key : value` flow form (`parse_explicit_flow_unquoted_key`)
+    /// has the same shape as the implicit key parser and was missing the same `#` arm.
+    #[test]
+    fn regression_issue_437_space_before_hash_starts_a_comment_in_an_explicit_flow_key() {
+        let err = build_semi_index(b"{? a # b : c}\n").unwrap_err();
+        assert!(
+            matches!(err, YamlError::KeyWithoutValue { line: 1, offset: 3 }),
+            "expected key-without-value at line 1 offset 3, got {err:?}"
         );
     }
 
