@@ -7179,71 +7179,6 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         .collect())
 }
 
-/// Prepare resolved paths for deletion: drop duplicates, then order so deleting
-/// one cannot invalidate the next.
-///
-/// Both halves are needed, and for the same reason — a deletion shifts the
-/// array under every path to its right.
-///
-/// *Duplicates*: `del(.[(0,0)])` names element 0 twice, and deleting twice takes
-/// element 1 with it — `[1,2,3]` would give `[3]` where jq gives `[2,3]`. jq's
-/// `delpaths` dedupes, so a repeated key deletes once.
-///
-/// *Order*: deleting `[0]` before `[2]` shifts the array under the second path.
-/// jq is order-insensitive here — both `del(.[(0,2)])` and `del(.[(2,0)])` on
-/// `[10,20,30,40]` give `[20,40]` — so sort by trailing index, descending.
-///
-/// Sorting on the *trailing* index is only sound while every path here has the
-/// same depth, which holds because one `del` argument is one chain: its keys
-/// fan out at a single position, so they differ only in that component.
-/// `del(.a, .b)` — which would break the assumption, since `[1]` sorts before
-/// `[2,0]` yet deleting it shifts the array `[2,0]` reaches into — does not
-/// parse at all today. Widen this to a full lexicographic descending sort
-/// before that changes.
-///
-/// Still divergent: a *negative* trailing index. Sorting descending puts `-1`
-/// before `-2`, but `-1` names the later element only until something is
-/// removed, so `[10,20,30,40] | del(.[(-1,-2)])` gives `[10,30]` where jq gives
-/// `[10,20]`. No descending order fixes this, because the two indices are
-/// counted from opposite ends of the array: jq resolves every index against the
-/// length the array had *before* any deletion and removes them in one pass,
-/// which is what [`delete_keys`] does. Routing `del` through that is #424.
-///
-/// (`builtin_delpaths` had both bugs above and was fixed in #398 — it works on
-/// runtime path arrays rather than path expressions, so it cannot call this,
-/// but [`delete_paths_sorted`] is the same rule stated over values, and is the
-/// reference for #424.)
-fn prepare_paths_for_deletion(paths: &mut Vec<Expr>) {
-    // Quadratic, but `paths` is one entry per resolved key — a handful, not a
-    // document-sized list — and `Expr` is neither `Hash` nor `Ord`. Skipped
-    // outright for the overwhelmingly common single-path `del(.foo)`, which is
-    // every `del` that has no computed key at all.
-    if paths.len() > 1 {
-        let mut kept: Vec<Expr> = Vec::with_capacity(paths.len());
-        for path in paths.drain(..) {
-            if !kept.contains(&path) {
-                kept.push(path);
-            }
-        }
-        *paths = kept;
-    }
-    sort_paths_for_deletion(paths);
-}
-
-/// Order resolved paths so deletion does not invalidate later ones. See
-/// [`prepare_paths_for_deletion`], the only caller.
-fn sort_paths_for_deletion(paths: &mut [Expr]) {
-    fn trailing_index(expr: &Expr) -> Option<i64> {
-        match expr {
-            Expr::Index(i) => Some(*i),
-            Expr::Pipe(exprs) => exprs.last().and_then(trailing_index),
-            Expr::Optional(inner) | Expr::Paren(inner) => trailing_index(inner),
-            _ => None,
-        }
-    }
-    paths.sort_by_key(|p| core::cmp::Reverse(trailing_index(p)));
-}
-
 // =============================================================================
 // Phase 8: Variables and Advanced Control Flow Implementation
 // =============================================================================
@@ -10109,6 +10044,342 @@ fn delete_keys(value: OwnedValue, keys: &[&OwnedValue]) -> Result<OwnedValue, Ev
     }
 }
 
+/// One atomic step of a resolved `del` path — a `Field`, `Index`, or
+/// `Iterate` component — paired with whether a type or bounds mismatch there
+/// should be swallowed rather than raised. That flag comes from `del`'s own
+/// `optional` argument, or from a `?` at or before this step; see
+/// [`flatten_delete_path`].
+struct DeleteStep {
+    component: Expr,
+    optional: bool,
+}
+
+/// Flatten a resolved (fully static) `del` path into atomic steps.
+///
+/// Mirrors `push_path_components`, but fully resolves `Optional` instead of
+/// leaving it as an opaque wrapper: [`delete_expr_paths_at`] compares steps
+/// across sibling paths position by position, so it needs one flat sequence
+/// of `Field`/`Index`/`Iterate` rather than a tree that hides some of them
+/// behind `Optional`/`Pipe` nodes.
+fn flatten_delete_path(expr: &Expr, optional: bool, out: &mut Vec<DeleteStep>) {
+    match expr {
+        Expr::Identity => {}
+        Expr::Pipe(exprs) => {
+            for e in exprs {
+                flatten_delete_path(e, optional, out);
+            }
+        }
+        Expr::Paren(inner) => flatten_delete_path(inner, optional, out),
+        Expr::Optional(inner) => flatten_delete_path(inner, true, out),
+        other => out.push(DeleteStep {
+            component: other.clone(),
+            optional,
+        }),
+    }
+}
+
+/// Delete every resolved `del` path in `paths` from `value`, the way
+/// [`delete_paths_sorted`] deletes `delpaths`' runtime path arrays: paths
+/// sharing a container at this depth are grouped, and their keys are removed
+/// from it together, so a negative index resolves against the length the
+/// container had before any sibling here was removed (#424) — one at a time,
+/// `[10,20,30,40] | del(.[(-1,-2)])` took the last element, shortened the
+/// array, and then took what was *now* second-to-last, giving `[10,30]` where
+/// jq gives `[10,20]`.
+///
+/// Unlike `delete_paths_sorted`, paths here are still `Expr` steps rather
+/// than resolved `OwnedValue` keys, so navigating a `Field`/`Index` still
+/// raises the type and bounds errors `del` has always raised (`delete_keys`
+/// cannot yet, #415) — `delete_keys` itself is reused for the part that does
+/// not need that: removing a container's own keys simultaneously once they
+/// are known.
+///
+/// Every path here comes from one `del` argument's single expression tree, so
+/// whichever branch a computed key took, the shape that follows is *usually*
+/// identical — only the concrete `Field`/`Index` values differ — which is
+/// what lets every path be exactly as long as its siblings. It is not always
+/// identical in *kind*, though: `null` accepts a string key, a numeric key,
+/// or `.[]` without erroring (`null | .a`, `null | .[0]`, and `null | .[]`
+/// are all `null`), so `.[("a",0)]` resolved against a null target yields one
+/// `Field("a")` path and one `Index(0)` path at the same position. Partition
+/// by actual shape below rather than trusting `paths[0]` to speak for the
+/// rest, which used to panic on exactly that input.
+fn delete_expr_paths_at(
+    mut value: OwnedValue,
+    paths: &[&[DeleteStep]],
+    start: usize,
+) -> Result<OwnedValue, EvalError> {
+    if paths.is_empty() {
+        return Ok(value);
+    }
+    if start == paths[0].len() {
+        // `del(.)`, or a path wrapped in enough `?`/`()` to flatten to
+        // nothing: replace the whole value reached here, as `delete_at_path`'s
+        // `Expr::Identity` arm does for the single-path case.
+        debug_assert_eq!(
+            paths.len(),
+            1,
+            "a path ending here without every sibling doing the same"
+        );
+        return Ok(OwnedValue::Null);
+    }
+
+    let mut fields: Vec<&[DeleteStep]> = Vec::new();
+    let mut indices: Vec<&[DeleteStep]> = Vec::new();
+    let mut iterates: Vec<&[DeleteStep]> = Vec::new();
+    for &path in paths {
+        match &path[start].component {
+            Expr::Field(_) => fields.push(path),
+            Expr::Index(_) => indices.push(path),
+            Expr::Iterate => iterates.push(path),
+            // `flatten_delete_path` only ever leaves Field/Index/Iterate
+            // components behind; anything else is a path shape `del` has
+            // never supported (e.g. `Slice`), matching `delete_at_path`'s
+            // catch-all.
+            _ => return Err(EvalError::new("cannot use expression as delete target")),
+        }
+    }
+
+    // `value` can only be one concrete type at a time, so at most one of
+    // these three actually mutates it — the others see a container of the
+    // wrong shape and take that branch's optional-vs-error path (see
+    // `delete_expr_object_paths`/`delete_expr_array_paths`). All three can
+    // be non-empty only when `value` is `null`, per the doc comment above.
+    if !fields.is_empty() {
+        value = delete_expr_object_paths(value, &fields, start)?;
+    }
+    if !indices.is_empty() {
+        value = delete_expr_array_paths(value, &indices, start)?;
+    }
+    if !iterates.is_empty() {
+        value = delete_expr_iterate_paths(value, &iterates, start)?;
+    }
+    Ok(value)
+}
+
+/// [`delete_expr_paths_at`]'s `Field` case: group by field name, delete the
+/// terminal ones from `value` together via [`delete_keys`], and recurse into
+/// the rest.
+fn delete_expr_object_paths(
+    mut value: OwnedValue,
+    paths: &[&[DeleteStep]],
+    start: usize,
+) -> Result<OwnedValue, EvalError> {
+    let mut terminal: Vec<&str> = Vec::new();
+    let mut groups: Vec<(&str, Vec<&[DeleteStep]>)> = Vec::new();
+    for path in paths {
+        let Expr::Field(name) = &path[start].component else {
+            unreachable!("delete_expr_paths_at only dispatches Field paths here")
+        };
+        let name = name.as_str();
+        if path.len() == start + 1 {
+            if !terminal.contains(&name) {
+                terminal.push(name);
+            }
+            continue;
+        }
+        let mut appended = false;
+        for group in &mut groups {
+            if group.0 == name {
+                group.1.push(*path);
+                appended = true;
+                break;
+            }
+        }
+        if !appended {
+            groups.push((name, vec![*path]));
+        }
+    }
+
+    if !matches!(value, OwnedValue::Object(_)) {
+        // A non-object container fails every path here identically, so this
+        // is not a per-key merge like the groups below: any single
+        // non-optional path among the siblings has to raise, regardless of
+        // where in the list it sits. Checking only `paths[0]` here used to
+        // let an optional sibling that happened to sort first (e.g. `.a?` in
+        // `del(.a?, .[("b","c")])` against `null`) silently swallow a
+        // non-optional one's error.
+        return match paths.iter().find(|p| !p[start].optional) {
+            None => Ok(value),
+            Some(required) => {
+                let Expr::Field(name) = &required[start].component else {
+                    unreachable!("dispatched on Field above")
+                };
+                Err(EvalError::cannot_index_with_field(
+                    owned_type_name(&value),
+                    name,
+                ))
+            }
+        };
+    }
+
+    if let OwnedValue::Object(entries) = &mut value {
+        for (name, group) in &groups {
+            match entries.get_mut(*name) {
+                Some(slot) => {
+                    let old = core::mem::replace(slot, OwnedValue::Null);
+                    *slot = delete_expr_paths_at(old, group, start + 1)?;
+                }
+                // Requiring *every* sibling naming this field to be optional
+                // would be too strict: one occurrence marking it optional is
+                // enough to cover the others, the same merge the
+                // terminal-index case below uses.
+                None if group.iter().any(|p| p[start].optional) => {}
+                None => return Err(EvalError::field_not_found(name)),
+            }
+        }
+    }
+
+    if !terminal.is_empty() {
+        let owned_keys: Vec<OwnedValue> = terminal
+            .iter()
+            .map(|name| OwnedValue::String((*name).to_string()))
+            .collect();
+        let key_refs: Vec<&OwnedValue> = owned_keys.iter().collect();
+        value = delete_keys(value, &key_refs)?;
+    }
+
+    Ok(value)
+}
+
+/// [`delete_expr_paths_at`]'s `Index` case: group by index, delete the
+/// terminal ones from `value` together via [`delete_keys`] — the one call
+/// that resolves every negative index against `value`'s length once, rather
+/// than once per deletion — and recurse into the rest.
+fn delete_expr_array_paths(
+    mut value: OwnedValue,
+    paths: &[&[DeleteStep]],
+    start: usize,
+) -> Result<OwnedValue, EvalError> {
+    let mut terminal: Vec<(i64, bool)> = Vec::new();
+    let mut groups: Vec<(i64, Vec<&[DeleteStep]>)> = Vec::new();
+    for path in paths {
+        let Expr::Index(idx) = &path[start].component else {
+            unreachable!("delete_expr_paths_at only dispatches Index paths here")
+        };
+        let idx = *idx;
+        if path.len() == start + 1 {
+            // One occurrence of `idx` marking it optional is enough to cover
+            // every other occurrence — merge rather than keep only whichever
+            // one was pushed first, which used to make the outcome depend on
+            // argument order (`del(.[(0,5)], .[5]?)` errored or not
+            // depending on which side `.[5]?` was written on).
+            match terminal.iter_mut().find(|(i, _)| *i == idx) {
+                Some(entry) => entry.1 |= path[start].optional,
+                None => terminal.push((idx, path[start].optional)),
+            }
+            continue;
+        }
+        let mut appended = false;
+        for group in &mut groups {
+            if group.0 == idx {
+                group.1.push(*path);
+                appended = true;
+                break;
+            }
+        }
+        if !appended {
+            groups.push((idx, vec![*path]));
+        }
+    }
+
+    if !matches!(value, OwnedValue::Array(_)) {
+        // Same reasoning as the object case above: a non-array container
+        // fails every path here identically, so a single non-optional path
+        // among the siblings has to raise even when others are optional.
+        return if paths.iter().all(|p| p[start].optional) {
+            Ok(value)
+        } else {
+            Err(EvalError::cannot_index_with_type(
+                owned_type_name(&value),
+                "number",
+            ))
+        };
+    }
+
+    if let OwnedValue::Array(arr) = &mut value {
+        for (idx, group) in &groups {
+            let len = arr.len() as i64;
+            let actual = if *idx < 0 { len + idx } else { *idx };
+            if actual >= 0 && (actual as usize) < arr.len() {
+                let slot = &mut arr[actual as usize];
+                let old = core::mem::replace(slot, OwnedValue::Null);
+                *slot = delete_expr_paths_at(old, group, start + 1)?;
+            } else if !group.iter().any(|p| p[start].optional) {
+                return Err(out_of_range_index(*idx, arr.len()));
+            }
+        }
+
+        // `delete_keys` silently drops an index that names nothing
+        // (`delpaths` has always done that, #415); a bare `del` never has, so
+        // an out-of-range terminal index still errors unless `?` covers it,
+        // exactly as the single-path case in `delete_at_path` does.
+        let len = arr.len() as i64;
+        for (idx, opt) in &terminal {
+            let actual = if *idx < 0 { len + idx } else { *idx };
+            if !opt && (actual < 0 || actual as usize >= arr.len()) {
+                return Err(out_of_range_index(*idx, arr.len()));
+            }
+        }
+    }
+
+    if !terminal.is_empty() {
+        let owned_keys: Vec<OwnedValue> = terminal
+            .iter()
+            .map(|(idx, _)| OwnedValue::Int(*idx))
+            .collect();
+        let key_refs: Vec<&OwnedValue> = owned_keys.iter().collect();
+        value = delete_keys(value, &key_refs)?;
+    }
+
+    Ok(value)
+}
+
+/// [`delete_expr_paths_at`]'s `Iterate` case: every path here shares the same
+/// tail — an `Iterate` names no component of its own to differ by — so there
+/// is nothing to group. Either every path ends here, clearing the whole
+/// container, or every path continues, and each element/value recurses with
+/// the same sibling list.
+fn delete_expr_iterate_paths(
+    value: OwnedValue,
+    paths: &[&[DeleteStep]],
+    start: usize,
+) -> Result<OwnedValue, EvalError> {
+    let optional = paths[0][start].optional;
+    if paths[0].len() == start + 1 {
+        return match value {
+            OwnedValue::Array(mut arr) => {
+                arr.clear();
+                Ok(OwnedValue::Array(arr))
+            }
+            OwnedValue::Object(mut map) => {
+                map.clear();
+                Ok(OwnedValue::Object(map))
+            }
+            other if optional => Ok(other),
+            other => Err(EvalError::cannot_iterate(&other)),
+        };
+    }
+    match value {
+        OwnedValue::Array(mut arr) => {
+            for elem in &mut arr {
+                let old = core::mem::replace(elem, OwnedValue::Null);
+                *elem = delete_expr_paths_at(old, paths, start + 1)?;
+            }
+            Ok(OwnedValue::Array(arr))
+        }
+        OwnedValue::Object(mut map) => {
+            for v in map.values_mut() {
+                let old = core::mem::replace(v, OwnedValue::Null);
+                *v = delete_expr_paths_at(old, paths, start + 1)?;
+            }
+            Ok(OwnedValue::Object(map))
+        }
+        other if optional => Ok(other),
+        other => Err(EvalError::cannot_iterate(&other)),
+    }
+}
+
 /// Builtin: del(path) - delete a single path
 fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
@@ -10116,23 +10387,48 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Convert to owned and delete the path
-    let mut result = to_owned(&value);
+    let result = to_owned(&value);
 
-    // Computed keys resolve against the original document, then delete
-    // right-to-left so an earlier removal cannot shift a later index.
-    let mut paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
+    // Computed keys resolve against the original document; each becomes one
+    // fully static path expression (Field/Index/Iterate components — see
+    // `resolve_dynamic_indexes`).
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
         Ok(paths) => paths,
         Err(e) => return QueryResult::Error(e),
     };
-    prepare_paths_for_deletion(&mut paths);
 
-    for path in &paths {
-        if let Err(e) = delete_at_path(&mut result, path, optional) {
-            return QueryResult::Error(e);
+    // The overwhelmingly common case — no computed key at all, or one that
+    // resolved to a single value — has no sibling that could shift under it,
+    // so it keeps the simple per-path walk.
+    if paths.len() <= 1 {
+        let mut result = result;
+        for path in &paths {
+            if let Err(e) = delete_at_path(&mut result, path, optional) {
+                return QueryResult::Error(e);
+            }
         }
+        return QueryResult::Owned(result);
     }
 
-    QueryResult::Owned(result)
+    // More than one resolved path only happens when a computed key produced
+    // several values (`.[(0,2)]`, `.[.a,.b]`, …) — exactly the shape #424
+    // got wrong by deleting them one at a time. `flatten_delete_path` reduces
+    // each resolved `Expr` to the same atomic-steps shape so
+    // `delete_expr_paths_at` can delete every resolved path together.
+    let flattened: Vec<Vec<DeleteStep>> = paths
+        .iter()
+        .map(|path| {
+            let mut steps = Vec::new();
+            flatten_delete_path(path, optional, &mut steps);
+            steps
+        })
+        .collect();
+    let refs: Vec<&[DeleteStep]> = flattened.iter().map(Vec::as_slice).collect();
+
+    match delete_expr_paths_at(result, &refs, 0) {
+        Ok(result) => QueryResult::Owned(result),
+        Err(e) => QueryResult::Error(e),
+    }
 }
 
 /// Delete a value at a path expression.
