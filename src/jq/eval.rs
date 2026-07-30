@@ -879,6 +879,7 @@ fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     match result {
         Ok(v) => QueryResult::Owned(v),
+        Err(_) if optional => QueryResult::None,
         Err(e) => QueryResult::Error(e),
     }
 }
@@ -1460,13 +1461,18 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let msg_result = eval_single::<W, S>(msg_expr, value, optional);
             match result_to_owned(msg_result) {
                 Ok(v) => v,
+                Err(_) if optional => return QueryResult::None,
                 Err(e) => return QueryResult::Error(e),
             }
         }
         None => to_owned(&value),
     };
 
-    QueryResult::Error(EvalError::from_value(payload))
+    if optional {
+        QueryResult::None
+    } else {
+        QueryResult::Error(EvalError::from_value(payload))
+    }
 }
 
 /// Evaluate a builtin function.
