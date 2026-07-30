@@ -5421,6 +5421,49 @@ mod tests {
         b"-\n- [1]\n- x\n",
     ];
 
+    /// Render a value to a compact, order-preserving string for cross-route
+    /// comparison, recursing through [`YamlValue::uncons`] rather than the
+    /// derived `Debug` impl.
+    ///
+    /// The derived `Debug` on [`YamlCursor`] prints the whole (shared, `&`)
+    /// [`YamlIndex`] inline, including the `Cell`-based sequential-cursor
+    /// caches `AdvancePositions`/`CompactEndPositions` use to make repeated
+    /// forward access O(1) (see the O1/O2 optimizations). Two access paths
+    /// that land on the identical logical node can still mutate that shared
+    /// cache differently on the way there, so comparing raw `Debug` strings
+    /// asserts cache-state equality, not value equality, and is flaky by
+    /// construction. Rendering only the semantic content sidesteps that.
+    fn render_value<W: AsRef<[u64]>>(v: &YamlValue<'_, W>) -> String {
+        match v {
+            YamlValue::Null => "null".to_string(),
+            YamlValue::String(s) => format!("{:?}", &*s.as_str().unwrap()),
+            YamlValue::Mapping(fields) => {
+                let mut parts = Vec::new();
+                let mut it = fields.clone();
+                while let Some((field, rest)) = it.uncons() {
+                    parts.push(format!(
+                        "{}:{}",
+                        render_value(&field.key()),
+                        render_value(&field.value())
+                    ));
+                    it = rest;
+                }
+                format!("{{{}}}", parts.join(","))
+            }
+            YamlValue::Sequence(elements) => {
+                let mut parts = Vec::new();
+                let mut it = *elements;
+                while let Some((val, rest)) = it.uncons() {
+                    parts.push(render_value(&val));
+                    it = rest;
+                }
+                format!("[{}]", parts.join(","))
+            }
+            YamlValue::Alias { anchor_name, .. } => format!("*{anchor_name}"),
+            YamlValue::Error(e) => format!("ERR({e})"),
+        }
+    }
+
     /// Every route from a sequence element to its value must agree — `uncons`,
     /// `uncons_cursor`, `get`, and the cursor-level `value()`.
     ///
@@ -5475,14 +5518,14 @@ mod tests {
                      than the shared predicate selects"
                 );
 
-                let expected = format!("{value:?}");
+                let expected = render_value(&value);
                 assert_eq!(
-                    format!("{:?}", elements.get(i).expect("get(i) in range")),
+                    render_value(&elements.get(i).expect("get(i) in range")),
                     expected,
                     "{shown:?} element {i}: get disagrees with uncons"
                 );
                 assert_eq!(
-                    format!("{:?}", cursor.value()),
+                    render_value(&cursor.value()),
                     expected,
                     "{shown:?} element {i}: uncons_cursor().value() disagrees with uncons"
                 );
