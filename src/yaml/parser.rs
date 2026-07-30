@@ -1717,18 +1717,36 @@ impl<'a> Parser<'a> {
             // is the whole-corpus guard on that.
         } else {
             // Inline value (`check_unsupported` ran above)
-            if self.peek() == Some(b'*') {
-                // `parse_alias` opens and closes its own node. `- k: *a` never
-                // became an alias node at all before #372, and was swallowed
-                // into the plain scalar below.
-                self.parse_alias()?;
-            } else {
-                // Open value node
-                self.set_ib();
-                self.write_bp_open();
-                let end_pos = self.parse_inline_value(indent)?;
-                self.set_bp_text_end(end_pos);
-                self.write_bp_close();
+            match self.peek() {
+                Some(b'*') => {
+                    // `parse_alias` opens and closes its own node. `- k: *a` never
+                    // became an alias node at all before #372, and was swallowed
+                    // into the plain scalar below.
+                    self.parse_alias()?;
+                }
+                Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
+                    // Block sequence indicator inline with a compact mapping's own
+                    // value (`- a: - x`): the same invalid-but-common shape #325
+                    // fixed for a top-level mapping value, one level deeper. This
+                    // arm was missing when #325 landed, so `- a: - x` still fell
+                    // through to `parse_inline_value` below and read back as the
+                    // scalar `"- x"` instead of the sequence `["x"]` — inconsistent
+                    // with the sibling fix in `parse_mapping_entry`.
+                    //
+                    // `self.current_column()` (not `indent + 2`), matching every
+                    // other site that opens this arm, so a continuation line whose
+                    // `-` sits at the same column joins this sequence.
+                    let seq_indent = self.current_column();
+                    self.parse_sequence_item(seq_indent)?;
+                }
+                _ => {
+                    // Open value node
+                    self.set_ib();
+                    self.write_bp_open();
+                    let end_pos = self.parse_inline_value(indent)?;
+                    self.set_bp_text_end(end_pos);
+                    self.write_bp_close();
+                }
             }
         }
 

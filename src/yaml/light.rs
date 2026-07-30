@@ -9595,4 +9595,37 @@ mod tests {
         // Top-level nested sequences.
         assert_eq!(first_doc_json(b"- - x\n- y\n"), r#"[["x"],"y"]"#);
     }
+
+    #[test]
+    fn test_inline_seq_as_compact_mapping_value_keeps_content() {
+        // `parse_compact_mapping_entry`'s own inline-value branch didn't get the
+        // #325 dash-sequence dispatch that its siblings (`parse_mapping_entry`,
+        // `parse_explicit_value`, `parse_value`) did, so a compact mapping's own
+        // same-line dash value fell through to `parse_inline_value` and read back
+        // as the scalar `"- x"` instead of the sequence `["x"]` — the same bug
+        // #325 fixed, one level deeper.
+        assert_eq!(first_doc_json(b"- a: - x\n"), r#"[{"a":["x"]}]"#);
+        // Bare dash is an empty item, matching the top-level case.
+        assert_eq!(first_doc_json(b"- a: -\n"), r#"[{"a":[null]}]"#);
+        // Nested inline sequence and compact mapping as the item.
+        assert_eq!(first_doc_json(b"- a: - - x\n"), r#"[{"a":[["x"]]}]"#);
+        assert_eq!(first_doc_json(b"- a: - k: v\n"), r#"[{"a":[{"k":"v"}]}]"#);
+        // A continuation line at the same column joins the same sequence.
+        assert_eq!(
+            first_doc_json(b"- a: - x\n     - y\n"),
+            r#"[{"a":["x","y"]}]"#
+        );
+        // A sibling entry in the same compact mapping still parses.
+        assert_eq!(
+            first_doc_json(b"- a: - x\n  b: 2\n"),
+            r#"[{"a":["x"],"b":2}]"#
+        );
+        // A `-` not followed by whitespace, and an alias, are unaffected.
+        assert_eq!(first_doc_json(b"- a: -1\n"), r#"[{"a":-1}]"#);
+        assert_eq!(first_doc_json(b"- a: -x\n"), r#"[{"a":"-x"}]"#);
+        assert_eq!(
+            first_doc_json(b"- b: &anc 1\n- a: *anc\n"),
+            r#"[{"b":1},{"a":1}]"#
+        );
+    }
 }
