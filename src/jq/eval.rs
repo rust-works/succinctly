@@ -6672,6 +6672,38 @@ fn set_path(
     }
 }
 
+/// Strip the wrappers a *resolved* path component can still carry, and say
+/// whether a `?` was among them.
+///
+/// `resolve_node` rewrites a computed key into the static component it denotes,
+/// but a branch resolved under `?` keeps an `Expr::Optional` around it —
+/// `path(.a[]? | .[.k]?)` resolves to `Optional(Field("x")) |
+/// Optional(Field("v"))`, not `Field("x") | Field("v")`. The wrapper carries
+/// one bit ("a failure here prunes rather than propagates"); the component
+/// underneath is what the walk actually follows.
+///
+/// `eval_with_path_tracking` looks through these already, which is why
+/// `path(…)` read correctly while `=`, `|=` and `del(…)` did not: their walkers
+/// matched the wrapper against `Field`/`Index`/`Iterate`, missed, and fell to a
+/// catch-all — `get_path_mut` to "invalid path component", and the two `Pipe`
+/// arms to one that silently *drops the rest of the path* and acts at the
+/// wrapper's own position, deleting or overwriting the parent of the intended
+/// target. [`flatten_delete_path`] got this right; the rest now agree with it.
+fn unwrap_path_component(expr: &Expr) -> (&Expr, bool) {
+    let mut current = expr;
+    let mut optional = false;
+    loop {
+        match current {
+            Expr::Optional(inner) => {
+                optional = true;
+                current = inner;
+            }
+            Expr::Paren(inner) => current = inner,
+            other => return (other, optional),
+        }
+    }
+}
+
 /// Get a mutable reference to a value at a path.
 fn get_path_mut<'a>(
     root: &'a mut OwnedValue,
@@ -6680,6 +6712,11 @@ fn get_path_mut<'a>(
     let mut current = root;
 
     for part in path_parts {
+        // The `?` bit is dropped rather than honoured: every path reaching a
+        // walker has already been resolved against the real document, so a
+        // component that survived resolution is one the walk can follow. What
+        // matters here is not matching the wrapper as an unknown component.
+        let (part, _optional) = unwrap_path_component(part);
         current = match part {
             Expr::Identity => current,
             Expr::Field(name) => {
@@ -6801,8 +6838,11 @@ fn update_path<S: EvalSemantics>(
             if exprs.len() == 1 {
                 update_path::<S>(root, &exprs[0], filter_expr, optional)
             } else {
-                // Navigate to the penultimate path, then update the last
-                let first = &exprs[0];
+                // Navigate to the penultimate path, then update the last.
+                // `here` is whether *this step* may fail quietly; `optional`
+                // keeps travelling to `rest`, which carries its own wrappers.
+                let (first, first_optional) = unwrap_path_component(&exprs[0]);
+                let here = optional || first_optional;
                 let rest = Expr::Pipe(exprs[1..].to_vec());
 
                 match first {
@@ -6810,7 +6850,7 @@ fn update_path<S: EvalSemantics>(
                         if let OwnedValue::Object(map) = root {
                             let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
                             update_path::<S>(current, &rest, filter_expr, optional)
-                        } else if optional {
+                        } else if here {
                             Ok(())
                         } else {
                             Err(EvalError::cannot_index_with_field(
@@ -6830,12 +6870,12 @@ fn update_path<S: EvalSemantics>(
                                     filter_expr,
                                     optional,
                                 )
-                            } else if optional {
+                            } else if here {
                                 Ok(())
                             } else {
                                 Err(out_of_range_index(*idx, arr.len()))
                             }
-                        } else if optional {
+                        } else if here {
                             Ok(())
                         } else {
                             Err(EvalError::cannot_index_with_type(
@@ -6857,10 +6897,19 @@ fn update_path<S: EvalSemantics>(
                             }
                             Ok(())
                         }
-                        _ if optional => Ok(()),
+                        _ if here => Ok(()),
                         _ => Err(EvalError::cannot_iterate(root)),
                     },
-                    _ => update_path::<S>(root, first, filter_expr, optional),
+                    // `resolve_node`'s `?` arm emits `Optional(Pipe([…]))`
+                    // when a branch resolved to more than one component, so
+                    // unwrapping can expose a nested pipe. Splice it in rather
+                    // than recursing on it alone, which would strand `rest`.
+                    Expr::Pipe(inner) => {
+                        let mut spliced = inner.clone();
+                        spliced.extend_from_slice(&exprs[1..]);
+                        update_path::<S>(root, &Expr::Pipe(spliced), filter_expr, here)
+                    }
+                    _ => update_path::<S>(root, first, filter_expr, here),
                 }
             }
         }
@@ -10658,7 +10707,14 @@ fn delete_at_path(
             if exprs.len() == 1 {
                 delete_at_path(root, &exprs[0], optional)
             } else {
-                let first = &exprs[0];
+                // Same unwrap as `update_path`'s chain arm: a resolved
+                // component can still be wrapped in `?`, and matching the
+                // wrapper as an unknown component used to fall through to the
+                // catch-all below, which deletes at *this* position and
+                // strands the rest of the path — `del(recurse | objects |
+                // .[.k]?)` removing the whole parent instead of one key.
+                let (first, first_optional) = unwrap_path_component(&exprs[0]);
+                let here = optional || first_optional;
                 let rest = Expr::Pipe(exprs[1..].to_vec());
 
                 match first {
@@ -10666,12 +10722,12 @@ fn delete_at_path(
                         if let OwnedValue::Object(map) = root {
                             if let Some(current) = map.get_mut(name) {
                                 delete_at_path(current, &rest, optional)
-                            } else if optional {
+                            } else if here {
                                 Ok(())
                             } else {
                                 Err(EvalError::field_not_found(name))
                             }
-                        } else if optional {
+                        } else if here {
                             Ok(())
                         } else {
                             Err(EvalError::cannot_index_with_field(
@@ -10686,12 +10742,12 @@ fn delete_at_path(
                             let actual_idx = if *idx < 0 { len + idx } else { *idx };
                             if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
                                 delete_at_path(&mut arr[actual_idx as usize], &rest, optional)
-                            } else if optional {
+                            } else if here {
                                 Ok(())
                             } else {
                                 Err(out_of_range_index(*idx, arr.len()))
                             }
-                        } else if optional {
+                        } else if here {
                             Ok(())
                         } else {
                             Err(EvalError::cannot_index_with_type(
@@ -10713,10 +10769,17 @@ fn delete_at_path(
                             }
                             Ok(())
                         }
-                        _ if optional => Ok(()),
+                        _ if here => Ok(()),
                         _ => Err(EvalError::cannot_iterate(root)),
                     },
-                    _ => delete_at_path(root, first, optional),
+                    // A nested pipe from `Optional(Pipe([…]))` — splice, do
+                    // not recurse on it alone, or `rest` is stranded.
+                    Expr::Pipe(inner) => {
+                        let mut spliced = inner.clone();
+                        spliced.extend_from_slice(&exprs[1..]);
+                        delete_at_path(root, &Expr::Pipe(spliced), here)
+                    }
+                    _ => delete_at_path(root, first, here),
                 }
             }
         }
