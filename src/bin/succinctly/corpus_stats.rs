@@ -681,7 +681,7 @@ pub(crate) fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 /// Derive `(workload, file)` labels from the path relative to the corpus root.
-fn labels(root: &Path, path: &Path) -> (String, String) {
+pub fn labels(root: &Path, path: &Path) -> (String, String) {
     let file = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -700,7 +700,7 @@ fn labels(root: &Path, path: &Path) -> (String, String) {
 // Report rendering
 // ---------------------------------------------------------------------------
 
-fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+pub fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
     let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {

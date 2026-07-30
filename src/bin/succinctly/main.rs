@@ -282,6 +282,32 @@ enum BenchSubcommand {
     Utf8(BenchUtf8Args),
     /// Report shape statistics for the real-workload corpus (#301)
     CorpusStats(BenchCorpusStatsArgs),
+    /// Report seq-item density and position-storage representation (#106)
+    SeqItemStats(BenchSeqItemStatsArgs),
+}
+
+/// Arguments for the seq-item density / position-storage report.
+#[derive(Debug, Parser)]
+struct BenchSeqItemStatsArgs {
+    /// Directory of YAML files to scan (recursively, by file extension)
+    #[arg(short, long, default_value = "data/bench/corpus/yaml")]
+    data_dir: PathBuf,
+
+    /// Markdown report to write (default: print to stdout)
+    #[arg(short, long)]
+    markdown: Option<PathBuf>,
+
+    /// Optional JSONL file of per-file records
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Also scan a YAML Test Suite JSON file (reaches the Dense fallback path)
+    #[arg(long)]
+    yaml_test_suite: Option<PathBuf>,
+
+    /// Print every predicate/structure mismatch with text context
+    #[arg(long)]
+    explain_mismatch: bool,
 }
 
 /// Arguments for the real-workload corpus shape-statistics report.
@@ -1329,6 +1355,16 @@ fn main() -> Result<()> {
                     )?;
                     std::process::exit(exit_code);
                 }
+                BenchSubcommand::SeqItemStats(args) => {
+                    let exit_code = seq_item_stats::run_all(
+                        &args.data_dir,
+                        args.markdown.as_deref(),
+                        args.output.as_deref(),
+                        args.yaml_test_suite.as_ref(),
+                        args.explain_mismatch,
+                    )?;
+                    std::process::exit(exit_code);
+                }
             },
             DevSubcommand::SelectStats(args) => {
                 let exit_code = select_stats_report::run(&args.data_dir, args.markdown.as_ref())?;
@@ -2147,6 +2183,7 @@ fn format_bytes(bytes: usize) -> String {
 #[cfg(feature = "bench-runner")]
 mod bench_runner;
 mod corpus_stats;
+mod seq_item_stats;
 mod dsv_bench;
 mod dsv_generators;
 mod env_config;
