@@ -580,13 +580,15 @@ fn test_unsupported_path_prefixes_report_rather_than_misfire() {
         r#"(.[] | .[("x","y")]) = 9"#,
         Outcome::error("expected array or object, got number"),
     );
-    // A multi-output component that is not `.[]` cannot be expanded into
-    // concrete path components, so it is refused rather than silently applied
-    // to one branch. jq resolves `..` and then fails on the first scalar it
-    // reaches (`Cannot index number with string "x"`).
+    // `range(3)` is a multi-output component with no path-tracking arm (#412
+    // covers `..`, `recurse` and the typeof filters — see
+    // `test_multi_output_path_components_fan_out` — but not arbitrary
+    // generators), so it is still refused rather than silently applied to one
+    // branch. jq itself refuses too, in its own words (`Invalid path
+    // expression near attempt to access element "x" of 0`).
     check(
         r#"{"a":1}"#,
-        r#"(.. | .[("x","y")]) = 9"#,
+        r#"(range(3) | .[("x","y")]) = 9"#,
         Outcome::error("Cannot use a computed index after a multi-output path component"),
     );
     // `. = 5` replaces the root, so the sibling branch then indexes a number,
@@ -596,6 +598,277 @@ fn test_unsupported_path_prefixes_report_rather_than_misfire() {
         r#"(., .a[("x","y")]) = 5"#,
         Outcome::error(r#"Cannot index number with string "a""#),
     );
+}
+
+/// #412: a computed key after `..`, `recurse` or a typeof filter (`objects`,
+/// `select`, ...) now resolves per branch instead of being refused outright —
+/// `resolve_node` names the Field/Index chain reaching *each* of the many
+/// values, the same job it already did for `.[]`.
+///
+/// Every expectation here was captured from real jq 1.7.1.
+#[test]
+fn test_multi_output_path_components_fan_out() {
+    // The exact repro from #412.
+    check(
+        r#"{"k":"a","a":{"k":"a","a":1}}"#,
+        r"[path(.. | objects | .[.k]?)]",
+        Outcome::values(&[r#"[["a"],["a","a"]]"#]),
+    );
+
+    let doc = r#"{"x":{"k":"v","v":1},"y":{"k":"w","w":2}}"#;
+    check(
+        doc,
+        r"[path(.. | objects | .[.k]?)]",
+        Outcome::values(&[r#"[["x","v"],["y","w"]]"#]),
+    );
+    check(
+        doc,
+        r"(.. | objects | .[.k]?) = 99",
+        Outcome::values(&[r#"{"x":{"k":"v","v":99},"y":{"k":"w","w":99}}"#]),
+    );
+    check(
+        doc,
+        r"(.. | objects | .[.k]?) |= (. + 1)",
+        Outcome::values(&[r#"{"x":{"k":"v","v":2},"y":{"k":"w","w":3}}"#]),
+    );
+    check(
+        doc,
+        r"del(.. | objects | .[.k]?)",
+        Outcome::values(&[r#"{"x":{"k":"v"},"y":{"k":"w"}}"#]),
+    );
+
+    // `recurse` (BFS order) and `select(f)` generalise the same way as `..`
+    // and `objects`.
+    check(
+        doc,
+        r"[path(recurse | objects | .[.k]?)]",
+        Outcome::values(&[r#"[["x","v"],["y","w"]]"#]),
+    );
+    check(
+        doc,
+        r#"[path(.. | select(type == "object") | .[.k]?)]"#,
+        Outcome::values(&[r#"[["x","v"],["y","w"]]"#]),
+    );
+
+    // `..` still fails loudly, in jq's own words, when the computed key
+    // reaches a value that cannot be indexed by it — the resolver fans out
+    // and lets the ordinary indexing error surface per branch.
+    check(
+        r#"{"a":1}"#,
+        r#"(.. | .[("x","y")]) = 9"#,
+        Outcome::error(r#"Cannot index number with string "x""#),
+    );
+}
+
+/// Every *writer* after a multi-output prefix, not just `path()`.
+///
+/// `path()` reads a resolved path; `=`, `|=`, `+=` and `del()` walk it, through
+/// three functions `path()` never touches (`get_path_mut`, `update_path`,
+/// `delete_at_path`). Checking only `path()` is what let a resolver emitting
+/// `Optional(Field("x")) | Optional(Field("v"))` — which those three matched
+/// against `Field`/`Index`/`Iterate`, missed, and handled by acting at the
+/// *wrapper's* position with the rest of the path dropped — read correctly
+/// while `del(recurse | objects | .[.k]?)` deleted the whole `.x` and
+/// `|=` overwrote it. So each prefix is pinned against all five.
+///
+/// `.[]?` carries the same wrapper and was wrong the same way before #412 —
+/// it is here because it is the case that shows the defect was never about
+/// `recurse`.
+#[test]
+fn test_every_writer_agrees_after_a_multi_output_prefix() {
+    let doc = r#"{"x":{"k":"v","v":1}}"#;
+
+    for prefix in [
+        ".. | objects",
+        "recurse | objects",
+        "recurse(.[]?) | objects",
+    ] {
+        check(
+            doc,
+            &format!("[path({prefix} | .[.k]?)]"),
+            Outcome::values(&[r#"[["x","v"]]"#]),
+        );
+        check(
+            doc,
+            &format!("({prefix} | .[.k]?) = 7"),
+            Outcome::values(&[r#"{"x":{"k":"v","v":7}}"#]),
+        );
+        check(
+            doc,
+            &format!("({prefix} | .[.k]?) |= 7"),
+            Outcome::values(&[r#"{"x":{"k":"v","v":7}}"#]),
+        );
+        check(
+            doc,
+            &format!("({prefix} | .[.k]?) += 7"),
+            Outcome::values(&[r#"{"x":{"k":"v","v":8}}"#]),
+        );
+        check(
+            doc,
+            &format!("del({prefix} | .[.k]?)"),
+            Outcome::values(&[r#"{"x":{"k":"v"}}"#]),
+        );
+    }
+
+    // The `?`-wrapped spelling of `.[]`, whose components reach the walkers
+    // wrapped even without any of the #412 arms in play.
+    check(
+        doc,
+        r"[path(.[]? | .[.k]?)]",
+        Outcome::values(&[r#"[["x","v"]]"#]),
+    );
+    check(
+        doc,
+        r"(.[]? | .[.k]?) = 7",
+        Outcome::values(&[r#"{"x":{"k":"v","v":7}}"#]),
+    );
+    check(
+        doc,
+        r"(.[]? | .[.k]?) |= 7",
+        Outcome::values(&[r#"{"x":{"k":"v","v":7}}"#]),
+    );
+    check(
+        doc,
+        r"del(.[]? | .[.k]?)",
+        Outcome::values(&[r#"{"x":{"k":"v"}}"#]),
+    );
+}
+
+/// `recurse(f)` for an `f` that never stops producing.
+///
+/// `f` is arbitrary, so nothing guarantees progress: `.a?` reads `null` from
+/// `null` forever. `builtin_recurse_f` is bounded because it does not queue a
+/// null child, and `resolve_recurse` has to make the same choice — without it
+/// the queue runs to its 10,000-item cutoff with the path prefix one component
+/// longer each round, which is quadratic. Measured at 9 GB resident and 5s of
+/// CPU for this 18-byte document; it is a bound, not a preference.
+///
+/// jq does not terminate here at all (it recurses until it cannot allocate),
+/// so the expectation is `builtin_recurse_f`'s, deliberately.
+#[test]
+fn test_recurse_over_a_null_producing_filter_terminates() {
+    let doc = r#"{"k":"a","a":null}"#;
+    // Both sides visit the root and stop: `.a?` yields null, which ends that
+    // line of descent rather than seeding another round.
+    check(
+        doc,
+        r"[recurse(.a?)]",
+        Outcome::values(&[r#"[{"k":"a","a":null}]"#]),
+    );
+    check(
+        doc,
+        r"[path(recurse(.a?) | objects | .[.k]?)]",
+        Outcome::values(&[r#"[["a"]]"#]),
+    );
+}
+
+/// The three parameterised `recurse` spellings, which
+/// `test_multi_output_path_components_fan_out` exercises only in its bare
+/// `recurse` form. Bare `recurse` is `..` and shares its resolver; these do
+/// not, because `f` is arbitrary — `resolve_recurse` re-implements
+/// `builtin_recurse_f`/`builtin_recurse_cond`'s queue in order to thread path
+/// components alongside each value, so the thing worth pinning is that it
+/// still visits what those two visit.
+///
+/// It does not follow them in *every* respect, and the difference is
+/// deliberate: when `f` yields an array those two descend into its elements
+/// (an artefact of collapsing a stream into one array), where jq and the
+/// resolver both stop at the array. See `resolve_recurse`'s own note.
+#[test]
+fn test_recurse_variants_fan_out_like_their_value_paths() {
+    let doc = r#"{"x":{"k":"v","v":1},"y":{"k":"w","w":2}}"#;
+    // `recurse(f)` and `recurse(f; cond)` with a cond that keeps everything
+    // both reduce to the bare `recurse` above.
+    check(
+        doc,
+        r"[path(recurse(.[]?) | objects | .[.k]?)]",
+        Outcome::values(&[r#"[["x","v"],["y","w"]]"#]),
+    );
+    check(
+        doc,
+        r"[path(recurse(.[]?; true) | objects | .[.k]?)]",
+        Outcome::values(&[r#"[["x","v"],["y","w"]]"#]),
+    );
+
+    // A cond that actually prunes: `.v` and `.w` are scalars, so recursion
+    // stops at them and only the two objects' own keys are reached. Without
+    // the cond being honoured this would also walk into the scalars.
+    check(
+        r#"{"k":"v","v":1,"deep":{"k":"w","w":2}}"#,
+        r#"[path(recurse(.[]?; type == "object") | objects | .[.k]?)]"#,
+        Outcome::values(&[r#"[["v"],["deep","w"]]"#]),
+    );
+
+    // `recurse_down` is a succinctly-only alias for `recurse` (jq 1.7.1 has no
+    // such builtin), so it is pinned against `recurse` rather than against jq.
+    check(
+        doc,
+        r"[path(recurse_down | objects | .[.k]?)]",
+        Outcome::values(&[r#"[["x","v"],["y","w"]]"#]),
+    );
+
+    // A cond that *errors* on some node prunes it, rather than propagating —
+    // `.k` on the string `"v"` cannot be indexed. jq instead raises `Cannot
+    // index string with string "k"`. This mirrors `builtin_recurse_cond`'s own
+    // `Err(_) => false`, i.e. the divergence is in the value path and predates
+    // #412; what is pinned here is that the path side agrees with it, because
+    // a resolver that propagated would make `path(f)` disagree with `f`.
+    check(
+        r#"{"k":"v","v":1,"deep":{"k":"w","w":2}}"#,
+        r#"[path(recurse(.[]?; .k != "w") | objects | .[.k]?)]"#,
+        Outcome::values(&[r#"[["v"]]"#]),
+    );
+}
+
+/// Each arm of `type_filter_matches`, which decides whether a typeof filter
+/// keeps a path branch or prunes it. A miswired arm (`booleans` matching
+/// numbers, `scalars` matching arrays) is invisible in the happy cases above,
+/// where only `objects` is exercised.
+///
+/// The key is `("p","q")` — two keys of the *same* kind, and neither derived
+/// from the value being indexed — so each branch either resolves both keys or
+/// neither, and the filter's keep/prune decision is the only thing under test.
+#[test]
+fn test_typeof_filters_decide_which_path_branches_survive() {
+    let doc = r#"{"arr":[10,20],"obj":{"p":1},"s":"str","n":7,"b":true,"u":null}"#;
+
+    // The filters that keep an indexable branch: the root and `.obj` are the
+    // two objects, and a string key into null is legal (it reads as null), so
+    // `.u` is what survives `scalars`/`nulls`.
+    for filter in ["objects", "values", "iterables"] {
+        check(
+            doc,
+            &format!(r#"[path(.. | {filter} | .[("p","q")]?)]"#),
+            Outcome::values(&[r#"[["p"],["q"],["obj","p"],["obj","q"]]"#]),
+        );
+    }
+    for filter in ["scalars", "nulls"] {
+        check(
+            doc,
+            &format!(r#"[path(.. | {filter} | .[("p","q")]?)]"#),
+            Outcome::values(&[r#"[["u","p"],["u","q"]]"#]),
+        );
+    }
+
+    // The remaining arms keep only branches a string key *cannot* index, so
+    // they emit no path at all — which on its own would also be the reading if
+    // the arm wrongly pruned everything. Dropping the `?` distinguishes the
+    // two: the error names the type the arm let through, so it is evidence the
+    // branch was kept. (`nulls` is absent here because assignment through null
+    // is a separate pre-existing gap: jq autovivifies `{"u":null} | .u.p = 9`
+    // to `{"u":{"p":9}}`, succinctly reports `Cannot index null with string`.)
+    for (filter, type_name) in [
+        ("arrays", "array"),
+        ("numbers", "number"),
+        ("strings", "string"),
+        ("booleans", "boolean"),
+    ] {
+        check(
+            doc,
+            &format!(r#"(.. | {filter} | .[("p","q")]) = 9"#),
+            Outcome::error(&format!(r#"Cannot index {type_name} with string "p""#)),
+        );
+    }
 }
 
 #[test]

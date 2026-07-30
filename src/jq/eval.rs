@@ -6672,6 +6672,38 @@ fn set_path(
     }
 }
 
+/// Strip the wrappers a *resolved* path component can still carry, and say
+/// whether a `?` was among them.
+///
+/// `resolve_node` rewrites a computed key into the static component it denotes,
+/// but a branch resolved under `?` keeps an `Expr::Optional` around it —
+/// `path(.a[]? | .[.k]?)` resolves to `Optional(Field("x")) |
+/// Optional(Field("v"))`, not `Field("x") | Field("v")`. The wrapper carries
+/// one bit ("a failure here prunes rather than propagates"); the component
+/// underneath is what the walk actually follows.
+///
+/// `eval_with_path_tracking` looks through these already, which is why
+/// `path(…)` read correctly while `=`, `|=` and `del(…)` did not: their walkers
+/// matched the wrapper against `Field`/`Index`/`Iterate`, missed, and fell to a
+/// catch-all — `get_path_mut` to "invalid path component", and the two `Pipe`
+/// arms to one that silently *drops the rest of the path* and acts at the
+/// wrapper's own position, deleting or overwriting the parent of the intended
+/// target. [`flatten_delete_path`] got this right; the rest now agree with it.
+fn unwrap_path_component(expr: &Expr) -> (&Expr, bool) {
+    let mut current = expr;
+    let mut optional = false;
+    loop {
+        match current {
+            Expr::Optional(inner) => {
+                optional = true;
+                current = inner;
+            }
+            Expr::Paren(inner) => current = inner,
+            other => return (other, optional),
+        }
+    }
+}
+
 /// Get a mutable reference to a value at a path.
 fn get_path_mut<'a>(
     root: &'a mut OwnedValue,
@@ -6680,6 +6712,11 @@ fn get_path_mut<'a>(
     let mut current = root;
 
     for part in path_parts {
+        // The `?` bit is dropped rather than honoured: every path reaching a
+        // walker has already been resolved against the real document, so a
+        // component that survived resolution is one the walk can follow. What
+        // matters here is not matching the wrapper as an unknown component.
+        let (part, _optional) = unwrap_path_component(part);
         current = match part {
             Expr::Identity => current,
             Expr::Field(name) => {
@@ -6801,8 +6838,11 @@ fn update_path<S: EvalSemantics>(
             if exprs.len() == 1 {
                 update_path::<S>(root, &exprs[0], filter_expr, optional)
             } else {
-                // Navigate to the penultimate path, then update the last
-                let first = &exprs[0];
+                // Navigate to the penultimate path, then update the last.
+                // `here` is whether *this step* may fail quietly; `optional`
+                // keeps travelling to `rest`, which carries its own wrappers.
+                let (first, first_optional) = unwrap_path_component(&exprs[0]);
+                let here = optional || first_optional;
                 let rest = Expr::Pipe(exprs[1..].to_vec());
 
                 match first {
@@ -6810,7 +6850,7 @@ fn update_path<S: EvalSemantics>(
                         if let OwnedValue::Object(map) = root {
                             let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
                             update_path::<S>(current, &rest, filter_expr, optional)
-                        } else if optional {
+                        } else if here {
                             Ok(())
                         } else {
                             Err(EvalError::cannot_index_with_field(
@@ -6830,12 +6870,12 @@ fn update_path<S: EvalSemantics>(
                                     filter_expr,
                                     optional,
                                 )
-                            } else if optional {
+                            } else if here {
                                 Ok(())
                             } else {
                                 Err(out_of_range_index(*idx, arr.len()))
                             }
-                        } else if optional {
+                        } else if here {
                             Ok(())
                         } else {
                             Err(EvalError::cannot_index_with_type(
@@ -6857,10 +6897,19 @@ fn update_path<S: EvalSemantics>(
                             }
                             Ok(())
                         }
-                        _ if optional => Ok(()),
+                        _ if here => Ok(()),
                         _ => Err(EvalError::cannot_iterate(root)),
                     },
-                    _ => update_path::<S>(root, first, filter_expr, optional),
+                    // `resolve_node`'s `?` arm emits `Optional(Pipe([…]))`
+                    // when a branch resolved to more than one component, so
+                    // unwrapping can expose a nested pipe. Splice it in rather
+                    // than recursing on it alone, which would strand `rest`.
+                    Expr::Pipe(inner) => {
+                        let mut spliced = inner.clone();
+                        spliced.extend_from_slice(&exprs[1..]);
+                        update_path::<S>(root, &Expr::Pipe(spliced), filter_expr, here)
+                    }
+                    _ => update_path::<S>(root, first, filter_expr, here),
                 }
             }
         }
@@ -7059,6 +7108,56 @@ fn resolve_node<S: EvalSemantics>(
             Ok(out)
         }
 
+        // `..` fans out to every node in the tree (pre-order, self before
+        // children), so each needs its own Field/Index chain rather than the
+        // verbatim `RecursiveDescent` the static-leaf arm below would
+        // otherwise store — the very case #412 was filed for.
+        Expr::RecursiveDescent => Ok(resolve_recursive_descent(value)),
+
+        // Bare `recurse` *is* `..` — jq defines it as `recurse(.[]?)` and
+        // `[recurse]` and `[..]` agree output for output. Sharing `..`'s
+        // resolver rather than routing `.[]?` through `resolve_recurse` is
+        // both simpler and what keeps the components bare: resolving under a
+        // `?` wraps each one in `Expr::Optional`, which the walkers that
+        // *write* (`get_path_mut`, `update_path`, `delete_at_path`) then have
+        // to unwrap. They do, but there is no reason to make them.
+        Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
+            Ok(resolve_recursive_descent(value))
+        }
+        // The parameterised spellings have no such shortcut: `f` is arbitrary,
+        // so the queue has to run.
+        Expr::Builtin(Builtin::RecurseF(f)) => resolve_recurse::<S>(f, None, value),
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) => resolve_recurse::<S>(f, Some(cond), value),
+
+        // `select(f)` and the typeof filters (`objects`, `arrays`, ...) add no
+        // path component of their own — they either pass a branch through
+        // unchanged or prune it, exactly like `Optional` above but driven by a
+        // predicate instead of an error.
+        Expr::Builtin(Builtin::Select(cond)) => {
+            if eval_owned_expr::<S>(cond, value, false)?.is_truthy() {
+                Ok(vec![(Vec::new(), value.clone())])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        Expr::Builtin(
+            builtin @ (Builtin::Values
+            | Builtin::Nulls
+            | Builtin::Booleans
+            | Builtin::Numbers
+            | Builtin::Strings
+            | Builtin::Arrays
+            | Builtin::Objects
+            | Builtin::Iterables
+            | Builtin::Scalars),
+        ) => {
+            if type_filter_matches(builtin, value) {
+                Ok(vec![(Vec::new(), value.clone())])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
         // A static leaf: keep it verbatim and thread its value through.
         other => {
             let mut components = Vec::new();
@@ -7068,15 +7167,126 @@ fn resolve_node<S: EvalSemantics>(
                 // No output prunes the branch.
                 0 => Ok(Vec::new()),
                 1 => Ok(vec![(components, values.pop().expect("len checked"))]),
-                // `..` and friends fan out to many values, each of which would
-                // need its own key resolved against it. jq handles this; we do
-                // not yet (#412), so say so in the user's terms rather than in
-                // the resolver's.
+                // A multi-output component with no path-tracking arm above
+                // (an arbitrary function call, `getpath` with a computed
+                // argument, ...). jq resolves these via general bytecode path
+                // tracking; we do not (#412), so say so in the user's terms
+                // rather than the resolver's.
                 _ => Err(EvalError::new(
                     "Cannot use a computed index after a multi-output path component",
                 )),
             }
         }
+    }
+}
+
+/// Fan `..` out into one branch per node in `value`'s tree, self before
+/// children in the same pre-order `collect_recursive` uses for the value-only
+/// `..`, so `path(..)`-derived branches visit values in the same order
+/// `[.. ]` would output them.
+fn resolve_recursive_descent(value: &OwnedValue) -> Vec<PathBranch> {
+    let mut out = Vec::new();
+    push_recursive_branches(&[], value, &mut out);
+    out
+}
+
+fn push_recursive_branches(prefix: &[Expr], value: &OwnedValue, out: &mut Vec<PathBranch>) {
+    out.push((prefix.to_vec(), value.clone()));
+    match value {
+        OwnedValue::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                let mut path = prefix.to_vec();
+                path.push(Expr::Index(i as i64));
+                push_recursive_branches(&path, item, out);
+            }
+        }
+        OwnedValue::Object(map) => {
+            for (k, v) in map {
+                let mut path = prefix.to_vec();
+                path.push(Expr::Field(k.clone()));
+                push_recursive_branches(&path, v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Fan `recurse(f)` / `recurse(f; cond)` out into one branch per visited
+/// node. Follows `builtin_recurse_f`/`builtin_recurse_cond`'s breadth-first
+/// queue — including swallowing `f`'s errors, a falsy `cond` pruning rather
+/// than propagating, not queueing a null child, and the `MAX_ITEMS` cutoff —
+/// but resolves `f` through [`resolve_node`] at each step instead of
+/// [`eval_owned_expr`], so every queued value carries the path components that
+/// reach it.
+///
+/// Not queueing a null child is the load-bearing one. `f` is arbitrary and
+/// nothing says it makes progress: `recurse(.a?)` over `{"a":null}` reads
+/// `null` from `null` forever, and the queue would run to `MAX_ITEMS` with a
+/// prefix one component longer each round — quadratic, and measured at 9 GB
+/// for an 18-byte document before this guard existed.
+///
+/// One difference from those two is deliberate. When `f` yields an array they
+/// queue its *elements* (`queue.extend(arr)`), an artefact of
+/// [`eval_owned_expr`] collapsing a stream into one array — so `[recurse(.a?)]`
+/// descends into an array-valued `.a` where jq stops at the array itself.
+/// Resolving through [`resolve_node`] keeps the array, which is jq's answer;
+/// mirroring the value path here would mean mirroring its bug.
+fn resolve_recurse<S: EvalSemantics>(
+    f: &Expr,
+    cond: Option<&Expr>,
+    value: &OwnedValue,
+) -> Result<Vec<PathBranch>, EvalError> {
+    let mut outputs: Vec<PathBranch> = Vec::new();
+    let mut queue: Vec<PathBranch> = vec![(Vec::new(), value.clone())];
+    const MAX_ITEMS: usize = 10000;
+
+    while !queue.is_empty() && outputs.len() < MAX_ITEMS {
+        let (prefix, current) = queue.remove(0);
+
+        if let Some(cond) = cond {
+            let should_continue =
+                eval_owned_expr::<S>(cond, &current, false).is_ok_and(|v| v.is_truthy());
+            if !should_continue {
+                continue;
+            }
+        }
+
+        outputs.push((prefix.clone(), current.clone()));
+
+        for (child_components, child_value) in resolve_node::<S>(f, &current).unwrap_or_default() {
+            // `builtin_recurse_f`'s `Ok(v) if !matches!(v, OwnedValue::Null)`:
+            // a null child ends that line of descent. See the note above on
+            // why this is what bounds the queue at all.
+            if matches!(child_value, OwnedValue::Null) {
+                continue;
+            }
+            let mut path = prefix.clone();
+            path.extend(child_components);
+            queue.push((path, child_value));
+        }
+    }
+
+    Ok(outputs)
+}
+
+/// Does `builtin` (one of `values`/`nulls`/`booleans`/.../`scalars`) keep
+/// `value`? Mirrors the `matches!` checks the value-only evaluator uses for
+/// these same builtins.
+fn type_filter_matches(builtin: &Builtin, value: &OwnedValue) -> bool {
+    match builtin {
+        Builtin::Values => !matches!(value, OwnedValue::Null),
+        Builtin::Nulls => matches!(value, OwnedValue::Null),
+        Builtin::Booleans => matches!(value, OwnedValue::Bool(_)),
+        Builtin::Numbers => matches!(
+            value,
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+        ),
+        Builtin::Strings => matches!(value, OwnedValue::String(_)),
+        Builtin::Arrays => matches!(value, OwnedValue::Array(_)),
+        Builtin::Objects => matches!(value, OwnedValue::Object(_)),
+        Builtin::Iterables => matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)),
+        Builtin::Scalars => !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)),
+        _ => false,
     }
 }
 
@@ -10497,7 +10707,14 @@ fn delete_at_path(
             if exprs.len() == 1 {
                 delete_at_path(root, &exprs[0], optional)
             } else {
-                let first = &exprs[0];
+                // Same unwrap as `update_path`'s chain arm: a resolved
+                // component can still be wrapped in `?`, and matching the
+                // wrapper as an unknown component used to fall through to the
+                // catch-all below, which deletes at *this* position and
+                // strands the rest of the path — `del(recurse | objects |
+                // .[.k]?)` removing the whole parent instead of one key.
+                let (first, first_optional) = unwrap_path_component(&exprs[0]);
+                let here = optional || first_optional;
                 let rest = Expr::Pipe(exprs[1..].to_vec());
 
                 match first {
@@ -10505,12 +10722,12 @@ fn delete_at_path(
                         if let OwnedValue::Object(map) = root {
                             if let Some(current) = map.get_mut(name) {
                                 delete_at_path(current, &rest, optional)
-                            } else if optional {
+                            } else if here {
                                 Ok(())
                             } else {
                                 Err(EvalError::field_not_found(name))
                             }
-                        } else if optional {
+                        } else if here {
                             Ok(())
                         } else {
                             Err(EvalError::cannot_index_with_field(
@@ -10525,12 +10742,12 @@ fn delete_at_path(
                             let actual_idx = if *idx < 0 { len + idx } else { *idx };
                             if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
                                 delete_at_path(&mut arr[actual_idx as usize], &rest, optional)
-                            } else if optional {
+                            } else if here {
                                 Ok(())
                             } else {
                                 Err(out_of_range_index(*idx, arr.len()))
                             }
-                        } else if optional {
+                        } else if here {
                             Ok(())
                         } else {
                             Err(EvalError::cannot_index_with_type(
@@ -10552,10 +10769,17 @@ fn delete_at_path(
                             }
                             Ok(())
                         }
-                        _ if optional => Ok(()),
+                        _ if here => Ok(()),
                         _ => Err(EvalError::cannot_iterate(root)),
                     },
-                    _ => delete_at_path(root, first, optional),
+                    // A nested pipe from `Optional(Pipe([…]))` — splice, do
+                    // not recurse on it alone, or `rest` is stranded.
+                    Expr::Pipe(inner) => {
+                        let mut spliced = inner.clone();
+                        spliced.extend_from_slice(&exprs[1..]);
+                        delete_at_path(root, &Expr::Pipe(spliced), here)
+                    }
+                    _ => delete_at_path(root, first, here),
                 }
             }
         }
