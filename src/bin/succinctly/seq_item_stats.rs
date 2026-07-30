@@ -742,6 +742,9 @@ mod tests {
     fn real_corpus_files_use_the_compact_representation() {
         // Option 2 could only tag a per-open u32, which only Dense holds.
         let s = m(b"services:\n  db:\n    image: x\n    ports:\n      - 80:80\n");
-        assert!(s.open_compact, "typical YAML should reach the compact encoding");
+        assert!(
+            s.open_compact,
+            "typical YAML should reach the compact encoding"
+        );
     }
 }

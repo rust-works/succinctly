@@ -2183,7 +2183,6 @@ fn format_bytes(bytes: usize) -> String {
 #[cfg(feature = "bench-runner")]
 mod bench_runner;
 mod corpus_stats;
-mod seq_item_stats;
 mod dsv_bench;
 mod dsv_generators;
 mod env_config;
@@ -2194,6 +2193,7 @@ mod jq_runner;
 mod json_validate;
 mod output;
 mod select_stats_report;
+mod seq_item_stats;
 mod text_generators;
 mod text_validate;
 mod utf8_bench;
