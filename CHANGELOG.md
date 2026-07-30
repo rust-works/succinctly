@@ -1372,6 +1372,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SelectIndex sample overflow** (#188): `SampleEntry` counters were `u32`
   and wrapped past 2^32 set bits (~512 MB of ones); widened to `u64`.
 
+- **jq postfix `?` was only accepted after a path expression** (#367): jq's
+  grammar allows `?` (shorthand for `try f`) after any Term — `length?`,
+  `keys?`, `(1)?`, `(.a)?`, `first(.[])?`, `getpath(["a"])?`,
+  `setpath(["a"];1)?`, `$x?`, `.?` — but succinctly's parser only checked for
+  a trailing `?` in two spots: the dot-field branch of `parse_primary`
+  (`.foo?`) and `parse_index_bracket_with_optional` (`.[0]?`). Everywhere
+  else a trailing `?` was left unconsumed, tripping the top-level "unexpected
+  character '?'" check. Rather than patch each of the ~13 branches that
+  didn't check for it individually, `parse_primary`'s whole dispatch is now
+  wrapped once (renamed to `parse_primary_inner`, with a thin outer
+  `parse_primary` checking for a trailing `?` after any Term); `?` was also
+  added to `is_expr_terminator` so bare `.?` is recognized as identity rather
+  than an attempted (invalid) field name. `Expr::Optional`'s evaluation was
+  already fully generic (`src/jq/eval.rs`/`eval_generic.rs`), so the parsing
+  gap itself needed no evaluator changes — but unlocking `?` after arbitrary
+  builtins surfaced latent divergences that were previously unreachable with
+  `optional` set through real syntax: `tonumber?`, `length?`, `keys?`,
+  `keys_unsorted?`, `first?`, `last?`, and `reverse?` raised a hard error
+  instead of suppressing it on a value they can't operate on, because their
+  `eval_generic.rs` arms (and, for `first`/`last`/`reverse`, their `eval.rs`
+  counterparts too) never checked the `optional` flag they were already
+  passed. All seven are now threaded through, verified row-by-row against jq
+  1.7.1. Not fixed here: `null | reverse` (no `?` involved) still errors
+  instead of yielding `[]` in the generic evaluator — a pre-existing,
+  unrelated gap (missing `is_null()` arm) that this change didn't expose or
+  touch.
+
 ### Changed
 
 - **A tag on an anchored sequence item is now rejected** (#328): `- &a !!str x`
