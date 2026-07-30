@@ -688,6 +688,22 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
 
+            // The full evaluator always starts a fresh `eval()` with
+            // `optional = false`, so an ambient `optional = true` here (e.g.
+            // `(.a + .b)?`, `first(.[])?`) would otherwise be silently
+            // dropped at this bridge instead of suppressing the error, as it
+            // does for the natively-handled arms above. Re-wrap in
+            // `Expr::Optional` so the full evaluator's own (nuanced) handling
+            // of `?` sees it, same as the `eval_on_owned` builtin-fallback
+            // bridge below (#367, #386).
+            let wrapped;
+            let expr = if optional {
+                wrapped = Expr::Optional(Box::new(expr.clone()));
+                &wrapped
+            } else {
+                expr
+            };
+
             // Evaluate using the full evaluator
             match full_eval::<Vec<u64>, S>(expr, cursor) {
                 QueryResult::One(v) => {
