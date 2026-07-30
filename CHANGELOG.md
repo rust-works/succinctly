@@ -171,9 +171,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the component `path()` prints), which the four previously open-coded bound
   clamps also collapse onto. Deletion resolves every key naming an element of
   one array against the length it had on entry and removes them in a single
-  batch, so overlapping ranges union rather than compound (`del(.[0:2],
-  .[1:3])` is `[4]`; a range naming the same element as a bare index deletes
-  it once). `indices`/`index`/`rindex` came along, since jq defines all three
+  batch, so overlapping ranges union rather than compound
+  (`delpaths([[{"start":0,"end":2}],[{"start":1,"end":3}]])` on `[1,2,3,4]`
+  is `[4]`), and a range naming the same element as a bare index deletes it
+  once (`delpaths([[1],[{"start":1,"end":2}]])` is `[1,3,4]`) — the equivalent
+  `del(.[0:2], .[1:3])` spelling doesn't run yet, since top-level
+  comma-separated `del()` targets are a separate, pre-existing gap (#475).
+  `indices`/`index`/`rindex` came along, since jq defines all three
   over `.[$i]` — an object pattern is the slice, not a search, so `"abcabc" |
   indices({"start":1,"end":2})` is the substring `"b"`. Two error sentences
   arrive with the feature, `A slice of an array can only be assigned another
