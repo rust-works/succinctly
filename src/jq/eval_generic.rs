@@ -1632,6 +1632,61 @@ mod tests {
     }
 
     #[test]
+    fn test_yaml_generic_to_entries_array() {
+        // `to_entries` on a YAML sequence takes the array branch (mirroring
+        // the mapping branch above), producing {key: <index>, value: <elem>}
+        // entries with integer keys -- matching real `yq`/`jq`.
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"- a\n- b\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+
+        let seq_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = seq_cursor.value();
+
+        let result = eval(&Expr::Builtin(Builtin::ToEntries), value);
+        let owned = result.into_owned().unwrap();
+
+        let expected_entry = |i: i64, v: &str| {
+            let mut entry = IndexMap::new();
+            entry.insert("key".to_string(), OwnedValue::Int(i));
+            entry.insert("value".to_string(), OwnedValue::String(v.to_string()));
+            OwnedValue::Object(entry)
+        };
+        assert_eq!(
+            owned,
+            OwnedValue::Array(vec![expected_entry(0, "a"), expected_entry(1, "b")])
+        );
+    }
+
+    #[test]
+    fn test_yaml_generic_to_entries_optional_on_scalar() {
+        // `try to_entries` (built as Expr::Optional here) on a scalar is
+        // neither an array nor an object, so it must yield no result instead
+        // of propagating `has_no_keys`.
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"42";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+
+        let scalar_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = scalar_cursor.value();
+
+        let result = eval(
+            &Expr::Optional(Box::new(Expr::Builtin(Builtin::ToEntries))),
+            value,
+        );
+
+        assert!(matches!(result, GenericResult::None));
+    }
+
+    #[test]
     fn test_yaml_generic_array() {
         use crate::yaml::YamlIndex;
 
