@@ -7197,6 +7197,69 @@ fn resolve_node<S: EvalSemantics>(
             Ok(out)
         }
 
+        // `E[K]?` only covers a failure to *index* — evaluating `E` or `K`
+        // is not covered (see `eval_index_expr`'s doc comment, which the
+        // value-position evaluator already honors). The blanket catch below
+        // is right for every other `?`-wrapped node (`.foo?`, `.[0]?`, ...),
+        // where evaluation and indexing are the same step, but it is wrong
+        // here: it would also swallow an error raised while computing `K`
+        // itself, e.g. `"str" | .[.k]? = 5` (#413).
+        Expr::Optional(inner) if matches!(inner.as_ref(), Expr::IndexExpr { .. }) => {
+            let Expr::IndexExpr { target, key } = inner.as_ref() else {
+                unreachable!("guarded by the match arm's `matches!` above")
+            };
+            // Keys before the target, and an empty key stream before either —
+            // rule (3) of `eval_index_expr`, which holds whether or not the `?`
+            // is there: `5 | .a[empty]? = 9` is `5` in jq, not the
+            // `Cannot index number with string "a"` that resolving the target
+            // first would raise.
+            let keys = eval_owned_multi::<S>(key, value)?;
+            if keys.is_empty() {
+                return Ok(Vec::new());
+            }
+            let target_branches = resolve_node::<S>(target, value)?;
+
+            let mut out = Vec::with_capacity(keys.len() * target_branches.len());
+            for k in &keys {
+                for (components, target_value) in &target_branches {
+                    // NaN names no element for a write to land on, so `?` does
+                    // not save it — but only where a number addresses an
+                    // element at all. On an object the failure is
+                    // `Cannot index object with number`, which is precisely the
+                    // failure to index that `?` does cover:
+                    // `{"a":1} | .[nan]? = 5` is `{"a":1}` in jq while
+                    // `[1,2,3] | .[nan]? = 5` raises.
+                    if matches!(
+                        k,
+                        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+                    ) && numeric_key_to_index(k).is_none()
+                    {
+                        if matches!(target_value, OwnedValue::Array(_) | OwnedValue::Null) {
+                            return Err(EvalError::new("Cannot set array element at NaN index"));
+                        }
+                        continue;
+                    }
+                    // Any other key/container mismatch is exactly the
+                    // failure to index that `?` suppresses: skip just this
+                    // branch instead of propagating.
+                    let Ok(component) = key_to_path_component(k, target_value) else {
+                        continue;
+                    };
+                    let next_value = match index_one_owned(target_value, k, false) {
+                        Ok(v) => v.expect("non-optional index yields a value or errors"),
+                        Err(_) => continue,
+                    };
+                    let mut path = components.clone();
+                    path.push(Expr::Optional(Box::new(component)));
+                    out.push((path, next_value));
+                }
+            }
+            Ok(out)
+        }
+
+        // Every other `?`-wrapped node: evaluation and indexing are the same
+        // step, so any failure anywhere underneath is the failure to index,
+        // and `?` covers all of it.
         Expr::Optional(inner) => {
             // A failure under `?` prunes the branch instead of propagating.
             let Ok(branches) = resolve_node::<S>(inner, value) else {
@@ -7235,8 +7298,15 @@ fn resolve_node<S: EvalSemantics>(
         },
 
         Expr::IndexExpr { target, key } => {
-            let target_branches = resolve_node::<S>(target, value)?;
+            // Keys first, and an empty key stream short-circuits before the
+            // target is touched: jq compiles `E[K]` as `K as $k | E | .[$k]`, so
+            // `5 | .a[empty] = 9` is `5` and `5 | .a[.k] = 9` blames `.k` rather
+            // than the `.a` it never reached. Rule (3) of `eval_index_expr`.
             let keys = eval_owned_multi::<S>(key, value)?;
+            if keys.is_empty() {
+                return Ok(Vec::new());
+            }
+            let target_branches = resolve_node::<S>(target, value)?;
 
             // Key outer, target inner — the same order the value path uses, so
             // `path(.[("a","b")])` emits `["a"]` then `["b"]`.
