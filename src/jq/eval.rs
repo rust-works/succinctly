@@ -17,6 +17,8 @@ use alloc::vec::Vec;
 
 use indexmap::IndexMap;
 
+use super::slice::{self, SliceBounds};
+
 /// Trait for evaluation semantics - determines behavior for edge cases.
 ///
 /// jq and yq (mikefarah/yq) have different behaviors for some operations.
@@ -350,43 +352,20 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                 }
 
-                // Only count characters when actually slicing
+                // Only count characters when actually slicing. jq indexes a
+                // string slice by character, so the length handed to `resolve`
+                // is a character count — the bound arithmetic is the same
+                // either way.
                 let len = s_str.chars().count();
+                let range = SliceBounds::from_literals(*start, *end).resolve(len);
 
-                // Resolve indices like jq does
-                let resolve_idx = |idx: i64| -> usize {
-                    if idx >= 0 {
-                        (idx as usize).min(len)
-                    } else {
-                        let pos = len as i64 + idx;
-                        if pos < 0 {
-                            0
-                        } else {
-                            pos as usize
-                        }
-                    }
-                };
-
-                let start_idx = start.map_or(0, resolve_idx);
-                let end_idx = end.map_or(len, resolve_idx);
-
-                // Check for empty slice
-                if start_idx >= end_idx || start_idx >= len {
-                    return QueryResult::Owned(OwnedValue::String(String::new()));
-                }
-
-                // Fast path: if resolved slice is full string, return original
-                if start_idx == 0 && end_idx == len {
+                // Fast path: if the resolved slice is the whole string, return
+                // the original rather than rebuilding it.
+                if range == (0..len) {
                     return QueryResult::One(value);
                 }
 
-                // Actually slice the string (requires character iteration)
-                let sliced: String = s_str
-                    .chars()
-                    .skip(start_idx)
-                    .take(end_idx - start_idx)
-                    .collect();
-                QueryResult::Owned(OwnedValue::String(sliced))
+                QueryResult::Owned(OwnedValue::String(slice::slice_str(&s_str, range)))
             }
             _ if optional => QueryResult::None,
             // jq models `.[a:b]` as indexing with `{"start":a,"end":b}`, so a
@@ -4698,11 +4677,39 @@ fn builtin_test<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// definition, because the three call sites are identical and had already
 /// drifted into wording (`expected string, got pattern`) that names no type.
 ///
-/// An *object* pattern is jq's slice — `"abcabc" | indices({"start":1,"end":2})`
-/// is `"b"` — which succinctly does not implement, so it lands here too with a
-/// sentence jq would not use. That is the same missing feature as #366.
+/// An *object* pattern never reaches here: it is jq's slice, handled by
+/// [`string_slice_pattern`].
 fn non_string_pattern<W>(value: &StandardJson<'_, W>, pattern: &OwnedValue) -> EvalError {
     EvalError::cannot_index(type_name(value), pattern)
+}
+
+/// What `indices`/`index`/`rindex` answer for an *object* pattern against a
+/// string, which in jq is the slice rather than a search.
+///
+/// jq defines all three over `.[$i]`, so an object pattern indexes the string
+/// with a slice descriptor: `"abcabc" | indices({"start":1,"end":2})` is
+/// `"b"`, not a list of positions. `index`/`rindex` then take `.[0]` of that
+/// string and report jq's `Cannot index string with number` — which falls out
+/// of their own definitions rather than needing a case here.
+///
+/// `None` when this is not a string searched by an object pattern, leaving
+/// the caller's own [`non_string_pattern`] refusal in place.
+fn string_slice_pattern<W>(
+    value: &StandardJson<'_, W>,
+    pattern: &OwnedValue,
+) -> Option<Result<OwnedValue, EvalError>> {
+    let (StandardJson::String(s), OwnedValue::Object(desc)) = (value, pattern) else {
+        return None;
+    };
+    let Ok(text) = s.as_str() else {
+        return Some(Err(EvalError::new("invalid string")));
+    };
+    Some(SliceBounds::from_descriptor(desc).map(|bounds| {
+        OwnedValue::String(slice::slice_str(
+            &text,
+            bounds.resolve(text.chars().count()),
+        ))
+    }))
 }
 
 /// What `indices`, `index` and `rindex` answer for an input they cannot search.
@@ -4744,6 +4751,15 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     match &value {
         StandardJson::String(s) => {
+            // An object pattern is jq's slice, which answers a *substring*
+            // rather than a list of positions — see `string_slice_pattern`.
+            if let Some(sliced) = string_slice_pattern(&value, &pattern) {
+                return match sliced {
+                    Ok(v) => QueryResult::Owned(v),
+                    Err(_) if optional => QueryResult::None,
+                    Err(e) => QueryResult::Error(e),
+                };
+            }
             // For strings, pattern must be a string
             let pattern_str = match &pattern {
                 OwnedValue::String(p) => p,
@@ -4795,6 +4811,18 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     match &value {
         StandardJson::String(s) => {
+            // jq defines `index`/`rindex` as `.[0]`/`.[-1:][0]` of what
+            // `indices` answers, so an object pattern — jq's slice — leaves a
+            // *substring* to be indexed with a number, and reports that.
+            if let Some(sliced) = string_slice_pattern(&value, &pattern) {
+                return match sliced {
+                    _ if optional => QueryResult::None,
+                    Err(e) => QueryResult::Error(e),
+                    Ok(_) => {
+                        QueryResult::Error(EvalError::cannot_index_with_type("string", "number"))
+                    }
+                };
+            }
             // For strings, pattern must be a string
             let pattern_str = match &pattern {
                 OwnedValue::String(p) => p,
@@ -4840,6 +4868,18 @@ fn builtin_rindex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     match &value {
         StandardJson::String(s) => {
+            // jq defines `index`/`rindex` as `.[0]`/`.[-1:][0]` of what
+            // `indices` answers, so an object pattern — jq's slice — leaves a
+            // *substring* to be indexed with a number, and reports that.
+            if let Some(sliced) = string_slice_pattern(&value, &pattern) {
+                return match sliced {
+                    _ if optional => QueryResult::None,
+                    Err(e) => QueryResult::Error(e),
+                    Ok(_) => {
+                        QueryResult::Error(EvalError::cannot_index_with_type("string", "number"))
+                    }
+                };
+            }
             // For strings, pattern must be a string
             let pattern_str = match &pattern {
                 OwnedValue::String(p) => p,
@@ -4970,6 +5010,26 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             ) => {
                 current = resolve_read_index(&segment, arr.len())
                     .map_or(OwnedValue::Null, |i| arr[i].clone());
+            }
+            // An object segment is jq's slice, `{"start":s,"end":e}`. jq
+            // checks the *container* first — an object or a scalar reports
+            // `Cannot index <type> with object` below without ever looking at
+            // the descriptor — and only then validates the bounds.
+            (OwnedValue::Array(arr), OwnedValue::Object(desc)) => {
+                let range = match SliceBounds::from_descriptor(desc) {
+                    Ok(bounds) => bounds.resolve(arr.len()),
+                    Err(_) if optional => return QueryResult::None,
+                    Err(e) => return QueryResult::Error(e),
+                };
+                current = OwnedValue::Array(arr[range].to_vec());
+            }
+            (OwnedValue::String(s), OwnedValue::Object(desc)) => {
+                let range = match SliceBounds::from_descriptor(desc) {
+                    Ok(bounds) => bounds.resolve(s.chars().count()),
+                    Err(_) if optional => return QueryResult::None,
+                    Err(e) => return QueryResult::Error(e),
+                };
+                current = OwnedValue::String(slice::slice_str(s, range));
             }
             _ if optional => return QueryResult::None,
             _ => {
@@ -6337,32 +6397,10 @@ fn slice_elements<W: Clone + AsRef<[u64]>>(
     end: Option<i64>,
 ) -> Vec<StandardJson<'_, W>> {
     let all: Vec<_> = elements.collect();
-    let len = all.len();
-
-    // Resolve negative indices
-    let resolve_idx = |idx: i64, _default: usize| -> usize {
-        if idx >= 0 {
-            (idx as usize).min(len)
-        } else {
-            let pos = len as i64 + idx;
-            if pos < 0 {
-                0
-            } else {
-                pos as usize
-            }
-        }
-    };
-
-    let start_idx = start.map_or(0, |i| resolve_idx(i, 0));
-    let end_idx = end.map_or(len, |i| resolve_idx(i, len));
-
-    if start_idx >= end_idx || start_idx >= len {
-        return Vec::new();
-    }
-
+    let range = SliceBounds::from_literals(start, end).resolve(all.len());
     all.into_iter()
-        .skip(start_idx)
-        .take(end_idx - start_idx)
+        .skip(range.start)
+        .take(range.len())
         .collect()
 }
 
@@ -6628,6 +6666,11 @@ fn set_path(
             // For chained paths like .a.b.c, navigate to parent and set at last element
             if exprs.len() == 1 {
                 set_path(root, &exprs[0], new_value)
+            } else if let Some(split) = split_at_slice(exprs) {
+                let parent = get_path_mut(root, split.before)?;
+                through_slice(parent, split.start, split.end, false, |sub| {
+                    set_path(sub, &split.tail, new_value)
+                })
             } else {
                 // Navigate to parent
                 let parent_path = &exprs[..exprs.len() - 1];
@@ -6659,6 +6702,14 @@ fn set_path(
             }
             _ => Err(EvalError::cannot_iterate(root)),
         },
+        // `.[a:b] = v` splices `v`'s elements over the range, so `v` has to be
+        // an array — that is the whole reason jq has a separate sentence for
+        // it. An out-of-range range clamps rather than erroring, unlike the
+        // `Expr::Index` arm above: `[1,2,3] | .[5:9] = ["x"]` appends.
+        Expr::Slice { start, end } => through_slice(root, *start, *end, false, |sub| {
+            *sub = new_value;
+            Ok(())
+        }),
         // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
         // into a static component before this runs. Explicit rather than left
         // to the catch-all so a missed install point fails loudly here instead
@@ -6702,6 +6753,79 @@ fn unwrap_path_component(expr: &Expr) -> (&Expr, bool) {
             other => return (other, optional),
         }
     }
+}
+
+/// Run `edit` over the sub-array a slice names, splicing the answer back over
+/// the original range.
+///
+/// The shared shape behind every write through `.[a:b]`, whether it is the
+/// last component (`.[1:2] = v`, `.[1:2] |= f`) or one the path continues
+/// through (`.[1:3][] = 9`). The edit sees the slice as an array of its own,
+/// and whatever it leaves has to still be an array — splicing back is element
+/// by element, which is exactly what jq's `A slice of an array can only be
+/// assigned another array` is about.
+fn through_slice(
+    root: &mut OwnedValue,
+    start: Option<i64>,
+    end: Option<i64>,
+    optional: bool,
+    edit: impl FnOnce(&mut OwnedValue) -> Result<(), EvalError>,
+) -> Result<(), EvalError> {
+    match root {
+        OwnedValue::Array(arr) => {
+            let range = SliceBounds::from_literals(start, end).resolve(arr.len());
+            let mut sub = OwnedValue::Array(arr[range.clone()].to_vec());
+            edit(&mut sub)?;
+            let OwnedValue::Array(items) = sub else {
+                return Err(EvalError::slice_assign_non_array());
+            };
+            arr.splice(range, items);
+            Ok(())
+        }
+        // jq reads a string slice but will not write one back, whatever the
+        // replacement — the refusal beats the non-array one above.
+        OwnedValue::String(_) => Err(EvalError::cannot_update_string_slices()),
+        _ if optional => Ok(()),
+        other => Err(EvalError::cannot_index_with_type(
+            owned_type_name(other),
+            "object",
+        )),
+    }
+}
+
+/// Where a chained path crosses a slice, as [`split_at_slice`] found it.
+struct SliceSplit<'a> {
+    /// The components to navigate before reaching the slice.
+    before: &'a [Expr],
+    start: Option<i64>,
+    end: Option<i64>,
+    /// Everything left to apply *inside* the slice, as one expression.
+    tail: Expr,
+}
+
+/// Split a chained path at its first slice, if it has one.
+///
+/// A slice names a *range*, not a slot, so `get_path_mut` cannot navigate
+/// through one — `.a[1:2][0] = 9` would fail on the middle component — and the
+/// walker has to hand off to [`through_slice`] there instead.
+fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit<'_>> {
+    let at = exprs.iter().position(|e| matches!(e, Expr::Slice { .. }))?;
+    let Expr::Slice { start, end } = &exprs[at] else {
+        unreachable!("position matched a Slice")
+    };
+    let rest = &exprs[at + 1..];
+    Some(SliceSplit {
+        before: &exprs[..at],
+        start: *start,
+        end: *end,
+        // An empty tail means the slice itself is the target, which `Identity`
+        // against the extracted sub-array says exactly.
+        tail: if rest.is_empty() {
+            Expr::Identity
+        } else {
+            Expr::Pipe(rest.to_vec())
+        },
+    })
 }
 
 /// Get a mutable reference to a value at a path.
@@ -6909,11 +7033,24 @@ fn update_path<S: EvalSemantics>(
                         spliced.extend_from_slice(&exprs[1..]);
                         update_path::<S>(root, &Expr::Pipe(spliced), filter_expr, here)
                     }
+                    // The chain continues *inside* the slice, so the update
+                    // runs against the sub-array and is spliced back:
+                    // `[1,2,3,4] | .[1:3][] |= .*10` is `[1,20,30,4]`.
+                    Expr::Slice { start, end } => through_slice(root, *start, *end, here, |sub| {
+                        update_path::<S>(sub, &rest, filter_expr, optional)
+                    }),
                     _ => update_path::<S>(root, first, filter_expr, here),
                 }
             }
         }
         Expr::Optional(inner) => update_path::<S>(root, inner, filter_expr, true),
+        // `.[a:b] |= f` runs `f` on the sub-array — not on each element — and
+        // splices the answer back, so `[1,2,3] | .[1:2] |= . + ["q"]` is
+        // `[1,2,"q",3]`. `f` may return an array of any length, but it has to
+        // be an array.
+        Expr::Slice { start, end } => through_slice(root, *start, *end, optional, |sub| {
+            update_path::<S>(sub, &Expr::Identity, filter_expr, optional)
+        }),
         // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
         // into a static component before this runs. Explicit rather than left
         // to the catch-all so a missed install point fails loudly here instead
@@ -9386,20 +9523,14 @@ fn eval_with_path_tracking(
             eval_with_path_tracking(inner, value, current_path, paths, optional);
         }
         Expr::Slice { start, end } => {
-            if let OwnedValue::Array(arr) = value {
-                let len = arr.len() as i64;
-                let s = start.unwrap_or(0);
-                let e = end.unwrap_or(len);
-                let actual_start = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
-                let actual_end = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-                // Slicing doesn't produce a single path - it produces a new value
-                // In jq, path on a slice gives the path to each element in the slice
-                for i in actual_start..actual_end {
-                    let mut new_path = current_path.to_vec();
-                    new_path.push(OwnedValue::Int(i as i64));
-                    paths.push(OwnedValue::Array(new_path));
-                }
-            }
+            // One component, not one per element: jq models `.[a:b]` as
+            // indexing with `{"start":a,"end":b}`, so `[1,2,3] | path(.[1:2])`
+            // is `[{"start":1,"end":2}]`. The bounds go in as written — a path
+            // is resolved against a container only when it is applied, which
+            // is what lets `path(.[-2:-1])` keep its negative bounds.
+            let mut new_path = current_path.to_vec();
+            new_path.push(slice::literal_component(*start, *end));
+            paths.push(OwnedValue::Array(new_path));
         }
         // Unreachable: computed keys are resolved to static components before
         // the tracker runs. The catch-all below emits *no* path rather than an
@@ -9534,23 +9665,26 @@ fn collect_intermediate_with_paths(
             }
         }
         Expr::Slice { start, end } => {
-            if let OwnedValue::Array(arr) = value {
-                let len = arr.len() as i64;
-                let s = start.unwrap_or(0);
-                let e = end.unwrap_or(len);
-                let actual_start = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
-                let actual_end = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-                for (i, item) in arr
-                    .iter()
-                    .enumerate()
-                    .skip(actual_start)
-                    .take(actual_end - actual_start)
-                {
-                    let mut new_path = current_path.to_vec();
-                    new_path.push(OwnedValue::Int(i as i64));
-                    results.push((new_path, item.clone()));
+            // One component carrying the *sliced value*, which is what lets a
+            // slice sit mid-path: `path(.[1:2][0])` is
+            // `[{"start":1,"end":2},0]`, so the tail walks the sub-array.
+            let bounds = SliceBounds::from_literals(*start, *end);
+            let sliced = match value {
+                OwnedValue::Array(arr) => {
+                    OwnedValue::Array(arr[bounds.resolve(arr.len())].to_vec())
                 }
-            }
+                OwnedValue::String(s) => {
+                    let range = bounds.resolve(s.chars().count());
+                    OwnedValue::String(slice::slice_str(s, range))
+                }
+                // jq slices `null` to `null`; anything else is not sliceable,
+                // and the walkers have no error channel — see the catch-all.
+                OwnedValue::Null => OwnedValue::Null,
+                _ => return,
+            };
+            let mut new_path = current_path.to_vec();
+            new_path.push(slice::literal_component(*start, *end));
+            results.push((new_path, sliced));
         }
         // Unreachable, for the same reason as in `eval_with_path_tracking`.
         Expr::IndexExpr { .. } => {
@@ -10023,15 +10157,47 @@ fn set_value_at_path(
             arr[index] = set_value_at_path(old, rest, new_val)?;
             Ok(OwnedValue::Array(arr))
         }
-        OwnedValue::Object(_) => match value {
-            // An object path element is jq's slice, `{"start":s,"end":e}` —
-            // what `path(.[1:2])` yields. Assigning through one is not
-            // implemented; leave the value untouched rather than raise an
-            // error jq does not. Only the containers jq would slice get that
-            // pass; on anything else the sentence below is jq's.
-            OwnedValue::Array(_) | OwnedValue::Null => Ok(value),
-            other => Err(EvalError::cannot_index(other.type_name(), key)),
-        },
+        // An object path element is jq's slice, `{"start":s,"end":e}` — what
+        // `path(.[1:2])` yields. Writing through one reads the sub-array,
+        // walks `rest` inside it, and splices the answer back over the
+        // original range, so the replacement has to be an array however deep
+        // the path went: `null | setpath([{"start":0,"end":1},"a"]; 9)` builds
+        // `{"a":9}` and is refused here, as it is in jq.
+        OwnedValue::Object(desc) => {
+            // Only a container jq would slice gets as far as the descriptor;
+            // on anything else the refusal names the container, which is why
+            // `{"a":1} | setpath([{"foo":1}]; 9)` is `Cannot index object with
+            // object` while `"abc"` and `null` report the malformed descriptor.
+            if !matches!(
+                value,
+                OwnedValue::Array(_) | OwnedValue::Null | OwnedValue::String(_)
+            ) {
+                return Err(EvalError::cannot_index(value.type_name(), key));
+            }
+            let bounds = SliceBounds::from_descriptor(desc)?;
+            // jq reads a string slice but will not write one back.
+            if matches!(value, OwnedValue::String(_)) {
+                return Err(EvalError::cannot_update_string_slices());
+            }
+            // jq reads the child with `jv_get` before recursing, and a `null`
+            // root reads as `null` rather than as an empty array — which is
+            // what makes `null | setpath([{"start":0,"end":1},"a"]; 9)` build
+            // `{"a":9}` and then fail the array check below, as jq does.
+            let (mut arr, sub) = match value {
+                OwnedValue::Array(arr) => {
+                    let range = bounds.resolve(arr.len());
+                    let sub = OwnedValue::Array(arr[range].to_vec());
+                    (arr, sub)
+                }
+                _ => (Vec::new(), OwnedValue::Null),
+            };
+            let range = bounds.resolve(arr.len());
+            let OwnedValue::Array(items) = set_value_at_path(sub, rest, new_val)? else {
+                return Err(EvalError::slice_assign_non_array());
+            };
+            arr.splice(range, items);
+            Ok(OwnedValue::Array(arr))
+        }
         // null, booleans and arrays index nothing, in any container.
         _ => Err(EvalError::cannot_index(value.type_name(), key)),
     }
@@ -10149,15 +10315,19 @@ fn delete_paths_under(
             other => Err(EvalError::cannot_index("object", other)),
         },
         OwnedValue::Array(mut arr) => match key {
-            // An object-shaped key is jq's slice descriptor
-            // (`path(.[a:b])` produces `{"start":a,"end":b}`). jq performs the
-            // slice delete for a valid one and raises `Array/string slice
-            // indices must be integers` for a malformed one; neither is
-            // implemented here, nor in `set_value_at_path`'s matching
-            // exclusion for assignment, so this silently no-ops instead of
-            // either — a real divergence from jq, tracked in #469, not a
-            // deliberate match for it.
-            OwnedValue::Object(_) => Ok(OwnedValue::Array(arr)),
+            // An object-shaped key is jq's slice descriptor (`path(.[a:b])`
+            // produces `{"start":a,"end":b}`). Recursing *through* one means
+            // deleting inside the sub-array and splicing it back:
+            // `[1,[2],[3]] | delpaths([[{"start":1,"end":3},0]])` is `[1,[3]]`.
+            OwnedValue::Object(desc) => {
+                let range = SliceBounds::from_descriptor(desc)?.resolve(arr.len());
+                let sub = OwnedValue::Array(arr[range.clone()].to_vec());
+                let OwnedValue::Array(items) = delete_paths_sorted(sub, paths, start)? else {
+                    unreachable!("deleting from an array yields an array")
+                };
+                arr.splice(range, items);
+                Ok(OwnedValue::Array(arr))
+            }
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
                 if let Some(index) = resolve_read_index(key, arr.len()) {
                     let old = core::mem::replace(&mut arr[index], OwnedValue::Null);
@@ -10211,18 +10381,24 @@ fn delete_keys(value: OwnedValue, keys: &[&OwnedValue]) -> Result<OwnedValue, Ev
         OwnedValue::Array(mut arr) => {
             // A key that is not a number is jq's `Cannot delete <kind> element
             // of array`. An object-shaped key is jq's slice descriptor
-            // (`.[a:b]`); jq performs the slice delete for a valid one and
-            // raises for a malformed one, neither of which is implemented
-            // here (nor in `set_value_at_path`'s matching exclusion), so this
-            // silently no-ops instead — a real divergence from jq, tracked in
-            // #469. `resolve_read_index` is `getpath`'s resolver: a
-            // float truncates toward zero, a negative counts back from the
-            // end, and anything that reaches no element (out of range, or
-            // NaN) is dropped rather than raised.
+            // (`.[a:b]`), which contributes its whole element range.
+            // `resolve_read_index` is `getpath`'s resolver: a float truncates
+            // toward zero, a negative counts back from the end, and anything
+            // that reaches no element (out of range, or NaN) is dropped rather
+            // than raised.
+            //
+            // Every key resolves against the length the array had on entry and
+            // they are deleted in one pass, which is what makes overlapping
+            // ranges union rather than compound: `[1,2,3,4] | del(.[0:2],
+            // .[1:3])` is `[4]`, and a slice naming the same element as a bare
+            // index deletes it once — `delpaths([[1],[{"start":1,"end":2}]])`
+            // is `[1,3,4]`.
             let mut indices: Vec<usize> = Vec::with_capacity(keys.len());
             for key in keys {
                 match key {
-                    OwnedValue::Object(_) => {}
+                    OwnedValue::Object(desc) => {
+                        indices.extend(SliceBounds::from_descriptor(desc)?.resolve(arr.len()));
+                    }
                     OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
                         if let Some(idx) = resolve_read_index(key, arr.len()) {
                             indices.push(idx);
@@ -10340,12 +10516,18 @@ fn delete_expr_paths_at(
     for &path in paths {
         match &path[start].component {
             Expr::Field(_) => fields.push(path),
-            Expr::Index(_) => indices.push(path),
+            // A `Slice` joins the `Index` bucket rather than getting one of
+            // its own: `delete_expr_array_paths` funnels every terminal key
+            // into a single `delete_keys` call, and that one batch is what
+            // makes overlapping ranges union instead of compound. Split into
+            // two calls, `del(.[0:2], .[1:3])` on `[1,2,3,4]` would resolve
+            // the second range against the already-shortened array and give
+            // `[3]` where jq gives `[4]`.
+            Expr::Index(_) | Expr::Slice { .. } => indices.push(path),
             Expr::Iterate => iterates.push(path),
-            // `flatten_delete_path` only ever leaves Field/Index/Iterate
+            // `flatten_delete_path` only ever leaves Field/Index/Slice/Iterate
             // components behind; anything else is a path shape `del` has
-            // never supported (e.g. `Slice`), matching `delete_at_path`'s
-            // catch-all.
+            // never supported, matching `delete_at_path`'s catch-all.
             _ => return Err(EvalError::new("cannot use expression as delete target")),
         }
     }
@@ -10461,35 +10643,36 @@ fn delete_expr_array_paths(
     paths: &[&[DeleteStep]],
     start: usize,
 ) -> Result<OwnedValue, EvalError> {
-    let mut terminal: Vec<(i64, bool)> = Vec::new();
-    let mut groups: Vec<(i64, Vec<&[DeleteStep]>)> = Vec::new();
+    let mut terminal: Vec<(ArrayStep, bool)> = Vec::new();
+    let mut groups: Vec<(ArrayStep, Vec<&[DeleteStep]>)> = Vec::new();
     for path in paths {
-        let Expr::Index(idx) = &path[start].component else {
-            unreachable!("delete_expr_paths_at only dispatches Index paths here")
+        let step = match &path[start].component {
+            Expr::Index(idx) => ArrayStep::Index(*idx),
+            Expr::Slice { start, end } => ArrayStep::Slice(*start, *end),
+            _ => unreachable!("delete_expr_paths_at only dispatches Index/Slice paths here"),
         };
-        let idx = *idx;
         if path.len() == start + 1 {
-            // One occurrence of `idx` marking it optional is enough to cover
+            // One occurrence of `step` marking it optional is enough to cover
             // every other occurrence — merge rather than keep only whichever
             // one was pushed first, which used to make the outcome depend on
             // argument order (`del(.[(0,5)], .[5]?)` errored or not
             // depending on which side `.[5]?` was written on).
-            match terminal.iter_mut().find(|(i, _)| *i == idx) {
+            match terminal.iter_mut().find(|(s, _)| *s == step) {
                 Some(entry) => entry.1 |= path[start].optional,
-                None => terminal.push((idx, path[start].optional)),
+                None => terminal.push((step, path[start].optional)),
             }
             continue;
         }
         let mut appended = false;
         for group in &mut groups {
-            if group.0 == idx {
+            if group.0 == step {
                 group.1.push(*path);
                 appended = true;
                 break;
             }
         }
         if !appended {
-            groups.push((idx, vec![*path]));
+            groups.push((step, vec![*path]));
         }
     }
 
@@ -10497,35 +10680,64 @@ fn delete_expr_array_paths(
         // Same reasoning as the object case above: a non-array container
         // fails every path here identically, so a single non-optional path
         // among the siblings has to raise even when others are optional.
+        //
+        // *Which* sentence comes from the first sibling, because jq walks the
+        // paths in source order and dies on the first: `5 | del(.[0], .[1:2])`
+        // is `Cannot index number with number`, and the same two written the
+        // other way round is `… with object`.
         return if paths.iter().all(|p| p[start].optional) {
             Ok(value)
         } else {
-            Err(EvalError::cannot_index_with_type(
-                owned_type_name(&value),
-                "number",
-            ))
+            Err(match &paths[0][start].component {
+                Expr::Slice { .. } if matches!(value, OwnedValue::String(_)) => {
+                    EvalError::cannot_delete_fields_from("string")
+                }
+                Expr::Slice { .. } => {
+                    EvalError::cannot_index_with_type(owned_type_name(&value), "object")
+                }
+                _ => EvalError::cannot_index_with_type(owned_type_name(&value), "number"),
+            })
         };
     }
 
     if let OwnedValue::Array(arr) = &mut value {
-        for (idx, group) in &groups {
-            let len = arr.len() as i64;
-            let actual = if *idx < 0 { len + idx } else { *idx };
-            if actual >= 0 && (actual as usize) < arr.len() {
-                let slot = &mut arr[actual as usize];
-                let old = core::mem::replace(slot, OwnedValue::Null);
-                *slot = delete_expr_paths_at(old, group, start + 1)?;
-            } else if !group.iter().any(|p| p[start].optional) {
-                return Err(out_of_range_index(*idx, arr.len()));
+        for (step, group) in &groups {
+            match step {
+                ArrayStep::Index(idx) => {
+                    let len = arr.len() as i64;
+                    let actual = if *idx < 0 { len + idx } else { *idx };
+                    if actual >= 0 && (actual as usize) < arr.len() {
+                        let slot = &mut arr[actual as usize];
+                        let old = core::mem::replace(slot, OwnedValue::Null);
+                        *slot = delete_expr_paths_at(old, group, start + 1)?;
+                    } else if !group.iter().any(|p| p[start].optional) {
+                        return Err(out_of_range_index(*idx, arr.len()));
+                    }
+                }
+                // Deleting *through* a slice deletes inside the sub-array and
+                // splices it back: `[1,[2],[3]] | del(.[1:3][0])` is `[1,[3]]`.
+                ArrayStep::Slice(s, e) => {
+                    let range = SliceBounds::from_literals(*s, *e).resolve(arr.len());
+                    let sub = OwnedValue::Array(arr[range.clone()].to_vec());
+                    let OwnedValue::Array(items) = delete_expr_paths_at(sub, group, start + 1)?
+                    else {
+                        unreachable!("deleting from an array yields an array")
+                    };
+                    arr.splice(range, items);
+                }
             }
         }
 
         // `delete_keys` silently drops an index that names nothing
         // (`delpaths` has always done that, #415); a bare `del` never has, so
         // an out-of-range terminal index still errors unless `?` covers it,
-        // exactly as the single-path case in `delete_at_path` does.
+        // exactly as the single-path case in `delete_at_path` does. A slice
+        // is exempt: jq clamps an out-of-range range rather than refusing it.
         let len = arr.len() as i64;
-        for (idx, opt) in &terminal {
+        for (step, opt) in &terminal {
+            let ArrayStep::Index(idx) = step else {
+                continue;
+            };
             let actual = if *idx < 0 { len + idx } else { *idx };
             if !opt && (actual < 0 || actual as usize >= arr.len()) {
                 return Err(out_of_range_index(*idx, arr.len()));
@@ -10536,13 +10748,28 @@ fn delete_expr_array_paths(
     if !terminal.is_empty() {
         let owned_keys: Vec<OwnedValue> = terminal
             .iter()
-            .map(|(idx, _)| OwnedValue::Int(*idx))
+            .map(|(step, _)| match step {
+                ArrayStep::Index(idx) => OwnedValue::Int(*idx),
+                ArrayStep::Slice(s, e) => slice::literal_component(*s, *e),
+            })
             .collect();
         let key_refs: Vec<&OwnedValue> = owned_keys.iter().collect();
         value = delete_keys(value, &key_refs)?;
     }
 
     Ok(value)
+}
+
+/// One array-level step of a `del` path: a bare index, or a slice.
+///
+/// The two share a bucket in [`delete_expr_paths_at`] because they name
+/// elements of the same array and have to reach [`delete_keys`] in one batch —
+/// see the comment there on why splitting them would compound overlapping
+/// ranges instead of unioning them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArrayStep {
+    Index(i64),
+    Slice(Option<i64>, Option<i64>),
 }
 
 /// [`delete_expr_paths_at`]'s `Iterate` case: every path here shares the same
@@ -10702,6 +10929,25 @@ fn delete_at_path(
                 _ => Err(EvalError::cannot_iterate(root)),
             }
         }
+        // `del(.[a:b])` drops the whole range. A range that reaches nothing is
+        // silently empty rather than an error — unlike the `Expr::Index` arm
+        // above, jq does not refuse an out-of-range slice, so `[1,2,3] |
+        // del(.[5:9])` is `[1,2,3]`.
+        Expr::Slice { start, end } => match root {
+            OwnedValue::Array(arr) => {
+                let range = SliceBounds::from_literals(*start, *end).resolve(arr.len());
+                arr.drain(range);
+                Ok(())
+            }
+            // `null` has no elements to drop, so jq leaves it alone.
+            OwnedValue::Null => Ok(()),
+            _ if optional => Ok(()),
+            OwnedValue::String(_) => Err(EvalError::cannot_delete_fields_from("string")),
+            other => Err(EvalError::cannot_index_with_type(
+                owned_type_name(other),
+                "object",
+            )),
+        },
         Expr::Pipe(exprs) if !exprs.is_empty() => {
             // Chain: navigate and delete at the last path
             if exprs.len() == 1 {
@@ -10779,6 +11025,13 @@ fn delete_at_path(
                         spliced.extend_from_slice(&exprs[1..]);
                         delete_at_path(root, &Expr::Pipe(spliced), here)
                     }
+                    // The chain continues *inside* the slice, so the delete
+                    // happens in the sub-array and the remainder is spliced
+                    // back: `[1,[2],[3]] | del(.[1:3][0])` is `[1,[3]]`, not
+                    // the whole range dropped.
+                    Expr::Slice { start, end } => through_slice(root, *start, *end, here, |sub| {
+                        delete_at_path(sub, &rest, optional)
+                    }),
                     _ => delete_at_path(root, first, here),
                 }
             }
@@ -19869,12 +20122,31 @@ mod tests {
                 Ok(r#"{"a":null}"#),
             ),
             (b"null", r#"delpaths([["a"]])"#, Ok("null")),
-            // Contrast: an object-shaped ("slice") key against an array is a
-            // no-op today, not a match for jq — jq performs the slice delete
-            // for a valid descriptor and raises for a malformed one like this
-            // empty `{}`. Pinned as a known gap, tracked in #469, not as
-            // correct behavior.
-            (b"[1,2,3]", "delpaths([[{}]])", Ok("[1,2,3]")),
+            // An object-shaped key against an array is jq's slice descriptor.
+            // A malformed one — no `start`/`end`, or a non-number bound — is
+            // the only place `delpaths` refuses an *object* key rather than
+            // deleting a range (#366).
+            (
+                b"[1,2,3]",
+                "delpaths([[{}]])",
+                Err("Array/string slice indices must be integers"),
+            ),
+            (
+                b"[1,2,3]",
+                r#"delpaths([[{"start":1}]])"#,
+                Err("Array/string slice indices must be integers"),
+            ),
+            (
+                b"[1,2,3]",
+                r#"delpaths([[{"start":"a","end":2}]])"#,
+                Err("Array/string slice indices must be integers"),
+            ),
+            // Contrast: a well-formed one deletes the range it names.
+            (
+                b"[1,2,3]",
+                r#"delpaths([[{"start":1,"end":2}]])"#,
+                Ok("[1,3]"),
+            ),
         ]);
     }
 

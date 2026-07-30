@@ -77,6 +77,7 @@ pub mod eval_generic;
 mod expr;
 mod lazy;
 mod parser;
+mod slice;
 pub mod stream;
 mod value;
 

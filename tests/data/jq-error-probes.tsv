@@ -64,6 +64,18 @@ update_negative_index_oob	.[-5] |= 9	[1,2]
 assign_negative_index_nested	.a[-5] = 9	{"a":[1,2]}
 slice_assign_non_array	setpath([{"start":1,"end":2}]; "x")	[1,2,3]
 slice_indices_not_integers	setpath([{"foo":1}]; 9)	[1,2]
+slice_update_string	.[1:2] = "x"	"abcdef"
+slice_update_string_via_filter	.[1:2] |= ["x"]	"abcdef"
+slice_setpath_string	setpath([{"start":1,"end":2}]; ["x"])	"abcdef"
+slice_getpath_malformed	getpath([{}])	[1,2,3]
+slice_delpaths_malformed	delpaths([[{}]])	[1,2,3]
+slice_indices_malformed	indices({})	"abcabc"
+slice_getpath_key_on_object	getpath([{"start":1,"end":2}])	{"a":1}
+slice_del_on_object	del(.[1:2])	{"a":1}
+slice_del_on_string	del(.[1:2])	"abcdef"
+slice_delpaths_on_object	delpaths([[{"start":1,"end":2}]])	{"a":1}
+slice_index_pattern_on_string	index({"start":1,"end":2})	"abcabc"
+slice_rindex_pattern_on_string	rindex({"start":1,"end":2})	"abcabc"
 getpath_on_number	getpath(["a"])	1
 getpath_nested_on_number	getpath(["a","b"])	{"a":1}
 getpath_non_array_path	getpath("a")	{"a":1}

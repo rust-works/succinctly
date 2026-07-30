@@ -333,6 +333,37 @@ impl EvalError {
         Self::new("Out of bounds negative array index")
     }
 
+    /// `Array/string slice indices must be integers`.
+    ///
+    /// The slice path component `{"start":s,"end":e}` was malformed. jq wants
+    /// *both* keys present — an explicit `null` counts, a missing one does not
+    /// — and each holding a number or `null`, so `[1,2] | setpath([{"foo":1}];
+    /// 9)` and `[1,2,3] | delpaths([[{}]])` both land here. Extra keys are
+    /// ignored.
+    pub fn slice_indices_not_integers() -> Self {
+        Self::new("Array/string slice indices must be integers")
+    }
+
+    /// `A slice of an array can only be assigned another array`.
+    ///
+    /// Writing through a slice splices the replacement in element by element,
+    /// so it has to be an array: `[1,2,3] | .[1:2] = "x"`. Raised on whatever
+    /// reaches the slice, which for a deeper path is the *result* of the rest
+    /// of the walk — `null | setpath([{"start":0,"end":1},"a"]; 9)` builds
+    /// `{"a":9}` and refuses it here.
+    pub fn slice_assign_non_array() -> Self {
+        Self::new("A slice of an array can only be assigned another array")
+    }
+
+    /// `Cannot update string slices`.
+    ///
+    /// jq reads a string slice but will not write one back, whatever the
+    /// replacement: `"abcdef" | .[1:2] = "x"`, `|= "x"`, and the `setpath`
+    /// spelling all report this.
+    pub fn cannot_update_string_slices() -> Self {
+        Self::new("Cannot update string slices")
+    }
+
     /// `Cannot iterate over <type> (<value>)`.
     pub fn cannot_iterate(value: &OwnedValue) -> Self {
         Self::new(format!("Cannot iterate over {}", describe(value)))
