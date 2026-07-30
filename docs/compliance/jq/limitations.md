@@ -24,16 +24,16 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 156 probes in
+Measured against jq-1.7.1 over the 168 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
-| Dimension                                    | Result              | Meaning                                            |
-|----------------------------------------------|---------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **154/156 = 98.7%** | Byte-identical to jq                               |
-| **Wording divergences**                      | **0**               | Every probe that errors in both errors identically |
-| **Behaviour / parser gaps**                  | **2**               | succinctly does not raise the error at all         |
+| Dimension                                    | Result               | Meaning                                            |
+|----------------------------------------------|----------------------|----------------------------------------------------|
+| **Message text** (both evaluators, verbatim) | **168/168 = 100.0%** | Byte-identical to jq                               |
+| **Wording divergences**                      | **0**                | Every probe that errors in both errors identically |
+| **Behaviour / parser gaps**                  | **0**                | succinctly does not raise the error at all         |
 
 These three numbers are asserted, not maintained by hand: `jq_error_message_tests.rs`
 parses them back out of this page and fails if they drift from the corpus (they went stale
@@ -246,13 +246,20 @@ shortest rendering differs from their source spelling.
 
 ## Behaviour and parser gaps
 
-The probes on record are not wording problems — succinctly never raises the error, so
-there is nothing to word. Each has its own issue and is listed in
-[`tests/data/jq-error-known-divergences.txt`](../../../tests/data/jq-error-known-divergences.txt).
+There are none left: every probe in the corpus now raises jq's sentence in both
+evaluators, and
+[`tests/data/jq-error-known-divergences.txt`](../../../tests/data/jq-error-known-divergences.txt)
+is empty. That file staying empty is itself asserted — the check is two-sided, so a probe
+that starts diverging without a line there fails the build.
 
-| Probe(s)                                                          | Divergence                                                       | Issue |
-|-------------------------------------------------------------------|------------------------------------------------------------------|-------|
-| `slice_assign_non_array`, `slice_indices_not_integers`            | A slice is not a path component, so `setpath` leaves the value alone | [#366](https://github.com/rust-works/succinctly/issues/366) |
+What used to be listed here, and what closed it:
+
+`slice_assign_non_array` and `slice_indices_not_integers` were the last two.
+[#366](https://github.com/rust-works/succinctly/issues/366) made a slice a real path
+component — `{"start":s,"end":e}` now comes out of `path()` and goes into
+`getpath`/`setpath`/`delpaths`, `=`, `|=` and `del()` — so both sentences have somewhere to
+be raised from. See "A slice is a path component" below for what that does and does not
+cover.
 
 `index_null_key_on_object`, `index_bool_key_on_object` and `index_object_key_on_object`
 were on this list too, as parser gaps: `.[null]`, `.[true]` and `.[{}]` did not parse, so
@@ -272,19 +279,28 @@ A probe is only admitted to the corpus if jq errors on it, so the corpus is blin
 opposite divergence: a filter that jq answers with a value and succinctly refuses. Those
 have to be recorded here.
 
-| Filter          | Input         | jq                          | succinctly                            |
-|-----------------|---------------|-----------------------------|---------------------------------------|
-| `.a = 1`        | `null`        | `{"a":1}`                   | `Cannot index null with string "a"`   |
-| `.a.b = 1`      | `{}`          | `{"a":{"b":1}}`             | `Cannot index null with string "b"`   |
-| `.[5] = 9`      | `[1,2]`       | `[1,2,null,null,null,9]`    | `index 5 out of bounds (length 2)`    |
-| `.[5] \|= 9`    | `[1,2]`       | `[1,2,null,null,null,9]`    | `index 5 out of bounds (length 2)`    |
-| `del(.[5])`     | `[1,2]`       | `[1,2]`                     | `index 5 out of bounds (length 2)`    |
-| `del(.[-5])`    | `[1,2]`       | `[1,2]`                     | `Out of bounds negative array index`  |
+| Filter            | Input         | jq                          | succinctly                            |
+|-------------------|---------------|-----------------------------|---------------------------------------|
+| `.a = 1`          | `null`        | `{"a":1}`                   | `Cannot index null with string "a"`   |
+| `.a.b = 1`        | `{}`          | `{"a":{"b":1}}`             | `Cannot index null with string "b"`   |
+| `.[5] = 9`        | `[1,2]`       | `[1,2,null,null,null,9]`    | `index 5 out of bounds (length 2)`    |
+| `.[5] \|= 9`      | `[1,2]`       | `[1,2,null,null,null,9]`    | `index 5 out of bounds (length 2)`    |
+| `.[1:2] = ["x"]`  | `null`        | `["x"]`                     | `Cannot index null with object`       |
+| `.[1:2] \|= ["x"]`| `null`        | `["x"]`                     | `Cannot index null with object`       |
+| `del(.[5])`       | `[1,2]`       | `[1,2]`                     | `index 5 out of bounds (length 2)`    |
+| `del(.[-5])`      | `[1,2]`       | `[1,2]`                     | `Out of bounds negative array index`  |
 
-Every row is an assignment, update or deletion walking a path *in place*, and every one is
-older than #356 — the rewording changed what these say, not whether they say it. The gap
-they share is auto-vivification: jq grows the container the path asks for (`null` into an
-object, an array up to the index) and treats an unreachable delete as a no-op.
+Every row is an assignment, update or deletion walking a path *in place*, and every one but
+the two slice rows is older than #356 — the rewording changed what these say, not whether
+they say it. The gap they share is auto-vivification: jq grows the container the path asks
+for (`null` into an object, an array up to the index) and treats an unreachable delete as a
+no-op.
+
+The two slice rows were added by [#366](https://github.com/rust-works/succinctly/issues/366)
+deliberately. Writing through a slice could have vivified `null` on its own — `setpath`
+does, and the shared code was right there — but that would have left `.[1:2] = ["x"]`
+growing a container while `.a = 1` beside it still refused, inside one feature. They match
+their neighbours instead, and close together with the rest of this table.
 
 An object key that yields something other than exactly one value is a second, unrelated
 group — it is the key half of
@@ -325,32 +341,46 @@ refuses with `Cannot grow array to <n> elements` — succinctly's own wording, s
 no jq sentence to copy. Only the impossible is refused; every length that fits in memory
 still pads, so `[1,2] | setpath([5]; 9)` still agrees with jq.
 
-## A slice is not a path component
+## A slice is a path component
 
 jq models `.[1:2]` as indexing with `{"start":1,"end":2}`, and treats that object as a
-first-class path component: it comes out of `path()`, goes into `getpath`/`setpath`, and
-drives `=`, `|=` and `del()`. succinctly can *read* a slice but does not treat it as a path,
-so `[1,2,3] | setpath([{"start":1,"end":2}]; ["x"])` leaves the value untouched where jq
-gives `[1,"x",3]`. The full divergence table is in
-[#366](https://github.com/rust-works/succinctly/issues/366).
+first-class path component: it comes out of `path()`, goes into `getpath`/`setpath`/
+`delpaths`, and drives `=`, `|=` and `del()`.
+[#366](https://github.com/rust-works/succinctly/issues/366) built that, closing
+[#469](https://github.com/rust-works/succinctly/issues/469) with it. Before it,
+`path(.[1:2])` answered `[1]` — one path per element, a wrong answer rather than a refusal,
+inherited by everything built on `path()` — while `setpath` and `delpaths` silently left
+the value alone.
 
-That is a missing feature rather than a wording divergence, and it is deliberately *not*
-raised as an error — inventing a message jq does not print would be a fresh divergence.
-Only the containers jq would slice get that pass; on a scalar, an object path element is
-refused with jq's `Cannot index <type> with object` (probe `setpath_slice_key_on_number`).
+The bounds a path carries are the ones written, not the ones resolved: `[1,2,3] |
+path(.[-2:-1])` is `[{"start":-2,"end":-1}]`, because a path is only resolved against a
+container when it is applied. Resolution then follows jq's `parse_slice` — floor the start,
+ceil the end (`.[1.7:2.9]` on five elements is `[2,3]`, reachable through a runtime
+descriptor even though the parser only folds integer literals), fold negatives against the
+length, clamp, and pull `end` up to `start` if they crossed. That last step matters only
+when writing, where crossed bounds are an insertion point: `[1,2,3] |
+setpath([{"start":2,"end":1}]; ["x"])` is `[1,2,"x",3]`.
 
-The same gap reaches `indices`/`index`/`rindex`, which jq also lets take a slice:
-`"abcabc" | indices({"start":1,"end":2})` is `"b"` there, and `indices({})` is `Array/string
-slice indices must be integers`. succinctly refuses both with `Cannot index string with
-object`. Every *other* pattern type reports jq's sentence exactly (probes
-`indices_number_pattern_on_string`, `index_null_pattern_on_string`,
-`rindex_array_pattern_on_string`), so the object case is the only one left, and it closes
-with #366 rather than separately.
+Deleting is the case worth knowing about. Every key naming an element of one array is
+resolved against the length it had on entry and removed in a single pass, so overlapping
+ranges union rather than compound — `[1,2,3,4] | del(.[0:2], .[1:3])` is `[4]`, and a slice
+naming the same element as a bare index deletes it once
+(`delpaths([[1],[{"start":1,"end":2}]])` is `[1,3,4]`). Doing the deletions one at a time
+would resolve the second range against an already-shortened array.
 
-The two error sentences the feature owes jq — `A slice of an array can only be assigned
-another array` and `Array/string slice indices must be integers` — are pinned as probes and
-listed in the divergence manifest against #366, so the two-sided check fails the build the
-moment either starts matching.
+`indices`/`index`/`rindex` came with it, since jq defines all three over `.[$i]` and so an
+object pattern is the slice rather than a search: `"abcabc" | indices({"start":1,"end":2})`
+is the substring `"b"`, and `index`/`rindex` are `.[0]`/`.[-1:][0]` of that, which is why
+they report `Cannot index string with number`.
+
+Two sentences arrived with the feature — `A slice of an array can only be assigned another
+array` and `Array/string slice indices must be integers` — and both were already pinned as
+probes, so the two-sided manifest check forced them to start matching in the same change.
+
+What #366 did *not* build: computed bounds. `.[$a:$b]` is still a parse error, because the
+parser folds slice bounds to integer literals; see
+[docs/reference/jq-language.md](../../reference/jq-language.md). And writing through a
+slice does not vivify `null` — see the table above for why that was deliberate.
 
 ## Errors reach the CLI with the right text but the wrong exit code
 

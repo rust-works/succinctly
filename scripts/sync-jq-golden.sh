@@ -60,8 +60,15 @@ for dir in "$GOLDEN_DIR"/cases/*/; do
   done
 
   # One CLI arg per line; blank lines ignored. (bash 3.2 compatible — no mapfile.)
+  #
+  # The `|| [[ -n "$arg" ]]` is load-bearing: `read` returns non-zero on a last
+  # line with no trailing newline, so a plain loop drops it. The Rust runner
+  # reads the same file with `.lines()`, which keeps it — the two disagreeing
+  # meant an `args` file written without the trailing newline silently captured
+  # goldens with the args *omitted*, then compared them against a run that
+  # applied them.
   args=()
-  while IFS= read -r arg; do
+  while IFS= read -r arg || [[ -n "$arg" ]]; do
     [[ -n "$arg" ]] && args+=("$arg")
   done < "$dir/args"
   filter="$(cat "$dir/filter")"
