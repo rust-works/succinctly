@@ -13099,7 +13099,12 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::None
             }
         }
-        _ => QueryResult::None,
+        QueryResult::One(_)
+        | QueryResult::OneCursor(_)
+        | QueryResult::Owned(_)
+        | QueryResult::None => QueryResult::None,
+        QueryResult::Error(e) => QueryResult::Error(e),
+        QueryResult::Break(label) => QueryResult::Break(label),
     }
 }
 
@@ -21852,6 +21857,25 @@ mod tests {
         query!(b"[10, 20, 30]", "nth(1; .[])",
             QueryResult::Owned(v) => {
                 assert_eq!(v, OwnedValue::Int(20));
+            }
+        );
+    }
+
+    #[test]
+    fn regression_issue_464_nth_stream_propagates_expr_error() {
+        // builtin_nth_stream's final match on expr's result had no explicit
+        // Error arm, so it fell through to the catch-all `_ => None` and
+        // silently discarded the error instead of propagating it.
+        query!(b"null", r#"nth(0; error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+        // Also reachable via a comma-generator argument (the path that
+        // originally surfaced this while verifying #155's fix).
+        query!(b"null", r#"nth(0; 1, error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
             }
         );
     }
