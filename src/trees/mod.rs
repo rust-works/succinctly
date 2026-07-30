@@ -21,4 +21,4 @@ mod bp;
 
 pub use bp::BalancedParens;
 pub use bp::{enclose, find_close, find_close_in_word, find_open, find_unmatched_close_in_word};
-pub use bp::{NoSelect, SelectSupport, WithSelect};
+pub use bp::{BpSelectCtx, NoSelect, SelectSupport, WithCsPoppy, WithSelect};
