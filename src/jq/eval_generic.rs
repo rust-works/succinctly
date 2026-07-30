@@ -1124,6 +1124,47 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
+        // Handled natively rather than through the `_` fallback below: the
+        // fallback materializes the whole value via `to_owned()` first,
+        // which merges duplicate YAML mapping keys into one `IndexMap`
+        // entry before this builtin ever runs (#443). Building one entry
+        // object per field directly off the field cursor -- like `Keys`/
+        // `Iterate` above -- means no user key is ever put into a shared
+        // map, so duplicates can't collapse.
+        Builtin::ToEntries => {
+            if let Some(elements) = value.as_array() {
+                let entries: Vec<OwnedValue> = elements
+                    .collect_values()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, elem)| {
+                        let mut entry = IndexMap::new();
+                        entry.insert("key".to_string(), OwnedValue::Int(i as i64));
+                        entry.insert("value".to_string(), to_owned(&elem));
+                        OwnedValue::Object(entry)
+                    })
+                    .collect();
+                GenericResult::Owned(OwnedValue::Array(entries))
+            } else if let Some(fields) = value.as_object() {
+                let mut entries: Vec<OwnedValue> = Vec::new();
+                let mut f = fields;
+                while let Some((field, rest)) = f.uncons() {
+                    if let Some(key) = field.key_str() {
+                        let mut entry = IndexMap::new();
+                        entry.insert("key".to_string(), OwnedValue::String(key.into_owned()));
+                        entry.insert("value".to_string(), to_owned(&field.value));
+                        entries.push(OwnedValue::Object(entry));
+                    }
+                    f = rest;
+                }
+                GenericResult::Owned(OwnedValue::Array(entries))
+            } else if optional {
+                GenericResult::None
+            } else {
+                GenericResult::Error(EvalError::has_no_keys(&to_owned(&value)))
+            }
+        }
+
         Builtin::IsNull => GenericResult::Owned(OwnedValue::Bool(value.is_null())),
 
         Builtin::IsBoolean => GenericResult::Owned(OwnedValue::Bool(value.is_bool())),
@@ -1557,6 +1598,92 @@ mod tests {
         let owned = result.into_owned().unwrap();
 
         assert_eq!(owned, OwnedValue::String("Alice".to_string()));
+    }
+
+    #[test]
+    fn test_yaml_generic_to_entries_duplicate_keys() {
+        // Duplicate YAML mapping keys must survive `to_entries` unmerged,
+        // matching real `yq` -- not collapse to the last occurrence via the
+        // `to_owned()` fallback's `IndexMap` (#443).
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: 1\na: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+
+        let mapping_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = mapping_cursor.value();
+
+        let result = eval(&Expr::Builtin(Builtin::ToEntries), value);
+        let owned = result.into_owned().unwrap();
+
+        let expected_entry = |v: i64| {
+            let mut entry = IndexMap::new();
+            entry.insert("key".to_string(), OwnedValue::String("a".to_string()));
+            entry.insert("value".to_string(), OwnedValue::Int(v));
+            OwnedValue::Object(entry)
+        };
+        assert_eq!(
+            owned,
+            OwnedValue::Array(vec![expected_entry(1), expected_entry(2)])
+        );
+    }
+
+    #[test]
+    fn test_yaml_generic_to_entries_array() {
+        // `to_entries` on a YAML sequence takes the array branch (mirroring
+        // the mapping branch above), producing {key: <index>, value: <elem>}
+        // entries with integer keys -- matching real `yq`/`jq`.
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"- a\n- b\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+
+        let seq_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = seq_cursor.value();
+
+        let result = eval(&Expr::Builtin(Builtin::ToEntries), value);
+        let owned = result.into_owned().unwrap();
+
+        let expected_entry = |i: i64, v: &str| {
+            let mut entry = IndexMap::new();
+            entry.insert("key".to_string(), OwnedValue::Int(i));
+            entry.insert("value".to_string(), OwnedValue::String(v.to_string()));
+            OwnedValue::Object(entry)
+        };
+        assert_eq!(
+            owned,
+            OwnedValue::Array(vec![expected_entry(0, "a"), expected_entry(1, "b")])
+        );
+    }
+
+    #[test]
+    fn test_yaml_generic_to_entries_optional_on_scalar() {
+        // `try to_entries` (built as Expr::Optional here) on a scalar is
+        // neither an array nor an object, so it must yield no result instead
+        // of propagating `has_no_keys`.
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"42";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+
+        let scalar_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = scalar_cursor.value();
+
+        let result = eval(
+            &Expr::Optional(Box::new(Expr::Builtin(Builtin::ToEntries))),
+            value,
+        );
+
+        assert!(matches!(result, GenericResult::None));
     }
 
     #[test]

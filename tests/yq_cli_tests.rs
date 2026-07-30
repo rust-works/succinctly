@@ -582,6 +582,33 @@ fn test_duplicate_mapping_key_survives_yaml_output() -> Result<()> {
 }
 
 #[test]
+fn test_duplicate_mapping_key_to_entries_preserves_both() -> Result<()> {
+    // Unlike `.a` field access (last-wins, #174), `to_entries` must pass
+    // every occurrence of a duplicate key through unmerged, matching real
+    // `yq` (issue #443).
+    let yaml = "a: 1\na: 2\n";
+    let (output, code) = run_yq_stdin("to_entries", yaml, &[])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(output, "-\n  key: a\n  value: 1\n-\n  key: a\n  value: 2\n");
+    Ok(())
+}
+
+#[test]
+fn test_duplicate_mapping_key_to_entries_json_compact() -> Result<()> {
+    // Same as above, exercising the exact `-o=json` repro from issue #443.
+    let yaml = "a: 1\na: 2\n";
+    let (output, code) = run_yq_stdin("to_entries", yaml, &["-o=json", "-I=0"])?;
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        r#"[{"key":"a","value":1},{"key":"a","value":2}]"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_compact_json_output() -> Result<()> {
     let yaml = r"
 a: 1

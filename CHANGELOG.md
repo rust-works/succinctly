@@ -173,6 +173,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separately) and left as a documented known divergence
   (`test_nan_container_ordering_known_divergence_421`).
 
+- **YAML `to_entries` collapsed a duplicate mapping key to its last
+  occurrence instead of emitting one entry per occurrence** (#443, a
+  follow-up gap left open by #174): `a: 1\na: 2` piped through `to_entries`
+  gave a single `{"key":"a","value":2}` where real `yq` emits both entries
+  unmerged. The
+  generic/cursor evaluator used for YAML (`eval_generic.rs`'s `eval_builtin`)
+  had no native arm for `Builtin::ToEntries`, so it fell through the
+  catch-all that materializes the whole value via `to_owned()` first —
+  which merges duplicate keys into one `IndexMap` entry before `to_entries`
+  ever runs, even though the field cursor it reads from indexes every
+  occurrence. Added a native `ToEntries` arm that walks the field/element
+  cursor directly, building one `{key, value}` entry per field (mirroring
+  `Keys`/`Iterate` in the same file, and the already-correct JSON-side
+  `builtin_to_entries`), so no user key is ever put into a shared map. New
+  coverage: a duplicate-key unit test in `eval_generic.rs`, two
+  `tests/yq_cli_tests.rs` cases (default YAML and compact JSON output), and
+  a `to_entries_duplicate_keys_{compact,pretty}` golden fixture pair
+  captured from real `yq`. The sibling `-o=json`/pretty-print identity
+  collapse is unrelated to this dispatch path and remains open as #442.
+
 - **`from_entries` and six other `map`-derived builtins refused an object of
   entries that jq accepts** (#422): jq defines `from_entries` as
   `map({...}) | add | .//={}`, and `map(f)` is `[.[] | f]` — `.[]` over an
@@ -555,9 +575,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   see both entries — only `YamlFields::find`, the name-based lookup behind
   `.key` field access (used by both the JSON-shaped and generic/cursor
   evaluators), returned on the first match instead of keeping the last one
-  seen. (`to_entries` and JSON/`-o=json` output still collapse duplicate keys
-  to a single entry via the owned-value conversion in `to_owned` — a
-  separate, still-open gap, not fixed here.)
+  seen. (`to_entries` collapsed duplicate keys the same way — fixed by #443,
+  above. JSON/`-o=json` pretty-print output still collapses them via the
+  same owned-value conversion in `to_owned` — a separate, still-open gap,
+  tracked as #442.)
 
 - **The strict YAML validator accepted an alias to an unknown anchor** (#404):
   `succinctly yaml validate` passed `a: *nope`, which `yq` rejects with
