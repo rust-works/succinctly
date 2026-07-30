@@ -1717,18 +1717,36 @@ impl<'a> Parser<'a> {
             // is the whole-corpus guard on that.
         } else {
             // Inline value (`check_unsupported` ran above)
-            if self.peek() == Some(b'*') {
-                // `parse_alias` opens and closes its own node. `- k: *a` never
-                // became an alias node at all before #372, and was swallowed
-                // into the plain scalar below.
-                self.parse_alias()?;
-            } else {
-                // Open value node
-                self.set_ib();
-                self.write_bp_open();
-                let end_pos = self.parse_inline_value(indent)?;
-                self.set_bp_text_end(end_pos);
-                self.write_bp_close();
+            match self.peek() {
+                Some(b'*') => {
+                    // `parse_alias` opens and closes its own node. `- k: *a` never
+                    // became an alias node at all before #372, and was swallowed
+                    // into the plain scalar below.
+                    self.parse_alias()?;
+                }
+                Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
+                    // Block sequence indicator inline with a compact mapping's own
+                    // value (`- a: - x`): the same invalid-but-common shape #325
+                    // fixed for a top-level mapping value, one level deeper. This
+                    // arm was missing when #325 landed, so `- a: - x` still fell
+                    // through to `parse_inline_value` below and read back as the
+                    // scalar `"- x"` instead of the sequence `["x"]` — inconsistent
+                    // with the sibling fix in `parse_mapping_entry`.
+                    //
+                    // `self.current_column()` (not `indent + 2`), matching every
+                    // other site that opens this arm, so a continuation line whose
+                    // `-` sits at the same column joins this sequence.
+                    let seq_indent = self.current_column();
+                    self.parse_sequence_item(seq_indent)?;
+                }
+                _ => {
+                    // Open value node
+                    self.set_ib();
+                    self.write_bp_open();
+                    let end_pos = self.parse_inline_value(indent)?;
+                    self.set_bp_text_end(end_pos);
+                    self.write_bp_close();
+                }
             }
         }
 
@@ -2050,6 +2068,30 @@ impl<'a> Parser<'a> {
                 Some(b'|' | b'>') => {
                     // Block scalar - handles its own BP
                     self.parse_block_scalar(indent)?;
+                }
+                Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
+                    // Block sequence indicator inline with the mapping key (`a: - x`).
+                    // This is invalid YAML (test-suite case 5U3A: a block sequence may
+                    // not begin on the same line as its parent mapping key), and the
+                    // opt-in strict validator rejects it. But the loader does minimal
+                    // validation by design, so it parses the obvious extension rather
+                    // than silently dropping the item's content. See #325.
+                    //
+                    // `parse_sequence_item` handles everything: the nesting guard, the
+                    // sequence container, the item wrapper, and the three item shapes
+                    // (`a: - - x`, `a: - k: v`, `a: - x`). No BP node has been opened
+                    // for the value yet, so it must open both itself.
+                    //
+                    // The indent is the actual column of the `-`, not `indent + 2`, so
+                    // that continuation lines whose `-` sits at the same column join
+                    // this sequence instead of opening a nested one:
+                    //
+                    // ```yaml
+                    // key: - a    # `-` at column 5 -> sequence at indent 5
+                    //      - b    # same column -> same sequence
+                    // ```
+                    let seq_indent = self.current_column();
+                    self.parse_sequence_item(seq_indent)?;
                 }
                 _ => {
                     // Scalar value - wrap in BP
@@ -2432,9 +2474,30 @@ impl<'a> Parser<'a> {
                 self.set_bp_text_end(self.pos);
                 self.write_bp_close();
             }
-            Some(b'-') if self.peek_at(1) == Some(b' ') || self.peek_at(1) == Some(b'\t') => {
-                // Inline sequence item - this creates a nested sequence
-                // The caller already opened a BP node for us
+            Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
+                // Inline sequence item - this creates a nested sequence.
+                //
+                // This arm used to be a no-op on the theory that "the caller already
+                // opened a BP node for us". The caller opens a *wrapper*, but nothing
+                // was ever emitted inside it, so the item's content was silently
+                // discarded and the node resolved to null (#325). Delegate instead,
+                // exactly as `parse_sequence_item_inner` does for `- - x`.
+                //
+                // Reached when a `-` gets past the callers' own dash checks, which
+                // happens once an anchor stands between the two: `- &a &b - x`.
+                // `parse_sequence_item_inner` sees `&`, not `-`, so it falls through
+                // to `parse_value`, whose anchor prologue consumes only the first
+                // anchor and leaves the cursor on the second. Rare, but real — see
+                // `test_double_anchor_before_nested_dash_keeps_content`.
+                //
+                // The guard goes through `is_seq_indicator_next`, so it accepts
+                // `\n`/`\r`/end-of-input as well as space/tab, matching the reader's
+                // seq-item predicate (`light.rs`, `index.rs`). The old hand-written
+                // space/tab-only spelling here was the asymmetry #325 called out: it
+                // let a bare trailing `-` reach the scalar arm, where the reader then
+                // classified the resulting node as an item wrapper with no child.
+                let seq_indent = self.current_column();
+                self.parse_sequence_item(seq_indent)?;
             }
             Some(b'[') => {
                 // Flow sequence

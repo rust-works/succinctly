@@ -2911,6 +2911,56 @@ fn test_flow_dash_space_scalar_content_is_not_dropped() -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Inline block sequence as a mapping value (#325)
+// ============================================================================
+// `a: - x` is invalid YAML (test-suite case 5U3A) and `yq` rejects it. The
+// loader does minimal validation by design, so rather than silently dropping
+// the item -- which is what it used to do, yielding `{"a":null}` -- it parses
+// the obvious extension. Strict rejection stays available via `yaml validate`.
+
+#[test]
+fn test_inline_sequence_as_mapping_value_is_not_dropped() -> Result<()> {
+    let (output, exit_code) = run_yq_stdin(".", "a: - x\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":["x"]}"#);
+    Ok(())
+}
+
+#[test]
+fn test_inline_sequence_continuation_line_joins_same_sequence() -> Result<()> {
+    // 5U3A itself: both items belong to one sequence, keyed off the column of
+    // the `-` rather than a fixed indent.
+    let (output, exit_code) = run_yq_stdin(".", "key: - a\n     - b\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"key":["a","b"]}"#);
+    Ok(())
+}
+
+#[test]
+fn test_bare_dash_as_mapping_value_is_an_empty_item() -> Result<()> {
+    // Per YAML 1.2 `ns-plain-first`, `-` before whitespace or end-of-input is
+    // always the sequence-entry indicator, so this is `[null]`, not `"-"`.
+    for input in ["a: -\n", "a: -"] {
+        let (output, exit_code) = run_yq_stdin(".", input, &["-o", "json", "-I0"])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output.trim(), r#"{"a":[null]}"#, "input: {input:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_inline_sequence_as_compact_mapping_value_is_not_dropped() -> Result<()> {
+    // `- a: - x` is the same shape #325 fixed for `a: - x`, one level deeper: a
+    // compact mapping entry (inside a sequence item) whose own value is an
+    // inline dash sequence. `parse_compact_mapping_entry` didn't get the dash
+    // dispatch when #325 landed, so this fell through to the scalar `"- x"`.
+    let (output, exit_code) = run_yq_stdin(".", "- a: - x\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":["x"]}]"#);
+    Ok(())
+}
+
 #[test]
 fn test_flow_dash_without_whitespace_is_still_a_scalar() -> Result<()> {
     // A `-` not followed by whitespace is a legitimate plain scalar in flow
@@ -3218,5 +3268,21 @@ fn test_navigation_queries_keep_whole_float_decimal_point_yaml() -> Result<()> {
     let (out, code) = run_yq_stdin(".x", "x: 1.0\n", &["-o=yaml", "-I=0"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "1.0");
+    Ok(())
+}
+
+#[test]
+fn test_dash_not_followed_by_space_is_still_a_scalar() -> Result<()> {
+    // Guard against over-matching: negative numbers and `-`-prefixed plain
+    // scalars must not be reinterpreted as sequences.
+    for (input, want) in [
+        ("a: -1\n", r#"{"a":-1}"#),
+        ("a: -x\n", r#"{"a":"-x"}"#),
+        ("{a: -}\n", r#"{"a":"-"}"#),
+    ] {
+        let (output, exit_code) = run_yq_stdin(".", input, &["-o", "json", "-I0"])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output.trim(), want, "input: {input:?}");
+    }
     Ok(())
 }
