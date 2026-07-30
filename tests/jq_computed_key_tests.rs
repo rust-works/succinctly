@@ -426,6 +426,122 @@ fn test_optional_prunes_a_path_that_cannot_resolve() {
     );
 }
 
+/// #413: `?` on an assignment path suppresses only the failure to *index* —
+/// exactly as it does in value position (`test_optional_does_not_reach_the_target`
+/// above). It does not cover a failure raised while evaluating the key itself,
+/// nor one raised while evaluating the target: `.[.k]?` on a string still
+/// raises "Cannot index string with string \"k\"" for `.k`, and NaN still
+/// refuses to name an *array* element, `?` or not.
+///
+/// The key is evaluated before the target here, as it is in value position, so
+/// which of the two a message blames — and whether the target runs at all — is
+/// part of what these cases pin.
+#[test]
+fn test_optional_does_not_swallow_a_key_or_target_evaluation_error() {
+    check(
+        r#""str""#,
+        ".[.k]? = 5",
+        Outcome::error(r#"Cannot index string with string "k""#),
+    );
+    // The key is evaluated against the value *threaded to that position*, not
+    // the document root, so the same failure shows up after a pipe stage too.
+    check(
+        r#"{"a":"str","k":"x"}"#,
+        ".a | .[.k]? = 5",
+        Outcome::error(r#"Cannot index string with string "k""#),
+    );
+    // A target evaluation failure is likewise not covered by the trailing `?` —
+    // but the key is evaluated first, so on `5` it is `.k` that raises and the
+    // `.a` the message names is the key, not the target that never ran.
+    check(
+        "5",
+        ".a[.k]? = 9",
+        Outcome::error(r#"Cannot index number with string "k""#),
+    );
+    // Keys-first is visible in the other direction too: an empty key stream
+    // short-circuits before the target, so the target's failure never happens.
+    // (`test_empty_key_stream_short_circuits` pins the same rule in value
+    // position.)
+    check("5", ".a[empty]? = 9", Outcome::values(&["5"]));
+    check("5", ".a[empty] = 9", Outcome::values(&["5"]));
+    // NaN denotes no array element, so it still errors under `?` even though a
+    // plain type mismatch (tested above) does not. null counts as an array here
+    // exactly as it does for a write: `null | .[0] = 5` builds one.
+    check(
+        "[1,2,3]",
+        ".[nan]? = 5",
+        Outcome::error("Cannot set array element at NaN index"),
+    );
+    check(
+        "null",
+        ".[nan]? = 5",
+        Outcome::error("Cannot set array element at NaN index"),
+    );
+    // On a container a number cannot address at all, though, the failure is the
+    // ordinary `Cannot index object with number` — which is exactly what `?`
+    // suppresses, so these leave the document alone rather than raising.
+    check(
+        r#"{"a":1}"#,
+        ".[nan]? = 5",
+        Outcome::values(&[r#"{"a":1}"#]),
+    );
+    check(r#""str""#, ".[nan]? = 5", Outcome::values(&[r#""str""#]));
+    // Per key, not per filter: the NaN prunes its own branch and the string key
+    // beside it still assigns.
+    check(
+        r#"{"a":0}"#,
+        r#".[("a",nan)]? = 1"#,
+        Outcome::values(&[r#"{"a":1}"#]),
+    );
+    // What `?` *does* still suppress: a genuine failure to index, once the
+    // target and key have both evaluated without error.
+    check(
+        r#"{"a":1}"#,
+        ".a[.k]? = 5",
+        Outcome::values(&[r#"{"a":1}"#]),
+    );
+}
+
+/// The rule of #413 belongs to the path *resolver*, so it has to hold for every
+/// filter that resolves a path — not just `=`, which is where the bug was found.
+/// `|=`, the compound forms, `del` and `path` all reach `resolve_dynamic_indexes`
+/// through their own entry points.
+#[test]
+fn test_optional_key_error_reaches_every_path_consuming_form() {
+    for filter in [
+        ".[.k]? = 5",
+        ".[.k]? |= 5",
+        ".[.k]? += 1",
+        ".[.k]? //= 5",
+        "del(.[.k]?)",
+        "[path(.[.k]?)]",
+    ] {
+        check(
+            r#""str""#,
+            filter,
+            Outcome::error(r#"Cannot index string with string "k""#),
+        );
+    }
+    // And the NaN-on-an-object case stays suppressed through the same forms:
+    // the writes are no-ops rather than errors.
+    check(
+        r#"{"a":1}"#,
+        ".[nan]? |= 5",
+        Outcome::values(&[r#"{"a":1}"#]),
+    );
+    check(
+        r#"{"a":1}"#,
+        "del(.[nan]?)",
+        Outcome::values(&[r#"{"a":1}"#]),
+    );
+    // DIVERGENCE from jq 1.7.1, and not one this rule owns: `path` renders "no
+    // paths at all" as the *root* path, so jq's `[]` reads `[[]]` here. It
+    // predates computed keys and needs no key to show — `{"a":1} |
+    // [path(empty)]` is `[[]]` too, where jq is `[]`. Pinned as-is so the day
+    // that changes is visible at this case rather than around it.
+    check(r#"{"a":1}"#, "[path(.[nan]?)]", Outcome::values(&["[[]]"]));
+}
+
 #[test]
 fn test_assignment_to_an_out_of_range_index_errors() {
     // DIVERGENCE from jq 1.7.1, and one that predates computed keys: jq pads
