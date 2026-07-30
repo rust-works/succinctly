@@ -853,8 +853,25 @@ impl<'a> Parser<'a> {
         Ok(Expr::Object(entries))
     }
 
-    /// Parse a primary expression (atoms and parenthesized expressions).
+    /// Parse a primary expression (atoms and parenthesized expressions), then
+    /// check for a trailing `?` (jq's postfix `try` shorthand), which applies
+    /// to any Term - not just path expressions. Field/bracket access already
+    /// consume their own narrower `?` inline (see
+    /// `parse_index_bracket_with_optional` and the dot-field branch below),
+    /// so by the time control reaches here any such `?` is already gone;
+    /// this only wraps a `?` still left over the whole term.
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        let expr = self.parse_primary_inner()?;
+        self.skip_ws();
+        if self.peek() == Some('?') {
+            self.next();
+            Ok(Expr::Optional(Box::new(expr)))
+        } else {
+            Ok(expr)
+        }
+    }
+
+    fn parse_primary_inner(&mut self) -> Result<Expr, ParseError> {
         self.skip_ws();
 
         match self.peek() {
@@ -3181,7 +3198,7 @@ impl<'a> Parser<'a> {
     fn is_expr_terminator(&self) -> bool {
         match self.peek() {
             // Structural terminators
-            Some(',' | ')' | ']' | '}' | '|' | ':' | ';') => true,
+            Some(',' | ')' | ']' | '}' | '|' | ':' | ';' | '?') => true,
             // Arithmetic operators
             Some('+' | '-' | '*' | '/' | '%') => true,
             // Comparison operators
