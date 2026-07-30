@@ -8300,6 +8300,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Owned(v) => vec![v],
         QueryResult::ManyOwned(vs) => vs,
         QueryResult::None => Vec::new(),
+        QueryResult::Error(_) if optional => return QueryResult::None,
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
     };
@@ -8308,6 +8309,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let init_result = eval_single::<W, S>(init, value.clone(), optional);
     let mut acc = match result_to_owned(init_result) {
         Ok(v) => v,
+        Err(_) if optional => return QueryResult::None,
         Err(e) => return QueryResult::Error(e),
     };
 
@@ -8319,6 +8321,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let acc_result = eval_owned_expr::<S>(&substituted, &acc, optional);
         match acc_result {
             Ok(new_acc) => acc = new_acc,
+            Err(_) if optional => return QueryResult::None,
             Err(e) => return QueryResult::Error(e),
         }
     }
