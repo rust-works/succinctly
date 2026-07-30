@@ -423,11 +423,11 @@ fn test_optional_builtin_fallback_parity_386() {
     // `contains` both live only in the full evaluator, so both reach this
     // fallback (`src/jq/eval_generic.rs`, `eval_builtin`'s `_ =>` arm).
     //
-    // `?` can't be parsed after a call (#367), so the expression is built
-    // with `Expr::optional` rather than parsed -- same as
-    // `jq_containment_tests.rs::optional_suppresses_the_error`.
-    for (json, filter) in [(b"1".as_slice(), r#"contains("a")"#), (b"1", "bsearch(9)")] {
-        let expr = parse(filter).expect("parse failed").optional();
+    for (json, filter) in [
+        (b"1".as_slice(), r#"contains("a")?"#),
+        (b"1", "bsearch(9)?"),
+    ] {
+        let expr = parse(filter).expect("parse failed");
         assert_optional_parity_suppressed(json, &expr);
     }
 }

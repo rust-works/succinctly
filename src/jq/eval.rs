@@ -879,6 +879,7 @@ fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     match result {
         Ok(v) => QueryResult::Owned(v),
+        Err(_) if optional => QueryResult::None,
         Err(e) => QueryResult::Error(e),
     }
 }
@@ -1460,13 +1461,18 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let msg_result = eval_single::<W, S>(msg_expr, value, optional);
             match result_to_owned(msg_result) {
                 Ok(v) => v,
+                Err(_) if optional => return QueryResult::None,
                 Err(e) => return QueryResult::Error(e),
             }
         }
         None => to_owned(&value),
     };
 
-    QueryResult::Error(EvalError::from_value(payload))
+    if optional {
+        QueryResult::None
+    } else {
+        QueryResult::Error(EvalError::from_value(payload))
+    }
 }
 
 /// Evaluate a builtin function.
@@ -2802,7 +2808,7 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Builtin: first - first element (.[0])
 fn builtin_first<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => match elements.get(0) {
@@ -2812,6 +2818,7 @@ fn builtin_first<W: Clone + AsRef<[u64]>>(
         },
         // jq: null | first => null
         StandardJson::Null => QueryResult::Owned(OwnedValue::Null),
+        _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index_with_type(
             type_name(&value),
             "number",
@@ -2822,7 +2829,7 @@ fn builtin_first<W: Clone + AsRef<[u64]>>(
 /// Builtin: last - last element (.[-1])
 fn builtin_last<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
@@ -2836,6 +2843,7 @@ fn builtin_last<W: Clone + AsRef<[u64]>>(
         }
         // jq: null | last => null
         StandardJson::Null => QueryResult::Owned(OwnedValue::Null),
+        _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index_with_type(
             type_name(&value),
             "number",
@@ -2876,7 +2884,7 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Builtin: reverse - reverse array
 fn builtin_reverse<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
@@ -2895,6 +2903,7 @@ fn builtin_reverse<W: Clone + AsRef<[u64]>>(
         }
         // jq: null | reverse => []
         StandardJson::Null => QueryResult::Owned(OwnedValue::Array(Vec::new())),
+        _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index_with_type(
             type_name(&value),
             "number",
@@ -8291,6 +8300,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Owned(v) => vec![v],
         QueryResult::ManyOwned(vs) => vs,
         QueryResult::None => Vec::new(),
+        QueryResult::Error(_) if optional => return QueryResult::None,
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
     };
@@ -8299,6 +8309,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let init_result = eval_single::<W, S>(init, value.clone(), optional);
     let mut acc = match result_to_owned(init_result) {
         Ok(v) => v,
+        Err(_) if optional => return QueryResult::None,
         Err(e) => return QueryResult::Error(e),
     };
 
@@ -8310,6 +8321,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let acc_result = eval_owned_expr::<S>(&substituted, &acc, optional);
         match acc_result {
             Ok(new_acc) => acc = new_acc,
+            Err(_) if optional => return QueryResult::None,
             Err(e) => return QueryResult::Error(e),
         }
     }
@@ -10215,11 +10227,16 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::One(v) => to_owned(&v),
         QueryResult::Owned(v) => v,
         QueryResult::Error(e) => return QueryResult::Error(e),
+        // A suppressed sub-result (e.g. `setpath((.a)?; 1)` on a value `.a`
+        // can't index) propagates as a suppressed whole, not `null`/an error.
+        QueryResult::None => return QueryResult::None,
+        _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::path_must_be_array()),
     };
 
     let path = match path_owned {
         OwnedValue::Array(p) => p,
+        _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::path_must_be_array()),
     };
 
@@ -10228,6 +10245,9 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::One(v) => to_owned(&v),
         QueryResult::Owned(v) => v,
         QueryResult::Error(e) => return QueryResult::Error(e),
+        // Same reasoning as the path result above: `setpath(["a"]; error)?`
+        // suppresses the whole call rather than setting `"a"` to `null` (#367).
+        QueryResult::None => return QueryResult::None,
         _ => OwnedValue::Null,
     };
 
@@ -10235,8 +10255,7 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match set_value_at_path(owned, &path, new_val) {
         Ok(result) => QueryResult::Owned(result),
         // An optional context swallows the refusal, as it does for every other
-        // builtin here. Not reachable through `setpath(…)?` yet — the parser
-        // does not take `?` after a call — but the flag is threaded in anyway.
+        // builtin here.
         Err(_) if optional => QueryResult::None,
         Err(e) => QueryResult::Error(e),
     }

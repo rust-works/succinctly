@@ -853,8 +853,25 @@ impl<'a> Parser<'a> {
         Ok(Expr::Object(entries))
     }
 
-    /// Parse a primary expression (atoms and parenthesized expressions).
+    /// Parse a primary expression (atoms and parenthesized expressions), then
+    /// check for a trailing `?` (jq's postfix `try` shorthand), which applies
+    /// to any Term - not just path expressions. Field/bracket access already
+    /// consume their own narrower `?` inline (see
+    /// `parse_index_bracket_with_optional` and the dot-field branch below),
+    /// so by the time control reaches here any such `?` is already gone;
+    /// this only wraps a `?` still left over the whole term.
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        let expr = self.parse_primary_inner()?;
+        self.skip_ws();
+        if self.peek() == Some('?') {
+            self.next();
+            Ok(Expr::Optional(Box::new(expr)))
+        } else {
+            Ok(expr)
+        }
+    }
+
+    fn parse_primary_inner(&mut self) -> Result<Expr, ParseError> {
         self.skip_ws();
 
         match self.peek() {
@@ -3181,7 +3198,7 @@ impl<'a> Parser<'a> {
     fn is_expr_terminator(&self) -> bool {
         match self.peek() {
             // Structural terminators
-            Some(',' | ')' | ']' | '}' | '|' | ':' | ';') => true,
+            Some(',' | ')' | ']' | '}' | '|' | ':' | ';' | '?') => true,
             // Arithmetic operators
             Some('+' | '-' | '*' | '/' | '%') => true,
             // Comparison operators
@@ -4160,6 +4177,72 @@ mod tests {
         assert_eq!(
             parse(".foo?").unwrap(),
             Expr::Optional(Box::new(Expr::Field("foo".into())))
+        );
+    }
+
+    /// jq accepts postfix `?` after any Term, not just a path expression
+    /// (#367). These cover the forms that used to fail with "unexpected
+    /// character '?'" because only the dot-field and index-bracket
+    /// productions checked for a trailing `?`.
+    #[test]
+    fn test_optional_after_builtin() {
+        assert_eq!(
+            parse("length?").unwrap(),
+            Expr::Optional(Box::new(Expr::Builtin(Builtin::Length)))
+        );
+        assert_eq!(
+            parse("keys?").unwrap(),
+            Expr::Optional(Box::new(Expr::Builtin(Builtin::Keys)))
+        );
+        assert_eq!(
+            parse("tonumber?").unwrap(),
+            Expr::Optional(Box::new(Expr::Builtin(Builtin::ToNumber)))
+        );
+    }
+
+    #[test]
+    fn test_optional_after_parenthesized_expr() {
+        assert_eq!(
+            parse("(.a)?").unwrap(),
+            Expr::Optional(Box::new(Expr::Paren(Box::new(Expr::Field("a".into())))))
+        );
+        assert_eq!(
+            parse("(1)?").unwrap(),
+            Expr::Optional(Box::new(Expr::Paren(Box::new(Expr::Literal(
+                Literal::Int(1)
+            )))))
+        );
+    }
+
+    #[test]
+    fn test_optional_after_function_call() {
+        match parse("first(.[])?").unwrap() {
+            Expr::Optional(inner) => assert!(matches!(*inner, Expr::FirstExpr(_))),
+            other => panic!("expected Expr::Optional, got {other:?}"),
+        }
+        match parse(r#"getpath(["a"])?"#).unwrap() {
+            Expr::Optional(inner) => {
+                assert!(matches!(*inner, Expr::Builtin(Builtin::GetPath(_))));
+            }
+            other => panic!("expected Expr::Optional, got {other:?}"),
+        }
+        match parse(r#"setpath(["a"];1)?"#).unwrap() {
+            Expr::Optional(inner) => {
+                assert!(matches!(*inner, Expr::Builtin(Builtin::SetPath(_, _))));
+            }
+            other => panic!("expected Expr::Optional, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_optional_after_variable_and_identity() {
+        assert_eq!(
+            parse("$x?").unwrap(),
+            Expr::Optional(Box::new(Expr::Var("x".into())))
+        );
+        assert_eq!(
+            parse(".?").unwrap(),
+            Expr::Optional(Box::new(Expr::Identity))
         );
     }
 
