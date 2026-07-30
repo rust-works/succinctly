@@ -580,13 +580,15 @@ fn test_unsupported_path_prefixes_report_rather_than_misfire() {
         r#"(.[] | .[("x","y")]) = 9"#,
         Outcome::error("expected array or object, got number"),
     );
-    // A multi-output component that is not `.[]` cannot be expanded into
-    // concrete path components, so it is refused rather than silently applied
-    // to one branch. jq resolves `..` and then fails on the first scalar it
-    // reaches (`Cannot index number with string "x"`).
+    // `range(3)` is a multi-output component with no path-tracking arm (#412
+    // covers `..`, `recurse` and the typeof filters — see
+    // `test_multi_output_path_components_fan_out` — but not arbitrary
+    // generators), so it is still refused rather than silently applied to one
+    // branch. jq itself refuses too, in its own words (`Invalid path
+    // expression near attempt to access element "x" of 0`).
     check(
         r#"{"a":1}"#,
-        r#"(.. | .[("x","y")]) = 9"#,
+        r#"(range(3) | .[("x","y")]) = 9"#,
         Outcome::error("Cannot use a computed index after a multi-output path component"),
     );
     // `. = 5` replaces the root, so the sibling branch then indexes a number,
@@ -595,6 +597,66 @@ fn test_unsupported_path_prefixes_report_rather_than_misfire() {
         r#"{"a":{"x":1}}"#,
         r#"(., .a[("x","y")]) = 5"#,
         Outcome::error(r#"Cannot index number with string "a""#),
+    );
+}
+
+/// #412: a computed key after `..`, `recurse` or a typeof filter (`objects`,
+/// `select`, ...) now resolves per branch instead of being refused outright —
+/// `resolve_node` names the Field/Index chain reaching *each* of the many
+/// values, the same job it already did for `.[]`.
+///
+/// Every expectation here was captured from real jq 1.7.1.
+#[test]
+fn test_multi_output_path_components_fan_out() {
+    // The exact repro from #412.
+    check(
+        r#"{"k":"a","a":{"k":"a","a":1}}"#,
+        r"[path(.. | objects | .[.k]?)]",
+        Outcome::values(&[r#"[["a"],["a","a"]]"#]),
+    );
+
+    let doc = r#"{"x":{"k":"v","v":1},"y":{"k":"w","w":2}}"#;
+    check(
+        doc,
+        r"[path(.. | objects | .[.k]?)]",
+        Outcome::values(&[r#"[["x","v"],["y","w"]]"#]),
+    );
+    check(
+        doc,
+        r"(.. | objects | .[.k]?) = 99",
+        Outcome::values(&[r#"{"x":{"k":"v","v":99},"y":{"k":"w","w":99}}"#]),
+    );
+    check(
+        doc,
+        r"(.. | objects | .[.k]?) |= (. + 1)",
+        Outcome::values(&[r#"{"x":{"k":"v","v":2},"y":{"k":"w","w":3}}"#]),
+    );
+    check(
+        doc,
+        r"del(.. | objects | .[.k]?)",
+        Outcome::values(&[r#"{"x":{"k":"v"},"y":{"k":"w"}}"#]),
+    );
+
+    // `recurse` (BFS order) and `select(f)` generalise the same way as `..`
+    // and `objects`.
+    check(
+        doc,
+        r"[path(recurse | objects | .[.k]?)]",
+        Outcome::values(&[r#"[["x","v"],["y","w"]]"#]),
+    );
+    check(
+        doc,
+        r#"[path(.. | select(type == "object") | .[.k]?)]"#,
+        Outcome::values(&[r#"[["x","v"],["y","w"]]"#]),
+    );
+
+    // `..` still fails loudly, in jq's own words, when the computed key
+    // reaches a value that cannot be indexed by it — the resolver fans out
+    // and lets the ordinary indexing error surface per branch.
+    check(
+        r#"{"a":1}"#,
+        r#"(.. | .[("x","y")]) = 9"#,
+        Outcome::error(r#"Cannot index number with string "x""#),
     );
 }
 
