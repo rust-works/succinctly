@@ -104,6 +104,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`del()` errored when a deleted key's container was `null`, where jq
+  silently no-ops** (#476): jq indexes `null` with any key and gets `null`
+  back — `null | .a`, `null | .[0]` and `null | delpaths([["a"]])` are all
+  `null` — so deleting through one is always a no-op. `delpaths`/`delete_keys`
+  already special-cased `OwnedValue::Null => Ok(OwnedValue::Null)`, but the
+  separate walker behind the `del(EXPR)` expression form — `delete_at_path`
+  and the grouped-deletion helpers `delete_expr_object_paths`/
+  `delete_expr_array_paths` added for #424 — never got the same exemption, so
+  `null | del(.a)` raised `Cannot index null with string "a"` and
+  `{"x":null} | del(.x.a)` raised the same reaching `.x` mid-chain. Both now
+  give `null` an unconditional no-op — regardless of `?` — in `delete_at_path`'s
+  `Field`/`Index` arms (top-level and the `Expr::Pipe` chain-walk), its
+  `Expr::Slice` chain-walk arm (added at the call site rather than inside the
+  shared `through_slice` helper — see below), and the two grouped-deletion
+  gates. `#424`'s own test suite had pinned two of these cases as *expected
+  errors* (`test_del_computed_index_against_null_does_not_panic`, since
+  renamed `..._is_a_no_op`, and the null cases in
+  `test_del_container_type_error_is_not_masked_by_an_earlier_optional_sibling`,
+  which now uses `5` as its wrong-type example instead) — both updated in
+  `tests/jq_computed_key_tests.rs`, plus new coverage in `src/jq/eval.rs` and
+  five new `tests/data/jq-golden/cases/null_del_*` fixtures. **Not covered**:
+  `del(.[])` on `null` still raises `Cannot iterate over null (null)`,
+  matching jq — only `Field`/`Index`/`Slice` steps get the exemption. Writing
+  through a slice still does not auto-vivify `null` (`null | .[1:2] =
+  ["x"]`) — that is `through_slice`'s shared behaviour with `=`/`|=` and a
+  separate, already-documented divergence (see "Where succinctly errors and
+  jq does not" in `docs/compliance/jq/limitations.md`), which this fix
+  deliberately leaves alone by special-casing `null` at the `del()` call site
+  instead of inside the shared helper. Also found, and deliberately left for
+  a future issue: a plain (non-`null`, non-comma) missing intermediate key —
+  `{"a":1} | del(.b.c)` — still raises `field 'b' not found` where jq
+  no-ops; that is a fourth, distinct gap from #475/#476/#477, not fixed here.
+
 - **A computed key after a multi-output path component was refused outright**
   (#412): `path(.. | objects | .[.k]?)` errored `Cannot use a computed index
   after a multi-output path component` even though the equivalent value path
