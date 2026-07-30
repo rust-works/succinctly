@@ -638,3 +638,99 @@ fn test_parity_number_literal_reaches_more_numeric_arg_builtins_387() {
     );
     assert_parity(br"[2020.0,0,1,0,0,0]", r#"strftime("%Y-%m-%d")"#);
 }
+
+/// A slice is a path component (#366), so it reaches `path()`, `getpath`,
+/// `setpath`, `delpaths`, `=`, `|=` and `del()`. The CLI drives the generic
+/// evaluator, which has no `Expr::Slice` arm of its own and round-trips to the
+/// full one — this pins that the hand-off keeps every one of those in step.
+///
+/// Each expectation is jq-1.7.1's, read off the pinned binary.
+#[test]
+fn slice_path_component_agrees_across_evaluators() {
+    for (json, filter, expected) in [
+        // `path()` yields ONE component carrying the bounds as written.
+        (
+            br"[1,2,3]".as_slice(),
+            "path(.[1:2])",
+            r#"[{"start":1,"end":2}]"#,
+        ),
+        (br"[1,2,3]", "path(.[-2:-1])", r#"[{"start":-2,"end":-1}]"#),
+        (br"[1,2,3]", "path(.[1:])", r#"[{"start":1,"end":null}]"#),
+        (br"[1,2,3]", "path(.[1:2][0])", r#"[{"start":1,"end":2},0]"#),
+        // …and it round-trips back through the consumers.
+        (br"[1,2,3]", "getpath(path(.[1:2]))", "[2]"),
+        (
+            br"[1,2,3]",
+            r#"setpath(path(.[1:2]); ["z"])"#,
+            r#"[1,"z",3]"#,
+        ),
+        (br"[1,2,3]", "delpaths([path(.[1:2])])", "[1,3]"),
+        // Reading a descriptor: array, string, and the whole-container bounds.
+        (br"[1,2,3]", r#"getpath([{"start":1,"end":2}])"#, "[2]"),
+        (
+            br#""abcdef""#,
+            r#"getpath([{"start":1,"end":2}])"#,
+            r#""b""#,
+        ),
+        (
+            br"[1,2,3]",
+            r#"getpath([{"start":null,"end":null}])"#,
+            "[1,2,3]",
+        ),
+        // Writing splices, and the range clamps rather than refusing.
+        (
+            br"[1,2,3]",
+            r#"setpath([{"start":1,"end":2}]; ["x","y"])"#,
+            r#"[1,"x","y",3]"#,
+        ),
+        (
+            br"[1,2,3]",
+            r#"setpath([{"start":5,"end":9}]; ["x"])"#,
+            r#"[1,2,3,"x"]"#,
+        ),
+        (
+            br"[1,2,3]",
+            r#"setpath([{"start":2,"end":1}]; ["x"])"#,
+            r#"[1,2,"x",3]"#,
+        ),
+        (
+            br"null",
+            r#"setpath([{"start":1,"end":2}]; ["x"])"#,
+            r#"["x"]"#,
+        ),
+        // The assignment operators, including a slice mid-chain.
+        (br"[1,2,3]", r#".[1:2] = ["x"]"#, r#"[1,"x",3]"#),
+        (br"[1,2,3]", r#".[1:2] |= . + ["q"]"#, r#"[1,2,"q",3]"#),
+        (br"[1,2,3]", r#".[0:2] += ["x"]"#, r#"[1,2,"x",3]"#),
+        (br"[1,2,3,4]", ".[1:3][] = 9", "[1,9,9,4]"),
+        (
+            br#"{"a":[1,{"b":5}]}"#,
+            ".a[1:2][0].b = 9",
+            r#"{"a":[1,{"b":9}]}"#,
+        ),
+        // Deleting: through a slice, and the single-batch union of ranges.
+        (br"[1,2,3]", "del(.[1:2])", "[1,3]"),
+        (br"[1,2,3]", "del(.[5:9])", "[1,2,3]"),
+        (br"[1,[2],[3]]", "del(.[1:3][0])", "[1,[3]]"),
+        (
+            br"[1,2,3,4]",
+            r#"delpaths([[{"start":0,"end":2}],[{"start":1,"end":3}]])"#,
+            "[4]",
+        ),
+        (
+            br"[1,2,3,4]",
+            r#"delpaths([[1],[{"start":1,"end":2}]])"#,
+            "[1,3,4]",
+        ),
+        // An object pattern to the string searches is the slice, not a search.
+        (br#""abcabc""#, r#"indices({"start":1,"end":2})"#, r#""b""#),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(json, filter)),
+            [expected],
+            "full evaluator disagrees with jq for `{filter}` on `{}`",
+            String::from_utf8_lossy(json)
+        );
+        assert_parity(json, filter);
+    }
+}
