@@ -7197,23 +7197,55 @@ fn resolve_node<S: EvalSemantics>(
             Ok(out)
         }
 
-        Expr::Optional(inner) => {
-            // A failure under `?` prunes the branch instead of propagating.
-            let Ok(branches) = resolve_node::<S>(inner, value) else {
-                return Ok(Vec::new());
-            };
-            Ok(branches
-                .into_iter()
-                .map(|(components, v)| {
-                    let inner_path = if components.len() == 1 {
-                        components.into_iter().next().expect("len checked")
-                    } else {
-                        Expr::Pipe(components)
-                    };
-                    (vec![Expr::Optional(Box::new(inner_path))], v)
-                })
-                .collect())
-        }
+        Expr::Optional(inner) => match inner.as_ref() {
+            // `E[K]?` only covers a failure to *index* — evaluating `E` or `K`
+            // is not covered (see `eval_index_expr`'s doc comment, which the
+            // value-position evaluator already honors). The blanket catch below
+            // is right for every other `?`-wrapped node, where evaluation and
+            // indexing are the same step, but it would also swallow an error
+            // raised while computing `K` itself, e.g. `"str" | .[.k]? = 5`
+            // (#413). Only the bare shape needs intercepting, and that is jq's
+            // own distinction rather than a limit of what parses: `(.[.k])?` is
+            // `try .[.k]`, which catches everything inside it including the key,
+            // so `"str" | (.[.k])? = 5` is `"str"` there while
+            // `"str" | .[.k]? = 5` raises. A parenthesised key therefore *should*
+            // reach the blanket arm below. It cannot yet — the postfix `?` takes
+            // a path expression and nothing else until #367 — but when it can,
+            // this arm still wants to see only the bare shape.
+            Expr::IndexExpr { target, key } => resolve_index_expr::<S>(target, key, value, true),
+
+            // Every other `?`-wrapped node (`.foo?`, `.[0]?`, ...): evaluation
+            // and indexing are the same step, so any failure anywhere
+            // underneath is the failure to index, and `?` covers all of it.
+            _ => {
+                // A failure under `?` prunes the branch instead of propagating.
+                let Ok(branches) = resolve_node::<S>(inner, value) else {
+                    return Ok(Vec::new());
+                };
+                Ok(branches
+                    .into_iter()
+                    .map(|(components, v)| {
+                        let inner_path = if components.len() == 1 {
+                            components.into_iter().next().expect("len checked")
+                        } else {
+                            // Unreached *today*, and deliberately not a panic: the
+                            // postfix `?` attaches to a single path element until
+                            // #367, so `(.a.b)?`, `(..)?` and `recurse?` are parse
+                            // errors, and `E[K]?` — which used to arrive here with
+                            // its target's components attached — now goes to
+                            // `resolve_index_expr`. #367 reopens it on purpose:
+                            // `(.a[.k])?` resolves through the `Paren` arm to
+                            // `["a","b"]`, two components, and jq writes
+                            // `{"a":{"b":5},"k":"b"}` for it. `eval_generic` can
+                            // synthesize `Expr::Optional` around any expression
+                            // too, so this was never an invariant of the type.
+                            Expr::Pipe(components)
+                        };
+                        (vec![Expr::Optional(Box::new(inner_path))], v)
+                    })
+                    .collect())
+            }
+        },
 
         // `.[]` before a computed key has to be expanded to concrete
         // components, because each element continues with its own key.
@@ -7234,25 +7266,7 @@ fn resolve_node<S: EvalSemantics>(
             )),
         },
 
-        Expr::IndexExpr { target, key } => {
-            let target_branches = resolve_node::<S>(target, value)?;
-            let keys = eval_owned_multi::<S>(key, value)?;
-
-            // Key outer, target inner — the same order the value path uses, so
-            // `path(.[("a","b")])` emits `["a"]` then `["b"]`.
-            let mut out = Vec::with_capacity(keys.len() * target_branches.len());
-            for k in &keys {
-                for (components, target_value) in &target_branches {
-                    let component = key_to_path_component(k, target_value)?;
-                    let next_value = index_one_owned(target_value, k, false)?
-                        .expect("non-optional index yields a value or errors");
-                    let mut path = components.clone();
-                    path.push(component);
-                    out.push((path, next_value));
-                }
-            }
-            Ok(out)
-        }
+        Expr::IndexExpr { target, key } => resolve_index_expr::<S>(target, key, value, false),
 
         // `..` fans out to every node in the tree (pre-order, self before
         // children), so each needs its own Field/Index chain rather than the
@@ -7434,6 +7448,78 @@ fn type_filter_matches(builtin: &Builtin, value: &OwnedValue) -> bool {
         Builtin::Scalars => !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)),
         _ => false,
     }
+}
+
+/// Resolve `E[K]` in path context, with or without a trailing `?`.
+///
+/// The two spellings differ in one thing only: what happens when the resolved
+/// key cannot be applied to the container it reached. `E[K]` propagates that
+/// failure; `E[K]?` prunes just that branch, because a failure to *index* is
+/// exactly what `?` covers. Everything else is shared, and worth sharing — the
+/// two were separate copies until #413, and the copy is where the NaN rule
+/// drifted into rejecting a case jq accepts.
+///
+/// Two rules the shared body carries, both from [`eval_index_expr`]:
+///
+/// - `K` is evaluated before `E`, and an empty key stream short-circuits before
+///   `E` runs at all. jq compiles `E[K]` as `K as $k | E | .[$k]`, so
+///   `5 | .a[.k] = 9` blames the `.k` that failed rather than the `.a` it never
+///   reached, and `5 | .a[empty] = 9` is `5` rather than an error.
+/// - The key stream is outer and the target stream inner, so
+///   `path(.[("a","b")])` emits `["a"]` then `["b"]`.
+fn resolve_index_expr<S: EvalSemantics>(
+    target: &Expr,
+    key: &Expr,
+    value: &OwnedValue,
+    optional: bool,
+) -> Result<Vec<PathBranch>, EvalError> {
+    let keys = eval_owned_multi::<S>(key, value)?;
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let target_branches = resolve_node::<S>(target, value)?;
+
+    let mut out = Vec::with_capacity(keys.len() * target_branches.len());
+    for k in &keys {
+        for (components, target_value) in &target_branches {
+            // A NaN key names no element for a write to land on, so `?` does not
+            // save it — but only where a number addresses an element at all. On
+            // an object the failure is the ordinary `Cannot index object with
+            // number`, which is precisely the failure to index that `?` covers,
+            // so it falls through to `key_to_path_component` below and is pruned
+            // or propagated with every other mismatch: `{"a":1} | .[nan]? = 5` is
+            // `{"a":1}` in jq while `[1,2,3] | .[nan]? = 5` raises.
+            if matches!(
+                k,
+                OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+            ) && numeric_key_to_index(k).is_none()
+                && matches!(target_value, OwnedValue::Array(_) | OwnedValue::Null)
+            {
+                return Err(EvalError::new("Cannot set array element at NaN index"));
+            }
+            let component = match key_to_path_component(k, target_value) {
+                Ok(component) => component,
+                Err(_) if optional => continue,
+                Err(e) => return Err(e),
+            };
+            // `false`, not `optional`: the failure has to arrive as an error for
+            // the two spellings to be told apart here, rather than as the `None`
+            // that the optional form of this call reports it as.
+            let next_value = match index_one_owned(target_value, k, false) {
+                Ok(v) => v.expect("non-optional index yields a value or errors"),
+                Err(_) if optional => continue,
+                Err(e) => return Err(e),
+            };
+            let mut path = components.clone();
+            path.push(if optional {
+                Expr::Optional(Box::new(component))
+            } else {
+                component
+            });
+            out.push((path, next_value));
+        }
+    }
+    Ok(out)
 }
 
 /// Thread a value through a run of static path components, without expanding
