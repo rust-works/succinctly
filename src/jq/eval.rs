@@ -7163,11 +7163,24 @@ fn eval_owned_multi<S: EvalSemantics>(
 /// `[10,20,30] | .[nan] = 5` is an error there too. (jq's `path(.[nan])` instead
 /// yields `[null]`, a path its own `setpath` then rejects; erroring at the
 /// source is the coherent half of that.)
+///
+/// That is only the right complaint where a number addresses an element at all.
+/// The key kind is otherwise dispatched before the container is inspected — which
+/// is what produces jq's `Cannot index <container> with <key>` rather than a
+/// generic type error — but NaN has to consult the container first, or a document
+/// that a number cannot index is reported as an array that has no such element:
+/// `{"a":1} | .[nan] = 5` is `Cannot index object with number` in jq, the same
+/// message `.[0] = 5` gets there, and says nothing about NaN.
 fn key_to_path_component(key: &OwnedValue, container: &OwnedValue) -> Result<Expr, EvalError> {
     match key {
         OwnedValue::String(s) => Ok(Expr::Field(s.clone())),
         // Truncation toward zero, as in the value path.
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+            // Null belongs with array: a write builds the array the index names,
+            // so `null | .[nan] = 5` is the NaN complaint in jq too.
+            if !matches!(container, OwnedValue::Array(_) | OwnedValue::Null) {
+                return Err(EvalError::cannot_index(owned_type_name(container), key));
+            }
             numeric_key_to_index(key)
                 .map(Expr::Index)
                 .ok_or_else(|| EvalError::new("Cannot set array element at NaN index"))
