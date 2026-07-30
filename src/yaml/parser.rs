@@ -1978,7 +1978,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // into the plain scalar below.
                     self.parse_alias()?;
                 }
-                Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
+                Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                     // Block sequence indicator inline with a compact mapping's own
                     // value (`- a: - x`): the same invalid-but-common shape #325
                     // fixed for a top-level mapping value, one level deeper. This
@@ -2318,7 +2318,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // Block scalar - handles its own BP
                     self.parse_block_scalar(indent)?;
                 }
-                Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
+                Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                     // Block sequence indicator inline with the mapping key (`a: - x`).
                     // This is invalid YAML (test-suite case 5U3A: a block sequence may
                     // not begin on the same line as its parent mapping key), and the
@@ -2723,7 +2723,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.set_bp_text_end(self.pos);
                 self.write_bp_close();
             }
-            Some(b'-') if Self::is_seq_indicator_next(self.peek_at(1)) => {
+            Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
                 // Inline sequence item - this creates a nested sequence.
                 //
                 // This arm used to be a no-op on the theory that "the caller already
