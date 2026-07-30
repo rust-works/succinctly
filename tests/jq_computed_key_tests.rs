@@ -660,6 +660,109 @@ fn test_multi_output_path_components_fan_out() {
     );
 }
 
+/// The three parameterised `recurse` spellings, which
+/// `test_multi_output_path_components_fan_out` exercises only in its bare
+/// `recurse` form. `resolve_recurse` re-implements
+/// `builtin_recurse_f`/`builtin_recurse_cond`'s queue in order to thread path
+/// components alongside each value, so the thing worth pinning is that it
+/// still visits what those two visit.
+#[test]
+fn test_recurse_variants_fan_out_like_their_value_paths() {
+    let doc = r#"{"x":{"k":"v","v":1},"y":{"k":"w","w":2}}"#;
+    // `recurse(f)` and `recurse(f; cond)` with a cond that keeps everything
+    // both reduce to the bare `recurse` above.
+    check(
+        doc,
+        r"[path(recurse(.[]?) | objects | .[.k]?)]",
+        Outcome::values(&[r#"[["x","v"],["y","w"]]"#]),
+    );
+    check(
+        doc,
+        r"[path(recurse(.[]?; true) | objects | .[.k]?)]",
+        Outcome::values(&[r#"[["x","v"],["y","w"]]"#]),
+    );
+
+    // A cond that actually prunes: `.v` and `.w` are scalars, so recursion
+    // stops at them and only the two objects' own keys are reached. Without
+    // the cond being honoured this would also walk into the scalars.
+    check(
+        r#"{"k":"v","v":1,"deep":{"k":"w","w":2}}"#,
+        r#"[path(recurse(.[]?; type == "object") | objects | .[.k]?)]"#,
+        Outcome::values(&[r#"[["v"],["deep","w"]]"#]),
+    );
+
+    // `recurse_down` is a succinctly-only alias for `recurse` (jq 1.7.1 has no
+    // such builtin), so it is pinned against `recurse` rather than against jq.
+    check(
+        doc,
+        r"[path(recurse_down | objects | .[.k]?)]",
+        Outcome::values(&[r#"[["x","v"],["y","w"]]"#]),
+    );
+
+    // A cond that *errors* on some node prunes it, rather than propagating —
+    // `.k` on the string `"v"` cannot be indexed. jq instead raises `Cannot
+    // index string with string "k"`. This mirrors `builtin_recurse_cond`'s own
+    // `Err(_) => false`, i.e. the divergence is in the value path and predates
+    // #412; what is pinned here is that the path side agrees with it, because
+    // a resolver that propagated would make `path(f)` disagree with `f`.
+    check(
+        r#"{"k":"v","v":1,"deep":{"k":"w","w":2}}"#,
+        r#"[path(recurse(.[]?; .k != "w") | objects | .[.k]?)]"#,
+        Outcome::values(&[r#"[["v"]]"#]),
+    );
+}
+
+/// Each arm of `type_filter_matches`, which decides whether a typeof filter
+/// keeps a path branch or prunes it. A miswired arm (`booleans` matching
+/// numbers, `scalars` matching arrays) is invisible in the happy cases above,
+/// where only `objects` is exercised.
+///
+/// The key is `("p","q")` — two keys of the *same* kind, and neither derived
+/// from the value being indexed — so each branch either resolves both keys or
+/// neither, and the filter's keep/prune decision is the only thing under test.
+#[test]
+fn test_typeof_filters_decide_which_path_branches_survive() {
+    let doc = r#"{"arr":[10,20],"obj":{"p":1},"s":"str","n":7,"b":true,"u":null}"#;
+
+    // The filters that keep an indexable branch: the root and `.obj` are the
+    // two objects, and a string key into null is legal (it reads as null), so
+    // `.u` is what survives `scalars`/`nulls`.
+    for filter in ["objects", "values", "iterables"] {
+        check(
+            doc,
+            &format!(r#"[path(.. | {filter} | .[("p","q")]?)]"#),
+            Outcome::values(&[r#"[["p"],["q"],["obj","p"],["obj","q"]]"#]),
+        );
+    }
+    for filter in ["scalars", "nulls"] {
+        check(
+            doc,
+            &format!(r#"[path(.. | {filter} | .[("p","q")]?)]"#),
+            Outcome::values(&[r#"[["u","p"],["u","q"]]"#]),
+        );
+    }
+
+    // The remaining arms keep only branches a string key *cannot* index, so
+    // they emit no path at all — which on its own would also be the reading if
+    // the arm wrongly pruned everything. Dropping the `?` distinguishes the
+    // two: the error names the type the arm let through, so it is evidence the
+    // branch was kept. (`nulls` is absent here because assignment through null
+    // is a separate pre-existing gap: jq autovivifies `{"u":null} | .u.p = 9`
+    // to `{"u":{"p":9}}`, succinctly reports `Cannot index null with string`.)
+    for (filter, type_name) in [
+        ("arrays", "array"),
+        ("numbers", "number"),
+        ("strings", "string"),
+        ("booleans", "boolean"),
+    ] {
+        check(
+            doc,
+            &format!(r#"(.. | {filter} | .[("p","q")]) = 9"#),
+            Outcome::error(&format!(r#"Cannot index {type_name} with string "p""#)),
+        );
+    }
+}
+
 #[test]
 fn test_del_resolves_and_orders_computed_keys() {
     check(
