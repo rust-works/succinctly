@@ -36,7 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Not covered: expression-valued slice bounds (`.[$a:$b]` — though both bounds
   now accept the same *literal* spellings, so `.[(1):3]` and `.[1:(3)]` agree),
   jq's indices-of-subarray form (`.[[20]]`), a computed key after a multi-output
-  path component (`path(.. | .[.k])`, #412), and — through a pre-existing defect
+  path component with no path-tracking arm, such as `range(3)` (`path(.. | .[.k])`
+  itself was fixed by #412, below), and — through a pre-existing defect
   in iterating a computed value, not in the brackets — `keys[] as $k | .[$k]`
   (#397). See [docs/reference/jq-language.md](docs/reference/jq-language.md).
   Incidentally, the `[range(0; length; 2) as $i | .[$i]]` workaround that doc
@@ -102,6 +103,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface.
 
 ### Fixed
+
+- **A computed key after a multi-output path component was refused outright**
+  (#412): `path(.. | objects | .[.k]?)` errored `Cannot use a computed index
+  after a multi-output path component` even though the equivalent value path
+  (`.. | objects | .[.k]?` without `path()`) evaluated fine. Only `path()`,
+  `=`, `|=` and `del()` are affected — they go through `resolve_dynamic_indexes`,
+  which rewrites each computed key into the static component it denotes
+  *before* the six path walkers run, and its `resolve_node` fan-out had an arm
+  for `.[]` only; every other multi-output component fell to the static-leaf
+  arm, which could not name the path reaching each of its many values.
+  `resolve_node` now also fans out `..` (`Expr::RecursiveDescent`),
+  `recurse`/`recurse(f)`/`recurse(f; cond)` (mirroring
+  `builtin_recurse_f`/`builtin_recurse_cond`'s breadth-first queue order, so
+  `path(recurse)` agrees with `[recurse]` on which nodes are visited and in
+  what order), and the typeof filters (`select(f)`, `objects`, `arrays`,
+  `values`, `booleans`, `numbers`, `strings`, `nulls`, `iterables`, `scalars`),
+  each branch now carrying the actual Field/Index chain that reaches it rather
+  than the multi-output expression itself. Not covered: a multi-output
+  component with none of those shapes — an arbitrary generator like
+  `range(3)`, or `getpath` with a computed argument — still reports the same
+  refusal, since naming its path components would mean tracking components for
+  a genuinely arbitrary expression. `path(..)` and `path(recurse)` *without* a
+  computed key are a separate, pre-existing gap this does not touch —
+  `resolve_node` only runs when a computed key is present, and
+  `eval_with_path_tracking` (the walker `path()` otherwise uses directly) is
+  unchanged.
 
 - **An inline block sequence as a mapping value silently discarded its
   content** (#325): `a: - x` — invalid YAML (test-suite case 5U3A: a block
