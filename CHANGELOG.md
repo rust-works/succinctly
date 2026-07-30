@@ -1384,9 +1384,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrapped once (renamed to `parse_primary_inner`, with a thin outer
   `parse_primary` checking for a trailing `?` after any Term); `?` was also
   added to `is_expr_terminator` so bare `.?` is recognized as identity rather
-  than an attempted (invalid) field name. `Expr::Optional`'s evaluation was
-  already fully generic (`src/jq/eval.rs`/`eval_generic.rs`), so the parsing
-  gap itself needed no evaluator changes — but unlocking `?` after arbitrary
+  than an attempted (invalid) field name. Unlocking `?` after arbitrary
   builtins surfaced latent divergences that were previously unreachable with
   `optional` set through real syntax: `tonumber?`, `length?`, `keys?`,
   `keys_unsorted?`, `first?`, `last?`, and `reverse?` raised a hard error
@@ -1398,6 +1396,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of yielding `[]` in the generic evaluator — a pre-existing,
   unrelated gap (missing `is_null()` arm) that this change didn't expose or
   touch.
+
+  A second, broader divergence surfaced once `?` could wrap compound
+  expressions rather than just bare builtins: `(.a)?`, `("a"+1)?`,
+  `first(error("x"))?`, and `setpath(["a"]; error)?` all leaked their error to
+  stderr instead of suppressing it, even though the CLI ran under the exact
+  `?` syntax the issue asked for. Root cause: the CLI's generic evaluator
+  (`eval_generic.rs`) only checks `optional` natively for a handful of `Expr`
+  shapes (`Field`, `Index`, `Iterate`, a few builtins); anything else (`Paren`,
+  `Arithmetic`, `Error`, `first(...)`, `reduce`, ...) falls through a bridge
+  that re-evaluates via the full evaluator's `eval()` — which always starts
+  with `optional = false`, silently dropping the flag. The bridge now
+  re-wraps the expression in `Expr::Optional` before re-entering the full
+  evaluator when the ambient `optional` is true, mirroring the
+  `eval_on_owned`/`eval_on_many_owned` builtin-fallback bridge already fixed
+  for #386. `eval_arithmetic` and `eval_error` (in `eval.rs`) also never
+  checked `optional` on their own final result, and `builtin_setpath` treated
+  a suppressed sub-result the same as a real `null` value instead of
+  propagating the suppression — all three are fixed the same way. Deliberately
+  preserved: `.[.k]?` and `.[error("boom")]?` still propagate an error raised
+  while evaluating the *key* expression, uncaught — jq's `?` only guards the
+  indexing operation itself, not the key computation (verified against jq
+  1.7.1; a regression here would have broken the existing
+  `test_optional_does_not_suppress_key_errors` coverage). Not fixed: `reduce`
+  built from a bare erroring generator (e.g. `(reduce error as $x (0; $x))?`)
+  still returns `0` instead of suppressing, and `(reduce .[] as $x (0;
+  $x+.))?` over a type-erroring element returns `null` instead of suppressing
+  — both go through `eval_owned_expr`, a helper shared by `reduce`/`foreach`/
+  `while`/`until`/`repeat` (20+ call sites) that collapses any suppressed
+  sub-result to `Ok(null)` before its caller can tell the difference. That is
+  the same class of problem as the already-tracked stream-builtin
+  error-swallowing issues and needs its own fix, not a tail-end change here.
 
 ### Changed
 
