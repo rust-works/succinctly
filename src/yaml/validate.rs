@@ -1116,10 +1116,16 @@ impl<'a> Validator<'a> {
                 // Every arm here is reached at a node start — after `[`, `{`,
                 // `,` or `:` — so a `*` is an alias, not scalar content (#404).
                 // An anchor is a property: its node still follows, so
-                // `expect_item` is left alone.
+                // `expect_item` is left alone. #452: that node must not itself
+                // be an alias (`[&a *a]`) — `check_after_anchor` (shared with
+                // block's `scan_anchor`) rejects that, after skipping the same
+                // separation `skip_flow_ws` already provides between any two
+                // flow tokens.
                 Some(b'&') => {
                     let name = self.scan_anchor_name();
                     self.record_anchor(name);
+                    self.skip_flow_ws()?;
+                    self.check_after_anchor()?;
                 }
                 Some(b'*') => {
                     self.scan_alias(true)?;
@@ -1254,11 +1260,24 @@ impl<'a> Validator<'a> {
         let name = self.scan_anchor_name(); // consumes `&` and the name
         self.record_anchor(name);
         self.skip_spaces_and_tabs();
+        self.check_after_anchor()?;
         match self.peek() {
-            Some(b'*') => Err(self.error(YamlValidationErrorKind::AnchorOnAlias)),
             Some(b'-') if matches!(self.peek_at(1), None | Some(b' ' | b'\t' | b'\n' | b'\r')) => {
                 Err(self.error(YamlValidationErrorKind::MisplacedAnchor))
             }
+            _ => Ok(()),
+        }
+    }
+
+    /// After an anchor property, reject an immediately following alias (`&a
+    /// *b`, SR86/SU74): an anchor decorates the node that follows it, and an
+    /// alias is a reference, not a node an anchor can decorate. Shared by
+    /// [`Self::scan_anchor`] (block context) and `scan_flow`'s `&` arm (flow
+    /// context, #452) — each skips its own context's whitespace/separation
+    /// before calling this, so the cursor sits on the byte right after that.
+    fn check_after_anchor(&self) -> Result<(), YamlValidationError> {
+        match self.peek() {
+            Some(b'*') => Err(self.error(YamlValidationErrorKind::AnchorOnAlias)),
             _ => Ok(()),
         }
     }
@@ -1908,6 +1927,38 @@ mod tests {
             kind(b"&anchor - sequence entry\n"),
             MisplacedAnchor
         )); // SY6V
+
+        // #452: `scan_flow`'s `&` arm (shared by `[...]` and `{...}`) had no
+        // placement check — it recorded the anchor and read a following
+        // `*alias` as an ordinary reference, which also passed the unrelated
+        // #404 unknown-anchor check since the anchor was just registered into
+        // scope.
+        assert!(matches!(kind(b"[&a *a]\n"), AnchorOnAlias));
+        assert!(matches!(kind(b"{k: &a *a}\n"), AnchorOnAlias));
+    }
+
+    /// #452: unlike block's `scan_anchor`, which skips only same-line
+    /// spaces/tabs before this check, flow's equivalent runs after
+    /// `skip_flow_ws`, which also crosses line breaks and comments — so an
+    /// anchor and alias split across either still decorate the same node and
+    /// must still be rejected, with the error still pointing at the `*`.
+    #[test]
+    fn rejects_anchor_on_alias_across_flow_separation() {
+        for input in [&b"[&a\n*a]\n"[..], b"[&a # note\n*a]\n"] {
+            let err = validate(input).unwrap_err();
+            let shown = String::from_utf8_lossy(input);
+            assert!(
+                matches!(err.kind, AnchorOnAlias),
+                "{shown:?}: {:?}",
+                err.kind
+            );
+            assert_eq!(
+                input.get(err.position.offset),
+                Some(&b'*'),
+                "{shown:?}: error should point at the alias sigil, not {:?}",
+                err.position
+            );
+        }
     }
 
     /// Issue #404: an alias naming an anchor that is not in scope. `yq` v4.53.3
