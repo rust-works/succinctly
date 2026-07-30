@@ -103,6 +103,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An inline block sequence as a mapping value silently discarded its
+  content** (#325): `a: - x` — invalid YAML (test-suite case 5U3A: a block
+  sequence may not begin on the same line as its parent mapping key; `yq`
+  rejects it) — read back as `{"a":null}`, the `x` gone with no error. #332
+  had already stopped the worse failure mode of dropping the text outright,
+  keeping it as the literal scalar `{"a":"- x"}`, but that reading was still
+  wrong: per YAML 1.2 `ns-plain-first`, a `-` before whitespace is always the
+  sequence-entry indicator and never starts a plain scalar. This finishes the
+  job: `parse_mapping_entry`, `parse_explicit_value`, and `parse_value`
+  (whose existing `-`-followed-by-space arm was dead code — a comment
+  claimed "the caller already opened a BP node for us" but nothing was ever
+  written into it) now dispatch to the same `parse_sequence_item` the valid
+  multi-line spelling already used, so `a: - x` parses as the obvious
+  extension `{"a":["x"]}`, and a bare `a: -` is the empty item `{"a":[null]}`
+  rather than the string `"-"`. The sequence's indent is derived from the
+  `-`'s own column rather than a fixed offset, so a continuation line at the
+  same column joins it: `key: - a\n     - b` is `{"key":["a","b"]}`. A
+  follow-up commit found the identical gap one level deeper, in
+  `parse_compact_mapping_entry` (a sequence item's own compact-mapping value,
+  `- a: - x`), which hadn't received the dispatch and still read back as the
+  scalar `"- x"`. The opt-in strict validator's 5U3A check is widened to
+  accept end-of-input as a terminator too, so a bare `a: -` with no trailing
+  newline is now rejected like every other shape the loader accepts
+  leniently. Also reconciles the asymmetry the issue called out: the
+  parser's dash-continuation guard now shares the same `is_seq_indicator_next`
+  predicate the reader already used, rather than its own narrower
+  space/tab-only spelling. New coverage: unit tests in `src/yaml/light.rs`
+  (item shapes, continuation lines, anchors, non-regression cases for
+  `-1`/`-x`/flow `{a: -}`), `tests/yaml_validate_tests.rs`, and
+  `tests/yq_cli_tests.rs`. See `docs/compliance/yaml/limitations.md` for the
+  updated rationale — flow's `[- x]` still reads as scalar text, since unlike
+  the block case there is no sequence to build there.
+
 - **Pretty-printed JSON/YAML output silently dropped duplicate mapping keys;
   compact output was correct** (#442): `yq -o json '.'` on `a: 1\na: 2` gave
   `{"a": 2}` (last-wins) while `-I0` gave `{"a":1,"a":2}`, matching real `yq`
