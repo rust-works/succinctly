@@ -7223,6 +7223,17 @@ fn resolve_node<S: EvalSemantics>(
                         let inner_path = if components.len() == 1 {
                             components.into_iter().next().expect("len checked")
                         } else {
+                            // Unreached by anything that parses: the postfix `?`
+                            // attaches to a single path element (#367), so every
+                            // spelling that would wrap a multi-component path —
+                            // `(.a.b)?`, `(..)?`, `recurse?` — is a parse error,
+                            // and `E[K]?`, which used to arrive here with its
+                            // target's components attached, now goes to
+                            // `resolve_index_expr`. Kept as a chain rather than a
+                            // panic because that is an argument about the parser,
+                            // not an invariant of the type: `eval_generic`
+                            // synthesizes `Expr::Optional` around whatever
+                            // expression it is handed.
                             Expr::Pipe(components)
                         };
                         (vec![Expr::Optional(Box::new(inner_path))], v)
