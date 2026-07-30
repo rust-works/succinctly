@@ -7204,9 +7204,14 @@ fn resolve_node<S: EvalSemantics>(
             // is right for every other `?`-wrapped node, where evaluation and
             // indexing are the same step, but it would also swallow an error
             // raised while computing `K` itself, e.g. `"str" | .[.k]? = 5`
-            // (#413). Only the bare shape needs intercepting: the parser takes a
-            // postfix `?` after a path expression and nowhere else (#367), so
-            // `(.[.k])?` cannot reach here.
+            // (#413). Only the bare shape needs intercepting, and that is jq's
+            // own distinction rather than a limit of what parses: `(.[.k])?` is
+            // `try .[.k]`, which catches everything inside it including the key,
+            // so `"str" | (.[.k])? = 5` is `"str"` there while
+            // `"str" | .[.k]? = 5` raises. A parenthesised key therefore *should*
+            // reach the blanket arm below. It cannot yet — the postfix `?` takes
+            // a path expression and nothing else until #367 — but when it can,
+            // this arm still wants to see only the bare shape.
             Expr::IndexExpr { target, key } => resolve_index_expr::<S>(target, key, value, true),
 
             // Every other `?`-wrapped node (`.foo?`, `.[0]?`, ...): evaluation
@@ -7223,17 +7228,17 @@ fn resolve_node<S: EvalSemantics>(
                         let inner_path = if components.len() == 1 {
                             components.into_iter().next().expect("len checked")
                         } else {
-                            // Unreached by anything that parses: the postfix `?`
-                            // attaches to a single path element (#367), so every
-                            // spelling that would wrap a multi-component path —
-                            // `(.a.b)?`, `(..)?`, `recurse?` — is a parse error,
-                            // and `E[K]?`, which used to arrive here with its
-                            // target's components attached, now goes to
-                            // `resolve_index_expr`. Kept as a chain rather than a
-                            // panic because that is an argument about the parser,
-                            // not an invariant of the type: `eval_generic`
-                            // synthesizes `Expr::Optional` around whatever
-                            // expression it is handed.
+                            // Unreached *today*, and deliberately not a panic: the
+                            // postfix `?` attaches to a single path element until
+                            // #367, so `(.a.b)?`, `(..)?` and `recurse?` are parse
+                            // errors, and `E[K]?` — which used to arrive here with
+                            // its target's components attached — now goes to
+                            // `resolve_index_expr`. #367 reopens it on purpose:
+                            // `(.a[.k])?` resolves through the `Paren` arm to
+                            // `["a","b"]`, two components, and jq writes
+                            // `{"a":{"b":5},"k":"b"}` for it. `eval_generic` can
+                            // synthesize `Expr::Optional` around any expression
+                            // too, so this was never an invariant of the type.
                             Expr::Pipe(components)
                         };
                         (vec![Expr::Optional(Box::new(inner_path))], v)
