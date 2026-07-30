@@ -156,7 +156,9 @@ fn rejects_inline_sequence_as_mapping_value() -> Result<()> {
     // 5U3A. The loader parses these leniently (#325), so strict rejection is
     // the validator's job. The bare-`-`-at-end-of-input spelling used to slip
     // through because the check required a byte after the `-`.
-    for input in ["a: - x\n", "a: -\n", "a: -"] {
+    // Also rejected one level deeper: a compact mapping entry's own value
+    // (`- a: - x`, now leniently parsed by `parse_compact_mapping_entry` too).
+    for input in ["a: - x\n", "a: -\n", "a: -", "- a: - x\n"] {
         let (_, stderr, code) = run_validate_stdin(input, &["--no-color"])?;
         assert_eq!(code, 1, "expected rejection for {input:?}: {stderr}");
     }

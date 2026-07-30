@@ -2950,6 +2950,18 @@ fn test_bare_dash_as_mapping_value_is_an_empty_item() -> Result<()> {
 }
 
 #[test]
+fn test_inline_sequence_as_compact_mapping_value_is_not_dropped() -> Result<()> {
+    // `- a: - x` is the same shape #325 fixed for `a: - x`, one level deeper: a
+    // compact mapping entry (inside a sequence item) whose own value is an
+    // inline dash sequence. `parse_compact_mapping_entry` didn't get the dash
+    // dispatch when #325 landed, so this fell through to the scalar `"- x"`.
+    let (output, exit_code) = run_yq_stdin(".", "- a: - x\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"[{"a":["x"]}]"#);
+    Ok(())
+}
+
+#[test]
 fn test_flow_dash_without_whitespace_is_still_a_scalar() -> Result<()> {
     // A `-` not followed by whitespace is a legitimate plain scalar in flow
     // context and was never affected; pinned so #332's fix cannot regress it.
