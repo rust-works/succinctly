@@ -10227,11 +10227,16 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::One(v) => to_owned(&v),
         QueryResult::Owned(v) => v,
         QueryResult::Error(e) => return QueryResult::Error(e),
+        // A suppressed sub-result (e.g. `setpath((.a)?; 1)` on a value `.a`
+        // can't index) propagates as a suppressed whole, not `null`/an error.
+        QueryResult::None => return QueryResult::None,
+        _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::path_must_be_array()),
     };
 
     let path = match path_owned {
         OwnedValue::Array(p) => p,
+        _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::path_must_be_array()),
     };
 
@@ -10240,6 +10245,9 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::One(v) => to_owned(&v),
         QueryResult::Owned(v) => v,
         QueryResult::Error(e) => return QueryResult::Error(e),
+        // Same reasoning as the path result above: `setpath(["a"]; error)?`
+        // suppresses the whole call rather than setting `"a"` to `null` (#367).
+        QueryResult::None => return QueryResult::None,
         _ => OwnedValue::Null,
     };
 
@@ -10247,8 +10255,7 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match set_value_at_path(owned, &path, new_val) {
         Ok(result) => QueryResult::Owned(result),
         // An optional context swallows the refusal, as it does for every other
-        // builtin here. Not reachable through `setpath(…)?` yet — the parser
-        // does not take `?` after a call — but the flag is threaded in anyway.
+        // builtin here.
         Err(_) if optional => QueryResult::None,
         Err(e) => QueryResult::Error(e),
     }
