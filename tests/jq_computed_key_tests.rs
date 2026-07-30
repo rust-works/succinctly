@@ -137,6 +137,59 @@ fn test_wrong_container_for_key_kind_errors() {
     );
 }
 
+/// #488: NaN is "no array element" only where a number addresses an element.
+///
+/// The key kind is otherwise dispatched before the container (see above), and
+/// NaN is the exception that has to look: on a container a number cannot index
+/// at all, the failure is the ordinary indexing one, and jq's message says
+/// nothing about NaN.
+#[test]
+fn test_nan_key_names_the_container_it_cannot_index() {
+    // An array — and the null a write would build into one — is where NaN's own
+    // complaint belongs.
+    for input in ["[1,2,3]", "null"] {
+        check(
+            input,
+            ".[nan] = 5",
+            Outcome::error("Cannot set array element at NaN index"),
+        );
+    }
+
+    // Anywhere else it is the message `.[0] = 5` gets on the same document.
+    check(
+        r#"{"a":1}"#,
+        ".[nan] = 5",
+        Outcome::error("Cannot index object with number"),
+    );
+    check(
+        r#"{"a":1}"#,
+        ".[0] = 5",
+        Outcome::error("Cannot index object with number"),
+    );
+    check(
+        r#""s""#,
+        ".[nan] = 5",
+        Outcome::error("Cannot index string with number"),
+    );
+    check(
+        "true",
+        ".[nan] = 5",
+        Outcome::error("Cannot index boolean with number"),
+    );
+
+    // Through the other writers that resolve a path, not just `=`.
+    check(
+        r#"{"a":1}"#,
+        ".[nan] |= 5",
+        Outcome::error("Cannot index object with number"),
+    );
+    check(
+        r#"{"a":1}"#,
+        "del(.[nan])",
+        Outcome::error("Cannot index object with number"),
+    );
+}
+
 #[test]
 fn test_key_of_an_unindexable_kind_errors_even_on_a_container() {
     check(
