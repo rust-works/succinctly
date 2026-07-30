@@ -18,6 +18,8 @@
 
 use core::ops::Range;
 
+use alloc::string::String;
+
 use indexmap::IndexMap;
 
 use super::error::EvalError;
@@ -134,7 +136,7 @@ pub(crate) fn literal_component(start: Option<i64>, end: Option<i64>) -> OwnedVa
 ///
 /// jq indexes string slices by *character*, not byte, so the caller resolves
 /// against `s.chars().count()` and this walks the same units back out.
-pub(crate) fn slice_str(s: &str, range: Range<usize>) -> alloc::string::String {
+pub(crate) fn slice_str(s: &str, range: Range<usize>) -> String {
     s.chars().skip(range.start).take(range.len()).collect()
 }
 
