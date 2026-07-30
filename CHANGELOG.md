@@ -152,6 +152,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arms added there emit the same wrapper, so `del(recurse | objects | .[.k]?)`
   would have inherited the defect.
 
+- **`?` on an assignment path with a computed key swallowed an error raised by
+  the key itself** (#413): `"str" | .[.k]? = 5` silently left the input
+  unchanged instead of raising jq's `Cannot index string with string "k"` for
+  the `.k` that failed. `?` is only supposed to cover a failure to *index* —
+  `eval_index_expr` already enforces this in value position (`.[.k]?` there
+  correctly still raises) — but the path-context resolver's `Expr::Optional`
+  arm caught *any* error from resolving the wrapped node, key evaluation and
+  target evaluation included. `resolve_node` now special-cases
+  `Optional(IndexExpr { target, key })`: the target and key are resolved with
+  `?`, propagating their errors as usual, and only a subsequent failure to
+  apply the resolved key to its container (wrong key/container kind) prunes
+  the branch. A NaN key still errors under `?` where a number addresses an
+  element at all (`[1,2,3] | .[nan]? = 5`, `null | .[nan]? = 5`), because there
+  is no element for the write to land on; on a container a number cannot index,
+  the failure is the ordinary `Cannot index object with number` that `?` does
+  cover, so `{"a":1} | .[nan]? = 5` leaves the document alone as jq does.
+  Both `E[K]` arms of the resolver now also evaluate `K` before `E`, matching
+  the desugaring `K as $k | E | .[$k]` that the value-position evaluator
+  follows: `5 | .a[.k] = 9` blames the `.k` that failed rather than the `.a` it
+  never reached, and `5 | .a[empty] = 9` is `5` rather than an error, since an
+  empty key stream leaves the target unevaluated.
+
 - **A slice was not a path component** (#366, closing #469 with it): jq has no
   slice *operator* — it models `.[a:b]` as indexing with `{"start":a,"end":b}`,
   and that object is a path component like any other. Succinctly could read a
