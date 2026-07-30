@@ -10681,6 +10681,13 @@ fn delete_expr_object_paths(
     paths: &[&[DeleteStep]],
     start: usize,
 ) -> Result<OwnedValue, EvalError> {
+    // `null` tolerates any field key unconditionally — `null | del(.a)` is
+    // `null` — so every sibling path here is a no-op regardless of
+    // `optional`, the same exemption `delete_keys`/`delete_paths_under`
+    // already give a runtime key (#476).
+    if matches!(value, OwnedValue::Null) {
+        return Ok(value);
+    }
     let mut terminal: Vec<&str> = Vec::new();
     let mut groups: Vec<(&str, Vec<&[DeleteStep]>)> = Vec::new();
     for path in paths {
@@ -10767,6 +10774,11 @@ fn delete_expr_array_paths(
     paths: &[&[DeleteStep]],
     start: usize,
 ) -> Result<OwnedValue, EvalError> {
+    // Same `null` exemption as `delete_expr_object_paths` above — applies to
+    // both a bare index and a slice component (#476).
+    if matches!(value, OwnedValue::Null) {
+        return Ok(value);
+    }
     let mut terminal: Vec<(ArrayStep, bool)> = Vec::new();
     let mut groups: Vec<(ArrayStep, Vec<&[DeleteStep]>)> = Vec::new();
     for path in paths {
@@ -10993,21 +11005,23 @@ fn delete_at_path(
             *root = OwnedValue::Null;
             Ok(())
         }
-        Expr::Field(name) => {
-            if let OwnedValue::Object(map) = root {
+        Expr::Field(name) => match root {
+            OwnedValue::Object(map) => {
                 map.shift_remove(name);
                 Ok(())
-            } else if optional {
-                Ok(())
-            } else {
-                Err(EvalError::cannot_index_with_field(
-                    owned_type_name(root),
-                    name,
-                ))
             }
-        }
-        Expr::Index(idx) => {
-            if let OwnedValue::Array(arr) = root {
+            // jq indexes `null` with any key and gets `null` back, so
+            // deleting through one is always a no-op — `null | del(.a)` is
+            // `null` (#476).
+            OwnedValue::Null => Ok(()),
+            _ if optional => Ok(()),
+            _ => Err(EvalError::cannot_index_with_field(
+                owned_type_name(root),
+                name,
+            )),
+        },
+        Expr::Index(idx) => match root {
+            OwnedValue::Array(arr) => {
                 let len = arr.len() as i64;
                 let actual_idx = if *idx < 0 { len + idx } else { *idx };
                 if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
@@ -11016,15 +11030,16 @@ fn delete_at_path(
                 // An out-of-range index names nothing to delete — jq's
                 // delpaths silently skips it, `?` or not (#477).
                 Ok(())
-            } else if optional {
-                Ok(())
-            } else {
-                Err(EvalError::cannot_index_with_type(
-                    owned_type_name(root),
-                    "number",
-                ))
             }
-        }
+            // `null` has no elements at any index, so this is always a
+            // no-op — `null | del(.[0])` is `null` (#476).
+            OwnedValue::Null => Ok(()),
+            _ if optional => Ok(()),
+            _ => Err(EvalError::cannot_index_with_type(
+                owned_type_name(root),
+                "number",
+            )),
+        },
         Expr::Iterate => {
             // del(.[]) removes all elements
             match root {
@@ -11075,8 +11090,8 @@ fn delete_at_path(
                 let rest = Expr::Pipe(exprs[1..].to_vec());
 
                 match first {
-                    Expr::Field(name) => {
-                        if let OwnedValue::Object(map) = root {
+                    Expr::Field(name) => match root {
+                        OwnedValue::Object(map) => {
                             if let Some(current) = map.get_mut(name) {
                                 delete_at_path(current, &rest, optional)
                             } else if here {
@@ -11084,17 +11099,20 @@ fn delete_at_path(
                             } else {
                                 Err(EvalError::field_not_found(name))
                             }
-                        } else if here {
-                            Ok(())
-                        } else {
-                            Err(EvalError::cannot_index_with_field(
-                                owned_type_name(root),
-                                name,
-                            ))
                         }
-                    }
-                    Expr::Index(idx) => {
-                        if let OwnedValue::Array(arr) = root {
+                        // `null` tolerates any key unconditionally, so the
+                        // rest of the chain never matters — `null |
+                        // del(.a.b)` and `{"x":null} | del(.x.a)` are both
+                        // no-ops (#476).
+                        OwnedValue::Null => Ok(()),
+                        _ if here => Ok(()),
+                        _ => Err(EvalError::cannot_index_with_field(
+                            owned_type_name(root),
+                            name,
+                        )),
+                    },
+                    Expr::Index(idx) => match root {
+                        OwnedValue::Array(arr) => {
                             let len = arr.len() as i64;
                             let actual_idx = if *idx < 0 { len + idx } else { *idx };
                             if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
@@ -11105,15 +11123,16 @@ fn delete_at_path(
                                 // no-op, `?` or not (#477).
                                 Ok(())
                             }
-                        } else if here {
-                            Ok(())
-                        } else {
-                            Err(EvalError::cannot_index_with_type(
-                                owned_type_name(root),
-                                "number",
-                            ))
                         }
-                    }
+                        // Same `null` exemption as the `Field` case above —
+                        // `null | del(.[0].a)` is a no-op (#476).
+                        OwnedValue::Null => Ok(()),
+                        _ if here => Ok(()),
+                        _ => Err(EvalError::cannot_index_with_type(
+                            owned_type_name(root),
+                            "number",
+                        )),
+                    },
                     Expr::Iterate => match root {
                         OwnedValue::Array(arr) => {
                             for elem in arr.iter_mut() {
@@ -11141,6 +11160,15 @@ fn delete_at_path(
                     // happens in the sub-array and the remainder is spliced
                     // back: `[1,[2],[3]] | del(.[1:3][0])` is `[1,[3]]`, not
                     // the whole range dropped.
+                    // `null` has no elements to descend into, matching the
+                    // top-level `Expr::Slice` arm's `Null` case above
+                    // (#476) — `null | del(.[0:2].a)` is a no-op. This is
+                    // deliberately not pushed into `through_slice` itself:
+                    // that helper is shared with `=`/`|=` assignment, where
+                    // a slice write auto-vivifies `null` instead of no-op'ing
+                    // (a separate, documented divergence — see
+                    // docs/compliance/jq/limitations.md).
+                    Expr::Slice { .. } if matches!(root, OwnedValue::Null) => Ok(()),
                     Expr::Slice { start, end } => through_slice(root, *start, *end, here, |sub| {
                         delete_at_path(sub, &rest, optional)
                     }),
@@ -21387,6 +21415,35 @@ mod tests {
                 } else {
                     panic!("Expected nested object");
                 }
+            }
+        );
+    }
+
+    #[test]
+    fn test_del_field_through_null_is_a_no_op() {
+        // #476: `null` tolerates any field key, so `null | del(.a)` is `null`
+        // rather than `Cannot index null with string "a"`, matching jq.
+        query!(br"null", r"del(.a)",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+        // The exemption applies mid-chain too: `.x` stays `null` untouched.
+        query!(br#"{"x": null}"#, r"del(.x.a)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("x"), Some(&OwnedValue::Null));
+            }
+        );
+    }
+
+    #[test]
+    fn test_del_index_through_null_is_a_no_op() {
+        // #476: same exemption for a numeric index — `null | del(.[0])` is
+        // `null`, matching jq's `null | .[0]` reading `null` back.
+        query!(br"null", r"del(.[0])",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+        query!(br#"{"x": null}"#, r"del(.x[0])",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("x"), Some(&OwnedValue::Null));
             }
         );
     }

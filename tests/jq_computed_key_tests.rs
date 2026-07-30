@@ -1195,29 +1195,38 @@ fn test_del_on_out_of_range_computed_index_is_a_silent_noop() {
 /// key, a numeric key, or `.[]` without erroring (`null | .a`, `null | .[0]`,
 /// and `null | .[]` are all `null`), so `.[("a",0)]` resolved against a null
 /// target yields one `Field("a")` path and one `Index(0)` path at the same
-/// position. That used to panic (`unreachable!()`) instead of erroring or
-/// succeeding. It now raises the same error the existing single-path
-/// `del(.a)` on `null` already raises — a separate, pre-existing divergence
-/// from jq's silent no-op that this fix does not attempt to close.
+/// position. That used to panic (`unreachable!()`); #424's fix stopped the
+/// panic but still raised the same error the existing single-path `del(.a)`
+/// on `null` raised at the time. #476 closed that remaining divergence:
+/// `delete_expr_object_paths`/`delete_expr_array_paths` now give `null` the
+/// same unconditional no-op exemption `delete_keys` already gave it, so all
+/// three cases below now agree with jq's silent no-op.
 #[test]
-fn test_del_computed_index_against_null_does_not_panic() {
-    check(
-        "null",
-        r#"del(.[("a",0)])"#,
-        Outcome::error(r#"Cannot index null with string "a""#),
-    );
-    // Same shape mismatch, opposite generation order — still no panic, and
-    // still order-independent (fields are always resolved before indices).
-    check(
-        "null",
-        r#"del(.[(0,"a")])"#,
-        Outcome::error(r#"Cannot index null with string "a""#),
-    );
+fn test_del_computed_index_against_null_is_a_no_op() {
+    check("null", r#"del(.[("a",0)])"#, Outcome::values(&["null"]));
+    // Same shape mismatch, opposite generation order — still order-independent
+    // (fields are always resolved before indices).
+    check("null", r#"del(.[(0,"a")])"#, Outcome::values(&["null"]));
     // Nested under a field rather than at the top of the path.
     check(
         r#"{"x":null}"#,
         r#"del(.x[("a",0)])"#,
-        Outcome::error(r#"Cannot index null with string "a""#),
+        Outcome::values(&[r#"{"x":null}"#]),
+    );
+    // The no-op is unconditional — a `?` on one sibling doesn't matter when
+    // *every* sibling reaches the same tolerant `null`, unlike the genuine
+    // wrong-type case in
+    // `test_del_container_type_error_is_not_masked_by_an_earlier_optional_sibling`
+    // below.
+    check(
+        "null",
+        r#"del(.a?, .[("b","c")])"#,
+        Outcome::values(&["null"]),
+    );
+    check(
+        "null",
+        r#"del(.[("b","c")], .a?)"#,
+        Outcome::values(&["null"]),
     );
 }
 
@@ -1245,20 +1254,27 @@ fn test_del_merges_optional_across_duplicate_indexes_order_independently() {
 
 /// A non-object (or non-array) container fails every sibling path
 /// identically, so an optional sibling must not mask a non-optional one's
-/// error just because it happens to resolve first. `.a?` on `null` succeeds
-/// silently, but `.[("b","c")]` (no `?`) reaching the same `null` still has
+/// error just because it happens to resolve first. `.a?` on `5` succeeds
+/// silently, but `.[("b","c")]` (no `?`) reaching the same `5` still has
 /// to raise — whichever order they're written in.
+///
+/// `null` used to be the example container here, but #476 gave `null` an
+/// unconditional no-op exemption (see `test_del_computed_index_against_null_is_a_no_op`
+/// above) — `null | del(.a?, .[("b","c")])` is now `null` regardless of the
+/// optional mix, so it no longer demonstrates this masking property. `5` is
+/// a genuine wrong type and still raises, both orderings, keeping the
+/// original intent of this test.
 #[test]
 fn test_del_container_type_error_is_not_masked_by_an_earlier_optional_sibling() {
     check(
-        "null",
+        "5",
         r#"del(.a?, .[("b","c")])"#,
-        Outcome::error(r#"Cannot index null with string "b""#),
+        Outcome::error(r#"Cannot index number with string "b""#),
     );
     check(
-        "null",
+        "5",
         r#"del(.[("b","c")], .a?)"#,
-        Outcome::error(r#"Cannot index null with string "b""#),
+        Outcome::error(r#"Cannot index number with string "b""#),
     );
 }
 
