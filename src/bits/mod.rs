@@ -7,7 +7,7 @@
 //!
 //! - [`BitVec`] - Main bitvector with integrated rank/select indices
 //! - [`RankDirectory`] - 3-level Poppy-style rank index (~25% overhead, cache-aligned)
-//! - [`SelectIndex`] - Sampled select index (~1-3% overhead)
+//! - [`SelectIndex`] - Sampled select index (density-dependent; see its docs)
 //! - [`EliasFano`](crate::bits::EliasFano) - Elias-Fano encoding for monotone integer sequences
 //!
 //! # Example
@@ -33,4 +33,4 @@ pub use elias_fano::{EliasFano, EliasFanoCursor, EliasFanoIter};
 pub use popcount::{popcount_word, popcount_word_portable, popcount_words};
 pub use rank::RankDirectory;
 pub use scan::{block_popcount_portable, scan_select, scan_select_scalar, select_from, BLOCK};
-pub use select::SelectIndex;
+pub use select::{SampleWord, SelectIndex};

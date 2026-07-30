@@ -52,6 +52,12 @@ pub trait SelectSupport: Clone + Default {
     /// Perform select1 query: find the position of the k-th 1-bit (0-indexed).
     /// Returns None if k >= total_ones.
     fn select1(&self, words: &[u64], len: usize, total_ones: usize, k: usize) -> Option<usize>;
+
+    /// Returns the heap memory this select support retains, in bytes.
+    ///
+    /// Zero for [`NoSelect`]. Exposed so the space cost of select support can
+    /// be measured rather than derived (#64).
+    fn heap_size(&self) -> usize;
 }
 
 /// No select support (zero-sized type for JSON).
@@ -73,15 +79,26 @@ impl SelectSupport for NoSelect {
         // NoSelect doesn't support select1 - caller should use binary search on rank1
         None
     }
+
+    #[inline]
+    fn heap_size(&self) -> usize {
+        0
+    }
 }
 
 /// Select support using sampled index (for YAML).
 ///
 /// Uses the existing SelectIndex from bits module for O(1) jump + short scan.
+///
+/// The samples are `u32`-wide: `build_bp_index` asserts `len <= u32::MAX` bits,
+/// so both a word index (`<= 2^26`) and a cumulative count (`<= len`) fit. That
+/// halves the index relative to the `u64` width `BitVec` needs, which matters
+/// here because balanced parens are ~50% ones by construction — the densest
+/// case, where a sampled select index is at its most expensive (#64).
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct WithSelect {
-    select_idx: SelectIndex,
+    select_idx: SelectIndex<u32>,
 }
 
 impl SelectSupport for WithSelect {
@@ -94,7 +111,11 @@ impl SelectSupport for WithSelect {
         // masked popcount of the target word, so select_in_word never lands on
         // a stray bit (the `result < len` check backstops the rest).
         //
-        // Use default sample rate of 256 for ~3% overhead
+        // INVARIANT: the u32 sample width above is sound only because
+        // build_bp_index has already asserted len <= u32::MAX. Every caller
+        // reaches this through that assert.
+        //
+        // Use default sample rate of 256.
         Self {
             select_idx: SelectIndex::build(words, total_ones, 256),
         }
@@ -125,6 +146,11 @@ impl SelectSupport for WithSelect {
         } else {
             None
         }
+    }
+
+    #[inline]
+    fn heap_size(&self) -> usize {
+        self.select_idx.heap_size()
     }
 }
 
@@ -1960,6 +1986,16 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
             .select1(self.words.as_ref(), self.len, self.total_ones, k)
     }
 
+    /// Returns the heap bytes retained by the select index.
+    ///
+    /// Zero for [`NoSelect`]. For [`WithSelect`] this is the sampled index,
+    /// whose size scales with the number of open parentheses rather than the
+    /// bit length — see [`SelectIndex`] for the density relationship.
+    #[inline]
+    pub fn select_heap_size(&self) -> usize {
+        self.select.heap_size()
+    }
+
     /// Check if the bit at position p is a 1 (open parenthesis).
     #[inline]
     pub fn is_open(&self, p: usize) -> bool {
@@ -2750,6 +2786,67 @@ mod tests {
         }
         assert_eq!(bp.select1(68), None);
         assert_eq!(bp.select1(69), None);
+    }
+
+    // ========================================================================
+    // Select index space cost (#64 Step A)
+    // ========================================================================
+
+    /// Builds `((((...))))`-style nested parens: n opens then n closes.
+    fn balanced_words(pairs: usize) -> (Vec<u64>, usize) {
+        let len = pairs * 2;
+        let mut words = vec![0u64; len.div_ceil(64)];
+        for i in 0..pairs {
+            words[i / 64] |= 1u64 << (i % 64);
+        }
+        (words, len)
+    }
+
+    #[test]
+    fn test_no_select_is_zero_sized() {
+        // JSON's path must stay free: NoSelect is a ZST and retains nothing.
+        assert_eq!(core::mem::size_of::<NoSelect>(), 0);
+
+        let (words, len) = balanced_words(50_000);
+        let bp = BalancedParens::new(words, len);
+        assert_eq!(bp.select_heap_size(), 0);
+    }
+
+    /// Step A's actual claim: at BP density the sampled index costs 12.5% of
+    /// the bitmap, not the 25% it cost with `u64` sample fields.
+    ///
+    /// Balanced parens are exactly 50% ones, so with 8-byte entries every
+    /// `rate` ones the index is `8 * (len/2) / 256` bytes against a `len/8`
+    /// byte bitmap — one eighth.
+    #[test]
+    fn test_select_index_costs_one_eighth_of_bitmap() {
+        let pairs = 100_000;
+        let (words, len) = balanced_words(pairs);
+        let bitmap_bytes = words.len() * 8;
+
+        let bp = BalancedParens::new_with_select(words, len);
+        assert_eq!(bp.total_ones(), pairs);
+
+        let select_bytes = bp.select_heap_size();
+        assert!(select_bytes > 0, "test data must produce samples");
+
+        // 8 bytes per sample, one sample per 256 ones.
+        let expected = pairs.div_ceil(256) * 8;
+        assert_eq!(select_bytes, expected);
+
+        // 12.5% of the bitmap, within one sample's rounding.
+        let ratio = select_bytes as f64 / bitmap_bytes as f64;
+        assert!(
+            (0.12..=0.13).contains(&ratio),
+            "select index is {:.2}% of the bitmap, expected ~12.5%",
+            ratio * 100.0
+        );
+
+        // Sanity: the narrowing did not break the queries it indexes.
+        for k in [0, 1, 255, 256, 257, pairs - 1] {
+            assert_eq!(bp.select1(k), Some(k), "select1({k})");
+        }
+        assert_eq!(bp.select1(pairs), None);
     }
 
     #[test]
