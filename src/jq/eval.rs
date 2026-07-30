@@ -10183,15 +10183,14 @@ fn set_value_at_path(
             // root reads as `null` rather than as an empty array — which is
             // what makes `null | setpath([{"start":0,"end":1},"a"]; 9)` build
             // `{"a":9}` and then fail the array check below, as jq does.
-            let (mut arr, sub) = match value {
+            let (mut arr, sub, range) = match value {
                 OwnedValue::Array(arr) => {
                     let range = bounds.resolve(arr.len());
-                    let sub = OwnedValue::Array(arr[range].to_vec());
-                    (arr, sub)
+                    let sub = OwnedValue::Array(arr[range.clone()].to_vec());
+                    (arr, sub, range)
                 }
-                _ => (Vec::new(), OwnedValue::Null),
+                _ => (Vec::new(), OwnedValue::Null, 0..0),
             };
-            let range = bounds.resolve(arr.len());
             let OwnedValue::Array(items) = set_value_at_path(sub, rest, new_val)? else {
                 return Err(EvalError::slice_assign_non_array());
             };
