@@ -660,12 +660,120 @@ fn test_multi_output_path_components_fan_out() {
     );
 }
 
+/// Every *writer* after a multi-output prefix, not just `path()`.
+///
+/// `path()` reads a resolved path; `=`, `|=`, `+=` and `del()` walk it, through
+/// three functions `path()` never touches (`get_path_mut`, `update_path`,
+/// `delete_at_path`). Checking only `path()` is what let a resolver emitting
+/// `Optional(Field("x")) | Optional(Field("v"))` — which those three matched
+/// against `Field`/`Index`/`Iterate`, missed, and handled by acting at the
+/// *wrapper's* position with the rest of the path dropped — read correctly
+/// while `del(recurse | objects | .[.k]?)` deleted the whole `.x` and
+/// `|=` overwrote it. So each prefix is pinned against all five.
+///
+/// `.[]?` carries the same wrapper and was wrong the same way before #412 —
+/// it is here because it is the case that shows the defect was never about
+/// `recurse`.
+#[test]
+fn test_every_writer_agrees_after_a_multi_output_prefix() {
+    let doc = r#"{"x":{"k":"v","v":1}}"#;
+
+    for prefix in [
+        ".. | objects",
+        "recurse | objects",
+        "recurse(.[]?) | objects",
+    ] {
+        check(
+            doc,
+            &format!("[path({prefix} | .[.k]?)]"),
+            Outcome::values(&[r#"[["x","v"]]"#]),
+        );
+        check(
+            doc,
+            &format!("({prefix} | .[.k]?) = 7"),
+            Outcome::values(&[r#"{"x":{"k":"v","v":7}}"#]),
+        );
+        check(
+            doc,
+            &format!("({prefix} | .[.k]?) |= 7"),
+            Outcome::values(&[r#"{"x":{"k":"v","v":7}}"#]),
+        );
+        check(
+            doc,
+            &format!("({prefix} | .[.k]?) += 7"),
+            Outcome::values(&[r#"{"x":{"k":"v","v":8}}"#]),
+        );
+        check(
+            doc,
+            &format!("del({prefix} | .[.k]?)"),
+            Outcome::values(&[r#"{"x":{"k":"v"}}"#]),
+        );
+    }
+
+    // The `?`-wrapped spelling of `.[]`, whose components reach the walkers
+    // wrapped even without any of the #412 arms in play.
+    check(
+        doc,
+        r"[path(.[]? | .[.k]?)]",
+        Outcome::values(&[r#"[["x","v"]]"#]),
+    );
+    check(
+        doc,
+        r"(.[]? | .[.k]?) = 7",
+        Outcome::values(&[r#"{"x":{"k":"v","v":7}}"#]),
+    );
+    check(
+        doc,
+        r"(.[]? | .[.k]?) |= 7",
+        Outcome::values(&[r#"{"x":{"k":"v","v":7}}"#]),
+    );
+    check(
+        doc,
+        r"del(.[]? | .[.k]?)",
+        Outcome::values(&[r#"{"x":{"k":"v"}}"#]),
+    );
+}
+
+/// `recurse(f)` for an `f` that never stops producing.
+///
+/// `f` is arbitrary, so nothing guarantees progress: `.a?` reads `null` from
+/// `null` forever. `builtin_recurse_f` is bounded because it does not queue a
+/// null child, and `resolve_recurse` has to make the same choice — without it
+/// the queue runs to its 10,000-item cutoff with the path prefix one component
+/// longer each round, which is quadratic. Measured at 9 GB resident and 5s of
+/// CPU for this 18-byte document; it is a bound, not a preference.
+///
+/// jq does not terminate here at all (it recurses until it cannot allocate),
+/// so the expectation is `builtin_recurse_f`'s, deliberately.
+#[test]
+fn test_recurse_over_a_null_producing_filter_terminates() {
+    let doc = r#"{"k":"a","a":null}"#;
+    // Both sides visit the root and stop: `.a?` yields null, which ends that
+    // line of descent rather than seeding another round.
+    check(
+        doc,
+        r"[recurse(.a?)]",
+        Outcome::values(&[r#"[{"k":"a","a":null}]"#]),
+    );
+    check(
+        doc,
+        r"[path(recurse(.a?) | objects | .[.k]?)]",
+        Outcome::values(&[r#"[["a"]]"#]),
+    );
+}
+
 /// The three parameterised `recurse` spellings, which
 /// `test_multi_output_path_components_fan_out` exercises only in its bare
-/// `recurse` form. `resolve_recurse` re-implements
+/// `recurse` form. Bare `recurse` is `..` and shares its resolver; these do
+/// not, because `f` is arbitrary — `resolve_recurse` re-implements
 /// `builtin_recurse_f`/`builtin_recurse_cond`'s queue in order to thread path
 /// components alongside each value, so the thing worth pinning is that it
 /// still visits what those two visit.
+///
+/// It does not follow them in *every* respect, and the difference is
+/// deliberate: when `f` yields an array those two descend into its elements
+/// (an artefact of collapsing a stream into one array), where jq and the
+/// resolver both stop at the array. See `resolve_recurse`'s own note.
 #[test]
 fn test_recurse_variants_fan_out_like_their_value_paths() {
     let doc = r#"{"x":{"k":"v","v":1},"y":{"k":"w","w":2}}"#;
