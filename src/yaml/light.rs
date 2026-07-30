@@ -7914,34 +7914,32 @@ mod tests {
     }
 
     #[test]
-    fn test_dash_scalar_in_mapping_value_keeps_its_text() {
-        // Characterization, not an endorsement. Per YAML 1.2 `ns-plain-first`, a `-`
-        // before whitespace is always the sequence-entry indicator and never starts a
-        // plain scalar, so `a: -` is invalid: a block sequence cannot begin on the
-        // same line as its parent mapping key. `yq` rejects all of these outright
-        // ("block sequence entries are not allowed in this context"), and
-        // `succinctly yaml validate` rejects them too.
+    fn test_dash_scalar_in_mapping_value_is_an_empty_sequence_item() {
+        // Renamed and re-pinned: #325 (already on `main` by the time this branch
+        // rebased past it) taught the mapping-value arm to dispatch a same-line `-`
+        // to the real sequence-item parser instead of treating it as plain-scalar
+        // text, so `a: -` is now an inline block sequence with one empty item —
+        // matching `a: - x` on the line above it (`{"a":["x"]}`) instead of
+        // splitting on whether the item happens to be empty. See
+        // `test_bare_dash_as_same_line_mapping_value_is_an_empty_item` below for the
+        // `first_doc_json` pin of the same behaviour; this one exercises the
+        // `YamlValue`/`render_value` DOM-walk path instead.
         //
-        // The parser's mapping-value arm accepts only space/tab after `-`
-        // (parser.rs, `parse_value`), so it emits a plain scalar node whose text is
-        // `-`. The wide reader predicate still classifies that as a wrapper, but a
-        // childless wrapper is now told apart from a plain scalar by whether the
-        // parser recorded an end position for it (#332), so the text survives instead
-        // of collapsing to null. The loader is lenient by design and preserving the
-        // text beats losing it. Locked in so the behaviour is a decision, not an
-        // accident.
+        // `yq` rejects all of these outright ("block sequence entries are not
+        // allowed in this context"), and `succinctly yaml validate` rejects them
+        // too — the loader is lenient by design.
         for yaml in [&b"a: -\n"[..], b"a: -", b"a: -\r\n"] {
             let index = YamlIndex::build(yaml).unwrap();
             let root = index.root(yaml);
             assert_eq!(
                 render_value(&first_doc(root)),
-                "{\"a\":\"-\"}",
+                "{\"a\":[null]}",
                 "unexpected result for {:?}",
                 String::from_utf8_lossy(yaml)
             );
         }
         // In flow context the byte after `-` is `}`, so it never looked like a
-        // wrapper in the first place — the same result by a different route.
+        // sequence indicator in the first place — unaffected by #325.
         let yaml = b"{a: -}\n";
         let index = YamlIndex::build(yaml).unwrap();
         let root = index.root(yaml);
