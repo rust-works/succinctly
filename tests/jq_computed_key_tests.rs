@@ -940,6 +940,48 @@ fn test_del_with_negative_computed_indexes_resolves_against_original_length() {
     );
 }
 
+/// #477: an out-of-range array index used to raise in `del()`, where jq's
+/// `delpaths` — which `del` is defined in terms of, `def del(f):
+/// delpaths([path(f)]);` — silently skips a path that names nothing, `?` or
+/// not. `delete_keys` already matched that (its doc comment: "silently drops
+/// an index that names nothing"); `del`'s own path-walking code, which can't
+/// just call `delete_keys` directly since it works on path *expressions*
+/// rather than resolved paths, raised instead.
+#[test]
+fn test_del_on_out_of_range_index_is_a_silent_noop() {
+    // Positive index past the end.
+    check("[1,2]", "del(.[5])", Outcome::values(&["[1,2]"]));
+    // Negative index still negative after counting back from the end.
+    check("[1,2]", "del(.[-5])", Outcome::values(&["[1,2]"]));
+    // `?` makes no difference — jq never errors on this in the first place.
+    check("[1,2]", "del(.[5]?)", Outcome::values(&["[1,2]"]));
+    check("[1,2]", "del(.[-5]?)", Outcome::values(&["[1,2]"]));
+    // The rest of the path is skipped along with it, rather than walked
+    // against the `null` an in-range read would have produced.
+    check("[1,2]", "del(.[5].a)", Outcome::values(&["[1,2]"]));
+    check(
+        "[[1,2],[3,4]]",
+        "del(.[5][0])",
+        Outcome::values(&["[[1,2],[3,4]]"]),
+    );
+}
+
+/// Same no-op behavior through the grouped/computed-key deletion path added
+/// for #424 — both when the out-of-range index shares a sibling group with an
+/// in-range one (`delete_expr_array_paths`'s per-key check), and when every
+/// sibling is out of range and the index only ever reaches the terminal
+/// `delete_keys` call.
+#[test]
+fn test_del_on_out_of_range_computed_index_is_a_silent_noop() {
+    check("[1,2]", "del(.[(0,5)])", Outcome::values(&["[2]"]));
+    check("[1,2]", "del(.[(5,6)])", Outcome::values(&["[1,2]"]));
+    check(
+        "[[1,2],[3,4]]",
+        "del(.[(0,5)][0])",
+        Outcome::values(&["[[2],[3,4]]"]),
+    );
+}
+
 /// Grouped deletion (added above for #424) assumed every sibling path
 /// reaching the same depth shared the exact same shape — all `Field`, all
 /// `Index`, or all `Iterate` — and dispatched once on the first path's shape
