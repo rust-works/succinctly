@@ -13,5 +13,3 @@
 # themselves always hold the correct (pinned yq) output; only this manifest
 # records where succinctly currently disagrees. See
 # tests/data/yaml-test-suite-known-failures.txt for the sibling manifest.
-
-explicit_key_non_scalar_pretty  dedup-keys  pretty-print silently drops a duplicate mapping key (last wins); compact (-I0) is correct — #442

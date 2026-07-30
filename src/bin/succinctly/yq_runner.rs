@@ -1230,7 +1230,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // Check if expression contains split_doc - if so, each result is a separate document
     let has_split_doc = contains_split_doc(&program.expr);
 
-    // M2 streaming fast path: navigation queries with compact output
+    // M2/M2.5 streaming fast path: navigation queries stream results
+    // directly from the document cursor, skipping the OwnedValue DOM (and
+    // its IndexMap, which cannot represent duplicate mapping keys — #442).
+    // Compact output always qualified; indented (pretty) output now does
+    // too, since both the YAML- and JSON-target streamers are indent-aware.
     // This avoids building OwnedValue DOM for:
     // - Identity: `.`
     // - Field access: `.field`
@@ -1241,8 +1245,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // Supports both JSON and YAML output formats.
     let is_identity = matches!(program.expr, Expr::Identity);
     let is_m2_streamable = can_use_m2_streaming(&program.expr);
+    // sort_keys and color aren't implemented by the cursor streamers, and
+    // tab indentation needs a string-based indent unit they don't accept
+    // yet — all three fall back to the DOM path, unchanged, rather than
+    // silently ignoring the flag the way compact mode already does today.
+    let can_stream_pretty = !args.sort_keys && !output_config.use_color && !args.tab;
     let can_json_fast_path = is_m2_streamable
-        && output_config.compact
+        && (output_config.compact || (can_stream_pretty && !args.ascii_output))
         && output_config.output_format == OutputFormat::Json
         && !args.null_input
         && !args.raw_input
@@ -1250,7 +1259,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && !args.inplace
         && context.named.is_empty();
     let can_yaml_fast_path = is_m2_streamable
-        && output_config.compact
+        && (output_config.compact || can_stream_pretty)
         && output_config.output_format == OutputFormat::Yaml
         && !args.null_input
         && !args.raw_input
@@ -1258,6 +1267,21 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && !args.inplace
         && context.named.is_empty();
     let can_fast_path = can_json_fast_path || can_yaml_fast_path;
+
+    // Indent width for the fast path's streamers. YAML's `-I0` is a special
+    // case: real `yq` treats it as "use the library default" (4 spaces),
+    // and succinctly's existing (pre-#442) compact-YAML fast path hardcodes
+    // 2 regardless of `-I` — preserved as-is here since reconciling that
+    // mismatch is a separate, out-of-scope issue. Every other value threads
+    // through directly, matching what the DOM path already produces
+    // (verified against `-I1` through `-I6`). JSON has no such quirk: `-I0`
+    // means compact/flow for both real yq and succinctly today.
+    let yaml_indent_spaces: usize = if args.indent == 0 {
+        2
+    } else {
+        args.indent as usize
+    };
+    let json_indent_spaces: usize = args.indent as usize;
 
     if can_fast_path {
         // M2 streaming fast path: evaluate expression and stream results directly
@@ -1276,7 +1300,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         // P9 path: stream directly without evaluation
                         emit_yaml_doc_separator($writer, &mut yaml_doc_streamed, true)?;
                         $cursor
-                            .stream_yaml(&mut FmtWriter($writer), 2)
+                            .stream_yaml(&mut FmtWriter($writer), yaml_indent_spaces)
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
                         writeln!($writer)?;
                         // Streaming skips evaluation, so inspect the document
@@ -1294,7 +1318,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             && !matches!(&result, GenericResult::ManyOwned(vs) if vs.is_empty());
                         emit_yaml_doc_separator($writer, &mut yaml_doc_streamed, will_output)?;
                         let stats = result
-                            .stream_yaml(&mut FmtWriter($writer), 2, |w| w.write_str("\n"))
+                            .stream_yaml(&mut FmtWriter($writer), yaml_indent_spaces, |w| {
+                                w.write_str("\n")
+                            })
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
                         any_truthy |= stats.any_truthy;
                     }
@@ -1303,7 +1329,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     if is_identity {
                         // P9 path: stream directly without evaluation
                         $cursor
-                            .stream_json(&mut FmtWriter($writer))
+                            .stream_json(&mut FmtWriter($writer), json_indent_spaces)
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
                         writeln!($writer)?;
                         // Streaming skips evaluation, so inspect the document
@@ -1315,7 +1341,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         // M2 path: evaluate and stream results
                         let result = eval_with_cursor_using::<YqSemantics, _>(&program.expr, $cursor);
                         let stats = result
-                            .stream_json(&mut FmtWriter($writer), |w| w.write_str("\n"))
+                            .stream_json(&mut FmtWriter($writer), json_indent_spaces, |w| {
+                                w.write_str("\n")
+                            })
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
                         any_truthy |= stats.any_truthy;
                     }
@@ -1357,11 +1385,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         if is_identity {
                             // P9 path for identity on single doc
                             if can_yaml_fast_path {
-                                root.stream_yaml_document(&mut FmtWriter(&mut writer), 2)
-                                    .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                root.stream_yaml_document(
+                                    &mut FmtWriter(&mut writer),
+                                    yaml_indent_spaces,
+                                )
+                                .map_err(|_| anyhow::anyhow!("Write error"))?;
                             } else {
-                                root.stream_json_document(&mut FmtWriter(&mut writer))
-                                    .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                root.stream_json_document(
+                                    &mut FmtWriter(&mut writer),
+                                    json_indent_spaces,
+                                )
+                                .map_err(|_| anyhow::anyhow!("Write error"))?;
                             }
                             writeln!(writer)?;
                             // `root` is the virtual document sequence; falsiness
@@ -1419,11 +1453,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             if is_identity {
                                 // P9 path for identity on single doc
                                 if can_yaml_fast_path {
-                                    root.stream_yaml_document(&mut FmtWriter(&mut writer), 2)
-                                        .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                    root.stream_yaml_document(
+                                        &mut FmtWriter(&mut writer),
+                                        yaml_indent_spaces,
+                                    )
+                                    .map_err(|_| anyhow::anyhow!("Write error"))?;
                                 } else {
-                                    root.stream_json_document(&mut FmtWriter(&mut writer))
-                                        .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                    root.stream_json_document(
+                                        &mut FmtWriter(&mut writer),
+                                        json_indent_spaces,
+                                    )
+                                    .map_err(|_| anyhow::anyhow!("Write error"))?;
                                 }
                                 writeln!(writer)?;
                                 // `root` is the virtual document sequence; falsiness

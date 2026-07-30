@@ -103,6 +103,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Pretty-printed JSON/YAML output silently dropped duplicate mapping keys;
+  compact output was correct** (#442): `yq -o json '.'` on `a: 1\na: 2` gave
+  `{"a": 2}` (last-wins) while `-I0` gave `{"a":1,"a":2}`, matching real `yq`
+  v4.53.3 only in compact mode. Cause: the pretty path evaluated through
+  `GenericResult`/`to_owned()` into `OwnedValue::Object`, backed by an
+  `IndexMap` that structurally cannot hold duplicate keys, while `-I0` streamed
+  straight from the document cursor. Fix: `JsonCursor`/`YamlCursor`'s
+  `stream_json`/`stream_json_document` (and the YAML-side JSON value
+  streamers) are now indentation-aware, and the M2 fast path's gate
+  (`can_json_fast_path`/`can_yaml_fast_path` in `yq_runner.rs`) no longer
+  requires `output_config.compact` — pretty output now takes the same
+  cursor-streaming path as compact for identity and simple navigation
+  (`.`, `.field`, `.[n]`, `.[]`, and pipes/parens/`?` of those), skipping
+  `OwnedValue` construction entirely rather than just formatting it
+  differently. Excluded from the widened fast path (falls back to the DOM
+  path, unchanged): `sort_keys`, `--ascii-output` (JSON target only — YAML
+  output has no such escaping), color, and `--tab` (its indent unit isn't
+  plumbed through yet). `explicit_key_non_scalar_pretty` moves off the
+  known-failures manifest. Also fixed as a side effect of routing more cases
+  through cursor streaming: multi-file pretty output no longer emits a
+  spurious leading `---` before the first document.
+
+  Not fixed by this change, since the M2 fast path only gives `Expr::Identity`
+  a true cursor result — `Field`/`Index`/`Iterate` still evaluate to an owned
+  `GenericResult::One`/`Many` and go through `to_owned()` when streamed, so a
+  duplicate key *nested inside* a navigated field (`.a` where `a`'s value has
+  a repeated key) still collapses, in both compact and pretty output, exactly
+  as before this fix (tracked as a comment on #443, which already covers the
+  same `to_owned()`/`IndexMap` mechanism for `to_entries`); `--slurp`,
+  `--inplace` (`yaml_to_owned_value`), and `jq --preserve-input` pretty output
+  (`standard_json_to_jq_value`, gated by `jq_runner.rs`'s
+  `can_use_raw_identity`) go through their own separate, still-`IndexMap`-backed
+  conversions and are tracked in #478.
+
 - **The strict YAML validator accepted a flow-collection anchor immediately
   followed by an alias** (#452): `[&a *a]` and `{k: &a *a}` passed
   `succinctly yaml validate`, which `yq` rejects — an anchor property cannot

@@ -77,13 +77,18 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
-    /// Stream this cursor's value as compact JSON to the output.
+    /// Stream this cursor's value as JSON to the output.
     ///
     /// This enables M2 streaming optimization where navigation query results
     /// can be written directly to output without materializing OwnedValue.
+    /// - `indent_spaces`: Spaces per indentation level (0 for compact)
     ///
     /// Default implementation returns an error indicating streaming is not supported.
-    fn stream_json<W: core::fmt::Write>(&self, _out: &mut W) -> core::fmt::Result {
+    fn stream_json<W: core::fmt::Write>(
+        &self,
+        _out: &mut W,
+        _indent_spaces: usize,
+    ) -> core::fmt::Result {
         Err(core::fmt::Error)
     }
 

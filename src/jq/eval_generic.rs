@@ -240,11 +240,13 @@ impl<V: DocumentValue> GenericResult<V> {
     ///
     /// This is the M2 streaming fast path that avoids OwnedValue materialization
     /// for cursor-based results. For owned results, uses the StreamableValue impl.
+    /// - `indent_spaces`: Spaces per indentation level (0 for compact)
     ///
     /// Returns the number of values streamed and whether the last was falsy.
     pub fn stream_json<W: core::fmt::Write>(
         &self,
         out: &mut W,
+        indent_spaces: usize,
         mut on_value: impl FnMut(&mut W) -> core::fmt::Result,
     ) -> Result<crate::jq::stream::StreamStats, core::fmt::Error> {
         use crate::jq::stream::{StreamStats, StreamableValue};
@@ -255,7 +257,7 @@ impl<V: DocumentValue> GenericResult<V> {
             Self::One(v) => {
                 // Convert to owned for streaming
                 let owned = to_owned(v);
-                owned.stream_json(out)?;
+                owned.stream_json(out, indent_spaces)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = owned.is_falsy();
@@ -263,7 +265,7 @@ impl<V: DocumentValue> GenericResult<V> {
             }
             Self::OneCursor(c) => {
                 // Stream directly from cursor using DocumentCursor trait
-                c.stream_json(out)?;
+                c.stream_json(out, indent_spaces)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = c.is_falsy();
@@ -272,7 +274,7 @@ impl<V: DocumentValue> GenericResult<V> {
             Self::Many(vs) => {
                 for v in vs {
                     let owned = to_owned(v);
-                    owned.stream_json(out)?;
+                    owned.stream_json(out, indent_spaces)?;
                     on_value(out)?;
                     stats.last_was_falsy = owned.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -288,7 +290,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 on_value(out)?;
             }
             Self::Owned(o) => {
-                o.stream_json(out)?;
+                o.stream_json(out, indent_spaces)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = o.is_falsy();
@@ -296,7 +298,7 @@ impl<V: DocumentValue> GenericResult<V> {
             }
             Self::ManyOwned(os) => {
                 for o in os {
-                    o.stream_json(out)?;
+                    o.stream_json(out, indent_spaces)?;
                     on_value(out)?;
                     stats.last_was_falsy = o.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -2034,16 +2036,20 @@ mod tests {
         // stream_json / stream_yaml exercise every variant's match arm.
         for r in &results {
             let mut j = String::new();
-            r.stream_json(&mut j, |_| Ok(())).unwrap();
+            r.stream_json(&mut j, 0, |_| Ok(())).unwrap();
             let mut y = String::new();
             r.stream_yaml(&mut y, 2, |_| Ok(())).unwrap();
         }
         // Spot-check the owned and error stream output.
         let mut owned_json = String::new();
-        results[2].stream_json(&mut owned_json, |_| Ok(())).unwrap();
+        results[2]
+            .stream_json(&mut owned_json, 0, |_| Ok(()))
+            .unwrap();
         assert_eq!(owned_json, "5");
         let mut err_json = String::new();
-        results[5].stream_json(&mut err_json, |_| Ok(())).unwrap();
+        results[5]
+            .stream_json(&mut err_json, 0, |_| Ok(()))
+            .unwrap();
         assert!(err_json.contains("boom"));
 
         // into_owned consumes; check the owned-family variants.
@@ -2101,13 +2107,52 @@ mod tests {
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(result.is_single_cursor());
         let mut j = String::new();
-        result.stream_json(&mut j, |_| Ok(())).unwrap();
+        result.stream_json(&mut j, 0, |_| Ok(())).unwrap();
         assert_eq!(j, "1");
         let mut y = String::new();
         result.stream_yaml(&mut y, 2, |_| Ok(())).unwrap();
 
         let result2 = eval_with_cursor(&expr, index.root(json));
         assert_eq!(result2.collect_owned(), vec![OwnedValue::Int(1)]);
+    }
+
+    #[test]
+    fn test_json_cursor_stream_json_rejects_pretty_indent() {
+        // JsonCursor::stream_json only supports compact (indent_spaces == 0)
+        // output; indented JSON->JSON cursor streaming isn't implemented, so
+        // callers must fall back to the DOM path (#442). Exercised through
+        // the generic OneCursor arm, same as the compact case above.
+        let json = br#"{"a": 1}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse("at_offset(6)").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(result.is_single_cursor());
+        let mut j = String::new();
+        assert!(result.stream_json(&mut j, 2, |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn test_yaml_generic_result_one_cursor_streaming() {
+        // YAML counterpart of `test_generic_result_one_cursor_streaming`:
+        // at_offset lands on a YamlCursor node and yields a OneCursor result,
+        // exercising the YamlCursor `DocumentCursor::stream_json`/`stream_yaml`
+        // trait delegation (as opposed to the inherent `YamlCursor` methods
+        // called directly elsewhere).
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: 1\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let expr = crate::jq::parse("at_offset(3)").unwrap(); // offset 3 == the `1`
+
+        let result = eval_with_cursor(&expr, index.root(yaml));
+        assert!(result.is_single_cursor());
+        let mut j = String::new();
+        result.stream_json(&mut j, 0, |_| Ok(())).unwrap();
+        assert_eq!(j, "1");
+        let mut y = String::new();
+        result.stream_yaml(&mut y, 2, |_| Ok(())).unwrap();
+        assert_eq!(y, "1");
     }
 
     #[test]

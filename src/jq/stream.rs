@@ -32,10 +32,16 @@ use crate::yaml::format_float_with_fraction;
 /// and owned values (OwnedValue), enabling unified streaming output regardless of
 /// how the value was obtained.
 pub trait StreamableValue {
-    /// Stream this value as compact JSON to the output.
+    /// Stream this value as JSON to the output.
     ///
     /// The output should be valid JSON without trailing newlines or separators.
-    fn stream_json<W: core::fmt::Write>(&self, out: &mut W) -> core::fmt::Result;
+    /// For pretty-printed output, pass indent_spaces > 0. For compact output,
+    /// pass indent_spaces = 0.
+    fn stream_json<W: core::fmt::Write>(
+        &self,
+        out: &mut W,
+        indent_spaces: usize,
+    ) -> core::fmt::Result;
 
     /// Stream this value as YAML to the output.
     ///
@@ -71,8 +77,12 @@ pub struct StreamStats {
 }
 
 impl StreamableValue for OwnedValue {
-    fn stream_json<W: core::fmt::Write>(&self, out: &mut W) -> core::fmt::Result {
-        stream_owned_value_json(self, out)
+    fn stream_json<W: core::fmt::Write>(
+        &self,
+        out: &mut W,
+        indent_spaces: usize,
+    ) -> core::fmt::Result {
+        stream_owned_value_json(self, out, 0, indent_spaces)
     }
 
     fn stream_yaml<W: core::fmt::Write>(
@@ -102,8 +112,17 @@ impl StreamableValue for OwnedValue {
 fn stream_owned_value_json<W: core::fmt::Write>(
     value: &OwnedValue,
     out: &mut W,
+    current_indent: usize,
+    indent_spaces: usize,
 ) -> core::fmt::Result {
-    stream_owned_value_json_with(value, out, write_json_body_yq, format_float_with_fraction)
+    stream_owned_value_json_with(
+        value,
+        out,
+        current_indent,
+        indent_spaces,
+        write_json_body_yq,
+        format_float_with_fraction,
+    )
 }
 
 /// Stream an OwnedValue as JSON, escaping strings the way `jq` does.
@@ -123,15 +142,22 @@ pub fn stream_owned_value_json_jq<W: core::fmt::Write>(
     value: &OwnedValue,
     out: &mut W,
 ) -> core::fmt::Result {
-    stream_owned_value_json_with(value, out, write_json_body_jq, |f| f.to_string())
+    // Always compact: this is the jq-error-message convention, which never
+    // pretty-prints.
+    stream_owned_value_json_with(value, out, 0, 0, write_json_body_jq, |f| f.to_string())
 }
 
 /// Stream an OwnedValue as JSON without intermediate string allocation, using
 /// `escape` for every string body and `float_fmt` for every float — the two
 /// places the `yq`/jq-error conventions differ.
+///
+/// - `current_indent`: Current indentation level (number of spaces)
+/// - `indent_spaces`: Spaces per indentation level (0 for compact)
 fn stream_owned_value_json_with<W: core::fmt::Write>(
     value: &OwnedValue,
     out: &mut W,
+    current_indent: usize,
+    indent_spaces: usize,
     escape: fn(&mut W, &str) -> core::fmt::Result,
     float_fmt: fn(f64) -> String,
 ) -> core::fmt::Result {
@@ -157,24 +183,62 @@ fn stream_owned_value_json_with<W: core::fmt::Write>(
         }
         OwnedValue::String(s) => stream_json_string(out, s, escape),
         OwnedValue::Array(arr) => {
+            if arr.is_empty() {
+                return out.write_str("[]");
+            }
             out.write_char('[')?;
+            let next_indent = current_indent + indent_spaces;
             for (i, elem) in arr.iter().enumerate() {
                 if i > 0 {
                     out.write_char(',')?;
                 }
-                stream_owned_value_json_with(elem, out, escape, float_fmt)?;
+                if indent_spaces > 0 {
+                    out.write_char('\n')?;
+                    write_indent(out, next_indent)?;
+                }
+                stream_owned_value_json_with(
+                    elem,
+                    out,
+                    next_indent,
+                    indent_spaces,
+                    escape,
+                    float_fmt,
+                )?;
+            }
+            if indent_spaces > 0 {
+                out.write_char('\n')?;
+                write_indent(out, current_indent)?;
             }
             out.write_char(']')
         }
         OwnedValue::Object(obj) => {
+            if obj.is_empty() {
+                return out.write_str("{}");
+            }
             out.write_char('{')?;
+            let next_indent = current_indent + indent_spaces;
             for (i, (key, value)) in obj.iter().enumerate() {
                 if i > 0 {
                     out.write_char(',')?;
                 }
+                if indent_spaces > 0 {
+                    out.write_char('\n')?;
+                    write_indent(out, next_indent)?;
+                }
                 stream_json_string(out, key, escape)?;
-                out.write_char(':')?;
-                stream_owned_value_json_with(value, out, escape, float_fmt)?;
+                out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
+                stream_owned_value_json_with(
+                    value,
+                    out,
+                    next_indent,
+                    indent_spaces,
+                    escape,
+                    float_fmt,
+                )?;
+            }
+            if indent_spaces > 0 {
+                out.write_char('\n')?;
+                write_indent(out, current_indent)?;
             }
             out.write_char('}')
         }
@@ -507,36 +571,36 @@ mod tests {
     #[test]
     fn test_stream_null() {
         let mut buf = String::new();
-        OwnedValue::Null.stream_json(&mut buf).unwrap();
+        OwnedValue::Null.stream_json(&mut buf, 0).unwrap();
         assert_eq!(buf, "null");
     }
 
     #[test]
     fn test_stream_bool() {
         let mut buf = String::new();
-        OwnedValue::Bool(true).stream_json(&mut buf).unwrap();
+        OwnedValue::Bool(true).stream_json(&mut buf, 0).unwrap();
         assert_eq!(buf, "true");
 
         buf.clear();
-        OwnedValue::Bool(false).stream_json(&mut buf).unwrap();
+        OwnedValue::Bool(false).stream_json(&mut buf, 0).unwrap();
         assert_eq!(buf, "false");
     }
 
     #[test]
     fn test_stream_int() {
         let mut buf = String::new();
-        OwnedValue::Int(42).stream_json(&mut buf).unwrap();
+        OwnedValue::Int(42).stream_json(&mut buf, 0).unwrap();
         assert_eq!(buf, "42");
 
         buf.clear();
-        OwnedValue::Int(-123).stream_json(&mut buf).unwrap();
+        OwnedValue::Int(-123).stream_json(&mut buf, 0).unwrap();
         assert_eq!(buf, "-123");
     }
 
     #[test]
     fn test_stream_float() {
         let mut buf = String::new();
-        OwnedValue::Float(3.125).stream_json(&mut buf).unwrap();
+        OwnedValue::Float(3.125).stream_json(&mut buf, 0).unwrap();
         assert_eq!(buf, "3.125");
     }
 
@@ -546,16 +610,16 @@ mod tests {
     #[test]
     fn test_stream_json_whole_float_keeps_decimal_point() {
         let mut buf = String::new();
-        OwnedValue::Float(1.0).stream_json(&mut buf).unwrap();
+        OwnedValue::Float(1.0).stream_json(&mut buf, 0).unwrap();
         assert_eq!(buf, "1.0");
 
         buf.clear();
-        OwnedValue::Float(-0.0).stream_json(&mut buf).unwrap();
+        OwnedValue::Float(-0.0).stream_json(&mut buf, 0).unwrap();
         assert_eq!(buf, "-0.0");
 
         buf.clear();
         OwnedValue::Array(vec![OwnedValue::Float(1.0), OwnedValue::Float(2.5)])
-            .stream_json(&mut buf)
+            .stream_json(&mut buf, 0)
             .unwrap();
         assert_eq!(buf, "[1.0,2.5]");
     }
@@ -584,7 +648,7 @@ mod tests {
     fn test_stream_json_number_literal() {
         let mut buf = String::new();
         OwnedValue::NumberLiteral(NumberRepr::Float(1.2e3), "1.2e3".into())
-            .stream_json(&mut buf)
+            .stream_json(&mut buf, 0)
             .unwrap();
         assert_eq!(buf, "1.2E+3");
     }
@@ -596,13 +660,13 @@ mod tests {
         // non-finite Float does, not fall through to `format_number_jq_compat`.
         let mut buf = String::new();
         OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into())
-            .stream_json(&mut buf)
+            .stream_json(&mut buf, 0)
             .unwrap();
         assert_eq!(buf, "null");
 
         buf.clear();
         OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1e400".into())
-            .stream_json(&mut buf)
+            .stream_json(&mut buf, 0)
             .unwrap();
         assert_eq!(buf, "null");
     }
@@ -632,7 +696,7 @@ mod tests {
     fn test_stream_string() {
         let mut buf = String::new();
         OwnedValue::String("hello".to_string())
-            .stream_json(&mut buf)
+            .stream_json(&mut buf, 0)
             .unwrap();
         assert_eq!(buf, "\"hello\"");
     }
@@ -641,19 +705,19 @@ mod tests {
     fn test_stream_string_escaping() {
         let mut buf = String::new();
         OwnedValue::String("hello\nworld".to_string())
-            .stream_json(&mut buf)
+            .stream_json(&mut buf, 0)
             .unwrap();
         assert_eq!(buf, "\"hello\\nworld\"");
 
         buf.clear();
         OwnedValue::String("tab\there".to_string())
-            .stream_json(&mut buf)
+            .stream_json(&mut buf, 0)
             .unwrap();
         assert_eq!(buf, "\"tab\\there\"");
 
         buf.clear();
         OwnedValue::String("quote\"here".to_string())
-            .stream_json(&mut buf)
+            .stream_json(&mut buf, 0)
             .unwrap();
         assert_eq!(buf, "\"quote\\\"here\"");
     }
@@ -666,7 +730,7 @@ mod tests {
             OwnedValue::Int(2),
             OwnedValue::Int(3),
         ])
-        .stream_json(&mut buf)
+        .stream_json(&mut buf, 0)
         .unwrap();
         assert_eq!(buf, "[1,2,3]");
     }
@@ -677,8 +741,58 @@ mod tests {
         let mut map = IndexMap::new();
         map.insert("name".to_string(), OwnedValue::String("Alice".to_string()));
         map.insert("age".to_string(), OwnedValue::Int(30));
-        OwnedValue::Object(map).stream_json(&mut buf).unwrap();
+        OwnedValue::Object(map).stream_json(&mut buf, 0).unwrap();
         assert_eq!(buf, "{\"name\":\"Alice\",\"age\":30}");
+    }
+
+    #[test]
+    fn test_stream_json_pretty_nested_containers() {
+        // All the pretty-print (indent_spaces > 0) tests above use indent 0;
+        // this covers the indented recursion path for a container nested
+        // inside another container (object-in-object, array-in-object).
+        let mut buf = String::new();
+        let mut inner = IndexMap::new();
+        inner.insert("name".to_string(), OwnedValue::String("Alice".to_string()));
+        let mut outer = IndexMap::new();
+        outer.insert("user".to_string(), OwnedValue::Object(inner));
+        outer.insert(
+            "tags".to_string(),
+            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+        );
+        OwnedValue::Object(outer).stream_json(&mut buf, 2).unwrap();
+        assert_eq!(
+            buf,
+            "{\n  \"user\": {\n    \"name\": \"Alice\"\n  },\n  \"tags\": [\n    1,\n    2\n  ]\n}"
+        );
+    }
+
+    /// A `core::fmt::Write` that fails as soon as it sees a specific marker
+    /// string, simulating a downstream write failure (e.g. a broken pipe)
+    /// partway through streaming.
+    struct FailOnMarker {
+        marker: &'static str,
+    }
+
+    impl core::fmt::Write for FailOnMarker {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            if s.contains(self.marker) {
+                Err(core::fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn test_stream_json_pretty_object_propagates_write_error() {
+        // A write failure while streaming an object field's value (not the
+        // key or punctuation around it) must propagate out of the recursive
+        // call rather than being silently swallowed.
+        let mut map = IndexMap::new();
+        map.insert("a".to_string(), OwnedValue::String("boom".to_string()));
+        let mut out = FailOnMarker { marker: "boom" };
+        let result = OwnedValue::Object(map).stream_json(&mut out, 2);
+        assert!(result.is_err());
     }
 
     #[test]

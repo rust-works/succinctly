@@ -1609,8 +1609,18 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     }
 
     #[inline]
-    fn stream_json<Out: core::fmt::Write>(&self, out: &mut Out) -> core::fmt::Result {
-        // For JSON, we can directly output the raw bytes - they're already valid JSON
+    fn stream_json<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        indent_spaces: usize,
+    ) -> core::fmt::Result {
+        // Compact only: echo the raw bytes verbatim, since they're already
+        // valid JSON. Indented (pretty) JSON->JSON streaming isn't
+        // implemented here — callers fall back to the DOM path (#442 only
+        // extended the YAML-target and YAML-cursor-to-JSON pretty paths).
+        if indent_spaces != 0 {
+            return Err(core::fmt::Error);
+        }
         if let Some(bytes) = self.raw_bytes() {
             // SAFETY: JSON input is valid UTF-8 (checked during indexing)
             let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
