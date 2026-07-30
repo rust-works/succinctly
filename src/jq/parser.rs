@@ -4180,6 +4180,72 @@ mod tests {
         );
     }
 
+    /// jq accepts postfix `?` after any Term, not just a path expression
+    /// (#367). These cover the forms that used to fail with "unexpected
+    /// character '?'" because only the dot-field and index-bracket
+    /// productions checked for a trailing `?`.
+    #[test]
+    fn test_optional_after_builtin() {
+        assert_eq!(
+            parse("length?").unwrap(),
+            Expr::Optional(Box::new(Expr::Builtin(Builtin::Length)))
+        );
+        assert_eq!(
+            parse("keys?").unwrap(),
+            Expr::Optional(Box::new(Expr::Builtin(Builtin::Keys)))
+        );
+        assert_eq!(
+            parse("tonumber?").unwrap(),
+            Expr::Optional(Box::new(Expr::Builtin(Builtin::ToNumber)))
+        );
+    }
+
+    #[test]
+    fn test_optional_after_parenthesized_expr() {
+        assert_eq!(
+            parse("(.a)?").unwrap(),
+            Expr::Optional(Box::new(Expr::Paren(Box::new(Expr::Field("a".into())))))
+        );
+        assert_eq!(
+            parse("(1)?").unwrap(),
+            Expr::Optional(Box::new(Expr::Paren(Box::new(Expr::Literal(
+                Literal::Int(1)
+            )))))
+        );
+    }
+
+    #[test]
+    fn test_optional_after_function_call() {
+        match parse("first(.[])?").unwrap() {
+            Expr::Optional(inner) => assert!(matches!(*inner, Expr::FirstExpr(_))),
+            other => panic!("expected Expr::Optional, got {other:?}"),
+        }
+        match parse(r#"getpath(["a"])?"#).unwrap() {
+            Expr::Optional(inner) => {
+                assert!(matches!(*inner, Expr::Builtin(Builtin::GetPath(_))));
+            }
+            other => panic!("expected Expr::Optional, got {other:?}"),
+        }
+        match parse(r#"setpath(["a"];1)?"#).unwrap() {
+            Expr::Optional(inner) => {
+                assert!(matches!(*inner, Expr::Builtin(Builtin::SetPath(_, _))));
+            }
+            other => panic!("expected Expr::Optional, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_optional_after_variable_and_identity() {
+        assert_eq!(
+            parse("$x?").unwrap(),
+            Expr::Optional(Box::new(Expr::Var("x".into())))
+        );
+        assert_eq!(
+            parse(".?").unwrap(),
+            Expr::Optional(Box::new(Expr::Identity))
+        );
+    }
+
     #[test]
     fn test_chained() {
         assert_eq!(
