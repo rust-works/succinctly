@@ -10728,9 +10728,9 @@ fn delete_expr_array_paths(
                         let slot = &mut arr[actual as usize];
                         let old = core::mem::replace(slot, OwnedValue::Null);
                         *slot = delete_expr_paths_at(old, group, start + 1)?;
-                    } else if !group.iter().any(|p| p[start].optional) {
-                        return Err(out_of_range_index(*idx, arr.len()));
                     }
+                    // An out-of-range index names nothing to delete through —
+                    // jq's delpaths silently skips it, `?` or not (#477).
                 }
                 // Deleting *through* a slice deletes inside the sub-array and
                 // splices it back: `[1,[2],[3]] | del(.[1:3][0])` is `[1,[3]]`.
@@ -10745,24 +10745,11 @@ fn delete_expr_array_paths(
                 }
             }
         }
-
-        // `delete_keys` silently drops an index that names nothing
-        // (`delpaths` has always done that, #415); a bare `del` never has, so
-        // an out-of-range terminal index still errors unless `?` covers it,
-        // exactly as the single-path case in `delete_at_path` does. A slice
-        // is exempt: jq clamps an out-of-range range rather than refusing it.
-        let len = arr.len() as i64;
-        for (step, opt) in &terminal {
-            let ArrayStep::Index(idx) = step else {
-                continue;
-            };
-            let actual = if *idx < 0 { len + idx } else { *idx };
-            if !opt && (actual < 0 || actual as usize >= arr.len()) {
-                return Err(out_of_range_index(*idx, arr.len()));
-            }
-        }
     }
 
+    // Terminal indices are deleted below via `delete_keys`, which already
+    // silently drops an index that names nothing (`delpaths` has always done
+    // that, #415) — including an out-of-range one, `?` or not (#477).
     if !terminal.is_empty() {
         let owned_keys: Vec<OwnedValue> = terminal
             .iter()
@@ -10917,12 +10904,10 @@ fn delete_at_path(
                 let actual_idx = if *idx < 0 { len + idx } else { *idx };
                 if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
                     arr.remove(actual_idx as usize);
-                    Ok(())
-                } else if optional {
-                    Ok(())
-                } else {
-                    Err(out_of_range_index(*idx, arr.len()))
                 }
+                // An out-of-range index names nothing to delete — jq's
+                // delpaths silently skips it, `?` or not (#477).
+                Ok(())
             } else if optional {
                 Ok(())
             } else {
@@ -11006,10 +10991,11 @@ fn delete_at_path(
                             let actual_idx = if *idx < 0 { len + idx } else { *idx };
                             if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
                                 delete_at_path(&mut arr[actual_idx as usize], &rest, optional)
-                            } else if here {
-                                Ok(())
                             } else {
-                                Err(out_of_range_index(*idx, arr.len()))
+                                // An out-of-range index resolves to null;
+                                // deleting further into null is always a
+                                // no-op, `?` or not (#477).
+                                Ok(())
                             }
                         } else if here {
                             Ok(())
