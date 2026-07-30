@@ -7065,15 +7065,18 @@ fn resolve_node<S: EvalSemantics>(
         // otherwise store — the very case #412 was filed for.
         Expr::RecursiveDescent => Ok(resolve_recursive_descent(value)),
 
-        // `recurse`/`recurse(f)`/`recurse(f; cond)` walk the same
-        // breadth-first queue as `builtin_recurse_f`/`builtin_recurse_cond`
-        // (their value-only counterparts below), threading a components
-        // prefix alongside each queued value so `path(recurse)` agrees with
-        // `[recurse]` on which nodes are visited and in what order.
+        // Bare `recurse` *is* `..` — jq defines it as `recurse(.[]?)` and
+        // `[recurse]` and `[..]` agree output for output. Sharing `..`'s
+        // resolver rather than routing `.[]?` through `resolve_recurse` is
+        // both simpler and what keeps the components bare: resolving under a
+        // `?` wraps each one in `Expr::Optional`, which the walkers that
+        // *write* (`get_path_mut`, `update_path`, `delete_at_path`) then have
+        // to unwrap. They do, but there is no reason to make them.
         Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
-            let default_f = Expr::Optional(Box::new(Expr::Iterate));
-            resolve_recurse::<S>(&default_f, None, value)
+            Ok(resolve_recursive_descent(value))
         }
+        // The parameterised spellings have no such shortcut: `f` is arbitrary,
+        // so the queue has to run.
         Expr::Builtin(Builtin::RecurseF(f)) => resolve_recurse::<S>(f, None, value),
         Expr::Builtin(Builtin::RecurseCond(f, cond)) => resolve_recurse::<S>(f, Some(cond), value),
 
@@ -7160,11 +7163,25 @@ fn push_recursive_branches(prefix: &[Expr], value: &OwnedValue, out: &mut Vec<Pa
 }
 
 /// Fan `recurse(f)` / `recurse(f; cond)` out into one branch per visited
-/// node. Mirrors `builtin_recurse_f`/`builtin_recurse_cond`'s
-/// breadth-first queue exactly (including swallowing `f`'s errors and the
-/// `MAX_ITEMS` cutoff), but resolves `f` through [`resolve_node`] at each step
-/// instead of [`eval_owned_expr`] so every queued value carries the path
-/// components that reach it.
+/// node. Follows `builtin_recurse_f`/`builtin_recurse_cond`'s breadth-first
+/// queue — including swallowing `f`'s errors, a falsy `cond` pruning rather
+/// than propagating, not queueing a null child, and the `MAX_ITEMS` cutoff —
+/// but resolves `f` through [`resolve_node`] at each step instead of
+/// [`eval_owned_expr`], so every queued value carries the path components that
+/// reach it.
+///
+/// Not queueing a null child is the load-bearing one. `f` is arbitrary and
+/// nothing says it makes progress: `recurse(.a?)` over `{"a":null}` reads
+/// `null` from `null` forever, and the queue would run to `MAX_ITEMS` with a
+/// prefix one component longer each round — quadratic, and measured at 9 GB
+/// for an 18-byte document before this guard existed.
+///
+/// One difference from those two is deliberate. When `f` yields an array they
+/// queue its *elements* (`queue.extend(arr)`), an artefact of
+/// [`eval_owned_expr`] collapsing a stream into one array — so `[recurse(.a?)]`
+/// descends into an array-valued `.a` where jq stops at the array itself.
+/// Resolving through [`resolve_node`] keeps the array, which is jq's answer;
+/// mirroring the value path here would mean mirroring its bug.
 fn resolve_recurse<S: EvalSemantics>(
     f: &Expr,
     cond: Option<&Expr>,
@@ -7188,6 +7205,12 @@ fn resolve_recurse<S: EvalSemantics>(
         outputs.push((prefix.clone(), current.clone()));
 
         for (child_components, child_value) in resolve_node::<S>(f, &current).unwrap_or_default() {
+            // `builtin_recurse_f`'s `Ok(v) if !matches!(v, OwnedValue::Null)`:
+            // a null child ends that line of descent. See the note above on
+            // why this is what bounds the queue at all.
+            if matches!(child_value, OwnedValue::Null) {
+                continue;
+            }
             let mut path = prefix.clone();
             path.extend(child_components);
             queue.push((path, child_value));
