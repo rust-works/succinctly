@@ -2802,7 +2802,7 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Builtin: first - first element (.[0])
 fn builtin_first<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => match elements.get(0) {
@@ -2812,6 +2812,7 @@ fn builtin_first<W: Clone + AsRef<[u64]>>(
         },
         // jq: null | first => null
         StandardJson::Null => QueryResult::Owned(OwnedValue::Null),
+        _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index_with_type(
             type_name(&value),
             "number",
@@ -2822,7 +2823,7 @@ fn builtin_first<W: Clone + AsRef<[u64]>>(
 /// Builtin: last - last element (.[-1])
 fn builtin_last<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
@@ -2836,6 +2837,7 @@ fn builtin_last<W: Clone + AsRef<[u64]>>(
         }
         // jq: null | last => null
         StandardJson::Null => QueryResult::Owned(OwnedValue::Null),
+        _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index_with_type(
             type_name(&value),
             "number",
@@ -2876,7 +2878,7 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Builtin: reverse - reverse array
 fn builtin_reverse<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
@@ -2895,6 +2897,7 @@ fn builtin_reverse<W: Clone + AsRef<[u64]>>(
         }
         // jq: null | reverse => []
         StandardJson::Null => QueryResult::Owned(OwnedValue::Array(Vec::new())),
+        _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index_with_type(
             type_name(&value),
             "number",

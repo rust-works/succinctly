@@ -1077,6 +1077,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 })
             } else if let Some(f) = value.as_f64() {
                 GenericResult::Owned(OwnedValue::Float(f.abs()))
+            } else if optional {
+                GenericResult::None
             } else {
                 GenericResult::Error(EvalError::has_no_length(&to_owned(&value)))
             }
@@ -1094,6 +1096,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 let indices: Vec<OwnedValue> =
                     (0..len).map(|i| OwnedValue::Int(i as i64)).collect();
                 GenericResult::Owned(OwnedValue::Array(indices))
+            } else if optional {
+                GenericResult::None
             } else {
                 GenericResult::Error(EvalError::has_no_keys(&to_owned(&value)))
             }
@@ -1110,6 +1114,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 let indices: Vec<OwnedValue> =
                     (0..len).map(|i| OwnedValue::Int(i as i64)).collect();
                 GenericResult::Owned(OwnedValue::Array(indices))
+            } else if optional {
+                GenericResult::None
             } else {
                 GenericResult::Error(EvalError::has_no_keys(&to_owned(&value)))
             }
@@ -1204,6 +1210,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 }
             } else if value.is_null() {
                 GenericResult::Owned(OwnedValue::Null)
+            } else if optional {
+                GenericResult::None
             } else {
                 GenericResult::Error(EvalError::cannot_index_with_type(
                     value.type_name(),
@@ -1222,6 +1230,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 }
             } else if value.is_null() {
                 GenericResult::Owned(OwnedValue::Null)
+            } else if optional {
+                GenericResult::None
             } else {
                 GenericResult::Error(EvalError::cannot_index_with_type(
                     value.type_name(),
@@ -1239,6 +1249,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     .map(to_owned)
                     .collect();
                 GenericResult::Owned(OwnedValue::Array(values))
+            } else if optional {
+                GenericResult::None
             } else {
                 GenericResult::Error(EvalError::cannot_index_with_type(
                     value.type_name(),
@@ -1275,8 +1287,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if let Some(s) = value.as_str() {
                 match tonumber_from_str(s.as_ref()) {
                     Ok(n) => GenericResult::Owned(n),
+                    Err(_) if optional => GenericResult::None,
                     Err(e) => GenericResult::Error(e),
                 }
+            } else if optional {
+                GenericResult::None
             } else {
                 GenericResult::Error(EvalError::cannot_parse_as_number(&to_owned(&value)))
             }
