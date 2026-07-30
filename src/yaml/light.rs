@@ -9560,6 +9560,34 @@ mod tests {
     }
 
     #[test]
+    fn test_bare_dash_as_explicit_key_is_an_empty_item() {
+        // The last shape #325's acceptance criteria name, and the only one that
+        // exercises the *key* side. `? -` is a non-scalar key — a one-item
+        // sequence whose item is empty — reached through `parse_explicit_key`,
+        // which delegates to the same `parse_sequence_item` every arm this issue
+        // touched now calls. So this is the regression guard on that shared
+        // helper from the one direction the value-side tests above cannot reach.
+        //
+        // The key renders as `""` because neither succinctly nor `yq` has a JSON
+        // spelling for a non-scalar key, so both collapse it (#172); the point
+        // here is that the *entry survives at all*, which is what the sibling
+        // `- ` shapes used to lose. Expectations are mikefarah/yq v4.53.3, which
+        // agrees byte-for-byte on every case below.
+        assert_eq!(first_doc_json(b"? -\n: v\n"), r#"{"":"v"}"#);
+        // No trailing newline: the `-` is the last byte of the key's line, so
+        // `is_seq_indicator_next`'s end-of-input arm is what keeps it an
+        // indicator rather than a scalar.
+        assert_eq!(first_doc_json(b"? -\n: v"), r#"{"":"v"}"#);
+        // No value at all — the key still stands, with a null value.
+        assert_eq!(first_doc_json(b"? -\n"), r#"{"":null}"#);
+        // Bare dash on *both* sides: an empty item as the key, and the value is
+        // the `{"a":[null]}` shape from `test_inline_seq_as_mapping_value_*`.
+        assert_eq!(first_doc_json(b"? -\n: -\n"), r#"{"":[null]}"#);
+        // All three YAML 1.2 §5.4 line breaks reach the same reading.
+        assert_eq!(first_doc_json(b"? -\r\n: v\r\n"), r#"{"":"v"}"#);
+    }
+
+    #[test]
     fn test_dash_in_mapping_value_non_sequence_cases_unchanged() {
         // A `-` NOT followed by whitespace starts a plain scalar as usual.
         assert_eq!(first_doc_json(b"a: -1\n"), r#"{"a":-1}"#);
