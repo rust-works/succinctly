@@ -229,7 +229,11 @@ fn detect_fast_bmi2() -> bool {
     // - AMD: Check family >= 0x19 (Zen 3+)
 
     // Check vendor string via CPUID leaf 0
-    let cpuid0 = core::arch::x86_64::__cpuid(0);
+    // SAFETY: CPUID leaf 0 has no target-feature precondition on x86_64.
+    // `__cpuid` became a safe fn in Rust 1.96; `allow` keeps this building
+    // on older toolchains where it is still `unsafe fn` (#474).
+    #[allow(unused_unsafe)]
+    let cpuid0 = unsafe { core::arch::x86_64::__cpuid(0) };
     let is_amd = cpuid0.ebx == 0x6874_7541  // "Auth"
         && cpuid0.edx == 0x6974_6E65        // "enti"
         && cpuid0.ecx == 0x444D_4163; // "cAMD"
@@ -240,7 +244,9 @@ fn detect_fast_bmi2() -> bool {
     }
 
     // AMD: Check family from CPUID leaf 1
-    let cpuid1 = core::arch::x86_64::__cpuid(1);
+    // SAFETY: CPUID leaf 1 has no target-feature precondition on x86_64.
+    #[allow(unused_unsafe)]
+    let cpuid1 = unsafe { core::arch::x86_64::__cpuid(1) };
     let family = ((cpuid1.eax >> 8) & 0xF) + ((cpuid1.eax >> 20) & 0xFF);
 
     // Family 0x17 = Zen 1/2 (slow BMI2)
