@@ -913,18 +913,23 @@ mod report_tests {
     }
 
     #[test]
-    fn the_false_positive_invariant_catches_the_dash_scalar_shape() {
-        // `a: -` is the #325 shape: the parser emits a plain scalar (its
-        // mapping-value dash guard is narrow) which the wide reader predicate then
-        // calls a wrapper. It is not a block-sequence child, so it registers as a
-        // false positive — the invariant is doing its job, and this pins that.
+    fn the_dash_scalar_shape_is_correctly_classified_after_325() {
+        // `a: -` used to be the one shape where the text predicate and the BP
+        // structure disagreed: before #325 landed on `main`, the mapping-value
+        // dash guard was narrow, so the parser emitted a plain scalar whose text
+        // happened to start with `-`, and the wide reader predicate misread it as
+        // a wrapper — a false positive.
         //
-        // It stays out of the corpus and suite numbers because neither contains
-        // the shape, which is why both report 0. See #325.
+        // #325 (already on `main` by the time this branch rebased past it) taught
+        // the mapping-value arm to dispatch a same-line `-` to the real
+        // sequence-item parser, so `a: -` is now a genuine block sequence with one
+        // empty item. The predicate and the structure agree: #325 closed this gap,
+        // it did not open a new one.
         let s = measure(b"a: -\n", "w".into(), "f".into()).unwrap();
-        assert_eq!(s.false_positives, 1);
-        assert_eq!(s.block_seq_children, 0);
-        // Well-formed input has none.
+        assert_eq!(s.seq_items, 1);
+        assert_eq!(s.block_seq_children, 1);
+        assert_eq!((s.false_positives, s.undetected_wrappers), (0, 0));
+        // Well-formed input has none either.
         let ok = measure(b"- a\n- b\n", "w".into(), "f".into()).unwrap();
         assert_eq!((ok.false_positives, ok.undetected_wrappers), (0, 0));
     }
