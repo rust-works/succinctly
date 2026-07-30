@@ -152,6 +152,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arms added there emit the same wrapper, so `del(recurse | objects | .[.k]?)`
   would have inherited the defect.
 
+- **A slice was not a path component** (#366, closing #469 with it): jq has no
+  slice *operator* — it models `.[a:b]` as indexing with `{"start":a,"end":b}`,
+  and that object is a path component like any other. Succinctly could read a
+  slice but did not treat it as a path, so `path(.[1:2])` answered `[1]` (one
+  path per element — a *wrong answer* rather than a refusal, inherited by
+  everything built on `path()`), `setpath([{"start":1,"end":2}]; ["x"])` and
+  `delpaths([[{"start":1,"end":2}]])` silently left the value alone, and
+  `.[1:2] = ["x"]`, `.[1:2] |= f` and `del(.[1:2])` were refused outright.
+  All now match jq-1.7.1: `path()` yields one component carrying the bounds
+  *as written* (`path(.[-2:-1])` keeps its negatives, an open end is `null`),
+  and it round-trips through `getpath`/`setpath`/`delpaths`, `=`, `|=`, `+=`
+  and `del()`, including mid-chain (`.a[1:2][0].b = 9`) and through the slice
+  (`del(.[1:3][0])`). Paths are modelled two ways in the evaluator —
+  `OwnedValue` components for the runtime builtins, `Expr` walked directly for
+  the operators — so the gap sat in the seam; both halves now share one
+  definition in `src/jq/slice.rs` (descriptor validation, bound resolution,
+  the component `path()` prints), which the four previously open-coded bound
+  clamps also collapse onto. Deletion resolves every key naming an element of
+  one array against the length it had on entry and removes them in a single
+  batch, so overlapping ranges union rather than compound (`del(.[0:2],
+  .[1:3])` is `[4]`; a range naming the same element as a bare index deletes
+  it once). `indices`/`index`/`rindex` came along, since jq defines all three
+  over `.[$i]` — an object pattern is the slice, not a search, so `"abcabc" |
+  indices({"start":1,"end":2})` is the substring `"b"`. Two error sentences
+  arrive with the feature, `A slice of an array can only be assigned another
+  array` and `Cannot update string slices`, plus `Array/string slice indices
+  must be integers` for a descriptor missing a bound or holding a non-number
+  (jq requires both keys *present*; an explicit `null` counts, extra keys are
+  ignored). The error corpus goes 154/156 → 168/168 in both evaluators and
+  `tests/data/jq-error-known-divergences.txt` is now empty. **Not covered**:
+  writing through a slice does not auto-vivify `null`, so `null | .[1:2] =
+  ["x"]` still refuses where jq answers `["x"]` — deliberate, so that
+  `.[1:2] = ["x"]` does not grow a container while `.a = 1` beside it refuses;
+  it is recorded in `docs/compliance/jq/limitations.md` under "Where
+  succinctly errors and jq does not", to close with the rest of that table.
+  Expression-valued bounds (`.[$a:$b]`) remain a parse error.
+
 - **An inline block sequence as a mapping value silently discarded its
   content** (#325): `a: - x` — invalid YAML (test-suite case 5U3A: a block
   sequence may not begin on the same line as its parent mapping key; `yq`
