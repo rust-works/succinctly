@@ -258,23 +258,19 @@ fn containment_matches_jq_in_the_generic_evaluator() {
 /// An optional expression swallows the error and yields nothing, as `?` does for
 /// every other error — jq prints nothing for `1 | contains("a")?`.
 ///
-/// The expression is built with [`Expr::optional`] rather than parsed, because
-/// succinctly's parser rejects a postfix `?` after *any* function call
-/// (`contains("a")?`, `has("a")?`, even `(contains("a"))?` — "unexpected
-/// character '?'"), where jq accepts all three. That is a parser gap unrelated to
-/// containment; going through the builder still exercises the evaluators' real
-/// `Expr::Optional` path, so this starts covering the surface syntax the moment
-/// the parser catches up (#367).
+/// Parses the real `?` syntax directly (`contains("a")?`, `inside([1])?`);
+/// the parser used to reject a postfix `?` after any function call, only
+/// accepting it after a path expression like `.a?` (#367, fixed).
 ///
 /// Both evaluators agree here: the generic evaluator's fallback to the full
-/// evaluator for builtins it doesn't implement itself now threads `optional`
+/// evaluator for builtins it doesn't implement itself threads `optional`
 /// through (`src/jq/eval_generic.rs`, `eval_on_owned`/`eval_on_many_owned`), so
 /// an optional-wrapped builtin it delegates is suppressed the same way as the
 /// full evaluator (#386, previously pinned as open drift here).
 #[test]
 fn optional_suppresses_the_error() {
-    for filter in [r#"contains("a")"#, r"inside([1])"] {
-        let expr = parse(filter).expect("parse failed").optional();
+    for filter in [r#"contains("a")?"#, r"inside([1])?"] {
+        let expr = parse(filter).expect("parse failed");
         let json: &[u8] = br"1";
         let index = JsonIndex::build(json);
 
