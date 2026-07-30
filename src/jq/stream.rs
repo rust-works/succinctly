@@ -766,6 +766,35 @@ mod tests {
         );
     }
 
+    /// A `core::fmt::Write` that fails as soon as it sees a specific marker
+    /// string, simulating a downstream write failure (e.g. a broken pipe)
+    /// partway through streaming.
+    struct FailOnMarker {
+        marker: &'static str,
+    }
+
+    impl core::fmt::Write for FailOnMarker {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            if s.contains(self.marker) {
+                Err(core::fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn test_stream_json_pretty_object_propagates_write_error() {
+        // A write failure while streaming an object field's value (not the
+        // key or punctuation around it) must propagate out of the recursive
+        // call rather than being silently swallowed.
+        let mut map = IndexMap::new();
+        map.insert("a".to_string(), OwnedValue::String("boom".to_string()));
+        let mut out = FailOnMarker { marker: "boom" };
+        let result = OwnedValue::Object(map).stream_json(&mut out, 2);
+        assert!(result.is_err());
+    }
+
     #[test]
     fn test_is_falsy() {
         assert!(OwnedValue::Null.is_falsy());
