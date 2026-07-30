@@ -477,6 +477,42 @@ fn test_optional_iterate_on_scalar() {
     );
 }
 
+/// jq accepts `?` after any Term, not just a path expression (#367): builtins,
+/// parenthesized expressions, and bare `.` should all parse and behave the
+/// same as the already-working `.foo?` form.
+#[test]
+fn test_optional_after_builtin_call_suppresses_error() {
+    // jq: 42 | keys? => (empty), since `keys` on a number is an error
+    query!(b"42", "keys?",
+        QueryResult::None => {}
+    );
+}
+
+#[test]
+fn test_optional_after_builtin_call_success() {
+    query!(br#"{"a": 1}"#, "length?",
+        QueryResult::Owned(OwnedValue::Int(n)) => {
+            assert_eq!(n, 1);
+        }
+    );
+}
+
+#[test]
+fn test_optional_after_parenthesized_expr() {
+    query!(b"null", "(1)?",
+        QueryResult::Owned(OwnedValue::Int(n)) => {
+            assert_eq!(n, 1);
+        }
+    );
+}
+
+#[test]
+fn test_optional_after_bare_dot() {
+    query!(br#"{"a": 1}"#, ".?",
+        QueryResult::One(StandardJson::Object(_)) => {}
+    );
+}
+
 // =============================================================================
 // Chained expression tests
 // =============================================================================
