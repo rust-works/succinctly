@@ -1289,6 +1289,64 @@ fn test_del_and_path_report_a_bad_computed_key() {
     );
 }
 
+/// #475: a top-level `Comma` with every branch static (no computed key at
+/// all, e.g. `del(.a, .b)`) used to be handed to the single-path walkers
+/// verbatim, none of which has a `Comma` arm, so it always fell into the
+/// "cannot use expression as delete target" catch-all — unconditionally, for
+/// the most basic multi-target `del()` form there is.
+#[test]
+fn test_del_with_purely_static_comma_paths() {
+    check(r#"{"a":1,"b":2}"#, "del(.a, .b)", Outcome::values(&["{}"]));
+    check("[1,2,3]", "del(.[0], .[2])", Outcome::values(&["[2]"]));
+}
+
+/// #475 follow-up: fixing the purely-static comma case above reaches a
+/// second surface that was unexercised until now — `delete_expr_paths_at`
+/// routing `Slice` into the same `indices` bucket as a plain `Index` (added
+/// for #366 / #492), previously only reachable through a computed key. These
+/// pin the three filters the issue's follow-up comment called out: two
+/// disjoint-range unions and one case where a slice and an index name the
+/// same element, so it's one deletion rather than two.
+#[test]
+fn test_del_with_static_comma_of_slices_and_indexes() {
+    check(
+        "[1,2,3,4]",
+        "del(.[0:2], .[1:3])",
+        Outcome::values(&["[4]"]),
+    );
+    check("[1,2,3,4]", "del(.[0], .[1:3])", Outcome::values(&["[4]"]));
+    check(
+        "[1,2,3,4]",
+        "del(.[1], .[1:2])",
+        Outcome::values(&["[1,3,4]"]),
+    );
+}
+
+/// #475 follow-up: on a container that cannot be sliced or indexed, jq
+/// reports the *first* sibling's key type rather than one fixed sentence —
+/// swapping which of an index and a slice comes first in the comma changes
+/// "with number" to "with object". An all-slice batch on a string reports
+/// "Cannot delete fields from", the message a whole-container deletion
+/// raises rather than an index/key-type mismatch.
+#[test]
+fn test_del_static_comma_type_error_reports_the_first_sibling() {
+    check(
+        "5",
+        "del(.[0], .[1:2])",
+        Outcome::error("Cannot index number with number"),
+    );
+    check(
+        "5",
+        "del(.[1:2], .[0])",
+        Outcome::error("Cannot index number with object"),
+    );
+    check(
+        r#""hi""#,
+        "del(.[0:1], .[1:2])",
+        Outcome::error("Cannot delete fields from string"),
+    );
+}
+
 #[test]
 fn test_path_of_a_computed_key_emits_one_path_per_key() {
     check(
