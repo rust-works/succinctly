@@ -301,24 +301,26 @@ impl<W: AsRef<[u64]>> SimpleJsonIndex<W> {
     /// Perform select1 on the IB (find position of k-th 1-bit, 0-indexed).
     fn ib_select1(&self, k: usize) -> Option<usize> {
         let words = self.ib.as_ref();
-        let mut remaining = k;
 
-        for (word_idx, &word) in words.iter().enumerate() {
-            let ones = word.count_ones() as usize;
-            if ones > remaining {
-                // Found the target word
-                let bit_pos = select_in_word(word, remaining as u32) as usize;
-                let result = word_idx * 64 + bit_pos;
-                return if result < self.ib_len {
-                    Some(result)
-                } else {
-                    None
-                };
-            }
-            remaining -= ones;
+        // No select index here: this scans from word 0 on every call, so it is
+        // the site that benefits most per call from block skipping — though it
+        // has no in-crate consumer, `SimpleJsonIndex` being a reference API.
+        let (word_idx, rem) = crate::bits::scan_select(words, 0, k)?;
+
+        // #40: words popcounted by this scan, including the crossing word.
+        #[cfg(feature = "select-stats")]
+        crate::util::select_stats::record(
+            crate::util::select_stats::Site::SimpleJson,
+            word_idx + 1,
+        );
+
+        let bit_pos = select_in_word(words[word_idx], rem as u32) as usize;
+        let result = word_idx * 64 + bit_pos;
+        if result < self.ib_len {
+            Some(result)
+        } else {
+            None
         }
-
-        None
     }
 
     /// Perform rank1 on the IB (count 1-bits in [0, pos)).

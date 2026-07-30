@@ -511,6 +511,27 @@ them. #342 acted on that finding by vendoring a Home Assistant config, so the co
 now reports 41 anchors and 86 aliases. That page is date-pinned, not CI-checked:
 upstream branches move.
 
+### Select scan-length lookup
+
+`corpus-stats` answers "does this input shape exist?". `select-stats` answers the
+same question one level down, for the `select` word scans: **how many words does
+each scan actually traverse?** It walks the corpus through the same cursor APIs
+`jq`/`yq` use and reads counters compiled in by the `select-stats` feature.
+
+```bash
+cargo run --release --features cli,select-stats -- \
+  dev select-stats --data-dir data/bench/corpus
+```
+
+The counters live behind a non-default feature, so they are absent from ordinary
+builds and **must never be enabled for a timing run**. The command exits non-zero
+if it recorded nothing, so a binary built without the feature cannot be mistaken
+for a workload that performs no scans.
+
+Read the `work >=4` column, not `calls <4`: the distribution is bimodal, and the
+share of *work* in long scans is what predicts a block kernel's effect. This is
+the measurement that justified [select-scan.md](../optimizations/select-scan.md).
+
 ---
 
 ## Platforms and Hardware

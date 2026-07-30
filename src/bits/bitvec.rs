@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bits::popcount::{popcount_word, popcount_words};
 use crate::bits::rank::RankDirectory;
+use crate::bits::scan::scan_select;
 use crate::bits::select::SelectIndex;
 use crate::util::broadword::select_in_word;
 use crate::{Config, RankSelect};
@@ -240,32 +241,29 @@ impl RankSelect for BitVec {
         }
 
         // Use select index to jump to approximate position
-        let (start_word, mut remaining) = self.select_idx.jump_to(k);
+        let (start_word, remaining) = self.select_idx.jump_to(k);
 
-        // Scan words from the starting position
-        for word_idx in start_word..self.words.len() {
-            let word = self.words[word_idx];
-            let pop = popcount_word(word) as usize;
+        // Scan forward for the word holding the target bit. Defensive: `k <
+        // ones_count` guarantees the scan finds it, so this `?` is unreachable.
+        let (word_idx, rem) = scan_select(&self.words, start_word, remaining)?;
 
-            if pop > remaining {
-                // Found the target word
-                let bit_pos = select_in_word(word, remaining as u32) as usize;
-                let result = word_idx * 64 + bit_pos;
-                // Defensive: `with_config` clears every bit at or past `len`, so a
-                // set bit cannot lie outside the vector and this cannot return
-                // None. Kept as a guard, hence unreachable in coverage reports.
-                return if result < self.len {
-                    Some(result)
-                } else {
-                    None
-                };
-            }
+        // #40: words popcounted by this scan, including the crossing word.
+        #[cfg(feature = "select-stats")]
+        crate::util::select_stats::record(
+            crate::util::select_stats::Site::BitVec,
+            word_idx - start_word + 1,
+        );
 
-            remaining -= pop;
+        let bit_pos = select_in_word(self.words[word_idx], rem as u32) as usize;
+        let result = word_idx * 64 + bit_pos;
+        // Defensive: `with_config` clears every bit at or past `len`, so a set
+        // bit cannot lie outside the vector and this cannot return None. Kept
+        // as a guard, hence unreachable in coverage reports.
+        if result < self.len {
+            Some(result)
+        } else {
+            None
         }
-
-        // Also defensive: `k < ones_count` guarantees the scan finds the bit.
-        None
     }
 }
 

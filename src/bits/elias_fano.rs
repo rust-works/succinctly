@@ -43,6 +43,7 @@ use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
+use crate::bits::scan::scan_select;
 use crate::util::broadword::select_in_word;
 
 /// Select sample rate - one sample per this many elements.
@@ -336,26 +337,50 @@ impl EliasFano {
             (0, k)
         };
 
-        // Scan from sample position
-        for word_idx in start_word..self.high_bits.len() {
-            let word = if word_idx == start_word && sample_idx < self.select_samples.len() {
-                // Mask off bits before sample position
-                let sample_pos = self.select_samples[sample_idx] as usize;
-                let bit_offset = sample_pos % 64;
-                self.high_bits[word_idx] & !((1u64 << bit_offset) - 1)
-            } else {
-                self.high_bits[word_idx]
-            };
+        // The sampled start word must have the bits *before* the sample point
+        // masked off, so it cannot be handed to the shared scan (which reads
+        // whole words). Handle it separately, then scan the rest unmasked.
+        if sample_idx < self.select_samples.len() {
+            let sample_pos = self.select_samples[sample_idx] as usize;
+            let bit_offset = sample_pos % 64;
+            let masked = self.high_bits[start_word] & !((1u64 << bit_offset) - 1);
 
-            let ones = word.count_ones() as usize;
+            let ones = masked.count_ones() as usize;
             if ones > remaining {
-                let bit_pos = select_in_word(word, remaining as u32) as usize;
-                return word_idx * 64 + bit_pos;
+                // #40: a single-word scan.
+                #[cfg(feature = "select-stats")]
+                crate::util::select_stats::record(crate::util::select_stats::Site::EliasFano, 1);
+
+                return start_word * 64 + select_in_word(masked, remaining as u32) as usize;
             }
             remaining -= ones;
+
+            let (word_idx, rem) = scan_select(&self.high_bits, start_word + 1, remaining)
+                .expect("select1: not enough 1-bits");
+
+            // #40: words popcounted, counting the masked start word.
+            #[cfg(feature = "select-stats")]
+            crate::util::select_stats::record(
+                crate::util::select_stats::Site::EliasFano,
+                word_idx - start_word + 1,
+            );
+
+            let bit_pos = select_in_word(self.high_bits[word_idx], rem as u32) as usize;
+            return word_idx * 64 + bit_pos;
         }
 
-        unreachable!("select1: not enough 1-bits");
+        // No usable sample: scan from the beginning, nothing to mask.
+        let (word_idx, rem) = scan_select(&self.high_bits, start_word, remaining)
+            .expect("select1: not enough 1-bits");
+
+        // #40: words popcounted by this scan, including the crossing word.
+        #[cfg(feature = "select-stats")]
+        crate::util::select_stats::record(
+            crate::util::select_stats::Site::EliasFano,
+            word_idx - start_word + 1,
+        );
+
+        word_idx * 64 + select_in_word(self.high_bits[word_idx], rem as u32) as usize
     }
 
     /// Read low bits for element i.

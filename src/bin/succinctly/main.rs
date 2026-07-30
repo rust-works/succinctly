@@ -216,6 +216,24 @@ struct DevCommand {
 enum DevSubcommand {
     /// Run benchmarks
     Bench(BenchCommand),
+    /// Report how many words the select word scans traverse (#40)
+    SelectStats(SelectStatsArgs),
+}
+
+/// Arguments for the select scan-length report.
+///
+/// Needs a binary built with the `select-stats` feature; without it the
+/// counters are compiled out and the command exits non-zero rather than
+/// printing zeros that look like a finding.
+#[derive(Debug, Parser)]
+struct SelectStatsArgs {
+    /// Corpus root directory to traverse (recursively, by file extension)
+    #[arg(short, long, default_value = "data/bench/corpus")]
+    data_dir: PathBuf,
+
+    /// Markdown report to write (default: print to stdout)
+    #[arg(short, long)]
+    markdown: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -1297,6 +1315,10 @@ fn main() -> Result<()> {
                     std::process::exit(exit_code);
                 }
             },
+            DevSubcommand::SelectStats(args) => {
+                let exit_code = select_stats_report::run(&args.data_dir, args.markdown.as_ref())?;
+                std::process::exit(exit_code);
+            }
         },
         Command::InstallAliases(args) => install_aliases(args),
         #[cfg(feature = "bench-runner")]
@@ -2122,6 +2144,7 @@ mod jq_locate;
 mod jq_runner;
 mod json_validate;
 mod output;
+mod select_stats_report;
 mod text_generators;
 mod text_validate;
 mod utf8_bench;

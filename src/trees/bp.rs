@@ -34,8 +34,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::bits::popcount::popcount_word;
-use crate::bits::SelectIndex;
+use crate::bits::{scan_select, SelectIndex};
 use crate::util::broadword::select_in_word;
 
 // ============================================================================
@@ -107,23 +106,25 @@ impl SelectSupport for WithSelect {
         }
 
         // Use select index to jump to approximate position
-        let (start_word, mut remaining) = self.select_idx.jump_to(k);
+        let (start_word, remaining) = self.select_idx.jump_to(k);
 
-        // Scan words from the starting position
-        for (word_idx, &word) in words.iter().enumerate().skip(start_word) {
-            let pop = popcount_word(word) as usize;
+        // Scan forward for the word holding the target bit.
+        let (word_idx, rem) = scan_select(words, start_word, remaining)?;
 
-            if pop > remaining {
-                // Found the target word
-                let bit_pos = select_in_word(word, remaining as u32) as usize;
-                let result = word_idx * 64 + bit_pos;
-                return if result < len { Some(result) } else { None };
-            }
+        // #40: words popcounted by this scan, including the crossing word.
+        #[cfg(feature = "select-stats")]
+        crate::util::select_stats::record(
+            crate::util::select_stats::Site::BpWithSelect,
+            word_idx - start_word + 1,
+        );
 
-            remaining -= pop;
+        let bit_pos = select_in_word(words[word_idx], rem as u32) as usize;
+        let result = word_idx * 64 + bit_pos;
+        if result < len {
+            Some(result)
+        } else {
+            None
         }
-
-        None
     }
 }
 

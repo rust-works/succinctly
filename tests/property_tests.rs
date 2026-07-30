@@ -1108,3 +1108,63 @@ fn test_million_bit_random() {
         );
     }
 }
+
+// ============================================================================
+// scan_select (#40): the vectorised word scan must be indistinguishable from
+// the per-word loop it replaces, for every input and every start word.
+// ============================================================================
+
+proptest! {
+    /// The block-skipping scan agrees with the scalar loop everywhere.
+    ///
+    /// This is the property that lets the five call sites delegate to the
+    /// shared helper: the SIMD path may be faster, but it may never disagree.
+    #[test]
+    fn scan_select_matches_scalar(
+        words in prop::collection::vec(any::<u64>(), 1..80),
+        start_word in 0usize..80,
+        k in 0usize..600,
+    ) {
+        use succinctly::bits::{scan_select, scan_select_scalar};
+        prop_assert_eq!(
+            scan_select(&words, start_word, k),
+            scan_select_scalar(&words, start_word, k)
+        );
+    }
+
+    /// Sparse inputs drive the block-skipping path, where whole all-zero
+    /// blocks are stepped over — the case dense random words rarely reach.
+    #[test]
+    fn scan_select_matches_scalar_when_sparse(
+        seeds in prop::collection::vec(0u32..64, 1..60),
+        k in 0usize..40,
+    ) {
+        use succinctly::bits::{scan_select, scan_select_scalar};
+        // Mostly-empty words with an occasional single set bit.
+        let words: Vec<u64> = seeds
+            .iter()
+            .map(|&s| if s % 5 == 0 { 1u64 << (s % 64) } else { 0 })
+            .collect();
+        prop_assert_eq!(
+            scan_select(&words, 0, k),
+            scan_select_scalar(&words, 0, k)
+        );
+    }
+
+    /// `select_from` enumerates exactly the set bits, in ascending order.
+    #[test]
+    fn select_from_enumerates_set_bits_in_order(
+        words in prop::collection::vec(any::<u64>(), 1..20),
+    ) {
+        use succinctly::bits::select_from;
+        let expected: Vec<usize> = (0..words.len() * 64)
+            .filter(|&b| (words[b / 64] >> (b % 64)) & 1 == 1)
+            .collect();
+
+        for (k, &bit) in expected.iter().enumerate() {
+            prop_assert_eq!(select_from(&words, 0, k), Some(bit));
+        }
+        // One past the last set bit must not resolve.
+        prop_assert_eq!(select_from(&words, 0, expected.len()), None);
+    }
+}

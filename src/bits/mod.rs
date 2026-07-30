@@ -25,10 +25,12 @@ mod bitvec;
 mod elias_fano;
 pub(crate) mod popcount;
 mod rank;
+mod scan;
 mod select;
 
 pub use bitvec::BitVec;
 pub use elias_fano::{EliasFano, EliasFanoCursor, EliasFanoIter};
 pub use popcount::{popcount_word, popcount_word_portable, popcount_words};
 pub use rank::RankDirectory;
+pub use scan::{block_popcount_portable, scan_select, scan_select_scalar, select_from, BLOCK};
 pub use select::SelectIndex;

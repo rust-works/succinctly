@@ -40,6 +40,7 @@ use alloc::vec::Vec;
 
 use core::cell::Cell;
 
+use crate::bits::scan_select;
 use crate::util::broadword::select_in_word;
 
 /// Select sample rate - one sample per this many 1-bits.
@@ -398,26 +399,33 @@ impl AdvancePositions {
             return Some(cursor.last_ib_result as u32);
         }
 
-        // Forward scan in IB bitmap from cursor position
-        let mut remaining = k - cursor.ib_ones_before;
-        let mut wi = cursor.ib_word_idx;
+        // Forward scan in IB bitmap from cursor position. This is the hottest
+        // select scan in the crate (once per node during yq streaming), and the
+        // one whose measured length distribution justified vectorising the
+        // shared helper — see `bits::scan`.
+        let start_wi = cursor.ib_word_idx;
+        let remaining = k - cursor.ib_ones_before;
 
-        while wi < self.ib_words.len() {
+        if let Some((wi, rem)) = scan_select(&self.ib_words, start_wi, remaining) {
             let word = self.ib_words[wi];
-            let ones = word.count_ones() as usize;
-            if remaining < ones {
-                let bit_pos = select_in_word(word, remaining as u32) as usize;
-                let result = wi * 64 + bit_pos;
+            let bit_pos = select_in_word(word, rem as u32) as usize;
+            let result = wi * 64 + bit_pos;
 
-                cursor.ib_ones_before = k - remaining;
-                cursor.ib_word_idx = wi;
-                cursor.last_ib_arg = k;
-                cursor.last_ib_result = result;
-                self.cursor.set(cursor);
-                return Some(result as u32);
-            }
-            remaining -= ones;
-            wi += 1;
+            // #40: words popcounted by this scan, including the crossing word.
+            #[cfg(feature = "select-stats")]
+            crate::util::select_stats::record(
+                crate::util::select_stats::Site::YamlAdvance,
+                wi - start_wi + 1,
+            );
+
+            // `rem` is the target's rank *within* word `wi`, so `k - rem` is
+            // the number of ones before that word — the cursor's invariant.
+            cursor.ib_ones_before = k - rem;
+            cursor.ib_word_idx = wi;
+            cursor.last_ib_arg = k;
+            cursor.last_ib_result = result;
+            self.cursor.set(cursor);
+            return Some(result as u32);
         }
 
         self.cursor.set(cursor);
