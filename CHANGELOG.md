@@ -113,14 +113,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *before* the six path walkers run, and its `resolve_node` fan-out had an arm
   for `.[]` only; every other multi-output component fell to the static-leaf
   arm, which could not name the path reaching each of its many values.
-  `resolve_node` now also fans out `..` (`Expr::RecursiveDescent`),
-  `recurse`/`recurse(f)`/`recurse(f; cond)` (mirroring
-  `builtin_recurse_f`/`builtin_recurse_cond`'s breadth-first queue order, so
-  `path(recurse)` agrees with `[recurse]` on which nodes are visited and in
-  what order), and the typeof filters (`select(f)`, `objects`, `arrays`,
+  `resolve_node` now also fans out `..` (`Expr::RecursiveDescent`), bare
+  `recurse`/`recurse_down` (which jq defines as `recurse(.[]?)` and which
+  therefore shares `..`'s resolver outright), the parameterised
+  `recurse(f)`/`recurse(f; cond)` (following
+  `builtin_recurse_f`/`builtin_recurse_cond`'s breadth-first queue, including
+  their choice not to descend through a null child — `f` is arbitrary and
+  `recurse(.a?)` over a null reads null from null forever, so that is what
+  bounds the walk), and the typeof filters (`select(f)`, `objects`, `arrays`,
   `values`, `booleans`, `numbers`, `strings`, `nulls`, `iterables`, `scalars`),
   each branch now carrying the actual Field/Index chain that reaches it rather
-  than the multi-output expression itself. Not covered: a multi-output
+  than the multi-output expression itself. One difference from the value path
+  is deliberate: when `f` yields an array, `[recurse(f)]` descends into its
+  elements where jq stops at the array; the resolver stops at the array, i.e.
+  agrees with jq rather than mirroring that bug. Not covered: a multi-output
   component with none of those shapes — an arbitrary generator like
   `range(3)`, or `getpath` with a computed argument — still reports the same
   refusal, since naming its path components would mean tracking components for
@@ -129,6 +135,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `resolve_node` only runs when a computed key is present, and
   `eval_with_path_tracking` (the walker `path()` otherwise uses directly) is
   unchanged.
+
+- **A `?` in the middle of an assignment or delete path made it act on the
+  parent of its target**: `del(.[]? | .[.k]?)` on `{"x":{"k":"v","v":1}}` gave
+  `{}` — the whole `.x` — where jq gives `{"x":{"k":"v"}}`, and
+  `(.[]? | .[.k]?) = 7` reported `invalid path component`. A branch resolved
+  under `?` keeps an `Expr::Optional` around its component, so a resolved path
+  is `Optional(Field("x")) | Optional(Field("v"))`. `eval_with_path_tracking`
+  looks through that wrapper, which is why `path()` read correctly, but
+  `get_path_mut`, `update_path` and `delete_at_path` matched it against
+  `Field`/`Index`/`Iterate`, missed, and fell to a catch-all that acts at the
+  wrapper's own position **with the rest of the path dropped** — hence deleting
+  or overwriting the parent. All three now unwrap it, as `flatten_delete_path`
+  already did, and splice a nested pipe rather than stranding what follows it.
+  Found while extending #412's coverage from `path()` to every writer: the
+  arms added there emit the same wrapper, so `del(recurse | objects | .[.k]?)`
+  would have inherited the defect.
 
 - **An inline block sequence as a mapping value silently discarded its
   content** (#325): `a: - x` — invalid YAML (test-suite case 5U3A: a block
