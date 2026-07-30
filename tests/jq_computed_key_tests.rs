@@ -426,6 +426,43 @@ fn test_optional_prunes_a_path_that_cannot_resolve() {
     );
 }
 
+/// The two ways a resolved branch is pruned rather than propagated, neither of
+/// which the cases above reach.
+///
+/// Both are the failure to *index* that `?` covers — the half #413 deliberately
+/// left suppressed — but they arrive at different points in the resolver, and a
+/// key kind that is valid on its own reaches only the second.
+#[test]
+fn test_optional_prunes_an_index_failure_and_an_unresolvable_target() {
+    // The key's *kind* fits (a string names a field, a number an element), so the
+    // component is built — and only then does applying it to the container fail.
+    // The suppressed-key cases elsewhere in this file fail one step earlier, when
+    // no component can be named at all (`.[null]?`).
+    for input in [
+        r#"{"a":"str","k":"x"}"#, // string key, string container
+        r#"{"a":true,"k":"x"}"#,  // string key, boolean container
+        r#"{"a":{},"k":0}"#,      // number key, object container
+    ] {
+        check(input, ".a[.k]? = 5", Outcome::values(&[input]));
+    }
+
+    // A `?`-wrapped node that is not `E[K]` is resolved by the blanket arm, which
+    // prunes when the node itself cannot resolve. Reaching it needs a computed key
+    // *elsewhere* in the path — without one the whole pre-pass short-circuits and
+    // the walkers see the `?` directly. `1+1`/`length` are keys that do not touch
+    // the input, so the target is what fails: `.a` on a string.
+    for filter in [".a?[1+1] = 5", ".a?[length] = 5"] {
+        check(r#""str""#, filter, Outcome::values(&[r#""str""#]));
+    }
+    // The contrast: with the target resolvable, the same filter reports the
+    // indexing failure that the missing `?` on the bracket no longer covers.
+    check(
+        r#"{"a":1}"#,
+        ".a?[length] = 5",
+        Outcome::error("Cannot index number with number"),
+    );
+}
+
 /// #413: `?` on an assignment path suppresses only the failure to *index* —
 /// exactly as it does in value position (`test_optional_does_not_reach_the_target`
 /// above). It does not cover a failure raised while evaluating the key itself,
