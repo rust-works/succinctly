@@ -7701,7 +7701,7 @@ mod tests {
             YamlValue::String(s) => format!("{:?}", &*s.as_str().unwrap()),
             YamlValue::Mapping(fields) => {
                 let mut parts = Vec::new();
-                let mut it = *fields;
+                let mut it = fields.clone();
                 while let Some((field, rest)) = it.uncons() {
                     parts.push(format!(
                         "{}:{}",
