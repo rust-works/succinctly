@@ -10797,36 +10797,62 @@ fn delete_expr_array_paths(
         }
     }
 
-    // Same reasoning as `delete_expr_object_paths` above — every path here is
-    // Index/Slice-kind, so `resolve_node` already validated `value` as
-    // indexable for each path before grouping ever runs; `null` is excluded
-    // by the check above, so this can only fire if that earlier validation
-    // regresses.
-    let OwnedValue::Array(arr) = &mut value else {
-        unreachable!("delete_expr_array_paths reached a non-array, non-null root")
-    };
-    for (step, group) in &groups {
-        match step {
-            ArrayStep::Index(idx) => {
-                let len = arr.len() as i64;
-                let actual = if *idx < 0 { len + idx } else { *idx };
-                if actual >= 0 && (actual as usize) < arr.len() {
-                    let slot = &mut arr[actual as usize];
-                    let old = core::mem::replace(slot, OwnedValue::Null);
-                    *slot = delete_expr_paths_at(old, group, start + 1)?;
+    // Unlike the object case above, this is NOT dead code: `resolve_node`
+    // validates a `Slice` component by evaluating it as a *read*, and slicing
+    // a string is a legal read (`"hi" | .[0:1]` is `"h"`) even though `del`
+    // through that same slice is not. `"hi" | del(.[0:1], .[1:2])` reaches
+    // here with `value` still a `String`, so this gate is load-bearing —
+    // dd2df4d1 removed it as believed-unreachable and #504's CI caught the
+    // regression via `test_del_static_comma_type_error_reports_the_first_sibling`.
+    if !matches!(value, OwnedValue::Array(_)) {
+        // A non-array container fails every path here identically, so a
+        // single non-optional path among the siblings has to raise even when
+        // others are optional.
+        //
+        // *Which* sentence comes from the first sibling, because jq walks the
+        // paths in source order and dies on the first: `5 | del(.[0], .[1:2])`
+        // is `Cannot index number with number`, and the same two written the
+        // other way round is `… with object`.
+        return if paths.iter().all(|p| p[start].optional) {
+            Ok(value)
+        } else {
+            Err(match &paths[0][start].component {
+                Expr::Slice { .. } if matches!(value, OwnedValue::String(_)) => {
+                    EvalError::cannot_delete_fields_from("string")
                 }
-                // An out-of-range index names nothing to delete through —
-                // jq's delpaths silently skips it, `?` or not (#477).
-            }
-            // Deleting *through* a slice deletes inside the sub-array and
-            // splices it back: `[1,[2],[3]] | del(.[1:3][0])` is `[1,[3]]`.
-            ArrayStep::Slice(s, e) => {
-                let range = SliceBounds::from_literals(*s, *e).resolve(arr.len());
-                let sub = OwnedValue::Array(arr[range.clone()].to_vec());
-                let OwnedValue::Array(items) = delete_expr_paths_at(sub, group, start + 1)? else {
-                    unreachable!("deleting from an array yields an array")
-                };
-                arr.splice(range, items);
+                Expr::Slice { .. } => {
+                    EvalError::cannot_index_with_type(owned_type_name(&value), "object")
+                }
+                _ => EvalError::cannot_index_with_type(owned_type_name(&value), "number"),
+            })
+        };
+    }
+
+    if let OwnedValue::Array(arr) = &mut value {
+        for (step, group) in &groups {
+            match step {
+                ArrayStep::Index(idx) => {
+                    let len = arr.len() as i64;
+                    let actual = if *idx < 0 { len + idx } else { *idx };
+                    if actual >= 0 && (actual as usize) < arr.len() {
+                        let slot = &mut arr[actual as usize];
+                        let old = core::mem::replace(slot, OwnedValue::Null);
+                        *slot = delete_expr_paths_at(old, group, start + 1)?;
+                    }
+                    // An out-of-range index names nothing to delete through —
+                    // jq's delpaths silently skips it, `?` or not (#477).
+                }
+                // Deleting *through* a slice deletes inside the sub-array and
+                // splices it back: `[1,[2],[3]] | del(.[1:3][0])` is `[1,[3]]`.
+                ArrayStep::Slice(s, e) => {
+                    let range = SliceBounds::from_literals(*s, *e).resolve(arr.len());
+                    let sub = OwnedValue::Array(arr[range.clone()].to_vec());
+                    let OwnedValue::Array(items) = delete_expr_paths_at(sub, group, start + 1)?
+                    else {
+                        unreachable!("deleting from an array yields an array")
+                    };
+                    arr.splice(range, items);
+                }
             }
         }
     }
