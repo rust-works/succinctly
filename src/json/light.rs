@@ -229,10 +229,25 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     }
 
     /// Get the line index, building it lazily on first use.
+    ///
+    /// The first caller's `text` wins for the lifetime of the index, so a
+    /// later call with different text silently reads the first one's line
+    /// map. The debug assertion catches the cheap half of that mistake.
     #[inline]
     fn ensure_lines(&self, text: &[u8]) -> &crate::text::LineIndex {
-        self.lines
-            .get_or_init(|| crate::text::LineIndex::build(text))
+        let lines = self
+            .lines
+            .get_or_init(|| crate::text::LineIndex::build(text));
+
+        debug_assert_eq!(
+            lines.text_len(),
+            text.len(),
+            "line index was built from different text ({} bytes) than this call passed ({} bytes)",
+            lines.text_len(),
+            text.len()
+        );
+
+        lines
     }
 
     /// Create a cursor at the root of the JSON document.
