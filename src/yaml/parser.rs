@@ -1018,6 +1018,63 @@ impl<'a> Parser<'a> {
         self.in_document = false;
     }
 
+    /// Skip `%`-directive lines (`%YAML 1.2`, `%TAG ...`, or any reserved
+    /// directive) preceding a document's `---` marker (#225).
+    ///
+    /// Recognized only at column 0 while `!self.in_document` — the same
+    /// gating condition the strict validator (`validate.rs`) uses. The
+    /// directive's name and parameters are fully discarded: this loader is
+    /// non-validating (see the module doc), so it does not need to
+    /// distinguish `%YAML`/`%TAG` from a reserved directive like `%FOO` —
+    /// all three are simply consumed here without emitting any content,
+    /// which also means a misspelled directive name (e.g. `%YAM`, `%YAMLL`)
+    /// is skipped exactly like a well-formed one, with no name matching at
+    /// all.
+    fn skip_directives(&mut self) {
+        loop {
+            self.skip_directive_gap_whitespace();
+            if self.in_document || self.peek() != Some(b'%') {
+                break;
+            }
+            self.skip_to_eol();
+            self.skip_line_break();
+        }
+    }
+
+    /// Skip blank lines (including tab-only ones) and comment lines between
+    /// directives, or between a directive and the following `---` (`DK95/07`,
+    /// #225).
+    ///
+    /// Deliberately its own copy of [`Self::skip_newlines`] rather than a
+    /// shared call: a tab-only line here is blank, because there is no
+    /// indentation to speak of in a pre-document gap, but `skip_newlines`'s
+    /// other callers depend on a bare tab breaking immediately so
+    /// `count_indent` can reject it as invalid indentation inside a
+    /// document's actual content. Folding the two together silently stopped
+    /// rejecting that case (`Y79Y/000`).
+    fn skip_directive_gap_whitespace(&mut self) {
+        while let Some(b) = self.peek() {
+            if is_line_break(b) {
+                self.skip_line_break();
+            } else if b == b'#' {
+                self.skip_to_eol();
+            } else if b == b' ' || b == b'\t' {
+                let start = self.pos;
+                self.skip_inline_whitespace();
+                if self.at_break() || self.peek() == Some(b'#') || self.peek().is_none() {
+                    if self.peek() == Some(b'#') {
+                        self.skip_to_eol();
+                    }
+                    continue;
+                }
+                self.pos = start;
+                break;
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Parse a double-quoted string.
     ///
     /// Uses SIMD fast-path to skip to the next quote or backslash.
@@ -3989,6 +4046,10 @@ impl<'a> Parser<'a> {
 
     /// Parse all documents in the stream.
     fn parse_documents(&mut self) -> Result<(), YamlError> {
+        // Skip any `%YAML`/`%TAG`/reserved directive lines before the first
+        // document (#225).
+        self.skip_directives();
+
         // Skip leading `---` if present (optional for first doc)
         if self.is_document_start() {
             self.skip_document_marker();
@@ -4033,6 +4094,16 @@ impl<'a> Parser<'a> {
                 }
 
                 // Check for another document or EOF
+                if self.peek().is_none() {
+                    break;
+                }
+
+                // A directive can recur here for the next document, e.g.
+                // after a `...` end marker (#225).
+                self.skip_directives();
+
+                // Check for another document or EOF (a directive-only tail
+                // can itself exhaust the input).
                 if self.peek().is_none() {
                     break;
                 }
@@ -4825,6 +4896,48 @@ mod tests {
         let yaml = b"---\na: 1\n---\nb: 2\n---\nc: 3";
         let result = build_semi_index(yaml);
         assert!(result.is_ok(), "three documents should parse: {result:?}");
+    }
+
+    // =========================================================================
+    // Directive tests (#225)
+    // =========================================================================
+
+    /// Collects one JSON string per document via the same `uncons_cursor` /
+    /// `to_json` path `tests/yaml_test_suite.rs` and `succinctly yq -o json`
+    /// both use, so these tests exercise the real read path rather than just
+    /// `build_semi_index(..).is_ok()`.
+    fn documents(yaml: &[u8]) -> Vec<String> {
+        use crate::yaml::{YamlIndex, YamlValue};
+
+        let index = YamlIndex::build(yaml).expect("parse failed");
+        let root = index.root(yaml);
+        let mut docs = Vec::new();
+        match root.value() {
+            YamlValue::Sequence(mut elements) => {
+                while let Some((cursor, rest)) = elements.uncons_cursor() {
+                    docs.push(cursor.to_json());
+                    elements = rest;
+                }
+            }
+            _ => docs.push(root.to_json_document()),
+        }
+        docs
+    }
+
+    #[test]
+    fn test_yaml_directive_before_single_document() {
+        // 27NA: a `%YAML` directive must not absorb the following `---`.
+        let docs = documents(b"%YAML 1.2\n--- text\n");
+        assert_eq!(docs, vec!["\"text\""]);
+    }
+
+    #[test]
+    fn test_reserved_directive_ignored() {
+        // 2LFX/6LVF: an unknown directive is dropped, not emitted as content.
+        let docs = documents(
+            b"%FOO  bar baz # Should be ignored\n              # with a warning.\n---\n\"foo\"\n",
+        );
+        assert_eq!(docs, vec!["\"foo\""]);
     }
 
     #[test]

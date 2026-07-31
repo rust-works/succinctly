@@ -26,10 +26,8 @@
 #   structure   Document or block structure differs from the spec. Not yet
 #               individually triaged.
 
-27NA      directives        %YAML/%TAG directive not recognized — #225
 2AUY      tags              tags (!) not supported — #224
 2CMS      lax:mapping       mapping/key rules not validated — #223
-2LFX      directives        %YAML/%TAG directive not recognized — #225
 2SXE      structure         document/block structure differs from spec
 2XXW      tags              tag shorthand emitted as scalar text — #224
 33X3      tags              tags (!) not supported — #224
@@ -42,7 +40,6 @@
 5TYM      tags              tags (!) not supported — #224
 6CK3      tags              tags (!) not supported — #224
 6JWB      tags              tags (!) not supported — #224
-6LVF      directives        %YAML/%TAG directive not recognized — #225
 6WLZ      tags              tags (!) not supported — #224
 6XDY      structure         document/block structure differs from spec
 6ZKB      directives        %YAML/%TAG directive not recognized — #225
@@ -58,7 +55,6 @@
 9KBC      lax:mapping       mapping/key rules not validated — #223
 9WXW      tags              tags (!) not supported — #224
 AVM7      scalars           scalar content/folding differs from spec
-BEC7      directives        %YAML/%TAG directive not recognized — #225
 BF9H      lax:comments      comment placement not validated — #223
 BU8L      tags              tag shorthand emitted as scalar text — #224
 C2SP      lax:flow          flow syntax not validated — #223
