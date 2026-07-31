@@ -567,7 +567,7 @@ pub fn contains_cr(input: &[u8]) -> bool {
     ))]
     {
         // SAFETY: NEON is mandatory on aarch64.
-        return unsafe { contains_cr_neon(input) };
+        unsafe { contains_cr_neon(input) }
     }
 
     #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
@@ -578,7 +578,7 @@ pub fn contains_cr(input: &[u8]) -> bool {
             return unsafe { contains_cr_avx2(input) };
         }
         // SAFETY: SSE2 is the x86_64 baseline.
-        return unsafe { contains_cr_sse2(input) };
+        unsafe { contains_cr_sse2(input) }
     }
 
     // Scalar: under `scalar-yaml`, on aarch64 under `broadword-yaml` (no
