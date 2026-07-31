@@ -2976,6 +2976,76 @@ fn test_inline_sequence_as_compact_mapping_value_is_not_dropped() -> Result<()> 
     Ok(())
 }
 
+// ============================================================================
+// Out-dented block sequence continuation (#485)
+// ============================================================================
+// A continuation `-` indented strictly between a sequence's own indent and
+// whatever encloses it is invalid YAML (`yq` rejects it, and so does the
+// strict validator), but the loader parses the obvious extension rather than
+// silently dropping the item, the same policy #325 chose for `a: - x`.
+// Before this fix, closing the sequence for the out-of-range indent reopened
+// a second, untagged sequence as a sibling child of the mapping instead of a
+// value under a key, which not only dropped the misaligned item but corrupted
+// the *next* mapping entry into a phantom `"":<value>` pair.
+
+#[test]
+fn test_out_dented_sequence_continuation_joins_the_sequence() -> Result<()> {
+    // The #485 repro: `y` used to vanish and `c: 2` corrupted into `"":"c"`.
+    let (output, exit_code) =
+        run_yq_stdin(".", "b:\n    - x\n   - y\nc: 2\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"b":["x","y"],"c":2}"#);
+    Ok(())
+}
+
+#[test]
+fn test_out_dented_sequence_continuation_does_not_lose_later_items() -> Result<()> {
+    // Everything after the misaligned item must survive too, not just resume
+    // being lost one item later.
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "b:\n    - x\n   - y\n    - z\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"b":["x","y","z"]}"#);
+    Ok(())
+}
+
+#[test]
+fn test_out_dented_sequence_continuation_minimal_form() -> Result<()> {
+    // No trailing entry, no outer nesting.
+    let (output, exit_code) = run_yq_stdin(".", "b:\n  - x\n - y\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"b":["x","y"]}"#);
+    Ok(())
+}
+
+#[test]
+fn test_out_dented_sequence_continuation_nested_in_a_mapping() -> Result<()> {
+    // The same shape one level deeper: `b`'s sequence sits inside `a`, and the
+    // enclosing frame the out-dented `- y` must reach past is `b`, not the
+    // document root.
+    let (output, exit_code) = run_yq_stdin(
+        ".",
+        "a:\n  b:\n    - x\n   - y\n  c: 2\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":{"b":["x","y"],"c":2}}"#);
+    Ok(())
+}
+
+#[test]
+fn test_correctly_aligned_sequence_is_unaffected_by_out_dent_handling() -> Result<()> {
+    // Regression guard: an ordinary, correctly-indented sequence must parse
+    // exactly as before.
+    let (output, exit_code) = run_yq_stdin(".", "b:\n  - x\n  - y\n", &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"b":["x","y"]}"#);
+    Ok(())
+}
+
 #[test]
 fn test_flow_dash_without_whitespace_is_still_a_scalar() -> Result<()> {
     // A `-` not followed by whitespace is a legitimate plain scalar in flow
