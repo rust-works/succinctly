@@ -51,12 +51,12 @@ files: 8, total bytes: 36085, anchors: 41, aliases: 86, bare-dash items: 5
 
 | metric               | unit         | n    | min  | p50  | p90  | p99  | max  |
 | -------------------- | ------------ | ---- | ---- | ---- | ---- | ---- | ---- |
-| scalar length        | bytes/scalar | 1587 | 0    | 7    | 25   | 89   | 374  |
-| mapping keys         | keys/mapping | 392  | 0    | 2    | 4    | 9    | 69   |
+| scalar length        | bytes/scalar | 1599 | 0    | 7    | 24   | 89   | 374  |
+| mapping keys         | keys/mapping | 398  | 0    | 2    | 4    | 9    | 69   |
 | sequence items       | items/seq    | 94   | 1    | 2    | 4    | 12   | 12   |
 | bare-dash seq items  | count/file   | 8    | 0    | 0    | 5    | 5    | 5    |
 | flow-collection size | bytes/flow   | 14   | 2    | 11   | 91   | 100  | 100  |
-| nesting depth        | levels/node  | 1206 | 2    | 6    | 8    | 10   | 12   |
+| nesting depth        | levels/node  | 1218 | 2    | 6    | 8    | 10   | 12   |
 | anchors              | count/file   | 8    | 0    | 0    | 41   | 41   | 41   |
 | aliases              | count/file   | 8    | 0    | 0    | 86   | 86   | 86   |
 | escape density       | per KiB/file | 8    | 0.00 | 0.00 | 0.05 | 0.05 | 0.05 |
