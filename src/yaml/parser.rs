@@ -1404,6 +1404,63 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Whether a sequence frame at `indent_stack[frame_idx]` should still hold
+    /// an item at `indent`: either an exact indent match (the ordinary case)
+    /// or, leniently, an out-of-range indent strictly between the sequence
+    /// and whatever encloses it.
+    ///
+    /// A block sequence continuation at such an indent is invalid YAML (`yq`
+    /// and the strict validator both reject it), but closing the sequence
+    /// here — the plain `close_deeper_indents` behaviour — pops it back to
+    /// its enclosing mapping and then reopens a second, untagged sequence as
+    /// a sibling *child* of that mapping instead of a value under any key.
+    /// That extra child throws off the mapping's key/value pairing for
+    /// everything after it, silently dropping the item and corrupting the
+    /// next entry into a phantom empty key (#485). Treating the out-of-range
+    /// indent as still belonging to the open sequence avoids that, the same
+    /// "parse the obvious extension" policy #325 used for `a: - x`.
+    ///
+    /// Shared by `close_deeper_indents_for_sequence_item` (decides whether to
+    /// stop closing) and `parse_sequence_item_inner` (decides whether to
+    /// reuse the sequence rather than opening a new one) so the two
+    /// can't drift out of sync (the #106 lesson: duplicated predicates
+    /// diverge silently).
+    fn sequence_frame_reaches(&self, frame_idx: usize, indent: usize) -> bool {
+        let frame_indent = self.indent_stack[frame_idx];
+        indent == frame_indent
+            || (frame_idx > 0 && indent > self.indent_stack[frame_idx - 1] && indent < frame_indent)
+    }
+
+    /// Close deeper containers before parsing a `-` sequence item at
+    /// `new_indent`, tolerating an out-dented continuation via
+    /// [`Self::sequence_frame_reaches`] instead of popping the sequence
+    /// (#485).
+    ///
+    /// Only `parse_sequence_item_inner` uses this variant of
+    /// `close_deeper_indents`: the tolerance is specific to the sequence
+    /// getting a new *item*, and does not generalize to other callers (a
+    /// mapping key at the same out-of-range indent has no sequence-item
+    /// wrapper to land in, and would produce a different, wrong shape).
+    fn close_deeper_indents_for_sequence_item(&mut self, new_indent: usize) {
+        while self.indent_stack.len() > 1 {
+            let top_idx = self.indent_stack.len() - 1;
+            let current_indent = self.indent_stack[top_idx];
+            if current_indent <= new_indent {
+                break;
+            }
+            if self.type_stack[top_idx] == NodeType::Sequence
+                && self.sequence_frame_reaches(top_idx, new_indent)
+            {
+                // Out-dented continuation - keep this sequence open.
+                break;
+            }
+            self.close_pending_explicit_key();
+            self.indent_stack.pop();
+            self.pop_type();
+            self.write_bp_close();
+        }
+    }
+
     /// Close a sequence that was the value of a previous mapping entry.
     ///
     /// When we're about to add a new entry to a mapping at indent N, and the top
@@ -1454,19 +1511,23 @@ impl<'a> Parser<'a> {
         self.set_ib();
 
         // First close any deeper containers. This might reveal an existing sequence
-        // at this indent level that we can reuse.
-        self.close_deeper_indents(indent);
+        // at this indent level that we can reuse. Uses the sequence-item-aware
+        // variant so an out-dented continuation reuses the open sequence instead
+        // of being closed out from under it (#485).
+        self.close_deeper_indents_for_sequence_item(indent);
 
         // Now check if we need to open a new sequence (check AFTER closing)
         // Normally, sequence items must be at the exact same indent as the sequence.
         // However, for nested sequences created by `- - item` pattern, items can be
-        // at greater indent because the nested sequence's indent is virtual.
+        // at greater indent because the nested sequence's indent is virtual. And an
+        // out-dented continuation (#485) can be at *lesser* indent, as long as it's
+        // still within the range `close_deeper_indents_for_sequence_item` tolerated.
         //
-        // We need a new sequence if:
-        // 1. There's no sequence on the stack, OR
-        // 2. The item indent doesn't match the sequence indent
+        // We need a new sequence if there's no sequence on the stack, or the item
+        // indent doesn't fall within the current sequence's range (exact match, or
+        // the same out-of-range gap `sequence_frame_reaches` already tolerated).
         let need_new_sequence = self.current_type != Some(NodeType::Sequence)
-            || self.indent_stack.last().copied() != Some(indent);
+            || !self.sequence_frame_reaches(self.indent_stack.len() - 1, indent);
 
         if need_new_sequence {
             // Open new sequence
@@ -1475,6 +1536,18 @@ impl<'a> Parser<'a> {
             self.indent_stack.push(indent);
             self.push_type(NodeType::Sequence);
         }
+
+        // Normalize to the sequence's own recorded indent for everything below:
+        // the item's virtual child indent, a compact mapping's indent, and the
+        // structure indent passed to `parse_value`. A no-op for the ordinary
+        // exact-match case and for a sequence just opened above (both already
+        // equal `indent`), but load-bearing for an out-dented continuation that
+        // reused the sequence (#485) - without it, a later sibling line whose
+        // indent falls between this out-dented `indent` and the sequence's real
+        // indent would look like "more indented than this item's own value" and
+        // fold into it as scalar continuation text instead of being recognized
+        // as the next sequence item.
+        let indent = *self.indent_stack.last().unwrap();
 
         // Open the sequence item node
         self.write_bp_open_seq_item();
