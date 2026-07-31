@@ -530,6 +530,59 @@ fn known_serde_divergences_are_exactly_as_classified() {
     assert_eq!(classify_divergence(b"[1,2]", true, false), None);
 }
 
+/// The classifier must be tight, not merely sufficient.
+///
+/// Every case here is a document on which we and `serde_json` actually *agree*,
+/// so a divergence reported for one could only be a real bug — yet each sits
+/// close enough to a classified case that a loose predicate would excuse it.
+/// This is the fuzzer's oracle: anything it excuses is invisible forever.
+#[test]
+fn classifier_does_not_excuse_near_misses() {
+    // Depth 127 is the deepest *both* implementations accept, so a disagreement
+    // there is a bug, not the known depth-limit divergence. A `>= 127` bound
+    // would have swallowed it.
+    let at_serde_limit = format!("{}{}", "[".repeat(127), "]".repeat(127));
+    assert!(
+        validate::validate(at_serde_limit.as_bytes()).is_ok(),
+        "depth 127 must be accepted"
+    );
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(at_serde_limit.as_bytes()).is_ok(),
+        "serde_json is expected to accept depth 127"
+    );
+    assert_eq!(
+        classify_divergence(at_serde_limit.as_bytes(), true, false),
+        None,
+        "depth 127 is below the divergence boundary and must not be excused"
+    );
+
+    // Zero with an exponent is exactly zero, not an underflow. Testing only
+    // `parsed == 0.0 && contains('e')` would classify these, and with them every
+    // divergence in any document that happens to contain such a literal.
+    for text in ["[0e0]", "[-0.0e5]", "[0E-100]", "[0e0,\"unrelated\"]"] {
+        assert!(
+            validate::validate(text.as_bytes()).is_ok(),
+            "{text} must be accepted"
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(text.as_bytes()).is_ok(),
+            "serde_json is expected to accept {text}"
+        );
+        assert_eq!(
+            classify_divergence(text.as_bytes(), true, false),
+            None,
+            "{text} is exactly zero, not an underflow, and must not be excused"
+        );
+    }
+
+    // The genuine underflow next door still classifies, so the tightening did
+    // not simply disable the rule.
+    assert_eq!(
+        classify_divergence(b"[1e-400]", true, false),
+        Some(KnownDivergence::NumberRange)
+    );
+}
+
 /// `position_of` is the test's own reimplementation; check it against the
 /// validator's incremental tracking on inputs whose positions are known.
 #[test]

@@ -77,7 +77,12 @@ pub enum KnownDivergence {
 pub fn classify_divergence(input: &[u8], ours: bool, theirs: bool) -> Option<KnownDivergence> {
     // We accept, serde rejects.
     if ours && !theirs {
-        if max_nesting_depth(input) >= 127 {
+        // Exactly 128, not `>= 127`: serde's deepest accepted nesting is 127 and
+        // ours is 128, so 128 is the *only* depth at which the two can disagree.
+        // A looser bound would excuse any disagreement in a deeply-nested
+        // document, whatever its real cause — and this classifier is the
+        // fuzzer's oracle, where a false "known divergence" hides a bug forever.
+        if max_nesting_depth(input) == 128 {
             return Some(KnownDivergence::DepthLimit);
         }
         if has_f64_overflowing_number(input) {
@@ -141,8 +146,12 @@ pub fn has_f64_overflowing_number(input: &[u8]) -> bool {
                 if let Ok(text) = core::str::from_utf8(&input[start..i]) {
                     match text.parse::<f64>() {
                         Ok(v) if v.is_infinite() => return true,
-                        // Underflow to zero from a non-zero literal.
-                        Ok(v) if v == 0.0 && text.contains(['e', 'E']) => return true,
+                        // Underflow: rounds to zero despite a non-zero mantissa.
+                        // The mantissa test is what keeps `0e0` — which is
+                        // exactly zero, not an underflow — from classifying, and
+                        // with it every divergence in any document containing a
+                        // zero-with-exponent literal.
+                        Ok(v) if v == 0.0 && is_underflow_literal(text) => return true,
                         Err(_) => return true,
                         _ => {}
                     }
@@ -152,6 +161,15 @@ pub fn has_f64_overflowing_number(input: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Whether a literal that parsed to `0.0` did so by underflowing.
+///
+/// True only if the mantissa holds a non-zero digit, so `1e-400` counts and
+/// `0e0` / `-0.0e5` do not.
+fn is_underflow_literal(text: &str) -> bool {
+    let mantissa = text.split(['e', 'E']).next().unwrap_or(text);
+    mantissa.bytes().any(|b| b.is_ascii_digit() && b != b'0')
 }
 
 /// Render bytes for an assertion message: lossy text plus a hex dump, because
