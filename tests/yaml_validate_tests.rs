@@ -145,6 +145,30 @@ fn rejects_inline_sequence_as_mapping_value() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn rejects_out_dented_sequence_continuation() -> Result<()> {
+    // #485. The loader parses these leniently (attaching the out-dented item
+    // to the enclosing sequence), but strict rejection stays the validator's
+    // job: a dedent that stops strictly between two open levels is invalid
+    // (`check_block_indent`'s `popped && matches!(kind, Seq | Map)` case).
+    for input in [
+        "b:\n    - x\n   - y\nc: 2\n",
+        "b:\n    - x\n   - y\n    - z\n",
+        "b:\n  - x\n - y\n",
+        "a:\n  b:\n    - x\n   - y\n  c: 2\n",
+    ] {
+        let (_, stderr, code) = run_validate_stdin(input, &["--no-color"])?;
+        assert_eq!(code, 1, "expected rejection for {input:?}: {stderr}");
+    }
+
+    // Correctly-aligned sequences stay valid.
+    for input in ["b:\n  - x\n  - y\n", "b:\n    - x\n    - y\nc: 2\n"] {
+        let (_, stderr, code) = run_validate_stdin(input, &["--no-color"])?;
+        assert_eq!(code, 0, "expected acceptance for {input:?}: {stderr}");
+    }
+    Ok(())
+}
+
 // ============================================================================
 // `syq --validate` (the yq runner's opt-in validation flag).
 // ============================================================================
