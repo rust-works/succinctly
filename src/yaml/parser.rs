@@ -159,6 +159,12 @@ struct Parser<'a> {
     // Document tracking
     /// Whether we're currently inside a document
     in_document: bool,
+    /// `bp_pos` recorded by [`Self::start_document`]. If [`Self::end_document`]
+    /// finds `bp_pos` unchanged, the document had no content (e.g. `---\n...\n`
+    /// or a directive-only document immediately followed by EOF) and gets a
+    /// synthesized null node, mirroring [`Self::close_pending_explicit_key`]
+    /// (#225).
+    document_start_bp_pos: usize,
 
     // Explicit key tracking
     /// Depth (`indent_stack.len()`) of the mapping holding an explicit key that
@@ -226,6 +232,7 @@ impl<'a> Parser<'a> {
             anchors: BTreeMap::new(),
             aliases: BTreeMap::new(),
             in_document: false,
+            document_start_bp_pos: 0,
             pending_explicit_key: None,
             nesting_depth: 0,
             #[cfg(debug_assertions)]
@@ -996,12 +1003,25 @@ impl<'a> Parser<'a> {
     /// This doesn't open a container - the document IS its content.
     fn start_document(&mut self) {
         self.in_document = true;
+        self.document_start_bp_pos = self.bp_pos;
     }
 
     /// End the current document, closing any open containers.
     fn end_document(&mut self) {
         if !self.in_document {
             return;
+        }
+
+        // An explicit `---`/`...` boundary always produces a document, even
+        // with no content before the next boundary or EOF (#225's `MUS6/02-06`,
+        // `6ZKB`, `9DXL`, `W4TN`) - give it a null value, the same way
+        // `close_pending_explicit_key` synthesizes null for a key with no
+        // value. `bp_pos` unchanged since `start_document` means nothing was
+        // written for this document: any container open, or scalar/anchor
+        // write, would have advanced it already.
+        if self.bp_pos == self.document_start_bp_pos {
+            self.write_bp_open_at(self.input.len());
+            self.write_bp_close();
         }
 
         // Close any remaining open containers within the document
@@ -4071,10 +4091,12 @@ impl<'a> Parser<'a> {
         // Skip leading `---` if present (optional for first doc)
         if self.is_document_start() {
             self.skip_document_marker();
+            // An explicit `---` always starts a document, content or not
+            // (#225) - `end_document` synthesizes null if nothing follows.
+            self.start_document();
 
             // Check for inline content after `---` (e.g., `--- >` or `--- value`)
             if self.has_content_on_line() {
-                self.start_document();
                 self.parse_inline_document_value()?;
                 // Don't skip newlines yet - let the main loop handle it
             } else {
@@ -4088,8 +4110,12 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
 
-        // Start first document if not already started
-        if !self.in_document {
+        // Start first document if not already started. Guarded on
+        // `!is_document_end()`: with no leading `---` at all, an immediate
+        // `...` (optionally after only comments/blank lines) means there was
+        // never a document to start - `HWV9`/`QT73` expect zero documents,
+        // not a phantom null one from `end_document`'s synthesis (#225).
+        if !self.in_document && !self.is_document_end() {
             self.start_document();
         }
 
@@ -4129,8 +4155,9 @@ impl<'a> Parser<'a> {
                 // If there's a document start marker, skip it and check for inline content
                 if self.is_document_start() {
                     self.skip_document_marker();
+                    // Unconditional, as above: `---` always starts a document (#225).
+                    self.start_document();
                     if self.has_content_on_line() {
-                        self.start_document();
                         self.parse_inline_document_value()?;
                     } else {
                         self.skip_newlines();
@@ -4148,17 +4175,14 @@ impl<'a> Parser<'a> {
             if self.is_document_start() {
                 self.end_document();
                 self.skip_document_marker();
+                // Unconditional, as above: `---` always starts a document (#225).
+                self.start_document();
 
                 // Check for inline content after `---` (e.g., `--- >` or `--- value`)
                 if self.has_content_on_line() {
-                    self.start_document();
                     self.parse_inline_document_value()?;
                 } else {
                     self.skip_newlines();
-                    // Start new document if there's content
-                    if self.peek().is_some() {
-                        self.start_document();
-                    }
                 }
                 continue;
             }
@@ -4967,6 +4991,42 @@ mod tests {
         //     "Document --- name"      # expected: "Document", then {"name": "Bob"}
         let docs = documents(b"Document\n---\nname: Bob\n");
         assert_eq!(docs, vec!["\"Document\"", "{\"name\":\"Bob\"}"]);
+    }
+
+    #[test]
+    fn test_misspelled_directive_name_still_skipped() {
+        // MUS6/05, MUS6/06: the loader never inspects the directive name, so
+        // `%YAM`/`%YAMLL` are skipped exactly like a well-formed `%YAML`.
+        assert_eq!(documents(b"%YAM 1.1\n---\n"), vec!["null"]);
+        assert_eq!(documents(b"%YAMLL 1.1\n---\n"), vec!["null"]);
+    }
+
+    #[test]
+    fn test_directive_recurs_after_document_end() {
+        // 6ZKB: an implicit first document, an explicit empty second document,
+        // and a directive recurring before the third document's `---` - all in
+        // one stream.
+        let yaml = b"Document\n---\n# Empty\n...\n%YAML 1.2\n---\nmatches %: 20\n";
+        assert_eq!(
+            documents(yaml),
+            vec!["\"Document\"", "null", "{\"matches %\":20}"]
+        );
+    }
+
+    #[test]
+    fn test_explicit_document_start_with_no_content_is_null() {
+        // An explicit `---` always starts a document, even with nothing
+        // before EOF or the next marker (MUS6/02-06's shape, minus the
+        // directive).
+        assert_eq!(documents(b"---\n"), vec!["null"]);
+    }
+
+    #[test]
+    fn test_bare_end_marker_with_nothing_before_it_is_empty_stream() {
+        // HWV9/QT73: an end marker with no preceding `---` and no content
+        // never started a document, so it must not synthesize a phantom one.
+        assert_eq!(documents(b"...\n"), Vec::<String>::new());
+        assert_eq!(documents(b"# comment\n...\n"), Vec::<String>::new());
     }
 
     #[test]

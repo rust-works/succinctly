@@ -11,8 +11,6 @@
 # Categories
 # ----------
 #   tags        !!str / !custom / verbatim tags are not supported at all. -> #224
-#   directives  %YAML / %TAG directives are not recognized and parse as
-#               scalars. -> #225
 #   lax:*       Invalid input that indexing accepts because it does not validate.
 #               This is a property of the default mode, not a defect: succinctly
 #               is a non-validating loader. Rejecting these is the job of the
@@ -41,15 +39,12 @@
 6CK3      tags              tags (!) not supported — #224
 6JWB      tags              tags (!) not supported — #224
 6WLZ      tags              tags (!) not supported — #224
-6XDY      structure         document/block structure differs from spec
-6ZKB      directives        %YAML/%TAG directive not recognized — #225
 735Y      tags              tags (!) not supported — #224
 74H7      tags              tags (!) not supported — #224
 7FWL      tags              tags (!) not supported — #224
 8MK2      tags              tags (!) not supported — #224
 8XDJ      lax:comments      comment placement not validated — #223
 9C9N      lax:indentation   indentation not validated — #223
-9DXL      directives        %YAML/%TAG directive not recognized — #225
 9KAX      tags              tags (!) not supported — #224
 9KBC      lax:mapping       mapping/key rules not validated — #223
 9WXW      tags              tags (!) not supported — #224
@@ -58,12 +53,11 @@ BF9H      lax:comments      comment placement not validated — #223
 BU8L      tags              tag shorthand emitted as scalar text — #224
 C2SP      lax:flow          flow syntax not validated — #223
 C4HZ      tags              tags (!) not supported — #224
-CC74      directives        %YAML/%TAG directive not recognized — #225
+CC74      tags              tags (!) not supported — #224
 CUP7      tags              tags (!) not supported — #224
 CXX2      lax:anchors       anchor/alias rules not validated — #223
 DK3J      scalars           scalar content/folding differs from spec
 DK4H      lax:mapping       mapping/key rules not validated — #223
-DK95/07   directives        %YAML/%TAG directive not recognized — #225
 EHF6      tags              tags (!) not supported — #224
 EW3V      lax:mapping       mapping/key rules not validated — #223
 F2C7      tags              tags (!) not supported — #224
@@ -82,13 +76,7 @@ LE5A      tags              tags (!) not supported — #224
 M5C3      scalars           scalar content/folding differs from spec
 M7A3      structure         bare document / `...` end-marker mis-parsed (both paths agree)
 MUS6/01   lax:documents     directive/document rules not validated — #223
-MUS6/02   directives        %YAML/%TAG directive not recognized — #225
-MUS6/03   directives        %YAML/%TAG directive not recognized — #225
-MUS6/04   directives        %YAML/%TAG directive not recognized — #225
-MUS6/05   directives        %YAML/%TAG directive not recognized — #225
-MUS6/06   directives        %YAML/%TAG directive not recognized — #225
-P76L      directives        %YAML/%TAG directive not recognized — #225
-PUW8      structure         document/block structure differs from spec
+P76L      tags              tags (!) not supported — #224
 QLJ7      lax:documents     directive/document rules not validated — #223
 S4JQ      tags              tags (!) not supported — #224
 S98Z      lax:block-scalar  block scalar header not validated — #223
@@ -97,9 +85,8 @@ U3C3      tags              tags (!) not supported — #224
 U44R      lax:indentation   indentation not validated — #223
 UGM3      structure         document/block structure differs from spec
 UKK6/02   tags              tags (!) not supported — #224
-UT92      structure         document/block structure differs from spec
 VJP3/00   lax:flow          flow syntax not validated — #223
-W4TN      directives        %YAML/%TAG directive not recognized — #225
+W4TN      scalars           scalar content/folding differs from spec
 W5VH      structure         document/block structure differs from spec
 W9L4      lax:block-scalar  block scalar header not validated — #223
 WZ62      tags              tag shorthand emitted as scalar text — #224
