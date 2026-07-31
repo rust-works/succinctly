@@ -10958,11 +10958,13 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::Owned(result);
     }
 
-    // More than one resolved path only happens when a computed key produced
-    // several values (`.[(0,2)]`, `.[.a,.b]`, …) — exactly the shape #424
-    // got wrong by deleting them one at a time. `flatten_delete_path` reduces
-    // each resolved `Expr` to the same atomic-steps shape so
-    // `delete_expr_paths_at` can delete every resolved path together.
+    // More than one resolved path happens when a computed key produced
+    // several values (`.[(0,2)]`, `.[.a,.b]`, …), or when a top-level `Comma`
+    // names more than one static path outright (`.a, .b`, #475) — either way
+    // the same shape #424 got wrong by deleting them one at a time.
+    // `flatten_delete_path` reduces each resolved `Expr` to the same
+    // atomic-steps shape so `delete_expr_paths_at` can delete every resolved
+    // path together.
     let flattened: Vec<Vec<DeleteStep>> = paths
         .iter()
         .map(|path| {
