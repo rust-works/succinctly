@@ -187,6 +187,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key can reach — `[1,2] | del(.[5][])` and `{"a":[1,2]} | del(.a[5][])` are
   still silent no-ops where jq raises. Tracked in #529.
 
+- **jq comma/pipe precedence was inverted, silently dropping outputs** (#462).
+  `,` was parsed as the loosest operator, wrapping `|`; jq's grammar is the
+  reverse (`parser.y` declares `%right '|'` before `%left ','`). So
+  `1,2,3 | . * 2` meant `1, 2, (3 | . * 2)` and printed `1 2 6` instead of
+  `2 4 6` — every comma branch but the last lost its transformation, with no
+  error. Any comma-separated generator piped into a filter without
+  disambiguating parens was affected. `|` is now the loosest operator and each
+  pipe stage is a comma list.
+  **Breaking**: this changes what existing queries mean. A query written
+  against the old behaviour and *relying* on it — `a, b | f` intending
+  `a, (b | f)` — now applies `f` to both branches. Queries that already used
+  explicit parens are unaffected, as are queries with no top-level comma
+  before a pipe.
+  Two parse errors fall out of the same fix, since `if` branches and `def`
+  bodies were also parsed one level too tight: `if true then 1,2 else 3 end`
+  and `def f: 1,2; f` now compile, as they do in jq. The same widening reaches
+  `elif`/`else` branches, `label` bodies, `reduce`/`foreach` init/update/extract
+  slots, `until`/`while`/`repeat`, `range` bounds, `error(...)`, `first`/`last`,
+  destructuring-binding bodies and string interpolation — every position jq
+  spells as a full `Exp`.
+  `as` binds below the comma, matching jq: `1,2 as $x | $x | .+10` is
+  `1, (2 as $x | $x | .+10)`, printing `1` then `12`.
+  Object-construction *values* stay comma-free — they are jq's `ExpD`, where
+  `,` separates entries, so `{a: 1, b: 2}` is unchanged and `{a: (1,2)}` still
+  needs its parens. The `n` argument of `limit`/`skip`/`nth` also stays
+  comma-free, preserving the existing deliberate restriction (jq's `$n`
+  per-output fanout convention is still not implemented).
+  Not fixed here, and still divergent: a multi-output expression in a position
+  that does not fan out (`range(1,2; 4)`, `"\(1,2)"`, `{a: (1,2)}`,
+  `select(.==1, .==3)`) now parses where it used to be a parse error, but takes
+  only the first output — the pre-existing fanout gap tracked by #354/#378,
+  previously reachable only with explicit parens.
+
 - **`%YAML`/`%TAG` directive lines were not recognized, and swallowed the
   following `---`** (#225): a directive fell through to the plain-scalar
   scanner, which absorbed both the directive text and the document marker

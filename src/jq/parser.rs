@@ -399,7 +399,7 @@ impl<'a> Parser<'a> {
                                 )));
                             }
                             // Parse the expression inside \(...)
-                            let expr = self.parse_pipe_no_comma()?;
+                            let expr = self.parse_expr()?;
                             self.skip_ws();
                             self.expect(')')?;
                             parts.push(StringPart::Expr(Box::new(expr)));
@@ -809,6 +809,9 @@ impl<'a> Parser<'a> {
             let value = if self.peek() == Some(':') {
                 self.next();
                 self.skip_ws();
+                // jq's `ExpD`, not `Exp`: the `,` here separates entries, so a
+                // value must stop at it or `{a: 1, b: 2}` reads `1, b` as one
+                // value. Use `(...)` to fan a value out: `{a: (1,2)}`.
                 self.parse_pipe_no_comma()?
             } else {
                 // Shorthand: key must be literal identifier
@@ -1062,7 +1065,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse condition
-        let cond = self.parse_pipe_no_comma()?;
+        let cond = self.parse_expr()?;
         self.skip_ws();
 
         // Expect 'then'
@@ -1073,7 +1076,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse then branch
-        let then_branch = self.parse_pipe_no_comma()?;
+        let then_branch = self.parse_expr()?;
         self.skip_ws();
 
         // Parse elif/else/end
@@ -1093,7 +1096,7 @@ impl<'a> Parser<'a> {
             self.consume_keyword("elif");
             self.skip_ws();
 
-            let cond = self.parse_pipe_no_comma()?;
+            let cond = self.parse_expr()?;
             self.skip_ws();
 
             if !self.matches_keyword("then") {
@@ -1102,7 +1105,7 @@ impl<'a> Parser<'a> {
             self.consume_keyword("then");
             self.skip_ws();
 
-            let then_branch = self.parse_pipe_no_comma()?;
+            let then_branch = self.parse_expr()?;
             self.skip_ws();
 
             let else_branch = self.parse_else_branch()?;
@@ -1116,7 +1119,7 @@ impl<'a> Parser<'a> {
             self.consume_keyword("else");
             self.skip_ws();
 
-            let else_branch = self.parse_pipe_no_comma()?;
+            let else_branch = self.parse_expr()?;
             self.skip_ws();
 
             if !self.matches_keyword("end") {
@@ -1174,7 +1177,7 @@ impl<'a> Parser<'a> {
         let msg = if self.peek() == Some('(') {
             self.next();
             self.skip_ws();
-            let msg_expr = self.parse_pipe_no_comma()?;
+            let msg_expr = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             Some(Box::new(msg_expr))
@@ -1210,11 +1213,11 @@ impl<'a> Parser<'a> {
         // Parse (init; update)
         self.expect('(')?;
         self.skip_ws();
-        let init = self.parse_pipe_no_comma()?;
+        let init = self.parse_expr()?;
         self.skip_ws();
         self.expect(';')?;
         self.skip_ws();
-        let update = self.parse_pipe_no_comma()?;
+        let update = self.parse_expr()?;
         self.skip_ws();
         self.expect(')')?;
 
@@ -1251,18 +1254,18 @@ impl<'a> Parser<'a> {
         // Parse (init; update[; extract])
         self.expect('(')?;
         self.skip_ws();
-        let init = self.parse_pipe_no_comma()?;
+        let init = self.parse_expr()?;
         self.skip_ws();
         self.expect(';')?;
         self.skip_ws();
-        let update = self.parse_pipe_no_comma()?;
+        let update = self.parse_expr()?;
         self.skip_ws();
 
         // Optional extract expression
         let extract = if self.peek() == Some(';') {
             self.next();
             self.skip_ws();
-            Some(Box::new(self.parse_pipe_no_comma()?))
+            Some(Box::new(self.parse_expr()?))
         } else {
             None
         };
@@ -1294,7 +1297,6 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         self.expect(';')?;
         self.skip_ws();
-        // Full expression — comma included (#155).
         let expr = self.parse_expr()?;
         self.skip_ws();
         self.expect(')')?;
@@ -1312,11 +1314,11 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         self.expect('(')?;
         self.skip_ws();
-        let cond = self.parse_pipe_no_comma()?;
+        let cond = self.parse_expr()?;
         self.skip_ws();
         self.expect(';')?;
         self.skip_ws();
-        let update = self.parse_pipe_no_comma()?;
+        let update = self.parse_expr()?;
         self.skip_ws();
         self.expect(')')?;
 
@@ -1333,11 +1335,11 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         self.expect('(')?;
         self.skip_ws();
-        let cond = self.parse_pipe_no_comma()?;
+        let cond = self.parse_expr()?;
         self.skip_ws();
         self.expect(';')?;
         self.skip_ws();
-        let update = self.parse_pipe_no_comma()?;
+        let update = self.parse_expr()?;
         self.skip_ws();
         self.expect(')')?;
 
@@ -1354,7 +1356,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         self.expect('(')?;
         self.skip_ws();
-        let expr = self.parse_pipe_no_comma()?;
+        let expr = self.parse_expr()?;
         self.skip_ws();
         self.expect(')')?;
 
@@ -1402,7 +1404,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         self.expect('(')?;
         self.skip_ws();
-        let first = self.parse_pipe_no_comma()?;
+        let first = self.parse_expr()?;
         self.skip_ws();
 
         if self.peek() == Some(')') {
@@ -1417,7 +1419,7 @@ impl<'a> Parser<'a> {
 
         self.expect(';')?;
         self.skip_ws();
-        let second = self.parse_pipe_no_comma()?;
+        let second = self.parse_expr()?;
         self.skip_ws();
 
         if self.peek() == Some(')') {
@@ -1432,7 +1434,7 @@ impl<'a> Parser<'a> {
 
         self.expect(';')?;
         self.skip_ws();
-        let step = self.parse_pipe_no_comma()?;
+        let step = self.parse_expr()?;
         self.skip_ws();
         self.expect(')')?;
 
@@ -1580,7 +1582,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse body expression
-        let body = self.parse_pipe_no_comma()?;
+        let body = self.parse_expr()?;
 
         Ok(Expr::Label {
             name,
@@ -1656,7 +1658,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse function body
-        let body = self.parse_pipe_no_comma()?;
+        let body = self.parse_expr()?;
         self.skip_ws();
 
         // Expect semicolon
@@ -1664,7 +1666,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse the rest of the expression where this function is in scope
-        let then = self.parse_pipe_no_comma()?;
+        let then = self.parse_expr()?;
 
         Ok(Expr::FuncDef {
             name,
@@ -2940,7 +2942,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect(';')?;
             self.skip_ws();
-            let expr = self.parse_pipe_no_comma()?;
+            let expr = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Limit(Box::new(n), Box::new(expr))));
@@ -2959,7 +2961,6 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect(';')?;
             self.skip_ws();
-            // Full expression — comma included (#155).
             let expr = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
@@ -2975,7 +2976,7 @@ impl<'a> Parser<'a> {
             if self.peek() == Some('(') {
                 self.next();
                 self.skip_ws();
-                let expr = self.parse_pipe_no_comma()?;
+                let expr = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::FirstStream(Box::new(expr))));
@@ -2992,7 +2993,7 @@ impl<'a> Parser<'a> {
             if self.peek() == Some('(') {
                 self.next();
                 self.skip_ws();
-                let expr = self.parse_pipe_no_comma()?;
+                let expr = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::LastStream(Box::new(expr))));
@@ -3016,7 +3017,6 @@ impl<'a> Parser<'a> {
             if self.peek() == Some(';') {
                 self.next();
                 self.skip_ws();
-                // Full expression — comma included (#155).
                 let expr = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
@@ -3524,21 +3524,32 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// Parse a pipe expression: `expr | expr | ...`
-    /// Also handles `as` binding: `expr as $var | body` or `expr as {pattern} | body`
-    fn parse_pipe_no_comma(&mut self) -> Result<Expr, ParseError> {
-        let first = self.parse_assignment()?;
+    /// Parse a complete expression — jq's `Exp`, and this grammar's entry point.
+    ///
+    /// The precedence order below `Exp` is, loosest first:
+    ///
+    /// ```text
+    /// parse_expr        Exp   := parse_pipe_expr
+    /// parse_pipe_expr         := parse_comma_expr ( '|' parse_comma_expr )*
+    /// parse_comma_expr        := parse_binding    ( ',' parse_binding    )*
+    /// parse_binding           := parse_assignment [ "as" Patterns '|' parse_expr ]
+    /// parse_obj_val     ExpD  := parse_binding    ( '|' parse_binding    )*
+    /// ```
+    ///
+    /// `|` is the *loosest* operator and `,` binds tighter, matching jq's
+    /// `parser.y`, which declares `%right '|'` before `%left ','`. Having these
+    /// the wrong way round made `1,2,3 | . * 2` mean `1, 2, (3 | . * 2)` and
+    /// print `1 2 6` instead of `2 4 6` — silent data loss, since every
+    /// comma branch but the last lost its transformation (#462).
+    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        self.parse_pipe_expr()
+    }
+
+    /// Parse a pipe expression: `stage | stage | ...`, where each stage is a
+    /// comma list.
+    fn parse_pipe_expr(&mut self) -> Result<Expr, ParseError> {
+        let first = self.parse_comma_expr()?;
         self.skip_ws();
-
-        // Check for `as` binding (Phase 8: simple var, Phase 9: patterns)
-        if self.matches_keyword("as") {
-            self.consume_keyword("as");
-            self.skip_ws();
-
-            // Check if it's a simple $var or a pattern
-            let as_expr = self.parse_as_pattern(first)?;
-            return Ok(as_expr);
-        }
 
         if self.peek() != Some('|') {
             return Ok(first);
@@ -3549,28 +3560,54 @@ impl<'a> Parser<'a> {
         while self.peek() == Some('|') {
             self.next();
             self.skip_ws();
-            let next_expr = self.parse_assignment()?;
+            exprs.push(self.parse_comma_expr()?);
             self.skip_ws();
-
-            // Check for `as` binding after pipe
-            if self.matches_keyword("as") {
-                self.consume_keyword("as");
-                self.skip_ws();
-
-                let as_expr = self.parse_as_pattern(next_expr)?;
-                // Wrap what we have so far
-                let so_far = if exprs.len() == 1 {
-                    exprs.pop().unwrap()
-                } else {
-                    Expr::Pipe(exprs)
-                };
-                return Ok(Expr::Pipe(vec![so_far, as_expr]));
-            }
-
-            exprs.push(next_expr);
         }
 
         Ok(Expr::pipe(exprs))
+    }
+
+    /// Parse one pipe stage: `expr, expr, ...`.
+    fn parse_comma_expr(&mut self) -> Result<Expr, ParseError> {
+        let first = self.parse_binding()?;
+        self.skip_ws();
+
+        if self.peek() != Some(',') {
+            return Ok(first);
+        }
+
+        let mut exprs = vec![first];
+
+        while self.peek() == Some(',') {
+            self.next();
+            self.skip_ws();
+            exprs.push(self.parse_binding()?);
+            self.skip_ws();
+        }
+
+        Ok(Expr::comma(exprs))
+    }
+
+    /// Parse one comma operand: an expression, optionally followed by an `as`
+    /// binding (`expr as $var | body`, `expr as {pattern} | body`).
+    ///
+    /// `as` belongs *below* the comma, not beside the pipe, because its body
+    /// swallows everything to its right: jq reads `1,2 as $x | $x | .+10` as
+    /// `1, (2 as $x | $x | .+10)`, printing `1` then `12` — not
+    /// `(1,2) as $x | ...`. Binding it above the comma would capture the whole
+    /// comma list as the bound expression.
+    fn parse_binding(&mut self) -> Result<Expr, ParseError> {
+        let expr = self.parse_assignment()?;
+        self.skip_ws();
+
+        // Phase 8: simple var; Phase 9: patterns.
+        if self.matches_keyword("as") {
+            self.consume_keyword("as");
+            self.skip_ws();
+            return self.parse_as_pattern(expr);
+        }
+
+        Ok(expr)
     }
 
     /// Parse the pattern part of an `as` binding.
@@ -3584,7 +3621,7 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 self.expect('|')?;
                 self.skip_ws();
-                let body = self.parse_pipe_no_comma()?;
+                let body = self.parse_expr()?;
                 Ok(Expr::As {
                     expr: Box::new(expr),
                     var,
@@ -3597,7 +3634,7 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 self.expect('|')?;
                 self.skip_ws();
-                let body = self.parse_pipe_no_comma()?;
+                let body = self.parse_expr()?;
                 Ok(Expr::AsPattern {
                     expr: Box::new(expr),
                     pattern,
@@ -3611,26 +3648,40 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a complete expression (entry point): `expr, expr, ...`
-    /// This is the lowest precedence operator.
-    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        let first = self.parse_pipe_no_comma()?;
+    /// Parse a pipe expression that stops at a `,` — deliberately *not* a full
+    /// [`Self::parse_expr`].
+    ///
+    /// Exactly two kinds of position want this, and no others:
+    ///
+    /// 1. **Object-construction values**, jq's `ExpD` production. Inside
+    ///    `{...}` a `,` separates entries, so `{a: 1, b: 2}` must not read
+    ///    `1, b` as one value.
+    /// 2. **The `n` of `limit`/`skip`/`nth`**, where the restriction is this
+    ///    crate's rather than jq's: jq's `$n` parameter convention fans the
+    ///    whole call out once per output of `n`, which is not implemented here,
+    ///    so `n` stays single-valued instead of silently taking one branch.
+    ///
+    /// Every *other* body that once called this — `if` branches, `def` bodies,
+    /// `reduce`/`foreach` slots, `label` bodies, string interpolation — is a
+    /// full `Exp` in jq and now says so (#462).
+    fn parse_pipe_no_comma(&mut self) -> Result<Expr, ParseError> {
+        let first = self.parse_binding()?;
         self.skip_ws();
 
-        if self.peek() != Some(',') {
+        if self.peek() != Some('|') {
             return Ok(first);
         }
 
         let mut exprs = vec![first];
 
-        while self.peek() == Some(',') {
+        while self.peek() == Some('|') {
             self.next();
             self.skip_ws();
-            exprs.push(self.parse_pipe_no_comma()?);
+            exprs.push(self.parse_binding()?);
             self.skip_ws();
         }
 
-        Ok(Expr::comma(exprs))
+        Ok(Expr::pipe(exprs))
     }
 
     // =========================================================================
@@ -3752,7 +3803,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse function body
-        let body = self.parse_pipe_no_comma()?;
+        let body = self.parse_expr()?;
         self.skip_ws();
 
         // Expect semicolon
@@ -4288,6 +4339,136 @@ mod tests {
                 Expr::Field("c".into()),
             ])
         );
+    }
+
+    /// `|` is the loosest operator and `,` binds tighter, so a pipe stage is a
+    /// comma list — not the other way round (#462).
+    ///
+    /// These assert the AST *shape*, because the failure this pins was silent
+    /// at the value level: `1,2,3 | . * 2` still produced three outputs, just
+    /// with the first two untransformed.
+    #[test]
+    fn test_comma_binds_tighter_than_pipe() {
+        let int = |i| Expr::Literal(Literal::Int(i));
+
+        // (1,2) | 3 — not 1, (2 | 3)
+        assert_eq!(
+            parse("1,2 | 3").unwrap(),
+            Expr::Pipe(vec![Expr::Comma(vec![int(1), int(2)]), int(3)])
+        );
+
+        // Every stage is a comma list, so both sides group.
+        assert_eq!(
+            parse("1,2 | 3,4").unwrap(),
+            Expr::Pipe(vec![
+                Expr::Comma(vec![int(1), int(2)]),
+                Expr::Comma(vec![int(3), int(4)]),
+            ])
+        );
+
+        // A pipe of three stages stays flat, with only the comma stage nested.
+        assert_eq!(
+            parse(".a | 1,2 | .b").unwrap(),
+            Expr::Pipe(vec![
+                Expr::Field("a".into()),
+                Expr::Comma(vec![int(1), int(2)]),
+                Expr::Field("b".into()),
+            ])
+        );
+
+        // Explicit parens were the old workaround; they must still mean the
+        // same thing they always did.
+        assert_eq!(
+            parse("(1,2) | 3").unwrap(),
+            Expr::Pipe(vec![
+                Expr::Paren(Box::new(Expr::Comma(vec![int(1), int(2)]))),
+                int(3),
+            ])
+        );
+
+        // A comma with no pipe is still a bare comma — no spurious Pipe wrapper.
+        assert_eq!(parse("1,2").unwrap(), Expr::Comma(vec![int(1), int(2)]));
+    }
+
+    /// `as` binds below the comma: its body swallows the rest of the
+    /// expression, so only the *last* comma operand is bound (#462).
+    #[test]
+    fn test_as_binds_inside_comma_operand() {
+        let int = |i| Expr::Literal(Literal::Int(i));
+
+        // 1, (2 as $x | $x) — not (1,2) as $x | $x
+        assert_eq!(
+            parse("1,2 as $x | $x").unwrap(),
+            Expr::Comma(vec![
+                int(1),
+                Expr::As {
+                    expr: Box::new(int(2)),
+                    var: "x".into(),
+                    body: Box::new(Expr::Var("x".into())),
+                },
+            ])
+        );
+
+        // The binding body is a full expression, comma included.
+        assert_eq!(
+            parse("1 as $x | 2,3").unwrap(),
+            Expr::As {
+                expr: Box::new(int(1)),
+                var: "x".into(),
+                body: Box::new(Expr::Comma(vec![int(2), int(3)])),
+            }
+        );
+    }
+
+    /// Object values are jq's `ExpD`, not `Exp`: the `,` inside `{...}`
+    /// separates entries and must not be swallowed by a value (#462).
+    #[test]
+    fn test_object_value_stops_at_comma() {
+        let entries = match parse("{a: 1, b: 2}").unwrap() {
+            Expr::Object(entries) => entries,
+            other => panic!("expected an object, got {other:?}"),
+        };
+        assert_eq!(entries.len(), 2, "the `,` must separate two entries");
+        assert_eq!(entries[0].value, Expr::Literal(Literal::Int(1)));
+        assert_eq!(entries[1].value, Expr::Literal(Literal::Int(2)));
+
+        // Parens are how a value fans out, and they still work.
+        let entries = match parse("{a: (1,2)}").unwrap() {
+            Expr::Object(entries) => entries,
+            other => panic!("expected an object, got {other:?}"),
+        };
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].value, Expr::Paren(_)));
+
+        // A pipe inside a value is still accepted, and still stops at the `,`.
+        let entries = match parse("{a: .x | .y, b: 2}").unwrap() {
+            Expr::Object(entries) => entries,
+            other => panic!("expected an object, got {other:?}"),
+        };
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(entries[0].value, Expr::Pipe(_)));
+    }
+
+    /// The bodies that jq spells as a full `Exp` accept a bare comma. Before
+    /// #462 these were parsed one level too tight and rejected it outright.
+    #[test]
+    fn test_comma_accepted_in_exp_bodies() {
+        assert!(parse("if true then 1,2 else 3 end").is_ok());
+        assert!(parse("if true then 1 elif false then 2,3 else 4 end").is_ok());
+        assert!(parse("if false then 1 else 2,3 end").is_ok());
+        assert!(parse("def f: 1,2; f").is_ok());
+        assert!(parse("label $out | 1,2").is_ok());
+        assert!(parse("reduce .[] as $x (0; .+$x, .)").is_ok());
+        assert!(parse("foreach .[] as $x (0; .+$x, .)").is_ok());
+        assert!(parse("[1,2] as [$a,$b] | $a,$b").is_ok());
+        assert!(parse(r#""\(1,2)""#).is_ok());
+        assert!(parse("range(1,2; 4)").is_ok());
+        assert!(parse("first(1,2)").is_ok());
+        assert!(parse("last(1,2)").is_ok());
+        assert!(parse("error(1,2)").is_ok());
+        assert!(parse("until(.>1; .+1,.)").is_ok());
+        assert!(parse("while(.<3; .+1,.)").is_ok());
+        assert!(parse("repeat(1,2)").is_ok());
     }
 
     #[test]

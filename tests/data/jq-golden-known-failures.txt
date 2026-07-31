@@ -32,7 +32,6 @@ comma_literal_before_document  comma              . evaluates before the literal
 object_construct_cartesian     object_construct   only the first output of each key/value generator is used instead of the cartesian product — #354
 if_multi_output_condition      if_condition       only the first output of a multi-output if-condition is used — #378
 assign_multi_output_rhs        assignment         .a = (1,2) only applies the first RHS output instead of forking once per output — #392
-comma_pipe_precedence          parser             , binds tighter than | in jq; succinctly's parser applies | only to the last comma operand — #462
 nan_type                       nan                nan | type reports "null" instead of "number" — #472
 path_recursive_descent         path               path(..) returns only the root path instead of every descendant path — #483
 assign_autovivify_nested       assignment         .a.b = 9 on {} errors instead of autovivifying the intermediate object — #486
