@@ -16,7 +16,7 @@
 # matter. A validator answers "is this well-formed JSON", not "does this survive
 # a round trip through f64", so magnitude is not its business. (serde_json takes
 # the opposite view and errors on f64 overflow — a known, deliberate divergence;
-# see classify_divergence in tests/json_validate_properties.rs.)
+# see classify_divergence in tests/common/json_oracle.rs.)
 i_number_double_huge_neg_exp.json         accept  RFC 8259 §6 sets no range on numbers
 i_number_huge_exp.json                    accept  RFC 8259 §6 sets no range on numbers
 i_number_neg_int_huge_exp.json            accept  RFC 8259 §6 sets no range on numbers
