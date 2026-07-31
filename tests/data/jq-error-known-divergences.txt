@@ -28,11 +28,17 @@
 # slice a real path component and took the last two, `slice_assign_non_array`
 # and `slice_indices_not_integers`, emptying the list.)
 #
-# The list is empty, and the two-sided check keeps it honest in both
+# The list was empty, and the two-sided check kept it honest in both
 # directions: a probe that starts diverging without a line here fails the
-# build, so this file staying empty is an assertion, not an absence.
+# build, so this file staying empty was an assertion, not an absence.
 #
 # This file cannot record the mirror image — a filter jq answers with a value
 # and succinctly refuses — because a probe is only admitted if jq errors on it.
 # Those live in prose, under "Where succinctly errors and jq does not" in
 # docs/compliance/jq/limitations.md.
+#
+# Reseeded by #513 from the open bug corpus: two probes pinning bugs filed
+# before a fix existed.
+
+optional_write_negative_oob  assignment  `?` only suppresses errors from path collection in jq, not setpath's write-time bounds check, so `.[-5]? = 9` silently no-ops instead of raising — #498
+repeat_error_swallowed       repeat      eval_repeat (src/jq/eval.rs) discards the generator's first error instead of propagating it — #495

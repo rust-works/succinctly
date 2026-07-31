@@ -39,6 +39,7 @@ setpath_non_array_path	setpath("a"; 1)	1	Path must be specified as an array
 assign_negative_index_oob	.[-5] = 9	[1,2]	Out of bounds negative array index
 update_negative_index_oob	.[-5] |= 9	[1,2]	Out of bounds negative array index
 assign_negative_index_nested	.a[-5] = 9	{"a":[1,2]}	Out of bounds negative array index
+optional_write_negative_oob	.[-5]? = 9	[1,2]	Out of bounds negative array index
 slice_assign_non_array	setpath([{"start":1,"end":2}]; "x")	[1,2,3]	A slice of an array can only be assigned another array
 slice_indices_not_integers	setpath([{"foo":1}]; 9)	[1,2]	Array/string slice indices must be integers
 slice_update_string	.[1:2] = "x"	"abcdef"	Cannot update string slices
@@ -170,3 +171,4 @@ fromjson_on_null	fromjson	null	null (null) only strings can be parsed
 fromjson_bad_string	fromjson	"a"	Invalid numeric literal at EOF at line 1, column 1 (while parsing 'a')
 fromjson_empty_string	fromjson	""	Expected JSON value (while parsing '')
 fromjson_hex_string	fromjson	"0x10"	Invalid numeric literal at EOF at line 1, column 4 (while parsing '0x10')
+repeat_error_swallowed	repeat(if . > 3 then error("boom") else .+1 end)	5	boom

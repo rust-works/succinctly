@@ -62,6 +62,7 @@ setpath_non_array_path	setpath("a"; 1)	1
 assign_negative_index_oob	.[-5] = 9	[1,2]
 update_negative_index_oob	.[-5] |= 9	[1,2]
 assign_negative_index_nested	.a[-5] = 9	{"a":[1,2]}
+optional_write_negative_oob	.[-5]? = 9	[1,2]
 slice_assign_non_array	setpath([{"start":1,"end":2}]; "x")	[1,2,3]
 slice_indices_not_integers	setpath([{"foo":1}]; 9)	[1,2]
 slice_update_string	.[1:2] = "x"	"abcdef"
@@ -234,3 +235,6 @@ fromjson_on_null	fromjson	null
 fromjson_bad_string	fromjson	"a"
 fromjson_empty_string	fromjson	""
 fromjson_hex_string	fromjson	"0x10"
+
+# ── Errors raised inside a generator are not swallowed ───────────────────────
+repeat_error_swallowed	repeat(if . > 3 then error("boom") else .+1 end)	5
