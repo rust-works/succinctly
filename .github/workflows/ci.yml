@@ -146,9 +146,9 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo build --features cli --bin succinctly
 
-      - name: Run cli-gated yq/jq tests
+      - name: Run cli-gated tests
         if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
@@ -242,9 +242,9 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo build --features cli --bin succinctly
 
-      - name: Run cli-gated yq/jq tests
+      - name: Run cli-gated tests
         if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
@@ -340,9 +340,9 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo build --features cli --bin succinctly
 
-      - name: Run cli-gated yq/jq tests
+      - name: Run cli-gated tests
         if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
@@ -403,8 +403,8 @@ jobs:
       - name: Build CLI (for integration tests)
         run: cargo build --features cli --bin succinctly
 
-      - name: Run cli-gated yq tests
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test yaml_bench_suite_coverage
+      - name: Run cli-gated tests
+        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests
 
       - name: Run tests
         run: cargo test --verbose

@@ -7,64 +7,20 @@
 //! exercised end-to-end.
 //!
 //! Run with: cargo test --features cli --test text_cli_tests
+#![cfg(feature = "cli")]
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 
 use anyhow::Result;
 use tempfile::{NamedTempFile, TempDir};
 
-/// Resolve the path to the pre-built `succinctly` CLI binary, building it once.
-///
-/// Mirrors the helper in `json_validate_tests.rs`: the integration-test harness
-/// is compiled without the `cli` feature, and the `succinctly` binary is gated by
-/// `required-features = ["cli"]`, so `CARGO_BIN_EXE_succinctly` is unavailable
-/// here. We build the binary once with the `cli` feature and derive its path from
-/// this test executable's own location. Invoking the built binary directly (not
-/// `cargo run`) keeps cargo's output out of each child's captured stderr.
-fn succinctly_bin() -> &'static Path {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-        let output = Command::new(cargo)
-            .args(["build", "--features", "cli", "--bin", "succinctly"])
-            .output()
-            .expect("failed to spawn `cargo build`");
-        assert!(
-            output.status.success(),
-            "`cargo build --features cli --bin succinctly` failed:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let mut path = target_profile_dir_from_test_exe();
-        path.push(format!("succinctly{}", std::env::consts::EXE_SUFFIX));
-        assert!(
-            path.is_file(),
-            "built `succinctly` binary not found at {}",
-            path.display()
-        );
-        path
-    })
-}
-
-/// Derive `<target>/<profile>/` from this test executable's own path.
-///
-/// The classic flat layout places the test exe at
-/// `<target>/<profile>/deps/<test>-<hash>`, but nightly's build-dir-layout-v2
-/// (rust-lang/cargo#17258, defaulted on nightly toolchains from ~2026-07)
-/// instead nests it at `<target>/<profile>/build/<pkg>/<hash>/out/<test>-<hash>`.
-/// Both layouts keep `<profile>` as the path component immediately after
-/// `target`, so locate it that way instead of assuming a fixed depth.
-fn target_profile_dir_from_test_exe() -> PathBuf {
-    let current_exe = std::env::current_exe().expect("resolve current_exe");
-    let components: Vec<_> = current_exe.components().collect();
-    let target_idx = components
-        .iter()
-        .rposition(|c| c.as_os_str() == "target")
-        .expect("test executable path has no `target` component");
-    components[..=target_idx + 1].iter().collect()
+/// Path to the pre-built `succinctly` CLI binary. Cargo builds the `succinctly`
+/// bin target (gated `required-features = ["cli"]`) before this test binary
+/// runs, since this file is itself gated on `cli`, and bakes the resulting
+/// path in at compile time — correct under any target-dir layout.
+fn succinctly_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_succinctly")
 }
 
 /// Run `text validate utf8` with raw bytes piped on stdin.
