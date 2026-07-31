@@ -31,12 +31,27 @@ A B   C E     D
 ## Data Structure
 
 ```rust
-pub struct BalancedParens {
-    bp: BitVec,              // Parentheses as bits
-    excess_min: Vec<i32>,    // RangeMin index for find_close
-    excess_min_pos: Vec<u32>,// Position of minimum
+pub struct BalancedParens<W = Vec<u64>, S: SelectSupport = NoSelect> {
+    words: W,                  // Parentheses as bits (1=open, 0=close)
+    len: usize,                // Number of valid bits
+    total_ones: usize,         // Cached count of open parens
+
+    // Three-level min-excess index for find_close
+    l0_min_excess: Vec<i8>,    l0_word_excess: Vec<i16>,   // per word
+    l1_min_excess: Vec<i16>,   l1_block_excess: Vec<i16>,  // per 32 words
+    l2_min_excess: Vec<i32>,   l2_block_excess: Vec<i32>,  // per 1024 words
+
+    // Cumulative rank directory for O(1) rank1()
+    rank_l1: Vec<u32>,         // absolute count per 512-bit block
+    rank_l2: Vec<u64>,         // 7 x 9-bit within-block offsets
+
+    select: S,                 // ZST for NoSelect; SelectIndex for WithSelect (P11)
 }
 ```
+
+Note it is **not** built on [`BitVec`](bitvec.md): it holds plain words plus its own rank arrays, so
+that `W` can be a borrowed slice (mmap) and so that select support is a compile-time choice. See
+[ADR-0011](../adrs/adr-0011.md#consequences).
 
 ## Core Operations
 
@@ -126,7 +141,9 @@ See [SIMD Optimizations](../optimizations/simd.md#x86-sse41-horizontal-minimum-p
 
 ## Depends On
 
-- [BitVec](bitvec.md) — the parenthesis sequence and RangeMin index are stored as bitvectors
+Nothing in [`bits/`](../../src/bits/) — the parenthesis sequence is a plain `Vec<u64>` (or borrowed
+slice) and the RangeMin and rank indices are its own arrays. See
+[BitVec](bitvec.md#used-by) for why it does not use that type.
 
 ## Academic Papers
 

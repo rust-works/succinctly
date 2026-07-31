@@ -15,7 +15,7 @@
 //! | Operation | Complexity | Notes |
 //! |-----------|------------|-------|
 //! | `get(i)` | O(1) | Uses select samples |
-//! | `predecessor(v)` | O(log n) | Binary search over `get`; cold paths only |
+//! | `predecessor(v)` | O(log n) | Binary search over `get`; no sequential fast path |
 //! | `advance_one()` | O(1) amortized | Scans for next 1-bit |
 //! | `advance_by(k)` | O(k/64) | Word-by-word scanning |
 //! | `seek(i)` | O(1) | Uses select samples |
@@ -257,8 +257,10 @@ impl EliasFano {
     /// # Performance
     ///
     /// O(log n) binary search over [`get`](Self::get), so O(log n) sampled
-    /// selects. Intended for cold paths (line/column lookup); use
-    /// [`EliasFanoCursor`] for sequential access.
+    /// selects, with no reuse between calls. A monotone sequence of queries —
+    /// which is what walking a document's nodes produces — pays the full
+    /// search every time; use [`EliasFanoCursor`] for sequential access, or
+    /// cache the last answer at the call site.
     ///
     /// # Example
     ///

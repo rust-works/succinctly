@@ -2022,11 +2022,19 @@ YAML cannot use BMI2 like DSV does because:
 
 **Status:** Analyzed and rejected 2026-01-17 (not implemented)
 
+> **Correction (#228).** The premise below is half wrong. JSON had *two* newline structures, and the
+> analysis found only the CLI-only one. The other, `JsonIndex::newlines`, was built **eagerly in
+> every `JsonIndex::build`**, costing an O(n) scan and ~15.9% of the input on every jq query. The
+> conclusion — don't build it during parsing — was right, and JSON was violating it. Both are now
+> [`text::LineIndex`](../optimizations/line-index.md), built lazily; see
+> [ADR-0012](../adrs/adr-0012.md). The same stale claim appears in [ADR-0009](../adrs/adr-0009.md),
+> corrected there too.
+
 **Goal:** Build a newline index (bitvector + rank structure) for fast line number lookups, similar to JSON's `NewlineIndex`.
 
 **Analysis Findings:**
 
-**JSON's `NewlineIndex` usage:**
+**JSON's `NewlineIndex` usage** (as believed at the time — see the correction above):
 - **NOT built during parsing** - only in `jq-locate` CLI tool
 - **Purpose:** Convert `--line X --column Y` to byte offset for user convenience
 - **Never used in:** JSON parsing, jq queries, or benchmarks

@@ -99,8 +99,11 @@ list of unsupported features (tags, `%YAML`/`%TAG` directives).
 
 ## Depends On
 
-- [BitVec](../architecture/bitvec.md) — all bit vectors use rank/select
 - [BalancedParens](../architecture/balanced-parens.md) — with `WithSelect` generic parameter
+- [LineIndex](../optimizations/line-index.md) — line/column lookup, built lazily on first use
+
+IB, TY and the container bits are plain `W: AsRef<[u64]>` with cumulative-rank `Vec<u32>`, not
+[BitVec](../architecture/bitvec.md) — see that page's *Used By* section.
 - [YAML Conformance](../compliance/yaml/limitations.md) — measured behavior and limitations
 
 ## Used By

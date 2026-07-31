@@ -102,9 +102,12 @@ Popcount uses platform-specific SIMD:
 
 ## Used By
 
-**Nothing in the crate, as of [#228](https://github.com/rust-works/succinctly/issues/228).** `BitVec`
-is public API — exported from the crate root, exercised by doctests and the serde round-trip tests —
-but it has no production callers. This section previously listed four, none of which were accurate:
+**No data path in the crate, as of [#228](https://github.com/rust-works/succinctly/issues/228).**
+`BitVec` is public API — exported from the crate root, exercised by doctests and the serde
+round-trip tests — but nothing parses, indexes or queries through it. Its one remaining caller is
+measurement scaffolding: the corpus-shape report reconstructs a dense bitmap per file purely to
+print what `LineIndex` saves against it ([src/bin/succinctly/corpus_stats.rs](../../src/bin/succinctly/corpus_stats.rs)).
+This section previously listed four callers, none of which were accurate:
 
 | Structure                             | What it actually stores                                                                                                                        |
 |---------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|

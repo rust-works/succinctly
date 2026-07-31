@@ -94,26 +94,52 @@ Cost of the lazy path is paid only by callers who need it:
 
 The deltas equal the dense index's `heap_size()` exactly — the allocation is simply gone.
 
-## Query cost, and why O(log n) is fine here
+## Query cost, and why O(log n) is acceptable here
 
 `to_line_column` needs "how many line starts precede this offset", which is a predecessor query.
 Elias-Fano has no rank, so `EliasFano::predecessor` is a binary search over `get` — O(log n) with a
 sampled select per step, against the bitmap's O(1) rank.
 
-That trade is deliberate. Every consumer is cold: error reporting, `$__loc__`'s document sibling
-`at_position`, and the two locate CLIs. Nothing in the parse or query hot path touches it.
-`to_offset` does not even need the predecessor — a line number is a direct index, so it stays O(1).
+`to_offset` does not need the predecessor at all — a line number is a direct index — so it stays
+O(1), and it is the direction both locate CLIs and `at_position(line; col)` use.
 
-If a hot consumer ever appears, the accelerator is already designed: `select_samples[j] -
-j * SAMPLE_RATE` is the high part of element `j*256` and is monotone in `j`, so binary-searching that
-plain `Vec<u32>` narrows to a 256-element block with zero select calls.
+### Who calls `to_line_column`
+
+| Caller                                                          | Frequency                  |
+|-----------------------------------------------------------------|----------------------------|
+| `jq-locate` / `yq-locate` (`--offset` → reported position)      | once per invocation        |
+| `YamlCursor::line()` / `column()` → the yq `line`/`column` builtins | **once per node visited**  |
+
+The second row is not a cold path, and an earlier draft of this page claimed it did not exist. It is
+reached only through the cursor evaluator ([src/jq/eval_generic.rs](../../src/jq/eval_generic.rs));
+the `OwnedValue` path that the `syq` CLI takes today stubs both builtins to `0`
+([src/jq/eval.rs](../../src/jq/eval.rs), `builtin_line`), so no shipped command currently drives it
+per node. That is a gap in the builtins, not a licence to call the path cold — if the stubs are ever
+wired up, `.[] | line` becomes one binary search per node, and `{l: line, c: column}` two, because
+`column()` recomputes the search rather than sharing it.
+
+Neither direction has been benchmarked. The comparison is not obviously a regression even at the
+per-node rate: `BitVec::select1` was itself sampled every 256 ones, which at the corpus's ~20
+bytes/line meant scanning up to ~80 words, against ~`log2(lines)` Elias-Fano `get`s here.
+
+If a hot consumer does appear, two accelerators are available. The cheap one is a one-entry
+`Cell` cache of the last `(offset, line, line_start)`, which makes the monotone walk `line()`
+performs amortised O(1) — the same trick `AdvancePositions` uses for O1/O2. The structural one:
+`select_samples[j] - j * SAMPLE_RATE` is the high part of element `j*256` and is monotone in `j`, so
+binary-searching that plain `Vec<u32>` narrows to a 256-element block with zero select calls.
 
 ## Transient build memory
 
 Building Elias-Fano needs the values up front (`universe` sizes `low_width`), so `LineIndex::build`
-collects a `Vec<u32>` of line starts first. A counting pass sizes it exactly, which matters more than
-it looks: without it, `Vec` doubling makes the transient 1.5-2x the vector — the failure mode O4
+collects a `Vec<u32>` of line starts first. A counting pass reserves it up front, which matters more
+than it looks: without it, `Vec` doubling makes the transient 1.5-2x the vector — the failure mode O4
 documented, where transient scratch dwarfed the retained structure.
+
+The count is *terminator bytes*, not line starts: it tallies `\n` and `\r` independently, so CRLF
+contributes two. On LF- or CR-only text — the whole corpus — that is exact. On an all-CRLF file it
+over-reserves by 2x, which is the same magnitude as the doubling it exists to prevent, so the
+guarantee is "never reallocates", not "never overshoots". Making it exact costs a second branch in
+the counting loop and buys nothing on any input the corpus contains.
 
 Measured momentary peak against the old *retained* cost:
 
@@ -138,8 +164,13 @@ momentary, where the old cost was permanent. Removing the transient entirely wou
   same discipline that rejected P5.
 - **Not building it beats making it smaller.** A 4-12x smaller structure is worth less than not
   constructing the structure at all on the hot path.
-- **Exact-size the scratch vector.** `Vec::with_capacity` from a counting pass costs one cheap
+- **Reserve the scratch vector.** `Vec::with_capacity` from a counting pass costs one cheap
   auto-vectorised scan and removes a 1.5-2x transient spike.
+- **Collapsing three copies of a scanner is worth nothing if it leaves a fourth.** The first cut of
+  this work open-coded the LF/CR/CRLF rule in `text::lines` on the grounds that JSON and DSV are not
+  YAML — but the rule is byte-identical for all three, so that was #341's duplication reintroduced
+  one module over. The definition lives in [text::line_break](../../src/text/line_break.rs) and
+  `yaml::line_break` re-exports it.
 
 ## See Also
 
