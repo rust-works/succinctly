@@ -327,22 +327,18 @@ analysis constrains.
 
 ### Reproducing
 
-Both columns need the **full** corpus: only three of the seven JSON files are
-vendored in the committed seed, and `json_validate_bench` announces on stderr
-when it is running seed-only. The synthetic ladder is a prerequisite too — the
-bench asserts the whole pattern/size matrix is present before registering any
-group, so the `--` filter does not exempt it.
+The throughput column needs the **full** corpus: only three of the seven JSON
+files are vendored in the committed seed, and `json_validate_real_corpus_bench`
+announces on stderr when it is running seed-only.
 
 ```bash
-./scripts/sync-bench-corpus.sh                            # fetch the 5-file JSON corpus
-cargo run --release --features cli --bin succinctly -- \
-    json generate-suite --max-size 10mb                   # synthetic ladder (once)
+./scripts/sync-bench-corpus.sh                            # fetch the full JSON corpus
 
 # shape statistics (the visits/64B column)
 succinctly dev bench corpus-stats --data-dir data/bench/corpus
 
-# throughput column
-cargo bench --bench json_validate_bench -- validate_real_corpus
+# throughput column — a standalone bench target, no synthetic ladder needed
+cargo bench --bench json_validate_real_corpus_bench
 ```
 
 ## Per-token scalar optimisations
@@ -396,6 +392,10 @@ cargo build --release --features bench-runner
 
 # Run with Criterion directly
 cargo bench --bench json_validate_bench
+
+# Real-workload corpus (separate target; see "Reproducing" above)
+./scripts/sync-bench-corpus.sh
+cargo bench --bench json_validate_real_corpus_bench
 ```
 
 ## Benchmark Data Location

@@ -1,14 +1,10 @@
-//! Benchmarks for JSON validation (RFC 8259).
+//! Synthetic-ladder benchmarks for JSON validation (RFC 8259).
 //!
-//! Two source groups, both mandatory:
-//!
-//! * **Synthetic** — the generated pattern/size ladder under
-//!   `data/bench/generated/`, which sweeps shapes (structural density, string
-//!   length, whitespace) far wider than any real file does.
-//! * **Real workload** — the `json/` tier of the corpus described by
-//!   `tests/data/bench-corpus/manifest.json`. Synthetic patterns are chosen to
-//!   stress the parser, not to resemble anything; per
-//!   `docs/guides/benchmarking.md` a synthetic-only win is not evidence.
+//! Sweeps the pattern/size ladder under `data/bench/generated/` — shapes
+//! (structural density, string length, whitespace) chosen to stress the
+//! parser, not to resemble anything real. Per `docs/guides/benchmarking.md` a
+//! synthetic-only win is not evidence; see `json_validate_real_corpus_bench.rs`
+//! for the leg that measures files that actually occur.
 //!
 //! Run with:
 //! ```bash
@@ -19,7 +15,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::fs;
 use std::hint::black_box;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use succinctly::json::validate;
 
 /// Test file patterns available in data/bench/generated/
@@ -42,12 +38,6 @@ const SIZES: &[&str] = &["1kb", "10kb", "100kb", "1mb", "10mb"];
 
 /// Base directory for generated files
 const BASE_DIR: &str = "data/bench/generated";
-
-/// Real-workload corpus root, populated by `scripts/sync-bench-corpus.sh`.
-const CORPUS_DIR: &str = "data/bench/corpus";
-
-/// Committed subset of the real-workload corpus, always present in a checkout.
-const CORPUS_SEED_DIR: &str = "tests/data/bench-corpus/seed";
 
 /// The command that populates [`BASE_DIR`].
 const GENERATE_CMD: &str =
@@ -95,84 +85,6 @@ fn load_file(pattern: &str, size: &str) -> Vec<u8> {
             path.display()
         )
     })
-}
-
-/// Collect `*.json` / `*.geojson` files under `dir`, recursively, sorted.
-fn collect_json_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_json_files(&path, out);
-        } else if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("json" | "geojson")
-        ) {
-            out.push(path);
-        }
-    }
-}
-
-/// The real-workload JSON corpus: the synced tree if present, else the
-/// committed seed. The seed is always in a checkout, so this never returns
-/// empty in a well-formed tree — and asserts rather than skipping if it does.
-///
-/// The seed holds **one** of the corpus's five JSON files, so a seed-only run
-/// measures a fraction of the intended workload. That is legitimate (it keeps
-/// the bench runnable offline) but it must never be mistaken for the full
-/// corpus, so which root was used is reported on stderr rather than inferred
-/// from the benchmark names.
-fn real_corpus_files() -> Vec<(String, Vec<u8>)> {
-    let synced = Path::new(CORPUS_DIR).join("json");
-    let seeded = !synced.is_dir();
-    let root = if seeded {
-        Path::new(CORPUS_SEED_DIR).join("json")
-    } else {
-        synced
-    };
-
-    let mut paths = Vec::new();
-    collect_json_files(&root, &mut paths);
-    paths.sort();
-
-    assert!(
-        !paths.is_empty(),
-        "json_validate_bench: no real-workload JSON found under {}. \
-         The committed seed at {CORPUS_SEED_DIR}/json/ should always be present; \
-         run ./scripts/sync-bench-corpus.sh for the full corpus.",
-        root.display(),
-    );
-
-    let files: Vec<(String, Vec<u8>)> = paths
-        .into_iter()
-        .map(|p| {
-            let name = p
-                .strip_prefix(&root)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .into_owned();
-            let bytes =
-                fs::read(&p).unwrap_or_else(|e| panic!("failed to read {}: {e}", p.display()));
-            (name, bytes)
-        })
-        .collect();
-
-    let total: usize = files.iter().map(|(_, b)| b.len()).sum();
-    eprintln!(
-        "json_validate_bench: real-workload corpus = {} file(s), {total} bytes, from {}{}",
-        files.len(),
-        root.display(),
-        if seeded {
-            " -- COMMITTED SEED ONLY, not the full corpus; \
-             run ./scripts/sync-bench-corpus.sh before quoting these numbers"
-        } else {
-            ""
-        },
-    );
-
-    files
 }
 
 /// Benchmark validation across all patterns for a given size
@@ -284,43 +196,11 @@ fn verify_all_files_valid(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark validation over the real-workload corpus.
-///
-/// This is the leg that decides merges. The synthetic patterns above sweep
-/// shapes chosen to stress the parser; this one measures files that actually
-/// occur. Per `docs/guides/benchmarking.md` and the P5 precedent, a synthetic
-/// win that does not appear here is not a win.
-fn bench_validate_real_corpus(c: &mut Criterion) {
-    let files = real_corpus_files();
-
-    let mut group = c.benchmark_group("validate_real_corpus");
-
-    for (name, bytes) in &files {
-        // Fail loudly rather than benchmark a document we would reject: a
-        // corpus file that does not validate means the corpus or the validator
-        // is broken, and timing it would measure the error path.
-        if let Err(e) = validate::validate(bytes) {
-            panic!("real-workload corpus file {name} failed validation: {e}");
-        }
-
-        group.throughput(Throughput::Bytes(bytes.len() as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(name), bytes, |b, bytes| {
-            b.iter(|| {
-                let result = validate::validate(black_box(bytes.as_slice()));
-                black_box(result)
-            });
-        });
-    }
-
-    group.finish();
-}
-
 criterion_group!(
     benches,
     bench_validate_by_size,
     bench_validate_by_pattern,
     bench_validate_large_files,
-    bench_validate_real_corpus,
     verify_all_files_valid,
 );
 criterion_main!(benches);
