@@ -10498,9 +10498,11 @@ fn delete_keys(value: OwnedValue, keys: &[&OwnedValue]) -> Result<OwnedValue, Ev
 
 /// One atomic step of a resolved `del` path — a `Field`, `Index`, or
 /// `Iterate` component — paired with whether a type or bounds mismatch there
-/// should be swallowed rather than raised. That flag comes from `del`'s own
-/// `optional` argument, or from a `?` at or before this step; see
-/// [`flatten_delete_path`].
+/// should be swallowed rather than raised. That flag comes from a `?` at or
+/// before this step *within the path expression itself* (`del(.a?.b)`) —
+/// never from `del(...)`'s own `optional` argument, which is `?` wrapping the
+/// whole call (`del(.a)?`) and is handled by `builtin_del` catching the
+/// walk's error instead (#537); see [`flatten_delete_path`].
 struct DeleteStep {
     component: Expr,
     optional: bool,
@@ -10941,11 +10943,24 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Convert to owned and delete the path
     let result = to_owned(&value);
 
+    // `optional` here is `del(...)`'s *own* `?` (`del(.a)?`), i.e. jq's
+    // `try del(.a) catch empty` around the whole call — not a per-step
+    // tolerance. It must never reach the walkers below as their starting
+    // flag: threading it in there converts a step's type/bounds error into a
+    // silent no-op that still emits the unchanged input, where jq emits
+    // nothing at all (#537). Instead every fallible step here passes `false`
+    // and any resulting error is caught right here, turning the *whole call's
+    // output* into empty when `optional` is set. A `?` written *inside* the
+    // path (`del(.a?)`) is unaffected — it's already a distinct
+    // `Expr::Optional` node baked into `path_expr`, which the walkers still
+    // honor on their own.
+
     // Computed keys resolve against the original document; each becomes one
     // fully static path expression (Field/Index/Iterate components — see
     // `resolve_dynamic_indexes`).
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
         Ok(paths) => paths,
+        Err(_) if optional => return QueryResult::None,
         Err(e) => return QueryResult::Error(e),
     };
 
@@ -10955,8 +10970,12 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if paths.len() <= 1 {
         let mut result = result;
         for path in &paths {
-            if let Err(e) = delete_at_path(&mut result, path, optional) {
-                return QueryResult::Error(e);
+            if let Err(e) = delete_at_path(&mut result, path, false) {
+                return if optional {
+                    QueryResult::None
+                } else {
+                    QueryResult::Error(e)
+                };
             }
         }
         return QueryResult::Owned(result);
@@ -10973,7 +10992,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         .iter()
         .map(|path| {
             let mut steps = Vec::new();
-            flatten_delete_path(path, optional, &mut steps);
+            flatten_delete_path(path, false, &mut steps);
             steps
         })
         .collect();
@@ -10981,6 +11000,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     match delete_expr_paths_at(result, &refs, 0) {
         Ok(result) => QueryResult::Owned(result),
+        Err(_) if optional => QueryResult::None,
         Err(e) => QueryResult::Error(e),
     }
 }
@@ -21711,6 +21731,26 @@ mod tests {
         query!(br"5", r"del(.[0].a)",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "Cannot index number with number");
+            }
+        );
+    }
+
+    #[test]
+    fn test_del_call_optional_prunes_output_rather_than_no_op() {
+        // #537: `del(f)?` wraps the *whole call* in try/catch-empty, like jq —
+        // a step error must prune the output entirely, not fall back to a
+        // silent no-op that still emits the unchanged input. Contrast with
+        // `test_del_field_on_wrong_type_respects_optional` above, where the
+        // `?` sits *inside* the path (`del(.a?)`) and a no-op is correct.
+        query!(br"5", r"del(.a)?", QueryResult::None => {});
+        query!(br"5", r"del(.[0])?", QueryResult::None => {});
+        query!(br#"{"a":5}"#, r"del(.a.b)?", QueryResult::None => {});
+        query!(br#"{"a":{"x":1}}"#, r"del(.a.b[])?", QueryResult::None => {});
+
+        // Without the outer `?`, the same queries still raise as before.
+        query!(br"5", r"del(.a)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index number with string \"a\"");
             }
         );
     }

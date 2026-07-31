@@ -113,6 +113,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`del(f)?` emitted the unchanged input where jq emits nothing** (#537): jq's
+  `?` on `del(...)?` is `try del(...) catch empty` around the **whole call** —
+  `5 | del(.a)` raises `Cannot index number with string "a"`, so `5 | del(.a)?`
+  produces no output at all. succinctly instead passed that outer `?` straight
+  into the deletion walk (`delete_at_path`/`flatten_delete_path`) as a per-step
+  "tolerate this" flag, which turned the step's error into a silent no-op that
+  still emitted the unchanged input: `5 | del(.a)? // "fell through"` returned
+  `5` instead of `"fell through"`, and `5 | [del(.a)?]` returned `[5]` instead
+  of `[]` — a `?` meant to prune the call instead produced a value that let it
+  survive downstream. `builtin_del` (`src/jq/eval.rs`) now always walks with no
+  per-step tolerance and catches the resulting error at the call boundary,
+  turning it into no output when the call itself is marked optional — matching
+  how `delpaths`'s `?` already worked. A `?` written *inside* the path
+  (`del(.a?)`) is unaffected: it is already a distinct `Expr::Optional` node
+  baked into the path expression, which the walkers still honor on their own.
+  Verified against jq-1.7.1 as 4 new golden cases, plus an in-crate test
+  covering the shapes from the issue.
+
 - **`path()` invented paths that do not exist, and lost paths that do** (#489):
   the tracker walked a filter through its own copy of jq's indexing rules, and
   that copy disagreed with the value path four ways. "No paths at all" rendered
