@@ -1253,15 +1253,23 @@ impl<'a> Parser<'a> {
             // EXCEPT at document root (start_indent == 0) where same-indent is allowed.
             // Next line shouldn't start block structure or be a comment.
             //
-            // For sequence indicators `- `, they're only block structure if at a
-            // "proper" indent level. A `- ` at indent just 1 greater than start_indent
-            // (like ` - ` when start_indent is 0) is scalar content, not a sequence.
-            // This handles cases like AB8U where the `- ` is at an invalid indent.
+            // A `- ` on a continuation line is ordinary scalar content at ANY indent
+            // greater than start_indent - per YAML 1.2 `nb-ns-plain-in-line`, once a
+            // plain scalar's first line has begun, a leading `-` on a later line is
+            // never re-tested as a sequence indicator. It's only block structure when
+            // it's at or before start_indent, which (since indent_allows_continuation
+            // already requires next_indent > start_indent outside doc-root) can only
+            // happen at document root, where it means a `- ` reappearing at column 0
+            // is a genuine new top-level sequence item, not scalar content.
+            //
+            // AB8U (`next_indent == start_indent + 1`) is just the narrowest case of
+            // "greater than start_indent" - it was once mishandled as the only correct
+            // one, wrongly stopping continuation for any deeper indent too (#484).
             let is_sequence_indicator = next_char == b'-'
                 && lookahead + 1 < self.input.len()
                 && matches!(self.input[lookahead + 1], b' ' | b'\t');
-            let sequence_indicator_is_block_structure = is_sequence_indicator
-                && (next_indent <= start_indent || next_indent >= start_indent + 2);
+            let sequence_indicator_is_block_structure =
+                is_sequence_indicator && next_indent <= start_indent;
 
             // At document root, same-indent continues the scalar (YAML spec 7.4).
             // Inside containers, must be more indented than start.
