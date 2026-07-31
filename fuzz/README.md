@@ -32,6 +32,8 @@ real bug in the other.
 
 ## Running
 
+A single target, by hand:
+
 ```bash
 cargo install cargo-fuzz              # once
 ./fuzz/seed-corpus.sh                 # materialise seeds from the vendored corpora
@@ -44,6 +46,17 @@ The seed corpus is generated, not committed — every seed duplicates something
 already tracked (the 318 vendored JSONTestSuite cases, the real-workload bench
 seed, the proptest regression seeds).
 
+All three targets, for a full campaign (see "When to run it" below):
+
+```bash
+./fuzz/run-campaign.sh                # 4 CPU-hours/target, auto worker count
+./fuzz/run-campaign.sh --cpu-hours 8
+```
+
+`run-campaign.sh` builds the targets, materialises the seed corpus, runs all
+three concurrently via cargo-fuzz's fork mode (`-j`), and exits nonzero if any
+target crashed or left an artifact behind.
+
 ## When to run it
 
 **Not on the pull-request path.** A useful run is minutes to hours; a 60-second
@@ -53,7 +66,8 @@ CI run finds nothing and grants false confidence — the exact failure mode
 * **Before any change to the validator's control flow**, run ≥ 4 CPU-hours per
   target on both benchmark architectures (they are different code paths only if
   the validator grows arch-specific fast paths, but the wall-clock is cheap and
-  the toolchains differ). Link the run in the pull request.
+  the toolchains differ). Link the run in the pull request — `run-campaign.sh`'s
+  summary table is written for pasting directly into a comment.
 * Optionally weekly, as a regression tripwire.
 
 ## When it finds something
