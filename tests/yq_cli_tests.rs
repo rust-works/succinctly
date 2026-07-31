@@ -3371,3 +3371,102 @@ fn test_dash_not_followed_by_space_is_still_a_scalar() -> Result<()> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// #355: an uncaught evaluation error must fail the process
+//
+// yq's conventions differ from jq's and both are drop-in targets, so the yq
+// path keeps yq's: `Error: <msg>` on stderr, exit 1, no position marker.
+// Captured from mikefarah/yq v4.53.3.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_uncaught_error_exits_1_yq_style() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(r#"error("boom")"#, "x: 1\n", &[])?;
+    assert_eq!(code, 1, "uncaught error must exit 1 like yq: {stderr}");
+    assert_eq!(stderr.trim_end(), "Error: boom");
+    assert_eq!(stdout, "", "a failed filter produces no output");
+    // yq carries neither of jq's markers.
+    assert!(!stderr.contains("(at "), "{stderr}");
+    assert!(!stderr.contains("(not a string)"), "{stderr}");
+    Ok(())
+}
+
+/// The diagnostic must never reach stdout.
+///
+/// The YAML and JSON streaming fast paths used to `write!` it into the output
+/// writer, so a failed filter emitted its error inline with data -- invisible
+/// to `2>/dev/null` and indistinguishable from a result to any consumer.
+#[test]
+fn test_uncaught_error_never_reaches_stdout() -> Result<()> {
+    for args in [&[][..], &["-o", "json"][..], &["-o", "yaml"][..]] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(r#"error("boom")"#, "x: 1\n", args)?;
+        assert_eq!(stdout, "", "diagnostic leaked to stdout with {args:?}");
+        assert_eq!(code, 1, "{args:?}");
+        assert!(stderr.contains("boom"), "{args:?}: {stderr}");
+    }
+    // Multi-document input goes through the same streaming path.
+    let (stdout, _, code) = run_yq_stdin_with_stderr(r#"error("boom")"#, "a: 1\n---\nb: 2\n", &[])?;
+    assert_eq!(stdout, "");
+    assert_eq!(code, 1);
+    Ok(())
+}
+
+/// yq reaches the evaluator by several routes; a half-fix would leave some
+/// exiting 0. Every route must agree.
+#[test]
+fn test_uncaught_error_fails_on_every_evaluation_path() -> Result<()> {
+    // YAML cursor streaming (the default), and the YAML DOM path via --slurp.
+    for args in [&[][..], &["-s"][..]] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(r#"error("boom")"#, "x: 1\n", args)?;
+        assert_eq!(code, 1, "{args:?}: {stderr}");
+        assert_eq!(stdout, "", "{args:?}");
+        assert_eq!(stderr.trim_end(), "Error: boom", "{args:?}");
+    }
+
+    // JSON input, and null input, which skip the YAML paths entirely.
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(r#"error("boom")"#, r#"{"a":1}"#, &["-p", "json"])?;
+    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr.trim_end(), "Error: boom");
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(r#"error("boom")"#, "", &["-n"])?;
+    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr.trim_end(), "Error: boom");
+    Ok(())
+}
+
+#[test]
+fn test_yq_caught_error_and_clean_run_still_exit_0() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(r#"try error("boom") catch "caught""#, "x: 1\n", &[])?;
+    assert_eq!(code, 0, "a caught error is not a failure: {stderr}");
+    assert_eq!(stderr, "");
+    assert_eq!(stdout.trim(), "caught");
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".x", "x: 1\n", &[])?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout.trim(), "1");
+    Ok(())
+}
+
+#[test]
+fn test_yq_error_outranks_exit_status_flag() -> Result<()> {
+    // Both are exit 1 for yq, but the message must be the error, not the
+    // "no matches found" that -e reports for an empty/falsy result (#178).
+    let (_, stderr, code) = run_yq_stdin_with_stderr(r#"error("boom")"#, "x: 1\n", &["-e"])?;
+    assert_eq!(code, 1);
+    assert_eq!(stderr.trim_end(), "Error: boom");
+    assert!(
+        !stderr.contains("no matches found"),
+        "an error is not a falsy result: {stderr}"
+    );
+
+    // -e's own semantics are untouched when nothing raised.
+    let (_, stderr, code) = run_yq_stdin_with_stderr("false", "x: 1\n", &["-e"])?;
+    assert_eq!(code, 1);
+    assert!(stderr.contains("no matches found"), "{stderr}");
+    Ok(())
+}

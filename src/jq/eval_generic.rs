@@ -249,7 +249,7 @@ impl<V: DocumentValue> GenericResult<V> {
         indent_spaces: usize,
         mut on_value: impl FnMut(&mut W) -> core::fmt::Result,
     ) -> Result<crate::jq::stream::StreamStats, core::fmt::Error> {
-        use crate::jq::stream::{StreamStats, StreamableValue};
+        use crate::jq::stream::{StreamError, StreamStats, StreamableValue};
 
         let mut stats = StreamStats::default();
 
@@ -285,9 +285,10 @@ impl<V: DocumentValue> GenericResult<V> {
                 // No output
             }
             Self::Error(e) => {
-                // Write error message (like jq does)
-                write!(out, "jq: error: {e}")?;
-                on_value(out)?;
+                // Nothing goes to `out`: `out` is stdout, and a diagnostic
+                // written there is indistinguishable from a result. Hand it
+                // back so the caller can print to stderr and fail (#355).
+                stats.error = Some(stream_error(e));
             }
             Self::Owned(o) => {
                 o.stream_json(out, indent_spaces)?;
@@ -306,8 +307,10 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.count = os.len();
             }
             Self::Break(label) => {
-                write!(out, "jq: error: break ${label} not in label")?;
-                on_value(out)?;
+                stats.error = Some(StreamError {
+                    message: format!("break ${label} not in label"),
+                    not_a_string: false,
+                });
             }
         }
 
@@ -333,7 +336,7 @@ impl<V: DocumentValue> GenericResult<V> {
         indent_spaces: usize,
         mut on_value: impl FnMut(&mut W) -> core::fmt::Result,
     ) -> Result<crate::jq::stream::StreamStats, core::fmt::Error> {
-        use crate::jq::stream::{StreamStats, StreamableValue};
+        use crate::jq::stream::{StreamError, StreamStats, StreamableValue};
 
         let mut stats = StreamStats::default();
 
@@ -368,9 +371,8 @@ impl<V: DocumentValue> GenericResult<V> {
                 // No output
             }
             Self::Error(e) => {
-                // Write error message (like yq does)
-                write!(out, "yq: error: {e}")?;
-                on_value(out)?;
+                // See `stream_json`: diagnostics never go to `out` (#355).
+                stats.error = Some(stream_error(e));
             }
             Self::Owned(o) => {
                 o.stream_yaml(out, indent_spaces)?;
@@ -389,12 +391,23 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.count = os.len();
             }
             Self::Break(label) => {
-                write!(out, "yq: error: break ${label} not in label")?;
-                on_value(out)?;
+                stats.error = Some(StreamError {
+                    message: format!("break ${label} not in label"),
+                    not_a_string: false,
+                });
             }
         }
 
         Ok(stats)
+    }
+}
+
+/// Render an [`EvalError`] into the payload a streaming caller needs to
+/// reproduce jq's diagnostic on stderr (#355).
+fn stream_error(e: &EvalError) -> crate::jq::stream::StreamError {
+    crate::jq::stream::StreamError {
+        message: e.message.clone(),
+        not_a_string: e.payload_is_not_a_string(),
     }
 }
 
@@ -2204,11 +2217,39 @@ mod tests {
             .stream_json(&mut owned_json, 0, |_| Ok(()))
             .unwrap();
         assert_eq!(owned_json, "5");
+        // An error writes nothing to `out` — `out` is stdout, and a diagnostic
+        // there would be indistinguishable from a result. It comes back through
+        // `stats.error` instead, for the caller to print to stderr (#355).
         let mut err_json = String::new();
-        results[5]
+        let err_stats = results[5]
             .stream_json(&mut err_json, 0, |_| Ok(()))
             .unwrap();
-        assert!(err_json.contains("boom"));
+        assert_eq!(err_json, "", "diagnostics must never reach stdout");
+        assert_eq!(
+            err_stats.error.as_ref().map(|e| e.message.as_str()),
+            Some("boom")
+        );
+        assert_eq!(err_stats.count, 0);
+
+        let mut err_yaml = String::new();
+        let err_stats = results[5]
+            .stream_yaml(&mut err_yaml, 2, |_| Ok(()))
+            .unwrap();
+        assert_eq!(err_yaml, "", "diagnostics must never reach stdout");
+        assert_eq!(
+            err_stats.error.as_ref().map(|e| e.message.as_str()),
+            Some("boom")
+        );
+
+        // Break escapes its label: an uncaught error like any other, and it too
+        // stays off stdout.
+        let mut brk = String::new();
+        let brk_stats = results[6].stream_json(&mut brk, 0, |_| Ok(())).unwrap();
+        assert_eq!(brk, "");
+        assert!(brk_stats
+            .error
+            .as_ref()
+            .is_some_and(|e| e.message.contains("not in label")));
 
         // into_owned consumes; check the owned-family variants.
         let owned: Vec<Option<OwnedValue>> =

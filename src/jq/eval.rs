@@ -1453,9 +1453,10 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // The payload is raised verbatim so `catch` can inspect it; `EvalError`
-    // renders the message from it. Bare `error` raises the input value, as jq
-    // does — `{"x":1} | error` reports `{"x":1}`, not `null`.
+    // The payload is raised verbatim so `catch` can inspect it, and so the CLI
+    // can flag a non-string one; `EvalError` renders the message from it. Bare
+    // `error` raises the input value, as jq does — `{"x":1} | error` reports
+    // `{"x":1}`, not `null`.
     let payload = match msg {
         Some(msg_expr) => {
             let msg_result = eval_single::<W, S>(msg_expr, value, optional);

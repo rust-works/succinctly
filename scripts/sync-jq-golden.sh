@@ -76,19 +76,47 @@ for dir in "$GOLDEN_DIR"/cases/*/; do
   # `${args[@]+...}` guards the empty-array case under `set -u` on bash 3.2
   # (macOS), where a case with no CLI args would otherwise trip "unbound
   # variable".
-  jq ${args[@]+"${args[@]}"} "$filter" < "$dir/input.json" > "$work_dir/out" || {
-    echo "error: jq failed on case $name" >&2
-    exit 1
-  }
+  # A non-zero exit is a legitimate fixture, not a script failure: cases that
+  # exercise uncaught errors (#355) capture jq's exit code and stderr too, and
+  # those are the only oracle for a failure — neither reaches stdout.
+  set +e
+  jq ${args[@]+"${args[@]}"} "$filter" < "$dir/input.json" \
+    > "$work_dir/out" 2> "$work_dir/err"
+  status=$?
+  set -e
 
   if $check_only; then
     if ! diff -u "$dir/expected.out" "$work_dir/out"; then
       echo "error: case $name expected.out does not match jq $PIN" >&2
       stale=$((stale + 1))
     fi
+    if [[ $status -eq 0 ]]; then
+      if [[ -f "$dir/expected.status" || -f "$dir/expected.err" ]]; then
+        echo "error: case $name now passes under jq $PIN but has expected.status/err" >&2
+        stale=$((stale + 1))
+      fi
+    else
+      if [[ "$(cat "$dir/expected.status" 2>/dev/null)" != "$status" ]]; then
+        echo "error: case $name exits $status under jq $PIN, expected.status says" \
+             "$(cat "$dir/expected.status" 2>/dev/null || echo '<missing>')" >&2
+        stale=$((stale + 1))
+      fi
+      if ! diff -u "$dir/expected.err" "$work_dir/err" 2>/dev/null; then
+        echo "error: case $name expected.err does not match jq $PIN" >&2
+        stale=$((stale + 1))
+      fi
+    fi
   else
     cp "$work_dir/out" "$dir/expected.out"
-    echo "wrote cases/$name/expected.out" >&2
+    if [[ $status -eq 0 ]]; then
+      # A case that used to fail and now passes sheds its failure fixtures.
+      rm -f "$dir/expected.status" "$dir/expected.err"
+      echo "wrote cases/$name/expected.out" >&2
+    else
+      echo "$status" > "$dir/expected.status"
+      cp "$work_dir/err" "$dir/expected.err"
+      echo "wrote cases/$name/expected.{out,err,status} (jq exit $status)" >&2
+    fi
   fi
 done
 

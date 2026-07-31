@@ -19,7 +19,7 @@ use succinctly::json::JsonIndex;
 use super::JqCommand;
 use crate::output::{
     self, escape_json_string, escape_json_string_ascii, exit_codes, ColorScheme, ControlEscape,
-    FloatStyle, JsonFormatOpts,
+    DiagStyle, ErrorSink, FloatStyle, InputLocation, JsonFormatOpts,
 };
 
 /// Evaluation context for passing variables to the jq evaluator.
@@ -689,6 +689,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // Track last output for exit status
     let mut last_output: Option<OwnedValue> = None;
     let mut had_output = false;
+    // Uncaught evaluation errors. Evaluation continues past one (as jq does),
+    // so the failure is remembered here and turned into exit 5 below (#355).
+    let mut sink = ErrorSink::default();
 
     // Validate DSV delimiter if provided
     if let Some(delim) = args.input_dsv {
@@ -711,7 +714,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     .collect::<Result<Vec<_>>>()?
             };
 
-            for raw in raw_inputs {
+            for (file_idx, raw) in raw_inputs.into_iter().enumerate() {
+                let file = files.get(file_idx).map(|p| p.to_string_lossy().to_string());
+
                 // Build DSV index (memory-efficient with SIMD)
                 let config = DsvConfig::default().with_delimiter(delimiter as u8);
                 let index = build_dsv_index(&raw, &config);
@@ -719,7 +724,11 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // Stream rows using the cursor - no materialization of all rows
                 let rows = DsvRows::new(&raw, &index);
 
-                for row in rows {
+                for (row_idx, row) in rows.enumerate() {
+                    // One row per line, so the row index is the line. Approximate
+                    // for fields containing an embedded newline; jq has no DSV
+                    // input mode, so there is no oracle to match here anyway.
+                    let at = InputLocation::at(file.as_deref(), row_idx + 1);
                     // Build JSON array for this row and write directly
                     let fields: Vec<OwnedValue> = row
                         .fields()
@@ -732,7 +741,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     let row_value = OwnedValue::Array(fields);
 
                     // Evaluate expression on this row
-                    let results = evaluate_input(&row_value, &expr, &context)?;
+                    let results = evaluate_input(&row_value, &expr, &context, &at, &mut sink)?;
 
                     for result in results {
                         had_output = true;
@@ -747,7 +756,12 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 
             out.flush()?;
 
-            // Determine exit code
+            // Determine exit code. An uncaught error outranks -e: jq's 5 says
+            // the filter failed, -e's 1/4 describe an otherwise-successful
+            // result that happened to be falsy (#355 vs #178).
+            if sink.hit() {
+                return Ok(DiagStyle::Jq.error_exit_code());
+            }
             if args.exit_status {
                 if !had_output {
                     return Ok(exit_codes::NO_OUTPUT);
@@ -795,13 +809,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         let use_identity_fast_path = expr.is_identity() && output_config.can_use_raw_identity();
 
         for (idx, raw) in raw_inputs.iter().enumerate() {
+            let filename: Option<String> = files.get(idx).map(|p| p.to_string_lossy().to_string());
             // Validate JSON if --validate flag is set
             if args.validate {
-                let filename: Option<String> = if files.is_empty() {
-                    None
-                } else {
-                    Some(files[idx].to_string_lossy().to_string())
-                };
                 if let Err(exit_code) = validate_json_input(raw, filename.as_deref()) {
                     return Ok(exit_code);
                 }
@@ -829,7 +839,10 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 
                 // Slow path: build index and evaluate expression
                 let index = JsonIndex::build(json_bytes);
-                let results = evaluate_bytes_lazy(json_bytes, &expr, &index);
+                // jq names the line the input value ends on, counted in the
+                // whole file rather than in this value's slice.
+                let at = InputLocation::at(filename.as_deref(), line_at(raw, end));
+                let results = evaluate_bytes_lazy(json_bytes, &expr, &index, &at, &mut sink);
 
                 // Consume results to free memory after each value is written
                 for result in results {
@@ -845,14 +858,15 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         }
     } else {
         // Original path: parse through serde_json (loses number formatting)
-        let inputs = match get_inputs(&args) {
+        let (inputs, locations) = match get_inputs(&args) {
             Ok(Ok(inputs)) => inputs,
             Ok(Err(e)) => return Err(e),
             Err(exit_code) => return Ok(exit_code), // Validation error
         };
 
-        for input in inputs {
-            let results = evaluate_input(&input, &expr, &context)?;
+        for (idx, input) in inputs.iter().enumerate() {
+            let at = locations.get(idx);
+            let results = evaluate_input(input, &expr, &context, &at, &mut sink)?;
 
             for result in results {
                 had_output = true;
@@ -864,7 +878,12 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 
     out.flush()?;
 
-    // Determine exit code
+    // Determine exit code. An uncaught error outranks -e: jq's 5 says the
+    // filter failed, -e's 1/4 describe an otherwise-successful result that
+    // happened to be falsy (#355 vs #178).
+    if sink.hit() {
+        return Ok(DiagStyle::Jq.error_exit_code());
+    }
     if args.exit_status {
         if !had_output {
             return Ok(exit_codes::NO_OUTPUT);
@@ -996,10 +1015,13 @@ fn get_input_files(args: &JqCommand) -> Vec<std::path::PathBuf> {
 
 /// Get input values based on arguments.
 /// Returns Err(i32) for validation failures (exit code), Ok(Err) for other errors.
-fn get_inputs(args: &JqCommand) -> std::result::Result<Result<Vec<OwnedValue>>, i32> {
+fn get_inputs(
+    args: &JqCommand,
+) -> std::result::Result<Result<(Vec<OwnedValue>, InputLocations)>, i32> {
     // Null input mode: use null as the single input
     if args.null_input {
-        return Ok(Ok(vec![OwnedValue::Null]));
+        // jq prints `(at <unknown>)` under -n: there is no input to point at.
+        return Ok(Ok((vec![OwnedValue::Null], InputLocations::unknown())));
     }
 
     // Get input files
@@ -1022,6 +1044,13 @@ fn get_inputs(args: &JqCommand) -> std::result::Result<Result<Vec<OwnedValue>>, 
         inputs
     };
 
+    let mut locations = InputLocations::new(
+        files
+            .iter()
+            .map(|p| Some(p.to_string_lossy().to_string()))
+            .collect(),
+    );
+
     // jq -R -s: the entire input (all files concatenated) becomes a single
     // string; no line splitting and no array wrap.
     if args.raw_input && args.slurp && args.input_dsv.is_none() {
@@ -1029,25 +1058,36 @@ fn get_inputs(args: &JqCommand) -> std::result::Result<Result<Vec<OwnedValue>>, 
         for (_, raw) in &raw_inputs {
             combined.push_str(raw);
         }
-        return Ok(Ok(vec![OwnedValue::String(combined)]));
+        // One value spanning everything: jq names its last content line.
+        locations.push(0, content_lines(&combined));
+        return Ok(Ok((vec![OwnedValue::String(combined)], locations)));
     }
 
     // Process based on input mode
     let mut values = Vec::new();
 
     for (file_idx, raw) in raw_inputs {
+        let src = file_idx.unwrap_or(0);
+
         if let Some(delimiter) = args.input_dsv {
             // DSV input: each row becomes a JSON array of strings
             let parsed = parse_dsv_input(&raw, delimiter);
+            // One row per line (approximate for embedded newlines; jq has no
+            // DSV input mode, so there is no oracle to match here).
+            for line in 1..=parsed.len() {
+                locations.push(src, line);
+            }
             values.extend(parsed);
         } else if args.raw_input {
             // Raw input: each line becomes a string
-            for line in raw.lines() {
+            for (line_idx, line) in raw.lines().enumerate() {
                 values.push(OwnedValue::String(line.to_string()));
+                locations.push(src, line_idx + 1);
             }
         } else if args.seq {
             // JSON sequence input (RFC 7464): split on RS, ignore parse failures
             let parsed = parse_json_seq(&raw);
+            locations.extend_from_ends(src, &raw, &json_seq_ends(raw.as_bytes()), parsed.len());
             values.extend(parsed);
         } else {
             // JSON input: validate first if --validate is set
@@ -1060,15 +1100,140 @@ fn get_inputs(args: &JqCommand) -> std::result::Result<Result<Vec<OwnedValue>>, 
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e)),
             };
+            let ends: Vec<usize> = find_json_values(raw.as_bytes())
+                .into_iter()
+                .map(|(_, end)| end)
+                .collect();
+            locations.extend_from_ends(src, &raw, &ends, parsed.len());
             values.extend(parsed);
         }
+
+        debug_assert_eq!(locations.len(), values.len(), "one location per value");
     }
 
     // Slurp mode: wrap all inputs in an array
     if args.slurp {
-        Ok(Ok(vec![OwnedValue::Array(values)]))
+        // One value covering every input: jq names the line the last of them
+        // ended on.
+        let last = locations.last();
+        Ok(Ok((
+            vec![OwnedValue::Array(values)],
+            InputLocations::single(last),
+        )))
     } else {
-        Ok(Ok(values))
+        Ok(Ok((values, locations)))
+    }
+}
+
+/// 1-based number of the last line carrying content.
+///
+/// What jq's marker reports for modes that collapse the whole input into one
+/// value (`-R -s`): a trailing newline does not open a new line.
+fn content_lines(raw: &str) -> usize {
+    raw.lines().count().max(1)
+}
+
+/// Exclusive end offsets of the RS-delimited records in a `--seq` stream.
+///
+/// Trailing whitespace is trimmed so the line lands on the record itself rather
+/// than on the separator that follows it, matching jq.
+fn json_seq_ends(raw: &[u8]) -> Vec<usize> {
+    const RS: u8 = 0x1e;
+    let starts: Vec<usize> = raw
+        .iter()
+        .enumerate()
+        .filter(|(_, &b)| b == RS)
+        .map(|(i, _)| i)
+        .collect();
+
+    (0..starts.len())
+        .map(|i| {
+            // A record runs up to the next separator, or to end of input.
+            let mut end = starts.get(i + 1).copied().unwrap_or(raw.len());
+            while end > 0 && raw[end - 1].is_ascii_whitespace() {
+                end -= 1;
+            }
+            end
+        })
+        .collect()
+}
+
+/// Source locations for the values returned by [`get_inputs`].
+///
+/// Kept apart from the values and stored as `(source, line)` pairs: an owned
+/// [`InputLocation`] per value would outweigh the values themselves on
+/// line-oriented modes like `-R`, where every value is one short string.
+#[derive(Debug, Default)]
+pub struct InputLocations {
+    /// File name per source, `None` for stdin.
+    files: Vec<Option<String>>,
+    /// `(source index, 1-based line)` per value. Empty means there is no input
+    /// to point at (`-n`), which jq renders as `<unknown>`.
+    per_value: Vec<(u32, u32)>,
+}
+
+impl InputLocations {
+    fn new(files: Vec<Option<String>>) -> Self {
+        Self {
+            files,
+            per_value: Vec::new(),
+        }
+    }
+
+    /// Locations for an input with nothing to point at (`-n`).
+    fn unknown() -> Self {
+        Self::default()
+    }
+
+    /// Locations for a single value at an already-resolved location.
+    fn single(at: InputLocation) -> Self {
+        let mut locations = Self::new(vec![at.file.clone()]);
+        if let Some(line) = at.line {
+            locations.push(0, line);
+        }
+        locations
+    }
+
+    fn push(&mut self, src: usize, line: usize) {
+        self.per_value.push((src as u32, line as u32));
+    }
+
+    fn len(&self) -> usize {
+        self.per_value.len()
+    }
+
+    /// Record one location per value from the values' end offsets in `raw`.
+    ///
+    /// Falls back to the last content line for every value when the counts
+    /// disagree — modes that skip unparsable records can produce fewer values
+    /// than the scan found offsets, and a wrong line is worse than a vague one.
+    fn extend_from_ends(&mut self, src: usize, raw: &str, ends: &[usize], values: usize) {
+        if ends.len() == values {
+            for &end in ends {
+                self.push(src, line_at(raw.as_bytes(), end));
+            }
+        } else {
+            let line = content_lines(raw);
+            for _ in 0..values {
+                self.push(src, line);
+            }
+        }
+    }
+
+    /// Location of the last value, or `<unknown>` if there were none.
+    fn last(&self) -> InputLocation {
+        self.get(self.per_value.len().saturating_sub(1))
+    }
+
+    /// Location of the value at `idx`.
+    pub fn get(&self, idx: usize) -> InputLocation {
+        match self.per_value.get(idx) {
+            Some(&(src, line)) => InputLocation::at(
+                self.files.get(src as usize).and_then(Option::as_deref),
+                line as usize,
+            ),
+            None => InputLocation::unknown(),
+        }
     }
 }
 
@@ -1099,6 +1264,18 @@ fn read_stdin_bytes() -> Result<Vec<u8>> {
 /// Read a file to bytes.
 fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))
+}
+
+/// 1-based line number of the byte at `end` within `bytes`.
+///
+/// jq's `(at <file>:<line>)` marker names the line on which the input value
+/// *ends*, so callers pass the exclusive end offset from [`find_json_values`].
+/// Only reached on the error path, so a plain scan is cheap enough.
+fn line_at(bytes: &[u8], end: usize) -> usize {
+    1 + bytes[..end.min(bytes.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
 }
 
 /// Find the byte ranges of JSON values in a byte slice.
@@ -1369,10 +1546,16 @@ fn serde_to_owned(value: &serde_json::Value) -> OwnedValue {
 }
 
 /// Evaluate the expression against an input value.
+///
+/// An uncaught error is reported to `sink` and yields no values, so evaluation
+/// continues with the next input the way jq does; `sink` then drives the exit
+/// code (#355).
 fn evaluate_input(
     input: &OwnedValue,
     expr: &jq::Expr,
     _context: &EvalContext,
+    at: &InputLocation,
+    sink: &mut ErrorSink,
 ) -> Result<Vec<OwnedValue>> {
     // Convert OwnedValue to JSON bytes for indexing
     let json_str = input.to_json();
@@ -1393,13 +1576,13 @@ fn evaluate_input(
         GenericResult::Many(vs) => Ok(vs.iter().map(generic_to_owned).collect()),
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
-            eprintln!("jq: error: {e}");
+            sink.report(DiagStyle::Jq, &e, at);
             Ok(vec![])
         }
         GenericResult::Owned(v) => Ok(vec![v]),
         GenericResult::ManyOwned(vs) => Ok(vs),
         GenericResult::Break(label) => {
-            eprintln!("jq: error: break ${label} not in label");
+            sink.report_break(DiagStyle::Jq, &label, at);
             Ok(vec![])
         }
     }
@@ -1413,11 +1596,13 @@ fn evaluate_bytes_lazy<'a>(
     json_bytes: &'a [u8],
     expr: &jq::Expr,
     index: &'a JsonIndex,
+    at: &InputLocation,
+    sink: &mut ErrorSink,
 ) -> Vec<JqValue<'a, Vec<u64>>> {
     let cursor = index.root(json_bytes);
     // Use eval_with_cursor to preserve cursor context for position-based navigation
     let result = eval_with_cursor(expr, cursor);
-    generic_result_to_jq_values(result, cursor)
+    generic_result_to_jq_values(result, cursor, at, sink)
 }
 
 /// Convert GenericResult to JqValue, preserving lazy cursor references.
@@ -1427,6 +1612,8 @@ fn evaluate_bytes_lazy<'a>(
 fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
     result: GenericResult<StandardJson<'a, W>>,
     cursor: JsonCursor<'a, W>,
+    at: &InputLocation,
+    sink: &mut ErrorSink,
 ) -> Vec<JqValue<'a, W>> {
     match result {
         GenericResult::One(v) => vec![standard_json_to_jq_value(v, &cursor)],
@@ -1438,13 +1625,13 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             .collect(),
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
-            eprintln!("jq: error: {e}");
+            sink.report(DiagStyle::Jq, &e, at);
             vec![]
         }
         GenericResult::Owned(v) => vec![JqValue::from_owned(v)],
         GenericResult::ManyOwned(vs) => vs.into_iter().map(JqValue::from_owned).collect(),
         GenericResult::Break(label) => {
-            eprintln!("jq: error: break ${label} not in label");
+            sink.report_break(DiagStyle::Jq, &label, at);
             vec![]
         }
     }

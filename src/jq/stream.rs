@@ -74,6 +74,25 @@ pub struct StreamStats {
     ///
     /// yq's `--exit-status` semantics: exit 1 unless some result is truthy.
     pub any_truthy: bool,
+    /// Diagnostic for an uncaught evaluation error, if the result was one.
+    ///
+    /// Streaming deliberately writes nothing to `out` for an error: the
+    /// diagnostic belongs on stderr and must set the process exit code, which
+    /// only the caller can do. Handing it back here keeps it off stdout (#355).
+    pub error: Option<StreamError>,
+}
+
+/// An uncaught evaluation error surfaced by a streaming operation.
+///
+/// Carries just enough to reproduce jq's diagnostic without borrowing from the
+/// streamed result: the rendered message, and whether the raised payload was a
+/// non-string (jq's `(not a string)` marker).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamError {
+    /// Rendered error message.
+    pub message: String,
+    /// Whether the raised payload was something other than a string.
+    pub not_a_string: bool,
 }
 
 impl StreamableValue for OwnedValue {

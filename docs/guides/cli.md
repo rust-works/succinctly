@@ -441,6 +441,26 @@ succinctly yq '.users[]' input.yaml
 
 - `-e, --exit-status`: Set exit status based on output (0 if last output != false/null)
 
+| Code | Meaning                                                              |
+|------|----------------------------------------------------------------------|
+| 0    | Success                                                              |
+| 1    | Uncaught evaluation error, or with `-e`, no truthy result            |
+| 3    | Compile error (`--validate` failure)                                 |
+
+An uncaught evaluation error prints `Error: <message>` to stderr and exits 1,
+matching mikefarah/yq. The diagnostic never goes to stdout, so the erroring
+document produces no output on its own — though in a multi-document stream,
+earlier documents that succeeded still reach stdout:
+
+```bash
+succinctly yq 'error("boom")' config.yaml   # stderr: Error: boom
+echo $?                                     # 1
+```
+
+Note this differs from the `jq` subcommand, which follows jq's convention of
+exit code 5 and a `jq: error (at <file>:<line>)` diagnostic. Each subcommand
+matches its own upstream.
+
 ### Examples
 
 ```bash
@@ -557,6 +577,46 @@ See [Environment Variables](../reference/environment-variables.md) for the accep
 - `--argjson NAME VALUE`: Set $NAME to the JSON VALUE
 - `--slurpfile NAME FILE`: Set $NAME to an array of JSON values from FILE
 - `--rawfile NAME FILE`: Set $NAME to the string contents of FILE
+
+### Exit Status
+
+- `-e, --exit-status`: Set exit status from the last output (see the table below)
+
+| Code | Meaning                                                              |
+|------|----------------------------------------------------------------------|
+| 0    | Success                                                              |
+| 1    | With `-e`, the last output was `false` or `null`                     |
+| 3    | Compile error (`--validate` failure)                                 |
+| 4    | With `-e`, no output was produced                                    |
+| 5    | Uncaught evaluation error                                            |
+
+An uncaught evaluation error prints a diagnostic to stderr and exits 5, so a
+failed filter is distinguishable from a successful one under `set -e`, `&&`, or
+an explicit `$?` check:
+
+```bash
+echo '{"x":1}' | succinctly jq 'error("boom")'
+# stderr: jq: error (at <stdin>:1): boom
+echo $?   # 5
+```
+
+The diagnostic names the file and the line the input value ended on (`<stdin>`
+when reading a pipe, `<unknown>` under `-n`), and flags a raised payload that is
+not a string, as jq does:
+
+```bash
+echo '{"x":1}' | succinctly jq 'error({"a":1})'
+# stderr: jq: error (at <stdin>:1) (not a string): {"a":1}
+```
+
+Codes 5 and `-e`'s 1/4 answer different questions and are not interchangeable:
+5 means the filter *failed*, while `-e`'s codes describe a filter that succeeded
+with a falsy or empty result. An error therefore outranks `-e`. A caught error
+(`try`/`catch`) is not a failure and exits 0.
+
+One divergence from jq is deliberate: jq's exit code reflects only the *last*
+input, so an error on any earlier input exits 0. `succinctly jq` exits 5 if any
+input raised, which is the point of having the code at all.
 
 ### Examples
 

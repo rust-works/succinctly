@@ -19,7 +19,16 @@ use succinctly::yaml::{
 };
 
 use super::{InputFormat, OutputFormat, YqCommand};
-use crate::output::{self, exit_codes, ColorScheme, ControlEscape, FloatStyle, JsonFormatOpts};
+use crate::output::{
+    self, exit_codes, ColorScheme, ControlEscape, DiagStyle, ErrorSink, FloatStyle, InputLocation,
+    JsonFormatOpts,
+};
+
+/// yq's diagnostics carry no `(at <file>:<line>)` marker, so the yq paths have
+/// no location to report — unlike jq, whose marker names the input value (#355).
+fn no_location() -> InputLocation {
+    InputLocation::unknown()
+}
 
 /// Adapter to use `std::io::Write` with `core::fmt::Write` methods.
 /// This enables streaming JSON output without intermediate String allocation.
@@ -274,6 +283,7 @@ fn evaluate_yaml_direct_filtered(
     bytes: &[u8],
     expr: &Expr,
     doc_filter: Option<(usize, usize)>,
+    sink: &mut ErrorSink,
 ) -> Result<(Vec<Vec<OwnedValue>>, usize)> {
     let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
     let root = index.root(bytes);
@@ -291,7 +301,7 @@ fn evaluate_yaml_direct_filtered(
                 };
 
                 if should_eval {
-                    let results = evaluate_yaml_cursor(cursor, expr)?;
+                    let results = evaluate_yaml_cursor(cursor, expr, sink)?;
                     // Only include documents that have results (select may filter them out)
                     if !results.is_empty() {
                         doc_results.push(results);
@@ -312,7 +322,7 @@ fn evaluate_yaml_direct_filtered(
 
             if should_eval {
                 if let Some(content_cursor) = root.first_child() {
-                    let results = evaluate_yaml_cursor(content_cursor, expr)?;
+                    let results = evaluate_yaml_cursor(content_cursor, expr, sink)?;
                     Ok((vec![results], 1))
                 } else {
                     // Empty document
@@ -329,7 +339,11 @@ fn evaluate_yaml_direct_filtered(
 ///
 /// Variables (`--arg`/`--argjson`, `$ARGS`) are substituted into `expr` up
 /// front in `run_yq`, so this function needs no evaluation context (#284).
-fn evaluate_input(input: &OwnedValue, expr: &jq::Expr) -> Result<Vec<OwnedValue>> {
+fn evaluate_input(
+    input: &OwnedValue,
+    expr: &jq::Expr,
+    sink: &mut ErrorSink,
+) -> Result<Vec<OwnedValue>> {
     // Convert OwnedValue to JSON bytes for indexing
     let json_str = input.to_json();
     let json_bytes = json_str.as_bytes();
@@ -347,13 +361,13 @@ fn evaluate_input(input: &OwnedValue, expr: &jq::Expr) -> Result<Vec<OwnedValue>
         QueryResult::Many(vs) => Ok(vs.iter().map(standard_json_to_owned).collect()),
         QueryResult::None => Ok(vec![]),
         QueryResult::Error(e) => {
-            eprintln!("yq: error: {e}");
+            sink.report(DiagStyle::Yq, &e, &no_location());
             Ok(vec![])
         }
         QueryResult::Owned(v) => Ok(vec![v]),
         QueryResult::ManyOwned(vs) => Ok(vs),
         QueryResult::Break(label) => {
-            eprintln!("yq: error: break ${label} not in label");
+            sink.report_break(DiagStyle::Yq, &label, &no_location());
             Ok(vec![])
         }
     }
@@ -365,6 +379,7 @@ fn evaluate_input(input: &OwnedValue, expr: &jq::Expr) -> Result<Vec<OwnedValue>
 fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     cursor: YamlCursor<'_, W>,
     expr: &Expr,
+    sink: &mut ErrorSink,
 ) -> Result<Vec<OwnedValue>> {
     let result = eval_with_cursor_using::<YqSemantics, _>(expr, cursor);
 
@@ -375,13 +390,13 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         GenericResult::Many(vs) => Ok(vs.iter().map(to_owned).collect()),
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
-            eprintln!("yq: error: {e}");
+            sink.report(DiagStyle::Yq, &e, &no_location());
             Ok(vec![])
         }
         GenericResult::Owned(v) => Ok(vec![v]),
         GenericResult::ManyOwned(vs) => Ok(vs),
         GenericResult::Break(label) => {
-            eprintln!("yq: error: break ${label} not in label");
+            sink.report_break(DiagStyle::Yq, &label, &no_location());
             Ok(vec![])
         }
     }
@@ -1227,6 +1242,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // output and all-falsy output alike as "no matches found".
     let mut any_truthy = false;
 
+    // Uncaught evaluation errors. Evaluation continues past one, so the failure
+    // is remembered here and turned into yq's exit 1 below (#355).
+    let mut sink = ErrorSink::default();
+
     // Check if expression contains split_doc - if so, each result is a separate document
     let has_split_doc = contains_split_doc(&program.expr);
 
@@ -1323,6 +1342,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             })
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
                         any_truthy |= stats.any_truthy;
+                        // Streaming never writes a diagnostic to stdout; it hands
+                        // the error back here so it reaches stderr and fails the run (#355).
+                        if let Some(err) = &stats.error {
+                            sink.report_stream(DiagStyle::Yq, err, &no_location());
+                        }
                     }
                 } else {
                     // M2 path: JSON output streaming
@@ -1346,6 +1370,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             })
                             .map_err(|_| anyhow::anyhow!("Write error"))?;
                         any_truthy |= stats.any_truthy;
+                        // Streaming never writes a diagnostic to stdout; it hands
+                        // the error back here so it reaches stderr and fails the run (#355).
+                        if let Some(err) = &stats.error {
+                            sink.report_stream(DiagStyle::Yq, err, &no_location());
+                        }
                     }
                 }
             }};
@@ -1486,7 +1515,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     } else if args.null_input {
         // Handle --null-input
         let mut split_doc_state = SplitDocState::new(has_split_doc);
-        let results = evaluate_input(&OwnedValue::Null, &program.expr)?;
+        let results = evaluate_input(&OwnedValue::Null, &program.expr, &mut sink)?;
         for result in results {
             split_doc_state.write_separator(&mut writer, &output_config)?;
             any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
@@ -1512,7 +1541,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // concatenated) becomes a single string; no line splitting and
             // no array wrap.
             let slurped = OwnedValue::String(input_content);
-            let results = evaluate_input(&slurped, &program.expr)?;
+            let results = evaluate_input(&slurped, &program.expr, &mut sink)?;
             for result in results {
                 split_doc_state.write_separator(&mut writer, &output_config)?;
                 any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
@@ -1522,7 +1551,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // Without --slurp, process each line independently
             for line in input_content.lines() {
                 let input = OwnedValue::String(line.to_string());
-                let results = evaluate_input(&input, &program.expr)?;
+                let results = evaluate_input(&input, &program.expr, &mut sink)?;
                 for result in results {
                     split_doc_state.write_separator(&mut writer, &output_config)?;
                     any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
@@ -1577,7 +1606,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
         // Create slurped array and evaluate
         let slurped = OwnedValue::Array(all_docs);
-        let results = evaluate_input(&slurped, &program.expr)?;
+        let results = evaluate_input(&slurped, &program.expr, &mut sink)?;
         let mut split_doc_state = SplitDocState::new(has_split_doc);
         for result in results {
             split_doc_state.write_separator(&mut writer, &output_config)?;
@@ -1634,7 +1663,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     {
                         writeln!(buf_writer, "---")?;
                     }
-                    let results = evaluate_input(input, &program.expr)?;
+                    let results = evaluate_input(input, &program.expr, &mut sink)?;
                     // Write without color for inplace editing
                     let mut no_color_config = output_config.clone();
                     no_color_config.use_color = false;
@@ -1695,7 +1724,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     // documents that don't match the --doc filter
                     let doc_filter = args.document.map(|target| (target, global_doc_index));
                     let (doc_results, num_docs) =
-                        evaluate_yaml_direct_filtered(bytes, &program.expr, doc_filter)?;
+                        evaluate_yaml_direct_filtered(bytes, &program.expr, doc_filter, &mut sink)?;
                     global_doc_index += num_docs;
                     all_results.push(doc_results);
                 }
@@ -1711,7 +1740,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 continue;
                             }
                         }
-                        let results = evaluate_input(&input, &program.expr)?;
+                        let results = evaluate_input(&input, &program.expr, &mut sink)?;
                         json_results.push(results);
                         global_doc_index += 1;
                     }
@@ -1749,8 +1778,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
     writer.flush()?;
 
-    // Determine exit code. yq compat: empty output and all-falsy output are
-    // the same failure, reported on stderr with a fixed message and exit 1.
+    // Determine exit code. An uncaught error outranks -e: the filter failed,
+    // which is not the same as it succeeding with a falsy result (#355 vs #178).
+    // yq collapses both to 1, but the diagnostic already went to stderr, so
+    // reporting "no matches found" on top of it would be misleading.
+    if sink.hit() {
+        return Ok(DiagStyle::Yq.error_exit_code());
+    }
+
+    // yq compat: empty output and all-falsy output are the same failure,
+    // reported on stderr with a fixed message and exit 1.
     if args.exit_status && !any_truthy {
         eprintln!("Error: no matches found");
         return Ok(exit_codes::FALSE_OR_NULL);
@@ -2014,7 +2051,8 @@ mod tests {
 
     /// Evaluate YAML through the production path and flatten per-document groups.
     fn eval_yaml(bytes: &[u8], expr: &Expr) -> Vec<OwnedValue> {
-        let (groups, _) = evaluate_yaml_direct_filtered(bytes, expr, None).unwrap();
+        let (groups, _) =
+            evaluate_yaml_direct_filtered(bytes, expr, None, &mut ErrorSink::default()).unwrap();
         groups.into_iter().flatten().collect()
     }
 
@@ -2126,7 +2164,7 @@ mod tests {
         let slurped = OwnedValue::Array(inputs);
 
         let expr = succinctly::jq::parse("length").unwrap();
-        let results = evaluate_input(&slurped, &expr).unwrap();
+        let results = evaluate_input(&slurped, &expr, &mut ErrorSink::default()).unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], OwnedValue::Int(3));

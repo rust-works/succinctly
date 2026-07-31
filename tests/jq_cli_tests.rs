@@ -70,6 +70,40 @@ fn run_jq_stdin_streams(
     unreachable!()
 }
 
+/// Run jq with an arbitrary argument list, returning stdout, stderr and the
+/// exit code.
+///
+/// `run_jq_stdin` discards stderr and cannot take file arguments, which makes
+/// it unusable for the diagnostics in #355 — those live entirely on stderr and
+/// in the exit code, and their `(at <file>:<line>)` marker needs a real file.
+///
+/// Invokes the built binary directly rather than through `cargo run`: cargo
+/// writes its own `Finished`/`Running` progress lines to stderr, which would be
+/// indistinguishable from the diagnostics under test. That also makes the
+/// lock-contention retry unnecessary.
+fn run_jq_full(args: &[&str], input: Option<&str>) -> Result<(String, String, i32)> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("jq")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = cmd.stdin.take() {
+        if let Some(input) = input {
+            stdin.write_all(input.as_bytes())?;
+        }
+    }
+
+    let output = cmd.wait_with_output()?;
+    Ok((
+        String::from_utf8(output.stdout)?,
+        String::from_utf8(output.stderr)?,
+        output.status.code().unwrap_or(-1),
+    ))
+}
+
 /// Helper to run jq command with file input
 #[allow(dead_code)]
 fn run_jq_file(filter: &str, file_path: &str, extra_args: &[&str]) -> Result<(String, i32)> {
@@ -866,9 +900,8 @@ fn test_builtin_first_last_on_empty_array_output_null() -> Result<()> {
 
 #[test]
 fn test_builtin_first_on_non_array_errors() -> Result<()> {
-    // jq: 5 | first => error. The error goes to stderr and nothing to stdout.
-    // (Runtime eval errors do not yet set jq's exit code 5 -- see
-    // exit_codes in jq_runner.rs -- so the exit status is not asserted.)
+    // jq: 5 | first => error. The error goes to stderr and nothing to stdout,
+    // and the process exits 5 so the failure is visible to a shell (#355).
     let mut cmd = Command::new("cargo")
         .args([
             "run",
@@ -899,6 +932,11 @@ fn test_builtin_first_on_non_array_errors() -> Result<()> {
     assert!(
         stderr.contains("Cannot index number with number"),
         "Should report jq's indexing error for `5 | first`: {stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "An uncaught eval error must exit 5 like jq: {stderr}"
     );
     Ok(())
 }
@@ -2399,5 +2437,186 @@ fn test_collect_iterator_pipe_issue_295() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "[2,3,4]");
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// #355: an uncaught evaluation error must fail the process
+//
+// Before this, a raised error printed a diagnostic and exited 0, so `set -e`,
+// `&&` and `$?` all read a failed filter as success. Every expectation below
+// was captured from jq 1.7.1 unless a comment says otherwise.
+// ---------------------------------------------------------------------------
+
+/// Write `contents` to a temp file and return it with its path.
+fn temp_json(contents: &str) -> Result<(NamedTempFile, String)> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(contents.as_bytes())?;
+    file.flush()?;
+    let path = file.path().to_string_lossy().to_string();
+    Ok((file, path))
+}
+
+#[test]
+fn test_uncaught_error_exits_5() -> Result<()> {
+    // jq: `jq: error (at <stdin>:1): boom`, exit 5.
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"error("boom")"#], Some(r#"{"x":1}"#))?;
+    assert_eq!(code, 5, "uncaught error must exit 5: {stderr}");
+    assert_eq!(stdout, "", "a failed filter produces no output");
+    assert_eq!(stderr.trim_end(), "jq: error (at <stdin>:1): boom");
+    Ok(())
+}
+
+#[test]
+fn test_uncaught_type_error_exits_5() -> Result<()> {
+    // Internal errors carry no payload, so no `(not a string)` marker. The
+    // wording still differs from jq's ("Cannot index number with string") --
+    // message parity is a separate concern from the exit code.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "1|.foo"], Some(r#"{"x":1}"#))?;
+    assert_eq!(code, 5, "uncaught type error must exit 5: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(stderr.starts_with("jq: error (at <stdin>:1): "), "{stderr}");
+    assert!(!stderr.contains("(not a string)"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_uncaught_error_marks_non_string_payload() -> Result<()> {
+    // jq flags a raised payload that is not a string. Needs the raw value at
+    // the print site -- the rendered message alone cannot tell the two apart.
+    for (filter, want) in [
+        (
+            r#"error({"a":1})"#,
+            r#"jq: error (at <stdin>:1) (not a string): {"a":1}"#,
+        ),
+        (
+            "error(null)",
+            "jq: error (at <stdin>:1) (not a string): null",
+        ),
+        ("error(42)", "jq: error (at <stdin>:1) (not a string): 42"),
+        // A string payload is *not* flagged.
+        (r#"error("boom")"#, "jq: error (at <stdin>:1): boom"),
+    ] {
+        let (_, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"x":1}"#))?;
+        assert_eq!(code, 5, "{filter}");
+        assert_eq!(stderr.trim_end(), want, "{filter}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_uncaught_error_names_the_file_and_line() -> Result<()> {
+    // jq's marker names the line the input value *ends* on, counted in the
+    // whole file rather than within the value.
+    let (_keep, path) = temp_json("{\"n\":1}\n{\"n\":2}\n")?;
+    let (_, stderr, code) = run_jq_full(
+        &["-c", r#"if .n==2 then error("bad") else . end"#, &path],
+        None,
+    )?;
+    assert_eq!(code, 5);
+    assert_eq!(stderr.trim_end(), format!("jq: error (at {path}:2): bad"));
+
+    // A value spanning several lines is reported at its last line, not first.
+    let (_keep, path) = temp_json("{\n  \"n\": 1\n}\n{\n  \"n\": 2\n}\n")?;
+    let (_, stderr, code) = run_jq_full(
+        &["-c", r#"if .n==2 then error("bad") else . end"#, &path],
+        None,
+    )?;
+    assert_eq!(code, 5);
+    assert_eq!(stderr.trim_end(), format!("jq: error (at {path}:6): bad"));
+    Ok(())
+}
+
+#[test]
+fn test_uncaught_error_on_any_input_fails_the_run() -> Result<()> {
+    // DELIBERATE DIVERGENCE FROM jq. jq's exit code reflects only the *last*
+    // input, so an error on any earlier one exits 0 -- the exact
+    // indistinguishability #355 exists to remove. We fail if any input raised.
+    let (_keep, path) = temp_json("{\"n\":1}\n{\"n\":2}\n")?;
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"if .n==1 then error("bad") else . end"#, &path],
+        None,
+    )?;
+    assert_eq!(code, 5, "real jq exits 0 here; we deliberately do not");
+    assert_eq!(stderr.trim_end(), format!("jq: error (at {path}:1): bad"));
+    // Evaluation still continues to the remaining inputs, as jq does.
+    assert_eq!(stdout.trim(), r#"{"n":2}"#);
+    Ok(())
+}
+
+#[test]
+fn test_caught_error_still_exits_0() -> Result<()> {
+    // Only *uncaught* errors fail. `try`/`catch` handles it, so the run
+    // succeeded and nothing goes to stderr.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"try error("boom") catch "caught""#], Some("{}"))?;
+    assert_eq!(code, 0, "a caught error is not a failure: {stderr}");
+    assert_eq!(stdout.trim(), r#""caught""#);
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_null_input_error_reports_unknown_location() -> Result<()> {
+    // Under -n there is no input to point at; jq prints `<unknown>`, with no
+    // line number at all.
+    let (_, stderr, code) = run_jq_full(&["-n", "-c", r#"error("boom")"#], None)?;
+    assert_eq!(code, 5);
+    assert_eq!(stderr.trim_end(), "jq: error (at <unknown>): boom");
+    Ok(())
+}
+
+#[test]
+fn test_error_exit_code_outranks_exit_status_flag() -> Result<()> {
+    // #178 gave -e its own codes for a falsy *result*; #355's 5 means the
+    // filter *failed*. The two must not be conflated, and the error wins.
+    let (_, stderr, code) = run_jq_full(&["-e", "-c", r#"error("boom")"#], Some("{}"))?;
+    assert_eq!(code, 5, "error outranks -e's 1/4: {stderr}");
+
+    // -e's own semantics are untouched when nothing raised.
+    let (_, _, code) = run_jq_full(&["-e", "-c", "false"], Some("{}"))?;
+    assert_eq!(code, 1, "-e still reports a falsy last result as 1");
+    let (_, _, code) = run_jq_full(&["-e", "-c", "empty"], Some("{}"))?;
+    assert_eq!(code, 4, "-e still reports no output as 4");
+    Ok(())
+}
+
+#[test]
+fn test_uncaught_error_locations_across_input_modes() -> Result<()> {
+    // The non-default input paths reach the evaluator through a different
+    // route than plain JSON, and each has to keep its own line mapping.
+    let (_keep, path) = temp_json("{\"n\":1}\n{\"n\":2}\n")?;
+
+    // --slurp collapses every input into one array; jq names the line the
+    // last of them ended on.
+    let (_, stderr, code) = run_jq_full(&["-s", "-c", r#"error("x")"#, &path], None)?;
+    assert_eq!(code, 5);
+    assert_eq!(stderr.trim_end(), format!("jq: error (at {path}:2): x"));
+
+    // --sort-keys routes through the materializing path, but per-value lines
+    // must survive it.
+    let (_, stderr, code) = run_jq_full(&["-S", "-c", r#"error("x")"#, &path], None)?;
+    assert_eq!(code, 5);
+    assert_eq!(
+        stderr.trim_end(),
+        format!("jq: error (at {path}:1): x\njq: error (at {path}:2): x")
+    );
+
+    // -R makes each line a string; the line number is that line.
+    let (_keep, path) = temp_json("aaa\nbbb\nccc\n")?;
+    let (_, stderr, code) = run_jq_full(&["-R", "-c", r#"error("x")"#, &path], None)?;
+    assert_eq!(code, 5);
+    assert_eq!(
+        stderr.trim_end(),
+        format!(
+            "jq: error (at {path}:1): x\njq: error (at {path}:2): x\njq: error (at {path}:3): x"
+        )
+    );
+
+    // -R -s makes the whole input one string, reported at its last content
+    // line -- a trailing newline does not open a new one.
+    let (_, stderr, code) = run_jq_full(&["-R", "-s", "-c", r#"error("x")"#, &path], None)?;
+    assert_eq!(code, 5);
+    assert_eq!(stderr.trim_end(), format!("jq: error (at {path}:3): x"));
     Ok(())
 }
