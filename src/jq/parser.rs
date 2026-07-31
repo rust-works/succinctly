@@ -4482,17 +4482,33 @@ mod tests {
         assert!(parse("if false then 1 else 2,3 end").is_ok());
         assert!(parse("def f: 1,2; f").is_ok());
         assert!(parse("label $out | 1,2").is_ok());
-        assert!(parse("reduce .[] as $x (0; .+$x, .)").is_ok());
-        assert!(parse("foreach .[] as $x (0; .+$x, .)").is_ok());
         assert!(parse("[1,2] as [$a,$b] | $a,$b").is_ok());
         assert!(parse(r#""\(1,2)""#).is_ok());
         assert!(parse("range(1,2; 4)").is_ok());
         assert!(parse("first(1,2)").is_ok());
         assert!(parse("last(1,2)").is_ok());
         assert!(parse("error(1,2)").is_ok());
-        assert!(parse("until(.>1; .+1,.)").is_ok());
-        assert!(parse("while(.<3; .+1,.)").is_ok());
         assert!(parse("repeat(1,2)").is_ok());
+    }
+
+    /// `reduce`/`foreach`'s init/update/extract and `until`/`while`'s
+    /// cond/update deliberately stay restricted to non-comma, unlike the
+    /// other `Exp` bodies above: jq forks the whole construct per
+    /// multi-output `init`, folds `update` by its last output per step, and
+    /// fans `extract`/loop backtracking out per output, none of which is
+    /// implemented here, so accepting the comma would parse but silently
+    /// misfold (#534).
+    #[test]
+    fn test_comma_rejected_in_reduce_foreach_until_while() {
+        assert!(parse("reduce .[] as $x (0; .+$x, .)").is_err());
+        assert!(parse("reduce .[] as $x (0,1; .+$x)").is_err());
+        assert!(parse("foreach .[] as $x (0; .+$x, .)").is_err());
+        assert!(parse("foreach .[] as $x (0,1; .+$x)").is_err());
+        assert!(parse("foreach .[] as $x (0; .+$x; ., .*2)").is_err());
+        assert!(parse("until(.>1; .+1,.)").is_err());
+        assert!(parse("until(.>1,.>2; .+1)").is_err());
+        assert!(parse("while(.<3; .+1,.)").is_err());
+        assert!(parse("while(.<3,.<5; .+1)").is_err());
     }
 
     #[test]
