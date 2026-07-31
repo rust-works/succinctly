@@ -85,6 +85,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- Removed `succinctly::jq::EvalError::field_not_found` (#527), whose last two
+  callers were the `del()` path walkers fixed below. **Breaking**: the
+  constructor is gone from the public API. `field '<name>' not found` was
+  succinctly's own invented wording — it sat above the `jq message shapes`
+  divider in `src/jq/error.rs`, i.e. among the sentences with no jq counterpart
+  — and jq has no error there to match: it reads a missing key as `null`.
+  Deleting it keeps that wording from being reintroduced at a site where jq
+  stays silent.
+
 - Removed `succinctly::bits::CompactRank` (#321), a two-level rank directory with
   no remaining callers. **Breaking**: the type is gone from the public API. It
   was introduced for the YAML index structures and used by them (`ib_rank`,
@@ -128,6 +137,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scoreboard for this bug — comes off it. **Not covered**: `path(..)`, `path(recurse)` and `path(select(f))`
   still have no walker arm (#483) — they now produce *no output* rather than the
   root path, which is still wrong but no longer a path that resolves.
+
+- **`del()` raised `field '<name>' not found` when a path walked through a
+  field the object does not have** (#527): `{"a":{"x":1}} | del(.a.b.c, .a.b.d)`
+  errored where jq returns the input unchanged, and so did the single-path
+  spelling `del(.a.b.c)`. Two walkers raised it — `delete_expr_object_paths`,
+  the grouped/comma one added for #424, and `delete_at_path`'s `Expr::Pipe`
+  chain-walk, whose gap `#476`'s entry below had recorded as deliberately
+  deferred. Both are fixed here, because they are one rule, and a fix to either
+  alone would have left `del(.a.b.c)` and `del(.a.b.c, .a.b.d)` — the same
+  query, written two ways — disagreeing. The rule jq actually follows is not
+  "skip a missing key" but **a step that reaches nothing reads as `null`, and
+  the rest of the path is still walked against that `null`**, so the *tail*
+  decides: `del(.a.b.c)`, `del(.a.b.c.d)`, `del(.a.b[0])` and `del(.a.b[1:2])`
+  are all no-ops through the per-step-kind `null` exemptions #476 installed,
+  while `del(.a.b[])` still raises `Cannot iterate over null (null)` —
+  verbatim jq, and *not* suppressed by a `?` on the missing step
+  (`del(.a.b?[])` raises in jq too; `del(.a.b[]?)` does not). Both walkers
+  therefore recurse into a throwaway `null` rather than returning early;
+  dropping that recursion's result instead of writing it back is what leaves
+  the absent key absent rather than materialising it. A field that *is* present
+  but cannot be indexed is untouched and still errors —
+  `{"a":{"b":5}} | del(.a.b.c, .a.b.d)` is `Cannot index number with string
+  "c"`, raised by the `resolve_node` read pre-pass before either walker sees
+  the value. **Breaking**, via the now-callerless constructor removed above.
+
+  The same "keep walking" correction was needed at #476's four `null` gates —
+  `delete_expr_object_paths`' and `delete_expr_array_paths`' entry checks, and
+  `delete_at_path`'s chain-walk `Field`/`Index`/`Slice` `null` arms — not as
+  scope creep but because the fix above is otherwise only correct one step
+  deep: it hands the tail to those gates, which returned `Ok` for the whole
+  remainder on the strength of one `null`. Without them `del(.a.b.c[])` would
+  have gone from a wrongly-worded error to a wrongly-silent no-op. So a batch
+  of `null` cases that were already diverging are fixed here too: `null |
+  del(.a[])`, `null | del(.[0:2][])` and `{"x":null} | del(.x.a[])` all raise
+  `Cannot iterate over null (null)` now, matching jq, while every tail `null`
+  does tolerate (`null | del(.a.b)`, `null | del(.[0].a)`) keeps the #476
+  no-op it already had.
+
+  New coverage: `test_del_through_a_missing_field_walks_the_rest_against_null`
+  and `test_del_through_null_still_raises_on_an_iterate_tail` in
+  `src/jq/eval.rs`,
+  `test_del_through_a_missing_intermediate_field_walks_the_rest_against_null`
+  in `tests/jq_computed_key_tests.rs`, four
+  `tests/data/jq-golden/cases/{,comma_}del_missing_*` fixtures captured from
+  the pinned jq oracle, and an `iterate_del_through_missing_field` error probe
+  pinning the `[]`-tail sentence. **Not covered**: the two remaining sites
+  with the same shape are #477's out-of-range-index gates, which no missing
+  key can reach — `[1,2] | del(.[5][])` and `{"a":[1,2]} | del(.a[5][])` are
+  still silent no-ops where jq raises. Tracked in #529.
 
 - **`%YAML`/`%TAG` directive lines were not recognized, and swallowed the
   following `---`** (#225): a directive fell through to the plain-scalar
@@ -259,6 +317,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a future issue: a plain (non-`null`, non-comma) missing intermediate key —
   `{"a":1} | del(.b.c)` — still raises `field 'b' not found` where jq
   no-ops; that is a fourth, distinct gap from #475/#476/#477, not fixed here.
+  (Since fixed, along with its comma form, by #527 below.)
 
 - **A computed key after a multi-output path component was refused outright**
   (#412): `path(.. | objects | .[.k]?)` errored `Cannot use a computed index
