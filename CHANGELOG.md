@@ -125,6 +125,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path (`at_offset`/`yq-locate`), which reads multi-line scalar extents from
   the same index this fixes rather than re-deriving them independently.
 
+- **An out-dented block sequence continuation silently dropped the item and
+  corrupted the next mapping entry** (#485): a `-` continuation line indented
+  strictly between its sequence's own indent and whatever encloses it —
+  `b:\n    - x\n   - y\nc: 2` — read back as `{"b":["x"],"":"c"}`: `y` vanished
+  with no error, and the well-formed `c: 2` that followed became a phantom
+  `"":"c"` pair with the `2` also gone. `close_deeper_indents` popped the
+  sequence for any indent shallower than its own, including one that still sat
+  inside the mapping enclosing it; `parse_sequence_item_inner` then reopened a
+  *second*, untagged sequence as a sibling child of the mapping rather than a
+  value under a key, throwing off the mapping's key/value pairing for
+  everything after it. A new `sequence_frame_reaches` predicate — shared by a
+  sequence-item-specific close variant and the reuse check, so the two
+  definitions of "does this indent still belong to the sequence" cannot drift
+  apart — now recognizes an out-of-range indent that doesn't reach down to the
+  enclosing frame and keeps the sequence open instead, joining the item to it:
+  `{"b":["x","y"],"c":2}`. This is the same "parse the obvious extension"
+  policy #325 used for `a: - x`. The input is still invalid YAML and the
+  opt-in strict validator continues to reject it.
+
 - **`del()` errored when a deleted key's container was `null`, where jq
   silently no-ops** (#476): jq indexes `null` with any key and gets `null`
   back — `null | .a`, `null | .[0]` and `null | delpaths([["a"]])` are all

@@ -125,6 +125,22 @@ an indicator, so there is no text to preserve. This is the one place the two rul
 and the split is deliberate: flow keeps text because no sequence can exist there; block
 builds the sequence because one can.
 
+A continuation line can also be invalid the other way: out-dented, sitting strictly between
+the sequence's own indent and whatever encloses it, rather than on the mapping key's line.
+[#485](https://github.com/rust-works/succinctly/issues/485) takes the same stance as #325 —
+the item joins the sequence rather than being dropped:
+
+```
+$ printf 'b:\n    - x\n   - y\nc: 2\n' | succinctly yq -o json -I0 '.'
+{"b":["x","y"],"c":2}     # yq: did not find expected key
+```
+
+Before #485 this lost more than the misaligned item: closing the sequence for the
+out-of-range indent reopened a second, untagged sequence as a sibling *child* of the
+mapping instead of a value under a key, which corrupted the next entry — here `c: 2` — into
+a phantom `"":"c"` pair, with the `2` dropped as well. Content after the misaligned item is
+kept too: a further out-dented or realigned line still joins the same sequence.
+
 ### Two exceptions: an alias with no usable target is rejected
 
 Two alias forms are refused at index build. They are the same failure underneath — an
