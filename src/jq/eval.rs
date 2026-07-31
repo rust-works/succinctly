@@ -21432,6 +21432,13 @@ mod tests {
                 assert_eq!(obj.get("x"), Some(&OwnedValue::Null));
             }
         );
+        // And when `null` is the root of a 2+-element chain itself (rather
+        // than reached by descending into an already-null field) — this
+        // exercises the `Null` arm inside the `Expr::Pipe` chain-walk, a
+        // separate code path from the single-step arm above.
+        query!(br"null", r"del(.a.b)",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
     }
 
     #[test]
@@ -21444,6 +21451,50 @@ mod tests {
         query!(br#"{"x": null}"#, r"del(.x[0])",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.get("x"), Some(&OwnedValue::Null));
+            }
+        );
+        // Same chain-root case as the field test above, for the `Index`
+        // arm's `Null` case inside the `Expr::Pipe` chain-walk.
+        query!(br"null", r"del(.[0].a)",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    #[test]
+    fn test_del_field_on_wrong_type_respects_optional() {
+        // A genuinely wrong (non-null) type still respects `?`, both as the
+        // sole path component and mid-chain: no-op rather than error.
+        query!(br"5", r"del(.a?)",
+            QueryResult::Owned(OwnedValue::Int(5) | OwnedValue::NumberLiteral(NumberRepr::Int(5), _)) => {}
+        );
+        query!(br"5", r"del(.a?.b)",
+            QueryResult::Owned(OwnedValue::Int(5) | OwnedValue::NumberLiteral(NumberRepr::Int(5), _)) => {}
+        );
+        // Without `?`, the same wrong type still raises, mid-chain too.
+        query!(br"5", r"del(.a.b)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index number with string \"a\"");
+            }
+        );
+    }
+
+    #[test]
+    fn test_del_index_on_wrong_type_respects_optional() {
+        // Same shape as the field test above, for a numeric index.
+        query!(br"5", r"del(.[0]?)",
+            QueryResult::Owned(OwnedValue::Int(5) | OwnedValue::NumberLiteral(NumberRepr::Int(5), _)) => {}
+        );
+        query!(br"5", r"del(.[0]?.a)",
+            QueryResult::Owned(OwnedValue::Int(5) | OwnedValue::NumberLiteral(NumberRepr::Int(5), _)) => {}
+        );
+        query!(br"5", r"del(.[0])",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index number with number");
+            }
+        );
+        query!(br"5", r"del(.[0].a)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index number with number");
             }
         );
     }
