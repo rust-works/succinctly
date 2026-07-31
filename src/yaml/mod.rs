@@ -17,12 +17,14 @@
 //! - Explicit keys (`?` / `:`)
 //! - Multi-document streams (`---` / `...`), wrapped in an implicit root sequence
 //! - Comments (ignored in block context)
+//! - `%YAML` / `%TAG` directives — recognized and consumed; a directive's version/handle
+//!   is not surfaced (issue #225)
 //!
 //! # Not supported
 //!
 //! - Tags (`!!str`, `!custom`, verbatim `!<...>`) — rejected in block context, absorbed
-//!   as scalar text in flow context
-//! - `%YAML` / `%TAG` directives — parsed as plain scalars
+//!   as scalar text in flow context, including a shorthand tag defined by a `%TAG`
+//!   directive (issue #224)
 //!
 //! # Validation
 //!
