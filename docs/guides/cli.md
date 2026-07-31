@@ -448,8 +448,9 @@ succinctly yq '.users[]' input.yaml
 | 3    | Compile error (`--validate` failure)                                 |
 
 An uncaught evaluation error prints `Error: <message>` to stderr and exits 1,
-matching mikefarah/yq. The diagnostic never goes to stdout, so a failed query
-produces no output at all:
+matching mikefarah/yq. The diagnostic never goes to stdout, so the erroring
+document produces no output on its own — though in a multi-document stream,
+earlier documents that succeeded still reach stdout:
 
 ```bash
 succinctly yq 'error("boom")' config.yaml   # stderr: Error: boom
