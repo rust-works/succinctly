@@ -1213,11 +1213,17 @@ impl<'a> Parser<'a> {
         // Parse (init; update)
         self.expect('(')?;
         self.skip_ws();
-        let init = self.parse_expr()?;
+        // `init`/`update` deliberately stay restricted to non-comma: jq forks
+        // the whole reduce per `init` output and folds `update` by taking
+        // only its last output per step (zero outputs terminates the reduce
+        // entirely) — neither fanout rule is implemented here, so accepting
+        // a comma would parse but silently misfold instead of erroring
+        // (#534, same reasoning as `limit`'s `n` parameter below).
+        let init = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(';')?;
         self.skip_ws();
-        let update = self.parse_expr()?;
+        let update = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(')')?;
 
@@ -1254,18 +1260,24 @@ impl<'a> Parser<'a> {
         // Parse (init; update[; extract])
         self.expect('(')?;
         self.skip_ws();
-        let init = self.parse_expr()?;
+        // `init`/`update`/`extract` deliberately stay restricted to
+        // non-comma: jq forks the whole foreach per `init` output, folds
+        // `update` by taking only its last output per step, and fans
+        // `extract` out per step — none of that is implemented here, so
+        // accepting a comma would parse but silently misfold instead of
+        // erroring (#534, same reasoning as `limit`'s `n` parameter below).
+        let init = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(';')?;
         self.skip_ws();
-        let update = self.parse_expr()?;
+        let update = self.parse_pipe_no_comma()?;
         self.skip_ws();
 
         // Optional extract expression
         let extract = if self.peek() == Some(';') {
             self.next();
             self.skip_ws();
-            Some(Box::new(self.parse_expr()?))
+            Some(Box::new(self.parse_pipe_no_comma()?))
         } else {
             None
         };
@@ -1314,11 +1326,17 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         self.expect('(')?;
         self.skip_ws();
-        let cond = self.parse_expr()?;
+        // `cond`/`update` deliberately stay restricted to non-comma: jq
+        // implements `until` as a backtracking generator where a
+        // multi-output `update` forks the rest of the loop per output —
+        // that fanout isn't implemented here, so accepting a comma would
+        // parse but silently misfold instead of erroring (#534, same
+        // reasoning as `limit`'s `n` parameter above).
+        let cond = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(';')?;
         self.skip_ws();
-        let update = self.parse_expr()?;
+        let update = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(')')?;
 
@@ -1335,11 +1353,17 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         self.expect('(')?;
         self.skip_ws();
-        let cond = self.parse_expr()?;
+        // `cond`/`update` deliberately stay restricted to non-comma: jq
+        // implements `while` as a backtracking generator where a
+        // multi-output `update` forks the rest of the loop per output —
+        // that fanout isn't implemented here, so accepting a comma would
+        // parse but silently misfold instead of erroring (#534, same
+        // reasoning as `limit`'s `n` parameter above).
+        let cond = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(';')?;
         self.skip_ws();
-        let update = self.parse_expr()?;
+        let update = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(')')?;
 

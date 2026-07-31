@@ -203,22 +203,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Two parse errors fall out of the same fix, since `if` branches and `def`
   bodies were also parsed one level too tight: `if true then 1,2 else 3 end`
   and `def f: 1,2; f` now compile, as they do in jq. The same widening reaches
-  `elif`/`else` branches, `label` bodies, `reduce`/`foreach` init/update/extract
-  slots, `until`/`while`/`repeat`, `range` bounds, `error(...)`, `first`/`last`,
-  destructuring-binding bodies and string interpolation — every position jq
-  spells as a full `Exp`.
+  `elif`/`else` branches, `label` bodies, `repeat`, `range` bounds,
+  `error(...)`, `first`/`last`, destructuring-binding bodies and string
+  interpolation — every position jq spells as a full `Exp`.
   `as` binds below the comma, matching jq: `1,2 as $x | $x | .+10` is
   `1, (2 as $x | $x | .+10)`, printing `1` then `12`.
   Object-construction *values* stay comma-free — they are jq's `ExpD`, where
   `,` separates entries, so `{a: 1, b: 2}` is unchanged and `{a: (1,2)}` still
   needs its parens. The `n` argument of `limit`/`skip`/`nth` also stays
   comma-free, preserving the existing deliberate restriction (jq's `$n`
-  per-output fanout convention is still not implemented).
+  per-output fanout convention is still not implemented). `reduce`/`foreach`'s
+  init/update/extract slots and `until`/`while`'s cond/update stay comma-free
+  for the same reason: jq forks the whole construct per multi-output `init`,
+  folds `update` by its last output per step, and fans `extract`/loop
+  backtracking out per output — none of that fanout is implemented here, so a
+  comma there would parse but silently misfold instead of erroring (#534).
   Not fixed here, and still divergent: a multi-output expression in a position
-  that does not fan out (`range(1,2; 4)`, `"\(1,2)"`, `{a: (1,2)}`,
-  `select(.==1, .==3)`) now parses where it used to be a parse error, but takes
-  only the first output — the pre-existing fanout gap tracked by #354/#378,
-  previously reachable only with explicit parens.
+  that does not fan out doesn't behave like jq's one-result-per-output rule.
+  Some silently take only the first output — `"\(1,2)"`, `{a: (1,2)}`,
+  `select(.==1, .==3)` — now parsing where they used to be a parse error,
+  previously reachable only with explicit parens (the pre-existing fanout gap
+  tracked by #354/#378). Others error instead of fanning out: `range(1,2; 4)`
+  (`Range bounds must be numeric`) and a computed object key
+  `{(("a","b")): 1}` (`key must be a string`). Separately, a bare top-level
+  comma after `label $out |` can now reach `break`, which discards the comma
+  siblings already emitted before it instead of keeping them —
+  `label $out | 1,2,break $out,4` prints nothing instead of `1`, `2` — the
+  pre-existing `eval_comma`/`QueryResult` architectural gap tracked by #400.
 
 - **`%YAML`/`%TAG` directive lines were not recognized, and swallowed the
   following `---`** (#225): a directive fell through to the plain-scalar

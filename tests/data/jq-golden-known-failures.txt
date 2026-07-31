@@ -37,3 +37,4 @@ path_recursive_descent         path               path(..) returns only the root
 assign_autovivify_nested       assignment         .a.b = 9 on {} errors instead of autovivifying the intermediate object — #486
 recurse_null_child             recurse            recurse on {"a":null} stops before visiting the null leaf — #490
 slice_computed_bounds          slice              computed slice bounds (.a[.k:2]) are a parse error; only integer literals are accepted — #499
+label_break_after_comma        label              break loses the already-emitted comma siblings that preceded it, producing no output — #400
