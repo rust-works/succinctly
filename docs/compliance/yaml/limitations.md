@@ -26,7 +26,7 @@ path:
 
 | Dimension                              | Result              | Meaning                                        |
 |----------------------------------------|---------------------|------------------------------------------------|
-| **Load** (valid YAML, output compared) | **217/279 = 77.8%** | Parses and produces the JSON the suite expects |
+| **Load** (valid YAML, output compared) | **235/279 = 84.2%** | Parses and produces the JSON the suite expects |
 | **Reject** (invalid YAML, must fail)   | **70/94 = 74.5%**   | Refused by the loader or the opt-in validator  |
 | **Parse** (valid YAML, no JSON form)   | **27/29 = 93.1%**   | Parses without error                           |
 
@@ -35,7 +35,7 @@ validator enabled (loader OR validator, see below). The *default non-validating
 loader alone* still rejects only 12/94 (12.8%) by design — the opt-in validator
 ([#223](https://github.com/rust-works/succinctly/issues/223)) closes 58 more.
 
-The 88 non-passing cases are enumerated individually, with a category and reason, in
+The 70 non-passing cases are enumerated individually, with a category and reason, in
 [`tests/data/yaml-test-suite-known-failures.txt`](../../../tests/data/yaml-test-suite-known-failures.txt).
 That file is the machine-readable source of truth; the test asserts it matches reality
 exactly, so it cannot silently drift from this page.
@@ -222,9 +222,9 @@ The loader stops where it cannot continue, not where a rule is broken — which 
 
 ## Unsupported features
 
-These are absent rather than wrong, and account for 47 of the 62 load failures.
+These are absent rather than wrong, and account for 33 of the 44 load failures.
 
-### Tags — 33 cases (31 load, 2 parse)
+### Tags — 35 cases (33 load, 2 parse)
 
 `!!str`, `!custom`, and verbatim `!<tag:...>` are not supported. In block context the
 parser rejects them outright:
@@ -249,19 +249,10 @@ contexts — `[x!y]` is `["x!y"]`, `a: hello!world` is `"hello!world"`. Only a `
 node is a tag.
 
 Tag *support* is tracked in [#224](https://github.com/rust-works/succinctly/issues/224);
-these 33 cases stay failures until it lands.
-
-### Directives — 16 cases (all load)
-
-`%YAML` and `%TAG` directives are not recognized. A directive line parses as an ordinary
-plain scalar, which also swallows the `---` that follows it:
-
-```
-$ printf '%%YAML 1.2\n--- text\n' | succinctly yq '.'
-"%YAML 1.2 --- text"      # expected: "text"
-```
-
-Tracked in [#225](https://github.com/rust-works/succinctly/issues/225).
+these 35 cases stay failures until it lands. Two of them (`CC74`, `P76L`) are `%TAG`
+directive cases: the directive line itself is recognized (see
+[Directives — resolved](#directives--resolved) below), but the shorthand tag it defines is
+still rejected when applied to a node, the same as any other tag.
 
 ### A flow collection as a same-line explicit key
 
@@ -290,6 +281,50 @@ mapping-value and sequence-item position — are correct since [#346], as is the
 mirrored value indicator (`? a` / `: b: c`).
 
 [#346]: https://github.com/rust-works/succinctly/issues/346
+
+## Directives — resolved
+
+`%YAML` and `%TAG` directive lines are now recognized and consumed
+([#225](https://github.com/rust-works/succinctly/issues/225)). Previously neither was
+recognized at all: a directive fell through to the ordinary plain-scalar scanner, which
+then also swallowed the `---` that followed it:
+
+```
+$ printf '%YAML 1.2\n--- text\n' | succinctly yq '.'
+"%YAML 1.2 --- text"      # before #225; now: "text"
+```
+
+The loader does not distinguish `%YAML` from `%TAG` from a reserved directive like `%FOO`
+— all three are recognized purely by the leading `%` at column 0 outside a document body
+and fully discarded, matching the non-validating loader's general philosophy. This also
+means a misspelled directive name (`%YAM`, `%YAMLL`) is skipped exactly like a well-formed
+one, with no name matching at all. Full `%YAML`-version and `%TAG`-handle semantics are out
+of scope for the default loader; the strict validator
+([`src/yaml/validate.rs`](../../../src/yaml/validate.rs), #223) already has the more
+detailed grammar for the opt-in validation path.
+
+Fixing this exposed two more pre-existing bugs, unrelated to directives, that were only
+visible once a directive line stopped masking them:
+
+- **A document-root plain scalar swallowed a following `---`/`...` even without any
+  directive involved.** `Document\n---\nname: Bob` produced the single scalar
+  `"Document --- name"` followed by `"Bob"`, instead of two documents. The scalar
+  continuation loop had no stop condition for a document marker; it now checks for one at
+  true document root (`parse_unquoted_value_with_indent_impl` in `src/yaml/parser.rs`).
+- **An empty document never produced a node at all**, rather than a `null` one. `---\n...\n`
+  produced zero documents instead of one `null` document, so `6ZKB`'s empty middle document
+  (`---\n# Empty\n...`) simply vanished from the output, and any directive-only document
+  immediately followed by `---`/EOF (`MUS6/02`-`06`) did too. `end_document` now synthesizes
+  a null node when nothing was written for the document, mirroring how
+  `close_pending_explicit_key` already synthesizes null for a key with no value — guarded so
+  a bare `...`/comment with **no** preceding document (`HWV9`, `QT73`) still produces zero
+  documents rather than a phantom one.
+
+Two of the sixteen `directives`-category corpus cases did not fully clear, for reasons
+unrelated to directive recognition itself: `CC74`/`P76L` apply the `%TAG`-defined shorthand
+to a node, which is `tags`/#224's job (see above); `W4TN` contains a document-root block
+scalar with content at column 0 (`--- |\n%!PS-Adobe-2.0\n...`), the same pre-existing
+zero-indented-block-scalar gap as `DK3J`/`FP8R` under `scalars`, below.
 
 ## Line breaks — resolved
 
@@ -348,14 +383,21 @@ floats render as integers on the streaming path, `1.0` → `1` —
 [#168](https://github.com/rust-works/succinctly/issues/168) /
 [#170](https://github.com/rust-works/succinctly/issues/170)).
 
-## Full accounting of the 62 load failures
+## Full accounting of the 44 load failures
 
 | Category     | Cases | Cause                                                             |
 |--------------|-------|-------------------------------------------------------------------|
-| `tags`       | 31    | Tags not supported (above)                                        |
-| `directives` | 16    | `%YAML` / `%TAG` not recognized (above)                           |
-| `structure`  | 8     | Document end markers; anchors with colons in the name             |
+| `tags`       | 33    | Tags not supported (above)                                        |
+| `structure`  | 4     | Document end markers; anchors with colons in the name             |
 | `scalars`    | 7     | Zero-indented block scalars; tabs; trailing whitespace            |
+
+`directives` was 16 until [#225](https://github.com/rust-works/succinctly/issues/225) (see
+[Directives — resolved](#directives--resolved) above); the category no longer exists.
+Thirteen cases cleared outright; `CC74` and `P76L` moved to `tags` and `W4TN` to `scalars`,
+each blocked on a different, pre-existing gap #225 did not touch. `structure` was 8 until
+the same fix: `6XDY`, `7Z25`, `PUW8` and `UT92` were blocked by the document-root
+scalar/`---`-swallowing bug #225 fixed alongside the directive gap, not by anything specific
+to their own category.
 
 `structure` was 9 until [#407](https://github.com/rust-works/succinctly/issues/407). The
 content of a `---` line went through a hand-rolled partial copy of the block-context
@@ -372,8 +414,9 @@ Fixing the folding rule in `decode_block_folded` cleared `4Q9F`, `7T8X`, `93WF`,
 and `TS54`. `DK95/00` (a tab used as separation before a plain scalar, retained as
 content instead of stripped) was fixed by
 [#381](https://github.com/rust-works/succinctly/issues/381). What remains under
-`scalars` is unrelated to folding: zero-indented block scalars (`DK3J`, `FP8R`), tab
-handling (`K54U`), trailing whitespace (`L24T/00`, `JEF9/02`), explicit indentation
+`scalars` is unrelated to folding: zero-indented block scalars (`DK3J`, `FP8R`, and
+`W4TN` — moved here from `directives` once #225 fixed the directive line that used to
+mask this same gap), trailing whitespace (`L24T/00`, `JEF9/02`), explicit indentation
 indicators (`M5C3`), and the empty stream (`AVM7`, filed under `scalars` although it
 is really a document-level case).
 
