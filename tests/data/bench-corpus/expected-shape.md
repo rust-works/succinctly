@@ -12,6 +12,8 @@ Distributions are derived from the crate's own semi-index (`JsonIndex` / `YamlIn
 | ------ | -------------- | --------------------------- | ----- |
 | dsv    | world-gdp      | world-gdp-with-codes.csv    | 4515  |
 | json   | charts         | bullet-data.json            | 548   |
+| json   | npm            | express-package.json        | 2731  |
+| json   | openapi        | swagger-v2-schema.json      | 40247 |
 | yaml   | actions        | codeql-analysis.yml         | 925   |
 | yaml   | actions        | stale.yml                   | 1290  |
 | yaml   | compose        | nginx-flask-mysql.yaml      | 1239  |
@@ -38,16 +40,16 @@ files: 7, total bytes: 17150, anchors: 41, aliases: 86, bare-dash items: 5
 
 ## JSON
 
-files: 1, total bytes: 548
+files: 3, total bytes: 43526
 
-| metric          | unit         | n  | min  | p50  | p90  | p99  | max  |
-| --------------- | ------------ | -- | ---- | ---- | ---- | ---- | ---- |
-| string length   | bytes/string | 35 | 1    | 7    | 12   | 17   | 17   |
-| object keys     | keys/object  | 5  | 5    | 5    | 5    | 5    | 5    |
-| array elements  | elems/array  | 16 | 1    | 2    | 3    | 5    | 5    |
-| collection size | bytes/coll   | 21 | 4    | 11   | 110  | 548  | 548  |
-| nesting depth   | levels/node  | 86 | 1    | 3    | 4    | 4    | 4    |
-| escape density  | per KiB/file | 1  | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+| metric          | unit         | n    | min  | p50  | p90  | p99  | max   |
+| --------------- | ------------ | ---- | ---- | ---- | ---- | ---- | ----- |
+| string length   | bytes/string | 1704 | 1    | 6    | 29   | 75   | 111   |
+| object keys     | keys/object  | 459  | 0    | 1    | 5    | 22   | 61    |
+| array elements  | elems/array  | 78   | 1    | 2    | 5    | 10   | 10    |
+| collection size | bytes/coll   | 537  | 2    | 65   | 428  | 2529 | 40247 |
+| nesting depth   | levels/node  | 2326 | 1    | 5    | 6    | 7    | 9     |
+| escape density  | per KiB/file | 3    | 0.00 | 0.00 | 0.15 | 0.15 | 0.15  |
 
 ## DSV
 

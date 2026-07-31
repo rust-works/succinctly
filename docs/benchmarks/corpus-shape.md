@@ -14,6 +14,8 @@ Distributions are derived from the crate's own semi-index (`JsonIndex` / `YamlIn
 | dsv    | world-gdp      | world-gdp-with-codes.csv    | 4515  |
 | json   | charts         | bullet-data.json            | 548   |
 | json   | geojson        | us-election.geojson         | 99715 |
+| json   | npm            | express-package.json        | 2731  |
+| json   | openapi        | swagger-v2-schema.json      | 40247 |
 | yaml   | actions        | codeql-analysis.yml         | 925   |
 | yaml   | actions        | prometheus-ci.yml           | 18935 |
 | yaml   | actions        | stale.yml                   | 1290  |
@@ -29,28 +31,28 @@ files: 8, total bytes: 36085, anchors: 41, aliases: 86, bare-dash items: 5
 
 | metric               | unit         | n    | min  | p50  | p90  | p99  | max  |
 | -------------------- | ------------ | ---- | ---- | ---- | ---- | ---- | ---- |
-| scalar length        | bytes/scalar | 1587 | 0    | 7    | 25   | 89   | 374  |
-| mapping keys         | keys/mapping | 392  | 0    | 2    | 4    | 9    | 69   |
+| scalar length        | bytes/scalar | 1599 | 0    | 7    | 24   | 89   | 374  |
+| mapping keys         | keys/mapping | 398  | 0    | 2    | 4    | 9    | 69   |
 | sequence items       | items/seq    | 94   | 1    | 2    | 4    | 12   | 12   |
 | bare-dash seq items  | count/file   | 8    | 0    | 0    | 5    | 5    | 5    |
 | flow-collection size | bytes/flow   | 14   | 2    | 11   | 91   | 100  | 100  |
-| nesting depth        | levels/node  | 1206 | 2    | 6    | 8    | 10   | 12   |
+| nesting depth        | levels/node  | 1218 | 2    | 6    | 8    | 10   | 12   |
 | anchors              | count/file   | 8    | 0    | 0    | 41   | 41   | 41   |
 | aliases              | count/file   | 8    | 0    | 0    | 86   | 86   | 86   |
 | escape density       | per KiB/file | 8    | 0.00 | 0.00 | 0.05 | 0.05 | 0.05 |
 
 ## JSON
 
-files: 2, total bytes: 100263
+files: 4, total bytes: 143241
 
-| metric          | unit         | n    | min  | p50  | p90  | p99  | max   |
-| --------------- | ------------ | ---- | ---- | ---- | ---- | ---- | ----- |
-| string length   | bytes/string | 676  | 1    | 7    | 11   | 24   | 51    |
-| object keys     | keys/object  | 180  | 1    | 2    | 4    | 5    | 5     |
-| array elements  | elems/array  | 2671 | 1    | 2    | 2    | 39   | 140   |
-| collection size | bytes/coll   | 2851 | 4    | 36   | 37   | 2959 | 99714 |
-| nesting depth   | levels/node  | 8573 | 1    | 8    | 9    | 9    | 9     |
-| escape density  | per KiB/file | 2    | 0.00 | 0.00 | 0.00 | 0.00 | 0.00  |
+| metric          | unit         | n     | min  | p50  | p90  | p99  | max   |
+| --------------- | ------------ | ----- | ---- | ---- | ---- | ---- | ----- |
+| string length   | bytes/string | 2345  | 1    | 7    | 23   | 67   | 111   |
+| object keys     | keys/object  | 634   | 0    | 1    | 4    | 21   | 61    |
+| array elements  | elems/array  | 2733  | 1    | 2    | 2    | 38   | 140   |
+| collection size | bytes/coll   | 3367  | 2    | 36   | 184  | 2883 | 99714 |
+| nesting depth   | levels/node  | 10813 | 1    | 8    | 9    | 9    | 9     |
+| escape density  | per KiB/file | 4     | 0.00 | 0.00 | 0.15 | 0.15 | 0.15  |
 
 ## DSV
 

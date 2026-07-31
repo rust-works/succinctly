@@ -79,6 +79,17 @@
       "vendored": true
     },
     {
+      "format": "json",
+      "workload": "npm",
+      "tier": "1kb",
+      "file": "json/npm/express-package.json",
+      "bytes": 2731,
+      "sha256": "01f5d42cf38cc1118cd9c1259b0d246f5414ae883f8e1c7c3ee55f984fb31a4f",
+      "source_url": "https://raw.githubusercontent.com/expressjs/express/ae6dd37680e3a00618d6c8a3e522f0ee4eeba1a4/package.json",
+      "license": "MIT",
+      "vendored": true
+    },
+    {
       "format": "dsv",
       "workload": "world-gdp",
       "tier": "10kb",
@@ -97,6 +108,17 @@
       "bytes": 9990,
       "sha256": "98d0e726ebf70e1537fce12ddd403b9629868a4559b27d979252adf92ee70662",
       "source_url": "https://raw.githubusercontent.com/home-assistant/core/05eeb6a1bcc18ff18d8edb8da376b9d648f89ce0/homeassistant/components/air_quality/conditions.yaml",
+      "license": "Apache-2.0",
+      "vendored": true
+    },
+    {
+      "format": "json",
+      "workload": "openapi",
+      "tier": "100kb",
+      "file": "json/openapi/swagger-v2-schema.json",
+      "bytes": 40247,
+      "sha256": "b36871c8016292c5e66dd3b203e69aeff98bfef97e0b3c67c1909036095586a5",
+      "source_url": "https://raw.githubusercontent.com/OAI/OpenAPI-Specification/8e166da300c64bb7144938fec518b8e3f4cae715/_archive_/schemas/v2.0/schema.json",
       "license": "Apache-2.0",
       "vendored": true
     },
