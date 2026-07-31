@@ -135,6 +135,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing in the corpus or issue's acceptance criteria requires reading
   them back.
 
+- **`del()` panicked when a comma target mixed identity (`.`) with any other
+  path** (#505): `del(.[.x], .)` and `del(., .[.x])` both crashed — an
+  index-out-of-bounds panic in release builds, a tripped `debug_assert_eq!` in
+  debug — instead of jq's `null`. `delete_expr_paths_at`'s leaf check
+  (`src/jq/eval.rs`, added for #424) only compared `start` against
+  `paths[0].len()` to decide whether every sibling comma branch was exhausted
+  at this depth. `flatten_delete_path` turns `.` into zero `DeleteStep`s while
+  any real path is one or more, so whichever branch order put `.` somewhere
+  other than index 0 broke: `.` second tripped the assert (the right answer,
+  reached the wrong way); `.` first, or any other position, fell into the
+  per-branch dispatch loop, which indexed straight past the end of `.`'s empty
+  component slice. The check now scans every sibling
+  (`paths.iter().any(|path| path.len() == start)`) instead of trusting
+  `paths[0]` alone, short-circuiting to `null` the moment any sibling is
+  already exhausted regardless of position — matching how `delpaths` reaches
+  the same answer by sorting the empty path first
+  (`Some([]) => Ok(OwnedValue::Null)`). The analogous depth-mismatch one level
+  down (`del(.a, .a.b)`) was already safe and stays that way:
+  `delete_expr_object_paths`/`delete_expr_array_paths` split "ends here" from
+  "continues" before ever recursing back into `delete_expr_paths_at`, so only
+  the top-level call — the one place nothing pre-filters exhausted paths — was
+  exposed. New coverage:
+  `test_del_with_comma_mixing_identity_and_other_paths` in
+  `tests/jq_computed_key_tests.rs`, plus two new
+  `tests/data/jq-golden/cases/comma_del_{identity_and_computed,computed_and_identity}`
+  fixtures captured from the pinned jq oracle.
+
 - **A plain scalar's `- `-led continuation line was misread as a nested
   sequence at indent 2 and deeper** (#484): `- x\n  - y\n` produced
   `["x",["y"]]`, inventing a nested sequence, where `yq` folds the

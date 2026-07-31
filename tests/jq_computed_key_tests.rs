@@ -1316,6 +1316,30 @@ fn test_del_with_purely_static_comma_paths() {
     check("[1,2,3]", "del(.[0], .[2])", Outcome::values(&["[2]"]));
 }
 
+/// #505: a comma target mixing bare `.` (identity, which flattens to zero
+/// path components) with any other path (one or more components) panicked —
+/// `delete_expr_paths_at`'s leaf check only compared `start` against
+/// `paths[0].len()`, so whichever ordering put `.` second either tripped a
+/// `debug_assert_eq!` (identity first) or indexed past the end of `.`'s empty
+/// component slice (identity elsewhere). An exhausted sibling deletes the
+/// whole subtree, which subsumes any other sibling's deletion within it, so
+/// the correct result is `null` regardless of order — matching jq.
+#[test]
+fn test_del_with_comma_mixing_identity_and_other_paths() {
+    check(
+        r#"{"a":1,"x":"a"}"#,
+        "del(.[.x], .)",
+        Outcome::values(&["null"]),
+    );
+    check(
+        r#"{"a":1,"x":"a"}"#,
+        "del(., .[.x])",
+        Outcome::values(&["null"]),
+    );
+    check(r#"{"a":1,"b":2}"#, "del(., .a)", Outcome::values(&["null"]));
+    check(r#"{"a":1,"b":2}"#, "del(., .)", Outcome::values(&["null"]));
+}
+
 /// #475 follow-up: fixing the purely-static comma case above reaches a
 /// second surface that was unexercised until now — `delete_expr_paths_at`
 /// routing `Slice` into the same `indices` bucket as a plain `Index` (added
