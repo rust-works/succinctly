@@ -307,9 +307,25 @@ cheaper (keyword and number scanning in the scalar path), not in skipping bytes
 between tokens. See #122/#123 for the adjacent SIMD proposals, which the same
 analysis constrains.
 
-Reproduce with `succinctly dev bench corpus-stats --data-dir data/bench/corpus`
-for the shape statistics and `cargo bench --bench json_validate_bench --
-validate_real_corpus` for the throughput column.
+### Reproducing
+
+Both columns need the **full** corpus: only one of the five JSON files is
+vendored in the committed seed, and `json_validate_bench` announces on stderr
+when it is running seed-only. The synthetic ladder is a prerequisite too — the
+bench asserts the whole pattern/size matrix is present before registering any
+group, so the `--` filter does not exempt it.
+
+```bash
+./scripts/sync-bench-corpus.sh                            # fetch the 5-file JSON corpus
+cargo run --release --features cli --bin succinctly -- \
+    json generate-suite --max-size 10mb                   # synthetic ladder (once)
+
+# shape statistics (the visits/64B column)
+succinctly dev bench corpus-stats --data-dir data/bench/corpus
+
+# throughput column
+cargo bench --bench json_validate_bench -- validate_real_corpus
+```
 
 ## Per-token scalar optimisations
 
