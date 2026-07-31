@@ -399,7 +399,7 @@ impl<'a> Parser<'a> {
                                 )));
                             }
                             // Parse the expression inside \(...)
-                            let expr = self.parse_pipe_expr()?;
+                            let expr = self.parse_pipe_no_comma()?;
                             self.skip_ws();
                             self.expect(')')?;
                             parts.push(StringPart::Expr(Box::new(expr)));
@@ -633,7 +633,7 @@ impl<'a> Parser<'a> {
         // consumed by an expression here — object construction needs `{`, and a
         // namespaced call needs `::` — so it reliably marks a slice.
         let key_start = self.pos;
-        let key = self.parse_comma_expr()?;
+        let key = self.parse_expr()?;
         self.skip_ws();
 
         match self.peek() {
@@ -728,7 +728,7 @@ impl<'a> Parser<'a> {
     /// `.[1:(3)]` did not — an asymmetry with no grammar behind it.
     fn parse_slice_bound(&mut self) -> Result<i64, ParseError> {
         let start = self.pos;
-        let bound = self.parse_comma_expr()?;
+        let bound = self.parse_expr()?;
         Self::fold_int_literal(&bound).ok_or_else(|| Self::slice_bound_error(start))
     }
 
@@ -763,7 +763,7 @@ impl<'a> Parser<'a> {
         }
 
         // Parse the inner expression (which may be a comma expression)
-        let inner = self.parse_comma_expr()?;
+        let inner = self.parse_expr()?;
         self.skip_ws();
         self.expect(']')?;
 
@@ -790,7 +790,7 @@ impl<'a> Parser<'a> {
             let key = if self.peek() == Some('(') {
                 // Dynamic key: (expr)
                 self.next();
-                let key_expr = self.parse_comma_expr()?;
+                let key_expr = self.parse_expr()?;
                 self.expect(')')?;
                 ObjectKey::Expr(Box::new(key_expr))
             } else if self.peek() == Some('"') {
@@ -809,7 +809,7 @@ impl<'a> Parser<'a> {
             let value = if self.peek() == Some(':') {
                 self.next();
                 self.skip_ws();
-                self.parse_pipe_expr()?
+                self.parse_pipe_no_comma()?
             } else {
                 // Shorthand: key must be literal identifier
                 match &key {
@@ -878,7 +878,7 @@ impl<'a> Parser<'a> {
             // Parenthesized expression
             Some('(') => {
                 self.next();
-                let expr = self.parse_comma_expr()?;
+                let expr = self.parse_expr()?;
                 self.expect(')')?;
                 let paren = Expr::Paren(Box::new(expr));
                 // Check for postfix operations after parentheses
@@ -1062,7 +1062,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse condition
-        let cond = self.parse_pipe_expr()?;
+        let cond = self.parse_pipe_no_comma()?;
         self.skip_ws();
 
         // Expect 'then'
@@ -1073,7 +1073,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse then branch
-        let then_branch = self.parse_pipe_expr()?;
+        let then_branch = self.parse_pipe_no_comma()?;
         self.skip_ws();
 
         // Parse elif/else/end
@@ -1093,7 +1093,7 @@ impl<'a> Parser<'a> {
             self.consume_keyword("elif");
             self.skip_ws();
 
-            let cond = self.parse_pipe_expr()?;
+            let cond = self.parse_pipe_no_comma()?;
             self.skip_ws();
 
             if !self.matches_keyword("then") {
@@ -1102,7 +1102,7 @@ impl<'a> Parser<'a> {
             self.consume_keyword("then");
             self.skip_ws();
 
-            let then_branch = self.parse_pipe_expr()?;
+            let then_branch = self.parse_pipe_no_comma()?;
             self.skip_ws();
 
             let else_branch = self.parse_else_branch()?;
@@ -1116,7 +1116,7 @@ impl<'a> Parser<'a> {
             self.consume_keyword("else");
             self.skip_ws();
 
-            let else_branch = self.parse_pipe_expr()?;
+            let else_branch = self.parse_pipe_no_comma()?;
             self.skip_ws();
 
             if !self.matches_keyword("end") {
@@ -1174,7 +1174,7 @@ impl<'a> Parser<'a> {
         let msg = if self.peek() == Some('(') {
             self.next();
             self.skip_ws();
-            let msg_expr = self.parse_pipe_expr()?;
+            let msg_expr = self.parse_pipe_no_comma()?;
             self.skip_ws();
             self.expect(')')?;
             Some(Box::new(msg_expr))
@@ -1210,11 +1210,11 @@ impl<'a> Parser<'a> {
         // Parse (init; update)
         self.expect('(')?;
         self.skip_ws();
-        let init = self.parse_pipe_expr()?;
+        let init = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(';')?;
         self.skip_ws();
-        let update = self.parse_pipe_expr()?;
+        let update = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(')')?;
 
@@ -1251,18 +1251,18 @@ impl<'a> Parser<'a> {
         // Parse (init; update[; extract])
         self.expect('(')?;
         self.skip_ws();
-        let init = self.parse_pipe_expr()?;
+        let init = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(';')?;
         self.skip_ws();
-        let update = self.parse_pipe_expr()?;
+        let update = self.parse_pipe_no_comma()?;
         self.skip_ws();
 
         // Optional extract expression
         let extract = if self.peek() == Some(';') {
             self.next();
             self.skip_ws();
-            Some(Box::new(self.parse_pipe_expr()?))
+            Some(Box::new(self.parse_pipe_no_comma()?))
         } else {
             None
         };
@@ -1290,12 +1290,12 @@ impl<'a> Parser<'a> {
         // comma-valued `n` re-invokes the whole builtin once per output.
         // That fanout isn't implemented here, so accepting a comma would
         // parse but silently misbehave — worse than today's parse error.
-        let n = self.parse_pipe_expr()?;
+        let n = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(';')?;
         self.skip_ws();
         // Full expression — comma included (#155).
-        let expr = self.parse_comma_expr()?;
+        let expr = self.parse_expr()?;
         self.skip_ws();
         self.expect(')')?;
 
@@ -1312,11 +1312,11 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         self.expect('(')?;
         self.skip_ws();
-        let cond = self.parse_pipe_expr()?;
+        let cond = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(';')?;
         self.skip_ws();
-        let update = self.parse_pipe_expr()?;
+        let update = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(')')?;
 
@@ -1333,11 +1333,11 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         self.expect('(')?;
         self.skip_ws();
-        let cond = self.parse_pipe_expr()?;
+        let cond = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(';')?;
         self.skip_ws();
-        let update = self.parse_pipe_expr()?;
+        let update = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(')')?;
 
@@ -1354,7 +1354,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         self.expect('(')?;
         self.skip_ws();
-        let expr = self.parse_pipe_expr()?;
+        let expr = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(')')?;
 
@@ -1369,7 +1369,7 @@ impl<'a> Parser<'a> {
         if self.peek() == Some('(') {
             self.next();
             self.skip_ws();
-            let expr = self.parse_comma_expr()?;
+            let expr = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             Ok(Expr::FirstExpr(Box::new(expr)))
@@ -1386,7 +1386,7 @@ impl<'a> Parser<'a> {
         if self.peek() == Some('(') {
             self.next();
             self.skip_ws();
-            let expr = self.parse_comma_expr()?;
+            let expr = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             Ok(Expr::LastExpr(Box::new(expr)))
@@ -1402,7 +1402,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         self.expect('(')?;
         self.skip_ws();
-        let first = self.parse_pipe_expr()?;
+        let first = self.parse_pipe_no_comma()?;
         self.skip_ws();
 
         if self.peek() == Some(')') {
@@ -1417,7 +1417,7 @@ impl<'a> Parser<'a> {
 
         self.expect(';')?;
         self.skip_ws();
-        let second = self.parse_pipe_expr()?;
+        let second = self.parse_pipe_no_comma()?;
         self.skip_ws();
 
         if self.peek() == Some(')') {
@@ -1432,7 +1432,7 @@ impl<'a> Parser<'a> {
 
         self.expect(';')?;
         self.skip_ws();
-        let step = self.parse_pipe_expr()?;
+        let step = self.parse_pipe_no_comma()?;
         self.skip_ws();
         self.expect(')')?;
 
@@ -1580,7 +1580,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse body expression
-        let body = self.parse_pipe_expr()?;
+        let body = self.parse_pipe_no_comma()?;
 
         Ok(Expr::Label {
             name,
@@ -1656,7 +1656,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse function body
-        let body = self.parse_pipe_expr()?;
+        let body = self.parse_pipe_no_comma()?;
         self.skip_ws();
 
         // Expect semicolon
@@ -1664,7 +1664,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse the rest of the expression where this function is in scope
-        let then = self.parse_pipe_expr()?;
+        let then = self.parse_pipe_no_comma()?;
 
         Ok(Expr::FuncDef {
             name,
@@ -1696,7 +1696,7 @@ impl<'a> Parser<'a> {
                 loop {
                     // Each `;`-separated slot is a full expression — comma
                     // included (#155) — matching jq's `Arg: Exp` grammar.
-                    let arg = self.parse_comma_expr()?;
+                    let arg = self.parse_expr()?;
                     args.push(arg);
                     self.skip_ws();
 
@@ -1904,7 +1904,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let arg = self.parse_comma_expr()?;
+            let arg = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Has(Box::new(arg))));
@@ -1916,7 +1916,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let cond = self.parse_comma_expr()?;
+            let cond = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Select(Box::new(cond))));
@@ -1933,7 +1933,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let f = self.parse_comma_expr()?;
+            let f = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::MapValues(Box::new(f))));
@@ -1943,7 +1943,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let f = self.parse_comma_expr()?;
+            let f = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Map(Box::new(f))));
@@ -1969,7 +1969,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let f = self.parse_comma_expr()?;
+            let f = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::MinBy(Box::new(f))));
@@ -1984,7 +1984,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let f = self.parse_comma_expr()?;
+            let f = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::MaxBy(Box::new(f))));
@@ -2001,7 +2001,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let obj = self.parse_comma_expr()?;
+            let obj = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::In(Box::new(obj))));
@@ -2021,7 +2021,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let s = self.parse_comma_expr()?;
+            let s = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Ltrimstr(Box::new(s))));
@@ -2031,7 +2031,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let s = self.parse_comma_expr()?;
+            let s = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Rtrimstr(Box::new(s))));
@@ -2041,7 +2041,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let s = self.parse_comma_expr()?;
+            let s = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Startswith(Box::new(s))));
@@ -2051,7 +2051,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let s = self.parse_comma_expr()?;
+            let s = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Endswith(Box::new(s))));
@@ -2062,12 +2062,12 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let re = self.parse_comma_expr()?;
+            let re = self.parse_expr()?;
             self.skip_ws();
             if self.peek() == Some(';') {
                 self.next(); // consume ';'
                 self.skip_ws();
-                let flags = self.parse_comma_expr()?;
+                let flags = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::SplitsFlags(Box::new(re), Box::new(flags))));
@@ -2080,12 +2080,12 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let s = self.parse_comma_expr()?;
+            let s = self.parse_expr()?;
             self.skip_ws();
             if self.peek() == Some(';') {
                 self.next(); // consume ';'
                 self.skip_ws();
-                let flags = self.parse_comma_expr()?;
+                let flags = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::SplitRegex(Box::new(s), Box::new(flags))));
@@ -2099,12 +2099,12 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let re = self.parse_comma_expr()?;
+            let re = self.parse_expr()?;
             self.skip_ws();
             if self.peek() == Some(';') {
                 self.next(); // consume ';'
                 self.skip_ws();
-                let flags = self.parse_comma_expr()?;
+                let flags = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::MatchFlags(Box::new(re), Box::new(flags))));
@@ -2118,12 +2118,12 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let re = self.parse_comma_expr()?;
+            let re = self.parse_expr()?;
             self.skip_ws();
             if self.peek() == Some(';') {
                 self.next(); // consume ';'
                 self.skip_ws();
-                let flags = self.parse_comma_expr()?;
+                let flags = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::CaptureFlags(Box::new(re), Box::new(flags))));
@@ -2137,16 +2137,16 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let re = self.parse_comma_expr()?;
+            let re = self.parse_expr()?;
             self.skip_ws();
             self.expect(';')?;
             self.skip_ws();
-            let replacement = self.parse_comma_expr()?;
+            let replacement = self.parse_expr()?;
             self.skip_ws();
             if self.peek() == Some(';') {
                 self.next(); // consume ';'
                 self.skip_ws();
-                let flags = self.parse_comma_expr()?;
+                let flags = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::SubFlags(
@@ -2164,16 +2164,16 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let re = self.parse_comma_expr()?;
+            let re = self.parse_expr()?;
             self.skip_ws();
             self.expect(';')?;
             self.skip_ws();
-            let replacement = self.parse_comma_expr()?;
+            let replacement = self.parse_expr()?;
             self.skip_ws();
             if self.peek() == Some(';') {
                 self.next(); // consume ';'
                 self.skip_ws();
-                let flags = self.parse_comma_expr()?;
+                let flags = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::GsubFlags(
@@ -2191,12 +2191,12 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let re = self.parse_comma_expr()?;
+            let re = self.parse_expr()?;
             self.skip_ws();
             if self.peek() == Some(';') {
                 self.next(); // consume ';'
                 self.skip_ws();
-                let flags = self.parse_comma_expr()?;
+                let flags = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::ScanFlags(Box::new(re), Box::new(flags))));
@@ -2209,7 +2209,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let s = self.parse_comma_expr()?;
+            let s = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Join(Box::new(s))));
@@ -2219,7 +2219,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let b = self.parse_comma_expr()?;
+            let b = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Contains(Box::new(b))));
@@ -2229,7 +2229,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let b = self.parse_comma_expr()?;
+            let b = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Inside(Box::new(b))));
@@ -2250,7 +2250,7 @@ impl<'a> Parser<'a> {
             if self.peek() == Some('(') {
                 self.next();
                 self.skip_ws();
-                let depth = self.parse_comma_expr()?;
+                let depth = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::FlattenDepth(Box::new(depth))));
@@ -2262,7 +2262,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let f = self.parse_comma_expr()?;
+            let f = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::GroupBy(Box::new(f))));
@@ -2273,7 +2273,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let f = self.parse_comma_expr()?;
+            let f = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::UniqueBy(Box::new(f))));
@@ -2288,7 +2288,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let f = self.parse_comma_expr()?;
+            let f = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::SortBy(Box::new(f))));
@@ -2312,7 +2312,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let f = self.parse_comma_expr()?;
+            let f = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::WithEntries(Box::new(f))));
@@ -2350,12 +2350,12 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let re = self.parse_comma_expr()?;
+            let re = self.parse_expr()?;
             self.skip_ws();
             if self.peek() == Some(';') {
                 self.next(); // consume ';'
                 self.skip_ws();
-                let flags = self.parse_comma_expr()?;
+                let flags = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::TestFlags(Box::new(re), Box::new(flags))));
@@ -2368,7 +2368,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let s = self.parse_comma_expr()?;
+            let s = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Indices(Box::new(s))));
@@ -2379,7 +2379,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let s = self.parse_comma_expr()?;
+            let s = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Rindex(Box::new(s))));
@@ -2389,7 +2389,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let s = self.parse_comma_expr()?;
+            let s = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Index(Box::new(s))));
@@ -2411,7 +2411,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let f = self.parse_comma_expr()?;
+            let f = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::FromStream(Box::new(f))));
@@ -2421,7 +2421,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let f = self.parse_comma_expr()?;
+            let f = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::TruncateStream(Box::new(f))));
@@ -2431,7 +2431,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let path = self.parse_comma_expr()?;
+            let path = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::GetPath(Box::new(path))));
@@ -2445,12 +2445,12 @@ impl<'a> Parser<'a> {
             if self.peek() == Some('(') {
                 self.next();
                 self.skip_ws();
-                let f = self.parse_comma_expr()?;
+                let f = self.parse_expr()?;
                 self.skip_ws();
                 if self.peek() == Some(';') {
                     self.next();
                     self.skip_ws();
-                    let cond = self.parse_comma_expr()?;
+                    let cond = self.parse_expr()?;
                     self.skip_ws();
                     self.expect(')')?;
                     return Ok(Some(Builtin::RecurseCond(Box::new(f), Box::new(cond))));
@@ -2467,7 +2467,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let f = self.parse_comma_expr()?;
+            let f = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Walk(Box::new(f))));
@@ -2479,7 +2479,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let expr = self.parse_comma_expr()?;
+            let expr = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::IsValid(Box::new(expr))));
@@ -2495,7 +2495,7 @@ impl<'a> Parser<'a> {
                 // path(expr) - jq style
                 self.next();
                 self.skip_ws();
-                let expr = self.parse_comma_expr()?;
+                let expr = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::Path(Box::new(expr))));
@@ -2512,7 +2512,7 @@ impl<'a> Parser<'a> {
                 // parent(n) - nth parent
                 self.next();
                 self.skip_ws();
-                let n = self.parse_comma_expr()?;
+                let n = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::ParentN(Box::new(n))));
@@ -2532,7 +2532,7 @@ impl<'a> Parser<'a> {
             if self.peek() == Some('(') {
                 self.next();
                 self.skip_ws();
-                let filter = self.parse_comma_expr()?;
+                let filter = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::PathsFilter(Box::new(filter))));
@@ -2545,11 +2545,11 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let path = self.parse_comma_expr()?;
+            let path = self.parse_expr()?;
             self.skip_ws();
             self.expect(';')?;
             self.skip_ws();
-            let value = self.parse_comma_expr()?;
+            let value = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::SetPath(Box::new(path), Box::new(value))));
@@ -2560,7 +2560,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let paths = self.parse_comma_expr()?;
+            let paths = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::DelPaths(Box::new(paths))));
@@ -2571,7 +2571,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let path = self.parse_comma_expr()?;
+            let path = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Del(Box::new(path))));
@@ -2630,11 +2630,11 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let base = self.parse_comma_expr()?;
+            let base = self.parse_expr()?;
             self.skip_ws();
             self.expect(';')?;
             self.skip_ws();
-            let exp = self.parse_comma_expr()?;
+            let exp = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Pow(Box::new(base), Box::new(exp))));
@@ -2670,11 +2670,11 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let y = self.parse_comma_expr()?;
+            let y = self.parse_expr()?;
             self.skip_ws();
             self.expect(';')?;
             self.skip_ws();
-            let x = self.parse_comma_expr()?;
+            let x = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Atan2(Box::new(y), Box::new(x))));
@@ -2738,7 +2738,7 @@ impl<'a> Parser<'a> {
             if self.peek() == Some('(') {
                 self.next();
                 self.skip_ws();
-                let msg = self.parse_comma_expr()?;
+                let msg = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::DebugMsg(Box::new(msg))));
@@ -2803,7 +2803,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let x = self.parse_comma_expr()?;
+            let x = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::BSearch(Box::new(x))));
@@ -2815,7 +2815,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let name = self.parse_comma_expr()?;
+            let name = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::ModuleMeta(Box::new(name))));
@@ -2827,7 +2827,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let keys = self.parse_comma_expr()?;
+            let keys = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Pick(Box::new(keys))));
@@ -2839,7 +2839,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let keys = self.parse_comma_expr()?;
+            let keys = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Omit(Box::new(keys))));
@@ -2936,11 +2936,11 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let n = self.parse_pipe_expr()?;
+            let n = self.parse_pipe_no_comma()?;
             self.skip_ws();
             self.expect(';')?;
             self.skip_ws();
-            let expr = self.parse_pipe_expr()?;
+            let expr = self.parse_pipe_no_comma()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Limit(Box::new(n), Box::new(expr))));
@@ -2955,12 +2955,12 @@ impl<'a> Parser<'a> {
             // `n` deliberately stays restricted to non-comma — same rationale
             // as `limit`'s `n`: real jq's `$n` parameter convention isn't
             // implemented here.
-            let n = self.parse_pipe_expr()?;
+            let n = self.parse_pipe_no_comma()?;
             self.skip_ws();
             self.expect(';')?;
             self.skip_ws();
             // Full expression — comma included (#155).
-            let expr = self.parse_comma_expr()?;
+            let expr = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Skip(Box::new(n), Box::new(expr))));
@@ -2975,7 +2975,7 @@ impl<'a> Parser<'a> {
             if self.peek() == Some('(') {
                 self.next();
                 self.skip_ws();
-                let expr = self.parse_pipe_expr()?;
+                let expr = self.parse_pipe_no_comma()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::FirstStream(Box::new(expr))));
@@ -2992,7 +2992,7 @@ impl<'a> Parser<'a> {
             if self.peek() == Some('(') {
                 self.next();
                 self.skip_ws();
-                let expr = self.parse_pipe_expr()?;
+                let expr = self.parse_pipe_no_comma()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::LastStream(Box::new(expr))));
@@ -3011,13 +3011,13 @@ impl<'a> Parser<'a> {
             // `n` deliberately stays restricted to non-comma — same rationale
             // as `limit`'s `n` above: real jq's `$n` parameter convention
             // (per-output fanout) isn't implemented here.
-            let n = self.parse_pipe_expr()?;
+            let n = self.parse_pipe_no_comma()?;
             self.skip_ws();
             if self.peek() == Some(';') {
                 self.next();
                 self.skip_ws();
                 // Full expression — comma included (#155).
-                let expr = self.parse_comma_expr()?;
+                let expr = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::NthStream(Box::new(n), Box::new(expr))));
@@ -3036,7 +3036,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let expr = self.parse_comma_expr()?;
+            let expr = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::IsEmpty(Box::new(expr))));
@@ -3067,7 +3067,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let fmt = self.parse_comma_expr()?;
+            let fmt = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Strftime(Box::new(fmt))));
@@ -3077,7 +3077,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let fmt = self.parse_comma_expr()?;
+            let fmt = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Strptime(Box::new(fmt))));
@@ -3113,7 +3113,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let zone = self.parse_comma_expr()?;
+            let zone = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Tz(Box::new(zone))));
@@ -3126,7 +3126,7 @@ impl<'a> Parser<'a> {
             if self.peek() == Some('(') {
                 self.next(); // consume '('
                 self.skip_ws();
-                let n = self.parse_comma_expr()?;
+                let n = self.parse_expr()?;
                 self.skip_ws();
                 self.expect(')')?;
                 return Ok(Some(Builtin::CombinationsN(Box::new(n))));
@@ -3152,7 +3152,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let file_expr = self.parse_comma_expr()?;
+            let file_expr = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::Load(Box::new(file_expr))));
@@ -3165,7 +3165,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let offset_expr = self.parse_comma_expr()?;
+            let offset_expr = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::AtOffset(Box::new(offset_expr))));
@@ -3177,11 +3177,11 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.expect('(')?;
             self.skip_ws();
-            let line_expr = self.parse_comma_expr()?;
+            let line_expr = self.parse_expr()?;
             self.skip_ws();
             self.expect(';')?;
             self.skip_ws();
-            let col_expr = self.parse_comma_expr()?;
+            let col_expr = self.parse_expr()?;
             self.skip_ws();
             self.expect(')')?;
             return Ok(Some(Builtin::AtPosition(
@@ -3526,7 +3526,7 @@ impl<'a> Parser<'a> {
 
     /// Parse a pipe expression: `expr | expr | ...`
     /// Also handles `as` binding: `expr as $var | body` or `expr as {pattern} | body`
-    fn parse_pipe_expr(&mut self) -> Result<Expr, ParseError> {
+    fn parse_pipe_no_comma(&mut self) -> Result<Expr, ParseError> {
         let first = self.parse_assignment()?;
         self.skip_ws();
 
@@ -3584,7 +3584,7 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 self.expect('|')?;
                 self.skip_ws();
-                let body = self.parse_pipe_expr()?;
+                let body = self.parse_pipe_no_comma()?;
                 Ok(Expr::As {
                     expr: Box::new(expr),
                     var,
@@ -3597,7 +3597,7 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 self.expect('|')?;
                 self.skip_ws();
-                let body = self.parse_pipe_expr()?;
+                let body = self.parse_pipe_no_comma()?;
                 Ok(Expr::AsPattern {
                     expr: Box::new(expr),
                     pattern,
@@ -3611,10 +3611,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a comma expression: `expr, expr, ...`
+    /// Parse a complete expression (entry point): `expr, expr, ...`
     /// This is the lowest precedence operator.
-    fn parse_comma_expr(&mut self) -> Result<Expr, ParseError> {
-        let first = self.parse_pipe_expr()?;
+    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        let first = self.parse_pipe_no_comma()?;
         self.skip_ws();
 
         if self.peek() != Some(',') {
@@ -3626,16 +3626,11 @@ impl<'a> Parser<'a> {
         while self.peek() == Some(',') {
             self.next();
             self.skip_ws();
-            exprs.push(self.parse_pipe_expr()?);
+            exprs.push(self.parse_pipe_no_comma()?);
             self.skip_ws();
         }
 
         Ok(Expr::comma(exprs))
-    }
-
-    /// Parse a complete expression (entry point).
-    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        self.parse_comma_expr()
     }
 
     // =========================================================================
@@ -3757,7 +3752,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse function body
-        let body = self.parse_pipe_expr()?;
+        let body = self.parse_pipe_no_comma()?;
         self.skip_ws();
 
         // Expect semicolon
@@ -3987,7 +3982,7 @@ impl<'a> Parser<'a> {
             let mut args = Vec::new();
             while self.peek() != Some(')') {
                 // Full expression per `;`-separated slot (#155).
-                args.push(self.parse_comma_expr()?);
+                args.push(self.parse_expr()?);
                 self.skip_ws();
                 if self.peek() == Some(';') {
                     self.next();
