@@ -10714,42 +10714,27 @@ fn delete_expr_object_paths(
         }
     }
 
-    if !matches!(value, OwnedValue::Object(_)) {
-        // A non-object container fails every path here identically, so this
-        // is not a per-key merge like the groups below: any single
-        // non-optional path among the siblings has to raise, regardless of
-        // where in the list it sits. Checking only `paths[0]` here used to
-        // let an optional sibling that happened to sort first (e.g. `.a?` in
-        // `del(.a?, .[("b","c")])` against `null`) silently swallow a
-        // non-optional one's error.
-        return match paths.iter().find(|p| !p[start].optional) {
-            None => Ok(value),
-            Some(required) => {
-                let Expr::Field(name) = &required[start].component else {
-                    unreachable!("dispatched on Field above")
-                };
-                Err(EvalError::cannot_index_with_field(
-                    owned_type_name(&value),
-                    name,
-                ))
+    // Every path here is Field-kind, so `resolve_node` (invoked by
+    // `resolve_dynamic_indexes` before `delete_expr_paths_at` ever runs)
+    // already validated `value` as field-indexable for each path — raising
+    // the same `Cannot index … with …` error itself — before grouping ever
+    // sees a non-object root. `null` is excluded by the check above, so this
+    // can only fire if that earlier validation regresses.
+    let OwnedValue::Object(entries) = &mut value else {
+        unreachable!("delete_expr_object_paths reached a non-object, non-null root")
+    };
+    for (name, group) in &groups {
+        match entries.get_mut(*name) {
+            Some(slot) => {
+                let old = core::mem::replace(slot, OwnedValue::Null);
+                *slot = delete_expr_paths_at(old, group, start + 1)?;
             }
-        };
-    }
-
-    if let OwnedValue::Object(entries) = &mut value {
-        for (name, group) in &groups {
-            match entries.get_mut(*name) {
-                Some(slot) => {
-                    let old = core::mem::replace(slot, OwnedValue::Null);
-                    *slot = delete_expr_paths_at(old, group, start + 1)?;
-                }
-                // Requiring *every* sibling naming this field to be optional
-                // would be too strict: one occurrence marking it optional is
-                // enough to cover the others, the same merge the
-                // terminal-index case below uses.
-                None if group.iter().any(|p| p[start].optional) => {}
-                None => return Err(EvalError::field_not_found(name)),
-            }
+            // Requiring *every* sibling naming this field to be optional
+            // would be too strict: one occurrence marking it optional is
+            // enough to cover the others, the same merge the
+            // terminal-index case below uses.
+            None if group.iter().any(|p| p[start].optional) => {}
+            None => return Err(EvalError::field_not_found(name)),
         }
     }
 
@@ -10812,55 +10797,36 @@ fn delete_expr_array_paths(
         }
     }
 
-    if !matches!(value, OwnedValue::Array(_)) {
-        // Same reasoning as the object case above: a non-array container
-        // fails every path here identically, so a single non-optional path
-        // among the siblings has to raise even when others are optional.
-        //
-        // *Which* sentence comes from the first sibling, because jq walks the
-        // paths in source order and dies on the first: `5 | del(.[0], .[1:2])`
-        // is `Cannot index number with number`, and the same two written the
-        // other way round is `… with object`.
-        return if paths.iter().all(|p| p[start].optional) {
-            Ok(value)
-        } else {
-            Err(match &paths[0][start].component {
-                Expr::Slice { .. } if matches!(value, OwnedValue::String(_)) => {
-                    EvalError::cannot_delete_fields_from("string")
+    // Same reasoning as `delete_expr_object_paths` above — every path here is
+    // Index/Slice-kind, so `resolve_node` already validated `value` as
+    // indexable for each path before grouping ever runs; `null` is excluded
+    // by the check above, so this can only fire if that earlier validation
+    // regresses.
+    let OwnedValue::Array(arr) = &mut value else {
+        unreachable!("delete_expr_array_paths reached a non-array, non-null root")
+    };
+    for (step, group) in &groups {
+        match step {
+            ArrayStep::Index(idx) => {
+                let len = arr.len() as i64;
+                let actual = if *idx < 0 { len + idx } else { *idx };
+                if actual >= 0 && (actual as usize) < arr.len() {
+                    let slot = &mut arr[actual as usize];
+                    let old = core::mem::replace(slot, OwnedValue::Null);
+                    *slot = delete_expr_paths_at(old, group, start + 1)?;
                 }
-                Expr::Slice { .. } => {
-                    EvalError::cannot_index_with_type(owned_type_name(&value), "object")
-                }
-                _ => EvalError::cannot_index_with_type(owned_type_name(&value), "number"),
-            })
-        };
-    }
-
-    if let OwnedValue::Array(arr) = &mut value {
-        for (step, group) in &groups {
-            match step {
-                ArrayStep::Index(idx) => {
-                    let len = arr.len() as i64;
-                    let actual = if *idx < 0 { len + idx } else { *idx };
-                    if actual >= 0 && (actual as usize) < arr.len() {
-                        let slot = &mut arr[actual as usize];
-                        let old = core::mem::replace(slot, OwnedValue::Null);
-                        *slot = delete_expr_paths_at(old, group, start + 1)?;
-                    }
-                    // An out-of-range index names nothing to delete through —
-                    // jq's delpaths silently skips it, `?` or not (#477).
-                }
-                // Deleting *through* a slice deletes inside the sub-array and
-                // splices it back: `[1,[2],[3]] | del(.[1:3][0])` is `[1,[3]]`.
-                ArrayStep::Slice(s, e) => {
-                    let range = SliceBounds::from_literals(*s, *e).resolve(arr.len());
-                    let sub = OwnedValue::Array(arr[range.clone()].to_vec());
-                    let OwnedValue::Array(items) = delete_expr_paths_at(sub, group, start + 1)?
-                    else {
-                        unreachable!("deleting from an array yields an array")
-                    };
-                    arr.splice(range, items);
-                }
+                // An out-of-range index names nothing to delete through —
+                // jq's delpaths silently skips it, `?` or not (#477).
+            }
+            // Deleting *through* a slice deletes inside the sub-array and
+            // splices it back: `[1,[2],[3]] | del(.[1:3][0])` is `[1,[3]]`.
+            ArrayStep::Slice(s, e) => {
+                let range = SliceBounds::from_literals(*s, *e).resolve(arr.len());
+                let sub = OwnedValue::Array(arr[range.clone()].to_vec());
+                let OwnedValue::Array(items) = delete_expr_paths_at(sub, group, start + 1)? else {
+                    unreachable!("deleting from an array yields an array")
+                };
+                arr.splice(range, items);
             }
         }
     }
