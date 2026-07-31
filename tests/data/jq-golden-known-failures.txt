@@ -25,6 +25,8 @@
 # Reseeded by #513 from the open bug corpus: 11 cases pinning bugs filed
 # *before* a fix existed, rather than alongside one, so the manifest can act
 # as a scoreboard instead of reading as a false clean bill of health.
+# path_empty (#489) has since been fixed and dropped, leaving 10; its golden
+# stays and now passes, which is the scoreboard working as intended.
 
 comma_literal_before_document  comma              . evaluates before the literal 1 inside [1, .], reversing output order — #353
 object_construct_cartesian     object_construct   only the first output of each key/value generator is used instead of the cartesian product — #354
@@ -34,6 +36,5 @@ comma_pipe_precedence          parser             , binds tighter than | in jq; 
 nan_type                       nan                nan | type reports "null" instead of "number" — #472
 path_recursive_descent         path               path(..) returns only the root path instead of every descendant path — #483
 assign_autovivify_nested       assignment         .a.b = 9 on {} errors instead of autovivifying the intermediate object — #486
-path_empty                     path               path(empty) should produce zero outputs but succinctly still emits one — #489
 recurse_null_child             recurse            recurse on {"a":null} stops before visiting the null leaf — #490
 slice_computed_bounds          slice              computed slice bounds (.a[.k:2]) are a parse error; only integer literals are accepted — #499

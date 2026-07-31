@@ -6743,7 +6743,7 @@ fn set_path(
 /// one bit ("a failure here prunes rather than propagates"); the component
 /// underneath is what the walk actually follows.
 ///
-/// `eval_with_path_tracking` looks through these already, which is why
+/// [`walk_path`] looks through these already, which is why
 /// `path(…)` read correctly while `=`, `|=` and `del(…)` did not: their walkers
 /// matched the wrapper against `Field`/`Index`/`Iterate`, missed, and fell to a
 /// catch-all — `get_path_mut` to "invalid path component", and the two `Pipe`
@@ -7088,12 +7088,11 @@ fn owned_type_name(value: &OwnedValue) -> &'static str {
 // Computed keys in path expressions (#360)
 // =============================================================================
 //
-// `set_path`, `get_path_mut`, `update_path`, `delete_at_path`,
-// `eval_with_path_tracking` and `collect_intermediate_with_paths` all understand
-// only *static* path components: `Identity`, `Field`, `Index`, `Iterate`,
-// `Slice`. Rather than teach six walkers about computed keys, the key is
-// resolved to the concrete component it denotes *before* they run, so they keep
-// seeing exactly the shapes they always have.
+// `set_path`, `get_path_mut`, `update_path`, `delete_at_path` and `walk_path`
+// all understand only *static* path components: `Identity`, `Field`, `Index`,
+// `Iterate`, `Slice`. Rather than teach every walker about computed keys, the
+// key is resolved to the concrete component it denotes *before* they run, so
+// they keep seeing exactly the shapes they always have.
 //
 // A pre-pass (rather than recursion inside `set_path`) is also what makes
 // multi-key assignment match jq: keys are computed against the *original*
@@ -9561,258 +9560,200 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return QueryResult::Error(e),
     };
 
-    let mut paths = Vec::new();
+    let mut reached = Vec::new();
     for expr in &exprs {
-        eval_with_path_tracking(expr, &owned, &[], &mut paths, optional);
+        if let Err(e) = walk_path::<S>(expr, &owned, &[], &mut reached, optional) {
+            return QueryResult::Error(e);
+        }
     }
 
-    if paths.is_empty() {
-        if optional {
-            QueryResult::None
-        } else {
-            QueryResult::Owned(OwnedValue::Array(vec![]))
-        }
-    } else if paths.len() == 1 {
-        QueryResult::Owned(paths.into_iter().next().unwrap())
-    } else {
-        // Multiple paths - return as Many
-        let owned_paths: Vec<OwnedValue> = paths;
-        // Convert to QueryResult::Many by wrapping each path
-        QueryResult::ManyOwned(owned_paths)
+    let mut paths: Vec<OwnedValue> = reached
+        .into_iter()
+        .map(|(path, _)| OwnedValue::Array(path))
+        .collect();
+
+    match paths.len() {
+        // "No paths at all" is *no output*, never `Array(vec![])`. The empty
+        // path is a real answer — it is what `path(.)` returns — and the one
+        // path that always resolves, so rendering emptiness as it aims a
+        // caller's `getpath`/`setpath`/`delpaths` at the document root (#489).
+        0 => QueryResult::None,
+        1 => QueryResult::Owned(paths.pop().expect("len checked")),
+        _ => QueryResult::ManyOwned(paths),
     }
 }
 
-/// Evaluate an expression while tracking the path taken to reach each value.
-/// Each path is collected as an OwnedValue::Array of path components.
-fn eval_with_path_tracking(
+/// Walk `expr` as a path expression, pushing `(path, value-at-path)` for every
+/// path it resolves to.
+///
+/// Every step's verdict — whether it resolves at all, and to what — comes from
+/// the value evaluator via [`eval_owned_multi`], never from a second copy of
+/// jq's indexing rules here. That is what keeps `path(f)` agreeing with `f`:
+/// a step that *reads* as `null` (a missing key, an out-of-range index, any
+/// step through `null`) keeps its component, exactly as jq's does, and a step
+/// that cannot index its value at all raises the sentence `src/jq/error.rs`
+/// already spells the way jq does rather than inventing a component for a
+/// place that does not exist.
+///
+/// `optional` is that error's off switch — `?`, which is precisely "turn this
+/// step's error into no output". It arrives either from an `Expr::Optional`
+/// wrapper (`.a?`) or from an enclosing `path(...)?`, and both mean the same
+/// thing here.
+///
+/// One walker, not one per position: the last step of a path and the steps
+/// before it obey the same rules, and keeping two copies of them is what let
+/// `path(.b.c)` lose the path that `path(.b)` kept (#489).
+fn walk_path<S: EvalSemantics>(
     expr: &Expr,
     value: &OwnedValue,
     current_path: &[OwnedValue],
-    paths: &mut Vec<OwnedValue>,
+    out: &mut Vec<(Vec<OwnedValue>, OwnedValue)>,
     optional: bool,
-) {
+) -> Result<(), EvalError> {
     match expr {
-        Expr::Identity => {
-            // Identity returns the current path
-            paths.push(OwnedValue::Array(current_path.to_vec()));
-        }
+        // The path already reaching here, named as it stands.
+        Expr::Identity => out.push((current_path.to_vec(), value.clone())),
+
+        // One component each, written as the step was written rather than as
+        // it resolves: jq keeps `path(.[-1])` as `[-1]` and `path(.[1:2])` as
+        // `[{"start":1,"end":2}]`, because a path is resolved against a
+        // container only when it is applied.
         Expr::Field(name) => {
-            // jq's path() returns the path regardless of whether the field exists
-            // This matches jq behavior: path(.missing) returns ["missing"]
-            let mut new_path = current_path.to_vec();
-            new_path.push(OwnedValue::String(name.clone()));
-            paths.push(OwnedValue::Array(new_path));
+            step_into::<S>(
+                expr,
+                OwnedValue::String(name.clone()),
+                value,
+                current_path,
+                out,
+                optional,
+            )?;
         }
         Expr::Index(idx) => {
-            // jq's path() preserves the original index (including negative)
-            // This matches jq behavior: path(.[-1]) returns [-1]
-            let mut new_path = current_path.to_vec();
-            new_path.push(OwnedValue::Int(*idx));
-            paths.push(OwnedValue::Array(new_path));
+            step_into::<S>(
+                expr,
+                OwnedValue::Int(*idx),
+                value,
+                current_path,
+                out,
+                optional,
+            )?;
         }
+        Expr::Slice { start, end } => {
+            step_into::<S>(
+                expr,
+                slice::literal_component(*start, *end),
+                value,
+                current_path,
+                out,
+                optional,
+            )?;
+        }
+
+        // The one step whose components come from the *value* rather than the
+        // expression, so it reads them off the container directly. Anything
+        // that is not a container still takes the evaluator's verdict, which
+        // is jq's `Cannot iterate over <t> (<v>)`.
         Expr::Iterate => match value {
             OwnedValue::Array(arr) => {
-                for (i, _) in arr.iter().enumerate() {
-                    let mut new_path = current_path.to_vec();
-                    new_path.push(OwnedValue::Int(i as i64));
-                    paths.push(OwnedValue::Array(new_path));
+                for (i, val) in arr.iter().enumerate() {
+                    out.push((extend(current_path, OwnedValue::Int(i as i64)), val.clone()));
                 }
             }
             OwnedValue::Object(entries) => {
-                for (key, _) in entries {
-                    let mut new_path = current_path.to_vec();
-                    new_path.push(OwnedValue::String(key.clone()));
-                    paths.push(OwnedValue::Array(new_path));
+                for (key, val) in entries {
+                    out.push((
+                        extend(current_path, OwnedValue::String(key.clone())),
+                        val.clone(),
+                    ));
                 }
             }
-            _ => {}
-        },
-        Expr::Pipe(exprs) => {
-            if exprs.is_empty() {
-                paths.push(OwnedValue::Array(current_path.to_vec()));
-                return;
+            other => {
+                if let Err(e) = eval_owned_multi::<S>(expr, other) {
+                    if !optional {
+                        return Err(e);
+                    }
+                }
             }
-            // For pipe, we need to evaluate step by step, tracking paths
-            eval_pipe_with_path_tracking(exprs, value, current_path, paths, optional);
-        }
-        Expr::Optional(inner) => {
-            eval_with_path_tracking(inner, value, current_path, paths, true);
-        }
-        Expr::Paren(inner) => {
-            eval_with_path_tracking(inner, value, current_path, paths, optional);
-        }
-        Expr::Slice { start, end } => {
-            // One component, not one per element: jq models `.[a:b]` as
-            // indexing with `{"start":a,"end":b}`, so `[1,2,3] | path(.[1:2])`
-            // is `[{"start":1,"end":2}]`. The bounds go in as written — a path
-            // is resolved against a container only when it is applied, which
-            // is what lets `path(.[-2:-1])` keep its negative bounds.
-            let mut new_path = current_path.to_vec();
-            new_path.push(slice::literal_component(*start, *end));
-            paths.push(OwnedValue::Array(new_path));
-        }
+        },
+
+        Expr::Pipe(exprs) => return walk_pipe::<S>(exprs, value, current_path, out, optional),
+        Expr::Optional(inner) => return walk_path::<S>(inner, value, current_path, out, true),
+        Expr::Paren(inner) => return walk_path::<S>(inner, value, current_path, out, optional),
+
         // Unreachable: computed keys are resolved to static components before
-        // the tracker runs. The catch-all below emits *no* path rather than an
+        // the walker runs. The catch-all below emits *no* path rather than an
         // error, so an unresolved one would silently produce an empty result.
         Expr::IndexExpr { .. } => {
             debug_assert!(false, "unresolved computed index reached path tracking");
         }
-        // For complex expressions that don't represent simple paths, we can't track
-        _ => {
-            // For non-path expressions, we don't produce path output
-            // This includes arithmetic, comparisons, etc.
-        }
+
+        // Expressions with no path-tracking arm — `..`, `recurse`, `select`,
+        // arithmetic — name no path (#483). `builtin_path` renders that as no
+        // output, which is still the wrong answer but no longer a path that
+        // resolves.
+        _ => {}
     }
+    Ok(())
 }
 
-/// Evaluate a pipe expression while tracking paths
-fn eval_pipe_with_path_tracking(
+/// Walk a pipe of path steps, threading each value reached into the next step.
+fn walk_pipe<S: EvalSemantics>(
     exprs: &[Expr],
     value: &OwnedValue,
     current_path: &[OwnedValue],
-    paths: &mut Vec<OwnedValue>,
+    out: &mut Vec<(Vec<OwnedValue>, OwnedValue)>,
     optional: bool,
-) {
-    if exprs.is_empty() {
-        paths.push(OwnedValue::Array(current_path.to_vec()));
-        return;
-    }
-
-    // For the first expression, get intermediate paths and values
-    let first = &exprs[0];
-    let rest = &exprs[1..];
-
+) -> Result<(), EvalError> {
+    let Some((first, rest)) = exprs.split_first() else {
+        // An empty pipe reaches nothing new, so it names the path handed to
+        // it — `path(())` is `[]`, as `path(.)` is.
+        out.push((current_path.to_vec(), value.clone()));
+        return Ok(());
+    };
     if rest.is_empty() {
-        // Last expression - collect final paths
-        eval_with_path_tracking(first, value, current_path, paths, optional);
-        return;
+        return walk_path::<S>(first, value, current_path, out, optional);
     }
 
-    // Get intermediate results with their paths
-    let mut intermediate: Vec<(Vec<OwnedValue>, OwnedValue)> = Vec::new();
-    collect_intermediate_with_paths(first, value, current_path, &mut intermediate, optional);
-
-    // Continue with the rest of the pipe for each intermediate result
-    for (path, val) in intermediate {
-        eval_pipe_with_path_tracking(rest, &val, &path, paths, optional);
+    let mut reached = Vec::new();
+    walk_path::<S>(first, value, current_path, &mut reached, optional)?;
+    for (path, val) in reached {
+        walk_pipe::<S>(rest, &val, &path, out, optional)?;
     }
+    Ok(())
 }
 
-/// Collect intermediate values along with their paths for continuing pipe evaluation
-#[allow(clippy::only_used_in_recursion)] // STYLE-0004: parameter used only in the recursive call; part of the recursion contract
-fn collect_intermediate_with_paths(
-    expr: &Expr,
+/// Take one path step: `component` names it, and the value evaluator decides
+/// both what it reaches and whether it may be taken at all.
+///
+/// Asking the evaluator rather than re-deciding here is the point — see
+/// [`walk_path`]. `Err` is suppressed into no output under `?`, which is all
+/// `?` means on a path step.
+fn step_into<S: EvalSemantics>(
+    step: &Expr,
+    component: OwnedValue,
     value: &OwnedValue,
     current_path: &[OwnedValue],
-    results: &mut Vec<(Vec<OwnedValue>, OwnedValue)>,
+    out: &mut Vec<(Vec<OwnedValue>, OwnedValue)>,
     optional: bool,
-) {
-    match expr {
-        Expr::Identity => {
-            results.push((current_path.to_vec(), value.clone()));
-        }
-        Expr::Field(name) => {
-            if let OwnedValue::Object(entries) = value {
-                for (key, val) in entries {
-                    if key == name {
-                        let mut new_path = current_path.to_vec();
-                        new_path.push(OwnedValue::String(name.clone()));
-                        results.push((new_path, val.clone()));
-                        return;
-                    }
-                }
-            }
-        }
-        Expr::Index(idx) => {
-            if let OwnedValue::Array(arr) = value {
-                let len = arr.len() as i64;
-                let actual_idx = if *idx < 0 { len + *idx } else { *idx };
-                if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
-                    let mut new_path = current_path.to_vec();
-                    // Preserve original index (including negative) to match jq behavior
-                    new_path.push(OwnedValue::Int(*idx));
-                    results.push((new_path, arr[actual_idx as usize].clone()));
-                }
-            }
-        }
-        Expr::Iterate => match value {
-            OwnedValue::Array(arr) => {
-                for (i, val) in arr.iter().enumerate() {
-                    let mut new_path = current_path.to_vec();
-                    new_path.push(OwnedValue::Int(i as i64));
-                    results.push((new_path, val.clone()));
-                }
-            }
-            OwnedValue::Object(entries) => {
-                for (key, val) in entries {
-                    let mut new_path = current_path.to_vec();
-                    new_path.push(OwnedValue::String(key.clone()));
-                    results.push((new_path, val.clone()));
-                }
-            }
-            _ => {}
-        },
-        Expr::Optional(inner) => {
-            collect_intermediate_with_paths(inner, value, current_path, results, true);
-        }
-        Expr::Paren(inner) => {
-            collect_intermediate_with_paths(inner, value, current_path, results, optional);
-        }
-        Expr::Pipe(inner_exprs) => {
-            // Nested pipe - flatten it
-            if inner_exprs.is_empty() {
-                results.push((current_path.to_vec(), value.clone()));
-                return;
-            }
-            let mut intermediate: Vec<(Vec<OwnedValue>, OwnedValue)> = Vec::new();
-            collect_intermediate_with_paths(
-                &inner_exprs[0],
-                value,
-                current_path,
-                &mut intermediate,
-                optional,
-            );
+) -> Result<(), EvalError> {
+    let values = match eval_owned_multi::<S>(step, value) {
+        Ok(values) => values,
+        Err(_) if optional => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    debug_assert!(values.len() <= 1, "one path step reaches at most one value");
+    let Some(reached) = values.into_iter().next() else {
+        return Ok(());
+    };
+    out.push((extend(current_path, component), reached));
+    Ok(())
+}
 
-            for (path, val) in intermediate {
-                if inner_exprs.len() == 1 {
-                    results.push((path, val));
-                } else {
-                    // Continue with rest
-                    let rest_pipe = Expr::Pipe(inner_exprs[1..].to_vec());
-                    collect_intermediate_with_paths(&rest_pipe, &val, &path, results, optional);
-                }
-            }
-        }
-        Expr::Slice { start, end } => {
-            // One component carrying the *sliced value*, which is what lets a
-            // slice sit mid-path: `path(.[1:2][0])` is
-            // `[{"start":1,"end":2},0]`, so the tail walks the sub-array.
-            let bounds = SliceBounds::from_literals(*start, *end);
-            let sliced = match value {
-                OwnedValue::Array(arr) => {
-                    OwnedValue::Array(arr[bounds.resolve(arr.len())].to_vec())
-                }
-                OwnedValue::String(s) => {
-                    let range = bounds.resolve(s.chars().count());
-                    OwnedValue::String(slice::slice_str(s, range))
-                }
-                // jq slices `null` to `null`; anything else is not sliceable,
-                // and the walkers have no error channel — see the catch-all.
-                OwnedValue::Null => OwnedValue::Null,
-                _ => return,
-            };
-            let mut new_path = current_path.to_vec();
-            new_path.push(slice::literal_component(*start, *end));
-            results.push((new_path, sliced));
-        }
-        // Unreachable, for the same reason as in `eval_with_path_tracking`.
-        Expr::IndexExpr { .. } => {
-            debug_assert!(false, "unresolved computed index reached path collection");
-        }
-        _ => {
-            // For non-path expressions, we can't track paths
-        }
-    }
+/// `current_path` with one more component on the end.
+fn extend(current_path: &[OwnedValue], component: OwnedValue) -> Vec<OwnedValue> {
+    let mut path = current_path.to_vec();
+    path.push(component);
+    path
 }
 
 /// Helper to collect all paths recursively
@@ -20602,6 +20543,122 @@ mod tests {
         );
     }
 
+    /// "No paths at all" is no output — never the *root* path (#489).
+    ///
+    /// `[]` is a real answer: it is what `path(.)` returns, and the one path
+    /// that always resolves. Rendering emptiness as it aimed a caller's
+    /// `getpath`/`setpath`/`delpaths` at the document root, which is why this
+    /// pins the variant (`None`) and not just the rendered output.
+    #[test]
+    fn test_path_of_nothing_is_no_output_not_the_root_path() {
+        query!(br#"{"a": 1}"#, "path(empty)", QueryResult::None => {});
+        // Both branches prune, so the comma composes to nothing at all.
+        query!(br#""s""#, "path(.a?, .b?)", QueryResult::None => {});
+        // The other direction, so a fix that returned `None` for everything
+        // would not pass: an empty path is still an answer when it is meant.
+        query!(br#"{"a": 1}"#, "path(.)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => assert!(arr.is_empty())
+        );
+    }
+
+    /// A `?`-suppressed step that cannot resolve contributes *no component*.
+    ///
+    /// It used to leave its component behind — `"s" | path(.a?)` answered
+    /// `["a"]`, a path into a string (#489). `?` is only an off switch for the
+    /// step's error; a step that never happened names nothing.
+    #[test]
+    fn test_optional_step_that_cannot_resolve_names_no_path() {
+        for filter in [
+            "path(.a?)",
+            "path(.[0]?)",
+            "path(.[]?)",
+            r#"path(.["a"]?)"#,
+            "path((.a)?)",
+            // `?` outside `path(...)` reaches the same walk, so it prunes too.
+            "path(.a)?",
+        ] {
+            assert_eq!(outputs(br#""s""#, filter), Vec::<String>::new(), "{filter}");
+        }
+        // The suppression is per *value*, not per spelling: the same step on a
+        // container it can index keeps its component.
+        assert_eq!(outputs(br#"{"a": 1}"#, "path(.a?)"), [r#"["a"]"#]);
+        assert_eq!(outputs(br"[1, 2]", "path(.[0]?)"), ["[0]"]);
+    }
+
+    /// A step *through* a missing key, a null, or an out-of-range index keeps
+    /// the whole path — jq's `{"a":1} | path(.b.c)` is `["b","c"]` (#489).
+    ///
+    /// Reading a path is not walking one: `.b` on `{"a":1}` reads `null`, and
+    /// `null` accepts a further step, so the path exists even though nothing
+    /// is stored along it. This is what `setpath`'s auto-vivification consumes.
+    #[test]
+    fn test_path_survives_a_step_that_reads_null() {
+        assert_eq!(outputs(br#"{"a": 1}"#, "path(.b.c)"), [r#"["b","c"]"#]);
+        assert_eq!(outputs(br"{}", "path(.a.b)"), [r#"["a","b"]"#]);
+        assert_eq!(outputs(br"null", "path(.a.b)"), [r#"["a","b"]"#]);
+        assert_eq!(outputs(br"[1]", "path(.[3].x)"), [r#"[3,"x"]"#]);
+        // Including under `?`, which suppresses errors and nothing else — a
+        // step that reads `null` never errored in the first place.
+        assert_eq!(outputs(br#"{"a": 1}"#, "path(.b.c?)"), [r#"["b","c"]"#]);
+        assert_eq!(outputs(br"[1, 2]", "path(.[5]?)"), ["[5]"]);
+    }
+
+    /// Without `?`, a step that cannot index its value raises jq's own
+    /// sentence rather than inventing a component for it (#489).
+    ///
+    /// The wording is not spelled here: it comes from the value evaluator, so
+    /// `path(f)` reports exactly what `f` reports. `tests/jq_error_message_tests.rs`
+    /// is what pins the text against real jq.
+    #[test]
+    fn test_unindexable_step_errors_instead_of_inventing_a_path() {
+        for (json, filter, message) in [
+            (
+                &br#""s""#[..],
+                "path(.a)",
+                r#"Cannot index string with string "a""#,
+            ),
+            (
+                &br#""s""#[..],
+                "path(.[0])",
+                "Cannot index string with number",
+            ),
+            (
+                &br#"{"a": 1}"#[..],
+                "path(.a.b)",
+                r#"Cannot index number with string "b""#,
+            ),
+            (
+                &br#"{"a": 1}"#[..],
+                "path(.[0])",
+                "Cannot index object with number",
+            ),
+            (
+                &br#"{"a": 1}"#[..],
+                "path(.[1:2])",
+                "Cannot index object with object",
+            ),
+            (
+                &br"[1, 2]"[..],
+                "path(.a)",
+                r#"Cannot index array with string "a""#,
+            ),
+            (
+                &br#""s""#[..],
+                "path(.[])",
+                r#"Cannot iterate over string ("s")"#,
+            ),
+            (
+                &br"null"[..],
+                "path(.[])",
+                "Cannot iterate over null (null)",
+            ),
+        ] {
+            query!(json, filter,
+                QueryResult::Error(e) => assert_eq!(e.message, message, "{filter}")
+            );
+        }
+    }
+
     #[test]
     fn test_paths_filter() {
         // paths(filter) streams paths where values match filter
@@ -23116,12 +23173,12 @@ mod tests {
     /// Every path walker refuses an unresolved [`Expr::IndexExpr`], loudly.
     ///
     /// [`resolve_dynamic_indexes`] rewrites each computed key into the static
-    /// component it denotes before any of these six run, so none of these arms
-    /// can fire through the public API — which is exactly why they need a test
-    /// of their own. They exist so that a *new* path context wired up without
+    /// component it denotes before any of these run, so none of these arms can
+    /// fire through the public API — which is exactly why they need a test of
+    /// their own. They exist so that a *new* path context wired up without
     /// that pre-pass fails where the mistake is, instead of blaming the user's
     /// filter through the `_` catch-alls ("invalid path component", "cannot use
-    /// expression as …") or, in the two trackers, silently emitting no path at
+    /// expression as …") or, in [`walk_path`], silently emitting no path at
     /// all. Nothing else pins that promise: the wording *is* the signal that an
     /// install point has gone missing.
     mod computed_key_guards {
@@ -23173,30 +23230,34 @@ mod tests {
             );
         }
 
-        // The two path trackers have no error channel — they simply emit no
-        // path — so their guard is a `debug_assert!`, which only fires in a
+        // [`walk_path`] does have an error channel, but a computed key that
+        // reaches it is a wiring bug rather than anything the user's filter
+        // did, so its guard stays a `debug_assert!` — which only fires in a
         // build that has them enabled.
 
         #[test]
         #[cfg(debug_assertions)]
         #[should_panic(expected = "unresolved computed index reached path tracking")]
         fn test_path_tracking_refuses_an_unresolved_key() {
-            let mut paths = Vec::new();
-            eval_with_path_tracking(&unresolved(), &OwnedValue::Null, &[], &mut paths, false);
-        }
-
-        #[test]
-        #[cfg(debug_assertions)]
-        #[should_panic(expected = "unresolved computed index reached path collection")]
-        fn test_path_collection_refuses_an_unresolved_key() {
-            let mut results = Vec::new();
-            collect_intermediate_with_paths(
+            let mut reached = Vec::new();
+            let _ = walk_path::<JqSemantics>(
                 &unresolved(),
                 &OwnedValue::Null,
                 &[],
-                &mut results,
+                &mut reached,
                 false,
             );
+        }
+
+        /// The same guard reached mid-pipe rather than as the last step —
+        /// the position that used to have a walker, and a wording, of its own.
+        #[test]
+        #[cfg(debug_assertions)]
+        #[should_panic(expected = "unresolved computed index reached path tracking")]
+        fn test_path_tracking_refuses_an_unresolved_key_mid_pipe() {
+            let mut reached = Vec::new();
+            let pipe = Expr::Pipe(vec![unresolved(), Expr::Field("a".to_string())]);
+            let _ = walk_path::<JqSemantics>(&pipe, &OwnedValue::Null, &[], &mut reached, false);
         }
     }
 }

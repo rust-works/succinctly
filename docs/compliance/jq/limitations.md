@@ -24,14 +24,14 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 170 probes in
+Measured against jq-1.7.1 over the 178 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result               | Meaning                                            |
 |----------------------------------------------|----------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **168/170 = 98.8%**  | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **176/178 = 98.9%**  | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**                | Every probe that errors in both errors identically |
 | **Behaviour / parser gaps**                  | **2**                | succinctly does not raise the error at all         |
 
@@ -394,6 +394,41 @@ What #366 did *not* build: computed bounds. `.[$a:$b]` is still a parse error, b
 parser folds slice bounds to integer literals; see
 [docs/reference/jq-language.md](../../reference/jq-language.md). And writing through a
 slice does not vivify `null` — see the table above for why that was deliberate.
+
+## Reading a path is indexing
+
+`path(f)` used to walk `f` through its own copy of jq's indexing rules, and that copy
+disagreed with the value path in four ways at once — all fixed by
+[#489](https://github.com/rust-works/succinctly/issues/489), which replaced both walkers
+with one that asks the value evaluator for every step's verdict:
+
+| Filter          | Input     | was       | jq, and now       |
+|-----------------|-----------|-----------|-------------------|
+| `[path(empty)]` | `{"a":1}` | `[[]]`    | `[]`              |
+| `[path(.a?)]`   | `"s"`     | `[["a"]]` | `[]`              |
+| `[path(.b.c)]`  | `{"a":1}` | `[[]]`    | `[["b","c"]]`     |
+| `[path(.a)]`    | `"s"`     | `[["a"]]` | the sentence below |
+
+The first row was the severe one: `[]` is a real answer — it is what `path(.)` returns —
+and the one path that always resolves, so rendering "no paths at all" as it aimed a
+caller's `getpath`/`setpath`/`delpaths` at the document root.
+
+Three rules, and none of them lives here any more:
+
+- **A step that reads `null` keeps its component.** A missing key, an out-of-range index
+  and any step through `null` all read as `null`, and `null` accepts a further step — so
+  the path exists even though nothing is stored along it. That is what `setpath`'s
+  auto-vivification consumes.
+- **A step that cannot index its value raises jq's sentence.** The eight `path_*` probes in
+  the corpus are the `index_*`/`iterate_*` rows above wrapped in `path(...)`, and they
+  report identically because the wording comes from the same place.
+- **`?` suppresses that error and nothing else.** A pruned step names no path (it never
+  happened), while a step that read `null` never errored and so is untouched by `?`.
+
+What remains is [#483](https://github.com/rust-works/succinctly/issues/483): `path(..)`,
+`path(recurse)` and `path(select(f))` have no arm in the walker, fall to its catch-all and
+name no path. They now produce *no output* rather than the root path — still the wrong
+answer, but no longer one that resolves.
 
 ## Errors reach the CLI with the right text but the wrong exit code
 

@@ -13,6 +13,9 @@ index_field_empty_key	.[""]	1	Cannot index number with string ""
 index_field_quoted_key	.["a\"b"]	1	Cannot index number with string "a"b"
 index_field_unicode_key	.["héllo"]	1	Cannot index number with string "héllo"
 index_field_long_key	.["aaaaaaaaaaaaaaaaaaaa"]	1	Cannot index number with string "aaaaaaaaaaaaaaaaaaaa"
+path_index_field_on_string	[path(.a)]	"s"	Cannot index string with string "a"
+path_index_field_on_array	[path(.a)]	[1,2]	Cannot index array with string "a"
+path_index_field_mid_chain	[path(.a.b)]	{"a":1}	Cannot index number with string "b"
 index_num_on_number	.[0]	1	Cannot index number with number
 index_num_on_string	.[0]	"str"	Cannot index string with number
 index_num_on_boolean	.[0]	true	Cannot index boolean with number
@@ -20,6 +23,9 @@ index_num_on_object	.[0]	{"a":1}	Cannot index object with number
 index_null_key_on_object	.[null]	{"a":1}	Cannot index object with null
 index_bool_key_on_object	.[true]	{"a":1}	Cannot index object with boolean
 index_object_key_on_object	.[{}]	{"a":1}	Cannot index object with object
+path_index_num_on_string	[path(.[0])]	"s"	Cannot index string with number
+path_index_num_on_object	[path(.[0])]	{"a":1}	Cannot index object with number
+path_slice_on_object	[path(.[1:2])]	{"a":1}	Cannot index object with object
 slice_on_number	.[1:2]	1	Cannot index number with object
 slice_on_boolean	.[1:2]	true	Cannot index boolean with object
 slice_on_object	.[1:2]	{"a":1}	Cannot index object with object
@@ -77,6 +83,8 @@ iterate_null	.[]	null	Cannot iterate over null (null)
 iterate_string_truncated	.[]	"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"	Cannot iterate over string ("aaaaaaaaaa...)
 iterate_string_at_limit	.[]	"abcdefghijkl"	Cannot iterate over string ("abcdefghijkl")
 iterate_string_over_limit	.[]	"abcdefghijklm"	Cannot iterate over string ("abcdefghij...)
+path_iterate_on_string	[path(.[])]	"s"	Cannot iterate over string ("s")
+path_iterate_on_null	[path(.[])]	null	Cannot iterate over null (null)
 iterate_assign_on_number	.[] = 1	5	Cannot iterate over number (5)
 map_on_number	map(.)	5	Cannot iterate over number (5)
 add_on_string	add	"s"	Cannot iterate over string ("s")
