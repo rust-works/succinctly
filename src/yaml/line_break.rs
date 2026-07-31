@@ -1,4 +1,4 @@
-//! The YAML line-break rule, in one place.
+//! The YAML line-break rule — re-exported from [`crate::text::line_break`].
 //!
 //! YAML 1.2 §5.4 spells a line break three ways: `\n`, a lone `\r`, and `\r\n`
 //! as the two-byte spelling of a *single* break. Every scalar consumer of YAML
@@ -7,17 +7,13 @@
 //! the same two answers: *is this byte a break*, and *how wide is the break
 //! here*.
 //!
-//! Line/column lookup was a fourth caller until #228 moved it to
-//! [`crate::text::LineIndex`], which carries its own copy of the rule because
-//! it indexes JSON and DSV text too, where the YAML spelling does not apply.
-//!
-//! Before #341 each of them carried its own copy: roughly twenty open-coded
-//! `if b == b'\r' { … if next == b'\n' { … } } else if b == b'\n' { … }` chains,
-//! grown while fixing CRLF handling (#324) and folded-scalar folding (#329).
-//! They all agreed, but that is exactly the shape #106 warns about — duplicated
-//! predicates diverge silently, and the next edge case would have landed in one
-//! copy and not the others. This module is the single definition; callers that
-//! need a different *shape* adapt around it rather than restating the rule.
+//! #341 collapsed roughly twenty open-coded copies of that rule onto this
+//! module. #228 then added a consumer outside `yaml` —
+//! [`crate::text::LineIndex`], which indexes JSON and DSV text as well — and
+//! the rule is byte-identical for all three formats, so the definition moved up
+//! to [`crate::text::line_break`] rather than being copied a second time. This
+//! module stays as the YAML-facing name and the place the YAML rationale is
+//! recorded; there is still exactly one definition.
 //!
 //! One deliberate exception survives: [`super::parser::Parser::skip_line_break`]
 //! keeps a hand-rolled dispatch for a measured reason documented there. It is
@@ -27,156 +23,4 @@
 //! `carriage_returns` mask cannot be phrased as a byte predicate — and stay
 //! covered by the per-kernel differential tests.
 
-/// Is `b` a YAML line break? Per YAML 1.2 §5.4 that is `\n` or `\r`; `\r\n` is
-/// the two-byte spelling of a single break.
-///
-/// Scans that look only for `\n` run straight past a lone `\r`, which is how a
-/// classic-Mac document turned every block scalar into the empty string (#324).
-#[inline]
-pub(super) fn is_line_break(b: u8) -> bool {
-    matches!(b, b'\n' | b'\r')
-}
-
-/// Width in bytes of the line break at `pos`: 2 for `\r\n`, 1 for a lone `\r`
-/// or `\n`, 0 if `pos` is not at a break.
-///
-/// Zero doubles as "not at a break", so `pos += line_break_len(text, pos)` is a
-/// safe unconditional advance only when the caller has already established that
-/// it is at one; otherwise test the width before stepping.
-#[inline]
-pub(super) fn line_break_len(text: &[u8], pos: usize) -> usize {
-    match text.get(pos) {
-        Some(b'\r') if text.get(pos + 1) == Some(&b'\n') => 2,
-        Some(b'\r' | b'\n') => 1,
-        _ => 0,
-    }
-}
-
-/// Width in bytes of the line break ending immediately *before* `pos`: 2 for
-/// `\r\n`, 1 for a lone `\r` or `\n`, 0 if `pos` is not preceded by one.
-///
-/// The mirror of [`line_break_len`], for backwards scans. Stepping back a fixed
-/// one byte lands in the middle of a CRLF, which leaves the `\r` attached to the
-/// previous line's text (#324).
-///
-/// Note this answers "is there break *text* behind me", not "does a break *end*
-/// here": standing on the `\n` of a CRLF it reports 1, for the `\r` behind it.
-/// Callers asking the latter want `line_break_len(text, pos - 1) == 1`, which is
-/// true only when the break starting one byte back also finishes there.
-#[inline]
-pub(super) fn line_break_len_before(text: &[u8], pos: usize) -> usize {
-    match pos.checked_sub(1).and_then(|i| text.get(i)) {
-        Some(b'\n') if pos >= 2 && text[pos - 2] == b'\r' => 2,
-        Some(b'\n' | b'\r') => 1,
-        _ => 0,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn is_line_break_accepts_both_break_bytes() {
-        assert!(is_line_break(b'\n'));
-        assert!(is_line_break(b'\r'));
-        for b in [b' ', b'\t', b'a', 0x0b, 0x0c] {
-            assert!(!is_line_break(b), "{b:#04x} is not a YAML line break");
-        }
-    }
-
-    #[test]
-    fn line_break_len_measures_each_break_form() {
-        assert_eq!(
-            line_break_len(b"a\r\nb", 1),
-            2,
-            "CRLF is one two-byte break"
-        );
-        assert_eq!(line_break_len(b"a\rb", 1), 1, "lone CR");
-        assert_eq!(line_break_len(b"a\nb", 1), 1, "LF");
-        // A CR at end of input has no LF to pair with.
-        assert_eq!(line_break_len(b"a\r", 1), 1);
-        // Not at a break, and past the end, both measure zero.
-        assert_eq!(line_break_len(b"ab", 0), 0);
-        assert_eq!(line_break_len(b"a\n", 9), 0);
-        assert_eq!(line_break_len(b"", 0), 0);
-    }
-
-    /// Standing on the LF of a CRLF, the break does not *end* there — it ends
-    /// one byte later. Callers distinguishing the two (`find_block_content_range`,
-    /// `Parser::current_line`) rely on the width being 2, not on a separate
-    /// lookahead.
-    #[test]
-    fn line_break_len_distinguishes_a_break_that_ends_here() {
-        // b"a\r\nb\rc\nd"
-        //   0 1 2 3 4 5 6 7
-        let text = b"a\r\nb\rc\nd";
-        assert_eq!(line_break_len(text, 1), 2, "CR of a CRLF: ends at 3, not 2");
-        assert_eq!(line_break_len(text, 4), 1, "lone CR ends at 5");
-        assert_eq!(line_break_len(text, 6), 1, "LF ends at 7");
-    }
-
-    #[test]
-    fn line_break_len_before_measures_backwards() {
-        // b"a\r\nb\rc\nd"
-        //   0 1 2 3 4 5 6 7
-        let text = b"a\r\nb\rc\nd";
-        assert_eq!(line_break_len_before(text, 3), 2, "CRLF ends before `b`");
-        assert_eq!(line_break_len_before(text, 2), 1, "just the CR of a CRLF");
-        assert_eq!(line_break_len_before(text, 5), 1, "lone CR ends before `c`");
-        assert_eq!(line_break_len_before(text, 7), 1, "LF ends before `d`");
-        assert_eq!(line_break_len_before(text, 1), 0, "`a` is not a break");
-        assert_eq!(
-            line_break_len_before(text, 0),
-            0,
-            "nothing before the start"
-        );
-        assert_eq!(line_break_len_before(b"", 0), 0);
-        // A bare LF at index 0 is a one-byte break with no CR in front of it.
-        assert_eq!(line_break_len_before(b"\nx", 1), 1);
-    }
-
-    /// The three helpers are one rule seen from three angles, and must not
-    /// drift apart: a byte is a break iff a break has non-zero width there, and
-    /// a break of width `n` *starting* at `i` is the break of width `n` ending
-    /// at `i + n`.
-    ///
-    /// The round trip is asserted only where `pos` really starts a break. On
-    /// the LF of a CRLF the forward width is 1 (that LF) while the backward
-    /// width is 2 (the whole CRLF) — the two helpers answer different
-    /// questions there, by design, and `find_block_content_range` depends on
-    /// exactly that difference.
-    #[test]
-    fn the_three_helpers_agree_over_every_break_form() {
-        for text in [
-            b"a\r\nb\rc\nd".as_slice(),
-            b"\r\n",
-            b"\n\r",
-            b"\r\r\n",
-            b"\n\n",
-            b"x",
-            b"",
-        ] {
-            for pos in 0..=text.len() {
-                let here = line_break_len(text, pos);
-
-                assert_eq!(
-                    here > 0,
-                    text.get(pos).copied().is_some_and(is_line_break),
-                    "{text:?} @ {pos}: width disagrees with the byte predicate"
-                );
-
-                let inside_a_crlf = pos > 0 && line_break_len(text, pos - 1) == 2;
-                if here > 0 && !inside_a_crlf {
-                    let ends_at = pos + here;
-                    assert_eq!(
-                        line_break_len_before(text, ends_at),
-                        here,
-                        "{text:?} @ {pos}: a break of width {here} starting here \
-                         must be the break of width {here} ending at {ends_at}"
-                    );
-                }
-            }
-        }
-    }
-}
+pub(super) use crate::text::line_break::{is_line_break, line_break_len, line_break_len_before};

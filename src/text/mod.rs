@@ -38,6 +38,7 @@
 //! assert_eq!(err.offset, 0);
 //! ```
 
+pub(crate) mod line_break;
 pub mod lines;
 pub mod utf8;
 

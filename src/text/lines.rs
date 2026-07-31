@@ -18,8 +18,10 @@
 //!
 //! # Line terminators
 //!
-//! Unix (LF), Windows (CRLF) and classic Mac (CR) are all recognised. A
-//! terminator at the very end of the text does *not* start a new line, so
+//! Unix (LF), Windows (CRLF) and classic Mac (CR) are all recognised, via the
+//! shared rule in [`crate::text::line_break`] that the YAML scanners also use —
+//! one definition, not a per-module copy (#341).
+//! A terminator at the very end of the text does *not* start a new line, so
 //! `"a\n"` has one line, not two.
 //!
 //! # Example
@@ -38,10 +40,21 @@
 use alloc::vec::Vec;
 
 use crate::bits::EliasFano;
+use crate::text::line_break::{is_line_break, line_break_len};
 
 /// Index over the byte offsets at which each line starts.
 ///
 /// Line and column numbers are 1-indexed; byte offsets are 0-indexed.
+///
+/// # Out-of-range positions
+///
+/// The two directions disagree on purpose, each preserving the behaviour of
+/// the `BitVec` implementation it replaced.
+/// [`to_line_column`](Self::to_line_column) extrapolates past the end of the
+/// text — offset 99 of a 5-byte text reports as a column on the last line —
+/// while [`to_offset`](Self::to_offset) rejects anything that would land past
+/// the end. So the round trip is total for in-bounds offsets only; feed it an
+/// out-of-range offset and `to_offset` returns `None` on the way back.
 ///
 /// See the [module docs](self) for the space rationale and terminator handling.
 #[derive(Clone, Debug)]
@@ -67,41 +80,32 @@ impl LineIndex {
             text.len()
         );
 
-        // Pass 1: size the scratch vector exactly. Counting LF and CR
-        // separately over-counts CRLF by one per line, which only
-        // over-reserves; an inexact capacity would let Vec doubling make the
+        // Pass 1: reserve the scratch vector up front. This counts break
+        // *bytes*, so CRLF contributes two where it needs one — an over-reserve
+        // on Windows text, exact on LF/CR-only text. Either way the vector
+        // never reallocates, which is the point: doubling would make the
         // transient allocation 1.5-2x the vector it is building.
-        let terminators = text.iter().filter(|&&b| b == b'\n' || b == b'\r').count();
+        let terminators = text.iter().copied().filter(|&b| is_line_break(b)).count();
         let mut starts = Vec::with_capacity(terminators + 1);
 
         // Line 1 starts at offset 0 even when the text is empty. Storing it
         // removes the `line == 1` special case from every query.
         starts.push(0u32);
 
-        // Pass 2: one line start per terminator that has text after it.
+        // Pass 2: one line start per break that has text after it. `\r\n` is a
+        // single break two bytes wide, so the rule lives in `text::line_break`
+        // rather than being spelled out again here (#341).
         let mut i = 0;
         while i < text.len() {
-            match text[i] {
-                b'\n' => {
-                    let next = i + 1;
-                    if next < text.len() {
-                        starts.push(next as u32);
-                    }
-                    i = next;
-                }
-                b'\r' => {
-                    // CRLF is one terminator, not two.
-                    let next = if i + 1 < text.len() && text[i + 1] == b'\n' {
-                        i + 2
-                    } else {
-                        i + 1
-                    };
-                    if next < text.len() {
-                        starts.push(next as u32);
-                    }
-                    i = next;
-                }
-                _ => i += 1,
+            let width = line_break_len(text, i);
+            if width == 0 {
+                i += 1;
+                continue;
+            }
+
+            i += width;
+            if i < text.len() {
+                starts.push(i as u32);
             }
         }
 
