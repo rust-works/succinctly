@@ -19,8 +19,8 @@
 //! # Line terminators
 //!
 //! Unix (LF), Windows (CRLF) and classic Mac (CR) are all recognised, via the
-//! shared rule in [`crate::text::line_break`] that the YAML scanners also use —
-//! one definition, not a per-module copy (#341).
+//! shared rule in `crate::text::line_break` (private) that the YAML scanners
+//! also use — one definition, not a per-module copy (#341).
 //! A terminator at the very end of the text does *not* start a new line, so
 //! `"a\n"` has one line, not two.
 //!
