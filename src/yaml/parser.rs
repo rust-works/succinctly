@@ -1328,6 +1328,23 @@ impl<'a> Parser<'a> {
             let sequence_indicator_is_block_structure =
                 is_sequence_indicator && next_indent <= start_indent;
 
+            // A `---`/`...` document marker at true document root must end the
+            // scalar rather than fold into it as content (#225): an implicit
+            // first document with no explicit leading `---` (a bare scalar
+            // like `Document`) would otherwise swallow the marker that starts
+            // or ends the next document. Scoped to `is_doc_root` only - inside
+            // a container, `indent_allows_continuation` already requires
+            // `next_indent > start_indent`, which a column-0 marker can't
+            // satisfy, so this never fires there.
+            let is_document_marker = is_doc_root
+                && next_indent == 0
+                && lookahead + 2 < self.input.len()
+                && matches!(&self.input[lookahead..lookahead + 3], b"---" | b"...")
+                && matches!(
+                    self.input.get(lookahead + 3),
+                    Some(b' ' | b'\t' | b'\n' | b'\r') | None
+                );
+
             // At document root, same-indent continues the scalar (YAML spec 7.4).
             // Inside containers, must be more indented than start.
             let indent_allows_continuation = is_doc_root || next_indent > start_indent;
@@ -1335,6 +1352,7 @@ impl<'a> Parser<'a> {
             if indent_allows_continuation
                 && next_char != b'#'
                 && !sequence_indicator_is_block_structure
+                && !is_document_marker
                 && !(next_char == b':'
                     && (lookahead + 1 >= self.input.len()
                         || matches!(self.input[lookahead + 1], b' ' | b'\t' | b'\n' | b'\r')))
@@ -4938,6 +4956,17 @@ mod tests {
             b"%FOO  bar baz # Should be ignored\n              # with a warning.\n---\n\"foo\"\n",
         );
         assert_eq!(docs, vec!["\"foo\""]);
+    }
+
+    #[test]
+    fn test_document_root_scalar_does_not_swallow_next_marker() {
+        // A bare scalar with no explicit leading `---` (an implicit first
+        // document) used to fold a following `---`/`...` into itself as
+        // content, the same underlying gap directives exposed (#225):
+        //     $ printf 'Document\n---\nname: Bob\n' | succinctly yq '.'
+        //     "Document --- name"      # expected: "Document", then {"name": "Bob"}
+        let docs = documents(b"Document\n---\nname: Bob\n");
+        assert_eq!(docs, vec!["\"Document\"", "{\"name\":\"Bob\"}"]);
     }
 
     #[test]

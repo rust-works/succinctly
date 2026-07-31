@@ -46,7 +46,6 @@
 735Y      tags              tags (!) not supported — #224
 74H7      tags              tags (!) not supported — #224
 7FWL      tags              tags (!) not supported — #224
-7Z25      structure         document/block structure differs from spec
 8MK2      tags              tags (!) not supported — #224
 8XDJ      lax:comments      comment placement not validated — #223
 9C9N      lax:indentation   indentation not validated — #223
@@ -91,7 +90,6 @@ MUS6/06   directives        %YAML/%TAG directive not recognized — #225
 P76L      directives        %YAML/%TAG directive not recognized — #225
 PUW8      structure         document/block structure differs from spec
 QLJ7      lax:documents     directive/document rules not validated — #223
-RTP8      directives        %YAML/%TAG directive not recognized — #225
 S4JQ      tags              tags (!) not supported — #224
 S98Z      lax:block-scalar  block scalar header not validated — #223
 T833      lax:flow          flow syntax not validated — #223
