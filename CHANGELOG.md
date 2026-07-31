@@ -104,6 +104,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`%YAML`/`%TAG` directive lines were not recognized, and swallowed the
+  following `---`** (#225): a directive fell through to the plain-scalar
+  scanner, which absorbed both the directive text and the document marker
+  after it as one scalar (`printf '%YAML 1.2\n--- text\n' | succinctly yq
+  '.'` gave `"%YAML 1.2 --- text"` instead of `"text"`). `skip_directives`
+  now consumes any `%`-line at column 0 outside a document body, called from
+  `parse_documents` both before the first document and after a `...` end
+  marker (a directive can recur there). It does not inspect the directive
+  name — `%YAML`, `%TAG`, and a reserved directive like `%FOO` are all just
+  dropped, so a misspelled name (`%YAM`, `%YAMLL`) is skipped the same way.
+  Fixing this exposed two more pre-existing bugs, unrelated to directives,
+  that a directive line had been masking: a document-root plain scalar with
+  no explicit leading `---` swallowed a following `---`/`...` the same way
+  even with no directive involved (`Document\n---\nname: Bob\n` gave one
+  scalar instead of two documents) — the continuation loop
+  (`parse_unquoted_value_with_indent_impl`) now stops at a column-0
+  `---`/`...` marker; and an empty document (nothing between `---` and the
+  next boundary or EOF) produced no node at all instead of `null` —
+  `end_document` now synthesizes a null node when nothing was written for
+  the document, mirroring `close_pending_explicit_key`'s existing null
+  synthesis for a key with no value. Clears 13 of the issue's 16 YAML Test
+  Suite cases, plus four more (`6XDY`, `7Z25`, `PUW8`, `UT92`) that the
+  document-marker/null-document bugs were independently blocking under the
+  `structure` category. **Not covered**: `CC74`/`P76L` apply a
+  `%TAG`-defined shorthand to a node, which is tag support's job (#224);
+  `W4TN` hits a pre-existing zero-indented block scalar gap shared with
+  `DK3J`/`FP8R`. Neither the `%YAML` version nor `%TAG` handles are
+  surfaced anywhere — there is no per-document metadata slot for them, and
+  nothing in the corpus or issue's acceptance criteria requires reading
+  them back.
+
 - **A plain scalar's `- `-led continuation line was misread as a nested
   sequence at indent 2 and deeper** (#484): `- x\n  - y\n` produced
   `["x",["y"]]`, inventing a nested sequence, where `yq` folds the
