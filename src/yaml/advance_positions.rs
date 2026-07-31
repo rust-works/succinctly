@@ -515,7 +515,7 @@ impl AdvancePositions {
             last_ib_result: result.map_or(0, |r| r as usize),
         });
 
-        result.map(|pos| pos as u32)
+        result
     }
 
     /// Create a cursor starting at open index 0.
