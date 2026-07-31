@@ -618,14 +618,21 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // now carries `1` forward as `Partial`'s prefix instead of
             // collapsing straight to a bare `Error`.
             QueryResult::Error(e) => {
-                return partial(merge_owned(all_results, all_owned), Control::Error(e));
+                return partial(
+                    merge_owned(borrowed, owned.unwrap_or_default()),
+                    Control::Error(e),
+                );
             }
             QueryResult::Break(label) => {
-                return partial(merge_owned(all_results, all_owned), Control::Break(label));
+                return partial(
+                    merge_owned(borrowed, owned.unwrap_or_default()),
+                    Control::Break(label),
+                );
             }
             QueryResult::Partial(vs, control) => {
-                all_owned.extend(vs);
-                return partial(merge_owned(all_results, all_owned), control);
+                let mut merged = merge_owned(borrowed, owned.unwrap_or_default());
+                merged.extend(vs);
+                return partial(merged, control);
             }
         }
     }

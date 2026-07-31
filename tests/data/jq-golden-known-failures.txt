@@ -57,8 +57,10 @@
 # no expected.status/expected.err is needed (those encode jq's own failure,
 # and jq doesn't fail here); the mismatch is the bare exit-code branch in
 # tests/jq_golden_tests.rs, taking the file to 14.
+#
+# comma_literal_before_document (#353) has since been fixed and dropped,
+# leaving 13.
 
-comma_literal_before_document  comma              . evaluates before the literal 1 inside [1, .], reversing output order — #353
 object_construct_cartesian     object_construct   only the first output of each key/value generator is used instead of the cartesian product — #354
 if_multi_output_condition      if_condition       only the first output of a multi-output if-condition is used — #378
 assign_multi_output_rhs        assignment         .a = (1,2) only applies the first RHS output instead of forking once per output — #392
