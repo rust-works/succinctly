@@ -123,6 +123,11 @@ iterate_assign_on_number	.[] = 1	5
 # the path against it — so an `[]` tail still raises where a `.c`/`[0]`/`[1:2]`
 # tail is a silent no-op (#527).
 iterate_del_through_missing_field	del(.a.b[])	{"a":{"x":1}}
+
+# Comma-group `del` routes through the multi-path walker (#424/#475); a
+# non-container `.[]` sibling used to raise succinctly's own "expected array
+# or object" wording instead of this sentence (#538).
+del_comma_group_iterate_on_number	del(.[], .a)	5
 map_on_number	map(.)	5
 add_on_string	add	"s"
 any_on_number	any	1

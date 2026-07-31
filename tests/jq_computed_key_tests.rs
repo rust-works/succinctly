@@ -778,12 +778,11 @@ fn test_computed_key_sees_the_container_it_indexes() {
 
 #[test]
 fn test_unsupported_path_prefixes_report_rather_than_misfire() {
-    // Iterating a scalar. jq says `Cannot iterate over number (1)`; the wording
-    // differs, the rejection does not.
+    // Iterating a scalar, reported in jq's own words (#538).
     check(
         "1",
         r#"(.[] | .[("x","y")]) = 9"#,
-        Outcome::error("expected array or object, got number"),
+        Outcome::error("Cannot iterate over number (1)"),
     );
     // `range(3)` is a multi-output component with no path-tracking arm (#412
     // covers `..`, `recurse` and the typeof filters — see
