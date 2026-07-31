@@ -118,12 +118,19 @@ fn collect_json_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// The real-workload JSON corpus: the synced tree if present, else the
 /// committed seed. The seed is always in a checkout, so this never returns
 /// empty in a well-formed tree — and asserts rather than skipping if it does.
+///
+/// The seed holds **one** of the corpus's five JSON files, so a seed-only run
+/// measures a fraction of the intended workload. That is legitimate (it keeps
+/// the bench runnable offline) but it must never be mistaken for the full
+/// corpus, so which root was used is reported on stderr rather than inferred
+/// from the benchmark names.
 fn real_corpus_files() -> Vec<(String, Vec<u8>)> {
     let synced = Path::new(CORPUS_DIR).join("json");
-    let root = if synced.is_dir() {
-        synced
-    } else {
+    let seeded = !synced.is_dir();
+    let root = if seeded {
         Path::new(CORPUS_SEED_DIR).join("json")
+    } else {
+        synced
     };
 
     let mut paths = Vec::new();
@@ -138,7 +145,7 @@ fn real_corpus_files() -> Vec<(String, Vec<u8>)> {
         root.display(),
     );
 
-    paths
+    let files: Vec<(String, Vec<u8>)> = paths
         .into_iter()
         .map(|p| {
             let name = p
@@ -150,7 +157,22 @@ fn real_corpus_files() -> Vec<(String, Vec<u8>)> {
                 fs::read(&p).unwrap_or_else(|e| panic!("failed to read {}: {e}", p.display()));
             (name, bytes)
         })
-        .collect()
+        .collect();
+
+    let total: usize = files.iter().map(|(_, b)| b.len()).sum();
+    eprintln!(
+        "json_validate_bench: real-workload corpus = {} file(s), {total} bytes, from {}{}",
+        files.len(),
+        root.display(),
+        if seeded {
+            " -- COMMITTED SEED ONLY, not the full corpus; \
+             run ./scripts/sync-bench-corpus.sh before quoting these numbers"
+        } else {
+            ""
+        },
+    );
+
+    files
 }
 
 /// Benchmark validation across all patterns for a given size
