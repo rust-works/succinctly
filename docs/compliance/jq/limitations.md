@@ -24,16 +24,16 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 168 probes in
+Measured against jq-1.7.1 over the 170 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result               | Meaning                                            |
 |----------------------------------------------|----------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **168/168 = 100.0%** | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **168/170 = 98.8%**  | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**                | Every probe that errors in both errors identically |
-| **Behaviour / parser gaps**                  | **0**                | succinctly does not raise the error at all         |
+| **Behaviour / parser gaps**                  | **2**                | succinctly does not raise the error at all         |
 
 These three numbers are asserted, not maintained by hand: `jq_error_message_tests.rs`
 parses them back out of this page and fails if they drift from the corpus (they went stale
@@ -246,11 +246,24 @@ shortest rendering differs from their source spelling.
 
 ## Behaviour and parser gaps
 
-There are none left: every probe in the corpus now raises jq's sentence in both
-evaluators, and
-[`tests/data/jq-error-known-divergences.txt`](../../../tests/data/jq-error-known-divergences.txt)
-is empty. That file staying empty is itself asserted — the check is two-sided, so a probe
-that starts diverging without a line there fails the build.
+Two remain open, recorded in
+[`tests/data/jq-error-known-divergences.txt`](../../../tests/data/jq-error-known-divergences.txt).
+That file's check is two-sided — a probe that starts diverging without a line there fails
+the build, and so does a line for a probe that starts matching — so this section cannot
+silently drift from the corpus.
+
+- **`optional_write_negative_oob`** (`.[-5]? = 9` on `[1,2]`): jq still raises `Out of
+  bounds negative array index` even through `?`, because `?` only suppresses errors
+  raised while *collecting* the path, not the write-time bounds check `setpath`
+  performs. succinctly currently treats `?` as suppressing the write too, so `.[-5]? = 9`
+  silently leaves the array unchanged instead of raising.
+  [#498](https://github.com/rust-works/succinctly/issues/498).
+- **`repeat_error_swallowed`** (`repeat(if . > 3 then error("boom") else .+1 end)` on
+  `5`): jq propagates the generator's error the first time it is raised — here, on the
+  very first iteration, since `5 > 3` immediately. `eval_repeat` in
+  [`src/jq/eval.rs`](../../../src/jq/eval.rs) discards the error (`Err(_) => break`)
+  instead of propagating it, so both evaluators produce no output at all rather than
+  erroring. [#495](https://github.com/rust-works/succinctly/issues/495).
 
 What used to be listed here, and what closed it:
 
