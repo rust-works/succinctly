@@ -244,8 +244,10 @@ chunk**. Call that the *interesting density*: structural characters outside
 strings, plus one visit per string (the body and closing quote are skipped),
 plus one per atom start, plus any garbage byte.
 
-Measured over the pinned real-workload corpus (5 JSON files, 971 KB), against
-current M4 Pro throughput:
+Measured over the real-workload corpus as it stood at the time of the decision
+(5 JSON files, 971 KB), against current M4 Pro throughput. The corpus has since
+grown to 7 files / 1014 KB — see [below](#the-corpus-has-since-grown) for what
+that changed:
 
 | corpus file            | visits / 64 B | bytes / visit | current throughput |
 | ---------------------- | ------------- | ------------- | ------------------ |
@@ -284,20 +286,36 @@ a chunk scanner to help.
 
 ### Two supporting findings
 
-* **String skipping is dead on real input.** String bodies are 4.6% of corpus
-  bytes; the longest string in the corpus is **51 bytes**, against the ~300 B
-  regime where #130 measured its win. Only 0.03% of strings reach even 32 bytes.
-* **The escape machinery never pays.** Escape density is **0.00 per KiB in all
-  five files** — not one backslash. The odd-backslash-run mask (`find_escaped`)
-  is the most intricate and highest-risk primitive in the design, has no
-  equivalent anywhere in this crate, and is nonetheless *structurally required*:
-  a single `\"` desynchronises the in-string mask for the rest of the document.
-  On real input it is pure cost that can never be recovered.
+* **String skipping is dead on real input.** String bodies are 5.7% of corpus
+  bytes and the longest string is **111 bytes**, against the ~300 B regime where
+  #130 measured its win — **not one string in the corpus reaches it**. Only 2.2%
+  reach even 32 bytes.
+* **The escape machinery never pays.** The entire 1014 KB corpus contains **six
+  backslashes**, all in one file. The odd-backslash-run mask (`find_escaped`) is
+  the most intricate and highest-risk primitive in the design, has no equivalent
+  anywhere in this crate, and is nonetheless *structurally required*: a single
+  `\"` desynchronises the in-string mask for the rest of the document. On real
+  input it is pure cost that can never be recovered.
 
 Note also that whitespace fraction is a misleading proxy. `3d-ribbon.json` is
 85% whitespace, but in runs of p50=19 / max=23 bytes — **0.00% of whitespace
 runs in the entire corpus reach 32 bytes**, so no single SIMD lane is ever
 filled by whitespace alone.
+
+### The corpus has since grown
+
+The decision above was taken against a 5-file / 971 KB JSON corpus. `f9792019`
+then added two string-heavy files (`npm/express-package.json`,
+`openapi/swagger-v2-schema.json`), taking it to 7 files / 1014 KB. Both are
+token-dense object documents, so they land *above* break-even and reinforce the
+rejection rather than challenging it. The two supporting findings above are
+quoted at post-growth values; against the original 5 files they read 4.6% of
+bytes / 51 B longest string / 0.03% ≥ 32 B, and zero backslashes.
+
+The one number that moved in the scanner's favour is the longest string, 51 B →
+111 B. It does not approach the threshold that matters: **no string in the
+corpus reaches the ~300 B regime where #130 measured its 1.16–1.32× win**, and
+the p50 is still 9 bytes.
 
 ### Consequence
 
@@ -309,7 +327,7 @@ analysis constrains.
 
 ### Reproducing
 
-Both columns need the **full** corpus: only one of the five JSON files is
+Both columns need the **full** corpus: only three of the seven JSON files are
 vendored in the committed seed, and `json_validate_bench` announces on stderr
 when it is running seed-only. The synthetic ladder is a prerequisite too — the
 bench asserts the whole pattern/size matrix is present before registering any
@@ -329,7 +347,7 @@ cargo bench --bench json_validate_bench -- validate_real_corpus
 
 ## Per-token scalar optimisations
 
-ADR-0012's finding — the slow patterns are slow because they are *token-dense* —
+ADR-0013's finding — the slow patterns are slow because they are *token-dense* —
 points the optimisation effort at per-token cost rather than at skipping bytes
 between tokens. Two changes were written and measured against that.
 

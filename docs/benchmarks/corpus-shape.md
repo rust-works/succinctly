@@ -15,6 +15,8 @@ Distributions are derived from the crate's own semi-index (`JsonIndex` / `YamlIn
 | json   | charts         | bullet-data.json            | 548    |
 | json   | geojson        | us-election.geojson         | 99715  |
 | json   | graph          | miserables.json             | 11536  |
+| json   | npm            | express-package.json        | 2731   |
+| json   | openapi        | swagger-v2-schema.json      | 40247  |
 | json   | pretty         | 3d-ribbon.json              | 823218 |
 | json   | tabular        | carshare-data.json          | 35815  |
 | yaml   | actions        | codeql-analysis.yml         | 925    |
@@ -63,16 +65,16 @@ files: 8, total bytes: 36085, anchors: 41, aliases: 86, bare-dash items: 5
 
 ## JSON
 
-files: 5, total bytes: 970832
+files: 7, total bytes: 1013810
 
 | metric          | unit         | n     | min  | p50  | p90  | p99  | max    |
 | --------------- | ------------ | ----- | ---- | ---- | ---- | ---- | ------ |
-| string length   | bytes/string | 3736  | 0    | 9    | 18   | 20   | 51     |
-| object keys     | keys/object  | 779   | 1    | 3    | 4    | 6    | 13     |
-| array elements  | elems/array  | 11201 | 1    | 2    | 2    | 2    | 401    |
-| collection size | bytes/coll   | 11980 | 4    | 72   | 88   | 1655 | 823218 |
-| nesting depth   | levels/node  | 38729 | 1    | 6    | 8    | 9    | 9      |
-| escape density  | per KiB/file | 5     | 0.00 | 0.00 | 0.00 | 0.00 | 0.00   |
+| string length   | bytes/string | 5405  | 0    | 9    | 18   | 56   | 111    |
+| object keys     | keys/object  | 1233  | 0    | 3    | 4    | 13   | 61     |
+| array elements  | elems/array  | 11263 | 1    | 2    | 2    | 4    | 401    |
+| collection size | bytes/coll   | 12496 | 2    | 72   | 88   | 1728 | 823218 |
+| nesting depth   | levels/node  | 40969 | 1    | 6    | 8    | 9    | 9      |
+| escape density  | per KiB/file | 7     | 0.00 | 0.00 | 0.15 | 0.15 | 0.15   |
 
 ## DSV
 
