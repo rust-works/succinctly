@@ -7100,18 +7100,22 @@ fn owned_type_name(value: &OwnedValue) -> &'static str {
 // `{"a":"x","x":1,"y":1}` — the second key is `"y"`, read from the original
 // `.x`, not the `1` the first assignment just wrote.
 
-/// Does this expression contain a computed-key index anywhere in its *path*
-/// structure?
+/// Does this expression need the multi-path pre-pass — a computed-key index
+/// anywhere in its *path* structure, or a `Comma` naming more than one path
+/// outright?
 ///
-/// Only the shapes that can appear as a path expression are traversed; a
-/// computed key nested inside, say, an `if` is not a path component and cannot
-/// reach the walkers. Used as a cheap guard so programs without a computed key
-/// skip the pre-pass entirely.
-fn contains_dynamic_index(expr: &Expr) -> bool {
+/// A `Comma` needs the pre-pass even when every branch is static (`.a, .b`):
+/// none of the single-path walkers (`get_path_mut`, `set_path`, `update_path`,
+/// `delete_at_path`) have a `Comma` arm, so one handed through verbatim is
+/// rejected as an invalid path component. Only the shapes that can appear as a
+/// path expression are traversed; a computed key nested inside, say, an `if`
+/// is not a path component and cannot reach the walkers. Used as a cheap guard
+/// so programs with neither shape skip the pre-pass entirely.
+fn needs_path_prepass(expr: &Expr) -> bool {
     match expr {
-        Expr::IndexExpr { .. } => true,
-        Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().any(contains_dynamic_index),
-        Expr::Optional(inner) | Expr::Paren(inner) => contains_dynamic_index(inner),
+        Expr::IndexExpr { .. } | Expr::Comma(_) => true,
+        Expr::Pipe(exprs) => exprs.iter().any(needs_path_prepass),
+        Expr::Optional(inner) | Expr::Paren(inner) => needs_path_prepass(inner),
         _ => false,
     }
 }
@@ -7579,11 +7583,12 @@ fn resolve_seq<S: EvalSemantics>(
         push_path_components(&mut flat, e);
     }
 
-    // Everything after the last computed key keeps its components verbatim —
-    // resolving them would expand `.[]` into one path per element for no gain.
-    // The *value* still has to be threaded through them, because an enclosing
-    // `IndexExpr` indexes it: in `.a[.k].b[.j]`, `.j` applies to `.a[.k].b`.
-    let Some(last_dynamic) = flat.iter().rposition(contains_dynamic_index) else {
+    // Everything after the last computed key or Comma keeps its components
+    // verbatim — resolving them would expand `.[]` into one path per element
+    // for no gain. The *value* still has to be threaded through them, because
+    // an enclosing `IndexExpr` indexes it: in `.a[.k].b[.j]`, `.j` applies to
+    // `.a[.k].b`.
+    let Some(last_dynamic) = flat.iter().rposition(needs_path_prepass) else {
         let end = value_after_components::<S>(&flat, value)?;
         return Ok(vec![(flat, end)]);
     };
@@ -7611,15 +7616,17 @@ fn resolve_seq<S: EvalSemantics>(
 }
 
 /// Rewrite every computed key in a path expression into the static component it
-/// denotes for `input`, yielding one fully-static path expression per key.
+/// denotes for `input`, and fan a top-level `Comma` out into one path per
+/// branch, yielding one fully-static path expression per resolved path.
 ///
 /// jq applies *all* of them: `{"a":0,"b":0} | .[("a","b")] = 1` is
-/// `{"a":1,"b":1}`, and `path()` emits one output per resolved path.
+/// `{"a":1,"b":1}`, and `path()` emits one output per resolved path. Likewise
+/// for a purely static `Comma` — `{"a":1,"b":2} | del(.a, .b)` is `{}`.
 fn resolve_dynamic_indexes<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Result<Vec<Expr>, EvalError> {
-    if !contains_dynamic_index(expr) {
+    if !needs_path_prepass(expr) {
         return Ok(vec![expr.clone()]);
     }
 
@@ -10951,11 +10958,13 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::Owned(result);
     }
 
-    // More than one resolved path only happens when a computed key produced
-    // several values (`.[(0,2)]`, `.[.a,.b]`, …) — exactly the shape #424
-    // got wrong by deleting them one at a time. `flatten_delete_path` reduces
-    // each resolved `Expr` to the same atomic-steps shape so
-    // `delete_expr_paths_at` can delete every resolved path together.
+    // More than one resolved path happens when a computed key produced
+    // several values (`.[(0,2)]`, `.[.a,.b]`, …), or when a top-level `Comma`
+    // names more than one static path outright (`.a, .b`, #475) — either way
+    // the same shape #424 got wrong by deleting them one at a time.
+    // `flatten_delete_path` reduces each resolved `Expr` to the same
+    // atomic-steps shape so `delete_expr_paths_at` can delete every resolved
+    // path together.
     let flattened: Vec<Vec<DeleteStep>> = paths
         .iter()
         .map(|path| {
