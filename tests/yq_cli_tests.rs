@@ -1380,6 +1380,21 @@ fn test_yaml_anchor_on_flow_sequence_key_binds_to_key() -> Result<()> {
 }
 
 #[test]
+fn test_yaml_plain_scalar_dash_continuation_at_indent_two_folds() -> Result<()> {
+    // #484, corpus-latent the same way #409 was: the YAML Test Suite's only
+    // relevant case, AB8U, uses a `- `-led continuation line at indent 1 - the
+    // one indent the parser happened to get right - so it gave no signal that
+    // indent 2 and deeper wrongly cut the scalar short and reparsed the `- `
+    // line as a nested sequence instead of folding it into the scalar, as `yq`
+    // does.
+    let input = "- x\n  - y\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"["x - y"]"#);
+    Ok(())
+}
+
+#[test]
 fn test_yaml_anchor_on_null_explicit_value_resolves_to_null() -> Result<()> {
     // Also found by the invariant (corpus case PW8X): an anchor on an explicit
     // value that turns out to be null had no node to point at, so the alias

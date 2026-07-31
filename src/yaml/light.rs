@@ -9153,6 +9153,38 @@ mod tests {
         assert_eq!(first_doc_json(b"key: - a\n"), r#"{"key":["a"]}"#);
     }
 
+    /// A `- ` on a plain scalar's *continuation* line (as opposed to its first
+    /// line, covered above) is ordinary content at any indent greater than the
+    /// enclosing block's own indent, matching `yq`. The corpus's only case for
+    /// this shape, AB8U, uses continuation indent exactly 1 - the parser used to
+    /// treat that as the *only* valid indent and wrongly cut the scalar short
+    /// (reparsing the `- ` line as a nested sequence) at indent 2 and deeper,
+    /// which AB8U can never catch (#484, corpus-latent like #382 and #409).
+    #[test]
+    fn test_dash_continuation_at_any_indent_folds_into_plain_scalar() {
+        // AB8U itself (continuation indent 1) must stay passing.
+        assert_eq!(
+            first_doc_json(b"- single multiline\n - sequence entry\n"),
+            r#"["single multiline - sequence entry"]"#
+        );
+        // The bug's exact repro (indent 2), and deeper indents - none of these
+        // should stop the fold.
+        assert_eq!(first_doc_json(b"- x\n  - y\n"), r#"["x - y"]"#);
+        assert_eq!(first_doc_json(b"- x\n   - y\n"), r#"["x - y"]"#);
+        assert_eq!(first_doc_json(b"- x\n    - y\n"), r#"["x - y"]"#);
+        assert_eq!(first_doc_json(b"- x\n     - y\n"), r#"["x - y"]"#);
+        // Same shape as a mapping value.
+        assert_eq!(
+            first_doc_json(b"b:\n  - x\n    - y\n"),
+            r#"{"b":["x - y"]}"#
+        );
+        // Regression guard: a genuinely nested sequence is unaffected, since it's
+        // recognized immediately after an item's own `-`, not via continuation
+        // folding.
+        assert_eq!(first_doc_json(b"- - y\n"), r#"[["y"]]"#);
+        assert_eq!(first_doc_json(b"- x\n- - y\n"), r#"["x",["y"]]"#);
+    }
+
     /// A same-line block mapping value that is a bare sequence-entry indicator, with
     /// no content after it. The parser records an extent covering the `-` alone
     /// (trailing spaces are trimmed), so this decodes as the string `"-"` — where

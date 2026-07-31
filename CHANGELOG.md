@@ -104,6 +104,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A plain scalar's `- `-led continuation line was misread as a nested
+  sequence at indent 2 and deeper** (#484): `- x\n  - y\n` produced
+  `["x",["y"]]`, inventing a nested sequence, where `yq` folds the
+  continuation line into the scalar and gives `["x - y"]`. Both are valid
+  YAML per the strict validator. `parse_unquoted_value_with_indent_impl`'s
+  `sequence_indicator_is_block_structure` (`src/yaml/parser.rs`) treated a
+  continuation line's leading `-` as block structure whenever
+  `next_indent >= start_indent + 2`, folding only at `next_indent ==
+  start_indent + 1`. Per YAML 1.2 `nb-ns-plain-in-line`, once a plain
+  scalar's first line has begun, a `-` on a later line is never re-tested as
+  a sequence indicator, at any indent — the disjunct is removed outright,
+  leaving `next_indent <= start_indent` (reachable only at document root, for
+  a `- ` reappearing at column 0 as a genuine new top-level item). The YAML
+  Test Suite's only relevant case, AB8U, uses continuation indent exactly 1 —
+  the one value that happened to work — so it gave no signal on indent 2+;
+  corpus-latent the same way #382 and #409 were. Unaffected: a genuinely
+  nested sequence (`- - y`, `- x\n- - y`), recognized immediately after an
+  item's own `-` rather than via this continuation-fold path, and the locate
+  path (`at_offset`/`yq-locate`), which reads multi-line scalar extents from
+  the same index this fixes rather than re-deriving them independently.
+
 - **`del()` errored when a deleted key's container was `null`, where jq
   silently no-ops** (#476): jq indexes `null` with any key and gets `null`
   back — `null | .a`, `null | .[0]` and `null | delpaths([["a"]])` are all
