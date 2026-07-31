@@ -10613,7 +10613,10 @@ fn flatten_delete_path(expr: &Expr, optional: bool, out: &mut Vec<DeleteStep>) {
 /// are all `null`), so `.[("a",0)]` resolved against a null target yields one
 /// `Field("a")` path and one `Index(0)` path at the same position. Partition
 /// by actual shape below rather than trusting `paths[0]` to speak for the
-/// rest, which used to panic on exactly that input.
+/// rest, which used to panic on exactly that input. Nor always identical in
+/// *length*: a bare `.` sibling flattens to zero steps while the rest of the
+/// comma keeps going, so the leaf check below scans every sibling rather than
+/// trusting `paths[0]` to be exhausted (or not) for all of them (#505).
 fn delete_expr_paths_at(
     mut value: OwnedValue,
     paths: &[&[DeleteStep]],
@@ -10622,15 +10625,17 @@ fn delete_expr_paths_at(
     if paths.is_empty() {
         return Ok(value);
     }
-    if start == paths[0].len() {
-        // `del(.)`, or a path wrapped in enough `?`/`()` to flatten to
-        // nothing: replace the whole value reached here, as `delete_at_path`'s
-        // `Expr::Identity` arm does for the single-path case.
-        debug_assert_eq!(
-            paths.len(),
-            1,
-            "a path ending here without every sibling doing the same"
-        );
+    if paths.iter().any(|path| path.len() == start) {
+        // `del(.)`, a path wrapped in enough `?`/`()` to flatten to nothing,
+        // or `.` as one branch of a comma whose other branches still have
+        // components left (#505): replace the whole value reached here, as
+        // `delete_at_path`'s `Expr::Identity` arm does for the single-path
+        // case. An exhausted sibling deletes this entire subtree, which
+        // subsumes whatever any other sibling here would have deleted from
+        // within it — the same short-circuit `delpaths` gets from sorting
+        // the empty path first (`Some([]) => Ok(OwnedValue::Null)`), just
+        // without needing a sort, since `paths[0]` isn't assumed
+        // representative of every sibling's length either.
         return Ok(OwnedValue::Null);
     }
 
