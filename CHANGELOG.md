@@ -104,6 +104,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`path()` invented paths that do not exist, and lost paths that do** (#489):
+  the tracker walked a filter through its own copy of jq's indexing rules, and
+  that copy disagreed with the value path four ways. "No paths at all" rendered
+  as the **root** path (`{"a":1} | [path(empty)]` was `[[]]`, jq `[]`) — the
+  severe one, since `[]` is the one path that always resolves, so a caller
+  feeding it to `getpath`/`setpath`/`delpaths` wrote to the document root. A
+  `?`-pruned step still contributed its component (`"s" | [path(.a?)]` was
+  `[["a"]]`, a path into a string; jq `[]`). A step *through* a missing key, a
+  `null` or an out-of-range index dropped the whole path (`{"a":1} |
+  [path(.b.c)]` was `[[]]`, jq `[["b","c"]]`) — including under `?`, so
+  `[path(.b.c?)]` was wrong too. And a non-optional step that could not index
+  its value answered with a path instead of refusing (`"s" | [path(.a)]` was
+  `[["a"]]`, jq errors). Fixed at the cause rather than the symptoms: the two
+  parallel walkers (`eval_with_path_tracking` and
+  `collect_intermediate_with_paths` — the terminal step of a path and the steps
+  before it, obeying the same rules from two copies) are now one `walk_path`
+  that asks the value evaluator for every step's verdict, so `path(f)` agrees
+  with `f` by construction and inherits its already-conformant wording. `?` now
+  means only what it means elsewhere: turn this step's error into no output.
+  Twelve new jq-golden cases and eight error probes pin the result against
+  jq-1.7.1, and `path_empty` — the case #513 seeded onto the known-failures
+  scoreboard for this bug — comes off it. **Not covered**: `path(..)`, `path(recurse)` and `path(select(f))`
+  still have no walker arm (#483) — they now produce *no output* rather than the
+  root path, which is still wrong but no longer a path that resolves.
+
 - **`%YAML`/`%TAG` directive lines were not recognized, and swallowed the
   following `---`** (#225): a directive fell through to the plain-scalar
   scanner, which absorbed both the directive text and the document marker

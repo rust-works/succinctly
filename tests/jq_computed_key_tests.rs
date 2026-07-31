@@ -624,12 +624,11 @@ fn test_optional_key_error_reaches_every_path_consuming_form() {
         "del(.[nan]?)",
         Outcome::values(&[r#"{"a":1}"#]),
     );
-    // DIVERGENCE from jq 1.7.1, and not one this rule owns: `path` renders "no
-    // paths at all" as the *root* path, so jq's `[]` reads `[[]]` here. It
-    // predates computed keys and needs no key to show — `{"a":1} |
-    // [path(empty)]` is `[[]]` too, where jq is `[]`. Pinned as-is so the day
-    // that changes is visible at this case rather than around it.
-    check(r#"{"a":1}"#, "[path(.[nan]?)]", Outcome::values(&["[[]]"]));
+    // And a suppressed key that resolves to no path at all is *no output*, not
+    // the root path — the divergence #489 fixed. It was pinned here as `[[]]`
+    // while it lasted, because it needed no key to show (`{"a":1} |
+    // [path(empty)]` read `[[]]` too) and this case is where it was visible.
+    check(r#"{"a":1}"#, "[path(.[nan]?)]", Outcome::values(&["[]"]));
 }
 
 #[test]
