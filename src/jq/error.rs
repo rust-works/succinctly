@@ -228,11 +228,6 @@ impl EvalError {
         Self::new(format!("expected {expected}, got {got}"))
     }
 
-    /// Create a field not found error.
-    pub fn field_not_found(name: &str) -> Self {
-        Self::new(format!("field '{name}' not found"))
-    }
-
     /// Create an index out of bounds error.
     pub fn index_out_of_bounds(index: i64, len: usize) -> Self {
         Self::new(format!("index {index} out of bounds (length {len})"))

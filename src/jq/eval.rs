@@ -10620,6 +10620,50 @@ fn delete_expr_paths_at(
     Ok(value)
 }
 
+/// Walk what is left of `paths` against the `null` that a step naming nothing
+/// reads as, for its errors alone.
+///
+/// `del(f)` is `delpaths([path(f)])`, and the two halves treat a dead end
+/// differently: `path()` reads a missing object key, an out-of-range index, or
+/// any key of `null` as `null` and keeps walking, and only then does
+/// `delpaths` skip what named nothing. So a dead end is not the end of the
+/// walk — the *tail* decides. Every step `null` tolerates is a no-op
+/// (`{"a":{}} | del(.a.b.c)`, `null | del(.a.b)`), but `.[]` refuses `null`
+/// even there, so `{"a":{}} | del(.a.b.c[])` is jq's `Cannot iterate over null
+/// (null)` rather than a no-op (#527).
+///
+/// Returning early instead — which every one of these sites used to do —
+/// exempts the whole rest of the path on the strength of one step, which is
+/// how the `.[]` case got lost. Nothing can be written back through a `null`
+/// root, so the rebuilt values are discarded and the container the dead end
+/// named is left exactly as it was: jq does not vivify it either.
+///
+/// A path that ends at `start` has no tail to walk and is skipped; the caller
+/// passes the position *after* the step that named nothing.
+fn delete_expr_paths_through_absent(
+    paths: &[&[DeleteStep]],
+    start: usize,
+) -> Result<(), EvalError> {
+    for path in paths {
+        if path.len() > start {
+            let deleted = delete_expr_paths_at(OwnedValue::Null, &[*path], start)?;
+            debug_assert!(
+                matches!(deleted, OwnedValue::Null),
+                "deleting through a synthetic null produced a value to write back"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// [`delete_expr_paths_through_absent`]'s single-path counterpart, for
+/// [`delete_at_path`]'s chain-walk. Same contract: errors propagate, the
+/// rebuilt `null` is discarded, the container is untouched.
+fn delete_at_path_through_absent(rest: &Expr, optional: bool) -> Result<(), EvalError> {
+    let mut absent = OwnedValue::Null;
+    delete_at_path(&mut absent, rest, optional)
+}
+
 /// [`delete_expr_paths_at`]'s `Field` case: group by field name, delete the
 /// terminal ones from `value` together via [`delete_keys`], and recurse into
 /// the rest.
@@ -10631,8 +10675,12 @@ fn delete_expr_object_paths(
     // `null` tolerates any field key unconditionally — `null | del(.a)` is
     // `null` — so every sibling path here is a no-op regardless of
     // `optional`, the same exemption `delete_keys`/`delete_paths_under`
-    // already give a runtime key (#476).
+    // already give a runtime key (#476). The exemption is per *step*, though:
+    // returning outright would hand it to every later step too, including the
+    // `.[]` #476 deliberately withheld it from, so the tails still get walked
+    // (#527).
     if matches!(value, OwnedValue::Null) {
+        delete_expr_paths_through_absent(paths, start + 1)?;
         return Ok(value);
     }
     let mut terminal: Vec<&str> = Vec::new();
@@ -10676,12 +10724,15 @@ fn delete_expr_object_paths(
                 let old = core::mem::replace(slot, OwnedValue::Null);
                 *slot = delete_expr_paths_at(old, group, start + 1)?;
             }
-            // Requiring *every* sibling naming this field to be optional
-            // would be too strict: one occurrence marking it optional is
-            // enough to cover the others, the same merge the
-            // terminal-index case below uses.
-            None if group.iter().any(|p| p[start].optional) => {}
-            None => return Err(EvalError::field_not_found(name)),
+            // A field the object doesn't have is a dead end, not an error:
+            // `del(.a.b.c, .a.b.d)` is a no-op in jq where this used to raise
+            // succinctly's own `field 'b' not found` (#527). The tail decides
+            // whether it stays one, so it is walked rather than skipped — see
+            // `delete_expr_paths_through_absent`. `optional` gets no say: a
+            // `?` marks a *failure to index* as tolerable, and a key that is
+            // merely absent never failed, which is why jq raises for
+            // `del(.a.b?[])` just as it does for `del(.a.b[])`.
+            None => delete_expr_paths_through_absent(group, start + 1)?,
         }
     }
 
@@ -10706,9 +10757,11 @@ fn delete_expr_array_paths(
     paths: &[&[DeleteStep]],
     start: usize,
 ) -> Result<OwnedValue, EvalError> {
-    // Same `null` exemption as `delete_expr_object_paths` above — applies to
-    // both a bare index and a slice component (#476).
+    // Same per-step `null` exemption as `delete_expr_object_paths` above —
+    // applies to both a bare index and a slice component (#476), and likewise
+    // covers only this step, so the tails are still walked (#527).
     if matches!(value, OwnedValue::Null) {
+        delete_expr_paths_through_absent(paths, start + 1)?;
         return Ok(value);
     }
     let mut terminal: Vec<(ArrayStep, bool)> = Vec::new();
@@ -11030,20 +11083,25 @@ fn delete_at_path(
 
                 match first {
                     Expr::Field(name) => match root {
-                        OwnedValue::Object(map) => {
-                            if let Some(current) = map.get_mut(name) {
-                                delete_at_path(current, &rest, optional)
-                            } else if here {
-                                Ok(())
-                            } else {
-                                Err(EvalError::field_not_found(name))
-                            }
-                        }
-                        // `null` tolerates any key unconditionally, so the
-                        // rest of the chain never matters — `null |
-                        // del(.a.b)` and `{"x":null} | del(.x.a)` are both
-                        // no-ops (#476).
-                        OwnedValue::Null => Ok(()),
+                        OwnedValue::Object(map) => match map.get_mut(name) {
+                            Some(current) => delete_at_path(current, &rest, optional),
+                            // Same "reads as `null`, keep walking" rule as
+                            // `delete_expr_object_paths`' missing-field arm
+                            // (#527): `del(.a.b.c)` is a no-op, `del(.a.b[])`
+                            // still raises. `here` no longer gates this — a
+                            // `?` on the missing step does not suppress what
+                            // the tail itself raises, and the walk into a
+                            // throwaway `null` cannot create the key.
+                            None => delete_at_path_through_absent(&rest, optional),
+                        },
+                        // `null` tolerates any key — `null | del(.a.b)` and
+                        // `{"x":null} | del(.x.a)` are both no-ops (#476) —
+                        // but only for *this* step. Returning here handed the
+                        // exemption to the whole rest of the chain, `.[]`
+                        // included, so `{"x":null} | del(.x.a[])` no-op'd
+                        // where jq raises `Cannot iterate over null (null)`
+                        // (#527).
+                        OwnedValue::Null => delete_at_path_through_absent(&rest, optional),
                         _ if here => Ok(()),
                         _ => Err(EvalError::cannot_index_with_field(
                             owned_type_name(root),
@@ -11063,9 +11121,10 @@ fn delete_at_path(
                                 Ok(())
                             }
                         }
-                        // Same `null` exemption as the `Field` case above —
-                        // `null | del(.[0].a)` is a no-op (#476).
-                        OwnedValue::Null => Ok(()),
+                        // Same per-step `null` exemption as the `Field` case
+                        // above — `null | del(.[0].a)` is a no-op (#476),
+                        // `null | del(.[0][])` still raises (#527).
+                        OwnedValue::Null => delete_at_path_through_absent(&rest, optional),
                         _ if here => Ok(()),
                         _ => Err(EvalError::cannot_index_with_type(
                             owned_type_name(root),
@@ -11101,13 +11160,16 @@ fn delete_at_path(
                     // the whole range dropped.
                     // `null` has no elements to descend into, matching the
                     // top-level `Expr::Slice` arm's `Null` case above
-                    // (#476) — `null | del(.[0:2].a)` is a no-op. This is
-                    // deliberately not pushed into `through_slice` itself:
-                    // that helper is shared with `=`/`|=` assignment, where
-                    // a slice write auto-vivifies `null` instead of no-op'ing
-                    // (a separate, documented divergence — see
-                    // docs/compliance/jq/limitations.md).
-                    Expr::Slice { .. } if matches!(root, OwnedValue::Null) => Ok(()),
+                    // (#476) — `null | del(.[0:2].a)` is a no-op, while
+                    // `null | del(.[0:2][])` still raises from the tail
+                    // (#527). This is deliberately not pushed into
+                    // `through_slice` itself: that helper is shared with
+                    // `=`/`|=` assignment, where a slice write auto-vivifies
+                    // `null` instead of no-op'ing (a separate, documented
+                    // divergence — see docs/compliance/jq/limitations.md).
+                    Expr::Slice { .. } if matches!(root, OwnedValue::Null) => {
+                        delete_at_path_through_absent(&rest, optional)
+                    }
                     Expr::Slice { start, end } => through_slice(root, *start, *end, here, |sub| {
                         delete_at_path(sub, &rest, optional)
                     }),
@@ -21472,6 +21534,105 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn test_del_through_a_missing_field_walks_the_rest_against_null() {
+        // #527: a field the object doesn't have reads as `null`, and jq keeps
+        // walking the rest of the path against that `null` rather than
+        // stopping at it — so the *tail* decides whether this is a no-op.
+        // These all reach `delete_at_path`'s `Expr::Pipe` chain-walk, which
+        // used to raise succinctly's own `field 'b' not found`.
+        query!(br#"{"a": {"x": 1}}"#, r"del(.a.b.c)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                let OwnedValue::Object(inner) = obj.get("a").unwrap() else {
+                    panic!("expected nested object");
+                };
+                assert!(inner.contains_key("x"));
+                // Walking through the absent key must not materialise it.
+                assert!(!inner.contains_key("b"), "del() created the missing key");
+            }
+        );
+        // The missing key can be the first component too.
+        query!(br#"{"a": 1}"#, r"del(.b.c)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert!(obj.contains_key("a"));
+                assert!(!obj.contains_key("b"), "del() created the missing key");
+            }
+        );
+        // Any length of `Field` tail, and an `Index`/`Slice` tail, stay
+        // no-ops: `null` tolerates all three (#476).
+        for filter in [r"del(.a.b.c.d)", r"del(.a.b[0])", r"del(.a.b[1:2])"] {
+            query!(br#"{"a": {"x": 1}}"#, filter,
+                QueryResult::Owned(OwnedValue::Object(obj)) => {
+                    let OwnedValue::Object(inner) = obj.get("a").unwrap() else {
+                        panic!("expected nested object");
+                    };
+                    assert_eq!(inner.len(), 1, "`{filter}` changed the object");
+                }
+            );
+        }
+        // An `[]` tail is the exception — iterating `null` raises in jq, and
+        // a `?` on the *missing* step does not suppress what the tail itself
+        // raises.
+        query!(br#"{"a": {"x": 1}}"#, r"del(.a.b[])",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot iterate over null (null)");
+            }
+        );
+        query!(br#"{"a": {"x": 1}}"#, r"del(.a.b?[])",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot iterate over null (null)");
+            }
+        );
+        // `?` on the iterate step itself does suppress it.
+        query!(br#"{"a": {"x": 1}}"#, r"del(.a.b[]?)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                let OwnedValue::Object(inner) = obj.get("a").unwrap() else {
+                    panic!("expected nested object");
+                };
+                assert_eq!(inner.len(), 1);
+            }
+        );
+        // The `[]` can be any distance past the absent key — the walk has to
+        // survive more than one step, which is what makes this a walk rather
+        // than a one-off check of the very next component.
+        for filter in [r"del(.a.b.c[])", r"del(.a.b[0][])", r"del(.a.b[1:2][])"] {
+            query!(br#"{"a": {"x": 1}}"#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "Cannot iterate over null (null)", "`{filter}`");
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_del_through_null_still_raises_on_an_iterate_tail() {
+        // #476 exempted `null` from `Field`/`Index`/`Slice` steps but
+        // explicitly not from `.[]`, which jq refuses on `null` — and the
+        // exemption is per *step*, so it cannot be granted by returning early
+        // and skipping whatever the path still had to say. #527: every one of
+        // these used to be a silent no-op.
+        for (json, filter) in [
+            (&br"null"[..], r"del(.a[])"),
+            (&br"null"[..], r"del(.a.b[])"),
+            (&br"null"[..], r"del(.[0][])"),
+            (&br"null"[..], r"del(.[0:2][])"),
+            (&br#"{"x": null}"#[..], r"del(.x.a[])"),
+            (&br#"{"a": {"b": null}}"#[..], r"del(.a.b.c[])"),
+        ] {
+            query!(json, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "Cannot iterate over null (null)", "`{filter}`");
+                }
+            );
+        }
+        // Every other tail keeps the #476 no-op it already had.
+        for filter in [r"del(.a.b)", r"del(.[0].a)", r"del(.[0:2].a)"] {
+            query!(br"null", filter,
+                QueryResult::Owned(OwnedValue::Null) => {}
+            );
+        }
     }
 
     #[test]
