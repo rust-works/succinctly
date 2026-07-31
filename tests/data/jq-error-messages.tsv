@@ -86,6 +86,7 @@ iterate_string_over_limit	.[]	"abcdefghijklm"	Cannot iterate over string ("abcde
 path_iterate_on_string	[path(.[])]	"s"	Cannot iterate over string ("s")
 path_iterate_on_null	[path(.[])]	null	Cannot iterate over null (null)
 iterate_assign_on_number	.[] = 1	5	Cannot iterate over number (5)
+iterate_del_through_missing_field	del(.a.b[])	{"a":{"x":1}}	Cannot iterate over null (null)
 map_on_number	map(.)	5	Cannot iterate over number (5)
 add_on_string	add	"s"	Cannot iterate over string ("s")
 any_on_number	any	1	Cannot iterate over number (1)

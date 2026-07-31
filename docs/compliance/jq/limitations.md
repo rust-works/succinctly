@@ -24,14 +24,14 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 178 probes in
+Measured against jq-1.7.1 over the 179 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result               | Meaning                                            |
 |----------------------------------------------|----------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **176/178 = 98.9%**  | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **177/179 = 98.9%**  | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**                | Every probe that errors in both errors identically |
 | **Behaviour / parser gaps**                  | **2**                | succinctly does not raise the error at all         |
 
@@ -300,14 +300,24 @@ have to be recorded here.
 | `.[5] \|= 9`      | `[1,2]`       | `[1,2,null,null,null,9]`    | `index 5 out of bounds (length 2)`    |
 | `.[1:2] = ["x"]`  | `null`        | `["x"]`                     | `Cannot index null with object`       |
 | `.[1:2] \|= ["x"]`| `null`        | `["x"]`                     | `Cannot index null with object`       |
-| `del(.[5])`       | `[1,2]`       | `[1,2]`                     | `index 5 out of bounds (length 2)`    |
-| `del(.[-5])`      | `[1,2]`       | `[1,2]`                     | `Out of bounds negative array index`  |
 
-Every row is an assignment, update or deletion walking a path *in place*, and every one but
-the two slice rows is older than #356 — the rewording changed what these say, not whether
-they say it. The gap they share is auto-vivification: jq grows the container the path asks
-for (`null` into an object, an array up to the index) and treats an unreachable delete as a
-no-op.
+Every row is an assignment or update walking a path *in place*, and every one but the two
+slice rows is older than #356 — the rewording changed what these say, not whether they say
+it. The gap they share is auto-vivification: jq grows the container the path asks for
+(`null` into an object, an array up to the index) where succinctly refuses.
+
+`del()` used to sit here too — `del(.[5])` and `del(.[-5])` on `[1,2]`, plus a missing
+intermediate key — but every one of those is a silent no-op now, matching jq, after
+[#477](https://github.com/rust-works/succinctly/issues/477) and
+[#527](https://github.com/rust-works/succinctly/issues/527). A step that reaches nothing
+reads as `null` and the rest of the path is walked against it, so only an `[]` tail still
+raises (`{"a":{"x":1}} | del(.a.b[])` is `Cannot iterate over null (null)` in both).
+
+What is left of that family diverges in the *opposite* direction, so it does not belong in
+this table at all: after an out-of-range index specifically, succinctly still skips the tail
+instead of walking it, so `[1,2] | del(.[5][])` is a silent no-op where jq raises `Cannot
+iterate over null (null)` — [#529](https://github.com/rust-works/succinctly/issues/529),
+not yet seeded into the probe corpus.
 
 The two slice rows were added by [#366](https://github.com/rust-works/succinctly/issues/366)
 deliberately. Writing through a slice could have vivified `null` on its own — `setpath`

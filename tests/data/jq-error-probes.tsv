@@ -119,6 +119,10 @@ iterate_string_over_limit	.[]	"abcdefghijklm"
 path_iterate_on_string	[path(.[])]	"s"
 path_iterate_on_null	[path(.[])]	null
 iterate_assign_on_number	.[] = 1	5
+# A field that isn't there reads as `null`, and `del` keeps walking the rest of
+# the path against it — so an `[]` tail still raises where a `.c`/`[0]`/`[1:2]`
+# tail is a silent no-op (#527).
+iterate_del_through_missing_field	del(.a.b[])	{"a":{"x":1}}
 map_on_number	map(.)	5
 add_on_string	add	"s"
 any_on_number	any	1

@@ -1339,6 +1339,95 @@ fn test_del_with_comma_mixing_identity_and_other_paths() {
     check(r#"{"a":1,"b":2}"#, "del(., .)", Outcome::values(&["null"]));
 }
 
+/// #527: two comma siblings continuing through the same *missing* field
+/// (`.a.b.c` and `.a.b.d`, both through `.a.b`) put `delete_expr_object_paths`
+/// in front of a field name the object doesn't have, and it raised
+/// succinctly's own `field 'b' not found`. jq reads a missing key as `null`
+/// and keeps walking the rest of the path against it, so the *tail* decides:
+/// a `Field`/`Index`/`Slice` tail is a no-op, an `[]` tail still raises.
+#[test]
+fn test_del_through_a_missing_intermediate_field_walks_the_rest_against_null() {
+    // The issue's own reproduction.
+    check(
+        r#"{"a":{"x":1}}"#,
+        "del(.a.b.c, .a.b.d)",
+        Outcome::values(&[r#"{"a":{"x":1}}"#]),
+    );
+    // A missing sibling must not cancel a present one beside it, in either
+    // order, and must not materialise the key it walked through.
+    check(
+        r#"{"a":{"x":1,"y":2}}"#,
+        "del(.a.b.c, .a.x)",
+        Outcome::values(&[r#"{"a":{"y":2}}"#]),
+    );
+    check(
+        r#"{"a":{"x":1,"y":2}}"#,
+        "del(.a.x, .a.b.c)",
+        Outcome::values(&[r#"{"a":{"y":2}}"#]),
+    );
+    // Terminal and continuing at the same name: deleting `.a` outright
+    // subsumes the walk through it.
+    check(
+        r#"{"a":{"x":1},"z":2}"#,
+        "del(.a, .a.b.c)",
+        Outcome::values(&[r#"{"z":2}"#]),
+    );
+    // The grouping is per container, so the same holds one array element
+    // down.
+    check(
+        r#"{"a":[{"z":1}]}"#,
+        "del(.a[0].b.c, .a[0].b.d)",
+        Outcome::values(&[r#"{"a":[{"z":1}]}"#]),
+    );
+    // An `[]` tail on the synthesised `null` still raises, and does so even
+    // when a no-op sibling shares the same missing field.
+    check(
+        r#"{"a":{"x":1}}"#,
+        "del(.a.b[], .a.b.c)",
+        Outcome::error("Cannot iterate over null (null)"),
+    );
+    // The `[]` can sit further down the tail than the very next step, and
+    // the walk still has to reach it.
+    check(
+        r#"{"a":[{"x":1},{"x":2}]}"#,
+        "del(.a[].b.c[], .a[].x)",
+        Outcome::error("Cannot iterate over null (null)"),
+    );
+    // Same rule where the dead end is an explicit `null` rather than an
+    // absent key: #476's exemption covers that one step, not the tail.
+    check(
+        r#"{"a":null}"#,
+        "del(.a.b[], .a.c[])",
+        Outcome::error("Cannot iterate over null (null)"),
+    );
+    check(
+        r#"{"a":null}"#,
+        "del(.a[0][], .a[1][])",
+        Outcome::error("Cannot iterate over null (null)"),
+    );
+    // ... while the tails `null` does tolerate stay no-ops.
+    check(
+        r#"{"a":null}"#,
+        "del(.a.b.c, .a.d.e)",
+        Outcome::values(&[r#"{"a":null}"#]),
+    );
+    // Regression guard: a field that *is* present but cannot be indexed is a
+    // genuine error, raised by the `resolve_node` read pre-pass before these
+    // walkers ever see the value. Treating a missing key as `null` must not
+    // extend to a wrong-typed one.
+    check(
+        r#"{"a":{"b":5}}"#,
+        "del(.a.b.c, .a.b.d)",
+        Outcome::error(r#"Cannot index number with string "c""#),
+    );
+    // ... while an explicitly `null` intermediate stays a no-op (#476).
+    check(
+        r#"{"a":{"b":null}}"#,
+        "del(.a.b.c, .a.b.d)",
+        Outcome::values(&[r#"{"a":{"b":null}}"#]),
+    );
+}
+
 /// #475 follow-up: fixing the purely-static comma case above reaches a
 /// second surface that was unexercised until now — `delete_expr_paths_at`
 /// routing `Slice` into the same `indices` bucket as a plain `Index` (added
