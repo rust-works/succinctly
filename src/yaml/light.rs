@@ -3246,6 +3246,25 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
         }
         result
     }
+
+    /// Find a field by name and return a cursor to its value.
+    ///
+    /// Same last-duplicate-key-wins semantics as [`find`](Self::find) — kept
+    /// as a separate loop rather than reusing `find` so the returned cursor
+    /// (needed for `line`/`column`) doesn't require re-navigating.
+    pub fn find_cursor(&self, name: &str) -> Option<YamlCursor<'a, W>> {
+        let mut fields = self.clone();
+        let mut result = None;
+        while let Some((field, rest)) = fields.uncons() {
+            if let YamlValue::String(key) = field.key() {
+                if key.as_str().ok()? == name {
+                    result = Some(field.value_cursor());
+                }
+            }
+            fields = rest;
+        }
+        result
+    }
 }
 
 impl<'a, W: AsRef<[u64]>> Iterator for YamlFields<'a, W> {
@@ -5064,6 +5083,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for YamlFields<'a, W> {
 
     fn find(&self, name: &str) -> Option<Self::Value> {
         YamlFields::find(self, name)
+    }
+
+    fn find_cursor(&self, name: &str) -> Option<Self::Cursor> {
+        YamlFields::find_cursor(self, name)
     }
 
     fn is_empty(&self) -> bool {

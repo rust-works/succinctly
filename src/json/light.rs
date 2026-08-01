@@ -997,6 +997,22 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         }
         None
     }
+
+    /// Find a field by name and return a cursor to its value.
+    ///
+    /// Same first-match semantics as [`find`](Self::find).
+    pub fn find_cursor(&self, name: &str) -> Option<JsonCursor<'a, W>> {
+        let mut fields = *self;
+        while let Some((field, rest)) = fields.uncons() {
+            if let StandardJson::String(key) = field.key() {
+                if key.as_str().ok()? == name {
+                    return Some(field.value_cursor());
+                }
+            }
+            fields = rest;
+        }
+        None
+    }
 }
 
 impl<'a, W: AsRef<[u64]>> Iterator for JsonFields<'a, W> {
@@ -1658,6 +1674,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for JsonFields<'a, W> {
 
     fn find(&self, name: &str) -> Option<Self::Value> {
         JsonFields::find(self, name)
+    }
+
+    fn find_cursor(&self, name: &str) -> Option<Self::Cursor> {
+        JsonFields::find_cursor(self, name)
     }
 
     fn is_empty(&self) -> bool {

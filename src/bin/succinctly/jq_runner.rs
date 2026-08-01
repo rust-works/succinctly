@@ -1574,6 +1574,9 @@ fn evaluate_input(
         GenericResult::One(v) => Ok(vec![generic_to_owned(&v)]),
         GenericResult::OneCursor(c) => Ok(vec![generic_to_owned(&c.value())]),
         GenericResult::Many(vs) => Ok(vs.iter().map(generic_to_owned).collect()),
+        GenericResult::ManyCursor(cs) => {
+            Ok(cs.iter().map(|c| generic_to_owned(&c.value())).collect())
+        }
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);
@@ -1623,6 +1626,8 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             .into_iter()
             .map(|v| standard_json_to_jq_value(v, &cursor))
             .collect(),
+        // ManyCursor: same lazy-cursor efficiency as OneCursor, per element.
+        GenericResult::ManyCursor(cs) => cs.into_iter().map(JqValue::Cursor).collect(),
         GenericResult::None => vec![],
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Jq, &e, at);

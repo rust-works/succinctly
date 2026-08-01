@@ -2836,6 +2836,79 @@ fn test_yq_json_control_char_escaping_consistent_across_paths() -> Result<()> {
 }
 
 // ============================================================================
+// line / column builtins (#532) — position-based navigation on the default
+// (cursor-preserving) YAML CLI path. Before this fix, `line`/`column`
+// resolved correctly only when called with zero preceding navigation
+// (`line` alone); anything downstream of `.foo`/`.[]`/`select(...)` silently
+// returned 0. No prior CLI-level test exercised these builtins through a
+// real pipeline — see the issue for the full root-cause writeup.
+// ============================================================================
+
+#[test]
+fn test_line_iterate_over_sequence() -> Result<()> {
+    // The issue's exact repro.
+    let yaml = "a: 1\nb: 2\nc: 3\n";
+    let (output, code) = run_yq_stdin(".[] | line", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "1\n2\n3\n");
+    Ok(())
+}
+
+#[test]
+fn test_line_field_access() -> Result<()> {
+    let yaml = "other: 1\nfoo: bar\n";
+    let (output, code) = run_yq_stdin(".foo | line", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "2");
+    Ok(())
+}
+
+#[test]
+fn test_column_field_access() -> Result<()> {
+    let yaml = "foo: bar\n";
+    let (output, code) = run_yq_stdin(".foo | column", yaml, &[])?;
+    assert_eq!(code, 0);
+    // "foo: bar" -> "bar" starts at column 6.
+    assert_eq!(output.trim(), "6");
+    Ok(())
+}
+
+#[test]
+fn test_line_select_filters_and_keeps_position() -> Result<()> {
+    let yaml = "- 1\n- 2\n- 3\n";
+    let (output, code) = run_yq_stdin(".[] | select(. > 1) | line", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "2\n3\n");
+    Ok(())
+}
+
+#[test]
+fn test_line_column_object_construction_is_a_known_limitation() -> Result<()> {
+    // Object/array construction (`{...}`/`[...]`) isn't natively cursor-aware
+    // in the generic evaluator — it round-trips through OwnedValue, which
+    // has nowhere to carry a position. Documented limitation (#532), pinned
+    // here so a future fix is visible as an intentional test change rather
+    // than a silent behavior shift.
+    let yaml = "foo: bar\nbaz: qux\n";
+    let (output, code) = run_yq_stdin(".baz | {l: line, c: column}", yaml, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"l":0,"c":0}"#);
+    Ok(())
+}
+
+#[test]
+fn test_line_dot_chain_through_nested_iteration() -> Result<()> {
+    // `.containers[].image` parses as its own nested Pipe distinct from the
+    // outer `| line` — exercises `ManyCursor` surviving a return out of an
+    // inner pipe evaluation, not just a single flat pipe.
+    let yaml = "containers:\n  - image: a\n  - image: b\n";
+    let (output, code) = run_yq_stdin(".containers[].image | line", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "2\n3\n");
+    Ok(())
+}
+
+// ============================================================================
 // Variable Tests - --arg / --argjson / $ARGS (jq-inherited extensions, #284)
 // ============================================================================
 

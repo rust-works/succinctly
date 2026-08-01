@@ -37,14 +37,24 @@ pub trait DocumentCursor: Sized + Copy + Clone {
 
     /// Get the 1-based line number of this node's position.
     ///
-    /// Returns 0 if position information is not available.
+    /// Returns 0 if position information is not available. "Not available"
+    /// specifically means this cursor's evaluator has no source position to
+    /// give — either the value was computed (arithmetic, string
+    /// interpolation, object/array construction) rather than navigated to,
+    /// or evaluation is on the `OwnedValue`/full-evaluator path
+    /// (`src/jq/eval.rs`), which never carries a cursor at all. It does
+    /// *not* mean position tracking is broken: ordinary navigation
+    /// (`.foo`, `.[]`, `select(...)`, chained field/index access) on the
+    /// generic cursor evaluator (`src/jq/eval_generic.rs`) forwards the
+    /// cursor and resolves a real line (#532).
     fn line(&self) -> usize {
         0
     }
 
     /// Get the 1-based column number of this node's position.
     ///
-    /// Returns 0 if position information is not available.
+    /// See [`line`](Self::line) — same "not available" contract, same
+    /// caveats about when it does and doesn't apply.
     fn column(&self) -> usize {
         0
     }
@@ -244,6 +254,14 @@ pub trait DocumentFields: Sized + Clone {
     /// Find a field by name.
     fn find(&self, name: &str) -> Option<Self::Value>;
 
+    /// Find a field by name and return a cursor to its value.
+    ///
+    /// Must agree with [`find`](Self::find) on which field wins when a name
+    /// is repeated (YAML keeps the last duplicate key; JSON keeps the
+    /// first), so callers can switch between the two without a behavior
+    /// change — see the per-format `find`/`find_cursor` implementations.
+    fn find_cursor(&self, name: &str) -> Option<Self::Cursor>;
+
     /// Check if there are no fields.
     fn is_empty(&self) -> bool;
 
@@ -309,6 +327,20 @@ pub trait DocumentElements: Sized + Copy + Clone {
     /// Get element by index (0-based).
     fn get(&self, index: usize) -> Option<Self::Value>;
 
+    /// Get element by index (0-based) and return a cursor to it.
+    ///
+    /// Default: walks [`uncons_cursor`](Self::uncons_cursor) `index` times —
+    /// the same sibling-walk `get` itself performs for both YAML and JSON
+    /// today, so this costs no more than `get`.
+    fn get_cursor(&self, index: usize) -> Option<Self::Cursor> {
+        let mut elems = *self;
+        for _ in 0..index {
+            let (_, rest) = elems.uncons_cursor()?;
+            elems = rest;
+        }
+        elems.uncons_cursor().map(|(cursor, _)| cursor)
+    }
+
     /// Check if there are no elements.
     fn is_empty(&self) -> bool;
 
@@ -332,5 +364,16 @@ pub trait DocumentElements: Sized + Copy + Clone {
             elems = rest;
         }
         values
+    }
+
+    /// Collect a cursor for every element into a Vec.
+    fn collect_cursors(&self) -> Vec<Self::Cursor> {
+        let mut cursors = Vec::new();
+        let mut elems = *self;
+        while let Some((cursor, rest)) = elems.uncons_cursor() {
+            cursors.push(cursor);
+            elems = rest;
+        }
+        cursors
     }
 }

@@ -14567,20 +14567,27 @@ fn builtin_kind<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryRes
 }
 
 /// `line` - returns the 1-based line number of the current node (yq)
-/// Since YAML position metadata is lost during conversion to OwnedValue, this returns 0.
-/// In a full yq implementation, this would require tracking source positions through the pipeline.
+///
+/// Always `0` here: this is the "full"/`OwnedValue` evaluator (`eval` in
+/// this file), whose `eval_single` never carries a cursor at all — unlike
+/// `src/jq/eval_generic.rs`'s `eval_single`, which takes an
+/// `Option<V::Cursor>` and, for the `Expr`/`Builtin` arms it handles
+/// natively, forwards it through navigation (`.foo`, `.[]`, `select(...)`)
+/// so `line`/`column` resolve real positions there (#532). This evaluator
+/// backs `yq`'s `-n`/`--slurp`/`--inplace`/JSON-input paths and any `Expr`
+/// eval_generic.rs doesn't natively handle; both round-trip through
+/// `OwnedValue`/JSON with no source-position tracking, so `0` is this path's
+/// permanent, correct answer per
+/// [`DocumentCursor::line`](crate::jq::document::DocumentCursor::line)'s
+/// documented "not available" contract, not a stub awaiting completion.
 fn builtin_line<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
-    // Currently source positions are not preserved through the OwnedValue conversion.
-    // Return 0 to indicate position is unknown (yq returns 1 for actual positions).
     QueryResult::Owned(OwnedValue::Int(0))
 }
 
 /// `column` - returns the 1-based column number of the current node (yq)
-/// Since YAML position metadata is lost during conversion to OwnedValue, this returns 0.
-/// In a full yq implementation, this would require tracking source positions through the pipeline.
+///
+/// See [`builtin_line`]: same reason, same evaluator, same permanent `0`.
 fn builtin_column<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
-    // Currently source positions are not preserved through the OwnedValue conversion.
-    // Return 0 to indicate position is unknown (yq returns 1 for actual positions).
     QueryResult::Owned(OwnedValue::Int(0))
 }
 

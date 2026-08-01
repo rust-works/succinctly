@@ -388,6 +388,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         GenericResult::One(v) => Ok(vec![to_owned(&v)]),
         GenericResult::OneCursor(c) => Ok(vec![to_owned(&c.value())]),
         GenericResult::Many(vs) => Ok(vs.iter().map(to_owned).collect()),
+        GenericResult::ManyCursor(cs) => Ok(cs.iter().map(|c| to_owned(&c.value())).collect()),
         GenericResult::None => Ok(vec![]),
         GenericResult::Error(e) => {
             sink.report(DiagStyle::Yq, &e, &no_location());
@@ -1334,6 +1335,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             &result,
                             GenericResult::None | GenericResult::Break(_)
                         ) && !matches!(&result, GenericResult::Many(vs) if vs.is_empty())
+                            && !matches!(&result, GenericResult::ManyCursor(cs) if cs.is_empty())
                             && !matches!(&result, GenericResult::ManyOwned(vs) if vs.is_empty());
                         emit_yaml_doc_separator($writer, &mut yaml_doc_streamed, will_output)?;
                         let stats = result
