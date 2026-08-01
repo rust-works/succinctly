@@ -127,6 +127,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Assignment (`=`, `|=`, the compound family, `//=`) refused to build a
+  missing container, and `?` on a write path swallowed the write itself**
+  (#486, #498): `.a.b = 9` on `{}` raised `Cannot index null with string
+  "b"` instead of building `{"a":{"b":9}}` like jq, and `.[5] = 9` on
+  `[1,2]` raised `index 5 out of bounds (length 2)` instead of padding to
+  `[1,2,null,null,null,9]` — `setpath()`'s writer already got both right,
+  `set_path`/`get_path_mut`/`update_path` behind every other write operator
+  never learned the same rule. Fixing the padding half meant `?` had to stop
+  swallowing the one write-time failure it never covers in jq: a still-negative
+  array index after counting back from the end (`.[-5]? = 9` now raises `Out
+  of bounds negative array index` instead of silently no-op'ing). Landing
+  those together surfaced three more places the same "`?` only prunes path
+  *production*, never path *application*" rule was violated: `get_path_mut`
+  dropped every inline `?` on a non-final path component, so
+  `"str" | .a?.b = 1` raised instead of leaving `"str"` untouched;
+  `update_path` threaded a path component's own `?` into the filter's own
+  evaluation, so `.a? |= error("boom")` silently corrupted `.a` to `null`
+  instead of raising; and neither `eval_assign` nor `eval_update` caught a
+  failure at the call boundary for a `?` wrapping the *whole* expression, so
+  `(.[-5] = 9)?` raised outright and `(.a |= error("boom"))?` also corrupted
+  to `null`, where jq produces no output for both — fixed by catching at the
+  boundary the same way `builtin_del`'s #537 fix already does, rather than
+  threading the outer `?` into the walkers as a starting flag.
+
 - **`del()`'s comma-group walker worded an `.[]`-over-a-scalar error its own
   way instead of jq's** (#538): `echo '5' | sjq -c 'del(.[], .a)'` said
   `expected array or object, got number` — succinctly's own wording, reserved
