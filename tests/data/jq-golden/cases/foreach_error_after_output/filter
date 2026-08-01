@@ -1,0 +1,1 @@
+foreach (1,2,3) as $x (0; if $x == 3 then error("boom") else .+$x end)

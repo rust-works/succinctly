@@ -326,6 +326,19 @@ then `2`. This is the pre-existing `eval_comma`/`QueryResult`
 per-stream-not-per-output architectural gap tracked by #400, newly reachable
 now that `label` bodies accept commas without parens (#462).
 
+**An error also discards the outputs already emitted before it** — the same gap
+reached by an error rather than a `break`. jq streams what it produced and
+*then* fails; here the prefix is lost and only the failure survives. The exit
+code (5) and the diagnostic are byte-identical to jq, so stdout alone differs:
+`(1,error("x")) // 2` prints nothing where jq prints `1` (#400), and
+`limit(3; 1,2,error("boom"),4)`,
+`while(. < 5; if . == 3 then error("boom") else .+1 end)` and
+`foreach (1,2,3) as $x (0; if $x == 3 then error("boom") else .+$x end)`
+likewise print nothing where jq prints `1 2`, `1 2 3` and `1 3` (#494). All
+four are pinned as `*_error_after_output` golden cases, which assert the
+streamed prefix and the exit code together so neither half can be fixed alone
+unnoticed.
+
 **Computed keys in brackets** (#360) accept any expression, but two jq behaviours are not reproduced:
 
 - **Slice bounds must fold to an integer literal.** Both bounds accept the same spellings — `.[1:3]`, `.[(1):3]`, `.[1:(3)]`, `.[1.0:3]` — but nothing that has to be evaluated: `.[$a:$b]` and `.[(1+1):]` are parse errors, where jq accepts them.

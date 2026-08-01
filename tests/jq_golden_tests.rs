@@ -10,6 +10,14 @@
 //! failure has no oracle at all: exit code and diagnostic text are exactly what
 //! diverged in #355, and neither appears on stdout.
 //!
+//! A failing case may still carry a non-empty `expected.out`: jq streams the
+//! outputs it produced before the error, then exits non-zero (the
+//! `*_error_after_output` cases). Stdout is compared in *both* branches, so
+//! that pair is what gets pinned — a fix that emits the prefix but loses the
+//! failure, or exits correctly but drops the prefix, fails either way. That
+//! pairing is the point of the shape for #400 and #494, where the bug is
+//! precisely that the outputs preceding the error are discarded.
+//!
 //! # Golden provenance
 //!
 //! `expected.out` is captured from jqlang/jq — the oracle — at the version
@@ -96,8 +104,9 @@ fn cases() -> Vec<Case> {
                 "case {name}: expected.status must record a *failing* exit code; \
                  a passing case omits it — rerun ./scripts/sync-jq-golden.sh"
             );
-            // A failing case legitimately produces no stdout; a passing one
-            // producing none means the fixture never got captured.
+            // A failing case may legitimately produce no stdout (though it can
+            // also stream a prefix first); a passing one producing none means
+            // the fixture never got captured.
             assert!(
                 !expected.is_empty() || expected_status.is_some(),
                 "case {name} has an empty expected.out — rerun ./scripts/sync-jq-golden.sh"
