@@ -2676,40 +2676,13 @@ fn stream_json_escape<Out: core::fmt::Write>(out: &mut Out, ch: char) -> core::f
             out.write_char(HEX[(b >> 4) as usize] as char)?;
             out.write_char(HEX[(b & 0xf) as usize] as char)
         }
-        c if (c as u32) >= 0x80 && (c as u32) < 0x100 => {
-            out.write_str("\\u00")?;
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            let b = c as u8;
-            out.write_char(HEX[(b >> 4) as usize] as char)?;
-            out.write_char(HEX[(b & 0xf) as usize] as char)
-        }
-        c if (c as u32) >= 0x100 => {
-            let cp = c as u32;
-            if cp <= 0xFFFF {
-                out.write_str("\\u")?;
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                out.write_char(HEX[((cp >> 12) & 0xF) as usize] as char)?;
-                out.write_char(HEX[((cp >> 8) & 0xF) as usize] as char)?;
-                out.write_char(HEX[((cp >> 4) & 0xF) as usize] as char)?;
-                out.write_char(HEX[(cp & 0xF) as usize] as char)
-            } else {
-                // Surrogate pair
-                let adjusted = cp - 0x10000;
-                let high = 0xD800 + (adjusted >> 10);
-                let low = 0xDC00 + (adjusted & 0x3FF);
-                out.write_str("\\u")?;
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                out.write_char(HEX[((high >> 12) & 0xF) as usize] as char)?;
-                out.write_char(HEX[((high >> 8) & 0xF) as usize] as char)?;
-                out.write_char(HEX[((high >> 4) & 0xF) as usize] as char)?;
-                out.write_char(HEX[(high & 0xF) as usize] as char)?;
-                out.write_str("\\u")?;
-                out.write_char(HEX[((low >> 12) & 0xF) as usize] as char)?;
-                out.write_char(HEX[((low >> 8) & 0xF) as usize] as char)?;
-                out.write_char(HEX[((low >> 4) & 0xF) as usize] as char)?;
-                out.write_char(HEX[(low & 0xF) as usize] as char)
-            }
-        }
+        // Everything >= 0x20 (including C1 controls 0x80-0x9F and higher
+        // codepoints) streams as raw UTF-8, matching `stream_json_string`'s
+        // policy and yq's own output: JSON only requires escaping `"`, `\`,
+        // and C0 controls. An earlier version of this function additionally
+        // re-escaped non-ASCII characters as `\u00XX`/`\uXXXX`, which
+        // diverged from `stream_json_string` and from yq for any string
+        // reached through this char-by-char escape-decode path (#532).
         c => out.write_char(c),
     }
 }
