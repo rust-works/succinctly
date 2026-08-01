@@ -265,9 +265,66 @@ These enable IDE integration and programmatic navigation to specific document po
 
 ---
 
+## Operator Precedence
+
+Loosest first, matching jq's `parser.y`:
+
+| Level | Operators                             | Notes                                              |
+|-------|---------------------------------------|----------------------------------------------------|
+| 1     | `\|`                                  | Loosest. Each stage is a comma list.               |
+| 2     | `,`                                   | Binds tighter than `\|`: `a,b \| f` is `(a,b) \| f`. |
+| 3     | `as`                                  | Sits inside a comma operand; its body runs to the end. |
+| 4     | `=` `\|=` `+=` `-=` `*=` `/=` `%=` `//=` | See divergence 2 below.                         |
+| 5     | `//`                                  | See divergence 2 below.                            |
+| 6     | `or`, `and`                           |                                                    |
+| 7     | `==` `!=` `<` `<=` `>` `>=`           |                                                    |
+| 8     | `+` `-`, then `*` `/` `%`             | Tightest.                                          |
+
+`1,2,3 | . * 2` is therefore `(1,2,3) | . * 2` → `2 4 6`, and
+`1,2 as $x | $x | .+10` is `1, (2 as $x | $x | .+10)` → `1 12` (#462).
+
+Three positions are deliberately **not** full expressions:
+
+- **Object-construction values** are jq's `ExpD`, where `,` separates entries.
+  `{a: 1, b: 2}` is two entries; write `{a: (1,2)}` to fan a value out.
+- **The `n` of `limit`/`skip`/`nth`** rejects a comma, because jq's `$n`
+  parameter convention (re-running the whole call per output of `n`) is not
+  implemented here — a parse error beats parsing and silently taking one branch.
+- **`reduce`/`foreach`'s `init`/`update`/`extract` and `until`/`while`'s
+  `cond`/`update`** reject a comma for the same reason: jq forks the whole
+  construct per multi-output `init`, folds `update` by its last output per
+  step, and fans `extract`/loop backtracking out per output — none of that is
+  implemented here (#534).
+
+Two precedence divergences from jq remain:
+
+1. **`as` binds an assignment-level expression, where jq binds a `Term`.** jq
+   reads `1 + 2 as $x | [$x]` as `1 + (2 as $x | [$x])`; here it is
+   `(1 + 2) as $x | [$x]`.
+2. **`//` binds tighter than assignment, where jq has it looser.** jq declares
+   `%right "//"` before the assignment operators, so `.a = 1 // 2` is
+   `(.a = 1) // 2`; here it is `.a = (1 // 2)`.
+
 ## Known Limitations
 
 **Note:** Array slicing with steps (`.[::2]`) is intentionally not supported - it's Python syntax, not jq. Use `[range(0; length; 2) as $i | .[$i]]` instead.
+
+**Multi-output expressions in non-fanout positions** parse but don't fan out
+the way jq does. Some silently take only the first output: `"\(1,2)"`,
+`{a: (1,2)}`, and `select(.==1, .==3)` (the condition's second branch is
+never evaluated) all yield one result where jq yields one per output. Others
+error instead of fanning out: `range(1,2; 4)` reports `Range bounds must be
+numeric` and a computed object key `{(("a","b")): 1}` reports `key must be a
+string`, rather than jq's one result per output. Before #462 several of these
+were parse errors rather than wrong answers, since the comma could not be
+written without parens.
+
+**A bare top-level comma after `label $out |` can reach `break`**, which
+discards the comma siblings already emitted before it instead of keeping
+them: `label $out | 1,2,break $out,4` prints nothing, where jq prints `1`
+then `2`. This is the pre-existing `eval_comma`/`QueryResult`
+per-stream-not-per-output architectural gap tracked by #400, newly reachable
+now that `label` bodies accept commas without parens (#462).
 
 **Computed keys in brackets** (#360) accept any expression, but two jq behaviours are not reproduced:
 
