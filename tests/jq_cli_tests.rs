@@ -14,6 +14,14 @@ use tempfile::NamedTempFile;
 /// This handles flaky failures from cargo lock contention when tests run in parallel.
 const MAX_CARGO_RETRIES: u32 = 3;
 
+/// Maximum retries for spawning the pre-built binary directly.
+///
+/// `run_jq_full` execs a fixed path (`CARGO_BIN_EXE_succinctly`) that other
+/// tests in this file concurrently rewrite via `cargo run` (see
+/// `run_jq_stdin_streams`). `spawn()` can transiently observe that path
+/// mid-replacement and fail with `ENOENT` (#550).
+const MAX_SPAWN_RETRIES: u32 = 3;
+
 /// Helper to run jq command with input from stdin
 fn run_jq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(String, i32)> {
     let (stdout, _, code) = run_jq_stdin_streams(filter, input, extra_args)?;
@@ -80,15 +88,10 @@ fn run_jq_stdin_streams(
 /// Invokes the built binary directly rather than through `cargo run`: cargo
 /// writes its own `Finished`/`Running` progress lines to stderr, which would be
 /// indistinguishable from the diagnostics under test. That also makes the
-/// lock-contention retry unnecessary.
+/// lock-contention retry unnecessary — but the direct spawn can still race
+/// concurrent rebuilds of the same path, so it gets its own retry below (#550).
 fn run_jq_full(args: &[&str], input: Option<&str>) -> Result<(String, String, i32)> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut cmd = spawn_jq_full(args)?;
 
     if let Some(mut stdin) = cmd.stdin.take() {
         if let Some(input) = input {
@@ -102,6 +105,31 @@ fn run_jq_full(args: &[&str], input: Option<&str>) -> Result<(String, String, i3
         String::from_utf8(output.stderr)?,
         output.status.code().unwrap_or(-1),
     ))
+}
+
+/// Spawns the pre-built `succinctly` binary, retrying on `ENOENT`.
+///
+/// See `MAX_SPAWN_RETRIES` for why this retry exists.
+fn spawn_jq_full(args: &[&str]) -> std::io::Result<std::process::Child> {
+    for attempt in 0..MAX_SPAWN_RETRIES {
+        match Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("jq")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound && attempt + 1 < MAX_SPAWN_RETRIES =>
+            {
+                std::thread::sleep(Duration::from_millis(50 * (attempt as u64 + 1)));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
 }
 
 /// Helper to run jq command with file input
