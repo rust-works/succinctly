@@ -13,3 +13,4 @@
 # themselves always hold the correct (pinned yq) output; only this manifest
 # records where succinctly currently disagrees. See
 # tests/data/yaml-test-suite-known-failures.txt for the sibling manifest.
+line_builtin                   position           line/column are hardcoded to 0 on the OwnedValue evaluator path yq actually runs — #532
