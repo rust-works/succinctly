@@ -185,6 +185,34 @@ Requires Intel Ice Lake+ or AMD Zen 4+.
    to update your branch first — the queue does that for you. Merges are done by
    **rebase**: your commits are replayed onto `main` with no merge commit.
 
+### Verifying CI actually ran
+
+`gh pr checks` reporting "no checks reported" is ambiguous: it can mean
+"nothing has started yet" *or* "GitHub silently failed to deliver the
+trigger event for the current head" (see #531 — force-pushes and a
+close/reopen on a PR stopped producing new workflow runs for ~50 minutes
+while `main` and other branches ran normally). Don't assume the former.
+
+Don't trust the last SHA that *did* run — check the PR's actual current head:
+
+```bash
+gh pr view <PR> --json headRefOid -q .headRefOid
+gh api repos/rust-works/succinctly/commits/<head-sha>/check-runs
+```
+
+If `total_count` is `0` for the real head SHA while other branches/PRs are
+running CI normally, treat it as a possible event-delivery gap rather than
+"still queued."
+
+The `Canary` workflow (`.github/workflows/canary.yml`) is the fastest
+signal: it completes in seconds and stamps the SHA it ran against in its
+Step Summary, so you can tell at a glance which head GitHub most recently
+triggered a run for.
+
+Per #531's timeline, a content-identical amend + force-push and a
+close/reopen did *not* revive triggering, but a real rebase (new commit
+SHAs) did — if you hit this, a rebase is a known workaround.
+
 ## Architecture Guidelines
 
 ### Memory Layout
