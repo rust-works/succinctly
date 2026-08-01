@@ -6616,21 +6616,46 @@ fn eval_alternative_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     eval_update::<W, S>(path_expr, &filter, input, optional)
 }
 
-/// The error for an array index a path walk cannot reach.
+/// Turn `root` into a fresh empty object if it is `Null`, otherwise leave it
+/// untouched.
 ///
-/// jq splits these two ways. An index that is *still* negative after being
-/// counted back from the end is `Out of bounds negative array index` —
-/// `[1,2] | .[-5] = 9`, the same sentence `setpath` raises. A positive index
-/// past the end is not an error in jq at all: `[1,2] | .[5] = 9` extends the
-/// array, as `setpath([5]; 9)` does here. Until that gap closes, the positive
-/// case keeps succinctly's own wording rather than borrowing a jq sentence for
-/// a case jq does not raise; see `docs/compliance/jq/limitations.md`.
-fn out_of_range_index(idx: i64, len: usize) -> EvalError {
-    if idx < 0 {
-        EvalError::out_of_bounds_negative_index()
-    } else {
-        EvalError::index_out_of_bounds(idx, len)
+/// The one auto-vivification jq performs when a write walks through a missing
+/// or explicitly-`null` intermediate — mirrors `set_value_at_path`'s
+/// `OwnedValue::Null` arm, adapted to mutate a `&mut OwnedValue` in place
+/// instead of returning a fresh owned value. Any other non-`null` value is
+/// left alone, so indexing it still refuses exactly as before: `null` is the
+/// only value auto-vivified, matching `set_value_at_path`'s own rule.
+fn autovivify_object(root: &mut OwnedValue) {
+    if matches!(root, OwnedValue::Null) {
+        *root = OwnedValue::Object(IndexMap::new());
     }
+}
+
+/// Sibling of [`autovivify_object`] for an `Index` step.
+fn autovivify_array(root: &mut OwnedValue) {
+    if matches!(root, OwnedValue::Null) {
+        *root = OwnedValue::Array(Vec::new());
+    }
+}
+
+/// Resolve `idx` against `arr`, padding with `null`s if it names a position
+/// past the end, and return that slot.
+///
+/// Mirrors `set_value_at_path`'s numeric-key arm, and reuses
+/// `resolve_setpath_index` (already shared with `setpath()`) for the index
+/// math, so there is exactly one place that decides what a numeric write
+/// index resolves to. A still-negative index (after counting back from the
+/// end) is jq's `Out of bounds negative array index` — the one write-time
+/// check `?` does not suppress — so this is never gated by an
+/// `optional`/`here` flag at any call site; only `set_path`'s
+/// `Expr::Optional` arm ever needs to tell it apart from a suppressible
+/// error, via [`EvalError::is_negative_index_out_of_bounds`] (#498).
+fn write_index(arr: &mut Vec<OwnedValue>, idx: i64) -> Result<&mut OwnedValue, EvalError> {
+    let actual_idx = resolve_setpath_index(&OwnedValue::Int(idx), arr.len())?;
+    if actual_idx >= arr.len() {
+        pad_with_nulls(arr, actual_idx)?;
+    }
+    Ok(&mut arr[actual_idx])
 }
 
 /// Set a value at a path in an owned value.
@@ -6645,6 +6670,7 @@ fn set_path(
             Ok(())
         }
         Expr::Field(name) => {
+            autovivify_object(root);
             if let OwnedValue::Object(map) = root {
                 map.insert(name.clone(), new_value);
                 Ok(())
@@ -6656,15 +6682,10 @@ fn set_path(
             }
         }
         Expr::Index(idx) => {
+            autovivify_array(root);
             if let OwnedValue::Array(arr) = root {
-                let len = arr.len() as i64;
-                let actual_idx = if *idx < 0 { len + idx } else { *idx };
-                if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
-                    arr[actual_idx as usize] = new_value;
-                    Ok(())
-                } else {
-                    Err(out_of_range_index(*idx, arr.len()))
-                }
+                *write_index(arr, *idx)? = new_value;
+                Ok(())
             } else {
                 Err(EvalError::cannot_index_with_type(
                     owned_type_name(root),
@@ -6690,13 +6711,16 @@ fn set_path(
                 set_path(parent, last_path, new_value)
             }
         }
-        Expr::Optional(inner) => {
-            // For optional assignment, try to set but don't error if path doesn't exist
-            match set_path(root, inner, new_value) {
-                Ok(()) => Ok(()),
-                Err(_) => Ok(()), // Silently succeed for optional
-            }
-        }
+        Expr::Optional(inner) => match set_path(root, inner, new_value) {
+            Ok(()) => Ok(()),
+            // jq's `?` suppresses errors raised while *collecting* a path,
+            // but not the write-time bounds check on a still-negative array
+            // index — the one error left that `Index`'s arm above can still
+            // raise now that a positive overrun pads instead of erroring
+            // (#498).
+            Err(e) if e.is_negative_index_out_of_bounds() => Err(e),
+            Err(_) => Ok(()), // Silently succeed for optional
+        },
         Expr::Iterate => match root {
             OwnedValue::Array(arr) => {
                 for elem in arr.iter_mut() {
@@ -6854,6 +6878,7 @@ fn get_path_mut<'a>(
         current = match part {
             Expr::Identity => current,
             Expr::Field(name) => {
+                autovivify_object(current);
                 if let OwnedValue::Object(map) = current {
                     map.entry(name.clone()).or_insert(OwnedValue::Null)
                 } else {
@@ -6864,14 +6889,9 @@ fn get_path_mut<'a>(
                 }
             }
             Expr::Index(idx) => {
+                autovivify_array(current);
                 if let OwnedValue::Array(arr) = current {
-                    let len = arr.len() as i64;
-                    let actual_idx = if *idx < 0 { len + idx } else { *idx };
-                    if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
-                        &mut arr[actual_idx as usize]
-                    } else {
-                        return Err(out_of_range_index(*idx, arr.len()));
-                    }
+                    write_index(arr, *idx)?
                 } else {
                     return Err(EvalError::cannot_index_with_type(
                         owned_type_name(current),
@@ -6911,6 +6931,7 @@ fn update_path<S: EvalSemantics>(
             }
         }
         Expr::Field(name) => {
+            autovivify_object(root);
             if let OwnedValue::Object(map) = root {
                 let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
                 update_path::<S>(current, &Expr::Identity, filter_expr, optional)
@@ -6924,21 +6945,14 @@ fn update_path<S: EvalSemantics>(
             }
         }
         Expr::Index(idx) => {
+            autovivify_array(root);
             if let OwnedValue::Array(arr) = root {
-                let len = arr.len() as i64;
-                let actual_idx = if *idx < 0 { len + idx } else { *idx };
-                if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
-                    update_path::<S>(
-                        &mut arr[actual_idx as usize],
-                        &Expr::Identity,
-                        filter_expr,
-                        optional,
-                    )
-                } else if optional {
-                    Ok(())
-                } else {
-                    Err(out_of_range_index(*idx, arr.len()))
-                }
+                update_path::<S>(
+                    write_index(arr, *idx)?,
+                    &Expr::Identity,
+                    filter_expr,
+                    optional,
+                )
             } else if optional {
                 Ok(())
             } else {
@@ -6981,6 +6995,7 @@ fn update_path<S: EvalSemantics>(
 
                 match first {
                     Expr::Field(name) => {
+                        autovivify_object(root);
                         if let OwnedValue::Object(map) = root {
                             let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
                             update_path::<S>(current, &rest, filter_expr, optional)
@@ -6994,21 +7009,9 @@ fn update_path<S: EvalSemantics>(
                         }
                     }
                     Expr::Index(idx) => {
+                        autovivify_array(root);
                         if let OwnedValue::Array(arr) = root {
-                            let len = arr.len() as i64;
-                            let actual_idx = if *idx < 0 { len + idx } else { *idx };
-                            if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
-                                update_path::<S>(
-                                    &mut arr[actual_idx as usize],
-                                    &rest,
-                                    filter_expr,
-                                    optional,
-                                )
-                            } else if here {
-                                Ok(())
-                            } else {
-                                Err(out_of_range_index(*idx, arr.len()))
-                            }
+                            update_path::<S>(write_index(arr, *idx)?, &rest, filter_expr, optional)
                         } else if here {
                             Ok(())
                         } else {
@@ -19526,6 +19529,21 @@ mod tests {
         ]);
     }
 
+    /// `=`/`|=` agree with `setpath()` on every auto-vivification/padding shape
+    /// above (#486) — the shared case table the issue asked for so `set_path`/
+    /// `update_path` and `set_value_at_path` cannot drift apart again.
+    #[test]
+    fn test_assign_and_update_agree_with_setpath_on_autovivification() {
+        assert_outcomes(&[
+            (b"null", ".a = 1", Ok(r#"{"a":1}"#)),
+            (b"null", ".a |= 1", Ok(r#"{"a":1}"#)),
+            (b"null", ".[0] = 1", Ok("[1]")),
+            (b"null", ".[0] |= 1", Ok("[1]")),
+            (br#"{"a":[]}"#, ".a[0] = 1", Ok(r#"{"a":[1]}"#)),
+            (br#"{"a":[]}"#, ".a[0] |= 1", Ok(r#"{"a":[1]}"#)),
+        ]);
+    }
+
     /// A real container indexed with the wrong kind of key is refused too —
     /// it is not silently replaced by the container the key does fit.
     #[test]
@@ -21511,6 +21529,129 @@ mod tests {
                     OwnedValue::Int(4),
                 ]));
             }
+        );
+    }
+
+    #[test]
+    fn test_assign_autovivifies_through_null_and_missing_fields() {
+        // #486: a write through a missing or `null` intermediate builds the
+        // container the path implies, exactly as `setpath()` already does,
+        // instead of erroring `Cannot index null with string "..."`.
+        assert_outcomes(&[
+            (b"null", ".a = 1", Ok(r#"{"a":1}"#)),
+            (b"{}", ".a.b = 9", Ok(r#"{"a":{"b":9}}"#)),
+            (br#"{"a":null}"#, ".a.b.c = 9", Ok(r#"{"a":{"b":{"c":9}}}"#)),
+            (b"{}", ".a[0] = 9", Ok(r#"{"a":[9]}"#)),
+        ]);
+    }
+
+    #[test]
+    fn test_assign_autovivifies_and_pads_through_null_index() {
+        // Sibling of the field case above, for a numeric index: `null`
+        // becomes an array, and an index past the end pads with `null`s
+        // rather than erroring — matching `setpath([5]; 9)`.
+        assert_outcomes(&[
+            (b"null", ".[0] = 9", Ok("[9]")),
+            (b"[1,2]", ".[5] = 9", Ok("[1,2,null,null,null,9]")),
+            (br#"{"a":[]}"#, ".a[0] = 9", Ok(r#"{"a":[9]}"#)),
+        ]);
+    }
+
+    #[test]
+    fn test_update_compound_and_alternative_assign_autovivify_too() {
+        // The same auto-vivification applies to every write operator that
+        // funnels through `update_path`, not just plain `=`.
+        assert_outcomes(&[
+            (b"{}", ".a.b |= 9", Ok(r#"{"a":{"b":9}}"#)),
+            (b"{}", ".a.b += 1", Ok(r#"{"a":{"b":1}}"#)),
+            (b"{}", ".a.b //= 9", Ok(r#"{"a":{"b":9}}"#)),
+            (b"[1,2]", ".[5] |= 9", Ok("[1,2,null,null,null,9]")),
+        ]);
+    }
+
+    #[test]
+    fn test_optional_assign_through_autovivified_null_no_longer_leaves_a_remnant() {
+        // Before #486/#498, `?` swallowed the write failure but not before
+        // `get_path_mut`'s `or_insert(Null)` had already created the key, so
+        // `.a[.k]? = 5` and `.a.b? = 5` left `"a":null` behind instead of
+        // either the full write or an untouched input. Now that the write
+        // itself succeeds, there is nothing left for `?` to swallow.
+        assert_outcomes(&[
+            (
+                br#"{"k":"z"}"#,
+                ".a[.k]? = 5",
+                Ok(r#"{"k":"z","a":{"z":5}}"#),
+            ),
+            (b"{}", ".a.b? = 5", Ok(r#"{"a":{"b":5}}"#)),
+        ]);
+    }
+
+    #[test]
+    fn test_optional_write_still_raises_on_negative_index_out_of_bounds() {
+        // #498: `?` suppresses errors raised while *collecting* a path, but
+        // not the write-time bounds check on a still-negative array index —
+        // jq raises `.[-5]? = 9` even though the trailing `?` would swallow
+        // any other indexing failure at that position.
+        assert_outcomes(&[
+            (
+                b"[1,2]",
+                ".[-5]? = 9",
+                Err("Out of bounds negative array index"),
+            ),
+            (
+                br#"{"a":[1,2]}"#,
+                ".a[-5]? = 9",
+                Err("Out of bounds negative array index"),
+            ),
+            // Unaffected: `?` on a genuine type mismatch (not an OOB index)
+            // still suppresses, same as before.
+            (b"5", ".a? = 1", Ok("5")),
+        ]);
+    }
+
+    #[test]
+    fn test_set_path_and_get_path_mut_autovivify_null_directly() {
+        // Direct-function coverage for the three walkers `autovivify_object`/
+        // `autovivify_array`/`write_index` touch (#486), bypassing the parser.
+        let mut root = OwnedValue::Null;
+        set_path(&mut root, &Expr::Field("a".to_string()), OwnedValue::Int(1)).unwrap();
+        assert_eq!(
+            root,
+            OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1),)]))
+        );
+
+        let mut root = OwnedValue::Null;
+        set_path(&mut root, &Expr::Index(0), OwnedValue::Int(1)).unwrap();
+        assert_eq!(root, OwnedValue::Array(vec![OwnedValue::Int(1)]));
+
+        let mut root = OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        set_path(&mut root, &Expr::Index(4), OwnedValue::Int(9)).unwrap();
+        assert_eq!(
+            root,
+            OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Null,
+                OwnedValue::Null,
+                OwnedValue::Int(9),
+            ])
+        );
+
+        // `get_path_mut` vivifies each intermediate as it walks a multi-part
+        // parent path, not just the first step.
+        let mut root = OwnedValue::Object(IndexMap::new());
+        let slot = get_path_mut(
+            &mut root,
+            &[Expr::Field("a".to_string()), Expr::Field("b".to_string())],
+        )
+        .unwrap();
+        assert_eq!(*slot, OwnedValue::Null);
+        assert_eq!(
+            root,
+            OwnedValue::Object(IndexMap::from([(
+                "a".to_string(),
+                OwnedValue::Object(IndexMap::from([("b".to_string(), OwnedValue::Null)])),
+            )]))
         );
     }
 

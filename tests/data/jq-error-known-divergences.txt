@@ -39,8 +39,13 @@
 #
 # Reseeded by #513 from the open bug corpus: two probes pinning bugs filed
 # before a fix existed.
+#
+# #486 (`set_path`/`get_path_mut`/`update_path` now auto-vivify and pad the
+# way `set_value_at_path` already did for `setpath()`) and #498 (the write-time
+# negative-index bounds check now survives `?`, since `?` only ever suppressed
+# errors raised while *collecting* a path) landed together and took
+# `optional_write_negative_oob` with them: `.[-5]? = 9` now raises, matching jq.
 
-optional_write_negative_oob  assignment  `?` only suppresses errors from path collection in jq, not setpath's write-time bounds check, so `.[-5]? = 9` silently no-ops instead of raising — #498
 repeat_error_swallowed       repeat      eval_repeat (src/jq/eval.rs) discards the generator's first error instead of propagating it — #495
 del_oob_index_iterate_tail           del             an out-of-range index resolves to null and the `[]` tail must raise; the #477 bounds check skips the tail entirely — #529
 del_oob_index_iterate_tail_nested    del             same site reached through a field, so the grouped and single-path walkers stay in step — #529

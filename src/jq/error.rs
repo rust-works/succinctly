@@ -338,7 +338,18 @@ impl EvalError {
     /// resolved against the array's length — `[1,2] | setpath([-5]; 9)`. The
     /// sentence carries neither the index nor the length.
     pub fn out_of_bounds_negative_index() -> Self {
-        Self::new("Out of bounds negative array index")
+        Self::new(Self::OUT_OF_BOUNDS_NEGATIVE_INDEX)
+    }
+
+    const OUT_OF_BOUNDS_NEGATIVE_INDEX: &'static str = "Out of bounds negative array index";
+
+    /// Whether this is exactly [`Self::out_of_bounds_negative_index`] — the one
+    /// write-time bounds check jq's `?` does not suppress, unlike every other
+    /// indexing error it raises (`?` only suppresses errors raised while
+    /// *collecting* a path, not this one). The lone call site that needs to tell
+    /// the two apart is `set_path`'s `Expr::Optional` arm in `eval.rs` (#498).
+    pub fn is_negative_index_out_of_bounds(&self) -> bool {
+        self.message == Self::OUT_OF_BOUNDS_NEGATIVE_INDEX
     }
 
     /// `Array/string slice indices must be integers`.
