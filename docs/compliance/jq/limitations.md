@@ -31,9 +31,9 @@ Measured against jq-1.7.1 over the 186 probes in
 
 | Dimension                                    | Result               | Meaning                                            |
 |----------------------------------------------|----------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **179/186 = 96.2%**  | Byte-identical to jq                               |
+| **Message text** (both evaluators, verbatim) | **180/186 = 96.8%**  | Byte-identical to jq                               |
 | **Wording divergences**                      | **0**                | Every probe that errors in both errors identically |
-| **Behaviour / parser gaps**                  | **7**                | succinctly does not raise the error at all         |
+| **Behaviour / parser gaps**                  | **6**                | succinctly does not raise the error at all         |
 
 These three numbers are asserted, not maintained by hand: `jq_error_message_tests.rs`
 parses them back out of this page and fails if they drift from the corpus (they went stale
@@ -246,18 +246,12 @@ shortest rendering differs from their source spelling.
 
 ## Behaviour and parser gaps
 
-Two remain open, recorded in
+One remains open, recorded in
 [`tests/data/jq-error-known-divergences.txt`](../../../tests/data/jq-error-known-divergences.txt).
 That file's check is two-sided — a probe that starts diverging without a line there fails
 the build, and so does a line for a probe that starts matching — so this section cannot
 silently drift from the corpus.
 
-- **`optional_write_negative_oob`** (`.[-5]? = 9` on `[1,2]`): jq still raises `Out of
-  bounds negative array index` even through `?`, because `?` only suppresses errors
-  raised while *collecting* the path, not the write-time bounds check `setpath`
-  performs. succinctly currently treats `?` as suppressing the write too, so `.[-5]? = 9`
-  silently leaves the array unchanged instead of raising.
-  [#498](https://github.com/rust-works/succinctly/issues/498).
 - **`repeat_error_swallowed`** (`repeat(if . > 3 then error("boom") else .+1 end)` on
   `5`): jq propagates the generator's error the first time it is raised — here, on the
   very first iteration, since `5 > 3` immediately. `eval_repeat` in
@@ -266,6 +260,14 @@ silently drift from the corpus.
   erroring. [#495](https://github.com/rust-works/succinctly/issues/495).
 
 What used to be listed here, and what closed it:
+
+`optional_write_negative_oob` (`.[-5]? = 9` on `[1,2]`) was here: `?` only suppresses
+errors raised while *collecting* a path, not the write-time bounds check on a
+still-negative array index, but succinctly treated `?` as suppressing the write too, so
+`.[-5]? = 9` silently left the array unchanged instead of raising.
+[#498](https://github.com/rust-works/succinctly/issues/498) closed it, landing together
+with [#486](https://github.com/rust-works/succinctly/issues/486) — see "Where succinctly
+errors and jq does not" below for the auto-vivification gap #498 depended on.
 
 `slice_assign_non_array` and `slice_indices_not_integers` were the last two.
 [#366](https://github.com/rust-works/succinctly/issues/366) made a slice a real path
@@ -294,17 +296,22 @@ have to be recorded here.
 
 | Filter            | Input         | jq                          | succinctly                            |
 |-------------------|---------------|-----------------------------|---------------------------------------|
-| `.a = 1`          | `null`        | `{"a":1}`                   | `Cannot index null with string "a"`   |
-| `.a.b = 1`        | `{}`          | `{"a":{"b":1}}`             | `Cannot index null with string "b"`   |
-| `.[5] = 9`        | `[1,2]`       | `[1,2,null,null,null,9]`    | `index 5 out of bounds (length 2)`    |
-| `.[5] \|= 9`      | `[1,2]`       | `[1,2,null,null,null,9]`    | `index 5 out of bounds (length 2)`    |
 | `.[1:2] = ["x"]`  | `null`        | `["x"]`                     | `Cannot index null with object`       |
 | `.[1:2] \|= ["x"]`| `null`        | `["x"]`                     | `Cannot index null with object`       |
 
-Every row is an assignment or update walking a path *in place*, and every one but the two
-slice rows is older than #356 — the rewording changed what these say, not whether they say
-it. The gap they share is auto-vivification: jq grows the container the path asks for
-(`null` into an object, an array up to the index) where succinctly refuses.
+Both rows are a slice write walking a path *in place*, and the gap is the same
+auto-vivification jq performs everywhere else it writes through a path: `null` grows into
+whatever container the path names. Four non-slice rows used to sit above these — `.a = 1`
+on `null`, `.a.b = 1` on `{}`, `.[5] = 9` and `.[5] |= 9` on `[1,2]`, all reported as
+`Cannot index …`/`index N out of bounds (length M)` where jq builds or pads the container —
+closed together by [#486](https://github.com/rust-works/succinctly/issues/486)
+(`set_path`/`get_path_mut`/`update_path` now vivify `null` and pad past the array end, the
+way `set_value_at_path` already did for `setpath()`) and
+[#498](https://github.com/rust-works/succinctly/issues/498) (the write-time negative-index
+bounds check now survives `?`, since padding is what makes the positive case succeed rather
+than needing `?` to swallow a failure). No write operator produces `index N out of bounds
+(length M)` any more; a numeric index past the end is not an error jq raises, so there is no
+longer a positive case for succinctly's own wording to cover.
 
 `del()` used to sit here too — `del(.[5])` and `del(.[-5])` on `[1,2]`, plus a missing
 intermediate key — but every one of those is a silent no-op now, matching jq, after
@@ -322,8 +329,11 @@ not yet seeded into the probe corpus.
 The two slice rows were added by [#366](https://github.com/rust-works/succinctly/issues/366)
 deliberately. Writing through a slice could have vivified `null` on its own — `setpath`
 does, and the shared code was right there — but that would have left `.[1:2] = ["x"]`
-growing a container while `.a = 1` beside it still refused, inside one feature. They match
-their neighbours instead, and close together with the rest of this table.
+growing a container while `.a = 1` beside it still refused, inside one feature; they matched
+their neighbours instead. Now that #486/#498 closed the rest of this table, the slice rows
+are the odd ones out rather than the ones fitting in — `.a = 1` and `.[5] = 9` vivify `null`
+today, and `.[1:2] = ["x"]` still deliberately does not. See "A slice is a path component"
+below for why that gap stays open.
 
 An object key that yields something other than exactly one value is a second, unrelated
 group — it is the key half of
@@ -343,16 +353,23 @@ means generating a stream, not renaming an error. The sentence stays succinctly'
 
 `setpath` is the same operation without the syntax, and after #359 it does follow jq —
 `[1,2] | setpath([5]; 9)` is `[1,2,null,null,null,9]`, and `null | setpath(["a"]; 1)` is
-`{"a":1}`. So the two disagree with each other in-tree today; closing that means teaching
-`set_path`/`update_path`/`delete_at_path` to vivify the way `set_value_at_path` now does.
+`{"a":1}`. The two used to disagree with each other in-tree; [#486](https://github.com/rust-works/succinctly/issues/486)
+closed that by teaching `set_path`/`get_path_mut`/`update_path` to vivify the way
+`set_value_at_path` already did, so `=`/`|=`/the compound operators/`//=` now agree with
+`setpath` on every one of the four shapes removed from the table earlier in this section.
+`delete_at_path` deliberately keeps its own,
+different mechanism — a step that reaches `null` or an out-of-range index is a no-op rather
+than a container to build (#476/#477), since `del` never needs to invent structure to delete
+through — so it is not a fourth function taught the same rule, it is a different rule for a
+different operation.
 
 Where the same walk *does* error in jq, the sentence matches. A still-negative index is
 jq's `Out of bounds negative array index` in `=` and `|=` as well as `setpath`, pinned by
 the probes `assign_negative_index_oob`, `update_negative_index_oob` and
-`assign_negative_index_nested`; `del` raises the same sentence, which is why the last row
-above shows it against a jq that does not raise at all. `index N out of bounds (length M)`
-is succinctly's own wording, kept deliberately for the positive case rather than borrowing
-a jq sentence for something jq never says.
+`assign_negative_index_nested`; `del` raises the same sentence for a negative index too.
+Unlike the positive case above, `?` does not suppress this one —
+[#498](https://github.com/rust-works/succinctly/issues/498) — because it is a write-time
+bounds check, not a failure to collect the path.
 
 ## Refusing an allocation jq does not survive
 
