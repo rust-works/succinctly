@@ -19,8 +19,9 @@ use indexmap::IndexMap;
 
 use super::document::{DocumentCursor, DocumentElements, DocumentFields, DocumentValue};
 use super::eval::{
-    compare_values, eval as full_eval, index_one_owned as index_owned_by_key, numeric_key_to_index,
-    tonumber_from_str, Control, EvalError, EvalSemantics, JqSemantics, QueryResult,
+    compare_values, eval as full_eval, index_one_owned as index_owned_by_key,
+    numeric_display_string, numeric_key_to_index, tonumber_from_str, Control, EvalError,
+    EvalSemantics, JqSemantics, QueryResult,
 };
 use super::expr::{Builtin, CompareOp, Expr, Literal};
 use super::value::OwnedValue;
@@ -1579,7 +1580,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 OwnedValue::Null => "null".to_string(),
                 OwnedValue::Bool(b) => b.to_string(),
                 OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-                    owned.number_str().expect("numeric variant").into_owned()
+                    numeric_display_string(&owned)
                 }
                 OwnedValue::String(s) => s.clone(),
                 OwnedValue::Array(_) | OwnedValue::Object(_) => owned.to_json(),
@@ -1820,6 +1821,21 @@ mod tests {
         let owned = result.into_owned().unwrap();
 
         assert_eq!(owned, OwnedValue::String("object".to_string()));
+    }
+
+    #[test]
+    fn test_generic_tostring_overflow_literal_renders_as_inf() {
+        // Mirrors eval.rs's test_number_literal_overflow_renders_as_inf_not_garbage
+        // (#561): the generic evaluator's ToString arm had the same bug.
+        let json = br"1e400";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let result = eval(&Expr::Builtin(Builtin::ToString), value);
+        let owned = result.into_owned().unwrap();
+
+        assert_eq!(owned, OwnedValue::String("inf".to_string()));
     }
 
     #[test]

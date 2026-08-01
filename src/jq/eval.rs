@@ -3653,6 +3653,25 @@ fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     QueryResult::Owned(OwnedValue::String(result))
 }
 
+/// Render a numeric value the way the non-JSON text formats want it.
+///
+/// `number_str()` deliberately skips NaN/Infinity handling (see its doc
+/// comment) because `to_json` needs "null" instead. Text formats (`@text`,
+/// `@uri`, `@html`, `@sh`, and the CSV/TSV/DSV cell formatter that falls back
+/// to `owned_to_string`) want the same `"inf"`/`"-inf"`/`"NaN"` rendering a
+/// plain `Int`/`Float` already gets from `f64::to_string()` -- a
+/// `NumberLiteral` just needs that check made explicit, since its `number_str`
+/// otherwise re-renders the (possibly nonsensical for an overflowed literal)
+/// source text via `format_number_jq_compat`.
+pub(crate) fn numeric_display_string(value: &OwnedValue) -> String {
+    if let OwnedValue::NumberLiteral(NumberRepr::Float(f), _) = value {
+        if f.is_nan() || f.is_infinite() {
+            return f.to_string();
+        }
+    }
+    value.number_str().expect("numeric variant").into_owned()
+}
+
 /// Convert an owned value to a string representation (for interpolation).
 fn owned_to_string(value: &OwnedValue) -> String {
     match value {
@@ -3660,7 +3679,7 @@ fn owned_to_string(value: &OwnedValue) -> String {
         OwnedValue::Bool(true) => "true".to_string(),
         OwnedValue::Bool(false) => "false".to_string(),
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-            value.number_str().expect("numeric variant").into_owned()
+            numeric_display_string(value)
         }
         OwnedValue::String(s) => s.clone(), // Don't quote strings in interpolation
         OwnedValue::Array(_) | OwnedValue::Object(_) => value.to_json(),
@@ -3713,7 +3732,7 @@ fn format_uri(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> 
     let s = match value {
         OwnedValue::String(s) => s.clone(),
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-            value.number_str().expect("numeric variant").into_owned()
+            numeric_display_string(value)
         }
         OwnedValue::Bool(b) => {
             if *b {
@@ -3933,7 +3952,7 @@ fn format_html(value: &OwnedValue, _optional: bool) -> Result<String, EvalError>
     let s = match value {
         OwnedValue::String(s) => s.clone(),
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-            value.number_str().expect("numeric variant").into_owned()
+            numeric_display_string(value)
         }
         OwnedValue::Bool(b) => {
             if *b {
@@ -3974,7 +3993,7 @@ fn shell_quote_value(value: &OwnedValue) -> String {
         }
         // Numbers, bools, null are NOT quoted in jq
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-            value.number_str().expect("numeric variant").into_owned()
+            numeric_display_string(value)
         }
         OwnedValue::Bool(b) => {
             if *b {
@@ -4007,7 +4026,7 @@ fn format_sh(value: &OwnedValue, _optional: bool) -> Result<String, EvalError> {
         }
         // Numbers, bools, null are converted to strings
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
-            Ok(value.number_str().expect("numeric variant").into_owned())
+            Ok(numeric_display_string(value))
         }
         OwnedValue::Bool(b) => Ok(if *b {
             "true".to_string()
@@ -4243,7 +4262,7 @@ fn builtin_tostring<W: Clone + AsRef<[u64]>>(
         OwnedValue::Bool(false) => "false".to_string(),
         OwnedValue::Int(n) => format!("{n}"),
         OwnedValue::Float(f) => format!("{f}"),
-        OwnedValue::NumberLiteral(_, literal) => format_number_jq_compat(literal.as_bytes()),
+        OwnedValue::NumberLiteral(..) => numeric_display_string(&owned),
         OwnedValue::Array(_) | OwnedValue::Object(_) => owned.to_json(),
     };
     QueryResult::Owned(OwnedValue::String(s))
@@ -19753,6 +19772,48 @@ mod tests {
         query!(br"null", "tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "null");
+            }
+        );
+    }
+
+    #[test]
+    fn test_number_literal_overflow_renders_as_inf_not_garbage() {
+        // A `NumberLiteral` whose parsed f64 overflows to infinity used to
+        // re-render its raw source text through `format_number_jq_compat`,
+        // producing garbage like "NaNE+2147483647" instead of "inf" (#561).
+        query!(br"1e400", "tostring",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "inf");
+            }
+        );
+
+        query!(br"-1e400", "tostring",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "-inf");
+            }
+        );
+
+        query!(br"1e400", "@uri",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "inf");
+            }
+        );
+
+        query!(br"1e400", "@html",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "inf");
+            }
+        );
+
+        query!(br"1e400", "@sh",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "inf");
+            }
+        );
+
+        query!(br"1e400", r#""\(.)""#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "inf");
             }
         );
     }
