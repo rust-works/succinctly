@@ -38,9 +38,34 @@
 
 #[cfg(not(test))]
 use alloc::vec::Vec;
+use core::cell::Cell;
 
 use crate::bits::EliasFano;
 use crate::text::line_break::{is_line_break, line_break_len};
+
+/// How many lines [`LineIndex::to_line_column`] will walk forward from the
+/// cache before giving up and falling back to a full binary search. Bounds
+/// the worst case of a query that lands just past the cached line while
+/// keeping the common near-sequential case (`.[] | line` walking a document
+/// top to bottom) cheap. Not benchmarked against other values — a reasonable
+/// starting point, not a tuned constant.
+const FORWARD_WALK_CAP: u32 = 16;
+
+/// One cached `(offset, line, line_start)` lookup, so a monotone walk of
+/// [`LineIndex::to_line_column`] — e.g. `.[] | line` visiting array elements
+/// in document order — resolves in amortised O(1) instead of a fresh
+/// `EliasFano::predecessor` binary search per call. Mirrors the one-entry
+/// `Cell`-based cache `AdvancePositions` uses for its O1/O2 optimizations
+/// (`src/yaml/advance_positions.rs`).
+#[derive(Clone, Copy, Debug)]
+struct LineCacheEntry {
+    /// The clamped query offset this entry was computed for.
+    offset: u32,
+    /// 0-indexed line containing `offset`.
+    line_idx: u32,
+    /// Byte offset at which `line_idx` starts.
+    line_start: u32,
+}
 
 /// Index over the byte offsets at which each line starts.
 ///
@@ -64,6 +89,9 @@ pub struct LineIndex {
     starts: EliasFano,
     /// Total length of the indexed text.
     text_len: usize,
+    /// Last `to_line_column` lookup, reused to speed up nearby/repeated
+    /// queries. `Cell<T: Copy>` keeps `LineIndex` both `Clone` and `Debug`.
+    cache: Cell<Option<LineCacheEntry>>,
 }
 
 impl LineIndex {
@@ -112,6 +140,7 @@ impl LineIndex {
         Self {
             starts: EliasFano::build(&starts),
             text_len: text.len(),
+            cache: Cell::new(None),
         }
     }
 
@@ -143,12 +172,36 @@ impl LineIndex {
     ///
     /// # Performance
     ///
-    /// O(log lines). A cold path: error reporting, `at_position`, and the
-    /// locate CLIs.
+    /// A repeated or monotonically-forward query (the access pattern
+    /// `.[] | line` produces when walking a document top to bottom) resolves
+    /// in amortised O(1) via a one-entry cache of the last lookup, up to
+    /// `FORWARD_WALK_CAP` lines of forward movement. Beyond that — or on
+    /// the first call, or a backward/large jump — this is `O(log lines)`,
+    /// still cheap enough for the cold paths that predate the cache: error
+    /// reporting, `at_position`, and the locate CLIs.
     pub fn to_line_column(&self, offset: usize) -> (usize, usize) {
         // text_len <= u32::MAX, so clamping only affects offsets that are
         // already past the end.
         let query = offset.min(u32::MAX as usize) as u32;
+
+        if let Some(entry) = self.cache.get() {
+            if query == entry.offset {
+                // Exact repeat (e.g. `{l: line, c: column}` querying the
+                // same node twice): no lookup at all.
+                return (
+                    entry.line_idx as usize + 1,
+                    offset - entry.line_start as usize + 1,
+                );
+            }
+
+            if query > entry.offset {
+                if let Some(result) = self.walk_forward_from(entry, offset, query) {
+                    return result;
+                }
+                // Walk exceeded FORWARD_WALK_CAP: fall through to the full
+                // binary search below, same as a cold/backward query.
+            }
+        }
 
         // Always `Some`: element 0 is offset 0.
         let (idx, start) = self
@@ -156,7 +209,49 @@ impl LineIndex {
             .predecessor(query)
             .expect("LineIndex always holds line 1");
 
+        self.cache.set(Some(LineCacheEntry {
+            offset: query,
+            line_idx: idx as u32,
+            line_start: start,
+        }));
+
         (idx + 1, offset - start as usize + 1)
+    }
+
+    /// Try to resolve `query` by walking forward at most
+    /// [`FORWARD_WALK_CAP`] lines from `entry`, using O(1)
+    /// [`EliasFano::get`] per step instead of a fresh binary search.
+    /// Returns `None` if the walk exceeds the cap without reaching `query`.
+    fn walk_forward_from(
+        &self,
+        entry: LineCacheEntry,
+        offset: usize,
+        query: u32,
+    ) -> Option<(usize, usize)> {
+        let mut line_idx = entry.line_idx;
+        let mut line_start = entry.line_start;
+
+        for _ in 0..FORWARD_WALK_CAP {
+            match self.starts.get(line_idx as usize + 1) {
+                Some(next_start) if next_start <= query => {
+                    line_idx += 1;
+                    line_start = next_start;
+                }
+                // `next_start > query`, or no further line (`None`, `query`
+                // is on/past the last line either way): `query` is on
+                // `line_idx`.
+                _ => {
+                    self.cache.set(Some(LineCacheEntry {
+                        offset: query,
+                        line_idx,
+                        line_start,
+                    }));
+                    return Some((line_idx as usize + 1, offset - line_start as usize + 1));
+                }
+            }
+        }
+
+        None
     }
 
     /// Convert a 1-indexed line and column to a 0-indexed byte offset.
@@ -447,5 +542,114 @@ mod tests {
             index.heap_size(),
             dense.heap_size()
         );
+    }
+
+    /// 40 one-line-per-`\n` lines, `line`'s 1-indexed start is `(line - 1) * 4`
+    /// (each line is `"L%02d\n"`, 5 bytes wide including the terminator, but
+    /// the last line has no trailing `\n` counted into it). Large enough to
+    /// exercise both sides of [`FORWARD_WALK_CAP`] (16).
+    fn many_lines_text() -> Vec<u8> {
+        let mut text = Vec::new();
+        for i in 0..40 {
+            text.extend_from_slice(format!("L{i:02}\n").as_bytes());
+        }
+        text
+    }
+
+    #[test]
+    fn to_line_column_forward_gap_within_cap_matches_naive() {
+        let text = many_lines_text();
+        let index = LineIndex::build(&text);
+        let starts = naive_line_starts(&text);
+
+        // Prime the cache on line 3, then jump forward 10 lines (< cap):
+        // should resolve via the forward walk, not a fresh binary search.
+        let seed_offset = starts[2];
+        assert_eq!(index.to_line_column(seed_offset), (3, 1));
+
+        let target_offset = starts[12];
+        let expected_line = starts.partition_point(|&s| s <= target_offset);
+        assert_eq!(
+            index.to_line_column(target_offset),
+            (expected_line, target_offset - starts[expected_line - 1] + 1)
+        );
+    }
+
+    #[test]
+    fn to_line_column_forward_gap_beyond_cap_falls_back_correctly() {
+        let text = many_lines_text();
+        let index = LineIndex::build(&text);
+        let starts = naive_line_starts(&text);
+
+        // Prime the cache on line 1, then jump forward more than
+        // FORWARD_WALK_CAP lines — must fall back to the binary search and
+        // still return the correct answer, not a truncated/capped one.
+        assert_eq!(index.to_line_column(0), (1, 1));
+
+        let target_line = 1 + FORWARD_WALK_CAP as usize + 5;
+        let target_offset = starts[target_line - 1];
+        assert_eq!(index.to_line_column(target_offset), (target_line, 1));
+    }
+
+    #[test]
+    fn to_line_column_backward_after_forward_run_matches_naive() {
+        let text = many_lines_text();
+        let index = LineIndex::build(&text);
+        let starts = naive_line_starts(&text);
+
+        // Walk forward to populate the cache with a "late" entry, then query
+        // an earlier offset — the cache must not poison a backward lookup.
+        for &line in &[1usize, 5, 10, 20] {
+            let offset = starts[line - 1];
+            assert_eq!(index.to_line_column(offset), (line, 1), "forward to {line}");
+        }
+
+        let backward_offset = starts[1]; // line 2
+        assert_eq!(
+            index.to_line_column(backward_offset),
+            (2, 1),
+            "backward jump"
+        );
+
+        // And a subsequent forward query from that backward position must
+        // still be correct too (cache state after a backward miss).
+        let offset = starts[7]; // line 8
+        assert_eq!(index.to_line_column(offset), (8, 1), "forward again");
+    }
+
+    #[test]
+    fn to_line_column_repeated_same_offset_is_exact_hit() {
+        let text = many_lines_text();
+        let index = LineIndex::build(&text);
+        let starts = naive_line_starts(&text);
+
+        let offset = starts[9]; // line 10
+        let first = index.to_line_column(offset);
+        let second = index.to_line_column(offset);
+        assert_eq!(first, (10, 1));
+        assert_eq!(first, second, "repeated query must return the same result");
+    }
+
+    #[test]
+    fn to_line_column_shuffled_access_matches_naive() {
+        // A non-monotonic access pattern (unlike `matches_naive_scanner_at_-
+        // every_offset`'s strictly increasing scan) exercises every cache
+        // branch — hit, forward-within-cap, forward-beyond-cap, and
+        // backward — in one pass, order chosen to be deterministic rather
+        // than random (no RNG dependency in this crate's core tests).
+        let text = many_lines_text();
+        let index = LineIndex::build(&text);
+        let starts = naive_line_starts(&text);
+
+        let order = [0usize, 39, 5, 5, 6, 4, 20, 21, 22, 10, 39, 0, 15];
+        for &line in &order {
+            let offset = starts[line];
+            let expected_line = starts.partition_point(|&s| s <= offset);
+            assert_eq!(
+                index.to_line_column(offset),
+                (expected_line, offset - starts[expected_line - 1] + 1),
+                "line index {line}"
+            );
+        }
     }
 }

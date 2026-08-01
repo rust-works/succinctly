@@ -94,7 +94,7 @@ Cost of the lazy path is paid only by callers who need it:
 
 The deltas equal the dense index's `heap_size()` exactly — the allocation is simply gone.
 
-## Query cost, and why O(log n) is acceptable here
+## Query cost, and why O(log n) was acceptable before it became hot
 
 `to_line_column` needs "how many line starts precede this offset", which is a predecessor query.
 Elias-Fano has no rank, so `EliasFano::predecessor` is a binary search over `get` — O(log n) with a
@@ -108,23 +108,38 @@ O(1), and it is the direction both locate CLIs and `at_position(line; col)` use.
 | Caller                                                          | Frequency                  |
 |-----------------------------------------------------------------|----------------------------|
 | `jq-locate` / `yq-locate` (`--offset` → reported position)      | once per invocation        |
-| `YamlCursor::line()` / `column()` → the yq `line`/`column` builtins | **once per node visited**  |
+| `YamlCursor::line()` / `column()` / `JsonCursor::line()`/`column()` → the `jq`/`yq` `line`/`column` builtins | **once per node visited**  |
 
-The second row is not a cold path, and an earlier draft of this page claimed it did not exist. It is
-reached only through the cursor evaluator ([src/jq/eval_generic.rs](../../src/jq/eval_generic.rs));
-the `OwnedValue` path that the `syq` CLI takes today stubs both builtins to `0`
-([src/jq/eval.rs](../../src/jq/eval.rs), `builtin_line`), so no shipped command currently drives it
-per node. That is a gap in the builtins, not a licence to call the path cold — if the stubs are ever
-wired up, `.[] | line` becomes one binary search per node, and `{l: line, c: column}` two, because
-`column()` recomputes the search rather than sharing it.
+The second row was believed dormant for a while: the cursor evaluator
+([src/jq/eval_generic.rs](../../src/jq/eval_generic.rs)) computed correct positions, but only for a
+bare `line`/`column` call with zero preceding navigation — every `Expr`/`Builtin` arm that actually
+walked the document (`.foo`, `.[]`, `select(...)`, `Identity`) received a cursor and silently dropped
+it before forwarding to the next pipe stage. `.[] | line` returned `0` for every element, same as the
+`OwnedValue` path's hardcoded stubs ([src/jq/eval.rs](../../src/jq/eval.rs), `builtin_line`) — see
+issue #532. Fixing that cursor-forwarding (not this page's job — see the eval_generic.rs history) made
+this row genuinely hot: `.[] | line` is now one lookup per node, and `{l: line, c: column}` two,
+because `column()` still recomputes the search rather than sharing it with `line()` (a combined
+`line_column()` accessor stayed out of scope of #532 — the cache below already removes most of the
+duplicate work). The `OwnedValue`/full-evaluator path (`-n`, `--slurp`, `--inplace`, JSON-formatted
+input) still returns the `0` sentinel; that evaluator structurally has no cursor to forward, and
+threading one through it is a separate, much larger effort (see #532's discussion for why).
 
-Neither direction has been benchmarked. The comparison is not obviously a regression even at the
-per-node rate: `BitVec::select1` was itself sampled every 256 ones, which at the corpus's ~20
-bytes/line meant scanning up to ~80 words, against ~`log2(lines)` Elias-Fano `get`s here.
+Neither direction had been benchmarked before the path went live. The comparison was not obviously a
+regression even at the per-node rate: `BitVec::select1` was itself sampled every 256 ones, which at
+the corpus's ~20 bytes/line meant scanning up to ~80 words, against ~`log2(lines)` Elias-Fano `get`s
+here.
 
-If a hot consumer does appear, two accelerators are available. The cheap one is a one-entry
-`Cell` cache of the last `(offset, line, line_start)`, which makes the monotone walk `line()`
-performs amortised O(1) — the same trick `AdvancePositions` uses for O1/O2. The structural one:
+Once the path was confirmed hot, the cheap accelerator sketched here was implemented: `LineIndex`
+carries a one-entry `Cell` cache of the last `(offset, line, line_start)` lookup — the same trick
+`AdvancePositions` uses for O1/O2. An exact-repeat query is O(1) with no bit operations at all; a
+forward query within `FORWARD_WALK_CAP` (16) lines resolves via bounded `EliasFano::get` steps instead
+of a fresh binary search — the shape `.[] | line` produces when walking a document top to bottom,
+since sibling iteration visits offsets in increasing order. Anything else (first call, backward jump,
+or a forward jump past the cap) falls back to the binary search and refreshes the cache. The
+structural accelerator below remains unimplemented — the cache was enough once actually measured
+against the real access pattern.
+
+The structural one, for reference, if the cache above is ever insufficient:
 `select_samples[j] - j * SAMPLE_RATE` is the high part of element `j*256` and is monotone in `j`, so
 binary-searching that plain `Vec<u32>` narrows to a 256-element block with zero select calls.
 
