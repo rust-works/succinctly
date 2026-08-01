@@ -30,6 +30,16 @@ jobs:
       - name: Run cargo-audit
         run: cargo audit
 
+      # fuzz/ and bench-compare/ are separate cargo workspaces (own
+      # Cargo.lock), deliberately isolated from the root dependency graph --
+      # see fuzz/Cargo.toml's header comment. CI compiles them but the
+      # default `cargo audit` above only ever looks at the root Cargo.lock.
+      - name: Run cargo-audit (fuzz workspace)
+        run: cargo audit -f fuzz/Cargo.lock
+
+      - name: Run cargo-audit (bench-compare workspace)
+        run: cargo audit -f bench-compare/Cargo.lock
+
   deny:
     name: Dependency Policy
     runs-on: ubuntu-latest
@@ -39,6 +49,20 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2.1.1
         with:
           command: check all
+
+      # Same isolation gap as cargo-audit above. cargo-deny-action has no
+      # input for a custom config path, so invoke cargo-deny directly with
+      # each workspace's own deny.toml (root deny.toml is intentionally
+      # tuned to the shipped crate's dependency tree only).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Dependency Policy (fuzz workspace)
+        run: cargo deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check all
+
+      - name: Dependency Policy (bench-compare workspace)
+        run: cargo deny --manifest-path bench-compare/Cargo.toml --config bench-compare/deny.toml check all
 
   secrets:
     name: Secret Scanning
