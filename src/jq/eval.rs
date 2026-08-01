@@ -7277,10 +7277,7 @@ fn resolve_node<S: EvalSemantics>(
                 .iter()
                 .map(|(k, v)| (vec![Expr::Field(k.clone())], v.clone()))
                 .collect()),
-            other => Err(EvalError::type_error(
-                "array or object",
-                owned_type_name(other),
-            )),
+            other => Err(EvalError::cannot_iterate(other)),
         },
 
         Expr::IndexExpr { target, key } => resolve_index_expr::<S>(target, key, value, false),

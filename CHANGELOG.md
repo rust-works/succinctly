@@ -127,6 +127,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`del()`'s comma-group walker worded an `.[]`-over-a-scalar error its own
+  way instead of jq's** (#538): `echo '5' | sjq -c 'del(.[], .a)'` said
+  `expected array or object, got number` — succinctly's own wording, reserved
+  for sites with no jq counterpart — where jq, and `del(.[])` alone with no
+  comma sibling, both say `Cannot iterate over number (5)`. Adding any comma
+  sibling (or any computed key, e.g. `.[("x","y")]`) routes `.[]` through
+  `resolve_node`'s path pre-pass (added for #424/#475's grouped delete, and
+  reused since for computed-key assignment and `path()`) instead of the
+  single-path walkers' own `Expr::Iterate` arm, and that pre-pass arm's
+  non-container case called `EvalError::type_error("array or object", …)`
+  instead of `EvalError::cannot_iterate` — which also picks up jq's
+  string-truncation rule for free. One-line fix in `resolve_node`
+  (`src/jq/eval.rs`); a new probe (`del_comma_group_iterate_on_number`) pins
+  it in `tests/data/jq-error-probes.tsv`, and an existing computed-key test
+  that had documented the divergence as accepted
+  (`test_unsupported_path_prefixes_report_rather_than_misfire`) now asserts
+  jq's real wording.
+
 - **`del(f)?` emitted the unchanged input where jq emits nothing** (#537): jq's
   `?` on `del(...)?` is `try del(...) catch empty` around the **whole call** —
   `5 | del(.a)` raises `Cannot index number with string "a"`, so `5 | del(.a)?`
