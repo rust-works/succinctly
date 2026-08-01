@@ -21785,6 +21785,49 @@ mod tests {
     }
 
     #[test]
+    fn test_optional_write_does_not_swallow_a_sibling_clobber_in_a_fan_out() {
+        // #498's multi-branch case: `?` prunes path *production*, never
+        // *application* — and that holds even for a path that resolved
+        // cleanly, once it is one of several a fan-out applies in sequence.
+        // `.. | objects` here visits the root and `.a`, both objects whose
+        // own `.k` names an existing field, so `.[.k]?` on each resolves
+        // fully against the *original* document (`path()` sees `["a"]` then
+        // `["a","a"]`, no pruning). The first write (`.a = 7`) turns `.a`
+        // from an object into a number; the second (`.a.a`) then needs `.a`
+        // to still be an object and raises, matching jq. Before this fix,
+        // the resolved path's leftover `Expr::Optional` marker (from
+        // `resolve_index_expr`/`resolve_node`, meant only to record that a
+        // `?` was involved in producing the branch) was still being
+        // consulted by `set_path`/`update_path` at write time, so the raise
+        // was swallowed and `.a` was left at `7` instead.
+        let doc = br#"{"k":"a","a":{"k":"a","a":1}}"#;
+        assert_outcomes(&[
+            (
+                doc,
+                "(.. | objects | .[.k]?) = 7",
+                Err(r#"Cannot index number with string "a""#),
+            ),
+            (
+                doc,
+                "(.. | objects | .[.k]?) |= 7",
+                Err(r#"Cannot index number with string "a""#),
+            ),
+        ]);
+
+        // The purely static flavour, reached without any computed key at
+        // all: `resolve_seq`'s no-dynamic-component fast path splices a
+        // chain like `.a.a?` straight through unresolved rather than routing
+        // it through `resolve_node`, so it needed its own fix at
+        // `resolve_dynamic_indexes`'s assembly point rather than only at the
+        // two sites that build a resolved component from a computed key.
+        assert_outcomes(&[(
+            br#"{"a":{"a":1}}"#,
+            "(.a, .a.a?) = 7",
+            Err(r#"Cannot index number with string "a""#),
+        )]);
+    }
+
+    #[test]
     fn test_set_path_and_get_path_mut_autovivify_null_directly() {
         // Direct-function coverage for the three walkers `autovivify_object`/
         // `autovivify_array`/`write_index` touch (#486), bypassing the parser.

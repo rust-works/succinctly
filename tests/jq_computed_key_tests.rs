@@ -939,6 +939,77 @@ fn test_every_writer_agrees_after_a_multi_output_prefix() {
     );
 }
 
+/// #498's multi-branch case: a `?` on a path component still had to stop
+/// covering *write*-time failures once #486/#498 made single-path writes
+/// auto-vivify, because a resolved path can still be applied as one of
+/// several in the same fan-out — and a sibling's write can clobber the
+/// container a *later* one needs, a failure `?` never covers in jq (`?`
+/// prunes path production, never application; jq's `setpath` never
+/// re-consults it).
+///
+/// `.. | objects` visits the root and `.a`, both objects whose own `.k`
+/// names an existing field ("a"), so both branches resolve fully during
+/// production — `path()` below is unchanged, `["a"]` then `["a","a"]`. The
+/// first write (`.a = 7`) turns `.a` from an object into a number; the
+/// second (`.a.a`) then needs `.a` to still be an object and raises `Cannot
+/// index number with string "a"`, matching jq. Before this fix, the `?`
+/// resolved-path components had never been stripped, so `set_path`/
+/// `update_path` swallowed that raise and produced `{"k":"a","a":7}`.
+#[test]
+fn test_write_clobber_through_a_computed_key_fan_out_raises_instead_of_swallowing() {
+    let doc = r#"{"k":"a","a":{"k":"a","a":1}}"#;
+
+    check(
+        doc,
+        "[path(.. | objects | .[.k]?)]",
+        Outcome::values(&[r#"[["a"],["a","a"]]"#]),
+    );
+    check(
+        doc,
+        "(.. | objects | .[.k]?) = 7",
+        Outcome::error(r#"Cannot index number with string "a""#),
+    );
+    check(
+        doc,
+        "(.. | objects | .[.k]?) |= 7",
+        Outcome::error(r#"Cannot index number with string "a""#),
+    );
+
+    // `del()` cannot hit this: deleting a field only ever removes structure,
+    // it never replaces a container with a scalar, so the clobber this test
+    // is built around cannot arise for it — both jq and here agree the
+    // second delete is simply through an already-missing field.
+    check(
+        doc,
+        "del(.. | objects | .[.k]?)",
+        Outcome::values(&[r#"{"k":"a"}"#]),
+    );
+}
+
+/// Sibling of the test above, reached without any computed key at all: a
+/// purely static `?` (`.a.a?`) sitting on one branch of a `Comma`.
+/// `resolve_seq`'s no-dynamic-component fast path splices a chain like this
+/// straight through unresolved rather than routing it through
+/// `resolve_node`, so it is a distinct code path from the computed-key case
+/// above and needs its own coverage: `resolve_dynamic_indexes` still has to
+/// strip the wrapper from whatever it hands back, however that branch's
+/// components were produced.
+#[test]
+fn test_write_clobber_through_a_static_optional_comma_raises_instead_of_swallowing() {
+    let doc = r#"{"a":{"a":1}}"#;
+
+    check(
+        doc,
+        "(.a, .a.a?) = 7",
+        Outcome::error(r#"Cannot index number with string "a""#),
+    );
+    check(
+        doc,
+        "(.a, .a.a?) |= 7",
+        Outcome::error(r#"Cannot index number with string "a""#),
+    );
+}
+
 /// `recurse(f)` for an `f` that never stops producing.
 ///
 /// `f` is arbitrary, so nothing guarantees progress: `.a?` reads `null` from
