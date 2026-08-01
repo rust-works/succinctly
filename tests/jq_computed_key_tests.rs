@@ -632,15 +632,16 @@ fn test_optional_key_error_reaches_every_path_consuming_form() {
 }
 
 #[test]
-fn test_assignment_to_an_out_of_range_index_errors() {
-    // DIVERGENCE from jq 1.7.1, and one that predates computed keys: jq pads
-    // the array, giving `[1,2,3,null,null,9]`. Pinned rather than fixed so the
-    // day it changes is visible; the computed-key work only wrapped this
-    // `set_path` call in a per-path loop, it did not introduce the error.
+fn test_assignment_to_an_out_of_range_index_pads_with_nulls() {
+    // #486: jq pads the array rather than erroring, matching `setpath([5]; 9)`.
+    // Used to be a pinned divergence (`index 5 out of bounds (length 3)`); the
+    // computed-key work only wrapped this `set_path` call in a per-path loop,
+    // it did not introduce the divergence, and does not need to reproduce it
+    // now that `set_path` pads like `set_value_at_path` does.
     check(
         "[1,2,3]",
         ".[5] = 9",
-        Outcome::error("index 5 out of bounds (length 3)"),
+        Outcome::values(&["[1,2,3,null,null,9]"]),
     );
 }
 
@@ -1054,13 +1055,25 @@ fn test_typeof_filters_decide_which_path_branches_survive() {
         );
     }
 
+    // `nulls` used to be excluded from the loop below: assignment through
+    // `null` was a separate pre-existing gap (#486) — jq autovivifies
+    // `{"u":null} | .u.p = 9` to `{"u":{"p":9}}`, where succinctly reported
+    // `Cannot index null with string`. Now that #486 is fixed, `.u` succeeds
+    // like every genuinely-indexable branch above, rather than erroring like
+    // the arms in the loop below.
+    check(
+        doc,
+        r#"(.. | nulls | .[("p","q")]) = 9"#,
+        Outcome::values(&[
+            r#"{"arr":[10,20],"obj":{"p":1},"s":"str","n":7,"b":true,"u":{"p":9,"q":9}}"#,
+        ]),
+    );
+
     // The remaining arms keep only branches a string key *cannot* index, so
     // they emit no path at all — which on its own would also be the reading if
     // the arm wrongly pruned everything. Dropping the `?` distinguishes the
     // two: the error names the type the arm let through, so it is evidence the
-    // branch was kept. (`nulls` is absent here because assignment through null
-    // is a separate pre-existing gap: jq autovivifies `{"u":null} | .u.p = 9`
-    // to `{"u":{"p":9}}`, succinctly reports `Cannot index null with string`.)
+    // branch was kept.
     for (filter, type_name) in [
         ("arrays", "array"),
         ("numbers", "number"),
