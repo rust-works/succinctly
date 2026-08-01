@@ -1,0 +1,36 @@
+name: Canary
+
+# Fires on the exact events issue #531 observed going missing: force-push
+# (synchronize) and reopen. Kept separate from ci.yml so it stays a fast,
+# independent signal of "did GitHub deliver *any* trigger event for this
+# SHA" rather than being entangled with the full matrix's health.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: canary-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: canary
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Stamp SHA and timestamp
+        run: |
+          {
+            echo "### CI Canary"
+            echo "- SHA: \`${{ github.sha }}\`"
+            echo "- Event: \`${{ github.event_name }}\`"
+            echo "- Ref: \`${{ github.ref }}\`"
+            echo "- Stamped at: \`$(date -u +%Y-%m-%dT%H:%M:%SZ)\`"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
