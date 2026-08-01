@@ -151,6 +151,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boundary the same way `builtin_del`'s #537 fix already does, rather than
   threading the outer `?` into the walkers as a starting flag.
 
+- **A `?` on one path in a fan-out (`..`, `recurse`, a computed key, a
+  `Comma`) still swallowed a write failure caused by an *earlier sibling's*
+  write clobbering the container a later one needed** (#498, the
+  multi-branch case the fix above did not close): `{"k":"a","a":{"k":"a",
+  "a":1}} | (.. | objects | .[.k]?) = 7` produced `{"k":"a","a":7}` instead
+  of raising `Cannot index number with string "a"` like jq — the first write
+  (`.a = 7`) turns `.a` from an object into a number, and the second
+  (`.a.a`) then fails to walk it. Both branches resolve cleanly during path
+  *production* (against the original document, before either write runs),
+  so their `?` had already finished its job; the bug was that the resolved
+  path still carried an `Expr::Optional` marker from `resolve_index_expr`/
+  `resolve_node`, which `set_path`/`update_path` kept consulting at *write*
+  time and used to swallow the second failure. jq's own model never has this
+  problem: `path()` computes every fully-static path up front and prunes
+  under `?` exactly once there, and `setpath` — which cannot even represent
+  `?` in a plain path array — applies each one afterward completely
+  unconditionally. `resolve_dynamic_indexes` now does the same: it strips
+  every `Expr::Optional` wrapper from a resolved path's components before
+  handing them to the writers, however that branch was produced — including
+  a purely static tail like `.a.a?` reached through `resolve_seq`'s
+  no-computed-key fast path rather than a computed key at all.
+
 - **`del()`'s comma-group walker worded an `.[]`-over-a-scalar error its own
   way instead of jq's** (#538): `echo '5' | sjq -c 'del(.[], .a)'` said
   `expected array or object, got number` — succinctly's own wording, reserved
