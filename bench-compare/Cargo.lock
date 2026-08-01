@@ -189,9 +189,9 @@ dependencies = [
 
 [[package]]
 name = "bytes"
-version = "1.11.0"
+version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
+checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cast"
@@ -370,9 +370,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -823,7 +823,7 @@ dependencies = [
  "serde_yaml",
  "simd-json",
  "sonic-rs",
- "succinctly 0.7.0",
+ "succinctly 0.8.0",
  "sucds",
  "sux",
  "tracking-allocator",
@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "succinctly"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "bytemuck",
  "indexmap",
