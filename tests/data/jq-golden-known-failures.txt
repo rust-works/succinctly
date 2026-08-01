@@ -27,6 +27,14 @@
 # as a scoreboard instead of reading as a false clean bill of health.
 # path_empty (#489) has since been fixed and dropped, leaving 10; its golden
 # stays and now passes, which is the scoreboard working as intended.
+#
+# Extended by #514 with four *_error_after_output cases, taking the file to 15
+# entries (the #534 pair having landed since the #513 reseed above). They
+# are the first entries whose golden carries a non-empty expected.out **and** a
+# non-zero expected.status: jq streams some outputs and then fails. Exit code
+# and stderr already match, so each fails on stdout alone — and a fix that
+# emits the prefix while losing the failure would fail on status instead,
+# which is the pairing #400/#494 need pinned.
 
 comma_literal_before_document  comma              . evaluates before the literal 1 inside [1, .], reversing output order — #353
 object_construct_cartesian     object_construct   only the first output of each key/value generator is used instead of the cartesian product — #354
@@ -39,3 +47,7 @@ slice_computed_bounds          slice              computed slice bounds (.a[.k:2
 label_break_after_comma        label              break loses the already-emitted comma siblings that preceded it, producing no output — #400
 reduce_multi_output_init       reduce             a multi-output reduce INIT forks in jq; only the first init output is used — #534
 foreach_multi_output_init      foreach            a multi-output foreach INIT forks in jq; only the first init output is used — #534
+alt_error_after_output         alt                // discards the outputs the LHS already emitted before it errored — #400
+limit_error_after_output       limit              limit drops the outputs already emitted when a later one errors — #494
+while_error_after_output       while              while drops the outputs already emitted when a later iteration errors — #494
+foreach_error_after_output     foreach            foreach drops the outputs already emitted when a later state errors — #494
