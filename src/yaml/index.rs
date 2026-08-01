@@ -155,9 +155,9 @@ pub struct YamlIndexMemory {
     pub containers_rank: usize,
     /// Anchor, reverse-anchor and alias maps (approximate).
     pub anchors: usize,
-    /// Lazily-built newline bitmap; 0 until first use.
+    /// Lazily-built line-start index (`LineIndex`); 0 until first use.
     pub newlines: usize,
-    /// Whether the newline bitmap has been materialized.
+    /// Whether the line-start index has been materialized.
     pub newlines_materialized: bool,
     /// Length of the indexed text in bytes.
     pub text_len: usize,
@@ -413,8 +413,8 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             anchors: anchor_map_bytes(&self.anchors)
                 + reverse_anchor_map_bytes(&self.bp_to_anchor)
                 + self.aliases.len() * (core::mem::size_of::<usize>() * 2 + BTREE_ENTRY_OVERHEAD),
-            newlines: self.newlines.get().map_or(0, |nl| nl.words().len() * 8),
-            newlines_materialized: self.newlines.get().is_some(),
+            newlines: self.lines.get().map_or(0, |li| li.heap_size()),
+            newlines_materialized: self.lines.get().is_some(),
             text_len,
             num_opens,
         }
@@ -1530,5 +1530,4 @@ mod tests {
             );
         }
     }
-
 }
