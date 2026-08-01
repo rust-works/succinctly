@@ -6698,17 +6698,21 @@ fn set_path(
             if exprs.len() == 1 {
                 set_path(root, &exprs[0], new_value)
             } else if let Some(split) = split_at_slice(exprs) {
-                let parent = get_path_mut(root, split.before)?;
-                through_slice(parent, split.start, split.end, false, |sub| {
-                    set_path(sub, &split.tail, new_value)
-                })
+                match get_path_mut(root, split.before)? {
+                    None => Ok(()),
+                    Some(parent) => through_slice(parent, split.start, split.end, false, |sub| {
+                        set_path(sub, &split.tail, new_value)
+                    }),
+                }
             } else {
                 // Navigate to parent
                 let parent_path = &exprs[..exprs.len() - 1];
                 let last_path = &exprs[exprs.len() - 1];
 
-                let parent = get_path_mut(root, parent_path)?;
-                set_path(parent, last_path, new_value)
+                match get_path_mut(root, parent_path)? {
+                    None => Ok(()),
+                    Some(parent) => set_path(parent, last_path, new_value),
+                }
             }
         }
         Expr::Optional(inner) => match set_path(root, inner, new_value) {
@@ -6862,25 +6866,44 @@ fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit<'_>> {
     })
 }
 
-/// Get a mutable reference to a value at a path.
+/// Get a mutable reference to the parent named by `path_parts`, or `None` if
+/// a component along the way could not be walked and was itself marked
+/// optional (`?`).
+///
+/// Autovivification means a *wrong-type* mismatch — the only failure this can
+/// still raise — can only be reached through data the document already held:
+/// `Null` always vivifies into whatever the next step needs, so nothing this
+/// function creates can itself go on to fail. That is what makes per-step `?`
+/// safe to honour here without any risk of leaving a half-built container
+/// behind.
+///
+/// Each component's own `?` is scoped to that component only, mirroring
+/// `update_path`'s `Pipe`-chain arm: `{"a":5} | .a?.b.c = 1` still raises on
+/// `.c` (unprotected) even though `.a?` (protected, but never triggered here
+/// since `.a` reads fine) precedes it. This used to drop the bit entirely —
+/// "every path reaching a walker has already been resolved" is only true of
+/// the *computed-key* pre-pass (`resolve_dynamic_indexes`/`resolve_node`); a
+/// plain static chain like `.a?.b = 1` never goes through it at all
+/// (`needs_path_prepass` says no), so `get_path_mut` was the last word on
+/// whether `?` applied and was ignoring it: `"str" | .a?.b = 1` raised
+/// `Cannot index string with string "a"` instead of leaving `"str"`
+/// untouched, matching jq.
 fn get_path_mut<'a>(
     root: &'a mut OwnedValue,
     path_parts: &[Expr],
-) -> Result<&'a mut OwnedValue, EvalError> {
+) -> Result<Option<&'a mut OwnedValue>, EvalError> {
     let mut current = root;
 
     for part in path_parts {
-        // The `?` bit is dropped rather than honoured: every path reaching a
-        // walker has already been resolved against the real document, so a
-        // component that survived resolution is one the walk can follow. What
-        // matters here is not matching the wrapper as an unknown component.
-        let (part, _optional) = unwrap_path_component(part);
+        let (part, optional) = unwrap_path_component(part);
         current = match part {
             Expr::Identity => current,
             Expr::Field(name) => {
                 autovivify_object(current);
                 if let OwnedValue::Object(map) = current {
                     map.entry(name.clone()).or_insert(OwnedValue::Null)
+                } else if optional {
+                    return Ok(None);
                 } else {
                     return Err(EvalError::cannot_index_with_field(
                         owned_type_name(current),
@@ -6891,7 +6914,15 @@ fn get_path_mut<'a>(
             Expr::Index(idx) => {
                 autovivify_array(current);
                 if let OwnedValue::Array(arr) = current {
+                    // A still-negative index is the write-time bounds check,
+                    // not a walking failure, so `?` never covers it here
+                    // either — same reasoning as `set_path`'s `Expr::Optional`
+                    // arm, just with nothing to catch: `write_index` never
+                    // returns that error for a component this function can
+                    // itself elect to suppress.
                     write_index(arr, *idx)?
+                } else if optional {
+                    return Ok(None);
                 } else {
                     return Err(EvalError::cannot_index_with_type(
                         owned_type_name(current),
@@ -6908,7 +6939,7 @@ fn get_path_mut<'a>(
         };
     }
 
-    Ok(current)
+    Ok(Some(current))
 }
 
 /// Update a value at a path by applying a filter.
@@ -21617,6 +21648,27 @@ mod tests {
     }
 
     #[test]
+    fn test_optional_midchain_walking_failure_stays_scoped_to_its_own_component() {
+        // `get_path_mut` used to drop every inline `?` on a non-final path
+        // component ("every path reaching a walker has already been
+        // resolved" was only true of the computed-key pre-pass, which a
+        // plain static chain like `.a?.b` never goes through), so
+        // `"str" | .a?.b = 1` raised `Cannot index string with string "a"`
+        // instead of leaving `"str"` untouched like jq.
+        assert_outcomes(&[(br#""str""#, ".a?.b = 1", Ok(r#""str""#))]);
+
+        // A component's own `?` protects only *that* component: `.a?`
+        // resolves fine here (`.a` already holds `5`, reading an existing
+        // object field never fails), so it is never exercised, and the
+        // unprotected `.c` still raises on the number it lands on.
+        assert_outcomes(&[(
+            br#"{"a":{"b":5}}"#,
+            ".a?.b.c |= 1",
+            Err(r#"Cannot index number with string "c""#),
+        )]);
+    }
+
+    #[test]
     fn test_set_path_and_get_path_mut_autovivify_null_directly() {
         // Direct-function coverage for the three walkers `autovivify_object`/
         // `autovivify_array`/`write_index` touch (#486), bypassing the parser.
@@ -21651,6 +21703,7 @@ mod tests {
             &mut root,
             &[Expr::Field("a".to_string()), Expr::Field("b".to_string())],
         )
+        .unwrap()
         .unwrap();
         assert_eq!(*slot, OwnedValue::Null);
         assert_eq!(
