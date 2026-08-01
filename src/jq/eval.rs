@@ -21566,6 +21566,13 @@ mod tests {
             (b"{}", ".a.b += 1", Ok(r#"{"a":{"b":1}}"#)),
             (b"{}", ".a.b //= 9", Ok(r#"{"a":{"b":9}}"#)),
             (b"[1,2]", ".[5] |= 9", Ok("[1,2,null,null,null,9]")),
+            // `|=`/`+=`/etc. walk a path recursively rather than looping like
+            // `get_path_mut` does for plain `=`, so a mid-path (not the last
+            // segment) `Index` step is a separate call site with its own
+            // autovivify_array + write_index calls — exercised only by an
+            // Index step that still has more path left after it.
+            (b"{}", ".a[0].b |= 9", Ok(r#"{"a":[{"b":9}]}"#)),
+            (b"[{},{}]", ".[0].x += 1", Ok(r#"[{"x":1},{}]"#)),
         ]);
     }
 
