@@ -2658,4 +2658,243 @@ mod tests {
         let yq_result = eval_using::<YqSemantics, _>(&expr, index.root(json).value());
         assert_eq!(yq_result.into_owned(), Some(OwnedValue::Float(1.5)));
     }
+
+    // Coverage follow-ups for #532: the tests above exercise the common
+    // `.foo`/`.[]`/`select(...)` shapes, but a few less-common `GenericResult`
+    // combinations at Pipe/Compare/Select/Iterables/Scalars stage boundaries
+    // weren't reached by any existing test. `Error`/`Break` in these arms
+    // return immediately, so those two get their own dedicated tests instead
+    // of being combined with the success-path ones.
+
+    #[test]
+    fn test_json_many_stage_result_produces_many_cursor_per_element() {
+        // `.[("a","b")]` is a computed multi-key index: on an object with
+        // both keys present as borrowed (non-owned) values, it resolves to a
+        // plain `Many` (not `ManyCursor`) pipe-stage result. Piping that into
+        // `.[]` evaluates the next stage per element, and each element's
+        // `.[]` yields its own `ManyCursor` — exercising the `Many(vs)`
+        // stage-transition arm's `ManyCursor` sub-case.
+        let json = br#"{"a": [1, 2], "b": [3, 4]}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(r#".[("a","b")] | .[]"#).unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Int(3),
+                OwnedValue::Int(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_json_iterate_then_field_error_propagates() {
+        // When `.[]` yields a `ManyCursor` and a later stage errors on one
+        // element (`.x` on a non-object), the error must propagate out of
+        // the whole evaluation rather than being dropped silently.
+        let json = br#"{"items": [{"x": 1}, 5]}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".items[] | .x").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(result.is_error());
+    }
+
+    #[test]
+    fn test_json_iterate_then_break_propagates() {
+        // Same shape as the error case above, but for `break`, which has its
+        // own early-return arm alongside `Error`.
+        let json = br#"{"items": [1, 2]}"#;
+        let index = JsonIndex::build(json);
+        let expr = Expr::Pipe(vec![
+            Expr::Field("items".to_string()),
+            Expr::Iterate,
+            Expr::Break("out".to_string()),
+        ]);
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(matches!(result, GenericResult::Break(label) if label == "out"));
+    }
+
+    #[test]
+    fn test_json_iterate_then_single_key_index_expr_yields_one() {
+        // Heterogeneous-flatten path of the `ManyCursor` stage arm: a
+        // computed single-key index yields a plain `One` per element rather
+        // than `OneCursor`, so the per-element results can't stay
+        // `ManyCursor` and must flatten through the `One` arm. Built directly
+        // as `Expr::IndexExpr` rather than parsed from `.["a"]`, since the
+        // parser folds a literal-string bracket index into a plain
+        // `Expr::Field` (which would instead take the all-`OneCursor` path).
+        let json = br#"{"items": [{"a": 1}, {"a": 2}]}"#;
+        let index = JsonIndex::build(json);
+        let expr = Expr::Pipe(vec![
+            Expr::Field("items".to_string()),
+            Expr::Iterate,
+            Expr::IndexExpr {
+                target: Box::new(Expr::Identity),
+                key: Box::new(Expr::Literal(Literal::String("a".to_string()))),
+            },
+        ]);
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::Int(1), OwnedValue::Int(2)]
+        );
+    }
+
+    #[test]
+    fn test_json_iterate_then_multi_key_index_expr_yields_many_and_many_owned() {
+        // Same flatten path, but the per-element computed index now yields
+        // `Many` (both keys found on the second item) or `ManyOwned` (a mix
+        // of found/missing keys forces the owned fallback on the first and
+        // third items), exercising both arms.
+        let json = br#"{"items": [{"a": 1}, {"a": 1, "b": 2}, {"c": 3}]}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(r#".items[] | .[("a","b")]"#).unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![
+                OwnedValue::Int(1),
+                OwnedValue::Null,
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Null,
+                OwnedValue::Null,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_json_iterate_then_nested_iterate_yields_many_cursor_in_flatten() {
+        // Same flatten path with a per-element `ManyCursor` (from a nested
+        // `.x[]`) alongside a `None` (empty array), exercising the
+        // `ManyCursor` arm of the heterogeneous flatten.
+        let json = br#"{"items": [{"x": [10, 20]}, {"x": []}]}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".items[] | .x[]").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::Int(10), OwnedValue::Int(20)]
+        );
+    }
+
+    #[test]
+    fn test_json_compare_left_many_cursor_uses_first_element() {
+        // `Compare`'s `ManyCursor`-operand arm: `.[]` on the left side yields
+        // a `ManyCursor`, and the comparison uses its first element.
+        let json = br"[1, 2]";
+        let index = JsonIndex::build(json);
+        let expr = Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Expr::Iterate),
+            right: Box::new(Expr::Literal(Literal::Int(1))),
+        };
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result.into_owned(), Some(OwnedValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_json_compare_right_many_cursor_uses_first_element() {
+        // Mirror of the above for the right-hand operand.
+        let json = br"[1, 2]";
+        let index = JsonIndex::build(json);
+        let expr = Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Expr::Literal(Literal::Int(1))),
+            right: Box::new(Expr::Iterate),
+        };
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result.into_owned(), Some(OwnedValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_json_select_cond_one_truthy() {
+        // `select`'s condition-result matching: a bare `One` (not
+        // `OneCursor`) condition result arises when `eval` is used without a
+        // cursor context, hitting a distinct arm from the `OneCursor` case
+        // below.
+        let json = b"5";
+        let index = JsonIndex::build(json);
+        let expr = Expr::Builtin(Builtin::Select(Box::new(Expr::Identity)));
+
+        let result = eval(&expr, index.root(json).value());
+        assert_eq!(result.into_owned(), Some(OwnedValue::Int(5)));
+    }
+
+    #[test]
+    fn test_json_select_cond_one_cursor_truthy() {
+        // Same as above, but evaluated with cursor context, so the condition
+        // result is `OneCursor` instead of `One`.
+        let json = b"5";
+        let index = JsonIndex::build(json);
+        let expr = Expr::Builtin(Builtin::Select(Box::new(Expr::Identity)));
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result.into_owned(), Some(OwnedValue::Int(5)));
+    }
+
+    #[test]
+    fn test_json_iterables_forwards_cursor() {
+        // `iterables`/`scalars` forward an incoming cursor when present,
+        // hitting the `OneCursor` arm of `cursor.map_or` instead of the
+        // cursor-less default.
+        let json = br"[1, 2]";
+        let index = JsonIndex::build(json);
+        let expr = Expr::Builtin(Builtin::Iterables);
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.into_owned(),
+            Some(OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2)
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_json_scalars_forwards_cursor() {
+        let json = b"5";
+        let index = JsonIndex::build(json);
+        let expr = Expr::Builtin(Builtin::Scalars);
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result.into_owned(), Some(OwnedValue::Int(5)));
+    }
+
+    #[test]
+    fn test_json_line_builtin_with_cursor() {
+        // JSON counterpart of `test_yaml_line_builtin_with_cursor`: exercises
+        // `JsonCursor`'s `DocumentCursor::line()` trait delegation (as
+        // opposed to the inherent method called directly by
+        // `test_cursor_line_column` in `json::light`).
+        let json = b"{\n  \"foo\": 1\n}";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".foo | line").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result.into_owned(), Some(OwnedValue::Int(2)));
+    }
+
+    #[test]
+    fn test_json_column_builtin_with_cursor() {
+        // JSON counterpart of `test_yaml_column_builtin_with_cursor`,
+        // exercising `JsonCursor`'s `DocumentCursor::column()` delegation.
+        let json = b"{\n  \"foo\": 1\n}";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".foo | column").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result.into_owned(), Some(OwnedValue::Int(10)));
+    }
 }
