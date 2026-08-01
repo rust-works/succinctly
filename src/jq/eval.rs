@@ -6506,8 +6506,21 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // Resolve computed keys against the *original* document, before any write,
     // then apply every resolved path: `.[("a","b")] = 1` assigns both.
+    //
+    // `optional` here is `=`'s *own* `?` (`(.a = 1)?`), i.e. jq's ordinary
+    // `try/catch` around the whole expression -- not a per-step tolerance. It
+    // must never reach `set_path` as a starting flag: `set_path`'s own
+    // `Expr::Optional` arm already gives per-component `?` its narrower
+    // meaning (path production only, never the write-time bounds check), and
+    // conflating the two would either over-suppress an inline `.[-5]? = 9` or
+    // under-suppress an outer `(.[-5] = 9)?` depending on which flag won.
+    // Instead every fallible step here is caught at this boundary and turned
+    // into empty output when the whole call is optional -- mirroring how
+    // `builtin_del` (#537) already separates `del(...)?` from a `?` written
+    // inside the path.
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
         Ok(paths) => paths,
+        Err(_) if optional => return QueryResult::None,
         Err(e) => return QueryResult::Error(e),
     };
 
@@ -6520,7 +6533,11 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             new_value.clone()
         };
         if let Err(e) = set_path(&mut result, path, value) {
-            return QueryResult::Error(e);
+            return if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(e)
+            };
         }
     }
 
@@ -6539,15 +6556,29 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut result = to_owned(&input);
 
     // Computed keys resolve against the original document, before any update.
+    //
+    // `optional` is `|=`'s *own* `?` (`(.a |= f)?`) -- see `eval_assign`'s
+    // matching comment for why it is caught here, at the call boundary,
+    // rather than threaded into `update_path` as a starting flag: doing that
+    // would let an outer `?` swallow a genuinely-raised `.[-5]? |= 9` (an
+    // inline path `?` never covers the write-time bounds check, #498) while
+    // an outer `(.[-5] |= 9)?` needs exactly that swallowed. `update_path` is
+    // always entered with `false` below; any `?` it still sees came from an
+    // `Expr::Optional` node inside `path_expr` itself.
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
         Ok(paths) => paths,
+        Err(_) if optional => return QueryResult::None,
         Err(e) => return QueryResult::Error(e),
     };
 
     // Get current value at path, apply filter, and set back
     for path in &paths {
-        if let Err(e) = update_path::<S>(&mut result, path, filter_expr, optional) {
-            return QueryResult::Error(e);
+        if let Err(e) = update_path::<S>(&mut result, path, filter_expr, false) {
+            return if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(e)
+            };
         }
     }
 
@@ -6951,15 +6982,19 @@ fn update_path<S: EvalSemantics>(
 ) -> Result<(), EvalError> {
     match path_expr {
         Expr::Identity => {
-            // Apply filter to root itself using eval_owned_expr
-            match eval_owned_expr::<S>(filter_expr, root, optional) {
-                Ok(v) => {
-                    *root = v;
-                    Ok(())
-                }
-                Err(_e) if optional => Ok(()),
-                Err(e) => Err(e),
-            }
+            // The filter runs as an ordinary sub-expression, not one
+            // implicitly wrapped in `try/catch` by whatever `?` got us here:
+            // `optional` at this point only ever came from an inline path
+            // component (`.a?`), which prunes path *production*, never
+            // covers path *application* (#498) -- `{"a":1} | .a? |=
+            // error("boom")` raises `boom` in jq, it does not fall back to
+            // leaving `.a` untouched. A `?` wrapping the *whole* `.path |=
+            // filter` expression is handled by `eval_update`'s caller
+            // instead, which is why `update_path` is always entered with
+            // `optional: false` at the top.
+            let v = eval_owned_expr::<S>(filter_expr, root, false)?;
+            *root = v;
+            Ok(())
         }
         Expr::Field(name) => {
             autovivify_object(root);
@@ -21644,6 +21679,39 @@ mod tests {
             // Unaffected: `?` on a genuine type mismatch (not an OOB index)
             // still suppresses, same as before.
             (b"5", ".a? = 1", Ok("5")),
+        ]);
+    }
+
+    #[test]
+    fn test_optional_write_does_not_protect_the_filter_or_the_whole_expression() {
+        // #498's rule applies just as much to `|=`'s filter as to the write
+        // itself: `?` on a path component prunes path *production*, and
+        // running the filter at the resolved location is path *application*
+        // — jq raises `boom` here rather than leaving `.a` untouched or
+        // swallowing the error. (Before this fix, `update_path` threaded the
+        // component's own `optional` into `eval_owned_expr` too, so the
+        // filter's `error("boom")` was itself evaluated as if `?`-guarded and
+        // silently produced `null`, corrupting `.a` to `{"a":null}` instead
+        // of raising.)
+        assert_outcomes(&[(br#"{"a":1}"#, ".a? |= error(\"boom\")", Err("boom"))]);
+    }
+
+    #[test]
+    fn test_outer_optional_around_a_failing_write_produces_no_output() {
+        // A `?` wrapping the *whole* `path op value` expression is ordinary
+        // `try/catch`, unrelated to a `?` written on a path component —
+        // jq's answer is no output at all, not the unchanged input and not a
+        // raised error. `eval_assign`/`eval_update` catch every failure at
+        // this boundary (mirroring `builtin_del`'s #537 fix) rather than
+        // threading their own `optional` into `set_path`/`update_path` as a
+        // starting flag, which is what let this either raise unconditionally
+        // (`=`, never fixed before this change) or leak a corrupted partial
+        // write (`|=`, once `?` also had to stop protecting the filter).
+        assert_outcomes(&[
+            (b"[1,2]", "(.[-5] = 9)?", Ok("")),
+            (b"[1,2]", "(.[-5] |= 9)?", Ok("")),
+            (b"[1,2]", "(.[-5] += 1)?", Ok("")),
+            (br#"{"a":1}"#, "(.a |= error(\"boom\"))?", Ok("")),
         ]);
     }
 
