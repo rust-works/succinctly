@@ -708,3 +708,75 @@ jobs:
             --data-dir tests/data/bench-corpus/seed \
             --markdown tests/data/bench-corpus/expected-shape.md \
             --check
+
+  # Drift detector for the vendored JSONTestSuite corpus
+  # (tests/data/json-test-suite-<sha>.json). The corpus is vendored so that
+  # `cargo test` needs no network; this job is the one place that re-fetches
+  # nst/JSONTestSuite at the pinned SHA and confirms the in-tree copy still
+  # matches, so the conformance suite cannot silently drift from upstream.
+  # Per-STEP gate for the same required-context-safe reason as jq/yq-drift.
+  json-suite-drift:
+    name: JSONTestSuite corpus drift check
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        if: needs.gate.outputs.code == 'true'
+
+      - name: Verify vendored corpus against pinned upstream
+        if: needs.gate.outputs.code == 'true'
+        run: ./scripts/sync-json-test-suite.sh --check
+
+  # Drift detector for docs/benchmarks/corpus-shape.md, the representativeness
+  # lookup that gates every perf proposal (ADR-0007, ADR-0012).
+  #
+  # Deliberately separate from corpus-shape-drift: that job is offline and
+  # covers the committed *seed*, which is 7 of the corpus's 8 YAML files and 1
+  # of its 5 JSON files. corpus-shape.md describes the *full* corpus, so the
+  # fetched tier is exactly the region the offline job cannot observe -- and it
+  # did drift there undetected (the #485 YAML fix shifted node counts in
+  # prometheus-ci.yml, the one YAML file the seed lacks, while the seed golden
+  # stayed green). Keeping the two jobs apart preserves the offline job's
+  # guarantee and isolates a fetch failure to the networked half.
+  # Per-STEP gate for the same required-context-safe reason as jq/yq-drift.
+  corpus-shape-full-drift:
+    name: corpus shape drift check (full corpus)
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        if: needs.gate.outputs.code == 'true'
+
+      - name: Fetch the full real-workload corpus
+        if: needs.gate.outputs.code == 'true'
+        run: ./scripts/sync-bench-corpus.sh
+
+      - name: Verify shape report matches the full corpus
+        if: needs.gate.outputs.code == 'true'
+        run: |
+          cargo run --features cli --bin succinctly -- \
+            dev bench corpus-stats \
+            --data-dir data/bench/corpus \
+            --markdown docs/benchmarks/corpus-shape.md \
+            --check
+
+  # Compile-check the fuzzing harness (fuzz/), a separate workspace on its own
+  # lockfile. Running the fuzzer on the PR path is deliberately NOT done -- a
+  # 60-second run finds nothing and grants false confidence (see fuzz/README.md
+  # "When to run it"). But *compiling* is a different question: the three target
+  # files and fuzz/Cargo.toml are otherwise built by nothing in CI, so the
+  # harness can rot silently and be discovered broken exactly when it is needed.
+  # `cargo check` on stable suffices -- nightly is only required to *run*
+  # cargo-fuzz (-Zsanitizer=address), not to expand `fuzz_target!`.
+  # Per-STEP gate for the same required-context-safe reason as jq/yq-drift.
+  fuzz-build:
+    name: fuzz harness compile check
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        if: needs.gate.outputs.code == 'true'
+
+      - name: Compile-check the fuzz targets
+        if: needs.gate.outputs.code == 'true'
+        run: cargo check --manifest-path fuzz/Cargo.toml --all-targets

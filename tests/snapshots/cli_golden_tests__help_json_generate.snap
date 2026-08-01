@@ -28,6 +28,7 @@ Options:
           - literals:      Boolean and null heavy (tests literal parsing)
           - unicode:       Unicode-heavy strings (tests UTF-8 handling)
           - pathological:  Worst-case for parsing (maximum structural density)
+          - pretty:        Indented, pretty-printed documents (tests whitespace skipping)
           
           [default: comprehensive]
 

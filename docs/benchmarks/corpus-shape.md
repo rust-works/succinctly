@@ -8,41 +8,49 @@ Distributions are derived from the crate's own semi-index (`JsonIndex` / `YamlIn
 
 ## Corpus inventory
 
-| format | workload       | file                        | bytes |
-| ------ | -------------- | --------------------------- | ----- |
-| dsv    | gapminder      | gapminder-five-year.csv     | 82079 |
-| dsv    | world-gdp      | world-gdp-with-codes.csv    | 4515  |
-| json   | charts         | bullet-data.json            | 548   |
-| json   | geojson        | us-election.geojson         | 99715 |
-| json   | npm            | express-package.json        | 2731  |
-| json   | openapi        | swagger-v2-schema.json      | 40247 |
-| yaml   | actions        | codeql-analysis.yml         | 925   |
-| yaml   | actions        | prometheus-ci.yml           | 18935 |
-| yaml   | actions        | stale.yml                   | 1290  |
-| yaml   | compose        | nginx-flask-mysql.yaml      | 1239  |
-| yaml   | compose        | wordpress.yaml              | 815   |
-| yaml   | home-assistant | air-quality-conditions.yaml | 9990  |
-| yaml   | k8s            | nginx-deployment.yml        | 836   |
-| yaml   | lint           | sass-lint.yml               | 2055  |
+| format | workload       | file                        | bytes  |
+| ------ | -------------- | --------------------------- | ------ |
+| dsv    | gapminder      | gapminder-five-year.csv     | 82079  |
+| dsv    | world-gdp      | world-gdp-with-codes.csv    | 4515   |
+| json   | charts         | bullet-data.json            | 548    |
+| json   | geojson        | us-election.geojson         | 99715  |
+| json   | graph          | miserables.json             | 11536  |
+| json   | npm            | express-package.json        | 2731   |
+| json   | openapi        | swagger-v2-schema.json      | 40247  |
+| json   | pretty         | 3d-ribbon.json              | 823218 |
+| json   | tabular        | carshare-data.json          | 35815  |
+| yaml   | actions        | codeql-analysis.yml         | 925    |
+| yaml   | actions        | prometheus-ci.yml           | 18935  |
+| yaml   | actions        | stale.yml                   | 1290   |
+| yaml   | compose        | nginx-flask-mysql.yaml      | 1239   |
+| yaml   | compose        | wordpress.yaml              | 815    |
+| yaml   | home-assistant | air-quality-conditions.yaml | 9990   |
+| yaml   | k8s            | nginx-deployment.yml        | 836    |
+| yaml   | lint           | sass-lint.yml               | 2055   |
 
 ## Line index
 
 Bytes retained by `text::LineIndex` per corpus file, against what the dense-bitmap newline index it replaced would have cost for the same text (#228). Both columns are the structures' own `heap_size()`, not a formula, so this section is a space-regression guard as well as a record: the dense representation cost ~1.27 bits per *input byte* whatever the line count, while the Elias-Fano one costs ~2 + log2(average line length) bits per *line*. `permille` is parts-per-thousand of the file.
 
-| format | file                                       | bytes | lines | bitvec bytes | line index bytes | bitvec permille | line index permille |
-| ------ | ------------------------------------------ | ----- | ----- | ------------ | ---------------- | --------------- | ------------------- |
-| dsv    | gapminder/gapminder-five-year.csv          | 82079 | 1705  | 12952        | 1636             | 157             | 19                  |
-| dsv    | world-gdp/world-gdp-with-codes.csv         | 4515  | 223   | 728          | 180              | 161             | 39                  |
-| json   | charts/bullet-data.json                    | 548   | 7     | 120          | 20               | 218             | 36                  |
-| json   | geojson/us-election.geojson                | 99715 | 60    | 15608        | 108              | 156             | 1                   |
-| yaml   | actions/codeql-analysis.yml                | 925   | 39    | 168          | 44               | 181             | 47                  |
-| yaml   | actions/prometheus-ci.yml                  | 18935 | 453   | 2992         | 432              | 158             | 22                  |
-| yaml   | actions/stale.yml                          | 1290  | 34    | 232          | 44               | 179             | 34                  |
-| yaml   | compose/nginx-flask-mysql.yaml             | 1239  | 62    | 224          | 60               | 180             | 48                  |
-| yaml   | compose/wordpress.yaml                     | 815   | 33    | 152          | 44               | 186             | 53                  |
-| yaml   | home-assistant/air-quality-conditions.yaml | 9990  | 466   | 1608         | 384              | 160             | 38                  |
-| yaml   | k8s/nginx-deployment.yml                   | 836   | 43    | 160          | 44               | 191             | 52                  |
-| yaml   | lint/sass-lint.yml                         | 2055  | 98    | 360          | 92               | 175             | 44                  |
+| format | file                                       | bytes  | lines | bitvec bytes | line index bytes | bitvec permille | line index permille |
+| ------ | ------------------------------------------ | ------ | ----- | ------------ | ---------------- | --------------- | ------------------- |
+| dsv    | gapminder/gapminder-five-year.csv          | 82079  | 1705  | 12952        | 1636             | 157             | 19                  |
+| dsv    | world-gdp/world-gdp-with-codes.csv         | 4515   | 223   | 728          | 180              | 161             | 39                  |
+| json   | charts/bullet-data.json                    | 548    | 7     | 120          | 20               | 218             | 36                  |
+| json   | geojson/us-election.geojson                | 99715  | 60    | 15608        | 108              | 156             | 1                   |
+| json   | graph/miserables.json                      | 11536  | 1     | 1816         | 12               | 157             | 1                   |
+| json   | npm/express-package.json                   | 2731   | 99    | 456          | 100              | 166             | 36                  |
+| json   | openapi/swagger-v2-schema.json             | 40247  | 1607  | 6408         | 1356             | 159             | 33                  |
+| json   | pretty/3d-ribbon.json                      | 823218 | 34169 | 130776       | 28328            | 158             | 34                  |
+| json   | tabular/carshare-data.json                 | 35815  | 1496  | 5696         | 1248             | 159             | 34                  |
+| yaml   | actions/codeql-analysis.yml                | 925    | 39    | 168          | 44               | 181             | 47                  |
+| yaml   | actions/prometheus-ci.yml                  | 18935  | 453   | 2992         | 432              | 158             | 22                  |
+| yaml   | actions/stale.yml                          | 1290   | 34    | 232          | 44               | 179             | 34                  |
+| yaml   | compose/nginx-flask-mysql.yaml             | 1239   | 62    | 224          | 60               | 180             | 48                  |
+| yaml   | compose/wordpress.yaml                     | 815    | 33    | 152          | 44               | 186             | 53                  |
+| yaml   | home-assistant/air-quality-conditions.yaml | 9990   | 466   | 1608         | 384              | 160             | 38                  |
+| yaml   | k8s/nginx-deployment.yml                   | 836    | 43    | 160          | 44               | 191             | 52                  |
+| yaml   | lint/sass-lint.yml                         | 2055   | 98    | 360          | 92               | 175             | 44                  |
 
 ## YAML
 
@@ -62,16 +70,16 @@ files: 8, total bytes: 36085, anchors: 41, aliases: 86, bare-dash items: 5
 
 ## JSON
 
-files: 4, total bytes: 143241
+files: 7, total bytes: 1013810
 
-| metric          | unit         | n     | min  | p50  | p90  | p99  | max   |
-| --------------- | ------------ | ----- | ---- | ---- | ---- | ---- | ----- |
-| string length   | bytes/string | 2345  | 1    | 7    | 23   | 67   | 111   |
-| object keys     | keys/object  | 634   | 0    | 1    | 4    | 21   | 61    |
-| array elements  | elems/array  | 2733  | 1    | 2    | 2    | 38   | 140   |
-| collection size | bytes/coll   | 3367  | 2    | 36   | 184  | 2883 | 99714 |
-| nesting depth   | levels/node  | 10813 | 1    | 8    | 9    | 9    | 9     |
-| escape density  | per KiB/file | 4     | 0.00 | 0.00 | 0.15 | 0.15 | 0.15  |
+| metric          | unit         | n     | min  | p50  | p90  | p99  | max    |
+| --------------- | ------------ | ----- | ---- | ---- | ---- | ---- | ------ |
+| string length   | bytes/string | 5405  | 0    | 9    | 18   | 56   | 111    |
+| object keys     | keys/object  | 1233  | 0    | 3    | 4    | 13   | 61     |
+| array elements  | elems/array  | 11263 | 1    | 2    | 2    | 4    | 401    |
+| collection size | bytes/coll   | 12496 | 2    | 72   | 88   | 1728 | 823218 |
+| nesting depth   | levels/node  | 40969 | 1    | 6    | 8    | 9    | 9      |
+| escape density  | per KiB/file | 7     | 0.00 | 0.00 | 0.15 | 0.15 | 0.15   |
 
 ## DSV
 

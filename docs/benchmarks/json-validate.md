@@ -229,6 +229,158 @@ Performance benchmarks for `succinctly json validate` - strict RFC 8259 JSON val
 
 5. **Cross-platform consistency**: ARM and x86_64 achieve comparable peak throughput (~1.8 GiB/s). The validator is purely scalar (no SIMD) - performance comes from efficient branch prediction and cache-friendly sequential access.
 
+## Shape analysis: what a chunk scanner could win (#130)
+
+Issue #130 proposes replacing the scalar recursive-descent validator with a
+64-byte SIMD chunk scanner feeding an explicit state machine. Per
+[docs/guides/benchmarking.md](../guides/benchmarking.md), #130 is gated on the
+corpus-shape check. This section is that check.
+
+### The metric that decides it
+
+Run length is the wrong metric. A chunk scanner does not need *long* runs of
+skippable bytes — it needs **few positions its state machine must visit per
+chunk**. Call that the *interesting density*: structural characters outside
+strings, plus one visit per string (the body and closing quote are skipped),
+plus one per atom start, plus any garbage byte.
+
+Measured over the real-workload corpus as it stood at the time of the decision
+(5 JSON files, 971 KB), against current M4 Pro throughput. The corpus has since
+grown to 7 files / 1014 KB — see [below](#the-corpus-has-since-grown) for what
+that changed:
+
+| corpus file            | visits / 64 B | bytes / visit | current throughput |
+| ---------------------- | ------------- | ------------- | ------------------ |
+| pretty/3d-ribbon.json  |           4.0 |          16.0 | **1.79 GiB/s**     |
+| tabular/carshare-data  |           8.0 |           8.0 | 1.21 GiB/s         |
+| geojson/us-election    |          10.9 |           5.9 | 1.19 GiB/s         |
+| charts/bullet-data     |          20.0 |           3.2 | 856 MiB/s          |
+| graph/miserables.json  |          24.0 |           2.7 | 789 MiB/s          |
+
+Throughput is almost perfectly inverse to density — unsurprising, since scalar
+cost tracks token count.
+
+### Where break-even sits
+
+#130's own prototype measured **1.16–1.32×** on string-heavy input (density ≈ 1)
+and **0.86–0.91×** on ASCII-heavy structured objects (density ≈ 18–22).
+Interpolating those two measured points puts break-even at roughly **8–12
+visits per 64-byte chunk**.
+
+### The answer
+
+**Every real corpus file falls on the wrong side of that line, in one of two
+ways:**
+
+* **Below break-even, but no headroom.** `3d-ribbon.json` is the one file with a
+  favourable density (4.0). It already validates at **1.79 GiB/s** — statistically
+  indistinguishable from the `nested` pattern (1.81 GiB/s) that this document
+  already describes as "near memory bandwidth limit". There is nothing left to
+  capture.
+* **Headroom, but above break-even.** The two slowest files, `miserables.json`
+  (789 MiB/s) and `bullet-data.json` (856 MiB/s), sit at densities of 24.0 and
+  20.0 — squarely in the band where #130's prototype measured a **regression**.
+
+No corpus file is both slow enough to be worth optimising and sparse enough for
+a chunk scanner to help.
+
+### Two supporting findings
+
+* **String skipping is dead on real input.** String bodies are 5.7% of corpus
+  bytes and the longest string is **111 bytes**, against the ~300 B regime where
+  #130 measured its win — **not one string in the corpus reaches it**. Only 2.2%
+  reach even 32 bytes.
+* **The escape machinery never pays.** The entire 1014 KB corpus contains **six
+  backslashes**, all in one file. The odd-backslash-run mask (`find_escaped`) is
+  the most intricate and highest-risk primitive in the design, has no equivalent
+  anywhere in this crate, and is nonetheless *structurally required*: a single
+  `\"` desynchronises the in-string mask for the rest of the document. On real
+  input it is pure cost that can never be recovered.
+
+Note also that whitespace fraction is a misleading proxy. `3d-ribbon.json` is
+85% whitespace, but in runs of p50=19 / max=23 bytes — **0.00% of whitespace
+runs in the entire corpus reach 32 bytes**, so no single SIMD lane is ever
+filled by whitespace alone.
+
+### The corpus has since grown
+
+The decision above was taken against a 5-file / 971 KB JSON corpus. `f9792019`
+then added two string-heavy files (`npm/express-package.json`,
+`openapi/swagger-v2-schema.json`), taking it to 7 files / 1014 KB. Both are
+token-dense object documents, so they land *above* break-even and reinforce the
+rejection rather than challenging it. The two supporting findings above are
+quoted at post-growth values; against the original 5 files they read 4.6% of
+bytes / 51 B longest string / 0.03% ≥ 32 B, and zero backslashes.
+
+The one number that moved in the scanner's favour is the longest string, 51 B →
+111 B. It does not approach the threshold that matters: **no string in the
+corpus reaches the ~300 B regime where #130 measured its 1.16–1.32× win**, and
+the p50 is still 9 bytes.
+
+### Consequence
+
+The optimisation with real headroom is the opposite of #130: the slow files are
+slow because they are *token-dense*, so the win is in making per-token work
+cheaper (keyword and number scanning in the scalar path), not in skipping bytes
+between tokens. See #122/#123 for the adjacent SIMD proposals, which the same
+analysis constrains.
+
+### Reproducing
+
+The throughput column needs the **full** corpus: only three of the seven JSON
+files are vendored in the committed seed, and `json_validate_real_corpus_bench`
+announces on stderr when it is running seed-only.
+
+```bash
+./scripts/sync-bench-corpus.sh                            # fetch the full JSON corpus
+
+# shape statistics (the visits/64B column)
+succinctly dev bench corpus-stats --data-dir data/bench/corpus
+
+# throughput column — a standalone bench target, no synthetic ladder needed
+cargo bench --bench json_validate_real_corpus_bench
+```
+
+## Per-token scalar optimisations
+
+ADR-0013's finding — the slow patterns are slow because they are *token-dense* —
+points the optimisation effort at per-token cost rather than at skipping bytes
+between tokens. Two changes were written and measured against that.
+
+**Method.** Three interleaved A/B/A/B rounds on an Apple M4 Pro, Criterion
+baselines, 100 KB tier. `nested` and `strings` contain neither numbers nor
+keywords, so any movement there is pure noise; they calibrate the floor at
+**±3.4%**. An earlier all-A-then-all-B run was discarded: it showed ±10% swings
+on those same control patterns, which the changes cannot affect, so thermal
+drift — not the code — dominated it.
+
+| change | numbers | literals | arrays | users | verdict |
+|---|---|---|---|---|---|
+| digit-run scanning | **−9.0%** | −0.9% | +0.3% | +1.9% | ✅ accepted |
+| keyword literal compare | +2.6% | **+6.0%** | −0.9% | +0.8% | ❌ rejected |
+
+**Accepted — digit-run scanning.** `validate_number`'s three digit loops called
+`advance()` per digit, each re-checking bounds and constructing an `Option`.
+Scanning the run once and adjusting `offset`/`column` in one step is exactly
+equivalent (digits contain no line terminator) and worth 9% on number-heavy
+input, with nothing else moving beyond noise.
+
+**Rejected — keyword literal compare.** Replacing `validate_keyword`'s
+byte-at-a-time loop with a first-byte dispatch plus a whole-literal compare made
+`literals` **6% slower** — the one pattern it was written for. The original loop
+runs four or five perfectly-predicted iterations; the dispatch, `starts_with`,
+and the mandatory one-byte lookahead together cost more than they save. This is
+[ADR-0006](../adrs/adr-0006.md)'s finding again, in a new place: on short,
+highly-predictable runs the branch predictor beats bulk comparison. Reverted
+rather than threshold-tuned, per [ADR-0005](../adrs/adr-0005.md).
+
+The lookahead that made it correct is worth recording even though the code is
+gone: without it, `truex` matches the `true` prefix and is reported as an
+unexpected `x`, where the greedy path reports `InvalidKeyword{found:"truex"}` at
+the `t` — different kind *and* offset, both rendered by the CLI. Two named tests
+in `src/json/validate.rs` now pin that contract so a future fast path cannot
+quietly lose it.
+
 ## Running Benchmarks
 
 ```bash
@@ -240,6 +392,10 @@ cargo build --release --features bench-runner
 
 # Run with Criterion directly
 cargo bench --bench json_validate_bench
+
+# Real-workload corpus (separate target; see "Reproducing" above)
+./scripts/sync-bench-corpus.sh
+cargo bench --bench json_validate_real_corpus_bench
 ```
 
 ## Benchmark Data Location
