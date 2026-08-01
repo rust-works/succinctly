@@ -329,6 +329,20 @@ fn test_i0_multidoc_separator_skips_empty_results() -> Result<()> {
 }
 
 #[test]
+fn test_select_after_iterate_stays_many_cursor() -> Result<()> {
+    // `select` isn't a "navigation-only" expression, so `.[] | select(...)`
+    // takes the DOM/cursor evaluation path (`evaluate_yaml_cursor`) instead
+    // of the M2 streaming fast path. When every filtered element keeps its
+    // position, the pipe's result stays a top-level `ManyCursor`, exercising
+    // that arm of `evaluate_yaml_cursor` directly (as opposed to a plain
+    // `.[]`, which the M2 fast path intercepts before it ever reaches here).
+    let (out, code) = run_yq_stdin(".[] | select(. > 0)", "- 2\n- 3\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2\n3");
+    Ok(())
+}
+
+#[test]
 fn test_i0_multidoc_doc_filter_no_separator() -> Result<()> {
     // #175: selecting a single document with --doc emits no stray separator.
     let (out, code) = run_yq_stdin(".", "a: 1\n---\nb: 2\n", &["-I=0", "--doc", "1"])?;
@@ -2832,6 +2846,79 @@ fn test_yq_json_control_char_escaping_consistent_across_paths() -> Result<()> {
     // Mutual consistency is the core guarantee (#262).
     assert_eq!(stream.trim(), dom.trim(), "streaming vs DOM");
     assert_eq!(stream.trim(), pretty.trim(), "streaming vs pretty");
+    Ok(())
+}
+
+// ============================================================================
+// line / column builtins (#532) — position-based navigation on the default
+// (cursor-preserving) YAML CLI path. Before this fix, `line`/`column`
+// resolved correctly only when called with zero preceding navigation
+// (`line` alone); anything downstream of `.foo`/`.[]`/`select(...)` silently
+// returned 0. No prior CLI-level test exercised these builtins through a
+// real pipeline — see the issue for the full root-cause writeup.
+// ============================================================================
+
+#[test]
+fn test_line_iterate_over_sequence() -> Result<()> {
+    // The issue's exact repro.
+    let yaml = "a: 1\nb: 2\nc: 3\n";
+    let (output, code) = run_yq_stdin(".[] | line", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "1\n2\n3\n");
+    Ok(())
+}
+
+#[test]
+fn test_line_field_access() -> Result<()> {
+    let yaml = "other: 1\nfoo: bar\n";
+    let (output, code) = run_yq_stdin(".foo | line", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "2");
+    Ok(())
+}
+
+#[test]
+fn test_column_field_access() -> Result<()> {
+    let yaml = "foo: bar\n";
+    let (output, code) = run_yq_stdin(".foo | column", yaml, &[])?;
+    assert_eq!(code, 0);
+    // "foo: bar" -> "bar" starts at column 6.
+    assert_eq!(output.trim(), "6");
+    Ok(())
+}
+
+#[test]
+fn test_line_select_filters_and_keeps_position() -> Result<()> {
+    let yaml = "- 1\n- 2\n- 3\n";
+    let (output, code) = run_yq_stdin(".[] | select(. > 1) | line", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "2\n3\n");
+    Ok(())
+}
+
+#[test]
+fn test_line_column_object_construction_is_a_known_limitation() -> Result<()> {
+    // Object/array construction (`{...}`/`[...]`) isn't natively cursor-aware
+    // in the generic evaluator — it round-trips through OwnedValue, which
+    // has nowhere to carry a position. Documented limitation (#532), pinned
+    // here so a future fix is visible as an intentional test change rather
+    // than a silent behavior shift.
+    let yaml = "foo: bar\nbaz: qux\n";
+    let (output, code) = run_yq_stdin(".baz | {l: line, c: column}", yaml, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"l":0,"c":0}"#);
+    Ok(())
+}
+
+#[test]
+fn test_line_dot_chain_through_nested_iteration() -> Result<()> {
+    // `.containers[].image` parses as its own nested Pipe distinct from the
+    // outer `| line` — exercises `ManyCursor` surviving a return out of an
+    // inner pipe evaluation, not just a single flat pipe.
+    let yaml = "containers:\n  - image: a\n  - image: b\n";
+    let (output, code) = run_yq_stdin(".containers[].image | line", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "2\n3\n");
     Ok(())
 }
 

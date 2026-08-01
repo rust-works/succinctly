@@ -152,6 +152,9 @@ fn eval_on_many_owned<S: EvalSemantics, V: DocumentValue>(
             GenericResult::One(_) => unreachable!("eval_on_owned never returns One"),
             GenericResult::OneCursor(_) => unreachable!("eval_on_owned never returns OneCursor"),
             GenericResult::Many(_) => unreachable!("eval_on_owned never returns Many"),
+            GenericResult::ManyCursor(_) => {
+                unreachable!("eval_on_owned never returns ManyCursor")
+            }
             GenericResult::None => {}
             GenericResult::Error(e) => return GenericResult::Error(e),
             GenericResult::Owned(o) => results.push(o),
@@ -178,6 +181,10 @@ pub enum GenericResult<V: DocumentValue> {
     /// Multiple values (from iteration).
     Many(Vec<V>),
 
+    /// Multiple cursor results (from iteration with position preserved,
+    /// e.g. `.[]`), enabling `line`/`column` on each element.
+    ManyCursor(Vec<V::Cursor>),
+
     /// No result (optional that was missing).
     None,
 
@@ -201,6 +208,9 @@ impl<V: DocumentValue> GenericResult<V> {
             Self::One(v) => Some(to_owned(&v)),
             Self::OneCursor(c) => Some(to_owned(&c.value())),
             Self::Many(vs) => Some(OwnedValue::Array(vs.iter().map(to_owned).collect())),
+            Self::ManyCursor(cs) => Some(OwnedValue::Array(
+                cs.iter().map(|c| to_owned(&c.value())).collect(),
+            )),
             Self::None => None,
             Self::Error(_) => None,
             Self::Owned(o) => Some(o),
@@ -215,6 +225,7 @@ impl<V: DocumentValue> GenericResult<V> {
             Self::One(v) => vec![to_owned(&v)],
             Self::OneCursor(c) => vec![to_owned(&c.value())],
             Self::Many(vs) => vs.iter().map(to_owned).collect(),
+            Self::ManyCursor(cs) => cs.iter().map(|c| to_owned(&c.value())).collect(),
             Self::None => vec![],
             Self::Error(_) => vec![],
             Self::Owned(o) => vec![o],
@@ -280,6 +291,15 @@ impl<V: DocumentValue> GenericResult<V> {
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = vs.len();
+            }
+            Self::ManyCursor(cs) => {
+                for c in cs {
+                    c.stream_json(out, indent_spaces)?;
+                    on_value(out)?;
+                    stats.last_was_falsy = c.is_falsy();
+                    stats.any_truthy |= !stats.last_was_falsy;
+                }
+                stats.count = cs.len();
             }
             Self::None => {
                 // No output
@@ -366,6 +386,15 @@ impl<V: DocumentValue> GenericResult<V> {
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = vs.len();
+            }
+            Self::ManyCursor(cs) => {
+                for c in cs {
+                    c.stream_yaml(out, indent_spaces)?;
+                    on_value(out)?;
+                    stats.last_was_falsy = c.is_falsy();
+                    stats.any_truthy |= !stats.last_was_falsy;
+                }
+                stats.count = cs.len();
             }
             Self::None => {
                 // No output
@@ -455,12 +484,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
     match expr {
-        Expr::Identity => GenericResult::One(value),
+        // Forward the cursor when we have one, so a bare `line`/`column`
+        // downstream of a no-op navigation step (`. | line`) still resolves
+        // a real position instead of falling to the `One`->`None` default.
+        Expr::Identity => cursor.map_or(GenericResult::One(value), GenericResult::OneCursor),
 
         Expr::Field(name) => {
             if let Some(fields) = value.as_object() {
-                match fields.find(name) {
-                    Some(v) => GenericResult::One(v),
+                match fields.find_cursor(name) {
+                    Some(c) => GenericResult::OneCursor(c),
                     // jq returns null for missing fields on objects (not an error)
                     None => GenericResult::Owned(OwnedValue::Null),
                 }
@@ -482,8 +514,8 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 } else {
                     *idx as usize
                 };
-                match elements.get(actual_idx) {
-                    Some(v) => GenericResult::One(v),
+                match elements.get_cursor(actual_idx) {
+                    Some(c) => GenericResult::OneCursor(c),
                     // jq returns null for out-of-bounds array indices (positive
                     // or negative), not an error. `.[n]` and `.[n]?` both yield
                     // null since there is no error for `?` to suppress. See #307.
@@ -515,23 +547,23 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 
         Expr::Iterate => {
             if let Some(elements) = value.as_array() {
-                let values = elements.collect_values();
-                if values.is_empty() {
+                let cursors = elements.collect_cursors();
+                if cursors.is_empty() {
                     GenericResult::None
                 } else {
-                    GenericResult::Many(values)
+                    GenericResult::ManyCursor(cursors)
                 }
             } else if let Some(fields) = value.as_object() {
-                let mut values = Vec::new();
+                let mut cursors = Vec::new();
                 let mut f = fields;
                 while let Some((field, rest)) = f.uncons() {
-                    values.push(field.value);
+                    cursors.push(field.value_cursor);
                     f = rest;
                 }
-                if values.is_empty() {
+                if cursors.is_empty() {
                     GenericResult::None
                 } else {
-                    GenericResult::Many(values)
+                    GenericResult::ManyCursor(cursors)
                 }
             } else if optional {
                 GenericResult::None
@@ -549,7 +581,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 
             let mut current = eval_single::<S, _>(&exprs[0], value, optional, cursor);
 
-            for expr in &exprs[1..] {
+            for (i, expr) in exprs.iter().enumerate().skip(1) {
                 current = match current {
                     GenericResult::One(v) => eval_single::<S, _>(expr, v, optional, None),
                     GenericResult::OneCursor(c) => {
@@ -564,6 +596,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                                 GenericResult::Many(rs) => {
                                     results.extend(rs.iter().map(to_owned));
                                 }
+                                GenericResult::ManyCursor(cs) => {
+                                    results.extend(cs.iter().map(|c| to_owned(&c.value())));
+                                }
                                 GenericResult::None => {}
                                 GenericResult::Error(e) => return GenericResult::Error(e),
                                 GenericResult::Owned(o) => results.push(o),
@@ -576,6 +611,77 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                         } else {
                             GenericResult::ManyOwned(results)
                         }
+                    }
+                    // Unlike the `Many` arm above, don't flatten after just
+                    // this one stage: a flattened `ManyOwned` can't carry a
+                    // per-element cursor into any *further* stage — including
+                    // one in an *enclosing* pipe, since a dot-chain like
+                    // `.a[].b` parses as its own nested `Pipe` (see
+                    // `parse_postfix`), so `.a[].b | line` only reaches
+                    // `line` after this whole inner pipe returns. Instead,
+                    // run the rest of the pipe (`expr` and everything after
+                    // it) against each cursor independently and, when every
+                    // element's result is itself a single cursor (the common
+                    // `.[] | .foo` / nested dot-chain shape), stay as
+                    // `ManyCursor` so an enclosing pipe or `line`/`column`
+                    // can still resolve a position. Only degrade to
+                    // materialized `ManyOwned` when a result is
+                    // heterogeneous (multiple values, filtered out, or a
+                    // computed value).
+                    GenericResult::ManyCursor(cs) => {
+                        let rest = Expr::Pipe(exprs[i..].to_vec());
+                        let mut per_element = Vec::with_capacity(cs.len());
+                        for c in cs {
+                            match eval_single::<S, _>(&rest, c.value(), optional, Some(c)) {
+                                GenericResult::Error(e) => return GenericResult::Error(e),
+                                GenericResult::Break(label) => return GenericResult::Break(label),
+                                other => per_element.push(other),
+                            }
+                        }
+
+                        let all_single_cursor = !per_element.is_empty()
+                            && per_element
+                                .iter()
+                                .all(|r| matches!(r, GenericResult::OneCursor(_)));
+
+                        return if all_single_cursor {
+                            GenericResult::ManyCursor(
+                                per_element
+                                    .into_iter()
+                                    .map(|r| match r {
+                                        GenericResult::OneCursor(c) => c,
+                                        _ => unreachable!("checked all_single_cursor above"),
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            let mut results = Vec::new();
+                            for r in per_element {
+                                match r {
+                                    GenericResult::One(v) => results.push(to_owned(&v)),
+                                    GenericResult::OneCursor(c) => {
+                                        results.push(to_owned(&c.value()));
+                                    }
+                                    GenericResult::Many(rs) => {
+                                        results.extend(rs.iter().map(to_owned));
+                                    }
+                                    GenericResult::ManyCursor(cs) => {
+                                        results.extend(cs.iter().map(|c| to_owned(&c.value())));
+                                    }
+                                    GenericResult::None => {}
+                                    GenericResult::Owned(o) => results.push(o),
+                                    GenericResult::ManyOwned(os) => results.extend(os),
+                                    GenericResult::Error(_) | GenericResult::Break(_) => {
+                                        unreachable!("Error/Break already returned above")
+                                    }
+                                }
+                            }
+                            if results.is_empty() {
+                                GenericResult::None
+                            } else {
+                                GenericResult::ManyOwned(results)
+                            }
+                        };
                     }
                     GenericResult::None => GenericResult::None,
                     GenericResult::Error(e) => return GenericResult::Error(e),
@@ -630,6 +736,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                         return GenericResult::None;
                     }
                 }
+                GenericResult::ManyCursor(cs) => {
+                    if let Some(first) = cs.first() {
+                        to_owned(&first.value())
+                    } else {
+                        return GenericResult::None;
+                    }
+                }
                 GenericResult::ManyOwned(vs) => {
                     if let Some(first) = vs.first() {
                         first.clone()
@@ -655,6 +768,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::Many(vs) => {
                     if let Some(first) = vs.first() {
                         to_owned(first)
+                    } else {
+                        return GenericResult::None;
+                    }
+                }
+                GenericResult::ManyCursor(cs) => {
+                    if let Some(first) = cs.first() {
+                        to_owned(&first.value())
                     } else {
                         return GenericResult::None;
                     }
@@ -829,6 +949,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         GenericResult::One(v) => vec![v],
         GenericResult::Many(vs) => vs,
         GenericResult::OneCursor(c) => vec![c.value()],
+        GenericResult::ManyCursor(cs) => cs.iter().map(DocumentCursor::value).collect(),
         // An owned target (a computed, non-navigational left side) has no
         // borrowed representation here; round-trip it through the shared
         // owned-value path by re-entering with the materialized document.
@@ -929,24 +1050,30 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 }
             };
 
+            // `select` never changes position — the truthy output IS the
+            // input node, so forward the incoming cursor (if any) rather
+            // than dropping it via a plain `One(value)`.
+            let pass =
+                || cursor.map_or(GenericResult::One(value.clone()), GenericResult::OneCursor);
+
             match cond_result {
                 GenericResult::Owned(ref o) => {
                     if is_truthy(o) {
-                        GenericResult::One(value)
+                        pass()
                     } else {
                         GenericResult::None
                     }
                 }
                 GenericResult::One(v) => {
                     if is_truthy(&to_owned(&v)) {
-                        GenericResult::One(value)
+                        pass()
                     } else {
                         GenericResult::None
                     }
                 }
                 GenericResult::OneCursor(c) => {
                     if is_truthy(&to_owned(&c.value())) {
-                        GenericResult::One(value)
+                        pass()
                     } else {
                         GenericResult::None
                     }
@@ -959,10 +1086,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     }
                 }
                 GenericResult::None => GenericResult::None,
-                GenericResult::Many(_) | GenericResult::ManyOwned(_) => {
+                GenericResult::Many(_)
+                | GenericResult::ManyOwned(_)
+                | GenericResult::ManyCursor(_) => {
                     // Multiple results from condition - this is unusual but treat first as condition
                     // jq behavior: select with multiple outputs uses first truthy value
-                    GenericResult::One(value)
+                    pass()
                 }
                 GenericResult::Break(label) => GenericResult::Break(label),
             }
@@ -1155,7 +1284,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             if value.is_null() {
                 GenericResult::None
             } else {
-                GenericResult::One(value)
+                cursor.map_or(GenericResult::One(value), GenericResult::OneCursor)
             }
         }
 
@@ -1215,7 +1344,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::Iterables => {
             // Returns input if iterable, empty otherwise
             if value.is_iterable() {
-                GenericResult::One(value)
+                cursor.map_or(GenericResult::One(value), GenericResult::OneCursor)
             } else {
                 GenericResult::None
             }
@@ -1224,7 +1353,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::Scalars => {
             // Returns input if scalar, empty otherwise
             if !value.is_iterable() {
-                GenericResult::One(value)
+                cursor.map_or(GenericResult::One(value), GenericResult::OneCursor)
             } else {
                 GenericResult::None
             }
@@ -1829,6 +1958,137 @@ mod tests {
         assert_eq!(owned, OwnedValue::Int(0));
     }
 
+    // Regression tests for #532: `line`/`column` returned 0 for anything
+    // downstream of `.foo`/`.[]`/`select(...)`, because those Expr/Builtin
+    // arms received a cursor but never forwarded it — only a bare `line`
+    // with zero preceding navigation (like the tests above) worked. These
+    // go through a real `.foo`/`.[]`/`select(...)`/dot-chain pipeline
+    // instead of calling `Builtin::Line` directly on a root cursor.
+
+    #[test]
+    fn test_yaml_field_then_line() {
+        use crate::yaml::YamlIndex;
+
+        // `foo` is the second key, so a correct result (2) can't be
+        // confused with the `line() == 0`/`line() == 1` defaults.
+        let yaml = b"other: 1\nfoo: bar\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse(".foo | line").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(2));
+    }
+
+    #[test]
+    fn test_yaml_iterate_array_then_line() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"- a\n- b\n- c\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse(".[] | line").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Int(3),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_yaml_iterate_object_then_line() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: 1\nb: 2\nc: 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        // The issue's exact repro.
+        let expr = crate::jq::parse(".[] | line").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Int(3),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_yaml_select_then_line_preserves_position() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"- 1\n- 2\n- 3\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse(".[] | select(. > 1) | line").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)])
+        );
+    }
+
+    #[test]
+    fn test_yaml_dot_chain_then_line() {
+        use crate::yaml::YamlIndex;
+
+        // `.containers[].image | line` parses as a *nested* `Pipe` (the
+        // dot-chain `.containers[].image` is its own Pipe, itself one
+        // element of the outer `| line` pipe) — a stricter test than a
+        // fully `|`-separated query, since the cursor must survive
+        // `ManyCursor` propagating out of an inner pipe's return.
+        let yaml = b"containers:\n  - image: a\n  - image: b\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse(".containers[].image | line").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(
+            result.into_owned().unwrap(),
+            OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)])
+        );
+    }
+
+    #[test]
+    fn test_yaml_identity_pipe_then_line() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"foo: bar\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let doc_cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+
+        let expr = crate::jq::parse(". | line").unwrap();
+        let result = eval_with_cursor(&expr, doc_cursor);
+        assert_eq!(result.into_owned().unwrap(), OwnedValue::Int(1));
+    }
+
     #[test]
     fn test_yaml_generic_pipe() {
         use crate::yaml::YamlIndex;
@@ -1970,6 +2230,12 @@ mod tests {
                 let result = eval_with_cursor(&expr, cursor);
                 match result {
                     GenericResult::One(v) => results.push(to_owned(&v)),
+                    // `select`'s truthy branch now forwards the cursor it
+                    // was given (needed for `line`/`column` to survive a
+                    // `select(...)`), so a match here is `OneCursor`, not
+                    // `One` — see the `Builtin::Select` cursor-forwarding
+                    // fix in `eval_builtin`.
+                    GenericResult::OneCursor(c) => results.push(to_owned(&c.value())),
                     GenericResult::Owned(o) => results.push(o),
                     GenericResult::None => {} // Filtered out
                     _ => {}
@@ -2008,7 +2274,12 @@ mod tests {
             while let Some((cursor, rest)) = docs.uncons_cursor() {
                 let result = eval_with_cursor(&expr, cursor);
                 match result {
-                    GenericResult::One(_) | GenericResult::Owned(_) => count += 1,
+                    // See the sibling `test_yaml_select_di_eq_n` comment:
+                    // `select`'s truthy branch now returns `OneCursor` when
+                    // given one, not `One`.
+                    GenericResult::One(_)
+                    | GenericResult::OneCursor(_)
+                    | GenericResult::Owned(_) => count += 1,
                     _ => {}
                 }
                 docs = rest;
@@ -2386,5 +2657,244 @@ mod tests {
 
         let yq_result = eval_using::<YqSemantics, _>(&expr, index.root(json).value());
         assert_eq!(yq_result.into_owned(), Some(OwnedValue::Float(1.5)));
+    }
+
+    // Coverage follow-ups for #532: the tests above exercise the common
+    // `.foo`/`.[]`/`select(...)` shapes, but a few less-common `GenericResult`
+    // combinations at Pipe/Compare/Select/Iterables/Scalars stage boundaries
+    // weren't reached by any existing test. `Error`/`Break` in these arms
+    // return immediately, so those two get their own dedicated tests instead
+    // of being combined with the success-path ones.
+
+    #[test]
+    fn test_json_many_stage_result_produces_many_cursor_per_element() {
+        // `.[("a","b")]` is a computed multi-key index: on an object with
+        // both keys present as borrowed (non-owned) values, it resolves to a
+        // plain `Many` (not `ManyCursor`) pipe-stage result. Piping that into
+        // `.[]` evaluates the next stage per element, and each element's
+        // `.[]` yields its own `ManyCursor` — exercising the `Many(vs)`
+        // stage-transition arm's `ManyCursor` sub-case.
+        let json = br#"{"a": [1, 2], "b": [3, 4]}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(r#".[("a","b")] | .[]"#).unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Int(3),
+                OwnedValue::Int(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_json_iterate_then_field_error_propagates() {
+        // When `.[]` yields a `ManyCursor` and a later stage errors on one
+        // element (`.x` on a non-object), the error must propagate out of
+        // the whole evaluation rather than being dropped silently.
+        let json = br#"{"items": [{"x": 1}, 5]}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".items[] | .x").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(result.is_error());
+    }
+
+    #[test]
+    fn test_json_iterate_then_break_propagates() {
+        // Same shape as the error case above, but for `break`, which has its
+        // own early-return arm alongside `Error`.
+        let json = br#"{"items": [1, 2]}"#;
+        let index = JsonIndex::build(json);
+        let expr = Expr::Pipe(vec![
+            Expr::Field("items".to_string()),
+            Expr::Iterate,
+            Expr::Break("out".to_string()),
+        ]);
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(matches!(result, GenericResult::Break(label) if label == "out"));
+    }
+
+    #[test]
+    fn test_json_iterate_then_single_key_index_expr_yields_one() {
+        // Heterogeneous-flatten path of the `ManyCursor` stage arm: a
+        // computed single-key index yields a plain `One` per element rather
+        // than `OneCursor`, so the per-element results can't stay
+        // `ManyCursor` and must flatten through the `One` arm. Built directly
+        // as `Expr::IndexExpr` rather than parsed from `.["a"]`, since the
+        // parser folds a literal-string bracket index into a plain
+        // `Expr::Field` (which would instead take the all-`OneCursor` path).
+        let json = br#"{"items": [{"a": 1}, {"a": 2}]}"#;
+        let index = JsonIndex::build(json);
+        let expr = Expr::Pipe(vec![
+            Expr::Field("items".to_string()),
+            Expr::Iterate,
+            Expr::IndexExpr {
+                target: Box::new(Expr::Identity),
+                key: Box::new(Expr::Literal(Literal::String("a".to_string()))),
+            },
+        ]);
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::Int(1), OwnedValue::Int(2)]
+        );
+    }
+
+    #[test]
+    fn test_json_iterate_then_multi_key_index_expr_yields_many_and_many_owned() {
+        // Same flatten path, but the per-element computed index now yields
+        // `Many` (both keys found on the second item) or `ManyOwned` (a mix
+        // of found/missing keys forces the owned fallback on the first and
+        // third items), exercising both arms.
+        let json = br#"{"items": [{"a": 1}, {"a": 1, "b": 2}, {"c": 3}]}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(r#".items[] | .[("a","b")]"#).unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![
+                OwnedValue::Int(1),
+                OwnedValue::Null,
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Null,
+                OwnedValue::Null,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_json_iterate_then_nested_iterate_yields_many_cursor_in_flatten() {
+        // Same flatten path with a per-element `ManyCursor` (from a nested
+        // `.x[]`) alongside a `None` (empty array), exercising the
+        // `ManyCursor` arm of the heterogeneous flatten.
+        let json = br#"{"items": [{"x": [10, 20]}, {"x": []}]}"#;
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".items[] | .x[]").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned(),
+            vec![OwnedValue::Int(10), OwnedValue::Int(20)]
+        );
+    }
+
+    #[test]
+    fn test_json_compare_left_many_cursor_uses_first_element() {
+        // `Compare`'s `ManyCursor`-operand arm: `.[]` on the left side yields
+        // a `ManyCursor`, and the comparison uses its first element.
+        let json = br"[1, 2]";
+        let index = JsonIndex::build(json);
+        let expr = Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Expr::Iterate),
+            right: Box::new(Expr::Literal(Literal::Int(1))),
+        };
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result.into_owned(), Some(OwnedValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_json_compare_right_many_cursor_uses_first_element() {
+        // Mirror of the above for the right-hand operand.
+        let json = br"[1, 2]";
+        let index = JsonIndex::build(json);
+        let expr = Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Expr::Literal(Literal::Int(1))),
+            right: Box::new(Expr::Iterate),
+        };
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result.into_owned(), Some(OwnedValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_json_select_cond_one_truthy() {
+        // `select`'s condition-result matching: a bare `One` (not
+        // `OneCursor`) condition result arises when `eval` is used without a
+        // cursor context, hitting a distinct arm from the `OneCursor` case
+        // below.
+        let json = b"5";
+        let index = JsonIndex::build(json);
+        let expr = Expr::Builtin(Builtin::Select(Box::new(Expr::Identity)));
+
+        let result = eval(&expr, index.root(json).value());
+        assert_eq!(result.into_owned(), Some(OwnedValue::Int(5)));
+    }
+
+    #[test]
+    fn test_json_select_cond_one_cursor_truthy() {
+        // Same as above, but evaluated with cursor context, so the condition
+        // result is `OneCursor` instead of `One`.
+        let json = b"5";
+        let index = JsonIndex::build(json);
+        let expr = Expr::Builtin(Builtin::Select(Box::new(Expr::Identity)));
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result.into_owned(), Some(OwnedValue::Int(5)));
+    }
+
+    #[test]
+    fn test_json_iterables_forwards_cursor() {
+        // `iterables`/`scalars` forward an incoming cursor when present,
+        // hitting the `OneCursor` arm of `cursor.map_or` instead of the
+        // cursor-less default.
+        let json = br"[1, 2]";
+        let index = JsonIndex::build(json);
+        let expr = Expr::Builtin(Builtin::Iterables);
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(
+            result.into_owned(),
+            Some(OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2)
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_json_scalars_forwards_cursor() {
+        let json = b"5";
+        let index = JsonIndex::build(json);
+        let expr = Expr::Builtin(Builtin::Scalars);
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result.into_owned(), Some(OwnedValue::Int(5)));
+    }
+
+    #[test]
+    fn test_json_line_builtin_with_cursor() {
+        // JSON counterpart of `test_yaml_line_builtin_with_cursor`: exercises
+        // `JsonCursor`'s `DocumentCursor::line()` trait delegation (as
+        // opposed to the inherent method called directly by
+        // `test_cursor_line_column` in `json::light`).
+        let json = b"{\n  \"foo\": 1\n}";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".foo | line").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result.into_owned(), Some(OwnedValue::Int(2)));
+    }
+
+    #[test]
+    fn test_json_column_builtin_with_cursor() {
+        // JSON counterpart of `test_yaml_column_builtin_with_cursor`,
+        // exercising `JsonCursor`'s `DocumentCursor::column()` delegation.
+        let json = b"{\n  \"foo\": 1\n}";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".foo | column").unwrap();
+
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result.into_owned(), Some(OwnedValue::Int(10)));
     }
 }

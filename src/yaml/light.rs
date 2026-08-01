@@ -2025,6 +2025,14 @@ fn write_json_string(output: &mut String, s: &str) {
 
 /// Write a JSON character escape sequence to output.
 /// Helper for direct transcoding functions.
+///
+/// Everything >= 0x20 (including C1 controls 0x80-0x9F and higher
+/// codepoints) streams as raw UTF-8, matching `stream_json_escape`'s policy
+/// and yq's own output: JSON only requires escaping `"`, `\`, and C0
+/// controls. An earlier version of this function additionally re-escaped
+/// non-ASCII characters as `\u00XX`/`\uXXXX`, which diverged from
+/// `stream_json_escape`/yq for any string reached through this non-streaming
+/// transcode path (#532).
 #[inline]
 fn write_json_escape(output: &mut String, ch: char) {
     match ch {
@@ -2040,42 +2048,6 @@ fn write_json_escape(output: &mut String, ch: char) {
             let b = c as u8;
             output.push(HEX[(b >> 4) as usize] as char);
             output.push(HEX[(b & 0xf) as usize] as char);
-        }
-        c if (c as u32) >= 0x80 && (c as u32) < 0x100 => {
-            // Extended ASCII (0x80-0xFF) - write as \u00XX
-            output.push_str("\\u00");
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            let b = c as u8;
-            output.push(HEX[(b >> 4) as usize] as char);
-            output.push(HEX[(b & 0xf) as usize] as char);
-        }
-        c if (c as u32) >= 0x100 => {
-            // Unicode - write as \uXXXX or surrogate pair
-            let cp = c as u32;
-            if cp <= 0xFFFF {
-                output.push_str("\\u");
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                output.push(HEX[((cp >> 12) & 0xF) as usize] as char);
-                output.push(HEX[((cp >> 8) & 0xF) as usize] as char);
-                output.push(HEX[((cp >> 4) & 0xF) as usize] as char);
-                output.push(HEX[(cp & 0xF) as usize] as char);
-            } else {
-                // Surrogate pair for characters > 0xFFFF
-                let adjusted = cp - 0x10000;
-                let high = 0xD800 + (adjusted >> 10);
-                let low = 0xDC00 + (adjusted & 0x3FF);
-                output.push_str("\\u");
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                output.push(HEX[((high >> 12) & 0xF) as usize] as char);
-                output.push(HEX[((high >> 8) & 0xF) as usize] as char);
-                output.push(HEX[((high >> 4) & 0xF) as usize] as char);
-                output.push(HEX[(high & 0xF) as usize] as char);
-                output.push_str("\\u");
-                output.push(HEX[((low >> 12) & 0xF) as usize] as char);
-                output.push(HEX[((low >> 8) & 0xF) as usize] as char);
-                output.push(HEX[((low >> 4) & 0xF) as usize] as char);
-                output.push(HEX[(low & 0xF) as usize] as char);
-            }
         }
         c => output.push(c),
     }
@@ -2129,8 +2101,17 @@ fn transcode_double_quoted_to_json(
                     b'v' => output.push_str("\\u000b"), // vertical tab
                     b'f' => output.push_str("\\u000c"), // form feed
                     b'e' => output.push_str("\\u001b"), // escape
-                    b'N' => output.push_str("\\u0085"), // next line
-                    b'_' => output.push_str("\\u00a0"), // non-breaking space
+                    // \N and \_ are C1/Latin-1 codepoints that yq streams as
+                    // raw UTF-8 (not JSON-escaped) — route through
+                    // write_json_escape so they get the same treatment as
+                    // any other char >= 0x20 (#532).
+                    b'N' => write_json_escape(output, '\u{0085}'), // next line
+                    b'_' => write_json_escape(output, '\u{00a0}'), // non-breaking space
+                    // \L and \P are always JSON-escaped by yq, even as raw
+                    // literal bytes — not merely because write_json_escape
+                    // treats them as "control" codepoints (it doesn't).
+                    // Keep them hardcoded rather than routing through
+                    // write_json_escape.
                     b'L' => output.push_str("\\u2028"), // line separator
                     b'P' => output.push_str("\\u2029"), // paragraph separator
                     b'\n' | b'\r' => {
@@ -2676,40 +2657,13 @@ fn stream_json_escape<Out: core::fmt::Write>(out: &mut Out, ch: char) -> core::f
             out.write_char(HEX[(b >> 4) as usize] as char)?;
             out.write_char(HEX[(b & 0xf) as usize] as char)
         }
-        c if (c as u32) >= 0x80 && (c as u32) < 0x100 => {
-            out.write_str("\\u00")?;
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            let b = c as u8;
-            out.write_char(HEX[(b >> 4) as usize] as char)?;
-            out.write_char(HEX[(b & 0xf) as usize] as char)
-        }
-        c if (c as u32) >= 0x100 => {
-            let cp = c as u32;
-            if cp <= 0xFFFF {
-                out.write_str("\\u")?;
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                out.write_char(HEX[((cp >> 12) & 0xF) as usize] as char)?;
-                out.write_char(HEX[((cp >> 8) & 0xF) as usize] as char)?;
-                out.write_char(HEX[((cp >> 4) & 0xF) as usize] as char)?;
-                out.write_char(HEX[(cp & 0xF) as usize] as char)
-            } else {
-                // Surrogate pair
-                let adjusted = cp - 0x10000;
-                let high = 0xD800 + (adjusted >> 10);
-                let low = 0xDC00 + (adjusted & 0x3FF);
-                out.write_str("\\u")?;
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                out.write_char(HEX[((high >> 12) & 0xF) as usize] as char)?;
-                out.write_char(HEX[((high >> 8) & 0xF) as usize] as char)?;
-                out.write_char(HEX[((high >> 4) & 0xF) as usize] as char)?;
-                out.write_char(HEX[(high & 0xF) as usize] as char)?;
-                out.write_str("\\u")?;
-                out.write_char(HEX[((low >> 12) & 0xF) as usize] as char)?;
-                out.write_char(HEX[((low >> 8) & 0xF) as usize] as char)?;
-                out.write_char(HEX[((low >> 4) & 0xF) as usize] as char)?;
-                out.write_char(HEX[(low & 0xF) as usize] as char)
-            }
-        }
+        // Everything >= 0x20 (including C1 controls 0x80-0x9F and higher
+        // codepoints) streams as raw UTF-8, matching `stream_json_string`'s
+        // policy and yq's own output: JSON only requires escaping `"`, `\`,
+        // and C0 controls. An earlier version of this function additionally
+        // re-escaped non-ASCII characters as `\u00XX`/`\uXXXX`, which
+        // diverged from `stream_json_string` and from yq for any string
+        // reached through this char-by-char escape-decode path (#532).
         c => out.write_char(c),
     }
 }
@@ -2770,12 +2724,19 @@ fn stream_transcode_double_quoted_to_json<Out: core::fmt::Write>(
                     b'e' => out
                         .write_str("\\u001b")
                         .map_err(|_| YamlStringError::InvalidUtf8)?,
-                    b'N' => out
-                        .write_str("\\u0085")
+                    // \N and \_ are C1/Latin-1 codepoints that yq streams as
+                    // raw UTF-8 (not JSON-escaped) — route through
+                    // stream_json_escape so they get the same treatment as
+                    // any other char >= 0x20 (#532).
+                    b'N' => stream_json_escape(out, '\u{0085}')
                         .map_err(|_| YamlStringError::InvalidUtf8)?,
-                    b'_' => out
-                        .write_str("\\u00a0")
+                    b'_' => stream_json_escape(out, '\u{00a0}')
                         .map_err(|_| YamlStringError::InvalidUtf8)?,
+                    // \L and \P are always JSON-escaped by yq, even as raw
+                    // literal bytes — not merely because stream_json_escape
+                    // treats them as "control" codepoints (it doesn't). Keep
+                    // them hardcoded rather than routing through
+                    // stream_json_escape.
                     b'L' => out
                         .write_str("\\u2028")
                         .map_err(|_| YamlStringError::InvalidUtf8)?,
@@ -3267,6 +3228,25 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
             if let YamlValue::String(key) = field.key() {
                 if key.as_str().ok()? == name {
                     result = Some(field.value());
+                }
+            }
+            fields = rest;
+        }
+        result
+    }
+
+    /// Find a field by name and return a cursor to its value.
+    ///
+    /// Same last-duplicate-key-wins semantics as [`find`](Self::find) — kept
+    /// as a separate loop rather than reusing `find` so the returned cursor
+    /// (needed for `line`/`column`) doesn't require re-navigating.
+    pub fn find_cursor(&self, name: &str) -> Option<YamlCursor<'a, W>> {
+        let mut fields = self.clone();
+        let mut result = None;
+        while let Some((field, rest)) = fields.uncons() {
+            if let YamlValue::String(key) = field.key() {
+                if key.as_str().ok()? == name {
+                    result = Some(field.value_cursor());
                 }
             }
             fields = rest;
@@ -5093,6 +5073,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for YamlFields<'a, W> {
         YamlFields::find(self, name)
     }
 
+    fn find_cursor(&self, name: &str) -> Option<Self::Cursor> {
+        YamlFields::find_cursor(self, name)
+    }
+
     fn is_empty(&self) -> bool {
         YamlFields::is_empty(self)
     }
@@ -5619,6 +5603,36 @@ mod tests {
         index.root(yaml).stream_json_document(&mut out, 0).unwrap();
         assert!(out.contains("\"i\":123"), "got {out}");
         assert!(out.contains("\"f\":1.5"), "got {out}");
+    }
+
+    /// Streaming counterpart of `test_transcode_double_quoted_next_line_escape`
+    /// / `test_transcode_double_quoted_nbsp_escape` — `stream_transcode_-
+    /// double_quoted_to_json`'s `\N`/`\_` branches had no dedicated test at
+    /// all before #532, which is how they were missed when the
+    /// `stream_json_escape` policy fix landed for the `\x`/`\u` escape
+    /// paths: both stream U+0085/U+00A0 as raw UTF-8, matching yq.
+    #[test]
+    fn test_stream_transcode_double_quoted_next_line_and_nbsp_escape() {
+        let yaml = b"s: \"next\\Nline\"\nt: \"non\\_break\"\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index.root(yaml).stream_json_document(&mut out, 0).unwrap();
+        assert!(out.contains("\"s\":\"next\u{0085}line\""), "got {out}");
+        assert!(out.contains("\"t\":\"non\u{00a0}break\""), "got {out}");
+    }
+
+    /// `\L`/`\P` (U+2028/U+2029) are the one pair still hardcoded rather than
+    /// routed through `stream_json_escape` — yq always JSON-escapes them,
+    /// even as raw literal bytes, unlike `\N`/`\_`. Pin that this streaming
+    /// path still escapes them after the #532 fix.
+    #[test]
+    fn test_stream_transcode_double_quoted_line_and_paragraph_separator_escape() {
+        let yaml = b"s: \"line\\Lsep\"\nt: \"para\\Psep\"\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index.root(yaml).stream_json_document(&mut out, 0).unwrap();
+        assert!(out.contains("\"s\":\"line\\u2028sep\""), "got {out}");
+        assert!(out.contains("\"t\":\"para\\u2029sep\""), "got {out}");
     }
 
     /// Issue #222: mapping keys are always strings and never dropped. An
@@ -7872,9 +7886,9 @@ mod tests {
         let yaml = b"\"next\\Nline\"";
         let transcoded = get_json_via_transcode(yaml);
         let decoded = get_json_via_decode(yaml);
-        // Transcoding uses \u0085, old path uses raw char - verify semantic equivalence
-        assert_json_semantically_equal(&transcoded, &decoded, "next line escape");
-        assert_eq!(transcoded, "\"next\\u0085line\"");
+        // Both paths stream U+0085 as raw UTF-8, matching yq (#532).
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"next\u{0085}line\"");
     }
 
     #[test]
@@ -7882,9 +7896,9 @@ mod tests {
         let yaml = b"\"non\\_break\"";
         let transcoded = get_json_via_transcode(yaml);
         let decoded = get_json_via_decode(yaml);
-        // Transcoding uses \u00a0, old path uses raw NBSP - verify semantic equivalence
-        assert_json_semantically_equal(&transcoded, &decoded, "nbsp escape");
-        assert_eq!(transcoded, "\"non\\u00a0break\"");
+        // Both paths stream U+00A0 as raw UTF-8, matching yq (#532).
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"non\u{00a0}break\"");
     }
 
     #[test]
@@ -7930,9 +7944,9 @@ mod tests {
         let yaml = b"\"euro\\u20ACsign\""; // € = U+20AC
         let transcoded = get_json_via_transcode(yaml);
         let decoded = get_json_via_decode(yaml);
-        // Transcoding uses \u20ac, old path uses raw € - verify semantic equivalence
-        assert_json_semantically_equal(&transcoded, &decoded, "unicode 4-digit escape");
-        assert_eq!(transcoded, "\"euro\\u20acsign\"");
+        // Both paths stream € as raw UTF-8, matching yq (#532).
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"euro€sign\"");
     }
 
     #[test]
@@ -7940,10 +7954,9 @@ mod tests {
         let yaml = b"\"emoji\\U0001F600face\""; // 😀 = U+1F600
         let transcoded = get_json_via_transcode(yaml);
         let decoded = get_json_via_decode(yaml);
-        // Transcoding uses surrogate pair \ud83d\ude00, old path uses raw 😀
-        // Verify semantic equivalence
-        assert_json_semantically_equal(&transcoded, &decoded, "unicode 8-digit escape");
-        assert_eq!(transcoded, "\"emoji\\ud83d\\ude00face\"");
+        // Both paths stream 😀 as raw UTF-8, matching yq (#532).
+        assert_eq!(transcoded, decoded);
+        assert_eq!(transcoded, "\"emoji😀face\"");
     }
 
     #[test]
