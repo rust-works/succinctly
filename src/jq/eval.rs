@@ -7303,6 +7303,19 @@ fn resolve_node<S: EvalSemantics>(
             // Every other `?`-wrapped node (`.foo?`, `.[0]?`, ...): evaluation
             // and indexing are the same step, so any failure anywhere
             // underneath is the failure to index, and `?` covers all of it.
+            //
+            // The `Expr::Optional` wrapper below marks the branch as one `?`
+            // reached, for whatever downstream still wants to know that —
+            // but it is *not* an instruction to keep suppressing failures at
+            // write time. `resolve_dynamic_indexes` strips every such
+            // wrapper from the final component list before handing it to
+            // `set_path`/`update_path`/`delete_at_path`, because those
+            // functions apply an already-resolved path unconditionally, the
+            // same way jq's `setpath` never re-consults the `?` that
+            // `path()` already spent (#498's multi-branch case: a sibling
+            // write earlier in the same fan-out batch can still clobber the
+            // container this branch needs, and that failure must propagate
+            // regardless of this branch's own `?`).
             _ => {
                 // A failure under `?` prunes the branch instead of propagating.
                 let Ok(branches) = resolve_node::<S>(inner, value) else {
@@ -7593,6 +7606,11 @@ fn resolve_index_expr<S: EvalSemantics>(
                 Err(_) if optional => continue,
                 Err(e) => return Err(e),
             };
+            // `resolve_dynamic_indexes` strips the `Expr::Optional` wrapper
+            // below from every component before it ever reaches
+            // `set_path`/`update_path`/`delete_at_path` (#498) — see the
+            // note on `resolve_node`'s matching arm for why a wrapper must
+            // not survive into the write.
             let mut path = components.clone();
             path.push(if optional {
                 Expr::Optional(Box::new(component))
@@ -7699,12 +7717,42 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     let branches = resolve_node::<S>(expr, input)?;
     Ok(branches
         .into_iter()
-        .map(|(components, _)| match components.len() {
-            0 => Expr::Identity,
-            1 => components.into_iter().next().expect("len checked"),
-            _ => Expr::Pipe(components),
+        .map(|(components, _)| {
+            let components: Vec<Expr> = components
+                .into_iter()
+                .map(strip_resolved_optional)
+                .collect();
+            match components.len() {
+                0 => Expr::Identity,
+                1 => components.into_iter().next().expect("len checked"),
+                _ => Expr::Pipe(components),
+            }
         })
         .collect())
+}
+
+/// Drop any `Expr::Optional` wrapper a resolved path component still
+/// carries — from `resolve_node`'s bare-`?` arm, `resolve_index_expr`, or
+/// verbatim from `resolve_seq`'s no-computed-key fast path, whose static
+/// suffix is spliced in unresolved and can still hold a source-level `?`.
+///
+/// `?` finishes its job during path *production* — this function's caller
+/// is the one place every resolved branch passes through on its way to
+/// `set_path`/`update_path`/`delete_at_path`, so it is the one place that
+/// can guarantee none of them still carry a marker telling those functions
+/// to keep suppressing failures at *write* time. jq's own model never asks
+/// `setpath` the question at all: `path()` computes the fully static path
+/// array first (pruning under `?` there, once), and applies that array
+/// unconditionally after — even when an earlier sibling in the same
+/// fan-out batch has since clobbered the container this branch needs
+/// (#498's multi-branch case, and its purely-static variant reached through
+/// `resolve_seq` rather than a computed key).
+fn strip_resolved_optional(component: Expr) -> Expr {
+    match component {
+        Expr::Optional(inner) => strip_resolved_optional(*inner),
+        Expr::Pipe(exprs) => Expr::Pipe(exprs.into_iter().map(strip_resolved_optional).collect()),
+        other => other,
+    }
 }
 
 // =============================================================================
