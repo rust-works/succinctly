@@ -95,7 +95,6 @@ impl CacheAlignedL1L2 {
 
     /// Get the number of entries.
     #[inline]
-    #[allow(dead_code)] // STYLE-0005: utility accessor kept for symmetry
     fn len(&self) -> usize {
         self.len
     }
@@ -461,6 +460,15 @@ impl RankDirectory {
         };
 
         (l0_rank + l1_rank + l2_rank) as usize
+    }
+
+    /// Returns the heap memory usage in bytes.
+    ///
+    /// One `u128` of L1+L2 metadata per 512-bit block (~25% of the indexed
+    /// bits, see the module docs) plus one `u64` per 2^32-bit superblock.
+    pub fn heap_size(&self) -> usize {
+        self.l0.len() * core::mem::size_of::<u64>()
+            + self.l1_l2.len() * core::mem::size_of::<u128>()
     }
 }
 

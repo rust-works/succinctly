@@ -521,7 +521,11 @@ For detailed documentation on optimization techniques used in this project, see 
   - **Additional context-sensitivity**: YAML has two quote types (`"` vs `'`), block scalars (`|` `>`), and context-dependent quote meaning
   - See [docs/parsing/yaml.md#p6-bmi2-operations-pdeppext---rejected-](docs/parsing/yaml.md#p6-bmi2-operations-pdeppext---rejected-) for full analysis
 - ❌ P7 (Newline Index): **REJECTED** - use case mismatch (CLI feature, not parsing optimization)
-  - **Discovery**: JSON's `NewlineIndex` is NOT built during parsing
+  - ⚠️ **Premise corrected by #228**: JSON had *two* newline structures and P7 found only one.
+    `JsonIndex::newlines` **was** built eagerly in every `JsonIndex::build` — an O(n) scan and ~15.9%
+    of the input on every jq query. P7's conclusion held; JSON was violating it. Both are now
+    `text::LineIndex`, built lazily (ADR-0012).
+  - **Discovery** (as believed at the time): JSON's `NewlineIndex` is NOT built during parsing
     - Only used in `jq-locate` CLI tool for `--line X --column Y` → byte offset conversion
     - Never built during JSON parsing, jq queries, or benchmarks
     - Zero performance impact on actual JSON processing

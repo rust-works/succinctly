@@ -81,8 +81,11 @@ let name: &str = cursor.as_str();
 
 ## Depends On
 
-- [BitVec](../architecture/bitvec.md) — IB and BP are stored as bitvectors with rank/select indices
 - [BalancedParens](../architecture/balanced-parens.md) — BP encoding with `find_close` for subtree skipping
+- [LineIndex](../optimizations/line-index.md) — line/column lookup, built lazily on first use
+
+IB is a plain `W: AsRef<[u64]>` plus a cumulative-rank `Vec<u32>`, not a
+[BitVec](../architecture/bitvec.md) — see that page's *Used By* section.
 
 ## Used By
 

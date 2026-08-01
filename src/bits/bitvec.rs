@@ -188,6 +188,18 @@ impl BitVec {
     pub fn words(&self) -> &[u64] {
         &self.words
     }
+
+    /// Returns the heap memory usage in bytes: raw words plus both indices.
+    ///
+    /// The indices are not free — the rank directory costs ~25% of the raw
+    /// words and the select index one 16-byte sample per
+    /// [`Config::select_sample_rate`](crate::Config) set bits. See
+    /// `docs/benchmarks/rust-succinct-libs.md` for measured totals.
+    pub fn heap_size(&self) -> usize {
+        self.words.len() * core::mem::size_of::<u64>()
+            + self.rank_dir.heap_size()
+            + self.select_idx.heap_size()
+    }
 }
 
 impl Default for BitVec {
@@ -893,5 +905,49 @@ mod tests {
             assert_eq!(bv.select1(k), Some(k), "select1({k})");
         }
         assert_eq!(bv.select1(bv.count_ones()), None);
+    }
+
+    // ========================================================================
+    // Space accounting
+    // ========================================================================
+
+    #[test]
+    fn test_heap_size_empty() {
+        assert_eq!(BitVec::new().heap_size(), 0);
+    }
+
+    #[test]
+    fn test_heap_size_accounts_for_both_indices() {
+        // 64 words = 4096 bits = 8 rank blocks; dense enough for select samples.
+        let words = vec![u64::MAX; 64];
+        let bv = BitVec::from_words(words, 4096);
+
+        let raw = 64 * 8;
+        // 8 blocks x 16 bytes of L1/L2 metadata (~25% of the raw words).
+        let rank = 8 * 16;
+        // 4096 ones at the default sample rate of 256 = 16 samples x 16 bytes.
+        let select = 16 * 16;
+
+        assert_eq!(bv.heap_size(), raw + rank + select);
+        assert!(
+            bv.heap_size() > raw,
+            "heap_size must include the indices, not just the words"
+        );
+    }
+
+    #[test]
+    fn test_heap_size_grows_with_density() {
+        // The select index samples set bits, so a denser vector costs more
+        // even at identical length. This is the effect measured in
+        // docs/benchmarks/rust-succinct-libs.md (27.5% -> 47.5%).
+        let sparse = BitVec::from_words(vec![1u64; 64], 4096);
+        let dense = BitVec::from_words(vec![u64::MAX; 64], 4096);
+
+        assert!(
+            dense.heap_size() > sparse.heap_size(),
+            "dense {} should exceed sparse {}",
+            dense.heap_size(),
+            sparse.heap_size()
+        );
     }
 }

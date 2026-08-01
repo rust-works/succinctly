@@ -15,6 +15,7 @@ silently truncating.
 | `YamlIndex::build`               | `u32::MAX` bytes (< 4 GiB)     | `Err(YamlError::InputTooLarge)`           | Text positions stored as u32 throughout the semi-index  |
 | `DsvIndexLightweight::new`       | `u32::MAX` bytes (< 4 GiB)     | Panic (documented)                        | Two rank arrays are ~12.5% of input combined            |
 | `BalancedParens` constructors    | `u32::MAX` bits                | Panic (documented)                        | `rank_l1` stores absolute cumulative rank as u32        |
+| `LineIndex::build`               | `u32::MAX` bytes (< 4 GiB)     | Panic (documented)                        | Line starts are Elias-Fano encoded from u32 offsets     |
 
 The `BalancedParens` ceiling acts as a backstop for pathological JSON/YAML
 that emits more BP bits than input bytes: such inputs can exceed the BP

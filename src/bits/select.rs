@@ -138,6 +138,14 @@ impl SelectIndex {
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
+
+    /// Returns the heap memory usage in bytes.
+    ///
+    /// One `SampleEntry` (16 bytes) per [`sample_rate`](Self::sample_rate)
+    /// set bits.
+    pub fn heap_size(&self) -> usize {
+        self.samples.len() * core::mem::size_of::<SampleEntry>()
+    }
 }
 
 #[cfg(test)]

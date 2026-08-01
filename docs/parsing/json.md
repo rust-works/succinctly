@@ -286,15 +286,16 @@ The `locate` module enables reverse lookup: given a byte offset or line/column p
 2. **Node lookup**: Use `ib_rank1(offset)` to find the containing structural element
 3. **Path construction**: Walk up using `bp.parent()`, collecting path components
 
-### NewlineIndex
+### LineIndex
 
-Fast line/column to offset conversion using rank/select on newline positions:
+Line/column to offset conversion, backed by Elias-Fano-encoded line starts so the index scales with
+the number of lines rather than the size of the text:
 
 ```rust
-use succinctly::json::locate::NewlineIndex;
+use succinctly::text::LineIndex;
 
 let text = b"line1\nline2\nline3";
-let index = NewlineIndex::build(text);
+let index = LineIndex::build(text);
 
 // Line/column are 1-indexed
 assert_eq!(index.to_offset(2, 1), Some(6));  // Start of line 2
@@ -302,6 +303,13 @@ assert_eq!(index.to_line_column(6), (2, 1)); // Reverse lookup
 ```
 
 Handles all line ending conventions: Unix (LF), Windows (CRLF), and classic Mac (CR).
+
+`JsonIndex` and `YamlIndex` build one lazily on the first `to_line_column`/`to_offset` call, so a jq
+query that never asks for a position never pays for it. See
+[optimizations/line-index.md](../optimizations/line-index.md) and [ADR-0012](../adrs/adr-0012.md).
+
+> `succinctly::json::locate::NewlineIndex` is a deprecated alias for this type, kept for source
+> compatibility until 0.9.0 (#228). New code should use `succinctly::text::LineIndex`.
 
 ### CLI Usage
 

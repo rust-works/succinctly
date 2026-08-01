@@ -1,6 +1,7 @@
 //! Property-based tests for rank/select operations.
 
 use proptest::prelude::*;
+use succinctly::text::LineIndex;
 use succinctly::{BitVec, RankSelect};
 
 proptest! {
@@ -224,6 +225,113 @@ proptest! {
             let expected = reference_select1(&words, len, k);
             let actual = bv.select1(k);
             prop_assert_eq!(actual, expected, "select1({}) mismatch", k);
+        }
+    }
+}
+
+// ============================================================================
+// LineIndex (#228)
+// ============================================================================
+
+/// Reference implementation of the line-start scan.
+///
+/// A terminator at the very end of the text starts no new line, and CRLF is
+/// one terminator rather than two.
+fn reference_line_starts(text: &[u8]) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    let mut i = 0;
+    while i < text.len() {
+        match text[i] {
+            b'\n' => {
+                if i + 1 < text.len() {
+                    starts.push(i + 1);
+                }
+                i += 1;
+            }
+            b'\r' => {
+                let next = if i + 1 < text.len() && text[i + 1] == b'\n' {
+                    i + 2
+                } else {
+                    i + 1
+                };
+                if next < text.len() {
+                    starts.push(next);
+                }
+                i = next;
+            }
+            _ => i += 1,
+        }
+    }
+    starts
+}
+
+/// Bytes drawn from `{a, b, \n, \r}` so CRLF / CR / LF / empty-line
+/// interleavings are dense — that is where hand-written cases are thinnest.
+fn terminator_heavy_text() -> impl Strategy<Value = Vec<u8>> {
+    prop::collection::vec(
+        prop::sample::select(vec![b'a', b'b', b'\n', b'\r']),
+        0..400usize,
+    )
+}
+
+proptest! {
+    /// `to_line_column` agrees with a naive forward scan at every offset.
+    #[test]
+    fn prop_line_index_matches_naive_scanner(text in terminator_heavy_text()) {
+        let index = LineIndex::build(&text);
+        let starts = reference_line_starts(&text);
+
+        prop_assert_eq!(index.line_count(), starts.len());
+
+        for offset in 0..text.len() {
+            let line = starts.partition_point(|&s| s <= offset);
+            let expected = (line, offset - starts[line - 1] + 1);
+            prop_assert_eq!(index.to_line_column(offset), expected, "offset {}", offset);
+        }
+    }
+
+    /// Every in-bounds offset survives offset -> line/column -> offset.
+    #[test]
+    fn prop_line_index_round_trip(text in terminator_heavy_text()) {
+        let index = LineIndex::build(&text);
+
+        for offset in 0..text.len() {
+            let (line, column) = index.to_line_column(offset);
+            prop_assert_eq!(index.to_offset(line, column), Some(offset), "offset {}", offset);
+        }
+    }
+
+    /// Line starts are strictly increasing, in bounds, and start at 0.
+    #[test]
+    fn prop_line_starts_are_monotone_and_in_bounds(text in terminator_heavy_text()) {
+        let index = LineIndex::build(&text);
+
+        prop_assert_eq!(index.line_start(1), Some(0));
+
+        let mut previous = None;
+        for line in 1..=index.line_count() {
+            let start = index.line_start(line).expect("line within count");
+            if let Some(previous) = previous {
+                prop_assert!(start > previous, "line {} start {} <= previous", line, start);
+            }
+            prop_assert!(start <= text.len());
+            previous = Some(start);
+        }
+
+        prop_assert_eq!(index.line_start(index.line_count() + 1), None);
+    }
+
+    /// Positions past the end are rejected, never turned into a bogus offset.
+    #[test]
+    fn prop_to_offset_stays_in_bounds(
+        text in terminator_heavy_text(),
+        line in 1usize..50,
+        column in 1usize..500,
+    ) {
+        let index = LineIndex::build(&text);
+
+        if let Some(offset) = index.to_offset(line, column) {
+            prop_assert!(offset < text.len(), "offset {} outside {} bytes", offset, text.len());
         }
     }
 }

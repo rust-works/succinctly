@@ -53,7 +53,9 @@ DSV indexing throughput (API-level, not end-to-end CLI):
 
 ## Depends On
 
-- [BitVec](../architecture/bitvec.md) — marker and newline bitvectors with rank/select
+- `DsvIndexLightweight` ([src/dsv/index_lightweight.rs](../../src/dsv/index_lightweight.rs)) — marker
+  and newline words as plain `Vec<u64>` plus cumulative-rank `Vec<u32>`, measured 5-9x faster to
+  iterate than [BitVec](../architecture/bitvec.md), which this module does not use
 
 ## Used By
 

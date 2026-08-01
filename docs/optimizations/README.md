@@ -19,6 +19,7 @@ This directory documents optimization techniques used in the succinctly library,
 | **Parallelism**      | [parallel-prefix.md](parallel-prefix.md)                 | Prefix XOR, cumulative index, carry propagation  |
 | **Parsing**          | [state-machines.md](state-machines.md)                   | PFSM, fast-path bypass, two-stage pipeline       |
 | **Compact encoding** | [end-positions.md](end-positions.md)                     | Bitmap encoding, advance index, sequential cursor|
+| **Sparse sets**      | [line-index.md](line-index.md)                           | Elias-Fano line starts, lazy build, crossover    |
 | **String search**    | [jq-string-search.md](jq-string-search.md)               | memmem vs std Two-Way for jq substring builtins   |
 | **Select scan**      | [select-scan.md](select-scan.md)                         | #40 scan-length measurement, IB cursor O(n²) fix |
 | **Targets**          | [targets.md](targets.md)                                 | CPU target configurations, architecture flags    |

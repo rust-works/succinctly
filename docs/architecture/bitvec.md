@@ -9,18 +9,22 @@ Design and implementation of the bit vector with rank/select support.
 `BitVec` is a bit vector that supports:
 - O(1) rank operations
 - O(log n) select operations
-- ~3-4% space overhead
+- **27.5-47.5% space overhead**, rising with bit density (see [Space Analysis](#space-analysis)) —
+  *not* the ~3% of a compact Poppy index, a figure this page previously quoted from the paper
 
 ## Data Layout
 
 ```rust
 pub struct BitVec {
-    bits: Vec<u64>,           // Raw bit storage
-    len: usize,               // Number of bits
-    superblock_rank: Vec<u64>, // Cumulative counts per 512 bits
-    block_rank: Vec<u16>,     // Counts per 64 bits within superblock
+    words: Vec<u64>,          // Raw bit storage
+    len: usize,               // Number of valid bits
+    ones_count: usize,        // Cached popcount
+    rank_dir: RankDirectory,  // 3-level Poppy directory (l0 + cache-aligned l1/l2)
+    select_idx: SelectIndex,  // One 16-byte sample per `select_sample_rate` ones
 }
 ```
+
+`heap_size()` reports the total of all three parts.
 
 ## Index Structure
 
@@ -98,10 +102,24 @@ Popcount uses platform-specific SIMD:
 
 ## Used By
 
-- [BalancedParens](balanced-parens.md) — stores its parenthesis sequence as a `BitVec`, uses rank1/select1 for tree navigation
-- [JsonIndex](../parsing/json-index.md) — interest bits and BP encoding are both bitvectors
-- [YamlIndex](../parsing/yaml-index.md) — same pattern, plus type bits
-- [DsvIndex](../parsing/dsv-index.md) — marker and newline bitvectors
+**No data path in the crate, as of [#228](https://github.com/rust-works/succinctly/issues/228).**
+`BitVec` is public API — exported from the crate root, exercised by doctests and the serde
+round-trip tests — but nothing parses, indexes or queries through it. Its one remaining caller is
+measurement scaffolding: the corpus-shape report reconstructs a dense bitmap per file purely to
+print what `LineIndex` saves against it ([src/bin/succinctly/corpus_stats.rs](../../src/bin/succinctly/corpus_stats.rs)).
+This section previously listed four callers, none of which were accurate:
+
+| Structure                             | What it actually stores                                                                                                                        |
+|---------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
+| [BalancedParens](balanced-parens.md)  | `words: W` (a plain `Vec<u64>` or borrowed slice) plus its own `rank_l1`/`rank_l2` arrays — never a `BitVec`                                   |
+| [JsonIndex](../parsing/json-index.md) | interest bits as `W` plus a cumulative-rank `Vec<u32>`; the newline index moved to [`text::LineIndex`](../../src/text/lines.rs)                |
+| [YamlIndex](../parsing/yaml-index.md) | same pattern, plus type bits; newline index likewise now `LineIndex`                                                                           |
+| [DsvIndex](../parsing/dsv-index.md)   | `DsvIndexLightweight` — plain `Vec<u64>` markers and newlines with cumulative-rank `Vec<u32>`, measured 5-9x faster to iterate than a `BitVec` |
+
+The parsers bypass `BitVec` because they need storage genericity (`W: AsRef<[u64]>` for mmap),
+hinted select, or cheap sequential iteration, none of which it offers. See
+[ADR-0011](../adrs/adr-0011.md) for why the structures are in-crate at all, and
+[ADR-0012](../adrs/adr-0012.md) for why the last auxiliary uses moved to Elias-Fano.
 
 ## Academic Papers
 

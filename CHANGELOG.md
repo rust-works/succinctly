@@ -58,6 +58,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pays nothing. It rejects 58 of the 82 previously-accepted-but-invalid YAML
   Test Suite cases (reject conformance 12/94 → 70/94) with no false positives on
   the valid corpus; the remaining structurally-deep cases stay on record.
+- **`succinctly::text::LineIndex`** (#228): a shared, Elias-Fano-backed line-start
+  index replacing three separate copies of the same `BitVec` newline scanner
+  (`JsonIndex`, `YamlIndex`, and `json::locate::NewlineIndex`). It costs
+  ~`2 + log2(average line length)` bits per *line* instead of ~1.27 bits per
+  *input byte*: 3.6-145x smaller on the real-workload corpus, and near-zero on
+  minified single-line input where the bitmap still cost 15.6% of the file.
+  See [ADR-0012](docs/adrs/adr-0012.md).
+- `EliasFano::predecessor` — the largest element `<= value`, with its index
+  (O(log n); intended for cold paths).
+- `heap_size()` on `BitVec`, `RankDirectory` and `SelectIndex`, matching
+  `EliasFano` and `CompactRank`.
+- The corpus shape report gains a `## Line index` section recording retained
+  index bytes per file, so the existing `corpus-shape-drift` CI job now guards
+  index space against regression.
 
 ### Changed
 
@@ -1653,6 +1667,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `AliasCycle` error on a valid document.
   - A **block sequence at a lower indent than a mapping key** was treated as
     that key's value, leaving the key's anchor dangling.
+- `YamlIndex::to_offset` no longer returns byte offsets past the end of the text
+  for an out-of-range column; it returns `None`, matching `JsonIndex::to_offset` (#228)
 - `jq -R -s` now yields the entire input as a single string instead of an array of per-line strings, matching jq (#176)
 - `yq -R -s` now yields the entire input as a single string instead of an array of per-line strings, matching jq and `jq -R -s` (#271)
 - YAML alias cycles (`a: &anchor {self: *anchor}`) are rejected at index build with the
@@ -1739,6 +1755,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the existing `AliasCycle` check, where it previously produced garbage. `yq`
   instead emits a depth-limited expansion; rejecting cycles is the documented
   policy (see `docs/compliance/yaml/limitations.md`).
+- **BREAKING — `JsonIndex` line/column lookup takes the text** (#228):
+  `to_line_column(offset, text)` and `to_offset(line, column, text)` now match
+  the existing `YamlIndex` signatures. The line index is built lazily on first
+  use instead of eagerly in `JsonIndex::build`, which removes an O(n) scan and a
+  full bitmap allocation from every JSON index build (−25.8% of build allocation
+  on a 100 KB GeoJSON file). `JsonCursor::cursor_at_position` and the
+  `at_position(line; col)` builtin are unaffected. As a consequence `JsonIndex`
+  is no longer `Sync` (`YamlIndex` already was not).
+- **BREAKING — zero-caller `BitVec` constructors removed** (#228):
+  `JsonIndex::from_parts_with_newlines`, `YamlIndex::from_parts_with_newlines`
+  and `YamlIndex::newlines` are gone. They were the last public signatures
+  exposing `BitVec` outside `succinctly::bits`; line indices are now derived from
+  the text on demand. `JsonIndex::from_parts` gains working line/column lookup as
+  a side effect — it used to install an empty newline index that silently
+  reported every position as line 1.
+- `succinctly::json::locate::NewlineIndex` is now an alias for
+  `succinctly::text::LineIndex`; `build`, `to_offset` and `to_line_column` are
+  unchanged. The alias will be removed in 0.9.0. (#228)
 - **4 GiB input ceilings enforced** (#188): instead of silently truncating
   `u32` counters, builds now fail loudly for inputs over `u32::MAX` bytes —
   `YamlIndex::build` returns the new `YamlError::InputTooLarge` variant

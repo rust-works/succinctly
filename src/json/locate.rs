@@ -7,16 +7,10 @@
 use alloc::{
     format,
     string::{String, ToString},
-    vec,
     vec::Vec,
 };
 
-#[cfg(test)]
-use std::vec;
-
-use crate::bits::BitVec;
 use crate::json::light::{JsonCursor, JsonIndex, StandardJson};
-use crate::RankSelect;
 
 // ============================================================================
 // NewlineIndex: Fast line/column to byte offset conversion
@@ -24,119 +18,10 @@ use crate::RankSelect;
 
 /// Index for fast line/column to byte offset conversion.
 ///
-/// Handles Unix (LF), Windows (CRLF), and classic Mac (CR) line endings.
-#[derive(Debug)]
-pub struct NewlineIndex {
-    /// Bitvector with 1s at positions immediately after line terminators
-    /// (i.e., the first byte of each line after line 1).
-    line_starts: BitVec,
-    /// Total length of the text
-    text_len: usize,
-}
-
-impl NewlineIndex {
-    /// Build a newline index from text.
-    ///
-    /// Scans the text once to find all line terminators and marks
-    /// the start position of each subsequent line.
-    pub fn build(text: &[u8]) -> Self {
-        if text.is_empty() {
-            return Self {
-                line_starts: BitVec::new(),
-                text_len: 0,
-            };
-        }
-
-        let mut bits = vec![0u64; text.len().div_ceil(64)];
-        let mut i = 0;
-
-        while i < text.len() {
-            match text[i] {
-                b'\n' => {
-                    // LF: next byte starts a new line
-                    let next = i + 1;
-                    if next < text.len() {
-                        bits[next / 64] |= 1 << (next % 64);
-                    }
-                    i += 1;
-                }
-                b'\r' => {
-                    // CR: check for CRLF
-                    let next = if i + 1 < text.len() && text[i + 1] == b'\n' {
-                        // CRLF: skip both, new line starts after \n
-                        i + 2
-                    } else {
-                        // Standalone CR (classic Mac): new line starts after \r
-                        i + 1
-                    };
-                    if next < text.len() {
-                        bits[next / 64] |= 1 << (next % 64);
-                    }
-                    i = next;
-                }
-                _ => i += 1,
-            }
-        }
-
-        Self {
-            line_starts: BitVec::from_words(bits, text.len()),
-            text_len: text.len(),
-        }
-    }
-
-    /// Convert 1-indexed line and column to byte offset.
-    ///
-    /// Column is 1-indexed byte offset within the line.
-    /// Returns `None` if line/column is 0 or if the position is out of bounds.
-    pub fn to_offset(&self, line: usize, column: usize) -> Option<usize> {
-        if line == 0 || column == 0 {
-            return None;
-        }
-
-        let line_start = if line == 1 {
-            // First line starts at offset 0
-            0
-        } else {
-            // Line N starts at the (N-1)th line-start marker (0-indexed select)
-            self.line_starts.select1(line - 2)?
-        };
-
-        let offset = line_start + column - 1;
-        if offset < self.text_len {
-            Some(offset)
-        } else {
-            None
-        }
-    }
-
-    /// Convert byte offset to 1-indexed line and column.
-    ///
-    /// Useful for error reporting and display.
-    pub fn to_line_column(&self, offset: usize) -> (usize, usize) {
-        if self.text_len == 0 {
-            return (1, 1);
-        }
-
-        // Line-start markers are at positions immediately after line terminators.
-        // rank1(offset + 1) gives the count of line-start markers in [0, offset],
-        // which equals the number of lines before the current line.
-        // So line number = 1 + rank1(offset + 1).
-        let markers_before_or_at = self.line_starts.rank1(offset + 1);
-        let line = 1 + markers_before_or_at;
-
-        // Column = offset - start of this line + 1
-        let line_start = if line == 1 {
-            0
-        } else {
-            // The start of line N is at the (N-2)th marker (0-indexed select)
-            // because line 1 has no marker, line 2 has marker 0, line 3 has marker 1, etc.
-            self.line_starts.select1(line - 2).unwrap_or(0)
-        };
-
-        let column = offset - line_start + 1;
-        (line, column)
-    }
-}
+/// Retained for compatibility; the implementation moved to
+/// [`crate::text::LineIndex`], which is shared with `JsonIndex`, `YamlIndex`
+/// and the locate CLIs (#228). This alias will be removed in 0.9.0.
+pub use crate::text::LineIndex as NewlineIndex;
 
 // ============================================================================
 // Path building utilities
@@ -494,102 +379,17 @@ mod tests {
     use super::*;
 
     // ------------------------------------------------------------------------
-    // NewlineIndex tests
+    // NewlineIndex alias
     // ------------------------------------------------------------------------
 
+    /// The behaviour itself is covered by `crate::text::lines`; this only
+    /// guards the compatibility re-export (#228).
     #[test]
-    fn test_newline_index_empty() {
-        let index = NewlineIndex::build(b"");
-        // Empty string has no valid positions
-        assert_eq!(index.to_offset(1, 1), None);
-        // But if we ask for line/column of offset 0, it's (1, 1)
-        assert_eq!(index.to_line_column(0), (1, 1));
-    }
+    fn test_newline_index_alias_resolves_to_line_index() {
+        let index = NewlineIndex::build(b"line1\nline2");
 
-    #[test]
-    fn test_newline_index_no_newlines() {
-        let text = b"hello world";
-        let index = NewlineIndex::build(text);
-
-        assert_eq!(index.to_offset(1, 1), Some(0));
-        assert_eq!(index.to_offset(1, 6), Some(5)); // space
-        assert_eq!(index.to_offset(1, 12), None); // past end
-        assert_eq!(index.to_offset(2, 1), None); // no line 2
-
-        assert_eq!(index.to_line_column(0), (1, 1));
-        assert_eq!(index.to_line_column(5), (1, 6));
-    }
-
-    #[test]
-    fn test_newline_index_unix_lf() {
-        let text = b"line1\nline2\nline3";
-        let index = NewlineIndex::build(text);
-
-        // Line 1: positions 0-4 (line1)
-        assert_eq!(index.to_offset(1, 1), Some(0));
-        assert_eq!(index.to_offset(1, 5), Some(4));
-
-        // Line 2: positions 6-10 (line2)
         assert_eq!(index.to_offset(2, 1), Some(6));
-        assert_eq!(index.to_offset(2, 5), Some(10));
-
-        // Line 3: positions 12-16 (line3)
-        assert_eq!(index.to_offset(3, 1), Some(12));
-        assert_eq!(index.to_offset(3, 5), Some(16));
-
-        // Reverse lookup
-        assert_eq!(index.to_line_column(0), (1, 1));
-        assert_eq!(index.to_line_column(5), (1, 6)); // the \n
         assert_eq!(index.to_line_column(6), (2, 1));
-        assert_eq!(index.to_line_column(12), (3, 1));
-    }
-
-    #[test]
-    fn test_newline_index_windows_crlf() {
-        let text = b"line1\r\nline2\r\nline3";
-        let index = NewlineIndex::build(text);
-
-        // Line 1: positions 0-4 (line1)
-        assert_eq!(index.to_offset(1, 1), Some(0));
-        assert_eq!(index.to_offset(1, 5), Some(4));
-
-        // Line 2: positions 7-11 (line2) - after \r\n
-        assert_eq!(index.to_offset(2, 1), Some(7));
-        assert_eq!(index.to_offset(2, 5), Some(11));
-
-        // Line 3: positions 14-18 (line3)
-        assert_eq!(index.to_offset(3, 1), Some(14));
-
-        // Reverse lookup
-        assert_eq!(index.to_line_column(0), (1, 1));
-        assert_eq!(index.to_line_column(7), (2, 1));
-        assert_eq!(index.to_line_column(14), (3, 1));
-    }
-
-    #[test]
-    fn test_newline_index_classic_mac_cr() {
-        let text = b"line1\rline2\rline3";
-        let index = NewlineIndex::build(text);
-
-        // Line 1: positions 0-4 (line1)
-        assert_eq!(index.to_offset(1, 1), Some(0));
-
-        // Line 2: positions 6-10 (line2) - after \r
-        assert_eq!(index.to_offset(2, 1), Some(6));
-
-        // Line 3: positions 12-16 (line3)
-        assert_eq!(index.to_offset(3, 1), Some(12));
-
-        // Reverse lookup
-        assert_eq!(index.to_line_column(6), (2, 1));
-    }
-
-    #[test]
-    fn test_newline_index_invalid_inputs() {
-        let index = NewlineIndex::build(b"hello\nworld");
-
-        assert_eq!(index.to_offset(0, 1), None); // line 0
-        assert_eq!(index.to_offset(1, 0), None); // column 0
     }
 
     // ------------------------------------------------------------------------

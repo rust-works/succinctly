@@ -3,8 +3,6 @@
 //! Holds the semi-index (IB, BP, TY) and provides rank/select operations.
 
 #[cfg(not(test))]
-use alloc::vec;
-#[cfg(not(test))]
 use alloc::{string::String, vec::Vec};
 
 #[cfg(not(test))]
@@ -22,7 +20,6 @@ use super::advance_positions::{build_cumulative_rank, OpenPositions};
 use super::end_positions::EndPositions;
 use super::error::YamlError;
 use super::light::YamlCursor;
-use super::line_break::line_break_len;
 use super::parser::build_semi_index;
 use super::starts_seq_entry;
 
@@ -69,10 +66,10 @@ pub struct YamlIndex<W = Vec<u64>> {
     bp_to_anchor: BTreeMap<usize, String>,
     /// Alias references: BP position of alias → target BP position (resolved at parse time)
     aliases: BTreeMap<usize, usize>,
-    /// Newline positions for fast line/column lookup (built lazily on first use).
-    /// Bit i is set if position i is the start of a new line (immediately after a line terminator).
-    /// Only needed by `to_line_column()` and `to_offset()` (used by `yq-locate` CLI).
-    newlines: OnceCell<crate::bits::BitVec>,
+    /// Line starts for line/column lookup (built lazily on first use).
+    /// Only needed by `to_line_column()` and `to_offset()` (used by the
+    /// `yq-locate` CLI and the `at_position` jq builtin).
+    lines: OnceCell<crate::text::LineIndex>,
 }
 
 /// Build cumulative popcount index for IB.
@@ -85,34 +82,6 @@ fn build_ib_rank(words: &[u64]) -> Vec<u32> {
 #[inline]
 fn build_containers_rank(words: &[u64]) -> Vec<u32> {
     build_cumulative_rank(words)
-}
-
-/// Build newline index from text.
-/// Sets bit i if position i is the start of a new line (immediately after a line terminator).
-/// Handles Unix (LF), Windows (CRLF), and classic Mac (CR) line endings.
-fn build_newline_index(text: &[u8]) -> crate::bits::BitVec {
-    if text.is_empty() {
-        return crate::bits::BitVec::new();
-    }
-
-    let mut bits = vec![0u64; text.len().div_ceil(64)];
-    let mut i = 0;
-
-    while i < text.len() {
-        // A new line starts at the byte after the break — one past a lone `\r`
-        // or `\n`, two past a `\r\n`, which is a single break.
-        let break_len = line_break_len(text, i);
-        if break_len == 0 {
-            i += 1;
-            continue;
-        }
-        i += break_len;
-        if i < text.len() {
-            bits[i / 64] |= 1 << (i % 64);
-        }
-    }
-
-    crate::bits::BitVec::from_words(bits, text.len())
 }
 
 impl YamlIndex<Vec<u64>> {
@@ -160,7 +129,7 @@ impl YamlIndex<Vec<u64>> {
             anchors: semi.anchors,
             bp_to_anchor,
             aliases: semi.aliases,
-            newlines: OnceCell::new(),
+            lines: OnceCell::new(),
         };
         index.validate_alias_acyclicity()?;
         Ok(index)
@@ -211,55 +180,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             anchors,
             bp_to_anchor,
             aliases,
-            newlines: OnceCell::new(),
-        }
-    }
-
-    /// Create a YAML index from pre-existing data including newlines.
-    ///
-    /// This is useful for loading serialized index data with full line/column support.
-    #[allow(clippy::too_many_arguments)] // STYLE-0004: constructor threads each index array; a builder would hide the 1:1 field mapping
-    pub fn from_parts_with_newlines(
-        ib: W,
-        ib_len: usize,
-        bp: W,
-        bp_len: usize,
-        ty: W,
-        ty_len: usize,
-        bp_to_text: Vec<u32>,
-        bp_to_text_end: Vec<u32>,
-        containers: W,
-        anchors: BTreeMap<String, usize>,
-        aliases: BTreeMap<usize, usize>,
-        newlines: crate::bits::BitVec,
-    ) -> Self {
-        let ib_rank = build_ib_rank(ib.as_ref());
-        let containers_rank = build_containers_rank(containers.as_ref());
-
-        // Build reverse anchor mapping
-        let bp_to_anchor: BTreeMap<usize, String> = anchors
-            .iter()
-            .map(|(name, &bp_pos)| (bp_pos, name.clone()))
-            .collect();
-
-        // Convert bp_to_text to compact storage when positions are monotonic
-        let open_positions = OpenPositions::build(&bp_to_text, ib_len);
-
-        Self {
-            ib,
-            ib_len,
-            ib_rank,
-            bp: BalancedParens::from_words_with_select(bp, bp_len),
-            ty,
-            ty_len,
-            open_positions,
-            bp_to_text_end: EndPositions::build(&bp_to_text_end, ib_len),
-            containers,
-            containers_rank,
-            anchors,
-            bp_to_anchor,
-            aliases,
-            newlines: OnceCell::from(newlines),
+            lines: OnceCell::new(),
         }
     }
 
@@ -753,12 +674,12 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         count
     }
 
-    /// Convert a byte offset to (line, column) using the newline index.
+    /// Convert a byte offset to (line, column) using the line index.
     ///
     /// Lines and columns are 1-based to match common editor conventions.
-    /// Returns (1, offset+1) if the text has no newlines.
+    /// Returns (1, offset+1) if the text has no line terminators.
     ///
-    /// The newline index is built lazily on first call from `text`.
+    /// The line index is built lazily on first call from `text`.
     ///
     /// # Example
     ///
@@ -776,40 +697,15 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// ```
     #[inline]
     pub fn to_line_column(&self, offset: usize, text: &[u8]) -> (usize, usize) {
-        use crate::RankSelect;
-
-        let newlines = self.ensure_newlines(text);
-
-        if newlines.is_empty() {
-            return (1, offset + 1);
-        }
-
-        // Line-start markers are at positions immediately after line terminators.
-        // rank1(offset + 1) gives the count of line-start markers in [0, offset],
-        // which equals the number of lines before the current line.
-        // So line number = 1 + rank1(offset + 1).
-        let markers_before_or_at = newlines.rank1(offset + 1);
-        let line = 1 + markers_before_or_at;
-
-        // Column = offset - start of this line + 1
-        let line_start = if line == 1 {
-            0
-        } else {
-            // The start of line N is at the (N-2)th marker (0-indexed select)
-            // because line 1 has no marker, line 2 has marker 0, line 3 has marker 1, etc.
-            newlines.select1(line - 2).unwrap_or(0)
-        };
-
-        let column = offset - line_start + 1;
-        (line, column)
+        self.ensure_lines(text).to_line_column(offset)
     }
 
-    /// Convert (line, column) to a byte offset using the newline index.
+    /// Convert (line, column) to a byte offset using the line index.
     ///
     /// Lines and columns are 1-based to match common editor conventions.
     /// Returns None if the line/column is out of bounds.
     ///
-    /// The newline index is built lazily on first call from `text`.
+    /// The line index is built lazily on first call from `text`.
     ///
     /// # Example
     ///
@@ -827,43 +723,29 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// ```
     #[inline]
     pub fn to_offset(&self, line: usize, column: usize, text: &[u8]) -> Option<usize> {
-        use crate::RankSelect;
-
-        if line == 0 || column == 0 {
-            return None;
-        }
-
-        let newlines = self.ensure_newlines(text);
-
-        if newlines.is_empty() {
-            // No newline markers means single-line document
-            if line == 1 {
-                return Some(column - 1);
-            }
-            return None;
-        }
-
-        // Line 1 starts at offset 0
-        // Line N starts at the (N-2)th line-start marker (0-indexed select)
-        let line_start = if line == 1 {
-            0
-        } else {
-            newlines.select1(line - 2)?
-        };
-
-        Some(line_start + column - 1)
+        self.ensure_lines(text).to_offset(line, column)
     }
 
-    /// Get a reference to the newline bitvector, building it lazily if needed.
+    /// Lazily build and cache the line index from the source text.
+    ///
+    /// The first caller's `text` wins for the lifetime of the index, so a
+    /// later call with different text silently reads the first one's line
+    /// map. The debug assertion catches the cheap half of that mistake.
     #[inline]
-    pub fn newlines(&self, text: &[u8]) -> &crate::bits::BitVec {
-        self.ensure_newlines(text)
-    }
+    fn ensure_lines(&self, text: &[u8]) -> &crate::text::LineIndex {
+        let lines = self
+            .lines
+            .get_or_init(|| crate::text::LineIndex::build(text));
 
-    /// Lazily build and cache the newline index from the source text.
-    #[inline]
-    fn ensure_newlines(&self, text: &[u8]) -> &crate::bits::BitVec {
-        self.newlines.get_or_init(|| build_newline_index(text))
+        debug_assert_eq!(
+            lines.text_len(),
+            text.len(),
+            "line index was built from different text ({} bytes) than this call passed ({} bytes)",
+            lines.text_len(),
+            text.len()
+        );
+
+        lines
     }
 }
 
@@ -1411,6 +1293,19 @@ mod tests {
 
         assert_eq!(index.to_offset(0, 1, yaml), None); // line 0 invalid
         assert_eq!(index.to_offset(1, 0, yaml), None); // column 0 invalid
+    }
+
+    #[test]
+    fn test_to_offset_rejects_positions_past_the_end() {
+        // Before #228 this returned Some(offset) for offsets past the text,
+        // unlike JsonIndex::to_offset. The shared LineIndex bounds-checks both.
+        let yaml = b"name: Alice\nage: 30";
+        let index = YamlIndex::build(yaml).unwrap();
+
+        assert_eq!(index.to_offset(2, 7, yaml), Some(18), "last byte");
+        assert_eq!(index.to_offset(2, 8, yaml), None, "one past the end");
+        assert_eq!(index.to_offset(2, 999, yaml), None, "far past the end");
+        assert_eq!(index.to_offset(3, 1, yaml), None, "no line 3");
     }
 
     #[test]

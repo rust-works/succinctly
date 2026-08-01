@@ -26,6 +26,7 @@ graph TD
 | DSV/CSV structural index   | [DsvIndex](parsing/dsv-index.md)                      | [src/dsv/](../src/dsv/)               | [parsing/dsv.md](parsing/dsv.md)                                   |
 | Query language             | [jq Evaluator](reference/jq-evaluator.md)             | [src/jq/](../src/jq/)                 | [CLAUDE.md](../CLAUDE.md#jq-format-functions)                      |
 | SIMD acceleration          | [SIMD Strategy](optimizations/simd-strategy.md)       | per-module `simd/` dirs               | [optimizations/simd.md](optimizations/simd.md)                     |
+| Line/column lookup         | [Line Index](optimizations/line-index.md)             | [src/text/lines.rs](../src/text/lines.rs) | [adrs/adr-0012.md](adrs/adr-0012.md)                           |
 
 ## How Semi-Indexing Works
 
@@ -79,7 +80,8 @@ Full data: [benchmarks/](benchmarks/)
 
 ## Key Cross-References
 
-- **BitVec → BalancedParens**: BP stores its parenthesis sequence as a `BitVec`, using rank1/select1 for O(1) tree navigation. See [architecture/core-concepts.md](architecture/core-concepts.md).
+- **BalancedParens rank/select**: BP stores its parenthesis sequence as plain `Vec<u64>` words with its own cumulative-rank arrays — *not* a `BitVec`, which it bypasses for storage genericity and hinted select. See [architecture/core-concepts.md](architecture/core-concepts.md) and [ADR-0011](adrs/adr-0011.md).
+- **LineIndex → JsonIndex/YamlIndex/locate CLIs**: line/column lookup is served by one shared Elias-Fano index over line starts, built lazily on first use. It replaced three dense-bitmap copies that cost ~16% of the input regardless of line count. See [ADR-0012](adrs/adr-0012.md).
 - **BalancedParens → JsonIndex/YamlIndex**: Each semi-index builds a BP encoding of the document's nesting structure. The BP's `find_close()` operation enables skipping entire subtrees.
 - **Interest Bits → Cursor API**: Additional bitvectors (string positions, array elements, object keys) enable the cursor to distinguish node types without re-parsing.
 - **jq Evaluator → Document trait**: The evaluator is generic over `Document`, allowing it to work with both `JsonIndex` and `YamlIndex` through a shared cursor interface. See [jq Evaluator](reference/jq-evaluator.md).
