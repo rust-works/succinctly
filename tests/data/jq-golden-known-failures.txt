@@ -25,16 +25,19 @@
 # Reseeded by #513 from the open bug corpus: 11 cases pinning bugs filed
 # *before* a fix existed, rather than alongside one, so the manifest can act
 # as a scoreboard instead of reading as a false clean bill of health.
-# path_empty (#489) has since been fixed and dropped, leaving 10; its golden
-# stays and now passes, which is the scoreboard working as intended.
+# path_empty (#489) and comma_pipe_precedence (#462) have since been fixed
+# and dropped, leaving 9; label_break_after_comma (#400) plus the
+# reduce/foreach_multi_output_init pair (#534) were then seeded from newly
+# filed issues, bringing it to 12, and assign_autovivify_nested (#486) has
+# since been fixed and dropped, leaving 11 — each drop/add the scoreboard
+# working as intended.
 #
-# Extended by #514 with four *_error_after_output cases, taking the file to 15
-# entries (the #534 pair having landed since the #513 reseed above). They
-# are the first entries whose golden carries a non-empty expected.out **and** a
-# non-zero expected.status: jq streams some outputs and then fails. Exit code
-# and stderr already match, so each fails on stdout alone — and a fix that
-# emits the prefix while losing the failure would fail on status instead,
-# which is the pairing #400/#494 need pinned.
+# Extended by #514 with four *_error_after_output cases, taking the file to
+# 15 entries. They are the first entries whose golden carries a non-empty
+# expected.out **and** a non-zero expected.status: jq streams some outputs
+# and then fails. Exit code and stderr already match, so each fails on
+# stdout alone — and a fix that emits the prefix while losing the failure
+# would fail on status instead, which is the pairing #400/#494 need pinned.
 
 comma_literal_before_document  comma              . evaluates before the literal 1 inside [1, .], reversing output order — #353
 object_construct_cartesian     object_construct   only the first output of each key/value generator is used instead of the cartesian product — #354
