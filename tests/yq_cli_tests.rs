@@ -329,6 +329,20 @@ fn test_i0_multidoc_separator_skips_empty_results() -> Result<()> {
 }
 
 #[test]
+fn test_select_after_iterate_stays_many_cursor() -> Result<()> {
+    // `select` isn't a "navigation-only" expression, so `.[] | select(...)`
+    // takes the DOM/cursor evaluation path (`evaluate_yaml_cursor`) instead
+    // of the M2 streaming fast path. When every filtered element keeps its
+    // position, the pipe's result stays a top-level `ManyCursor`, exercising
+    // that arm of `evaluate_yaml_cursor` directly (as opposed to a plain
+    // `.[]`, which the M2 fast path intercepts before it ever reaches here).
+    let (out, code) = run_yq_stdin(".[] | select(. > 0)", "- 2\n- 3\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2\n3");
+    Ok(())
+}
+
+#[test]
 fn test_i0_multidoc_doc_filter_no_separator() -> Result<()> {
     // #175: selecting a single document with --doc emits no stray separator.
     let (out, code) = run_yq_stdin(".", "a: 1\n---\nb: 2\n", &["-I=0", "--doc", "1"])?;
