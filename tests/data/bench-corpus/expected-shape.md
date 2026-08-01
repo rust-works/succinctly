@@ -63,19 +63,19 @@ Measured with `YamlIndex::memory()`. `L` is input bytes, `M` is BP opens (nodes)
 
 | workload       | file                        | L    | M   | L/M  | index | % of L | open enc | open | open alt | end enc | end  | end alt |
 | -------------- | --------------------------- | ---- | --- | ---- | ----- | ------ | -------- | ---- | -------- | ------- | ---- | ------- |
-| actions        | codeql-analysis.yml         | 925  | 73  | 12.7 | 1409  | 152.3% | compact  | 152  | 292      | compact | 152  | 292     |
-| actions        | stale.yml                   | 1290 | 54  | 23.9 | 1530  | 118.6% | compact  | 188  | 216      | compact | 188  | 216     |
-| compose        | nginx-flask-mysql.yaml      | 1239 | 112 | 11.1 | 1572  | 126.9% | compact  | 192  | 448      | compact | 192  | 448     |
-| compose        | wordpress.yaml              | 815  | 56  | 14.6 | 1306  | 160.2% | compact  | 124  | 224      | compact | 124  | 224     |
-| home-assistant | air-quality-conditions.yaml | 9990 | 890 | 11.2 | 14290 | 143.0% | compact  | 1440 | 3560     | compact | 1440 | 3560    |
-| k8s            | nginx-deployment.yml        | 836  | 86  | 9.7  | 1381  | 165.2% | compact  | 144  | 344      | compact | 144  | 344     |
-| lint           | sass-lint.yml               | 2055 | 184 | 11.2 | 2006  | 97.6%  | compact  | 308  | 736      | compact | 308  | 736     |
+| actions        | codeql-analysis.yml         | 925  | 73  | 12.7 | 1417  | 153.2% | compact  | 152  | 292      | compact | 152  | 292     |
+| actions        | stale.yml                   | 1290 | 54  | 23.9 | 1538  | 119.2% | compact  | 188  | 216      | compact | 188  | 216     |
+| compose        | nginx-flask-mysql.yaml      | 1239 | 112 | 11.1 | 1580  | 127.5% | compact  | 192  | 448      | compact | 192  | 448     |
+| compose        | wordpress.yaml              | 815  | 56  | 14.6 | 1314  | 161.2% | compact  | 124  | 224      | compact | 124  | 224     |
+| home-assistant | air-quality-conditions.yaml | 9990 | 890 | 11.2 | 14298 | 143.1% | compact  | 1440 | 3560     | compact | 1440 | 3560    |
+| k8s            | nginx-deployment.yml        | 836  | 86  | 9.7  | 1389  | 166.1% | compact  | 144  | 344      | compact | 144  | 344     |
+| lint           | sass-lint.yml               | 2055 | 184 | 11.2 | 2014  | 98.0%  | compact  | 308  | 736      | compact | 308  | 736     |
 
-Corpus totals: L = 17150 bytes, M = 1455 opens, index = 23494 bytes (137.0%) — 16.15 bytes/node, 11.8 text bytes/node.
+Corpus totals: L = 17150 bytes, M = 1455 opens, index = 23550 bytes (137.3%) — 16.19 bytes/node, 11.8 text bytes/node.
 
 | component       | bytes | % of index | % of L |
 | --------------- | ----- | ---------- | ------ |
-| inline struct   | 5600  | 23.8%      | 32.7%  |
+| inline struct   | 5656  | 24.0%      | 33.0%  |
 | ib              | 2184  | 9.3%       | 12.7%  |
 | ib_rank         | 1120  | 4.8%       | 6.5%   |
 | bp words        | 384   | 1.6%       | 2.2%   |
@@ -85,7 +85,7 @@ Corpus totals: L = 17150 bytes, M = 1455 opens, index = 23494 bytes (137.0%) —
 | end_positions   | 2548  | 10.8%      | 14.9%  |
 | containers      | 384   | 1.6%       | 2.2%   |
 | containers_rank | 220   | 0.9%       | 1.3%   |
-| anchors/aliases | 7918  | 33.7%      | 46.2%  |
+| anchors/aliases | 7918  | 33.6%      | 46.2%  |
 
 `inline struct` is `size_of::<YamlIndex>()` — a fixed per-index cost that holds every `Vec`/`BTreeMap` header in one place, so nothing is double-counted. It does not scale with input, and therefore dominates `% of L` on kilobyte-sized files while vanishing on megabyte-sized ones; read the scaling components, not the total, when comparing across sizes. `newlines` is omitted: it is built lazily and stays unallocated for parse-only and query workloads that never ask for line/column positions.
 
