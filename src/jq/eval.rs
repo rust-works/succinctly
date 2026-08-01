@@ -6506,8 +6506,21 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // Resolve computed keys against the *original* document, before any write,
     // then apply every resolved path: `.[("a","b")] = 1` assigns both.
+    //
+    // `optional` here is `=`'s *own* `?` (`(.a = 1)?`), i.e. jq's ordinary
+    // `try/catch` around the whole expression -- not a per-step tolerance. It
+    // must never reach `set_path` as a starting flag: `set_path`'s own
+    // `Expr::Optional` arm already gives per-component `?` its narrower
+    // meaning (path production only, never the write-time bounds check), and
+    // conflating the two would either over-suppress an inline `.[-5]? = 9` or
+    // under-suppress an outer `(.[-5] = 9)?` depending on which flag won.
+    // Instead every fallible step here is caught at this boundary and turned
+    // into empty output when the whole call is optional -- mirroring how
+    // `builtin_del` (#537) already separates `del(...)?` from a `?` written
+    // inside the path.
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
         Ok(paths) => paths,
+        Err(_) if optional => return QueryResult::None,
         Err(e) => return QueryResult::Error(e),
     };
 
@@ -6520,7 +6533,11 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             new_value.clone()
         };
         if let Err(e) = set_path(&mut result, path, value) {
-            return QueryResult::Error(e);
+            return if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(e)
+            };
         }
     }
 
@@ -6539,15 +6556,29 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut result = to_owned(&input);
 
     // Computed keys resolve against the original document, before any update.
+    //
+    // `optional` is `|=`'s *own* `?` (`(.a |= f)?`) -- see `eval_assign`'s
+    // matching comment for why it is caught here, at the call boundary,
+    // rather than threaded into `update_path` as a starting flag: doing that
+    // would let an outer `?` swallow a genuinely-raised `.[-5]? |= 9` (an
+    // inline path `?` never covers the write-time bounds check, #498) while
+    // an outer `(.[-5] |= 9)?` needs exactly that swallowed. `update_path` is
+    // always entered with `false` below; any `?` it still sees came from an
+    // `Expr::Optional` node inside `path_expr` itself.
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &result) {
         Ok(paths) => paths,
+        Err(_) if optional => return QueryResult::None,
         Err(e) => return QueryResult::Error(e),
     };
 
     // Get current value at path, apply filter, and set back
     for path in &paths {
-        if let Err(e) = update_path::<S>(&mut result, path, filter_expr, optional) {
-            return QueryResult::Error(e);
+        if let Err(e) = update_path::<S>(&mut result, path, filter_expr, false) {
+            return if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(e)
+            };
         }
     }
 
@@ -6698,17 +6729,21 @@ fn set_path(
             if exprs.len() == 1 {
                 set_path(root, &exprs[0], new_value)
             } else if let Some(split) = split_at_slice(exprs) {
-                let parent = get_path_mut(root, split.before)?;
-                through_slice(parent, split.start, split.end, false, |sub| {
-                    set_path(sub, &split.tail, new_value)
-                })
+                match get_path_mut(root, split.before)? {
+                    None => Ok(()),
+                    Some(parent) => through_slice(parent, split.start, split.end, false, |sub| {
+                        set_path(sub, &split.tail, new_value)
+                    }),
+                }
             } else {
                 // Navigate to parent
                 let parent_path = &exprs[..exprs.len() - 1];
                 let last_path = &exprs[exprs.len() - 1];
 
-                let parent = get_path_mut(root, parent_path)?;
-                set_path(parent, last_path, new_value)
+                match get_path_mut(root, parent_path)? {
+                    None => Ok(()),
+                    Some(parent) => set_path(parent, last_path, new_value),
+                }
             }
         }
         Expr::Optional(inner) => match set_path(root, inner, new_value) {
@@ -6862,25 +6897,44 @@ fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit<'_>> {
     })
 }
 
-/// Get a mutable reference to a value at a path.
+/// Get a mutable reference to the parent named by `path_parts`, or `None` if
+/// a component along the way could not be walked and was itself marked
+/// optional (`?`).
+///
+/// Autovivification means a *wrong-type* mismatch — the only failure this can
+/// still raise — can only be reached through data the document already held:
+/// `Null` always vivifies into whatever the next step needs, so nothing this
+/// function creates can itself go on to fail. That is what makes per-step `?`
+/// safe to honour here without any risk of leaving a half-built container
+/// behind.
+///
+/// Each component's own `?` is scoped to that component only, mirroring
+/// `update_path`'s `Pipe`-chain arm: `{"a":5} | .a?.b.c = 1` still raises on
+/// `.c` (unprotected) even though `.a?` (protected, but never triggered here
+/// since `.a` reads fine) precedes it. This used to drop the bit entirely —
+/// "every path reaching a walker has already been resolved" is only true of
+/// the *computed-key* pre-pass (`resolve_dynamic_indexes`/`resolve_node`); a
+/// plain static chain like `.a?.b = 1` never goes through it at all
+/// (`needs_path_prepass` says no), so `get_path_mut` was the last word on
+/// whether `?` applied and was ignoring it: `"str" | .a?.b = 1` raised
+/// `Cannot index string with string "a"` instead of leaving `"str"`
+/// untouched, matching jq.
 fn get_path_mut<'a>(
     root: &'a mut OwnedValue,
     path_parts: &[Expr],
-) -> Result<&'a mut OwnedValue, EvalError> {
+) -> Result<Option<&'a mut OwnedValue>, EvalError> {
     let mut current = root;
 
     for part in path_parts {
-        // The `?` bit is dropped rather than honoured: every path reaching a
-        // walker has already been resolved against the real document, so a
-        // component that survived resolution is one the walk can follow. What
-        // matters here is not matching the wrapper as an unknown component.
-        let (part, _optional) = unwrap_path_component(part);
+        let (part, optional) = unwrap_path_component(part);
         current = match part {
             Expr::Identity => current,
             Expr::Field(name) => {
                 autovivify_object(current);
                 if let OwnedValue::Object(map) = current {
                     map.entry(name.clone()).or_insert(OwnedValue::Null)
+                } else if optional {
+                    return Ok(None);
                 } else {
                     return Err(EvalError::cannot_index_with_field(
                         owned_type_name(current),
@@ -6891,7 +6945,15 @@ fn get_path_mut<'a>(
             Expr::Index(idx) => {
                 autovivify_array(current);
                 if let OwnedValue::Array(arr) = current {
+                    // A still-negative index is the write-time bounds check,
+                    // not a walking failure, so `?` never covers it here
+                    // either — same reasoning as `set_path`'s `Expr::Optional`
+                    // arm, just with nothing to catch: `write_index` never
+                    // returns that error for a component this function can
+                    // itself elect to suppress.
                     write_index(arr, *idx)?
+                } else if optional {
+                    return Ok(None);
                 } else {
                     return Err(EvalError::cannot_index_with_type(
                         owned_type_name(current),
@@ -6908,7 +6970,7 @@ fn get_path_mut<'a>(
         };
     }
 
-    Ok(current)
+    Ok(Some(current))
 }
 
 /// Update a value at a path by applying a filter.
@@ -6920,15 +6982,19 @@ fn update_path<S: EvalSemantics>(
 ) -> Result<(), EvalError> {
     match path_expr {
         Expr::Identity => {
-            // Apply filter to root itself using eval_owned_expr
-            match eval_owned_expr::<S>(filter_expr, root, optional) {
-                Ok(v) => {
-                    *root = v;
-                    Ok(())
-                }
-                Err(_e) if optional => Ok(()),
-                Err(e) => Err(e),
-            }
+            // The filter runs as an ordinary sub-expression, not one
+            // implicitly wrapped in `try/catch` by whatever `?` got us here:
+            // `optional` at this point only ever came from an inline path
+            // component (`.a?`), which prunes path *production*, never
+            // covers path *application* (#498) -- `{"a":1} | .a? |=
+            // error("boom")` raises `boom` in jq, it does not fall back to
+            // leaving `.a` untouched. A `?` wrapping the *whole* `.path |=
+            // filter` expression is handled by `eval_update`'s caller
+            // instead, which is why `update_path` is always entered with
+            // `optional: false` at the top.
+            let v = eval_owned_expr::<S>(filter_expr, root, false)?;
+            *root = v;
+            Ok(())
         }
         Expr::Field(name) => {
             autovivify_object(root);
@@ -7237,6 +7303,19 @@ fn resolve_node<S: EvalSemantics>(
             // Every other `?`-wrapped node (`.foo?`, `.[0]?`, ...): evaluation
             // and indexing are the same step, so any failure anywhere
             // underneath is the failure to index, and `?` covers all of it.
+            //
+            // The `Expr::Optional` wrapper below marks the branch as one `?`
+            // reached, for whatever downstream still wants to know that —
+            // but it is *not* an instruction to keep suppressing failures at
+            // write time. `resolve_dynamic_indexes` strips every such
+            // wrapper from the final component list before handing it to
+            // `set_path`/`update_path`/`delete_at_path`, because those
+            // functions apply an already-resolved path unconditionally, the
+            // same way jq's `setpath` never re-consults the `?` that
+            // `path()` already spent (#498's multi-branch case: a sibling
+            // write earlier in the same fan-out batch can still clobber the
+            // container this branch needs, and that failure must propagate
+            // regardless of this branch's own `?`).
             _ => {
                 // A failure under `?` prunes the branch instead of propagating.
                 let Ok(branches) = resolve_node::<S>(inner, value) else {
@@ -7527,6 +7606,11 @@ fn resolve_index_expr<S: EvalSemantics>(
                 Err(_) if optional => continue,
                 Err(e) => return Err(e),
             };
+            // `resolve_dynamic_indexes` strips the `Expr::Optional` wrapper
+            // below from every component before it ever reaches
+            // `set_path`/`update_path`/`delete_at_path` (#498) — see the
+            // note on `resolve_node`'s matching arm for why a wrapper must
+            // not survive into the write.
             let mut path = components.clone();
             path.push(if optional {
                 Expr::Optional(Box::new(component))
@@ -7633,12 +7717,42 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     let branches = resolve_node::<S>(expr, input)?;
     Ok(branches
         .into_iter()
-        .map(|(components, _)| match components.len() {
-            0 => Expr::Identity,
-            1 => components.into_iter().next().expect("len checked"),
-            _ => Expr::Pipe(components),
+        .map(|(components, _)| {
+            let components: Vec<Expr> = components
+                .into_iter()
+                .map(strip_resolved_optional)
+                .collect();
+            match components.len() {
+                0 => Expr::Identity,
+                1 => components.into_iter().next().expect("len checked"),
+                _ => Expr::Pipe(components),
+            }
         })
         .collect())
+}
+
+/// Drop any `Expr::Optional` wrapper a resolved path component still
+/// carries — from `resolve_node`'s bare-`?` arm, `resolve_index_expr`, or
+/// verbatim from `resolve_seq`'s no-computed-key fast path, whose static
+/// suffix is spliced in unresolved and can still hold a source-level `?`.
+///
+/// `?` finishes its job during path *production* — this function's caller
+/// is the one place every resolved branch passes through on its way to
+/// `set_path`/`update_path`/`delete_at_path`, so it is the one place that
+/// can guarantee none of them still carry a marker telling those functions
+/// to keep suppressing failures at *write* time. jq's own model never asks
+/// `setpath` the question at all: `path()` computes the fully static path
+/// array first (pruning under `?` there, once), and applies that array
+/// unconditionally after — even when an earlier sibling in the same
+/// fan-out batch has since clobbered the container this branch needs
+/// (#498's multi-branch case, and its purely-static variant reached through
+/// `resolve_seq` rather than a computed key).
+fn strip_resolved_optional(component: Expr) -> Expr {
+    match component {
+        Expr::Optional(inner) => strip_resolved_optional(*inner),
+        Expr::Pipe(exprs) => Expr::Pipe(exprs.into_iter().map(strip_resolved_optional).collect()),
+        other => other,
+    }
 }
 
 // =============================================================================
@@ -21617,6 +21731,103 @@ mod tests {
     }
 
     #[test]
+    fn test_optional_write_does_not_protect_the_filter_or_the_whole_expression() {
+        // #498's rule applies just as much to `|=`'s filter as to the write
+        // itself: `?` on a path component prunes path *production*, and
+        // running the filter at the resolved location is path *application*
+        // — jq raises `boom` here rather than leaving `.a` untouched or
+        // swallowing the error. (Before this fix, `update_path` threaded the
+        // component's own `optional` into `eval_owned_expr` too, so the
+        // filter's `error("boom")` was itself evaluated as if `?`-guarded and
+        // silently produced `null`, corrupting `.a` to `{"a":null}` instead
+        // of raising.)
+        assert_outcomes(&[(br#"{"a":1}"#, ".a? |= error(\"boom\")", Err("boom"))]);
+    }
+
+    #[test]
+    fn test_outer_optional_around_a_failing_write_produces_no_output() {
+        // A `?` wrapping the *whole* `path op value` expression is ordinary
+        // `try/catch`, unrelated to a `?` written on a path component —
+        // jq's answer is no output at all, not the unchanged input and not a
+        // raised error. `eval_assign`/`eval_update` catch every failure at
+        // this boundary (mirroring `builtin_del`'s #537 fix) rather than
+        // threading their own `optional` into `set_path`/`update_path` as a
+        // starting flag, which is what let this either raise unconditionally
+        // (`=`, never fixed before this change) or leak a corrupted partial
+        // write (`|=`, once `?` also had to stop protecting the filter).
+        assert_outcomes(&[
+            (b"[1,2]", "(.[-5] = 9)?", Ok("")),
+            (b"[1,2]", "(.[-5] |= 9)?", Ok("")),
+            (b"[1,2]", "(.[-5] += 1)?", Ok("")),
+            (br#"{"a":1}"#, "(.a |= error(\"boom\"))?", Ok("")),
+        ]);
+    }
+
+    #[test]
+    fn test_optional_midchain_walking_failure_stays_scoped_to_its_own_component() {
+        // `get_path_mut` used to drop every inline `?` on a non-final path
+        // component ("every path reaching a walker has already been
+        // resolved" was only true of the computed-key pre-pass, which a
+        // plain static chain like `.a?.b` never goes through), so
+        // `"str" | .a?.b = 1` raised `Cannot index string with string "a"`
+        // instead of leaving `"str"` untouched like jq.
+        assert_outcomes(&[(br#""str""#, ".a?.b = 1", Ok(r#""str""#))]);
+
+        // A component's own `?` protects only *that* component: `.a?`
+        // resolves fine here (`.a` already holds `5`, reading an existing
+        // object field never fails), so it is never exercised, and the
+        // unprotected `.c` still raises on the number it lands on.
+        assert_outcomes(&[(
+            br#"{"a":{"b":5}}"#,
+            ".a?.b.c |= 1",
+            Err(r#"Cannot index number with string "c""#),
+        )]);
+    }
+
+    #[test]
+    fn test_optional_write_does_not_swallow_a_sibling_clobber_in_a_fan_out() {
+        // #498's multi-branch case: `?` prunes path *production*, never
+        // *application* — and that holds even for a path that resolved
+        // cleanly, once it is one of several a fan-out applies in sequence.
+        // `.. | objects` here visits the root and `.a`, both objects whose
+        // own `.k` names an existing field, so `.[.k]?` on each resolves
+        // fully against the *original* document (`path()` sees `["a"]` then
+        // `["a","a"]`, no pruning). The first write (`.a = 7`) turns `.a`
+        // from an object into a number; the second (`.a.a`) then needs `.a`
+        // to still be an object and raises, matching jq. Before this fix,
+        // the resolved path's leftover `Expr::Optional` marker (from
+        // `resolve_index_expr`/`resolve_node`, meant only to record that a
+        // `?` was involved in producing the branch) was still being
+        // consulted by `set_path`/`update_path` at write time, so the raise
+        // was swallowed and `.a` was left at `7` instead.
+        let doc = br#"{"k":"a","a":{"k":"a","a":1}}"#;
+        assert_outcomes(&[
+            (
+                doc,
+                "(.. | objects | .[.k]?) = 7",
+                Err(r#"Cannot index number with string "a""#),
+            ),
+            (
+                doc,
+                "(.. | objects | .[.k]?) |= 7",
+                Err(r#"Cannot index number with string "a""#),
+            ),
+        ]);
+
+        // The purely static flavour, reached without any computed key at
+        // all: `resolve_seq`'s no-dynamic-component fast path splices a
+        // chain like `.a.a?` straight through unresolved rather than routing
+        // it through `resolve_node`, so it needed its own fix at
+        // `resolve_dynamic_indexes`'s assembly point rather than only at the
+        // two sites that build a resolved component from a computed key.
+        assert_outcomes(&[(
+            br#"{"a":{"a":1}}"#,
+            "(.a, .a.a?) = 7",
+            Err(r#"Cannot index number with string "a""#),
+        )]);
+    }
+
+    #[test]
     fn test_set_path_and_get_path_mut_autovivify_null_directly() {
         // Direct-function coverage for the three walkers `autovivify_object`/
         // `autovivify_array`/`write_index` touch (#486), bypassing the parser.
@@ -21651,6 +21862,7 @@ mod tests {
             &mut root,
             &[Expr::Field("a".to_string()), Expr::Field("b".to_string())],
         )
+        .unwrap()
         .unwrap();
         assert_eq!(*slot, OwnedValue::Null);
         assert_eq!(

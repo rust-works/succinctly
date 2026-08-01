@@ -127,6 +127,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Assignment (`=`, `|=`, the compound family, `//=`) refused to build a
+  missing container, and `?` on a write path swallowed the write itself**
+  (#486, #498): `.a.b = 9` on `{}` raised `Cannot index null with string
+  "b"` instead of building `{"a":{"b":9}}` like jq, and `.[5] = 9` on
+  `[1,2]` raised `index 5 out of bounds (length 2)` instead of padding to
+  `[1,2,null,null,null,9]` — `setpath()`'s writer already got both right,
+  `set_path`/`get_path_mut`/`update_path` behind every other write operator
+  never learned the same rule. Fixing the padding half meant `?` had to stop
+  swallowing the one write-time failure it never covers in jq: a still-negative
+  array index after counting back from the end (`.[-5]? = 9` now raises `Out
+  of bounds negative array index` instead of silently no-op'ing). Landing
+  those together surfaced three more places the same "`?` only prunes path
+  *production*, never path *application*" rule was violated: `get_path_mut`
+  dropped every inline `?` on a non-final path component, so
+  `"str" | .a?.b = 1` raised instead of leaving `"str"` untouched;
+  `update_path` threaded a path component's own `?` into the filter's own
+  evaluation, so `.a? |= error("boom")` silently corrupted `.a` to `null`
+  instead of raising; and neither `eval_assign` nor `eval_update` caught a
+  failure at the call boundary for a `?` wrapping the *whole* expression, so
+  `(.[-5] = 9)?` raised outright and `(.a |= error("boom"))?` also corrupted
+  to `null`, where jq produces no output for both — fixed by catching at the
+  boundary the same way `builtin_del`'s #537 fix already does, rather than
+  threading the outer `?` into the walkers as a starting flag.
+
+- **A `?` on one path in a fan-out (`..`, `recurse`, a computed key, a
+  `Comma`) still swallowed a write failure caused by an *earlier sibling's*
+  write clobbering the container a later one needed** (#498, the
+  multi-branch case the fix above did not close): `{"k":"a","a":{"k":"a",
+  "a":1}} | (.. | objects | .[.k]?) = 7` produced `{"k":"a","a":7}` instead
+  of raising `Cannot index number with string "a"` like jq — the first write
+  (`.a = 7`) turns `.a` from an object into a number, and the second
+  (`.a.a`) then fails to walk it. Both branches resolve cleanly during path
+  *production* (against the original document, before either write runs),
+  so their `?` had already finished its job; the bug was that the resolved
+  path still carried an `Expr::Optional` marker from `resolve_index_expr`/
+  `resolve_node`, which `set_path`/`update_path` kept consulting at *write*
+  time and used to swallow the second failure. jq's own model never has this
+  problem: `path()` computes every fully-static path up front and prunes
+  under `?` exactly once there, and `setpath` — which cannot even represent
+  `?` in a plain path array — applies each one afterward completely
+  unconditionally. `resolve_dynamic_indexes` now does the same: it strips
+  every `Expr::Optional` wrapper from a resolved path's components before
+  handing them to the writers, however that branch was produced — including
+  a purely static tail like `.a.a?` reached through `resolve_seq`'s
+  no-computed-key fast path rather than a computed key at all.
+
 - **`del()`'s comma-group walker worded an `.[]`-over-a-scalar error its own
   way instead of jq's** (#538): `echo '5' | sjq -c 'del(.[], .a)'` said
   `expected array or object, got number` — succinctly's own wording, reserved
