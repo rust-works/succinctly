@@ -258,3 +258,22 @@ fromjson_hex_string	fromjson	"0x10"
 
 # ── Errors raised inside a generator are not swallowed ───────────────────────
 repeat_error_swallowed	repeat(if . > 3 then error("boom") else .+1 end)	5
+
+# ── del() through an absent container: the tail decides (#476/#527/#529) ─────
+# `del(f)` is `delpaths([path(f)])`, and `path()` reads a dead end as null and
+# keeps walking, so the *tail* decides whether the walk raises. A Field/Index/
+# Slice tail is a no-op; an `[]` tail raises, because null refuses iteration
+# even there. An out-of-range index is the only way to reach the two sites left
+# over from #477.
+del_oob_index_iterate_tail	del(.[5][])	[1,2]
+del_oob_index_iterate_tail_nested	del(.a[5][])	{"a":[1,2]}
+# The comma spelling reaches the grouped walker, the bare one the single-path
+# walker; they had drifted apart (#538), so probe the comma spelling directly.
+del_comma_group_iterate_error	del(.[], .a)	5
+
+# ── path() refuses a filter that is not a path expression ────────────────────
+# Distinct from the walker gaps in #483: these are expressions jq is required to
+# reject by name, and `?` does not suppress the refusal (#530).
+path_non_path_literal	path(1)	{"a":1}
+path_non_path_builtin	path(length)	{"a":1}
+path_non_path_arithmetic	path(.a + 1)	{"a":1}

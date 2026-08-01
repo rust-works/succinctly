@@ -182,3 +182,9 @@ fromjson_bad_string	fromjson	"a"	Invalid numeric literal at EOF at line 1, colum
 fromjson_empty_string	fromjson	""	Expected JSON value (while parsing '')
 fromjson_hex_string	fromjson	"0x10"	Invalid numeric literal at EOF at line 1, column 4 (while parsing '0x10')
 repeat_error_swallowed	repeat(if . > 3 then error("boom") else .+1 end)	5	boom
+del_oob_index_iterate_tail	del(.[5][])	[1,2]	Cannot iterate over null (null)
+del_oob_index_iterate_tail_nested	del(.a[5][])	{"a":[1,2]}	Cannot iterate over null (null)
+del_comma_group_iterate_error	del(.[], .a)	5	Cannot iterate over number (5)
+path_non_path_literal	path(1)	{"a":1}	Invalid path expression with result 1
+path_non_path_builtin	path(length)	{"a":1}	Invalid path expression with result 1
+path_non_path_arithmetic	path(.a + 1)	{"a":1}	Invalid path expression with result 2

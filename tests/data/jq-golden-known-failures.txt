@@ -38,3 +38,5 @@ assign_autovivify_nested       assignment         .a.b = 9 on {} errors instead 
 recurse_null_child             recurse            recurse on {"a":null} stops before visiting the null leaf — #490
 slice_computed_bounds          slice              computed slice bounds (.a[.k:2]) are a parse error; only integer literals are accepted — #499
 label_break_after_comma        label              break loses the already-emitted comma siblings that preceded it, producing no output — #400
+reduce_multi_output_init       reduce             a multi-output reduce INIT forks in jq; only the first init output is used — #534
+foreach_multi_output_init      foreach            a multi-output foreach INIT forks in jq; only the first init output is used — #534
