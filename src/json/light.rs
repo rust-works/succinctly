@@ -555,6 +555,28 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
         self.index.ib_select1_from(rank, hint)
     }
 
+    /// Get the 1-based line number of this node's position in the JSON text.
+    ///
+    /// Returns 0 if the position cannot be resolved (should not normally
+    /// happen for a valid cursor).
+    #[inline]
+    pub fn line(&self) -> usize {
+        let offset = self.text_position().unwrap_or(0);
+        let (line, _column) = self.index.to_line_column(offset, self.text);
+        line
+    }
+
+    /// Get the 1-based column number of this node's position in the JSON text.
+    ///
+    /// Returns 0 if the position cannot be resolved (should not normally
+    /// happen for a valid cursor).
+    #[inline]
+    pub fn column(&self) -> usize {
+        let offset = self.text_position().unwrap_or(0);
+        let (_line, column) = self.index.to_line_column(offset, self.text);
+        column
+    }
+
     /// Navigate to the first child.
     ///
     /// Returns `None` if this position has no children (is a leaf or close paren).
@@ -1525,6 +1547,16 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     }
 
     #[inline]
+    fn line(&self) -> usize {
+        JsonCursor::line(self)
+    }
+
+    #[inline]
+    fn column(&self) -> usize {
+        JsonCursor::column(self)
+    }
+
+    #[inline]
     fn cursor_at_offset(&self, offset: usize) -> Option<Self> {
         JsonCursor::cursor_at_offset(self, offset)
     }
@@ -2056,6 +2088,25 @@ mod tests {
         let index = JsonIndex::build(json);
         let root = index.root(json);
         assert_eq!(root.bp_position(), 0);
+    }
+
+    #[test]
+    fn test_cursor_line_column() {
+        // JsonCursor previously had no `line()`/`column()` at all — it fell
+        // through to `DocumentCursor`'s `0` default even at the root (#532).
+        let json = b"{\n  \"a\": 1,\n  \"b\": 2\n}";
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        assert_eq!(root.line(), 1);
+        assert_eq!(root.column(), 1);
+
+        let StandardJson::Object(fields) = root.value() else {
+            panic!("expected object");
+        };
+        let b_cursor = fields.find_cursor("b").expect("field b");
+        assert_eq!(b_cursor.line(), 3);
+        assert_eq!(b_cursor.column(), 8);
     }
 
     #[test]
