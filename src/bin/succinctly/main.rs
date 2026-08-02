@@ -2161,6 +2161,7 @@ mod text_generators;
 mod text_validate;
 mod utf8_bench;
 mod yaml_generators;
+mod yaml_pattern_registry;
 mod yaml_validate;
 mod yq_bench;
 mod yq_locate;
