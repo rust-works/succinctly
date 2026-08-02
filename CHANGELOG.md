@@ -1807,6 +1807,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same class of problem as the already-tracked stream-builtin
   error-swallowing issues and needs its own fix, not a tail-end change here.
 
+- **`try`/`catch` did not catch `break`** (#562): `label $out | try break
+  $out catch "c"` produced no output instead of `"c"` like jq — `eval_try`
+  only matched `QueryResult::Error` to invoke the catch handler, so a
+  `QueryResult::Break` fell through its `other => other` arm and propagated
+  untouched past the `try`, out to the enclosing `label`, which silently
+  absorbed it. jq's `catch` catches a `break` the same way it catches a
+  raised error, regardless of which label it targets — confirmed against jq
+  1.7.1 that `try`/`catch` catches any break flowing through it even when
+  the label is bound scopes further out (`label $A | label $B | try break
+  $A catch "caught"` still yields `"caught"`). `eval_try` now has a
+  `QueryResult::Break` arm parallel to the `Error` one; the catch handler's
+  input is bound to `null` rather than jq's own internal `{"__jq":N}` break
+  marker, which is an implementation detail not worth replicating.
+
 ### Changed
 
 - **A tag on an anchored sequence item is now rejected** (#328): `- &a !!str x`
