@@ -1,0 +1,1 @@
+foreach (1,2,error("x"),4) as $v (0; .+$v)
