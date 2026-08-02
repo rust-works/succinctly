@@ -13,17 +13,6 @@ use alloc::{
 use crate::json::light::{JsonCursor, JsonIndex, StandardJson};
 
 // ============================================================================
-// NewlineIndex: Fast line/column to byte offset conversion
-// ============================================================================
-
-/// Index for fast line/column to byte offset conversion.
-///
-/// Retained for compatibility; the implementation moved to
-/// [`crate::text::LineIndex`], which is shared with `JsonIndex`, `YamlIndex`
-/// and the locate CLIs (#228). This alias will be removed in 0.9.0.
-pub use crate::text::LineIndex as NewlineIndex;
-
-// ============================================================================
 // Path building utilities
 // ============================================================================
 
@@ -377,20 +366,6 @@ pub fn locate_offset_detailed<W: AsRef<[u64]>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ------------------------------------------------------------------------
-    // NewlineIndex alias
-    // ------------------------------------------------------------------------
-
-    /// The behaviour itself is covered by `crate::text::lines`; this only
-    /// guards the compatibility re-export (#228).
-    #[test]
-    fn test_newline_index_alias_resolves_to_line_index() {
-        let index = NewlineIndex::build(b"line1\nline2");
-
-        assert_eq!(index.to_offset(2, 1), Some(6));
-        assert_eq!(index.to_line_column(6), (2, 1));
-    }
 
     // ------------------------------------------------------------------------
     // Path notation tests

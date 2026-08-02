@@ -308,9 +308,6 @@ Handles all line ending conventions: Unix (LF), Windows (CRLF), and classic Mac 
 query that never asks for a position never pays for it. See
 [optimizations/line-index.md](../optimizations/line-index.md) and [ADR-0012](../adrs/adr-0012.md).
 
-> `succinctly::json::locate::NewlineIndex` is a deprecated alias for this type, kept for source
-> compatibility until 0.9.0 (#228). New code should use `succinctly::text::LineIndex`.
-
 ### CLI Usage
 
 ```bash
