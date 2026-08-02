@@ -99,6 +99,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- Removed the deprecated `succinctly::json::locate::NewlineIndex` alias
+  (#542), a compatibility re-export of `succinctly::text::LineIndex` kept
+  since #228. **Breaking**: code still importing `NewlineIndex` must switch
+  to `text::LineIndex` directly — `build`, `to_offset` and `to_line_column`
+  are unchanged.
+
 - Removed `succinctly::jq::EvalError::field_not_found` (#527), whose last two
   callers were the `del()` path walkers fixed below. **Breaking**: the
   constructor is gone from the public API. `field '<name>' not found` was
