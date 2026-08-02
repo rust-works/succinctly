@@ -130,6 +130,10 @@ struct YamlStats {
     anchors_per_file: Dist,
     aliases_per_file: Dist,
     bare_dash_items_per_file: Dist,
+    /// Files containing at least one `\r`-based line break (CRLF or lone CR) —
+    /// what #340's `has_cr` fast path actually gates on, per `docs/parsing/yaml.md`.
+    cr_line_breaks_files: u64,
+    cr_line_breaks_per_file: Dist,
 }
 
 /// Counters that are accumulated over a whole file rather than per node, so the
@@ -478,6 +482,27 @@ fn flow_extent(bytes: &[u8], start: usize) -> Option<usize> {
 fn ingest_yaml(bytes: &[u8], st: &mut YamlStats) -> Result<()> {
     let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse failed: {e:?}"))?;
 
+    // \r-based line breaks (CRLF or lone CR) — a raw-byte property of the whole
+    // file, independent of the parsed structure, so it needs no visit_yaml pass.
+    let mut cr_line_breaks = 0u64;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' {
+            cr_line_breaks += 1;
+            i += if bytes.get(i + 1) == Some(&b'\n') {
+                2
+            } else {
+                1
+            };
+        } else {
+            i += 1;
+        }
+    }
+    st.cr_line_breaks_per_file.push(cr_line_breaks);
+    if cr_line_breaks > 0 {
+        st.cr_line_breaks_files += 1;
+    }
+
     // Anchor/alias totals from the BP structure (no bulk accessor exists).
     let bp = index.bp();
     let (mut anchors, mut aliases) = (0u64, 0u64);
@@ -785,8 +810,14 @@ while the Elias-Fano one costs ~2 + log2(average line length) bits per \
 
     // YAML
     md.push_str("## YAML\n\n");
+    let cr_pct = if corpus.yaml.files > 0 {
+        100.0 * corpus.yaml.cr_line_breaks_files as f64 / corpus.yaml.files as f64
+    } else {
+        0.0
+    };
     md.push_str(&format!(
-        "files: {}, total bytes: {}, anchors: {}, aliases: {}, bare-dash items: {}\n\n",
+        "files: {}, total bytes: {}, anchors: {}, aliases: {}, bare-dash items: {}, \
+CRLF/CR files: {:.2}% ({}/{})\n\n",
         corpus.yaml.files,
         corpus.yaml.total_bytes,
         corpus.yaml.anchors_per_file.values.iter().sum::<u64>(),
@@ -797,6 +828,9 @@ while the Elias-Fano one costs ~2 + log2(average line length) bits per \
             .values
             .iter()
             .sum::<u64>(),
+        cr_pct,
+        corpus.yaml.cr_line_breaks_files,
+        corpus.yaml.files,
     ));
     md.push_str(&render_table(
         DIST_HEADERS,
@@ -816,6 +850,11 @@ while the Elias-Fano one costs ~2 + log2(average line length) bits per \
                 "bare-dash seq items",
                 "count/file",
                 &corpus.yaml.bare_dash_items_per_file,
+            ),
+            dist_row(
+                "CR line breaks",
+                "count/file",
+                &corpus.yaml.cr_line_breaks_per_file,
             ),
             dist_row(
                 "flow-collection size",
@@ -989,6 +1028,35 @@ mod tests {
         // exactly one flow collection recorded, of length == "[1, 2, 3]"
         assert_eq!(st.flow_collection_bytes.values.len(), 1);
         assert_eq!(st.flow_collection_bytes.values[0], "[1, 2, 3]".len() as u64);
+    }
+
+    #[test]
+    fn yaml_lf_only_has_no_cr_line_breaks() {
+        let doc = b"a: 1\nb: 2\n";
+        let mut st = YamlStats::default();
+        ingest_yaml(doc, &mut st).unwrap();
+        assert_eq!(st.cr_line_breaks_per_file.values, vec![0]);
+        assert_eq!(st.cr_line_breaks_files, 0);
+    }
+
+    #[test]
+    fn yaml_crlf_counts_one_break_per_crlf_pair() {
+        let doc = b"a: 1\r\nb: 2\r\n";
+        let mut st = YamlStats::default();
+        ingest_yaml(doc, &mut st).unwrap();
+        // Two CRLF pairs, not four bytes counted individually.
+        assert_eq!(st.cr_line_breaks_per_file.values, vec![2]);
+        assert_eq!(st.cr_line_breaks_files, 1);
+    }
+
+    #[test]
+    fn yaml_lone_cr_counts_as_a_line_break() {
+        // A lone `\r` with no trailing `\n` still counts as one break.
+        let doc = b"a: 1\rb: 2\n";
+        let mut st = YamlStats::default();
+        ingest_yaml(doc, &mut st).unwrap();
+        assert_eq!(st.cr_line_breaks_per_file.values, vec![1]);
+        assert_eq!(st.cr_line_breaks_files, 1);
     }
 
     #[test]
