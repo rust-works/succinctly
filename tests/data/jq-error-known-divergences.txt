@@ -46,7 +46,6 @@
 # errors raised while *collecting* a path) landed together and took
 # `optional_write_negative_oob` with them: `.[-5]? = 9` now raises, matching jq.
 
-repeat_error_swallowed       repeat      eval_repeat (src/jq/eval.rs) discards the generator's first error instead of propagating it — #495
 del_oob_index_iterate_tail           del             an out-of-range index resolves to null and the `[]` tail must raise; the #477 bounds check skips the tail entirely — #529
 del_oob_index_iterate_tail_nested    del             same site reached through a field, so the grouped and single-path walkers stay in step — #529
 path_non_path_literal                path            path() answers with no output where jq refuses a non-path filter by name — #530
