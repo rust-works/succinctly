@@ -1266,16 +1266,24 @@ fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))
 }
 
-/// 1-based line number of the byte at `end` within `bytes`.
+/// jq's line number for the value whose exclusive end offset is `end` within
+/// `bytes`.
 ///
 /// jq's `(at <file>:<line>)` marker names the line on which the input value
 /// *ends*, so callers pass the exclusive end offset from [`find_json_values`].
-/// Only reached on the error path, so a plain scan is cheap enough.
+/// jq's counter is the number of `\n` bytes its lexer has consumed by the
+/// time the value's boundary is confirmed: every newline strictly before
+/// `end`, plus exactly one byte of trailing lookahead if it exists and is a
+/// newline. It is zero-based, not one-based — a value ending before any `\n`
+/// reports line 0. Only reached on the error path, so a plain scan is cheap
+/// enough.
 fn line_at(bytes: &[u8], end: usize) -> usize {
-    1 + bytes[..end.min(bytes.len())]
-        .iter()
-        .filter(|&&b| b == b'\n')
-        .count()
+    let end = end.min(bytes.len());
+    let mut count = bytes[..end].iter().filter(|&&b| b == b'\n').count();
+    if bytes.get(end) == Some(&b'\n') {
+        count += 1;
+    }
+    count
 }
 
 /// Find the byte ranges of JSON values in a byte slice.
