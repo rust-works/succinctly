@@ -3557,3 +3557,54 @@ fn test_yq_error_outranks_exit_status_flag() -> Result<()> {
     assert!(stderr.contains("no matches found"), "{stderr}");
     Ok(())
 }
+
+#[test]
+fn test_yq_outputs_before_an_error_or_break_survive() -> Result<()> {
+    // The yq side of #400/#494: a stream that produces outputs and *then*
+    // fails keeps those outputs, with the failure reported on stderr and in
+    // the exit code. yq's two evaluation routes each convert the result
+    // separately, so both are exercised here.
+    //
+    // Real yq (mikefarah v4.53.3) buffers the whole result before printing,
+    // so it emits nothing at all on stdout for these filters and exits 1 --
+    // succinctly streams instead. Only the diagnostic and exit code match.
+    // These therefore pin succinctly's own behavior; the byte-for-byte yq
+    // oracle lives in tests/yq_golden_tests.rs.
+
+    // Default YAML input goes through the direct-cursor (generic) route.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(r#"1,2,error("x")"#, "a: 1\n", &[])?;
+    assert_eq!(stdout, "1\n2\n");
+    assert_eq!(stderr.trim_end(), "Error: x");
+    assert_eq!(code, 1);
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("1,2,break $out", "a: 1\n", &[])?;
+    assert_eq!(stdout, "1\n2\n");
+    assert_eq!(stderr.trim_end(), "Error: break $out not in label");
+    assert_eq!(code, 1);
+
+    // The same under `-o json`: the output format is orthogonal to the
+    // prefix-then-failure contract.
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(r#"1,2,error("x")"#, "a: 1\n", &["-o", "json"])?;
+    assert_eq!(stdout, "1\n2\n");
+    assert_eq!(stderr.trim_end(), "Error: x");
+    assert_eq!(code, 1);
+
+    // `--null-input` and `--slurp` take the OwnedValue route, which converts
+    // the full evaluator's result rather than the generic one's.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(r#"1,2,error("x")"#, "", &["-n"])?;
+    assert_eq!(stdout, "1\n2\n");
+    assert_eq!(stderr.trim_end(), "Error: x");
+    assert_eq!(code, 1);
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("1,2,break $out", "", &["-n"])?;
+    assert_eq!(stdout, "1\n2\n");
+    assert_eq!(stderr.trim_end(), "Error: break $out not in label");
+    assert_eq!(code, 1);
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("1,2,break $out", "a: 1\n", &["-s"])?;
+    assert_eq!(stdout, "1\n2\n");
+    assert_eq!(stderr.trim_end(), "Error: break $out not in label");
+    assert_eq!(code, 1);
+    Ok(())
+}
