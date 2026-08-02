@@ -81,7 +81,7 @@ mod slice;
 pub mod stream;
 mod value;
 
-pub use error::{BinOp, EvalError};
+pub use error::{BinOp, Control, EvalError};
 pub use eval::{
     eval, eval_lenient, substitute_vars, EvalSemantics, JqSemantics, QueryResult, YqSemantics,
 };

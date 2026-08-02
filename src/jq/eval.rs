@@ -104,6 +104,15 @@ pub enum QueryResult<'a, W = Vec<u64>> {
     /// Break from a labeled scope.
     /// Contains the label name to match against enclosing Label expressions.
     Break(String),
+
+    /// One or more outputs were produced before the stream terminated in an
+    /// error or a `break` (#400, #494).
+    ///
+    /// `Error`/`Break` remain the zero-prefix case — every terminal raise
+    /// deep in a builtin still constructs them directly, unchanged. The
+    /// prefix is always non-empty by construction (see [`partial`]); an
+    /// empty prefix normalizes to bare `Error`/`Break`.
+    Partial(Vec<OwnedValue>, Control),
 }
 
 impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
@@ -119,18 +128,26 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
 
     /// Returns true if this result is an evaluation error.
     ///
+    /// A `Partial` prefix followed by an error still counts — this answers
+    /// "did evaluating this end in an error," not "did it produce nothing."
+    ///
     /// Mirrors [`crate::jq::eval_generic::GenericResult::is_error`] so the two
     /// evaluators can be compared directly in tests.
     pub fn is_error(&self) -> bool {
-        matches!(self, QueryResult::Error(_))
+        matches!(
+            self,
+            QueryResult::Error(_) | QueryResult::Partial(_, Control::Error(_))
+        )
     }
 
     /// Collect all output values into a `Vec<OwnedValue>`.
     ///
-    /// Mirrors [`crate::jq::eval_generic::GenericResult::collect_owned`]: `None`,
-    /// `Error`, and `Break` collect to an empty `Vec`. This gives the full
-    /// evaluator the same materialization surface as the generic (CLI) path,
-    /// which is what evaluator-parity tests rely on.
+    /// Mirrors [`crate::jq::eval_generic::GenericResult::collect_owned`]:
+    /// `None`, `Error`, and `Break` collect to an empty `Vec`. A `Partial`
+    /// collects its prefix — the whole point of #400/#494 is that those
+    /// outputs are no longer discarded. This gives the full evaluator the
+    /// same materialization surface as the generic (CLI) path, which is what
+    /// evaluator-parity tests rely on.
     pub fn collect_owned(self) -> Vec<OwnedValue> {
         match self {
             QueryResult::One(v) => vec![to_owned(&v)],
@@ -141,6 +158,7 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
             QueryResult::Owned(o) => vec![o],
             QueryResult::ManyOwned(os) => os,
             QueryResult::Break(_) => Vec::new(),
+            QueryResult::Partial(vs, _control) => vs,
         }
     }
 }
@@ -151,7 +169,7 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
 //
 // The kind helpers below stay here: they are about values, not messages,
 // and `super::error` renders whatever it is handed.
-pub use super::error::{BinOp, EvalError};
+pub use super::error::{BinOp, Control, EvalError};
 
 // jq's `jv_kind` discriminants, verbatim from `jv.h`, so the two enums can be
 // read side by side. `JV_KIND_INVALID` (0) has no `OwnedValue` counterpart — an
@@ -574,8 +592,20 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 all_owned.extend(vs);
             }
             QueryResult::None => {}
-            QueryResult::Error(e) => return QueryResult::Error(e),
-            QueryResult::Break(label) => return QueryResult::Break(label),
+            // A sibling that errors or breaks no longer discards the outputs
+            // the earlier siblings already produced (#400): `(1,error("x"))`
+            // now carries `1` forward as `Partial`'s prefix instead of
+            // collapsing straight to a bare `Error`.
+            QueryResult::Error(e) => {
+                return partial(merge_owned(all_results, all_owned), Control::Error(e));
+            }
+            QueryResult::Break(label) => {
+                return partial(merge_owned(all_results, all_owned), Control::Break(label));
+            }
+            QueryResult::Partial(vs, control) => {
+                all_owned.extend(vs);
+                return partial(merge_owned(all_results, all_owned), control);
+            }
         }
     }
 
@@ -613,6 +643,11 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => vec![],
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
+        // Array construction is atomic in jq (verified: `[1,error("x"),3]`
+        // produces no output at all, not a partial array) — a `Partial`
+        // inner stream just surfaces its control, same as a bare one.
+        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+        QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
     };
 
     QueryResult::Owned(OwnedValue::Array(items))
@@ -704,6 +739,11 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::None => OwnedValue::Null,
             QueryResult::Error(e) => return QueryResult::Error(e),
             QueryResult::Break(label) => return QueryResult::Break(label),
+            // Object construction is atomic in jq (verified:
+            // `{a:1,b:error("x")}` produces no output at all) — a `Partial`
+            // value stream just surfaces its control, same as a bare one.
+            QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+            QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
         };
 
         map.insert(key_str, owned_val);
@@ -743,6 +783,86 @@ fn collect_recursive<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Merge a borrowed accumulator and an owned accumulator into one owned
+/// prefix, in the order their values were produced. Shared by every
+/// stream-combining function that promotes a borrowed `Vec<StandardJson>` to
+/// owned the moment an owned value (or a terminal control) forces it.
+fn merge_owned<W: Clone + AsRef<[u64]>>(
+    borrowed: Vec<StandardJson<'_, W>>,
+    owned: Vec<OwnedValue>,
+) -> Vec<OwnedValue> {
+    let mut merged: Vec<OwnedValue> = borrowed.iter().map(to_owned).collect();
+    merged.extend(owned);
+    merged
+}
+
+/// Normalize a `Vec<OwnedValue>` accumulator into the smallest `QueryResult`
+/// shape that represents it: empty stays `None`, one value collapses to
+/// `Owned`, more than one stays `ManyOwned`.
+fn owned_vec_to_result<'a, W>(mut vs: Vec<OwnedValue>) -> QueryResult<'a, W> {
+    match vs.len() {
+        0 => QueryResult::None,
+        1 => QueryResult::Owned(vs.pop().unwrap()),
+        _ => QueryResult::ManyOwned(vs),
+    }
+}
+
+/// Normalize a prefix and its terminator into a `QueryResult` (#400, #494).
+///
+/// An empty prefix collapses to the bare `Error`/`Break` variant, so callers
+/// that had nothing accumulated before hitting a control signal produce
+/// exactly what they did before `Partial` existed.
+fn partial<'a, W>(prefix: Vec<OwnedValue>, control: Control) -> QueryResult<'a, W> {
+    if prefix.is_empty() {
+        match control {
+            Control::Error(e) => QueryResult::Error(e),
+            Control::Break(label) => QueryResult::Break(label),
+        }
+    } else {
+        QueryResult::Partial(prefix, control)
+    }
+}
+
+/// Splice `prefix` in front of whatever `result` yields.
+///
+/// Used by `try`/`catch` (#400): the body's outputs before the error, then
+/// the catch handler's own result — which may itself be `Partial` if the
+/// handler errors too, in which case the two prefixes concatenate.
+fn prepend<W: Clone + AsRef<[u64]>>(
+    mut prefix: Vec<OwnedValue>,
+    result: QueryResult<'_, W>,
+) -> QueryResult<'_, W> {
+    if prefix.is_empty() {
+        return result;
+    }
+    match result.materialize_cursor() {
+        QueryResult::None => owned_vec_to_result(prefix),
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
+        QueryResult::One(v) => {
+            prefix.push(to_owned(&v));
+            owned_vec_to_result(prefix)
+        }
+        QueryResult::Owned(v) => {
+            prefix.push(v);
+            owned_vec_to_result(prefix)
+        }
+        QueryResult::Many(vs) => {
+            prefix.extend(vs.iter().map(to_owned));
+            owned_vec_to_result(prefix)
+        }
+        QueryResult::ManyOwned(vs) => {
+            prefix.extend(vs);
+            owned_vec_to_result(prefix)
+        }
+        QueryResult::Error(e) => partial(prefix, Control::Error(e)),
+        QueryResult::Break(label) => partial(prefix, Control::Break(label)),
+        QueryResult::Partial(vs, control) => {
+            prefix.extend(vs);
+            partial(prefix, control)
+        }
+    }
+}
+
 /// Convert a QueryResult to an OwnedValue for use in computations.
 fn result_to_owned<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
@@ -765,6 +885,10 @@ fn result_to_owned<W: Clone + AsRef<[u64]>>(
                 Err(EvalError::new("empty result"))
             }
         }
+        // Same "take the first output, ignore the rest" policy already
+        // applied to `Many`/`ManyOwned` above — a `Partial` prefix is never
+        // empty (see `partial`), so there is always a first value to take.
+        QueryResult::Partial(vs, _control) => Ok(vs.into_iter().next().unwrap()),
         QueryResult::None => Err(EvalError::new("no value")),
         QueryResult::Error(e) => Err(e),
         QueryResult::Break(label) => Err(EvalError::new(format!("break ${label} not in label"))),
@@ -813,23 +937,35 @@ fn retain_truthy<W: Clone + AsRef<[u64]>>(result: QueryResult<'_, W>) -> QueryRe
                 _ => QueryResult::ManyOwned(vs),
             }
         }
+        // The prefix is filtered exactly like `ManyOwned` above — jq's `//`
+        // retains truthy outputs regardless of whether the stream that
+        // produced them went on to error (#400): `(1,false,error("x")) // 2`
+        // is `1`, not `1 false`, then the error.
+        QueryResult::Partial(mut vs, control) => {
+            vs.retain(OwnedValue::is_truthy);
+            partial(vs, control)
+        }
         other @ (QueryResult::None | QueryResult::Error(_) | QueryResult::Break(_)) => other,
     }
 }
 
 /// Append one truthiness bit per output of a stream to `out`.
 ///
-/// Returns `Some(control)` when the stream was an `Error` or a `Break`, which
-/// the caller must propagate as its own result; `None` when every output was
+/// Returns `Some(control)` when the stream was an `Error`, a `Break`, or a
+/// `Partial` (in which case the `Partial`'s own prefix is pushed first), which
+/// the caller must combine with whatever it has already accumulated in `out`
+/// and propagate as a `Partial` of its own (#400) — `out` itself is *not*
+/// discarded here, unlike before #400/#494; the caller owns it and decides
+/// how to fold it into the final result. `None` when every output was
 /// consumed. An empty stream contributes no bits, which is how `empty and true`
 /// ends up yielding nothing.
 ///
 /// Collecting `bool` rather than `OwnedValue` is deliberate: `and`/`or` only
 /// ever need whether an output was truthy, never the output itself.
-fn push_truthiness<'a, W: Clone + AsRef<[u64]>>(
-    result: QueryResult<'a, W>,
+fn push_truthiness<W: Clone + AsRef<[u64]>>(
+    result: QueryResult<'_, W>,
     out: &mut Vec<bool>,
-) -> Option<QueryResult<'a, W>> {
+) -> Option<Control> {
     match result.materialize_cursor() {
         QueryResult::One(v) => out.push(json_is_truthy(&v)),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
@@ -837,8 +973,12 @@ fn push_truthiness<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::Many(vs) => out.extend(vs.iter().map(json_is_truthy)),
         QueryResult::ManyOwned(vs) => out.extend(vs.iter().map(OwnedValue::is_truthy)),
         QueryResult::None => {}
-        QueryResult::Error(e) => return Some(QueryResult::Error(e)),
-        QueryResult::Break(label) => return Some(QueryResult::Break(label)),
+        QueryResult::Error(e) => return Some(Control::Error(e)),
+        QueryResult::Break(label) => return Some(Control::Break(label)),
+        QueryResult::Partial(vs, control) => {
+            out.extend(vs.iter().map(OwnedValue::is_truthy));
+            return Some(control);
+        }
     }
     None
 }
@@ -1310,6 +1450,16 @@ fn eval_or<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// The right operand is re-evaluated per left output rather than evaluated once
 /// and reused. That matches jq's backtracking, and it costs nothing in the
 /// common case where the left operand is single-output.
+///
+/// An error or a break in either operand no longer discards `out` (#400,
+/// #494): a left operand that errors after producing some truthy values
+/// (e.g. `(true,error("x")) and false`) still pairs those left values against
+/// the right operand before the error surfaces — jq emits `false`, then
+/// errors — so `left`'s own trailing control is held in `left_control` and
+/// only applied once the ordinary per-left-output loop has run its course. A
+/// control from evaluating the right operand for a given left output instead
+/// ends the whole expression immediately, matching jq's generator not asking
+/// for further left outputs once one pairing has failed.
 fn eval_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     left: &Expr,
     right: &Expr,
@@ -1318,12 +1468,10 @@ fn eval_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     short_circuit: bool,
 ) -> QueryResult<'a, W> {
     let mut left_bools = Vec::new();
-    if let Some(control) = push_truthiness(
+    let left_control = push_truthiness(
         eval_single::<W, S>(left, value.clone(), optional),
         &mut left_bools,
-    ) {
-        return control;
-    }
+    );
 
     let mut out = Vec::with_capacity(left_bools.len());
     for left_bool in left_bools {
@@ -1331,19 +1479,18 @@ fn eval_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             out.push(short_circuit);
             continue;
         }
-        // An error or a break in the right operand is the whole result. Outputs
-        // already accumulated are lost, because `QueryResult` models both as a
-        // property of the stream rather than of an element — the same limit
-        // `eval_comma` has.
         if let Some(control) = push_truthiness(
             eval_single::<W, S>(right, value.clone(), optional),
             &mut out,
         ) {
-            return control;
+            return partial(out.into_iter().map(OwnedValue::Bool).collect(), control);
         }
     }
 
-    bools_to_result(out)
+    match left_control {
+        Some(control) => partial(out.into_iter().map(OwnedValue::Bool).collect(), control),
+        None => bools_to_result(out),
+    }
 }
 
 /// Evaluate boolean NOT.
@@ -1398,6 +1545,17 @@ fn eval_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => false,
         QueryResult::Error(e) => return QueryResult::Error(e.clone()),
         QueryResult::Break(label) => return QueryResult::Break(label.clone()),
+        // The condition is only ever consulted for its first output (#378,
+        // a separate, already-tracked limitation — a multi-output condition
+        // does not fork the branches). A `Partial` condition is treated the
+        // same as a bare `Error`/`Break` above: the condition is evaluated
+        // once, and — per array/object construction's precedent, verified
+        // against jq — a value-position sub-expression that errors partway
+        // aborts outright rather than exposing a prefix.
+        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e.clone()),
+        QueryResult::Partial(_, Control::Break(label)) => {
+            return QueryResult::Break(label.clone());
+        }
     };
 
     if is_truthy {
@@ -1426,14 +1584,37 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             None => QueryResult::None,
         },
         // jq's `catch` catches a `break` the same way it catches a raised
-        // error, regardless of which label it targets. Real jq binds the
-        // catch handler's input to its internal `{"__jq":N}` break marker —
-        // an implementation detail not worth replicating — so bind `null`
-        // instead.
+        // error, regardless of which label it targets (#562). Real jq binds
+        // the catch handler's input to its internal `{"__jq":N}` break
+        // marker — an implementation detail not worth replicating — so bind
+        // `null` instead.
         QueryResult::Break(_) => match catch {
             Some(catch_expr) => eval_owned_input::<W, S>(catch_expr, &OwnedValue::Null, optional),
             None => QueryResult::None,
         },
+        // The body produced some outputs before erroring (#400): emit them
+        // (`try (1,2,error("x")) catch "c"` is `1`, `2`, `"c"`), then run the
+        // catch handler and splice its own result — which may itself be
+        // `Partial` if the handler errors too — in after them.
+        QueryResult::Partial(prefix, Control::Error(e)) => {
+            let handled = match catch {
+                Some(catch_expr) => eval_owned_input::<W, S>(catch_expr, &e.payload(), optional),
+                None => QueryResult::None,
+            };
+            prepend(prefix, handled)
+        }
+        // Same as the plain `Break` case above (#562), but the body
+        // produced outputs before breaking: emit them, then run the catch
+        // handler bound to `null` and splice its result in after them.
+        QueryResult::Partial(prefix, Control::Break(_)) => {
+            let handled = match catch {
+                Some(catch_expr) => {
+                    eval_owned_input::<W, S>(catch_expr, &OwnedValue::Null, optional)
+                }
+                None => QueryResult::None,
+            };
+            prepend(prefix, handled)
+        }
         // Non-error, non-break results pass through
         other => other,
     }
@@ -1451,7 +1632,13 @@ fn eval_label<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match result {
         // If we get a Break with matching label, convert to empty output
         QueryResult::Break(label) if label == name => QueryResult::None,
-        // Non-matching breaks propagate up
+        // A matching break that already carries a prefix (#400): emit the
+        // outputs the body produced before breaking, dropping the control —
+        // `label $out | 1,2,break $out,4` is `1`, `2`.
+        QueryResult::Partial(prefix, Control::Break(label)) if label == name => {
+            owned_vec_to_result(prefix)
+        }
+        // Non-matching breaks (bare or `Partial`) propagate up unchanged.
         other => other,
     }
 }
@@ -2144,6 +2331,17 @@ fn builtin_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => false,
         QueryResult::Error(e) => return QueryResult::Error(e.clone()),
         QueryResult::Break(label) => return QueryResult::Break(label.clone()),
+        // The condition is only ever consulted for its first output (#378,
+        // a separate, already-tracked limitation — a multi-output condition
+        // does not fork the branches). A `Partial` condition is treated the
+        // same as a bare `Error`/`Break` above: the condition is evaluated
+        // once, and — per array/object construction's precedent, verified
+        // against jq — a value-position sub-expression that errors partway
+        // aborts outright rather than exposing a prefix.
+        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e.clone()),
+        QueryResult::Partial(_, Control::Break(label)) => {
+            return QueryResult::Break(label.clone());
+        }
     };
 
     if is_truthy {
@@ -2173,6 +2371,11 @@ fn map_over<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::None => {}
             QueryResult::Error(e) => return QueryResult::Error(e),
             QueryResult::Break(label) => return QueryResult::Break(label),
+            // `map(f)` is `[.[] | f]` — array construction, atomic in jq
+            // (see `eval_array_construction`) — so a `Partial` just
+            // surfaces its control, same as a bare one.
+            QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+            QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
         }
     }
     QueryResult::Owned(OwnedValue::Array(results))
@@ -2239,6 +2442,13 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::None => {}
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
+                    // Object construction is atomic in jq (see
+                    // `eval_object_construction`) — a `Partial` field value
+                    // just surfaces its control, same as a bare one.
+                    QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+                    QueryResult::Partial(_, Control::Break(label)) => {
+                        return QueryResult::Break(label);
+                    }
                 }
             }
             QueryResult::Owned(OwnedValue::Object(result_map))
@@ -2264,6 +2474,13 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::None => {}
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
+                    // Array construction is atomic in jq — a `Partial`
+                    // element value just surfaces its control, same as a
+                    // bare one.
+                    QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+                    QueryResult::Partial(_, Control::Break(label)) => {
+                        return QueryResult::Break(label);
+                    }
                 }
             }
             QueryResult::Owned(OwnedValue::Array(results))
@@ -3361,6 +3578,11 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::None => {}
             QueryResult::Error(e) => return QueryResult::Error(e),
             QueryResult::Break(label) => return QueryResult::Break(label),
+            // `with_entries(f)` is `from_entries(map(f))` — array
+            // construction, atomic in jq — so a `Partial` just surfaces its
+            // control, same as a bare one.
+            QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+            QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
         }
     }
 
@@ -3415,6 +3637,13 @@ fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::None => String::new(),
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
+                    // String interpolation is atomic (a "\(...)" slot embeds
+                    // one value into the string) — a `Partial` just surfaces
+                    // its control, same as a bare one.
+                    QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+                    QueryResult::Partial(_, Control::Break(label)) => {
+                        return QueryResult::Break(label);
+                    }
                 };
                 result.push_str(&s);
             }
@@ -4183,6 +4412,14 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        // Unlike `limit`, `skip` always wants the rest of the stream — it
+        // never reaches a point where it can stop asking for more values —
+        // so the trailing control always surfaces, after whatever survived
+        // the skip.
+        QueryResult::Partial(vs, control) => {
+            let skipped: Vec<OwnedValue> = vs.into_iter().skip(n).collect();
+            partial(skipped, control)
+        }
     }
 }
 
@@ -6055,8 +6292,21 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         })
                         .extend(rs),
                     QueryResult::None => {}
-                    QueryResult::Error(e) => return QueryResult::Error(e),
-                    QueryResult::Break(label) => return QueryResult::Break(label),
+                    // A downstream error/break no longer discards outputs
+                    // already piped through from earlier elements (#400).
+                    QueryResult::Error(e) => {
+                        let prefix = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
+                        return partial(prefix, Control::Error(e));
+                    }
+                    QueryResult::Break(label) => {
+                        let prefix = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
+                        return partial(prefix, Control::Break(label));
+                    }
+                    QueryResult::Partial(rs, control) => {
+                        let mut prefix = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
+                        prefix.extend(rs);
+                        return partial(prefix, control);
+                    }
                 }
             }
             match owned {
@@ -6076,32 +6326,55 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::None => QueryResult::None,
                 QueryResult::ManyOwned(vs) => QueryResult::ManyOwned(vs),
                 QueryResult::Break(label) => QueryResult::Break(label),
-                _ => unreachable!("eval_owned_pipe only returns Owned variants"),
+                QueryResult::Partial(vs, control) => QueryResult::Partial(vs, control),
+                _ => unreachable!("eval_owned_pipe only returns Owned-family variants"),
             }
         }
-        QueryResult::ManyOwned(vs) => {
-            // Pipe each owned value through the rest
-            let mut all_results: Vec<OwnedValue> = Vec::new();
-            for v in vs {
-                match eval_owned_pipe::<Vec<u64>, S>(rest, v, optional).materialize_cursor() {
-                    QueryResult::Owned(r) => all_results.push(r),
-                    QueryResult::OneCursor(_) => unreachable!(),
-                    QueryResult::ManyOwned(rs) => all_results.extend(rs),
-                    QueryResult::One(r) => all_results.push(to_owned(&r)),
-                    QueryResult::Many(rs) => all_results.extend(rs.iter().map(to_owned)),
-                    QueryResult::None => {}
-                    QueryResult::Error(e) => return QueryResult::Error(e),
-                    QueryResult::Break(label) => return QueryResult::Break(label),
-                }
-            }
-            if all_results.is_empty() {
-                QueryResult::None
-            } else if all_results.len() == 1 {
-                QueryResult::Owned(all_results.pop().unwrap())
-            } else {
-                QueryResult::ManyOwned(all_results)
+        QueryResult::ManyOwned(vs) => pipe_owned_prefix::<S, W>(rest, vs, None, optional),
+        // `first`'s own stream produced `vs` before terminating in
+        // `outer_control` (#400, #494): pipe each already-produced value
+        // through `rest` first — jq's generator still pairs those with the
+        // rest of the pipe (`(1,2,error("x")) | .+10` is `11`, `12`, then the
+        // error) — and only attach `outer_control` once that's done, unless
+        // piping itself fails first, in which case that failure is what the
+        // generator actually reaches and `outer_control` never surfaces.
+        QueryResult::Partial(vs, outer_control) => {
+            pipe_owned_prefix::<S, W>(rest, vs, Some(outer_control), optional)
+        }
+    }
+}
+
+/// Pipe each of `vs` (already-owned values) through `rest`, accumulating
+/// outputs. If `trailing` is `Some`, it is attached as the terminating
+/// control once every value has been piped through cleanly; a control
+/// encountered while piping `vs` itself takes precedence and is returned
+/// immediately, dropping `trailing` (the generator never reaches it).
+fn pipe_owned_prefix<'a, S: EvalSemantics, W>(
+    rest: &[Expr],
+    vs: Vec<OwnedValue>,
+    trailing: Option<Control>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let mut all_results: Vec<OwnedValue> = Vec::new();
+    for v in vs {
+        match eval_owned_pipe::<Vec<u64>, S>(rest, v, optional).materialize_cursor() {
+            QueryResult::Owned(r) => all_results.push(r),
+            QueryResult::OneCursor(_) => unreachable!(),
+            QueryResult::ManyOwned(rs) => all_results.extend(rs),
+            QueryResult::One(r) => all_results.push(to_owned(&r)),
+            QueryResult::Many(rs) => all_results.extend(rs.iter().map(to_owned)),
+            QueryResult::None => {}
+            QueryResult::Error(e) => return partial(all_results, Control::Error(e)),
+            QueryResult::Break(label) => return partial(all_results, Control::Break(label)),
+            QueryResult::Partial(rs, control) => {
+                all_results.extend(rs);
+                return partial(all_results, control);
             }
         }
+    }
+    match trailing {
+        Some(control) => partial(all_results, control),
+        None => owned_vec_to_result(all_results),
     }
 }
 
@@ -6320,6 +6593,11 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
+        // Computed indexing's key/target forking isn't part of #400/#494's
+        // verified semantics — conservatively matching the existing
+        // Error/Break arms rather than inventing new partial-key behavior.
+        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+        QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
     };
     if keys.is_empty() {
         return QueryResult::None;
@@ -6342,6 +6620,9 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
+        // Same conservative treatment as the key stream above.
+        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+        QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
     };
 
     // (2) Key outer, target inner.
@@ -6465,6 +6746,7 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Owned(_) => Vec::new(), // Owned values not returned as StandardJson
         QueryResult::ManyOwned(_) => Vec::new(),
         QueryResult::Break(_) => Vec::new(), // Break without matching label
+        QueryResult::Partial(..) => Vec::new(), // Same: not representable as borrowed StandardJson
     }
 }
 
@@ -6493,6 +6775,11 @@ fn eval_rhs_once<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::ManyOwned(vs) => Ok(vs.into_iter().next().unwrap_or(OwnedValue::Null)),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
         QueryResult::Break(label) => Err(QueryResult::Break(label)),
+        // Same "take the first output, ignore the rest" policy as `ManyOwned`
+        // above; the trailing control is dropped, consistent with how this
+        // function already doesn't fork over a multi-output RHS (#392, a
+        // separate, pre-existing limitation).
+        QueryResult::Partial(vs, _control) => Ok(vs.into_iter().next().unwrap_or(OwnedValue::Null)),
     }
 }
 
@@ -8473,17 +8760,24 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Evaluate the expression to get the value to bind
     let bound_result = eval_single::<W, S>(expr, value.clone(), optional);
 
-    // Get all values from the expression
-    let bound_values: Vec<OwnedValue> = match bound_result.materialize_cursor() {
-        QueryResult::One(v) => vec![to_owned(&v)],
-        QueryResult::OneCursor(_) => unreachable!(),
-        QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
-        QueryResult::Owned(v) => vec![v],
-        QueryResult::ManyOwned(vs) => vs,
-        QueryResult::None => return QueryResult::None,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        QueryResult::Break(label) => return QueryResult::Break(label),
-    };
+    // Get all values from the expression. A `Partial` (#400, #494) still has
+    // its produced prefix bound and run through the body below — jq's
+    // generator processes each bound value as it's produced:
+    // `(1,2,error("x")) as $v | $v + 10` is `11`, `12`, then the error — so
+    // the bind expression's own control is held until that loop over its
+    // prefix has run its course.
+    let (bound_values, bound_control): (Vec<OwnedValue>, Option<Control>) =
+        match bound_result.materialize_cursor() {
+            QueryResult::One(v) => (vec![to_owned(&v)], None),
+            QueryResult::OneCursor(_) => unreachable!(),
+            QueryResult::Many(vs) => (vs.iter().map(to_owned).collect(), None),
+            QueryResult::Owned(v) => (vec![v], None),
+            QueryResult::ManyOwned(vs) => (vs, None),
+            QueryResult::None => return QueryResult::None,
+            QueryResult::Error(e) => return QueryResult::Error(e),
+            QueryResult::Break(label) => return QueryResult::Break(label),
+            QueryResult::Partial(vs, control) => (vs, Some(control)),
+        };
 
     // For each bound value, substitute and evaluate the body
     let mut all_results: Vec<OwnedValue> = Vec::new();
@@ -8497,17 +8791,19 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(v) => all_results.push(v),
             QueryResult::ManyOwned(vs) => all_results.extend(vs),
             QueryResult::None => {}
-            QueryResult::Error(e) => return QueryResult::Error(e),
-            QueryResult::Break(label) => return QueryResult::Break(label),
+            // The outputs already produced no longer vanish (#400, #494).
+            QueryResult::Error(e) => return partial(all_results, Control::Error(e)),
+            QueryResult::Break(label) => return partial(all_results, Control::Break(label)),
+            QueryResult::Partial(vs, control) => {
+                all_results.extend(vs);
+                return partial(all_results, control);
+            }
         }
     }
 
-    if all_results.is_empty() {
-        QueryResult::None
-    } else if all_results.len() == 1 {
-        QueryResult::Owned(all_results.pop().unwrap())
-    } else {
-        QueryResult::ManyOwned(all_results)
+    match bound_control {
+        Some(control) => partial(all_results, control),
+        None => owned_vec_to_result(all_results),
     }
 }
 
@@ -8532,6 +8828,14 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Error(_) if optional => return QueryResult::None,
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
+        // `reduce`'s own output is always single-shot — it only ever emits
+        // the final accumulator, never intermediate values (verified against
+        // jq: `reduce (1,2,error("x"),4) as $v (0;.+$v)` produces no output
+        // at all, just the error) — so a `Partial` input stream just extracts
+        // the control and drops the prefix, same as the bare arms above.
+        QueryResult::Partial(_prefix, Control::Error(_)) if optional => return QueryResult::None,
+        QueryResult::Partial(_prefix, Control::Error(e)) => return QueryResult::Error(e),
+        QueryResult::Partial(_prefix, Control::Break(label)) => return QueryResult::Break(label),
     };
 
     // Evaluate initial accumulator
@@ -8596,6 +8900,17 @@ fn eval_owned_expr<S: EvalSemantics>(
         QueryResult::None => Ok(OwnedValue::Null),
         QueryResult::Error(e) => Err(e),
         QueryResult::Break(label) => Err(EvalError::new(format!("break ${label} not in label"))),
+        // Same collapse-to-single-or-array policy as `Many`/`ManyOwned`
+        // above; the trailing control is dropped, consistent with how this
+        // function already doesn't fork over a multi-output update (a
+        // separate, pre-existing limitation, not #400/#494's concern).
+        QueryResult::Partial(vs, _control) => {
+            if vs.len() == 1 {
+                Ok(vs.into_iter().next().unwrap())
+            } else {
+                Ok(OwnedValue::Array(vs))
+            }
+        }
     }
 }
 
@@ -8633,6 +8948,9 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        // Stream-preserving, so a `Partial` passes straight through — this
+        // function's whole point is keeping the shape intact.
+        QueryResult::Partial(vs, control) => QueryResult::Partial(vs, control),
     }
 }
 
@@ -8646,18 +8964,24 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate input to get the stream
+    // Evaluate input to get the stream. A `Partial` input (#400, #494) still
+    // has its produced prefix iterated below — jq's generator processes each
+    // input value as it's produced, so `foreach (1,2,error("x"),4) as $v (0;
+    // .+$v)` emits `1`, `3` before erroring — the input stream's own control
+    // is held until the loop over that prefix has run its course.
     let input_result = eval_single::<W, S>(input, value.clone(), optional);
-    let input_values: Vec<OwnedValue> = match input_result.materialize_cursor() {
-        QueryResult::One(v) => vec![to_owned(&v)],
-        QueryResult::OneCursor(_) => unreachable!(),
-        QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
-        QueryResult::Owned(v) => vec![v],
-        QueryResult::ManyOwned(vs) => vs,
-        QueryResult::None => Vec::new(),
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        QueryResult::Break(label) => return QueryResult::Break(label),
-    };
+    let (input_values, input_control): (Vec<OwnedValue>, Option<Control>) =
+        match input_result.materialize_cursor() {
+            QueryResult::One(v) => (vec![to_owned(&v)], None),
+            QueryResult::OneCursor(_) => unreachable!(),
+            QueryResult::Many(vs) => (vs.iter().map(to_owned).collect(), None),
+            QueryResult::Owned(v) => (vec![v], None),
+            QueryResult::ManyOwned(vs) => (vs, None),
+            QueryResult::None => (Vec::new(), None),
+            QueryResult::Error(e) => return QueryResult::Error(e),
+            QueryResult::Break(label) => return QueryResult::Break(label),
+            QueryResult::Partial(vs, control) => (vs, Some(control)),
+        };
 
     // Evaluate initial state
     let init_result = eval_single::<W, S>(init, value.clone(), optional);
@@ -8679,23 +9003,21 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     let substituted_extract = substitute_var(ext, var, &input_val);
                     match eval_owned_expr::<S>(&substituted_extract, &state, optional) {
                         Ok(output) => outputs.push(output),
-                        Err(e) => return QueryResult::Error(e),
+                        // The steps already produced no longer vanish (#494).
+                        Err(e) => return partial(outputs, Control::Error(e)),
                     }
                 } else {
                     // Without extract, output the current state
                     outputs.push(state.clone());
                 }
             }
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => return partial(outputs, Control::Error(e)),
         }
     }
 
-    if outputs.is_empty() {
-        QueryResult::None
-    } else if outputs.len() == 1 {
-        QueryResult::Owned(outputs.pop().unwrap())
-    } else {
-        QueryResult::ManyOwned(outputs)
+    match input_control {
+        Some(control) => partial(outputs, control),
+        None => owned_vec_to_result(outputs),
     }
 }
 
@@ -8749,7 +9071,31 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
-        _ => QueryResult::None,
+        // A break used to be silently swallowed here (fell into the old
+        // wildcard arm below) instead of reaching its label — fixed
+        // alongside #494, the same "limit drops what it shouldn't" family.
+        QueryResult::Break(label) => QueryResult::Break(label),
+        // jq's generator-based `limit` never asks its operand for values
+        // past `n` (verified: `limit(2; 1,2,error("boom"))` is `1`, `2`,
+        // exit 0 — the error is never even reached). So once `n` outputs are
+        // available in the prefix, the trailing control is dropped entirely,
+        // mirroring how excess *values* beyond `n` are already silently
+        // ignored above. Only when fewer than `n` were produced does the
+        // control still surface (`limit(3; 1,2,error("boom"),4)` is `1`,
+        // `2`, then the error — the existing golden case).
+        QueryResult::Partial(vs, control) => {
+            let satisfied = vs.len() >= n;
+            let taken: Vec<_> = vs.into_iter().take(n).collect();
+            if satisfied {
+                owned_vec_to_result(taken)
+            } else {
+                partial(taken, control)
+            }
+        }
+        QueryResult::OneCursor(_) => unreachable!("eval_single never produces OneCursor"),
+        QueryResult::One(_) | QueryResult::Owned(_) => unreachable!(
+            "n >= 1 here (n == 0 returned above), so the `if n >= 1` guards above always match"
+        ),
     }
 }
 
@@ -8781,6 +9127,12 @@ fn eval_first_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        // jq's generator-based `first` never asks for values past the
+        // first (verified: `first(1,2,error("x"))` is `1`, exit 0 — the
+        // error is never reached), so a non-empty prefix always satisfies
+        // it and the trailing control is dropped. `Partial`'s prefix is
+        // never empty by construction.
+        QueryResult::Partial(vs, _control) => QueryResult::Owned(vs.into_iter().next().unwrap()),
     }
 }
 
@@ -8812,6 +9164,13 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        // Unlike `first`, `last` cannot short-circuit — it doesn't know a
+        // value is the last one until the stream is exhausted (verified:
+        // `last(1,2,error("x"))` raises, it does not answer `2`) — so a
+        // `Partial` just surfaces its control, dropping the prefix, the
+        // same as `reduce`'s input-stream handling.
+        QueryResult::Partial(_, Control::Error(e)) => QueryResult::Error(e),
+        QueryResult::Partial(_, Control::Break(label)) => QueryResult::Break(label),
     }
 }
 
@@ -8856,6 +9215,18 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        // Like `first`/`limit`, `nth` never asks for values past index `n`
+        // (verified: `nth(1; 1,2,error("x"))` is `2`, exit 0, but
+        // `nth(5; 1,2,error("x"))` raises — index 5 was never reached). So
+        // the trailing control is dropped once the prefix reaches index `n`,
+        // and surfaces otherwise.
+        QueryResult::Partial(vs, control) => match vs.into_iter().nth(n) {
+            Some(item) => QueryResult::Owned(item),
+            None => match control {
+                Control::Error(e) => QueryResult::Error(e),
+                Control::Break(label) => QueryResult::Break(label),
+            },
+        },
     }
 }
 
@@ -8909,7 +9280,10 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     break;
                 }
             }
-            Err(e) => return QueryResult::Error(e),
+            // The values already output no longer vanish (#494):
+            // `while(. < 5; if . == 3 then error("boom") else .+1 end)` on
+            // `1` is `1`, `2`, `3`, then the error.
+            Err(e) => return partial(outputs, Control::Error(e)),
         }
 
         // Output current value
@@ -8918,17 +9292,11 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Apply update
         match eval_owned_expr::<S>(update, &current, optional) {
             Ok(new_val) => current = new_val,
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => return partial(outputs, Control::Error(e)),
         }
     }
 
-    if outputs.is_empty() {
-        QueryResult::None
-    } else if outputs.len() == 1 {
-        QueryResult::Owned(outputs.pop().unwrap())
-    } else {
-        QueryResult::ManyOwned(outputs)
-    }
+    owned_vec_to_result(outputs)
 }
 
 /// Evaluate `repeat(expr)` - repeatedly evaluate expr with the original input.
@@ -13275,6 +13643,18 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        // Same semantics as `eval_limit`: jq's generator-based `limit` never
+        // asks for values past `n`, so a prefix that already reaches `n`
+        // drops the trailing control; only a shorter prefix still surfaces it.
+        QueryResult::Partial(vs, control) => {
+            let satisfied = vs.len() >= n;
+            let taken: Vec<_> = vs.into_iter().take(n).collect();
+            if satisfied {
+                owned_vec_to_result(taken)
+            } else {
+                partial(taken, control)
+            }
+        }
     }
 }
 
@@ -13306,6 +13686,9 @@ fn builtin_first_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        // Same semantics as `eval_first_expr`: a non-empty prefix always
+        // satisfies `first`, so the trailing control is dropped.
+        QueryResult::Partial(vs, _control) => QueryResult::Owned(vs.into_iter().next().unwrap()),
     }
 }
 
@@ -13337,6 +13720,10 @@ fn builtin_last_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        // Same semantics as `eval_last_expr`: `last` cannot short-circuit,
+        // so a `Partial` just surfaces its control, dropping the prefix.
+        QueryResult::Partial(_, Control::Error(e)) => QueryResult::Error(e),
+        QueryResult::Partial(_, Control::Break(label)) => QueryResult::Break(label),
     }
 }
 
@@ -13390,6 +13777,15 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         | QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
+        // Same semantics as `eval_nth_expr`: the trailing control is dropped
+        // once the prefix reaches index `n`, and surfaces otherwise.
+        QueryResult::Partial(vs, control) => match vs.into_iter().nth(n) {
+            Some(item) => QueryResult::Owned(item),
+            None => match control {
+                Control::Error(e) => QueryResult::Error(e),
+                Control::Break(label) => QueryResult::Break(label),
+            },
+        },
     }
 }
 
@@ -14348,6 +14744,9 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Many(_) => {
             return QueryResult::Error(EvalError::new("pick: keys expression produced no output"))
         }
+        // Same "take the first output, ignore the rest" policy as
+        // `Many`/`ManyOwned` above; the trailing control is dropped.
+        QueryResult::Partial(vs, _control) => vs.into_iter().next().unwrap(),
     };
 
     // Keys must be an array
@@ -14435,6 +14834,9 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Many(_) => {
             return QueryResult::Error(EvalError::new("omit: keys expression produced no output"))
         }
+        // Same "take the first output, ignore the rest" policy as
+        // `Many`/`ManyOwned` above; the trailing control is dropped.
+        QueryResult::Partial(vs, _control) => vs.into_iter().next().unwrap(),
     };
 
     // Keys must be an array
@@ -14779,16 +15181,21 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Evaluate the expression to get the value to destructure
     let bound_result = eval_single::<W, S>(expr, value.clone(), optional);
 
-    let bound_values: Vec<OwnedValue> = match bound_result.materialize_cursor() {
-        QueryResult::One(v) => vec![to_owned(&v)],
-        QueryResult::OneCursor(_) => unreachable!(),
-        QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
-        QueryResult::Owned(v) => vec![v],
-        QueryResult::ManyOwned(vs) => vs,
-        QueryResult::None => return QueryResult::None,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        QueryResult::Break(label) => return QueryResult::Break(label),
-    };
+    // A `Partial` bind expression (#400, #494) still has its produced prefix
+    // destructured and run through the body below, same as `eval_as`; the
+    // bind's own control is held until that loop has run its course.
+    let (bound_values, bound_control): (Vec<OwnedValue>, Option<Control>) =
+        match bound_result.materialize_cursor() {
+            QueryResult::One(v) => (vec![to_owned(&v)], None),
+            QueryResult::OneCursor(_) => unreachable!(),
+            QueryResult::Many(vs) => (vs.iter().map(to_owned).collect(), None),
+            QueryResult::Owned(v) => (vec![v], None),
+            QueryResult::ManyOwned(vs) => (vs, None),
+            QueryResult::None => return QueryResult::None,
+            QueryResult::Error(e) => return QueryResult::Error(e),
+            QueryResult::Break(label) => return QueryResult::Break(label),
+            QueryResult::Partial(vs, control) => (vs, Some(control)),
+        };
 
     let mut all_results: Vec<OwnedValue> = Vec::new();
 
@@ -14812,17 +15219,19 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(v) => all_results.push(v),
             QueryResult::ManyOwned(vs) => all_results.extend(vs),
             QueryResult::None => {}
-            QueryResult::Error(e) => return QueryResult::Error(e),
-            QueryResult::Break(label) => return QueryResult::Break(label),
+            // The outputs already produced no longer vanish (#400, #494).
+            QueryResult::Error(e) => return partial(all_results, Control::Error(e)),
+            QueryResult::Break(label) => return partial(all_results, Control::Break(label)),
+            QueryResult::Partial(vs, control) => {
+                all_results.extend(vs);
+                return partial(all_results, control);
+            }
         }
     }
 
-    if all_results.is_empty() {
-        QueryResult::None
-    } else if all_results.len() == 1 {
-        QueryResult::Owned(all_results.pop().unwrap())
-    } else {
-        QueryResult::ManyOwned(all_results)
+    match bound_control {
+        Some(control) => partial(all_results, control),
+        None => owned_vec_to_result(all_results),
     }
 }
 
@@ -22743,8 +23152,14 @@ mod tests {
             }
         );
         // Also reachable via a comma-generator argument (the path that
-        // originally surfaced this while verifying #155's fix).
-        query!(b"null", r#"nth(0; 1, error("boom"))"#,
+        // originally surfaced this while verifying #155's fix). Index 1 is
+        // requested but the stream only reaches index 0 before erroring, so
+        // the error still surfaces — verified against jq 1.7.1, which raises
+        // here too. (#400/#494 changed what happens when the requested index
+        // *is* reached before the error: `nth(0; 1, error("boom"))` is `1`,
+        // not an error, matching jq's generator never asking for a value
+        // past the one it needed — see `regression_issue_400_nth_stream_*`.)
+        query!(b"null", r#"nth(1; 1, error("boom"))"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "boom");
             }
