@@ -2648,3 +2648,49 @@ fn test_uncaught_error_locations_across_input_modes() -> Result<()> {
     assert_eq!(stderr.trim_end(), format!("jq: error (at {path}:3): x"));
     Ok(())
 }
+
+#[test]
+fn test_uncaught_break_after_output_keeps_the_prefix() -> Result<()> {
+    // #400/#494 for the `break` terminator: the outputs a stream produced
+    // before an uncaught `break` still reach stdout, and the break still
+    // drives the diagnostic and the exit code.
+    //
+    // The error terminator is pinned against real jq in
+    // `tests/data/jq-golden/cases/*_error_after_output`. `break` cannot be:
+    // jq rejects an unlabelled `break $out` at *compile* time ("$*label-out
+    // is not defined", exit 3), so there is no oracle for the shape that
+    // reaches this arm. These pin succinctly's own accept-and-report
+    // behavior; the labelled (caught) forms, which jq does accept, are
+    // covered by the `and_break_after_output`, `or_break_after_output` and
+    // `label_break_after_comma` golden cases.
+
+    // `run_jq_full` spawns the built binary rather than shelling out to
+    // `cargo run`, which would build (and measure) a second, separate
+    // binary — under `cargo llvm-cov` only the former is instrumented.
+
+    // Lazy raw-bytes path (the default for JSON on stdin).
+    let (stdout, stderr, code) = run_jq_full(&["1,2,break $out"], Some("null"))?;
+    assert_eq!(stdout, "1\n2\n");
+    assert!(
+        stderr.contains("break $out not in label"),
+        "expected the break diagnostic, got: {stderr}"
+    );
+    assert_eq!(code, 5);
+
+    // A prefix built one pipe element at a time, rather than by a comma.
+    let (stdout, stderr, code) = run_jq_full(
+        &[".[] | if . == 3 then break $out else . end"],
+        Some("[1,2,3,4]"),
+    )?;
+    assert_eq!(stdout, "1\n2\n");
+    assert!(stderr.contains("break $out not in label"), "{stderr}");
+    assert_eq!(code, 5);
+
+    // `--null-input` takes the serde-parsed path instead, which has its own
+    // copy of the result conversion.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "1,2,break $out"], None)?;
+    assert_eq!(stdout, "1\n2\n");
+    assert!(stderr.contains("break $out not in label"), "{stderr}");
+    assert_eq!(code, 5);
+    Ok(())
+}
